@@ -4,7 +4,7 @@ use std::{
     fs,
     io::{IsTerminal, Read, Write},
     path::{Path, PathBuf},
-    process::{Child as StdChild, ChildStdin, Command, Stdio},
+    process::Command,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -12,6 +12,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(windows)]
+use std::process::{Child as StdChild, ChildStdin, Stdio};
 
 use agent_bridge::{AgentDefinition, AgentId, TabSet, agents, handoff_text_from, session_title};
 use anyhow::{Context, Result};
