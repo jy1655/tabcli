@@ -1,0 +1,26 @@
+[package]
+name = "agent-bridge"
+version = "0.1.0"
+edition = "2024"
+description = "Local TUI control room for first-party coding agent CLIs"
+license = "MIT"
+rust-version = "1.88"
+
+[dependencies]
+anyhow = "1.0"
+crossbeam-channel = "0.5"
+crossterm = "0.29"
+ratatui = "0.30"
+serde_json = "1.0"
+vt100 = "0.16"
+
+[target.'cfg(not(windows))'.dependencies]
+portable-pty = "0.9"
+
+[target.'cfg(windows)'.dependencies]
+conpty = "0.7"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
