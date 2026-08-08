@@ -9,6 +9,19 @@ Agent Bridge의 목표와 가장 가까운 오픈소스 프로젝트에서 세�
 | [Claude Squad](https://github.com/smtg-ai/claude-squad) | 세션 생성 시 프로그램 프로필 선택, 여러 로컬 에이전트 병렬 관리 | `F3` 생성 화면에서 Codex, Claude, Agy를 매번 자유롭게 선택한다. |
 | [Squad](https://github.com/mco-org/squad) | 로컬 에이전트 사이 메시지 전달과 SQLite 기반 협업 | 외부 서비스 없이 `F2` 릴레이를 유지하되 중복 세션을 구분하는 탭 이름을 출처로 넣는다. |
 
+## Workspace 벤치마킹 (2026-08-09)
+
+- ccmux는 cwd를 세션 identity로 표시하고 새 세션의 디렉터리를 선택한 세션/그룹에서 파생한다. restart도 해당 세션 문맥을 유지한다.
+- Agent Deck은 `add .`로 현재 디렉터리를 세션에 결합하고, 병렬 격리가 필요하면 세션별 Git worktree를 선택적으로 만든다.
+- Agent Bridge는 자동 worktree 수명주기를 도입하지 않는다. 대신 F3에서 탭별 workspace를 명시적으로 입력하고, rail/header/restart/relay에 같은 경로를 보존·표시한다. 이는 서로 다른 저장소와 같은 저장소의 모듈 디렉터리를 모두 다루면서 기존 PTY·퍼스트파티 CLI 원칙을 유지한다.
+
+## Relay 재검증 (2026-08-09)
+
+- ccmux의 `send`는 text를 대상 pane에 보내는 낮은 수준의 prompt dispatch이며, 별도의 screen/transcript 검색과 diff review handback이 문맥 전달을 보완한다.
+- Agent Deck의 `session handoff`는 session working context를 읽기 전용으로 요약하는 handoff prompt builder다.
+- Squad는 SQLite inbox/history와 task ack/complete 상태를 제공해 비동기 협업을 내구성 있게 추적한다.
+- Agent Bridge F2는 source의 최근 visible terminal context를 최대 6,000자로 제한해 tab/workspace provenance와 사용자 요청에 결합하는 최소 handoff다. 전체 transcript·자동 요약·task queue는 포함하지 않는다. 실제 Codex가 만든 marker를 context로 캡처해 Claude가 새 ACK 값을 생성하는 live test로 source 응답 전달까지 검증했다. target 변경이나 요청 편집은 기존 capture를 폐기하며 두 번째 Enter 전까지 전송하지 않는다.
+
 2026-08-08 재조사에서는 경쟁 제품의 공식 GitHub 문서만 근거로 사용했다. 자동 승인·자동 worktree 생성·외부 데몬 도입은 현재 제품 원칙과 맞지 않아 백로그에 넣지 않았다.
 
 후속 구현으로 앱 내 `F12` 전체 키 도움말, Windows Terminal에서도 도달하는 `Ctrl+F11` 다음 키 직접 전달, 스크롤백 검색, fresh restart, branch/dirty 표시와 읽기 전용 diff 뷰를 반영했다. 세션 상태는 PTY 관측만으로 의미를 추측하지 않도록 activity(`active/quiet/exited/unknown`)와 authoritative hook 상태를 분리했다. Claude는 공식 `UserPromptSubmit`, 전체 `Notification`, `Stop`, `SessionEnd` 이벤트를 세션별 임시 설정으로 연결하며, opt-in waiting/finished 벨 알림도 이 상태 전이에만 반응한다. Codex와 Agy는 신뢰할 수 있는 사용자 대기 이벤트 계약이 없는 동안 activity만 유지한다.

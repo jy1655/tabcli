@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use agent_bridge::{AgentDefinition, AgentId, TabSet, agents, relay_text_from, session_title};
+use agent_bridge::{AgentDefinition, AgentId, TabSet, agents, handoff_text_from, session_title};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use crossterm::event::{
@@ -34,6 +34,7 @@ use ratatui::{
 struct AgentSession {
     definition: AgentDefinition,
     title: String,
+    workspace: PathBuf,
     parser: Arc<Mutex<vt100::Parser>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     alive: Arc<AtomicBool>,
@@ -197,7 +198,7 @@ fn global_node_modules() -> Result<PathBuf> {
 
 fn help_text() -> String {
     format!(
-        "agent-bridge {}\n\nUsage: agent-bridge [--yolo] [WORKSPACE]\n\nOptions:\n  --yolo  DANGER: bypass approval and sandbox protections in every spawned CLI session",
+        "agent-bridge {}\n\nUsage: agent-bridge [-yolo|--yolo] [WORKSPACE]\n\nOptions:\n  -yolo, --yolo  DANGER: bypass approval and sandbox protections in every spawned CLI session",
         env!("CARGO_PKG_VERSION")
     )
 }
@@ -358,6 +359,7 @@ impl AgentSession {
         Ok(Self {
             definition,
             title,
+            workspace: cwd.to_path_buf(),
             parser,
             writer,
             alive,
@@ -433,6 +435,7 @@ impl AgentSession {
         Ok(Self {
             definition,
             title,
+            workspace: cwd.to_path_buf(),
             parser,
             writer,
             alive,
@@ -659,6 +662,7 @@ impl Drop for AgentSession {
 trait SessionIo {
     fn definition(&self) -> AgentDefinition;
     fn title(&self) -> &str;
+    fn workspace(&self) -> &Path;
     fn parser(&self) -> &Arc<Mutex<vt100::Parser>>;
     fn is_alive(&self) -> bool;
     fn write(&self, bytes: &[u8]) -> Result<()>;
@@ -673,6 +677,39 @@ trait SessionIo {
     fn mouse_protocol(&self) -> (vt100::MouseProtocolMode, vt100::MouseProtocolEncoding);
 }
 
+fn submit_relay(destination: &dyn SessionIo, message: &str) -> Result<()> {
+    let bracketed = destination.bracketed_paste();
+    if bracketed {
+        destination.write(format!("\x1b[200~{message}\x1b[201~").as_bytes())?;
+    } else {
+        destination.write(message.as_bytes())?;
+    }
+    thread::sleep(Duration::from_millis(50));
+    destination.write(b"\r")?;
+    if bracketed {
+        thread::sleep(Duration::from_millis(250));
+        destination.write(b"\r")?;
+    }
+    Ok(())
+}
+
+fn visible_terminal_context(session: &dyn SessionIo, max_chars: usize) -> Result<String> {
+    let parser = session
+        .parser()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("terminal parser poisoned"))?;
+    let text = parser.screen().contents();
+    let count = text.chars().count();
+    if count <= max_chars {
+        return Ok(text.trim().to_owned());
+    }
+    let tail = text.chars().skip(count - max_chars).collect::<String>();
+    Ok(format!(
+        "[... earlier visible context omitted ...]\n{}",
+        tail.trim()
+    ))
+}
+
 impl SessionIo for AgentSession {
     fn definition(&self) -> AgentDefinition {
         self.definition
@@ -680,6 +717,10 @@ impl SessionIo for AgentSession {
 
     fn title(&self) -> &str {
         &self.title
+    }
+
+    fn workspace(&self) -> &Path {
+        &self.workspace
     }
 
     fn parser(&self) -> &Arc<Mutex<vt100::Parser>> {
@@ -788,8 +829,11 @@ fn parser_contains_text(parser: &Arc<Mutex<vt100::Parser>>, query: &str) -> Resu
     Ok(found)
 }
 
-type SessionSpawner =
+#[cfg(test)]
+type LegacySessionSpawner =
     Box<dyn FnMut(AgentDefinition, String, &Path, Sender<()>) -> Result<Box<dyn SessionIo>>>;
+type SessionSpawner =
+    Box<dyn FnMut(AgentDefinition, String, &Path, Sender<()>, bool) -> Result<Box<dyn SessionIo>>>;
 
 enum Mode {
     Terminal,
@@ -805,11 +849,13 @@ enum Mode {
     },
     Add {
         selected: usize,
+        workspace: String,
     },
     Relay {
         target: usize,
         input: String,
         confirm: bool,
+        context: Option<String>,
     },
 }
 
@@ -1017,19 +1063,36 @@ struct App {
 
 impl App {
     fn new(cwd: &Path, redraw: Sender<()>, yolo: bool) -> Self {
-        Self::new_with_spawner(
+        Self::new_with_spawner_yolo(
             cwd,
             redraw,
-            Box::new(move |definition, title, cwd, redraw| {
+            yolo,
+            Box::new(move |definition, title, cwd, redraw, yolo| {
                 Ok(Box::new(AgentSession::spawn(
                     definition, title, cwd, redraw, yolo,
                 )?))
             }),
         )
-        .with_yolo(yolo)
     }
 
-    fn new_with_spawner(cwd: &Path, redraw: Sender<()>, spawner: SessionSpawner) -> Self {
+    #[cfg(test)]
+    fn new_with_spawner(cwd: &Path, redraw: Sender<()>, mut spawner: LegacySessionSpawner) -> Self {
+        Self::new_with_spawner_yolo(
+            cwd,
+            redraw,
+            false,
+            Box::new(move |definition, title, cwd, redraw, _| {
+                spawner(definition, title, cwd, redraw)
+            }),
+        )
+    }
+
+    fn new_with_spawner_yolo(
+        cwd: &Path,
+        redraw: Sender<()>,
+        yolo: bool,
+        spawner: SessionSpawner,
+    ) -> Self {
         let mut app = Self {
             sessions: TabSet::new(),
             cwd: cwd.to_path_buf(),
@@ -1041,7 +1104,7 @@ impl App {
             notice: format!("workspace: {}", cwd.display()),
             notifications: notifications_enabled(),
             observed_states: HashMap::new(),
-            yolo: false,
+            yolo,
             terminal_pane: Rect::default(),
         };
         if let Err(error) = app.add_session(AgentId::Codex) {
@@ -1050,12 +1113,12 @@ impl App {
         app
     }
 
-    fn with_yolo(mut self, yolo: bool) -> Self {
-        self.yolo = yolo;
-        self
+    fn add_session(&mut self, id: AgentId) -> Result<()> {
+        let workspace = self.cwd.clone();
+        self.add_session_at(id, &workspace)
     }
 
-    fn add_session(&mut self, id: AgentId) -> Result<()> {
+    fn add_session_at(&mut self, id: AgentId, workspace: &Path) -> Result<()> {
         let definition = agents()
             .into_iter()
             .find(|definition| definition.id == id)
@@ -1063,8 +1126,14 @@ impl App {
         let ordinal_index = agent_index(id);
         let ordinal = self.ordinals[ordinal_index] + 1;
         let title = session_title(id, ordinal);
-        let session = (self.spawner)(definition, title.clone(), &self.cwd, self.redraw.clone())
-            .with_context(|| format!("failed to create {title}"))?;
+        let session = (self.spawner)(
+            definition,
+            title.clone(),
+            workspace,
+            self.redraw.clone(),
+            self.yolo,
+        )
+        .with_context(|| format!("failed to create {title}"))?;
         self.ordinals[ordinal_index] = ordinal;
         self.sessions.push(session);
         self.notice = format!("created {title}");
@@ -1080,8 +1149,15 @@ impl App {
         }
         let definition = session.definition();
         let title = session.title().to_owned();
-        let replacement = (self.spawner)(definition, title.clone(), &self.cwd, self.redraw.clone())
-            .with_context(|| format!("failed to restart {title}"))?;
+        let workspace = session.workspace().to_path_buf();
+        let replacement = (self.spawner)(
+            definition,
+            title.clone(),
+            &workspace,
+            self.redraw.clone(),
+            self.yolo,
+        )
+        .with_context(|| format!("failed to restart {title}"))?;
         self.sessions
             .replace_active(replacement)
             .expect("active session exists");
@@ -1144,9 +1220,15 @@ impl App {
                 }
             }
             Mode::Search { input } => input.push_str(text),
-            Mode::Relay { input, confirm, .. } => {
+            Mode::Relay {
+                input,
+                confirm,
+                context,
+                ..
+            } => {
                 input.push_str(text);
                 *confirm = false;
+                *context = None;
             }
             Mode::Help | Mode::Scrollback | Mode::Diff { .. } | Mode::Add { .. } => {}
         }
@@ -1210,11 +1292,19 @@ impl App {
                 KeyCode::F(12) => self.mode = Mode::Help,
                 KeyCode::F(11) => self.mode = Mode::PassThrough,
                 KeyCode::F(10) => return Ok(true),
-                KeyCode::F(1) => match read_git_diff(&self.cwd) {
-                    Ok(text) => self.mode = Mode::Diff { text, offset: 0 },
-                    Err(error) => self.notice = error.to_string(),
+                KeyCode::F(1) => match self.sessions.active().map(|session| session.workspace()) {
+                    Some(workspace) => match read_git_diff(workspace) {
+                        Ok(text) => self.mode = Mode::Diff { text, offset: 0 },
+                        Err(error) => self.notice = error.to_string(),
+                    },
+                    None => self.notice = "no active session".to_owned(),
                 },
-                KeyCode::F(3) => self.mode = Mode::Add { selected: 0 },
+                KeyCode::F(3) => {
+                    self.mode = Mode::Add {
+                        selected: 0,
+                        workspace: self.cwd.display().to_string(),
+                    }
+                }
                 KeyCode::F(4) => {
                     if let Some(session) = self.sessions.remove_active() {
                         self.observed_states.remove(session.title());
@@ -1243,6 +1333,7 @@ impl App {
                             % self.sessions.len(),
                         input: String::new(),
                         confirm: false,
+                        context: None,
                     };
                 }
                 KeyCode::F(2) => {
@@ -1353,29 +1444,77 @@ impl App {
                 },
                 _ => self.mode = Mode::Search { input },
             },
-            Mode::Add { mut selected } => match key.code {
+            Mode::Add {
+                mut selected,
+                mut workspace,
+            } => match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
                 KeyCode::Left | KeyCode::Up | KeyCode::BackTab => {
                     selected = selected.checked_sub(1).unwrap_or(agents().len() - 1);
-                    self.mode = Mode::Add { selected };
+                    self.mode = Mode::Add {
+                        selected,
+                        workspace,
+                    };
                 }
                 KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
                     selected = (selected + 1) % agents().len();
-                    self.mode = Mode::Add { selected };
+                    self.mode = Mode::Add {
+                        selected,
+                        workspace,
+                    };
+                }
+                KeyCode::Backspace => {
+                    workspace.pop();
+                    self.mode = Mode::Add {
+                        selected,
+                        workspace,
+                    };
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    workspace.clear();
+                    self.mode = Mode::Add {
+                        selected,
+                        workspace,
+                    };
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    workspace.push(character);
+                    self.mode = Mode::Add {
+                        selected,
+                        workspace,
+                    };
                 }
                 KeyCode::Enter => {
-                    if let Err(error) = self.add_session(agents()[selected].id) {
+                    let path = PathBuf::from(workspace.trim());
+                    let result = if !path.is_dir() {
+                        Err(anyhow::anyhow!(
+                            "workspace is not a directory: {}",
+                            path.display()
+                        ))
+                    } else {
+                        self.add_session_at(agents()[selected].id, &path)
+                    };
+                    if let Err(error) = result {
                         self.notice = format!("{error:#}");
-                        self.mode = Mode::Add { selected };
+                        self.mode = Mode::Add {
+                            selected,
+                            workspace,
+                        };
                     }
                 }
-                _ => self.mode = Mode::Add { selected },
+                _ => {
+                    self.mode = Mode::Add {
+                        selected,
+                        workspace,
+                    }
+                }
             },
             Mode::Relay {
                 mut target,
                 mut input,
                 mut confirm,
+                mut context,
             } => match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {}
@@ -1386,6 +1525,7 @@ impl App {
                         target,
                         input,
                         confirm,
+                        context: None,
                     };
                 }
                 KeyCode::Right | KeyCode::Tab => {
@@ -1395,6 +1535,7 @@ impl App {
                         target,
                         input,
                         confirm,
+                        context: None,
                     };
                 }
                 KeyCode::Backspace => {
@@ -1403,6 +1544,7 @@ impl App {
                         target,
                         input,
                         confirm: false,
+                        context: None,
                     };
                 }
                 KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1411,6 +1553,7 @@ impl App {
                         target,
                         input,
                         confirm: false,
+                        context: None,
                     };
                 }
                 KeyCode::Enter => {
@@ -1418,7 +1561,28 @@ impl App {
                         return Ok(false);
                     };
                     let source_title = source_session.title().to_owned();
-                    match relay_text_from(&source_title, &input) {
+                    let source = format!(
+                        "{} @ {}",
+                        source_title,
+                        source_session.workspace().display()
+                    );
+                    let captured = match context.take() {
+                        Some(context) => context,
+                        None => match visible_terminal_context(source_session.as_ref(), 6_000) {
+                            Ok(context) => context,
+                            Err(error) => {
+                                self.notice = error.to_string();
+                                self.mode = Mode::Relay {
+                                    target,
+                                    input,
+                                    confirm,
+                                    context: None,
+                                };
+                                return Ok(false);
+                            }
+                        },
+                    };
+                    match handoff_text_from(&source, &input, &captured) {
                         Ok(message) => {
                             let destination = self.sessions.get(target).expect("relay target");
                             if !destination.is_alive() {
@@ -1427,25 +1591,29 @@ impl App {
                                     target,
                                     input,
                                     confirm,
+                                    context: Some(captured),
                                 };
                             } else if !confirm {
                                 self.notice = format!(
-                                    "press Enter again to relay to {}",
-                                    destination.title()
+                                    "captured {} context chars; Enter again to send to {} @ {}",
+                                    captured.chars().count(),
+                                    destination.title(),
+                                    destination.workspace().display()
                                 );
                                 self.mode = Mode::Relay {
                                     target,
                                     input,
                                     confirm: true,
+                                    context: Some(captured),
                                 };
-                            } else if let Err(error) =
-                                destination.write(format!("{message}\r").as_bytes())
+                            } else if let Err(error) = submit_relay(destination.as_ref(), &message)
                             {
                                 self.notice = error.to_string();
                                 self.mode = Mode::Relay {
                                     target,
                                     input,
                                     confirm,
+                                    context: Some(captured),
                                 };
                             } else {
                                 self.notice =
@@ -1459,6 +1627,7 @@ impl App {
                                 target,
                                 input,
                                 confirm,
+                                context: Some(captured),
                             };
                         }
                     }
@@ -1468,6 +1637,7 @@ impl App {
                         target,
                         input,
                         confirm,
+                        context,
                     }
                 }
             },
@@ -1599,7 +1769,10 @@ fn terminal_inner_size(area: Rect) -> (u16, u16) {
 fn render(frame: &mut Frame, app: &App) {
     let (header, rail, terminal, footer) = app_layout(frame.area());
     let git_label = app
-        .git_context
+        .sessions
+        .active()
+        .filter(|session| session.workspace() == app.cwd)
+        .and(app.git_context.as_ref())
         .as_ref()
         .map(|git| {
             format!(
@@ -1639,7 +1812,7 @@ fn render(frame: &mut Frame, app: &App) {
         frame.render_widget(
             Paragraph::new(
                 "F1      tracked git diff HEAD\n\
-                 F2      relay prompt (Enter twice to send)\n\
+                 F2      handoff request + recent source context (Enter twice)\n\
                  F3      create session\n\
                  F4      close active session\n\
                  F5/F6   previous/next session\n\
@@ -1715,7 +1888,10 @@ fn render(frame: &mut Frame, app: &App) {
             Line::from(" GIT DIFF  ·  ↑/↓ line  ·  PgUp/PgDn page  ·  Home top"),
             Line::from(" Esc/F1 return to terminal"),
         ],
-        Mode::Add { selected } => {
+        Mode::Add {
+            selected,
+            workspace,
+        } => {
             let choices = agents()
                 .iter()
                 .enumerate()
@@ -1737,8 +1913,9 @@ fn render(frame: &mut Frame, app: &App) {
             vec![
                 Line::from(choices),
                 Line::from(format!(
-                    "{}←/→ choose CLI  ·  Enter create tab  ·  Esc cancel",
-                    if app.yolo { "YOLO · " } else { "" }
+                    "{}workspace: {}  ·  type/edit path  ·  ←/→ CLI  ·  Enter create",
+                    if app.yolo { "YOLO · " } else { "" },
+                    workspace
                 )),
             ]
         }
@@ -1746,24 +1923,28 @@ fn render(frame: &mut Frame, app: &App) {
             target,
             input,
             confirm,
+            context,
         } => {
             let target_name = app
                 .sessions
                 .get(*target)
-                .map(|session| session.title())
-                .unwrap_or("?");
+                .map(|session| format!("{} @ {}", session.title(), session.workspace().display()))
+                .unwrap_or_else(|| "?".to_owned());
             vec![
                 Line::from(vec![
                     Span::styled(
-                        format!(" RELAY → {target_name} "),
+                        format!(" HANDOFF → {target_name} "),
                         Style::default().fg(Color::Black).bg(Color::Yellow),
                     ),
                     Span::raw(format!(" {input}")),
                 ]),
                 Line::from(if *confirm {
-                    " Enter confirm send  ·  edit/target change resets confirmation  ·  Esc cancel"
+                    format!(
+                        " {} context chars captured  ·  Enter confirm handoff  ·  edit resets",
+                        context.as_ref().map_or(0, |value| value.chars().count())
+                    )
                 } else {
-                    " ←/→ target  ·  Enter review  ·  Esc cancel"
+                    " ←/→ target  ·  Enter capture recent context  ·  Esc cancel".to_owned()
                 }),
             ]
         }
@@ -1807,7 +1988,13 @@ fn render_tab_rail(frame: &mut Frame, app: &App, area: Rect) {
                     .map(SemanticState::label)
                     .unwrap_or_else(|| activity.label())
             };
-            ListItem::new(format!(" {marker} {} [{}]", session.title(), status)).style(style)
+            ListItem::new(format!(
+                " {marker} {} [{}]\n   {}",
+                session.title(),
+                status,
+                session.workspace().display()
+            ))
+            .style(style)
         })
         .collect::<Vec<_>>();
     frame.render_widget(
@@ -1824,10 +2011,11 @@ fn render_session(frame: &mut Frame, session: &dyn SessionIo, area: Rect) {
     let definition = session.definition();
     let color = agent_color(definition.id);
     let title = format!(
-        " {} · {} · {} ",
+        " {} · {} · {} · {} ",
         session.title(),
         definition.role,
         definition.command,
+        session.workspace().display(),
     );
     let block = Block::default()
         .title(title)
@@ -2025,7 +2213,7 @@ fn parse_args_from(args: impl IntoIterator<Item = OsString>) -> Result<Launch> {
     let mut workspace = None;
     let mut yolo = false;
     for argument in std::iter::once(argument).chain(args) {
-        if argument == "--yolo" {
+        if argument == "--yolo" || argument == "-yolo" {
             if yolo {
                 anyhow::bail!("--yolo may only be specified once");
             }
@@ -2094,6 +2282,7 @@ mod tests {
     struct TestSession {
         definition: AgentDefinition,
         title: String,
+        workspace: PathBuf,
         parser: Arc<Mutex<vt100::Parser>>,
         write_error: bool,
         writes: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -2108,6 +2297,10 @@ mod tests {
 
         fn title(&self) -> &str {
             &self.title
+        }
+
+        fn workspace(&self) -> &Path {
+            &self.workspace
         }
 
         fn parser(&self) -> &Arc<Mutex<vt100::Parser>> {
@@ -2190,6 +2383,7 @@ mod tests {
         TestSession {
             definition,
             title,
+            workspace: PathBuf::from("workspace"),
             parser: Arc::new(Mutex::new(vt100::Parser::new(32, 100, 2_000))),
             write_error,
             writes,
@@ -2401,6 +2595,13 @@ mod tests {
         );
         app.add_session(AgentId::Claude).unwrap();
         app.sessions.set_active(0);
+        app.sessions
+            .active()
+            .unwrap()
+            .parser()
+            .lock()
+            .unwrap()
+            .process(b"SOURCE FINDING: retry path is unsafe");
         app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
             .unwrap();
         app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
@@ -2413,7 +2614,11 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
-        assert_eq!(writes.lock().unwrap().len(), 1);
+        assert_eq!(writes.lock().unwrap().len(), 2);
+        assert!(
+            String::from_utf8_lossy(&writes.lock().unwrap()[0])
+                .contains("SOURCE FINDING: retry path is unsafe")
+        );
         assert_eq!(app.sessions.active_index(), Some(1));
     }
 
@@ -2458,6 +2663,67 @@ mod tests {
         assert_eq!(app.sessions.active().unwrap().title(), "Codex 1");
         assert_eq!(spawn_count.load(Ordering::SeqCst), 2);
         assert!(!app.observed_states.contains_key("Codex 1"));
+    }
+
+    #[test]
+    fn new_tabs_can_spawn_in_a_workspace_distinct_from_the_launch_workspace() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let spawned = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+        let captured = Arc::clone(&spawned);
+        let mut app = App::new_with_spawner(
+            Path::new("launch-workspace"),
+            redraw,
+            Box::new(move |definition, title, cwd, _| {
+                captured.lock().unwrap().push(cwd.to_path_buf());
+                let mut session = test_session(definition, title, false);
+                session.workspace = cwd.to_path_buf();
+                Ok(Box::new(session))
+            }),
+        );
+
+        app.add_session_at(AgentId::Claude, Path::new("other-workspace"))
+            .unwrap();
+
+        assert_eq!(
+            *spawned.lock().unwrap(),
+            vec![
+                PathBuf::from("launch-workspace"),
+                PathBuf::from("other-workspace")
+            ]
+        );
+        assert_eq!(
+            app.sessions.active().unwrap().workspace(),
+            Path::new("other-workspace")
+        );
+    }
+
+    #[test]
+    fn restart_preserves_the_tabs_original_workspace() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let spawned = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
+        let captured = Arc::clone(&spawned);
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_for_factory = Arc::clone(&count);
+        let mut app = App::new_with_spawner(
+            Path::new("launch-workspace"),
+            redraw,
+            Box::new(move |definition, title, cwd, _| {
+                captured.lock().unwrap().push(cwd.to_path_buf());
+                let mut session = test_session(definition, title, false);
+                session.workspace = cwd.to_path_buf();
+                session.alive = count_for_factory.fetch_add(1, Ordering::SeqCst) == 0;
+                Ok(Box::new(session))
+            }),
+        );
+        app.add_session_at(AgentId::Claude, Path::new("other-workspace"))
+            .unwrap();
+
+        app.restart_active().unwrap();
+
+        assert_eq!(
+            spawned.lock().unwrap().last(),
+            Some(&PathBuf::from("other-workspace"))
+        );
     }
 
     #[test]
@@ -2810,6 +3076,66 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "live smoke test: requires installed and authenticated Codex and Claude CLIs"]
+    fn live_relay_delivers_a_prompt_to_another_cli_session() {
+        let (redraw, _) = crossbeam_channel::bounded(32);
+        let mut app = App::new(Path::new(env!("CARGO_MANIFEST_DIR")), redraw, false);
+        assert!(wait_for_screen_text(
+            app.sessions.active().unwrap().as_ref(),
+            "codex",
+            Duration::from_secs(20)
+        ));
+        submit_relay(
+            app.sessions.active().unwrap().as_ref(),
+            "Output only the uppercase concatenation of: source, underscore, context, underscore, 731.",
+        )
+        .unwrap();
+        let source_ready = wait_for_screen_text(
+            app.sessions.active().unwrap().as_ref(),
+            "SOURCE_CONTEXT_731",
+            Duration::from_secs(30),
+        );
+        let source_screen = app.sessions.active().unwrap().parser().lock().unwrap();
+        assert!(
+            source_ready,
+            "handoff source screen:\n{}",
+            source_screen.screen().contents()
+        );
+        drop(source_screen);
+        app.add_session(AgentId::Claude).unwrap();
+        app.sessions.set_active(0);
+        assert!(wait_for_screen_text(
+            app.sessions.get(1).unwrap().as_ref(),
+            "Claude Code",
+            Duration::from_secs(20)
+        ));
+
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_paste(
+            "Find the marker beginning with SOURCE_CONTEXT in the recent source terminal context, append underscore followed by ACK, and output only the resulting value.",
+        )
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(app.sessions.active_index(), Some(1));
+        let delivered = wait_for_screen_text(
+            app.sessions.active().unwrap().as_ref(),
+            "SOURCE_CONTEXT_731_ACK",
+            Duration::from_secs(30),
+        );
+        let screen = app.sessions.active().unwrap().parser().lock().unwrap();
+        assert!(
+            delivered,
+            "relay target screen:\n{}",
+            screen.screen().contents()
+        );
+    }
+
+    #[test]
     fn incoming_output_keeps_a_scrollback_view_anchored() {
         let mut parser = vt100::Parser::new(4, 40, 100);
         for index in 0..20 {
@@ -2867,9 +3193,19 @@ mod tests {
     }
 
     #[test]
+    fn command_line_without_a_workspace_inherits_process_cwd() {
+        let expected = std::env::current_dir().unwrap();
+        assert!(matches!(
+            parse_args_from(Vec::<OsString>::new()).unwrap(),
+            Launch::Run { cwd, yolo: false } if cwd == expected
+        ));
+    }
+
+    #[test]
     fn command_line_accepts_yolo_before_or_after_workspace() {
         for args in [
             vec![OsString::from("--yolo"), OsString::from(".")],
+            vec![OsString::from("-yolo"), OsString::from(".")],
             vec![OsString::from("."), OsString::from("--yolo")],
             vec![OsString::from("--yolo")],
         ] {
@@ -2878,6 +3214,26 @@ mod tests {
                 Launch::Run { yolo: true, .. }
             ));
         }
+    }
+
+    #[test]
+    fn yolo_mode_is_forwarded_to_initial_and_new_tab_spawns() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_by_spawner = Arc::clone(&observed);
+        let mut app = App::new_with_spawner_yolo(
+            Path::new("workspace"),
+            redraw,
+            true,
+            Box::new(move |definition, title, _, _, yolo| {
+                observed_by_spawner.lock().unwrap().push(yolo);
+                Ok(Box::new(test_session(definition, title, false)))
+            }),
+        );
+
+        app.add_session(AgentId::Claude).unwrap();
+
+        assert_eq!(*observed.lock().unwrap(), vec![true, true]);
     }
 
     #[test]

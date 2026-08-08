@@ -1,4 +1,6 @@
-use agent_bridge::{AgentId, TabSet, agents, relay_text, relay_text_from, session_title};
+use agent_bridge::{
+    AgentId, TabSet, agents, handoff_text_from, relay_text, relay_text_from, session_title,
+};
 
 #[test]
 fn registry_uses_first_party_cli_commands() {
@@ -28,6 +30,20 @@ fn relay_distinguishes_duplicate_agent_tabs() {
         relay_text_from("Codex 2", "Review Codex 1 output").unwrap(),
         "[Agent Bridge · from Codex 2] Review Codex 1 output"
     );
+}
+
+#[test]
+fn handoff_includes_the_request_and_recent_source_context() {
+    let text = handoff_text_from(
+        "Codex 1 @ D:\\Dev\\alpha",
+        "Review the implementation",
+        "Tests pass. Remaining risk: timeout handling.",
+    )
+    .unwrap();
+
+    assert!(text.contains("Source: Codex 1 @ D:\\Dev\\alpha"));
+    assert!(text.contains("Request: Review the implementation"));
+    assert!(text.contains("Tests pass. Remaining risk: timeout handling."));
 }
 
 #[test]
