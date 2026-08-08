@@ -18,7 +18,9 @@ npm install -g node-pty
 cargo run -- D:\Dev
 ```
 
-승인 확인과 sandbox 보호를 우회해야 하는 명시적인 작업에서는 `--yolo`를 workspace 앞이나 뒤에 지정할 수 있습니다.
+workspace를 생략하면 `agent-bridge`를 실행한 현재 디렉터리를 사용합니다. `F3` 생성 화면에서는 기본 경로를 `Ctrl+U`로 지운 뒤 다른 디렉터리를 입력해 탭마다 별도 workspace를 선택할 수 있습니다. 탭을 재시작해도 선택한 workspace가 유지됩니다.
+
+승인 확인과 sandbox 보호를 우회해야 하는 명시적인 작업에서는 `--yolo` 또는 `-yolo`를 workspace 앞이나 뒤에 지정할 수 있습니다. 이 mode는 실행 중 만드는 모든 새 탭과 restart 세션에도 유지됩니다.
 
 ```powershell
 cargo run -- --yolo D:\Dev
@@ -39,18 +41,20 @@ cargo build --release
 
 - `F12`: 앱 안에서 전체 단축키 도움말 열기
 - `Ctrl+F11` (`F11`도 가능): 다음 키 하나를 Agent Bridge 단축키 처리 없이 활성 CLI로 전달. Windows Terminal이 plain `F11`을 전체화면 전환으로 소비하므로 `Ctrl+F11`을 권장
-- `F3`: 새 탭 열기 (`←`/`→`로 CLI 선택, `Enter`로 생성)
+- `F3`: 새 탭 열기 (`←`/`→`로 CLI 선택, workspace 경로 입력, `Ctrl+U`로 기본 경로 지우기, `Enter`로 생성)
 - `F1`: 현재 workspace의 tracked `git diff HEAD` 읽기 전용 보기
 - `F4`: 활성 탭 종료
 - `F5` / `F6`: 이전/다음 탭으로 이동
 - `F7`: 탭 제목과 보관된 터미널 출력 검색
-- `F2`: 현재 탭 이름으로 다른 탭에 프롬프트 전달 (탭 2개 이상 필요)
+- `F2`: 현재 탭의 최근 visible terminal context(최대 6,000자), tab/workspace provenance, 사용자가 입력한 요청을 다른 탭에 handoff (탭 2개 이상 필요, 첫 `Enter`로 context를 캡처하고 두 번째 `Enter`로 전송)
 - `F8`: 스크롤백 모드 (`↑`/`↓`, `PageUp`/`PageDown`, `Home`/`End`, `Esc`로 복귀)
 - 마우스 휠: CLI가 마우스 리포팅을 요청하지 않으면 터미널 스크롤백 이동. 마우스 캡처 중 Windows Terminal의 텍스트 선택·복사는 `Shift`를 누른 채 드래그
 - `F9`: 종료된 탭을 같은 CLI·이름으로 새 세션 재시작
 - `F10`: Agent Bridge 종료
 - Agent Bridge가 예약하지 않은 키: 활성 에이전트 PTY에 그대로 전달 (`Ctrl+F11`로 예약 키도 전달 가능)
 - 릴레이 입력 중 `←` / `→`: 대상 변경, `Enter` 두 번: 검토 후 전송, `Esc`: 취소
+
+F2 handoff는 source CLI의 현재 화면에 보이는 최근 응답과 대화 문맥만 캡처합니다. 전체 transcript나 숨겨진 세션 상태를 읽지 않으며, target 변경이나 요청 편집 시 캡처를 폐기하고 다시 검토합니다. 민감한 terminal 출력이 보이는 경우 전송 전에 source 화면과 캡처 문자 수를 확인하고 취소하세요.
 
 앱은 처음에 `Codex 1`만 엽니다. `F3`을 반복해서 원하는 구성을 만드세요. 마지막 탭을 닫아도 앱은 유지되며 다시 `F3`으로 세션을 만들 수 있습니다.
 

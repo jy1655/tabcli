@@ -56,6 +56,24 @@ pub fn relay_text_from(from: &str, value: &str) -> Result<String> {
     Ok(format!("[Agent Bridge · from {from}] {text}"))
 }
 
+pub fn handoff_text_from(from: &str, request: &str, context: &str) -> Result<String> {
+    let request = request.trim();
+    if request.is_empty() {
+        bail!("handoff request cannot be empty");
+    }
+    let context = context.trim();
+    Ok(format!(
+        "[Agent Bridge handoff]\nSource: {}\nRequest: {}\n\nRecent source terminal:\n---\n{}\n---",
+        from.trim(),
+        request,
+        if context.is_empty() {
+            "(no visible source context)"
+        } else {
+            context
+        }
+    ))
+}
+
 pub fn session_title(agent: AgentId, ordinal: u32) -> String {
     format!("{} {ordinal}", agent.name())
 }
