@@ -4,10 +4,10 @@ use std::{
     fs,
     io::{IsTerminal, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child as StdChild, ChildStdin, Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -17,8 +17,8 @@ use agent_bridge::{AgentDefinition, AgentId, TabSet, agents, relay_text_from, se
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender};
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 #[cfg(not(windows))]
@@ -41,24 +41,178 @@ struct AgentSession {
     hook_adapter: Option<HookAdapter>,
     size: (u16, u16),
     #[cfg(windows)]
-    process: conpty::Process,
+    process: WindowsSessionProcess,
+    #[cfg(windows)]
+    node_control: Option<Arc<Mutex<ChildStdin>>>,
     #[cfg(not(windows))]
     master: Box<dyn MasterPty + Send>,
     #[cfg(not(windows))]
     child: Box<dyn Child + Send + Sync>,
 }
 
-static NEXT_HOOK_ADAPTER_ID: AtomicU64 = AtomicU64::new(1);
-
-struct HookAdapter {
-    status_path: PathBuf,
-    settings_path: PathBuf,
+#[cfg(windows)]
+enum WindowsSessionProcess {
+    Conpty(conpty::Process),
+    NodePty(StdChild),
 }
 
-impl Drop for HookAdapter {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.status_path);
-        let _ = fs::remove_file(&self.settings_path);
+#[cfg(windows)]
+type WindowsSpawnParts = (
+    WindowsSessionProcess,
+    Box<dyn Read + Send>,
+    Box<dyn Write + Send>,
+    Option<Arc<Mutex<ChildStdin>>>,
+);
+
+#[cfg(windows)]
+struct NodePtyControlWriter {
+    input: Arc<Mutex<ChildStdin>>,
+}
+
+#[cfg(windows)]
+impl Write for NodePtyControlWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut input = self
+            .input
+            .lock()
+            .map_err(|_| std::io::Error::other("Claude PTY control channel poisoned"))?;
+        writeln!(input, "{{\"t\":\"write\",\"d\":\"{}\"}}", hex(bytes))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.input
+            .lock()
+            .map_err(|_| std::io::Error::other("Claude PTY control channel poisoned"))?
+            .flush()
+    }
+}
+
+#[cfg(windows)]
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+#[cfg(windows)]
+const NODE_PTY_SIDECAR: &str = r#"
+const readline = require('readline');
+const pty = require('node-pty');
+const program = process.env.AGENT_BRIDGE_CLAUDE_PROGRAM;
+const args = JSON.parse(process.env.AGENT_BRIDGE_CLAUDE_ARGS || '[]');
+const child = pty.spawn(program, args, {
+  name: 'xterm-256color', cols: 100, rows: 32, cwd: process.cwd(), env: process.env,
+  useConpty: true, useConptyDll: true
+});
+child.onData(data => process.stdout.write(data));
+child.onExit(({exitCode}) => process.exit(exitCode || 0));
+readline.createInterface({input: process.stdin, crlfDelay: Infinity}).on('line', line => {
+  const message = JSON.parse(line);
+  if (message.t === 'write') child.write(Buffer.from(message.d, 'hex').toString());
+  if (message.t === 'resize') child.resize(message.cols, message.rows);
+});
+process.on('SIGTERM', () => child.kill());
+"#;
+
+struct HookAdapter {
+    status_file: tempfile::NamedTempFile,
+    settings_file: tempfile::NamedTempFile,
+}
+
+fn session_arguments(
+    definition: AgentDefinition,
+    yolo: bool,
+    claude_settings: Option<&Path>,
+) -> Vec<OsString> {
+    let mut arguments = Vec::new();
+    if yolo {
+        arguments.push(OsString::from(match definition.id {
+            AgentId::Codex => "--dangerously-bypass-approvals-and-sandbox",
+            AgentId::Claude | AgentId::Agy => "--dangerously-skip-permissions",
+        }));
+    }
+    if definition.id == AgentId::Claude
+        && let Some(settings) = claude_settings
+    {
+        arguments.push(OsString::from("--settings"));
+        arguments.push(settings.as_os_str().to_owned());
+    }
+    arguments
+}
+
+#[cfg(windows)]
+fn resolve_windows_agent_command(
+    definition: AgentDefinition,
+    path: Option<&std::ffi::OsStr>,
+    user_profile: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    let names = [
+        format!("{}.exe", definition.command),
+        format!("{}.cmd", definition.command),
+        format!("{}.bat", definition.command),
+        definition.command.to_owned(),
+    ];
+    if let Some(path) = path {
+        for directory in std::env::split_paths(path) {
+            for name in &names {
+                let candidate = directory.join(name);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+    }
+    if definition.id == AgentId::Claude
+        && let Some(user_profile) = user_profile
+    {
+        let candidate = PathBuf::from(user_profile)
+            .join(".local")
+            .join("bin")
+            .join("claude.exe");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from(definition.command)
+}
+
+#[cfg(windows)]
+fn global_node_modules() -> Result<PathBuf> {
+    let output = Command::new("npm.cmd")
+        .args(["root", "-g"])
+        .output()
+        .context("failed to locate global node modules")?;
+    anyhow::ensure!(output.status.success(), "`npm root -g` failed");
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    anyhow::ensure!(
+        path.join("node-pty").is_dir(),
+        "Claude PTY dependency is missing; run `npm install -g node-pty`"
+    );
+    Ok(path)
+}
+
+fn help_text() -> String {
+    format!(
+        "agent-bridge {}\n\nUsage: agent-bridge [--yolo] [WORKSPACE]\n\nOptions:\n  --yolo  DANGER: bypass approval and sandbox protections in every spawned CLI session",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn yolo_label(yolo: bool) -> &'static str {
+    if yolo { " YOLO " } else { "" }
+}
+
+impl HookAdapter {
+    fn status_path(&self) -> &Path {
+        self.status_file.path()
+    }
+
+    fn settings_path(&self) -> &Path {
+        self.settings_file.path()
     }
 }
 
@@ -66,52 +220,112 @@ fn prepare_hook_adapter(definition: AgentDefinition) -> Result<Option<HookAdapte
     if definition.id != AgentId::Claude {
         return Ok(None);
     }
-    let id = NEXT_HOOK_ADAPTER_ID.fetch_add(1, Ordering::Relaxed);
-    let stem = format!("agent-bridge-{}-{id}", std::process::id());
-    let status_path = std::env::temp_dir().join(format!("{stem}.status"));
-    let settings_path = std::env::temp_dir().join(format!("{stem}.settings.json"));
-    let adapter = HookAdapter {
-        status_path,
-        settings_path,
-    };
-    fs::write(&adapter.status_path, "idle")?;
+    let mut status_file = tempfile::Builder::new()
+        .prefix("agent-bridge-")
+        .suffix(".status")
+        .tempfile_in(std::env::temp_dir())?;
+    status_file.write_all(b"idle")?;
     let executable = std::env::current_exe().context("failed to locate agent-bridge executable")?;
     let settings = serde_json::to_vec_pretty(&claude_hook_settings(&executable))?;
-    fs::write(&adapter.settings_path, settings)?;
-    Ok(Some(adapter))
+    let mut settings_file = tempfile::Builder::new()
+        .prefix("agent-bridge-")
+        .suffix(".settings.json")
+        .tempfile_in(std::env::temp_dir())?;
+    settings_file.write_all(&settings)?;
+    Ok(Some(HookAdapter {
+        status_file,
+        settings_file,
+    }))
 }
 
 impl AgentSession {
+    fn arguments(
+        definition: AgentDefinition,
+        yolo: bool,
+        hook_adapter: Option<&HookAdapter>,
+    ) -> Vec<OsString> {
+        session_arguments(
+            definition,
+            yolo,
+            hook_adapter.map(HookAdapter::settings_path),
+        )
+    }
+
     #[cfg(windows)]
     fn spawn(
         definition: AgentDefinition,
         title: String,
         cwd: &Path,
         redraw: Sender<()>,
+        yolo: bool,
     ) -> Result<Self> {
         let hook_adapter = prepare_hook_adapter(definition)?;
-        let mut command = Command::new("cmd.exe");
-        let invocation = if let Some(adapter) = &hook_adapter {
-            command.env("AGENT_BRIDGE_STATUS_FILE", &adapter.status_path);
-            format!(
-                "{} --settings \"{}\"",
-                definition.command,
-                adapter.settings_path.display()
+        let program = resolve_windows_agent_command(
+            definition,
+            std::env::var_os("PATH").as_deref(),
+            std::env::var_os("USERPROFILE").as_deref(),
+        );
+        let arguments = Self::arguments(definition, yolo, hook_adapter.as_ref());
+        let (process, mut reader, writer, node_control): WindowsSpawnParts = if definition.id
+            == AgentId::Claude
+        {
+            let node_path = global_node_modules()?;
+            let arguments_json = serde_json::to_string(
+                &arguments
+                    .iter()
+                    .map(|argument| argument.to_string_lossy())
+                    .collect::<Vec<_>>(),
+            )?;
+            let mut command = Command::new("node.exe");
+            command
+                .args(["-e", NODE_PTY_SIDECAR])
+                .current_dir(cwd)
+                .env("NODE_PATH", node_path)
+                .env("AGENT_BRIDGE_CLAUDE_PROGRAM", &program)
+                .env("AGENT_BRIDGE_CLAUDE_ARGS", arguments_json)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit());
+            if let Some(adapter) = &hook_adapter {
+                command.env("AGENT_BRIDGE_STATUS_FILE", adapter.status_path());
+            }
+            let mut child = command.spawn().context(
+                "failed to start Claude PTY sidecar; install node-pty with `npm install -g node-pty`",
+            )?;
+            let reader = Box::new(
+                child
+                    .stdout
+                    .take()
+                    .context("Claude PTY stdout unavailable")?,
+            );
+            let node_control = Arc::new(Mutex::new(
+                child.stdin.take().context("Claude PTY stdin unavailable")?,
+            ));
+            let writer = Box::new(NodePtyControlWriter {
+                input: Arc::clone(&node_control),
+            });
+            (
+                WindowsSessionProcess::NodePty(child),
+                reader,
+                writer,
+                Some(node_control),
             )
         } else {
-            definition.command.to_owned()
+            let mut command = Command::new(&program);
+            command.args(&arguments).current_dir(cwd);
+            if let Some(adapter) = &hook_adapter {
+                command.env("AGENT_BRIDGE_STATUS_FILE", adapter.status_path());
+            }
+            let mut child = conpty::ProcessOptions::default()
+                .set_console_size(Some((100, 32)))
+                .spawn(command)
+                .with_context(|| format!("failed to start {}", program.display()))?;
+            let reader = Box::new(child.output()?);
+            let writer = Box::new(child.input()?);
+            (WindowsSessionProcess::Conpty(child), reader, writer, None)
         };
-        command
-            .args(["/D", "/S", "/C"])
-            .arg(invocation)
-            .current_dir(cwd);
-        let mut process = conpty::ProcessOptions::default()
-            .set_console_size(Some((100, 32)))
-            .spawn(command)
-            .with_context(|| format!("failed to start {}", definition.command))?;
-        let mut reader = process.output()?;
-        let writer: Box<dyn Write + Send> = Box::new(process.input()?);
         let writer = Arc::new(Mutex::new(writer));
+        let writer_for_reader = Arc::clone(&writer);
         let parser = Arc::new(Mutex::new(vt100::Parser::new(32, 100, 2_000)));
         let parser_for_reader = Arc::clone(&parser);
         let alive = Arc::new(AtomicBool::new(true));
@@ -123,6 +337,12 @@ impl AgentSession {
             while let Ok(count) = reader.read(&mut buffer) {
                 if count == 0 {
                     break;
+                }
+                if let Some(response) = terminal_query_response(&buffer[..count])
+                    && let Ok(mut input) = writer_for_reader.lock()
+                {
+                    let _ = input.write_all(response);
+                    let _ = input.flush();
                 }
                 if let Ok(mut parser) = parser_for_reader.lock() {
                     process_output(&mut parser, &buffer[..count]);
@@ -135,7 +355,6 @@ impl AgentSession {
             alive_for_reader.store(false, Ordering::Release);
             let _ = redraw.try_send(());
         });
-
         Ok(Self {
             definition,
             title,
@@ -146,6 +365,7 @@ impl AgentSession {
             hook_adapter,
             size: (100, 32),
             process,
+            node_control,
         })
     }
 
@@ -155,6 +375,7 @@ impl AgentSession {
         title: String,
         cwd: &Path,
         redraw: Sender<()>,
+        yolo: bool,
     ) -> Result<Self> {
         let hook_adapter = prepare_hook_adapter(definition)?;
         let pair = native_pty_system().openpty(PtySize {
@@ -163,12 +384,14 @@ impl AgentSession {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        let mut command = CommandBuilder::new(definition.command);
+        let program = PathBuf::from(definition.command);
+        let mut command = CommandBuilder::new(program);
         command.cwd(cwd);
+        for argument in Self::arguments(definition, yolo, hook_adapter.as_ref()) {
+            command.arg(argument);
+        }
         if let Some(adapter) = &hook_adapter {
-            command.arg("--settings");
-            command.arg(&adapter.settings_path);
-            command.env("AGENT_BRIDGE_STATUS_FILE", &adapter.status_path);
+            command.env("AGENT_BRIDGE_STATUS_FILE", adapter.status_path());
         }
         let child = pair
             .slave
@@ -177,6 +400,7 @@ impl AgentSession {
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader()?;
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
+        let writer_for_reader = Arc::clone(&writer);
         let parser = Arc::new(Mutex::new(vt100::Parser::new(32, 100, 2_000)));
         let parser_for_reader = Arc::clone(&parser);
         let alive = Arc::new(AtomicBool::new(true));
@@ -188,6 +412,12 @@ impl AgentSession {
             while let Ok(count) = reader.read(&mut buffer) {
                 if count == 0 {
                     break;
+                }
+                if let Some(response) = terminal_query_response(&buffer[..count])
+                    && let Ok(mut input) = writer_for_reader.lock()
+                {
+                    let _ = input.write_all(response);
+                    let _ = input.flush();
                 }
                 if let Ok(mut parser) = parser_for_reader.lock() {
                     process_output(&mut parser, &buffer[..count]);
@@ -239,7 +469,22 @@ impl AgentSession {
             return Ok(());
         }
         #[cfg(windows)]
-        self.process.resize(cols as i16, rows as i16)?;
+        match &mut self.process {
+            WindowsSessionProcess::Conpty(process) => process.resize(cols as i16, rows as i16)?,
+            WindowsSessionProcess::NodePty(_) => {
+                let mut input = self
+                    .node_control
+                    .as_ref()
+                    .context("Claude PTY control channel unavailable")?
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Claude PTY control channel poisoned"))?;
+                writeln!(
+                    input,
+                    "{{\"t\":\"resize\",\"cols\":{cols},\"rows\":{rows}}}"
+                )?;
+                input.flush()?;
+            }
+        }
         #[cfg(not(windows))]
         self.master.resize(PtySize {
             rows,
@@ -364,6 +609,16 @@ fn process_output(parser: &mut vt100::Parser, bytes: &[u8]) {
         .set_scrollback(pinned.saturating_add(new_maximum.saturating_sub(old_maximum)));
 }
 
+fn terminal_query_response(bytes: &[u8]) -> Option<&'static [u8]> {
+    if bytes.windows(4).any(|window| window == b"\x1b[>c") {
+        Some(b"\x1b[>0;276;0c")
+    } else if bytes.windows(3).any(|window| window == b"\x1b[c") {
+        Some(b"\x1b[?1;2c")
+    } else {
+        None
+    }
+}
+
 impl SessionActivity {
     const fn label(self) -> &'static str {
         match self {
@@ -388,7 +643,14 @@ fn classify_activity(alive: bool, elapsed: Duration) -> SessionActivity {
 impl Drop for AgentSession {
     fn drop(&mut self) {
         #[cfg(windows)]
-        let _ = self.process.exit(0);
+        match &mut self.process {
+            WindowsSessionProcess::Conpty(process) => {
+                let _ = process.exit(0);
+            }
+            WindowsSessionProcess::NodePty(child) => {
+                let _ = child.kill();
+            }
+        }
         #[cfg(not(windows))]
         let _ = self.child.kill();
     }
@@ -408,6 +670,7 @@ trait SessionIo {
     fn contains_text(&self, query: &str) -> Result<bool>;
     fn application_cursor(&self) -> bool;
     fn bracketed_paste(&self) -> bool;
+    fn mouse_protocol(&self) -> (vt100::MouseProtocolMode, vt100::MouseProtocolEncoding);
 }
 
 impl SessionIo for AgentSession {
@@ -463,7 +726,7 @@ impl SessionIo for AgentSession {
 
     fn semantic_state(&self) -> Option<SemanticState> {
         let adapter = self.hook_adapter.as_ref()?;
-        parse_semantic_state(&fs::read_to_string(&adapter.status_path).ok()?)
+        parse_semantic_state(&fs::read_to_string(adapter.status_path()).ok()?)
     }
 
     fn contains_text(&self, query: &str) -> Result<bool> {
@@ -480,6 +743,21 @@ impl SessionIo for AgentSession {
         self.parser
             .lock()
             .is_ok_and(|parser| parser.screen().bracketed_paste())
+    }
+
+    fn mouse_protocol(&self) -> (vt100::MouseProtocolMode, vt100::MouseProtocolEncoding) {
+        self.parser.lock().map_or(
+            (
+                vt100::MouseProtocolMode::None,
+                vt100::MouseProtocolEncoding::Default,
+            ),
+            |parser| {
+                (
+                    parser.screen().mouse_protocol_mode(),
+                    parser.screen().mouse_protocol_encoding(),
+                )
+            },
+        )
     }
 }
 
@@ -626,6 +904,102 @@ fn max_diff_offset(text: &str) -> u16 {
         .min(u16::MAX as usize) as u16
 }
 
+fn mouse_button_code(kind: MouseEventKind) -> Option<(u8, bool, bool)> {
+    match kind {
+        MouseEventKind::Down(MouseButton::Left) => Some((0, false, false)),
+        MouseEventKind::Down(MouseButton::Middle) => Some((1, false, false)),
+        MouseEventKind::Down(MouseButton::Right) => Some((2, false, false)),
+        MouseEventKind::Up(_) => Some((3, true, false)),
+        MouseEventKind::Drag(MouseButton::Left) => Some((32, false, true)),
+        MouseEventKind::Drag(MouseButton::Middle) => Some((33, false, true)),
+        MouseEventKind::Drag(MouseButton::Right) => Some((34, false, true)),
+        MouseEventKind::Moved => Some((35, false, true)),
+        MouseEventKind::ScrollUp => Some((64, false, false)),
+        MouseEventKind::ScrollDown => Some((65, false, false)),
+        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => None,
+    }
+}
+
+fn mouse_mode_reports(mode: vt100::MouseProtocolMode, kind: MouseEventKind) -> bool {
+    match mode {
+        vt100::MouseProtocolMode::None => false,
+        vt100::MouseProtocolMode::Press => {
+            matches!(
+                kind,
+                MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+        }
+        vt100::MouseProtocolMode::PressRelease => !matches!(
+            kind,
+            MouseEventKind::Drag(_)
+                | MouseEventKind::Moved
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+        ),
+        vt100::MouseProtocolMode::ButtonMotion => !matches!(
+            kind,
+            MouseEventKind::Moved | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+        ),
+        vt100::MouseProtocolMode::AnyMotion => !matches!(
+            kind,
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+        ),
+    }
+}
+
+fn encode_mouse(
+    mouse: MouseEvent,
+    encoding: vt100::MouseProtocolEncoding,
+    column: u16,
+    row: u16,
+) -> Option<Vec<u8>> {
+    let (mut code, released, _) = mouse_button_code(mouse.kind)?;
+    if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+        code += 4;
+    }
+    if mouse.modifiers.contains(KeyModifiers::ALT) {
+        code += 8;
+    }
+    if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+        code += 16;
+    }
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => Some(
+            format!(
+                "\x1b[<{code};{column};{row}{}",
+                if released { 'm' } else { 'M' }
+            )
+            .into_bytes(),
+        ),
+        vt100::MouseProtocolEncoding::Default => {
+            if column > 223 || row > 223 {
+                return None;
+            }
+            Some(vec![
+                0x1b,
+                b'[',
+                b'M',
+                code.saturating_add(32),
+                (column as u8).saturating_add(32),
+                (row as u8).saturating_add(32),
+            ])
+        }
+        vt100::MouseProtocolEncoding::Utf8 => {
+            let mut bytes = b"\x1b[M".to_vec();
+            for value in [
+                u32::from(code) + 32,
+                u32::from(column) + 32,
+                u32::from(row) + 32,
+            ] {
+                let character = char::from_u32(value)?;
+                let mut buffer = [0; 4];
+                bytes.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+            }
+            Some(bytes)
+        }
+    }
+}
+
 struct App {
     sessions: TabSet<Box<dyn SessionIo>>,
     cwd: PathBuf,
@@ -637,19 +1011,22 @@ struct App {
     notice: String,
     notifications: bool,
     observed_states: HashMap<String, SemanticState>,
+    yolo: bool,
+    terminal_pane: Rect,
 }
 
 impl App {
-    fn new(cwd: &Path, redraw: Sender<()>) -> Self {
+    fn new(cwd: &Path, redraw: Sender<()>, yolo: bool) -> Self {
         Self::new_with_spawner(
             cwd,
             redraw,
-            Box::new(|definition, title, cwd, redraw| {
+            Box::new(move |definition, title, cwd, redraw| {
                 Ok(Box::new(AgentSession::spawn(
-                    definition, title, cwd, redraw,
+                    definition, title, cwd, redraw, yolo,
                 )?))
             }),
         )
+        .with_yolo(yolo)
     }
 
     fn new_with_spawner(cwd: &Path, redraw: Sender<()>, spawner: SessionSpawner) -> Self {
@@ -664,11 +1041,18 @@ impl App {
             notice: format!("workspace: {}", cwd.display()),
             notifications: notifications_enabled(),
             observed_states: HashMap::new(),
+            yolo: false,
+            terminal_pane: Rect::default(),
         };
         if let Err(error) = app.add_session(AgentId::Codex) {
             app.notice = format!("{error:#}");
         }
         app
+    }
+
+    fn with_yolo(mut self, yolo: bool) -> Self {
+        self.yolo = yolo;
+        self
     }
 
     fn add_session(&mut self, id: AgentId) -> Result<()> {
@@ -768,6 +1152,50 @@ impl App {
         }
         if pass_through {
             self.mode = Mode::Terminal;
+        }
+        Ok(())
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        let Some(session) = self.sessions.active() else {
+            return Ok(());
+        };
+        let (protocol_mode, protocol_encoding) = session.mouse_protocol();
+        if protocol_mode != vt100::MouseProtocolMode::None {
+            let pane = self.terminal_pane;
+            if mouse.column <= pane.x
+                || mouse.column >= pane.right().saturating_sub(1)
+                || mouse.row <= pane.y
+                || mouse.row >= pane.bottom().saturating_sub(1)
+            {
+                return Ok(());
+            }
+            if mouse_mode_reports(protocol_mode, mouse.kind)
+                && let Some(bytes) = encode_mouse(
+                    mouse,
+                    protocol_encoding,
+                    mouse.column - pane.x,
+                    mouse.row - pane.y,
+                )
+            {
+                session.write(&bytes)?;
+            }
+            return Ok(());
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                session.set_scrollback(session.scrollback()?.saturating_add(3))?;
+                self.mode = Mode::Scrollback;
+            }
+            MouseEventKind::ScrollDown => {
+                session.set_scrollback(session.scrollback()?.saturating_sub(3))?;
+                if session.scrollback()? == 0 {
+                    self.mode = Mode::Terminal;
+                } else {
+                    self.mode = Mode::Scrollback;
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -1063,6 +1491,17 @@ fn encode_key(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
         {
             vec![(character.to_ascii_lowercase() as u8) - b'a' + 1]
         }
+        KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            match character {
+                ' ' | '@' => vec![0x00],
+                '[' => vec![0x1b],
+                '\\' => vec![0x1c],
+                ']' => vec![0x1d],
+                '^' => vec![0x1e],
+                '_' => vec![0x1f],
+                _ => character.to_string().into_bytes(),
+            }
+        }
         KeyCode::Char(character) => character.to_string().into_bytes(),
         KeyCode::Enter => b"\r".to_vec(),
         KeyCode::Backspace => vec![0x7f],
@@ -1150,8 +1589,9 @@ fn app_layout(area: Rect) -> (Rect, Rect, Rect, Rect) {
 }
 
 fn terminal_inner_size(area: Rect) -> (u16, u16) {
+    const PTY_RIGHT_MARGIN: u16 = 2;
     (
-        area.width.saturating_sub(2).max(1),
+        area.width.saturating_sub(2 + PTY_RIGHT_MARGIN).max(1),
         area.height.saturating_sub(2).max(1),
     )
 }
@@ -1179,6 +1619,13 @@ fn render(frame: &mut Frame, app: &App) {
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(
+                yolo_label(app.yolo),
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  local PTY control room  ·  "),
             Span::styled(&app.notice, Style::default().fg(Color::DarkGray)),
             Span::styled(git_label, Style::default().fg(Color::Yellow)),
@@ -1201,6 +1648,7 @@ fn render(frame: &mut Frame, app: &App) {
                  F9      restart an exited session\n\
                  F10     quit Agent Bridge\n\
                  Ctrl+F11 send the next key directly to the CLI\n\
+                 Shift+drag terminal-native text selection during mouse capture\n\
                  F12     close this help\n\n\
                  Other terminal input goes directly to the active CLI.",
             )
@@ -1288,7 +1736,10 @@ fn render(frame: &mut Frame, app: &App) {
                 .collect::<Vec<_>>();
             vec![
                 Line::from(choices),
-                Line::from(" ←/→ choose CLI  ·  Enter create tab  ·  Esc cancel"),
+                Line::from(format!(
+                    "{}←/→ choose CLI  ·  Enter create tab  ·  Esc cancel",
+                    if app.yolo { "YOLO · " } else { "" }
+                )),
             ]
         }
         Mode::Relay {
@@ -1469,6 +1920,7 @@ fn handle_event(app: &mut App, event: Event) -> Result<bool> {
     match event {
         Event::Key(key) => app.handle_key(key),
         Event::Paste(text) => app.handle_paste(&text).map(|()| false),
+        Event::Mouse(mouse) => app.handle_mouse(mouse).map(|()| false),
         _ => Ok(false),
     }
 }
@@ -1482,16 +1934,17 @@ fn emit_pending_bell(writer: &mut impl Write, pending: &mut bool) -> Result<()> 
     Ok(())
 }
 
-fn run(terminal: &mut DefaultTerminal, cwd: &Path) -> Result<()> {
+fn run(terminal: &mut DefaultTerminal, cwd: &Path, yolo: bool) -> Result<()> {
     let (redraw_sender, redraw_receiver) = crossbeam_channel::bounded(1);
     let event_receiver = spawn_event_reader();
     let heartbeat = crossbeam_channel::tick(Duration::from_secs(1));
     let git_context_receiver = spawn_git_context_reader(cwd.to_path_buf());
-    let mut app = App::new(cwd, redraw_sender);
+    let mut app = App::new(cwd, redraw_sender, yolo);
     let mut bell_pending = false;
     loop {
         let size = terminal.size()?;
         let (_, _, pane, _) = app_layout(Rect::new(0, 0, size.width, size.height));
+        app.terminal_pane = pane;
         let (cols, rows) = terminal_inner_size(pane);
         for session in app.sessions.items_mut() {
             if !session.is_alive() {
@@ -1532,7 +1985,7 @@ fn run(terminal: &mut DefaultTerminal, cwd: &Path) -> Result<()> {
 }
 
 enum Launch {
-    Run(PathBuf),
+    Run { cwd: PathBuf, yolo: bool },
     Help,
     Version,
     Hook(SemanticState),
@@ -1541,7 +1994,10 @@ enum Launch {
 fn parse_args_from(args: impl IntoIterator<Item = OsString>) -> Result<Launch> {
     let mut args = args.into_iter();
     let Some(argument) = args.next() else {
-        return Ok(Launch::Run(std::env::current_dir()?));
+        return Ok(Launch::Run {
+            cwd: std::env::current_dir()?,
+            yolo: false,
+        });
     };
     if argument == "hook" {
         let state = args
@@ -1553,35 +2009,47 @@ fn parse_args_from(args: impl IntoIterator<Item = OsString>) -> Result<Launch> {
         }
         return Ok(Launch::Hook(state));
     }
-    if args.next().is_some() {
-        anyhow::bail!("expected at most one workspace path");
-    }
     if argument == "--help" || argument == "-h" {
+        if args.next().is_some() {
+            anyhow::bail!("--help does not accept arguments");
+        }
         return Ok(Launch::Help);
     }
     if argument == "--version" || argument == "-V" {
+        if args.next().is_some() {
+            anyhow::bail!("--version does not accept arguments");
+        }
         return Ok(Launch::Version);
     }
-    if argument.to_string_lossy().starts_with('-') {
-        anyhow::bail!("unknown option: {}", argument.to_string_lossy());
+
+    let mut workspace = None;
+    let mut yolo = false;
+    for argument in std::iter::once(argument).chain(args) {
+        if argument == "--yolo" {
+            if yolo {
+                anyhow::bail!("--yolo may only be specified once");
+            }
+            yolo = true;
+        } else if argument.to_string_lossy().starts_with('-') {
+            anyhow::bail!("unknown option: {}", argument.to_string_lossy());
+        } else if workspace.replace(PathBuf::from(argument)).is_some() {
+            anyhow::bail!("expected at most one workspace path");
+        }
     }
-    let path = PathBuf::from(argument);
+    let path = workspace.unwrap_or(std::env::current_dir()?);
     if !path.exists() {
         anyhow::bail!("workspace does not exist: {}", path.display());
     }
     if !path.is_dir() {
         anyhow::bail!("workspace is not a directory: {}", path.display());
     }
-    Ok(Launch::Run(path))
+    Ok(Launch::Run { cwd: path, yolo })
 }
 
 fn main() -> Result<()> {
     match parse_args_from(std::env::args_os().skip(1))? {
         Launch::Help => {
-            println!(
-                "agent-bridge {}\n\nUsage: agent-bridge [WORKSPACE]",
-                env!("CARGO_PKG_VERSION")
-            );
+            println!("{}", help_text());
             Ok(())
         }
         Launch::Version => {
@@ -1589,12 +2057,21 @@ fn main() -> Result<()> {
             Ok(())
         }
         Launch::Hook(state) => write_hook_state(state),
-        Launch::Run(cwd) => {
+        Launch::Run { cwd, yolo } => {
             ensure_interactive_terminal(std::io::stdout().is_terminal())?;
-            execute!(std::io::stdout(), EnableBracketedPaste)?;
-            let result = ratatui::run(|terminal| run(terminal, &cwd));
-            execute!(std::io::stdout(), DisableBracketedPaste)?;
-            result
+            struct InputModesGuard;
+            impl Drop for InputModesGuard {
+                fn drop(&mut self) {
+                    let _ = execute!(
+                        std::io::stdout(),
+                        DisableMouseCapture,
+                        DisableBracketedPaste
+                    );
+                }
+            }
+            let _input_modes = InputModesGuard;
+            execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture)?;
+            ratatui::run(|terminal| run(terminal, &cwd, yolo))
         }
     }
 }
@@ -1602,6 +2079,17 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wait_for_screen_text(session: &dyn SessionIo, query: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if session.contains_text(query).unwrap_or(false) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
 
     struct TestSession {
         definition: AgentDefinition,
@@ -1673,6 +2161,14 @@ mod tests {
 
         fn bracketed_paste(&self) -> bool {
             self.parser.lock().unwrap().screen().bracketed_paste()
+        }
+
+        fn mouse_protocol(&self) -> (vt100::MouseProtocolMode, vt100::MouseProtocolEncoding) {
+            let parser = self.parser.lock().unwrap();
+            (
+                parser.screen().mouse_protocol_mode(),
+                parser.screen().mouse_protocol_encoding(),
+            )
         }
     }
 
@@ -2016,8 +2512,23 @@ mod tests {
 
     #[test]
     fn git_diff_works_before_the_first_commit() {
-        let result = read_git_diff(Path::new(env!("CARGO_MANIFEST_DIR")));
-        assert!(result.is_ok(), "{result:?}");
+        let repository = tempfile::tempdir().unwrap();
+        let init = Command::new("git")
+            .arg("init")
+            .arg(repository.path())
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        fs::write(repository.path().join("untracked.txt"), "new file").unwrap();
+
+        assert_eq!(
+            read_git_diff(repository.path()).unwrap(),
+            "No tracked changes."
+        );
     }
 
     #[test]
@@ -2033,6 +2544,25 @@ mod tests {
             settings["hooks"]["Notification"][0]["matcher"],
             serde_json::json!("*")
         );
+    }
+
+    #[test]
+    fn hook_adapter_does_not_overwrite_a_preclaimed_legacy_path() {
+        let claimed = std::env::temp_dir().join(format!(
+            "agent-bridge-{}-preclaimed.status",
+            std::process::id()
+        ));
+        fs::write(&claimed, "attacker-owned").unwrap();
+
+        let claude = agents()
+            .into_iter()
+            .find(|item| item.id == AgentId::Claude)
+            .unwrap();
+        let adapter = prepare_hook_adapter(claude).unwrap().unwrap();
+
+        assert_eq!(fs::read_to_string(&claimed).unwrap(), "attacker-owned");
+        drop(adapter);
+        let _ = fs::remove_file(claimed);
     }
 
     #[test]
@@ -2081,6 +2611,202 @@ mod tests {
             .unwrap();
         assert!(matches!(app.mode, Mode::Terminal));
         assert_eq!(app.sessions.active().unwrap().scrollback().unwrap(), 0);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_history_without_writing_to_the_cli() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let captured_writes = Arc::clone(&writes);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(move |definition, title, _, _| {
+                let session = test_session_with_writes(
+                    definition,
+                    title,
+                    false,
+                    Arc::clone(&captured_writes),
+                );
+                for index in 0..80 {
+                    session
+                        .parser
+                        .lock()
+                        .unwrap()
+                        .process(format!("line {index}\r\n").as_bytes());
+                }
+                Ok(Box::new(session))
+            }),
+        );
+
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 40,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .unwrap();
+
+        assert!(app.sessions.active().unwrap().scrollback().unwrap() > 0);
+        assert!(matches!(app.mode, Mode::Scrollback));
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sgr_mouse_reporting_is_forwarded_with_terminal_relative_coordinates() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let captured_writes = Arc::clone(&writes);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(move |definition, title, _, _| {
+                let session = test_session_with_writes(
+                    definition,
+                    title,
+                    false,
+                    Arc::clone(&captured_writes),
+                );
+                session
+                    .parser
+                    .lock()
+                    .unwrap()
+                    .process(b"\x1b[?1000h\x1b[?1006h");
+                Ok(Box::new(session))
+            }),
+        );
+        app.terminal_pane = Rect::new(25, 3, 95, 30);
+
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 30,
+                row: 7,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(writes.lock().unwrap().as_slice(), [b"\x1b[<64;5;4M"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "live smoke test: requires installed and authenticated Codex CLI"]
+    fn live_codex_prompt_survives_mouse_wheel_scrolling() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut app = App::new(Path::new(env!("CARGO_MANIFEST_DIR")), redraw, false);
+        app.terminal_pane = Rect::new(25, 3, 95, 30);
+        let session = app.sessions.active().expect("Codex session starts");
+        assert!(
+            wait_for_screen_text(session.as_ref(), "codex", Duration::from_secs(20)),
+            "Codex prompt did not become ready"
+        );
+        session.write(b"wheel-preserves-this").unwrap();
+        assert!(wait_for_screen_text(
+            session.as_ref(),
+            "wheel-preserves-this",
+            Duration::from_secs(5)
+        ));
+
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 40,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .unwrap();
+
+        assert!(
+            app.sessions
+                .active()
+                .unwrap()
+                .contains_text("wheel-preserves-this")
+                .unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "live smoke test: requires installed and authenticated Agy CLI"]
+    fn live_agy_effort_label_survives_resize_with_right_margin() {
+        let definition = AgentDefinition {
+            id: AgentId::Agy,
+            command: "agy --effort high",
+            role: "live-smoke-test",
+        };
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut session = AgentSession::spawn(
+            definition,
+            "Agy live smoke test".to_owned(),
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            redraw,
+            false,
+        )
+        .unwrap();
+        assert!(
+            wait_for_screen_text(&session, "High", Duration::from_secs(20)),
+            "Agy did not render the full High effort label at 100 columns"
+        );
+
+        session.resize(68, 24).unwrap();
+        assert!(
+            wait_for_screen_text(&session, "High", Duration::from_secs(10)),
+            "Agy did not retain the full High effort label after narrowing to 68 columns"
+        );
+        session.resize(100, 32).unwrap();
+        assert!(
+            wait_for_screen_text(&session, "High", Duration::from_secs(10)),
+            "Agy did not retain the full High effort label after widening again"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "live smoke test: requires installed and authenticated Claude CLI"]
+    fn live_claude_starts_through_conpty_compatible_runtime() {
+        let definition = agents()
+            .into_iter()
+            .find(|item| item.id == AgentId::Claude)
+            .unwrap();
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut session = AgentSession::spawn(
+            definition,
+            "Claude live smoke test".to_owned(),
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            redraw,
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            wait_for_screen_text(&session, "Claude Code", Duration::from_secs(20)),
+            "Claude Code prompt did not become ready; alive: {}; screen: {:?}",
+            session.is_alive(),
+            session.parser.lock().unwrap().screen().contents()
+        );
+        assert!(
+            !session
+                .parser
+                .lock()
+                .unwrap()
+                .screen()
+                .contents()
+                .contains("내부 또는 외부 명령")
+        );
+        session.resize(68, 24).unwrap();
+        assert!(wait_for_screen_text(
+            &session,
+            "Claude Code",
+            Duration::from_secs(10)
+        ));
     }
 
     #[test]
@@ -2136,8 +2862,127 @@ mod tests {
         ));
         assert!(matches!(
             parse_args_from([std::ffi::OsString::from(".")]).unwrap(),
-            Launch::Run(_)
+            Launch::Run { yolo: false, .. }
         ));
+    }
+
+    #[test]
+    fn command_line_accepts_yolo_before_or_after_workspace() {
+        for args in [
+            vec![OsString::from("--yolo"), OsString::from(".")],
+            vec![OsString::from("."), OsString::from("--yolo")],
+            vec![OsString::from("--yolo")],
+        ] {
+            assert!(matches!(
+                parse_args_from(args).unwrap(),
+                Launch::Run { yolo: true, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn session_arguments_add_only_the_selected_cli_danger_flag() {
+        let definitions = agents();
+        let expected = [
+            (AgentId::Codex, "--dangerously-bypass-approvals-and-sandbox"),
+            (AgentId::Claude, "--dangerously-skip-permissions"),
+            (AgentId::Agy, "--dangerously-skip-permissions"),
+        ];
+
+        for (id, danger_flag) in expected {
+            let definition = definitions.iter().find(|item| item.id == id).unwrap();
+            assert_eq!(
+                session_arguments(*definition, false, None),
+                Vec::<OsString>::new()
+            );
+            assert_eq!(
+                session_arguments(*definition, true, None),
+                vec![OsString::from(danger_flag)]
+            );
+        }
+    }
+
+    #[test]
+    fn claude_yolo_arguments_keep_session_settings() {
+        let definition = agents()
+            .into_iter()
+            .find(|item| item.id == AgentId::Claude)
+            .unwrap();
+        assert_eq!(
+            session_arguments(definition, true, Some(Path::new("hook settings.json"))),
+            vec![
+                OsString::from("--dangerously-skip-permissions"),
+                OsString::from("--settings"),
+                OsString::from("hook settings.json"),
+            ]
+        );
+    }
+
+    #[test]
+    fn yolo_mode_has_a_persistent_warning_label() {
+        assert_eq!(yolo_label(false), "");
+        assert!(yolo_label(true).contains("YOLO"));
+    }
+
+    #[test]
+    fn help_describes_yolo_risk() {
+        let help = help_text();
+        assert!(help.contains("--yolo"));
+        assert!(help.contains("bypass approval and sandbox protections"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_resolves_claude_from_official_user_install_when_path_is_stale() {
+        let home = tempfile::tempdir().unwrap();
+        let install_dir = home.path().join(".local").join("bin");
+        fs::create_dir_all(&install_dir).unwrap();
+        let executable = install_dir.join("claude.exe");
+        fs::write(&executable, b"test executable marker").unwrap();
+        let definition = agents()
+            .into_iter()
+            .find(|item| item.id == AgentId::Claude)
+            .unwrap();
+
+        assert_eq!(
+            resolve_windows_agent_command(
+                definition,
+                Some(std::ffi::OsStr::new("")),
+                Some(home.path().as_os_str())
+            ),
+            executable
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_prefers_executable_suffix_over_extensionless_shell_shim() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("agy"), b"shell shim").unwrap();
+        let executable = directory.path().join("agy.exe");
+        fs::write(&executable, b"native executable").unwrap();
+        let definition = agents()
+            .into_iter()
+            .find(|item| item.id == AgentId::Agy)
+            .unwrap();
+
+        assert_eq!(
+            resolve_windows_agent_command(definition, Some(directory.path().as_os_str()), None),
+            executable
+        );
+    }
+
+    #[test]
+    fn terminal_device_attribute_queries_receive_xterm_responses() {
+        assert_eq!(
+            terminal_query_response(b"\x1b[c"),
+            Some(b"\x1b[?1;2c".as_slice())
+        );
+        assert_eq!(
+            terminal_query_response(b"prefix\x1b[>csuffix"),
+            Some(b"\x1b[>0;276;0c".as_slice())
+        );
+        assert_eq!(terminal_query_response(b"ordinary output"), None);
     }
 
     #[test]
@@ -2155,7 +3000,15 @@ mod tests {
     #[test]
     fn pty_size_matches_the_terminal_block_inner_area() {
         let area = Rect::new(24, 3, 96, 30);
-        assert_eq!(terminal_inner_size(area), (94, 28));
+        assert_eq!(terminal_inner_size(area), (92, 28));
+    }
+
+    #[test]
+    fn pty_keeps_two_columns_clear_of_the_visible_right_margin() {
+        let area = Rect::new(25, 3, 95, 30);
+        let (pty_cols, _) = terminal_inner_size(area);
+        let visible_cols = area.width.saturating_sub(2);
+        assert_eq!(visible_cols.saturating_sub(pty_cols), 2);
     }
 
     #[test]
@@ -2175,6 +3028,27 @@ mod tests {
             encode_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT), false),
             Some(b"\x1b\r".to_vec())
         );
+    }
+
+    #[test]
+    fn non_alphabetic_control_keys_use_terminal_control_bytes() {
+        for (character, expected) in [
+            ('[', 0x1b),
+            ('\\', 0x1c),
+            (']', 0x1d),
+            ('^', 0x1e),
+            ('_', 0x1f),
+            (' ', 0x00),
+        ] {
+            assert_eq!(
+                encode_key(
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL),
+                    false
+                ),
+                Some(vec![expected]),
+                "Ctrl+{character:?}"
+            );
+        }
     }
 
     #[test]

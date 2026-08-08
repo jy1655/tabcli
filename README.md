@@ -8,9 +8,25 @@
 
 Rust 및 Visual C++ Build Tools가 설치된 Developer PowerShell에서:
 
+Windows에서 최신 네이티브 Claude Code를 임베드하려면 bundled ConPTY transport를 제공하는 `node-pty`가 필요합니다. Claude CLI 자체는 공식 네이티브 설치본을 그대로 사용합니다.
+
+```powershell
+npm install -g node-pty
+```
+
 ```powershell
 cargo run -- D:\Dev
 ```
+
+승인 확인과 sandbox 보호를 우회해야 하는 명시적인 작업에서는 `--yolo`를 workspace 앞이나 뒤에 지정할 수 있습니다.
+
+```powershell
+cargo run -- --yolo D:\Dev
+agent-bridge D:\Dev --yolo
+```
+
+> [!WARNING]
+> `--yolo`는 새로 만드는 모든 Codex, Claude, Agy 세션에 각 CLI의 공식 위험 플래그를 전달합니다. 해당 세션은 명령 실행 승인을 묻지 않고 sandbox 제한도 우회할 수 있으므로, 신뢰하는 코드와 workspace에서만 사용하세요. 플래그를 생략한 기본 모드의 승인 흐름은 바뀌지 않습니다.
 
 릴리스 바이너리:
 
@@ -30,6 +46,7 @@ cargo build --release
 - `F7`: 탭 제목과 보관된 터미널 출력 검색
 - `F2`: 현재 탭 이름으로 다른 탭에 프롬프트 전달 (탭 2개 이상 필요)
 - `F8`: 스크롤백 모드 (`↑`/`↓`, `PageUp`/`PageDown`, `Home`/`End`, `Esc`로 복귀)
+- 마우스 휠: CLI가 마우스 리포팅을 요청하지 않으면 터미널 스크롤백 이동. 마우스 캡처 중 Windows Terminal의 텍스트 선택·복사는 `Shift`를 누른 채 드래그
 - `F9`: 종료된 탭을 같은 CLI·이름으로 새 세션 재시작
 - `F10`: Agent Bridge 종료
 - Agent Bridge가 예약하지 않은 키: 활성 에이전트 PTY에 그대로 전달 (`Ctrl+F11`로 예약 키도 전달 가능)
@@ -51,4 +68,4 @@ cargo build --release
 
 - 인증과 세션은 각 퍼스트파티 CLI가 소유합니다.
 - Agent Bridge는 토큰을 읽거나 저장하지 않습니다.
-- 자동 승인, IDE, 웹 UI, 외부 오케스트레이션 서비스는 포함하지 않습니다.
+- 기본 모드에서의 자동 승인, IDE, 웹 UI, 외부 오케스트레이션 서비스는 포함하지 않습니다. `--yolo` 모드는 Agent Bridge가 자체 승인 로직을 구현하지 않고 각 CLI의 공식 위험 플래그만 전달합니다.
