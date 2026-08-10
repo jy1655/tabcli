@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -357,6 +357,10 @@ impl AgentSession {
             if let Some(adapter) = &hook_adapter {
                 command.env("AGENT_BRIDGE_STATUS_FILE", adapter.status_path());
             }
+            if let Some(dir) = DELEGATION_DIR.get() {
+                command.env("AGENT_BRIDGE_REQUESTS", dir);
+                command.env("AGENT_BRIDGE_TAB", &title);
+            }
             let mut child = command.spawn().context(
                 "failed to start Claude PTY sidecar; install node-pty with `npm install -g node-pty`",
             )?;
@@ -383,6 +387,10 @@ impl AgentSession {
             command.args(&arguments).current_dir(cwd);
             if let Some(adapter) = &hook_adapter {
                 command.env("AGENT_BRIDGE_STATUS_FILE", adapter.status_path());
+            }
+            if let Some(dir) = DELEGATION_DIR.get() {
+                command.env("AGENT_BRIDGE_REQUESTS", dir);
+                command.env("AGENT_BRIDGE_TAB", &title);
             }
             let mut child = conpty::ProcessOptions::default()
                 .set_console_size(Some((100, 32)))
@@ -466,6 +474,10 @@ impl AgentSession {
         }
         if let Some(adapter) = &hook_adapter {
             command.env("AGENT_BRIDGE_STATUS_FILE", adapter.status_path());
+        }
+        if let Some(dir) = DELEGATION_DIR.get() {
+            command.env("AGENT_BRIDGE_REQUESTS", dir);
+            command.env("AGENT_BRIDGE_TAB", &title);
         }
         let child = pair
             .slave
@@ -1261,6 +1273,26 @@ fn parse_layout(text: &str) -> Option<(bool, Vec<SavedTab>)> {
     Some((yolo, saved))
 }
 
+static DELEGATION_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+fn create_delegation_dir() -> Option<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("agent-bridge-{}-requests", std::process::id()));
+    fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+fn write_json_atomically(path: &Path, value: &serde_json::Value) -> Result<()> {
+    let payload = serde_json::to_vec_pretty(value)?;
+    let part = path.with_extension("part");
+    fs::write(&part, payload)?;
+    fs::rename(&part, path)?;
+    Ok(())
+}
+
+fn delegation_provenance(from: &str, text: &str) -> String {
+    format!("[Agent Bridge delegation · from {from}] {text}")
+}
+
 struct PendingWrite {
     title: String,
     bytes: Vec<u8>,
@@ -1287,6 +1319,7 @@ struct App {
     layout_path: Option<PathBuf>,
     restorable_layout: Vec<SavedTab>,
     registry: [RegisteredAgent; 3],
+    delegation_dir: Option<PathBuf>,
 }
 
 impl App {
@@ -1299,6 +1332,9 @@ impl App {
                 },
                 None => (default_registry(), None),
             };
+        if let Some(dir) = create_delegation_dir() {
+            let _ = DELEGATION_DIR.set(dir);
+        }
         let mut app = Self::new_with_spawner_yolo_registry(
             cwd,
             redraw,
@@ -1310,6 +1346,7 @@ impl App {
                 )?))
             }),
         );
+        app.delegation_dir = DELEGATION_DIR.get().cloned();
         if let Some(warning) = registry_warning {
             app.notice = format!("{warning}; using built-in agents");
         }
@@ -1388,6 +1425,7 @@ impl App {
             layout_path: None,
             restorable_layout: Vec::new(),
             registry,
+            delegation_dir: None,
         };
         if let Err(error) = app.add_session(AgentId::Codex) {
             app.notice = format!("{error:#}");
@@ -1523,6 +1561,168 @@ impl App {
             }
             if let Err(error) = session.write(&write.bytes) {
                 self.notice = format!("relay to {} failed: {error}", write.title);
+            }
+        }
+    }
+
+    fn enqueue_delegation_prompt(&mut self, title: &str, from: &str, text: &str, delay: Duration) {
+        let message = delegation_provenance(from, text);
+        let now = Instant::now();
+        for (offset, bytes) in relay_write_plan(false, &message) {
+            self.pending_writes.push(PendingWrite {
+                title: title.to_owned(),
+                bytes,
+                due: now + delay + offset,
+            });
+        }
+        self.notice = format!("delegation: {from} → {title}");
+    }
+
+    fn handle_delegation(&mut self, request: &serde_json::Value) -> serde_json::Value {
+        let from = request
+            .get("from")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("external")
+            .to_owned();
+        let target = request
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        match request.get("kind").and_then(serde_json::Value::as_str) {
+            Some("open") => {
+                let Some(id) = request
+                    .get("agent")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(agent_by_key)
+                else {
+                    return serde_json::json!({
+                        "ok": false,
+                        "error": "unknown agent (expected codex, claude, or agy)"
+                    });
+                };
+                let workspace = request
+                    .get("workspace")
+                    .and_then(serde_json::Value::as_str)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| self.cwd.clone());
+                if !workspace.is_dir() {
+                    return serde_json::json!({
+                        "ok": false,
+                        "error": format!("workspace is not a directory: {}", workspace.display())
+                    });
+                }
+                if let Err(error) = self.add_session_at(id, &workspace) {
+                    return serde_json::json!({ "ok": false, "error": format!("{error:#}") });
+                }
+                let title = self
+                    .sessions
+                    .active()
+                    .map(|session| session.title().to_owned())
+                    .unwrap_or_default();
+                if let Some(prompt) = request.get("prompt").and_then(serde_json::Value::as_str) {
+                    self.enqueue_delegation_prompt(
+                        &title,
+                        &from,
+                        prompt,
+                        Duration::from_millis(2_500),
+                    );
+                }
+                serde_json::json!({ "ok": true, "tab": title })
+            }
+            Some("prompt") => {
+                let exists = self
+                    .sessions
+                    .items()
+                    .iter()
+                    .any(|session| session.title() == target);
+                if !exists {
+                    return serde_json::json!({ "ok": false, "error": format!("no such tab: {target}") });
+                }
+                let Some(text) = request.get("prompt").and_then(serde_json::Value::as_str) else {
+                    return serde_json::json!({ "ok": false, "error": "prompt text is required" });
+                };
+                self.enqueue_delegation_prompt(&target, &from, text, Duration::ZERO);
+                self.flush_due_writes(Instant::now());
+                serde_json::json!({ "ok": true, "tab": target })
+            }
+            Some("status") => {
+                let Some(session) = self
+                    .sessions
+                    .items()
+                    .iter()
+                    .find(|session| session.title() == target)
+                else {
+                    return serde_json::json!({ "ok": false, "error": format!("no such tab: {target}") });
+                };
+                let state = if !session.is_alive() {
+                    "exited".to_owned()
+                } else {
+                    self.observed_states
+                        .get(&target)
+                        .copied()
+                        .map(|state| state.label().to_owned())
+                        .unwrap_or_else(|| session.activity().label().to_owned())
+                };
+                serde_json::json!({ "ok": true, "tab": target, "state": state })
+            }
+            Some("read") => {
+                let Some(session) = self
+                    .sessions
+                    .items()
+                    .iter()
+                    .find(|session| session.title() == target)
+                else {
+                    return serde_json::json!({ "ok": false, "error": format!("no such tab: {target}") });
+                };
+                match session.parser().lock() {
+                    Ok(parser) => serde_json::json!({
+                        "ok": true,
+                        "tab": target,
+                        "output": parser.screen().contents()
+                    }),
+                    Err(_) => {
+                        serde_json::json!({ "ok": false, "error": "terminal parser poisoned" })
+                    }
+                }
+            }
+            _ => serde_json::json!({ "ok": false, "error": "unknown request kind" }),
+        }
+    }
+
+    fn process_delegation_requests(&mut self) {
+        let Some(dir) = self.delegation_dir.clone() else {
+            return;
+        };
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !name.starts_with("req-") || !name.ends_with(".json") || name.ends_with(".rsp.json")
+            {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let _ = fs::remove_file(&path);
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(&text) else {
+                continue;
+            };
+            let response = self.handle_delegation(&request);
+            let Some(reply) = request
+                .get("reply")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from)
+            else {
+                continue;
+            };
+            if reply.parent() == Some(dir.as_path()) {
+                let _ = write_json_atomically(&reply, &response);
             }
         }
     }
@@ -2720,6 +2920,7 @@ fn run(terminal: &mut DefaultTerminal, cwd: &Path, yolo: bool) -> Result<()> {
                 if app.poll_semantic_notifications() {
                     bell_pending = true;
                 }
+                app.process_delegation_requests();
             }
             recv(git_context_receiver) -> update => {
                 let (workspace, context) = update.context("git context reader stopped")?;
@@ -2737,11 +2938,258 @@ fn run(terminal: &mut DefaultTerminal, cwd: &Path, yolo: bool) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum DelegateCommand {
+    Open {
+        agent: String,
+        workspace: Option<PathBuf>,
+        prompt: Option<String>,
+    },
+    Prompt {
+        target: String,
+        text: String,
+    },
+    Status {
+        target: String,
+    },
+    Read {
+        target: String,
+    },
+    Wait {
+        target: String,
+        until: Vec<String>,
+        timeout_secs: u64,
+    },
+}
+
+fn parse_delegate_command(kind: &str, args: Vec<String>) -> Result<DelegateCommand> {
+    let mut rest = args;
+    match kind {
+        "open" => {
+            anyhow::ensure!(
+                !rest.is_empty(),
+                "open requires an agent (codex, claude, or agy)"
+            );
+            let agent = rest.remove(0);
+            let mut workspace = None;
+            let mut prompt = None;
+            while !rest.is_empty() {
+                match rest[0].as_str() {
+                    "--workspace" => {
+                        anyhow::ensure!(rest.len() >= 2, "--workspace requires a path");
+                        rest.remove(0);
+                        workspace = Some(PathBuf::from(rest.remove(0)));
+                    }
+                    "--prompt" => {
+                        anyhow::ensure!(rest.len() >= 2, "--prompt requires text");
+                        rest.remove(0);
+                        prompt = Some(rest.remove(0));
+                    }
+                    other => anyhow::bail!("unknown open option: {other}"),
+                }
+            }
+            Ok(DelegateCommand::Open {
+                agent,
+                workspace,
+                prompt,
+            })
+        }
+        "prompt" => {
+            anyhow::ensure!(rest.len() >= 2, "prompt requires a tab title and text");
+            let target = rest.remove(0);
+            Ok(DelegateCommand::Prompt {
+                target,
+                text: rest.join(" "),
+            })
+        }
+        "status" => {
+            anyhow::ensure!(rest.len() == 1, "status requires exactly one tab title");
+            Ok(DelegateCommand::Status {
+                target: rest.remove(0),
+            })
+        }
+        "read" => {
+            anyhow::ensure!(rest.len() == 1, "read requires exactly one tab title");
+            Ok(DelegateCommand::Read {
+                target: rest.remove(0),
+            })
+        }
+        "wait" => {
+            anyhow::ensure!(!rest.is_empty(), "wait requires a tab title");
+            let target = rest.remove(0);
+            let mut until = Vec::new();
+            let mut timeout_secs = 600;
+            while !rest.is_empty() {
+                match rest[0].as_str() {
+                    "--until" => {
+                        anyhow::ensure!(rest.len() >= 2, "--until requires a state");
+                        rest.remove(0);
+                        until.push(rest.remove(0));
+                    }
+                    "--timeout-secs" => {
+                        anyhow::ensure!(rest.len() >= 2, "--timeout-secs requires a number");
+                        rest.remove(0);
+                        timeout_secs = rest
+                            .remove(0)
+                            .parse()
+                            .context("--timeout-secs expects a number")?;
+                    }
+                    other => anyhow::bail!("unknown wait option: {other}"),
+                }
+            }
+            if until.is_empty() {
+                until.push("finished".to_owned());
+            }
+            Ok(DelegateCommand::Wait {
+                target,
+                until,
+                timeout_secs,
+            })
+        }
+        _ => anyhow::bail!("unknown delegation command: {kind}"),
+    }
+}
+
+fn delegation_spool_dir() -> Result<PathBuf> {
+    Ok(PathBuf::from(std::env::var_os("AGENT_BRIDGE_REQUESTS").context(
+        "AGENT_BRIDGE_REQUESTS is not set — delegation commands only work inside an Agent Bridge session",
+    )?))
+}
+
+fn send_delegation_request(
+    mut request: serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value> {
+    let dir = delegation_spool_dir()?;
+    let mut file = tempfile::Builder::new()
+        .prefix("req-")
+        .suffix(".part")
+        .tempfile_in(&dir)?;
+    let stem = file
+        .path()
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .context("request file name is not valid UTF-8")?
+        .to_owned();
+    let reply = dir.join(format!("{stem}.rsp.json"));
+    request["from"] = serde_json::json!(
+        std::env::var("AGENT_BRIDGE_TAB").unwrap_or_else(|_| "external".to_owned())
+    );
+    request["reply"] = serde_json::json!(reply.to_string_lossy());
+    file.write_all(&serde_json::to_vec_pretty(&request)?)?;
+    let target = dir.join(format!("{stem}.json"));
+    file.persist(&target)
+        .map_err(|error| anyhow::anyhow!("failed to submit delegation request: {error}"))?;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if reply.exists() {
+            let text = fs::read_to_string(&reply)?;
+            let _ = fs::remove_file(&reply);
+            return Ok(serde_json::from_str(&text)?);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::bail!("timed out waiting for Agent Bridge to answer (is the TUI running?)")
+}
+
+fn print_delegation_response(response: &serde_json::Value) -> Result<()> {
+    if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        anyhow::bail!(
+            "{}",
+            response
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("delegation failed")
+        );
+    }
+    for key in ["tab", "state", "output"] {
+        if let Some(value) = response.get(key).and_then(serde_json::Value::as_str) {
+            println!("{value}");
+        }
+    }
+    Ok(())
+}
+
+fn run_delegate(command: DelegateCommand) -> Result<()> {
+    match command {
+        DelegateCommand::Open {
+            agent,
+            workspace,
+            prompt,
+        } => {
+            let mut request = serde_json::json!({ "kind": "open", "agent": agent });
+            if let Some(workspace) = workspace {
+                let workspace = if workspace.is_absolute() {
+                    workspace
+                } else {
+                    std::env::current_dir()?.join(workspace)
+                };
+                request["workspace"] = serde_json::json!(workspace.to_string_lossy());
+            }
+            if let Some(prompt) = prompt {
+                request["prompt"] = serde_json::json!(prompt);
+            }
+            print_delegation_response(&send_delegation_request(request, Duration::from_secs(15))?)
+        }
+        DelegateCommand::Prompt { target, text } => {
+            print_delegation_response(&send_delegation_request(
+                serde_json::json!({ "kind": "prompt", "target": target, "prompt": text }),
+                Duration::from_secs(15),
+            )?)
+        }
+        DelegateCommand::Status { target } => print_delegation_response(&send_delegation_request(
+            serde_json::json!({ "kind": "status", "target": target }),
+            Duration::from_secs(15),
+        )?),
+        DelegateCommand::Read { target } => print_delegation_response(&send_delegation_request(
+            serde_json::json!({ "kind": "read", "target": target }),
+            Duration::from_secs(15),
+        )?),
+        DelegateCommand::Wait {
+            target,
+            until,
+            timeout_secs,
+        } => {
+            let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+            loop {
+                let response = send_delegation_request(
+                    serde_json::json!({ "kind": "status", "target": target }),
+                    Duration::from_secs(15),
+                )?;
+                if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+                    anyhow::bail!(
+                        "{}",
+                        response
+                            .get("error")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("delegation failed")
+                    );
+                }
+                let state = response
+                    .get("state")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned();
+                if until.iter().any(|u| u.eq_ignore_ascii_case(&state)) {
+                    println!("{state}");
+                    return Ok(());
+                }
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {target}; last state: {state}"
+                );
+                thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+}
+
 enum Launch {
     Run { cwd: PathBuf, yolo: bool },
     Help,
     Version,
     Hook(SemanticState),
+    Delegate(DelegateCommand),
 }
 
 fn parse_args_from(args: impl IntoIterator<Item = OsString>) -> Result<Launch> {
@@ -2762,6 +3210,16 @@ fn parse_args_from(args: impl IntoIterator<Item = OsString>) -> Result<Launch> {
             anyhow::bail!("hook accepts one state and an optional notify payload");
         }
         return Ok(Launch::Hook(state));
+    }
+    if matches!(
+        argument.to_string_lossy().as_ref(),
+        "open" | "prompt" | "status" | "read" | "wait"
+    ) {
+        let kind = argument.to_string_lossy().into_owned();
+        let rest = args
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        return Ok(Launch::Delegate(parse_delegate_command(&kind, rest)?));
     }
     if argument == "--help" || argument == "-h" {
         if args.next().is_some() {
@@ -2811,6 +3269,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Launch::Hook(state) => write_hook_state(state),
+        Launch::Delegate(command) => run_delegate(command),
         Launch::Run { cwd, yolo } => {
             ensure_interactive_terminal(std::io::stdout().is_terminal())?;
             struct InputModesGuard;
@@ -3177,6 +3636,204 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL))
             .unwrap();
         assert!(app.notice.contains("no saved layout"));
+    }
+
+    #[test]
+    fn delegate_command_parsing_covers_all_subcommands() {
+        assert_eq!(
+            parse_delegate_command(
+                "open",
+                vec![
+                    "codex".to_owned(),
+                    "--workspace".to_owned(),
+                    "/tmp/x".to_owned(),
+                    "--prompt".to_owned(),
+                    "review this".to_owned(),
+                ],
+            )
+            .unwrap(),
+            DelegateCommand::Open {
+                agent: "codex".to_owned(),
+                workspace: Some(PathBuf::from("/tmp/x")),
+                prompt: Some("review this".to_owned()),
+            }
+        );
+        assert_eq!(
+            parse_delegate_command(
+                "prompt",
+                vec![
+                    "Claude 1".to_owned(),
+                    "fix".to_owned(),
+                    "the bug".to_owned()
+                ],
+            )
+            .unwrap(),
+            DelegateCommand::Prompt {
+                target: "Claude 1".to_owned(),
+                text: "fix the bug".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_delegate_command("wait", vec!["Codex 2".to_owned()]).unwrap(),
+            DelegateCommand::Wait {
+                target: "Codex 2".to_owned(),
+                until: vec!["finished".to_owned()],
+                timeout_secs: 600,
+            }
+        );
+        assert!(parse_delegate_command("open", Vec::new()).is_err());
+        assert!(parse_delegate_command("status", Vec::new()).is_err());
+        assert!(matches!(
+            parse_args_from([OsString::from("open"), OsString::from("claude")]).unwrap(),
+            Launch::Delegate(DelegateCommand::Open { .. })
+        ));
+    }
+
+    #[test]
+    fn delegation_open_request_creates_a_visible_tab_and_replies() {
+        let spool = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut app = App::new_with_spawner(
+            Path::new("launch-workspace"),
+            redraw,
+            Box::new(|definition, title, cwd, _| {
+                let mut session = test_session(definition, title, false);
+                session.workspace = cwd.to_path_buf();
+                Ok(Box::new(session))
+            }),
+        );
+        app.delegation_dir = Some(spool.path().to_path_buf());
+        let reply = spool.path().join("req-t1.rsp.json");
+        fs::write(
+            spool.path().join("req-t1.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "kind": "open",
+                "agent": "claude",
+                "workspace": workspace.path().to_string_lossy(),
+                "prompt": "review this diff",
+                "from": "Codex 1",
+                "reply": reply.to_string_lossy(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        app.process_delegation_requests();
+
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.sessions.active().unwrap().title(), "Claude 1");
+        assert_eq!(app.sessions.active().unwrap().workspace(), workspace.path());
+        let response: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&reply).unwrap()).unwrap();
+        assert_eq!(response["ok"], serde_json::json!(true));
+        assert_eq!(response["tab"], serde_json::json!("Claude 1"));
+        assert!(!spool.path().join("req-t1.json").exists());
+        assert!(app.pending_writes.iter().any(|write| {
+            String::from_utf8_lossy(&write.bytes)
+                .contains("[Agent Bridge delegation · from Codex 1] review this diff")
+        }));
+    }
+
+    #[test]
+    fn delegation_status_read_and_unknown_kinds_reply_accurately() {
+        let spool = tempfile::tempdir().unwrap();
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(|definition, title, _, _| {
+                let session = test_session(definition, title, false);
+                session.parser.lock().unwrap().process(b"hello output");
+                Ok(Box::new(session))
+            }),
+        );
+        app.delegation_dir = Some(spool.path().to_path_buf());
+        app.observed_states
+            .insert("Codex 1".to_owned(), SemanticState::Working);
+
+        let status = app.handle_delegation(&serde_json::json!({
+            "kind": "status", "target": "Codex 1"
+        }));
+        assert_eq!(status["state"], serde_json::json!("working"));
+
+        let read = app.handle_delegation(&serde_json::json!({
+            "kind": "read", "target": "Codex 1"
+        }));
+        assert!(read["output"].as_str().unwrap().contains("hello output"));
+
+        let missing = app.handle_delegation(&serde_json::json!({
+            "kind": "status", "target": "Nope 9"
+        }));
+        assert_eq!(missing["ok"], serde_json::json!(false));
+
+        let bogus = app.handle_delegation(&serde_json::json!({ "kind": "explode" }));
+        assert_eq!(bogus["ok"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn delegation_reply_path_outside_the_spool_is_refused() {
+        let spool = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(|definition, title, _, _| {
+                Ok(Box::new(test_session(definition, title, false)))
+            }),
+        );
+        app.delegation_dir = Some(spool.path().to_path_buf());
+        let escape = outside.path().join("stolen.json");
+        fs::write(
+            spool.path().join("req-evil.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "kind": "status",
+                "target": "Codex 1",
+                "reply": escape.to_string_lossy(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        app.process_delegation_requests();
+
+        assert!(!escape.exists());
+        assert!(!spool.path().join("req-evil.json").exists());
+    }
+
+    #[test]
+    fn delegation_prompt_reaches_an_existing_tab_with_provenance() {
+        let spool = tempfile::tempdir().unwrap();
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&writes);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(move |definition, title, _, _| {
+                Ok(Box::new(test_session_with_writes(
+                    definition,
+                    title,
+                    false,
+                    Arc::clone(&captured),
+                )))
+            }),
+        );
+        app.delegation_dir = Some(spool.path().to_path_buf());
+
+        let response = app.handle_delegation(&serde_json::json!({
+            "kind": "prompt",
+            "target": "Codex 1",
+            "prompt": "run the tests",
+            "from": "Claude 1",
+        }));
+
+        assert_eq!(response["ok"], serde_json::json!(true));
+        assert!(
+            String::from_utf8_lossy(&writes.lock().unwrap()[0])
+                .contains("[Agent Bridge delegation · from Claude 1] run the tests")
+        );
     }
 
     #[test]

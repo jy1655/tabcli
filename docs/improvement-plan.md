@@ -65,6 +65,18 @@ herdr(https://github.com/ogulcancelik/herdr)는 재라이선스 이력이 있다
 
 Housekeeping: `src/lib.rs:47-49` `relay_text` 구 API 정리 (앱 미사용, 테스트 전용). — **완료 2026-08-10**: `relay_text`/`relay_text_from` 제거, 빈 입력 검증 커버리지는 `handoff_rejects_an_empty_request`(tests/core.rs)로 이관.
 
+### P5 — Visible delegation (2026-08-10 착수 — herdr agent-automation 벤치마킹, 전체 표면)
+
+herdr에서는 pane 안의 에이전트가 `herdr` CLI/소켓(JSON-RPC, env `HERDR_PANE_ID`로 자기 위치 인지)으로 `pane split → agent start codex → agent prompt --wait --until done → agent read`를 호출해, 위임받은 에이전트가 **보이는 pane에서** 돌아간다. 초기에는 read-back을 제외한 축소안을 설계했으나, **2026-08-10 owner 결정으로 자동 판독·전달 루프 금지가 해제**되어(benchmark.md 개정 참조 — 상용 검증된 기능의 도입) 전체 표면을 채택한다:
+
+| # | 항목 | 내용 | 수용 기준 |
+|---|---|---|---|
+| 18 | 파일 스풀 delegation 채널 | 소켓 대신 인스턴스별 요청 디렉터리(요청/응답 JSON, tmp+rename 원자성) + 세션 env(`AGENT_BRIDGE_REQUESTS`, `AGENT_BRIDGE_TAB`) 주입, 1s heartbeat가 수거. 응답 경로는 스풀 디렉터리 내부로 강제(임의 파일 쓰기 차단). 기존 hook 파일 패턴 재사용, 신규 의존성 0, 크로스플랫폼 | 탭 안의 에이전트가 `agent-bridge open <cli> [--workspace] [--prompt]`로 새 보이는 탭을 만들고 탭 이름을 돌려받는다 |
+| 19 | prompt/status/read/wait 서브커맨드 | `prompt <탭> <텍스트>`(provenance 배너 부착 주입), `status <탭>`(semantic/activity 라벨), `read <탭>`(현재 보이는 화면 텍스트), `wait <탭> --until <상태>`(클라이언트 측 status 폴링 루프) | 호출 에이전트가 위임 대상의 완료를 기다렸다가 출력을 회수하는 전 과정이 가능하고, 그 전 과정이 사용자 화면에 보인다 |
+| 20 | 불변 유지 장치 | 모든 주입에 `[Agent Bridge delegation · from <탭>]` provenance 강제(생략 불가), 위임 탭은 레일에 즉시 표시, 자동 승인·권한 우회는 계속 `--yolo`만 | provenance 없는 주입 경로가 코드에 존재하지 않음 |
+
+전제·한계(v1): 에이전트가 이 채널을 쓰도록 CLAUDE.md/AGENTS.md 한 줄 지시 필요(herdr도 skill로 동일하게 opt-in), Claude 내부 Task 서브에이전트는 가로챌 수 없음(herdr도 동일), 나란히 보기는 pane 분할 부재로 레일 전환 관전(P4-17 split 후보와 연결), `open --prompt`는 CLI 기동 대기를 고정 지연(약 2.5s)으로 처리하며 단문 프롬프트 권장(정교한 준비 감지·bracketed 주입은 후속).
+
 ### P4 — 마우스 친화 TUI (2026-08-10 사용자 요청 신설, herdr 벤치마킹)
 
 | # | 항목 | 내용 | 수용 기준 |
