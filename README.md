@@ -80,7 +80,7 @@ workspace 선택과 `--yolo` 동작은 위 Windows 설명과 동일합니다.
 - `F7`: 탭 제목과 보관된 터미널 출력 검색. 스크롤백 매치는 해당 위치로 점프해 스크롤백 모드로 표시 (`Esc`로 라이브 복귀)
 - `F2`: 현재 탭의 최근 visible terminal context(최대 6,000자), tab/workspace provenance, 사용자가 입력한 요청을 다른 탭에 handoff (탭 2개 이상 필요, 첫 `Enter`로 context를 캡처하고 두 번째 `Enter`로 전송)
 - `F8`: 스크롤백 모드 (`↑`/`↓`, `PageUp`/`PageDown`, `Home`/`End`, `Esc`로 복귀). 보관 줄 수는 기본 2,000이며 `AGENT_BRIDGE_SCROLLBACK`(1~100,000)으로 조정
-- 마우스 휠: CLI가 마우스 리포팅을 요청하지 않으면 터미널 스크롤백 이동. 마우스 캡처 중 Windows Terminal의 텍스트 선택·복사는 `Shift`를 누른 채 드래그
+- 마우스: 좌측 레일에서 세션 클릭으로 전환(F2 handoff 중에는 대상 선택), 레일 위 휠로 이전/다음 세션 이동, F3 화면의 CLI 칩 클릭 선택, F1 diff 뷰는 휠로 스크롤. CLI가 마우스 리포팅을 요청하면 터미널 영역 안의 이벤트는 그대로 CLI에 전달되고, 요청하지 않으면 터미널 위 휠은 스크롤백 이동. 마우스 캡처 중 Windows Terminal의 텍스트 선택·복사는 `Shift`를 누른 채 드래그
 - `F9`: 종료된 탭을 같은 CLI·이름으로 새 세션 재시작
 - `F10`: Agent Bridge 종료
 - Agent Bridge가 예약하지 않은 키: 활성 에이전트 PTY에 그대로 전달 (`Ctrl+F11`로 예약 키도 전달 가능)

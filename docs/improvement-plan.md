@@ -65,6 +65,15 @@ herdr(https://github.com/ogulcancelik/herdr)는 재라이선스 이력이 있다
 
 Housekeeping: `src/lib.rs:47-49` `relay_text` 구 API 정리 (앱 미사용, 테스트 전용). — **완료 2026-08-10**: `relay_text`/`relay_text_from` 제거, 빈 입력 검증 커버리지는 `handoff_rejects_an_empty_request`(tests/core.rs)로 이관.
 
+### P4 — 마우스 친화 TUI (2026-08-10 사용자 요청 신설, herdr 벤치마킹)
+
+| # | 항목 | 내용 | 수용 기준 |
+|---|---|---|---|
+| 16 | 마우스 친화 1차 | 레일 클릭 세션 전환, relay 중 레일 클릭으로 대상 선택, 레일 휠 세션 순환, F3 CLI 칩 클릭 선택, F1 diff 휠 스크롤. 자식 CLI mouse reporting은 터미널 영역 내 최우선 유지 | 키보드 없이 세션 전환·relay 대상 지정·CLI 선택 가능. 기존 마우스 전달·스크롤백 회귀 없음 |
+| 17 | 마우스 친화 2차 (후속) | 푸터 힌트 클릭으로 F키 동작 실행, 레일 항목의 닫기(×) 클릭, 레일 스크롤(세션 다수), scrollbar 표시 | 미착수 |
+
+> 적용 현황: **P4-16 — 2026-08-10 로컬 적용 완료 (미커밋)**. 우선순위: 레일 영역(클릭·휠, 모든 모드에서 소비) → diff 휠 → Add 칩 → 기존 자식 전달/스크롤백. hit-test는 순수 함수(`rail_row_to_session_index`, `agent_chip_at`)로 분리해 유닛 테스트. 레일 클릭은 Terminal/Scrollback/PassThrough에서 전환, Relay에서는 대상 선택(확인·캡처 리셋), 모달(Add/Search/Diff/Help)에서는 무시.
+
 ## 확인점 (구현 착수 전 검증 필요)
 
 - a. **Codex notify 계약 재조사** — benchmark.md의 "신뢰할 수 있는 대기 이벤트 계약 미확인"은 2026-08-08 기준. 당시 판정 근거(Wiki 2026-08-08 기록): Codex `PermissionRequest` hook은 자동 review 중에도 발생해 사용자 대기 신호로 부적합. 따라서 재조사 대상은 PermissionRequest가 아니라 `notify`(turn-complete 계열) 경로이며, 세션별 주입 가능한지 최신 문서·실측으로 재확인. 성립 시 "Codex semantic state 승격"을 P2에 추가.

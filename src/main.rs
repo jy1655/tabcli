@@ -1281,6 +1281,8 @@ struct App {
     observed_states: HashMap<String, SemanticState>,
     yolo: bool,
     terminal_pane: Rect,
+    rail_pane: Rect,
+    footer_pane: Rect,
     pending_writes: Vec<PendingWrite>,
     layout_path: Option<PathBuf>,
     restorable_layout: Vec<SavedTab>,
@@ -1380,6 +1382,8 @@ impl App {
             observed_states: HashMap::new(),
             yolo,
             terminal_pane: Rect::default(),
+            rail_pane: Rect::default(),
+            footer_pane: Rect::default(),
             pending_writes: Vec::new(),
             layout_path: None,
             restorable_layout: Vec::new(),
@@ -1620,7 +1624,85 @@ impl App {
         Ok(())
     }
 
+    fn handle_rail_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let rail = self.rail_pane;
+        if rail.width < 3 || rail.height < 3 {
+            return false;
+        }
+        let inside = mouse.column > rail.x
+            && mouse.column < rail.right().saturating_sub(1)
+            && mouse.row > rail.y
+            && mouse.row < rail.bottom().saturating_sub(1);
+        if !inside {
+            return false;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp if matches!(self.mode, Mode::Terminal | Mode::Scrollback) => {
+                self.sessions.move_active(-1);
+            }
+            MouseEventKind::ScrollDown
+                if matches!(self.mode, Mode::Terminal | Mode::Scrollback) =>
+            {
+                self.sessions.move_active(1);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(index) = rail_row_to_session_index(rail, mouse.row, self.sessions.len())
+                else {
+                    return true;
+                };
+                match &mut self.mode {
+                    Mode::Relay {
+                        target,
+                        confirm,
+                        override_busy,
+                        context,
+                        ..
+                    } => {
+                        *target = index;
+                        *confirm = false;
+                        *override_busy = false;
+                        *context = None;
+                    }
+                    Mode::Terminal | Mode::Scrollback | Mode::PassThrough => {
+                        if self.sessions.set_active(index)
+                            && let Some(session) = self.sessions.active()
+                        {
+                            self.notice = format!("switched to {}", session.title());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        if self.handle_rail_mouse(mouse) {
+            return Ok(());
+        }
+        if let Mode::Diff { text, offset } = &mut self.mode {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    *offset = offset.saturating_sub(3);
+                    return Ok(());
+                }
+                MouseEventKind::ScrollDown => {
+                    *offset = offset.saturating_add(3).min(max_diff_offset(text));
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        if let Mode::Add { selected, .. } = &mut self.mode
+            && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && mouse.row == self.footer_pane.y.saturating_add(1)
+            && let Some(index) = agent_chip_at(mouse.column, self.footer_pane.x)
+        {
+            *selected = index;
+            return Ok(());
+        }
         let Some(session) = self.sessions.active() else {
             return Ok(());
         };
@@ -2203,6 +2285,27 @@ fn terminal_inner_size(area: Rect) -> (u16, u16) {
     )
 }
 
+fn rail_row_to_session_index(rail: Rect, row: u16, sessions: usize) -> Option<usize> {
+    let first = rail.y.saturating_add(1);
+    if row < first {
+        return None;
+    }
+    let index = usize::from(row.saturating_sub(first)) / 2;
+    (index < sessions).then_some(index)
+}
+
+fn agent_chip_at(column: u16, origin: u16) -> Option<usize> {
+    let mut x = origin;
+    for (index, definition) in agents().iter().enumerate() {
+        let width = definition.id.name().len() as u16 + 2;
+        if column >= x && column < x.saturating_add(width) {
+            return Some(index);
+        }
+        x = x.saturating_add(width + 2);
+    }
+    None
+}
+
 fn render(frame: &mut Frame, app: &App) {
     let (header, rail, terminal, footer) = app_layout(frame.area());
     let git_label = app
@@ -2257,6 +2360,8 @@ fn render(frame: &mut Frame, app: &App) {
                  F10     quit Agent Bridge\n\
                  Ctrl+F11 send the next key directly to the CLI\n\
                  Shift+drag terminal-native text selection during mouse capture\n\
+                 Mouse   click a rail entry to focus it (during F2: pick the target),\n\
+                         wheel over the rail switches sessions, wheel scrolls output/diff\n\
                  F12     close this help\n\n\
                  Other terminal input goes directly to the active CLI.",
             )
@@ -2574,8 +2679,10 @@ fn run(terminal: &mut DefaultTerminal, cwd: &Path, yolo: bool) -> Result<()> {
     loop {
         app.sync_active_workspace();
         let size = terminal.size()?;
-        let (_, _, pane, _) = app_layout(Rect::new(0, 0, size.width, size.height));
+        let (_, rail, pane, footer) = app_layout(Rect::new(0, 0, size.width, size.height));
+        app.rail_pane = rail;
         app.terminal_pane = pane;
+        app.footer_pane = footer;
         let (cols, rows) = terminal_inner_size(pane);
         for session in app.sessions.items_mut() {
             if !session.is_alive() {
@@ -3784,6 +3891,207 @@ mod tests {
             .unwrap();
         assert!(matches!(app.mode, Mode::Terminal));
         assert_eq!(app.sessions.active().unwrap().scrollback().unwrap(), 0);
+    }
+
+    #[test]
+    fn rail_rows_map_to_session_indices_within_bounds() {
+        let rail = Rect::new(0, 3, 24, 30);
+        assert_eq!(rail_row_to_session_index(rail, 3, 3), None);
+        assert_eq!(rail_row_to_session_index(rail, 4, 3), Some(0));
+        assert_eq!(rail_row_to_session_index(rail, 5, 3), Some(0));
+        assert_eq!(rail_row_to_session_index(rail, 6, 3), Some(1));
+        assert_eq!(rail_row_to_session_index(rail, 8, 3), Some(2));
+        assert_eq!(rail_row_to_session_index(rail, 10, 3), None);
+    }
+
+    #[test]
+    fn add_screen_agent_chips_resolve_by_column() {
+        assert_eq!(agent_chip_at(0, 0), Some(0));
+        assert_eq!(agent_chip_at(6, 0), Some(0));
+        assert_eq!(agent_chip_at(7, 0), None);
+        assert_eq!(agent_chip_at(9, 0), Some(1));
+        assert_eq!(agent_chip_at(16, 0), Some(1));
+        assert_eq!(agent_chip_at(19, 0), Some(2));
+        assert_eq!(agent_chip_at(24, 0), None);
+    }
+
+    #[test]
+    fn clicking_a_rail_entry_activates_that_session() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(|definition, title, _, _| {
+                Ok(Box::new(test_session(definition, title, false)))
+            }),
+        );
+        app.add_session(AgentId::Claude).unwrap();
+        app.sessions.set_active(0);
+        app.rail_pane = Rect::new(0, 3, 24, 30);
+
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(app.sessions.active_index(), Some(1));
+        assert!(app.notice.contains("switched to"));
+    }
+
+    #[test]
+    fn clicking_the_rail_during_relay_picks_the_target() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(|definition, title, _, _| {
+                Ok(Box::new(test_session(definition, title, false)))
+            }),
+        );
+        app.add_session(AgentId::Claude).unwrap();
+        app.add_session(AgentId::Claude).unwrap();
+        app.sessions.set_active(0);
+        app.rail_pane = Rect::new(0, 3, 24, 30);
+
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(app.mode, Mode::Relay { confirm: true, .. }));
+
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 8,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            app.mode,
+            Mode::Relay {
+                target: 2,
+                confirm: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn wheel_over_the_rail_switches_sessions() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(|definition, title, _, _| {
+                Ok(Box::new(test_session(definition, title, false)))
+            }),
+        );
+        app.add_session(AgentId::Claude).unwrap();
+        app.rail_pane = Rect::new(0, 3, 24, 30);
+
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 5,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(app.sessions.active_index(), Some(0));
+        assert!(matches!(app.mode, Mode::Terminal));
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_diff_view() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(|_, _, _, _| anyhow::bail!("unused")),
+        );
+        app.mode = Mode::Diff {
+            text: "one\ntwo\nthree\nfour\nfive\nsix".to_owned(),
+            offset: 0,
+        };
+
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 40,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(app.mode, Mode::Diff { offset: 3, .. }));
+
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 40,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(app.mode, Mode::Diff { offset: 5, .. }));
+
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 40,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(app.mode, Mode::Diff { offset: 2, .. }));
+    }
+
+    #[test]
+    fn clicking_an_agent_chip_selects_that_cli_on_the_add_screen() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(|definition, title, _, _| {
+                Ok(Box::new(test_session(definition, title, false)))
+            }),
+        );
+        app.footer_pane = Rect::new(0, 33, 120, 4);
+        app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE))
+            .unwrap();
+
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 10,
+                row: 34,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .unwrap();
+
+        assert!(matches!(app.mode, Mode::Add { selected: 1, .. }));
     }
 
     #[test]
