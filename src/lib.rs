@@ -87,11 +87,24 @@ impl<T> TabSet<T> {
 
     pub fn remove_active(&mut self) -> Option<T> {
         let index = self.active?;
+        self.remove(index)
+    }
+
+    pub fn remove(&mut self, index: usize) -> Option<T> {
+        if index >= self.items.len() {
+            return None;
+        }
         let removed = self.items.remove(index);
         self.active = if self.items.is_empty() {
             None
         } else {
-            Some(index.min(self.items.len() - 1))
+            self.active.map(|active| {
+                if index < active {
+                    active - 1
+                } else {
+                    active.min(self.items.len() - 1)
+                }
+            })
         };
         Some(removed)
     }

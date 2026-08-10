@@ -67,6 +67,22 @@ fn tab_navigation_wraps_and_close_selects_a_neighbor() {
 }
 
 #[test]
+fn removing_a_background_tab_keeps_the_active_selection() {
+    let mut tabs = TabSet::new();
+    tabs.push("Codex 1");
+    tabs.push("Claude 1");
+    tabs.push("Codex 2");
+    assert_eq!(tabs.active_index(), Some(2));
+
+    assert_eq!(tabs.remove(0), Some("Codex 1"));
+    assert_eq!(tabs.active(), Some(&"Codex 2"));
+
+    assert_eq!(tabs.remove(5), None);
+    assert_eq!(tabs.remove(1), Some("Codex 2"));
+    assert_eq!(tabs.active(), Some(&"Claude 1"));
+}
+
+#[test]
 fn tabs_can_activate_a_known_index_without_navigation_loops() {
     let mut tabs = TabSet::new();
     tabs.push("Codex 1");
