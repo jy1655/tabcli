@@ -44,18 +44,6 @@ pub const fn agents() -> [AgentDefinition; 3] {
     ]
 }
 
-pub fn relay_text(from: AgentId, value: &str) -> Result<String> {
-    relay_text_from(from.name(), value)
-}
-
-pub fn relay_text_from(from: &str, value: &str) -> Result<String> {
-    let text = value.trim();
-    if text.is_empty() {
-        bail!("relay text cannot be empty");
-    }
-    Ok(format!("[Agent Bridge · from {from}] {text}"))
-}
-
 pub fn handoff_text_from(from: &str, request: &str, context: &str) -> Result<String> {
     let request = request.trim();
     if request.is_empty() {

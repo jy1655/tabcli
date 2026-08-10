@@ -18,7 +18,7 @@ use std::process::{Child as StdChild, ChildStdin, Stdio};
 
 use agent_bridge::{AgentDefinition, AgentId, TabSet, agents, handoff_text_from, session_title};
 use anyhow::{Context, Result};
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, after, never};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -124,13 +124,14 @@ process.on('SIGTERM', () => child.kill());
 
 struct HookAdapter {
     status_file: tempfile::NamedTempFile,
-    settings_file: tempfile::NamedTempFile,
+    settings_file: Option<tempfile::NamedTempFile>,
 }
 
 fn session_arguments(
     definition: AgentDefinition,
     yolo: bool,
     claude_settings: Option<&Path>,
+    codex_notify_exe: Option<&Path>,
 ) -> Vec<OsString> {
     let mut arguments = Vec::new();
     if yolo {
@@ -144,6 +145,17 @@ fn session_arguments(
     {
         arguments.push(OsString::from("--settings"));
         arguments.push(settings.as_os_str().to_owned());
+    }
+    if definition.id == AgentId::Codex
+        && let Some(exe) = codex_notify_exe
+    {
+        let exe_text = exe.display().to_string();
+        if !exe_text.contains('\'') {
+            arguments.push(OsString::from("-c"));
+            arguments.push(OsString::from(format!(
+                "notify=['{exe_text}','hook','finished']"
+            )));
+        }
     }
     arguments
 }
@@ -184,6 +196,34 @@ fn resolve_windows_agent_command(
     PathBuf::from(definition.command)
 }
 
+#[cfg(not(windows))]
+fn resolve_unix_agent_command(
+    definition: AgentDefinition,
+    path: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    if let Some(path) = path {
+        for directory in std::env::split_paths(path) {
+            let candidate = directory.join(definition.command);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    if definition.id == AgentId::Claude
+        && let Some(home) = home
+    {
+        let candidate = PathBuf::from(home)
+            .join(".local")
+            .join("bin")
+            .join("claude");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    PathBuf::from(definition.command)
+}
+
 #[cfg(windows)]
 fn global_node_modules() -> Result<PathBuf> {
     let output = Command::new("npm.cmd")
@@ -215,31 +255,45 @@ impl HookAdapter {
         self.status_file.path()
     }
 
-    fn settings_path(&self) -> &Path {
-        self.settings_file.path()
+    fn settings_path(&self) -> Option<&Path> {
+        self.settings_file
+            .as_ref()
+            .map(tempfile::NamedTempFile::path)
     }
 }
 
-fn prepare_hook_adapter(definition: AgentDefinition) -> Result<Option<HookAdapter>> {
-    if definition.id != AgentId::Claude {
-        return Ok(None);
-    }
+fn new_status_file(initial: &[u8]) -> Result<tempfile::NamedTempFile> {
     let mut status_file = tempfile::Builder::new()
         .prefix("agent-bridge-")
         .suffix(".status")
         .tempfile_in(std::env::temp_dir())?;
-    status_file.write_all(b"idle")?;
-    let executable = std::env::current_exe().context("failed to locate agent-bridge executable")?;
-    let settings = serde_json::to_vec_pretty(&claude_hook_settings(&executable))?;
-    let mut settings_file = tempfile::Builder::new()
-        .prefix("agent-bridge-")
-        .suffix(".settings.json")
-        .tempfile_in(std::env::temp_dir())?;
-    settings_file.write_all(&settings)?;
-    Ok(Some(HookAdapter {
-        status_file,
-        settings_file,
-    }))
+    status_file.write_all(initial)?;
+    Ok(status_file)
+}
+
+fn prepare_hook_adapter(definition: AgentDefinition) -> Result<Option<HookAdapter>> {
+    match definition.id {
+        AgentId::Claude => {
+            let status_file = new_status_file(b"idle")?;
+            let executable =
+                std::env::current_exe().context("failed to locate agent-bridge executable")?;
+            let settings = serde_json::to_vec_pretty(&claude_hook_settings(&executable))?;
+            let mut settings_file = tempfile::Builder::new()
+                .prefix("agent-bridge-")
+                .suffix(".settings.json")
+                .tempfile_in(std::env::temp_dir())?;
+            settings_file.write_all(&settings)?;
+            Ok(Some(HookAdapter {
+                status_file,
+                settings_file: Some(settings_file),
+            }))
+        }
+        AgentId::Codex => Ok(Some(HookAdapter {
+            status_file: new_status_file(b"")?,
+            settings_file: None,
+        })),
+        AgentId::Agy => Ok(None),
+    }
 }
 
 impl AgentSession {
@@ -247,12 +301,21 @@ impl AgentSession {
         definition: AgentDefinition,
         yolo: bool,
         hook_adapter: Option<&HookAdapter>,
+        extra_args: &[String],
     ) -> Vec<OsString> {
-        session_arguments(
+        let notify_exe = if definition.id == AgentId::Codex && hook_adapter.is_some() {
+            std::env::current_exe().ok()
+        } else {
+            None
+        };
+        let mut arguments = session_arguments(
             definition,
             yolo,
-            hook_adapter.map(HookAdapter::settings_path),
-        )
+            hook_adapter.and_then(HookAdapter::settings_path),
+            notify_exe.as_deref(),
+        );
+        arguments.extend(extra_args.iter().map(OsString::from));
+        arguments
     }
 
     #[cfg(windows)]
@@ -262,6 +325,7 @@ impl AgentSession {
         cwd: &Path,
         redraw: Sender<()>,
         yolo: bool,
+        extra_args: &[String],
     ) -> Result<Self> {
         let hook_adapter = prepare_hook_adapter(definition)?;
         let program = resolve_windows_agent_command(
@@ -269,7 +333,7 @@ impl AgentSession {
             std::env::var_os("PATH").as_deref(),
             std::env::var_os("USERPROFILE").as_deref(),
         );
-        let arguments = Self::arguments(definition, yolo, hook_adapter.as_ref());
+        let arguments = Self::arguments(definition, yolo, hook_adapter.as_ref(), extra_args);
         let (process, mut reader, writer, node_control): WindowsSpawnParts = if definition.id
             == AgentId::Claude
         {
@@ -330,7 +394,7 @@ impl AgentSession {
         };
         let writer = Arc::new(Mutex::new(writer));
         let writer_for_reader = Arc::clone(&writer);
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(32, 100, 2_000)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(32, 100, scrollback_rows())));
         let parser_for_reader = Arc::clone(&parser);
         let alive = Arc::new(AtomicBool::new(true));
         let alive_for_reader = Arc::clone(&alive);
@@ -381,6 +445,7 @@ impl AgentSession {
         cwd: &Path,
         redraw: Sender<()>,
         yolo: bool,
+        extra_args: &[String],
     ) -> Result<Self> {
         let hook_adapter = prepare_hook_adapter(definition)?;
         let pair = native_pty_system().openpty(PtySize {
@@ -389,10 +454,14 @@ impl AgentSession {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        let program = PathBuf::from(definition.command);
+        let program = resolve_unix_agent_command(
+            definition,
+            std::env::var_os("PATH").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        );
         let mut command = CommandBuilder::new(program);
         command.cwd(cwd);
-        for argument in Self::arguments(definition, yolo, hook_adapter.as_ref()) {
+        for argument in Self::arguments(definition, yolo, hook_adapter.as_ref(), extra_args) {
             command.arg(argument);
         }
         if let Some(adapter) = &hook_adapter {
@@ -406,7 +475,7 @@ impl AgentSession {
         let mut reader = pair.master.try_clone_reader()?;
         let writer = Arc::new(Mutex::new(pair.master.take_writer()?));
         let writer_for_reader = Arc::clone(&writer);
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(32, 100, 2_000)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(32, 100, scrollback_rows())));
         let parser_for_reader = Arc::clone(&parser);
         let alive = Arc::new(AtomicBool::new(true));
         let alive_for_reader = Arc::clone(&alive);
@@ -550,6 +619,21 @@ fn notifications_enabled() -> bool {
         .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
+const DEFAULT_SCROLLBACK_ROWS: usize = 2_000;
+const MAX_SCROLLBACK_ROWS: usize = 100_000;
+
+fn scrollback_rows() -> usize {
+    scrollback_rows_from(std::env::var("AGENT_BRIDGE_SCROLLBACK").ok().as_deref())
+}
+
+fn scrollback_rows_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|text| text.trim().parse::<usize>().ok())
+        .filter(|rows| *rows > 0)
+        .map(|rows| rows.min(MAX_SCROLLBACK_ROWS))
+        .unwrap_or(DEFAULT_SCROLLBACK_ROWS)
+}
+
 fn valid_hook_status_path(path: &Path) -> bool {
     path.parent() == Some(std::env::temp_dir().as_path())
         && path
@@ -674,26 +758,30 @@ trait SessionIo {
     fn set_scrollback(&self, rows: usize) -> Result<()>;
     fn activity(&self) -> SessionActivity;
     fn semantic_state(&self) -> Option<SemanticState>;
-    fn contains_text(&self, query: &str) -> Result<bool>;
+    fn clear_finished_state(&self);
+    fn find_text(&self, query: &str) -> Result<Option<usize>>;
     fn application_cursor(&self) -> bool;
     fn bracketed_paste(&self) -> bool;
     fn mouse_protocol(&self) -> (vt100::MouseProtocolMode, vt100::MouseProtocolEncoding);
 }
 
-fn submit_relay(destination: &dyn SessionIo, message: &str) -> Result<()> {
-    let bracketed = destination.bracketed_paste();
+const RELAY_ENTER_DELAY: Duration = Duration::from_millis(50);
+const RELAY_BRACKETED_CONFIRM_DELAY: Duration = Duration::from_millis(300);
+
+fn relay_write_plan(bracketed: bool, message: &str) -> Vec<(Duration, Vec<u8>)> {
+    let mut plan = vec![(
+        Duration::ZERO,
+        if bracketed {
+            format!("\x1b[200~{message}\x1b[201~").into_bytes()
+        } else {
+            message.as_bytes().to_vec()
+        },
+    )];
+    plan.push((RELAY_ENTER_DELAY, b"\r".to_vec()));
     if bracketed {
-        destination.write(format!("\x1b[200~{message}\x1b[201~").as_bytes())?;
-    } else {
-        destination.write(message.as_bytes())?;
+        plan.push((RELAY_BRACKETED_CONFIRM_DELAY, b"\r".to_vec()));
     }
-    thread::sleep(Duration::from_millis(50));
-    destination.write(b"\r")?;
-    if bracketed {
-        thread::sleep(Duration::from_millis(250));
-        destination.write(b"\r")?;
-    }
-    Ok(())
+    plan
 }
 
 fn visible_terminal_context(session: &dyn SessionIo, max_chars: usize) -> Result<String> {
@@ -773,8 +861,17 @@ impl SessionIo for AgentSession {
         parse_semantic_state(&fs::read_to_string(adapter.status_path()).ok()?)
     }
 
-    fn contains_text(&self, query: &str) -> Result<bool> {
-        parser_contains_text(&self.parser, query)
+    fn clear_finished_state(&self) {
+        let Some(adapter) = self.hook_adapter.as_ref() else {
+            return;
+        };
+        if self.semantic_state() == Some(SemanticState::Finished) {
+            let _ = fs::write(adapter.status_path(), b"");
+        }
+    }
+
+    fn find_text(&self, query: &str) -> Result<Option<usize>> {
+        parser_find_text(&self.parser, query)
     }
 
     fn application_cursor(&self) -> bool {
@@ -805,7 +902,7 @@ impl SessionIo for AgentSession {
     }
 }
 
-fn parser_contains_text(parser: &Arc<Mutex<vt100::Parser>>, query: &str) -> Result<bool> {
+fn parser_find_text(parser: &Arc<Mutex<vt100::Parser>>, query: &str) -> Result<Option<usize>> {
     let query = query.to_lowercase();
     let mut parser = parser
         .lock()
@@ -815,18 +912,18 @@ fn parser_contains_text(parser: &Arc<Mutex<vt100::Parser>>, query: &str) -> Resu
     screen.set_scrollback(usize::MAX);
     let maximum = screen.scrollback();
     let page = usize::from(screen.size().0).max(1);
-    let mut offset = maximum;
-    let mut found = false;
+    let mut offset = 0;
+    let mut found = None;
     loop {
         screen.set_scrollback(offset);
         if screen.contents().to_lowercase().contains(&query) {
-            found = true;
+            found = Some(offset);
             break;
         }
-        if offset == 0 {
+        if offset >= maximum {
             break;
         }
-        offset = offset.saturating_sub(page);
+        offset = offset.saturating_add(page).min(maximum);
     }
     screen.set_scrollback(original);
     Ok(found)
@@ -835,8 +932,16 @@ fn parser_contains_text(parser: &Arc<Mutex<vt100::Parser>>, query: &str) -> Resu
 #[cfg(test)]
 type LegacySessionSpawner =
     Box<dyn FnMut(AgentDefinition, String, &Path, Sender<()>) -> Result<Box<dyn SessionIo>>>;
-type SessionSpawner =
-    Box<dyn FnMut(AgentDefinition, String, &Path, Sender<()>, bool) -> Result<Box<dyn SessionIo>>>;
+type SessionSpawner = Box<
+    dyn FnMut(
+        AgentDefinition,
+        String,
+        &Path,
+        Sender<()>,
+        bool,
+        &[String],
+    ) -> Result<Box<dyn SessionIo>>,
+>;
 
 enum Mode {
     Terminal,
@@ -858,6 +963,7 @@ enum Mode {
         target: usize,
         input: String,
         confirm: bool,
+        override_busy: bool,
         context: Option<String>,
     },
 }
@@ -900,11 +1006,18 @@ fn read_git_context(cwd: &Path) -> Option<GitContext> {
     ))
 }
 
-fn spawn_git_context_reader(cwd: PathBuf) -> Receiver<Option<GitContext>> {
+fn spawn_git_context_reader(
+    workspace: Arc<Mutex<PathBuf>>,
+) -> Receiver<(PathBuf, Option<GitContext>)> {
     let (sender, receiver) = crossbeam_channel::bounded(1);
     thread::spawn(move || {
         loop {
-            if sender.send(read_git_context(&cwd)).is_err() {
+            let target = match workspace.lock() {
+                Ok(path) => path.clone(),
+                Err(_) => break,
+            };
+            let context = read_git_context(&target);
+            if sender.send((target, context)).is_err() {
                 break;
             }
             thread::sleep(Duration::from_secs(5));
@@ -1049,12 +1162,118 @@ fn encode_mouse(
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SavedTab {
+    agent: AgentId,
+    workspace: PathBuf,
+}
+
+fn layout_manifest_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(
+        PathBuf::from(home)
+            .join(".agent-bridge")
+            .join("last-layout.json"),
+    )
+}
+
+fn agent_by_key(key: &str) -> Option<AgentId> {
+    match key.to_ascii_lowercase().as_str() {
+        "codex" => Some(AgentId::Codex),
+        "claude" => Some(AgentId::Claude),
+        "agy" => Some(AgentId::Agy),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RegisteredAgent {
+    definition: AgentDefinition,
+    extra_args: Vec<String>,
+}
+
+fn default_registry() -> [RegisteredAgent; 3] {
+    agents().map(|definition| RegisteredAgent {
+        definition,
+        extra_args: Vec::new(),
+    })
+}
+
+fn leak_str(value: String) -> &'static str {
+    Box::leak(value.into_boxed_str())
+}
+
+fn agents_config_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(
+        PathBuf::from(home)
+            .join(".agent-bridge")
+            .join("agents.json"),
+    )
+}
+
+fn registered_agents_from(text: Option<&str>) -> Result<[RegisteredAgent; 3], String> {
+    let mut registry = default_registry();
+    let Some(text) = text else {
+        return Ok(registry);
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|error| format!("agents.json parse error: {error}"))?;
+    let Some(overrides) = value.get("agents").and_then(serde_json::Value::as_object) else {
+        return Ok(registry);
+    };
+    for (key, spec) in overrides {
+        let Some(id) = agent_by_key(key) else {
+            return Err(format!(
+                "agents.json: unknown agent {key:?} (expected codex, claude, or agy)"
+            ));
+        };
+        let entry = &mut registry[agent_index(id)];
+        if let Some(command) = spec.get("command").and_then(serde_json::Value::as_str) {
+            entry.definition.command = leak_str(command.to_owned());
+        }
+        if let Some(role) = spec.get("role").and_then(serde_json::Value::as_str) {
+            entry.definition.role = leak_str(role.to_owned());
+        }
+        if let Some(args) = spec.get("args").and_then(serde_json::Value::as_array) {
+            entry.extra_args = args
+                .iter()
+                .filter_map(|argument| argument.as_str().map(str::to_owned))
+                .collect();
+        }
+    }
+    Ok(registry)
+}
+
+fn parse_layout(text: &str) -> Option<(bool, Vec<SavedTab>)> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let yolo = value
+        .get("yolo")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let tabs = value.get("tabs")?.as_array()?;
+    let mut saved = Vec::new();
+    for tab in tabs {
+        let agent = agent_by_key(tab.get("agent")?.as_str()?)?;
+        let workspace = PathBuf::from(tab.get("workspace")?.as_str()?);
+        saved.push(SavedTab { agent, workspace });
+    }
+    Some((yolo, saved))
+}
+
+struct PendingWrite {
+    title: String,
+    bytes: Vec<u8>,
+    due: Instant,
+}
+
 struct App {
     sessions: TabSet<Box<dyn SessionIo>>,
     cwd: PathBuf,
     redraw: Sender<()>,
     spawner: SessionSpawner,
-    git_context: Option<GitContext>,
+    git_contexts: HashMap<PathBuf, GitContext>,
+    active_workspace: Arc<Mutex<PathBuf>>,
     ordinals: [u32; 3],
     mode: Mode,
     notice: String,
@@ -1062,20 +1281,60 @@ struct App {
     observed_states: HashMap<String, SemanticState>,
     yolo: bool,
     terminal_pane: Rect,
+    rail_pane: Rect,
+    footer_pane: Rect,
+    pending_writes: Vec<PendingWrite>,
+    layout_path: Option<PathBuf>,
+    restorable_layout: Vec<SavedTab>,
+    registry: [RegisteredAgent; 3],
 }
 
 impl App {
     fn new(cwd: &Path, redraw: Sender<()>, yolo: bool) -> Self {
-        Self::new_with_spawner_yolo(
+        let (registry, registry_warning) =
+            match agents_config_path().and_then(|path| fs::read_to_string(path).ok()) {
+                Some(text) => match registered_agents_from(Some(&text)) {
+                    Ok(registry) => (registry, None),
+                    Err(error) => (default_registry(), Some(error)),
+                },
+                None => (default_registry(), None),
+            };
+        let mut app = Self::new_with_spawner_yolo_registry(
             cwd,
             redraw,
             yolo,
-            Box::new(move |definition, title, cwd, redraw, yolo| {
+            registry,
+            Box::new(move |definition, title, cwd, redraw, yolo, extra| {
                 Ok(Box::new(AgentSession::spawn(
-                    definition, title, cwd, redraw, yolo,
+                    definition, title, cwd, redraw, yolo, extra,
                 )?))
             }),
-        )
+        );
+        if let Some(warning) = registry_warning {
+            app.notice = format!("{warning}; using built-in agents");
+        }
+        if let Some(path) = layout_manifest_path() {
+            if let Some((saved_yolo, tabs)) = fs::read_to_string(&path)
+                .ok()
+                .as_deref()
+                .and_then(parse_layout)
+                && !tabs.is_empty()
+            {
+                app.notice = format!(
+                    "previous layout: {} tab(s) — F3, then Ctrl+L to restore{}",
+                    tabs.len(),
+                    if saved_yolo && !app.yolo {
+                        " (saved as YOLO; restore keeps current mode)"
+                    } else {
+                        ""
+                    }
+                );
+                app.restorable_layout = tabs;
+            }
+            app.layout_path = Some(path);
+            app.save_layout();
+        }
+        app
     }
 
     #[cfg(test)]
@@ -1084,16 +1343,27 @@ impl App {
             cwd,
             redraw,
             false,
-            Box::new(move |definition, title, cwd, redraw, _| {
+            Box::new(move |definition, title, cwd, redraw, _, _| {
                 spawner(definition, title, cwd, redraw)
             }),
         )
     }
 
+    #[cfg(test)]
     fn new_with_spawner_yolo(
         cwd: &Path,
         redraw: Sender<()>,
         yolo: bool,
+        spawner: SessionSpawner,
+    ) -> Self {
+        Self::new_with_spawner_yolo_registry(cwd, redraw, yolo, default_registry(), spawner)
+    }
+
+    fn new_with_spawner_yolo_registry(
+        cwd: &Path,
+        redraw: Sender<()>,
+        yolo: bool,
+        registry: [RegisteredAgent; 3],
         spawner: SessionSpawner,
     ) -> Self {
         let mut app = Self {
@@ -1101,7 +1371,10 @@ impl App {
             cwd: cwd.to_path_buf(),
             redraw,
             spawner,
-            git_context: read_git_context(cwd),
+            git_contexts: read_git_context(cwd)
+                .map(|context| HashMap::from([(cwd.to_path_buf(), context)]))
+                .unwrap_or_default(),
+            active_workspace: Arc::new(Mutex::new(cwd.to_path_buf())),
             ordinals: [0; 3],
             mode: Mode::Terminal,
             notice: format!("workspace: {}", cwd.display()),
@@ -1109,6 +1382,12 @@ impl App {
             observed_states: HashMap::new(),
             yolo,
             terminal_pane: Rect::default(),
+            rail_pane: Rect::default(),
+            footer_pane: Rect::default(),
+            pending_writes: Vec::new(),
+            layout_path: None,
+            restorable_layout: Vec::new(),
+            registry,
         };
         if let Err(error) = app.add_session(AgentId::Codex) {
             app.notice = format!("{error:#}");
@@ -1122,24 +1401,23 @@ impl App {
     }
 
     fn add_session_at(&mut self, id: AgentId, workspace: &Path) -> Result<()> {
-        let definition = agents()
-            .into_iter()
-            .find(|definition| definition.id == id)
-            .expect("registered agent");
         let ordinal_index = agent_index(id);
+        let agent = self.registry[ordinal_index].clone();
         let ordinal = self.ordinals[ordinal_index] + 1;
         let title = session_title(id, ordinal);
         let session = (self.spawner)(
-            definition,
+            agent.definition,
             title.clone(),
             workspace,
             self.redraw.clone(),
             self.yolo,
+            &agent.extra_args,
         )
         .with_context(|| format!("failed to create {title}"))?;
         self.ordinals[ordinal_index] = ordinal;
         self.sessions.push(session);
         self.notice = format!("created {title}");
+        self.save_layout();
         Ok(())
     }
 
@@ -1153,12 +1431,14 @@ impl App {
         let definition = session.definition();
         let title = session.title().to_owned();
         let workspace = session.workspace().to_path_buf();
+        let extra_args = self.registry[agent_index(definition.id)].extra_args.clone();
         let replacement = (self.spawner)(
             definition,
             title.clone(),
             &workspace,
             self.redraw.clone(),
             self.yolo,
+            &extra_args,
         )
         .with_context(|| format!("failed to restart {title}"))?;
         self.sessions
@@ -1169,7 +1449,7 @@ impl App {
         Ok(())
     }
 
-    fn find_session(&self, query: &str) -> Result<Option<usize>> {
+    fn find_session(&self, query: &str) -> Result<Option<(usize, Option<usize>)>> {
         if query.trim().is_empty() || self.sessions.is_empty() {
             return Ok(None);
         }
@@ -1178,10 +1458,11 @@ impl App {
         for step in 1..=self.sessions.len() {
             let index = (start + step) % self.sessions.len();
             let session = self.sessions.get(index).expect("session index");
-            if session.title().to_lowercase().contains(&query_lower)
-                || session.contains_text(query)?
-            {
-                return Ok(Some(index));
+            if session.title().to_lowercase().contains(&query_lower) {
+                return Ok(Some((index, None)));
+            }
+            if let Some(offset) = session.find_text(query)? {
+                return Ok(Some((index, Some(offset))));
             }
         }
         Ok(None)
@@ -1191,6 +1472,7 @@ impl App {
         let mut bell = false;
         for session in self.sessions.items() {
             let Some(state) = session.semantic_state() else {
+                self.observed_states.remove(session.title());
                 continue;
             };
             let previous = self
@@ -1205,6 +1487,105 @@ impl App {
             }
         }
         bell
+    }
+
+    fn next_write_deadline(&self) -> Option<Instant> {
+        self.pending_writes.iter().map(|write| write.due).min()
+    }
+
+    fn flush_due_writes(&mut self, now: Instant) {
+        let mut due = Vec::new();
+        let mut index = 0;
+        while index < self.pending_writes.len() {
+            if self.pending_writes[index].due <= now {
+                due.push(self.pending_writes.remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        due.sort_by_key(|write| write.due);
+        for write in due {
+            let Some(session) = self
+                .sessions
+                .items()
+                .iter()
+                .find(|session| session.title() == write.title)
+            else {
+                self.notice = format!("relay dropped: {} is gone", write.title);
+                continue;
+            };
+            if !session.is_alive() {
+                self.notice = format!("relay dropped: {} has exited", write.title);
+                continue;
+            }
+            if write.bytes.contains(&b'\r') {
+                session.clear_finished_state();
+            }
+            if let Err(error) = session.write(&write.bytes) {
+                self.notice = format!("relay to {} failed: {error}", write.title);
+            }
+        }
+    }
+
+    fn layout_manifest(&self) -> serde_json::Value {
+        let tabs = self
+            .sessions
+            .items()
+            .iter()
+            .map(|session| {
+                serde_json::json!({
+                    "agent": session.definition().id.name().to_ascii_lowercase(),
+                    "workspace": session.workspace().display().to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({ "version": 1, "yolo": self.yolo, "tabs": tabs })
+    }
+
+    fn save_layout(&mut self) {
+        let Some(path) = self.layout_path.clone() else {
+            return;
+        };
+        let manifest = self.layout_manifest();
+        let result = serde_json::to_vec_pretty(&manifest)
+            .map_err(anyhow::Error::from)
+            .and_then(|payload| {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&path, payload)?;
+                Ok(())
+            });
+        if let Err(error) = result {
+            self.notice = format!("layout save failed: {error}");
+        }
+    }
+
+    fn restore_saved_layout(&mut self) {
+        let saved = std::mem::take(&mut self.restorable_layout);
+        let mut restored = 0_usize;
+        let mut skipped = 0_usize;
+        for tab in &saved {
+            if tab.workspace.is_dir() && self.add_session_at(tab.agent, &tab.workspace).is_ok() {
+                restored += 1;
+            } else {
+                skipped += 1;
+            }
+        }
+        self.notice = format!("restored {restored} tab(s), skipped {skipped}");
+    }
+
+    fn sync_active_workspace(&self) {
+        let target = self
+            .sessions
+            .active()
+            .map(|session| session.workspace().to_path_buf())
+            .unwrap_or_else(|| self.cwd.clone());
+        if let Ok(mut workspace) = self.active_workspace.lock()
+            && *workspace != target
+        {
+            *workspace = target;
+        }
     }
 
     fn handle_paste(&mut self, text: &str) -> Result<()> {
@@ -1226,11 +1607,13 @@ impl App {
             Mode::Relay {
                 input,
                 confirm,
+                override_busy,
                 context,
                 ..
             } => {
                 input.push_str(text);
                 *confirm = false;
+                *override_busy = false;
                 *context = None;
             }
             Mode::Help | Mode::Scrollback | Mode::Diff { .. } | Mode::Add { .. } => {}
@@ -1241,7 +1624,85 @@ impl App {
         Ok(())
     }
 
+    fn handle_rail_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let rail = self.rail_pane;
+        if rail.width < 3 || rail.height < 3 {
+            return false;
+        }
+        let inside = mouse.column > rail.x
+            && mouse.column < rail.right().saturating_sub(1)
+            && mouse.row > rail.y
+            && mouse.row < rail.bottom().saturating_sub(1);
+        if !inside {
+            return false;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp if matches!(self.mode, Mode::Terminal | Mode::Scrollback) => {
+                self.sessions.move_active(-1);
+            }
+            MouseEventKind::ScrollDown
+                if matches!(self.mode, Mode::Terminal | Mode::Scrollback) =>
+            {
+                self.sessions.move_active(1);
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(index) = rail_row_to_session_index(rail, mouse.row, self.sessions.len())
+                else {
+                    return true;
+                };
+                match &mut self.mode {
+                    Mode::Relay {
+                        target,
+                        confirm,
+                        override_busy,
+                        context,
+                        ..
+                    } => {
+                        *target = index;
+                        *confirm = false;
+                        *override_busy = false;
+                        *context = None;
+                    }
+                    Mode::Terminal | Mode::Scrollback | Mode::PassThrough => {
+                        if self.sessions.set_active(index)
+                            && let Some(session) = self.sessions.active()
+                        {
+                            self.notice = format!("switched to {}", session.title());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        if self.handle_rail_mouse(mouse) {
+            return Ok(());
+        }
+        if let Mode::Diff { text, offset } = &mut self.mode {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    *offset = offset.saturating_sub(3);
+                    return Ok(());
+                }
+                MouseEventKind::ScrollDown => {
+                    *offset = offset.saturating_add(3).min(max_diff_offset(text));
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        if let Mode::Add { selected, .. } = &mut self.mode
+            && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && mouse.row == self.footer_pane.y.saturating_add(1)
+            && let Some(index) = agent_chip_at(mouse.column, self.footer_pane.x)
+        {
+            *selected = index;
+            return Ok(());
+        }
         let Some(session) = self.sessions.active() else {
             return Ok(());
         };
@@ -1312,6 +1773,7 @@ impl App {
                     if let Some(session) = self.sessions.remove_active() {
                         self.observed_states.remove(session.title());
                         self.notice = format!("closed {}", session.title());
+                        self.save_layout();
                     }
                 }
                 KeyCode::F(8) if !self.sessions.is_empty() => {
@@ -1336,6 +1798,7 @@ impl App {
                             % self.sessions.len(),
                         input: String::new(),
                         confirm: false,
+                        override_busy: false,
                         context: None,
                     };
                 }
@@ -1345,9 +1808,13 @@ impl App {
                 _ => {
                     if let Some(session) = self.sessions.active()
                         && let Some(bytes) = encode_key(key, session.application_cursor())
-                        && let Err(error) = session.write(&bytes)
                     {
-                        self.notice = error.to_string();
+                        if bytes.contains(&b'\r') {
+                            session.clear_finished_state();
+                        }
+                        if let Err(error) = session.write(&bytes) {
+                            self.notice = error.to_string();
+                        }
                     }
                 }
             },
@@ -1358,9 +1825,13 @@ impl App {
             Mode::PassThrough => {
                 if let Some(session) = self.sessions.active()
                     && let Some(bytes) = encode_key(key, session.application_cursor())
-                    && let Err(error) = session.write(&bytes)
                 {
-                    self.notice = error.to_string();
+                    if bytes.contains(&b'\r') {
+                        session.clear_finished_state();
+                    }
+                    if let Err(error) = session.write(&bytes) {
+                        self.notice = error.to_string();
+                    }
                 }
             }
             Mode::Scrollback => {
@@ -1431,10 +1902,17 @@ impl App {
                     self.mode = Mode::Search { input };
                 }
                 KeyCode::Enter => match self.find_session(&input) {
-                    Ok(Some(index)) => {
+                    Ok(Some((index, offset))) => {
                         self.sessions.set_active(index);
-                        self.notice =
-                            format!("search matched {}", self.sessions.active().unwrap().title());
+                        let session = self.sessions.active().expect("matched session");
+                        if let Some(rows) = offset.filter(|rows| *rows > 0) {
+                            session.set_scrollback(rows)?;
+                            self.notice =
+                                format!("search matched {} (scrollback)", session.title());
+                            self.mode = Mode::Scrollback;
+                        } else {
+                            self.notice = format!("search matched {}", session.title());
+                        }
                     }
                     Ok(None) => {
                         self.notice = format!("no session matches {input:?}");
@@ -1481,6 +1959,17 @@ impl App {
                         workspace,
                     };
                 }
+                KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if self.restorable_layout.is_empty() {
+                        self.notice = "no saved layout to restore".to_owned();
+                        self.mode = Mode::Add {
+                            selected,
+                            workspace,
+                        };
+                    } else {
+                        self.restore_saved_layout();
+                    }
+                }
                 KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     workspace.push(character);
                     self.mode = Mode::Add {
@@ -1517,6 +2006,7 @@ impl App {
                 mut target,
                 mut input,
                 mut confirm,
+                override_busy,
                 mut context,
             } => match key.code {
                 KeyCode::Esc => {}
@@ -1528,6 +2018,7 @@ impl App {
                         target,
                         input,
                         confirm,
+                        override_busy: false,
                         context: None,
                     };
                 }
@@ -1538,6 +2029,7 @@ impl App {
                         target,
                         input,
                         confirm,
+                        override_busy: false,
                         context: None,
                     };
                 }
@@ -1547,6 +2039,7 @@ impl App {
                         target,
                         input,
                         confirm: false,
+                        override_busy: false,
                         context: None,
                     };
                 }
@@ -1556,6 +2049,7 @@ impl App {
                         target,
                         input,
                         confirm: false,
+                        override_busy: false,
                         context: None,
                     };
                 }
@@ -1579,6 +2073,7 @@ impl App {
                                     target,
                                     input,
                                     confirm,
+                                    override_busy: false,
                                     context: None,
                                 };
                                 return Ok(false);
@@ -1594,6 +2089,7 @@ impl App {
                                     target,
                                     input,
                                     confirm,
+                                    override_busy: false,
                                     context: Some(captured),
                                 };
                             } else if !confirm {
@@ -1607,21 +2103,39 @@ impl App {
                                     target,
                                     input,
                                     confirm: true,
-                                    context: Some(captured),
-                                };
-                            } else if let Err(error) = submit_relay(destination.as_ref(), &message)
-                            {
-                                self.notice = error.to_string();
-                                self.mode = Mode::Relay {
-                                    target,
-                                    input,
-                                    confirm,
+                                    override_busy: false,
                                     context: Some(captured),
                                 };
                             } else {
-                                self.notice =
-                                    format!("{source_title} → {} relayed", destination.title());
-                                self.sessions.set_active(target);
+                                let title = destination.title().to_owned();
+                                if !override_busy
+                                    && self.observed_states.get(&title)
+                                        == Some(&SemanticState::Working)
+                                {
+                                    self.notice = format!(
+                                        "⚠ {title} is working — Enter again to interrupt, Esc to cancel"
+                                    );
+                                    self.mode = Mode::Relay {
+                                        target,
+                                        input,
+                                        confirm: true,
+                                        override_busy: true,
+                                        context: Some(captured),
+                                    };
+                                } else {
+                                    let bracketed = destination.bracketed_paste();
+                                    let now = Instant::now();
+                                    for (offset, bytes) in relay_write_plan(bracketed, &message) {
+                                        self.pending_writes.push(PendingWrite {
+                                            title: title.clone(),
+                                            bytes,
+                                            due: now + offset,
+                                        });
+                                    }
+                                    self.sessions.set_active(target);
+                                    self.notice = format!("{source_title} → {title} relayed");
+                                    self.flush_due_writes(now);
+                                }
                             }
                         }
                         Err(error) => {
@@ -1630,6 +2144,7 @@ impl App {
                                 target,
                                 input,
                                 confirm,
+                                override_busy: false,
                                 context: Some(captured),
                             };
                         }
@@ -1640,6 +2155,7 @@ impl App {
                         target,
                         input,
                         confirm,
+                        override_busy,
                         context,
                     }
                 }
@@ -1769,14 +2285,33 @@ fn terminal_inner_size(area: Rect) -> (u16, u16) {
     )
 }
 
+fn rail_row_to_session_index(rail: Rect, row: u16, sessions: usize) -> Option<usize> {
+    let first = rail.y.saturating_add(1);
+    if row < first {
+        return None;
+    }
+    let index = usize::from(row.saturating_sub(first)) / 2;
+    (index < sessions).then_some(index)
+}
+
+fn agent_chip_at(column: u16, origin: u16) -> Option<usize> {
+    let mut x = origin;
+    for (index, definition) in agents().iter().enumerate() {
+        let width = definition.id.name().len() as u16 + 2;
+        if column >= x && column < x.saturating_add(width) {
+            return Some(index);
+        }
+        x = x.saturating_add(width + 2);
+    }
+    None
+}
+
 fn render(frame: &mut Frame, app: &App) {
     let (header, rail, terminal, footer) = app_layout(frame.area());
     let git_label = app
         .sessions
         .active()
-        .filter(|session| session.workspace() == app.cwd)
-        .and(app.git_context.as_ref())
-        .as_ref()
+        .and_then(|session| app.git_contexts.get(session.workspace()))
         .map(|git| {
             format!(
                 "  ·  git:{}{}",
@@ -1825,6 +2360,8 @@ fn render(frame: &mut Frame, app: &App) {
                  F10     quit Agent Bridge\n\
                  Ctrl+F11 send the next key directly to the CLI\n\
                  Shift+drag terminal-native text selection during mouse capture\n\
+                 Mouse   click a rail entry to focus it (during F2: pick the target),\n\
+                         wheel over the rail switches sessions, wheel scrolls output/diff\n\
                  F12     close this help\n\n\
                  Other terminal input goes directly to the active CLI.",
             )
@@ -1916,9 +2453,14 @@ fn render(frame: &mut Frame, app: &App) {
             vec![
                 Line::from(choices),
                 Line::from(format!(
-                    "{}workspace: {}  ·  type/edit path  ·  ←/→ CLI  ·  Enter create",
+                    "{}workspace: {}  ·  type/edit path  ·  ←/→ CLI  ·  Enter create{}",
                     if app.yolo { "YOLO · " } else { "" },
-                    workspace
+                    workspace,
+                    if app.restorable_layout.is_empty() {
+                        ""
+                    } else {
+                        "  ·  Ctrl+L restore last layout"
+                    }
                 )),
             ]
         }
@@ -1926,6 +2468,7 @@ fn render(frame: &mut Frame, app: &App) {
             target,
             input,
             confirm,
+            override_busy: _,
             context,
         } => {
             let target_name = app
@@ -1986,8 +2529,9 @@ fn render_tab_rail(frame: &mut Frame, app: &App, area: Rect) {
             let status = if activity == SessionActivity::Exited {
                 activity.label()
             } else {
-                session
-                    .semantic_state()
+                app.observed_states
+                    .get(session.title())
+                    .copied()
                     .map(SemanticState::label)
                     .unwrap_or_else(|| activity.label())
             };
@@ -2129,13 +2673,16 @@ fn run(terminal: &mut DefaultTerminal, cwd: &Path, yolo: bool) -> Result<()> {
     let (redraw_sender, redraw_receiver) = crossbeam_channel::bounded(1);
     let event_receiver = spawn_event_reader();
     let heartbeat = crossbeam_channel::tick(Duration::from_secs(1));
-    let git_context_receiver = spawn_git_context_reader(cwd.to_path_buf());
     let mut app = App::new(cwd, redraw_sender, yolo);
+    let git_context_receiver = spawn_git_context_reader(Arc::clone(&app.active_workspace));
     let mut bell_pending = false;
     loop {
+        app.sync_active_workspace();
         let size = terminal.size()?;
-        let (_, _, pane, _) = app_layout(Rect::new(0, 0, size.width, size.height));
+        let (_, rail, pane, footer) = app_layout(Rect::new(0, 0, size.width, size.height));
+        app.rail_pane = rail;
         app.terminal_pane = pane;
+        app.footer_pane = footer;
         let (cols, rows) = terminal_inner_size(pane);
         for session in app.sessions.items_mut() {
             if !session.is_alive() {
@@ -2148,7 +2695,14 @@ fn run(terminal: &mut DefaultTerminal, cwd: &Path, yolo: bool) -> Result<()> {
         terminal.draw(|frame| render(frame, &app))?;
         emit_pending_bell(terminal.backend_mut(), &mut bell_pending)?;
 
+        let write_deadline = app
+            .next_write_deadline()
+            .map(|due| after(due.saturating_duration_since(Instant::now())))
+            .unwrap_or_else(never);
         crossbeam_channel::select! {
+            recv(write_deadline) -> _ => {
+                app.flush_due_writes(Instant::now());
+            }
             recv(event_receiver) -> event => {
                 if handle_event(&mut app, event.context("terminal event reader stopped")??)? {
                     break;
@@ -2167,8 +2721,16 @@ fn run(terminal: &mut DefaultTerminal, cwd: &Path, yolo: bool) -> Result<()> {
                     bell_pending = true;
                 }
             }
-            recv(git_context_receiver) -> context => {
-                app.git_context = context.context("git context reader stopped")?;
+            recv(git_context_receiver) -> update => {
+                let (workspace, context) = update.context("git context reader stopped")?;
+                match context {
+                    Some(context) => {
+                        app.git_contexts.insert(workspace, context);
+                    }
+                    None => {
+                        app.git_contexts.remove(&workspace);
+                    }
+                }
             }
         }
     }
@@ -2195,8 +2757,9 @@ fn parse_args_from(args: impl IntoIterator<Item = OsString>) -> Result<Launch> {
             .next()
             .and_then(|value| parse_semantic_state(&value.to_string_lossy()))
             .context("hook requires one of: working, waiting, idle, finished")?;
+        let _codex_notify_payload = args.next();
         if args.next().is_some() {
-            anyhow::bail!("hook accepts exactly one state");
+            anyhow::bail!("hook accepts one state and an optional notify payload");
         }
         return Ok(Launch::Hook(state));
     }
@@ -2271,10 +2834,26 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
 
+    fn submit_relay(destination: &dyn SessionIo, message: &str) -> Result<()> {
+        let mut elapsed = Duration::ZERO;
+        for (offset, bytes) in relay_write_plan(destination.bracketed_paste(), message) {
+            if offset > elapsed {
+                thread::sleep(offset - elapsed);
+                elapsed = offset;
+            }
+            destination.write(&bytes)?;
+        }
+        Ok(())
+    }
+
     fn wait_for_screen_text(session: &dyn SessionIo, query: &str, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if session.contains_text(query).unwrap_or(false) {
+            if session
+                .find_text(query)
+                .map(|found| found.is_some())
+                .unwrap_or(false)
+            {
                 return true;
             }
             thread::sleep(Duration::from_millis(100));
@@ -2347,8 +2926,15 @@ mod tests {
             *self.semantic_state.lock().unwrap()
         }
 
-        fn contains_text(&self, query: &str) -> Result<bool> {
-            parser_contains_text(&self.parser, query)
+        fn clear_finished_state(&self) {
+            let mut state = self.semantic_state.lock().unwrap();
+            if *state == Some(SemanticState::Finished) {
+                *state = None;
+            }
+        }
+
+        fn find_text(&self, query: &str) -> Result<Option<usize>> {
+            parser_find_text(&self.parser, query)
         }
 
         fn application_cursor(&self) -> bool {
@@ -2396,12 +2982,285 @@ mod tests {
     }
 
     #[test]
+    fn agents_config_overrides_builtins_and_rejects_unknown_agents() {
+        let registry = registered_agents_from(None).unwrap();
+        assert_eq!(registry[0].definition.command, "codex");
+        assert!(registry[0].extra_args.is_empty());
+
+        let registry = registered_agents_from(Some(
+            r#"{ "agents": { "agy": { "command": "/opt/agy", "role": "helper", "args": ["--effort", "high"] } } }"#,
+        ))
+        .unwrap();
+        let agy = &registry[agent_index(AgentId::Agy)];
+        assert_eq!(agy.definition.command, "/opt/agy");
+        assert_eq!(agy.definition.role, "helper");
+        assert_eq!(agy.extra_args, vec!["--effort", "high"]);
+        assert_eq!(
+            registry[agent_index(AgentId::Codex)].definition.command,
+            "codex"
+        );
+
+        assert!(registered_agents_from(Some(r#"{ "agents": { "gemini": {} } }"#)).is_err());
+        assert!(registered_agents_from(Some("not json")).is_err());
+    }
+
+    #[test]
+    fn overridden_registry_reaches_the_spawner_with_extra_args() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&observed);
+        let registry = registered_agents_from(Some(
+            r#"{ "agents": { "codex": { "command": "codex-nightly", "args": ["--profile", "fast"] } } }"#,
+        ))
+        .unwrap();
+        let mut app = App::new_with_spawner_yolo_registry(
+            Path::new("workspace"),
+            redraw,
+            false,
+            registry,
+            Box::new(move |definition, title, _, _, _, extra| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((definition.command.to_owned(), extra.to_vec()));
+                Ok(Box::new(test_session(definition, title, false)))
+            }),
+        );
+        app.add_session(AgentId::Claude).unwrap();
+
+        let observed = observed.lock().unwrap();
+        assert_eq!(
+            observed[0],
+            (
+                "codex-nightly".to_owned(),
+                vec!["--profile".to_owned(), "fast".to_owned()]
+            )
+        );
+        assert_eq!(observed[1], ("claude".to_owned(), Vec::new()));
+    }
+
+    #[test]
+    fn spawn_arguments_append_configured_extra_args_last() {
+        let codex = agents()
+            .into_iter()
+            .find(|item| item.id == AgentId::Codex)
+            .unwrap();
+        assert_eq!(
+            AgentSession::arguments(
+                codex,
+                true,
+                None,
+                &["--profile".to_owned(), "fast".to_owned()]
+            ),
+            vec![
+                OsString::from("--dangerously-bypass-approvals-and-sandbox"),
+                OsString::from("--profile"),
+                OsString::from("fast"),
+            ]
+        );
+    }
+
+    #[test]
+    fn scrollback_rows_come_from_the_environment_with_safe_bounds() {
+        assert_eq!(scrollback_rows_from(None), 2_000);
+        assert_eq!(scrollback_rows_from(Some("500")), 500);
+        assert_eq!(scrollback_rows_from(Some("0")), 2_000);
+        assert_eq!(scrollback_rows_from(Some("junk")), 2_000);
+        assert_eq!(scrollback_rows_from(Some("999999")), 100_000);
+    }
+
+    #[test]
+    fn f7_search_positions_scrollback_at_an_older_match() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(|definition, title, _, _| {
+                let session = test_session(definition, title, false);
+                {
+                    let mut parser = session.parser.lock().unwrap();
+                    parser.process(b"deep needle\r\n");
+                    for index in 0..80 {
+                        parser.process(format!("line {index}\r\n").as_bytes());
+                    }
+                }
+                Ok(Box::new(session))
+            }),
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE))
+            .unwrap();
+        for character in "deep".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE))
+                .unwrap();
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(app.sessions.active().unwrap().scrollback().unwrap() > 0);
+        assert!(matches!(app.mode, Mode::Scrollback));
+        assert!(app.notice.contains("scrollback"));
+    }
+
+    #[test]
+    fn layout_manifest_saves_on_add_and_round_trips() {
+        let directory = tempfile::tempdir().unwrap();
+        let manifest_path = directory.path().join("state").join("last-layout.json");
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut app = App::new_with_spawner(
+            Path::new("launch-workspace"),
+            redraw,
+            Box::new(|definition, title, cwd, _| {
+                let mut session = test_session(definition, title, false);
+                session.workspace = cwd.to_path_buf();
+                Ok(Box::new(session))
+            }),
+        );
+        app.layout_path = Some(manifest_path.clone());
+
+        app.add_session_at(AgentId::Claude, Path::new("other-workspace"))
+            .unwrap();
+
+        let (yolo, tabs) = parse_layout(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        assert!(!yolo);
+        assert_eq!(
+            tabs,
+            vec![
+                SavedTab {
+                    agent: AgentId::Codex,
+                    workspace: PathBuf::from("launch-workspace"),
+                },
+                SavedTab {
+                    agent: AgentId::Claude,
+                    workspace: PathBuf::from("other-workspace"),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn saved_layout_restores_once_from_the_add_screen() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut app = App::new_with_spawner(
+            Path::new("launch-workspace"),
+            redraw,
+            Box::new(|definition, title, cwd, _| {
+                let mut session = test_session(definition, title, false);
+                session.workspace = cwd.to_path_buf();
+                Ok(Box::new(session))
+            }),
+        );
+        app.restorable_layout = vec![
+            SavedTab {
+                agent: AgentId::Claude,
+                workspace: workspace.path().to_path_buf(),
+            },
+            SavedTab {
+                agent: AgentId::Agy,
+                workspace: PathBuf::from("does-not-exist-anywhere"),
+            },
+        ];
+
+        app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.sessions.active().unwrap().workspace(), workspace.path());
+        assert!(app.notice.contains("restored 1"));
+        assert!(matches!(app.mode, Mode::Terminal));
+
+        app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL))
+            .unwrap();
+        assert!(app.notice.contains("no saved layout"));
+    }
+
+    #[test]
     fn command_line_accepts_only_trusted_hook_states() {
         assert!(matches!(
             parse_args_from([OsString::from("hook"), OsString::from("waiting")]).unwrap(),
             Launch::Hook(SemanticState::Waiting)
         ));
         assert!(parse_args_from([OsString::from("hook"), OsString::from("done")]).is_err());
+        assert!(matches!(
+            parse_args_from([
+                OsString::from("hook"),
+                OsString::from("finished"),
+                OsString::from("{\"type\":\"agent-turn-complete\"}"),
+            ])
+            .unwrap(),
+            Launch::Hook(SemanticState::Finished)
+        ));
+        assert!(
+            parse_args_from([
+                OsString::from("hook"),
+                OsString::from("finished"),
+                OsString::from("payload"),
+                OsString::from("extra"),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn codex_arguments_inject_a_session_notify_hook_for_finished() {
+        let codex = agents()
+            .into_iter()
+            .find(|item| item.id == AgentId::Codex)
+            .unwrap();
+        assert_eq!(
+            session_arguments(codex, false, None, Some(Path::new("/opt/agent-bridge"))),
+            vec![
+                OsString::from("-c"),
+                OsString::from("notify=['/opt/agent-bridge','hook','finished']"),
+            ]
+        );
+
+        let claude = agents()
+            .into_iter()
+            .find(|item| item.id == AgentId::Claude)
+            .unwrap();
+        assert_eq!(
+            session_arguments(claude, false, None, Some(Path::new("/opt/agent-bridge"))),
+            Vec::<OsString>::new()
+        );
+    }
+
+    #[test]
+    fn enter_clears_a_stale_finished_state_before_submitting() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let state = Arc::new(Mutex::new(Some(SemanticState::Finished)));
+        let session_state = Arc::clone(&state);
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let captured_writes = Arc::clone(&writes);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(move |definition, title, _, _| {
+                let mut session = test_session_with_writes(
+                    definition,
+                    title,
+                    false,
+                    Arc::clone(&captured_writes),
+                );
+                session.semantic_state = Arc::clone(&session_state);
+                Ok(Box::new(session))
+            }),
+        );
+        app.observed_states
+            .insert("Codex 1".to_owned(), SemanticState::Finished);
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(*state.lock().unwrap(), None);
+        assert_eq!(writes.lock().unwrap().as_slice(), [b"\r".to_vec()]);
+        assert!(!app.poll_semantic_notifications());
+        assert!(!app.observed_states.contains_key("Codex 1"));
     }
 
     #[test]
@@ -2428,6 +3287,30 @@ mod tests {
         assert!(!app.poll_semantic_notifications());
         *state.lock().unwrap() = Some(SemanticState::Finished);
         assert!(app.poll_semantic_notifications());
+    }
+
+    #[test]
+    fn heartbeat_poll_caches_semantic_state_for_rail_rendering() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let state = Arc::new(Mutex::new(Some(SemanticState::Working)));
+        let session_state = Arc::clone(&state);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(move |definition, title, _, _| {
+                let mut session = test_session(definition, title, false);
+                session.semantic_state = Arc::clone(&session_state);
+                Ok(Box::new(session))
+            }),
+        );
+        app.notifications = false;
+
+        assert!(app.observed_states.is_empty());
+        assert!(!app.poll_semantic_notifications());
+        assert_eq!(
+            app.observed_states.get("Codex 1"),
+            Some(&SemanticState::Working)
+        );
     }
 
     #[test]
@@ -2617,12 +3500,111 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
-        assert_eq!(writes.lock().unwrap().len(), 2);
+        assert_eq!(writes.lock().unwrap().len(), 1);
         assert!(
             String::from_utf8_lossy(&writes.lock().unwrap()[0])
                 .contains("SOURCE FINDING: retry path is unsafe")
         );
         assert_eq!(app.sessions.active_index(), Some(1));
+
+        app.flush_due_writes(Instant::now() + Duration::from_millis(400));
+        assert_eq!(writes.lock().unwrap().len(), 2);
+        assert_eq!(writes.lock().unwrap()[1], b"\r".to_vec());
+    }
+
+    #[test]
+    fn handoff_to_a_working_claude_requires_an_explicit_interrupt_confirmation() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let writes_for_sessions = Arc::clone(&writes);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(move |definition, title, _, _| {
+                Ok(Box::new(test_session_with_writes(
+                    definition,
+                    title,
+                    false,
+                    Arc::clone(&writes_for_sessions),
+                )))
+            }),
+        );
+        app.add_session(AgentId::Claude).unwrap();
+        app.sessions.set_active(0);
+        app.observed_states
+            .insert("Claude 1".to_owned(), SemanticState::Working);
+
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(writes.lock().unwrap().is_empty());
+        assert!(app.notice.contains("working"));
+        assert!(matches!(
+            app.mode,
+            Mode::Relay {
+                override_busy: true,
+                ..
+            }
+        ));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(!writes.lock().unwrap().is_empty());
+        assert_eq!(app.sessions.active_index(), Some(1));
+    }
+
+    #[test]
+    fn relay_write_plan_schedules_enter_after_paste_without_blocking() {
+        assert_eq!(
+            relay_write_plan(false, "go"),
+            vec![
+                (Duration::ZERO, b"go".to_vec()),
+                (Duration::from_millis(50), b"\r".to_vec()),
+            ]
+        );
+        let bracketed = relay_write_plan(true, "go");
+        assert_eq!(bracketed[0].1, b"\x1b[200~go\x1b[201~".to_vec());
+        assert_eq!(bracketed[1], (Duration::from_millis(50), b"\r".to_vec()));
+        assert_eq!(bracketed[2], (Duration::from_millis(300), b"\r".to_vec()));
+    }
+
+    #[test]
+    fn deferred_relay_writes_drop_when_the_target_is_gone() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&writes);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(move |definition, title, _, _| {
+                Ok(Box::new(test_session_with_writes(
+                    definition,
+                    title,
+                    false,
+                    Arc::clone(&captured),
+                )))
+            }),
+        );
+        app.add_session(AgentId::Claude).unwrap();
+        let now = Instant::now();
+        app.pending_writes.push(PendingWrite {
+            title: "Claude 1".to_owned(),
+            bytes: b"\r".to_vec(),
+            due: now,
+        });
+        app.sessions.remove_active();
+
+        app.flush_due_writes(now);
+
+        assert!(app.notice.contains("relay dropped"));
+        assert!(writes.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2726,6 +3708,35 @@ mod tests {
         assert_eq!(
             spawned.lock().unwrap().last(),
             Some(&PathBuf::from("other-workspace"))
+        );
+    }
+
+    #[test]
+    fn active_workspace_for_git_polling_follows_the_active_tab() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut app = App::new_with_spawner(
+            Path::new("launch-workspace"),
+            redraw,
+            Box::new(|definition, title, cwd, _| {
+                let mut session = test_session(definition, title, false);
+                session.workspace = cwd.to_path_buf();
+                Ok(Box::new(session))
+            }),
+        );
+        app.add_session_at(AgentId::Claude, Path::new("other-workspace"))
+            .unwrap();
+
+        app.sync_active_workspace();
+        assert_eq!(
+            *app.active_workspace.lock().unwrap(),
+            PathBuf::from("other-workspace")
+        );
+
+        app.sessions.set_active(0);
+        app.sync_active_workspace();
+        assert_eq!(
+            *app.active_workspace.lock().unwrap(),
+            PathBuf::from("launch-workspace")
         );
     }
 
@@ -2883,6 +3894,207 @@ mod tests {
     }
 
     #[test]
+    fn rail_rows_map_to_session_indices_within_bounds() {
+        let rail = Rect::new(0, 3, 24, 30);
+        assert_eq!(rail_row_to_session_index(rail, 3, 3), None);
+        assert_eq!(rail_row_to_session_index(rail, 4, 3), Some(0));
+        assert_eq!(rail_row_to_session_index(rail, 5, 3), Some(0));
+        assert_eq!(rail_row_to_session_index(rail, 6, 3), Some(1));
+        assert_eq!(rail_row_to_session_index(rail, 8, 3), Some(2));
+        assert_eq!(rail_row_to_session_index(rail, 10, 3), None);
+    }
+
+    #[test]
+    fn add_screen_agent_chips_resolve_by_column() {
+        assert_eq!(agent_chip_at(0, 0), Some(0));
+        assert_eq!(agent_chip_at(6, 0), Some(0));
+        assert_eq!(agent_chip_at(7, 0), None);
+        assert_eq!(agent_chip_at(9, 0), Some(1));
+        assert_eq!(agent_chip_at(16, 0), Some(1));
+        assert_eq!(agent_chip_at(19, 0), Some(2));
+        assert_eq!(agent_chip_at(24, 0), None);
+    }
+
+    #[test]
+    fn clicking_a_rail_entry_activates_that_session() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(|definition, title, _, _| {
+                Ok(Box::new(test_session(definition, title, false)))
+            }),
+        );
+        app.add_session(AgentId::Claude).unwrap();
+        app.sessions.set_active(0);
+        app.rail_pane = Rect::new(0, 3, 24, 30);
+
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(app.sessions.active_index(), Some(1));
+        assert!(app.notice.contains("switched to"));
+    }
+
+    #[test]
+    fn clicking_the_rail_during_relay_picks_the_target() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(|definition, title, _, _| {
+                Ok(Box::new(test_session(definition, title, false)))
+            }),
+        );
+        app.add_session(AgentId::Claude).unwrap();
+        app.add_session(AgentId::Claude).unwrap();
+        app.sessions.set_active(0);
+        app.rail_pane = Rect::new(0, 3, 24, 30);
+
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(app.mode, Mode::Relay { confirm: true, .. }));
+
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 8,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            app.mode,
+            Mode::Relay {
+                target: 2,
+                confirm: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn wheel_over_the_rail_switches_sessions() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(|definition, title, _, _| {
+                Ok(Box::new(test_session(definition, title, false)))
+            }),
+        );
+        app.add_session(AgentId::Claude).unwrap();
+        app.rail_pane = Rect::new(0, 3, 24, 30);
+
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 5,
+                row: 6,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(app.sessions.active_index(), Some(0));
+        assert!(matches!(app.mode, Mode::Terminal));
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_diff_view() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(|_, _, _, _| anyhow::bail!("unused")),
+        );
+        app.mode = Mode::Diff {
+            text: "one\ntwo\nthree\nfour\nfive\nsix".to_owned(),
+            offset: 0,
+        };
+
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 40,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(app.mode, Mode::Diff { offset: 3, .. }));
+
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 40,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(app.mode, Mode::Diff { offset: 5, .. }));
+
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 40,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(app.mode, Mode::Diff { offset: 2, .. }));
+    }
+
+    #[test]
+    fn clicking_an_agent_chip_selects_that_cli_on_the_add_screen() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(|definition, title, _, _| {
+                Ok(Box::new(test_session(definition, title, false)))
+            }),
+        );
+        app.footer_pane = Rect::new(0, 33, 120, 4);
+        app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE))
+            .unwrap();
+
+        handle_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 10,
+                row: 34,
+                modifiers: KeyModifiers::NONE,
+            }),
+        )
+        .unwrap();
+
+        assert!(matches!(app.mode, Mode::Add { selected: 1, .. }));
+    }
+
+    #[test]
     fn mouse_wheel_scrolls_history_without_writing_to_the_cli() {
         let (redraw, _) = crossbeam_channel::bounded(1);
         let writes = Arc::new(Mutex::new(Vec::new()));
@@ -2997,8 +4209,9 @@ mod tests {
             app.sessions
                 .active()
                 .unwrap()
-                .contains_text("wheel-preserves-this")
+                .find_text("wheel-preserves-this")
                 .unwrap()
+                .is_some()
         );
     }
 
@@ -3018,6 +4231,7 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")),
             redraw,
             false,
+            &[],
         )
         .unwrap();
         assert!(
@@ -3052,6 +4266,7 @@ mod tests {
             Path::new(env!("CARGO_MANIFEST_DIR")),
             redraw,
             false,
+            &[],
         )
         .unwrap();
 
@@ -3228,7 +4443,7 @@ mod tests {
             Path::new("workspace"),
             redraw,
             true,
-            Box::new(move |definition, title, _, _, yolo| {
+            Box::new(move |definition, title, _, _, yolo, _| {
                 observed_by_spawner.lock().unwrap().push(yolo);
                 Ok(Box::new(test_session(definition, title, false)))
             }),
@@ -3251,11 +4466,11 @@ mod tests {
         for (id, danger_flag) in expected {
             let definition = definitions.iter().find(|item| item.id == id).unwrap();
             assert_eq!(
-                session_arguments(*definition, false, None),
+                session_arguments(*definition, false, None, None),
                 Vec::<OsString>::new()
             );
             assert_eq!(
-                session_arguments(*definition, true, None),
+                session_arguments(*definition, true, None, None),
                 vec![OsString::from(danger_flag)]
             );
         }
@@ -3268,7 +4483,12 @@ mod tests {
             .find(|item| item.id == AgentId::Claude)
             .unwrap();
         assert_eq!(
-            session_arguments(definition, true, Some(Path::new("hook settings.json"))),
+            session_arguments(
+                definition,
+                true,
+                Some(Path::new("hook settings.json")),
+                None
+            ),
             vec![
                 OsString::from("--dangerously-skip-permissions"),
                 OsString::from("--settings"),
@@ -3327,6 +4547,29 @@ mod tests {
 
         assert_eq!(
             resolve_windows_agent_command(definition, Some(directory.path().as_os_str()), None),
+            executable
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_resolves_claude_from_official_user_install_when_path_is_stale() {
+        let home = tempfile::tempdir().unwrap();
+        let install_dir = home.path().join(".local").join("bin");
+        fs::create_dir_all(&install_dir).unwrap();
+        let executable = install_dir.join("claude");
+        fs::write(&executable, b"test executable marker").unwrap();
+        let definition = agents()
+            .into_iter()
+            .find(|item| item.id == AgentId::Claude)
+            .unwrap();
+
+        assert_eq!(
+            resolve_unix_agent_command(
+                definition,
+                Some(std::ffi::OsStr::new("")),
+                Some(home.path().as_os_str())
+            ),
             executable
         );
     }
