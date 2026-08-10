@@ -6,6 +6,8 @@
 
 ## 실행
 
+### Windows
+
 Rust 및 Visual C++ Build Tools가 설치된 Developer PowerShell에서:
 
 Windows에서 최신 네이티브 Claude Code를 임베드하려면 bundled ConPTY transport를 제공하는 `node-pty`가 필요합니다. Claude CLI 자체는 공식 네이티브 설치본을 그대로 사용합니다.
@@ -37,17 +39,47 @@ cargo build --release
 .\target\release\agent-bridge.exe D:\Dev
 ```
 
+### macOS / Linux
+
+Rust 툴체인만 있으면 됩니다. `node-pty`는 Windows에서 Claude를 임베드할 때만 필요하며 macOS/Linux에서는 설치하지 않습니다. 각 CLI(`codex`, `claude`, `agy`)는 PATH에서 찾습니다.
+
+```sh
+cargo run -- ~/Dev
+```
+
+릴리스 바이너리:
+
+```sh
+cargo build --release
+./target/release/agent-bridge ~/Dev
+```
+
+workspace 선택과 `--yolo` 동작은 위 Windows 설명과 동일합니다.
+
+## 설정 (선택)
+
+`~/.agent-bridge/agents.json`으로 내장 3개 CLI의 실행 명령·역할 표시·기본 추가 인자를 재정의할 수 있습니다. 파일이 없으면 기본값으로 동작하고, 파싱 실패나 알 수 없는 에이전트 이름이 있으면 파일 전체를 무시하고 기본값으로 기동하며 헤더에 사유를 표시합니다. 신규 에이전트 종류 추가는 아직 지원하지 않습니다.
+
+```json
+{
+  "agents": {
+    "claude": { "command": "/opt/claude/claude" },
+    "agy": { "args": ["--effort", "high"] }
+  }
+}
+```
+
 ## 키
 
 - `F12`: 앱 안에서 전체 단축키 도움말 열기
 - `Ctrl+F11` (`F11`도 가능): 다음 키 하나를 Agent Bridge 단축키 처리 없이 활성 CLI로 전달. Windows Terminal이 plain `F11`을 전체화면 전환으로 소비하므로 `Ctrl+F11`을 권장
-- `F3`: 새 탭 열기 (`←`/`→`로 CLI 선택, workspace 경로 입력, `Ctrl+U`로 기본 경로 지우기, `Enter`로 생성)
+- `F3`: 새 탭 열기 (`←`/`→`로 CLI 선택, workspace 경로 입력, `Ctrl+U`로 기본 경로 지우기, `Enter`로 생성). 직전 실행의 탭 구성이 `~/.agent-bridge/last-layout.json`에 저장되어 있으면 `Ctrl+L`로 한 번에 복원 (없어진 디렉터리는 건너뜀, `--yolo` 여부는 현재 실행 모드를 따름)
 - `F1`: 현재 workspace의 tracked `git diff HEAD` 읽기 전용 보기
 - `F4`: 활성 탭 종료
 - `F5` / `F6`: 이전/다음 탭으로 이동
-- `F7`: 탭 제목과 보관된 터미널 출력 검색
+- `F7`: 탭 제목과 보관된 터미널 출력 검색. 스크롤백 매치는 해당 위치로 점프해 스크롤백 모드로 표시 (`Esc`로 라이브 복귀)
 - `F2`: 현재 탭의 최근 visible terminal context(최대 6,000자), tab/workspace provenance, 사용자가 입력한 요청을 다른 탭에 handoff (탭 2개 이상 필요, 첫 `Enter`로 context를 캡처하고 두 번째 `Enter`로 전송)
-- `F8`: 스크롤백 모드 (`↑`/`↓`, `PageUp`/`PageDown`, `Home`/`End`, `Esc`로 복귀)
+- `F8`: 스크롤백 모드 (`↑`/`↓`, `PageUp`/`PageDown`, `Home`/`End`, `Esc`로 복귀). 보관 줄 수는 기본 2,000이며 `AGENT_BRIDGE_SCROLLBACK`(1~100,000)으로 조정
 - 마우스 휠: CLI가 마우스 리포팅을 요청하지 않으면 터미널 스크롤백 이동. 마우스 캡처 중 Windows Terminal의 텍스트 선택·복사는 `Shift`를 누른 채 드래그
 - `F9`: 종료된 탭을 같은 CLI·이름으로 새 세션 재시작
 - `F10`: Agent Bridge 종료
@@ -61,7 +93,8 @@ F2 handoff는 source CLI의 현재 화면에 보이는 최근 응답과 대화 �
 ## 상태와 알림
 
 - Claude 세션은 세션별 임시 `--settings` hook을 사용해 `working`, `waiting`, `idle`, `finished`를 표시합니다. `waiting`은 Claude의 Notification hook 전체에 반응합니다. 전역 Claude 설정은 수정하지 않으며 임시 파일은 탭 종료 시 삭제합니다.
-- Codex와 Agy는 신뢰할 수 있는 사용자 대기 이벤트 계약이 확인되지 않아 PTY에서 관측한 `active`, `quiet`, `exited`, `unknown`만 표시합니다. `quiet`은 의미상 완료나 대기를 뜻하지 않습니다.
+- Codex는 세션별 `-c notify` 주입으로 공식 `agent-turn-complete` 이벤트를 받아 턴 종료 시에만 `finished`를 표시합니다. 대기(waiting) 신호는 Codex notify hook에 공식 계약이 없어 계속 표시하지 않으며, `finished` 표시는 해당 탭에 Enter로 새 입력을 보내면 해제됩니다.
+- Agy는 신뢰할 수 있는 이벤트 계약이 확인되지 않아 PTY에서 관측한 `active`, `quiet`, `exited`, `unknown`만 표시합니다. `quiet`은 의미상 완료나 대기를 뜻하지 않습니다.
 - `AGENT_BRIDGE_NOTIFICATIONS=1`을 설정하면 Claude가 `waiting` 또는 `finished`로 전이할 때 터미널 벨과 앱 내 알림을 냅니다. 알림은 승인 동작을 수행하지 않습니다.
 
 ## 설계 근거
