@@ -74,17 +74,21 @@ workspace 선택과 `--yolo` 동작은 위 Windows 설명과 동일합니다.
 탭 안에서 도는 에이전트는 자신이 Agent Bridge 안에 있음을 env(`AGENT_BRIDGE_REQUESTS`, `AGENT_BRIDGE_TAB`)로 알 수 있고, 같은 바이너리의 서브커맨드로 **보이는 탭**에 다른 CLI를 열어 위임할 수 있습니다. 백그라운드 자식 프로세스 대신 사용자가 전 과정을 화면에서 관전합니다:
 
 ```sh
-agent-bridge open codex --workspace ~/Dev/x --prompt "이 diff 리뷰해줘"   # 새 탭 이름 출력
-agent-bridge wait "Codex 2" --until finished --timeout-secs 900
-agent-bridge read "Codex 2"                                              # 현재 보이는 화면 텍스트
-agent-bridge prompt "Codex 2" "테스트도 돌려줘"
-agent-bridge status "Codex 2"
+agent-bridge open codex --workspace ~/Dev/x --title Reviewer --prompt "이 diff 리뷰해줘"
+agent-bridge wait Reviewer --until finished --timeout-secs 900
+agent-bridge read Reviewer --lines 200        # 스크롤백 포함 최근 200줄
+agent-bridge prompt Reviewer --wait "테스트도 돌려줘"   # 제출+완료 대기 원자 결합
+agent-bridge list                             # 전체 탭: 제목·상태·에이전트·workspace
+agent-bridge close Reviewer
 ```
+
+모든 서브커맨드는 `--json`으로 기계 판독 출력을 지원합니다. TUI를 `agent-bridge --restore .`로 띄우면 저장된 레이아웃을 기동 즉시 복원합니다.
 
 - 주입되는 모든 프롬프트에는 `[Agent Bridge delegation · from <탭>]` provenance가 강제로 붙습니다.
 - 전송은 파일 스풀(요청/응답 JSON)로 이루어지며 1초 주기로 수거됩니다. 응답 파일은 스풀 디렉터리 내부로만 쓰입니다.
 - `open --prompt`는 CLI 기동을 고정 지연(약 2.5초)으로 기다린 뒤 주입합니다 — 단문 프롬프트를 권장하며, 정교한 제어는 `open` → `wait --until idle` → `prompt` 순서를 쓰세요.
-- 에이전트가 이 채널을 쓰게 하려면 해당 에이전트의 지침(CLAUDE.md/AGENTS.md)에 위임 시 `agent-bridge open`을 쓰라고 한 줄 추가하면 됩니다.
+- 별도 스킬·지침 문서 없이도 `agent-bridge --help`가 서브커맨드·env 컨텍스트·상태 의미·왕복 예제를 담은 에이전트용 레퍼런스입니다 (서브커맨드 뒤 `--help`도 동일 출력). 에이전트 지침(CLAUDE.md/AGENTS.md)에는 "위임은 `agent-bridge open` 사용 — 자세한 건 `agent-bridge --help`" 한 줄이면 충분합니다.
+- **Agent Bridge 밖에서도 호출 가능**: TUI가 실행 중이면 `~/.agent-bridge/instance.json` 포인터를 통해 일반 터미널의 Claude/Codex도 같은 서브커맨드로 그 TUI 창에 탭을 만들 수 있습니다. TUI가 없으면 명확한 오류("no running Agent Bridge found")가 나며, TUI를 대신 띄워주지는 않습니다(보이는 탭 원칙). 포인터는 마지막에 뜬 인스턴스를 가리키고 정상 종료 시 정리됩니다.
 
 ## 키
 

@@ -77,6 +77,12 @@ herdr에서는 pane 안의 에이전트가 `herdr` CLI/소켓(JSON-RPC, env `HER
 
 전제·한계(v1): 에이전트가 이 채널을 쓰도록 CLAUDE.md/AGENTS.md 한 줄 지시 필요(herdr도 skill로 동일하게 opt-in), Claude 내부 Task 서브에이전트는 가로챌 수 없음(herdr도 동일), 나란히 보기는 pane 분할 부재로 레일 전환 관전(P4-17 split 후보와 연결), `open --prompt`는 CLI 기동 대기를 고정 지연(약 2.5s)으로 처리하며 단문 프롬프트 권장(정교한 준비 감지·bracketed 주입은 후속).
 
+| # | 항목 | 내용 | 수용 기준 |
+|---|---|---|---|
+| 22 | self-documenting `--help` (2026-08-10 신설·**같은 날 로컬 적용 완료, 미커밋**) | 스킬·지침 문서 없이 `--help` 자체가 에이전트용 delegation 레퍼런스(서브커맨드·env 컨텍스트·상태 의미·왕복 예제). 서브커맨드 뒤 `--help`/`-h`도 인식 | 낯선 에이전트가 `--help` 한 번으로 위임 왕복을 수행할 수 있는 정보량 |
+| 23 | 플래그 확장 패키지 (2026-08-10 평가·**같은 날 ①~⑦ 전부 로컬 적용 완료, 미커밋**) | 우선순위순: ① `read --lines N`(스크롤백 포함 최근 N줄 — "보이는 화면만"의 문서화된 한계 해소) ② `list`(전체 탭·상태·workspace 열람 — 밖에서 호출 시 핸들 발견) ③ 전 서브커맨드 `--json`(기계 판독 출력) ④ `prompt --wait [--until S]`(herdr처럼 제출+대기 원자 결합 — 별도 호출 간 상태 전이 경쟁 제거) ⑤ `open --title T`(의미 있는 탭 핸들, 중복 검사) ⑥ `close <tab>`(위임 탭 정리) ⑦ TUI `--restore`(기동 시 레이아웃 즉시 복원). **의도적 비채택**: `open --yolo`(위임 에이전트발 권한 상향 경로 — yolo는 launch 전역 전용 유지), `prompt --raw`(provenance 불변 위반) | 각 항목 채택 시 개별 수용 기준 정의 |
+| 21 | 외부 호출 디스커버리 (2026-08-10 신설·**같은 날 로컬 적용 완료, 미커밋**) | 현재 delegation 서브커맨드는 세션 env(`AGENT_BRIDGE_REQUESTS`)가 필요해 **agent-bridge 밖의** Claude/Codex는 호출 불가. TUI 기동 시 `~/.agent-bridge/instance.json`(pid·스풀 경로)을 기록하고 종료 시 정리, 클라이언트는 env 부재 시 이 포인터를 읽어 stale-pid 검증 후 실행 중인 인스턴스의 스풀로 요청 — herdr의 고정 소켓 경로와 같은 역할을 데몬 없이 수행 | 밖의 터미널에서 `agent-bridge open codex --prompt "..."`가 이미 떠 있는 TUI 창에 보이는 탭을 만든다. TUI 미실행 시 명확한 오류("실행 중인 Agent Bridge가 없음"). 완전 headless(TUI 없는 spawn)는 비범위 — 보이는 탭 원칙과 충돌, 상시 가용이 필요해지면 daemon 전환을 별도 결정 |
+
 ### P4 — 마우스 친화 TUI (2026-08-10 사용자 요청 신설, herdr 벤치마킹)
 
 | # | 항목 | 내용 | 수용 기준 |
