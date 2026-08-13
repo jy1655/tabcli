@@ -33,6 +33,8 @@ pub fn terminal_safe_text(value: &str, multiline: bool) -> String {
 pub enum FirstPartyCli {
     Codex,
     Claude,
+    Agy,
+    Pi,
 }
 
 impl FirstPartyCli {
@@ -40,6 +42,8 @@ impl FirstPartyCli {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Agy => "agy",
+            Self::Pi => "pi",
         }
     }
 
@@ -51,6 +55,8 @@ impl FirstPartyCli {
         match self {
             Self::Codex => Version::new(0, 147, 0),
             Self::Claude => Version::new(2, 1, 229),
+            Self::Agy => Version::new(1, 1, 12),
+            Self::Pi => Version::new(0, 84, 1),
         }
     }
 }
@@ -62,8 +68,10 @@ impl FromStr for FirstPartyCli {
         match value {
             "codex" => Ok(Self::Codex),
             "claude" => Ok(Self::Claude),
+            "agy" => Ok(Self::Agy),
+            "pi" => Ok(Self::Pi),
             _ => Err(format!(
-                "unsupported CLI {value:?}; expected codex or claude"
+                "unsupported CLI {value:?}; expected codex, claude, agy, or pi"
             )),
         }
     }
@@ -95,6 +103,8 @@ pub fn provider_launch_args(cli: FirstPartyCli, yolo: bool) -> Vec<&'static str>
     match cli {
         FirstPartyCli::Codex => vec!["--dangerously-bypass-approvals-and-sandbox"],
         FirstPartyCli::Claude => vec!["--dangerously-skip-permissions"],
+        FirstPartyCli::Agy => vec!["--dangerously-skip-permissions"],
+        FirstPartyCli::Pi => Vec::new(),
     }
 }
 

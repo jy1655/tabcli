@@ -2,7 +2,7 @@
 name = "agent-bridge"
 version = "0.1.0"
 edition = "2024"
-description = "Visible terminal bridge for first-party Codex and Claude CLIs"
+description = "Visible terminal bridge for Codex, Claude, Agy, and Pi CLIs"
 license = "MIT"
 rust-version = "1.88"
 

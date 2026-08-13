@@ -1,8 +1,8 @@
 # Agent Bridge
 
-로컬에 설치되고 로그인된 공식 `codex`와 `claude` CLI를 **실제 iTerm 탭**에서 연결하는 로컬 브리지입니다. API 키나 세션 토큰을 대신 소유하지 않고, 각 CLI의 기존 로그인·설정·대화형 UI를 그대로 사용합니다.
+로컬에 설치되고 로그인된 `codex`, `claude`, `agy`, `pi` CLI를 **실제 iTerm 탭**에서 연결하는 로컬 브리지입니다. API 키나 세션 토큰을 대신 소유하지 않고, 각 CLI의 기존 로그인·설정·대화형 UI를 그대로 사용합니다.
 
-실행 중인 Codex나 Claude가 새 iTerm 탭을 열어 다른 공식 CLI에 작업을 맡기고 결과를 돌려받을 수 있습니다. 그 탭은 첫 응답 뒤에도 닫히지 않으므로 브리지가 후속 프롬프트를 보낼 수도 있고, 사용자가 직접 탭을 선택해 그대로 이어서 작업할 수도 있습니다.
+실행 중인 CLI가 새 iTerm 탭을 열어 다른 지원 CLI에 작업을 맡기고 결과를 돌려받을 수 있습니다. 그 탭은 첫 응답 뒤에도 닫히지 않으므로 브리지가 후속 프롬프트를 보낼 수도 있고, 사용자가 직접 탭을 선택해 그대로 이어서 작업할 수도 있습니다.
 
 기존의 다중 PTY TUI는 호환 경로로 남아 있지만, 새 기본 사용 흐름은 `ask` / `tell` / `sessions` / `close-session`입니다.
 
@@ -19,13 +19,13 @@ cargo build --release
 ```
 
 `--workspace`를 생략하면 호출한 현재 디렉터리를 사용하고, `--title`을 생략하면 CLI 이름과 workspace 이름으로 탭 제목을 만듭니다.
-Codex 세션은 `--model <MODEL>`로 해당 요청에만 모델을 지정할 수 있습니다. Claude에는 이 옵션을 거부하며 전역 Codex 설정은 바꾸지 않습니다.
+Codex, Agy, Pi 세션은 `--model <MODEL>`로 해당 요청에만 모델을 지정할 수 있습니다. Claude에는 이 옵션을 거부하며 어떤 CLI의 전역 모델 설정도 바꾸지 않습니다.
 
 `ask`는 다음 순서로 동작합니다.
 
-1. 절대 PATH 항목에서 `codex` 또는 `claude` 실행 파일을 찾아 canonical 절대 경로로 고정하고 최소 지원 버전을 확인합니다. PATH 자체는 사용자가 신뢰한 실행 환경으로 간주합니다.
-2. iTerm에 실제 탭을 만들고 지정한 workspace에서 공식 대화형 CLI를 실행합니다.
-3. Codex `notify` 또는 Claude `Stop` hook으로 첫 결과를 받아 호출자에게 반환합니다.
+1. 절대 PATH 항목에서 요청한 `codex`, `claude`, `agy`, `pi` 실행 파일을 찾아 canonical 절대 경로로 고정하고 최소 지원 버전을 확인합니다. PATH 자체는 사용자가 신뢰한 실행 환경으로 간주합니다.
+2. iTerm에 실제 탭을 만들고 지정한 workspace에서 해당 대화형 CLI를 실행합니다.
+3. Codex `notify`, Claude `Stop` hook, Agy의 세션 transcript, Pi의 세션 전용 lifecycle 확장 중 해당 provider의 계약으로 결과를 받아 호출자에게 반환합니다.
 4. CLI와 iTerm 탭은 그대로 유지합니다.
 
 기계 판독이 필요하면 `--json`을 사용합니다. 반환된 `session` id로 같은 탭에 다음 프롬프트를 실제 키 입력처럼 전달할 수 있습니다.
@@ -40,21 +40,25 @@ agent-bridge sessions --json
 
 ### 권한과 버전 정책
 
-- 새 자식 세션의 `--yolo`는 **해당 `ask` 요청에 명시된 경우에만** 전달합니다. 부모 Codex/Claude가 yolo로 실행 중이어도 자동 상속하지 않습니다.
+- 새 자식 세션의 `--yolo`는 **해당 `ask` 요청에 명시된 경우에만** 적용합니다. 부모 CLI가 yolo로 실행 중이어도 자동 상속하지 않습니다.
 - `ask`와 `tell`로 주입하는 모든 프롬프트에는 호출한 브리지 세션의 provenance를 강제로 붙입니다. `tell`은 세션별 한 턴만 허용하고 bracketed paste로 전송하며, Enter·ESC 등 별도 터미널 동작을 만들 수 있는 제어문자는 거부합니다.
-- `agent-bridge ask codex ... --yolo`는 Codex의 `--dangerously-bypass-approvals-and-sandbox`, Claude에는 `--dangerously-skip-permissions`를 전달합니다.
-- 최소 지원 버전은 Codex `>= 0.147.0`, Claude `>= 2.1.229`입니다. 정확 버전 고정이 아니므로 더 새로운 버전도 허용합니다.
+- 사용자는 결과가 반환된 뒤 열린 탭에서 그대로 작업을 이어갈 수 있습니다. 다만 provider가 수동 입력과 bridge 입력을 권위 있게 대응시키는 공통 신호를 제공하지 않으므로, 진행 중인 `ask`/`tell`과 같은 탭의 수동 입력을 겹치지 않아야 합니다. 겹치면 먼저 끝난 수동 턴이 대기 중인 bridge 결과로 인식될 수 있습니다.
+- 명시적 `--yolo`는 Codex의 `--dangerously-bypass-approvals-and-sandbox`, Claude와 Agy의 `--dangerously-skip-permissions`를 전달합니다.
+- Pi는 원래 내장 승인 팝업이나 sandbox가 없으므로 브리지가 별도 권한 계층을 만들지 않습니다. Pi에서 `--yolo`는 허용되지만 추가 인자를 전달하지 않는 no-op이며, project trust를 대신 승인하는 `--approve`도 합성하지 않습니다.
+- 최소 지원 버전은 Codex `>= 0.147.0`, Claude `>= 2.1.229`, Agy `>= 1.1.12`, Pi `>= 0.84.1`입니다. 정확 버전 고정이 아니므로 더 새로운 버전도 허용합니다.
 - 브리지가 연 탭을 닫는 명령은 `agent-bridge close-session <session> --explicit`처럼 명시적 확인 플래그가 있어야 실행됩니다. 기록된 iTerm session id와 정확히 일치하는 세션만 대상으로 합니다.
-- 세션 메타데이터와 결과는 `~/.agent-bridge/native-sessions` 아래의 세션별 비공개 디렉터리에 저장합니다. 전역 Codex/Claude 설정은 수정하지 않습니다.
-- 최초 `ask` 프롬프트는 공식 CLI의 대화형 positional prompt로 전달되므로 실행 중 같은 머신의 프로세스 인자 검사에서 보일 수 있습니다. `tell` 프롬프트는 권한 `0600` 임시 파일을 iTerm 입력으로 전달하고 즉시 폐기하며, 사람이 읽는 결과 출력에서는 터미널 제어문자를 가시적인 문자열로 이스케이프합니다.
+- 세션 메타데이터와 결과는 `~/.agent-bridge/native-sessions` 아래의 세션별 비공개 디렉터리에 저장합니다. 전역 CLI 설정이나 workspace hook 파일은 수정하지 않습니다. Agy adapter는 세션별 로그에서 conversation id를 얻어 Agy가 생성한 `~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl`을 읽기만 하며, Pi adapter는 세션 비공개 디렉터리의 결과 회수 확장만 `--extension`으로 로드합니다.
+- 최초 `ask` 프롬프트는 각 CLI의 대화형 시작 인자로 전달되므로 실행 중 같은 머신의 프로세스 인자 검사에서 보일 수 있습니다. `tell` 프롬프트는 권한 `0600` 임시 파일을 iTerm 입력으로 전달하고 즉시 폐기하며, 사람이 읽는 결과 출력에서는 터미널 제어문자를 가시적인 문자열로 이스케이프합니다.
 
 ```sh
 agent-bridge ask claude --workspace ~/Dev/project --prompt "테스트까지 실행해줘" --yolo
+agent-bridge ask agy --workspace ~/Dev/project --model MODEL --prompt "취약점을 검토해줘"
+agent-bridge ask pi --workspace ~/Dev/project --model MODEL --prompt "이 변경을 검토해줘"
 agent-bridge close-session session-XXXXXXXX --explicit
 ```
 
 > [!WARNING]
-> `--yolo`는 공식 CLI의 승인·sandbox 우회 플래그입니다. 브리지는 요청 단위의 명시 여부와 탭/경로 경계만 통제하며, yolo 세션 내부의 명령 실행을 다시 sandbox하지 않습니다.
+> Codex, Claude, Agy에서 `--yolo`는 해당 CLI의 승인·sandbox 우회 플래그입니다. 브리지는 요청 단위의 명시 여부와 탭/경로 경계만 통제하며, yolo 세션 내부의 명령 실행을 다시 sandbox하지 않습니다. Pi는 `--yolo` 여부와 관계없이 Pi 자체의 권한 모델을 그대로 사용합니다.
 
 ## 레거시 PTY TUI 실행
 
@@ -177,7 +181,7 @@ F2 handoff는 source CLI의 현재 화면에 보이는 최근 응답과 대화 �
 
 ## 원칙
 
-- 인증과 세션은 각 퍼스트파티 CLI가 소유합니다.
+- 인증과 provider 세션은 각 CLI가 소유합니다.
 - Agent Bridge는 토큰을 읽거나 저장하지 않습니다.
-- 네이티브 브리지는 Codex와 Claude만 허용하며, 글로벌 설정을 수정하지 않고 세션별 hook/notify 인자만 사용합니다.
-- 기본 모드에서의 자동 승인, IDE, 웹 UI, 외부 오케스트레이션 서비스는 포함하지 않습니다. `--yolo` 모드는 Agent Bridge가 자체 승인 로직을 구현하지 않고 각 CLI의 공식 위험 플래그만 전달합니다.
+- 네이티브 브리지는 Codex, Claude, Agy, Pi를 허용하며, 글로벌 설정을 수정하지 않고 세션별 hook·notify·log·extension 인자만 사용합니다.
+- 기본 모드에서의 자동 승인, IDE, 웹 UI, 외부 오케스트레이션 서비스는 포함하지 않습니다. `--yolo`는 provider에 원래 대응 기능이 있을 때만 그 위험 플래그를 전달하며, Pi에 없는 권한 기능을 브리지가 새로 만들지 않습니다.

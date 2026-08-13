@@ -327,10 +327,10 @@ fn global_node_modules() -> Result<PathBuf> {
 
 fn help_text() -> String {
     format!(
-        "agent-bridge {} — visible terminal bridge for first-party coding agent CLIs
+        "agent-bridge {} — visible terminal bridge for supported coding agent CLIs
 
 Usage:
-  agent-bridge ask <codex|claude> [--workspace PATH] --prompt TEXT [--title NAME]
+  agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] --prompt TEXT [--title NAME]
       [--model MODEL] [--yolo] [--timeout-secs N] [--detach] [--json]
   agent-bridge tell <session> --prompt TEXT [--timeout-secs N] [--detach] [--json]
   agent-bridge sessions [--json]
@@ -350,10 +350,10 @@ Legacy embedded TUI:
   Every delegation subcommand also accepts --json for machine-readable output.
 
 Native visible sessions (macOS + iTerm2):
-  ask      open a real iTerm tab, cd to PATH, and run the installed first-party
-           Codex or Claude CLI interactively. By default it waits for the first
-           hook/notify result, prints it, and leaves the tab and CLI running.
-           --model selects the model for that Codex session only.
+  ask      open a real iTerm tab, cd to PATH, and run the installed Codex,
+           Claude, Agy, or Pi CLI interactively. By default it waits for the
+           first provider result, prints it, and leaves the tab and CLI running.
+           --model selects the model for Codex, Agy, or Pi; Claude rejects it.
   tell     type another prompt into that same visible iTerm session and return
            the next result. Follow-ups are serialized per session, framed as one
            bracketed paste, and reject terminal submission/control bytes. The user
@@ -362,12 +362,15 @@ Native visible sessions (macOS + iTerm2):
   close-session closes only a recorded bridge-owned iTerm session and requires
            the literal --explicit flag.
 
-  Child policy is per request: --yolo is NEVER inherited from the calling Codex
-  or Claude process. It is forwarded only when that ask command contains
-  --yolo. Supported CLI checks are minimums, so newer releases continue to work:
-  Codex >= 0.147.0; Claude >= 2.1.229. Prompts and results are kept in
-  private per-session storage under ~/.agent-bridge/native-sessions. Every
-  injected prompt carries an Agent Bridge source-provenance banner.
+  Child policy is per request: --yolo is NEVER inherited from the calling CLI.
+  It is forwarded only when that ask command contains --yolo and the provider
+  has a matching flag: Codex, Claude, and Agy do; Pi keeps its native policy, so
+  --yolo is a no-op for Pi. Pi has no built-in permission popup or sandbox.
+  Supported CLI checks are minimums, so newer releases continue to work:
+  Codex >= 0.147.0; Claude >= 2.1.229; Agy >= 1.1.12; Pi >= 0.84.1. Prompts
+  and results are kept in private per-session storage under
+  ~/.agent-bridge/native-sessions. Every injected prompt carries an Agent Bridge
+  source-provenance banner.
 
 TUI:
   Runs codex, claude, and agy in visible PTY tabs. Press F12 inside the app
@@ -6367,7 +6370,7 @@ mod tests {
 
         let help = help_text();
         for needle in [
-            "ask <codex|claude>",
+            "ask <codex|claude|agy|pi>",
             "--model MODEL",
             "tell <session>",
             "sessions [--json]",
@@ -6375,6 +6378,9 @@ mod tests {
             "NEVER inherited",
             "Codex >= 0.147.0",
             "Claude >= 2.1.229",
+            "Agy >= 1.1.12",
+            "Pi >= 0.84.1",
+            "--yolo is a no-op for Pi",
         ] {
             assert!(help.contains(needle), "help is missing {needle:?}");
         }

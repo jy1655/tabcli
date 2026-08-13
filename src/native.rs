@@ -2,7 +2,6 @@
 mod tests {
     use super::*;
     use agent_bridge::FirstPartyCli;
-    use std::path::PathBuf;
 
     #[test]
     fn ask_yolo_is_false_unless_the_child_request_contains_the_flag() {
@@ -23,12 +22,12 @@ mod tests {
                 workspace,
                 yolo: false,
                 ..
-            }) if workspace == PathBuf::from("/tmp/project")
+            }) if workspace.as_path() == Path::new("/tmp/project")
         ));
     }
 
     #[test]
-    fn ask_codex_accepts_a_request_scoped_model_and_claude_rejects_it() {
+    fn ask_model_is_supported_by_codex_agy_and_pi_but_not_claude() {
         let command = parse_args([
             "ask",
             "codex",
@@ -46,6 +45,20 @@ mod tests {
                 ..
             }) if model == "gpt-daybreak-blue-latest"
         ));
+        for provider in ["agy", "pi"] {
+            assert!(
+                parse_args([
+                    "ask",
+                    provider,
+                    "--prompt",
+                    "review this",
+                    "--model",
+                    "provider-model",
+                ])
+                .is_ok(),
+                "{provider} rejected --model"
+            );
+        }
         assert!(
             parse_args([
                 "ask",
@@ -57,6 +70,93 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn agy_log_and_transcript_parsers_accept_only_the_expected_completed_result() {
+        let id = "3e166585-bc21-43b7-b3d1-dec5e67688b3";
+        assert_eq!(
+            parse_agy_conversation_id(&format!("prefix Created conversation {id}\n")),
+            Some(id.to_owned())
+        );
+        assert!(parse_agy_conversation_id("Created conversation ../../outside").is_none());
+
+        let completed = r#"{"type":"PLANNER_RESPONSE","status":"DONE","source":"MODEL","step_index":9,"content":"AGY_TOOL_OK"}"#;
+        assert_eq!(
+            parse_agy_transcript_line(completed),
+            Some((9, "AGY_TOOL_OK".to_owned()))
+        );
+        let intermediate = r#"{"type":"PLANNER_RESPONSE","status":"DONE","source":"MODEL","step_index":7,"content":""}"#;
+        assert_eq!(parse_agy_transcript_line(intermediate), None);
+        let planner_tool = r#"{"type":"PLANNER_RESPONSE","status":"DONE","source":"MODEL","step_index":8,"content":"checking","tool_calls":[{"name":"run_command"}]}"#;
+        assert_eq!(parse_agy_transcript_line(planner_tool), None);
+        let tool = r#"{"type":"RUN_COMMAND","status":"DONE","source":"MODEL","step_index":8,"content":"output"}"#;
+        assert_eq!(parse_agy_transcript_line(tool), None);
+    }
+
+    #[test]
+    fn pi_session_extension_reports_only_settled_results_without_changing_tool_policy() {
+        let extension = pi_bridge_extension();
+
+        assert!(extension.contains("agent_start"));
+        assert!(extension.contains("agent_end"));
+        assert!(extension.contains("agent_settled"));
+        assert!(extension.contains("stopReason"));
+        assert!(extension.contains("agent_bridge_error"));
+        assert!(extension.contains("pi-hook-failure.json"));
+        assert!(extension.contains("renameSync"));
+        assert!(extension.contains("native-hook\", \"pi"));
+        assert!(!extension.contains("tool_call"));
+        assert!(!extension.contains("--approve"));
+    }
+
+    #[test]
+    fn provider_failures_finish_the_bridge_turn_without_reporting_success() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        claim.retain();
+
+        record_provider_failure(
+            directory.path(),
+            FirstPartyCli::Pi,
+            "Pi turn aborted",
+            Some("provider-session".to_owned()),
+            Some("provider-turn".to_owned()),
+        )
+        .unwrap();
+
+        assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state, "ready");
+        assert_eq!(status.error.as_deref(), Some("Pi turn aborted"));
+        let error = wait_for_event(directory.path(), 0, Duration::from_secs(1)).unwrap_err();
+        assert!(format!("{error:#}").contains("Pi turn aborted"));
+    }
+
+    #[test]
+    fn pi_hook_transport_failure_signal_recovers_the_bridge_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        claim.retain();
+        write_json_atomic(
+            &directory.path().join(PI_HOOK_FAILURE_FILE),
+            &PiHookFailureSignal {
+                error: "native hook exited with status 1".to_owned(),
+                provider_session_id: Some("provider-session".to_owned()),
+                turn_id: Some("provider-turn".to_owned()),
+            },
+        )
+        .unwrap();
+
+        assert!(consume_pi_hook_failure(directory.path()).unwrap());
+        assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+        assert!(!directory.path().join(PI_HOOK_FAILURE_FILE).exists());
+        let error = wait_for_event(directory.path(), 0, Duration::from_secs(1)).unwrap_err();
+        assert!(format!("{error:#}").contains("native hook exited with status 1"));
     }
 
     #[test]
@@ -295,15 +395,183 @@ mod tests {
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
         assert_eq!(status.state, "exited");
     }
+
+    #[test]
+    fn agy_transcript_cursor_records_each_completed_response_once() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-safe123");
+        fs::create_dir(&directory).unwrap();
+        fs::create_dir(directory.join("events")).unwrap();
+        update_status(&directory, "working", None, None).unwrap();
+
+        let id = "3e166585-bc21-43b7-b3d1-dec5e67688b3";
+        let brain = root.path().join("brain");
+        let transcript_path = brain
+            .join(id)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript_path,
+            concat!(
+                "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":1,\"content\":\"first\"}\n",
+                "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":2,\"content\":\"still working\",\"tool_calls\":[{\"name\":\"run_command\"}]}\n",
+                "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":3,\"content\":\"short...\",\"is_truncated\":true}\n"
+            ),
+        )
+        .unwrap();
+        let mut cursor = AgyTranscriptCursor::new(transcript_path.clone());
+        cursor.poll(&directory, &brain, id).unwrap();
+        cursor.poll(&directory, &brain, id).unwrap();
+        assert_eq!(event_paths(&directory).unwrap().len(), 1);
+
+        fs::write(
+            transcript_path.with_file_name("transcript_full.jsonl"),
+            concat!(
+                "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":1,\"content\":\"first\"}\n",
+                "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":2,\"content\":\"still working\",\"tool_calls\":[{\"name\":\"run_command\"}]}\n",
+                "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":3,\"content\":\"complete long response\"}\n"
+            ),
+        )
+        .unwrap();
+        cursor.poll(&directory, &brain, id).unwrap();
+        let paths = event_paths(&directory).unwrap();
+        assert_eq!(paths.len(), 2);
+        let latest: SessionEvent = read_json(paths.last().unwrap()).unwrap();
+        assert_eq!(latest.message, "complete long response");
+
+        let mut transcript = OpenOptions::new()
+            .append(true)
+            .open(&transcript_path)
+            .unwrap();
+        writeln!(
+            transcript,
+            "{{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":4,\"content\":\"second\"}}"
+        )
+        .unwrap();
+        cursor.poll(&directory, &brain, id).unwrap();
+
+        let paths = event_paths(&directory).unwrap();
+        assert_eq!(paths.len(), 3);
+        let latest: SessionEvent = read_json(paths.last().unwrap()).unwrap();
+        assert_eq!(latest.message, "second");
+        assert_eq!(latest.provider_session_id.as_deref(), Some(id));
+        assert_eq!(latest.turn_id.as_deref(), Some("4"));
+        let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+        assert_eq!(status.state, "ready");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agy_session_uses_interactive_prompt_model_log_and_explicit_yolo() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let provider = root.path().join("fake-agy");
+        fs::write(
+            &provider,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '1.1.12\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" > \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/argv.txt\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let directory = root.path().join("session-safe123");
+        fs::create_dir(&directory).unwrap();
+        fs::create_dir(directory.join("events")).unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        write_json_atomic(
+            &directory.join("manifest.json"),
+            &SessionManifest {
+                schema: SESSION_SCHEMA,
+                id: "session-safe123".to_owned(),
+                provider: "agy".to_owned(),
+                provider_path: provider,
+                provider_version: "1.1.12".to_owned(),
+                workspace,
+                title: "Agy test".to_owned(),
+                model: Some("gemini-model".to_owned()),
+                yolo: true,
+                created_unix_ms: unix_ms(),
+            },
+        )
+        .unwrap();
+        write_private(&directory.join("initial-prompt.txt"), b"agy prompt").unwrap();
+
+        run_session_inner(&directory).unwrap();
+
+        let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
+        assert!(arguments.contains("--dangerously-skip-permissions"));
+        assert!(arguments.contains("--model\ngemini-model"));
+        assert!(arguments.contains("--log-file"));
+        assert!(arguments.contains(directory.join("agy.log").to_string_lossy().as_ref()));
+        assert!(arguments.contains("--prompt-interactive\nagy prompt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_session_loads_only_the_result_extension_and_preserves_native_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let provider = root.path().join("fake-pi");
+        fs::write(
+            &provider,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '0.84.1\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" > \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/argv.txt\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let directory = root.path().join("session-safe123");
+        fs::create_dir(&directory).unwrap();
+        fs::create_dir(directory.join("events")).unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        write_json_atomic(
+            &directory.join("manifest.json"),
+            &SessionManifest {
+                schema: SESSION_SCHEMA,
+                id: "session-safe123".to_owned(),
+                provider: "pi".to_owned(),
+                provider_path: provider,
+                provider_version: "0.84.1".to_owned(),
+                workspace,
+                title: "Pi test".to_owned(),
+                model: Some("provider/model".to_owned()),
+                yolo: true,
+                created_unix_ms: unix_ms(),
+            },
+        )
+        .unwrap();
+        write_private(&directory.join("initial-prompt.txt"), b"pi prompt").unwrap();
+
+        run_session_inner(&directory).unwrap();
+
+        let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
+        assert!(arguments.contains("--model\nprovider/model"));
+        assert!(arguments.contains("--extension"));
+        assert!(arguments.contains("--name\nPi test"));
+        assert!(arguments.ends_with("pi prompt\n"));
+        assert!(!arguments.contains("--approve"));
+        assert!(!arguments.contains("dangerously"));
+        let extension = fs::read_to_string(directory.join("pi-agent-bridge.js")).unwrap();
+        assert_eq!(extension, pi_bridge_extension());
+    }
 }
 use std::{
+    collections::VecDeque,
     ffi::OsString,
     fs::{self, OpenOptions},
-    io::{IsTerminal, Read, Write},
+    io::{BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Command,
     str::FromStr,
-    thread,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -319,6 +587,7 @@ const SESSION_DIR_ENV: &str = "AGENT_BRIDGE_NATIVE_SESSION_DIR";
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
 const SESSION_SCHEMA: u32 = 1;
 const TURN_CLAIM_FILE: &str = "turn.claim";
+const PI_HOOK_FAILURE_FILE: &str = "pi-hook-failure.json";
 
 pub(crate) const OPEN_ITERM_TAB_SCRIPT: &str = r#"
 on run argv
@@ -465,9 +734,18 @@ struct SessionStatus {
 struct SessionEvent {
     provider: String,
     message: String,
+    #[serde(default)]
+    error: Option<String>,
     provider_session_id: Option<String>,
     turn_id: Option<String>,
     created_unix_ms: u128,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PiHookFailureSignal {
+    error: String,
+    provider_session_id: Option<String>,
+    turn_id: Option<String>,
 }
 
 struct CreatedSession {
@@ -520,7 +798,9 @@ where
 }
 
 fn parse_ask(args: &[String]) -> Result<NativeCommand> {
-    let (provider, options) = args.split_first().context("ask requires codex or claude")?;
+    let (provider, options) = args
+        .split_first()
+        .context("ask requires codex, claude, agy, or pi")?;
     let provider = FirstPartyCli::from_str(provider).map_err(anyhow::Error::msg)?;
     let mut workspace = None;
     let mut prompt = None;
@@ -572,8 +852,8 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
     if model.as_ref().is_some_and(|value| value.trim().is_empty()) {
         bail!("--model cannot be empty");
     }
-    if provider != FirstPartyCli::Codex && model.is_some() {
-        bail!("--model is currently supported only for codex");
+    if provider == FirstPartyCli::Claude && model.is_some() {
+        bail!("--model is supported for codex, agy, and pi, but not claude");
     }
     Ok(NativeCommand::Ask(AskRequest {
         provider,
@@ -660,7 +940,7 @@ fn parse_close(args: &[String]) -> Result<NativeCommand> {
 fn parse_hook(args: &[String]) -> Result<NativeCommand> {
     let (provider, payload) = args
         .split_first()
-        .context("native-hook requires codex or claude")?;
+        .context("native-hook requires codex, claude, agy, or pi")?;
     let provider = FirstPartyCli::from_str(provider).map_err(anyhow::Error::msg)?;
     if payload.len() > 1 {
         bail!("native-hook accepts at most one payload argument");
@@ -1014,6 +1294,8 @@ fn run_session_inner(directory: &Path) -> Result<()> {
         .into_iter()
         .map(OsString::from)
         .collect::<Vec<_>>();
+    let mut prompt_is_positional = true;
+    let mut agy_log_path = None;
     match provider {
         FirstPartyCli::Codex => {
             if let Some(model) = &manifest.model {
@@ -1038,23 +1320,67 @@ fn run_session_inner(directory: &Path) -> Result<()> {
             arguments.push(OsString::from("--name"));
             arguments.push(OsString::from(&manifest.title));
         }
+        FirstPartyCli::Agy => {
+            if let Some(model) = &manifest.model {
+                arguments.push(OsString::from("--model"));
+                arguments.push(OsString::from(model));
+            }
+            let log_path = directory.join("agy.log");
+            arguments.push(OsString::from("--log-file"));
+            arguments.push(log_path.as_os_str().to_owned());
+            arguments.push(OsString::from("--prompt-interactive"));
+            arguments.push(OsString::from(prompt.as_str()));
+            prompt_is_positional = false;
+            agy_log_path = Some(log_path);
+        }
+        FirstPartyCli::Pi => {
+            if let Some(model) = &manifest.model {
+                arguments.push(OsString::from("--model"));
+                arguments.push(OsString::from(model));
+            }
+            let extension_path = directory.join("pi-agent-bridge.js");
+            write_private(&extension_path, pi_bridge_extension().as_bytes())?;
+            arguments.push(OsString::from("--extension"));
+            arguments.push(extension_path.into_os_string());
+            arguments.push(OsString::from("--name"));
+            arguments.push(OsString::from(&manifest.title));
+        }
     }
-    arguments.push(OsString::from(prompt));
+    if prompt_is_positional {
+        arguments.push(OsString::from(prompt));
+    }
 
     update_status(directory, "running", None, None)?;
+    let agy_monitor = if let Some(log_path) = agy_log_path.as_ref() {
+        Some(AgyMonitor::start(directory, log_path, &agy_brain_root()?)?)
+    } else {
+        None
+    };
+    let pi_failure_monitor = if provider == FirstPartyCli::Pi {
+        Some(PiFailureMonitor::start(directory)?)
+    } else {
+        None
+    };
     let status = Command::new(&manifest.provider_path)
         .args(arguments)
         .current_dir(&manifest.workspace)
         .env(SESSION_DIR_ENV, directory)
         .env("AGENT_BRIDGE_NATIVE_SESSION_ID", &manifest.id)
-        .status()
-        .with_context(|| {
-            format!(
-                "failed to start {} at {}",
-                provider.as_str(),
-                manifest.provider_path.display()
-            )
-        })?;
+        .env("AGENT_BRIDGE_EXECUTABLE", &executable)
+        .status();
+    if let Some(monitor) = agy_monitor {
+        monitor.stop()?;
+    }
+    if let Some(monitor) = pi_failure_monitor {
+        monitor.stop()?;
+    }
+    let status = status.with_context(|| {
+        format!(
+            "failed to start {} at {}",
+            provider.as_str(),
+            manifest.provider_path.display()
+        )
+    })?;
     update_status(directory, "exited", status.code(), None)?;
     if !status.success() {
         bail!("{} exited with {status}", provider.as_str());
@@ -1085,22 +1411,62 @@ fn run_hook(provider: FirstPartyCli, argument_payload: Option<&str>) -> Result<(
     };
     let payload: serde_json::Value =
         serde_json::from_str(&payload_text).context("native hook received invalid JSON")?;
+    let provider_session_id = json_string(&payload, &["session_id", "thread-id", "thread_id"]);
+    let turn_id = json_string(&payload, &["turn_id", "turn-id"]);
+    if let Some(error) = payload
+        .get("agent_bridge_error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return record_provider_failure(&directory, provider, error, provider_session_id, turn_id);
+    }
     let message = extract_assistant_message(&payload)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .context("native hook payload did not contain an assistant result")?;
-    let provider_session_id = json_string(&payload, &["session_id", "thread-id", "thread_id"]);
-    let turn_id = json_string(&payload, &["turn_id", "turn-id"]);
+    record_provider_result(&directory, provider, message, provider_session_id, turn_id)
+}
+
+fn record_provider_result(
+    directory: &Path,
+    provider: FirstPartyCli,
+    message: &str,
+    provider_session_id: Option<String>,
+    turn_id: Option<String>,
+) -> Result<()> {
     let event = SessionEvent {
         provider: provider.as_str().to_owned(),
         message: message.to_owned(),
+        error: None,
         provider_session_id,
         turn_id,
         created_unix_ms: unix_ms(),
     };
-    write_event(&directory, &event)?;
-    update_status(&directory, "ready", None, None)?;
-    release_turn_claim(&directory)
+    write_event(directory, &event)?;
+    update_status(directory, "ready", None, None)?;
+    release_turn_claim(directory)
+}
+
+fn record_provider_failure(
+    directory: &Path,
+    provider: FirstPartyCli,
+    error: &str,
+    provider_session_id: Option<String>,
+    turn_id: Option<String>,
+) -> Result<()> {
+    let error = terminal_safe_text(error, true);
+    let event = SessionEvent {
+        provider: provider.as_str().to_owned(),
+        message: String::new(),
+        error: Some(error.clone()),
+        provider_session_id,
+        turn_id,
+        created_unix_ms: unix_ms(),
+    };
+    write_event(directory, &event)?;
+    update_status(directory, "ready", None, Some(error))?;
+    release_turn_claim(directory)
 }
 
 pub(crate) fn extract_assistant_message(payload: &serde_json::Value) -> Option<&str> {
@@ -1130,6 +1496,506 @@ fn claude_hook_settings(executable: &Path) -> serde_json::Value {
             }]
         }
     })
+}
+
+fn pi_bridge_extension() -> &'static str {
+    r#"import { spawnSync } from "node:child_process";
+import { renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+function assistantText(message) {
+  if (!Array.isArray(message.content)) return undefined;
+  const text = message.content
+    .filter((part) => part?.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("\n")
+    .trim();
+  return text || undefined;
+}
+
+function lastAssistantOutcome(messages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== "assistant") continue;
+    if (message.stopReason !== "stop") {
+      const detail = typeof message.errorMessage === "string" && message.errorMessage.trim()
+        ? `: ${message.errorMessage.trim()}`
+        : "";
+      return { agent_bridge_error: `Pi turn ended with ${message.stopReason ?? "an unknown state"}${detail}` };
+    }
+    const text = assistantText(message);
+    if (text) return { last_assistant_message: text };
+    return { agent_bridge_error: "Pi settled without assistant text." };
+  }
+  return { agent_bridge_error: "Pi settled without an assistant result." };
+}
+
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function deliverResult(executable, payload) {
+  if (!executable) {
+    return { ok: false, detail: "Agent Bridge executable is unavailable" };
+  }
+  let detail = "native hook failed";
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const result = spawnSync(executable, ["native-hook", "pi"], {
+      input: JSON.stringify(payload),
+      encoding: "utf8",
+      stdio: ["pipe", "ignore", "pipe"],
+    });
+    if (!result.error && result.status === 0) return { ok: true };
+    const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
+    detail = result.error?.message || stderr || `native hook exited with status ${result.status}`;
+    if (attempt < 2) await wait(100 * (attempt + 1));
+  }
+  return { ok: false, detail: detail.slice(0, 1024) };
+}
+
+function persistHookFailure(payload, detail) {
+  const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
+  if (!directory) return false;
+  const target = join(directory, "pi-hook-failure.json");
+  const temporary = join(
+    directory,
+    `.pi-hook-failure-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`,
+  );
+  const signal = {
+    error: `Pi result delivery failed: ${detail}`,
+    provider_session_id: payload.session_id,
+    turn_id: payload.turn_id,
+  };
+  try {
+    writeFileSync(temporary, JSON.stringify(signal), { encoding: "utf8", flag: "wx", mode: 0o600 });
+    renameSync(temporary, target);
+    return true;
+  } catch {
+    try { unlinkSync(temporary); } catch {}
+    return false;
+  }
+}
+
+export default function (pi) {
+  let pending;
+  let undelivered = false;
+
+  pi.on("agent_start", (_event, ctx) => {
+    if (undelivered && pending) {
+      if (!persistHookFailure(pending, "a prior result remained undelivered")) {
+        ctx.ui.notify("Agent Bridge still cannot recover the previous Pi result.", "warning");
+        return;
+      }
+      undelivered = false;
+    }
+    pending = undefined;
+  });
+
+  pi.on("agent_end", (event, ctx) => {
+    if (undelivered) return;
+    pending = {
+      ...lastAssistantOutcome(event.messages),
+      session_id: ctx.sessionManager.getSessionId(),
+      turn_id: ctx.sessionManager.getLeafId() ?? undefined,
+    };
+  });
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    if (!pending) return;
+    const payload = pending;
+    const executable = process.env.AGENT_BRIDGE_EXECUTABLE;
+    const delivery = await deliverResult(executable, payload);
+    if (!delivery.ok) {
+      if (persistHookFailure(payload, delivery.detail)) {
+        pending = undefined;
+        ctx.ui.notify("Agent Bridge marked this undelivered Pi result as failed.", "warning");
+        return;
+      }
+      undelivered = true;
+      ctx.ui.notify("Agent Bridge could not record or recover this Pi result.", "warning");
+      return;
+    }
+    pending = undefined;
+  });
+}
+"#
+}
+
+struct PiFailureMonitor {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<Result<()>>,
+}
+
+impl PiFailureMonitor {
+    fn start(directory: &Path) -> Result<Self> {
+        let directory = directory.to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let error_directory = directory.clone();
+        let handle = thread::Builder::new()
+            .name("agent-bridge-pi-failure-monitor".to_owned())
+            .spawn(move || {
+                let result = monitor_pi_hook_failures(&directory, &stop_for_thread);
+                if let Err(error) = &result {
+                    let _ = update_status(
+                        &error_directory,
+                        "failed",
+                        None,
+                        Some(format!("Pi result recovery monitor failed: {error:#}")),
+                    );
+                    let _ = release_turn_claim(&error_directory);
+                }
+                result
+            })
+            .context("failed to start Pi result recovery monitor")?;
+        Ok(Self { stop, handle })
+    }
+
+    fn stop(self) -> Result<()> {
+        self.stop.store(true, Ordering::Release);
+        self.handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("Pi result recovery monitor panicked"))??;
+        Ok(())
+    }
+}
+
+fn monitor_pi_hook_failures(directory: &Path, stop: &AtomicBool) -> Result<()> {
+    loop {
+        consume_pi_hook_failure(directory)?;
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn consume_pi_hook_failure(directory: &Path) -> Result<bool> {
+    let path = directory.join(PI_HOOK_FAILURE_FILE);
+    let Some(text) = read_regular_text_if_present(&path)? else {
+        return Ok(false);
+    };
+    let signal: PiHookFailureSignal =
+        serde_json::from_str(&text).context("invalid Pi hook failure recovery signal")?;
+    let error = signal.error.trim();
+    if error.is_empty() {
+        bail!("Pi hook failure recovery signal has no error");
+    }
+    fs::remove_file(&path).context("failed to consume Pi hook failure recovery signal")?;
+    record_provider_failure(
+        directory,
+        FirstPartyCli::Pi,
+        error,
+        signal.provider_session_id,
+        signal.turn_id,
+    )?;
+    Ok(true)
+}
+
+struct AgyMonitor {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<Result<()>>,
+}
+
+impl AgyMonitor {
+    fn start(directory: &Path, log_path: &Path, brain_root: &Path) -> Result<Self> {
+        let directory = directory.to_owned();
+        let log_path = log_path.to_owned();
+        let brain_root = brain_root.to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let error_directory = directory.clone();
+        let handle = thread::Builder::new()
+            .name("agent-bridge-agy-monitor".to_owned())
+            .spawn(move || {
+                let result =
+                    monitor_agy_session(&directory, &log_path, &brain_root, &stop_for_thread);
+                if let Err(error) = &result {
+                    let _ = update_status(
+                        &error_directory,
+                        "failed",
+                        None,
+                        Some(format!("Agy result monitor failed: {error:#}")),
+                    );
+                    let _ = release_turn_claim(&error_directory);
+                }
+                result
+            })
+            .context("failed to start Agy result monitor")?;
+        Ok(Self { stop, handle })
+    }
+
+    fn stop(self) -> Result<()> {
+        self.stop.store(true, Ordering::Release);
+        self.handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("Agy result monitor panicked"))??;
+        Ok(())
+    }
+}
+
+struct AgyTranscriptCursor {
+    path: PathBuf,
+    full_path: PathBuf,
+    offset: u64,
+    partial_line: Vec<u8>,
+    pending_results: VecDeque<AgyPlannerResult>,
+    greatest_result_step: Option<u64>,
+}
+
+impl AgyTranscriptCursor {
+    fn new(path: PathBuf) -> Self {
+        let full_path = path.with_file_name("transcript_full.jsonl");
+        Self {
+            path,
+            full_path,
+            offset: 0,
+            partial_line: Vec::new(),
+            pending_results: VecDeque::new(),
+            greatest_result_step: None,
+        }
+    }
+
+    fn poll(&mut self, directory: &Path, brain_root: &Path, conversation_id: &str) -> Result<()> {
+        let Some(metadata) = validated_agy_file_metadata(&self.path, brain_root)? else {
+            return Ok(());
+        };
+        if metadata.len() < self.offset {
+            self.offset = 0;
+            self.partial_line.clear();
+            self.pending_results.clear();
+        }
+
+        let mut file = OpenOptions::new().read(true).open(&self.path)?;
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        self.offset = self.offset.saturating_add(bytes.len() as u64);
+        self.partial_line.extend_from_slice(&bytes);
+
+        let mut lines = Vec::new();
+        let mut start = 0;
+        for (index, byte) in self.partial_line.iter().enumerate() {
+            if *byte == b'\n' {
+                lines.push(String::from_utf8_lossy(&self.partial_line[start..index]).into_owned());
+                start = index + 1;
+            }
+        }
+        if start > 0 {
+            self.partial_line.drain(..start);
+        }
+
+        for line in lines {
+            let Some(result) = parse_agy_planner_result(&line) else {
+                continue;
+            };
+            if self
+                .greatest_result_step
+                .is_some_and(|previous| result.step <= previous)
+                || self
+                    .pending_results
+                    .iter()
+                    .any(|pending| pending.step == result.step)
+            {
+                continue;
+            }
+            self.pending_results.push_back(result);
+        }
+
+        while let Some(result) = self.pending_results.front() {
+            let message = if result.truncated {
+                let Some(message) = read_agy_full_result(&self.full_path, brain_root, result.step)?
+                else {
+                    break;
+                };
+                message
+            } else {
+                result.message.clone()
+            };
+            let step = result.step;
+            record_provider_result(
+                directory,
+                FirstPartyCli::Agy,
+                &message,
+                Some(conversation_id.to_owned()),
+                Some(step.to_string()),
+            )?;
+            self.greatest_result_step = Some(step);
+            self.pending_results.pop_front();
+        }
+        Ok(())
+    }
+}
+
+fn validated_agy_file_metadata(path: &Path, brain_root: &Path) -> Result<Option<fs::Metadata>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("refusing non-regular Agy transcript: {}", path.display());
+    }
+    let canonical_root = brain_root
+        .canonicalize()
+        .context("Agy brain directory is unavailable")?;
+    let canonical_path = path
+        .canonicalize()
+        .with_context(|| format!("Agy transcript cannot be resolved: {}", path.display()))?;
+    if !canonical_path.starts_with(&canonical_root) {
+        bail!(
+            "refusing Agy transcript outside its data directory: {}",
+            path.display()
+        );
+    }
+    Ok(Some(metadata))
+}
+
+fn read_agy_full_result(path: &Path, brain_root: &Path, step: u64) -> Result<Option<String>> {
+    if validated_agy_file_metadata(path, brain_root)?.is_none() {
+        return Ok(None);
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .with_context(|| format!("failed to read full Agy transcript: {}", path.display()))?;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if value.get("step_index").and_then(serde_json::Value::as_u64) != Some(step) {
+            continue;
+        }
+        let result = parse_agy_planner_value(&value)
+            .context("full Agy transcript row did not contain a final response")?;
+        if result.truncated {
+            bail!("full Agy transcript unexpectedly marked step {step} as truncated");
+        }
+        return Ok(Some(result.message));
+    }
+    Ok(None)
+}
+
+fn monitor_agy_session(
+    directory: &Path,
+    log_path: &Path,
+    brain_root: &Path,
+    stop: &AtomicBool,
+) -> Result<()> {
+    let mut conversation_id = None;
+    let mut transcript = None;
+    loop {
+        if conversation_id.is_none()
+            && let Some(log) = read_regular_text_if_present(log_path)?
+        {
+            conversation_id = parse_agy_conversation_id(&log);
+        }
+        if let Some(id) = conversation_id.as_deref() {
+            let cursor = transcript.get_or_insert_with(|| {
+                AgyTranscriptCursor::new(
+                    brain_root
+                        .join(id)
+                        .join(".system_generated")
+                        .join("logs")
+                        .join("transcript.jsonl"),
+                )
+            });
+            cursor.poll(directory, brain_root, id)?;
+        }
+        if stop.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn read_regular_text_if_present(path: &Path) -> Result<Option<String>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("refusing non-regular session file: {}", path.display());
+    }
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+fn agy_brain_root() -> Result<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
+    Ok(home.join(".gemini").join("antigravity-cli").join("brain"))
+}
+
+fn parse_agy_conversation_id(log: &str) -> Option<String> {
+    log.lines().rev().find_map(|line| {
+        let (_, suffix) = line.rsplit_once("Created conversation ")?;
+        let candidate = suffix.split_whitespace().next()?;
+        valid_uuid(candidate).then(|| candidate.to_owned())
+    })
+}
+
+fn valid_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+#[derive(Debug)]
+struct AgyPlannerResult {
+    step: u64,
+    message: String,
+    truncated: bool,
+}
+
+fn parse_agy_planner_result(line: &str) -> Option<AgyPlannerResult> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    parse_agy_planner_value(&value)
+}
+
+fn parse_agy_planner_value(value: &serde_json::Value) -> Option<AgyPlannerResult> {
+    if value.get("type")?.as_str()? != "PLANNER_RESPONSE"
+        || value.get("status")?.as_str()? != "DONE"
+        || value.get("source")?.as_str()? != "MODEL"
+    {
+        return None;
+    }
+    if value
+        .get("tool_calls")
+        .is_some_and(|tool_calls| match tool_calls {
+            serde_json::Value::Null => false,
+            serde_json::Value::Array(calls) => !calls.is_empty(),
+            _ => true,
+        })
+    {
+        return None;
+    }
+    let step = value.get("step_index")?.as_u64()?;
+    let message = value.get("content")?.as_str()?.trim();
+    (!message.is_empty()).then(|| AgyPlannerResult {
+        step,
+        message: message.to_owned(),
+        truncated: value
+            .get("is_truncated")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+#[cfg(test)]
+fn parse_agy_transcript_line(line: &str) -> Option<(u64, String)> {
+    let result = parse_agy_planner_result(line)?;
+    (!result.truncated).then_some((result.step, result.message))
 }
 
 fn create_session(spec: SessionSpec) -> Result<CreatedSession> {
@@ -1362,7 +2228,11 @@ fn wait_for_event(directory: &Path, baseline: usize, timeout: Duration) -> Resul
     loop {
         let paths = event_paths(directory)?;
         if paths.len() > baseline {
-            return read_json(paths.last().context("event path disappeared")?);
+            let event: SessionEvent = read_json(paths.last().context("event path disappeared")?)?;
+            if let Some(error) = event.error.as_deref() {
+                bail!("{error}");
+            }
+            return Ok(event);
         }
         if let Ok(status) = read_json::<SessionStatus>(&directory.join("status.json"))
             && matches!(status.state.as_str(), "failed" | "exited" | "closed")
