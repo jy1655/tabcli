@@ -16,7 +16,10 @@ use std::{
 #[cfg(windows)]
 use std::process::{Child as StdChild, ChildStdin, Stdio};
 
-use agent_bridge::{AgentDefinition, AgentId, TabSet, agents, handoff_text_from, session_title};
+use agent_bridge::{
+    AgentDefinition, AgentId, TabSet, agents, handoff_text_from, session_title, terminal_safe_text,
+    validate_terminal_input,
+};
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, after, never};
 use crossterm::event::{
@@ -33,6 +36,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
+
+mod native;
 
 struct AgentSession {
     definition: AgentDefinition,
@@ -160,12 +165,67 @@ fn session_arguments(
     arguments
 }
 
+fn ensure_extra_args_respect_policy(
+    definition: AgentDefinition,
+    yolo: bool,
+    extra_args: &[String],
+) -> Result<()> {
+    if yolo {
+        return Ok(());
+    }
+
+    let option_value = |index: usize, long: &str, short: Option<&str>| -> Option<&str> {
+        let argument = extra_args.get(index)?;
+        if argument == long || short.is_some_and(|short| argument == short) {
+            return extra_args.get(index + 1).map(String::as_str);
+        }
+        argument
+            .strip_prefix(&format!("{long}="))
+            .or_else(|| short.and_then(|short| argument.strip_prefix(&format!("{short}="))))
+    };
+
+    for (index, argument) in extra_args.iter().enumerate() {
+        let bypasses = match definition.id {
+            AgentId::Codex => {
+                argument == "--dangerously-bypass-approvals-and-sandbox"
+                    || argument == "--dangerously-bypass-hook-trust"
+                    || option_value(index, "--sandbox", Some("-s"))
+                        .is_some_and(|value| value.eq_ignore_ascii_case("danger-full-access"))
+                    || option_value(index, "--ask-for-approval", Some("-a"))
+                        .is_some_and(|value| value.eq_ignore_ascii_case("never"))
+                    || option_value(index, "--config", Some("-c")).is_some_and(|value| {
+                        let compact = value
+                            .chars()
+                            .filter(|character| {
+                                !character.is_whitespace() && !matches!(character, '\'' | '"')
+                            })
+                            .collect::<String>()
+                            .to_ascii_lowercase();
+                        compact == "approval_policy=never"
+                            || compact == "sandbox_mode=danger-full-access"
+                    })
+            }
+            AgentId::Claude | AgentId::Agy => {
+                argument == "--dangerously-skip-permissions"
+                    || option_value(index, "--permission-mode", None)
+                        .is_some_and(|value| value.eq_ignore_ascii_case("bypassPermissions"))
+            }
+        };
+        if bypasses {
+            anyhow::bail!(
+                "agents.json cannot enable dangerous mode with {argument:?}; launch Agent Bridge with --yolo explicitly"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn resolve_windows_agent_command(
     definition: AgentDefinition,
     path: Option<&std::ffi::OsStr>,
     user_profile: Option<&std::ffi::OsStr>,
-) -> PathBuf {
+) -> Result<PathBuf> {
     let names = [
         format!("{}.exe", definition.command),
         format!("{}.cmd", definition.command),
@@ -174,10 +234,15 @@ fn resolve_windows_agent_command(
     ];
     if let Some(path) = path {
         for directory in std::env::split_paths(path) {
+            if !directory.is_absolute() {
+                continue;
+            }
             for name in &names {
                 let candidate = directory.join(name);
                 if candidate.is_file() {
-                    return candidate;
+                    return candidate.canonicalize().with_context(|| {
+                        format!("failed to canonicalize agent path {}", candidate.display())
+                    });
                 }
             }
         }
@@ -190,10 +255,15 @@ fn resolve_windows_agent_command(
             .join("bin")
             .join("claude.exe");
         if candidate.is_file() {
-            return candidate;
+            return candidate.canonicalize().with_context(|| {
+                format!("failed to canonicalize Claude path {}", candidate.display())
+            });
         }
     }
-    PathBuf::from(definition.command)
+    anyhow::bail!(
+        "{} was not found on an absolute PATH entry",
+        definition.command
+    )
 }
 
 #[cfg(not(windows))]
@@ -201,12 +271,23 @@ fn resolve_unix_agent_command(
     definition: AgentDefinition,
     path: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
-) -> PathBuf {
+) -> Result<PathBuf> {
+    let configured = Path::new(definition.command);
+    if configured.is_absolute() && configured.is_file() {
+        return configured.canonicalize().with_context(|| {
+            format!("failed to canonicalize agent path {}", configured.display())
+        });
+    }
     if let Some(path) = path {
         for directory in std::env::split_paths(path) {
+            if !directory.is_absolute() {
+                continue;
+            }
             let candidate = directory.join(definition.command);
             if candidate.is_file() {
-                return candidate;
+                return candidate.canonicalize().with_context(|| {
+                    format!("failed to canonicalize agent path {}", candidate.display())
+                });
             }
         }
     }
@@ -218,10 +299,15 @@ fn resolve_unix_agent_command(
             .join("bin")
             .join("claude");
         if candidate.is_file() {
-            return candidate;
+            return candidate.canonicalize().with_context(|| {
+                format!("failed to canonicalize Claude path {}", candidate.display())
+            });
         }
     }
-    PathBuf::from(definition.command)
+    anyhow::bail!(
+        "{} was not found on an absolute PATH entry",
+        definition.command
+    )
 }
 
 #[cfg(windows)]
@@ -241,9 +327,16 @@ fn global_node_modules() -> Result<PathBuf> {
 
 fn help_text() -> String {
     format!(
-        "agent-bridge {} — local PTY control room for first-party coding agent CLIs
+        "agent-bridge {} — visible terminal bridge for first-party coding agent CLIs
 
 Usage:
+  agent-bridge ask <codex|claude> [--workspace PATH] --prompt TEXT [--title NAME]
+      [--model MODEL] [--yolo] [--timeout-secs N] [--detach] [--json]
+  agent-bridge tell <session> --prompt TEXT [--timeout-secs N] [--detach] [--json]
+  agent-bridge sessions [--json]
+  agent-bridge close-session <session> --explicit [--json]
+
+Legacy embedded TUI:
   agent-bridge [-yolo|--yolo] [--restore] [WORKSPACE]         start the TUI (default)
   agent-bridge open <agent> [--workspace PATH] [--prompt TEXT] [--title NAME]
   agent-bridge prompt <tab> [--wait [--until STATE]...] <text...>
@@ -251,10 +344,30 @@ Usage:
   agent-bridge read <tab> [--lines N]
   agent-bridge wait <tab> [--until STATE]... [--timeout-secs N]
   agent-bridge list
-  agent-bridge close <tab>
+  agent-bridge close <tab> --explicit
   agent-bridge --help | --version
 
   Every delegation subcommand also accepts --json for machine-readable output.
+
+Native visible sessions (macOS + iTerm2):
+  ask      open a real iTerm tab, cd to PATH, and run the installed first-party
+           Codex or Claude CLI interactively. By default it waits for the first
+           hook/notify result, prints it, and leaves the tab and CLI running.
+           --model selects the model for that Codex session only.
+  tell     type another prompt into that same visible iTerm session and return
+           the next result. Follow-ups are serialized per session, framed as one
+           bracketed paste, and reject terminal submission/control bytes. The user
+           can also click the tab and continue typing.
+  sessions list native session ids, state, workspace, yolo policy, and results.
+  close-session closes only a recorded bridge-owned iTerm session and requires
+           the literal --explicit flag.
+
+  Child policy is per request: --yolo is NEVER inherited from the calling Codex
+  or Claude process. It is forwarded only when that ask command contains
+  --yolo. Supported CLI checks are minimums, so newer releases continue to work:
+  Codex >= 0.147.0; Claude >= 2.1.229. Prompts and results are kept in
+  private per-session storage under ~/.agent-bridge/native-sessions. Every
+  injected prompt carries an Agent Bridge source-provenance banner.
 
 TUI:
   Runs codex, claude, and agy in visible PTY tabs. Press F12 inside the app
@@ -285,7 +398,7 @@ Delegation (drive a visible tab from a script or another agent):
           the most recent N lines including scrollback.
   wait    poll status until one of the given states (default: finished).
   list    print every tab as title, state, agent, workspace (tab-separated).
-  close   close a tab and terminate its CLI session.
+  close   close a tab and terminate its CLI session; requires --explicit.
 
 Example round trip:
   TAB=$(agent-bridge open codex --prompt \"review this diff\")
@@ -327,7 +440,7 @@ fn prepare_hook_adapter(definition: AgentDefinition) -> Result<Option<HookAdapte
             let status_file = new_status_file(b"idle")?;
             let executable =
                 std::env::current_exe().context("failed to locate agent-bridge executable")?;
-            let settings = serde_json::to_vec_pretty(&claude_hook_settings(&executable))?;
+            let settings = serde_json::to_vec_pretty(&claude_hook_settings(&executable)?)?;
             let mut settings_file = tempfile::Builder::new()
                 .prefix("agent-bridge-")
                 .suffix(".settings.json")
@@ -378,11 +491,12 @@ impl AgentSession {
         extra_args: &[String],
     ) -> Result<Self> {
         let hook_adapter = prepare_hook_adapter(definition)?;
+        ensure_extra_args_respect_policy(definition, yolo, extra_args)?;
         let program = resolve_windows_agent_command(
             definition,
             std::env::var_os("PATH").as_deref(),
             std::env::var_os("USERPROFILE").as_deref(),
-        );
+        )?;
         let arguments = Self::arguments(definition, yolo, hook_adapter.as_ref(), extra_args);
         let (process, mut reader, writer, node_control): WindowsSpawnParts = if definition.id
             == AgentId::Claude
@@ -506,6 +620,7 @@ impl AgentSession {
         extra_args: &[String],
     ) -> Result<Self> {
         let hook_adapter = prepare_hook_adapter(definition)?;
+        ensure_extra_args_respect_policy(definition, yolo, extra_args)?;
         let pair = native_pty_system().openpty(PtySize {
             rows: 32,
             cols: 100,
@@ -516,7 +631,7 @@ impl AgentSession {
             definition,
             std::env::var_os("PATH").as_deref(),
             std::env::var_os("HOME").as_deref(),
-        );
+        )?;
         let mut command = CommandBuilder::new(program);
         command.cwd(cwd);
         for argument in Self::arguments(definition, yolo, hook_adapter.as_ref(), extra_args) {
@@ -715,15 +830,39 @@ fn write_hook_state(state: SemanticState) -> Result<()> {
     fs::write(path, state.label()).context("failed to update hook status")
 }
 
-fn claude_hook_settings(executable: &Path) -> serde_json::Value {
+#[cfg(not(windows))]
+fn quote_claude_hook_executable(executable: &Path) -> Result<String> {
+    let executable = executable
+        .to_str()
+        .context("Agent Bridge executable path is not valid UTF-8")?;
+    Ok(format!("'{}'", executable.replace('\'', "'\"'\"'")))
+}
+
+#[cfg(windows)]
+fn quote_claude_hook_executable(executable: &Path) -> Result<String> {
+    let executable = executable
+        .to_str()
+        .context("Agent Bridge executable path is not valid UTF-8")?;
+    anyhow::ensure!(
+        !executable.chars().any(|character| matches!(
+            character,
+            '"' | '&' | '|' | '<' | '>' | '^' | '%' | '!' | '(' | ')' | '\r' | '\n'
+        )),
+        "Agent Bridge executable path cannot be represented safely in a Claude command hook"
+    );
+    Ok(format!("\"{executable}\""))
+}
+
+fn claude_hook_settings(executable: &Path) -> Result<serde_json::Value> {
+    let executable = quote_claude_hook_executable(executable)?;
     let handler = |state: &str| {
         serde_json::json!({
             "type": "command",
-            "command": format!("\"{}\" hook {state}", executable.display()),
+            "command": format!("{executable} hook {state}"),
             "timeout": 5,
         })
     };
-    serde_json::json!({
+    Ok(serde_json::json!({
         "hooks": {
             "SessionStart": [{ "hooks": [handler("idle")] }],
             "UserPromptSubmit": [{ "hooks": [handler("working")] }],
@@ -734,7 +873,7 @@ fn claude_hook_settings(executable: &Path) -> serde_json::Value {
             "Stop": [{ "hooks": [handler("finished")] }],
             "SessionEnd": [{ "hooks": [handler("finished")] }]
         }
-    })
+    }))
 }
 
 fn ensure_interactive_terminal(is_terminal: bool) -> Result<()> {
@@ -1363,21 +1502,111 @@ fn parse_layout(text: &str) -> Option<(bool, Vec<SavedTab>)> {
 static DELEGATION_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 fn create_delegation_dir() -> Option<PathBuf> {
-    let dir = std::env::temp_dir().join(format!("agent-bridge-{}-requests", std::process::id()));
-    fs::create_dir_all(&dir).ok()?;
-    Some(dir)
+    create_delegation_dir_in(&std::env::temp_dir())
+}
+
+fn create_delegation_dir_in(root: &Path) -> Option<PathBuf> {
+    let temporary = tempfile::Builder::new()
+        .prefix("agent-bridge-requests-")
+        .tempdir_in(root)
+        .ok()?;
+    set_owner_only_directory(temporary.path()).ok()?;
+    Some(temporary.keep())
 }
 
 fn write_json_atomically(path: &Path, value: &serde_json::Value) -> Result<()> {
-    let payload = serde_json::to_vec_pretty(value)?;
-    let part = path.with_extension("part");
-    fs::write(&part, payload)?;
-    fs::rename(&part, path)?;
+    let parent = path.parent().context("JSON path has no parent")?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".agent-bridge-")
+        .suffix(".part")
+        .tempfile_in(parent)?;
+    set_owner_only_file(temporary.as_file())?;
+    temporary.write_all(&serde_json::to_vec_pretty(value)?)?;
+    temporary.flush()?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to persist {}", path.display()))?;
     Ok(())
 }
 
-fn delegation_provenance(from: &str, text: &str) -> String {
-    format!("[Agent Bridge delegation · from {from}] {text}")
+#[cfg(unix)]
+fn set_owner_only_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_owner_only_file(file: &fs::File) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_file(_file: &fs::File) -> Result<()> {
+    Ok(())
+}
+
+fn delegation_message(bracketed: bool, from: &str, text: &str) -> Result<String> {
+    validate_terminal_input(text, "delegation prompt")?;
+    let source = from
+        .chars()
+        .take(128)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let source = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    let source = if source.is_empty() {
+        "external"
+    } else {
+        &source
+    };
+    let message = format!("[Agent Bridge delegation · from {source}] {text}");
+    if bracketed {
+        Ok(message)
+    } else {
+        Ok(message
+            .chars()
+            .map(|character| {
+                if matches!(character, '\n' | '\t') {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect())
+    }
+}
+
+fn sanitize_legacy_title(value: &str) -> Result<String> {
+    let title = value
+        .chars()
+        .take(80)
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    anyhow::ensure!(!title.is_empty(), "tab title cannot be empty");
+    Ok(title)
 }
 
 fn instance_pointer_path() -> Option<PathBuf> {
@@ -1399,6 +1628,7 @@ fn parse_instance_pointer(text: &str) -> Option<(u64, PathBuf)> {
 fn write_instance_pointer_at(pointer: &Path, pid: u64, spool: &Path) -> Result<()> {
     if let Some(parent) = pointer.parent() {
         fs::create_dir_all(parent)?;
+        set_owner_only_directory(parent)?;
     }
     write_json_atomically(
         pointer,
@@ -1421,8 +1651,15 @@ fn clear_instance_pointer() {
     }
 }
 
+fn clear_delegation_dir() {
+    if let Some(directory) = DELEGATION_DIR.get() {
+        let _ = fs::remove_dir_all(directory);
+    }
+}
+
 struct PendingWrite {
     title: String,
+    generation: u64,
     bytes: Vec<u8>,
     due: Instant,
 }
@@ -1444,6 +1681,8 @@ struct App {
     rail_pane: Rect,
     footer_pane: Rect,
     pending_writes: Vec<PendingWrite>,
+    session_generations: HashMap<String, u64>,
+    next_session_generation: u64,
     layout_path: Option<PathBuf>,
     restorable_layout: Vec<SavedTab>,
     registry: [RegisteredAgent; 3],
@@ -1555,6 +1794,8 @@ impl App {
             rail_pane: Rect::default(),
             footer_pane: Rect::default(),
             pending_writes: Vec::new(),
+            session_generations: HashMap::new(),
+            next_session_generation: 0,
             layout_path: None,
             restorable_layout: Vec::new(),
             registry,
@@ -1573,6 +1814,14 @@ impl App {
 
     fn add_session_at(&mut self, id: AgentId, workspace: &Path) -> Result<()> {
         self.add_session_at_titled(id, workspace, None)
+    }
+
+    fn assign_session_generation(&mut self, title: &str) -> u64 {
+        self.next_session_generation = self.next_session_generation.wrapping_add(1).max(1);
+        let generation = self.next_session_generation;
+        self.session_generations
+            .insert(title.to_owned(), generation);
+        generation
     }
 
     fn add_session_at_titled(
@@ -1600,6 +1849,7 @@ impl App {
             self.ordinals[ordinal_index] += 1;
         }
         self.sessions.push(session);
+        self.assign_session_generation(&title);
         self.notice = format!("created {title}");
         self.save_layout();
         Ok(())
@@ -1628,6 +1878,7 @@ impl App {
         self.sessions
             .replace_active(replacement)
             .expect("active session exists");
+        self.assign_session_generation(&title);
         self.observed_states.remove(&title);
         self.notice = format!("restarted {title} (fresh session)");
         Ok(())
@@ -1689,6 +1940,10 @@ impl App {
         }
         due.sort_by_key(|write| write.due);
         for write in due {
+            if self.session_generations.get(&write.title) != Some(&write.generation) {
+                self.notice = format!("relay dropped: {} was replaced", write.title);
+                continue;
+            }
             let Some(session) = self
                 .sessions
                 .items()
@@ -1711,17 +1966,36 @@ impl App {
         }
     }
 
-    fn enqueue_delegation_prompt(&mut self, title: &str, from: &str, text: &str, delay: Duration) {
-        let message = delegation_provenance(from, text);
+    fn enqueue_delegation_prompt(
+        &mut self,
+        title: &str,
+        from: &str,
+        text: &str,
+        delay: Duration,
+    ) -> Result<()> {
+        let session = self
+            .sessions
+            .items()
+            .iter()
+            .find(|session| session.title() == title)
+            .with_context(|| format!("no such tab: {title}"))?;
+        let bracketed = session.bracketed_paste();
+        let generation = *self
+            .session_generations
+            .get(title)
+            .with_context(|| format!("session generation is missing for {title}"))?;
+        let message = delegation_message(bracketed, from, text)?;
         let now = Instant::now();
-        for (offset, bytes) in relay_write_plan(false, &message) {
+        for (offset, bytes) in relay_write_plan(bracketed, &message) {
             self.pending_writes.push(PendingWrite {
                 title: title.to_owned(),
+                generation,
                 bytes,
                 due: now + delay + offset,
             });
         }
         self.notice = format!("delegation: {from} → {title}");
+        Ok(())
     }
 
     fn handle_delegation(&mut self, request: &serde_json::Value) -> serde_json::Value {
@@ -1761,7 +2035,19 @@ impl App {
                 let requested_title = request
                     .get("title")
                     .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
+                    .map(sanitize_legacy_title)
+                    .transpose();
+                let requested_title = match requested_title {
+                    Ok(title) => title,
+                    Err(error) => {
+                        return serde_json::json!({ "ok": false, "error": error.to_string() });
+                    }
+                };
+                if let Some(prompt) = request.get("prompt").and_then(serde_json::Value::as_str)
+                    && let Err(error) = validate_terminal_input(prompt, "delegation prompt")
+                {
+                    return serde_json::json!({ "ok": false, "error": error.to_string() });
+                }
                 if let Some(requested) = &requested_title
                     && self
                         .sessions
@@ -1782,13 +2068,15 @@ impl App {
                     .active()
                     .map(|session| session.title().to_owned())
                     .unwrap_or_default();
-                if let Some(prompt) = request.get("prompt").and_then(serde_json::Value::as_str) {
-                    self.enqueue_delegation_prompt(
+                if let Some(prompt) = request.get("prompt").and_then(serde_json::Value::as_str)
+                    && let Err(error) = self.enqueue_delegation_prompt(
                         &title,
                         &from,
                         prompt,
                         Duration::from_millis(2_500),
-                    );
+                    )
+                {
+                    return serde_json::json!({ "ok": false, "error": error.to_string() });
                 }
                 serde_json::json!({ "ok": true, "tab": title })
             }
@@ -1804,7 +2092,11 @@ impl App {
                 let Some(text) = request.get("prompt").and_then(serde_json::Value::as_str) else {
                     return serde_json::json!({ "ok": false, "error": "prompt text is required" });
                 };
-                self.enqueue_delegation_prompt(&target, &from, text, Duration::ZERO);
+                if let Err(error) =
+                    self.enqueue_delegation_prompt(&target, &from, text, Duration::ZERO)
+                {
+                    return serde_json::json!({ "ok": false, "error": error.to_string() });
+                }
                 self.flush_due_writes(Instant::now());
                 serde_json::json!({ "ok": true, "tab": target })
             }
@@ -1892,6 +2184,12 @@ impl App {
                 serde_json::json!({ "ok": true, "tabs": tabs })
             }
             Some("close") => {
+                if request.get("explicit").and_then(serde_json::Value::as_bool) != Some(true) {
+                    return serde_json::json!({
+                        "ok": false,
+                        "error": "close requires explicit authorization"
+                    });
+                }
                 let Some(index) = self
                     .sessions
                     .items()
@@ -1907,6 +2205,7 @@ impl App {
                 let title = removed.title().to_owned();
                 drop(removed);
                 self.observed_states.remove(&title);
+                self.session_generations.remove(&title);
                 self.save_layout();
                 self.notice = format!("delegation: {from} closed {title}");
                 serde_json::json!({ "ok": true, "tab": title })
@@ -2197,6 +2496,7 @@ impl App {
                 KeyCode::F(4) => {
                     if let Some(session) = self.sessions.remove_active() {
                         self.observed_states.remove(session.title());
+                        self.session_generations.remove(session.title());
                         self.notice = format!("closed {}", session.title());
                         self.save_layout();
                     }
@@ -2549,10 +2849,15 @@ impl App {
                                     };
                                 } else {
                                     let bracketed = destination.bracketed_paste();
+                                    let generation = *self
+                                        .session_generations
+                                        .get(&title)
+                                        .context("relay target generation is missing")?;
                                     let now = Instant::now();
                                     for (offset, bytes) in relay_write_plan(bracketed, &message) {
                                         self.pending_writes.push(PendingWrite {
                                             title: title.clone(),
+                                            generation,
                                             bytes,
                                             due: now + offset,
                                         });
@@ -3200,6 +3505,7 @@ enum DelegateCommand {
     List,
     Close {
         target: String,
+        explicit: bool,
     },
 }
 
@@ -3352,9 +3658,16 @@ fn parse_delegate_command(kind: &str, args: Vec<String>) -> Result<DelegateInvoc
             DelegateCommand::List
         }
         "close" => {
+            let explicit_count = rest.iter().filter(|value| *value == "--explicit").count();
+            rest.retain(|value| value != "--explicit");
+            anyhow::ensure!(
+                explicit_count == 1,
+                "close requires exactly one --explicit flag to terminate a visible session"
+            );
             anyhow::ensure!(rest.len() == 1, "close requires exactly one tab title");
             DelegateCommand::Close {
                 target: rest.remove(0),
+                explicit: true,
             }
         }
         _ => anyhow::bail!("unknown delegation command: {kind}"),
@@ -3424,15 +3737,18 @@ fn print_delegation_response(response: &serde_json::Value) -> Result<()> {
     if response.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
         anyhow::bail!(
             "{}",
-            response
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("delegation failed")
+            terminal_safe_text(
+                response
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("delegation failed"),
+                true,
+            )
         );
     }
     for key in ["tab", "state", "output"] {
         if let Some(value) = response.get(key).and_then(serde_json::Value::as_str) {
-            println!("{value}");
+            println!("{}", terminal_safe_text(value, key == "output"));
         }
     }
     if let Some(tabs) = response.get("tabs").and_then(serde_json::Value::as_array) {
@@ -3440,8 +3756,8 @@ fn print_delegation_response(response: &serde_json::Value) -> Result<()> {
             let field = |key: &str| {
                 tab.get(key)
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("?")
-                    .to_owned()
+                    .map(|value| terminal_safe_text(value, false))
+                    .unwrap_or_else(|| "?".to_owned())
             };
             println!(
                 "{}\t{}\t{}\t{}",
@@ -3594,9 +3910,9 @@ fn run_delegate(invocation: DelegateInvocation) -> Result<()> {
             )?,
             json,
         ),
-        DelegateCommand::Close { target } => emit_delegation_response(
+        DelegateCommand::Close { target, explicit } => emit_delegation_response(
             &send_delegation_request(
-                serde_json::json!({ "kind": "close", "target": target }),
+                serde_json::json!({ "kind": "close", "target": target, "explicit": explicit }),
                 Duration::from_secs(15),
             )?,
             json,
@@ -3614,6 +3930,7 @@ enum Launch {
     Version,
     Hook(SemanticState),
     Delegate(DelegateInvocation),
+    Native(native::NativeCommand),
 }
 
 fn parse_args_from(args: impl IntoIterator<Item = OsString>) -> Result<Launch> {
@@ -3625,6 +3942,21 @@ fn parse_args_from(args: impl IntoIterator<Item = OsString>) -> Result<Launch> {
             restore: false,
         });
     };
+    if native::is_command(&argument.to_string_lossy()) {
+        let command = argument.to_string_lossy().into_owned();
+        let rest = args
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        if rest
+            .first()
+            .is_some_and(|value| value == "--help" || value == "-h")
+        {
+            return Ok(Launch::Help);
+        }
+        return Ok(Launch::Native(native::parse_args(
+            std::iter::once(command).chain(rest),
+        )?));
+    }
     if argument == "hook" {
         let state = args
             .next()
@@ -3638,7 +3970,7 @@ fn parse_args_from(args: impl IntoIterator<Item = OsString>) -> Result<Launch> {
     }
     if matches!(
         argument.to_string_lossy().as_ref(),
-        "open" | "prompt" | "status" | "read" | "wait"
+        "open" | "prompt" | "status" | "read" | "wait" | "list" | "close"
     ) {
         let kind = argument.to_string_lossy().into_owned();
         let rest = args
@@ -3705,6 +4037,7 @@ fn main() -> Result<()> {
         }
         Launch::Hook(state) => write_hook_state(state),
         Launch::Delegate(invocation) => run_delegate(invocation),
+        Launch::Native(command) => native::run(command),
         Launch::Run { cwd, yolo, restore } => {
             ensure_interactive_terminal(std::io::stdout().is_terminal())?;
             struct InputModesGuard;
@@ -3721,6 +4054,7 @@ fn main() -> Result<()> {
             execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture)?;
             let result = ratatui::run(|terminal| run(terminal, &cwd, yolo, restore));
             clear_instance_pointer();
+            clear_delegation_dir();
             result
         }
     }
@@ -3957,6 +4291,51 @@ mod tests {
     }
 
     #[test]
+    fn configured_arguments_cannot_hide_dangerous_mode() {
+        let codex = agents()
+            .into_iter()
+            .find(|item| item.id == AgentId::Codex)
+            .unwrap();
+        let claude = agents()
+            .into_iter()
+            .find(|item| item.id == AgentId::Claude)
+            .unwrap();
+
+        assert!(
+            ensure_extra_args_respect_policy(
+                codex,
+                false,
+                &["--dangerously-bypass-approvals-and-sandbox".to_owned()]
+            )
+            .is_err()
+        );
+        assert!(
+            ensure_extra_args_respect_policy(
+                codex,
+                false,
+                &["--sandbox".to_owned(), "danger-full-access".to_owned()]
+            )
+            .is_err()
+        );
+        assert!(
+            ensure_extra_args_respect_policy(
+                claude,
+                false,
+                &["--permission-mode=bypassPermissions".to_owned()]
+            )
+            .is_err()
+        );
+        assert!(
+            ensure_extra_args_respect_policy(
+                codex,
+                true,
+                &["--sandbox".to_owned(), "danger-full-access".to_owned()]
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn scrollback_rows_come_from_the_environment_with_safe_bounds() {
         assert_eq!(scrollback_rows_from(None), 2_000);
         assert_eq!(scrollback_rows_from(Some("500")), 500);
@@ -4092,6 +4471,68 @@ mod tests {
     }
 
     #[test]
+    fn delegation_spools_are_random_and_private() {
+        let root = tempfile::tempdir().unwrap();
+        let first = create_delegation_dir_in(root.path()).unwrap();
+        let second = create_delegation_dir_in(root.path()).unwrap();
+
+        assert_ne!(first, second);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(first).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delegation_reply_write_does_not_follow_a_part_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = directory.path().join("outside");
+        let reply = directory.path().join("reply.json");
+        let predictable_part = directory.path().join("reply.part");
+        fs::write(&outside, "preserve me").unwrap();
+        symlink(&outside, &predictable_part).unwrap();
+
+        write_json_atomically(&reply, &serde_json::json!({ "ok": true })).unwrap();
+
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "preserve me");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(reply).unwrap()).unwrap(),
+            serde_json::json!({ "ok": true })
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn claude_hook_shell_quotes_the_executable_as_one_word() {
+        let settings = claude_hook_settings(Path::new("/tmp/bridge'$(touch nope)")).unwrap();
+        let command = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+
+        assert_eq!(command, "'/tmp/bridge'\"'\"'$(touch nope)' hook finished");
+    }
+
+    #[test]
+    fn delegated_prompts_reject_controls_and_use_target_paste_mode() {
+        assert!(delegation_message(true, "parent", "review\u{1b}[31m").is_err());
+        assert_eq!(
+            delegation_message(true, "parent", "line one\nline two").unwrap(),
+            "[Agent Bridge delegation · from parent] line one\nline two"
+        );
+        assert_eq!(
+            delegation_message(false, "parent", "line one\nline two").unwrap(),
+            "[Agent Bridge delegation · from parent] line one line two"
+        );
+    }
+
+    #[test]
     fn clearing_the_instance_pointer_only_removes_our_own() {
         let directory = tempfile::tempdir().unwrap();
         let pointer = directory.path().join("instance.json");
@@ -4183,12 +4624,17 @@ mod tests {
                 json: true,
             }
         );
+        assert!(parse_delegate_command("close", vec!["Reviewer".to_owned()]).is_err());
         assert_eq!(
-            parse_delegate_command("close", vec!["Reviewer".to_owned()])
-                .unwrap()
-                .command,
+            parse_delegate_command(
+                "close",
+                vec!["Reviewer".to_owned(), "--explicit".to_owned()]
+            )
+            .unwrap()
+            .command,
             DelegateCommand::Close {
                 target: "Reviewer".to_owned(),
+                explicit: true,
             }
         );
         assert!(parse_delegate_command("open", Vec::new()).is_err());
@@ -4290,15 +4736,21 @@ mod tests {
         assert_eq!(app.sessions.active().unwrap().title(), "Claude 2");
         app.delegation_dir = Some(spool.path().to_path_buf());
 
-        let response = app.handle_delegation(&serde_json::json!({
+        let denied = app.handle_delegation(&serde_json::json!({
             "kind": "close", "target": "Codex 1"
+        }));
+        assert_eq!(denied["ok"], serde_json::json!(false));
+        assert_eq!(app.sessions.len(), 3);
+
+        let response = app.handle_delegation(&serde_json::json!({
+            "kind": "close", "target": "Codex 1", "explicit": true
         }));
         assert_eq!(response["ok"], serde_json::json!(true));
         assert_eq!(app.sessions.len(), 2);
         assert_eq!(app.sessions.active().unwrap().title(), "Claude 2");
 
         let missing = app.handle_delegation(&serde_json::json!({
-            "kind": "close", "target": "Codex 1"
+            "kind": "close", "target": "Codex 1", "explicit": true
         }));
         assert_eq!(missing["ok"], serde_json::json!(false));
     }
@@ -4897,6 +5349,7 @@ mod tests {
         let now = Instant::now();
         app.pending_writes.push(PendingWrite {
             title: "Claude 1".to_owned(),
+            generation: app.session_generations["Claude 1"],
             bytes: b"\r".to_vec(),
             due: now,
         });
@@ -4905,6 +5358,47 @@ mod tests {
         app.flush_due_writes(now);
 
         assert!(app.notice.contains("relay dropped"));
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn deferred_relay_writes_do_not_rebind_to_a_same_title_replacement() {
+        let (redraw, _) = crossbeam_channel::bounded(1);
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&writes);
+        let mut app = App::new_with_spawner(
+            Path::new("workspace"),
+            redraw,
+            Box::new(move |definition, title, _, _| {
+                Ok(Box::new(test_session_with_writes(
+                    definition,
+                    title,
+                    false,
+                    Arc::clone(&captured),
+                )))
+            }),
+        );
+        app.add_session(AgentId::Claude).unwrap();
+        let stale_generation = app.session_generations["Claude 1"];
+        let now = Instant::now();
+        app.pending_writes.push(PendingWrite {
+            title: "Claude 1".to_owned(),
+            generation: stale_generation,
+            bytes: b"stale prompt\r".to_vec(),
+            due: now,
+        });
+        app.sessions.remove_active();
+        app.add_session_at_titled(
+            AgentId::Claude,
+            Path::new("replacement-workspace"),
+            Some("Claude 1".to_owned()),
+        )
+        .unwrap();
+
+        app.flush_due_writes(now);
+
+        assert_ne!(app.session_generations["Claude 1"], stale_generation);
+        assert!(app.notice.contains("replaced"));
         assert!(writes.lock().unwrap().is_empty());
     }
 
@@ -5114,10 +5608,14 @@ mod tests {
 
     #[test]
     fn claude_hook_settings_use_schema_valid_command_strings() {
-        let settings = claude_hook_settings(Path::new("C:/tools/agent-bridge.exe"));
+        let settings = claude_hook_settings(Path::new("C:/tools/agent-bridge.exe")).unwrap();
+        #[cfg(windows)]
+        let expected = "\"C:/tools/agent-bridge.exe\" hook working";
+        #[cfg(not(windows))]
+        let expected = "'C:/tools/agent-bridge.exe' hook working";
         assert_eq!(
             settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"],
-            serde_json::json!("\"C:/tools/agent-bridge.exe\" hook working")
+            serde_json::json!(expected)
         );
         assert!(settings["hooks"]["UserPromptSubmit"][0]["hooks"][0]["args"].is_null());
         assert!(settings["hooks"]["PermissionRequest"].is_null());
@@ -5814,7 +6312,7 @@ mod tests {
             "read <tab>",
             "wait <tab>",
             "agent-bridge list",
-            "close <tab>",
+            "close <tab> --explicit",
             "--lines N",
             "--json",
             "--restore",
@@ -5835,6 +6333,51 @@ mod tests {
             parse_args_from([OsString::from("wait"), OsString::from("-h")]).unwrap(),
             Launch::Help
         ));
+    }
+
+    #[test]
+    fn command_line_routes_the_native_visible_session_surface() {
+        assert!(matches!(
+            parse_args_from([
+                OsString::from("ask"),
+                OsString::from("codex"),
+                OsString::from("--workspace"),
+                OsString::from("."),
+                OsString::from("--prompt"),
+                OsString::from("review this"),
+                OsString::from("--yolo"),
+            ])
+            .unwrap(),
+            Launch::Native(native::NativeCommand::Ask(native::AskRequest {
+                yolo: true,
+                ..
+            }))
+        ));
+        assert!(
+            parse_args_from([
+                OsString::from("close-session"),
+                OsString::from("session-safe123"),
+            ])
+            .is_err()
+        );
+        assert!(matches!(
+            parse_args_from([OsString::from("ask"), OsString::from("--help")]).unwrap(),
+            Launch::Help
+        ));
+
+        let help = help_text();
+        for needle in [
+            "ask <codex|claude>",
+            "--model MODEL",
+            "tell <session>",
+            "sessions [--json]",
+            "close-session <session> --explicit",
+            "NEVER inherited",
+            "Codex >= 0.147.0",
+            "Claude >= 2.1.229",
+        ] {
+            assert!(help.contains(needle), "help is missing {needle:?}");
+        }
     }
 
     #[test]
@@ -5862,8 +6405,9 @@ mod tests {
                 definition,
                 Some(std::ffi::OsStr::new("")),
                 Some(home.path().as_os_str())
-            ),
-            executable
+            )
+            .unwrap(),
+            executable.canonicalize().unwrap()
         );
     }
 
@@ -5880,8 +6424,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            resolve_windows_agent_command(definition, Some(directory.path().as_os_str()), None),
-            executable
+            resolve_windows_agent_command(definition, Some(directory.path().as_os_str()), None)
+                .unwrap(),
+            executable.canonicalize().unwrap()
         );
     }
 
@@ -5903,8 +6448,9 @@ mod tests {
                 definition,
                 Some(std::ffi::OsStr::new("")),
                 Some(home.path().as_os_str())
-            ),
-            executable
+            )
+            .unwrap(),
+            executable.canonicalize().unwrap()
         );
     }
 

@@ -1,4 +1,109 @@
 use anyhow::{Result, bail};
+use semver::Version;
+use std::str::FromStr;
+
+pub fn validate_terminal_input(value: &str, field: &str) -> Result<()> {
+    if let Some(character) = value
+        .chars()
+        .find(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+    {
+        bail!(
+            "{field} contains terminal control U+{:04X}; only newline and tab are allowed",
+            u32::from(character)
+        );
+    }
+    Ok(())
+}
+
+pub fn terminal_safe_text(value: &str, multiline: bool) -> String {
+    let mut safe = String::with_capacity(value.len());
+    for character in value.chars() {
+        if multiline && matches!(character, '\n' | '\t') {
+            safe.push(character);
+        } else if character.is_control() {
+            safe.extend(character.escape_default());
+        } else {
+            safe.push(character);
+        }
+    }
+    safe
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirstPartyCli {
+    Codex,
+    Claude,
+}
+
+impl FirstPartyCli {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+
+    pub const fn command(self) -> &'static str {
+        self.as_str()
+    }
+
+    pub fn minimum_version(self) -> Version {
+        match self {
+            Self::Codex => Version::new(0, 147, 0),
+            Self::Claude => Version::new(2, 1, 229),
+        }
+    }
+}
+
+impl FromStr for FirstPartyCli {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "codex" => Ok(Self::Codex),
+            "claude" => Ok(Self::Claude),
+            _ => Err(format!(
+                "unsupported CLI {value:?}; expected codex or claude"
+            )),
+        }
+    }
+}
+
+pub fn cli_version_is_supported(cli: FirstPartyCli, output: &str) -> Result<bool> {
+    let installed = output
+        .split_whitespace()
+        .filter_map(|token| {
+            let candidate = token
+                .trim_matches(|character: char| !character.is_ascii_alphanumeric())
+                .strip_prefix('v')
+                .unwrap_or(
+                    token.trim_matches(|character: char| !character.is_ascii_alphanumeric()),
+                );
+            Version::parse(candidate).ok()
+        })
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("could not parse a semantic version from {output:?}"))?;
+
+    Ok(installed >= cli.minimum_version())
+}
+
+pub fn provider_launch_args(cli: FirstPartyCli, yolo: bool) -> Vec<&'static str> {
+    if !yolo {
+        return Vec::new();
+    }
+
+    match cli {
+        FirstPartyCli::Codex => vec!["--dangerously-bypass-approvals-and-sandbox"],
+        FirstPartyCli::Claude => vec!["--dangerously-skip-permissions"],
+    }
+}
+
+pub fn confirm_explicit_close(explicit: bool) -> Result<()> {
+    if !explicit {
+        bail!("closing a visible terminal session requires --explicit");
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentId {

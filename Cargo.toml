@@ -2,7 +2,7 @@
 name = "agent-bridge"
 version = "0.1.0"
 edition = "2024"
-description = "Local TUI control room for first-party coding agent CLIs"
+description = "Visible terminal bridge for first-party Codex and Claude CLIs"
 license = "MIT"
 rust-version = "1.88"
 
@@ -11,7 +11,9 @@ anyhow = "1.0"
 crossbeam-channel = "0.5"
 crossterm = "0.29"
 ratatui = "0.30"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+semver = "1.0"
 tempfile = "3.20"
 vt100 = "0.16"
 

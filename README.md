@@ -1,10 +1,62 @@
 # Agent Bridge
 
-로컬에 설치되고 로그인된 퍼스트파티 `codex`, `claude`, `agy` CLI를 하나의 터미널에서 다루는 Rust TUI입니다. API 키나 중간 SaaS 없이 각 CLI를 실제 PTY에서 그대로 실행합니다.
+로컬에 설치되고 로그인된 공식 `codex`와 `claude` CLI를 **실제 iTerm 탭**에서 연결하는 로컬 브리지입니다. API 키나 세션 토큰을 대신 소유하지 않고, 각 CLI의 기존 로그인·설정·대화형 UI를 그대로 사용합니다.
 
-좌측 세션 레일에서 활성 CLI를 전환할 수 있고, 같은 CLI를 여러 번 열거나 서로 다른 CLI를 원하는 비율로 조합할 수 있습니다. 예를 들어 `Codex 1`, `Codex 2`, `Claude 1`을 동시에 실행할 수 있습니다.
+실행 중인 Codex나 Claude가 새 iTerm 탭을 열어 다른 공식 CLI에 작업을 맡기고 결과를 돌려받을 수 있습니다. 그 탭은 첫 응답 뒤에도 닫히지 않으므로 브리지가 후속 프롬프트를 보낼 수도 있고, 사용자가 직접 탭을 선택해 그대로 이어서 작업할 수도 있습니다.
 
-## 실행
+기존의 다중 PTY TUI는 호환 경로로 남아 있지만, 새 기본 사용 흐름은 `ask` / `tell` / `sessions` / `close-session`입니다.
+
+## 네이티브 iTerm 브리지
+
+현재 네이티브 브리지는 macOS + iTerm2를 대상으로 합니다. 먼저 바이너리를 빌드하고 PATH에 두거나 절대 경로로 실행합니다.
+
+```sh
+cargo build --release
+./target/release/agent-bridge ask claude \
+  --workspace ~/Dev/project \
+  --title "Claude reviewer" \
+  --prompt "이 변경을 검토하고 결과만 요약해줘"
+```
+
+`--workspace`를 생략하면 호출한 현재 디렉터리를 사용하고, `--title`을 생략하면 CLI 이름과 workspace 이름으로 탭 제목을 만듭니다.
+Codex 세션은 `--model <MODEL>`로 해당 요청에만 모델을 지정할 수 있습니다. Claude에는 이 옵션을 거부하며 전역 Codex 설정은 바꾸지 않습니다.
+
+`ask`는 다음 순서로 동작합니다.
+
+1. 절대 PATH 항목에서 `codex` 또는 `claude` 실행 파일을 찾아 canonical 절대 경로로 고정하고 최소 지원 버전을 확인합니다. PATH 자체는 사용자가 신뢰한 실행 환경으로 간주합니다.
+2. iTerm에 실제 탭을 만들고 지정한 workspace에서 공식 대화형 CLI를 실행합니다.
+3. Codex `notify` 또는 Claude `Stop` hook으로 첫 결과를 받아 호출자에게 반환합니다.
+4. CLI와 iTerm 탭은 그대로 유지합니다.
+
+기계 판독이 필요하면 `--json`을 사용합니다. 반환된 `session` id로 같은 탭에 다음 프롬프트를 실제 키 입력처럼 전달할 수 있습니다.
+
+```sh
+agent-bridge ask codex --workspace ~/Dev/project --model gpt-daybreak-blue-latest --prompt "원인을 진단해줘" --json
+agent-bridge tell session-XXXXXXXX --prompt "그중 2번만 수정해줘" --json
+agent-bridge sessions --json
+```
+
+호출자가 기다리지 않고 탭만 열려면 `--detach`를 붙입니다. 기본 결과 대기 시간은 900초이며 `--timeout-secs`로 조정합니다. 대기가 실패하거나 시간 초과되어도 이미 열린 탭은 닫지 않습니다.
+
+### 권한과 버전 정책
+
+- 새 자식 세션의 `--yolo`는 **해당 `ask` 요청에 명시된 경우에만** 전달합니다. 부모 Codex/Claude가 yolo로 실행 중이어도 자동 상속하지 않습니다.
+- `ask`와 `tell`로 주입하는 모든 프롬프트에는 호출한 브리지 세션의 provenance를 강제로 붙입니다. `tell`은 세션별 한 턴만 허용하고 bracketed paste로 전송하며, Enter·ESC 등 별도 터미널 동작을 만들 수 있는 제어문자는 거부합니다.
+- `agent-bridge ask codex ... --yolo`는 Codex의 `--dangerously-bypass-approvals-and-sandbox`, Claude에는 `--dangerously-skip-permissions`를 전달합니다.
+- 최소 지원 버전은 Codex `>= 0.147.0`, Claude `>= 2.1.229`입니다. 정확 버전 고정이 아니므로 더 새로운 버전도 허용합니다.
+- 브리지가 연 탭을 닫는 명령은 `agent-bridge close-session <session> --explicit`처럼 명시적 확인 플래그가 있어야 실행됩니다. 기록된 iTerm session id와 정확히 일치하는 세션만 대상으로 합니다.
+- 세션 메타데이터와 결과는 `~/.agent-bridge/native-sessions` 아래의 세션별 비공개 디렉터리에 저장합니다. 전역 Codex/Claude 설정은 수정하지 않습니다.
+- 최초 `ask` 프롬프트는 공식 CLI의 대화형 positional prompt로 전달되므로 실행 중 같은 머신의 프로세스 인자 검사에서 보일 수 있습니다. `tell` 프롬프트는 권한 `0600` 임시 파일을 iTerm 입력으로 전달하고 즉시 폐기하며, 사람이 읽는 결과 출력에서는 터미널 제어문자를 가시적인 문자열로 이스케이프합니다.
+
+```sh
+agent-bridge ask claude --workspace ~/Dev/project --prompt "테스트까지 실행해줘" --yolo
+agent-bridge close-session session-XXXXXXXX --explicit
+```
+
+> [!WARNING]
+> `--yolo`는 공식 CLI의 승인·sandbox 우회 플래그입니다. 브리지는 요청 단위의 명시 여부와 탭/경로 경계만 통제하며, yolo 세션 내부의 명령 실행을 다시 sandbox하지 않습니다.
+
+## 레거시 PTY TUI 실행
 
 ### Windows
 
@@ -58,7 +110,7 @@ workspace 선택과 `--yolo` 동작은 위 Windows 설명과 동일합니다.
 
 ## 설정 (선택)
 
-`~/.agent-bridge/agents.json`으로 내장 3개 CLI의 실행 명령·역할 표시·기본 추가 인자를 재정의할 수 있습니다. 파일이 없으면 기본값으로 동작하고, 파싱 실패나 알 수 없는 에이전트 이름이 있으면 파일 전체를 무시하고 기본값으로 기동하며 헤더에 사유를 표시합니다. 신규 에이전트 종류 추가는 아직 지원하지 않습니다.
+`~/.agent-bridge/agents.json`으로 내장 3개 CLI의 실행 명령·역할 표시·기본 추가 인자를 재정의할 수 있습니다. 파일이 없으면 기본값으로 동작하고, 파싱 실패나 알 수 없는 에이전트 이름이 있으면 파일 전체를 무시하고 기본값으로 기동하며 헤더에 사유를 표시합니다. 신규 에이전트 종류 추가는 아직 지원하지 않습니다. 승인·sandbox 우회 인자는 이 파일에서 기본 모드에 숨겨 넣을 수 없으며, 반드시 TUI 실행 시 `--yolo`를 명시해야 합니다.
 
 ```json
 {
@@ -69,7 +121,7 @@ workspace 선택과 `--yolo` 동작은 위 Windows 설명과 동일합니다.
 }
 ```
 
-## Visible delegation (에이전트 간 위임)
+## 레거시 TUI Visible delegation
 
 탭 안에서 도는 에이전트는 자신이 Agent Bridge 안에 있음을 env(`AGENT_BRIDGE_REQUESTS`, `AGENT_BRIDGE_TAB`)로 알 수 있고, 같은 바이너리의 서브커맨드로 **보이는 탭**에 다른 CLI를 열어 위임할 수 있습니다. 백그라운드 자식 프로세스 대신 사용자가 전 과정을 화면에서 관전합니다:
 
@@ -79,13 +131,14 @@ agent-bridge wait Reviewer --until finished --timeout-secs 900
 agent-bridge read Reviewer --lines 200        # 스크롤백 포함 최근 200줄
 agent-bridge prompt Reviewer --wait "테스트도 돌려줘"   # 제출+완료 대기 원자 결합
 agent-bridge list                             # 전체 탭: 제목·상태·에이전트·workspace
-agent-bridge close Reviewer
+agent-bridge close Reviewer --explicit
 ```
 
 모든 서브커맨드는 `--json`으로 기계 판독 출력을 지원합니다. TUI를 `agent-bridge --restore .`로 띄우면 저장된 레이아웃을 기동 즉시 복원합니다.
 
 - 주입되는 모든 프롬프트에는 `[Agent Bridge delegation · from <탭>]` provenance가 강제로 붙습니다.
-- 전송은 파일 스풀(요청/응답 JSON)로 이루어지며 1초 주기로 수거됩니다. 응답 파일은 스풀 디렉터리 내부로만 쓰입니다.
+- 전송은 프로세스마다 무작위로 독점 생성한 권한 `0700` 파일 스풀(요청/응답 JSON)로 이루어지며 1초 주기로 수거됩니다. 응답은 무작위 임시 일반 파일에서 원자적으로 교체하므로 고정 `.part` 심볼릭 링크를 따라가지 않습니다.
+- 레거시 `close`도 `--explicit`이 없으면 거부합니다. 지연 전송은 탭 제목뿐 아니라 세션 세대에도 묶여, 같은 제목으로 다시 연 탭에 이전 프롬프트가 전달되지 않습니다.
 - `open --prompt`는 CLI 기동을 고정 지연(약 2.5초)으로 기다린 뒤 주입합니다 — 단문 프롬프트를 권장하며, 정교한 제어는 `open` → `wait --until idle` → `prompt` 순서를 쓰세요.
 - 별도 스킬·지침 문서 없이도 `agent-bridge --help`가 서브커맨드·env 컨텍스트·상태 의미·왕복 예제를 담은 에이전트용 레퍼런스입니다 (서브커맨드 뒤 `--help`도 동일 출력). 에이전트 지침(CLAUDE.md/AGENTS.md)에는 "위임은 `agent-bridge open` 사용 — 자세한 건 `agent-bridge --help`" 한 줄이면 충분합니다.
 - **Agent Bridge 밖에서도 호출 가능**: TUI가 실행 중이면 `~/.agent-bridge/instance.json` 포인터를 통해 일반 터미널의 Claude/Codex도 같은 서브커맨드로 그 TUI 창에 탭을 만들 수 있습니다. TUI가 없으면 명확한 오류("no running Agent Bridge found")가 나며, TUI를 대신 띄워주지는 않습니다(보이는 탭 원칙). 포인터는 마지막에 뜬 인스턴스를 가리키고 정상 종료 시 정리됩니다.
@@ -126,4 +179,5 @@ F2 handoff는 source CLI의 현재 화면에 보이는 최근 응답과 대화 �
 
 - 인증과 세션은 각 퍼스트파티 CLI가 소유합니다.
 - Agent Bridge는 토큰을 읽거나 저장하지 않습니다.
+- 네이티브 브리지는 Codex와 Claude만 허용하며, 글로벌 설정을 수정하지 않고 세션별 hook/notify 인자만 사용합니다.
 - 기본 모드에서의 자동 승인, IDE, 웹 UI, 외부 오케스트레이션 서비스는 포함하지 않습니다. `--yolo` 모드는 Agent Bridge가 자체 승인 로직을 구현하지 않고 각 CLI의 공식 위험 플래그만 전달합니다.

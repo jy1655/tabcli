@@ -1,4 +1,7 @@
-use agent_bridge::{AgentId, TabSet, agents, handoff_text_from, session_title};
+use agent_bridge::{
+    AgentId, TabSet, agents, handoff_text_from, session_title, terminal_safe_text,
+    validate_terminal_input,
+};
 
 #[test]
 fn registry_uses_first_party_cli_commands() {
@@ -101,4 +104,25 @@ fn active_tab_can_be_replaced_in_place() {
 
     assert_eq!(tabs.replace_active("Codex new"), Some("Codex old"));
     assert_eq!(tabs.active(), Some(&"Codex new"));
+}
+
+#[test]
+fn terminal_input_rejects_submission_and_escape_controls() {
+    assert!(validate_terminal_input("line one\nline two\tindented", "prompt").is_ok());
+    for control in ['\0', '\r', '\u{1b}', '\u{7f}'] {
+        assert!(
+            validate_terminal_input(&format!("before{control}after"), "prompt").is_err(),
+            "accepted terminal control U+{:04X}",
+            u32::from(control)
+        );
+    }
+}
+
+#[test]
+fn terminal_output_renders_controls_as_visible_text() {
+    let escaped = terminal_safe_text("ok\u{1b}]52;clipboard\u{7}\nnext", true);
+
+    assert_eq!(escaped, "ok\\u{1b}]52;clipboard\\u{7}\nnext");
+    assert!(!escaped.contains('\u{1b}'));
+    assert!(!escaped.contains('\u{7}'));
 }
