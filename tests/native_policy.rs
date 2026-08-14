@@ -1,6 +1,7 @@
 use agent_bridge::{
     FirstPartyCli, cli_version_is_supported, confirm_explicit_close, provider_adapter,
-    provider_launch_args, provider_model_args, supported_clis,
+    provider_launch_args, provider_model_args, supported_clis, terminal_safe_text,
+    validate_terminal_input,
 };
 
 #[test]
@@ -128,4 +129,25 @@ fn claude_normalizes_only_the_observed_fable5_model_alias() {
             ["--model", "Fable5"]
         );
     }
+}
+
+#[test]
+fn terminal_input_rejects_submission_and_escape_controls() {
+    assert!(validate_terminal_input("line one\nline two\tindented", "prompt").is_ok());
+    for control in ['\0', '\r', '\u{1b}', '\u{7f}'] {
+        assert!(
+            validate_terminal_input(&format!("before{control}after"), "prompt").is_err(),
+            "accepted terminal control U+{:04X}",
+            u32::from(control)
+        );
+    }
+}
+
+#[test]
+fn terminal_output_renders_controls_as_visible_text() {
+    let escaped = terminal_safe_text("ok\u{1b}]52;clipboard\u{7}\nnext", true);
+
+    assert_eq!(escaped, "ok\\u{1b}]52;clipboard\\u{7}\nnext");
+    assert!(!escaped.contains('\u{1b}'));
+    assert!(!escaped.contains('\u{7}'));
 }

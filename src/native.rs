@@ -2767,9 +2767,7 @@ fn session_accepts_prompt(state: &str) -> bool {
 }
 
 fn delegation_source() -> String {
-    std::env::var("AGENT_BRIDGE_NATIVE_SESSION_ID")
-        .or_else(|_| std::env::var("AGENT_BRIDGE_TAB"))
-        .unwrap_or_else(|_| "external".to_owned())
+    std::env::var("AGENT_BRIDGE_NATIVE_SESSION_ID").unwrap_or_else(|_| "external".to_owned())
 }
 
 fn native_delegation_prompt(source: &str, prompt: &str) -> String {
