@@ -112,12 +112,12 @@ agent-bridge --help | --version
 
 ```text
 src/providers/                 공통 provider 정책: 명령, 버전, model/effort/yolo 인자
-src/native/provider/          provider별 실행 준비와 결과 회수 계약
+src/native/provider/          provider별 실행 인자와 완료 monitor 선택
 src/native/terminal/          OS·터미널별 visible session transport
-src/native.rs                 세션 상태, lifecycle, 명령 orchestration
+src/native.rs                 세션 상태, lifecycle, 명령 및 현재 결과 monitor orchestration
 ```
 
-새 CLI를 추가할 때는 provider registry와 두 provider adapter를 추가하고, model/effort/권한 및 실제 결과 회수 계약을 각각 테스트합니다. 새 OS나 터미널을 추가할 때는 provider adapter를 바꾸지 않고 `src/native/terminal/`에 transport를 추가합니다. 공통화가 플랫폼의 native 동작을 약화한다면 플랫폼별 구현을 우선합니다.
+새 CLI를 추가할 때는 provider registry와 두 provider adapter를 추가하고, model/effort/권한 및 실제 결과 회수 계약을 각각 테스트합니다. 새 OS나 터미널은 provider adapter를 재사용하면서 `src/native/terminal/`에 transport를 추가합니다. 다만 현재 iTerm2 terminal record와 POSIX launch command 조립 일부는 `src/native.rs`에 남아 있으므로, Windows/Linux 구현에서는 [Issue #6](https://github.com/jy1655/agent-bridge/issues/6)의 transport-neutral session 계약으로 함께 분리해야 합니다. 공통화가 플랫폼의 native 동작을 약화한다면 플랫폼별 구현을 우선합니다.
 
 ## 0.2.0 마이그레이션
 
