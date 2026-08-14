@@ -60,6 +60,37 @@ fn run_native_adapter_smoke(provider: &str) {
         .as_str()
         .expect("native ask response is missing its session id");
 
+    let follow_up_marker = format!("{marker}_FOLLOW_UP");
+    let follow_up_prompt =
+        format!("Reply with exactly this marker and nothing else: {follow_up_marker}");
+    let tell_output = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        .args([
+            "tell",
+            session,
+            "--timeout-secs",
+            "300",
+            "--prompt",
+            &follow_up_prompt,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        tell_output.status.success(),
+        "native {provider} follow-up failed: {}",
+        String::from_utf8_lossy(&tell_output.stderr)
+    );
+    print!("{}", String::from_utf8_lossy(&tell_output.stdout));
+    let tell_response: serde_json::Value = serde_json::from_slice(&tell_output.stdout).unwrap();
+    assert_eq!(tell_response["session"], session);
+    assert!(
+        tell_response["result"]
+            .as_str()
+            .is_some_and(|result| result.contains(&follow_up_marker)),
+        "unexpected native {provider} follow-up result: {}",
+        String::from_utf8_lossy(&tell_output.stdout)
+    );
+
     let close_output = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
         .args(["close-session", session, "--explicit", "--json"])
         .output()

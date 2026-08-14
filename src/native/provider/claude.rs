@@ -32,10 +32,8 @@ pub(super) fn hook_settings(executable: &Path) -> serde_json::Value {
             "Stop": [{
                 "hooks": [{
                     "type": "command",
-                    "command": format!(
-                        "{} native-hook claude",
-                        super::super::shell_quote(executable.as_os_str())
-                    ),
+                    "command": executable,
+                    "args": ["native-hook", "claude"],
                     "timeout": 10
                 }]
             }]

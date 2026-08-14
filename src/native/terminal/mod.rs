@@ -84,6 +84,14 @@ pub(super) struct TerminalSession {
     pub(super) window_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) managed_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) windows_process_identity: Option<WindowsProcessIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct WindowsProcessIdentity {
+    pub(super) creation_time: u64,
+    pub(super) executable_path: String,
 }
 
 impl TerminalSession {
@@ -123,8 +131,36 @@ pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
 }
 
 #[cfg(target_os = "windows")]
-pub(super) fn windows_console_control(action: &str, pid: u32, input: Option<&str>) -> Result<()> {
-    windows::console_control(action, pid, input)
+pub(super) fn windows_console_control(
+    action: &str,
+    session: &TerminalSession,
+    input_path: Option<&Path>,
+    submit_count: usize,
+) -> Result<()> {
+    windows::console_control(action, session, input_path, submit_count)
+}
+
+#[cfg(target_os = "windows")]
+pub(super) fn windows_powershell_executable() -> Result<std::path::PathBuf> {
+    windows::powershell_executable()
+}
+
+#[cfg(windows)]
+pub(super) fn windows_set_private_permissions(path: &Path, directory: bool) -> Result<()> {
+    windows::set_private_permissions(path, directory)
+}
+
+#[cfg(windows)]
+pub(super) fn windows_process_identity(pid: u32) -> Result<WindowsProcessIdentity> {
+    windows::query_process_identity(pid)
+}
+
+#[cfg(windows)]
+pub(super) fn verify_windows_process_identity(
+    pid: u32,
+    identity: &WindowsProcessIdentity,
+) -> Result<()> {
+    windows::verify_process_identity(pid, identity.creation_time, &identity.executable_path)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -271,6 +307,7 @@ mod tests {
             tab_id: Some("tab-id".to_owned()),
             window_id: Some("window-id".to_owned()),
             managed_session_id: None,
+            windows_process_identity: None,
         };
         assert_eq!(
             serde_json::to_value(&ghostty).unwrap(),

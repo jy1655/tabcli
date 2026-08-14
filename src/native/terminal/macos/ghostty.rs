@@ -329,6 +329,7 @@ where
         tab_id: Some(surface.tab_id),
         window_id: Some(surface.window_id),
         managed_session_id: None,
+        windows_process_identity: None,
     })
 }
 

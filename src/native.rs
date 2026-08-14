@@ -2,6 +2,7 @@
 mod tests {
     use super::*;
     use agent_bridge::FirstPartyCli;
+    use std::process::Command;
 
     #[test]
     fn ask_yolo_is_false_unless_the_child_request_contains_the_flag() {
@@ -315,6 +316,7 @@ mod tests {
                 tab_id: None,
                 window_id: None,
                 managed_session_id: None,
+                windows_process_identity: None,
             },
         )
         .unwrap();
@@ -353,6 +355,7 @@ mod tests {
                 tab_id: None,
                 window_id: None,
                 managed_session_id: None,
+                windows_process_identity: None,
             },
         )
         .unwrap();
@@ -386,6 +389,7 @@ mod tests {
                 tab_id: Some("ghostty-tab".to_owned()),
                 window_id: Some("ghostty-window".to_owned()),
                 managed_session_id: None,
+                windows_process_identity: None,
             },
         )
         .unwrap();
@@ -413,6 +417,7 @@ mod tests {
                 tab_id: None,
                 window_id: None,
                 managed_session_id: None,
+                windows_process_identity: None,
             },
         )
         .unwrap();
@@ -709,17 +714,18 @@ mod tests {
     fn claude_settings_capture_only_stop_for_the_native_session() {
         let settings =
             provider::claude_hook_settings(Path::new("/opt/Agent Bridge/bin/agent-bridge"));
-        let command = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap();
-
         assert_eq!(
-            command,
-            "'/opt/Agent Bridge/bin/agent-bridge' native-hook claude"
+            settings["hooks"]["Stop"][0]["hooks"][0]["command"],
+            "/opt/Agent Bridge/bin/agent-bridge"
+        );
+        assert_eq!(
+            settings["hooks"]["Stop"][0]["hooks"][0]["args"],
+            serde_json::json!(["native-hook", "claude"])
         );
         assert!(settings["hooks"]["PermissionRequest"].is_null());
     }
 
+    #[cfg(unix)]
     #[test]
     fn shell_quoting_handles_apostrophes_without_executing_them() {
         assert_eq!(
@@ -742,14 +748,15 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_provider_resolution_skips_extensionless_npm_shell_shims() {
+    fn windows_provider_resolution_prefers_powershell_npm_shims_over_batch() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("codex"), b"#!/bin/sh\n").unwrap();
         fs::write(directory.path().join("codex.cmd"), b"@echo off\r\n").unwrap();
+        fs::write(directory.path().join("codex.ps1"), b"#!/usr/bin/env pwsh\n").unwrap();
         let path = std::env::join_paths([directory.path()]).unwrap();
         assert_eq!(
             resolve_provider_from_path(FirstPartyCli::Codex, &path).unwrap(),
-            directory.path().join("codex.cmd").canonicalize().unwrap()
+            directory.path().join("codex.ps1").canonicalize().unwrap()
         );
     }
 
@@ -784,13 +791,59 @@ mod tests {
             vec![OsString::from("--config"), OsString::from("a&b")],
         )
         .unwrap();
-        assert_eq!(command.get_program(), "pwsh.exe");
+        assert!(Path::new(command.get_program()).is_absolute());
+        assert_eq!(
+            Path::new(command.get_program()).file_name().unwrap(),
+            "pwsh.exe"
+        );
         let args = command.get_args().collect::<Vec<_>>();
         assert_eq!(args[0], "-NoLogo");
         assert_eq!(args[1], "-NoProfile");
         assert_eq!(args[2], "-File");
         assert_eq!(args[4], r"C:\npm\codex.cmd");
         assert_eq!(args[6], "a&b");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_batch_providers_fail_closed_on_percent_expansion() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = provider_process_command(
+            Path::new(r"C:\npm\codex.cmd"),
+            directory.path(),
+            vec![OsString::from("prompt %SECRET_ENV%")],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot contain '%'"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_console_helper_accepts_only_managed_session_identity() {
+        assert!(matches!(
+            parse_args([
+                "native-console-control",
+                "send",
+                "session-owner123",
+                "pending-prompt-1.txt",
+            ])
+            .unwrap(),
+            NativeCommand::ConsoleControl {
+                action,
+                id,
+                input_name: Some(input_name),
+            } if action == "send" && id == "session-owner123" && input_name == "pending-prompt-1.txt"
+        ));
+        assert!(parse_args(["native-console-control", "close", "1234"]).is_err());
+        assert!(
+            parse_args([
+                "native-console-control",
+                "send",
+                "session-owner123",
+                "..\\outside.txt",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -931,6 +984,7 @@ mod tests {
                 tab_id: None,
                 window_id: Some("1001".to_owned()),
                 managed_session_id: Some("session-owner123".to_owned()),
+                windows_process_identity: None,
             },
         )
         .unwrap();
@@ -940,6 +994,7 @@ mod tests {
                 pid: owner_pid,
                 managed_session_id: Some("session-owner123".to_owned()),
                 terminal_tty: Some("/dev/ttys999".to_owned()),
+                windows_process_identity: test_windows_process_identity(owner_pid),
                 ..NativeSessionOwner::default()
             },
         )
@@ -1009,6 +1064,7 @@ mod tests {
             &directory.path().join(SESSION_OWNER_FILE),
             &NativeSessionOwner {
                 pid: std::process::id(),
+                windows_process_identity: test_windows_process_identity(std::process::id()),
                 ..NativeSessionOwner::default()
             },
         )
@@ -1018,6 +1074,16 @@ mod tests {
         assert!(directory.path().join(TURN_CLAIM_FILE).exists());
         let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
         assert_eq!(status.state, "working");
+    }
+
+    #[cfg(windows)]
+    fn test_windows_process_identity(pid: u32) -> Option<terminal::WindowsProcessIdentity> {
+        terminal::windows_process_identity(pid).ok()
+    }
+
+    #[cfg(not(windows))]
+    fn test_windows_process_identity(_pid: u32) -> Option<terminal::WindowsProcessIdentity> {
+        None
     }
 
     #[test]
@@ -1065,6 +1131,7 @@ mod tests {
             terminal_tty_device: Some(7),
             process_start_seconds: Some(100),
             process_start_microseconds: Some(200),
+            windows_process_identity: None,
         };
         let live = NativeProcessIdentity {
             pid: 4242,
@@ -1082,6 +1149,7 @@ mod tests {
             terminal_tty_device: None,
             process_start_seconds: None,
             process_start_microseconds: None,
+            windows_process_identity: None,
         };
         assert!(
             verify_terminal_owner_attestation(
@@ -1503,7 +1571,12 @@ mod tests {
     }
 }
 mod provider;
+mod provider_process;
 mod terminal;
+
+use provider_process::{
+    command as provider_process_command, version_command as provider_version_command,
+};
 
 use std::{
     collections::VecDeque,
@@ -1511,7 +1584,6 @@ use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::Command,
     str::FromStr,
     sync::{
         Arc,
@@ -1521,10 +1593,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(not(windows))]
+use agent_bridge::process_is_alive;
 use agent_bridge::{
     FirstPartyCli, checked_deadline_from, cli_version_is_supported, confirm_explicit_close,
-    process_is_alive, provider_effort_args, provider_launch_args, provider_model_args,
-    terminal_safe_text, validate_terminal_input,
+    provider_effort_args, provider_launch_args, provider_model_args, terminal_safe_text,
+    validate_terminal_input,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -1558,8 +1632,8 @@ pub(crate) enum NativeCommand {
     },
     ConsoleControl {
         action: String,
-        pid: u32,
-        input: Option<String>,
+        id: String,
+        input_name: Option<String>,
     },
 }
 
@@ -1650,6 +1724,8 @@ struct NativeSessionOwner {
     process_start_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     process_start_microseconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    windows_process_identity: Option<terminal::WindowsProcessIdentity>,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -1753,21 +1829,22 @@ where
         }
         "native-hook" => parse_hook(rest),
         "native-console-control" => {
-            let [action, pid, tail @ ..] = rest else {
-                bail!("native-console-control requires an action and process id");
+            let [action, id, tail @ ..] = rest else {
+                bail!("native-console-control requires an action and managed session id");
             };
+            require_valid_session_id(id)?;
             if !matches!(action.as_str(), "send" | "close") {
                 bail!("unsupported native console action: {action}");
             }
-            let input = match (action.as_str(), tail) {
-                ("send", [input]) => Some(input.clone()),
+            let input_name = match (action.as_str(), tail) {
+                ("send", [input]) if valid_pending_prompt_name(input) => Some(input.clone()),
                 ("close", []) => None,
                 _ => bail!("invalid native console control arguments"),
             };
             Ok(NativeCommand::ConsoleControl {
                 action: action.clone(),
-                pid: pid.parse().context("invalid native console process id")?,
-                input,
+                id: id.clone(),
+                input_name,
             })
         }
         _ => bail!("unknown native command: {command}"),
@@ -2007,10 +2084,44 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
         NativeCommand::Close(request) => run_close(request),
         NativeCommand::RunSession { id } => run_session(&id),
         NativeCommand::Hook { provider, payload } => run_hook(provider, payload.as_deref()),
-        NativeCommand::ConsoleControl { action, pid, input } => {
-            terminal::windows_console_control(&action, pid, input.as_deref())
-        }
+        NativeCommand::ConsoleControl {
+            action,
+            id,
+            input_name,
+        } => run_windows_console_control(&action, &id, input_name.as_deref()),
     }
+}
+
+fn valid_pending_prompt_name(value: &str) -> bool {
+    value.starts_with("pending-prompt-")
+        && value.ends_with(".txt")
+        && value.len() <= 128
+        && Path::new(value).file_name().and_then(|name| name.to_str()) == Some(value)
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_console_control(action: &str, id: &str, input_name: Option<&str>) -> Result<()> {
+    let directory = session_directory(id)?;
+    let manifest = read_manifest(&directory)?;
+    let handle_name = if action == "close" && directory.join(TERMINAL_CLOSING_FILE).is_file() {
+        TERMINAL_CLOSING_FILE
+    } else {
+        TERMINAL_HANDLE_FILE
+    };
+    let session: terminal::TerminalSession = read_json(&directory.join(handle_name))?;
+    if session.kind != terminal::TerminalKind::WindowsConsole {
+        bail!("managed session is not owned by the Windows console transport");
+    }
+    verify_terminal_surface_ownership(&directory, id, &session)?;
+    let input_path = input_name.map(|name| directory.join(name));
+    let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
+    let submit_count = usize::from(provider == FirstPartyCli::Codex) + 1;
+    terminal::windows_console_control(action, &session, input_path.as_deref(), submit_count)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_windows_console_control(_action: &str, _id: &str, _input_name: Option<&str>) -> Result<()> {
+    bail!("native Windows console control is only available on Windows")
 }
 
 fn run_ask(request: AskRequest) -> Result<()> {
@@ -2206,10 +2317,22 @@ fn current_native_session_owner(session_id: &str) -> Result<NativeSessionOwner> 
         terminal_tty_device: Some(terminal_tty_device),
         process_start_seconds: Some(live.process_start_seconds),
         process_start_microseconds: Some(live.process_start_microseconds),
+        windows_process_identity: None,
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+fn current_native_session_owner(session_id: &str) -> Result<NativeSessionOwner> {
+    let pid = std::process::id();
+    Ok(NativeSessionOwner {
+        pid,
+        managed_session_id: Some(session_id.to_owned()),
+        windows_process_identity: Some(terminal::windows_process_identity(pid)?),
+        ..NativeSessionOwner::default()
+    })
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn current_native_session_owner(session_id: &str) -> Result<NativeSessionOwner> {
     Ok(NativeSessionOwner {
         pid: std::process::id(),
@@ -2659,45 +2782,6 @@ fn run_session_inner(directory: &Path) -> Result<()> {
         bail!("{} exited with {status}", provider.as_str());
     }
     Ok(())
-}
-
-fn provider_process_command(
-    executable: &Path,
-    directory: &Path,
-    arguments: Vec<OsString>,
-) -> Result<Command> {
-    #[cfg(windows)]
-    if executable
-        .extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|value| value.eq_ignore_ascii_case("cmd") || value.eq_ignore_ascii_case("bat"))
-    {
-        const FORWARDER: &str = "param(\n  [Parameter(Mandatory=$true)][string]$Provider,\n  [Parameter(ValueFromRemainingArguments=$true)][string[]]$ProviderArgs\n)\n& $Provider @ProviderArgs\nexit $LASTEXITCODE\n";
-        let forwarder = directory.join("provider-launch.ps1");
-        write_private(&forwarder, FORWARDER.as_bytes())?;
-        let mut command = Command::new("pwsh.exe");
-        command.args(["-NoLogo", "-NoProfile", "-File"]);
-        command
-            .arg(forwarder)
-            .arg(windows_command_path(executable))
-            .args(arguments);
-        return Ok(command);
-    }
-
-    let mut command = Command::new(executable);
-    command.args(arguments);
-    Ok(command)
-}
-
-#[cfg(windows)]
-fn windows_command_path(path: &Path) -> OsString {
-    let value = path.as_os_str().to_string_lossy();
-    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
-        return OsString::from(format!(r"\\{rest}"));
-    }
-    value
-        .strip_prefix(r"\\?\")
-        .map_or_else(|| path.as_os_str().to_owned(), OsString::from)
 }
 
 fn run_hook(provider: FirstPartyCli, argument_payload: Option<&str>) -> Result<()> {
@@ -3568,15 +3652,33 @@ fn repair_dead_native_owner(directory: &Path) -> Result<bool> {
             return Err(error).with_context(|| format!("failed to read {}", owner_path.display()));
         }
     };
+    #[cfg(windows)]
+    if let Some(identity) = &owner.windows_process_identity
+        && terminal::verify_windows_process_identity(owner.pid, identity).is_ok()
+    {
+        return Ok(false);
+    }
+    #[cfg(not(windows))]
     if process_is_alive(owner.pid) {
         return Ok(false);
     }
+    #[cfg(windows)]
+    if let Ok(session) =
+        read_json::<terminal::TerminalSession>(&directory.join(TERMINAL_HANDLE_FILE))
+        && session.kind == terminal::TerminalKind::WindowsConsole
+    {
+        // The visible console root can outlive a failed native-session owner.
+        // Close the identity-bound surface before consuming its only handle.
+        let _ = terminal::close_session(&session);
+    }
     mark_session_closed(
         directory,
-        Some(format!(
-            "native session process {} is no longer running",
-            owner.pid
-        )),
+        status.error.or_else(|| {
+            Some(format!(
+                "native session process {} is no longer running",
+                owner.pid
+            ))
+        }),
     )?;
     Ok(true)
 }
@@ -3660,6 +3762,7 @@ fn resolve_provider_from_path(provider: FirstPartyCli, path: &std::ffi::OsStr) -
         #[cfg(windows)]
         let names = [
             format!("{}.exe", provider.command()),
+            format!("{}.ps1", provider.command()),
             format!("{}.cmd", provider.command()),
             format!("{}.bat", provider.command()),
         ];
@@ -3687,7 +3790,8 @@ fn resolve_provider_from_path(provider: FirstPartyCli, path: &std::ffi::OsStr) -
 }
 
 fn check_provider_version(provider: FirstPartyCli, executable: &Path) -> Result<String> {
-    let output = Command::new(executable)
+    let mut command = provider_version_command(executable)?;
+    let output = command
         .arg("--version")
         .output()
         .with_context(|| format!("failed to query {} --version", executable.display()))?;
@@ -3725,6 +3829,7 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
+#[cfg(unix)]
 fn shell_quote(value: &std::ffi::OsStr) -> String {
     let value = value.to_string_lossy();
     format!("'{}'", value.replace('\'', "'\"'\"'"))
@@ -3861,9 +3966,9 @@ fn set_private_directory_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn set_private_directory_permissions(_path: &Path) -> Result<()> {
-    Ok(())
+#[cfg(windows)]
+fn set_private_directory_permissions(path: &Path) -> Result<()> {
+    terminal::windows_set_private_permissions(path, true)
 }
 
 #[cfg(unix)]
@@ -3873,7 +3978,23 @@ fn set_private_file_permissions(file: &fs::File) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn set_private_file_permissions(_file: &fs::File) -> Result<()> {
-    Ok(())
+#[cfg(windows)]
+fn set_private_file_permissions(file: &fs::File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+
+    let mut path = vec![0u16; 32768];
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            path.as_mut_ptr(),
+            path.len() as u32,
+            0,
+        )
+    };
+    if length == 0 || length as usize >= path.len() {
+        return Err(std::io::Error::last_os_error()).context("failed to resolve private file path");
+    }
+    path.truncate(length as usize);
+    terminal::windows_set_private_permissions(&PathBuf::from(String::from_utf16(&path)?), false)
 }
