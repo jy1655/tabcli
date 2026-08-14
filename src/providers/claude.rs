@@ -1,0 +1,30 @@
+use super::{FirstPartyCli, ProviderAdapter};
+use anyhow::Result;
+use semver::Version;
+
+pub(super) static ADAPTER: ClaudeAdapter = ClaudeAdapter;
+pub(super) const COMMAND: &str = "claude";
+
+pub(super) struct ClaudeAdapter;
+
+impl ProviderAdapter for ClaudeAdapter {
+    fn cli(&self) -> FirstPartyCli {
+        FirstPartyCli::Claude
+    }
+
+    fn command(&self) -> &'static str {
+        COMMAND
+    }
+
+    fn minimum_version(&self) -> Version {
+        Version::new(2, 1, 229)
+    }
+
+    fn yolo_args(&self) -> &'static [&'static str] {
+        &["--dangerously-skip-permissions"]
+    }
+
+    fn effort_args(&self, effort: &str) -> Result<Vec<String>> {
+        Ok(vec!["--effort".to_owned(), effort.to_owned()])
+    }
+}

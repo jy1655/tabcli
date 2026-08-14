@@ -6,6 +6,14 @@
 
 기존의 다중 PTY TUI는 호환 경로로 남아 있지만, 새 기본 사용 흐름은 `ask` / `tell` / `sessions` / `close-session`입니다.
 
+## 지원 경계와 확장 원칙
+
+- Agent Bridge가 `ask` 또는 향후 제공할 opt-in command shim을 통해 **시작부터 관리한 세션**만 제어합니다. 이미 독립적으로 실행된 임의 프로세스에 사후 attach하는 기능은 현재 범위에 포함하지 않습니다.
+- 의미를 이해하고 결과 완료 계약까지 제공하는 CLI는 Codex, Claude, Agy, Pi 네 가지입니다. 임의 CLI의 화면을 추측해 의미를 해석하지 않습니다.
+- 공통 provider 정책은 `src/providers/`의 CLI별 adapter가 소유하고, 현재 네이티브 실행·완료 감지 준비는 `src/native/provider/`의 CLI별 adapter가 소유합니다. 새 CLI는 기존 provider의 조건문에 기능을 덧붙이는 대신 자체 adapter와 검증을 추가합니다.
+- OS 간에는 provider와 session 상태 계약만 공유합니다. 터미널 생성·입력·종료 transport는 플랫폼별로 최적화하며 하나의 PTY 구현을 강제하지 않습니다. macOS + iTerm2는 기존 AppleScript 직접 제어를 유지하고, Windows와 Linux 확장 시에는 각 플랫폼에 맞는 별도 transport를 구현합니다.
+- PTY/ConPTY가 필요한 플랫폼에서도 그것은 보이지 않는 입출력 transport일 뿐이며, 여러 내부 터미널을 그리는 레거시 PTY TUI를 새 기본 흐름으로 되돌리지 않습니다.
+
 ## 네이티브 iTerm 브리지
 
 현재 네이티브 브리지는 macOS + iTerm2를 대상으로 합니다. 먼저 바이너리를 빌드하고 PATH에 두거나 절대 경로로 실행합니다.

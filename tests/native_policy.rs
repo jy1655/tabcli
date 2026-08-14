@@ -1,5 +1,6 @@
 use agent_bridge::{
-    FirstPartyCli, cli_version_is_supported, confirm_explicit_close, provider_launch_args,
+    FirstPartyCli, cli_version_is_supported, confirm_explicit_close, provider_adapter,
+    provider_launch_args, supported_clis,
 };
 
 #[test]
@@ -56,4 +57,52 @@ fn the_native_bridge_accepts_each_supported_visible_cli() {
     assert_eq!("agy".parse(), Ok(FirstPartyCli::Agy));
     assert_eq!("pi".parse(), Ok(FirstPartyCli::Pi));
     assert!("unknown".parse::<FirstPartyCli>().is_err());
+}
+
+#[test]
+fn supported_clis_are_backed_by_one_complete_adapter_registry() {
+    assert_eq!(
+        supported_clis(),
+        &[
+            FirstPartyCli::Codex,
+            FirstPartyCli::Claude,
+            FirstPartyCli::Agy,
+            FirstPartyCli::Pi,
+        ]
+    );
+
+    for &cli in supported_clis() {
+        let adapter = provider_adapter(cli);
+        assert_eq!(adapter.cli(), cli);
+        assert_eq!(adapter.command(), cli.as_str());
+        assert_eq!(adapter.minimum_version(), cli.minimum_version());
+    }
+}
+
+#[test]
+fn each_provider_adapter_owns_its_native_effort_policy() {
+    assert_eq!(
+        provider_adapter(FirstPartyCli::Codex)
+            .effort_args("xhigh")
+            .unwrap(),
+        ["-c", "model_reasoning_effort=\"xhigh\""]
+    );
+    assert_eq!(
+        provider_adapter(FirstPartyCli::Claude)
+            .effort_args("max")
+            .unwrap(),
+        ["--effort", "max"]
+    );
+    assert_eq!(
+        provider_adapter(FirstPartyCli::Agy)
+            .effort_args("high")
+            .unwrap(),
+        ["--effort", "high"]
+    );
+    assert_eq!(
+        provider_adapter(FirstPartyCli::Pi)
+            .effort_args("minimal")
+            .unwrap(),
+        ["--thinking", "minimal"]
+    );
 }

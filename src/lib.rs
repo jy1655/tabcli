@@ -1,9 +1,10 @@
 use anyhow::{Result, bail};
 use semver::Version;
-use std::{
-    str::FromStr,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
+
+pub mod providers;
+
+pub use providers::{FirstPartyCli, ProviderAdapter, provider_adapter, supported_clis};
 
 #[cfg(unix)]
 pub fn process_is_alive(pid: u32) -> bool {
@@ -78,54 +79,6 @@ pub fn terminal_safe_text(value: &str, multiline: bool) -> String {
     safe
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FirstPartyCli {
-    Codex,
-    Claude,
-    Agy,
-    Pi,
-}
-
-impl FirstPartyCli {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Claude => "claude",
-            Self::Agy => "agy",
-            Self::Pi => "pi",
-        }
-    }
-
-    pub const fn command(self) -> &'static str {
-        self.as_str()
-    }
-
-    pub fn minimum_version(self) -> Version {
-        match self {
-            Self::Codex => Version::new(0, 147, 0),
-            Self::Claude => Version::new(2, 1, 229),
-            Self::Agy => Version::new(1, 1, 12),
-            Self::Pi => Version::new(0, 84, 1),
-        }
-    }
-}
-
-impl FromStr for FirstPartyCli {
-    type Err = String;
-
-    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-        match value {
-            "codex" => Ok(Self::Codex),
-            "claude" => Ok(Self::Claude),
-            "agy" => Ok(Self::Agy),
-            "pi" => Ok(Self::Pi),
-            _ => Err(format!(
-                "unsupported CLI {value:?}; expected codex, claude, agy, or pi"
-            )),
-        }
-    }
-}
-
 pub fn cli_version_is_supported(cli: FirstPartyCli, output: &str) -> Result<bool> {
     let installed = output
         .split_whitespace()
@@ -149,12 +102,11 @@ pub fn provider_launch_args(cli: FirstPartyCli, yolo: bool) -> Vec<&'static str>
         return Vec::new();
     }
 
-    match cli {
-        FirstPartyCli::Codex => vec!["--dangerously-bypass-approvals-and-sandbox"],
-        FirstPartyCli::Claude => vec!["--dangerously-skip-permissions"],
-        FirstPartyCli::Agy => vec!["--dangerously-skip-permissions"],
-        FirstPartyCli::Pi => Vec::new(),
-    }
+    provider_adapter(cli).yolo_args().to_vec()
+}
+
+pub fn provider_effort_args(cli: FirstPartyCli, effort: &str) -> Result<Vec<String>> {
+    provider_adapter(cli).effort_args(effort)
 }
 
 pub fn confirm_explicit_close(explicit: bool) -> Result<()> {

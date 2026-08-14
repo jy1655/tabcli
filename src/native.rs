@@ -337,25 +337,25 @@ mod tests {
 
     #[test]
     fn iterm_script_keeps_dynamic_values_in_argv() {
-        assert!(!OPEN_ITERM_TAB_SCRIPT.contains("review this"));
-        assert!(OPEN_ITERM_TAB_SCRIPT.contains("item 1 of argv"));
-        assert!(OPEN_ITERM_TAB_SCRIPT.contains("write text bridgeCommand"));
+        assert!(!terminal::macos_iterm::OPEN_TAB_SCRIPT.contains("review this"));
+        assert!(terminal::macos_iterm::OPEN_TAB_SCRIPT.contains("item 1 of argv"));
+        assert!(terminal::macos_iterm::OPEN_TAB_SCRIPT.contains("write text bridgeCommand"));
     }
 
     #[test]
     fn iterm_follow_up_sends_an_explicit_carriage_return() {
-        assert!(SEND_ITERM_TEXT_SCRIPT.contains("ASCII character 13"));
-        assert!(SEND_ITERM_TEXT_SCRIPT.contains("newline NO"));
-        assert!(!SEND_ITERM_TEXT_SCRIPT.contains("write text \"\""));
+        assert!(terminal::macos_iterm::SEND_FILE_SCRIPT.contains("ASCII character 13"));
+        assert!(terminal::macos_iterm::SEND_FILE_SCRIPT.contains("newline NO"));
+        assert!(!terminal::macos_iterm::SEND_FILE_SCRIPT.contains("write text \"\""));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn iterm_applescripts_compile_without_opening_a_tab() {
         for script in [
-            OPEN_ITERM_TAB_SCRIPT,
-            SEND_ITERM_TEXT_SCRIPT,
-            CLOSE_ITERM_SESSION_SCRIPT,
+            terminal::macos_iterm::OPEN_TAB_SCRIPT,
+            terminal::macos_iterm::SEND_FILE_SCRIPT,
+            terminal::macos_iterm::CLOSE_SESSION_SCRIPT,
         ] {
             let directory = tempfile::tempdir().unwrap();
             let output = std::process::Command::new("/usr/bin/osacompile")
@@ -385,7 +385,8 @@ mod tests {
 
     #[test]
     fn claude_settings_capture_only_stop_for_the_native_session() {
-        let settings = claude_hook_settings(Path::new("/opt/Agent Bridge/bin/agent-bridge"));
+        let settings =
+            provider::claude_hook_settings(Path::new("/opt/Agent Bridge/bin/agent-bridge"));
         let command = settings["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
             .unwrap();
@@ -921,6 +922,9 @@ mod tests {
         assert_eq!(extension, pi_bridge_extension());
     }
 }
+mod provider;
+mod terminal;
+
 use std::{
     collections::VecDeque,
     ffi::OsString,
@@ -939,7 +943,8 @@ use std::{
 
 use agent_bridge::{
     FirstPartyCli, checked_deadline_from, cli_version_is_supported, confirm_explicit_close,
-    process_is_alive, provider_launch_args, terminal_safe_text, validate_terminal_input,
+    process_is_alive, provider_effort_args, provider_launch_args, terminal_safe_text,
+    validate_terminal_input,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -952,73 +957,6 @@ const TURN_CLAIM_FILE: &str = "turn.claim";
 const SESSION_OWNER_FILE: &str = "native-session.json";
 const CLOSED_STATUS_FILE: &str = "closed.json";
 const PI_HOOK_FAILURE_FILE: &str = "pi-hook-failure.json";
-
-pub(crate) const OPEN_ITERM_TAB_SCRIPT: &str = r#"
-on run argv
-    set bridgeCommand to item 1 of argv
-    set tabTitle to item 2 of argv
-    tell application "iTerm2"
-        activate
-        if (count of windows) is 0 then
-            set targetWindow to (create window with default profile)
-            set targetSession to current session of targetWindow
-        else
-            set targetWindow to current window
-            tell targetWindow
-                set targetTab to (create tab with default profile)
-                set targetSession to current session of targetTab
-            end tell
-        end if
-        tell targetSession
-            set name to tabTitle
-            write text bridgeCommand
-            return unique ID
-        end tell
-    end tell
-end run
-"#;
-
-const SEND_ITERM_TEXT_SCRIPT: &str = r#"
-on run argv
-    set wantedId to item 1 of argv
-    set promptPath to item 2 of argv
-    tell application "iTerm2"
-        repeat with targetWindow in windows
-            repeat with targetTab in tabs of targetWindow
-                repeat with targetSession in sessions of targetTab
-                    if unique ID of targetSession is wantedId then
-                        tell targetSession
-                            write contents of file promptPath
-                            write text (ASCII character 13) newline NO
-                        end tell
-                        return "sent"
-                    end if
-                end repeat
-            end repeat
-        end repeat
-    end tell
-    error "Agent Bridge iTerm session not found"
-end run
-"#;
-
-const CLOSE_ITERM_SESSION_SCRIPT: &str = r#"
-on run argv
-    set wantedId to item 1 of argv
-    tell application "iTerm2"
-        repeat with targetWindow in windows
-            repeat with targetTab in tabs of targetWindow
-                repeat with targetSession in sessions of targetTab
-                    if unique ID of targetSession is wantedId then
-                        close targetSession
-                        return "closed"
-                    end if
-                end repeat
-            end repeat
-        end repeat
-    end tell
-    return "missing"
-end run
-"#;
 
 #[derive(Debug)]
 pub(crate) enum NativeCommand {
@@ -1405,7 +1343,7 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
 }
 
 fn run_ask(request: AskRequest) -> Result<()> {
-    ensure_macos_iterm()?;
+    terminal::macos_iterm::ensure_available()?;
     let workspace = request.workspace.canonicalize().with_context(|| {
         format!(
             "workspace does not exist or cannot be resolved: {}",
@@ -1446,20 +1384,22 @@ fn run_ask(request: AskRequest) -> Result<()> {
         &executable,
         &created.id,
     )?;
-    let iterm_session_id = match open_iterm_tab(&bridge_command, &created.manifest.title) {
-        Ok(id) => id,
-        Err(error) => {
-            let _ = fs::remove_file(created.directory.join("initial-prompt.txt"));
-            let _ = update_status(
-                &created.directory,
-                "failed",
-                None,
-                Some(format!("{error:#}")),
-            );
-            return Err(error)
-                .with_context(|| format!("failed to open iTerm tab for session {}", created.id));
-        }
-    };
+    let iterm_session_id =
+        match terminal::macos_iterm::open_tab(&bridge_command, &created.manifest.title) {
+            Ok(id) => id,
+            Err(error) => {
+                let _ = fs::remove_file(created.directory.join("initial-prompt.txt"));
+                let _ = update_status(
+                    &created.directory,
+                    "failed",
+                    None,
+                    Some(format!("{error:#}")),
+                );
+                return Err(error).with_context(|| {
+                    format!("failed to open iTerm tab for session {}", created.id)
+                });
+            }
+        };
     write_json_atomic(
         &created.directory.join("terminal.json"),
         &TerminalRecord {
@@ -1493,7 +1433,7 @@ fn run_ask(request: AskRequest) -> Result<()> {
 }
 
 fn run_tell(request: TellRequest) -> Result<()> {
-    ensure_macos_iterm()?;
+    terminal::macos_iterm::ensure_available()?;
     let directory = session_directory(&request.id)?;
     repair_dead_native_owner(&directory)?;
     let claim = acquire_turn_claim(&directory)?;
@@ -1517,7 +1457,9 @@ fn run_tell(request: TellRequest) -> Result<()> {
     let prompt = native_delegation_prompt(&delegation_source(), &request.prompt);
     prompt_file.write_all(&terminal_paste_bytes(&prompt))?;
     prompt_file.flush()?;
-    if let Err(error) = send_iterm_file(&terminal.iterm_session_id, prompt_file.path()) {
+    if let Err(error) =
+        terminal::macos_iterm::send_file(&terminal.iterm_session_id, prompt_file.path())
+    {
         let _ = update_status(
             &directory,
             &previous_state,
@@ -1607,10 +1549,10 @@ fn run_sessions(json: bool) -> Result<()> {
 }
 
 fn run_close(request: CloseRequest) -> Result<()> {
-    ensure_macos_iterm()?;
+    terminal::macos_iterm::ensure_available()?;
     confirm_explicit_close(request.explicit)?;
     let directory = session_directory(&request.id)?;
-    close_session_state(&directory, close_iterm_session)
+    close_session_state(&directory, terminal::macos_iterm::close_session)
         .with_context(|| format!("failed to close visible iTerm session {}", request.id))?;
     if request.json {
         println!(
@@ -1722,60 +1664,35 @@ fn run_session_inner(directory: &Path) -> Result<()> {
         arguments.push(OsString::from("--model"));
         arguments.push(OsString::from(model));
     }
-    let mut prompt_is_positional = true;
-    let mut agy_log_path = None;
-    match provider {
-        FirstPartyCli::Codex => {
-            let notify = serde_json::to_string(&[
-                executable.to_string_lossy().as_ref(),
-                "native-hook",
-                "codex",
-            ])?;
-            arguments.push(OsString::from("-c"));
-            arguments.push(OsString::from(format!("notify={notify}")));
-            arguments.push(OsString::from("-C"));
-            arguments.push(manifest.workspace.as_os_str().to_owned());
-        }
-        FirstPartyCli::Claude => {
-            let settings_path = directory.join("claude-settings.json");
-            write_json_atomic(&settings_path, &claude_hook_settings(&executable))?;
-            arguments.push(OsString::from("--settings"));
-            arguments.push(settings_path.into_os_string());
-            arguments.push(OsString::from("--name"));
-            arguments.push(OsString::from(&manifest.title));
-        }
-        FirstPartyCli::Agy => {
-            let log_path = directory.join("agy.log");
-            arguments.push(OsString::from("--log-file"));
-            arguments.push(log_path.as_os_str().to_owned());
-            arguments.push(OsString::from("--prompt-interactive"));
-            arguments.push(OsString::from(prompt.as_str()));
-            prompt_is_positional = false;
-            agy_log_path = Some(log_path);
-        }
-        FirstPartyCli::Pi => {
-            let extension_path = directory.join("pi-agent-bridge.js");
-            write_private(&extension_path, pi_bridge_extension().as_bytes())?;
-            arguments.push(OsString::from("--extension"));
-            arguments.push(extension_path.into_os_string());
-            arguments.push(OsString::from("--name"));
-            arguments.push(OsString::from(&manifest.title));
-        }
-    }
+    let provider::LaunchPlan {
+        arguments: provider_arguments,
+        prompt_is_positional,
+        completion_monitor,
+    } = provider::prepare_launch(
+        provider,
+        provider::LaunchContext {
+            bridge_executable: &executable,
+            directory,
+            workspace: &manifest.workspace,
+            title: &manifest.title,
+            prompt: &prompt,
+        },
+    )?;
+    arguments.extend(provider_arguments);
     if prompt_is_positional {
         arguments.push(OsString::from(prompt));
     }
 
     update_status(directory, "running", None, None)?;
-    let agy_monitor = if let Some(log_path) = agy_log_path.as_ref() {
-        Some(AgyMonitor::start(directory, log_path, &agy_brain_root()?)?)
-    } else {
-        None
-    };
-    let pi_failure_monitor = if provider == FirstPartyCli::Pi {
-        Some(PiFailureMonitor::start(directory)?)
-    } else {
-        None
+    let (agy_monitor, pi_failure_monitor) = match completion_monitor {
+        provider::CompletionMonitor::Hook => (None, None),
+        provider::CompletionMonitor::AgyTranscript { log_path } => (
+            Some(AgyMonitor::start(directory, &log_path, &agy_brain_root()?)?),
+            None,
+        ),
+        provider::CompletionMonitor::PiHookFailure => {
+            (None, Some(PiFailureMonitor::start(directory)?))
+        }
     };
     let status = Command::new(&manifest.provider_path)
         .args(arguments)
@@ -1802,18 +1719,6 @@ fn run_session_inner(directory: &Path) -> Result<()> {
         bail!("{} exited with {status}", provider.as_str());
     }
     Ok(())
-}
-
-fn provider_effort_args(provider: FirstPartyCli, effort: &str) -> Result<Vec<String>> {
-    let (option, value) = match provider {
-        FirstPartyCli::Codex => (
-            "-c",
-            format!("model_reasoning_effort={}", serde_json::to_string(effort)?),
-        ),
-        FirstPartyCli::Claude | FirstPartyCli::Agy => ("--effort", effort.to_owned()),
-        FirstPartyCli::Pi => ("--thinking", effort.to_owned()),
-    };
-    Ok(vec![option.to_owned(), value])
 }
 
 fn run_hook(provider: FirstPartyCli, argument_payload: Option<&str>) -> Result<()> {
@@ -1909,20 +1814,6 @@ fn json_string(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
             .get(*key)
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
-    })
-}
-
-fn claude_hook_settings(executable: &Path) -> serde_json::Value {
-    serde_json::json!({
-        "hooks": {
-            "Stop": [{
-                "hooks": [{
-                    "type": "command",
-                    "command": format!("{} native-hook claude", shell_quote(executable.as_os_str())),
-                    "timeout": 10
-                }]
-            }]
-        }
     })
 }
 
@@ -2822,61 +2713,6 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable(path: &Path) -> bool {
     path.is_file()
-}
-
-fn ensure_macos_iterm() -> Result<()> {
-    if !cfg!(target_os = "macos") {
-        bail!("native visible sessions currently require macOS and iTerm2");
-    }
-    Ok(())
-}
-
-fn run_osascript(script: &str, arguments: &[&str]) -> Result<String> {
-    let output = Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(script)
-        .args(arguments)
-        .output()
-        .context("failed to execute /usr/bin/osascript")?;
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        bail!(
-            "iTerm2 automation failed: {}",
-            if error.is_empty() {
-                output.status.to_string()
-            } else {
-                error
-            }
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-fn open_iterm_tab(command: &str, title: &str) -> Result<String> {
-    let id = run_osascript(OPEN_ITERM_TAB_SCRIPT, &[command, title])?;
-    if id.is_empty() {
-        bail!("iTerm2 did not return a session id");
-    }
-    Ok(id)
-}
-
-fn send_iterm_file(iterm_session_id: &str, prompt_path: &Path) -> Result<()> {
-    let prompt_path = prompt_path
-        .to_str()
-        .context("prompt path is not valid UTF-8")?;
-    let response = run_osascript(SEND_ITERM_TEXT_SCRIPT, &[iterm_session_id, prompt_path])?;
-    if response != "sent" {
-        bail!("unexpected iTerm2 send response: {response:?}");
-    }
-    Ok(())
-}
-
-fn close_iterm_session(iterm_session_id: &str) -> Result<ItermCloseOutcome> {
-    match run_osascript(CLOSE_ITERM_SESSION_SCRIPT, &[iterm_session_id])?.as_str() {
-        "closed" => Ok(ItermCloseOutcome::Closed),
-        "missing" => Ok(ItermCloseOutcome::Missing),
-        response => bail!("unexpected iTerm2 close response: {response:?}"),
-    }
 }
 
 fn shell_quote(value: &std::ffi::OsStr) -> String {
