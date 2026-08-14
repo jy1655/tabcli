@@ -55,6 +55,41 @@ fn run_native_adapter_smoke(provider: &str) {
     );
     print!("{}", String::from_utf8_lossy(&output.stdout));
     let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let session = response["session"]
+        .as_str()
+        .expect("native ask response is missing its session id");
+
+    let close_output = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        .args(["close-session", session, "--explicit", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        close_output.status.success(),
+        "native {provider} close failed: {}",
+        String::from_utf8_lossy(&close_output.stderr)
+    );
+    print!("{}", String::from_utf8_lossy(&close_output.stdout));
+    let close_response: serde_json::Value = serde_json::from_slice(&close_output.stdout).unwrap();
+    assert_eq!(close_response["ok"], true);
+    assert_eq!(close_response["closed"], true);
+    assert_eq!(close_response["session"], session);
+
+    let sessions_output = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        .args(["sessions", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        sessions_output.status.success(),
+        "native sessions lookup failed after closing {session}: {}",
+        String::from_utf8_lossy(&sessions_output.stderr)
+    );
+    let sessions: serde_json::Value = serde_json::from_slice(&sessions_output.stdout).unwrap();
+    let closed_session = sessions
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["id"] == session))
+        .expect("closed native session is missing from the session registry");
+    assert_eq!(closed_session["state"], "closed");
+
     assert_eq!(response["provider"], provider);
     assert!(
         response["result"]
@@ -66,25 +101,25 @@ fn run_native_adapter_smoke(provider: &str) {
 }
 
 #[test]
-#[ignore = "manual live smoke: opens a real iTerm tab and requires authenticated Codex"]
-fn live_native_codex_forwards_flags_and_returns_result() {
+#[ignore = "manual live smoke: opens and closes a real iTerm tab and requires authenticated Codex"]
+fn live_native_codex_returns_result_and_closes_session() {
     run_native_adapter_smoke("codex");
 }
 
 #[test]
-#[ignore = "manual live smoke: opens a real iTerm tab and requires authenticated Claude"]
-fn live_native_claude_forwards_flags_and_returns_result() {
+#[ignore = "manual live smoke: opens and closes a real iTerm tab and requires authenticated Claude"]
+fn live_native_claude_returns_result_and_closes_session() {
     run_native_adapter_smoke("claude");
 }
 
 #[test]
-#[ignore = "manual live smoke: opens a real iTerm tab and requires authenticated Agy"]
-fn live_native_agy_forwards_flags_and_returns_result() {
+#[ignore = "manual live smoke: opens and closes a real iTerm tab and requires authenticated Agy"]
+fn live_native_agy_returns_result_and_closes_session() {
     run_native_adapter_smoke("agy");
 }
 
 #[test]
-#[ignore = "manual live smoke: opens a real iTerm tab and requires authenticated Pi"]
-fn live_native_pi_forwards_flags_and_returns_result() {
+#[ignore = "manual live smoke: opens and closes a real iTerm tab and requires authenticated Pi"]
+fn live_native_pi_returns_result_and_closes_session() {
     run_native_adapter_smoke("pi");
 }

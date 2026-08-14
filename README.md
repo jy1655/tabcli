@@ -139,13 +139,13 @@ cargo test --all-targets --all-features
 cargo build --release
 ```
 
-`tests/native_live.rs`의 ignored 테스트는 실제 iTerm2 탭과 로그인된 provider를 사용합니다. 한 번에 한 provider만 실행하고, 테스트가 남긴 탭은 확인 후 `close-session --explicit`로 닫습니다.
+`tests/native_live.rs`의 ignored 테스트는 실제 iTerm2 탭과 로그인된 provider를 사용합니다. 각 테스트는 `ask → result → close-session --explicit → closed 상태 조회`를 한 번에 검증하고 정상 경로에서 테스트 탭을 닫습니다. 종료 단계 자체가 실패하면 진단을 위해 탭이 남을 수 있으므로 `sessions`로 확인합니다.
 
 ```sh
 AGENT_BRIDGE_LIVE_CLAUDE_MODEL=Fable5 \
 AGENT_BRIDGE_LIVE_CLAUDE_EFFORT=max \
 cargo test --test native_live \
-  live_native_claude_forwards_flags_and_returns_result \
+  live_native_claude_returns_result_and_closes_session \
   -- --ignored --exact --nocapture
 ```
 
