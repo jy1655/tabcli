@@ -73,6 +73,54 @@ mod tests {
     }
 
     #[test]
+    fn ask_effort_is_supported_by_every_native_provider() {
+        for (provider, requested_effort) in [
+            ("codex", "xhigh"),
+            ("claude", "max"),
+            ("agy", "high"),
+            ("pi", "minimal"),
+        ] {
+            let command = parse_args([
+                "ask",
+                provider,
+                "--prompt",
+                "review this",
+                "--effort",
+                requested_effort,
+            ])
+            .unwrap();
+
+            assert!(matches!(
+                command,
+                NativeCommand::Ask(AskRequest {
+                    effort: Some(effort),
+                    ..
+                }) if effort == requested_effort
+            ));
+        }
+    }
+
+    #[test]
+    fn effort_uses_each_provider_native_session_option() {
+        assert_eq!(
+            provider_effort_args(FirstPartyCli::Codex, "xhigh").unwrap(),
+            ["-c", "model_reasoning_effort=\"xhigh\""]
+        );
+        assert_eq!(
+            provider_effort_args(FirstPartyCli::Claude, "max").unwrap(),
+            ["--effort", "max"]
+        );
+        assert_eq!(
+            provider_effort_args(FirstPartyCli::Agy, "high").unwrap(),
+            ["--effort", "high"]
+        );
+        assert_eq!(
+            provider_effort_args(FirstPartyCli::Pi, "minimal").unwrap(),
+            ["--thinking", "minimal"]
+        );
+    }
+
+    #[test]
     fn agy_log_and_transcript_parsers_accept_only_the_expected_completed_result() {
         let id = "3e166585-bc21-43b7-b3d1-dec5e67688b3";
         assert_eq!(
@@ -365,6 +413,7 @@ mod tests {
                 workspace: workspace.clone(),
                 title: "Codex test".to_owned(),
                 model: Some("gpt-daybreak-blue-latest".to_owned()),
+                effort: Some("xhigh".to_owned()),
                 yolo: true,
                 created_unix_ms: unix_ms(),
             },
@@ -381,6 +430,7 @@ mod tests {
         let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
         assert!(arguments.contains("--dangerously-bypass-approvals-and-sandbox"));
         assert!(arguments.contains("--model\ngpt-daybreak-blue-latest"));
+        assert!(arguments.contains("-c\nmodel_reasoning_effort=\"xhigh\""));
         assert!(arguments.contains("notify=["));
         assert!(arguments.contains("native-hook"));
         assert!(arguments.contains("[Agent Bridge native delegation]"));
@@ -492,6 +542,7 @@ mod tests {
                 workspace,
                 title: "Agy test".to_owned(),
                 model: Some("gemini-model".to_owned()),
+                effort: Some("high".to_owned()),
                 yolo: true,
                 created_unix_ms: unix_ms(),
             },
@@ -504,6 +555,7 @@ mod tests {
         let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
         assert!(arguments.contains("--dangerously-skip-permissions"));
         assert!(arguments.contains("--model\ngemini-model"));
+        assert!(arguments.contains("--effort\nhigh"));
         assert!(arguments.contains("--log-file"));
         assert!(arguments.contains(directory.join("agy.log").to_string_lossy().as_ref()));
         assert!(arguments.contains("--prompt-interactive\nagy prompt"));
@@ -539,6 +591,7 @@ mod tests {
                 workspace,
                 title: "Pi test".to_owned(),
                 model: Some("provider/model".to_owned()),
+                effort: Some("minimal".to_owned()),
                 yolo: true,
                 created_unix_ms: unix_ms(),
             },
@@ -550,6 +603,7 @@ mod tests {
 
         let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
         assert!(arguments.contains("--model\nprovider/model"));
+        assert!(arguments.contains("--thinking\nminimal"));
         assert!(arguments.contains("--extension"));
         assert!(arguments.contains("--name\nPi test"));
         assert!(arguments.ends_with("pi prompt\n"));
@@ -680,6 +734,7 @@ pub(crate) struct AskRequest {
     pub(crate) prompt: String,
     pub(crate) title: Option<String>,
     pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
     pub(crate) yolo: bool,
     pub(crate) timeout: Duration,
     pub(crate) detach: bool,
@@ -713,6 +768,8 @@ struct SessionManifest {
     title: String,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    effort: Option<String>,
     yolo: bool,
     created_unix_ms: u128,
 }
@@ -761,6 +818,7 @@ struct SessionSpec {
     workspace: PathBuf,
     title: String,
     model: Option<String>,
+    effort: Option<String>,
     yolo: bool,
     prompt: String,
 }
@@ -806,6 +864,7 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
     let mut prompt = None;
     let mut title = None;
     let mut model = None;
+    let mut effort = None;
     let mut yolo = false;
     let mut timeout = None;
     let mut detach = false;
@@ -833,6 +892,11 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
                 option_value(options, &mut index, "--model")?.to_owned(),
                 "--model",
             )?,
+            "--effort" => set_once(
+                &mut effort,
+                option_value(options, &mut index, "--effort")?.to_owned(),
+                "--effort",
+            )?,
             "--timeout-secs" => {
                 let value = option_value(options, &mut index, "--timeout-secs")?;
                 set_once(&mut timeout, parse_timeout(value)?, "--timeout-secs")?;
@@ -852,6 +916,9 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
     if model.as_ref().is_some_and(|value| value.trim().is_empty()) {
         bail!("--model cannot be empty");
     }
+    if effort.as_ref().is_some_and(|value| value.trim().is_empty()) {
+        bail!("--effort cannot be empty");
+    }
     if provider == FirstPartyCli::Claude && model.is_some() {
         bail!("--model is supported for codex, agy, and pi, but not claude");
     }
@@ -861,6 +928,7 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
         prompt,
         title,
         model,
+        effort,
         yolo,
         timeout: timeout.unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
         detach,
@@ -1044,6 +1112,7 @@ fn run_ask(request: AskRequest) -> Result<()> {
         workspace,
         title,
         model: request.model,
+        effort: request.effort,
         yolo: request.yolo,
         prompt: native_delegation_prompt(&delegation_source(), &request.prompt),
     })?;
@@ -1294,6 +1363,13 @@ fn run_session_inner(directory: &Path) -> Result<()> {
         .into_iter()
         .map(OsString::from)
         .collect::<Vec<_>>();
+    if let Some(effort) = &manifest.effort {
+        arguments.extend(
+            provider_effort_args(provider, effort)?
+                .into_iter()
+                .map(OsString::from),
+        );
+    }
     let mut prompt_is_positional = true;
     let mut agy_log_path = None;
     match provider {
@@ -1386,6 +1462,18 @@ fn run_session_inner(directory: &Path) -> Result<()> {
         bail!("{} exited with {status}", provider.as_str());
     }
     Ok(())
+}
+
+fn provider_effort_args(provider: FirstPartyCli, effort: &str) -> Result<Vec<String>> {
+    let (option, value) = match provider {
+        FirstPartyCli::Codex => (
+            "-c",
+            format!("model_reasoning_effort={}", serde_json::to_string(effort)?),
+        ),
+        FirstPartyCli::Claude | FirstPartyCli::Agy => ("--effort", effort.to_owned()),
+        FirstPartyCli::Pi => ("--thinking", effort.to_owned()),
+    };
+    Ok(vec![option.to_owned(), value])
 }
 
 fn run_hook(provider: FirstPartyCli, argument_payload: Option<&str>) -> Result<()> {
@@ -2026,6 +2114,7 @@ fn create_session(spec: SessionSpec) -> Result<CreatedSession> {
         workspace: spec.workspace,
         title: spec.title,
         model: spec.model,
+        effort: spec.effort,
         yolo: spec.yolo,
         created_unix_ms: unix_ms(),
     };

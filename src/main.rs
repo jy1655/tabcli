@@ -331,7 +331,7 @@ fn help_text() -> String {
 
 Usage:
   agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] --prompt TEXT [--title NAME]
-      [--model MODEL] [--yolo] [--timeout-secs N] [--detach] [--json]
+      [--model MODEL] [--effort EFFORT] [--yolo] [--timeout-secs N] [--detach] [--json]
   agent-bridge tell <session> --prompt TEXT [--timeout-secs N] [--detach] [--json]
   agent-bridge sessions [--json]
   agent-bridge close-session <session> --explicit [--json]
@@ -354,6 +354,8 @@ Native visible sessions (macOS + iTerm2):
            Claude, Agy, or Pi CLI interactively. By default it waits for the
            first provider result, prints it, and leaves the tab and CLI running.
            --model selects the model for Codex, Agy, or Pi; Claude rejects it.
+           --effort selects only this child session's native reasoning/thinking
+           level; omission preserves the provider's configured default.
   tell     type another prompt into that same visible iTerm session and return
            the next result. Follow-ups are serialized per session, framed as one
            bracketed paste, and reject terminal submission/control bytes. The user
@@ -362,9 +364,10 @@ Native visible sessions (macOS + iTerm2):
   close-session closes only a recorded bridge-owned iTerm session and requires
            the literal --explicit flag.
 
-  Child policy is per request: --yolo is NEVER inherited from the calling CLI.
-  It is forwarded only when that ask command contains --yolo and the provider
-  has a matching flag: Codex, Claude, and Agy do; Pi keeps its native policy, so
+  Child settings are per request: --model and --effort are never inferred from
+  the caller. --yolo is NEVER inherited from the calling CLI and is forwarded
+  only when that ask command contains --yolo and the provider has a matching
+  flag: Codex, Claude, and Agy do; Pi keeps its native policy, so
   --yolo is a no-op for Pi. Pi has no built-in permission popup or sandbox.
   Supported CLI checks are minimums, so newer releases continue to work:
   Codex >= 0.147.0; Claude >= 2.1.229; Agy >= 1.1.12; Pi >= 0.84.1. Prompts
@@ -6372,6 +6375,7 @@ mod tests {
         for needle in [
             "ask <codex|claude|agy|pi>",
             "--model MODEL",
+            "--effort EFFORT",
             "tell <session>",
             "sessions [--json]",
             "close-session <session> --explicit",

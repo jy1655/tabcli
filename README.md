@@ -19,7 +19,7 @@ cargo build --release
 ```
 
 `--workspace`를 생략하면 호출한 현재 디렉터리를 사용하고, `--title`을 생략하면 CLI 이름과 workspace 이름으로 탭 제목을 만듭니다.
-Codex, Agy, Pi 세션은 `--model <MODEL>`로 해당 요청에만 모델을 지정할 수 있습니다. Claude에는 이 옵션을 거부하며 어떤 CLI의 전역 모델 설정도 바꾸지 않습니다.
+Codex, Agy, Pi 세션은 `--model <MODEL>`로 해당 요청에만 모델을 지정할 수 있습니다. Claude에는 이 옵션을 거부합니다. 네 provider 모두 `--effort <EFFORT>`를 지원하며 Codex의 `model_reasoning_effort`, Claude/Agy의 `--effort`, Pi의 `--thinking`으로 전달합니다. 지정하지 않으면 각 CLI의 기존 세션 기본값을 유지하고 어떤 CLI의 전역 설정도 바꾸지 않습니다. 지원 effort 값은 선택한 CLI·모델이 최종 검증하므로 새 버전에서 추가된 값을 브리지가 임의로 차단하지 않습니다.
 
 `ask`는 다음 순서로 동작합니다.
 
@@ -31,7 +31,7 @@ Codex, Agy, Pi 세션은 `--model <MODEL>`로 해당 요청에만 모델을 지�
 기계 판독이 필요하면 `--json`을 사용합니다. 반환된 `session` id로 같은 탭에 다음 프롬프트를 실제 키 입력처럼 전달할 수 있습니다.
 
 ```sh
-agent-bridge ask codex --workspace ~/Dev/project --model gpt-daybreak-blue-latest --prompt "원인을 진단해줘" --json
+agent-bridge ask codex --workspace ~/Dev/project --model gpt-daybreak-blue-latest --effort xhigh --prompt "원인을 진단해줘" --json
 agent-bridge tell session-XXXXXXXX --prompt "그중 2번만 수정해줘" --json
 agent-bridge sessions --json
 ```
@@ -41,6 +41,7 @@ agent-bridge sessions --json
 ### 권한과 버전 정책
 
 - 새 자식 세션의 `--yolo`는 **해당 `ask` 요청에 명시된 경우에만** 적용합니다. 부모 CLI가 yolo로 실행 중이어도 자동 상속하지 않습니다.
+- `--model`과 `--effort`도 부모 CLI에서 추측하거나 상속하지 않습니다. 해당 `ask`에 명시한 값만 새 세션 시작 인자로 전달하며, 실행 중인 세션의 effort를 `tell`로 바꾸지는 않습니다.
 - `ask`와 `tell`로 주입하는 모든 프롬프트에는 호출한 브리지 세션의 provenance를 강제로 붙입니다. `tell`은 세션별 한 턴만 허용하고 bracketed paste로 전송하며, Enter·ESC 등 별도 터미널 동작을 만들 수 있는 제어문자는 거부합니다.
 - 사용자는 결과가 반환된 뒤 열린 탭에서 그대로 작업을 이어갈 수 있습니다. 다만 provider가 수동 입력과 bridge 입력을 권위 있게 대응시키는 공통 신호를 제공하지 않으므로, 진행 중인 `ask`/`tell`과 같은 탭의 수동 입력을 겹치지 않아야 합니다. 겹치면 먼저 끝난 수동 턴이 대기 중인 bridge 결과로 인식될 수 있습니다.
 - 명시적 `--yolo`는 Codex의 `--dangerously-bypass-approvals-and-sandbox`, Claude와 Agy의 `--dangerously-skip-permissions`를 전달합니다.
@@ -51,9 +52,9 @@ agent-bridge sessions --json
 - 최초 `ask` 프롬프트는 각 CLI의 대화형 시작 인자로 전달되므로 실행 중 같은 머신의 프로세스 인자 검사에서 보일 수 있습니다. `tell` 프롬프트는 권한 `0600` 임시 파일을 iTerm 입력으로 전달하고 즉시 폐기하며, 사람이 읽는 결과 출력에서는 터미널 제어문자를 가시적인 문자열로 이스케이프합니다.
 
 ```sh
-agent-bridge ask claude --workspace ~/Dev/project --prompt "테스트까지 실행해줘" --yolo
-agent-bridge ask agy --workspace ~/Dev/project --model MODEL --prompt "취약점을 검토해줘"
-agent-bridge ask pi --workspace ~/Dev/project --model MODEL --prompt "이 변경을 검토해줘"
+agent-bridge ask claude --workspace ~/Dev/project --effort high --prompt "테스트까지 실행해줘" --yolo
+agent-bridge ask agy --workspace ~/Dev/project --model MODEL --effort high --prompt "취약점을 검토해줘"
+agent-bridge ask pi --workspace ~/Dev/project --model MODEL --effort high --prompt "이 변경을 검토해줘"
 agent-bridge close-session session-XXXXXXXX --explicit
 ```
 
