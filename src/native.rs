@@ -352,25 +352,26 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn iterm_applescripts_compile_without_opening_a_tab() {
-        for script in [
-            terminal::macos_iterm::OPEN_TAB_SCRIPT,
-            terminal::macos_iterm::SEND_FILE_SCRIPT,
-            terminal::macos_iterm::CLOSE_SESSION_SCRIPT,
+        for (name, script) in [
+            ("open tab", terminal::macos_iterm::OPEN_TAB_SCRIPT),
+            ("send file", terminal::macos_iterm::SEND_FILE_SCRIPT),
+            ("close session", terminal::macos_iterm::CLOSE_SESSION_SCRIPT),
         ] {
             let directory = tempfile::tempdir().unwrap();
             let script = format!(
                 "using terms from application \"/Applications/iTerm.app\"\n{script}\nend using terms from"
             );
+            let source = directory.path().join("bridge.applescript");
+            std::fs::write(&source, script).unwrap();
             let output = std::process::Command::new("/usr/bin/osacompile")
                 .arg("-o")
                 .arg(directory.path().join("bridge.scpt"))
-                .arg("-e")
-                .arg(&script)
+                .arg(source)
                 .output()
                 .unwrap();
             assert!(
                 output.status.success(),
-                "AppleScript did not compile: {}",
+                "{name} AppleScript did not compile: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
