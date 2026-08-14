@@ -132,6 +132,25 @@ fn claude_normalizes_only_the_observed_fable5_model_alias() {
 }
 
 #[test]
+fn pi_qualifies_only_the_exact_fable_model_alias() {
+    assert_eq!(
+        provider_model_args(FirstPartyCli::Pi, "Fable"),
+        ["--model", "anthropic/claude-fable-5"]
+    );
+    for model in [
+        "fable",
+        "Fable5",
+        "anthropic/claude-fable-5",
+        "provider/model",
+    ] {
+        assert_eq!(
+            provider_model_args(FirstPartyCli::Pi, model),
+            ["--model", model]
+        );
+    }
+}
+
+#[test]
 fn terminal_input_rejects_submission_and_escape_controls() {
     assert!(validate_terminal_input("line one\nline two\tindented", "prompt").is_ok());
     for control in ['\0', '\r', '\u{1b}', '\u{7f}'] {

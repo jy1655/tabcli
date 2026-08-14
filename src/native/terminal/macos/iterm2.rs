@@ -1,14 +1,19 @@
-use super::super::ItermCloseOutcome;
+use std::path::Path;
+
 use anyhow::{Context, Result, bail};
-use std::{path::Path, process::Command};
+
+use super::{CloseOutcome, TerminalKind, TerminalSession, applescript, close_response};
 
 pub(in crate::native) const OPEN_TAB_SCRIPT: &str = r#"
 on run argv
     set bridgeCommand to item 1 of argv
-    set tabTitle to item 2 of argv
+    set itermWasRunning to application "iTerm2" is running
     tell application "iTerm2"
         activate
-        if (count of windows) is 0 then
+        if not itermWasRunning then
+            set targetWindow to (create window with default profile)
+            set targetSession to current session of targetWindow
+        else if (count of windows) is 0 then
             set targetWindow to (create window with default profile)
             set targetSession to current session of targetWindow
         else
@@ -19,7 +24,6 @@ on run argv
             end tell
         end if
         tell targetSession
-            set name to tabTitle
             write text bridgeCommand
             return unique ID
         end tell
@@ -31,15 +35,14 @@ pub(in crate::native) const SEND_FILE_SCRIPT: &str = r#"
 on run argv
     set wantedId to item 1 of argv
     set promptPath to item 2 of argv
+    set carriageReturn to return
     tell application "iTerm2"
         repeat with targetWindow in windows
             repeat with targetTab in tabs of targetWindow
                 repeat with targetSession in sessions of targetTab
                     if unique ID of targetSession is wantedId then
-                        tell targetSession
-                            write contents of file promptPath
-                            write text (ASCII character 13) newline NO
-                        end tell
+                        write targetSession contents of file (POSIX file promptPath)
+                        write targetSession text carriageReturn newline false
                         return "sent"
                     end if
                 end repeat
@@ -69,57 +72,32 @@ on run argv
 end run
 "#;
 
-pub(in crate::native) fn ensure_available() -> Result<()> {
-    if !cfg!(target_os = "macos") {
-        bail!("native visible sessions currently require macOS and iTerm2");
-    }
-    Ok(())
-}
-
-pub(in crate::native) fn open_tab(command: &str, title: &str) -> Result<String> {
-    let id = run_osascript(OPEN_TAB_SCRIPT, &[command, title])?;
+pub(super) fn open_tab(command: &str) -> Result<TerminalSession> {
+    let id = applescript::run("iTerm2", OPEN_TAB_SCRIPT, &[command])?;
     if id.is_empty() {
         bail!("iTerm2 did not return a session id");
     }
-    Ok(id)
+    Ok(TerminalSession {
+        kind: TerminalKind::Iterm2,
+        id,
+        tab_id: None,
+        window_id: None,
+        managed_session_id: None,
+    })
 }
 
-pub(in crate::native) fn send_file(iterm_session_id: &str, prompt_path: &Path) -> Result<()> {
+pub(super) fn send_file(session: &TerminalSession, prompt_path: &Path) -> Result<()> {
     let prompt_path = prompt_path
         .to_str()
         .context("prompt path is not valid UTF-8")?;
-    let response = run_osascript(SEND_FILE_SCRIPT, &[iterm_session_id, prompt_path])?;
+    let response = applescript::run("iTerm2", SEND_FILE_SCRIPT, &[&session.id, prompt_path])?;
     if response != "sent" {
         bail!("unexpected iTerm2 send response: {response:?}");
     }
     Ok(())
 }
 
-pub(in crate::native) fn close_session(iterm_session_id: &str) -> Result<ItermCloseOutcome> {
-    match run_osascript(CLOSE_SESSION_SCRIPT, &[iterm_session_id])?.as_str() {
-        "closed" => Ok(ItermCloseOutcome::Closed),
-        "missing" => Ok(ItermCloseOutcome::Missing),
-        response => bail!("unexpected iTerm2 close response: {response:?}"),
-    }
-}
-
-fn run_osascript(script: &str, arguments: &[&str]) -> Result<String> {
-    let output = Command::new("/usr/bin/osascript")
-        .arg("-e")
-        .arg(script)
-        .args(arguments)
-        .output()
-        .context("failed to execute /usr/bin/osascript")?;
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        bail!(
-            "iTerm2 automation failed: {}",
-            if error.is_empty() {
-                output.status.to_string()
-            } else {
-                error
-            }
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
+    let response = applescript::run("iTerm2", CLOSE_SESSION_SCRIPT, &[&session.id])?;
+    close_response(TerminalKind::Iterm2, &response)
 }

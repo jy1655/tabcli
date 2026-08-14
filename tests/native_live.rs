@@ -28,24 +28,25 @@ fn run_native_adapter_smoke(provider: &str) {
         .as_nanos();
     let title = format!("Agent Bridge live {provider} {nonce}");
     let prompt = format!("Reply with exactly this marker and nothing else: {marker}");
-    let output = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
-        .args([
-            "ask",
-            provider,
-            "--workspace",
-            env!("CARGO_MANIFEST_DIR"),
-            "--title",
-            &title,
-            "--model",
-            &model,
-            "--effort",
-            &effort,
-            "--timeout-secs",
-            "300",
-            "--prompt",
-            &prompt,
-            "--json",
-        ])
+    let selected_terminal = std::env::var("AGENT_BRIDGE_LIVE_TERMINAL").ok();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-bridge"));
+    command.args([
+        "ask",
+        provider,
+        "--workspace",
+        env!("CARGO_MANIFEST_DIR"),
+        "--title",
+        &title,
+        "--model",
+        &model,
+        "--effort",
+        &effort,
+    ]);
+    if let Some(terminal) = selected_terminal.as_deref() {
+        command.args(["--terminal", terminal]);
+    }
+    let output = command
+        .args(["--timeout-secs", "300", "--prompt", &prompt, "--json"])
         .output()
         .unwrap();
     assert!(
@@ -92,6 +93,21 @@ fn run_native_adapter_smoke(provider: &str) {
 
     assert_eq!(response["provider"], provider);
     assert!(
+        matches!(
+            response["terminal"].as_str(),
+            Some("ghostty" | "iterm2" | "apple-terminal")
+        ),
+        "native response is missing a supported terminal kind: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        response["terminal_session_id"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "native response is missing its terminal session id: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
         response["result"]
             .as_str()
             .is_some_and(|result| result.contains(&marker)),
@@ -101,25 +117,25 @@ fn run_native_adapter_smoke(provider: &str) {
 }
 
 #[test]
-#[ignore = "manual live smoke: opens and closes a real iTerm tab and requires authenticated Codex"]
+#[ignore = "manual live smoke: opens and closes a detected macOS terminal surface and requires authenticated Codex"]
 fn live_native_codex_returns_result_and_closes_session() {
     run_native_adapter_smoke("codex");
 }
 
 #[test]
-#[ignore = "manual live smoke: opens and closes a real iTerm tab and requires authenticated Claude"]
+#[ignore = "manual live smoke: opens and closes a detected macOS terminal surface and requires authenticated Claude"]
 fn live_native_claude_returns_result_and_closes_session() {
     run_native_adapter_smoke("claude");
 }
 
 #[test]
-#[ignore = "manual live smoke: opens and closes a real iTerm tab and requires authenticated Agy"]
+#[ignore = "manual live smoke: opens and closes a detected macOS terminal surface and requires authenticated Agy"]
 fn live_native_agy_returns_result_and_closes_session() {
     run_native_adapter_smoke("agy");
 }
 
 #[test]
-#[ignore = "manual live smoke: opens and closes a real iTerm tab and requires authenticated Pi"]
+#[ignore = "manual live smoke: opens and closes a detected macOS terminal surface and requires authenticated Pi"]
 fn live_native_pi_returns_result_and_closes_session() {
     run_native_adapter_smoke("pi");
 }
