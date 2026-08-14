@@ -358,8 +358,9 @@ mod tests {
             ("close session", terminal::macos_iterm::CLOSE_SESSION_SCRIPT),
         ] {
             let directory = tempfile::tempdir().unwrap();
-            let script = format!(
-                "using terms from application \"/Applications/iTerm.app\"\n{script}\nend using terms from"
+            let script = script.replace(
+                "tell application \"iTerm2\"",
+                "tell application \"/Applications/iTerm.app\"",
             );
             let source = directory.path().join("bridge.applescript");
             std::fs::write(&source, script).unwrap();
