@@ -19,10 +19,7 @@ jobs:
           components: rustfmt, clippy
       - name: Install iTerm2 for AppleScript compile tests
         if: runner.os == 'macOS'
-        run: |
-          brew install --cask iterm2
-          /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
-            -f /Applications/iTerm.app
+        run: brew install --cask iterm2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets --all-features

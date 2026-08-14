@@ -358,11 +358,14 @@ mod tests {
             terminal::macos_iterm::CLOSE_SESSION_SCRIPT,
         ] {
             let directory = tempfile::tempdir().unwrap();
+            let script = format!(
+                "using terms from application \"/Applications/iTerm.app\"\n{script}\nend using terms from"
+            );
             let output = std::process::Command::new("/usr/bin/osacompile")
                 .arg("-o")
                 .arg(directory.path().join("bridge.scpt"))
                 .arg("-e")
-                .arg(script)
+                .arg(&script)
                 .output()
                 .unwrap();
             assert!(
