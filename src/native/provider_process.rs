@@ -1,12 +1,15 @@
 use std::{ffi::OsString, path::Path, process::Command};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
+#[cfg(windows)]
+use anyhow::bail;
 
+#[cfg(windows)]
 use super::{terminal, write_private};
 
 pub(super) fn command(
     executable: &Path,
-    directory: &Path,
+    _directory: &Path,
     arguments: Vec<OsString>,
 ) -> Result<Command> {
     #[cfg(windows)]
@@ -30,7 +33,7 @@ pub(super) fn command(
             );
         }
         const FORWARDER: &str = "param(\n  [Parameter(Mandatory=$true)][string]$Provider,\n  [Parameter(ValueFromRemainingArguments=$true)][string[]]$ProviderArgs\n)\n& $Provider @ProviderArgs\nexit $LASTEXITCODE\n";
-        let forwarder = directory.join("provider-launch.ps1");
+        let forwarder = _directory.join("provider-launch.ps1");
         write_private(&forwarder, FORWARDER.as_bytes())?;
         let mut command = Command::new(terminal::windows_powershell_executable()?);
         command.args(["-NoLogo", "-NoProfile", "-File"]);
