@@ -24,6 +24,15 @@ impl ProviderAdapter for PiAdapter {
         &[]
     }
 
+    fn model_args(&self, model: &str) -> Vec<String> {
+        let model = if model == "Fable" {
+            "anthropic/claude-fable-5"
+        } else {
+            model
+        };
+        vec!["--model".to_owned(), model.to_owned()]
+    }
+
     fn effort_args(&self, effort: &str) -> Result<Vec<String>> {
         Ok(vec!["--thinking".to_owned(), effort.to_owned()])
     }

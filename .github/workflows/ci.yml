@@ -17,9 +17,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Install iTerm2 for AppleScript compile tests
+      - name: Install macOS terminal apps for AppleScript compile tests
         if: runner.os == 'macOS'
-        run: brew install --cask iterm2
+        run: brew install --cask ghostty iterm2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets --all-features

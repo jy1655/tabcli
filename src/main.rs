@@ -19,21 +19,26 @@ fn help_text() -> String {
 
 Usage:
   agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] --prompt TEXT [--title NAME]
-      [--model MODEL] [--effort EFFORT] [--yolo] [--timeout-secs N] [--detach] [--json]
+      [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal>]
+      [--yolo] [--timeout-secs N] [--detach] [--json]
   agent-bridge tell <session> --prompt TEXT [--timeout-secs N] [--detach] [--json]
   agent-bridge sessions [--json]
   agent-bridge close-session <session> --explicit [--json]
   agent-bridge --help | --version
 
 Runtime:
-  macOS with iTerm2 is currently supported. Agent Bridge opens a real iTerm2 tab
-  for Codex, Claude, Agy, or Pi and controls only sessions that it launched.
-  Attaching to an arbitrary CLI that was already running is not supported.
+  macOS detects Ghostty, iTerm2, or Terminal.app from the invoking environment
+  and opens a real surface for Codex, Claude, Agy, or Pi. Terminal.app always
+  uses a dedicated new window. Use --terminal to override detection. An
+  unknown host falls back to Terminal.app. Linux and Windows are
+  not yet supported. Agent Bridge controls only sessions that it launched.
+  Attaching to an arbitrary CLI is not supported.
 
 Session policy:
-  --model and --effort apply only to the new child session. For Claude only,
-  the exact model value Fable5 is passed to Claude Code as Fable. Other model
-  values are forwarded unchanged.
+  --model and --effort apply only to the new child session. For Claude, the exact
+  model value Fable5 is passed to Claude Code as Fable. The exact model value
+  Fable is passed to Pi as anthropic/claude-fable-5. All other model values are
+  forwarded unchanged.
 
   --yolo is never inherited. It is forwarded only when the ask command includes
   it and the provider has a matching option. Codex, Claude, and Agy do; for Pi
@@ -191,8 +196,12 @@ mod tests {
             "tell <session>",
             "sessions [--json]",
             "close-session <session> --explicit",
-            "macOS with iTerm2 is currently supported",
+            "macOS detects Ghostty, iTerm2, or Terminal.app",
+            "Terminal.app always\n  uses a dedicated new window",
+            "Use --terminal to override",
+            "unknown host falls back to Terminal.app",
             "Fable5 is passed to Claude Code as Fable",
+            "Fable is passed to Pi as anthropic/claude-fable-5",
             "Attaching to an arbitrary CLI",
         ] {
             assert!(help.contains(expected), "help is missing {expected:?}");

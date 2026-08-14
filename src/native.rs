@@ -93,6 +93,50 @@ mod tests {
     }
 
     #[test]
+    fn ask_terminal_can_be_selected_without_changing_the_auto_default() {
+        let automatic = parse_args(["ask", "pi", "--prompt", "review this"]).unwrap();
+        assert!(matches!(
+            automatic,
+            NativeCommand::Ask(AskRequest { terminal: None, .. })
+        ));
+
+        for (requested, expected) in [
+            ("ghostty", terminal::TerminalKind::Ghostty),
+            ("iterm2", terminal::TerminalKind::Iterm2),
+            ("terminal", terminal::TerminalKind::AppleTerminal),
+        ] {
+            let command = parse_args([
+                "ask",
+                "pi",
+                "--prompt",
+                "review this",
+                "--terminal",
+                requested,
+            ])
+            .unwrap();
+            assert!(matches!(
+                command,
+                NativeCommand::Ask(AskRequest {
+                    terminal: Some(actual),
+                    ..
+                }) if actual == expected
+            ));
+        }
+
+        assert!(
+            parse_args([
+                "ask",
+                "pi",
+                "--prompt",
+                "review this",
+                "--terminal",
+                "vscode",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn native_ask_and_tell_reject_unrepresentable_timeouts() {
         let too_large = u64::MAX.to_string();
         assert!(
@@ -249,7 +293,7 @@ mod tests {
 
         close_session_state(directory.path(), |_| {
             close_was_called = true;
-            Ok(ItermCloseOutcome::Closed)
+            Ok(terminal::CloseOutcome::Closed)
         })
         .unwrap();
 
@@ -260,13 +304,17 @@ mod tests {
     }
 
     #[test]
-    fn explicit_close_is_idempotent_when_iterm_session_is_missing() {
+    fn explicit_close_consumes_the_handle_and_repeated_close_skips_the_adapter() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
         write_json_atomic(
             &directory.path().join("terminal.json"),
-            &TerminalRecord {
-                iterm_session_id: "missing-iterm-session".to_owned(),
+            &terminal::TerminalSession {
+                kind: terminal::TerminalKind::Iterm2,
+                id: "missing-iterm-session".to_owned(),
+                tab_id: None,
+                window_id: None,
+                managed_session_id: None,
             },
         )
         .unwrap();
@@ -276,18 +324,81 @@ mod tests {
         let mut close_calls = 0;
 
         for _ in 0..2 {
-            close_session_state(directory.path(), |id| {
-                assert_eq!(id, "missing-iterm-session");
+            close_session_state(directory.path(), |session| {
+                assert_eq!(session.kind, terminal::TerminalKind::Iterm2);
+                assert_eq!(session.id, "missing-iterm-session");
                 close_calls += 1;
-                Ok(ItermCloseOutcome::Missing)
+                Ok(terminal::CloseOutcome::Missing)
             })
             .unwrap();
         }
 
-        assert_eq!(close_calls, 2);
+        assert_eq!(close_calls, 1);
+        assert!(!directory.path().join("terminal.json").exists());
+        assert!(directory.path().join("terminal.closed.json").exists());
         assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
         let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
         assert_eq!(status.state, "closed");
+    }
+
+    #[test]
+    fn already_closed_session_never_reuses_a_stale_terminal_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        write_json_atomic(
+            &directory.path().join("terminal.json"),
+            &terminal::TerminalSession {
+                kind: terminal::TerminalKind::Iterm2,
+                id: "stale-iterm-session".to_owned(),
+                tab_id: None,
+                window_id: None,
+                managed_session_id: None,
+            },
+        )
+        .unwrap();
+        update_status(directory.path(), "closed", None, None).unwrap();
+        let mut close_calls = 0;
+
+        close_session_state(directory.path(), |_| {
+            close_calls += 1;
+            Ok(terminal::CloseOutcome::Closed)
+        })
+        .unwrap();
+
+        assert_eq!(close_calls, 0);
+        assert_eq!(
+            read_json::<SessionStatus>(&directory.path().join("status.json"))
+                .unwrap()
+                .state,
+            "closed"
+        );
+    }
+
+    #[test]
+    fn explicit_close_routes_using_the_recorded_terminal_kind() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        write_json_atomic(
+            &directory.path().join("terminal.json"),
+            &terminal::TerminalSession {
+                kind: terminal::TerminalKind::Ghostty,
+                id: "ghostty-terminal".to_owned(),
+                tab_id: Some("ghostty-tab".to_owned()),
+                window_id: Some("ghostty-window".to_owned()),
+                managed_session_id: None,
+            },
+        )
+        .unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+
+        close_session_state(directory.path(), |session| {
+            assert_eq!(session.kind, terminal::TerminalKind::Ghostty);
+            assert_eq!(session.id, "ghostty-terminal");
+            assert_eq!(session.tab_id.as_deref(), Some("ghostty-tab"));
+            assert_eq!(session.window_id.as_deref(), Some("ghostty-window"));
+            Ok(terminal::CloseOutcome::Closed)
+        })
+        .unwrap();
     }
 
     #[test]
@@ -296,14 +407,18 @@ mod tests {
         fs::create_dir(directory.path().join("events")).unwrap();
         write_json_atomic(
             &directory.path().join("terminal.json"),
-            &TerminalRecord {
-                iterm_session_id: "closing-iterm-session".to_owned(),
+            &terminal::TerminalSession {
+                kind: terminal::TerminalKind::Iterm2,
+                id: "closing-iterm-session".to_owned(),
+                tab_id: None,
+                window_id: None,
+                managed_session_id: None,
             },
         )
         .unwrap();
         update_status(directory.path(), "running", None, None).unwrap();
 
-        close_session_state(directory.path(), |_| Ok(ItermCloseOutcome::Closed)).unwrap();
+        close_session_state(directory.path(), |_| Ok(terminal::CloseOutcome::Closed)).unwrap();
         update_status(directory.path(), "exited", Some(1), None).unwrap();
         update_status(
             directory.path(),
@@ -335,32 +450,234 @@ mod tests {
         assert_eq!(extract_assistant_message(&claude), Some("claude result"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn iterm_script_keeps_dynamic_values_in_argv() {
-        assert!(!terminal::macos_iterm::OPEN_TAB_SCRIPT.contains("review this"));
-        assert!(terminal::macos_iterm::OPEN_TAB_SCRIPT.contains("item 1 of argv"));
-        assert!(terminal::macos_iterm::OPEN_TAB_SCRIPT.contains("write text bridgeCommand"));
-    }
-
-    #[test]
-    fn iterm_follow_up_sends_an_explicit_carriage_return() {
-        assert!(terminal::macos_iterm::SEND_FILE_SCRIPT.contains("ASCII character 13"));
-        assert!(terminal::macos_iterm::SEND_FILE_SCRIPT.contains("newline NO"));
-        assert!(!terminal::macos_iterm::SEND_FILE_SCRIPT.contains("write text \"\""));
+        assert!(!terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains("review this"));
+        assert!(terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains("item 1 of argv"));
+        assert!(terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains("write text bridgeCommand"));
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn iterm_applescripts_compile_without_opening_a_tab() {
+    fn iterm_follow_up_sends_an_explicit_carriage_return() {
+        assert!(terminal::macos::iterm2::SEND_FILE_SCRIPT.contains("set carriageReturn to return"));
+        assert!(terminal::macos::iterm2::SEND_FILE_SCRIPT.contains("newline false"));
+        assert!(!terminal::macos::iterm2::SEND_FILE_SCRIPT.contains("write text \"\""));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cold_start_never_adopts_an_app_restored_surface() {
+        assert!(
+            terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains(
+                "if not itermWasRunning then\n            set targetWindow to (create window with default profile)"
+            )
+        );
+        assert!(
+            terminal::macos::ghostty::CREATE_SURFACE_SCRIPT.contains(
+                "if not ghosttyWasRunning then\n            set targetWindow to new window"
+            )
+        );
+        assert!(!terminal::macos::apple_terminal::OPEN_TAB_SCRIPT.contains(
+            "set targetTab to do script bridgeCommand\n            set targetWindow to front window"
+        ));
+        for restored_surface in ["front window", "current window", "selected tab"] {
+            assert!(
+                !terminal::macos::apple_terminal::OPEN_TAB_SCRIPT.contains(restored_surface),
+                "Terminal.app cold-start path still references {restored_surface}"
+            );
+        }
+        assert!(
+            terminal::macos::apple_terminal::OPEN_TAB_SCRIPT
+                .contains("set targetWindowId to my windowIdForTty(targetTty)")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn terminal_app_actions_require_the_recorded_window_and_tty() {
+        for script in [
+            terminal::macos::apple_terminal::SEND_FILE_SCRIPT,
+            terminal::macos::apple_terminal::CLOSE_TAB_SCRIPT,
+            terminal::macos::apple_terminal::WAIT_FOR_CLOSE_SCRIPT,
+        ] {
+            assert!(script.contains("wantedWindowId"));
+            assert!(script.contains("wantedTty"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stable_iterm_and_ghostty_ids_do_not_depend_on_mutable_display_titles() {
+        for script in [
+            terminal::macos::iterm2::SEND_FILE_SCRIPT,
+            terminal::macos::iterm2::CLOSE_SESSION_SCRIPT,
+        ] {
+            assert!(script.contains("unique ID of targetSession is wantedId"));
+            assert!(!script.contains("wantedOwnershipTitle"));
+            assert!(!script.contains("name of targetSession"));
+        }
+        for script in [
+            terminal::macos::ghostty::SEND_FILE_SCRIPT,
+            terminal::macos::ghostty::CLOSE_TAB_SCRIPT,
+        ] {
+            assert!(script.contains("wantedTerminalId"));
+            assert!(script.contains("wantedTabId"));
+            assert!(script.contains("wantedWindowId"));
+            assert!(!script.contains("wantedOwnershipTitle"));
+            assert!(!script.contains("name of targetTab"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_terminal_adapters_never_set_or_verify_display_titles() {
         for (name, script) in [
-            ("open tab", terminal::macos_iterm::OPEN_TAB_SCRIPT),
-            ("send file", terminal::macos_iterm::SEND_FILE_SCRIPT),
-            ("close session", terminal::macos_iterm::CLOSE_SESSION_SCRIPT),
+            ("iTerm2 open", terminal::macos::iterm2::OPEN_TAB_SCRIPT),
+            ("iTerm2 send", terminal::macos::iterm2::SEND_FILE_SCRIPT),
+            (
+                "iTerm2 close",
+                terminal::macos::iterm2::CLOSE_SESSION_SCRIPT,
+            ),
+            (
+                "Ghostty create",
+                terminal::macos::ghostty::CREATE_SURFACE_SCRIPT,
+            ),
+            (
+                "Ghostty discover",
+                terminal::macos::ghostty::DISCOVER_TERMINAL_SCRIPT,
+            ),
+            (
+                "Ghostty queue",
+                terminal::macos::ghostty::QUEUE_COMMAND_SCRIPT,
+            ),
+            (
+                "Ghostty press Enter",
+                terminal::macos::ghostty::PRESS_ENTER_SCRIPT,
+            ),
+            ("Ghostty send", terminal::macos::ghostty::SEND_FILE_SCRIPT),
+            ("Ghostty close", terminal::macos::ghostty::CLOSE_TAB_SCRIPT),
+            (
+                "Terminal.app open",
+                terminal::macos::apple_terminal::OPEN_TAB_SCRIPT,
+            ),
+            (
+                "Terminal.app send",
+                terminal::macos::apple_terminal::SEND_FILE_SCRIPT,
+            ),
+            (
+                "Terminal.app close",
+                terminal::macos::apple_terminal::CLOSE_TAB_SCRIPT,
+            ),
+            (
+                "Terminal.app wait",
+                terminal::macos::apple_terminal::WAIT_FOR_CLOSE_SCRIPT,
+            ),
+        ] {
+            for forbidden in [
+                "tabTitle",
+                "set name",
+                "set_tab_title",
+                "custom title",
+                "title displays custom title",
+                "wantedOwnershipTitle",
+            ] {
+                assert!(
+                    !script.contains(forbidden),
+                    "{name} still depends on visible title fragment {forbidden:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_terminal_applescripts_compile_without_opening_a_tab() {
+        for (name, script, application, path) in [
+            (
+                "iTerm2 open tab",
+                terminal::macos::iterm2::OPEN_TAB_SCRIPT,
+                "iTerm2",
+                "/Applications/iTerm.app",
+            ),
+            (
+                "iTerm2 send file",
+                terminal::macos::iterm2::SEND_FILE_SCRIPT,
+                "iTerm2",
+                "/Applications/iTerm.app",
+            ),
+            (
+                "iTerm2 close session",
+                terminal::macos::iterm2::CLOSE_SESSION_SCRIPT,
+                "iTerm2",
+                "/Applications/iTerm.app",
+            ),
+            (
+                "Terminal.app open tab",
+                terminal::macos::apple_terminal::OPEN_TAB_SCRIPT,
+                "Terminal",
+                "/System/Applications/Utilities/Terminal.app",
+            ),
+            (
+                "Terminal.app send file",
+                terminal::macos::apple_terminal::SEND_FILE_SCRIPT,
+                "Terminal",
+                "/System/Applications/Utilities/Terminal.app",
+            ),
+            (
+                "Terminal.app close tab",
+                terminal::macos::apple_terminal::CLOSE_TAB_SCRIPT,
+                "Terminal",
+                "/System/Applications/Utilities/Terminal.app",
+            ),
+            (
+                "Terminal.app wait for close",
+                terminal::macos::apple_terminal::WAIT_FOR_CLOSE_SCRIPT,
+                "Terminal",
+                "/System/Applications/Utilities/Terminal.app",
+            ),
+            (
+                "Ghostty create surface",
+                terminal::macos::ghostty::CREATE_SURFACE_SCRIPT,
+                "Ghostty",
+                "/Applications/Ghostty.app",
+            ),
+            (
+                "Ghostty discover terminal",
+                terminal::macos::ghostty::DISCOVER_TERMINAL_SCRIPT,
+                "Ghostty",
+                "/Applications/Ghostty.app",
+            ),
+            (
+                "Ghostty queue command",
+                terminal::macos::ghostty::QUEUE_COMMAND_SCRIPT,
+                "Ghostty",
+                "/Applications/Ghostty.app",
+            ),
+            (
+                "Ghostty press Enter",
+                terminal::macos::ghostty::PRESS_ENTER_SCRIPT,
+                "Ghostty",
+                "/Applications/Ghostty.app",
+            ),
+            (
+                "Ghostty send file",
+                terminal::macos::ghostty::SEND_FILE_SCRIPT,
+                "Ghostty",
+                "/Applications/Ghostty.app",
+            ),
+            (
+                "Ghostty close tab",
+                terminal::macos::ghostty::CLOSE_TAB_SCRIPT,
+                "Ghostty",
+                "/Applications/Ghostty.app",
+            ),
         ] {
             let directory = tempfile::tempdir().unwrap();
             let script = script.replace(
-                "tell application \"iTerm2\"",
-                "tell application \"/Applications/iTerm.app\"",
+                &format!("tell application \"{application}\""),
+                &format!("tell application \"{path}\""),
             );
             let source = directory.path().join("bridge.applescript");
             std::fs::write(&source, script).unwrap();
@@ -515,6 +832,86 @@ mod tests {
         pid
     }
 
+    fn write_owned_terminal_state(directory: &Path, state: &str, owner_pid: u32) {
+        fs::create_dir(directory.join("events")).unwrap();
+        update_status(directory, state, None, None).unwrap();
+        let claim = acquire_turn_claim(directory).unwrap();
+        claim.retain();
+        write_json_atomic(
+            &directory.join(TERMINAL_HANDLE_FILE),
+            &terminal::TerminalSession {
+                kind: terminal::TerminalKind::AppleTerminal,
+                id: "/dev/ttys999".to_owned(),
+                tab_id: None,
+                window_id: Some("1001".to_owned()),
+                managed_session_id: Some("session-owner123".to_owned()),
+            },
+        )
+        .unwrap();
+        write_json_atomic(
+            &directory.join(SESSION_OWNER_FILE),
+            &NativeSessionOwner {
+                pid: owner_pid,
+                managed_session_id: Some("session-owner123".to_owned()),
+                terminal_tty: Some("/dev/ttys999".to_owned()),
+                ..NativeSessionOwner::default()
+            },
+        )
+        .unwrap();
+    }
+
+    fn assert_dead_terminal_owner_close_converges(state: &str) {
+        let directory = tempfile::tempdir().unwrap();
+        write_owned_terminal_state(directory.path(), state, reaped_child_pid());
+        let mut adapter_calls = 0;
+
+        assert!(repair_dead_native_owner(directory.path()).unwrap());
+        close_session_state(directory.path(), |_| {
+            adapter_calls += 1;
+            Ok(terminal::CloseOutcome::Closed)
+        })
+        .unwrap();
+        assert!(!repair_dead_native_owner(directory.path()).unwrap());
+        close_session_state(directory.path(), |_| {
+            adapter_calls += 1;
+            Ok(terminal::CloseOutcome::Closed)
+        })
+        .unwrap();
+
+        assert_eq!(adapter_calls, 0);
+        assert!(!directory.path().join(TERMINAL_HANDLE_FILE).exists());
+        assert!(!directory.path().join(TERMINAL_CLOSING_FILE).exists());
+        assert!(directory.path().join(TERMINAL_TOMBSTONE_FILE).exists());
+        assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state, "closed");
+    }
+
+    #[test]
+    fn exited_dead_native_owner_consumes_terminal_without_adapter_calls() {
+        assert_dead_terminal_owner_close_converges("exited");
+    }
+
+    #[test]
+    fn failed_dead_native_owner_consumes_terminal_without_adapter_calls() {
+        assert_dead_terminal_owner_close_converges("failed");
+    }
+
+    #[test]
+    fn exited_and_failed_live_native_owners_are_not_repaired() {
+        for state in ["exited", "failed"] {
+            let directory = tempfile::tempdir().unwrap();
+            write_owned_terminal_state(directory.path(), state, std::process::id());
+
+            assert!(!repair_dead_native_owner(directory.path()).unwrap());
+            assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
+            assert!(!directory.path().join(TERMINAL_TOMBSTONE_FILE).exists());
+            assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+            let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+            assert_eq!(status.state, state);
+        }
+    }
+
     #[test]
     fn live_native_session_owner_is_not_repaired() {
         let directory = tempfile::tempdir().unwrap();
@@ -526,6 +923,7 @@ mod tests {
             &directory.path().join(SESSION_OWNER_FILE),
             &NativeSessionOwner {
                 pid: std::process::id(),
+                ..NativeSessionOwner::default()
             },
         )
         .unwrap();
@@ -547,6 +945,7 @@ mod tests {
             &directory.path().join(SESSION_OWNER_FILE),
             &NativeSessionOwner {
                 pid: reaped_child_pid(),
+                ..NativeSessionOwner::default()
             },
         )
         .unwrap();
@@ -562,6 +961,95 @@ mod tests {
                 .is_some_and(|error| error.contains("no longer running"))
         );
         assert!(directory.path().join("events").is_dir());
+    }
+
+    #[test]
+    fn terminal_owner_proof_rejects_record_only_ids_and_reused_surfaces() {
+        let terminal: terminal::TerminalSession = serde_json::from_value(serde_json::json!({
+            "terminal": "apple-terminal",
+            "session_id": "/dev/ttys001",
+            "window_id": "1001",
+            "managed_session_id": "session-owner123"
+        }))
+        .unwrap();
+        let owner = NativeSessionOwner {
+            pid: 4242,
+            managed_session_id: Some("session-owner123".to_owned()),
+            terminal_tty: Some("/dev/ttys001".to_owned()),
+            terminal_tty_device: Some(7),
+            process_start_seconds: Some(100),
+            process_start_microseconds: Some(200),
+        };
+        let live = NativeProcessIdentity {
+            pid: 4242,
+            terminal_tty_device: 7,
+            process_start_seconds: 100,
+            process_start_microseconds: 200,
+        };
+
+        verify_terminal_owner_attestation("session-owner123", &terminal, &owner, &live, 7).unwrap();
+
+        let record_only = NativeSessionOwner {
+            pid: 4242,
+            managed_session_id: Some("session-owner123".to_owned()),
+            terminal_tty: None,
+            terminal_tty_device: None,
+            process_start_seconds: None,
+            process_start_microseconds: None,
+        };
+        assert!(
+            verify_terminal_owner_attestation(
+                "session-owner123",
+                &terminal,
+                &record_only,
+                &live,
+                7,
+            )
+            .is_err()
+        );
+
+        let wrong_session = NativeSessionOwner {
+            managed_session_id: Some("session-other456".to_owned()),
+            ..owner.clone()
+        };
+        assert!(
+            verify_terminal_owner_attestation(
+                "session-owner123",
+                &terminal,
+                &wrong_session,
+                &live,
+                7,
+            )
+            .is_err()
+        );
+
+        let wrong_tty = NativeSessionOwner {
+            terminal_tty: Some("/dev/ttys002".to_owned()),
+            ..owner.clone()
+        };
+        assert!(
+            verify_terminal_owner_attestation("session-owner123", &terminal, &wrong_tty, &live, 7,)
+                .is_err()
+        );
+
+        let reused_process = NativeProcessIdentity {
+            process_start_microseconds: 201,
+            ..live
+        };
+        assert!(
+            verify_terminal_owner_attestation(
+                "session-owner123",
+                &terminal,
+                &owner,
+                &reused_process,
+                7,
+            )
+            .is_err()
+        );
+        assert!(
+            verify_terminal_owner_attestation("session-owner123", &terminal, &owner, &live, 8,)
+                .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -591,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_titles_drop_control_characters_and_are_bounded() {
+    fn session_metadata_titles_drop_control_characters_and_are_bounded() {
         assert_eq!(sanitize_title(" Review\nTab\t ").unwrap(), "Review Tab");
         assert_eq!(
             sanitize_title(&"x".repeat(200)).unwrap().chars().count(),
@@ -905,7 +1393,7 @@ mod tests {
                 provider_version: "0.84.1".to_owned(),
                 workspace,
                 title: "Pi test".to_owned(),
-                model: Some("provider/model".to_owned()),
+                model: Some("Fable".to_owned()),
                 effort: Some("minimal".to_owned()),
                 yolo: true,
                 created_unix_ms: unix_ms(),
@@ -917,7 +1405,7 @@ mod tests {
         run_session_inner(&directory).unwrap();
 
         let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
-        assert!(arguments.contains("--model\nprovider/model"));
+        assert!(arguments.contains("--model\nanthropic/claude-fable-5"));
         assert!(arguments.contains("--thinking\nminimal"));
         assert!(arguments.contains("--extension"));
         assert!(arguments.contains("--name\nPi test"));
@@ -963,6 +1451,9 @@ const TURN_CLAIM_FILE: &str = "turn.claim";
 const SESSION_OWNER_FILE: &str = "native-session.json";
 const CLOSED_STATUS_FILE: &str = "closed.json";
 const PI_HOOK_FAILURE_FILE: &str = "pi-hook-failure.json";
+const TERMINAL_HANDLE_FILE: &str = "terminal.json";
+const TERMINAL_CLOSING_FILE: &str = "terminal.closing.json";
+const TERMINAL_TOMBSTONE_FILE: &str = "terminal.closed.json";
 
 #[derive(Debug)]
 pub(crate) enum NativeCommand {
@@ -989,6 +1480,7 @@ pub(crate) struct AskRequest {
     pub(crate) title: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) effort: Option<String>,
+    pub(crate) terminal: Option<terminal::TerminalKind>,
     pub(crate) yolo: bool,
     pub(crate) timeout: Duration,
     pub(crate) detach: bool,
@@ -1029,17 +1521,6 @@ struct SessionManifest {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct TerminalRecord {
-    iterm_session_id: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ItermCloseOutcome {
-    Closed,
-    Missing,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
 struct SessionStatus {
     state: String,
     updated_unix_ms: u128,
@@ -1065,9 +1546,67 @@ struct PiHookFailureSignal {
     turn_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct NativeSessionOwner {
     pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_tty: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_tty_device: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_start_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_start_microseconds: Option<u64>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeProcessIdentity {
+    pid: u32,
+    terminal_tty_device: u64,
+    process_start_seconds: u64,
+    process_start_microseconds: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MacProcBsdInfo {
+    _flags: u32,
+    _status: u32,
+    _exit_status: u32,
+    pid: u32,
+    _parent_pid: u32,
+    _uid: u32,
+    _gid: u32,
+    _real_uid: u32,
+    _real_gid: u32,
+    _saved_uid: u32,
+    _saved_gid: u32,
+    _reserved: u32,
+    _command: [libc::c_char; 16],
+    _name: [libc::c_char; 32],
+    _open_files: u32,
+    _process_group: u32,
+    _job_control_count: u32,
+    terminal_tty_device: u32,
+    _terminal_process_group: u32,
+    _nice: i32,
+    process_start_seconds: u64,
+    process_start_microseconds: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "proc")]
+unsafe extern "C" {
+    fn proc_pidinfo(
+        pid: libc::c_int,
+        flavor: libc::c_int,
+        arg: u64,
+        buffer: *mut libc::c_void,
+        buffer_size: libc::c_int,
+    ) -> libc::c_int;
 }
 
 struct CreatedSession {
@@ -1130,6 +1669,7 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
     let mut title = None;
     let mut model = None;
     let mut effort = None;
+    let mut terminal = None;
     let mut yolo = false;
     let mut timeout = None;
     let mut detach = false;
@@ -1162,6 +1702,12 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
                 option_value(options, &mut index, "--effort")?.to_owned(),
                 "--effort",
             )?,
+            "--terminal" => set_once(
+                &mut terminal,
+                terminal::TerminalKind::from_str(option_value(options, &mut index, "--terminal")?)
+                    .map_err(anyhow::Error::msg)?,
+                "--terminal",
+            )?,
             "--timeout-secs" => {
                 let value = option_value(options, &mut index, "--timeout-secs")?;
                 set_once(&mut timeout, parse_timeout(value)?, "--timeout-secs")?;
@@ -1191,6 +1737,7 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
         title,
         model,
         effort,
+        terminal,
         yolo,
         timeout: timeout.unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
         detach,
@@ -1349,7 +1896,7 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
 }
 
 fn run_ask(request: AskRequest) -> Result<()> {
-    terminal::macos_iterm::ensure_available()?;
+    let terminal_kind = terminal::select(request.terminal)?;
     let workspace = request.workspace.canonicalize().with_context(|| {
         format!(
             "workspace does not exist or cannot be resolved: {}",
@@ -1390,34 +1937,33 @@ fn run_ask(request: AskRequest) -> Result<()> {
         &executable,
         &created.id,
     )?;
-    let iterm_session_id =
-        match terminal::macos_iterm::open_tab(&bridge_command, &created.manifest.title) {
-            Ok(id) => id,
-            Err(error) => {
-                let _ = fs::remove_file(created.directory.join("initial-prompt.txt"));
-                let _ = update_status(
-                    &created.directory,
-                    "failed",
-                    None,
-                    Some(format!("{error:#}")),
-                );
-                return Err(error).with_context(|| {
-                    format!("failed to open iTerm tab for session {}", created.id)
-                });
-            }
-        };
-    write_json_atomic(
-        &created.directory.join("terminal.json"),
-        &TerminalRecord {
-            iterm_session_id: iterm_session_id.clone(),
-        },
-    )?;
+    let mut terminal_session = match terminal::open_tab(terminal_kind, &bridge_command) {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = fs::remove_file(created.directory.join("initial-prompt.txt"));
+            let _ = update_status(
+                &created.directory,
+                "failed",
+                None,
+                Some(format!("{error:#}")),
+            );
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to open {} surface for session {}",
+                    terminal_kind.display_name(),
+                    created.id
+                )
+            });
+        }
+    };
+    terminal_session.managed_session_id = Some(created.id.clone());
+    write_json_atomic(&created.directory.join("terminal.json"), &terminal_session)?;
 
     if request.detach {
         return emit_session_result(
             request.json,
             &created.id,
-            &iterm_session_id,
+            &terminal_session,
             request.provider,
             None,
         );
@@ -1425,26 +1971,207 @@ fn run_ask(request: AskRequest) -> Result<()> {
 
     let event = wait_for_event(&created.directory, 0, request.timeout).with_context(|| {
         format!(
-            "session {} remains open in iTerm; use `agent-bridge sessions` to inspect it",
-            created.id
+            "session {} remains open in {}; use `agent-bridge sessions` to inspect it",
+            created.id,
+            terminal_session.kind.display_name()
         )
     })?;
     emit_session_result(
         request.json,
         &created.id,
-        &iterm_session_id,
+        &terminal_session,
         request.provider,
         Some(&event),
     )
 }
 
+fn verify_terminal_surface_ownership(
+    directory: &Path,
+    expected_session_id: &str,
+    session: &terminal::TerminalSession,
+) -> Result<()> {
+    session.verify_managed_session(expected_session_id)?;
+    if session.kind == terminal::TerminalKind::AppleTerminal {
+        verify_apple_terminal_owner(directory, expected_session_id, session)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_apple_terminal_owner(
+    directory: &Path,
+    expected_session_id: &str,
+    session: &terminal::TerminalSession,
+) -> Result<()> {
+    let owner_path = directory.join(SESSION_OWNER_FILE);
+    let owner_text = read_regular_text_if_present(&owner_path)?
+        .with_context(|| "Terminal.app ownership requires a live native-session owner")?;
+    let owner: NativeSessionOwner = serde_json::from_str(&owner_text)
+        .with_context(|| format!("invalid JSON in {}", owner_path.display()))?;
+    let live = live_native_process_identity(owner.pid)?;
+    let surface_tty_device = terminal_tty_device(Path::new(&session.id))?;
+    verify_terminal_owner_attestation(
+        expected_session_id,
+        session,
+        &owner,
+        &live,
+        surface_tty_device,
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_apple_terminal_owner(
+    _directory: &Path,
+    _expected_session_id: &str,
+    _session: &terminal::TerminalSession,
+) -> Result<()> {
+    bail!("Terminal.app ownership proof is only available on macOS")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn verify_terminal_owner_attestation(
+    expected_session_id: &str,
+    session: &terminal::TerminalSession,
+    owner: &NativeSessionOwner,
+    live: &NativeProcessIdentity,
+    surface_tty_device: u64,
+) -> Result<()> {
+    if session.kind != terminal::TerminalKind::AppleTerminal {
+        bail!("native-session TTY attestation is only valid for Terminal.app")
+    }
+    session.verify_managed_session(expected_session_id)?;
+    if session.window_id.as_deref().is_none_or(str::is_empty) {
+        bail!("Terminal.app session record is missing its dedicated window id")
+    }
+    if owner.managed_session_id.as_deref() != Some(expected_session_id) {
+        bail!("native-session owner is not bound to this managed session")
+    }
+    if owner.terminal_tty.as_deref() != Some(session.id.as_str()) {
+        bail!("native-session owner is attached to a different terminal TTY")
+    }
+    if owner.pid != live.pid {
+        bail!("native-session owner PID no longer identifies the live process")
+    }
+    let owner_tty_device = owner
+        .terminal_tty_device
+        .context("native-session owner is missing its controlling TTY device")?;
+    if owner_tty_device != live.terminal_tty_device || owner_tty_device != surface_tty_device {
+        bail!("Terminal.app TTY no longer belongs to the native-session owner")
+    }
+    let owner_start_seconds = owner
+        .process_start_seconds
+        .context("native-session owner is missing its process start time")?;
+    let owner_start_microseconds = owner
+        .process_start_microseconds
+        .context("native-session owner is missing its process start time")?;
+    if owner_start_seconds != live.process_start_seconds
+        || owner_start_microseconds != live.process_start_microseconds
+    {
+        bail!("native-session owner PID was reused by another process")
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn current_native_session_owner(session_id: &str) -> Result<NativeSessionOwner> {
+    let pid = std::process::id();
+    let live = live_native_process_identity(pid)?;
+    let terminal_tty = current_terminal_tty()?;
+    let terminal_tty_device = terminal_tty_device(Path::new(&terminal_tty))?;
+    if live.terminal_tty_device != terminal_tty_device {
+        bail!("native-session process is not attached to its reported terminal TTY")
+    }
+    Ok(NativeSessionOwner {
+        pid,
+        managed_session_id: Some(session_id.to_owned()),
+        terminal_tty: Some(terminal_tty),
+        terminal_tty_device: Some(terminal_tty_device),
+        process_start_seconds: Some(live.process_start_seconds),
+        process_start_microseconds: Some(live.process_start_microseconds),
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn current_native_session_owner(session_id: &str) -> Result<NativeSessionOwner> {
+    Ok(NativeSessionOwner {
+        pid: std::process::id(),
+        managed_session_id: Some(session_id.to_owned()),
+        ..NativeSessionOwner::default()
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn current_terminal_tty() -> Result<String> {
+    let mut buffer = [0 as libc::c_char; libc::PATH_MAX as usize];
+    let error = unsafe { libc::ttyname_r(libc::STDIN_FILENO, buffer.as_mut_ptr(), buffer.len()) };
+    if error != 0 {
+        return Err(std::io::Error::from_raw_os_error(error))
+            .context("failed to resolve native-session controlling TTY");
+    }
+    let tty = unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) }
+        .to_str()
+        .context("native-session controlling TTY is not valid UTF-8")?;
+    Ok(tty.to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn terminal_tty_device(path: &Path) -> Result<u64> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to inspect terminal TTY {}", path.display()))?;
+    if !metadata.file_type().is_char_device() {
+        bail!("terminal TTY is not a character device: {}", path.display())
+    }
+    Ok(metadata.rdev())
+}
+
+#[cfg(target_os = "macos")]
+fn live_native_process_identity(pid: u32) -> Result<NativeProcessIdentity> {
+    const PROC_PIDTBSDINFO: libc::c_int = 3;
+
+    let pid_value = libc::c_int::try_from(pid).context("native-session PID is out of range")?;
+    let buffer_size = libc::c_int::try_from(std::mem::size_of::<MacProcBsdInfo>())
+        .context("macOS process-info structure is too large")?;
+    let mut info = std::mem::MaybeUninit::<MacProcBsdInfo>::zeroed();
+    let returned = unsafe {
+        proc_pidinfo(
+            pid_value,
+            PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            buffer_size,
+        )
+    };
+    if returned != buffer_size {
+        if returned <= 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to inspect native-session process {pid}"));
+        }
+        bail!("macOS returned an incomplete identity for native-session process {pid}")
+    }
+    let info = unsafe { info.assume_init() };
+    if info.pid != pid {
+        bail!("macOS returned the wrong native-session process identity")
+    }
+    if info.terminal_tty_device == u32::MAX {
+        bail!("native-session process has no controlling TTY")
+    }
+    Ok(NativeProcessIdentity {
+        pid,
+        terminal_tty_device: u64::from(info.terminal_tty_device),
+        process_start_seconds: info.process_start_seconds,
+        process_start_microseconds: info.process_start_microseconds,
+    })
+}
+
 fn run_tell(request: TellRequest) -> Result<()> {
-    terminal::macos_iterm::ensure_available()?;
     let directory = session_directory(&request.id)?;
     repair_dead_native_owner(&directory)?;
     let claim = acquire_turn_claim(&directory)?;
     let manifest = read_manifest(&directory)?;
-    let terminal: TerminalRecord = read_json(&directory.join("terminal.json"))?;
+    let terminal_session: terminal::TerminalSession = read_json(&directory.join("terminal.json"))?;
+    verify_terminal_surface_ownership(&directory, &request.id, &terminal_session)?;
     let baseline = event_paths(&directory)?.len();
     let previous_state = read_json::<SessionStatus>(&directory.join("status.json"))?.state;
     if !session_accepts_prompt(&previous_state) {
@@ -1463,17 +2190,20 @@ fn run_tell(request: TellRequest) -> Result<()> {
     let prompt = native_delegation_prompt(&delegation_source(), &request.prompt);
     prompt_file.write_all(&terminal_paste_bytes(&prompt))?;
     prompt_file.flush()?;
-    if let Err(error) =
-        terminal::macos_iterm::send_file(&terminal.iterm_session_id, prompt_file.path())
-    {
+    if let Err(error) = terminal::send_file(&terminal_session, prompt_file.path()) {
         let _ = update_status(
             &directory,
             &previous_state,
             None,
             Some(format!("{error:#}")),
         );
-        return Err(error)
-            .with_context(|| format!("failed to type into visible iTerm session {}", request.id));
+        return Err(error).with_context(|| {
+            format!(
+                "failed to type into visible {} session {}",
+                terminal_session.kind.display_name(),
+                request.id
+            )
+        });
     }
     claim.retain();
 
@@ -1481,21 +2211,22 @@ fn run_tell(request: TellRequest) -> Result<()> {
         return emit_session_result(
             request.json,
             &request.id,
-            &terminal.iterm_session_id,
+            &terminal_session,
             FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?,
             None,
         );
     }
     let event = wait_for_event(&directory, baseline, request.timeout).with_context(|| {
         format!(
-            "session {} remains open in iTerm; the requested turn did not report completion",
-            request.id
+            "session {} remains open in {}; the requested turn did not report completion",
+            request.id,
+            terminal_session.kind.display_name()
         )
     })?;
     emit_session_result(
         request.json,
         &request.id,
-        &terminal.iterm_session_id,
+        &terminal_session,
         FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?,
         Some(&event),
     )
@@ -1520,7 +2251,8 @@ fn run_sessions(json: bool) -> Result<()> {
                 continue;
             };
             let status = read_json::<SessionStatus>(&directory.join("status.json")).ok();
-            let terminal = read_json::<TerminalRecord>(&directory.join("terminal.json")).ok();
+            let terminal =
+                read_json::<terminal::TerminalSession>(&directory.join("terminal.json")).ok();
             sessions.push(serde_json::json!({
                 "id": manifest.id,
                 "provider": manifest.provider,
@@ -1528,7 +2260,13 @@ fn run_sessions(json: bool) -> Result<()> {
                 "title": manifest.title,
                 "yolo": manifest.yolo,
                 "state": status.as_ref().map(|value| value.state.as_str()).unwrap_or("unknown"),
-                "iterm_session_id": terminal.map(|value| value.iterm_session_id),
+                "terminal": terminal.as_ref().map(|value| value.kind.as_str()),
+                "terminal_session_id": terminal.as_ref().map(|value| value.id.as_str()),
+                "terminal_tab_id": terminal.as_ref().and_then(|value| value.tab_id.as_deref()),
+                "terminal_window_id": terminal.as_ref().and_then(|value| value.window_id.as_deref()),
+                "iterm_session_id": terminal.as_ref()
+                    .filter(|value| value.kind == terminal::TerminalKind::Iterm2)
+                    .map(|value| value.id.as_str()),
                 "results": event_paths(&directory).map(|paths| paths.len()).unwrap_or(0),
             }));
         }
@@ -1541,11 +2279,12 @@ fn run_sessions(json: bool) -> Result<()> {
     } else {
         for session in sessions {
             println!(
-                "{}\t{}\t{}\t{}\tyolo={}\t{} result(s)",
+                "{}\t{}\t{}\t{}\tterminal={}\tyolo={}\t{} result(s)",
                 session["id"].as_str().unwrap_or("?"),
                 terminal_safe_text(session["state"].as_str().unwrap_or("unknown"), false),
                 terminal_safe_text(session["provider"].as_str().unwrap_or("?"), false),
                 terminal_safe_text(session["workspace"].as_str().unwrap_or("?"), false),
+                session["terminal"].as_str().unwrap_or("unknown"),
                 session["yolo"].as_bool().unwrap_or(false),
                 session["results"].as_u64().unwrap_or(0),
             );
@@ -1555,11 +2294,14 @@ fn run_sessions(json: bool) -> Result<()> {
 }
 
 fn run_close(request: CloseRequest) -> Result<()> {
-    terminal::macos_iterm::ensure_available()?;
     confirm_explicit_close(request.explicit)?;
     let directory = session_directory(&request.id)?;
-    close_session_state(&directory, terminal::macos_iterm::close_session)
-        .with_context(|| format!("failed to close visible iTerm session {}", request.id))?;
+    repair_dead_native_owner(&directory)?;
+    close_session_state(&directory, |session| {
+        verify_terminal_surface_ownership(&directory, &request.id, session)?;
+        terminal::close_session(session)
+    })
+    .with_context(|| format!("failed to close visible terminal session {}", request.id))?;
     if request.json {
         println!(
             "{}",
@@ -1577,30 +2319,99 @@ fn run_close(request: CloseRequest) -> Result<()> {
 
 fn close_session_state<F>(directory: &Path, mut close_terminal: F) -> Result<()>
 where
-    F: FnMut(&str) -> Result<ItermCloseOutcome>,
+    F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
 {
-    let terminal_path = directory.join("terminal.json");
-    let terminal = match fs::read_to_string(&terminal_path) {
-        Ok(text) => Some(
-            serde_json::from_str::<TerminalRecord>(&text)
-                .with_context(|| format!("invalid JSON in {}", terminal_path.display()))?,
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+    let status: SessionStatus = read_json(&directory.join("status.json"))?;
+    if status.state == "closed" {
+        let consume_result = consume_terminal_handle(directory, None);
+        let close_result = mark_session_closed(directory, None);
+        consume_result?;
+        return close_result;
+    }
+
+    let terminal_path = directory.join(TERMINAL_HANDLE_FILE);
+    let closing_path = directory.join(TERMINAL_CLOSING_FILE);
+    if directory.join(TERMINAL_TOMBSTONE_FILE).exists() {
+        let consume_result = consume_terminal_handle(directory, None);
+        let close_result = mark_session_closed(directory, None);
+        consume_result?;
+        return close_result;
+    }
+    match fs::rename(&terminal_path, &closing_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if closing_path.exists() {
+                bail!("another close request already owns this terminal handle");
+            }
+            return mark_session_closed(directory, None);
+        }
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read {}", terminal_path.display()));
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to claim terminal handle {}",
+                    terminal_path.display()
+                )
+            });
+        }
+    }
+
+    let terminal = match read_json::<terminal::TerminalSession>(&closing_path) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            restore_terminal_handle(&closing_path, &terminal_path)?;
+            return Err(error);
         }
     };
-    if let Some(terminal) = terminal {
-        close_terminal(&terminal.iterm_session_id)?;
+    if let Err(error) = close_terminal(&terminal) {
+        restore_terminal_handle(&closing_path, &terminal_path)?;
+        return Err(error);
     }
-    mark_session_closed(directory, None)
+
+    let consume_result = consume_terminal_handle(directory, Some(terminal.kind));
+    let close_result = mark_session_closed(directory, None);
+    consume_result?;
+    close_result
+}
+
+fn restore_terminal_handle(closing_path: &Path, terminal_path: &Path) -> Result<()> {
+    fs::rename(closing_path, terminal_path).with_context(|| {
+        format!(
+            "failed to restore terminal handle {} after close failure",
+            terminal_path.display()
+        )
+    })
+}
+
+fn consume_terminal_handle(
+    directory: &Path,
+    terminal_kind: Option<terminal::TerminalKind>,
+) -> Result<()> {
+    let tombstone_result = write_json_atomic(
+        &directory.join(TERMINAL_TOMBSTONE_FILE),
+        &serde_json::json!({
+            "consumed": true,
+            "terminal": terminal_kind.map(terminal::TerminalKind::as_str),
+        }),
+    );
+    let active_result = remove_file_if_present(&directory.join(TERMINAL_HANDLE_FILE));
+    let closing_result = remove_file_if_present(&directory.join(TERMINAL_CLOSING_FILE));
+    tombstone_result?;
+    active_result?;
+    closing_result
+}
+
+fn remove_file_if_present(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
+    }
 }
 
 fn emit_session_result(
     json: bool,
     id: &str,
-    iterm_session_id: &str,
+    terminal_session: &terminal::TerminalSession,
     provider: FirstPartyCli,
     event: Option<&SessionEvent>,
 ) -> Result<()> {
@@ -1611,7 +2422,12 @@ fn emit_session_result(
                 "ok": true,
                 "session": id,
                 "provider": provider.as_str(),
-                "iterm_session_id": iterm_session_id,
+                "terminal": terminal_session.kind.as_str(),
+                "terminal_session_id": terminal_session.id,
+                "terminal_tab_id": terminal_session.tab_id,
+                "terminal_window_id": terminal_session.window_id,
+                "iterm_session_id": (terminal_session.kind == terminal::TerminalKind::Iterm2)
+                    .then_some(terminal_session.id.as_str()),
                 "result": event.map(|value| value.message.as_str()),
                 "provider_session_id": event.and_then(|value| value.provider_session_id.as_deref()),
                 "turn_id": event.and_then(|value| value.turn_id.as_deref()),
@@ -1632,12 +2448,8 @@ fn run_session(id: &str) -> Result<()> {
         bail!("native-session must run in a visible interactive terminal");
     }
     let directory = session_directory(id)?;
-    write_json_atomic(
-        &directory.join(SESSION_OWNER_FILE),
-        &NativeSessionOwner {
-            pid: std::process::id(),
-        },
-    )?;
+    let owner = current_native_session_owner(id)?;
+    write_json_atomic(&directory.join(SESSION_OWNER_FILE), &owner)?;
     let result = run_session_inner(&directory);
     let _ = release_turn_claim(&directory);
     if let Err(error) = &result {
@@ -2554,8 +3366,16 @@ fn release_turn_claim(directory: &Path) -> Result<()> {
 }
 
 fn mark_session_closed(directory: &Path, error: Option<String>) -> Result<()> {
+    let consume_result = if directory.join(TERMINAL_HANDLE_FILE).exists()
+        || directory.join(TERMINAL_CLOSING_FILE).exists()
+    {
+        consume_terminal_handle(directory, None)
+    } else {
+        Ok(())
+    };
     let status_result = update_status(directory, "closed", None, error);
     let claim_result = release_turn_claim(directory);
+    consume_result?;
     status_result?;
     claim_result
 }
@@ -2564,7 +3384,7 @@ fn repair_dead_native_owner(directory: &Path) -> Result<bool> {
     let status: SessionStatus = read_json(&directory.join("status.json"))?;
     if !matches!(
         status.state.as_str(),
-        "launching" | "running" | "working" | "ready"
+        "launching" | "running" | "working" | "ready" | "exited" | "failed"
     ) {
         return Ok(false);
     }
