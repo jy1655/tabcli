@@ -728,18 +728,104 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_provider_resolution_accepts_exe_suffix() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("agy.exe"), b"stub").unwrap();
+        let path = std::env::join_paths([directory.path()]).unwrap();
+        assert_eq!(
+            resolve_provider_from_path(FirstPartyCli::Agy, &path).unwrap(),
+            directory.path().join("agy.exe").canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_provider_resolution_skips_extensionless_npm_shell_shims() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("codex"), b"#!/bin/sh\n").unwrap();
+        fs::write(directory.path().join("codex.cmd"), b"@echo off\r\n").unwrap();
+        let path = std::env::join_paths([directory.path()]).unwrap();
+        assert_eq!(
+            resolve_provider_from_path(FirstPartyCli::Codex, &path).unwrap(),
+            directory.path().join("codex.cmd").canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_provider_version_check_runs_cmd_shims() {
+        let directory = tempfile::tempdir().unwrap();
+        let shim = directory.path().join("agy.cmd");
+        fs::write(&shim, "@echo off\r\necho agy 1.1.12\r\n").unwrap();
+        assert_eq!(
+            check_provider_version(FirstPartyCli::Agy, &shim).unwrap(),
+            "agy 1.1.12"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_state_root_falls_back_to_userprofile_without_home() {
+        assert_eq!(
+            default_state_root(None, Some(std::ffi::OsStr::new(r"C:\Users\cmd-user"))).unwrap(),
+            PathBuf::from(r"C:\Users\cmd-user\.agent-bridge\native-sessions")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_batch_providers_are_launched_through_a_fixed_powershell_forwarder() {
+        let directory = tempfile::tempdir().unwrap();
+        let command = provider_process_command(
+            Path::new(r"\\?\C:\npm\codex.cmd"),
+            directory.path(),
+            vec![OsString::from("--config"), OsString::from("a&b")],
+        )
+        .unwrap();
+        assert_eq!(command.get_program(), "pwsh.exe");
+        let args = command.get_args().collect::<Vec<_>>();
+        assert_eq!(args[0], "-NoLogo");
+        assert_eq!(args[1], "-NoProfile");
+        assert_eq!(args[2], "-File");
+        assert_eq!(args[4], r"C:\npm\codex.cmd");
+        assert_eq!(args[6], "a&b");
+    }
+
     #[test]
     fn bridge_shell_command_quotes_the_workspace_and_executable() {
+        let command = bridge_shell_command(
+            Path::new("/tmp/project; touch nope"),
+            Path::new("/tmp/state root"),
+            Path::new("/tmp/Agent Bridge/bin"),
+            "session-safe123",
+        )
+        .unwrap();
+        #[cfg(unix)]
         assert_eq!(
-            bridge_shell_command(
-                Path::new("/tmp/project; touch nope"),
-                Path::new("/tmp/state root"),
-                Path::new("/tmp/Agent Bridge/bin"),
-                "session-safe123",
-            )
-            .unwrap(),
+            command,
             "cd '/tmp/project; touch nope' && AGENT_BRIDGE_NATIVE_STATE_DIR='/tmp/state root' '/tmp/Agent Bridge/bin' native-session 'session-safe123'"
         );
+        #[cfg(windows)]
+        assert_eq!(
+            command,
+            "Set-Location -LiteralPath '/tmp/project; touch nope'; $env:AGENT_BRIDGE_NATIVE_STATE_DIR = '/tmp/state root'; & '/tmp/Agent Bridge/bin' native-session 'session-safe123'"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_launch_quoting_doubles_apostrophes() {
+        let command = bridge_shell_command(
+            Path::new("C:\\work\\owner's repo"),
+            Path::new("C:\\state"),
+            Path::new("C:\\bin\\agent-bridge.exe"),
+            "session-safe123",
+        )
+        .unwrap();
+        assert!(command.contains("'C:\\work\\owner''s repo'"));
+        assert!(!command.contains("owner's repo"));
     }
 
     #[test]
@@ -1470,6 +1556,11 @@ pub(crate) enum NativeCommand {
         provider: FirstPartyCli,
         payload: Option<String>,
     },
+    ConsoleControl {
+        action: String,
+        pid: u32,
+        input: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -1630,7 +1721,13 @@ struct SessionSpec {
 pub(crate) fn is_command(value: &str) -> bool {
     matches!(
         value,
-        "ask" | "tell" | "sessions" | "close-session" | "native-session" | "native-hook"
+        "ask"
+            | "tell"
+            | "sessions"
+            | "close-session"
+            | "native-session"
+            | "native-hook"
+            | "native-console-control"
     )
 }
 
@@ -1655,6 +1752,24 @@ where
             Ok(NativeCommand::RunSession { id: id.to_owned() })
         }
         "native-hook" => parse_hook(rest),
+        "native-console-control" => {
+            let [action, pid, tail @ ..] = rest else {
+                bail!("native-console-control requires an action and process id");
+            };
+            if !matches!(action.as_str(), "send" | "close") {
+                bail!("unsupported native console action: {action}");
+            }
+            let input = match (action.as_str(), tail) {
+                ("send", [input]) => Some(input.clone()),
+                ("close", []) => None,
+                _ => bail!("invalid native console control arguments"),
+            };
+            Ok(NativeCommand::ConsoleControl {
+                action: action.clone(),
+                pid: pid.parse().context("invalid native console process id")?,
+                input,
+            })
+        }
         _ => bail!("unknown native command: {command}"),
     }
 }
@@ -1892,6 +2007,9 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
         NativeCommand::Close(request) => run_close(request),
         NativeCommand::RunSession { id } => run_session(&id),
         NativeCommand::Hook { provider, payload } => run_hook(provider, payload.as_deref()),
+        NativeCommand::ConsoleControl { action, pid, input } => {
+            terminal::windows_console_control(&action, pid, input.as_deref())
+        }
     }
 }
 
@@ -2515,8 +2633,9 @@ fn run_session_inner(directory: &Path) -> Result<()> {
             (None, Some(PiFailureMonitor::start(directory)?))
         }
     };
-    let status = Command::new(&manifest.provider_path)
-        .args(arguments)
+    let mut provider_command =
+        provider_process_command(&manifest.provider_path, directory, arguments)?;
+    let status = provider_command
         .current_dir(&manifest.workspace)
         .env(SESSION_DIR_ENV, directory)
         .env("AGENT_BRIDGE_NATIVE_SESSION_ID", &manifest.id)
@@ -2540,6 +2659,45 @@ fn run_session_inner(directory: &Path) -> Result<()> {
         bail!("{} exited with {status}", provider.as_str());
     }
     Ok(())
+}
+
+fn provider_process_command(
+    executable: &Path,
+    directory: &Path,
+    arguments: Vec<OsString>,
+) -> Result<Command> {
+    #[cfg(windows)]
+    if executable
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("cmd") || value.eq_ignore_ascii_case("bat"))
+    {
+        const FORWARDER: &str = "param(\n  [Parameter(Mandatory=$true)][string]$Provider,\n  [Parameter(ValueFromRemainingArguments=$true)][string[]]$ProviderArgs\n)\n& $Provider @ProviderArgs\nexit $LASTEXITCODE\n";
+        let forwarder = directory.join("provider-launch.ps1");
+        write_private(&forwarder, FORWARDER.as_bytes())?;
+        let mut command = Command::new("pwsh.exe");
+        command.args(["-NoLogo", "-NoProfile", "-File"]);
+        command
+            .arg(forwarder)
+            .arg(windows_command_path(executable))
+            .args(arguments);
+        return Ok(command);
+    }
+
+    let mut command = Command::new(executable);
+    command.args(arguments);
+    Ok(command)
+}
+
+#[cfg(windows)]
+fn windows_command_path(path: &Path) -> OsString {
+    let value = path.as_os_str().to_string_lossy();
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        return OsString::from(format!(r"\\{rest}"));
+    }
+    value
+        .strip_prefix(r"\\?\")
+        .map_or_else(|| path.as_os_str().to_owned(), OsString::from)
 }
 
 fn run_hook(provider: FirstPartyCli, argument_payload: Option<&str>) -> Result<()> {
@@ -3199,7 +3357,20 @@ fn state_root() -> Result<PathBuf> {
     if let Some(root) = std::env::var_os(STATE_DIR_ENV) {
         return Ok(PathBuf::from(root));
     }
-    let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
+    default_state_root(
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("USERPROFILE").as_deref(),
+    )
+}
+
+fn default_state_root(
+    home: Option<&std::ffi::OsStr>,
+    user_profile: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
+    let home = home
+        .or(user_profile)
+        .map(PathBuf::from)
+        .context("neither HOME nor USERPROFILE is set")?;
     Ok(home.join(".agent-bridge").join("native-sessions"))
 }
 
@@ -3486,16 +3657,26 @@ fn resolve_provider_from_path(provider: FirstPartyCli, path: &std::ffi::OsStr) -
         if !directory.is_absolute() {
             continue;
         }
-        let candidate = directory.join(provider.command());
-        if candidate.is_file() && is_executable(&candidate) {
-            let canonical = candidate.canonicalize().with_context(|| {
-                format!(
-                    "failed to canonicalize provider path {}",
-                    candidate.display()
-                )
-            })?;
-            if canonical.is_file() && is_executable(&canonical) {
-                return Ok(canonical);
+        #[cfg(windows)]
+        let names = [
+            format!("{}.exe", provider.command()),
+            format!("{}.cmd", provider.command()),
+            format!("{}.bat", provider.command()),
+        ];
+        #[cfg(not(windows))]
+        let names = [provider.command().to_owned()];
+        for name in names {
+            let candidate = directory.join(name);
+            if candidate.is_file() && is_executable(&candidate) {
+                let canonical = candidate.canonicalize().with_context(|| {
+                    format!(
+                        "failed to canonicalize provider path {}",
+                        candidate.display()
+                    )
+                })?;
+                if canonical.is_file() && is_executable(&canonical) {
+                    return Ok(canonical);
+                }
             }
         }
     }
@@ -3549,6 +3730,7 @@ fn shell_quote(value: &std::ffi::OsStr) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+#[cfg(unix)]
 fn bridge_shell_command(
     workspace: &Path,
     state_root: &Path,
@@ -3570,6 +3752,36 @@ fn bridge_shell_command(
         shell_quote(state_root.as_os_str()),
         shell_quote(executable.as_os_str()),
         shell_quote(OsString::from(id).as_os_str())
+    ))
+}
+
+#[cfg(windows)]
+fn powershell_quote(value: &std::ffi::OsStr) -> String {
+    format!("'{}'", value.to_string_lossy().replace('\'', "''"))
+}
+
+#[cfg(windows)]
+fn bridge_shell_command(
+    workspace: &Path,
+    state_root: &Path,
+    executable: &Path,
+    id: &str,
+) -> Result<String> {
+    for (value, field) in [
+        (workspace.as_os_str(), "workspace"),
+        (state_root.as_os_str(), "state root"),
+        (executable.as_os_str(), "Agent Bridge executable"),
+        (std::ffi::OsStr::new(id), "session id"),
+    ] {
+        validate_shell_command_component(value, field)?;
+    }
+    Ok(format!(
+        "Set-Location -LiteralPath {}; $env:{} = {}; & {} native-session {}",
+        powershell_quote(workspace.as_os_str()),
+        STATE_DIR_ENV,
+        powershell_quote(state_root.as_os_str()),
+        powershell_quote(executable.as_os_str()),
+        powershell_quote(std::ffi::OsStr::new(id)),
     ))
 }
 

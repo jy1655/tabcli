@@ -1,4 +1,4 @@
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "windows"))]
 
 use std::{
     process::Command,
@@ -95,7 +95,7 @@ fn run_native_adapter_smoke(provider: &str) {
     assert!(
         matches!(
             response["terminal"].as_str(),
-            Some("ghostty" | "iterm2" | "apple-terminal")
+            Some("ghostty" | "iterm2" | "apple-terminal" | "windows-console")
         ),
         "native response is missing a supported terminal kind: {}",
         String::from_utf8_lossy(&output.stdout)
@@ -117,25 +117,25 @@ fn run_native_adapter_smoke(provider: &str) {
 }
 
 #[test]
-#[ignore = "manual live smoke: opens and closes a detected macOS terminal surface and requires authenticated Codex"]
+#[ignore = "manual live smoke: opens and closes a supported terminal surface and requires authenticated Codex"]
 fn live_native_codex_returns_result_and_closes_session() {
     run_native_adapter_smoke("codex");
 }
 
 #[test]
-#[ignore = "manual live smoke: opens and closes a detected macOS terminal surface and requires authenticated Claude"]
+#[ignore = "manual live smoke: opens and closes a supported terminal surface and requires authenticated Claude"]
 fn live_native_claude_returns_result_and_closes_session() {
     run_native_adapter_smoke("claude");
 }
 
 #[test]
-#[ignore = "manual live smoke: opens and closes a detected macOS terminal surface and requires authenticated Agy"]
+#[ignore = "manual live smoke: opens and closes a supported terminal surface and requires authenticated Agy"]
 fn live_native_agy_returns_result_and_closes_session() {
     run_native_adapter_smoke("agy");
 }
 
 #[test]
-#[ignore = "manual live smoke: opens and closes a detected macOS terminal surface and requires authenticated Pi"]
+#[ignore = "manual live smoke: opens and closes a supported terminal surface and requires authenticated Pi"]
 fn live_native_pi_returns_result_and_closes_session() {
     run_native_adapter_smoke("pi");
 }

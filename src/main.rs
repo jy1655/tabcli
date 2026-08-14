@@ -19,7 +19,7 @@ fn help_text() -> String {
 
 Usage:
   agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] --prompt TEXT [--title NAME]
-      [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal>]
+      [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|windows-console>]
       [--yolo] [--timeout-secs N] [--detach] [--json]
   agent-bridge tell <session> --prompt TEXT [--timeout-secs N] [--detach] [--json]
   agent-bridge sessions [--json]
@@ -30,8 +30,9 @@ Runtime:
   macOS detects Ghostty, iTerm2, or Terminal.app from the invoking environment
   and opens a real surface for Codex, Claude, Agy, or Pi. Terminal.app always
   uses a dedicated new window. Use --terminal to override detection. An
-  unknown host falls back to Terminal.app. Linux and Windows are
-  not yet supported. Agent Bridge controls only sessions that it launched.
+  unknown host falls back to Terminal.app. Windows opens a dedicated managed
+  PowerShell 7 console from either PowerShell or cmd. Linux is not yet supported.
+  Agent Bridge controls only sessions that it launched.
   Attaching to an arbitrary CLI is not supported.
 
 Session policy:
@@ -200,6 +201,8 @@ mod tests {
             "Terminal.app always\n  uses a dedicated new window",
             "Use --terminal to override",
             "unknown host falls back to Terminal.app",
+            "Windows opens a dedicated managed",
+            "PowerShell 7 console from either PowerShell or cmd",
             "Fable5 is passed to Claude Code as Fable",
             "Fable is passed to Pi as anthropic/claude-fable-5",
             "Attaching to an arbitrary CLI",

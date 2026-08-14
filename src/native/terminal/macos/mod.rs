@@ -26,6 +26,7 @@ pub(super) fn open_tab(kind: TerminalKind, command: &str) -> Result<TerminalSess
         TerminalKind::Iterm2 => iterm2::open_tab(command),
         TerminalKind::AppleTerminal => apple_terminal::open_tab(command),
         TerminalKind::Ghostty => ghostty::open_tab(command),
+        TerminalKind::WindowsConsole => bail!("Windows Console is only available on Windows"),
     }
 }
 
@@ -34,6 +35,7 @@ pub(super) fn send_file(session: &TerminalSession, prompt_path: &Path) -> Result
         TerminalKind::Iterm2 => iterm2::send_file(session, prompt_path),
         TerminalKind::AppleTerminal => apple_terminal::send_file(session, prompt_path),
         TerminalKind::Ghostty => ghostty::send_file(session, prompt_path),
+        TerminalKind::WindowsConsole => bail!("Windows Console is only available on Windows"),
     }
 }
 
@@ -42,6 +44,7 @@ pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
         TerminalKind::Iterm2 => iterm2::close_session(session),
         TerminalKind::AppleTerminal => apple_terminal::close_session(session),
         TerminalKind::Ghostty => ghostty::close_session(session),
+        TerminalKind::WindowsConsole => bail!("Windows Console is only available on Windows"),
     }
 }
 

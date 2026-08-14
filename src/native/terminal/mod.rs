@@ -27,6 +27,7 @@ pub(crate) enum TerminalKind {
     Iterm2,
     AppleTerminal,
     Ghostty,
+    WindowsConsole,
 }
 
 impl TerminalKind {
@@ -35,6 +36,7 @@ impl TerminalKind {
             Self::Iterm2 => "iterm2",
             Self::AppleTerminal => "apple-terminal",
             Self::Ghostty => "ghostty",
+            Self::WindowsConsole => "windows-console",
         }
     }
 
@@ -43,6 +45,7 @@ impl TerminalKind {
             Self::Iterm2 => "iTerm2",
             Self::AppleTerminal => "Terminal.app",
             Self::Ghostty => "Ghostty",
+            Self::WindowsConsole => "Windows Console",
         }
     }
 }
@@ -53,6 +56,7 @@ impl FromStr for TerminalKind {
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         match value.to_ascii_lowercase().as_str() {
             "ghostty" => Ok(Self::Ghostty),
+            "windows-console" | "windows" | "console" => Ok(Self::WindowsConsole),
             "iterm" | "iterm.app" | "iterm2" => Ok(Self::Iterm2),
             "apple-terminal" | "apple_terminal" | "default" | "terminal" | "terminal.app" => {
                 Ok(Self::AppleTerminal)
@@ -116,6 +120,11 @@ pub(super) fn send_file(session: &TerminalSession, prompt_path: &Path) -> Result
 
 pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
     platform::close_session(session)
+}
+
+#[cfg(target_os = "windows")]
+pub(super) fn windows_console_control(action: &str, pid: u32, input: Option<&str>) -> Result<()> {
+    windows::console_control(action, pid, input)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -228,7 +237,22 @@ mod tests {
             );
         }
         assert_eq!(TerminalKind::from_str("Ghostty"), Ok(TerminalKind::Ghostty));
+        assert_eq!(
+            TerminalKind::from_str("windows-console"),
+            Ok(TerminalKind::WindowsConsole)
+        );
         assert!(TerminalKind::from_str("vscode").is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_selects_its_managed_console_transport() {
+        assert_eq!(super::select(None).unwrap(), TerminalKind::WindowsConsole);
+        assert_eq!(
+            super::select(Some(TerminalKind::WindowsConsole)).unwrap(),
+            TerminalKind::WindowsConsole
+        );
+        assert!(super::select(Some(TerminalKind::Iterm2)).is_err());
     }
 
     #[test]
