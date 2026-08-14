@@ -1561,6 +1561,7 @@ struct NativeSessionOwner {
     process_start_microseconds: Option<u64>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeProcessIdentity {
     pid: u32,
@@ -2027,6 +2028,7 @@ fn verify_apple_terminal_owner(
     bail!("Terminal.app ownership proof is only available on macOS")
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn verify_terminal_owner_attestation(
     expected_session_id: &str,
     session: &terminal::TerminalSession,
