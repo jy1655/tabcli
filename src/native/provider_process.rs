@@ -14,11 +14,8 @@ pub(super) fn command(
 ) -> Result<Command> {
     #[cfg(windows)]
     if has_extension(executable, "ps1") {
-        let mut command = Command::new(terminal::windows_powershell_executable()?);
-        command.args(["-NoLogo", "-NoProfile", "-File"]);
-        command
-            .arg(windows_command_path(executable))
-            .args(arguments);
+        let mut command = powershell_file_command(executable)?;
+        command.args(arguments);
         return Ok(command);
     }
 
@@ -35,10 +32,8 @@ pub(super) fn command(
         const FORWARDER: &str = "param(\n  [Parameter(Mandatory=$true)][string]$Provider,\n  [Parameter(ValueFromRemainingArguments=$true)][string[]]$ProviderArgs\n)\n& $Provider @ProviderArgs\nexit $LASTEXITCODE\n";
         let forwarder = _directory.join("provider-launch.ps1");
         write_private(&forwarder, FORWARDER.as_bytes())?;
-        let mut command = Command::new(terminal::windows_powershell_executable()?);
-        command.args(["-NoLogo", "-NoProfile", "-File"]);
+        let mut command = powershell_file_command(&forwarder)?;
         command
-            .arg(forwarder)
             .arg(windows_command_path(executable))
             .args(arguments);
         return Ok(command);
@@ -52,12 +47,23 @@ pub(super) fn command(
 pub(super) fn version_command(executable: &Path) -> Result<Command> {
     #[cfg(windows)]
     if has_extension(executable, "ps1") {
-        let mut command = Command::new(terminal::windows_powershell_executable()?);
-        command.args(["-NoLogo", "-NoProfile", "-File"]);
-        command.arg(windows_command_path(executable));
-        return Ok(command);
+        return powershell_file_command(executable);
     }
     Ok(Command::new(executable))
+}
+
+#[cfg(windows)]
+fn powershell_file_command(script: &Path) -> Result<Command> {
+    let mut command = Command::new(terminal::windows_powershell_executable()?);
+    command.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+    ]);
+    command.arg(windows_command_path(script));
+    Ok(command)
 }
 
 #[cfg(windows)]

@@ -799,9 +799,11 @@ mod tests {
         let args = command.get_args().collect::<Vec<_>>();
         assert_eq!(args[0], "-NoLogo");
         assert_eq!(args[1], "-NoProfile");
-        assert_eq!(args[2], "-File");
-        assert_eq!(args[4], r"C:\npm\codex.cmd");
-        assert_eq!(args[6], "a&b");
+        assert_eq!(args[2], "-ExecutionPolicy");
+        assert_eq!(args[3], "Bypass");
+        assert_eq!(args[4], "-File");
+        assert_eq!(args[6], r"C:\npm\codex.cmd");
+        assert_eq!(args[8], "a&b");
     }
 
     #[cfg(windows)]
@@ -843,6 +845,22 @@ mod tests {
                 "..\\outside.txt",
             ])
             .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_close_control_uses_the_claimed_terminal_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join(TERMINAL_HANDLE_FILE), b"active").unwrap();
+        assert_eq!(
+            windows_console_handle_path(directory.path(), "close"),
+            directory.path().join(TERMINAL_HANDLE_FILE)
+        );
+        fs::write(directory.path().join(TERMINAL_CLOSING_FILE), b"closing").unwrap();
+        assert_eq!(
+            windows_console_handle_path(directory.path(), "close"),
+            directory.path().join(TERMINAL_CLOSING_FILE)
         );
     }
 
@@ -2103,12 +2121,8 @@ fn valid_pending_prompt_name(value: &str) -> bool {
 fn run_windows_console_control(action: &str, id: &str, input_name: Option<&str>) -> Result<()> {
     let directory = session_directory(id)?;
     let manifest = read_manifest(&directory)?;
-    let handle_name = if action == "close" && directory.join(TERMINAL_CLOSING_FILE).is_file() {
-        TERMINAL_CLOSING_FILE
-    } else {
-        TERMINAL_HANDLE_FILE
-    };
-    let session: terminal::TerminalSession = read_json(&directory.join(handle_name))?;
+    let session: terminal::TerminalSession =
+        read_json(&windows_console_handle_path(&directory, action))?;
     if session.kind != terminal::TerminalKind::WindowsConsole {
         bail!("managed session is not owned by the Windows console transport");
     }
@@ -2117,6 +2131,16 @@ fn run_windows_console_control(action: &str, id: &str, input_name: Option<&str>)
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
     let submit_count = usize::from(provider == FirstPartyCli::Codex) + 1;
     terminal::windows_console_control(action, &session, input_path.as_deref(), submit_count)
+}
+
+#[cfg(windows)]
+fn windows_console_handle_path(directory: &Path, action: &str) -> PathBuf {
+    let closing = directory.join(TERMINAL_CLOSING_FILE);
+    if action == "close" && closing.is_file() {
+        closing
+    } else {
+        directory.join(TERMINAL_HANDLE_FILE)
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -3664,12 +3688,13 @@ fn repair_dead_native_owner(directory: &Path) -> Result<bool> {
     }
     #[cfg(windows)]
     if let Ok(session) =
-        read_json::<terminal::TerminalSession>(&directory.join(TERMINAL_HANDLE_FILE))
+        read_json::<terminal::TerminalSession>(&windows_console_handle_path(directory, "close"))
         && session.kind == terminal::TerminalKind::WindowsConsole
     {
         // The visible console root can outlive a failed native-session owner.
         // Close the identity-bound surface before consuming its only handle.
-        let _ = terminal::close_session(&session);
+        terminal::close_session(&session)
+            .context("failed to close a Windows console whose native owner exited")?;
     }
     mark_session_closed(
         directory,

@@ -11,12 +11,19 @@ use windows_sys::Win32::System::Console::{
     KEY_EVENT, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0, WriteConsoleInputW,
 };
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE},
+    Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree},
+    Security::{
+        Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
+            SetNamedSecurityInfoW,
+        },
+        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
+    },
     Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING},
     System::Threading::{
-        CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CreateProcessW, GetProcessTimes, OpenProcess,
-        PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
-        STARTUPINFOW,
+        CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CreateProcessW,
+        GetProcessTimes, OpenProcess, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW, ResumeThread, STARTUPINFOW, TerminateProcess,
     },
 };
 
@@ -68,7 +75,7 @@ pub(super) fn open_tab(kind: TerminalKind, command: &str) -> Result<TerminalSess
             std::ptr::null(),
             std::ptr::null(),
             0,
-            CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP,
+            console_creation_flags(),
             std::ptr::null(),
             std::ptr::null(),
             &startup,
@@ -79,7 +86,26 @@ pub(super) fn open_tab(kind: TerminalKind, command: &str) -> Result<TerminalSess
         return Err(std::io::Error::last_os_error())
             .context("failed to open a managed Windows console with PowerShell 7 (pwsh.exe)");
     }
-    let identity = query_process_identity_from_handle(process.hProcess)?;
+    let identity = match query_process_identity_from_handle(process.hProcess) {
+        Ok(identity) => identity,
+        Err(error) => {
+            unsafe {
+                TerminateProcess(process.hProcess, 1);
+                CloseHandle(process.hThread);
+                CloseHandle(process.hProcess);
+            }
+            return Err(error).context("failed to attest the managed Windows console process");
+        }
+    };
+    if unsafe { ResumeThread(process.hThread) } == u32::MAX {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            TerminateProcess(process.hProcess, 1);
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+        }
+        return Err(error).context("failed to start the attested managed Windows console process");
+    }
     unsafe {
         CloseHandle(process.hThread);
         CloseHandle(process.hProcess);
@@ -92,6 +118,10 @@ pub(super) fn open_tab(kind: TerminalKind, command: &str) -> Result<TerminalSess
         managed_session_id: None,
         windows_process_identity: Some(identity),
     })
+}
+
+fn console_creation_flags() -> u32 {
+    CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED
 }
 
 fn resolve_executable_from_path(name: &str, path: &OsStr) -> Result<PathBuf> {
@@ -117,10 +147,6 @@ pub(super) fn powershell_executable() -> Result<PathBuf> {
 
 pub(super) fn set_private_permissions(path: &Path, directory: bool) -> Result<()> {
     let system_directory = system_directory()?;
-    let icacls = system_directory.join("icacls.exe");
-    if !icacls.is_file() {
-        bail!("Windows ACL tool was not found at {}", icacls.display());
-    }
     let whoami = system_directory.join("whoami.exe");
     let whoami_output = Command::new(&whoami)
         .args(["/user", "/fo", "csv", "/nh"])
@@ -143,30 +169,67 @@ pub(super) fn set_private_permissions(path: &Path, directory: bool) -> Result<()
                 && value.chars().all(|c| c == '-' || c.is_ascii_alphanumeric())
         })
         .context("whoami did not return a Windows user SID")?;
-    let inheritance = if directory { "(OI)(CI)" } else { "" };
-    let identity = format!("*{sid}:{inheritance}F");
-    let output = Command::new(icacls)
-        .arg(path)
-        .args(["/inheritance:r", "/grant:r"])
-        .arg(identity)
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to apply a private Windows ACL to {}",
-                path.display()
-            )
-        })?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        bail!(
-            "failed to apply a private Windows ACL to {}{}",
-            path.display(),
-            if message.is_empty() {
-                String::new()
-            } else {
-                format!(": {message}")
-            }
-        );
+    apply_private_dacl(path, &private_sddl(sid, directory))
+}
+
+fn private_sddl(sid: &str, directory: bool) -> String {
+    format!("D:P(A;{};FA;;;{sid})", if directory { "OICI" } else { "" })
+}
+
+fn apply_private_dacl(path: &Path, sddl: &str) -> Result<()> {
+    let descriptor_text = OsStr::new(sddl)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut descriptor = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            descriptor_text.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to build a private Windows security descriptor");
+    }
+
+    let mut present = 0;
+    let mut defaulted = 0;
+    let mut dacl = std::ptr::null_mut();
+    let extracted =
+        unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) };
+    if extracted == 0 || present == 0 || dacl.is_null() {
+        let error = if extracted == 0 {
+            anyhow::Error::new(std::io::Error::last_os_error())
+        } else {
+            anyhow::anyhow!("private Windows security descriptor contains no DACL")
+        };
+        unsafe { LocalFree(descriptor) };
+        return Err(error).context("failed to extract a private Windows DACL");
+    }
+
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe { LocalFree(descriptor) };
+    if status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status as i32))
+            .context("failed to atomically apply a private Windows DACL");
     }
     Ok(())
 }
@@ -249,7 +312,7 @@ pub(super) fn console_control(
         .windows_process_identity
         .as_ref()
         .context("Windows console handle is missing its process identity")?;
-    verify_process_identity(pid, identity.creation_time, &identity.executable_path)?;
+    verify_control_process_identity(pid, identity)?;
     // This runs only in the short-lived helper process so detaching its inherited
     // console cannot disturb the user's invoking PowerShell or cmd session.
     unsafe {
@@ -281,6 +344,16 @@ pub(super) fn console_control(
     };
     unsafe { FreeConsole() };
     result
+}
+
+fn verify_control_process_identity(pid: u32, identity: &WindowsProcessIdentity) -> Result<()> {
+    match verify_process_identity(pid, identity.creation_time, &identity.executable_path) {
+        Ok(()) => Ok(()),
+        Err(_) if !agent_bridge::process_is_alive(pid) => {
+            bail!("console process is no longer available")
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(super) fn query_process_identity(pid: u32) -> Result<WindowsProcessIdentity> {
@@ -436,10 +509,11 @@ fn build_console_input_records(input: &str, submit_count: usize) -> Vec<INPUT_RE
 #[cfg(test)]
 mod tests {
     use super::{
-        build_console_input_records, query_process_identity, resolve_executable_from_path,
-        verify_process_identity,
+        build_console_input_records, console_creation_flags, private_sddl, query_process_identity,
+        resolve_executable_from_path, verify_control_process_identity, verify_process_identity,
     };
     use std::fs;
+    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
 
     #[test]
     fn powershell_resolution_uses_only_absolute_path_entries() {
@@ -460,6 +534,11 @@ mod tests {
     }
 
     #[test]
+    fn console_launch_is_suspended_until_process_identity_is_recorded() {
+        assert_ne!(console_creation_flags() & CREATE_SUSPENDED, 0);
+    }
+
+    #[test]
     fn process_identity_rejects_reused_pid_creation_time() {
         let pid = std::process::id();
         let identity = query_process_identity(pid).unwrap();
@@ -472,6 +551,25 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn missing_console_process_converges_to_the_standard_missing_result() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let error = verify_control_process_identity(
+            pid,
+            &super::WindowsProcessIdentity {
+                creation_time: 0,
+                executable_path: String::new(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no longer available"));
     }
 
     #[test]
@@ -510,5 +608,14 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn private_acl_is_one_protected_current_user_entry() {
+        assert_eq!(
+            private_sddl("S-1-5-21-1", true),
+            "D:P(A;OICI;FA;;;S-1-5-21-1)"
+        );
+        assert_eq!(private_sddl("S-1-5-21-1", false), "D:P(A;;FA;;;S-1-5-21-1)");
     }
 }
