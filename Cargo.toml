@@ -4,6 +4,8 @@ version = "0.2.0"
 edition = "2024"
 description = "Visible terminal bridge for Codex, Claude, Agy, and Pi CLIs"
 license = "MIT"
+repository = "https://github.com/jy1655/agent-bridge"
+readme = "README.md"
 rust-version = "1.88"
 
 [dependencies]
