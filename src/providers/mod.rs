@@ -20,6 +20,9 @@ pub trait ProviderAdapter: Sync {
     fn command(&self) -> &'static str;
     fn minimum_version(&self) -> Version;
     fn yolo_args(&self) -> &'static [&'static str];
+    fn model_args(&self, model: &str) -> Vec<String> {
+        vec!["--model".to_owned(), model.to_owned()]
+    }
     fn effort_args(&self, effort: &str) -> Result<Vec<String>>;
 }
 

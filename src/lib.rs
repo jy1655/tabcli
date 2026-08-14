@@ -105,6 +105,10 @@ pub fn provider_launch_args(cli: FirstPartyCli, yolo: bool) -> Vec<&'static str>
     provider_adapter(cli).yolo_args().to_vec()
 }
 
+pub fn provider_model_args(cli: FirstPartyCli, model: &str) -> Vec<String> {
+    provider_adapter(cli).model_args(model)
+}
+
 pub fn provider_effort_args(cli: FirstPartyCli, effort: &str) -> Result<Vec<String>> {
     provider_adapter(cli).effort_args(effort)
 }

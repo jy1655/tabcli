@@ -1,6 +1,6 @@
 use agent_bridge::{
     FirstPartyCli, cli_version_is_supported, confirm_explicit_close, provider_adapter,
-    provider_launch_args, supported_clis,
+    provider_launch_args, provider_model_args, supported_clis,
 };
 
 #[test]
@@ -105,4 +105,27 @@ fn each_provider_adapter_owns_its_native_effort_policy() {
             .unwrap(),
         ["--thinking", "minimal"]
     );
+}
+
+#[test]
+fn claude_normalizes_only_the_observed_fable5_model_alias() {
+    assert_eq!(
+        provider_model_args(FirstPartyCli::Claude, "Fable5"),
+        ["--model", "Fable"]
+    );
+    assert_eq!(
+        provider_model_args(FirstPartyCli::Claude, "Fable"),
+        ["--model", "Fable"]
+    );
+    assert_eq!(
+        provider_model_args(FirstPartyCli::Claude, "fable5"),
+        ["--model", "fable5"]
+    );
+
+    for provider in [FirstPartyCli::Codex, FirstPartyCli::Agy, FirstPartyCli::Pi] {
+        assert_eq!(
+            provider_model_args(provider, "Fable5"),
+            ["--model", "Fable5"]
+        );
+    }
 }

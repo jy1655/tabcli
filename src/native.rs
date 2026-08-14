@@ -687,7 +687,7 @@ mod tests {
                 provider_version: "2.1.229 (Claude Code)".to_owned(),
                 workspace,
                 title: "Claude test".to_owned(),
-                model: Some("claude-provider-model".to_owned()),
+                model: Some("Fable5".to_owned()),
                 effort: Some("high".to_owned()),
                 yolo: false,
                 created_unix_ms: unix_ms(),
@@ -699,7 +699,8 @@ mod tests {
         run_session_inner(&directory).unwrap();
 
         let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
-        assert!(arguments.contains("--model\nclaude-provider-model"));
+        assert!(arguments.contains("--model\nFable"));
+        assert!(!arguments.contains("Fable5"));
         assert!(arguments.contains("--effort\nhigh"));
         assert!(arguments.contains("--settings"));
         assert!(arguments.ends_with("claude prompt\n"));
@@ -943,8 +944,8 @@ use std::{
 
 use agent_bridge::{
     FirstPartyCli, checked_deadline_from, cli_version_is_supported, confirm_explicit_close,
-    process_is_alive, provider_effort_args, provider_launch_args, terminal_safe_text,
-    validate_terminal_input,
+    process_is_alive, provider_effort_args, provider_launch_args, provider_model_args,
+    terminal_safe_text, validate_terminal_input,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -1661,8 +1662,11 @@ fn run_session_inner(directory: &Path) -> Result<()> {
         );
     }
     if let Some(model) = &manifest.model {
-        arguments.push(OsString::from("--model"));
-        arguments.push(OsString::from(model));
+        arguments.extend(
+            provider_model_args(provider, model)
+                .into_iter()
+                .map(OsString::from),
+        );
     }
     let provider::LaunchPlan {
         arguments: provider_arguments,
