@@ -10,6 +10,7 @@ dependencies = [
  "conpty",
  "crossbeam-channel",
  "crossterm",
+ "libc",
  "portable-pty",
  "ratatui",
  "semver",
@@ -17,6 +18,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "vt100",
+ "windows-sys",
 ]
 
 [[package]]

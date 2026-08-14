@@ -27,49 +27,41 @@ mod tests {
     }
 
     #[test]
-    fn ask_model_is_supported_by_codex_agy_and_pi_but_not_claude() {
-        let command = parse_args([
-            "ask",
-            "codex",
-            "--prompt",
-            "review this",
-            "--model",
-            "gpt-daybreak-blue-latest",
-        ])
-        .unwrap();
-
-        assert!(matches!(
-            command,
-            NativeCommand::Ask(AskRequest {
-                model: Some(model),
-                ..
-            }) if model == "gpt-daybreak-blue-latest"
-        ));
-        for provider in ["agy", "pi"] {
-            assert!(
-                parse_args([
-                    "ask",
-                    provider,
-                    "--prompt",
-                    "review this",
-                    "--model",
-                    "provider-model",
-                ])
-                .is_ok(),
-                "{provider} rejected --model"
-            );
-        }
-        assert!(
-            parse_args([
+    fn ask_model_is_supported_by_every_native_provider() {
+        for provider in ["codex", "claude", "agy", "pi"] {
+            let command = parse_args([
                 "ask",
-                "claude",
+                provider,
                 "--prompt",
                 "review this",
                 "--model",
-                "gpt-daybreak-blue-latest",
+                "provider-model",
             ])
-            .is_err()
-        );
+            .unwrap_or_else(|error| panic!("{provider} rejected --model: {error:#}"));
+
+            assert!(matches!(
+                command,
+                NativeCommand::Ask(AskRequest {
+                    model: Some(model),
+                    ..
+                }) if model == "provider-model"
+            ));
+        }
+    }
+
+    #[test]
+    fn model_and_effort_are_not_inherited_when_omitted() {
+        for provider in ["codex", "claude", "agy", "pi"] {
+            let command = parse_args(["ask", provider, "--prompt", "review this"]).unwrap();
+            assert!(matches!(
+                command,
+                NativeCommand::Ask(AskRequest {
+                    model: None,
+                    effort: None,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
@@ -98,6 +90,33 @@ mod tests {
                 }) if effort == requested_effort
             ));
         }
+    }
+
+    #[test]
+    fn native_ask_and_tell_reject_unrepresentable_timeouts() {
+        let too_large = u64::MAX.to_string();
+        assert!(
+            parse_args([
+                "ask",
+                "codex",
+                "--prompt",
+                "review this",
+                "--timeout-secs",
+                &too_large,
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args([
+                "tell",
+                "session-safe123",
+                "--prompt",
+                "continue",
+                "--timeout-secs",
+                &too_large,
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -214,6 +233,93 @@ mod tests {
     }
 
     #[test]
+    fn explicit_close_repairs_failed_launch_without_terminal_record() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(
+            directory.path(),
+            "failed",
+            None,
+            Some("launch failed".to_owned()),
+        )
+        .unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        claim.retain();
+        let mut close_was_called = false;
+
+        close_session_state(directory.path(), |_| {
+            close_was_called = true;
+            Ok(ItermCloseOutcome::Closed)
+        })
+        .unwrap();
+
+        assert!(!close_was_called);
+        assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state, "closed");
+    }
+
+    #[test]
+    fn explicit_close_is_idempotent_when_iterm_session_is_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        write_json_atomic(
+            &directory.path().join("terminal.json"),
+            &TerminalRecord {
+                iterm_session_id: "missing-iterm-session".to_owned(),
+            },
+        )
+        .unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        claim.retain();
+        let mut close_calls = 0;
+
+        for _ in 0..2 {
+            close_session_state(directory.path(), |id| {
+                assert_eq!(id, "missing-iterm-session");
+                close_calls += 1;
+                Ok(ItermCloseOutcome::Missing)
+            })
+            .unwrap();
+        }
+
+        assert_eq!(close_calls, 2);
+        assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state, "closed");
+    }
+
+    #[test]
+    fn explicit_close_is_terminal_against_late_native_wrapper_updates() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        write_json_atomic(
+            &directory.path().join("terminal.json"),
+            &TerminalRecord {
+                iterm_session_id: "closing-iterm-session".to_owned(),
+            },
+        )
+        .unwrap();
+        update_status(directory.path(), "running", None, None).unwrap();
+
+        close_session_state(directory.path(), |_| Ok(ItermCloseOutcome::Closed)).unwrap();
+        update_status(directory.path(), "exited", Some(1), None).unwrap();
+        update_status(
+            directory.path(),
+            "failed",
+            None,
+            Some("provider exited after close".to_owned()),
+        )
+        .unwrap();
+
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state, "closed");
+        assert_eq!(status.exit_code, None);
+        assert_eq!(status.error, None);
+    }
+
+    #[test]
     fn internal_session_ids_cannot_escape_the_state_root() {
         assert!(valid_session_id("session-abCD_123-xyz"));
         assert!(!valid_session_id("../outside"));
@@ -307,9 +413,49 @@ mod tests {
                 Path::new("/tmp/state root"),
                 Path::new("/tmp/Agent Bridge/bin"),
                 "session-safe123",
-            ),
+            )
+            .unwrap(),
             "cd '/tmp/project; touch nope' && AGENT_BRIDGE_NATIVE_STATE_DIR='/tmp/state root' '/tmp/Agent Bridge/bin' native-session 'session-safe123'"
         );
+    }
+
+    #[test]
+    fn bridge_shell_command_rejects_controls_in_dynamic_components() {
+        for control in ['\0', '\n', '\t', '\r', '\u{1b}', '\u{7f}'] {
+            let unsafe_value = format!("unsafe{control}value");
+            for result in [
+                bridge_shell_command(
+                    Path::new(&unsafe_value),
+                    Path::new("/tmp/state"),
+                    Path::new("/tmp/bridge"),
+                    "session-safe123",
+                ),
+                bridge_shell_command(
+                    Path::new("/tmp/workspace"),
+                    Path::new(&unsafe_value),
+                    Path::new("/tmp/bridge"),
+                    "session-safe123",
+                ),
+                bridge_shell_command(
+                    Path::new("/tmp/workspace"),
+                    Path::new("/tmp/state"),
+                    Path::new(&unsafe_value),
+                    "session-safe123",
+                ),
+                bridge_shell_command(
+                    Path::new("/tmp/workspace"),
+                    Path::new("/tmp/state"),
+                    Path::new("/tmp/bridge"),
+                    &unsafe_value,
+                ),
+            ] {
+                assert!(
+                    result.is_err(),
+                    "accepted terminal control U+{:04X}",
+                    u32::from(control)
+                );
+            }
+        }
     }
 
     #[test]
@@ -345,6 +491,71 @@ mod tests {
         assert!(acquire_turn_claim(directory.path()).is_err());
         release_turn_claim(directory.path()).unwrap();
         assert!(acquire_turn_claim(directory.path()).is_ok());
+    }
+
+    fn reaped_child_pid() -> u32 {
+        #[cfg(windows)]
+        let mut child = Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .unwrap();
+        #[cfg(not(windows))]
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[test]
+    fn live_native_session_owner_is_not_repaired() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        claim.retain();
+        write_json_atomic(
+            &directory.path().join(SESSION_OWNER_FILE),
+            &NativeSessionOwner {
+                pid: std::process::id(),
+            },
+        )
+        .unwrap();
+
+        assert!(!repair_dead_native_owner(directory.path()).unwrap());
+        assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state, "working");
+    }
+
+    #[test]
+    fn dead_native_session_owner_releases_the_turn_and_closes_state() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        claim.retain();
+        write_json_atomic(
+            &directory.path().join(SESSION_OWNER_FILE),
+            &NativeSessionOwner {
+                pid: reaped_child_pid(),
+            },
+        )
+        .unwrap();
+
+        assert!(repair_dead_native_owner(directory.path()).unwrap());
+        assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state, "closed");
+        assert!(
+            status
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("no longer running"))
+        );
+        assert!(directory.path().join("events").is_dir());
     }
 
     #[cfg(unix)]
@@ -446,6 +657,53 @@ mod tests {
         assert_eq!(status.state, "exited");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn claude_session_forwards_requested_model() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let provider = root.path().join("fake-claude");
+        fs::write(
+            &provider,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '2.1.229 (Claude Code)\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" > \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/argv.txt\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let directory = root.path().join("session-safe123");
+        fs::create_dir(&directory).unwrap();
+        fs::create_dir(directory.join("events")).unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        write_json_atomic(
+            &directory.join("manifest.json"),
+            &SessionManifest {
+                schema: SESSION_SCHEMA,
+                id: "session-safe123".to_owned(),
+                provider: "claude".to_owned(),
+                provider_path: provider,
+                provider_version: "2.1.229 (Claude Code)".to_owned(),
+                workspace,
+                title: "Claude test".to_owned(),
+                model: Some("claude-provider-model".to_owned()),
+                effort: Some("high".to_owned()),
+                yolo: false,
+                created_unix_ms: unix_ms(),
+            },
+        )
+        .unwrap();
+        write_private(&directory.join("initial-prompt.txt"), b"claude prompt").unwrap();
+
+        run_session_inner(&directory).unwrap();
+
+        let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
+        assert!(arguments.contains("--model\nclaude-provider-model"));
+        assert!(arguments.contains("--effort\nhigh"));
+        assert!(arguments.contains("--settings"));
+        assert!(arguments.ends_with("claude prompt\n"));
+    }
+
     #[test]
     fn agy_transcript_cursor_records_each_completed_response_once() {
         let root = tempfile::tempdir().unwrap();
@@ -510,6 +768,56 @@ mod tests {
         assert_eq!(latest.turn_id.as_deref(), Some("4"));
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
         assert_eq!(status.state, "ready");
+    }
+
+    #[test]
+    fn agy_monitor_switches_to_the_newest_created_conversation() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-safe123");
+        fs::create_dir(&directory).unwrap();
+        fs::create_dir(directory.join("events")).unwrap();
+        update_status(&directory, "working", None, None).unwrap();
+        let brain = root.path().join("brain");
+        let log = directory.join("agy.log");
+        let first_id = "11111111-1111-1111-1111-111111111111";
+        let second_id = "22222222-2222-2222-2222-222222222222";
+        for (id, message) in [(first_id, "before clear"), (second_id, "after clear")] {
+            let transcript = brain
+                .join(id)
+                .join(".system_generated")
+                .join("logs")
+                .join("transcript.jsonl");
+            fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+            fs::write(
+                transcript,
+                format!(
+                    "{{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":1,\"content\":{}}}\n",
+                    serde_json::to_string(message).unwrap()
+                ),
+            )
+            .unwrap();
+        }
+        fs::write(&log, format!("Created conversation {first_id}\n")).unwrap();
+        let mut monitor = AgyMonitorState::default();
+
+        monitor.poll(&directory, &log, &brain).unwrap();
+        update_status(&directory, "working", None, None).unwrap();
+        fs::write(
+            &log,
+            format!("Created conversation {first_id}\n/clear\nCreated conversation {second_id}\n"),
+        )
+        .unwrap();
+        monitor.poll(&directory, &log, &brain).unwrap();
+
+        let paths = event_paths(&directory).unwrap();
+        assert_eq!(paths.len(), 2);
+        let first: SessionEvent = read_json(&paths[0]).unwrap();
+        let second: SessionEvent = read_json(&paths[1]).unwrap();
+        assert_eq!(first.message, "before clear");
+        assert_eq!(first.provider_session_id.as_deref(), Some(first_id));
+        assert_eq!(second.message, "after clear");
+        assert_eq!(second.provider_session_id.as_deref(), Some(second_id));
+        assert_eq!(second.turn_id.as_deref(), Some("1"));
     }
 
     #[cfg(unix)]
@@ -630,8 +938,8 @@ use std::{
 };
 
 use agent_bridge::{
-    FirstPartyCli, cli_version_is_supported, confirm_explicit_close, provider_launch_args,
-    terminal_safe_text, validate_terminal_input,
+    FirstPartyCli, checked_deadline_from, cli_version_is_supported, confirm_explicit_close,
+    process_is_alive, provider_launch_args, terminal_safe_text, validate_terminal_input,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -641,6 +949,8 @@ const SESSION_DIR_ENV: &str = "AGENT_BRIDGE_NATIVE_SESSION_DIR";
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
 const SESSION_SCHEMA: u32 = 1;
 const TURN_CLAIM_FILE: &str = "turn.claim";
+const SESSION_OWNER_FILE: &str = "native-session.json";
+const CLOSED_STATUS_FILE: &str = "closed.json";
 const PI_HOOK_FAILURE_FILE: &str = "pi-hook-failure.json";
 
 pub(crate) const OPEN_ITERM_TAB_SCRIPT: &str = r#"
@@ -706,7 +1016,7 @@ on run argv
             end repeat
         end repeat
     end tell
-    error "Agent Bridge iTerm session not found"
+    return "missing"
 end run
 "#;
 
@@ -779,6 +1089,12 @@ struct TerminalRecord {
     iterm_session_id: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ItermCloseOutcome {
+    Closed,
+    Missing,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct SessionStatus {
     state: String,
@@ -803,6 +1119,11 @@ struct PiHookFailureSignal {
     error: String,
     provider_session_id: Option<String>,
     turn_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct NativeSessionOwner {
+    pid: u32,
 }
 
 struct CreatedSession {
@@ -918,9 +1239,6 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
     }
     if effort.as_ref().is_some_and(|value| value.trim().is_empty()) {
         bail!("--effort cannot be empty");
-    }
-    if provider == FirstPartyCli::Claude && model.is_some() {
-        bail!("--model is supported for codex, agy, and pi, but not claude");
     }
     Ok(NativeCommand::Ask(AskRequest {
         provider,
@@ -1055,7 +1373,9 @@ fn parse_timeout(value: &str) -> Result<Duration> {
     if seconds == 0 {
         bail!("timeout must be greater than zero");
     }
-    Ok(Duration::from_secs(seconds))
+    let timeout = Duration::from_secs(seconds);
+    checked_deadline_from(Instant::now(), timeout)?;
+    Ok(timeout)
 }
 
 pub(crate) fn valid_session_id(value: &str) -> bool {
@@ -1125,7 +1445,7 @@ fn run_ask(request: AskRequest) -> Result<()> {
             .context("session directory has no state root")?,
         &executable,
         &created.id,
-    );
+    )?;
     let iterm_session_id = match open_iterm_tab(&bridge_command, &created.manifest.title) {
         Ok(id) => id,
         Err(error) => {
@@ -1175,6 +1495,7 @@ fn run_ask(request: AskRequest) -> Result<()> {
 fn run_tell(request: TellRequest) -> Result<()> {
     ensure_macos_iterm()?;
     let directory = session_directory(&request.id)?;
+    repair_dead_native_owner(&directory)?;
     let claim = acquire_turn_claim(&directory)?;
     let manifest = read_manifest(&directory)?;
     let terminal: TerminalRecord = read_json(&directory.join("terminal.json"))?;
@@ -1246,6 +1567,7 @@ fn run_sessions(json: bool) -> Result<()> {
                 continue;
             }
             let directory = entry.path();
+            let _ = repair_dead_native_owner(&directory);
             let Ok(manifest) = read_manifest(&directory) else {
                 continue;
             };
@@ -1288,10 +1610,8 @@ fn run_close(request: CloseRequest) -> Result<()> {
     ensure_macos_iterm()?;
     confirm_explicit_close(request.explicit)?;
     let directory = session_directory(&request.id)?;
-    let terminal: TerminalRecord = read_json(&directory.join("terminal.json"))?;
-    close_iterm_session(&terminal.iterm_session_id)
+    close_session_state(&directory, close_iterm_session)
         .with_context(|| format!("failed to close visible iTerm session {}", request.id))?;
-    update_status(&directory, "closed", None, None)?;
     if request.json {
         println!(
             "{}",
@@ -1305,6 +1625,28 @@ fn run_close(request: CloseRequest) -> Result<()> {
         println!("closed {}", request.id);
     }
     Ok(())
+}
+
+fn close_session_state<F>(directory: &Path, mut close_terminal: F) -> Result<()>
+where
+    F: FnMut(&str) -> Result<ItermCloseOutcome>,
+{
+    let terminal_path = directory.join("terminal.json");
+    let terminal = match fs::read_to_string(&terminal_path) {
+        Ok(text) => Some(
+            serde_json::from_str::<TerminalRecord>(&text)
+                .with_context(|| format!("invalid JSON in {}", terminal_path.display()))?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read {}", terminal_path.display()));
+        }
+    };
+    if let Some(terminal) = terminal {
+        close_terminal(&terminal.iterm_session_id)?;
+    }
+    mark_session_closed(directory, None)
 }
 
 fn emit_session_result(
@@ -1342,6 +1684,12 @@ fn run_session(id: &str) -> Result<()> {
         bail!("native-session must run in a visible interactive terminal");
     }
     let directory = session_directory(id)?;
+    write_json_atomic(
+        &directory.join(SESSION_OWNER_FILE),
+        &NativeSessionOwner {
+            pid: std::process::id(),
+        },
+    )?;
     let result = run_session_inner(&directory);
     let _ = release_turn_claim(&directory);
     if let Err(error) = &result {
@@ -1370,14 +1718,14 @@ fn run_session_inner(directory: &Path) -> Result<()> {
                 .map(OsString::from),
         );
     }
+    if let Some(model) = &manifest.model {
+        arguments.push(OsString::from("--model"));
+        arguments.push(OsString::from(model));
+    }
     let mut prompt_is_positional = true;
     let mut agy_log_path = None;
     match provider {
         FirstPartyCli::Codex => {
-            if let Some(model) = &manifest.model {
-                arguments.push(OsString::from("--model"));
-                arguments.push(OsString::from(model));
-            }
             let notify = serde_json::to_string(&[
                 executable.to_string_lossy().as_ref(),
                 "native-hook",
@@ -1397,10 +1745,6 @@ fn run_session_inner(directory: &Path) -> Result<()> {
             arguments.push(OsString::from(&manifest.title));
         }
         FirstPartyCli::Agy => {
-            if let Some(model) = &manifest.model {
-                arguments.push(OsString::from("--model"));
-                arguments.push(OsString::from(model));
-            }
             let log_path = directory.join("agy.log");
             arguments.push(OsString::from("--log-file"));
             arguments.push(log_path.as_os_str().to_owned());
@@ -1410,10 +1754,6 @@ fn run_session_inner(directory: &Path) -> Result<()> {
             agy_log_path = Some(log_path);
         }
         FirstPartyCli::Pi => {
-            if let Some(model) = &manifest.model {
-                arguments.push(OsString::from("--model"));
-                arguments.push(OsString::from(model));
-            }
             let extension_path = directory.join("pi-agent-bridge.js");
             write_private(&extension_path, pi_bridge_extension().as_bytes())?;
             arguments.push(OsString::from("--extension"));
@@ -1967,32 +2307,44 @@ fn read_agy_full_result(path: &Path, brain_root: &Path, step: u64) -> Result<Opt
     Ok(None)
 }
 
+#[derive(Default)]
+struct AgyMonitorState {
+    conversation_id: Option<String>,
+    transcript: Option<AgyTranscriptCursor>,
+}
+
+impl AgyMonitorState {
+    fn poll(&mut self, directory: &Path, log_path: &Path, brain_root: &Path) -> Result<()> {
+        if let Some(log) = read_regular_text_if_present(log_path)?
+            && let Some(newest_id) = parse_agy_conversation_id(&log)
+            && self.conversation_id.as_deref() != Some(newest_id.as_str())
+        {
+            let path = brain_root
+                .join(&newest_id)
+                .join(".system_generated")
+                .join("logs")
+                .join("transcript.jsonl");
+            self.conversation_id = Some(newest_id);
+            self.transcript = Some(AgyTranscriptCursor::new(path));
+        }
+        if let (Some(id), Some(cursor)) =
+            (self.conversation_id.as_deref(), self.transcript.as_mut())
+        {
+            cursor.poll(directory, brain_root, id)?;
+        }
+        Ok(())
+    }
+}
+
 fn monitor_agy_session(
     directory: &Path,
     log_path: &Path,
     brain_root: &Path,
     stop: &AtomicBool,
 ) -> Result<()> {
-    let mut conversation_id = None;
-    let mut transcript = None;
+    let mut state = AgyMonitorState::default();
     loop {
-        if conversation_id.is_none()
-            && let Some(log) = read_regular_text_if_present(log_path)?
-        {
-            conversation_id = parse_agy_conversation_id(&log);
-        }
-        if let Some(id) = conversation_id.as_deref() {
-            let cursor = transcript.get_or_insert_with(|| {
-                AgyTranscriptCursor::new(
-                    brain_root
-                        .join(id)
-                        .join(".system_generated")
-                        .join("logs")
-                        .join("transcript.jsonl"),
-                )
-            });
-            cursor.poll(directory, brain_root, id)?;
-        }
+        state.poll(directory, log_path, brain_root)?;
         if stop.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -2226,15 +2578,36 @@ fn update_status(
     exit_code: Option<i32>,
     error: Option<String>,
 ) -> Result<()> {
-    write_json_atomic(
-        &directory.join("status.json"),
-        &SessionStatus {
-            state: state.to_owned(),
-            updated_unix_ms: unix_ms(),
-            exit_code,
-            error,
-        },
-    )
+    let status = SessionStatus {
+        state: state.to_owned(),
+        updated_unix_ms: unix_ms(),
+        exit_code,
+        error,
+    };
+    let status_path = directory.join("status.json");
+    let closed_path = directory.join(CLOSED_STATUS_FILE);
+    if state == "closed" {
+        write_json_atomic(&closed_path, &status)?;
+        return write_json_atomic(&status_path, &status);
+    }
+    if let Some(closed) = read_status_if_present(&closed_path)? {
+        return write_json_atomic(&status_path, &closed);
+    }
+    write_json_atomic(&status_path, &status)?;
+    if let Some(closed) = read_status_if_present(&closed_path)? {
+        write_json_atomic(&status_path, &closed)?;
+    }
+    Ok(())
+}
+
+fn read_status_if_present(path: &Path) -> Result<Option<SessionStatus>> {
+    match fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map(Some)
+            .with_context(|| format!("invalid JSON in {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
 }
 
 struct TurnClaim {
@@ -2280,6 +2653,43 @@ fn release_turn_claim(directory: &Path) -> Result<()> {
     }
 }
 
+fn mark_session_closed(directory: &Path, error: Option<String>) -> Result<()> {
+    let status_result = update_status(directory, "closed", None, error);
+    let claim_result = release_turn_claim(directory);
+    status_result?;
+    claim_result
+}
+
+fn repair_dead_native_owner(directory: &Path) -> Result<bool> {
+    let status: SessionStatus = read_json(&directory.join("status.json"))?;
+    if !matches!(
+        status.state.as_str(),
+        "launching" | "running" | "working" | "ready"
+    ) {
+        return Ok(false);
+    }
+    let owner_path = directory.join(SESSION_OWNER_FILE);
+    let owner = match fs::read_to_string(&owner_path) {
+        Ok(text) => serde_json::from_str::<NativeSessionOwner>(&text)
+            .with_context(|| format!("invalid JSON in {}", owner_path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", owner_path.display()));
+        }
+    };
+    if process_is_alive(owner.pid) {
+        return Ok(false);
+    }
+    mark_session_closed(
+        directory,
+        Some(format!(
+            "native session process {} is no longer running",
+            owner.pid
+        )),
+    )?;
+    Ok(true)
+}
+
 fn write_event(directory: &Path, event: &SessionEvent) -> Result<()> {
     let events = directory.join("events");
     let name = format!(
@@ -2313,8 +2723,9 @@ fn event_paths(directory: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn wait_for_event(directory: &Path, baseline: usize, timeout: Duration) -> Result<SessionEvent> {
-    let deadline = Instant::now() + timeout;
+    let deadline = checked_deadline_from(Instant::now(), timeout)?;
     loop {
+        repair_dead_native_owner(directory)?;
         let paths = event_paths(directory)?;
         if paths.len() > baseline {
             let event: SessionEvent = read_json(paths.last().context("event path disappeared")?)?;
@@ -2460,12 +2871,12 @@ fn send_iterm_file(iterm_session_id: &str, prompt_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn close_iterm_session(iterm_session_id: &str) -> Result<()> {
-    let response = run_osascript(CLOSE_ITERM_SESSION_SCRIPT, &[iterm_session_id])?;
-    if response != "closed" {
-        bail!("unexpected iTerm2 close response: {response:?}");
+fn close_iterm_session(iterm_session_id: &str) -> Result<ItermCloseOutcome> {
+    match run_osascript(CLOSE_ITERM_SESSION_SCRIPT, &[iterm_session_id])?.as_str() {
+        "closed" => Ok(ItermCloseOutcome::Closed),
+        "missing" => Ok(ItermCloseOutcome::Missing),
+        response => bail!("unexpected iTerm2 close response: {response:?}"),
     }
-    Ok(())
 }
 
 fn shell_quote(value: &std::ffi::OsStr) -> String {
@@ -2478,15 +2889,37 @@ fn bridge_shell_command(
     state_root: &Path,
     executable: &Path,
     id: &str,
-) -> String {
-    format!(
+) -> Result<String> {
+    for (value, field) in [
+        (workspace.as_os_str(), "workspace"),
+        (state_root.as_os_str(), "state root"),
+        (executable.as_os_str(), "Agent Bridge executable"),
+        (std::ffi::OsStr::new(id), "session id"),
+    ] {
+        validate_shell_command_component(value, field)?;
+    }
+    Ok(format!(
         "cd {} && {}={} {} native-session {}",
         shell_quote(workspace.as_os_str()),
         STATE_DIR_ENV,
         shell_quote(state_root.as_os_str()),
         shell_quote(executable.as_os_str()),
         shell_quote(OsString::from(id).as_os_str())
-    )
+    ))
+}
+
+fn validate_shell_command_component(value: &std::ffi::OsStr, field: &str) -> Result<()> {
+    if let Some(character) = value
+        .to_string_lossy()
+        .chars()
+        .find(|value| value.is_control())
+    {
+        bail!(
+            "{field} contains terminal control U+{:04X}",
+            u32::from(character)
+        );
+    }
+    Ok(())
 }
 
 fn session_accepts_prompt(state: &str) -> bool {

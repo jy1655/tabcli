@@ -1,6 +1,55 @@
 use anyhow::{Result, bail};
 use semver::Version;
-use std::str::FromStr;
+use std::{
+    str::FromStr,
+    time::{Duration, Instant},
+};
+
+#[cfg(unix)]
+pub fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+pub fn process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError, STILL_ACTIVE},
+        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+
+    if pid == 0 {
+        return false;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
+    }
+    let mut exit_code = 0;
+    let queried = unsafe { GetExitCodeProcess(handle, &mut exit_code) };
+    let _ = unsafe { CloseHandle(handle) };
+    queried != 0 && exit_code == STILL_ACTIVE as u32
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn process_is_alive(pid: u32) -> bool {
+    pid == std::process::id()
+}
+
+pub fn checked_deadline_from(start: Instant, timeout: Duration) -> Result<Instant> {
+    start.checked_add(timeout).ok_or_else(|| {
+        anyhow::anyhow!(
+            "timeout of {} seconds cannot be represented by this platform's monotonic clock",
+            timeout.as_secs()
+        )
+    })
+}
 
 pub fn validate_terminal_input(value: &str, field: &str) -> Result<()> {
     if let Some(character) = value

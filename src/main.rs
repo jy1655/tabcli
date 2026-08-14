@@ -17,8 +17,8 @@ use std::{
 use std::process::{Child as StdChild, ChildStdin, Stdio};
 
 use agent_bridge::{
-    AgentDefinition, AgentId, TabSet, agents, handoff_text_from, session_title, terminal_safe_text,
-    validate_terminal_input,
+    AgentDefinition, AgentId, TabSet, agents, checked_deadline_from, handoff_text_from,
+    process_is_alive, session_title, terminal_safe_text, validate_terminal_input,
 };
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, after, never};
@@ -183,6 +183,18 @@ fn ensure_extra_args_respect_policy(
             .strip_prefix(&format!("{long}="))
             .or_else(|| short.and_then(|short| argument.strip_prefix(&format!("{short}="))))
     };
+    let option_present = |argument: &str, long: &str, short: Option<&str>| {
+        argument == long
+            || argument.starts_with(&format!("{long}="))
+            || short.is_some_and(|short| {
+                argument == short
+                    || argument.starts_with(&format!("{short}="))
+                    || (short.starts_with('-')
+                        && !short.starts_with("--")
+                        && argument.starts_with(short)
+                        && argument.len() > short.len())
+            })
+    };
 
     for (index, argument) in extra_args.iter().enumerate() {
         let bypasses = match definition.id {
@@ -204,8 +216,15 @@ fn ensure_extra_args_respect_policy(
                         compact == "approval_policy=never"
                             || compact == "sandbox_mode=danger-full-access"
                     })
+                    || option_present(argument, "--profile", Some("-p"))
             }
-            AgentId::Claude | AgentId::Agy => {
+            AgentId::Claude => {
+                argument == "--dangerously-skip-permissions"
+                    || option_value(index, "--permission-mode", None)
+                        .is_some_and(|value| value.eq_ignore_ascii_case("bypassPermissions"))
+                    || option_present(argument, "--settings", None)
+            }
+            AgentId::Agy => {
                 argument == "--dangerously-skip-permissions"
                     || option_value(index, "--permission-mode", None)
                         .is_some_and(|value| value.eq_ignore_ascii_case("bypassPermissions"))
@@ -353,7 +372,7 @@ Native visible sessions (macOS + iTerm2):
   ask      open a real iTerm tab, cd to PATH, and run the installed Codex,
            Claude, Agy, or Pi CLI interactively. By default it waits for the
            first provider result, prints it, and leaves the tab and CLI running.
-           --model selects the model for Codex, Agy, or Pi; Claude rejects it.
+           --model selects the model for any of the four providers.
            --effort selects only this child session's native reasoning/thinking
            level; omission preserves the provider's configured default.
   tell     type another prompt into that same visible iTerm session and return
@@ -362,7 +381,8 @@ Native visible sessions (macOS + iTerm2):
            can also click the tab and continue typing.
   sessions list native session ids, state, workspace, yolo policy, and results.
   close-session closes only a recorded bridge-owned iTerm session and requires
-           the literal --explicit flag.
+           the literal --explicit flag. It is idempotent if that tab is already
+           gone and can close the record of a launch that never obtained a tab.
 
   Child settings are per request: --model and --effort are never inferred from
   the caller. --yolo is NEVER inherited from the calling CLI and is forwarded
@@ -386,8 +406,9 @@ Delegation (drive a visible tab from a script or another agent):
   These subcommands talk to a RUNNING Agent Bridge TUI. Inside a tab, the
   session env (AGENT_BRIDGE_REQUESTS, AGENT_BRIDGE_TAB) routes requests to
   that instance; outside, the most recent TUI is discovered via
-  ~/.agent-bridge/instance.json. If no TUI is running, commands fail fast —
-  Agent Bridge never spawns agents invisibly.
+  ~/.agent-bridge/instance.json. The recorded TUI process must still be alive;
+  stale pointers fail fast even if their spool directory remains. If no TUI is
+  running, commands fail — Agent Bridge never spawns agents invisibly.
 
   open    create a visible tab running <agent> (codex|claude|agy) and print
           the new tab title. --prompt injects TEXT after a short startup
@@ -1629,6 +1650,21 @@ fn parse_instance_pointer(text: &str) -> Option<(u64, PathBuf)> {
     let pid = value.get("pid").and_then(serde_json::Value::as_u64)?;
     let spool = PathBuf::from(value.get("spool").and_then(serde_json::Value::as_str)?);
     Some((pid, spool))
+}
+
+fn instance_spool_from_pointer(text: &str) -> Result<PathBuf> {
+    let (pid, spool) = parse_instance_pointer(text).context("instance pointer is malformed")?;
+    let pid = u32::try_from(pid).context("instance pointer PID is out of range")?;
+    anyhow::ensure!(
+        process_is_alive(pid),
+        "Agent Bridge instance owner process {pid} is not running; restart the TUI"
+    );
+    anyhow::ensure!(
+        spool.is_dir(),
+        "Agent Bridge instance pointer is stale (spool missing: {}); restart the TUI",
+        spool.display()
+    );
+    Ok(spool)
 }
 
 fn write_instance_pointer_at(pointer: &Path, pid: u64, spool: &Path) -> Result<()> {
@@ -3521,6 +3557,12 @@ struct DelegateInvocation {
     json: bool,
 }
 
+fn parse_legacy_timeout_secs(value: &str) -> Result<u64> {
+    let seconds = value.parse().context("--timeout-secs expects a number")?;
+    checked_deadline_from(Instant::now(), Duration::from_secs(seconds))?;
+    Ok(seconds)
+}
+
 fn parse_delegate_command(kind: &str, args: Vec<String>) -> Result<DelegateInvocation> {
     let mut rest = args;
     let before = rest.len();
@@ -3585,10 +3627,7 @@ fn parse_delegate_command(kind: &str, args: Vec<String>) -> Result<DelegateInvoc
                     "--timeout-secs" => {
                         anyhow::ensure!(rest.len() >= 2, "--timeout-secs requires a number");
                         rest.remove(0);
-                        timeout_secs = rest
-                            .remove(0)
-                            .parse()
-                            .context("--timeout-secs expects a number")?;
+                        timeout_secs = parse_legacy_timeout_secs(&rest.remove(0))?;
                     }
                     _ => text_parts.push(rest.remove(0)),
                 }
@@ -3642,10 +3681,7 @@ fn parse_delegate_command(kind: &str, args: Vec<String>) -> Result<DelegateInvoc
                     "--timeout-secs" => {
                         anyhow::ensure!(rest.len() >= 2, "--timeout-secs requires a number");
                         rest.remove(0);
-                        timeout_secs = rest
-                            .remove(0)
-                            .parse()
-                            .context("--timeout-secs expects a number")?;
+                        timeout_secs = parse_legacy_timeout_secs(&rest.remove(0))?;
                     }
                     other => anyhow::bail!("unknown wait option: {other}"),
                 }
@@ -3693,20 +3729,15 @@ fn delegation_spool_dir() -> Result<PathBuf> {
             pointer.display()
         )
     })?;
-    let (_, spool) = parse_instance_pointer(&text)
-        .with_context(|| format!("instance pointer is malformed: {}", pointer.display()))?;
-    anyhow::ensure!(
-        spool.is_dir(),
-        "Agent Bridge instance pointer is stale (spool missing: {}); restart the TUI",
-        spool.display()
-    );
-    Ok(spool)
+    instance_spool_from_pointer(&text)
+        .with_context(|| format!("stale instance pointer: {}", pointer.display()))
 }
 
 fn send_delegation_request(
     mut request: serde_json::Value,
     timeout: Duration,
 ) -> Result<serde_json::Value> {
+    let deadline = checked_deadline_from(Instant::now(), timeout)?;
     let dir = delegation_spool_dir()?;
     let mut file = tempfile::Builder::new()
         .prefix("req-")
@@ -3727,7 +3758,6 @@ fn send_delegation_request(
     let target = dir.join(format!("{stem}.json"));
     file.persist(&target)
         .map_err(|error| anyhow::anyhow!("failed to submit delegation request: {error}"))?;
-    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if reply.exists() {
             let text = fs::read_to_string(&reply)?;
@@ -3797,7 +3827,7 @@ fn wait_for_state(
     grace: Duration,
 ) -> Result<serde_json::Value> {
     let started = Instant::now();
-    let deadline = started + timeout;
+    let deadline = checked_deadline_from(started, timeout)?;
     loop {
         let response = send_delegation_request(
             serde_json::json!({ "kind": "status", "target": target }),
@@ -4246,7 +4276,7 @@ mod tests {
         let observed = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&observed);
         let registry = registered_agents_from(Some(
-            r#"{ "agents": { "codex": { "command": "codex-nightly", "args": ["--profile", "fast"] } } }"#,
+            r#"{ "agents": { "codex": { "command": "codex-nightly", "args": ["--model", "fast"] } } }"#,
         ))
         .unwrap();
         let mut app = App::new_with_spawner_yolo_registry(
@@ -4269,7 +4299,7 @@ mod tests {
             observed[0],
             (
                 "codex-nightly".to_owned(),
-                vec!["--profile".to_owned(), "fast".to_owned()]
+                vec!["--model".to_owned(), "fast".to_owned()]
             )
         );
         assert_eq!(observed[1], ("claude".to_owned(), Vec::new()));
@@ -4338,6 +4368,54 @@ mod tests {
                 &["--sandbox".to_owned(), "danger-full-access".to_owned()]
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn configured_arguments_reject_dangerous_mode_indirections() {
+        let definitions = agents();
+        let codex = *definitions
+            .iter()
+            .find(|item| item.id == AgentId::Codex)
+            .unwrap();
+        let claude = *definitions
+            .iter()
+            .find(|item| item.id == AgentId::Claude)
+            .unwrap();
+        let agy = *definitions
+            .iter()
+            .find(|item| item.id == AgentId::Agy)
+            .unwrap();
+
+        for arguments in [
+            vec!["--profile".to_owned(), "danger".to_owned()],
+            vec!["-p".to_owned(), "danger".to_owned()],
+            vec!["--profile=danger".to_owned()],
+            vec!["-p=danger".to_owned()],
+            vec!["-pdanger".to_owned()],
+        ] {
+            assert!(
+                ensure_extra_args_respect_policy(codex, false, &arguments).is_err(),
+                "accepted Codex profile indirection {arguments:?}"
+            );
+        }
+        for arguments in [
+            vec!["--settings".to_owned(), "danger.json".to_owned()],
+            vec!["--settings=danger.json".to_owned()],
+        ] {
+            assert!(
+                ensure_extra_args_respect_policy(claude, false, &arguments).is_err(),
+                "accepted Claude settings indirection {arguments:?}"
+            );
+        }
+        assert!(
+            ensure_extra_args_respect_policy(
+                agy,
+                false,
+                &["--settings".to_owned(), "provider-value".to_owned()]
+            )
+            .is_ok(),
+            "Agent Bridge must not invent an Agy --settings policy"
         );
     }
 
@@ -4458,6 +4536,43 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL))
             .unwrap();
         assert!(app.notice.contains("no saved layout"));
+    }
+
+    fn reaped_test_process_pid() -> u32 {
+        #[cfg(windows)]
+        let mut child = Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .unwrap();
+        #[cfg(not(windows))]
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    #[test]
+    fn instance_pointer_requires_a_live_tui_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let pointer = directory.path().join("instance.json");
+        let spool = directory.path().join("spool");
+        fs::create_dir(&spool).unwrap();
+
+        write_instance_pointer_at(&pointer, u64::from(std::process::id()), &spool).unwrap();
+        let live_text = fs::read_to_string(&pointer).unwrap();
+        assert_eq!(instance_spool_from_pointer(&live_text).unwrap(), spool);
+
+        write_instance_pointer_at(&pointer, u64::from(reaped_test_process_pid()), &spool).unwrap();
+        let stale_text = fs::read_to_string(&pointer).unwrap();
+        let error = instance_spool_from_pointer(&stale_text).unwrap_err();
+        assert!(format!("{error:#}").contains("not running"));
+        assert!(
+            spool.is_dir(),
+            "stale detection must preserve the private spool"
+        );
     }
 
     #[test]
@@ -4653,6 +4768,90 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    const DELEGATION_DEADLINE_PROBE_ENV: &str = "AGENT_BRIDGE_TEST_DEADLINE_PROBE";
+
+    #[test]
+    fn delegation_deadline_probe_child() {
+        let Some(spool) = std::env::var_os(DELEGATION_DEADLINE_PROBE_ENV) else {
+            return;
+        };
+        let spool = PathBuf::from(spool);
+        let error = send_delegation_request(
+            serde_json::json!({ "kind": "status", "target": "Codex 1" }),
+            Duration::from_secs(u64::MAX),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("cannot be represented"));
+        assert_eq!(
+            fs::read_dir(&spool).unwrap().count(),
+            0,
+            "an invalid deadline must not create or persist a spool request"
+        );
+    }
+
+    #[test]
+    fn unrepresentable_delegation_deadline_is_rejected_before_spool_side_effects() {
+        let spool = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "tests::delegation_deadline_probe_child",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("AGENT_BRIDGE_REQUESTS", spool.path())
+            .env(DELEGATION_DEADLINE_PROBE_ENV, spool.path())
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "deadline side-effect probe failed:\n{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_dir(spool.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn legacy_wait_and_prompt_validate_instant_boundaries() {
+        let too_large = u64::MAX.to_string();
+        assert!(
+            parse_delegate_command(
+                "wait",
+                vec![
+                    "Codex 1".to_owned(),
+                    "--timeout-secs".to_owned(),
+                    too_large.clone(),
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_delegate_command(
+                "prompt",
+                vec![
+                    "Codex 1".to_owned(),
+                    "--wait".to_owned(),
+                    "--timeout-secs".to_owned(),
+                    too_large,
+                    "continue".to_owned(),
+                ],
+            )
+            .is_err()
+        );
+
+        let ten_years = (10 * 365 * 24 * 60 * 60_u64).to_string();
+        assert!(
+            parse_delegate_command(
+                "wait",
+                vec!["Codex 1".to_owned(), "--timeout-secs".to_owned(), ten_years,],
+            )
+            .is_ok(),
+            "representable long deadlines must not be rejected by an arbitrary cap"
+        );
     }
 
     #[test]
@@ -6375,10 +6574,12 @@ mod tests {
         for needle in [
             "ask <codex|claude|agy|pi>",
             "--model MODEL",
+            "--model selects the model for any of the four providers",
             "--effort EFFORT",
             "tell <session>",
             "sessions [--json]",
             "close-session <session> --explicit",
+            "idempotent if that tab is already",
             "NEVER inherited",
             "Codex >= 0.147.0",
             "Claude >= 2.1.229",

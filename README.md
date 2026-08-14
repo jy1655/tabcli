@@ -19,7 +19,7 @@ cargo build --release
 ```
 
 `--workspace`를 생략하면 호출한 현재 디렉터리를 사용하고, `--title`을 생략하면 CLI 이름과 workspace 이름으로 탭 제목을 만듭니다.
-Codex, Agy, Pi 세션은 `--model <MODEL>`로 해당 요청에만 모델을 지정할 수 있습니다. Claude에는 이 옵션을 거부합니다. 네 provider 모두 `--effort <EFFORT>`를 지원하며 Codex의 `model_reasoning_effort`, Claude/Agy의 `--effort`, Pi의 `--thinking`으로 전달합니다. 지정하지 않으면 각 CLI의 기존 세션 기본값을 유지하고 어떤 CLI의 전역 설정도 바꾸지 않습니다. 지원 effort 값은 선택한 CLI·모델이 최종 검증하므로 새 버전에서 추가된 값을 브리지가 임의로 차단하지 않습니다.
+Codex, Claude, Agy, Pi 네 provider 모두 `--model <MODEL>`로 해당 요청에만 모델을 지정할 수 있습니다. 네 provider 모두 `--effort <EFFORT>`도 지원하며 Codex의 `model_reasoning_effort`, Claude/Agy의 `--effort`, Pi의 `--thinking`으로 전달합니다. 지정하지 않으면 각 CLI의 기존 세션 기본값을 유지하고 어떤 CLI의 전역 설정도 바꾸지 않습니다. model과 effort 값은 선택한 CLI·모델이 최종 검증하므로 새 버전에서 추가된 값을 브리지가 임의로 차단하지 않습니다.
 
 `ask`는 다음 순서로 동작합니다.
 
@@ -36,7 +36,7 @@ agent-bridge tell session-XXXXXXXX --prompt "그중 2번만 수정해줘" --json
 agent-bridge sessions --json
 ```
 
-호출자가 기다리지 않고 탭만 열려면 `--detach`를 붙입니다. 기본 결과 대기 시간은 900초이며 `--timeout-secs`로 조정합니다. 대기가 실패하거나 시간 초과되어도 이미 열린 탭은 닫지 않습니다.
+호출자가 기다리지 않고 탭만 열려면 `--detach`를 붙입니다. 기본 결과 대기 시간은 900초이며 `--timeout-secs`로 조정합니다. 플랫폼의 monotonic `Instant`가 표현할 수 없는 timeout은 탭이나 요청을 만들기 전에 거부합니다. 대기가 실패하거나 시간 초과되어도 이미 열린 탭은 닫지 않습니다.
 
 ### 권한과 버전 정책
 
@@ -47,12 +47,13 @@ agent-bridge sessions --json
 - 명시적 `--yolo`는 Codex의 `--dangerously-bypass-approvals-and-sandbox`, Claude와 Agy의 `--dangerously-skip-permissions`를 전달합니다.
 - Pi는 원래 내장 승인 팝업이나 sandbox가 없으므로 브리지가 별도 권한 계층을 만들지 않습니다. Pi에서 `--yolo`는 허용되지만 추가 인자를 전달하지 않는 no-op이며, project trust를 대신 승인하는 `--approve`도 합성하지 않습니다.
 - 최소 지원 버전은 Codex `>= 0.147.0`, Claude `>= 2.1.229`, Agy `>= 1.1.12`, Pi `>= 0.84.1`입니다. 정확 버전 고정이 아니므로 더 새로운 버전도 허용합니다.
-- 브리지가 연 탭을 닫는 명령은 `agent-bridge close-session <session> --explicit`처럼 명시적 확인 플래그가 있어야 실행됩니다. 기록된 iTerm session id와 정확히 일치하는 세션만 대상으로 합니다.
-- 세션 메타데이터와 결과는 `~/.agent-bridge/native-sessions` 아래의 세션별 비공개 디렉터리에 저장합니다. 전역 CLI 설정이나 workspace hook 파일은 수정하지 않습니다. Agy adapter는 세션별 로그에서 conversation id를 얻어 Agy가 생성한 `~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl`을 읽기만 하며, Pi adapter는 세션 비공개 디렉터리의 결과 회수 확장만 `--extension`으로 로드합니다.
-- 최초 `ask` 프롬프트는 각 CLI의 대화형 시작 인자로 전달되므로 실행 중 같은 머신의 프로세스 인자 검사에서 보일 수 있습니다. `tell` 프롬프트는 권한 `0600` 임시 파일을 iTerm 입력으로 전달하고 즉시 폐기하며, 사람이 읽는 결과 출력에서는 터미널 제어문자를 가시적인 문자열로 이스케이프합니다.
+- 브리지가 연 탭을 닫는 명령은 `agent-bridge close-session <session> --explicit`처럼 명시적 확인 플래그가 있어야 실행됩니다. 기록된 iTerm session id와 정확히 일치하는 세션만 대상으로 하며, 탭이 이미 사라졌거나 launch 실패로 `terminal.json`이 없는 경우에도 명시적 close는 idempotent하게 기록을 `closed`로 만들고 turn claim을 해제합니다.
+- 네이티브 세션 프로세스의 PID를 별도로 기록합니다. 탭 수동 종료나 SIGHUP 뒤 그 프로세스가 죽은 것이 확인되면 `tell`, `sessions`, 결과 대기가 stale `running`/`working` 상태와 claim을 복구합니다. `turn.claim`을 만든 짧게 사는 `tell` 호출자의 PID만으로 stale 여부를 판단하지 않습니다.
+- 세션 메타데이터와 결과는 `~/.agent-bridge/native-sessions` 아래의 세션별 비공개 디렉터리에 저장하며, 종료 후에도 과거 디렉터리와 결과를 보존합니다. 전역 CLI 설정이나 workspace hook 파일은 수정하지 않습니다. Agy adapter는 세션별 로그에서 매번 가장 최신의 `Created conversation` id를 얻어(따라서 `/clear` 뒤 새 대화로 전환) Agy가 생성한 `~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl`을 읽기만 하며, Pi adapter는 세션 비공개 디렉터리의 결과 회수 확장만 `--extension`으로 로드합니다.
+- 최초 `ask` 프롬프트는 각 CLI의 대화형 시작 인자로 전달되므로 실행 중 같은 머신의 프로세스 인자 검사에서 보일 수 있습니다. iTerm에 입력하는 launch command의 workspace·state root·실행 파일 등 동적 구성요소는 terminal control 문자를 거부하고, 일반 shell metacharacter는 한 인자로 quote합니다. `tell` 프롬프트는 권한 `0600` 임시 파일을 iTerm 입력으로 전달하고 즉시 폐기하며, 사람이 읽는 결과 출력에서는 터미널 제어문자를 가시적인 문자열로 이스케이프합니다.
 
 ```sh
-agent-bridge ask claude --workspace ~/Dev/project --effort high --prompt "테스트까지 실행해줘" --yolo
+agent-bridge ask claude --workspace ~/Dev/project --model MODEL --effort high --prompt "테스트까지 실행해줘" --yolo
 agent-bridge ask agy --workspace ~/Dev/project --model MODEL --effort high --prompt "취약점을 검토해줘"
 agent-bridge ask pi --workspace ~/Dev/project --model MODEL --effort high --prompt "이 변경을 검토해줘"
 agent-bridge close-session session-XXXXXXXX --explicit
@@ -60,6 +61,21 @@ agent-bridge close-session session-XXXXXXXX --explicit
 
 > [!WARNING]
 > Codex, Claude, Agy에서 `--yolo`는 해당 CLI의 승인·sandbox 우회 플래그입니다. 브리지는 요청 단위의 명시 여부와 탭/경로 경계만 통제하며, yolo 세션 내부의 명령 실행을 다시 sandbox하지 않습니다. Pi는 `--yolo` 여부와 관계없이 Pi 자체의 권한 모델을 그대로 사용합니다.
+
+### 수동 네이티브 release smoke
+
+provider별 ignored smoke는 실제 iTerm 탭을 열고 first-party 로그인 세션을 사용하며, 지정한 model/effort flag와 결과 회수 계약을 함께 확인합니다. 일반 `cargo test`에서는 실행되지 않습니다. 실행할 provider가 지원하는 값을 환경변수에 넣고 **한 테스트만** 수동 실행하세요. 테스트는 탭을 자동으로 닫지 않으므로 확인 후 `close-session --explicit`을 사용합니다.
+
+```sh
+AGENT_BRIDGE_LIVE_CODEX_MODEL=MODEL AGENT_BRIDGE_LIVE_CODEX_EFFORT=medium \
+  cargo test --test native_live live_native_codex_forwards_flags_and_returns_result -- --ignored --exact --nocapture
+AGENT_BRIDGE_LIVE_CLAUDE_MODEL=MODEL AGENT_BRIDGE_LIVE_CLAUDE_EFFORT=high \
+  cargo test --test native_live live_native_claude_forwards_flags_and_returns_result -- --ignored --exact --nocapture
+AGENT_BRIDGE_LIVE_AGY_MODEL=MODEL AGENT_BRIDGE_LIVE_AGY_EFFORT=high \
+  cargo test --test native_live live_native_agy_forwards_flags_and_returns_result -- --ignored --exact --nocapture
+AGENT_BRIDGE_LIVE_PI_MODEL=MODEL AGENT_BRIDGE_LIVE_PI_EFFORT=medium \
+  cargo test --test native_live live_native_pi_forwards_flags_and_returns_result -- --ignored --exact --nocapture
+```
 
 ## 레거시 PTY TUI 실행
 
@@ -115,7 +131,9 @@ workspace 선택과 `--yolo` 동작은 위 Windows 설명과 동일합니다.
 
 ## 설정 (선택)
 
-`~/.agent-bridge/agents.json`으로 내장 3개 CLI의 실행 명령·역할 표시·기본 추가 인자를 재정의할 수 있습니다. 파일이 없으면 기본값으로 동작하고, 파싱 실패나 알 수 없는 에이전트 이름이 있으면 파일 전체를 무시하고 기본값으로 기동하며 헤더에 사유를 표시합니다. 신규 에이전트 종류 추가는 아직 지원하지 않습니다. 승인·sandbox 우회 인자는 이 파일에서 기본 모드에 숨겨 넣을 수 없으며, 반드시 TUI 실행 시 `--yolo`를 명시해야 합니다.
+`~/.agent-bridge/agents.json`으로 내장 3개 CLI의 실행 명령·역할 표시·기본 추가 인자를 재정의할 수 있습니다. 파일이 없으면 기본값으로 동작하고, 파싱 실패나 알 수 없는 에이전트 이름이 있으면 파일 전체를 무시하고 기본값으로 기동하며 헤더에 사유를 표시합니다. 신규 에이전트 종류 추가는 아직 지원하지 않습니다.
+
+이 파일은 같은 OS owner가 관리하는 **신뢰된 설정**입니다. non-yolo 모드에서는 알려진 직접 danger flag뿐 아니라 우회 mode를 선택할 수 있는 Codex `--profile`/`-p`와 Claude `--settings` indirection도 `args`에서 차단합니다(Agy에 존재하지 않는 `--settings` 계약은 가정하지 않습니다). 그러나 `command`에 지정한 임의 wrapper가 내부에서 어떤 인자를 추가하는지는 브리지가 강제할 수 없습니다. 신뢰하지 않는 wrapper를 설정하지 말고, 강제 sandbox 경계가 필요하다고 가정하지 마세요.
 
 ```json
 {
@@ -146,7 +164,7 @@ agent-bridge close Reviewer --explicit
 - 레거시 `close`도 `--explicit`이 없으면 거부합니다. 지연 전송은 탭 제목뿐 아니라 세션 세대에도 묶여, 같은 제목으로 다시 연 탭에 이전 프롬프트가 전달되지 않습니다.
 - `open --prompt`는 CLI 기동을 고정 지연(약 2.5초)으로 기다린 뒤 주입합니다 — 단문 프롬프트를 권장하며, 정교한 제어는 `open` → `wait --until idle` → `prompt` 순서를 쓰세요.
 - 별도 스킬·지침 문서 없이도 `agent-bridge --help`가 서브커맨드·env 컨텍스트·상태 의미·왕복 예제를 담은 에이전트용 레퍼런스입니다 (서브커맨드 뒤 `--help`도 동일 출력). 에이전트 지침(CLAUDE.md/AGENTS.md)에는 "위임은 `agent-bridge open` 사용 — 자세한 건 `agent-bridge --help`" 한 줄이면 충분합니다.
-- **Agent Bridge 밖에서도 호출 가능**: TUI가 실행 중이면 `~/.agent-bridge/instance.json` 포인터를 통해 일반 터미널의 Claude/Codex도 같은 서브커맨드로 그 TUI 창에 탭을 만들 수 있습니다. TUI가 없으면 명확한 오류("no running Agent Bridge found")가 나며, TUI를 대신 띄워주지는 않습니다(보이는 탭 원칙). 포인터는 마지막에 뜬 인스턴스를 가리키고 정상 종료 시 정리됩니다.
+- **Agent Bridge 밖에서도 호출 가능**: TUI가 실행 중이면 `~/.agent-bridge/instance.json` 포인터를 통해 일반 터미널의 Claude/Codex도 같은 서브커맨드로 그 TUI 창에 탭을 만들 수 있습니다. 포인터가 가리키는 private spool이 남아 있어도 기록된 TUI PID가 죽었으면 즉시 stale 오류를 반환합니다. TUI가 없으면 명확한 오류("no running Agent Bridge found")가 나며, TUI를 대신 띄워주지는 않습니다(보이는 탭 원칙). 포인터는 마지막에 뜬 인스턴스를 가리키고 정상 종료 시 정리됩니다.
 
 ## 키
 
