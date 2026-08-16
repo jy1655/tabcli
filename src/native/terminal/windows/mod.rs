@@ -1,33 +1,36 @@
 use std::{
     ffi::OsStr,
     os::windows::ffi::OsStrExt,
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
     process::Command,
 };
 
 use anyhow::{Context, Result, bail};
 use windows_sys::Win32::System::Console::{
-    AttachConsole, CTRL_BREAK_EVENT, FreeConsole, GenerateConsoleCtrlEvent, INPUT_RECORD,
-    KEY_EVENT, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0, WriteConsoleInputW,
+    AttachConsole, FreeConsole, GetConsoleProcessList, GetConsoleWindow, INPUT_RECORD, KEY_EVENT,
+    KEY_EVENT_RECORD, KEY_EVENT_RECORD_0, WriteConsoleInputW,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree},
-    Security::{
-        Authorization::{
-            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT,
-            SetNamedSecurityInfoW,
-        },
-        DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
+    Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE},
+    Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, SYNCHRONIZE,
     },
-    Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING},
     System::Threading::{
         CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED, CreateProcessW,
-        GetProcessTimes, OpenProcess, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-        QueryFullProcessImageNameW, ResumeThread, STARTUPINFOW, TerminateProcess,
+        OpenProcess, PROCESS_INFORMATION, PROCESS_TERMINATE, ResumeThread, STARTUPINFOW,
+        TerminateProcess, WaitForSingleObject,
     },
 };
 
 use super::{CloseOutcome, TerminalKind, TerminalSession, WindowsProcessIdentity};
+
+mod process;
+mod security;
+pub(super) use process::{query_process_identity, verify_process_identity};
+use process::{query_process_identity_from_handle, verify_control_process_identity};
+pub(super) use security::set_private_permissions;
 
 pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     match preferred {
@@ -145,107 +148,6 @@ pub(super) fn powershell_executable() -> Result<PathBuf> {
         .context("PowerShell 7 (pwsh.exe) was not found on an absolute PATH entry")
 }
 
-pub(super) fn set_private_permissions(path: &Path, directory: bool) -> Result<()> {
-    let system_directory = system_directory()?;
-    let whoami = system_directory.join("whoami.exe");
-    let whoami_output = Command::new(&whoami)
-        .args(["/user", "/fo", "csv", "/nh"])
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to query the current Windows identity via {}",
-                whoami.display()
-            )
-        })?;
-    if !whoami_output.status.success() {
-        bail!("failed to query the current Windows identity");
-    }
-    let identity_output = String::from_utf8_lossy(&whoami_output.stdout);
-    let sid = identity_output
-        .split([',', '"', '\r', '\n'])
-        .map(str::trim)
-        .find(|value| {
-            value.starts_with("S-1-")
-                && value.chars().all(|c| c == '-' || c.is_ascii_alphanumeric())
-        })
-        .context("whoami did not return a Windows user SID")?;
-    apply_private_dacl(path, &private_sddl(sid, directory))
-}
-
-fn private_sddl(sid: &str, directory: bool) -> String {
-    format!("D:P(A;{};FA;;;{sid})", if directory { "OICI" } else { "" })
-}
-
-fn apply_private_dacl(path: &Path, sddl: &str) -> Result<()> {
-    let descriptor_text = OsStr::new(sddl)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let mut descriptor = std::ptr::null_mut();
-    if unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            descriptor_text.as_ptr(),
-            SDDL_REVISION_1,
-            &mut descriptor,
-            std::ptr::null_mut(),
-        )
-    } == 0
-    {
-        return Err(std::io::Error::last_os_error())
-            .context("failed to build a private Windows security descriptor");
-    }
-
-    let mut present = 0;
-    let mut defaulted = 0;
-    let mut dacl = std::ptr::null_mut();
-    let extracted =
-        unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) };
-    if extracted == 0 || present == 0 || dacl.is_null() {
-        let error = if extracted == 0 {
-            anyhow::Error::new(std::io::Error::last_os_error())
-        } else {
-            anyhow::anyhow!("private Windows security descriptor contains no DACL")
-        };
-        unsafe { LocalFree(descriptor) };
-        return Err(error).context("failed to extract a private Windows DACL");
-    }
-
-    let path = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let status = unsafe {
-        SetNamedSecurityInfoW(
-            path.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            dacl,
-            std::ptr::null_mut(),
-        )
-    };
-    unsafe { LocalFree(descriptor) };
-    if status != 0 {
-        return Err(std::io::Error::from_raw_os_error(status as i32))
-            .context("failed to atomically apply a private Windows DACL");
-    }
-    Ok(())
-}
-
-fn system_directory() -> Result<PathBuf> {
-    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
-
-    let mut path = vec![0u16; 32768];
-    let length = unsafe { GetSystemDirectoryW(path.as_mut_ptr(), path.len() as u32) };
-    if length == 0 || length as usize >= path.len() {
-        return Err(std::io::Error::last_os_error()).context("failed to resolve Windows System32");
-    }
-    path.truncate(length as usize);
-    Ok(PathBuf::from(String::from_utf16(&path)?))
-}
-
 pub(super) fn send_file(session: &TerminalSession, prompt_path: &Path) -> Result<()> {
     let prompt_path = prompt_path
         .to_str()
@@ -325,6 +227,8 @@ pub(super) fn console_control(
         }
     }
 
+    let close_requested = action == "close";
+    let mut console_processes = Vec::new();
     let result = match action {
         "send" => {
             let path = input_path.context("send requires a prompt path")?;
@@ -333,79 +237,113 @@ pub(super) fn console_control(
             write_console_input(&input, submit_count)
         }
         "close" => {
-            if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) } == 0 {
-                Err(std::io::Error::last_os_error())
-                    .context("failed to interrupt managed Windows console")
-            } else {
-                Ok(())
+            console_processes = attached_console_processes()?;
+            let window = unsafe { GetConsoleWindow() };
+            if !window.is_null() {
+                // Closing the surface is best-effort. Conhost can invalidate the HWND
+                // before the console root exits, so the identity-bound process fallback
+                // below remains authoritative.
+                unsafe { PostMessageW(window, console_close_message(), 0, 0) };
             }
+            Ok(())
         }
         _ => bail!("unsupported native console action: {action}"),
     };
     unsafe { FreeConsole() };
-    result
-}
-
-fn verify_control_process_identity(pid: u32, identity: &WindowsProcessIdentity) -> Result<()> {
-    match verify_process_identity(pid, identity.creation_time, &identity.executable_path) {
-        Ok(()) => Ok(()),
-        Err(_) if !agent_bridge::process_is_alive(pid) => {
-            bail!("console process is no longer available")
+    result?;
+    if close_requested {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if verify_control_process_identity(pid, identity).is_ok() {
+            terminate_console_processes(&console_processes, pid)?;
         }
-        Err(error) => Err(error),
+        wait_for_console_process_exit(pid, identity)
+    } else {
+        Ok(())
     }
 }
 
-pub(super) fn query_process_identity(pid: u32) -> Result<WindowsProcessIdentity> {
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if handle.is_null() {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("failed to open Windows process {pid}"));
-    }
-    let result = query_process_identity_from_handle(handle);
-    unsafe { CloseHandle(handle) };
-    result
-}
-
-fn query_process_identity_from_handle(
-    handle: windows_sys::Win32::Foundation::HANDLE,
-) -> Result<WindowsProcessIdentity> {
-    let mut creation = windows_sys::Win32::Foundation::FILETIME::default();
-    let mut exit = windows_sys::Win32::Foundation::FILETIME::default();
-    let mut kernel = windows_sys::Win32::Foundation::FILETIME::default();
-    let mut user = windows_sys::Win32::Foundation::FILETIME::default();
-    if unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("failed to query process creation time");
-    }
-    let mut path = vec![0u16; 32768];
-    let mut path_len = path.len() as u32;
-    if unsafe { QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &mut path_len) } == 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("failed to query process executable path");
-    }
-    path.truncate(path_len as usize);
-    Ok(WindowsProcessIdentity {
-        creation_time: (u64::from(creation.dwHighDateTime) << 32)
-            | u64::from(creation.dwLowDateTime),
-        executable_path: String::from_utf16(&path)
-            .context("process executable path is not valid UTF-16")?,
-    })
-}
-
-pub(super) fn verify_process_identity(
+struct ConsoleProcess {
     pid: u32,
-    creation_time: u64,
-    executable_path: &str,
-) -> Result<()> {
-    let live = query_process_identity(pid)?;
-    if live.creation_time != creation_time {
-        bail!("Windows console process id was reused");
+    handle: OwnedHandle,
+}
+
+fn attached_console_processes() -> Result<Vec<ConsoleProcess>> {
+    let mut processes = vec![0u32; 64];
+    loop {
+        let count =
+            unsafe { GetConsoleProcessList(processes.as_mut_ptr(), processes.len() as u32) };
+        if count == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to enumerate managed Windows console processes");
+        }
+        if count as usize <= processes.len() {
+            processes.truncate(count as usize);
+            let current_pid = std::process::id();
+            return processes
+                .into_iter()
+                .filter(|pid| *pid != current_pid)
+                .filter_map(|pid| {
+                    let handle = unsafe { OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, 0, pid) };
+                    if handle.is_null() {
+                        if agent_bridge::process_is_alive(pid) {
+                            return Some(Err(std::io::Error::last_os_error()).with_context(|| {
+                                format!("failed to retain managed console process {pid}")
+                            }));
+                        }
+                        return None;
+                    }
+                    Some(Ok(ConsoleProcess {
+                        pid,
+                        handle: unsafe { OwnedHandle::from_raw_handle(handle) },
+                    }))
+                })
+                .collect();
+        }
+        processes.resize(count as usize, 0);
     }
-    if !live.executable_path.eq_ignore_ascii_case(executable_path) {
-        bail!("Windows console process executable identity changed");
+}
+
+fn terminate_console_processes(processes: &[ConsoleProcess], root_pid: u32) -> Result<()> {
+    let ordered = processes
+        .iter()
+        .filter(|process| process.pid != root_pid)
+        .chain(processes.iter().filter(|process| process.pid == root_pid));
+    for process in ordered {
+        let handle = process.handle.as_raw_handle();
+        if unsafe { WaitForSingleObject(handle, 0) }
+            == windows_sys::Win32::Foundation::WAIT_OBJECT_0
+        {
+            continue;
+        }
+        let terminated = unsafe { TerminateProcess(handle, 1) };
+        let error = std::io::Error::last_os_error();
+        if terminated == 0
+            && unsafe { WaitForSingleObject(handle, 0) }
+                != windows_sys::Win32::Foundation::WAIT_OBJECT_0
+        {
+            return Err(error)
+                .with_context(|| format!("failed to terminate console process {}", process.pid));
+        }
     }
     Ok(())
+}
+
+fn console_close_message() -> u32 {
+    WM_CLOSE
+}
+
+fn wait_for_console_process_exit(pid: u32, identity: &WindowsProcessIdentity) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match verify_control_process_identity(pid, identity) {
+            Err(_) if !agent_bridge::process_is_alive(pid) => return Ok(()),
+            Err(error) => return Err(error).context("managed Windows console identity changed"),
+            Ok(()) if std::time::Instant::now() >= deadline => {
+                bail!("managed Windows console did not close within 5 seconds")
+            }
+            Ok(()) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
 }
 
 fn write_console_input(input: &str, submit_count: usize) -> Result<()> {
@@ -507,115 +445,4 @@ fn build_console_input_records(input: &str, submit_count: usize) -> Vec<INPUT_RE
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        build_console_input_records, console_creation_flags, private_sddl, query_process_identity,
-        resolve_executable_from_path, verify_control_process_identity, verify_process_identity,
-    };
-    use std::fs;
-    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
-
-    #[test]
-    fn powershell_resolution_uses_only_absolute_path_entries() {
-        let directory = tempfile::tempdir().unwrap();
-        let relative = directory.path().join("relative");
-        let trusted = directory.path().join("trusted");
-        fs::create_dir_all(&relative).unwrap();
-        fs::create_dir_all(&trusted).unwrap();
-        fs::write(relative.join("pwsh.exe"), b"planted").unwrap();
-        fs::write(trusted.join("pwsh.exe"), b"trusted").unwrap();
-
-        let path =
-            std::env::join_paths([std::path::Path::new("relative"), trusted.as_path()]).unwrap();
-        assert_eq!(
-            resolve_executable_from_path("pwsh.exe", &path).unwrap(),
-            trusted.join("pwsh.exe").canonicalize().unwrap()
-        );
-    }
-
-    #[test]
-    fn console_launch_is_suspended_until_process_identity_is_recorded() {
-        assert_ne!(console_creation_flags() & CREATE_SUSPENDED, 0);
-    }
-
-    #[test]
-    fn process_identity_rejects_reused_pid_creation_time() {
-        let pid = std::process::id();
-        let identity = query_process_identity(pid).unwrap();
-        verify_process_identity(pid, identity.creation_time, &identity.executable_path).unwrap();
-        assert!(
-            verify_process_identity(
-                pid,
-                identity.creation_time.wrapping_add(1),
-                &identity.executable_path,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn missing_console_process_converges_to_the_standard_missing_result() {
-        let mut child = std::process::Command::new("cmd")
-            .args(["/C", "exit", "0"])
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        child.wait().unwrap();
-        let error = verify_control_process_identity(
-            pid,
-            &super::WindowsProcessIdentity {
-                creation_time: 0,
-                executable_path: String::new(),
-            },
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("no longer available"));
-    }
-
-    #[test]
-    fn submit_is_a_real_windows_return_key_event() {
-        let records = build_console_input_records("prompt", 2);
-        let down = unsafe { records[records.len() - 2].Event.KeyEvent };
-        let up = unsafe { records[records.len() - 1].Event.KeyEvent };
-        assert_eq!(down.bKeyDown, 1);
-        assert_eq!(up.bKeyDown, 0);
-        assert_eq!(down.wVirtualKeyCode, 0x0d);
-        assert_eq!(down.wVirtualScanCode, 0x1c);
-        assert_eq!(unsafe { down.uChar.UnicodeChar }, u16::from(b'\r'));
-        assert_eq!(
-            records
-                .iter()
-                .filter(|record| unsafe {
-                    record.Event.KeyEvent.bKeyDown == 1
-                        && record.Event.KeyEvent.wVirtualKeyCode == 0x0d
-                })
-                .count(),
-            2,
-            "bracketed paste confirmation and prompt submission require separate Return keys"
-        );
-    }
-
-    #[test]
-    fn single_submit_provider_gets_one_return_key() {
-        let records = build_console_input_records("prompt", 1);
-        assert_eq!(
-            records
-                .iter()
-                .filter(|record| unsafe {
-                    record.Event.KeyEvent.bKeyDown == 1
-                        && record.Event.KeyEvent.wVirtualKeyCode == 0x0d
-                })
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn private_acl_is_one_protected_current_user_entry() {
-        assert_eq!(
-            private_sddl("S-1-5-21-1", true),
-            "D:P(A;OICI;FA;;;S-1-5-21-1)"
-        );
-        assert_eq!(private_sddl("S-1-5-21-1", false), "D:P(A;;FA;;;S-1-5-21-1)");
-    }
-}
+mod tests;

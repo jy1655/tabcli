@@ -62,7 +62,7 @@ impl FromStr for TerminalKind {
                 Ok(Self::AppleTerminal)
             }
             _ => Err(format!(
-                "unsupported terminal {value:?}; expected ghostty, iterm2, or terminal"
+                "unsupported terminal {value:?}; expected ghostty, iterm2, terminal, or windows-console"
             )),
         }
     }
@@ -277,7 +277,8 @@ mod tests {
             TerminalKind::from_str("windows-console"),
             Ok(TerminalKind::WindowsConsole)
         );
-        assert!(TerminalKind::from_str("vscode").is_err());
+        let error = TerminalKind::from_str("vscode").unwrap_err();
+        assert!(error.contains("windows-console"), "{error}");
     }
 
     #[cfg(target_os = "windows")]

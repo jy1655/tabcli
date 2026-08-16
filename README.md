@@ -94,7 +94,7 @@ agent-bridge --help | --version
 
 - Agent Bridge는 같은 `ask` 작업에서 새로 만든 surface만 기록합니다. 새 handle은 managed session ID와 host가 제공하는 stable ID를 결합하며 `tell`과 `close-session` 직전에 live wrapper와 함께 다시 검증합니다. Terminal.app은 전용 window ID·TTY에 target `native-session` owner의 managed session ID·PID·controlling TTY device·process start fingerprint를 결합합니다. Windows는 console root와 `native-session` owner의 PID 생성 시각·실행 파일 identity를 함께 검증해 PID 재사용을 fail-closed합니다. 호출 당시 터미널을 재감지하거나 복원된 front/current/selected surface를 채택하지 않습니다.
 - 새 세션의 `--model`, `--effort`, `--yolo`는 부모 CLI에서 추측하거나 상속하지 않습니다. 해당 `ask` 요청에 명시된 값만 사용합니다.
-- `--yolo`는 Codex의 `--dangerously-bypass-approvals-and-sandbox`, Claude와 Agy의 `--dangerously-skip-permissions`를 전달합니다. Pi에서는 추가 인자를 만들지 않는 no-op이며 Pi의 native 권한 정책을 유지합니다.
+- `--yolo`는 Codex의 `--dangerously-bypass-approvals-and-sandbox`, Claude와 Agy의 `--dangerously-skip-permissions`를 전달합니다. Pi에서는 해당 실행의 project-local files를 신뢰하는 `--approve`를 전달하며 Pi 자체 tool 정책은 유지합니다.
 - `tell`은 세션별 한 턴만 허용합니다. 프롬프트를 하나의 bracketed paste로 전송하고 Enter·ESC 같은 별도 터미널 동작을 만들 수 있는 제어문자를 거부합니다.
 - 모든 bridge 프롬프트에는 source provenance가 붙습니다. 사람이 읽는 결과의 터미널 제어문자는 가시적인 문자열로 이스케이프합니다.
 - 결과가 돌아온 뒤 탭은 열린 채 유지되어 사용자가 직접 이어서 작업할 수 있습니다. 진행 중인 bridge 요청과 같은 탭의 수동 입력을 겹치면 수동 턴 결과가 bridge 요청의 결과로 먼저 인식될 수 있으므로 동시에 입력하지 않아야 합니다.
@@ -124,8 +124,9 @@ src/native/provider_process.rs provider process 실행과 Windows shim 경계
 src/native/terminal/mod.rs     공통 terminal kind, session record, OS dispatch
 src/native/terminal/macos/     iTerm2, Terminal.app, Ghostty adapter
 src/native/terminal/linux/     Linux transport 경계(현재 미지원)
-src/native/terminal/windows/   Windows managed visible-console transport
-src/native.rs                 세션 상태, lifecycle, 명령 및 현재 결과 monitor orchestration
+src/native/terminal/windows/   Windows console transport, process identity, ACL/security
+src/native.rs                  세션 상태, lifecycle, 명령 및 결과 monitor orchestration
+src/native/tests.rs            native orchestration 단위 테스트
 ```
 
 새 CLI를 추가할 때는 provider registry와 두 provider adapter를 추가하고, model/effort/권한 및 실제 결과 회수 계약을 각각 테스트합니다. 새 터미널은 해당 OS 디렉터리에 adapter를 추가하고 OS dispatcher에 등록합니다. 새 OS는 독립 디렉터리에서 같은 `detect/open_tab/send_file/close_session` 계약을 구현합니다. launch command quoting은 POSIX shell과 Windows PowerShell을 분리해 유지합니다. 공통화가 플랫폼의 native 동작을 약화한다면 플랫폼별 구현을 우선합니다.

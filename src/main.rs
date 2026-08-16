@@ -42,8 +42,9 @@ Session policy:
   forwarded unchanged.
 
   --yolo is never inherited. It is forwarded only when the ask command includes
-  it and the provider has a matching option. Codex, Claude, and Agy do; for Pi
-  it is a no-op so Pi retains its native permission policy.
+  it and the provider has a matching option. Codex, Claude, and Agy receive their
+  native bypass flags. Pi receives --approve for project-local trust while its
+  native tool policy remains in effect.
 
   Supported CLI minimums: Codex 0.147.0, Claude 2.1.229, Agy 1.1.12, Pi 0.84.1.
   Session state is stored privately under ~/.agent-bridge/native-sessions.
@@ -205,6 +206,7 @@ mod tests {
             "PowerShell 7 console from either PowerShell or cmd",
             "Fable5 is passed to Claude Code as Fable",
             "Fable is passed to Pi as anthropic/claude-fable-5",
+            "Pi receives --approve for project-local trust",
             "Attaching to an arbitrary CLI",
         ] {
             assert!(help.contains(expected), "help is missing {expected:?}");

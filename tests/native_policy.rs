@@ -42,7 +42,7 @@ fn yolo_is_forwarded_only_when_the_new_session_explicitly_requests_it() {
         provider_launch_args(FirstPartyCli::Agy, true),
         ["--dangerously-skip-permissions"]
     );
-    assert!(provider_launch_args(FirstPartyCli::Pi, true).is_empty());
+    assert_eq!(provider_launch_args(FirstPartyCli::Pi, true), ["--approve"]);
 }
 
 #[test]
