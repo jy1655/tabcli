@@ -1,6 +1,6 @@
 use std::{ffi::OsString, path::Path, process::Command};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 
 #[cfg(windows)]
 use super::{terminal, write_private};
@@ -60,7 +60,7 @@ $Cmd = Join-Path ([Environment]::GetFolderPath('System')) 'cmd.exe'
 exit $LASTEXITCODE
 "#;
         let forwarder = _directory.join("provider-launch.ps1");
-        write_private(&forwarder, FORWARDER.as_bytes())?;
+        ensure_private_forwarder(&forwarder, FORWARDER.as_bytes())?;
         let mut command = powershell_file_command(&forwarder)?;
         command
             .arg(windows_command_path(executable))
@@ -71,6 +71,31 @@ exit $LASTEXITCODE
     let mut command = Command::new(executable);
     command.args(arguments);
     Ok(command)
+}
+
+#[cfg(windows)]
+fn ensure_private_forwarder(path: &Path, expected: &[u8]) -> Result<()> {
+    match std::fs::read(path) {
+        Ok(existing) if existing == expected => return Ok(()),
+        Ok(_) => bail!(
+            "refusing to replace a mismatched provider forwarder {}",
+            path.display()
+        ),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect provider forwarder {}", path.display())
+            });
+        }
+        Err(_) => {}
+    }
+    match write_private(path, expected) {
+        Ok(()) => Ok(()),
+        Err(write_error) => match std::fs::read(path) {
+            Ok(existing) if existing == expected => Ok(()),
+            _ => Err(write_error)
+                .with_context(|| format!("failed to create provider forwarder {}", path.display())),
+        },
+    }
 }
 
 pub(super) fn version_command(executable: &Path) -> Result<Command> {

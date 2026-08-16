@@ -1,6 +1,6 @@
 use super::{
     CompletionMonitor, FollowUpTransport, InitialPromptTransport, LaunchContext, LaunchPlan,
-    NativeProviderAdapter,
+    NativeProviderAdapter, ResumeContext, ResumePlan,
 };
 use anyhow::Result;
 use std::{ffi::OsString, path::Path, time::Duration};
@@ -28,6 +28,10 @@ impl NativeProviderAdapter for PiAdapter {
             prompt_is_positional: true,
             completion_monitor: CompletionMonitor::PiHookFailure,
         })
+    }
+
+    fn prepare_resume(&self, _context: ResumeContext<'_>) -> Result<Option<ResumePlan>> {
+        Ok(None)
     }
 
     fn initial_prompt_transport(&self) -> InitialPromptTransport {

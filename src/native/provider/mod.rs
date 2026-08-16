@@ -23,6 +23,16 @@ pub(super) struct LaunchPlan {
     pub(super) completion_monitor: CompletionMonitor,
 }
 
+pub(super) struct ResumeContext<'a> {
+    pub(super) bridge_executable: &'a Path,
+    pub(super) directory: &'a Path,
+    pub(super) provider_session_id: &'a str,
+}
+
+pub(super) struct ResumePlan {
+    pub(super) arguments: Vec<OsString>,
+}
+
 pub(super) enum CompletionMonitor {
     Hook,
     AgyTranscript { log_path: PathBuf },
@@ -32,11 +42,13 @@ pub(super) enum CompletionMonitor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FollowUpTransport {
     TerminalPasteFallback,
+    ProviderResumeSupervisor,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum InitialPromptTransport {
     ProviderArgument,
+    ProviderStdin,
     TerminalPasteAfterLaunch,
 }
 
@@ -44,12 +56,14 @@ impl FollowUpTransport {
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::TerminalPasteFallback => "terminal-paste-fallback",
+            Self::ProviderResumeSupervisor => "provider-resume-supervisor",
         }
     }
 }
 
 trait NativeProviderAdapter: Sync {
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan>;
+    fn prepare_resume(&self, context: ResumeContext<'_>) -> Result<Option<ResumePlan>>;
     fn initial_prompt_transport(&self) -> InitialPromptTransport;
     fn initial_prompt_ready_delay(&self) -> Duration;
     fn send_initial_prompt(
@@ -76,6 +90,13 @@ pub(super) fn prepare_launch(
     context: LaunchContext<'_>,
 ) -> Result<LaunchPlan> {
     adapter(provider).prepare_launch(context)
+}
+
+pub(super) fn prepare_resume(
+    provider: FirstPartyCli,
+    context: ResumeContext<'_>,
+) -> Result<Option<ResumePlan>> {
+    adapter(provider).prepare_resume(context)
 }
 
 pub(super) fn follow_up_transport(provider: FirstPartyCli) -> FollowUpTransport {

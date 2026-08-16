@@ -1,6 +1,6 @@
 use super::{
     CompletionMonitor, FollowUpTransport, InitialPromptTransport, LaunchContext, LaunchPlan,
-    NativeProviderAdapter,
+    NativeProviderAdapter, ResumeContext, ResumePlan,
 };
 use anyhow::Result;
 use std::{ffi::OsString, path::Path, time::Duration};
@@ -18,21 +18,45 @@ impl NativeProviderAdapter for ClaudeAdapter {
             &settings_path,
             &super::claude_hook_settings(context.bridge_executable),
         )?;
+        let mut arguments = vec![
+            OsString::from("--settings"),
+            settings_path.into_os_string(),
+            OsString::from("--name"),
+            OsString::from(context.title),
+        ];
+        if cfg!(windows) {
+            arguments.push(OsString::from("--print"));
+        }
         Ok(LaunchPlan {
-            arguments: vec![
-                OsString::from("--settings"),
-                settings_path.into_os_string(),
-                OsString::from("--name"),
-                OsString::from(context.title),
-            ],
-            prompt_is_positional: true,
+            arguments,
+            prompt_is_positional: !cfg!(windows),
             completion_monitor: CompletionMonitor::Hook,
         })
     }
 
+    fn prepare_resume(&self, context: ResumeContext<'_>) -> Result<Option<ResumePlan>> {
+        if !cfg!(windows) {
+            return Ok(None);
+        }
+        let settings_path = context.directory.join("claude-settings.json");
+        super::super::write_json_atomic(
+            &settings_path,
+            &super::claude_hook_settings(context.bridge_executable),
+        )?;
+        Ok(Some(ResumePlan {
+            arguments: vec![
+                OsString::from("--settings"),
+                settings_path.into_os_string(),
+                OsString::from("--print"),
+                OsString::from("--resume"),
+                OsString::from(context.provider_session_id),
+            ],
+        }))
+    }
+
     fn initial_prompt_transport(&self) -> InitialPromptTransport {
         if cfg!(windows) {
-            InitialPromptTransport::TerminalPasteAfterLaunch
+            InitialPromptTransport::ProviderStdin
         } else {
             InitialPromptTransport::ProviderArgument
         }
@@ -51,7 +75,11 @@ impl NativeProviderAdapter for ClaudeAdapter {
     }
 
     fn follow_up_transport(&self) -> FollowUpTransport {
-        FollowUpTransport::TerminalPasteFallback
+        if cfg!(windows) {
+            FollowUpTransport::ProviderResumeSupervisor
+        } else {
+            FollowUpTransport::TerminalPasteFallback
+        }
     }
 
     fn send_follow_up(

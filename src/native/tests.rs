@@ -26,6 +26,36 @@ fn ask_yolo_is_false_unless_the_child_request_contains_the_flag() {
 }
 
 #[test]
+fn ask_and_tell_accept_prompt_files_without_putting_prompt_text_in_argv() {
+    let directory = tempfile::tempdir().unwrap();
+    let prompt_path = directory.path().join("prompt.txt");
+    fs::write(&prompt_path, "long prompt from file").unwrap();
+    let prompt_path = prompt_path.to_string_lossy().into_owned();
+
+    let ask = parse_args(["ask", "claude", "--prompt-file", &prompt_path]).unwrap();
+    assert!(matches!(
+        ask,
+        NativeCommand::Ask(AskRequest { prompt, .. }) if prompt == "long prompt from file"
+    ));
+    let tell = parse_args(["tell", "session-file123", "--prompt-file", &prompt_path]).unwrap();
+    assert!(matches!(
+        tell,
+        NativeCommand::Tell(TellRequest { prompt, .. }) if prompt == "long prompt from file"
+    ));
+    assert!(
+        parse_args([
+            "ask",
+            "claude",
+            "--prompt",
+            "inline",
+            "--prompt-file",
+            &prompt_path,
+        ])
+        .is_err()
+    );
+}
+
+#[test]
 fn ask_model_is_supported_by_every_native_provider() {
     for provider in ["codex", "claude", "agy", "pi"] {
         let command = parse_args([
@@ -877,15 +907,12 @@ pwsh.exe -NoLogo -NoProfile -Command "[Console]::OutputEncoding=[Text.Encoding]:
 "#,
     )
     .unwrap();
-    let mut command = provider_process_command(
-        &provider,
-        directory.path(),
-        vec![
-            OsString::from("prompt %SECRET_ENV% 100%"),
-            OsString::from("owner's & | < > ^ !"),
-        ],
-    )
-    .unwrap();
+    let arguments = vec![
+        OsString::from("prompt %SECRET_ENV% 100%"),
+        OsString::from("owner's & | < > ^ !"),
+    ];
+    provider_process_command(&provider, directory.path(), arguments.clone()).unwrap();
+    let mut command = provider_process_command(&provider, directory.path(), arguments).unwrap();
     command.env("SECRET_ENV", "EXPANDED");
     let output = command.output().unwrap();
     assert!(
@@ -1043,17 +1070,20 @@ fn follow_up_prompts_only_enter_a_completed_live_cli_turn() {
 
 #[test]
 fn every_provider_declares_its_current_follow_up_transport() {
-    for provider in [
-        FirstPartyCli::Codex,
-        FirstPartyCli::Claude,
-        FirstPartyCli::Agy,
-        FirstPartyCli::Pi,
-    ] {
+    for provider in [FirstPartyCli::Codex, FirstPartyCli::Agy, FirstPartyCli::Pi] {
         assert_eq!(
             provider::follow_up_transport(provider),
             provider::FollowUpTransport::TerminalPasteFallback
         );
     }
+    assert_eq!(
+        provider::follow_up_transport(FirstPartyCli::Claude),
+        if cfg!(windows) {
+            provider::FollowUpTransport::ProviderResumeSupervisor
+        } else {
+            provider::FollowUpTransport::TerminalPasteFallback
+        }
+    );
 }
 
 #[test]
@@ -1067,12 +1097,54 @@ fn every_provider_declares_its_initial_prompt_transport() {
         #[cfg(windows)]
         assert_eq!(
             provider::initial_prompt_transport(provider),
-            provider::InitialPromptTransport::TerminalPasteAfterLaunch
+            if provider == FirstPartyCli::Claude {
+                provider::InitialPromptTransport::ProviderStdin
+            } else {
+                provider::InitialPromptTransport::TerminalPasteAfterLaunch
+            }
         );
         #[cfg(not(windows))]
         assert_eq!(
             provider::initial_prompt_transport(provider),
             provider::InitialPromptTransport::ProviderArgument
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_claude_resume_plan_uses_the_official_session_id_and_print_mode() {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = std::env::current_exe().unwrap();
+    let plan = provider::prepare_resume(
+        FirstPartyCli::Claude,
+        provider::ResumeContext {
+            bridge_executable: &executable,
+            directory: directory.path(),
+            provider_session_id: "claude-session-id",
+        },
+    )
+    .unwrap()
+    .unwrap();
+    let arguments = plan.arguments;
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["--resume", "claude-session-id"])
+    );
+    assert!(arguments.iter().any(|argument| argument == "--print"));
+    for provider in [FirstPartyCli::Codex, FirstPartyCli::Agy, FirstPartyCli::Pi] {
+        assert!(
+            provider::prepare_resume(
+                provider,
+                provider::ResumeContext {
+                    bridge_executable: &executable,
+                    directory: directory.path(),
+                    provider_session_id: "unused",
+                },
+            )
+            .unwrap()
+            .is_none()
         );
     }
 }
@@ -1310,6 +1382,28 @@ fn dead_native_session_owner_releases_the_turn_and_closes_state() {
             .is_some_and(|error| error.contains("no longer running"))
     );
     assert!(directory.path().join("events").is_dir());
+}
+
+#[test]
+fn resume_pending_dead_owner_is_repaired_instead_of_stalling() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "resume-pending", None, None).unwrap();
+    let claim = acquire_turn_claim(directory.path()).unwrap();
+    claim.retain();
+    write_json_atomic(
+        &directory.path().join(SESSION_OWNER_FILE),
+        &NativeSessionOwner {
+            pid: reaped_child_pid(),
+            ..NativeSessionOwner::default()
+        },
+    )
+    .unwrap();
+
+    assert!(repair_dead_native_owner(directory.path()).unwrap());
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "closed");
 }
 
 #[test]
