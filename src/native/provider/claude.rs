@@ -1,6 +1,10 @@
-use super::{CompletionMonitor, LaunchContext, LaunchPlan, NativeProviderAdapter};
+use super::{
+    CompletionMonitor, FollowUpTransport, LaunchContext, LaunchPlan, NativeProviderAdapter,
+};
 use anyhow::Result;
 use std::{ffi::OsString, path::Path};
+
+use super::super::terminal;
 
 pub(super) static ADAPTER: ClaudeAdapter = ClaudeAdapter;
 
@@ -24,6 +28,18 @@ impl NativeProviderAdapter for ClaudeAdapter {
             completion_monitor: CompletionMonitor::Hook,
         })
     }
+
+    fn follow_up_transport(&self) -> FollowUpTransport {
+        FollowUpTransport::TerminalPasteFallback
+    }
+
+    fn send_follow_up(
+        &self,
+        session: &terminal::TerminalSession,
+        prompt_path: &Path,
+    ) -> Result<()> {
+        terminal::send_file(session, prompt_path)
+    }
 }
 
 pub(super) fn hook_settings(executable: &Path) -> serde_json::Value {
@@ -32,10 +48,8 @@ pub(super) fn hook_settings(executable: &Path) -> serde_json::Value {
             "Stop": [{
                 "hooks": [{
                     "type": "command",
-                    "command": format!(
-                        "{} native-hook claude",
-                        super::super::shell_quote(executable.as_os_str())
-                    ),
+                    "command": executable,
+                    "args": ["native-hook", "claude"],
                     "timeout": 10
                 }]
             }]

@@ -83,6 +83,7 @@ pub(super) fn open_tab(command: &str) -> Result<TerminalSession> {
         tab_id: None,
         window_id: None,
         managed_session_id: None,
+        windows_process_identity: None,
     })
 }
 

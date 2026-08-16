@@ -12,7 +12,7 @@
 | macOS + iTerm2 | 지원 | iTerm2 AppleScript 직접 제어 |
 | macOS + Terminal.app | 지원 | Terminal AppleScript 직접 제어 |
 | macOS의 다른 터미널 | fallback | 별도 adapter가 없으면 Terminal.app에서 시작 |
-| Windows PowerShell / cmd | 미지원 | [Issue #6](https://github.com/jy1655/agent-bridge/issues/6)에서 별도 구현 |
+| Windows PowerShell / cmd | 지원 | PowerShell 7(`pwsh.exe`) 기반 전용 visible console; `ask`/`tell`/`sessions`/explicit close |
 | Linux 터미널 | 미지원 | [Issue #6](https://github.com/jy1655/agent-bridge/issues/6)에서 별도 구현 |
 | VS Code 통합 터미널 | 현재 비범위 | 전용 adapter가 필요하면 별도로 판단 |
 
@@ -20,7 +20,7 @@ macOS에서는 `TERM_PROGRAM`, `TERM`, `ITERM_SESSION_ID`, `TERM_SESSION_ID` 순
 
 Ghostty의 AppleScript는 1.3에서 추가된 preview API이며 macOS Automation 권한이 필요합니다. Ghostty 설정에서 `macos-applescript = false`이면 adapter를 사용할 수 없습니다. Terminal.app은 기존 tab이나 UI scripting을 사용하지 않고 native AppleScript로 항상 전용 새 window를 만듭니다.
 
-Windows와 Linux도 여러 내부 터미널을 그리는 TUI를 다시 만드는 방향이 아니라, 사용자가 보는 OS 터미널 창·탭에서 CLI를 시작하고 그 세션을 관리하는 방향으로 확장합니다. provider/session 계약은 공유하되 OS와 terminal transport는 각각 독립 모듈로 유지합니다.
+Windows는 PowerShell 또는 cmd에서 호출할 수 있으며 PowerShell 7(`pwsh.exe`)이 설치되어 있어야 합니다. bridge는 absolute PATH entry에서 찾은 `pwsh.exe`의 절대 경로를 `CreateProcessW`에 전달하고, `CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP`로 전용 visible console을 만듭니다. 후속 입력과 explicit close는 managed session ID, PID 생성 시각, 실행 파일 identity가 모두 일치할 때만 전달합니다. npm provider shim은 `.exe`, `.ps1`, `.cmd`, `.bat` 순으로 찾고 PowerShell shim을 우선해 `%NAME%`의 `cmd.exe` 확장을 피합니다. Linux는 아직 미지원입니다. provider/session 계약은 공유하되 OS와 terminal transport는 각각 독립 모듈로 유지합니다. provider 간에도 transport 구현을 억지로 공통화하지 않습니다. 각 provider adapter가 공식 session messaging·follow-up·result identity를 우선 사용하고, upstream에서 제공하지 않는 플랫폼·버전에만 같은 의미론의 fallback을 소유합니다. upstream 지원이 추가되면 공통층을 늘리는 대신 해당 fallback을 삭제·교체합니다.
 
 의미를 이해하고 완료 결과를 회수하는 provider는 다음 네 가지입니다.
 
@@ -82,7 +82,7 @@ agent-bridge close-session session-XXXXXXXX --explicit
 
 ```text
 agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] --prompt TEXT [--title NAME]
-    [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal>]
+    [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|windows-console>]
     [--yolo] [--timeout-secs N] [--detach] [--json]
 agent-bridge tell <session> --prompt TEXT [--timeout-secs N] [--detach] [--json]
 agent-bridge sessions [--json]
@@ -92,14 +92,14 @@ agent-bridge --help | --version
 
 ## 권한과 세션 경계
 
-- Agent Bridge는 같은 `ask` 작업에서 새로 만든 surface만 기록합니다. 새 handle은 managed session ID와 host가 제공하는 stable ID를 결합하며 `tell`과 `close-session` 직전에 live wrapper와 함께 다시 검증합니다. Terminal.app은 전용 window ID·TTY에 target `native-session` owner의 managed session ID·PID·controlling TTY device·process start fingerprint를 결합해 TTY나 PID 재사용을 fail-closed합니다. 호출 당시 터미널을 재감지하거나 복원된 front/current/selected surface를 채택하지 않습니다.
+- Agent Bridge는 같은 `ask` 작업에서 새로 만든 surface만 기록합니다. 새 handle은 managed session ID와 host가 제공하는 stable ID를 결합하며 `tell`과 `close-session` 직전에 live wrapper와 함께 다시 검증합니다. Terminal.app은 전용 window ID·TTY에 target `native-session` owner의 managed session ID·PID·controlling TTY device·process start fingerprint를 결합합니다. Windows는 console root와 `native-session` owner의 PID 생성 시각·실행 파일 identity를 함께 검증해 PID 재사용을 fail-closed합니다. 호출 당시 터미널을 재감지하거나 복원된 front/current/selected surface를 채택하지 않습니다.
 - 새 세션의 `--model`, `--effort`, `--yolo`는 부모 CLI에서 추측하거나 상속하지 않습니다. 해당 `ask` 요청에 명시된 값만 사용합니다.
-- `--yolo`는 Codex의 `--dangerously-bypass-approvals-and-sandbox`, Claude와 Agy의 `--dangerously-skip-permissions`를 전달합니다. Pi에서는 추가 인자를 만들지 않는 no-op이며 Pi의 native 권한 정책을 유지합니다.
+- `--yolo`는 Codex의 `--dangerously-bypass-approvals-and-sandbox`, Claude와 Agy의 `--dangerously-skip-permissions`를 전달합니다. Pi에서는 해당 실행의 project-local files를 신뢰하는 `--approve`를 전달하며 Pi 자체 tool 정책은 유지합니다.
 - `tell`은 세션별 한 턴만 허용합니다. 프롬프트를 하나의 bracketed paste로 전송하고 Enter·ESC 같은 별도 터미널 동작을 만들 수 있는 제어문자를 거부합니다.
 - 모든 bridge 프롬프트에는 source provenance가 붙습니다. 사람이 읽는 결과의 터미널 제어문자는 가시적인 문자열로 이스케이프합니다.
 - 결과가 돌아온 뒤 탭은 열린 채 유지되어 사용자가 직접 이어서 작업할 수 있습니다. 진행 중인 bridge 요청과 같은 탭의 수동 입력을 겹치면 수동 턴 결과가 bridge 요청의 결과로 먼저 인식될 수 있으므로 동시에 입력하지 않아야 합니다.
 - `close-session`은 `--explicit`이 있어야 합니다. Terminal.app은 live `native-session` owner attestation과 전용 window ID·TTY가 모두 일치할 때만 busy surface에 interrupt를 보내고 닫습니다. close finality에서는 `terminal.json` handle을 `terminal.closed.json` tombstone으로 소진하며, 이미 `closed`인 세션의 반복 close는 terminal adapter를 호출하지 않습니다.
-- 세션별 상태와 결과는 권한을 제한한 `~/.agent-bridge/native-sessions` 아래에 저장합니다. provider의 전역 설정이나 workspace hook 파일은 수정하지 않습니다.
+- 세션별 상태와 결과는 권한을 제한한 `~/.agent-bridge/native-sessions` 아래에 저장합니다. Windows는 사용자 지정 state root에서도 ACL 상속을 제거하고 현재 사용자 전용 ACL을 적용합니다. provider의 전역 설정이나 workspace hook 파일은 수정하지 않습니다.
 
 최소 지원 버전은 다음과 같습니다. 더 새로운 버전은 허용합니다.
 
@@ -119,15 +119,17 @@ agent-bridge --help | --version
 
 ```text
 src/providers/                 공통 provider 정책: 명령, 버전, model/effort/yolo 인자
-src/native/provider/          provider별 실행 인자와 완료 monitor 선택
+src/native/provider/          provider별 실행, follow-up transport, 완료 monitor 선택
+src/native/provider_process.rs provider process 실행과 Windows shim 경계
 src/native/terminal/mod.rs     공통 terminal kind, session record, OS dispatch
 src/native/terminal/macos/     iTerm2, Terminal.app, Ghostty adapter
 src/native/terminal/linux/     Linux transport 경계(현재 미지원)
-src/native/terminal/windows/   Windows transport 경계(현재 미지원)
-src/native.rs                 세션 상태, lifecycle, 명령 및 현재 결과 monitor orchestration
+src/native/terminal/windows/   Windows console transport, process identity, ACL/security
+src/native.rs                  세션 상태, lifecycle, 명령 및 결과 monitor orchestration
+src/native/tests.rs            native orchestration 단위 테스트
 ```
 
-새 CLI를 추가할 때는 provider registry와 두 provider adapter를 추가하고, model/effort/권한 및 실제 결과 회수 계약을 각각 테스트합니다. 새 터미널은 해당 OS 디렉터리에 adapter를 추가하고 OS dispatcher에 등록합니다. 새 OS는 독립 디렉터리에서 같은 `detect/open_tab/send_file/close_session` 계약을 구현합니다. 현재 POSIX launch command 조립은 `src/native.rs`에 남아 있으므로 Windows 구현에서는 [Issue #6](https://github.com/jy1655/agent-bridge/issues/6)의 플랫폼별 launch 계약도 함께 분리해야 합니다. 공통화가 플랫폼의 native 동작을 약화한다면 플랫폼별 구현을 우선합니다.
+새 CLI를 추가할 때는 provider registry와 두 provider adapter를 추가하고, model/effort/권한 및 실제 결과 회수 계약을 각각 테스트합니다. 새 터미널은 해당 OS 디렉터리에 adapter를 추가하고 OS dispatcher에 등록합니다. 새 OS는 독립 디렉터리에서 같은 `detect/open_tab/send_file/close_session` 계약을 구현합니다. launch command quoting은 POSIX shell과 Windows PowerShell을 분리해 유지합니다. 공통화가 플랫폼의 native 동작을 약화한다면 플랫폼별 구현을 우선합니다.
 
 기존 `{"iterm_session_id":"..."}` 형식의 `terminal.json`은 iTerm2 세션으로 계속 읽습니다. 새 세션은 terminal-neutral한 `terminal`, `session_id`, 선택적 `tab_id`·`window_id`와 내부 `managed_session_id` binding을 기록합니다. 가시적인 terminal title은 설정하거나 ownership record에 저장하지 않습니다. Terminal.app의 추가 owner attestation은 target `native-session`이 별도 private record에 기록합니다.
 
@@ -151,7 +153,7 @@ cargo test --all-targets --all-features
 cargo build --release
 ```
 
-`tests/native_live.rs`의 ignored 테스트는 감지되거나 `--terminal`로 지정한 macOS 터미널의 실제 session surface와 로그인된 provider를 사용합니다. 각 테스트는 `ask → result → close-session --explicit → closed 상태 조회`를 한 번에 검증하고 정상 경로에서 생성한 탭 또는 창을 닫습니다. 종료 단계 자체가 실패하면 진단을 위해 surface가 남을 수 있으므로 `sessions`로 확인합니다.
+`tests/native_live.rs`의 ignored 테스트는 감지되거나 `--terminal`로 지정한 실제 session surface와 로그인된 provider를 사용합니다. macOS에서는 지원 앱을, Windows에서는 `windows-console`을 지정합니다. 각 테스트는 `ask → result → tell → result → close-session --explicit → closed 상태 조회`를 한 번에 검증하고 정상 경로에서 생성한 surface를 닫습니다. 종료 단계 자체가 실패하면 진단을 위해 surface가 남을 수 있으므로 `sessions`로 확인합니다. Pi 0.84.1 이상은 Node.js 22.19.0 이상이 필요합니다.
 
 ```sh
 AGENT_BRIDGE_LIVE_TERMINAL=terminal \

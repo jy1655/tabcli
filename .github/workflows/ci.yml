@@ -19,7 +19,9 @@ jobs:
           components: rustfmt, clippy
       - name: Install macOS terminal apps for AppleScript compile tests
         if: runner.os == 'macOS'
-        run: brew install --cask ghostty iterm2
+        run: |
+          brew untap aws/tap 2>/dev/null || true
+          brew install --cask ghostty iterm2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets --all-features

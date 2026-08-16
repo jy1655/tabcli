@@ -1,4 +1,4 @@
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "windows"))]
 
 use std::{
     process::Command,
@@ -60,6 +60,37 @@ fn run_native_adapter_smoke(provider: &str) {
         .as_str()
         .expect("native ask response is missing its session id");
 
+    let follow_up_marker = format!("{marker}_FOLLOW_UP");
+    let follow_up_prompt =
+        format!("Reply with exactly this marker and nothing else: {follow_up_marker}");
+    let tell_output = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        .args([
+            "tell",
+            session,
+            "--timeout-secs",
+            "300",
+            "--prompt",
+            &follow_up_prompt,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        tell_output.status.success(),
+        "native {provider} follow-up failed: {}",
+        String::from_utf8_lossy(&tell_output.stderr)
+    );
+    print!("{}", String::from_utf8_lossy(&tell_output.stdout));
+    let tell_response: serde_json::Value = serde_json::from_slice(&tell_output.stdout).unwrap();
+    assert_eq!(tell_response["session"], session);
+    assert!(
+        tell_response["result"]
+            .as_str()
+            .is_some_and(|result| result.contains(&follow_up_marker)),
+        "unexpected native {provider} follow-up result: {}",
+        String::from_utf8_lossy(&tell_output.stdout)
+    );
+
     let close_output = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
         .args(["close-session", session, "--explicit", "--json"])
         .output()
@@ -95,7 +126,7 @@ fn run_native_adapter_smoke(provider: &str) {
     assert!(
         matches!(
             response["terminal"].as_str(),
-            Some("ghostty" | "iterm2" | "apple-terminal")
+            Some("ghostty" | "iterm2" | "apple-terminal" | "windows-console")
         ),
         "native response is missing a supported terminal kind: {}",
         String::from_utf8_lossy(&output.stdout)
@@ -117,25 +148,25 @@ fn run_native_adapter_smoke(provider: &str) {
 }
 
 #[test]
-#[ignore = "manual live smoke: opens and closes a detected macOS terminal surface and requires authenticated Codex"]
+#[ignore = "manual live smoke: opens and closes a supported terminal surface and requires authenticated Codex"]
 fn live_native_codex_returns_result_and_closes_session() {
     run_native_adapter_smoke("codex");
 }
 
 #[test]
-#[ignore = "manual live smoke: opens and closes a detected macOS terminal surface and requires authenticated Claude"]
+#[ignore = "manual live smoke: opens and closes a supported terminal surface and requires authenticated Claude"]
 fn live_native_claude_returns_result_and_closes_session() {
     run_native_adapter_smoke("claude");
 }
 
 #[test]
-#[ignore = "manual live smoke: opens and closes a detected macOS terminal surface and requires authenticated Agy"]
+#[ignore = "manual live smoke: opens and closes a supported terminal surface and requires authenticated Agy"]
 fn live_native_agy_returns_result_and_closes_session() {
     run_native_adapter_smoke("agy");
 }
 
 #[test]
-#[ignore = "manual live smoke: opens and closes a detected macOS terminal surface and requires authenticated Pi"]
+#[ignore = "manual live smoke: opens and closes a supported terminal surface and requires authenticated Pi"]
 fn live_native_pi_returns_result_and_closes_session() {
     run_native_adapter_smoke("pi");
 }

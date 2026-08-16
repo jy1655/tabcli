@@ -21,7 +21,7 @@ impl ProviderAdapter for PiAdapter {
     }
 
     fn yolo_args(&self) -> &'static [&'static str] {
-        &[]
+        &["--approve"]
     }
 
     fn model_args(&self, model: &str) -> Vec<String> {

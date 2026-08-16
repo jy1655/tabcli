@@ -27,6 +27,7 @@ pub(crate) enum TerminalKind {
     Iterm2,
     AppleTerminal,
     Ghostty,
+    WindowsConsole,
 }
 
 impl TerminalKind {
@@ -35,6 +36,7 @@ impl TerminalKind {
             Self::Iterm2 => "iterm2",
             Self::AppleTerminal => "apple-terminal",
             Self::Ghostty => "ghostty",
+            Self::WindowsConsole => "windows-console",
         }
     }
 
@@ -43,6 +45,7 @@ impl TerminalKind {
             Self::Iterm2 => "iTerm2",
             Self::AppleTerminal => "Terminal.app",
             Self::Ghostty => "Ghostty",
+            Self::WindowsConsole => "Windows Console",
         }
     }
 }
@@ -53,12 +56,13 @@ impl FromStr for TerminalKind {
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         match value.to_ascii_lowercase().as_str() {
             "ghostty" => Ok(Self::Ghostty),
+            "windows-console" | "windows" | "console" => Ok(Self::WindowsConsole),
             "iterm" | "iterm.app" | "iterm2" => Ok(Self::Iterm2),
             "apple-terminal" | "apple_terminal" | "default" | "terminal" | "terminal.app" => {
                 Ok(Self::AppleTerminal)
             }
             _ => Err(format!(
-                "unsupported terminal {value:?}; expected ghostty, iterm2, or terminal"
+                "unsupported terminal {value:?}; expected ghostty, iterm2, terminal, or windows-console"
             )),
         }
     }
@@ -80,6 +84,14 @@ pub(super) struct TerminalSession {
     pub(super) window_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) managed_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) windows_process_identity: Option<WindowsProcessIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(super) struct WindowsProcessIdentity {
+    pub(super) creation_time: u64,
+    pub(super) executable_path: String,
 }
 
 impl TerminalSession {
@@ -116,6 +128,39 @@ pub(super) fn send_file(session: &TerminalSession, prompt_path: &Path) -> Result
 
 pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
     platform::close_session(session)
+}
+
+#[cfg(target_os = "windows")]
+pub(super) fn windows_console_control(
+    action: &str,
+    session: &TerminalSession,
+    input_path: Option<&Path>,
+    submit_count: usize,
+) -> Result<()> {
+    windows::console_control(action, session, input_path, submit_count)
+}
+
+#[cfg(target_os = "windows")]
+pub(super) fn windows_powershell_executable() -> Result<std::path::PathBuf> {
+    windows::powershell_executable()
+}
+
+#[cfg(windows)]
+pub(super) fn windows_set_private_permissions(path: &Path, directory: bool) -> Result<()> {
+    windows::set_private_permissions(path, directory)
+}
+
+#[cfg(windows)]
+pub(super) fn windows_process_identity(pid: u32) -> Result<WindowsProcessIdentity> {
+    windows::query_process_identity(pid)
+}
+
+#[cfg(windows)]
+pub(super) fn verify_windows_process_identity(
+    pid: u32,
+    identity: &WindowsProcessIdentity,
+) -> Result<()> {
+    windows::verify_process_identity(pid, identity.creation_time, &identity.executable_path)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -228,7 +273,23 @@ mod tests {
             );
         }
         assert_eq!(TerminalKind::from_str("Ghostty"), Ok(TerminalKind::Ghostty));
-        assert!(TerminalKind::from_str("vscode").is_err());
+        assert_eq!(
+            TerminalKind::from_str("windows-console"),
+            Ok(TerminalKind::WindowsConsole)
+        );
+        let error = TerminalKind::from_str("vscode").unwrap_err();
+        assert!(error.contains("windows-console"), "{error}");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_selects_its_managed_console_transport() {
+        assert_eq!(super::select(None).unwrap(), TerminalKind::WindowsConsole);
+        assert_eq!(
+            super::select(Some(TerminalKind::WindowsConsole)).unwrap(),
+            TerminalKind::WindowsConsole
+        );
+        assert!(super::select(Some(TerminalKind::Iterm2)).is_err());
     }
 
     #[test]
@@ -247,6 +308,7 @@ mod tests {
             tab_id: Some("tab-id".to_owned()),
             window_id: Some("window-id".to_owned()),
             managed_session_id: None,
+            windows_process_identity: None,
         };
         assert_eq!(
             serde_json::to_value(&ghostty).unwrap(),
