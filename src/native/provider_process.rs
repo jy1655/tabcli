@@ -1,6 +1,8 @@
 use std::{ffi::OsString, path::Path, process::Command};
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
+#[cfg(windows)]
+use anyhow::{Context, bail};
 
 #[cfg(windows)]
 use super::{terminal, write_private};
