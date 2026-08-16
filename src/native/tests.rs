@@ -860,6 +860,7 @@ fn windows_state_root_falls_back_to_userprofile_without_home() {
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn windows_agy_brain_root_falls_back_to_userprofile_without_home() {
     assert_eq!(
