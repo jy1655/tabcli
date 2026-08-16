@@ -2153,9 +2153,7 @@ fn write_event(directory: &Path, event: &SessionEvent) -> Result<()> {
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
         std::process::id()
     );
-    write_json_atomic(&events.join(name), event)?;
-    let _ = write_json_atomic(&directory.join("latest.json"), event);
-    Ok(())
+    write_json_atomic(&events.join(name), event)
 }
 
 fn event_paths(directory: &Path) -> Result<Vec<PathBuf>> {

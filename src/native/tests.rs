@@ -984,10 +984,9 @@ fn stale_turn_claim_cannot_release_a_new_owner() {
 }
 
 #[test]
-fn event_commit_does_not_depend_on_latest_cache_write() {
+fn event_commit_does_not_create_a_racy_latest_cache() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
-    fs::create_dir(directory.path().join("latest.json")).unwrap();
     let event = SessionEvent {
         provider: "codex".to_owned(),
         message: "committed".to_owned(),
@@ -1003,6 +1002,7 @@ fn event_commit_does_not_depend_on_latest_cache_write() {
     assert_eq!(paths.len(), 1);
     let stored: SessionEvent = read_json(&paths[0]).unwrap();
     assert_eq!(stored.message, "committed");
+    assert!(!directory.path().join("latest.json").exists());
 }
 
 fn reaped_child_pid() -> u32 {
