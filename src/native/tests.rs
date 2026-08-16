@@ -1626,7 +1626,7 @@ fn agy_session_uses_interactive_prompt_model_log_and_explicit_yolo() {
 
 #[cfg(unix)]
 #[test]
-fn pi_session_loads_only_the_result_extension_and_preserves_native_permissions() {
+fn pi_session_loads_the_result_extension_and_explicit_project_approval() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile::tempdir().unwrap();
@@ -1670,7 +1670,7 @@ fn pi_session_loads_only_the_result_extension_and_preserves_native_permissions()
     assert!(arguments.contains("--extension"));
     assert!(arguments.contains("--name\nPi test"));
     assert!(arguments.ends_with("pi prompt\n"));
-    assert!(!arguments.contains("--approve"));
+    assert!(arguments.contains("--approve"));
     assert!(!arguments.contains("dangerously"));
     let extension = fs::read_to_string(directory.join("pi-agent-bridge.js")).unwrap();
     assert_eq!(extension, pi_bridge_extension());
