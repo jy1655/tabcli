@@ -1003,6 +1003,21 @@ fn follow_up_prompts_only_enter_a_completed_live_cli_turn() {
 }
 
 #[test]
+fn every_provider_declares_its_current_follow_up_transport() {
+    for provider in [
+        FirstPartyCli::Codex,
+        FirstPartyCli::Claude,
+        FirstPartyCli::Agy,
+        FirstPartyCli::Pi,
+    ] {
+        assert_eq!(
+            provider::follow_up_transport(provider),
+            provider::FollowUpTransport::TerminalPasteFallback
+        );
+    }
+}
+
+#[test]
 fn follow_up_prompt_is_one_bracketed_paste_payload() {
     assert_eq!(
         terminal_paste_bytes("line one\nline two"),

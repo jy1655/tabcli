@@ -849,6 +849,7 @@ fn run_tell(request: TellRequest) -> Result<()> {
     repair_dead_native_owner(&directory)?;
     let claim = acquire_turn_claim(&directory)?;
     let manifest = read_manifest(&directory)?;
+    let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
     let terminal_session: terminal::TerminalSession = read_json(&directory.join("terminal.json"))?;
     verify_terminal_surface_ownership(&directory, &request.id, &terminal_session)?;
     let baseline = event_paths(&directory)?.len();
@@ -869,31 +870,33 @@ fn run_tell(request: TellRequest) -> Result<()> {
     let prompt = native_delegation_prompt(&delegation_source(), &request.prompt);
     prompt_file.write_all(&terminal_paste_bytes(&prompt))?;
     prompt_file.flush()?;
-    if let Err(error) = terminal::send_file(&terminal_session, prompt_file.path()) {
+    let follow_up_transport = provider::follow_up_transport(provider);
+    if let Err(error) = provider::send_follow_up(provider, &terminal_session, prompt_file.path()) {
         let _ = update_status(
             &directory,
             &previous_state,
             None,
             Some(format!("{error:#}")),
         );
-        return Err(error).with_context(|| {
-            format!(
-                "failed to type into visible {} session {}",
-                terminal_session.kind.display_name(),
-                request.id
-            )
-        });
+        return Err(error)
+            .with_context(|| {
+                format!(
+                    "failed to type into visible {} session {}",
+                    terminal_session.kind.display_name(),
+                    request.id
+                )
+            })
+            .with_context(|| {
+                format!(
+                    "provider follow-up transport {} failed",
+                    follow_up_transport.as_str()
+                )
+            });
     }
     claim.retain();
 
     if request.detach {
-        return emit_session_result(
-            request.json,
-            &request.id,
-            &terminal_session,
-            FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?,
-            None,
-        );
+        return emit_session_result(request.json, &request.id, &terminal_session, provider, None);
     }
     let event = wait_for_event(&directory, baseline, request.timeout).with_context(|| {
         format!(
@@ -906,7 +909,7 @@ fn run_tell(request: TellRequest) -> Result<()> {
         request.json,
         &request.id,
         &terminal_session,
-        FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?,
+        provider,
         Some(&event),
     )
 }
