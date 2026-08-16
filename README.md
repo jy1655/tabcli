@@ -39,6 +39,8 @@ cd agent-bridge
 cargo install --path . --locked
 ```
 
+Windows 명령줄 한도를 넘는 요청은 `--prompt-file`로 전달합니다. 파일은 UTF-8 텍스트로 읽으며 Agent Bridge가 원본을 삭제하거나 수정하지 않습니다.
+
 기존 설치를 교체할 때는 `cargo install --path . --locked --force`를 사용합니다. 기본 설치 위치인 `~/.cargo/bin`이 `PATH`에 없다면 추가하거나 빌드한 바이너리를 절대 경로로 실행합니다.
 
 ## 사용법
@@ -81,10 +83,10 @@ agent-bridge close-session session-XXXXXXXX --explicit
 전체 명령은 다음과 같습니다.
 
 ```text
-agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] --prompt TEXT [--title NAME]
+agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]
     [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|windows-console>]
     [--yolo] [--timeout-secs N] [--detach] [--json]
-agent-bridge tell <session> --prompt TEXT [--timeout-secs N] [--detach] [--json]
+agent-bridge tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
 agent-bridge sessions [--json]
 agent-bridge close-session <session> --explicit [--json]
 agent-bridge --help | --version
@@ -95,7 +97,7 @@ agent-bridge --help | --version
 - Agent Bridge는 같은 `ask` 작업에서 새로 만든 surface만 기록합니다. 새 handle은 managed session ID와 host가 제공하는 stable ID를 결합하며 `tell`과 `close-session` 직전에 live wrapper와 함께 다시 검증합니다. Terminal.app은 전용 window ID·TTY에 target `native-session` owner의 managed session ID·PID·controlling TTY device·process start fingerprint를 결합합니다. Windows는 console root와 `native-session` owner의 PID 생성 시각·실행 파일 identity를 함께 검증해 PID 재사용을 fail-closed합니다. 호출 당시 터미널을 재감지하거나 복원된 front/current/selected surface를 채택하지 않습니다.
 - 새 세션의 `--model`, `--effort`, `--yolo`는 부모 CLI에서 추측하거나 상속하지 않습니다. 해당 `ask` 요청에 명시된 값만 사용합니다.
 - `--yolo`는 Codex의 `--dangerously-bypass-approvals-and-sandbox`, Claude와 Agy의 `--dangerously-skip-permissions`를 전달합니다. Pi에서는 해당 실행의 project-local files를 신뢰하는 `--approve`를 전달하며 Pi 자체 tool 정책은 유지합니다.
-- `tell`은 세션별 한 턴만 허용합니다. 프롬프트를 하나의 bracketed paste로 전송하고 Enter·ESC 같은 별도 터미널 동작을 만들 수 있는 제어문자를 거부합니다.
+- `tell`은 세션별 한 턴만 허용합니다. Windows Claude는 visible console supervisor 안에서 공식 `--resume <session-id>`와 stdin을 사용합니다. Codex·Pi·Agy 및 아직 공식 session transport가 없는 플랫폼 fallback은 provider adapter가 소유한 terminal paste를 사용합니다. Enter·ESC 같은 별도 터미널 동작을 만들 수 있는 제어문자는 거부합니다.
 - 모든 bridge 프롬프트에는 source provenance가 붙습니다. 사람이 읽는 결과의 터미널 제어문자는 가시적인 문자열로 이스케이프합니다.
 - 결과가 돌아온 뒤 탭은 열린 채 유지되어 사용자가 직접 이어서 작업할 수 있습니다. 진행 중인 bridge 요청과 같은 탭의 수동 입력을 겹치면 수동 턴 결과가 bridge 요청의 결과로 먼저 인식될 수 있으므로 동시에 입력하지 않아야 합니다.
 - `close-session`은 `--explicit`이 있어야 합니다. Terminal.app은 live `native-session` owner attestation과 전용 window ID·TTY가 모두 일치할 때만 busy surface에 interrupt를 보내고 닫습니다. close finality에서는 `terminal.json` handle을 `terminal.closed.json` tombstone으로 소진하며, 이미 `closed`인 세션의 반복 close는 terminal adapter를 호출하지 않습니다.

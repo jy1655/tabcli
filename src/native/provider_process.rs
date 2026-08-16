@@ -2,7 +2,7 @@ use std::{ffi::OsString, path::Path, process::Command};
 
 use anyhow::Result;
 #[cfg(windows)]
-use anyhow::bail;
+use anyhow::{Context, bail};
 
 #[cfg(windows)]
 use super::{terminal, write_private};
@@ -21,17 +21,48 @@ pub(super) fn command(
 
     #[cfg(windows)]
     if has_extension(executable, "cmd") || has_extension(executable, "bat") {
-        if arguments
-            .iter()
-            .any(|argument| argument.to_string_lossy().contains('%'))
-        {
-            bail!(
-                "Windows batch provider arguments cannot contain '%' without expansion; install an .exe or .ps1 shim"
-            );
-        }
-        const FORWARDER: &str = "param(\n  [Parameter(Mandatory=$true)][string]$Provider,\n  [Parameter(ValueFromRemainingArguments=$true)][string[]]$ProviderArgs\n)\n& $Provider @ProviderArgs\nexit $LASTEXITCODE\n";
+        const FORWARDER: &str = r#"param(
+  [Parameter(Mandatory=$true)][string]$Provider,
+  [Parameter(ValueFromRemainingArguments=$true)][string[]]$ProviderArgs
+)
+
+function ConvertTo-NativeArgument([string]$Value) {
+  $Builder = [System.Text.StringBuilder]::new()
+  [void]$Builder.Append('"')
+  $Backslashes = 0
+  foreach ($Character in $Value.ToCharArray()) {
+    if ($Character -eq '\') {
+      $Backslashes++
+      continue
+    }
+    if ($Character -eq '"') {
+      [void]$Builder.Append(('\' * (($Backslashes * 2) + 1)))
+      [void]$Builder.Append('"')
+    } else {
+      [void]$Builder.Append(('\' * $Backslashes))
+      [void]$Builder.Append($Character)
+    }
+    $Backslashes = 0
+  }
+  [void]$Builder.Append(('\' * ($Backslashes * 2)))
+  [void]$Builder.Append('"')
+  $Builder.ToString()
+}
+
+$Names = [System.Collections.Generic.List[string]]::new()
+for ($Index = 0; $Index -lt $ProviderArgs.Count; $Index++) {
+  $Name = "AGENT_BRIDGE_BATCH_ARG_$Index"
+  [Environment]::SetEnvironmentVariable($Name, (ConvertTo-NativeArgument $ProviderArgs[$Index]), 'Process')
+  $Names.Add($Name)
+}
+$ArgumentLine = ($Names | ForEach-Object { "%$_%" }) -join ' '
+$CommandLine = (ConvertTo-NativeArgument $Provider) + $(if ($ArgumentLine) { " $ArgumentLine" } else { '' })
+$Cmd = Join-Path ([Environment]::GetFolderPath('System')) 'cmd.exe'
+& $Cmd /d /v:off /s /c ('"' + $CommandLine + '"')
+exit $LASTEXITCODE
+"#;
         let forwarder = _directory.join("provider-launch.ps1");
-        write_private(&forwarder, FORWARDER.as_bytes())?;
+        ensure_private_forwarder(&forwarder, FORWARDER.as_bytes())?;
         let mut command = powershell_file_command(&forwarder)?;
         command
             .arg(windows_command_path(executable))
@@ -42,6 +73,31 @@ pub(super) fn command(
     let mut command = Command::new(executable);
     command.args(arguments);
     Ok(command)
+}
+
+#[cfg(windows)]
+fn ensure_private_forwarder(path: &Path, expected: &[u8]) -> Result<()> {
+    match std::fs::read(path) {
+        Ok(existing) if existing == expected => return Ok(()),
+        Ok(_) => bail!(
+            "refusing to replace a mismatched provider forwarder {}",
+            path.display()
+        ),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect provider forwarder {}", path.display())
+            });
+        }
+        Err(_) => {}
+    }
+    match write_private(path, expected) {
+        Ok(()) => Ok(()),
+        Err(write_error) => match std::fs::read(path) {
+            Ok(existing) if existing == expected => Ok(()),
+            _ => Err(write_error)
+                .with_context(|| format!("failed to create provider forwarder {}", path.display())),
+        },
+    }
 }
 
 pub(super) fn version_command(executable: &Path) -> Result<Command> {

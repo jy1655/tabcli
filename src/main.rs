@@ -18,10 +18,10 @@ fn help_text() -> String {
         "agent-bridge {} — visible native terminal bridge for coding agent CLIs
 
 Usage:
-  agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] --prompt TEXT [--title NAME]
+  agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]
       [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|windows-console>]
       [--yolo] [--timeout-secs N] [--detach] [--json]
-  agent-bridge tell <session> --prompt TEXT [--timeout-secs N] [--detach] [--json]
+  agent-bridge tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
   agent-bridge sessions [--json]
   agent-bridge close-session <session> --explicit [--json]
   agent-bridge --help | --version

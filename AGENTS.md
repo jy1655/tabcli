@@ -39,8 +39,11 @@ launch, observe, continue, and close without replacing the capabilities those CL
   including WSL 2, through its session messaging facilities. Prefer that official path
   when all Claude availability gates pass.
 - Claude Code does not currently provide cross-session messaging on native Windows.
-  Keep the Windows terminal-input path as a Claude-specific fallback with equivalent
-  addressed-session semantics until Claude adds native support.
+  On native Windows, keep the visible Agent Bridge console under a Claude-specific
+  supervisor and run turns through Claude's official `--print` and
+  `--resume <session-id>` session continuity. Prompts travel over stdin, not terminal
+  key injection or provider argv. Replace this supervisor with Claude cross-session
+  messaging when upstream adds native Windows support.
 - Do not emulate Claude result correlation with a generic message hash. Identical valid
   responses can occur in separate turns; correlation must use Claude-owned identity or a
   provider-specific protocol with an explicit replacement boundary.

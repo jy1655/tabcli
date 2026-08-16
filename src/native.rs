@@ -15,6 +15,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    process::Stdio,
     str::FromStr,
     sync::{
         Arc,
@@ -45,6 +46,8 @@ const PI_HOOK_FAILURE_FILE: &str = "pi-hook-failure.json";
 const TERMINAL_HANDLE_FILE: &str = "terminal.json";
 const TERMINAL_CLOSING_FILE: &str = "terminal.closing.json";
 const TERMINAL_TOMBSTONE_FILE: &str = "terminal.closed.json";
+const RESUME_PENDING_FILE: &str = "resume.pending.json";
+const RESUME_RUNNING_FILE: &str = "resume.running.json";
 static TURN_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -115,6 +118,13 @@ struct SessionManifest {
     effort: Option<String>,
     yolo: bool,
     created_unix_ms: u128,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ResumeRequest {
+    id: String,
+    provider_session_id: String,
+    prompt: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -290,6 +300,7 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
     let provider = FirstPartyCli::from_str(provider).map_err(anyhow::Error::msg)?;
     let mut workspace = None;
     let mut prompt = None;
+    let mut prompt_file = None;
     let mut title = None;
     let mut model = None;
     let mut effort = None;
@@ -310,6 +321,11 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
                 &mut prompt,
                 option_value(options, &mut index, "--prompt")?.to_owned(),
                 "--prompt",
+            )?,
+            "--prompt-file" => set_once(
+                &mut prompt_file,
+                PathBuf::from(option_value(options, &mut index, "--prompt-file")?),
+                "--prompt-file",
             )?,
             "--title" => set_once(
                 &mut title,
@@ -344,7 +360,7 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
         index += 1;
     }
     let workspace = workspace.unwrap_or(std::env::current_dir()?);
-    let prompt = prompt.context("ask requires --prompt <text>")?;
+    let prompt = read_prompt_option(prompt, prompt_file, "ask")?;
     if prompt.trim().is_empty() {
         bail!("--prompt cannot be empty");
     }
@@ -373,6 +389,7 @@ fn parse_tell(args: &[String]) -> Result<NativeCommand> {
     let (id, options) = args.split_first().context("tell requires one session id")?;
     require_valid_session_id(id)?;
     let mut prompt = None;
+    let mut prompt_file = None;
     let mut timeout = None;
     let mut detach = false;
     let mut json = false;
@@ -384,6 +401,11 @@ fn parse_tell(args: &[String]) -> Result<NativeCommand> {
                 option_value(options, &mut index, "--prompt")?.to_owned(),
                 "--prompt",
             )?,
+            "--prompt-file" => set_once(
+                &mut prompt_file,
+                PathBuf::from(option_value(options, &mut index, "--prompt-file")?),
+                "--prompt-file",
+            )?,
             "--timeout-secs" => {
                 let value = option_value(options, &mut index, "--timeout-secs")?;
                 set_once(&mut timeout, parse_timeout(value)?, "--timeout-secs")?;
@@ -394,7 +416,7 @@ fn parse_tell(args: &[String]) -> Result<NativeCommand> {
         }
         index += 1;
     }
-    let prompt = prompt.context("tell requires --prompt <text>")?;
+    let prompt = read_prompt_option(prompt, prompt_file, "tell")?;
     if prompt.trim().is_empty() {
         bail!("--prompt cannot be empty");
     }
@@ -406,6 +428,20 @@ fn parse_tell(args: &[String]) -> Result<NativeCommand> {
         detach,
         json,
     }))
+}
+
+fn read_prompt_option(
+    inline: Option<String>,
+    file: Option<PathBuf>,
+    command: &str,
+) -> Result<String> {
+    match (inline, file) {
+        (Some(_), Some(_)) => bail!("{command} accepts only one of --prompt or --prompt-file"),
+        (Some(prompt), None) => Ok(prompt),
+        (None, Some(path)) => fs::read_to_string(&path)
+            .with_context(|| format!("failed to read prompt file {}", path.display())),
+        (None, None) => bail!("{command} requires --prompt <text> or --prompt-file <path>"),
+    }
 }
 
 fn parse_sessions(args: &[String]) -> Result<NativeCommand> {
@@ -625,6 +661,40 @@ fn run_ask(request: AskRequest) -> Result<()> {
     };
     terminal_session.managed_session_id = Some(created.id.clone());
     write_json_atomic(&created.directory.join("terminal.json"), &terminal_session)?;
+
+    if provider::initial_prompt_transport(request.provider)
+        == provider::InitialPromptTransport::TerminalPasteAfterLaunch
+    {
+        wait_for_status(
+            &created.directory,
+            "awaiting-initial-input",
+            request.timeout,
+        )?;
+        thread::sleep(provider::initial_prompt_ready_delay(request.provider));
+        let claim = acquire_turn_claim(&created.directory)?;
+        let initial_prompt_path = created.directory.join("initial-prompt.txt");
+        let initial_prompt = fs::read_to_string(&initial_prompt_path)
+            .context("failed to read the preserved initial prompt")?;
+        let mut prompt_file = tempfile::Builder::new()
+            .prefix("pending-prompt-")
+            .suffix(".txt")
+            .tempfile_in(&created.directory)?;
+        set_private_file_permissions(prompt_file.as_file())?;
+        prompt_file.write_all(&terminal_paste_bytes(&initial_prompt))?;
+        prompt_file.flush()?;
+        provider::send_initial_prompt(request.provider, &terminal_session, prompt_file.path())
+            .with_context(|| {
+                format!(
+                    "failed to deliver the initial prompt to {} session {}",
+                    request.provider.as_str(),
+                    created.id
+                )
+            })?;
+        fs::remove_file(&initial_prompt_path)
+            .context("failed to remove the delivered initial prompt")?;
+        update_status(&created.directory, "working", None, None)?;
+        claim.retain();
+    }
 
     if request.detach {
         return emit_session_result(
@@ -860,38 +930,80 @@ fn run_tell(request: TellRequest) -> Result<()> {
             request.id
         );
     }
-    update_status(&directory, "working", None, None)?;
-
-    let mut prompt_file = tempfile::Builder::new()
-        .prefix("pending-prompt-")
-        .suffix(".txt")
-        .tempfile_in(&directory)?;
-    set_private_file_permissions(prompt_file.as_file())?;
     let prompt = native_delegation_prompt(&delegation_source(), &request.prompt);
-    prompt_file.write_all(&terminal_paste_bytes(&prompt))?;
-    prompt_file.flush()?;
     let follow_up_transport = provider::follow_up_transport(provider);
-    if let Err(error) = provider::send_follow_up(provider, &terminal_session, prompt_file.path()) {
-        let _ = update_status(
-            &directory,
-            &previous_state,
-            None,
-            Some(format!("{error:#}")),
-        );
-        return Err(error)
-            .with_context(|| {
-                format!(
-                    "failed to type into visible {} session {}",
-                    terminal_session.kind.display_name(),
+    match follow_up_transport {
+        provider::FollowUpTransport::TerminalPasteFallback => {
+            update_status(&directory, "working", None, None)?;
+            let mut prompt_file = tempfile::Builder::new()
+                .prefix("pending-prompt-")
+                .suffix(".txt")
+                .tempfile_in(&directory)?;
+            set_private_file_permissions(prompt_file.as_file())?;
+            prompt_file.write_all(&terminal_paste_bytes(&prompt))?;
+            prompt_file.flush()?;
+            if let Err(error) =
+                provider::send_follow_up(provider, &terminal_session, prompt_file.path())
+            {
+                let _ = update_status(
+                    &directory,
+                    &previous_state,
+                    None,
+                    Some(format!("{error:#}")),
+                );
+                return Err(error)
+                    .with_context(|| {
+                        format!(
+                            "failed to type into visible {} session {}",
+                            terminal_session.kind.display_name(),
+                            request.id
+                        )
+                    })
+                    .with_context(|| {
+                        format!(
+                            "provider follow-up transport {} failed",
+                            follow_up_transport.as_str()
+                        )
+                    });
+            }
+        }
+        provider::FollowUpTransport::ProviderResumeSupervisor => {
+            let latest = event_paths(&directory)?
+                .last()
+                .cloned()
+                .context("provider resume requires a completed initial turn")?;
+            let event: SessionEvent = read_json(&latest)?;
+            let provider_session_id = event
+                .provider_session_id
+                .context("provider resume requires a provider session id")?;
+            let resume = ResumeRequest {
+                id: format!(
+                    "resume-{}-{}",
+                    unix_ms(),
+                    TURN_CLAIM_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                ),
+                provider_session_id,
+                prompt,
+            };
+            if directory.join(RESUME_PENDING_FILE).exists()
+                || directory.join(RESUME_RUNNING_FILE).exists()
+            {
+                bail!(
+                    "provider resume request already exists for session {}",
                     request.id
-                )
-            })
-            .with_context(|| {
-                format!(
-                    "provider follow-up transport {} failed",
-                    follow_up_transport.as_str()
-                )
-            });
+                );
+            }
+            update_status(&directory, "resume-pending", None, None)?;
+            if let Err(error) = write_json_atomic(&directory.join(RESUME_PENDING_FILE), &resume) {
+                let _ = update_status(
+                    &directory,
+                    &previous_state,
+                    None,
+                    Some(format!("{error:#}")),
+                );
+                return Err(error).context("failed to publish provider resume request");
+            }
+        }
     }
     claim.retain();
 
@@ -1146,22 +1258,22 @@ fn run_session_inner(directory: &Path) -> Result<()> {
     check_provider_version(provider, &manifest.provider_path)?;
     let prompt_path = directory.join("initial-prompt.txt");
     let prompt = fs::read_to_string(&prompt_path).context("failed to read initial prompt")?;
-    fs::remove_file(&prompt_path).context("failed to remove consumed initial prompt")?;
+    let initial_prompt_transport = provider::initial_prompt_transport(provider);
 
     let executable = std::env::current_exe().context("failed to locate agent-bridge executable")?;
-    let mut arguments = provider_launch_args(provider, manifest.yolo)
+    let mut policy_arguments = provider_launch_args(provider, manifest.yolo)
         .into_iter()
         .map(OsString::from)
         .collect::<Vec<_>>();
     if let Some(effort) = &manifest.effort {
-        arguments.extend(
+        policy_arguments.extend(
             provider_effort_args(provider, effort)?
                 .into_iter()
                 .map(OsString::from),
         );
     }
     if let Some(model) = &manifest.model {
-        arguments.extend(
+        policy_arguments.extend(
             provider_model_args(provider, model)
                 .into_iter()
                 .map(OsString::from),
@@ -1181,12 +1293,26 @@ fn run_session_inner(directory: &Path) -> Result<()> {
             prompt: &prompt,
         },
     )?;
+    let mut arguments = policy_arguments.clone();
     arguments.extend(provider_arguments);
-    if prompt_is_positional {
-        arguments.push(OsString::from(prompt));
+    if initial_prompt_transport == provider::InitialPromptTransport::ProviderArgument
+        && prompt_is_positional
+    {
+        arguments.push(OsString::from(prompt.clone()));
     }
 
-    update_status(directory, "running", None, None)?;
+    if provider::follow_up_transport(provider)
+        == provider::FollowUpTransport::ProviderResumeSupervisor
+    {
+        return run_provider_resume_supervisor(
+            directory,
+            &manifest,
+            &executable,
+            policy_arguments,
+            arguments,
+        );
+    }
+
     let (agy_monitor, pi_failure_monitor) = match completion_monitor {
         provider::CompletionMonitor::Hook => (None, None),
         provider::CompletionMonitor::AgyTranscript { log_path } => (
@@ -1199,12 +1325,33 @@ fn run_session_inner(directory: &Path) -> Result<()> {
     };
     let mut provider_command =
         provider_process_command(&manifest.provider_path, directory, arguments)?;
-    let status = provider_command
+    let child = provider_command
         .current_dir(&manifest.workspace)
         .env(SESSION_DIR_ENV, directory)
         .env("AGENT_BRIDGE_NATIVE_SESSION_ID", &manifest.id)
         .env("AGENT_BRIDGE_EXECUTABLE", &executable)
-        .status();
+        .spawn();
+    let mut child = child.with_context(|| {
+        format!(
+            "failed to start {} at {}",
+            provider.as_str(),
+            manifest.provider_path.display()
+        )
+    })?;
+    match initial_prompt_transport {
+        provider::InitialPromptTransport::ProviderArgument => {
+            fs::remove_file(&prompt_path)
+                .context("failed to remove the accepted initial prompt")?;
+            update_status(directory, "running", None, None)?;
+        }
+        provider::InitialPromptTransport::TerminalPasteAfterLaunch => {
+            update_status(directory, "awaiting-initial-input", None, None)?;
+        }
+        provider::InitialPromptTransport::ProviderStdin => {
+            bail!("provider stdin transport requires a resume supervisor")
+        }
+    }
+    let status = child.wait();
     if let Some(monitor) = agy_monitor {
         monitor.stop()?;
     }
@@ -1223,6 +1370,140 @@ fn run_session_inner(directory: &Path) -> Result<()> {
         bail!("{} exited with {status}", provider.as_str());
     }
     Ok(())
+}
+
+fn run_provider_resume_supervisor(
+    directory: &Path,
+    manifest: &SessionManifest,
+    executable: &Path,
+    policy_arguments: Vec<OsString>,
+    initial_arguments: Vec<OsString>,
+) -> Result<()> {
+    let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
+    let initial_prompt_path = directory.join("initial-prompt.txt");
+    let initial_prompt = fs::read_to_string(&initial_prompt_path)
+        .context("failed to read supervisor initial prompt")?;
+    update_status(directory, "running", None, None)?;
+    let initial_status = run_provider_stdin_turn(
+        directory,
+        manifest,
+        provider,
+        executable,
+        initial_arguments,
+        &initial_prompt,
+    )?;
+    if !initial_status.success() {
+        bail!(
+            "{} initial turn exited with {initial_status}",
+            provider.as_str()
+        );
+    }
+    fs::remove_file(&initial_prompt_path)
+        .context("failed to remove the accepted initial prompt")?;
+    let initial_state = read_json::<SessionStatus>(&directory.join("status.json"))?.state;
+    if initial_state != "ready" {
+        bail!(
+            "{} initial turn exited without reporting completion",
+            provider.as_str()
+        );
+    }
+
+    loop {
+        if directory.join(CLOSED_STATUS_FILE).is_file() {
+            return Ok(());
+        }
+        let pending = directory.join(RESUME_PENDING_FILE);
+        if !pending.is_file() {
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        let running = directory.join(RESUME_RUNNING_FILE);
+        fs::rename(&pending, &running).context("failed to claim provider resume request")?;
+        let resume: ResumeRequest = read_json(&running)?;
+        let latest = event_paths(directory)?
+            .last()
+            .cloned()
+            .context("provider resume requires a completed prior turn")?;
+        let prior_event: SessionEvent = read_json(&latest)?;
+        if prior_event.provider_session_id.as_deref() != Some(&resume.provider_session_id) {
+            bail!("provider resume session identity changed before launch");
+        }
+        let plan = provider::prepare_resume(
+            provider,
+            provider::ResumeContext {
+                bridge_executable: executable,
+                directory,
+                provider_session_id: &resume.provider_session_id,
+            },
+        )?
+        .context("provider declared resume supervision without a resume plan")?;
+        let mut arguments = policy_arguments.clone();
+        arguments.extend(plan.arguments);
+        update_status(directory, "working", None, None)?;
+        let status = run_provider_stdin_turn(
+            directory,
+            manifest,
+            provider,
+            executable,
+            arguments,
+            &resume.prompt,
+        );
+        remove_file_if_present(&running)?;
+        let status = status?;
+        if !status.success() {
+            bail!("{} resume turn exited with {status}", provider.as_str());
+        }
+        let state = read_json::<SessionStatus>(&directory.join("status.json"))?.state;
+        if state != "ready" {
+            bail!(
+                "{} resume turn exited without reporting completion",
+                provider.as_str()
+            );
+        }
+    }
+}
+
+fn run_provider_stdin_turn(
+    directory: &Path,
+    manifest: &SessionManifest,
+    provider: FirstPartyCli,
+    executable: &Path,
+    arguments: Vec<OsString>,
+    prompt: &str,
+) -> Result<std::process::ExitStatus> {
+    let mut command = provider_process_command(&manifest.provider_path, directory, arguments)?;
+    let mut child = command
+        .current_dir(&manifest.workspace)
+        .env(SESSION_DIR_ENV, directory)
+        .env("AGENT_BRIDGE_NATIVE_SESSION_ID", &manifest.id)
+        .env("AGENT_BRIDGE_EXECUTABLE", executable)
+        .stdin(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to start {} at {}",
+                provider.as_str(),
+                manifest.provider_path.display()
+            )
+        })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("provider stdin pipe was not created")?;
+    if let Err(error) = stdin.write_all(prompt.as_bytes()) {
+        drop(stdin);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error).context("failed to deliver provider prompt over stdin");
+    }
+    drop(stdin);
+    child.wait().with_context(|| {
+        format!(
+            "failed to wait for {} at {}",
+            provider.as_str(),
+            manifest.provider_path.display()
+        )
+    })
 }
 
 fn run_hook(provider: FirstPartyCli, argument_payload: Option<&str>) -> Result<()> {
@@ -1763,7 +2044,20 @@ fn read_regular_text_if_present(path: &Path) -> Result<Option<String>> {
 }
 
 fn agy_brain_root() -> Result<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
+    default_agy_brain_root(
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("USERPROFILE").as_deref(),
+    )
+}
+
+fn default_agy_brain_root(
+    home: Option<&std::ffi::OsStr>,
+    user_profile: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
+    let home = PathBuf::from(
+        home.or(user_profile)
+            .context("neither HOME nor USERPROFILE is set for the Agy brain root")?,
+    );
     Ok(home.join(".gemini").join("antigravity-cli").join("brain"))
 }
 
@@ -2104,7 +2398,7 @@ fn repair_dead_native_owner(directory: &Path) -> Result<bool> {
     let status: SessionStatus = read_json(&directory.join("status.json"))?;
     if !matches!(
         status.state.as_str(),
-        "launching" | "running" | "working" | "ready" | "exited" | "failed"
+        "launching" | "running" | "resume-pending" | "working" | "ready" | "exited" | "failed"
     ) {
         return Ok(false);
     }
@@ -2196,6 +2490,35 @@ fn event_paths(directory: &Path) -> Result<Vec<PathBuf>> {
     }
     paths.sort();
     Ok(paths)
+}
+
+fn wait_for_status(
+    directory: &Path,
+    expected_state: &str,
+    timeout: Duration,
+) -> Result<SessionStatus> {
+    let deadline = checked_deadline_from(Instant::now(), timeout)?;
+    loop {
+        repair_dead_native_owner(directory)?;
+        if let Ok(status) = read_json::<SessionStatus>(&directory.join("status.json")) {
+            if status.state == expected_state {
+                return Ok(status);
+            }
+            if matches!(status.state.as_str(), "failed" | "exited" | "closed") {
+                let reason = status
+                    .error
+                    .unwrap_or_else(|| format!("session entered state {}", status.state));
+                bail!("{reason}");
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out after {} seconds waiting for session state {expected_state}",
+                timeout.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn wait_for_event(directory: &Path, baseline: usize, timeout: Duration) -> Result<SessionEvent> {
