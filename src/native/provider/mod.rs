@@ -5,7 +5,7 @@ mod pi;
 
 use agent_bridge::FirstPartyCli;
 use anyhow::Result;
-use std::{ffi::OsString, path::Path, path::PathBuf};
+use std::{ffi::OsString, path::Path, path::PathBuf, time::Duration};
 
 use super::terminal;
 
@@ -34,6 +34,12 @@ pub(super) enum FollowUpTransport {
     TerminalPasteFallback,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InitialPromptTransport {
+    ProviderArgument,
+    TerminalPasteAfterLaunch,
+}
+
 impl FollowUpTransport {
     pub(super) const fn as_str(self) -> &'static str {
         match self {
@@ -44,6 +50,13 @@ impl FollowUpTransport {
 
 trait NativeProviderAdapter: Sync {
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan>;
+    fn initial_prompt_transport(&self) -> InitialPromptTransport;
+    fn initial_prompt_ready_delay(&self) -> Duration;
+    fn send_initial_prompt(
+        &self,
+        session: &terminal::TerminalSession,
+        prompt_path: &Path,
+    ) -> Result<()>;
     fn follow_up_transport(&self) -> FollowUpTransport;
     fn send_follow_up(&self, session: &terminal::TerminalSession, prompt_path: &Path)
     -> Result<()>;
@@ -69,12 +82,28 @@ pub(super) fn follow_up_transport(provider: FirstPartyCli) -> FollowUpTransport 
     adapter(provider).follow_up_transport()
 }
 
+pub(super) fn initial_prompt_transport(provider: FirstPartyCli) -> InitialPromptTransport {
+    adapter(provider).initial_prompt_transport()
+}
+
+pub(super) fn initial_prompt_ready_delay(provider: FirstPartyCli) -> Duration {
+    adapter(provider).initial_prompt_ready_delay()
+}
+
 pub(super) fn send_follow_up(
     provider: FirstPartyCli,
     session: &terminal::TerminalSession,
     prompt_path: &Path,
 ) -> Result<()> {
     adapter(provider).send_follow_up(session, prompt_path)
+}
+
+pub(super) fn send_initial_prompt(
+    provider: FirstPartyCli,
+    session: &terminal::TerminalSession,
+    prompt_path: &Path,
+) -> Result<()> {
+    adapter(provider).send_initial_prompt(session, prompt_path)
 }
 
 pub(super) fn claude_hook_settings(executable: &Path) -> serde_json::Value {

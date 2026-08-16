@@ -830,6 +830,14 @@ fn windows_state_root_falls_back_to_userprofile_without_home() {
     );
 }
 
+#[test]
+fn windows_agy_brain_root_falls_back_to_userprofile_without_home() {
+    assert_eq!(
+        default_agy_brain_root(None, Some(std::ffi::OsStr::new(r"C:\Users\agy-user"))).unwrap(),
+        PathBuf::from(r"C:\Users\agy-user\.gemini\antigravity-cli\brain")
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_batch_providers_are_launched_through_a_fixed_powershell_forwarder() {
@@ -857,15 +865,46 @@ fn windows_batch_providers_are_launched_through_a_fixed_powershell_forwarder() {
 
 #[cfg(windows)]
 #[test]
-fn windows_batch_providers_fail_closed_on_percent_expansion() {
+fn windows_batch_providers_preserve_percent_and_shell_metacharacters() {
     let directory = tempfile::tempdir().unwrap();
-    let error = provider_process_command(
-        Path::new(r"C:\npm\codex.cmd"),
-        directory.path(),
-        vec![OsString::from("prompt %SECRET_ENV%")],
+    let provider = directory.path().join("provider.cmd");
+    write_private(
+        &provider,
+        br#"@echo off
+set "AGENT_BRIDGE_PROBE_1=%~1"
+set "AGENT_BRIDGE_PROBE_2=%~2"
+pwsh.exe -NoLogo -NoProfile -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; [Console]::WriteLine('ARG=[' + $env:AGENT_BRIDGE_PROBE_1 + ']'); [Console]::WriteLine('ARG=[' + $env:AGENT_BRIDGE_PROBE_2 + ']')"
+"#,
     )
-    .unwrap_err();
-    assert!(error.to_string().contains("cannot contain '%'"));
+    .unwrap();
+    let mut command = provider_process_command(
+        &provider,
+        directory.path(),
+        vec![
+            OsString::from("prompt %SECRET_ENV% 100%"),
+            OsString::from("owner's & | < > ^ !"),
+        ],
+    )
+    .unwrap();
+    command.env("SECRET_ENV", "EXPANDED");
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "status={} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            "ARG=[prompt %SECRET_ENV% 100%]",
+            "ARG=[owner's & | < > ^ !]",
+        ]
+    );
 }
 
 #[cfg(windows)]
@@ -1013,6 +1052,46 @@ fn every_provider_declares_its_current_follow_up_transport() {
         assert_eq!(
             provider::follow_up_transport(provider),
             provider::FollowUpTransport::TerminalPasteFallback
+        );
+    }
+}
+
+#[test]
+fn every_provider_declares_its_initial_prompt_transport() {
+    for provider in [
+        FirstPartyCli::Codex,
+        FirstPartyCli::Claude,
+        FirstPartyCli::Agy,
+        FirstPartyCli::Pi,
+    ] {
+        #[cfg(windows)]
+        assert_eq!(
+            provider::initial_prompt_transport(provider),
+            provider::InitialPromptTransport::TerminalPasteAfterLaunch
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            provider::initial_prompt_transport(provider),
+            provider::InitialPromptTransport::ProviderArgument
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_initial_prompt_readiness_is_provider_specific() {
+    assert_eq!(
+        provider::initial_prompt_ready_delay(FirstPartyCli::Agy),
+        Duration::from_secs(12)
+    );
+    for provider in [
+        FirstPartyCli::Codex,
+        FirstPartyCli::Claude,
+        FirstPartyCli::Pi,
+    ] {
+        assert_eq!(
+            provider::initial_prompt_ready_delay(provider),
+            Duration::from_secs(2)
         );
     }
 }

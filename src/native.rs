@@ -626,6 +626,40 @@ fn run_ask(request: AskRequest) -> Result<()> {
     terminal_session.managed_session_id = Some(created.id.clone());
     write_json_atomic(&created.directory.join("terminal.json"), &terminal_session)?;
 
+    if provider::initial_prompt_transport(request.provider)
+        == provider::InitialPromptTransport::TerminalPasteAfterLaunch
+    {
+        wait_for_status(
+            &created.directory,
+            "awaiting-initial-input",
+            request.timeout,
+        )?;
+        thread::sleep(provider::initial_prompt_ready_delay(request.provider));
+        let claim = acquire_turn_claim(&created.directory)?;
+        let initial_prompt_path = created.directory.join("initial-prompt.txt");
+        let initial_prompt = fs::read_to_string(&initial_prompt_path)
+            .context("failed to read the preserved initial prompt")?;
+        let mut prompt_file = tempfile::Builder::new()
+            .prefix("pending-prompt-")
+            .suffix(".txt")
+            .tempfile_in(&created.directory)?;
+        set_private_file_permissions(prompt_file.as_file())?;
+        prompt_file.write_all(&terminal_paste_bytes(&initial_prompt))?;
+        prompt_file.flush()?;
+        provider::send_initial_prompt(request.provider, &terminal_session, prompt_file.path())
+            .with_context(|| {
+                format!(
+                    "failed to deliver the initial prompt to {} session {}",
+                    request.provider.as_str(),
+                    created.id
+                )
+            })?;
+        fs::remove_file(&initial_prompt_path)
+            .context("failed to remove the delivered initial prompt")?;
+        update_status(&created.directory, "working", None, None)?;
+        claim.retain();
+    }
+
     if request.detach {
         return emit_session_result(
             request.json,
@@ -1146,7 +1180,7 @@ fn run_session_inner(directory: &Path) -> Result<()> {
     check_provider_version(provider, &manifest.provider_path)?;
     let prompt_path = directory.join("initial-prompt.txt");
     let prompt = fs::read_to_string(&prompt_path).context("failed to read initial prompt")?;
-    fs::remove_file(&prompt_path).context("failed to remove consumed initial prompt")?;
+    let initial_prompt_transport = provider::initial_prompt_transport(provider);
 
     let executable = std::env::current_exe().context("failed to locate agent-bridge executable")?;
     let mut arguments = provider_launch_args(provider, manifest.yolo)
@@ -1182,11 +1216,12 @@ fn run_session_inner(directory: &Path) -> Result<()> {
         },
     )?;
     arguments.extend(provider_arguments);
-    if prompt_is_positional {
+    if initial_prompt_transport == provider::InitialPromptTransport::ProviderArgument
+        && prompt_is_positional
+    {
         arguments.push(OsString::from(prompt));
     }
 
-    update_status(directory, "running", None, None)?;
     let (agy_monitor, pi_failure_monitor) = match completion_monitor {
         provider::CompletionMonitor::Hook => (None, None),
         provider::CompletionMonitor::AgyTranscript { log_path } => (
@@ -1199,12 +1234,30 @@ fn run_session_inner(directory: &Path) -> Result<()> {
     };
     let mut provider_command =
         provider_process_command(&manifest.provider_path, directory, arguments)?;
-    let status = provider_command
+    let child = provider_command
         .current_dir(&manifest.workspace)
         .env(SESSION_DIR_ENV, directory)
         .env("AGENT_BRIDGE_NATIVE_SESSION_ID", &manifest.id)
         .env("AGENT_BRIDGE_EXECUTABLE", &executable)
-        .status();
+        .spawn();
+    let mut child = child.with_context(|| {
+        format!(
+            "failed to start {} at {}",
+            provider.as_str(),
+            manifest.provider_path.display()
+        )
+    })?;
+    match initial_prompt_transport {
+        provider::InitialPromptTransport::ProviderArgument => {
+            fs::remove_file(&prompt_path)
+                .context("failed to remove the accepted initial prompt")?;
+            update_status(directory, "running", None, None)?;
+        }
+        provider::InitialPromptTransport::TerminalPasteAfterLaunch => {
+            update_status(directory, "awaiting-initial-input", None, None)?;
+        }
+    }
+    let status = child.wait();
     if let Some(monitor) = agy_monitor {
         monitor.stop()?;
     }
@@ -1763,7 +1816,20 @@ fn read_regular_text_if_present(path: &Path) -> Result<Option<String>> {
 }
 
 fn agy_brain_root() -> Result<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?);
+    default_agy_brain_root(
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("USERPROFILE").as_deref(),
+    )
+}
+
+fn default_agy_brain_root(
+    home: Option<&std::ffi::OsStr>,
+    user_profile: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf> {
+    let home = PathBuf::from(
+        home.or(user_profile)
+            .context("neither HOME nor USERPROFILE is set for the Agy brain root")?,
+    );
     Ok(home.join(".gemini").join("antigravity-cli").join("brain"))
 }
 
@@ -2196,6 +2262,35 @@ fn event_paths(directory: &Path) -> Result<Vec<PathBuf>> {
     }
     paths.sort();
     Ok(paths)
+}
+
+fn wait_for_status(
+    directory: &Path,
+    expected_state: &str,
+    timeout: Duration,
+) -> Result<SessionStatus> {
+    let deadline = checked_deadline_from(Instant::now(), timeout)?;
+    loop {
+        repair_dead_native_owner(directory)?;
+        if let Ok(status) = read_json::<SessionStatus>(&directory.join("status.json")) {
+            if status.state == expected_state {
+                return Ok(status);
+            }
+            if matches!(status.state.as_str(), "failed" | "exited" | "closed") {
+                let reason = status
+                    .error
+                    .unwrap_or_else(|| format!("session entered state {}", status.state));
+                bail!("{reason}");
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out after {} seconds waiting for session state {expected_state}",
+                timeout.as_secs()
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn wait_for_event(directory: &Path, baseline: usize, timeout: Duration) -> Result<SessionEvent> {
