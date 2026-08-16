@@ -342,6 +342,59 @@ fn explicit_close_consumes_the_handle_and_repeated_close_skips_the_adapter() {
 }
 
 #[test]
+fn concurrent_close_requests_share_one_terminal_handle_claim() {
+    use std::sync::{Arc, Barrier, atomic::AtomicUsize};
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_json_atomic(
+        &directory.path().join(TERMINAL_HANDLE_FILE),
+        &terminal::TerminalSession {
+            kind: terminal::TerminalKind::Iterm2,
+            id: "concurrent-close".to_owned(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: None,
+            windows_process_identity: None,
+        },
+    )
+    .unwrap();
+    update_status(directory.path(), "running", None, None).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let first_directory = directory.path().to_owned();
+    let first_barrier = Arc::clone(&barrier);
+    let first_calls = Arc::clone(&calls);
+    let first = std::thread::spawn(move || {
+        close_session_state(&first_directory, |_| {
+            first_calls.fetch_add(1, Ordering::SeqCst);
+            first_barrier.wait();
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(terminal::CloseOutcome::Closed)
+        })
+    });
+
+    while !directory.path().join(TERMINAL_CLOSING_FILE).exists() {
+        std::thread::yield_now();
+    }
+    barrier.wait();
+    close_session_state(directory.path(), |_| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Ok(terminal::CloseOutcome::Closed)
+    })
+    .unwrap();
+    first.join().unwrap().unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        read_json::<SessionStatus>(&directory.path().join("status.json"))
+            .unwrap()
+            .state,
+        "closed"
+    );
+}
+
+#[test]
 fn already_closed_session_never_reuses_a_stale_terminal_handle() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();

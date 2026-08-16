@@ -1020,7 +1020,7 @@ where
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if closing_path.exists() {
-                bail!("another close request already owns this terminal handle");
+                return Ok(());
             }
             return mark_session_closed(directory, None);
         }
@@ -2125,25 +2125,43 @@ fn repair_dead_native_owner(directory: &Path) -> Result<bool> {
         return Ok(false);
     }
     #[cfg(windows)]
-    if let Ok(session) =
-        read_json::<terminal::TerminalSession>(&windows_console_handle_path(directory, "close"))
-        && session.kind == terminal::TerminalKind::WindowsConsole
     {
-        // The visible console root can outlive a failed native-session owner.
-        // Close the identity-bound surface before consuming its only handle.
-        terminal::close_session(&session)
-            .context("failed to close a Windows console whose native owner exited")?;
-    }
-    mark_session_closed(
-        directory,
-        status.error.or_else(|| {
+        let repair_error = status.error.clone().or_else(|| {
             Some(format!(
                 "native session process {} is no longer running",
                 owner.pid
             ))
-        }),
-    )?;
-    Ok(true)
+        });
+        if matches!(status.state.as_str(), "exited" | "failed") {
+            mark_session_closed(directory, repair_error)?;
+            return Ok(true);
+        }
+        // The visible console root can outlive a failed native-session owner. Reuse the same
+        // atomic terminal-handle claim as explicit close so concurrent repair callers cannot
+        // perform the external close side effect twice.
+        close_session_state(directory, |session| {
+            if session.kind != terminal::TerminalKind::WindowsConsole {
+                bail!("dead Windows native owner has a non-Windows terminal handle")
+            }
+            terminal::close_session(session)
+        })
+        .context("failed to close a Windows console whose native owner exited")?;
+        update_status(directory, "closed", None, repair_error)?;
+        Ok(true)
+    }
+    #[cfg(not(windows))]
+    {
+        mark_session_closed(
+            directory,
+            status.error.or_else(|| {
+                Some(format!(
+                    "native session process {} is no longer running",
+                    owner.pid
+                ))
+            }),
+        )?;
+        Ok(true)
+    }
 }
 
 fn write_event(directory: &Path, event: &SessionEvent) -> Result<()> {
