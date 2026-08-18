@@ -7,6 +7,17 @@ on:
     branches: [main]
 
 jobs:
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets --all-features
+
   rust:
     strategy:
       matrix:
@@ -22,6 +33,6 @@ jobs:
         run: |
           brew untap aws/tap 2>/dev/null || true
           brew install --cask ghostty iterm2
-      - run: cargo fmt --check
+      - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets --all-features

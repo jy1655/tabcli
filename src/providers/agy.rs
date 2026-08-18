@@ -24,6 +24,10 @@ impl ProviderAdapter for AgyAdapter {
         &["--dangerously-skip-permissions"]
     }
 
+    fn model_args(&self, model: &str) -> Vec<String> {
+        vec!["--model".to_owned(), model.to_owned()]
+    }
+
     fn effort_args(&self, effort: &str) -> Result<Vec<String>> {
         Ok(vec!["--effort".to_owned(), effort.to_owned()])
     }

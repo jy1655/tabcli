@@ -2,7 +2,7 @@
 
 로컬에 설치되고 로그인된 `codex`, `claude`, `agy`, `pi` CLI를 사용자가 볼 수 있는 실제 터미널 세션에서 연결하는 브리지입니다. API 키나 로그인 토큰을 대신 소유하지 않고 각 CLI의 기존 인증·설정·대화형 UI를 그대로 사용합니다.
 
-현재 릴리스는 macOS에서 **Ghostty 1.3 이상, iTerm2, 내장 Terminal.app**을 지원합니다. Agent Bridge는 자신을 실행한 터미널을 감지해 같은 앱의 새 surface에서 세션을 시작하고, 자신이 만든 surface만 제어합니다. Terminal.app에서는 기존 tab/window를 사용하지 않고 항상 전용 새 window를 엽니다. 감지할 수 없는 호스트에서는 Terminal.app으로 안전하게 fallback합니다. 이미 독립적으로 실행 중인 임의의 CLI에는 사후 attach하지 않습니다.
+첫 설치 가능 릴리스는 **v0.0.1**입니다. macOS에서 Ghostty 1.3 이상, iTerm2, 내장 Terminal.app을 지원합니다. Agent Bridge는 자신을 실행한 터미널을 감지해 같은 앱의 새 surface에서 세션을 시작하고, 자신이 만든 surface만 제어합니다. Terminal.app에서는 기존 tab/window를 사용하지 않고 항상 전용 새 window를 엽니다. 감지할 수 없는 호스트에서는 Terminal.app으로 안전하게 fallback합니다. 이미 독립적으로 실행 중인 임의의 CLI에는 사후 attach하지 않습니다.
 
 ## 지원 범위
 
@@ -12,7 +12,7 @@
 | macOS + iTerm2 | 지원 | iTerm2 AppleScript 직접 제어 |
 | macOS + Terminal.app | 지원 | Terminal AppleScript 직접 제어 |
 | macOS의 다른 터미널 | fallback | 별도 adapter가 없으면 Terminal.app에서 시작 |
-| Windows PowerShell / cmd | 지원 | PowerShell 7(`pwsh.exe`) 기반 전용 visible console; `ask`/`tell`/`sessions`/explicit close |
+| Windows PowerShell / cmd | 지원 | PowerShell 7(`pwsh.exe`) 기반 전용 visible console; `ask`/`tell`/`sessions`/explicit prune·close |
 | Linux 터미널 | 미지원 | [Issue #6](https://github.com/jy1655/agent-bridge/issues/6)에서 별도 구현 |
 | VS Code 통합 터미널 | 현재 비범위 | 전용 adapter가 필요하면 별도로 판단 |
 
@@ -31,13 +31,16 @@ Windows는 PowerShell 또는 cmd에서 호출할 수 있으며 PowerShell 7(`pws
 
 ## 설치
 
-Rust 1.88 이상, 지원하는 macOS 터미널 하나, 그리고 사용할 provider CLI가 필요합니다. Ghostty를 사용하면 1.3 이상이어야 합니다. 각 CLI는 먼저 직접 실행해 로그인과 초기 설정을 완료해야 합니다.
+Rust 1.97.1 이상, 지원하는 macOS 터미널 하나, 그리고 사용할 provider CLI가 필요합니다. Ghostty를 사용하면 1.3 이상이어야 합니다. 각 CLI는 먼저 직접 실행해 로그인과 초기 설정을 완료해야 합니다.
 
 ```sh
-git clone https://github.com/jy1655/agent-bridge.git
+git clone --branch v0.0.1 --depth 1 https://github.com/jy1655/agent-bridge.git
 cd agent-bridge
 cargo install --path . --locked
+agent-bridge --version
 ```
+
+마지막 명령은 `agent-bridge 0.0.1`을 출력해야 합니다. 개발 중인 `main`이 아니라 릴리스 tag에서 설치해야 설치본과 소스의 경계가 명확합니다.
 
 Windows 명령줄 한도를 넘는 요청은 `--prompt-file`로 전달합니다. 파일은 UTF-8 텍스트로 읽으며 Agent Bridge가 원본을 삭제하거나 수정하지 않습니다.
 
@@ -58,7 +61,7 @@ agent-bridge ask claude \
 
 Claude provider에서 정확한 모델 입력값 `Fable5`는 Claude Code가 요구하는 `Fable`로 변환됩니다. Pi provider에서는 정확한 입력값 `Fable`만 `anthropic/claude-fable-5`로 변환합니다. 각 provider의 다른 모델 값은 그대로 전달합니다.
 
-`--workspace`를 생략하면 현재 디렉터리를 사용합니다. `--title`은 세션 metadata이며 지원하는 provider의 native session name으로 전달되지만 terminal surface의 제목을 설정하거나 고정하지 않습니다. 생략하면 provider와 workspace 이름으로 metadata를 만듭니다. `--model`과 `--effort`를 생략하면 각 CLI의 기존 기본값을 유지합니다. `--terminal`을 생략하면 호출 환경을 자동 감지하고, 감지 불가 시 Terminal.app을 사용합니다.
+`--workspace`를 생략하면 현재 디렉터리를 사용합니다. `--title`은 사람이 읽는 세션 metadata이며 terminal surface의 제목을 설정하거나 고정하지 않습니다. Claude Code에는 정확한 cross-session 주소를 보장하기 위해 Agent Bridge의 고유 session ID를 native session name으로 전달합니다. 다른 provider는 지원 범위에 따라 title을 native name으로 사용할 수 있습니다. `--title`을 생략하면 provider와 workspace 이름으로 metadata를 만듭니다. `--model`과 `--effort`를 생략하면 각 CLI의 기존 기본값을 유지합니다. `--terminal`을 생략하면 호출 환경을 자동 감지하고, 감지 불가 시 Terminal.app을 사용합니다.
 
 기계 판독이 필요하면 `--json`을 사용합니다. 반환된 `session` id로 같은 탭에 후속 프롬프트를 전달할 수 있습니다. 응답에는 `terminal`, `terminal_session_id`와 adapter가 제공하는 `terminal_tab_id`·`terminal_window_id`가 포함됩니다. 호환성을 위해 iTerm2 세션에만 기존 `iterm_session_id`도 함께 제공합니다.
 
@@ -75,10 +78,11 @@ agent-bridge tell session-XXXXXXXX \
   --json
 
 agent-bridge sessions --json
+agent-bridge prune-sessions --closed-before-days 30 --explicit
 agent-bridge close-session session-XXXXXXXX --explicit
 ```
 
-`ask`와 `tell`은 기본적으로 다음 provider 결과를 최대 900초 기다립니다. `--timeout-secs`로 제한을 바꾸거나, 결과를 기다리지 않고 탭만 열려면 `--detach`를 사용합니다. 대기 실패나 timeout은 이미 열린 탭을 자동으로 닫지 않습니다.
+`ask`와 `tell`은 기본적으로 다음 provider 결과를 최대 900초 기다립니다. `tell --timeout-secs`는 provider-native 전송과 결과 대기를 합친 전체 시간 제한입니다. 제한을 바꾸거나, 결과를 기다리지 않고 탭만 열려면 `--detach`를 사용합니다. 대기 실패나 timeout은 이미 열린 탭을 자동으로 닫지 않습니다.
 
 전체 명령은 다음과 같습니다.
 
@@ -88,32 +92,37 @@ agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --pro
     [--yolo] [--timeout-secs N] [--detach] [--json]
 agent-bridge tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
 agent-bridge sessions [--json]
+agent-bridge prune-sessions --closed-before-days N --explicit [--json]
 agent-bridge close-session <session> --explicit [--json]
 agent-bridge --help | --version
 ```
 
 ## 권한과 세션 경계
 
-- Agent Bridge는 같은 `ask` 작업에서 새로 만든 surface만 기록합니다. 새 handle은 managed session ID와 host가 제공하는 stable ID를 결합하며 `tell`과 `close-session` 직전에 live wrapper와 함께 다시 검증합니다. Terminal.app은 전용 window ID·TTY에 target `native-session` owner의 managed session ID·PID·controlling TTY device·process start fingerprint를 결합합니다. Windows는 console root와 `native-session` owner의 PID 생성 시각·실행 파일 identity를 함께 검증해 PID 재사용을 fail-closed합니다. 호출 당시 터미널을 재감지하거나 복원된 front/current/selected surface를 채택하지 않습니다.
+- Agent Bridge는 같은 `ask` 작업에서 새로 만든 surface만 기록합니다. 새 handle은 managed session ID와 host가 제공하는 stable ID를 결합하며 `tell`과 `close-session` 직전에 live wrapper와 함께 다시 검증합니다. Terminal.app은 전용 window ID·TTY에 target `native-session` owner의 managed session ID·PID·controlling TTY device·process start fingerprint를 결합하고, 새 owner에는 managed process group과 전용 login shell의 PID·process group·시작 fingerprint도 기록합니다. Windows는 console root와 `native-session` owner의 PID 생성 시각·실행 파일 identity를 함께 검증해 PID 재사용을 fail-closed합니다. 호출 당시 터미널을 재감지하거나 복원된 front/current/selected surface를 채택하지 않습니다.
 - 새 세션의 `--model`, `--effort`, `--yolo`는 부모 CLI에서 추측하거나 상속하지 않습니다. 해당 `ask` 요청에 명시된 값만 사용합니다.
 - `--yolo`는 Codex의 `--dangerously-bypass-approvals-and-sandbox`, Claude와 Agy의 `--dangerously-skip-permissions`를 전달합니다. Pi에서는 해당 실행의 project-local files를 신뢰하는 `--approve`를 전달하며 Pi 자체 tool 정책은 유지합니다.
-- `tell`은 세션별 한 턴만 허용합니다. Windows Claude는 visible console supervisor 안에서 공식 `--resume <session-id>`와 stdin을 사용합니다. Codex·Pi·Agy 및 아직 공식 session transport가 없는 플랫폼 fallback은 provider adapter가 소유한 terminal paste를 사용합니다. Enter·ESC 같은 별도 터미널 동작을 만들 수 있는 제어문자는 거부합니다.
+- `tell`은 세션별 한 턴만 허용합니다. macOS Claude Code 2.1.232 이상은 별도의 비영속·격리 설정 print-mode Claude 프로세스에서 공식 `ListAgents`로 고유 managed session name을 찾고 `SendMessage`로 전달합니다. cross-session 기능 자체는 2.1.224에 도입됐지만, 여기서 사용하는 단일 bare name 확정 전송은 2.1.232부터의 계약입니다. 같은 non-Windows provider 경계는 향후 Linux/WSL terminal adapter가 추가돼도 이 공식 경로를 사용합니다. 메시지는 stdin JSON으로만 전달하고, 임시 `PreToolUse` hook이 정확한 local session name·요약·본문을 실행 전에 검증하며 `isolatePeerMachines`로 cross-machine 전송을 막고 실제 tool call과 성공 결과도 다시 일치해야 전송 성공으로 인정합니다. 대상 세션의 `Stop` hook은 요청별 고유 Claude turn ID와 정확한 최종 마커가 일치한 응답만 결과로 기록하고 반환값에서는 마커를 제거합니다. 마커가 다른 수동·비상관 턴에는 개입하지 않고 pending claim을 유지합니다. 이 provider 전용 상관관계 프로토콜은 Claude가 대상 turn identity를 공식 결과로 제공하면 교체할 경계입니다. 이 provider-native 전송에는 `tell`마다 별도의 Claude transport turn이 한 번 필요합니다. provider·feature-flag·정책 설정 때문에 공식 기능을 사용할 수 없으면 terminal injection으로 자동 전환하지 않고 전송 전에 실패합니다. 전송을 시도한 뒤 성공 여부를 확인할 수 없으면 중복 재전송을 막기 위해 turn claim을 유지하며, 대상 결과가 도착하거나 `close-session --explicit`으로 닫을 때 해제됩니다. native Windows Claude는 visible console supervisor 안에서 공식 `--resume <session-id>`와 stdin을 사용하며, upstream이 native Windows cross-session messaging을 제공하면 이 supervisor를 교체합니다. Codex·Pi·Agy는 각 provider adapter가 소유한 terminal paste fallback을 사용합니다. Enter·ESC 같은 별도 터미널 동작을 만들 수 있는 제어문자는 거부합니다.
 - 모든 bridge 프롬프트에는 source provenance가 붙습니다. 사람이 읽는 결과의 터미널 제어문자는 가시적인 문자열로 이스케이프합니다.
-- 결과가 돌아온 뒤 탭은 열린 채 유지되어 사용자가 직접 이어서 작업할 수 있습니다. 진행 중인 bridge 요청과 같은 탭의 수동 입력을 겹치면 수동 턴 결과가 bridge 요청의 결과로 먼저 인식될 수 있으므로 동시에 입력하지 않아야 합니다.
-- `close-session`은 `--explicit`이 있어야 합니다. Terminal.app은 live `native-session` owner attestation과 전용 window ID·TTY가 모두 일치할 때만 busy surface에 interrupt를 보내고 닫습니다. close finality에서는 `terminal.json` handle을 `terminal.closed.json` tombstone으로 소진하며, 이미 `closed`인 세션의 반복 close는 terminal adapter를 호출하지 않습니다.
-- 세션별 상태와 결과는 권한을 제한한 `~/.agent-bridge/native-sessions` 아래에 저장합니다. Windows는 사용자 지정 state root에서도 ACL 상속을 제거하고 현재 사용자 전용 ACL을 적용합니다. provider의 전역 설정이나 workspace hook 파일은 수정하지 않습니다.
+- 결과가 돌아온 뒤 탭은 열린 채 유지되어 사용자가 직접 이어서 작업할 수 있습니다. terminal paste fallback을 쓰는 provider에서는 진행 중인 bridge 요청과 같은 탭의 수동 입력을 겹치면 수동 턴 결과가 bridge 요청의 결과로 먼저 인식될 수 있으므로 동시에 입력하지 않아야 합니다.
+- `close-session`은 `--explicit`이 있어야 합니다. Terminal.app은 live `native-session` owner attestation과 전용 window ID·TTY가 모두 일치하고 owner가 현재 terminal foreground process group의 leader임을 확인합니다. 이어 같은 TTY의 실제 parent login shell이 별도 process-group leader이고 owner를 foreground group으로 보고하는지도 검증한 뒤, managed group에는 `SIGTERM`, 전용 shell group에는 `SIGKILL`을 보내 Terminal.app이 idle 전이를 관찰한 경우에만 전용 window를 닫습니다. 과거 owner record에 process-group·shell 필드가 없어도 PID·시작시각·parent 관계·TTY가 일치하는 live identity에서 같은 관계를 모두 증명해야 하며, terminal control character나 UI scripting은 사용하지 않습니다. close finality에서는 `terminal.json` handle을 `terminal.closed.json` tombstone으로 소진하며, 이미 `closed`인 세션의 반복 close는 terminal adapter를 호출하지 않습니다.
+- `prune-sessions`도 `--explicit`이 있어야 합니다. `closed.json` 시각이 보존 기간보다 오래됐고 현재 status도 `closed`이며 terminal handle, pending resume, turn claim, live owner가 없는 관리 디렉터리만 삭제합니다. 열린 세션이나 판별할 수 없는 owner는 유지하며 자동 보존 기간이나 암묵적 삭제는 없습니다.
+- 세션별 상태와 결과는 권한을 제한한 `~/.agent-bridge/native-sessions` 아래에 저장합니다. Windows는 사용자 지정 state root에서도 ACL 상속을 제거하고 현재 사용자 전용 ACL을 적용합니다. provider의 전역 설정이나 workspace hook 파일은 수정하지 않습니다. Agent Bridge가 만든 Claude 세션의 private `--settings` 파일에는 `Stop`·`StopFailure` hook을 기록하고, 공식 cross-session follow-up이 있는 non-Windows에서만 `crossSessionInbound: "accept"`를 추가합니다. Messenger의 `PreToolUse` guard 설정과 기대 payload 파일은 해당 `tell` 동안만 같은 private 세션 디렉터리에 존재하고 종료 시 제거합니다. 요청별 pending turn 레코드는 상관된 결과에서 제거하며, 상관관계를 확인할 수 없는 오류에서는 보존합니다.
 
 최소 지원 버전은 다음과 같습니다. 더 새로운 버전은 허용합니다.
 
 | Provider | 최소 버전 |
 | --- | --- |
 | Codex | 0.147.0 |
-| Claude Code | 2.1.229 |
+| Claude Code | 2.1.232 |
 | Agy | 1.1.12 |
 | Pi | 0.84.1 |
 
 > [!WARNING]
 > Codex, Claude, Agy에서 `--yolo`는 해당 CLI의 승인·sandbox 보호를 우회합니다. 신뢰하는 코드와 workspace에서만 명시적으로 사용하세요. Agent Bridge는 그 세션 내부의 명령을 다시 sandbox하지 않습니다.
+
+> [!WARNING]
+> Agent Bridge가 만든 Claude 세션은 같은 계정의 다른 Claude 세션에서 오는 공식 cross-session 메시지를 자동 수락합니다. 고유 session ID를 주소로 사용하지만, `--yolo`와 결합하면 inbound 작업도 해당 세션의 우회 권한 경계 안에서 실행될 수 있으므로 관리 세션 ID와 로그인 계정을 신뢰 경계로 취급하세요.
 
 ## 구조와 확장
 
@@ -127,20 +136,20 @@ src/native/terminal/mod.rs     공통 terminal kind, session record, OS dispatch
 src/native/terminal/macos/     iTerm2, Terminal.app, Ghostty adapter
 src/native/terminal/linux/     Linux transport 경계(현재 미지원)
 src/native/terminal/windows/   Windows console transport, process identity, ACL/security
-src/native.rs                  세션 상태, lifecycle, 명령 및 결과 monitor orchestration
-src/native/tests.rs            native orchestration 단위 테스트
+src/native.rs                  세션 상태, lifecycle, 명령 및 provider-neutral orchestration
+src/native/tests.rs            provider-neutral native orchestration 단위 테스트
 ```
 
 새 CLI를 추가할 때는 provider registry와 두 provider adapter를 추가하고, model/effort/권한 및 실제 결과 회수 계약을 각각 테스트합니다. 새 터미널은 해당 OS 디렉터리에 adapter를 추가하고 OS dispatcher에 등록합니다. 새 OS는 독립 디렉터리에서 같은 `detect/open_tab/send_file/close_session` 계약을 구현합니다. launch command quoting은 POSIX shell과 Windows PowerShell을 분리해 유지합니다. 공통화가 플랫폼의 native 동작을 약화한다면 플랫폼별 구현을 우선합니다.
 
 기존 `{"iterm_session_id":"..."}` 형식의 `terminal.json`은 iTerm2 세션으로 계속 읽습니다. 새 세션은 terminal-neutral한 `terminal`, `session_id`, 선택적 `tab_id`·`window_id`와 내부 `managed_session_id` binding을 기록합니다. 가시적인 terminal title은 설정하거나 ownership record에 저장하지 않습니다. Terminal.app의 추가 owner attestation은 target `native-session`이 별도 private record에 기록합니다.
 
-## 0.2.0 마이그레이션
+## 0.0.1 마이그레이션
 
-0.2.0은 예전 embedded multi-PTY TUI와 그 전용 표면을 제거했습니다.
+0.0.1은 예전 embedded multi-PTY TUI와 그 전용 표면을 제거한 뒤 처음 고정한 설치 가능 릴리스입니다.
 
 - 인자 없는 `agent-bridge`, workspace 직접 인자, `--restore`, 전역 `--yolo`는 더 이상 TUI를 시작하지 않습니다.
-- 예전 `open`, `prompt`, `status`, `read`, `wait`, `list`, `close`, `hook` 명령은 제거되었습니다. 새 명령은 `ask`, `tell`, `sessions`, `close-session`입니다.
+- 예전 `open`, `prompt`, `status`, `read`, `wait`, `list`, `close`, `hook` 명령은 제거되었습니다. 새 명령은 `ask`, `tell`, `sessions`, `prune-sessions`, `close-session`입니다.
 - `~/.agent-bridge/agents.json`, 이전 layout, spool 등 레거시 파일은 읽지 않으며 자동 삭제하지도 않습니다.
 - 실행 중인 구버전 TUI가 있다면 종료한 뒤 바이너리를 교체하세요.
 

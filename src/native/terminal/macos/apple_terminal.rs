@@ -9,13 +9,17 @@ on windowIdForTty(wantedTty)
     tell application "Terminal"
         set matchedWindowId to missing value
         set matchCount to 0
-        repeat with candidateWindow in windows
-            repeat with candidateTab in tabs of candidateWindow
-                if tty of candidateTab is wantedTty then
-                    set matchedWindowId to id of candidateWindow
-                    set matchCount to matchCount + 1
-                end if
-            end repeat
+        set candidateWindows to get windows
+        repeat with candidateWindow in candidateWindows
+            try
+                set candidateTabs to get tabs of candidateWindow
+                repeat with candidateTab in candidateTabs
+                    if tty of candidateTab is wantedTty then
+                        set matchedWindowId to id of candidateWindow
+                        set matchCount to matchCount + 1
+                    end if
+                end repeat
+            end try
         end repeat
         if matchCount is not 1 then error "Agent Bridge could not prove the newly created Terminal.app window"
         return matchedWindowId
@@ -72,7 +76,6 @@ pub(in crate::native) const CLOSE_TAB_SCRIPT: &str = r#"
 on run argv
     set wantedTty to item 1 of argv
     set wantedWindowId to item 2 of argv as integer
-    set controlC to character id 3
     tell application "Terminal"
         try
             set targetWindow to first window whose id is wantedWindowId
@@ -92,17 +95,12 @@ on run argv
         if matchCount is not 1 then error "Agent Bridge Terminal.app ownership proof matched multiple tabs"
         if (count of tabs of targetWindow) is not 1 then error "Agent Bridge refuses to close a Terminal.app window containing another tab"
 
-        -- Terminal ignores native close requests while a foreground process is
-        -- busy. Re-check the full ownership proof before every interrupt.
-        repeat 3 times
+        -- Rust terminates the attested foreground process group before this
+        -- script runs. Wait for Terminal to observe that transition without
+        -- injecting control characters into a possibly changed shell surface.
+        repeat 60 times
             if not busy of targetTab then exit repeat
-            if id of targetWindow is not wantedWindowId then return "missing"
-            if tty of targetTab is not wantedTty then return "missing"
-            do script controlC in targetTab
-            repeat 20 times
-                delay 0.05
-                if not busy of targetTab then exit repeat
-            end repeat
+            delay 0.05
         end repeat
         if busy of targetTab then error "Agent Bridge could not stop the foreground process in its Terminal.app tab"
 
@@ -171,6 +169,59 @@ pub(super) fn send_file(session: &TerminalSession, prompt_path: &Path) -> Result
     )?;
     if response != "sent" {
         bail!("unexpected Terminal.app send response: {response:?}");
+    }
+    Ok(())
+}
+
+pub(in crate::native) fn process_group_signal_target(process_group: u32) -> Result<libc::pid_t> {
+    let process_group = libc::pid_t::try_from(process_group)
+        .context("Terminal.app process group is out of range")?;
+    if process_group <= 0 {
+        bail!("Terminal.app process group must be positive")
+    }
+    process_group
+        .checked_neg()
+        .context("Terminal.app process group cannot be represented as a signal target")
+}
+
+pub(in crate::native) fn close_signal_plan(
+    managed_process_group: u32,
+    shell_process_group: u32,
+) -> Result<[(libc::pid_t, libc::c_int); 2]> {
+    if managed_process_group == shell_process_group {
+        bail!("Terminal.app managed and shell process groups must be distinct")
+    }
+    Ok([
+        (
+            process_group_signal_target(managed_process_group)?,
+            libc::SIGTERM,
+        ),
+        (
+            process_group_signal_target(shell_process_group)?,
+            libc::SIGKILL,
+        ),
+    ])
+}
+
+pub(in crate::native) fn terminate_process_groups(
+    managed_process_group: u32,
+    shell_process_group: u32,
+) -> Result<()> {
+    for (target, signal) in close_signal_plan(managed_process_group, shell_process_group)? {
+        let result = unsafe { libc::kill(target, signal) };
+        if result == 0 {
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            continue;
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "failed to send signal {signal} to Terminal.app process group {}",
+                target.checked_neg().unwrap_or_default()
+            )
+        });
     }
     Ok(())
 }

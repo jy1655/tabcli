@@ -24,6 +24,10 @@ impl ProviderAdapter for CodexAdapter {
         &["--dangerously-bypass-approvals-and-sandbox"]
     }
 
+    fn model_args(&self, model: &str) -> Vec<String> {
+        vec!["--model".to_owned(), model.to_owned()]
+    }
+
     fn effort_args(&self, effort: &str) -> Result<Vec<String>> {
         Ok(vec![
             "-c".to_owned(),

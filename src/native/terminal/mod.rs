@@ -456,10 +456,9 @@ mod tests {
         assert!(
             macos::apple_terminal::SEND_FILE_SCRIPT.contains("do script promptText in targetTab")
         );
-        assert!(macos::apple_terminal::CLOSE_TAB_SCRIPT.contains("set controlC to character id 3"));
-        assert!(
-            macos::apple_terminal::CLOSE_TAB_SCRIPT.contains("do script controlC in targetTab")
-        );
+        assert!(!macos::apple_terminal::CLOSE_TAB_SCRIPT.contains("character id 3"));
+        assert!(!macos::apple_terminal::CLOSE_TAB_SCRIPT.contains("do script controlC"));
+        assert!(macos::apple_terminal::CLOSE_TAB_SCRIPT.contains("repeat 60 times"));
         assert!(
             macos::apple_terminal::CLOSE_TAB_SCRIPT
                 .contains("if (count of tabs of targetWindow) is not 1 then error")

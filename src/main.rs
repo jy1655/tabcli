@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 
 mod native;
 
-const LEGACY_REMOVAL_MESSAGE: &str = "the embedded multi-PTY TUI was removed in agent-bridge 0.2.0; use ask, tell, sessions, or close-session";
+const LEGACY_REMOVAL_MESSAGE: &str = "the embedded multi-PTY TUI was removed in agent-bridge 0.0.1; use ask, tell, sessions, prune-sessions, or close-session";
 
 #[derive(Debug)]
 enum Launch {
@@ -23,6 +23,7 @@ Usage:
       [--yolo] [--timeout-secs N] [--detach] [--json]
   agent-bridge tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
   agent-bridge sessions [--json]
+  agent-bridge prune-sessions --closed-before-days N --explicit [--json]
   agent-bridge close-session <session> --explicit [--json]
   agent-bridge --help | --version
 
@@ -46,11 +47,13 @@ Session policy:
   native bypass flags. Pi receives --approve for project-local trust while its
   native tool policy remains in effect.
 
-  Supported CLI minimums: Codex 0.147.0, Claude 2.1.229, Agy 1.1.12, Pi 0.84.1.
+  Supported CLI minimums: Codex 0.147.0, Claude 2.1.232, Agy 1.1.12, Pi 0.84.1.
   Session state is stored privately under ~/.agent-bridge/native-sessions.
+  Closed records remain until prune-sessions explicitly removes quiescent records
+  older than the requested retention window.
 
 Migration:
-  The embedded multi-PTY TUI was removed in 0.2.0. Existing legacy files under
+  The embedded multi-PTY TUI was removed in 0.0.1. Existing legacy files under
   ~/.agent-bridge are not read or deleted automatically.",
         env!("CARGO_PKG_VERSION")
     )
@@ -197,6 +200,7 @@ mod tests {
             "ask <codex|claude|agy|pi>",
             "tell <session>",
             "sessions [--json]",
+            "prune-sessions --closed-before-days N --explicit",
             "close-session <session> --explicit",
             "macOS detects Ghostty, iTerm2, or Terminal.app",
             "Terminal.app always\n  uses a dedicated new window",

@@ -10,27 +10,21 @@ use provider_process::{
 };
 
 use std::{
-    collections::VecDeque,
     ffi::OsString,
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write},
+    io::{IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::Stdio,
     str::FromStr,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    thread::{self, JoinHandle},
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(not(windows))]
-use agent_bridge::process_is_alive;
 use agent_bridge::{
     FirstPartyCli, checked_deadline_from, cli_version_is_supported, confirm_explicit_close,
-    provider_effort_args, provider_launch_args, provider_model_args, terminal_safe_text,
-    validate_terminal_input,
+    process_is_alive, provider_effort_args, provider_launch_args, provider_model_args,
+    terminal_safe_text, validate_terminal_input,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -42,7 +36,6 @@ const SESSION_SCHEMA: u32 = 1;
 const TURN_CLAIM_FILE: &str = "turn.claim";
 const SESSION_OWNER_FILE: &str = "native-session.json";
 const CLOSED_STATUS_FILE: &str = "closed.json";
-const PI_HOOK_FAILURE_FILE: &str = "pi-hook-failure.json";
 const TERMINAL_HANDLE_FILE: &str = "terminal.json";
 const TERMINAL_CLOSING_FILE: &str = "terminal.closing.json";
 const TERMINAL_TOMBSTONE_FILE: &str = "terminal.closed.json";
@@ -57,6 +50,7 @@ pub(crate) enum NativeCommand {
     Sessions {
         json: bool,
     },
+    Prune(PruneRequest),
     Close(CloseRequest),
     RunSession {
         id: String,
@@ -64,6 +58,10 @@ pub(crate) enum NativeCommand {
     Hook {
         provider: FirstPartyCli,
         payload: Option<String>,
+    },
+    ProviderControl {
+        provider: FirstPartyCli,
+        arguments: Vec<String>,
     },
     ConsoleControl {
         action: String,
@@ -99,6 +97,13 @@ pub(crate) struct TellRequest {
 #[derive(Debug)]
 pub(crate) struct CloseRequest {
     id: String,
+    explicit: bool,
+    json: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct PruneRequest {
+    closed_before_days: u64,
     explicit: bool,
     json: bool,
 }
@@ -146,13 +151,6 @@ struct SessionEvent {
     created_unix_ms: u128,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct PiHookFailureSignal {
-    error: String,
-    provider_session_id: Option<String>,
-    turn_id: Option<String>,
-}
-
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct NativeSessionOwner {
     pid: u32,
@@ -167,14 +165,32 @@ struct NativeSessionOwner {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     process_start_microseconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_group: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_process_group: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_shell: Option<MacTerminalShellIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     windows_process_identity: Option<terminal::WindowsProcessIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct MacTerminalShellIdentity {
+    pid: u32,
+    process_group: u32,
+    terminal_tty_device: u64,
+    process_start_seconds: u64,
+    process_start_microseconds: u64,
 }
 
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeProcessIdentity {
     pid: u32,
+    parent_pid: u32,
     terminal_tty_device: u64,
+    process_group: u32,
+    terminal_process_group: u32,
     process_start_seconds: u64,
     process_start_microseconds: u64,
 }
@@ -186,7 +202,7 @@ struct MacProcBsdInfo {
     _status: u32,
     _exit_status: u32,
     pid: u32,
-    _parent_pid: u32,
+    parent_pid: u32,
     _uid: u32,
     _gid: u32,
     _real_uid: u32,
@@ -197,10 +213,10 @@ struct MacProcBsdInfo {
     _command: [libc::c_char; 16],
     _name: [libc::c_char; 32],
     _open_files: u32,
-    _process_group: u32,
+    process_group: u32,
     _job_control_count: u32,
     terminal_tty_device: u32,
-    _terminal_process_group: u32,
+    terminal_process_group: u32,
     _nice: i32,
     process_start_seconds: u64,
     process_start_microseconds: u64,
@@ -242,9 +258,11 @@ pub(crate) fn is_command(value: &str) -> bool {
         "ask"
             | "tell"
             | "sessions"
+            | "prune-sessions"
             | "close-session"
             | "native-session"
             | "native-hook"
+            | "native-provider-control"
             | "native-console-control"
     )
 }
@@ -263,6 +281,7 @@ where
         "ask" => parse_ask(rest),
         "tell" => parse_tell(rest),
         "sessions" => parse_sessions(rest),
+        "prune-sessions" => parse_prune(rest),
         "close-session" => parse_close(rest),
         "native-session" => {
             let id = one_positional(rest, "native-session requires one session id")?;
@@ -270,6 +289,16 @@ where
             Ok(NativeCommand::RunSession { id: id.to_owned() })
         }
         "native-hook" => parse_hook(rest),
+        "native-provider-control" => {
+            let (provider, arguments) = rest
+                .split_first()
+                .context("native-provider-control requires a provider")?;
+            let provider = FirstPartyCli::from_str(provider).map_err(anyhow::Error::msg)?;
+            Ok(NativeCommand::ProviderControl {
+                provider,
+                arguments: arguments.to_vec(),
+            })
+        }
         "native-console-control" => {
             let [action, id, tail @ ..] = rest else {
                 bail!("native-console-control requires an action and managed session id");
@@ -452,6 +481,41 @@ fn parse_sessions(args: &[String]) -> Result<NativeCommand> {
     }
 }
 
+fn parse_prune(args: &[String]) -> Result<NativeCommand> {
+    let mut closed_before_days = None;
+    let mut explicit = false;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--closed-before-days" => {
+                let value = option_value(args, &mut index, "--closed-before-days")?;
+                let days = value
+                    .parse::<u64>()
+                    .with_context(|| format!("invalid retention days: {value}"))?;
+                if days == 0 || days.checked_mul(86_400).is_none() {
+                    bail!("--closed-before-days must be a positive supported day count");
+                }
+                set_once(&mut closed_before_days, days, "--closed-before-days")?;
+            }
+            "--explicit" => set_flag_once(&mut explicit, "--explicit")?,
+            "--json" => set_flag_once(&mut json, "--json")?,
+            option => bail!("unknown prune-sessions option: {option}"),
+        }
+        index += 1;
+    }
+    let closed_before_days =
+        closed_before_days.context("prune-sessions requires --closed-before-days N")?;
+    if !explicit {
+        bail!("pruning closed session records requires --explicit");
+    }
+    Ok(NativeCommand::Prune(PruneRequest {
+        closed_before_days,
+        explicit,
+        json,
+    }))
+}
+
 fn parse_close(args: &[String]) -> Result<NativeCommand> {
     let (id, options) = args
         .split_first()
@@ -549,9 +613,14 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
         NativeCommand::Ask(request) => run_ask(request),
         NativeCommand::Tell(request) => run_tell(request),
         NativeCommand::Sessions { json } => run_sessions(json),
+        NativeCommand::Prune(request) => run_prune(request),
         NativeCommand::Close(request) => run_close(request),
         NativeCommand::RunSession { id } => run_session(&id),
         NativeCommand::Hook { provider, payload } => run_hook(provider, payload.as_deref()),
+        NativeCommand::ProviderControl {
+            provider,
+            arguments,
+        } => provider::run_control(provider, &arguments),
         NativeCommand::ConsoleControl {
             action,
             id,
@@ -579,7 +648,7 @@ fn run_windows_console_control(action: &str, id: &str, input_name: Option<&str>)
     verify_terminal_surface_ownership(&directory, id, &session)?;
     let input_path = input_name.map(|name| directory.join(name));
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
-    let submit_count = usize::from(provider == FirstPartyCli::Codex) + 1;
+    let submit_count = provider::terminal_submit_count(provider);
     terminal::windows_console_control(action, &session, input_path.as_deref(), submit_count)
 }
 
@@ -740,6 +809,15 @@ fn verify_apple_terminal_owner(
     expected_session_id: &str,
     session: &terminal::TerminalSession,
 ) -> Result<()> {
+    verified_apple_terminal_owner(directory, expected_session_id, session).map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn verified_apple_terminal_owner(
+    directory: &Path,
+    expected_session_id: &str,
+    session: &terminal::TerminalSession,
+) -> Result<(NativeSessionOwner, NativeProcessIdentity)> {
     let owner_path = directory.join(SESSION_OWNER_FILE);
     let owner_text = read_regular_text_if_present(&owner_path)?
         .with_context(|| "Terminal.app ownership requires a live native-session owner")?;
@@ -753,7 +831,21 @@ fn verify_apple_terminal_owner(
         &owner,
         &live,
         surface_tty_device,
-    )
+    )?;
+    Ok((owner, live))
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_apple_terminal_owner(
+    directory: &Path,
+    expected_session_id: &str,
+    session: &terminal::TerminalSession,
+) -> Result<()> {
+    let (owner, live) = verified_apple_terminal_owner(directory, expected_session_id, session)?;
+    let process_group = verified_terminal_owner_process_group(&owner, &live)?;
+    let live_shell = live_native_process_identity(live.parent_pid)?;
+    let shell_process_group = verified_terminal_shell_process_group(&owner, &live, &live_shell)?;
+    terminal::macos::apple_terminal::terminate_process_groups(process_group, shell_process_group)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -818,15 +910,29 @@ fn current_native_session_owner(session_id: &str) -> Result<NativeSessionOwner> 
     if live.terminal_tty_device != terminal_tty_device {
         bail!("native-session process is not attached to its reported terminal TTY")
     }
-    Ok(NativeSessionOwner {
+    let live_shell = live_native_process_identity(live.parent_pid)?;
+    let terminal_shell = MacTerminalShellIdentity {
+        pid: live_shell.pid,
+        process_group: live_shell.process_group,
+        terminal_tty_device: live_shell.terminal_tty_device,
+        process_start_seconds: live_shell.process_start_seconds,
+        process_start_microseconds: live_shell.process_start_microseconds,
+    };
+    let owner = NativeSessionOwner {
         pid,
         managed_session_id: Some(session_id.to_owned()),
         terminal_tty: Some(terminal_tty),
         terminal_tty_device: Some(terminal_tty_device),
         process_start_seconds: Some(live.process_start_seconds),
         process_start_microseconds: Some(live.process_start_microseconds),
+        process_group: Some(live.process_group),
+        terminal_process_group: Some(live.terminal_process_group),
+        terminal_shell: Some(terminal_shell),
         windows_process_identity: None,
-    })
+    };
+    verified_terminal_owner_process_group(&owner, &live)?;
+    verified_terminal_shell_process_group(&owner, &live, &live_shell)?;
+    Ok(owner)
 }
 
 #[cfg(windows)]
@@ -908,13 +1014,74 @@ fn live_native_process_identity(pid: u32) -> Result<NativeProcessIdentity> {
     }
     Ok(NativeProcessIdentity {
         pid,
+        parent_pid: info.parent_pid,
         terminal_tty_device: u64::from(info.terminal_tty_device),
+        process_group: info.process_group,
+        terminal_process_group: info.terminal_process_group,
         process_start_seconds: info.process_start_seconds,
         process_start_microseconds: info.process_start_microseconds,
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn verified_terminal_owner_process_group(
+    owner: &NativeSessionOwner,
+    live: &NativeProcessIdentity,
+) -> Result<u32> {
+    if owner.pid != live.pid {
+        bail!("native-session process group no longer belongs to the recorded owner")
+    }
+    match (owner.process_group, owner.terminal_process_group) {
+        (Some(process_group), Some(terminal_process_group)) => {
+            if process_group != live.process_group
+                || terminal_process_group != live.terminal_process_group
+            {
+                bail!("native-session process group identity changed")
+            }
+        }
+        (None, None) => {}
+        _ => bail!("native-session owner has an incomplete process group identity"),
+    }
+    let process_group = live.process_group;
+    let terminal_process_group = live.terminal_process_group;
+    if process_group != owner.pid || terminal_process_group != process_group {
+        bail!("native-session owner does not lead the terminal foreground process group")
+    }
+    Ok(process_group)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn verified_terminal_shell_process_group(
+    owner: &NativeSessionOwner,
+    live_owner: &NativeProcessIdentity,
+    live_shell: &NativeProcessIdentity,
+) -> Result<u32> {
+    if owner.pid != live_owner.pid || live_owner.parent_pid != live_shell.pid {
+        bail!("Terminal.app shell no longer owns the native-session process")
+    }
+    if live_shell.terminal_tty_device != live_owner.terminal_tty_device {
+        bail!("Terminal.app shell is attached to a different TTY")
+    }
+    if live_shell.process_group != live_shell.pid
+        || live_shell.terminal_process_group != live_owner.process_group
+        || live_shell.process_group == live_owner.process_group
+    {
+        bail!("Terminal.app shell does not own the expected foreground job")
+    }
+    if let Some(recorded) = &owner.terminal_shell
+        && (recorded.pid != live_shell.pid
+            || recorded.process_group != live_shell.process_group
+            || recorded.terminal_tty_device != live_shell.terminal_tty_device
+            || recorded.process_start_seconds != live_shell.process_start_seconds
+            || recorded.process_start_microseconds != live_shell.process_start_microseconds)
+    {
+        bail!("Terminal.app shell identity changed")
+    }
+    Ok(live_shell.process_group)
+}
+
 fn run_tell(request: TellRequest) -> Result<()> {
+    let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
     let directory = session_directory(&request.id)?;
     repair_dead_native_owner(&directory)?;
     let claim = acquire_turn_claim(&directory)?;
@@ -932,6 +1099,7 @@ fn run_tell(request: TellRequest) -> Result<()> {
     }
     let prompt = native_delegation_prompt(&delegation_source(), &request.prompt);
     let follow_up_transport = provider::follow_up_transport(provider);
+    let mut expected_turn_id = None;
     match follow_up_transport {
         provider::FollowUpTransport::TerminalPasteFallback => {
             update_status(&directory, "working", None, None)?;
@@ -943,7 +1111,7 @@ fn run_tell(request: TellRequest) -> Result<()> {
             prompt_file.write_all(&terminal_paste_bytes(&prompt))?;
             prompt_file.flush()?;
             if let Err(error) =
-                provider::send_follow_up(provider, &terminal_session, prompt_file.path())
+                provider::send_terminal_follow_up(provider, &terminal_session, prompt_file.path())
             {
                 let _ = update_status(
                     &directory,
@@ -1004,19 +1172,65 @@ fn run_tell(request: TellRequest) -> Result<()> {
                 return Err(error).context("failed to publish provider resume request");
             }
         }
+        provider::FollowUpTransport::ProviderCrossSessionMessage => {
+            let transport_timeout = remaining_turn_timeout(deadline, request.timeout)?;
+            let request_id = provider::new_cross_session_turn_id(provider)?;
+            let bridge_executable =
+                std::env::current_exe().context("failed to locate agent-bridge executable")?;
+            update_status(&directory, "working", None, None)?;
+            if let Err(failure) = provider::send_cross_session_message(
+                provider,
+                provider::CrossSessionMessageContext {
+                    bridge_executable: &bridge_executable,
+                    directory: &directory,
+                    provider_path: &manifest.provider_path,
+                    request_id: &request_id,
+                    prompt: &prompt,
+                    timeout: transport_timeout,
+                },
+            ) {
+                if failure.delivery_may_have_occurred() {
+                    let error = failure.into_error();
+                    claim.retain();
+                    return Err(error).with_context(|| {
+                        format!(
+                            "provider follow-up transport {} could not confirm delivery; the turn remains claimed until the target reports completion or the session is explicitly closed",
+                            follow_up_transport.as_str()
+                        )
+                    });
+                }
+                let error = failure.into_error();
+                let _ = update_status(
+                    &directory,
+                    &previous_state,
+                    None,
+                    Some(format!("{error:#}")),
+                );
+                return Err(error).with_context(|| {
+                    format!(
+                        "provider follow-up transport {} failed",
+                        follow_up_transport.as_str()
+                    )
+                });
+            }
+            expected_turn_id = Some(request_id);
+        }
     }
     claim.retain();
 
     if request.detach {
         return emit_session_result(request.json, &request.id, &terminal_session, provider, None);
     }
-    let event = wait_for_event(&directory, baseline, request.timeout).with_context(|| {
-        format!(
-            "session {} remains open in {}; the requested turn did not report completion",
-            request.id,
-            terminal_session.kind.display_name()
-        )
-    })?;
+    let remaining = remaining_turn_timeout(deadline, request.timeout)?;
+    let event =
+        wait_for_event_for_turn(&directory, baseline, expected_turn_id.as_deref(), remaining)
+            .with_context(|| {
+                format!(
+                    "session {} remains open in {}; the requested turn did not report completion",
+                    request.id,
+                    terminal_session.kind.display_name()
+                )
+            })?;
     emit_session_result(
         request.json,
         &request.id,
@@ -1024,6 +1238,13 @@ fn run_tell(request: TellRequest) -> Result<()> {
         provider,
         Some(&event),
     )
+}
+
+fn remaining_turn_timeout(deadline: Instant, requested: Duration) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .with_context(|| format!("timed out after {} seconds", requested.as_secs()))
 }
 
 fn run_sessions(json: bool) -> Result<()> {
@@ -1087,12 +1308,189 @@ fn run_sessions(json: bool) -> Result<()> {
     Ok(())
 }
 
+fn run_prune(request: PruneRequest) -> Result<()> {
+    if !request.explicit {
+        bail!("pruning closed session records requires --explicit");
+    }
+    let retention_ms = u128::from(request.closed_before_days)
+        .checked_mul(86_400_000)
+        .context("closed-session retention window is too large")?;
+    let now_unix_ms = unix_ms();
+    let removed = if retention_ms > now_unix_ms {
+        Vec::new()
+    } else {
+        prune_closed_sessions(&state_root()?, now_unix_ms - retention_ms)?
+    };
+    if request.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": true,
+                "closed_before_days": request.closed_before_days,
+                "pruned": removed,
+            }))?
+        );
+    } else if removed.is_empty() {
+        println!("no eligible closed Agent Bridge sessions");
+    } else {
+        for id in &removed {
+            println!("pruned {id}");
+        }
+        println!("pruned {} closed session(s)", removed.len());
+    }
+    Ok(())
+}
+
+fn prune_closed_sessions(root: &Path, cutoff_unix_ms: u128) -> Result<Vec<String>> {
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve state directory {}", root.display()))?;
+    let mut removed = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let id = entry.file_name().to_string_lossy().into_owned();
+        if !valid_session_id(&id) {
+            continue;
+        }
+        let directory = entry.path();
+        if !is_regular_file(&directory.join("manifest.json"))? {
+            continue;
+        }
+        let Ok(manifest) = read_manifest(&directory) else {
+            continue;
+        };
+        if manifest.id != id {
+            continue;
+        }
+        let closed = match read_regular_status_if_present(&directory.join(CLOSED_STATUS_FILE)) {
+            Ok(Some(closed)) => closed,
+            Ok(None) | Err(_) => continue,
+        };
+        let status = match read_regular_status_if_present(&directory.join("status.json")) {
+            Ok(Some(status)) => status,
+            Ok(None) | Err(_) => continue,
+        };
+        if closed.state != "closed"
+            || status.state != "closed"
+            || closed.updated_unix_ms > cutoff_unix_ms
+            || status.updated_unix_ms > cutoff_unix_ms
+            || has_active_session_capability(&directory)
+            || native_owner_blocks_prune(&directory)?
+        {
+            continue;
+        }
+        let canonical_directory = directory
+            .canonicalize()
+            .with_context(|| format!("failed to resolve session directory {id}"))?;
+        if canonical_directory.parent() != Some(canonical_root.as_path()) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&directory)
+            .with_context(|| format!("failed to recheck session directory {id}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        fs::remove_dir_all(&directory)
+            .with_context(|| format!("failed to prune closed session {id}"))?;
+        removed.push(id);
+    }
+    removed.sort();
+    Ok(removed)
+}
+
+fn has_active_session_capability(directory: &Path) -> bool {
+    [
+        TERMINAL_HANDLE_FILE,
+        TERMINAL_CLOSING_FILE,
+        TURN_CLAIM_FILE,
+        RESUME_PENDING_FILE,
+        RESUME_RUNNING_FILE,
+    ]
+    .into_iter()
+    .any(|name| fs::symlink_metadata(directory.join(name)).is_ok())
+}
+
+fn is_regular_file(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file() && !metadata.file_type().is_symlink()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn read_regular_status_if_present(path: &Path) -> Result<Option<SessionStatus>> {
+    let Some(text) = read_regular_text_if_present(path)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .with_context(|| format!("invalid JSON in {}", path.display()))
+}
+
+fn native_owner_blocks_prune(directory: &Path) -> Result<bool> {
+    let path = directory.join(SESSION_OWNER_FILE);
+    let text = match read_regular_text_if_present(&path) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Ok(false),
+        Err(_) => return Ok(true),
+    };
+    let owner = match serde_json::from_str::<NativeSessionOwner>(&text) {
+        Ok(owner) => owner,
+        Err(_) => return Ok(true),
+    };
+
+    #[cfg(windows)]
+    {
+        let Some(identity) = &owner.windows_process_identity else {
+            return Ok(true);
+        };
+        if !process_is_alive(owner.pid) {
+            return Ok(false);
+        }
+        match terminal::windows_process_identity(owner.pid) {
+            Ok(live) => Ok(&live == identity),
+            Err(_) => Ok(true),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if !process_is_alive(owner.pid) {
+            return Ok(false);
+        }
+        let (Some(seconds), Some(microseconds)) = (
+            owner.process_start_seconds,
+            owner.process_start_microseconds,
+        ) else {
+            return Ok(true);
+        };
+        match live_native_process_identity(owner.pid) {
+            Ok(live) => Ok(live.process_start_seconds == seconds
+                && live.process_start_microseconds == microseconds),
+            Err(_) => Ok(true),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        Ok(process_is_alive(owner.pid))
+    }
+}
+
 fn run_close(request: CloseRequest) -> Result<()> {
     confirm_explicit_close(request.explicit)?;
     let directory = session_directory(&request.id)?;
     repair_dead_native_owner(&directory)?;
     close_session_state(&directory, |session| {
         verify_terminal_surface_ownership(&directory, &request.id, session)?;
+        #[cfg(target_os = "macos")]
+        if session.kind == terminal::TerminalKind::AppleTerminal {
+            terminate_apple_terminal_owner(&directory, &request.id, session)?;
+        }
         terminal::close_session(session)
     })
     .with_context(|| format!("failed to close visible terminal session {}", request.id))?;
@@ -1313,16 +1711,7 @@ fn run_session_inner(directory: &Path) -> Result<()> {
         );
     }
 
-    let (agy_monitor, pi_failure_monitor) = match completion_monitor {
-        provider::CompletionMonitor::Hook => (None, None),
-        provider::CompletionMonitor::AgyTranscript { log_path } => (
-            Some(AgyMonitor::start(directory, &log_path, &agy_brain_root()?)?),
-            None,
-        ),
-        provider::CompletionMonitor::PiHookFailure => {
-            (None, Some(PiFailureMonitor::start(directory)?))
-        }
-    };
+    let completion_monitor = completion_monitor.start(directory)?;
     let mut provider_command =
         provider_process_command(&manifest.provider_path, directory, arguments)?;
     let child = provider_command
@@ -1352,12 +1741,7 @@ fn run_session_inner(directory: &Path) -> Result<()> {
         }
     }
     let status = child.wait();
-    if let Some(monitor) = agy_monitor {
-        monitor.stop()?;
-    }
-    if let Some(monitor) = pi_failure_monitor {
-        monitor.stop()?;
-    }
+    completion_monitor.stop()?;
     let status = status.with_context(|| {
         format!(
             "failed to start {} at {}",
@@ -1529,21 +1913,7 @@ fn run_hook(provider: FirstPartyCli, argument_payload: Option<&str>) -> Result<(
     };
     let payload: serde_json::Value =
         serde_json::from_str(&payload_text).context("native hook received invalid JSON")?;
-    let provider_session_id = json_string(&payload, &["session_id", "thread-id", "thread_id"]);
-    let turn_id = json_string(&payload, &["turn_id", "turn-id"]);
-    if let Some(error) = payload
-        .get("agent_bridge_error")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return record_provider_failure(&directory, provider, error, provider_session_id, turn_id);
-    }
-    let message = extract_assistant_message(&payload)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .context("native hook payload did not contain an assistant result")?;
-    record_provider_result(&directory, provider, message, provider_session_id, turn_id)
+    provider::handle_hook(provider, &directory, &payload)
 }
 
 fn record_provider_result(
@@ -1587,447 +1957,6 @@ fn record_provider_failure(
     release_turn_claim(directory)
 }
 
-pub(crate) fn extract_assistant_message(payload: &serde_json::Value) -> Option<&str> {
-    ["last-assistant-message", "last_assistant_message"]
-        .into_iter()
-        .find_map(|key| payload.get(key).and_then(serde_json::Value::as_str))
-}
-
-fn json_string(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| {
-        payload
-            .get(*key)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-    })
-}
-
-fn pi_bridge_extension() -> &'static str {
-    r#"import { spawnSync } from "node:child_process";
-import { renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-
-function assistantText(message) {
-  if (!Array.isArray(message.content)) return undefined;
-  const text = message.content
-    .filter((part) => part?.type === "text" && typeof part.text === "string")
-    .map((part) => part.text)
-    .join("\n")
-    .trim();
-  return text || undefined;
-}
-
-function lastAssistantOutcome(messages) {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message?.role !== "assistant") continue;
-    if (message.stopReason !== "stop") {
-      const detail = typeof message.errorMessage === "string" && message.errorMessage.trim()
-        ? `: ${message.errorMessage.trim()}`
-        : "";
-      return { agent_bridge_error: `Pi turn ended with ${message.stopReason ?? "an unknown state"}${detail}` };
-    }
-    const text = assistantText(message);
-    if (text) return { last_assistant_message: text };
-    return { agent_bridge_error: "Pi settled without assistant text." };
-  }
-  return { agent_bridge_error: "Pi settled without an assistant result." };
-}
-
-function wait(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-async function deliverResult(executable, payload) {
-  if (!executable) {
-    return { ok: false, detail: "Agent Bridge executable is unavailable" };
-  }
-  let detail = "native hook failed";
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const result = spawnSync(executable, ["native-hook", "pi"], {
-      input: JSON.stringify(payload),
-      encoding: "utf8",
-      stdio: ["pipe", "ignore", "pipe"],
-    });
-    if (!result.error && result.status === 0) return { ok: true };
-    const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
-    detail = result.error?.message || stderr || `native hook exited with status ${result.status}`;
-    if (attempt < 2) await wait(100 * (attempt + 1));
-  }
-  return { ok: false, detail: detail.slice(0, 1024) };
-}
-
-function persistHookFailure(payload, detail) {
-  const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
-  if (!directory) return false;
-  const target = join(directory, "pi-hook-failure.json");
-  const temporary = join(
-    directory,
-    `.pi-hook-failure-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`,
-  );
-  const signal = {
-    error: `Pi result delivery failed: ${detail}`,
-    provider_session_id: payload.session_id,
-    turn_id: payload.turn_id,
-  };
-  try {
-    writeFileSync(temporary, JSON.stringify(signal), { encoding: "utf8", flag: "wx", mode: 0o600 });
-    renameSync(temporary, target);
-    return true;
-  } catch {
-    try { unlinkSync(temporary); } catch {}
-    return false;
-  }
-}
-
-export default function (pi) {
-  let pending;
-  let undelivered = false;
-
-  pi.on("agent_start", (_event, ctx) => {
-    if (undelivered && pending) {
-      if (!persistHookFailure(pending, "a prior result remained undelivered")) {
-        ctx.ui.notify("Agent Bridge still cannot recover the previous Pi result.", "warning");
-        return;
-      }
-      undelivered = false;
-    }
-    pending = undefined;
-  });
-
-  pi.on("agent_end", (event, ctx) => {
-    if (undelivered) return;
-    pending = {
-      ...lastAssistantOutcome(event.messages),
-      session_id: ctx.sessionManager.getSessionId(),
-      turn_id: ctx.sessionManager.getLeafId() ?? undefined,
-    };
-  });
-
-  pi.on("agent_settled", async (_event, ctx) => {
-    if (!pending) return;
-    const payload = pending;
-    const executable = process.env.AGENT_BRIDGE_EXECUTABLE;
-    const delivery = await deliverResult(executable, payload);
-    if (!delivery.ok) {
-      if (persistHookFailure(payload, delivery.detail)) {
-        pending = undefined;
-        ctx.ui.notify("Agent Bridge marked this undelivered Pi result as failed.", "warning");
-        return;
-      }
-      undelivered = true;
-      ctx.ui.notify("Agent Bridge could not record or recover this Pi result.", "warning");
-      return;
-    }
-    pending = undefined;
-  });
-}
-"#
-}
-
-struct PiFailureMonitor {
-    stop: Arc<AtomicBool>,
-    handle: JoinHandle<Result<()>>,
-}
-
-impl PiFailureMonitor {
-    fn start(directory: &Path) -> Result<Self> {
-        let directory = directory.to_owned();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_for_thread = Arc::clone(&stop);
-        let error_directory = directory.clone();
-        let handle = thread::Builder::new()
-            .name("agent-bridge-pi-failure-monitor".to_owned())
-            .spawn(move || {
-                let result = monitor_pi_hook_failures(&directory, &stop_for_thread);
-                if let Err(error) = &result {
-                    let _ = update_status(
-                        &error_directory,
-                        "failed",
-                        None,
-                        Some(format!("Pi result recovery monitor failed: {error:#}")),
-                    );
-                    let _ = release_turn_claim(&error_directory);
-                }
-                result
-            })
-            .context("failed to start Pi result recovery monitor")?;
-        Ok(Self { stop, handle })
-    }
-
-    fn stop(self) -> Result<()> {
-        self.stop.store(true, Ordering::Release);
-        self.handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("Pi result recovery monitor panicked"))??;
-        Ok(())
-    }
-}
-
-fn monitor_pi_hook_failures(directory: &Path, stop: &AtomicBool) -> Result<()> {
-    loop {
-        consume_pi_hook_failure(directory)?;
-        if stop.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn consume_pi_hook_failure(directory: &Path) -> Result<bool> {
-    let path = directory.join(PI_HOOK_FAILURE_FILE);
-    let Some(text) = read_regular_text_if_present(&path)? else {
-        return Ok(false);
-    };
-    let signal: PiHookFailureSignal =
-        serde_json::from_str(&text).context("invalid Pi hook failure recovery signal")?;
-    let error = signal.error.trim();
-    if error.is_empty() {
-        bail!("Pi hook failure recovery signal has no error");
-    }
-    fs::remove_file(&path).context("failed to consume Pi hook failure recovery signal")?;
-    record_provider_failure(
-        directory,
-        FirstPartyCli::Pi,
-        error,
-        signal.provider_session_id,
-        signal.turn_id,
-    )?;
-    Ok(true)
-}
-
-struct AgyMonitor {
-    stop: Arc<AtomicBool>,
-    handle: JoinHandle<Result<()>>,
-}
-
-impl AgyMonitor {
-    fn start(directory: &Path, log_path: &Path, brain_root: &Path) -> Result<Self> {
-        let directory = directory.to_owned();
-        let log_path = log_path.to_owned();
-        let brain_root = brain_root.to_owned();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_for_thread = Arc::clone(&stop);
-        let error_directory = directory.clone();
-        let handle = thread::Builder::new()
-            .name("agent-bridge-agy-monitor".to_owned())
-            .spawn(move || {
-                let result =
-                    monitor_agy_session(&directory, &log_path, &brain_root, &stop_for_thread);
-                if let Err(error) = &result {
-                    let _ = update_status(
-                        &error_directory,
-                        "failed",
-                        None,
-                        Some(format!("Agy result monitor failed: {error:#}")),
-                    );
-                    let _ = release_turn_claim(&error_directory);
-                }
-                result
-            })
-            .context("failed to start Agy result monitor")?;
-        Ok(Self { stop, handle })
-    }
-
-    fn stop(self) -> Result<()> {
-        self.stop.store(true, Ordering::Release);
-        self.handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("Agy result monitor panicked"))??;
-        Ok(())
-    }
-}
-
-struct AgyTranscriptCursor {
-    path: PathBuf,
-    full_path: PathBuf,
-    offset: u64,
-    partial_line: Vec<u8>,
-    pending_results: VecDeque<AgyPlannerResult>,
-    greatest_result_step: Option<u64>,
-}
-
-impl AgyTranscriptCursor {
-    fn new(path: PathBuf) -> Self {
-        let full_path = path.with_file_name("transcript_full.jsonl");
-        Self {
-            path,
-            full_path,
-            offset: 0,
-            partial_line: Vec::new(),
-            pending_results: VecDeque::new(),
-            greatest_result_step: None,
-        }
-    }
-
-    fn poll(&mut self, directory: &Path, brain_root: &Path, conversation_id: &str) -> Result<()> {
-        let Some(metadata) = validated_agy_file_metadata(&self.path, brain_root)? else {
-            return Ok(());
-        };
-        if metadata.len() < self.offset {
-            self.offset = 0;
-            self.partial_line.clear();
-            self.pending_results.clear();
-        }
-
-        let mut file = OpenOptions::new().read(true).open(&self.path)?;
-        file.seek(SeekFrom::Start(self.offset))?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        self.offset = self.offset.saturating_add(bytes.len() as u64);
-        self.partial_line.extend_from_slice(&bytes);
-
-        let mut lines = Vec::new();
-        let mut start = 0;
-        for (index, byte) in self.partial_line.iter().enumerate() {
-            if *byte == b'\n' {
-                lines.push(String::from_utf8_lossy(&self.partial_line[start..index]).into_owned());
-                start = index + 1;
-            }
-        }
-        if start > 0 {
-            self.partial_line.drain(..start);
-        }
-
-        for line in lines {
-            let Some(result) = parse_agy_planner_result(&line) else {
-                continue;
-            };
-            if self
-                .greatest_result_step
-                .is_some_and(|previous| result.step <= previous)
-                || self
-                    .pending_results
-                    .iter()
-                    .any(|pending| pending.step == result.step)
-            {
-                continue;
-            }
-            self.pending_results.push_back(result);
-        }
-
-        while let Some(result) = self.pending_results.front() {
-            let message = if result.truncated {
-                let Some(message) = read_agy_full_result(&self.full_path, brain_root, result.step)?
-                else {
-                    break;
-                };
-                message
-            } else {
-                result.message.clone()
-            };
-            let step = result.step;
-            record_provider_result(
-                directory,
-                FirstPartyCli::Agy,
-                &message,
-                Some(conversation_id.to_owned()),
-                Some(step.to_string()),
-            )?;
-            self.greatest_result_step = Some(step);
-            self.pending_results.pop_front();
-        }
-        Ok(())
-    }
-}
-
-fn validated_agy_file_metadata(path: &Path, brain_root: &Path) -> Result<Option<fs::Metadata>> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
-        }
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!("refusing non-regular Agy transcript: {}", path.display());
-    }
-    let canonical_root = brain_root
-        .canonicalize()
-        .context("Agy brain directory is unavailable")?;
-    let canonical_path = path
-        .canonicalize()
-        .with_context(|| format!("Agy transcript cannot be resolved: {}", path.display()))?;
-    if !canonical_path.starts_with(&canonical_root) {
-        bail!(
-            "refusing Agy transcript outside its data directory: {}",
-            path.display()
-        );
-    }
-    Ok(Some(metadata))
-}
-
-fn read_agy_full_result(path: &Path, brain_root: &Path, step: u64) -> Result<Option<String>> {
-    if validated_agy_file_metadata(path, brain_root)?.is_none() {
-        return Ok(None);
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .with_context(|| format!("failed to read full Agy transcript: {}", path.display()))?;
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        if value.get("step_index").and_then(serde_json::Value::as_u64) != Some(step) {
-            continue;
-        }
-        let result = parse_agy_planner_value(&value)
-            .context("full Agy transcript row did not contain a final response")?;
-        if result.truncated {
-            bail!("full Agy transcript unexpectedly marked step {step} as truncated");
-        }
-        return Ok(Some(result.message));
-    }
-    Ok(None)
-}
-
-#[derive(Default)]
-struct AgyMonitorState {
-    conversation_id: Option<String>,
-    transcript: Option<AgyTranscriptCursor>,
-}
-
-impl AgyMonitorState {
-    fn poll(&mut self, directory: &Path, log_path: &Path, brain_root: &Path) -> Result<()> {
-        if let Some(log) = read_regular_text_if_present(log_path)?
-            && let Some(newest_id) = parse_agy_conversation_id(&log)
-            && self.conversation_id.as_deref() != Some(newest_id.as_str())
-        {
-            let path = brain_root
-                .join(&newest_id)
-                .join(".system_generated")
-                .join("logs")
-                .join("transcript.jsonl");
-            self.conversation_id = Some(newest_id);
-            self.transcript = Some(AgyTranscriptCursor::new(path));
-        }
-        if let (Some(id), Some(cursor)) =
-            (self.conversation_id.as_deref(), self.transcript.as_mut())
-        {
-            cursor.poll(directory, brain_root, id)?;
-        }
-        Ok(())
-    }
-}
-
-fn monitor_agy_session(
-    directory: &Path,
-    log_path: &Path,
-    brain_root: &Path,
-    stop: &AtomicBool,
-) -> Result<()> {
-    let mut state = AgyMonitorState::default();
-    loop {
-        state.poll(directory, log_path, brain_root)?;
-        if stop.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
-}
-
 fn read_regular_text_if_present(path: &Path) -> Result<Option<String>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -2041,90 +1970,6 @@ fn read_regular_text_if_present(path: &Path) -> Result<Option<String>> {
     }
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
-}
-
-fn agy_brain_root() -> Result<PathBuf> {
-    default_agy_brain_root(
-        std::env::var_os("HOME").as_deref(),
-        std::env::var_os("USERPROFILE").as_deref(),
-    )
-}
-
-fn default_agy_brain_root(
-    home: Option<&std::ffi::OsStr>,
-    user_profile: Option<&std::ffi::OsStr>,
-) -> Result<PathBuf> {
-    let home = PathBuf::from(
-        home.or(user_profile)
-            .context("neither HOME nor USERPROFILE is set for the Agy brain root")?,
-    );
-    Ok(home.join(".gemini").join("antigravity-cli").join("brain"))
-}
-
-fn parse_agy_conversation_id(log: &str) -> Option<String> {
-    log.lines().rev().find_map(|line| {
-        let (_, suffix) = line.rsplit_once("Created conversation ")?;
-        let candidate = suffix.split_whitespace().next()?;
-        valid_uuid(candidate).then(|| candidate.to_owned())
-    })
-}
-
-fn valid_uuid(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if matches!(index, 8 | 13 | 18 | 23) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        })
-}
-
-#[derive(Debug)]
-struct AgyPlannerResult {
-    step: u64,
-    message: String,
-    truncated: bool,
-}
-
-fn parse_agy_planner_result(line: &str) -> Option<AgyPlannerResult> {
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    parse_agy_planner_value(&value)
-}
-
-fn parse_agy_planner_value(value: &serde_json::Value) -> Option<AgyPlannerResult> {
-    if value.get("type")?.as_str()? != "PLANNER_RESPONSE"
-        || value.get("status")?.as_str()? != "DONE"
-        || value.get("source")?.as_str()? != "MODEL"
-    {
-        return None;
-    }
-    if value
-        .get("tool_calls")
-        .is_some_and(|tool_calls| match tool_calls {
-            serde_json::Value::Null => false,
-            serde_json::Value::Array(calls) => !calls.is_empty(),
-            _ => true,
-        })
-    {
-        return None;
-    }
-    let step = value.get("step_index")?.as_u64()?;
-    let message = value.get("content")?.as_str()?.trim();
-    (!message.is_empty()).then(|| AgyPlannerResult {
-        step,
-        message: message.to_owned(),
-        truncated: value
-            .get("is_truncated")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
-    })
-}
-
-#[cfg(test)]
-fn parse_agy_transcript_line(line: &str) -> Option<(u64, String)> {
-    let result = parse_agy_planner_result(line)?;
-    (!result.truncated).then_some((result.step, result.message))
 }
 
 fn create_session(spec: SessionSpec) -> Result<CreatedSession> {
@@ -2522,16 +2367,42 @@ fn wait_for_status(
 }
 
 fn wait_for_event(directory: &Path, baseline: usize, timeout: Duration) -> Result<SessionEvent> {
+    wait_for_event_for_turn(directory, baseline, None, timeout)
+}
+
+fn wait_for_event_for_turn(
+    directory: &Path,
+    baseline: usize,
+    expected_turn_id: Option<&str>,
+    timeout: Duration,
+) -> Result<SessionEvent> {
     let deadline = checked_deadline_from(Instant::now(), timeout)?;
     loop {
         repair_dead_native_owner(directory)?;
         let paths = event_paths(directory)?;
         if paths.len() > baseline {
-            let event: SessionEvent = read_json(paths.last().context("event path disappeared")?)?;
-            if let Some(error) = event.error.as_deref() {
-                bail!("{error}");
+            let candidates = &paths[baseline..];
+            let event = if let Some(expected_turn_id) = expected_turn_id {
+                let mut matched = None;
+                for path in candidates {
+                    let event: SessionEvent = read_json(path)?;
+                    if event.turn_id.as_deref() == Some(expected_turn_id) {
+                        matched = Some(event);
+                        break;
+                    }
+                }
+                matched
+            } else {
+                Some(read_json(
+                    candidates.last().context("event path disappeared")?,
+                )?)
+            };
+            if let Some(event) = event {
+                if let Some(error) = event.error.as_deref() {
+                    bail!("{error}");
+                }
+                return Ok(event);
             }
-            return Ok(event);
         }
         if let Ok(status) = read_json::<SessionStatus>(&directory.join("status.json"))
             && matches!(status.state.as_str(), "failed" | "exited" | "closed")

@@ -5,14 +5,29 @@ use agent_bridge::{
 };
 
 #[test]
+fn claude_message_guard_control_fails_closed_without_managed_state() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        .args(["native-provider-control", "claude", "message-guard"])
+        .env_remove("AGENT_BRIDGE_NATIVE_SESSION_DIR")
+        .env_remove("AGENT_BRIDGE_NATIVE_STATE_DIR")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let decision: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(decision["hookSpecificOutput"]["permissionDecision"], "deny");
+}
+
+#[test]
 fn supported_cli_versions_use_a_minimum_not_an_exact_pin() {
     assert!(cli_version_is_supported(FirstPartyCli::Codex, "codex-cli 0.147.0").unwrap());
     assert!(cli_version_is_supported(FirstPartyCli::Codex, "codex-cli 0.148.3").unwrap());
     assert!(!cli_version_is_supported(FirstPartyCli::Codex, "codex-cli 0.146.9").unwrap());
 
-    assert!(cli_version_is_supported(FirstPartyCli::Claude, "2.1.229 (Claude Code)").unwrap());
+    assert!(cli_version_is_supported(FirstPartyCli::Claude, "2.1.232 (Claude Code)").unwrap());
     assert!(cli_version_is_supported(FirstPartyCli::Claude, "2.2.0 (Claude Code)").unwrap());
-    assert!(!cli_version_is_supported(FirstPartyCli::Claude, "2.1.228 (Claude Code)").unwrap());
+    assert!(!cli_version_is_supported(FirstPartyCli::Claude, "2.1.231 (Claude Code)").unwrap());
 
     assert!(cli_version_is_supported(FirstPartyCli::Agy, "agy 1.1.12").unwrap());
     assert!(cli_version_is_supported(FirstPartyCli::Agy, "agy 1.2.0").unwrap());

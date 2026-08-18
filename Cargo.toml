@@ -1,12 +1,12 @@
 [package]
 name = "agent-bridge"
-version = "0.2.0"
+version = "0.0.1"
 edition = "2024"
 description = "Visible terminal bridge for Codex, Claude, Agy, and Pi CLIs"
 license = "MIT"
 repository = "https://github.com/jy1655/agent-bridge"
 readme = "README.md"
-rust-version = "1.88"
+rust-version = "1.97.1"
 
 [dependencies]
 anyhow = "1.0"

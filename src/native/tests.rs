@@ -193,6 +193,18 @@ fn native_ask_and_tell_reject_unrepresentable_timeouts() {
 }
 
 #[test]
+fn remaining_turn_timeout_rejects_an_exhausted_total_budget() {
+    let expired = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
+    let error = remaining_turn_timeout(expired, Duration::from_secs(5)).unwrap_err();
+    assert!(format!("{error:#}").contains("timed out after 5 seconds"));
+
+    let future = Instant::now().checked_add(Duration::from_secs(5)).unwrap();
+    let remaining = remaining_turn_timeout(future, Duration::from_secs(5)).unwrap();
+    assert!(remaining > Duration::ZERO);
+    assert!(remaining <= Duration::from_secs(5));
+}
+
+#[test]
 fn effort_uses_each_provider_native_session_option() {
     assert_eq!(
         provider_effort_args(FirstPartyCli::Codex, "xhigh").unwrap(),
@@ -210,44 +222,6 @@ fn effort_uses_each_provider_native_session_option() {
         provider_effort_args(FirstPartyCli::Pi, "minimal").unwrap(),
         ["--thinking", "minimal"]
     );
-}
-
-#[test]
-fn agy_log_and_transcript_parsers_accept_only_the_expected_completed_result() {
-    let id = "3e166585-bc21-43b7-b3d1-dec5e67688b3";
-    assert_eq!(
-        parse_agy_conversation_id(&format!("prefix Created conversation {id}\n")),
-        Some(id.to_owned())
-    );
-    assert!(parse_agy_conversation_id("Created conversation ../../outside").is_none());
-
-    let completed = r#"{"type":"PLANNER_RESPONSE","status":"DONE","source":"MODEL","step_index":9,"content":"AGY_TOOL_OK"}"#;
-    assert_eq!(
-        parse_agy_transcript_line(completed),
-        Some((9, "AGY_TOOL_OK".to_owned()))
-    );
-    let intermediate = r#"{"type":"PLANNER_RESPONSE","status":"DONE","source":"MODEL","step_index":7,"content":""}"#;
-    assert_eq!(parse_agy_transcript_line(intermediate), None);
-    let planner_tool = r#"{"type":"PLANNER_RESPONSE","status":"DONE","source":"MODEL","step_index":8,"content":"checking","tool_calls":[{"name":"run_command"}]}"#;
-    assert_eq!(parse_agy_transcript_line(planner_tool), None);
-    let tool = r#"{"type":"RUN_COMMAND","status":"DONE","source":"MODEL","step_index":8,"content":"output"}"#;
-    assert_eq!(parse_agy_transcript_line(tool), None);
-}
-
-#[test]
-fn pi_session_extension_reports_only_settled_results_without_changing_tool_policy() {
-    let extension = pi_bridge_extension();
-
-    assert!(extension.contains("agent_start"));
-    assert!(extension.contains("agent_end"));
-    assert!(extension.contains("agent_settled"));
-    assert!(extension.contains("stopReason"));
-    assert!(extension.contains("agent_bridge_error"));
-    assert!(extension.contains("pi-hook-failure.json"));
-    assert!(extension.contains("renameSync"));
-    assert!(extension.contains("native-hook\", \"pi"));
-    assert!(!extension.contains("tool_call"));
-    assert!(!extension.contains("--approve"));
 }
 
 #[test]
@@ -276,33 +250,175 @@ fn provider_failures_finish_the_bridge_turn_without_reporting_success() {
 }
 
 #[test]
-fn pi_hook_transport_failure_signal_recovers_the_bridge_turn() {
+fn correlated_wait_ignores_other_completed_turns() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
-    update_status(directory.path(), "working", None, None).unwrap();
-    let claim = acquire_turn_claim(directory.path()).unwrap();
-    claim.retain();
-    write_json_atomic(
-        &directory.path().join(PI_HOOK_FAILURE_FILE),
-        &PiHookFailureSignal {
-            error: "native hook exited with status 1".to_owned(),
-            provider_session_id: Some("provider-session".to_owned()),
-            turn_id: Some("provider-turn".to_owned()),
-        },
+    update_status(directory.path(), "ready", None, None).unwrap();
+    for (turn_id, message) in [
+        ("claude-turn-other", "other result"),
+        ("claude-turn-expected", "expected result"),
+    ] {
+        write_event(
+            directory.path(),
+            &SessionEvent {
+                provider: "claude".to_owned(),
+                message: message.to_owned(),
+                error: None,
+                provider_session_id: Some("claude-session".to_owned()),
+                turn_id: Some(turn_id.to_owned()),
+                created_unix_ms: unix_ms(),
+            },
+        )
+        .unwrap();
+    }
+
+    let event = wait_for_event_for_turn(
+        directory.path(),
+        0,
+        Some("claude-turn-expected"),
+        Duration::from_secs(1),
     )
     .unwrap();
-
-    assert!(consume_pi_hook_failure(directory.path()).unwrap());
-    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
-    assert!(!directory.path().join(PI_HOOK_FAILURE_FILE).exists());
-    let error = wait_for_event(directory.path(), 0, Duration::from_secs(1)).unwrap_err();
-    assert!(format!("{error:#}").contains("native hook exited with status 1"));
+    assert_eq!(event.message, "expected result");
 }
 
 #[test]
 fn close_is_rejected_without_the_explicit_flag() {
     assert!(parse_args(["close-session", "session-safe123"]).is_err());
     assert!(parse_args(["close-session", "session-safe123", "--explicit"]).is_ok());
+}
+
+#[test]
+fn prune_sessions_requires_an_explicit_positive_retention_window() {
+    assert!(parse_args(["prune-sessions", "--closed-before-days", "30"]).is_err());
+    assert!(parse_args(["prune-sessions", "--closed-before-days", "0", "--explicit",]).is_err());
+    assert!(parse_args(["prune-sessions", "--closed-before-days", "30", "--explicit",]).is_ok());
+}
+
+fn write_prune_test_session(
+    root: &Path,
+    id: &str,
+    state: &str,
+    closed_unix_ms: Option<u128>,
+) -> PathBuf {
+    let directory = root.join(id);
+    fs::create_dir(&directory).unwrap();
+    fs::create_dir(directory.join("events")).unwrap();
+    write_json_atomic(
+        &directory.join("manifest.json"),
+        &SessionManifest {
+            schema: SESSION_SCHEMA,
+            id: id.to_owned(),
+            provider: "codex".to_owned(),
+            provider_path: PathBuf::from("/opt/codex"),
+            provider_version: "codex-cli 0.147.0".to_owned(),
+            workspace: root.to_owned(),
+            title: id.to_owned(),
+            model: None,
+            effort: None,
+            yolo: false,
+            created_unix_ms: 1,
+        },
+    )
+    .unwrap();
+    let status = SessionStatus {
+        state: state.to_owned(),
+        updated_unix_ms: closed_unix_ms.unwrap_or(1_000),
+        exit_code: None,
+        error: None,
+    };
+    write_json_atomic(&directory.join("status.json"), &status).unwrap();
+    if let Some(updated_unix_ms) = closed_unix_ms {
+        write_json_atomic(
+            &directory.join(CLOSED_STATUS_FILE),
+            &SessionStatus {
+                state: "closed".to_owned(),
+                updated_unix_ms,
+                exit_code: None,
+                error: None,
+            },
+        )
+        .unwrap();
+    }
+    directory
+}
+
+#[test]
+fn pruning_removes_only_old_quiescent_closed_session_directories() {
+    let root = tempfile::tempdir().unwrap();
+    let old = write_prune_test_session(root.path(), "session-old123", "closed", Some(100));
+    let recent = write_prune_test_session(root.path(), "session-recent123", "closed", Some(900));
+    let live = write_prune_test_session(root.path(), "session-live123", "ready", None);
+    let claimed = write_prune_test_session(root.path(), "session-claimed123", "closed", Some(100));
+    fs::write(claimed.join(TURN_CLAIM_FILE), "still-owned").unwrap();
+    #[cfg(not(windows))]
+    let owned = {
+        let owned = write_prune_test_session(root.path(), "session-owned123", "closed", Some(100));
+        write_json_atomic(
+            &owned.join(SESSION_OWNER_FILE),
+            &NativeSessionOwner {
+                pid: std::process::id(),
+                managed_session_id: Some("session-owned123".to_owned()),
+                ..NativeSessionOwner::default()
+            },
+        )
+        .unwrap();
+        owned
+    };
+    #[cfg(windows)]
+    let owned = {
+        let owned = write_prune_test_session(root.path(), "session-owned123", "closed", Some(100));
+        write_json_atomic(
+            &owned.join(SESSION_OWNER_FILE),
+            &NativeSessionOwner {
+                pid: std::process::id(),
+                managed_session_id: Some("session-owned123".to_owned()),
+                windows_process_identity: Some(
+                    terminal::windows_process_identity(std::process::id()).unwrap(),
+                ),
+                ..NativeSessionOwner::default()
+            },
+        )
+        .unwrap();
+        owned
+    };
+
+    let removed = prune_closed_sessions(root.path(), 500).unwrap();
+
+    assert_eq!(removed, ["session-old123"]);
+    assert!(!old.exists());
+    assert!(recent.exists());
+    assert!(live.exists());
+    assert!(claimed.exists());
+    assert!(owned.exists());
+}
+
+#[test]
+fn pruning_skips_malformed_closed_records_without_blocking_valid_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let valid = write_prune_test_session(root.path(), "session-valid123", "closed", Some(100));
+    let malformed = write_prune_test_session(root.path(), "session-broken123", "closed", Some(100));
+    fs::write(malformed.join(CLOSED_STATUS_FILE), "not-json").unwrap();
+
+    let removed = prune_closed_sessions(root.path(), 500).unwrap();
+
+    assert_eq!(removed, ["session-valid123"]);
+    assert!(!valid.exists());
+    assert!(malformed.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn pruning_never_follows_a_session_directory_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let target = write_prune_test_session(outside.path(), "session-target123", "closed", Some(100));
+    symlink(&target, root.path().join("session-link123")).unwrap();
+
+    assert!(prune_closed_sessions(root.path(), 500).unwrap().is_empty());
+    assert!(target.exists());
 }
 
 #[test]
@@ -527,15 +643,6 @@ fn internal_session_ids_cannot_escape_the_state_root() {
     assert!(!valid_session_id("session/child"));
 }
 
-#[test]
-fn hook_payload_extracts_first_party_assistant_results() {
-    let codex = serde_json::json!({ "last-assistant-message": "codex result" });
-    let claude = serde_json::json!({ "last_assistant_message": "claude result" });
-
-    assert_eq!(extract_assistant_message(&codex), Some("codex result"));
-    assert_eq!(extract_assistant_message(&claude), Some("claude result"));
-}
-
 #[cfg(target_os = "macos")]
 #[test]
 fn iterm_script_keeps_dynamic_values_in_argv() {
@@ -581,6 +688,17 @@ fn macos_cold_start_never_adopts_an_app_restored_surface() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn terminal_app_window_discovery_snapshots_and_skips_stale_window_references() {
+    let script = terminal::macos::apple_terminal::OPEN_TAB_SCRIPT;
+    assert!(script.contains("set candidateWindows to get windows"));
+    assert!(script.contains("repeat with candidateWindow in candidateWindows"));
+    assert!(script.contains("set candidateTabs to get tabs of candidateWindow"));
+    assert!(script.contains("repeat with candidateTab in candidateTabs"));
+    assert!(script.contains("try\n                set candidateTabs"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn terminal_app_actions_require_the_recorded_window_and_tty() {
     for script in [
         terminal::macos::apple_terminal::SEND_FILE_SCRIPT,
@@ -590,6 +708,28 @@ fn terminal_app_actions_require_the_recorded_window_and_tty() {
         assert!(script.contains("wantedWindowId"));
         assert!(script.contains("wantedTty"));
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn terminal_app_close_waits_for_attested_process_group_shutdown_without_key_injection() {
+    let script = terminal::macos::apple_terminal::CLOSE_TAB_SCRIPT;
+    assert!(script.contains("repeat 60 times"));
+    assert!(!script.contains("character id 3"));
+    assert!(!script.contains("do script controlC"));
+
+    assert_eq!(
+        terminal::macos::apple_terminal::process_group_signal_target(4242).unwrap(),
+        -4242
+    );
+    assert!(terminal::macos::apple_terminal::process_group_signal_target(0).is_err());
+    assert!(
+        terminal::macos::apple_terminal::process_group_signal_target(i32::MAX as u32 + 1).is_err()
+    );
+    assert_eq!(
+        terminal::macos::apple_terminal::close_signal_plan(4242, 4000).unwrap(),
+        [(-4242, libc::SIGTERM), (-4000, libc::SIGKILL)]
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -790,20 +930,6 @@ fn status_updates_replace_atomically() {
     assert_eq!(status.state, "ready");
 }
 
-#[test]
-fn claude_settings_capture_only_stop_for_the_native_session() {
-    let settings = provider::claude_hook_settings(Path::new("/opt/Agent Bridge/bin/agent-bridge"));
-    assert_eq!(
-        settings["hooks"]["Stop"][0]["hooks"][0]["command"],
-        "/opt/Agent Bridge/bin/agent-bridge"
-    );
-    assert_eq!(
-        settings["hooks"]["Stop"][0]["hooks"][0]["args"],
-        serde_json::json!(["native-hook", "claude"])
-    );
-    assert!(settings["hooks"]["PermissionRequest"].is_null());
-}
-
 #[cfg(unix)]
 #[test]
 fn shell_quoting_handles_apostrophes_without_executing_them() {
@@ -857,15 +983,6 @@ fn windows_state_root_falls_back_to_userprofile_without_home() {
     assert_eq!(
         default_state_root(None, Some(std::ffi::OsStr::new(r"C:\Users\cmd-user"))).unwrap(),
         PathBuf::from(r"C:\Users\cmd-user\.agent-bridge\native-sessions")
-    );
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_agy_brain_root_falls_back_to_userprofile_without_home() {
-    assert_eq!(
-        default_agy_brain_root(None, Some(std::ffi::OsStr::new(r"C:\Users\agy-user"))).unwrap(),
-        PathBuf::from(r"C:\Users\agy-user\.gemini\antigravity-cli\brain")
     );
 }
 
@@ -1078,11 +1195,11 @@ fn every_provider_declares_its_current_follow_up_transport() {
         );
     }
     assert_eq!(
-        provider::follow_up_transport(FirstPartyCli::Claude),
+        provider::follow_up_transport(FirstPartyCli::Claude).as_str(),
         if cfg!(windows) {
-            provider::FollowUpTransport::ProviderResumeSupervisor
+            "provider-resume-supervisor"
         } else {
-            provider::FollowUpTransport::TerminalPasteFallback
+            "provider-cross-session-message"
         }
     );
 }
@@ -1112,41 +1229,11 @@ fn every_provider_declares_its_initial_prompt_transport() {
     }
 }
 
-#[cfg(windows)]
 #[test]
-fn windows_claude_resume_plan_uses_the_official_session_id_and_print_mode() {
-    let directory = tempfile::tempdir().unwrap();
-    let executable = std::env::current_exe().unwrap();
-    let plan = provider::prepare_resume(
-        FirstPartyCli::Claude,
-        provider::ResumeContext {
-            bridge_executable: &executable,
-            directory: directory.path(),
-            provider_session_id: "claude-session-id",
-        },
-    )
-    .unwrap()
-    .unwrap();
-    let arguments = plan.arguments;
-    assert!(
-        arguments
-            .windows(2)
-            .any(|pair| pair == ["--resume", "claude-session-id"])
-    );
-    assert!(arguments.iter().any(|argument| argument == "--print"));
-    for provider in [FirstPartyCli::Codex, FirstPartyCli::Agy, FirstPartyCli::Pi] {
-        assert!(
-            provider::prepare_resume(
-                provider,
-                provider::ResumeContext {
-                    bridge_executable: &executable,
-                    directory: directory.path(),
-                    provider_session_id: "unused",
-                },
-            )
-            .unwrap()
-            .is_none()
-        );
+fn every_provider_declares_its_terminal_submission_count() {
+    assert_eq!(provider::terminal_submit_count(FirstPartyCli::Codex), 2);
+    for provider in [FirstPartyCli::Claude, FirstPartyCli::Agy, FirstPartyCli::Pi] {
+        assert_eq!(provider::terminal_submit_count(provider), 1);
     }
 }
 
@@ -1423,11 +1510,17 @@ fn terminal_owner_proof_rejects_record_only_ids_and_reused_surfaces() {
         terminal_tty_device: Some(7),
         process_start_seconds: Some(100),
         process_start_microseconds: Some(200),
+        process_group: Some(4242),
+        terminal_process_group: Some(4242),
+        terminal_shell: None,
         windows_process_identity: None,
     };
     let live = NativeProcessIdentity {
         pid: 4242,
+        parent_pid: 4000,
         terminal_tty_device: 7,
+        process_group: 4242,
+        terminal_process_group: 4242,
         process_start_seconds: 100,
         process_start_microseconds: 200,
     };
@@ -1441,6 +1534,9 @@ fn terminal_owner_proof_rejects_record_only_ids_and_reused_surfaces() {
         terminal_tty_device: None,
         process_start_seconds: None,
         process_start_microseconds: None,
+        process_group: None,
+        terminal_process_group: None,
+        terminal_shell: None,
         windows_process_identity: None,
     };
     assert!(
@@ -1484,6 +1580,104 @@ fn terminal_owner_proof_rejects_record_only_ids_and_reused_surfaces() {
         verify_terminal_owner_attestation("session-owner123", &terminal, &owner, &live, 8,)
             .is_err()
     );
+}
+
+#[test]
+fn terminal_owner_process_group_must_match_the_attested_foreground_group() {
+    let owner = NativeSessionOwner {
+        pid: 4242,
+        process_group: Some(4242),
+        terminal_process_group: Some(4242),
+        ..NativeSessionOwner::default()
+    };
+    let live = NativeProcessIdentity {
+        pid: 4242,
+        parent_pid: 4000,
+        terminal_tty_device: 7,
+        process_group: 4242,
+        terminal_process_group: 4242,
+        process_start_seconds: 100,
+        process_start_microseconds: 200,
+    };
+
+    assert_eq!(
+        verified_terminal_owner_process_group(&owner, &live).unwrap(),
+        4242
+    );
+
+    let changed_foreground_group = NativeProcessIdentity {
+        terminal_process_group: 7777,
+        ..live
+    };
+    assert!(verified_terminal_owner_process_group(&owner, &changed_foreground_group).is_err());
+
+    let missing_group = NativeSessionOwner {
+        process_group: None,
+        terminal_process_group: None,
+        ..owner
+    };
+    assert_eq!(
+        verified_terminal_owner_process_group(&missing_group, &live).unwrap(),
+        4242
+    );
+
+    let partial_group = NativeSessionOwner {
+        process_group: Some(4242),
+        terminal_process_group: None,
+        ..missing_group
+    };
+    assert!(verified_terminal_owner_process_group(&partial_group, &live).is_err());
+}
+
+#[test]
+fn terminal_shell_process_group_must_match_the_live_owner_parent_and_tty() {
+    let shell = MacTerminalShellIdentity {
+        pid: 4000,
+        process_group: 4000,
+        terminal_tty_device: 7,
+        process_start_seconds: 90,
+        process_start_microseconds: 100,
+    };
+    let owner = NativeSessionOwner {
+        pid: 4242,
+        terminal_shell: Some(shell.clone()),
+        ..NativeSessionOwner::default()
+    };
+    let live_owner = NativeProcessIdentity {
+        pid: 4242,
+        parent_pid: 4000,
+        terminal_tty_device: 7,
+        process_group: 4242,
+        terminal_process_group: 4242,
+        process_start_seconds: 100,
+        process_start_microseconds: 200,
+    };
+    let live_shell = NativeProcessIdentity {
+        pid: 4000,
+        parent_pid: 3999,
+        terminal_tty_device: 7,
+        process_group: 4000,
+        terminal_process_group: 4242,
+        process_start_seconds: 90,
+        process_start_microseconds: 100,
+    };
+
+    assert_eq!(
+        verified_terminal_shell_process_group(&owner, &live_owner, &live_shell).unwrap(),
+        4000
+    );
+
+    let wrong_tty = NativeProcessIdentity {
+        terminal_tty_device: 8,
+        ..live_shell
+    };
+    assert!(verified_terminal_shell_process_group(&owner, &live_owner, &wrong_tty).is_err());
+
+    let changed_shell = NativeProcessIdentity {
+        process_start_microseconds: 101,
+        ..live_shell
+    };
+    assert!(verified_terminal_shell_process_group(&owner, &live_owner, &changed_shell).is_err());
 }
 
 #[cfg(unix)]
@@ -1594,7 +1788,7 @@ fn claude_session_forwards_requested_model() {
     let provider = root.path().join("fake-claude");
     fs::write(
             &provider,
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '2.1.229 (Claude Code)\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" > \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/argv.txt\"\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '2.1.232 (Claude Code)\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" > \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/argv.txt\"\n",
         )
         .unwrap();
     fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1611,7 +1805,7 @@ fn claude_session_forwards_requested_model() {
             id: "session-safe123".to_owned(),
             provider: "claude".to_owned(),
             provider_path: provider,
-            provider_version: "2.1.229 (Claude Code)".to_owned(),
+            provider_version: "2.1.232 (Claude Code)".to_owned(),
             workspace,
             title: "Claude test".to_owned(),
             model: Some("Fable5".to_owned()),
@@ -1631,122 +1825,6 @@ fn claude_session_forwards_requested_model() {
     assert!(arguments.contains("--effort\nhigh"));
     assert!(arguments.contains("--settings"));
     assert!(arguments.ends_with("claude prompt\n"));
-}
-
-#[test]
-fn agy_transcript_cursor_records_each_completed_response_once() {
-    let root = tempfile::tempdir().unwrap();
-    let directory = root.path().join("session-safe123");
-    fs::create_dir(&directory).unwrap();
-    fs::create_dir(directory.join("events")).unwrap();
-    update_status(&directory, "working", None, None).unwrap();
-
-    let id = "3e166585-bc21-43b7-b3d1-dec5e67688b3";
-    let brain = root.path().join("brain");
-    let transcript_path = brain
-        .join(id)
-        .join(".system_generated")
-        .join("logs")
-        .join("transcript.jsonl");
-    fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
-    fs::write(
-            &transcript_path,
-            concat!(
-                "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":1,\"content\":\"first\"}\n",
-                "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":2,\"content\":\"still working\",\"tool_calls\":[{\"name\":\"run_command\"}]}\n",
-                "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":3,\"content\":\"short...\",\"is_truncated\":true}\n"
-            ),
-        )
-        .unwrap();
-    let mut cursor = AgyTranscriptCursor::new(transcript_path.clone());
-    cursor.poll(&directory, &brain, id).unwrap();
-    cursor.poll(&directory, &brain, id).unwrap();
-    assert_eq!(event_paths(&directory).unwrap().len(), 1);
-
-    fs::write(
-            transcript_path.with_file_name("transcript_full.jsonl"),
-            concat!(
-                "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":1,\"content\":\"first\"}\n",
-                "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":2,\"content\":\"still working\",\"tool_calls\":[{\"name\":\"run_command\"}]}\n",
-                "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":3,\"content\":\"complete long response\"}\n"
-            ),
-        )
-        .unwrap();
-    cursor.poll(&directory, &brain, id).unwrap();
-    let paths = event_paths(&directory).unwrap();
-    assert_eq!(paths.len(), 2);
-    let latest: SessionEvent = read_json(paths.last().unwrap()).unwrap();
-    assert_eq!(latest.message, "complete long response");
-
-    let mut transcript = OpenOptions::new()
-        .append(true)
-        .open(&transcript_path)
-        .unwrap();
-    writeln!(
-            transcript,
-            "{{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":4,\"content\":\"second\"}}"
-        )
-        .unwrap();
-    cursor.poll(&directory, &brain, id).unwrap();
-
-    let paths = event_paths(&directory).unwrap();
-    assert_eq!(paths.len(), 3);
-    let latest: SessionEvent = read_json(paths.last().unwrap()).unwrap();
-    assert_eq!(latest.message, "second");
-    assert_eq!(latest.provider_session_id.as_deref(), Some(id));
-    assert_eq!(latest.turn_id.as_deref(), Some("4"));
-    let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
-    assert_eq!(status.state, "ready");
-}
-
-#[test]
-fn agy_monitor_switches_to_the_newest_created_conversation() {
-    let root = tempfile::tempdir().unwrap();
-    let directory = root.path().join("session-safe123");
-    fs::create_dir(&directory).unwrap();
-    fs::create_dir(directory.join("events")).unwrap();
-    update_status(&directory, "working", None, None).unwrap();
-    let brain = root.path().join("brain");
-    let log = directory.join("agy.log");
-    let first_id = "11111111-1111-1111-1111-111111111111";
-    let second_id = "22222222-2222-2222-2222-222222222222";
-    for (id, message) in [(first_id, "before clear"), (second_id, "after clear")] {
-        let transcript = brain
-            .join(id)
-            .join(".system_generated")
-            .join("logs")
-            .join("transcript.jsonl");
-        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
-        fs::write(
-                transcript,
-                format!(
-                    "{{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":1,\"content\":{}}}\n",
-                    serde_json::to_string(message).unwrap()
-                ),
-            )
-            .unwrap();
-    }
-    fs::write(&log, format!("Created conversation {first_id}\n")).unwrap();
-    let mut monitor = AgyMonitorState::default();
-
-    monitor.poll(&directory, &log, &brain).unwrap();
-    update_status(&directory, "working", None, None).unwrap();
-    fs::write(
-        &log,
-        format!("Created conversation {first_id}\n/clear\nCreated conversation {second_id}\n"),
-    )
-    .unwrap();
-    monitor.poll(&directory, &log, &brain).unwrap();
-
-    let paths = event_paths(&directory).unwrap();
-    assert_eq!(paths.len(), 2);
-    let first: SessionEvent = read_json(&paths[0]).unwrap();
-    let second: SessionEvent = read_json(&paths[1]).unwrap();
-    assert_eq!(first.message, "before clear");
-    assert_eq!(first.provider_session_id.as_deref(), Some(first_id));
-    assert_eq!(second.message, "after clear");
-    assert_eq!(second.provider_session_id.as_deref(), Some(second_id));
-    assert_eq!(second.turn_id.as_deref(), Some("1"));
 }
 
 #[cfg(unix)]
@@ -1847,5 +1925,5 @@ fn pi_session_loads_the_result_extension_and_explicit_project_approval() {
     assert!(arguments.contains("--approve"));
     assert!(!arguments.contains("dangerously"));
     let extension = fs::read_to_string(directory.join("pi-agent-bridge.js")).unwrap();
-    assert_eq!(extension, pi_bridge_extension());
+    assert!(extension.contains("agent_settled"));
 }
