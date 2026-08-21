@@ -59,7 +59,7 @@ agent-bridge ask claude \
   --prompt "이 변경을 검토하고 결과만 요약해줘"
 ```
 
-Claude provider에서 정확한 모델 입력값 `Fable5`는 Claude Code가 요구하는 `Fable`로 변환됩니다. Pi provider에서는 정확한 입력값 `Fable`만 `anthropic/claude-fable-5`로 변환합니다. 각 provider의 다른 모델 값은 그대로 전달합니다.
+Codex provider에 Pi 형식의 `openai-codex/<model>`이 들어오면 비어 있지 않은 `<model>`을 Codex가 요구하는 bare model ID로 변환합니다. Claude provider에서 정확한 모델 입력값 `Fable5`는 Claude Code가 요구하는 `Fable`로 변환됩니다. Pi provider에서는 정확한 입력값 `Fable`만 `anthropic/claude-fable-5`로 변환합니다. 그 밖의 모델 값은 각 provider에 그대로 전달합니다.
 
 `--workspace`를 생략하면 현재 디렉터리를 사용합니다. `--title`은 사람이 읽는 세션 metadata이며 terminal surface의 제목을 설정하거나 고정하지 않습니다. Claude Code에는 정확한 cross-session 주소를 보장하기 위해 Agent Bridge의 고유 session ID를 native session name으로 전달합니다. 다른 provider는 지원 범위에 따라 title을 native name으로 사용할 수 있습니다. `--title`을 생략하면 provider와 workspace 이름으로 metadata를 만듭니다. `--model`과 `--effort`를 생략하면 각 CLI의 기존 기본값을 유지합니다. `--terminal`을 생략하면 호출 환경을 자동 감지하고, 감지 불가 시 Terminal.app을 사용합니다.
 

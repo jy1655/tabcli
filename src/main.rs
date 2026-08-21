@@ -37,10 +37,11 @@ Runtime:
   Attaching to an arbitrary CLI is not supported.
 
 Session policy:
-  --model and --effort apply only to the new child session. For Claude, the exact
-  model value Fable5 is passed to Claude Code as Fable. The exact model value
-  Fable is passed to Pi as anthropic/claude-fable-5. All other model values are
-  forwarded unchanged.
+  --model and --effort apply only to the new child session. For Codex, a non-empty
+  Pi-qualified openai-codex/<model> value is passed as the native bare <model>.
+  For Claude, the exact model value Fable5 is passed to Claude Code as Fable. The
+  exact model value Fable is passed to Pi as anthropic/claude-fable-5. All other
+  model values are forwarded unchanged.
 
   --yolo is never inherited. It is forwarded only when the ask command includes
   it and the provider has a matching option. Codex, Claude, and Agy receive their
@@ -208,6 +209,7 @@ mod tests {
             "unknown host falls back to Terminal.app",
             "Windows opens a dedicated managed",
             "PowerShell 7 console from either PowerShell or cmd",
+            "Pi-qualified openai-codex/<model> value is passed as the native bare <model>",
             "Fable5 is passed to Claude Code as Fable",
             "Fable is passed to Pi as anthropic/claude-fable-5",
             "Pi receives --approve for project-local trust",
