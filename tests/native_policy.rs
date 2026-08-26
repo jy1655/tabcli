@@ -124,6 +124,29 @@ fn each_provider_adapter_owns_its_native_effort_policy() {
 }
 
 #[test]
+fn codex_normalizes_only_pi_qualified_openai_codex_models() {
+    assert_eq!(
+        provider_model_args(FirstPartyCli::Codex, "openai-codex/gpt-5.6-sol"),
+        ["--model", "gpt-5.6-sol"]
+    );
+    assert_eq!(
+        provider_model_args(FirstPartyCli::Codex, "gpt-5.6-sol"),
+        ["--model", "gpt-5.6-sol"]
+    );
+    assert_eq!(
+        provider_model_args(FirstPartyCli::Codex, "openai-codex/"),
+        ["--model", "openai-codex/"]
+    );
+
+    for provider in [FirstPartyCli::Claude, FirstPartyCli::Agy, FirstPartyCli::Pi] {
+        assert_eq!(
+            provider_model_args(provider, "openai-codex/gpt-5.6-sol"),
+            ["--model", "openai-codex/gpt-5.6-sol"]
+        );
+    }
+}
+
+#[test]
 fn claude_normalizes_only_the_observed_fable5_model_alias() {
     assert_eq!(
         provider_model_args(FirstPartyCli::Claude, "Fable5"),

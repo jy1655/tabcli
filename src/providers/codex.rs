@@ -25,6 +25,10 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn model_args(&self, model: &str) -> Vec<String> {
+        let model = model
+            .strip_prefix("openai-codex/")
+            .filter(|model| !model.is_empty())
+            .unwrap_or(model);
         vec!["--model".to_owned(), model.to_owned()]
     }
 

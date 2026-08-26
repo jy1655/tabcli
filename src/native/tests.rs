@@ -1745,7 +1745,7 @@ fn native_session_executes_the_provider_with_policy_and_provenance() {
             provider_version: "codex-cli 0.147.0".to_owned(),
             workspace: workspace.clone(),
             title: "Codex test".to_owned(),
-            model: Some("gpt-daybreak-blue-latest".to_owned()),
+            model: Some("openai-codex/gpt-5.6-sol".to_owned()),
             effort: Some("xhigh".to_owned()),
             yolo: true,
             created_unix_ms: unix_ms(),
@@ -1762,7 +1762,8 @@ fn native_session_executes_the_provider_with_policy_and_provenance() {
 
     let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
     assert!(arguments.contains("--dangerously-bypass-approvals-and-sandbox"));
-    assert!(arguments.contains("--model\ngpt-daybreak-blue-latest"));
+    assert!(arguments.contains("--model\ngpt-5.6-sol"));
+    assert!(!arguments.contains("openai-codex/gpt-5.6-sol"));
     assert!(arguments.contains("-c\nmodel_reasoning_effort=\"xhigh\""));
     assert!(arguments.contains("notify=["));
     assert!(arguments.contains("native-hook"));
