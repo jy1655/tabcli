@@ -34,13 +34,13 @@ Windows는 PowerShell 또는 cmd에서 호출할 수 있으며 PowerShell 7(`pws
 Rust 1.97.1 이상, 지원하는 macOS 터미널 하나, 그리고 사용할 provider CLI가 필요합니다. Ghostty를 사용하면 1.3 이상이어야 합니다. 각 CLI는 먼저 직접 실행해 로그인과 초기 설정을 완료해야 합니다.
 
 ```sh
-git clone --branch v0.0.1 --depth 1 https://github.com/jy1655/agent-bridge.git
+git clone --branch v0.0.2 --depth 1 https://github.com/jy1655/agent-bridge.git
 cd agent-bridge
 cargo install --path . --locked
 agent-bridge --version
 ```
 
-마지막 명령은 `agent-bridge 0.0.1`을 출력해야 합니다. 개발 중인 `main`이 아니라 릴리스 tag에서 설치해야 설치본과 소스의 경계가 명확합니다.
+마지막 명령은 `agent-bridge 0.0.2`를 출력해야 합니다. 개발 중인 `main`이 아니라 릴리스 tag에서 설치해야 설치본과 소스의 경계가 명확합니다.
 
 Windows 명령줄 한도를 넘는 요청은 `--prompt-file`로 전달합니다. 파일은 UTF-8 텍스트로 읽으며 Agent Bridge가 원본을 삭제하거나 수정하지 않습니다.
 
@@ -143,6 +143,10 @@ src/native/tests.rs            provider-neutral native orchestration 단위 테�
 새 CLI를 추가할 때는 provider registry와 두 provider adapter를 추가하고, model/effort/권한 및 실제 결과 회수 계약을 각각 테스트합니다. 새 터미널은 해당 OS 디렉터리에 adapter를 추가하고 OS dispatcher에 등록합니다. 새 OS는 독립 디렉터리에서 같은 `detect/open_tab/send_file/close_session` 계약을 구현합니다. launch command quoting은 POSIX shell과 Windows PowerShell을 분리해 유지합니다. 공통화가 플랫폼의 native 동작을 약화한다면 플랫폼별 구현을 우선합니다.
 
 기존 `{"iterm_session_id":"..."}` 형식의 `terminal.json`은 iTerm2 세션으로 계속 읽습니다. 새 세션은 terminal-neutral한 `terminal`, `session_id`, 선택적 `tab_id`·`window_id`와 내부 `managed_session_id` binding을 기록합니다. 가시적인 terminal title은 설정하거나 ownership record에 저장하지 않습니다. Terminal.app의 추가 owner attestation은 target `native-session`이 별도 private record에 기록합니다.
+
+## 0.0.2 업데이트
+
+0.0.2는 Pi 형식의 `openai-codex/<model>`이 Codex session에 전달됐을 때 ChatGPT 계정에서 지원되지 않는 모델이라는 오류가 발생하던 문제를 수정합니다. Codex adapter만 비어 있지 않은 `openai-codex/` prefix를 제거하며, bare Codex model ID와 Claude·Agy·Pi의 model 값은 그대로 유지합니다. Windows transport 구현과 runtime 검증 상태는 0.0.1에서 변경하지 않습니다. 자세한 추적 기록은 [Issue #20](https://github.com/jy1655/agent-bridge/issues/20)에 있습니다.
 
 ## 0.0.1 마이그레이션
 
