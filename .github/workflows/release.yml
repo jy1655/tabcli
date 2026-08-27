@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "$tag_version"
+          test "$tag_version" = "$cargo_version"
+          echo "version=$tag_version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            archive: agent-bridge-${{ needs.validate.outputs.version }}-aarch64-apple-darwin.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: agent-bridge-${{ needs.validate.outputs.version }}-x86_64-pc-windows-msvc.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets --all-features
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Verify binary version
+        shell: pwsh
+        run: |
+          $suffix = if ($IsWindows) { ".exe" } else { "" }
+          $binary = Join-Path "target/${{ matrix.target }}/release" "agent-bridge$suffix"
+          $actual = & $binary --version
+          if ($actual.Trim() -ne "agent-bridge ${{ needs.validate.outputs.version }}") {
+            throw "unexpected binary version: $actual"
+          }
+      - name: Package macOS archive and checksum
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${{ matrix.archive }}"
+          tar -C "target/${{ matrix.target }}/release" -czf "$archive" agent-bridge
+          shasum -a 256 "$archive" > "$archive.sha256"
+      - name: Package Windows archive and checksum
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = "${{ matrix.archive }}"
+          Compress-Archive -LiteralPath "target/${{ matrix.target }}/release/agent-bridge.exe" -DestinationPath $archive
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          "$hash  $archive" | Set-Content -Encoding ascii -NoNewline "$archive.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: [validate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
