@@ -61,7 +61,9 @@ pub(super) fn open_tab(kind: TerminalKind, command: &str) -> Result<TerminalSess
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
-    let command_line = format!("\"{powershell_text}\" -NoLogo -NoProfile -Command \"{command}\"");
+    let console_command = console_command_line(command);
+    let command_line =
+        format!("\"{powershell_text}\" -NoLogo -NoProfile -Command \"{console_command}\"");
     let mut command_line = command_line
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -121,6 +123,10 @@ pub(super) fn open_tab(kind: TerminalKind, command: &str) -> Result<TerminalSess
         managed_session_id: None,
         windows_process_identity: Some(identity),
     })
+}
+
+fn console_command_line(command: &str) -> String {
+    format!("Remove-Item Env:TERM -ErrorAction SilentlyContinue; {command}")
 }
 
 fn console_creation_flags() -> u32 {

@@ -364,12 +364,14 @@ fn handle_correlated_stop(directory: &Path, payload: &serde_json::Value) -> Resu
     let consuming_path = directory.join(PENDING_TURN_CONSUMING_FILE);
     fs::rename(&pending_path, &consuming_path)
         .context("failed to claim the pending Claude turn result")?;
-    let result = super::super::record_provider_result(
+    let claim_token = active_windows_claim_token();
+    let result = super::super::record_provider_result_for_claim(
         directory,
         agent_bridge::FirstPartyCli::Claude,
         message,
         claude_owned_string(payload, "session_id"),
         Some(pending.request_id),
+        claim_token.as_deref(),
     );
     if let Err(error) = result {
         let _ = fs::rename(&consuming_path, &pending_path);
@@ -384,13 +386,25 @@ fn handle_uncorrelated_stop(directory: &Path, payload: &serde_json::Value) -> Re
         .map(str::trim)
         .filter(|message| !message.is_empty())
         .context("Claude Stop hook payload has no assistant result")?;
-    super::super::record_provider_result(
-        directory,
-        agent_bridge::FirstPartyCli::Claude,
-        message,
-        claude_owned_string(payload, "session_id"),
-        None,
-    )
+    let claim_token = active_windows_claim_token();
+    if let Some(claim_token) = claim_token.as_deref() {
+        super::super::record_provider_result_for_claim(
+            directory,
+            agent_bridge::FirstPartyCli::Claude,
+            message,
+            claude_owned_string(payload, "session_id"),
+            None,
+            Some(claim_token),
+        )
+    } else {
+        super::super::record_initial_provider_result(
+            directory,
+            agent_bridge::FirstPartyCli::Claude,
+            message,
+            claude_owned_string(payload, "session_id"),
+            None,
+        )
+    }
 }
 
 fn handle_stop_failure(directory: &Path, payload: &serde_json::Value) -> Result<()> {
@@ -413,14 +427,37 @@ fn handle_stop_failure(directory: &Path, payload: &serde_json::Value) -> Result<
         || format!("Claude turn failed: {error}"),
         |detail| format!("Claude turn failed: {error}: {detail}"),
     );
-    super::super::record_provider_failure(
-        directory,
-        agent_bridge::FirstPartyCli::Claude,
-        &error,
-        claude_owned_string(payload, "session_id"),
-        None,
-    )?;
+    let claim_token = active_windows_claim_token();
+    if let Some(claim_token) = claim_token.as_deref() {
+        super::super::record_provider_failure_for_claim(
+            directory,
+            agent_bridge::FirstPartyCli::Claude,
+            &error,
+            claude_owned_string(payload, "session_id"),
+            None,
+            Some(claim_token),
+        )?;
+    } else {
+        super::super::record_initial_provider_failure(
+            directory,
+            agent_bridge::FirstPartyCli::Claude,
+            &error,
+            claude_owned_string(payload, "session_id"),
+            None,
+        )?;
+    }
     Ok(())
+}
+
+fn active_windows_claim_token() -> Option<String> {
+    #[cfg(windows)]
+    {
+        std::env::var(super::super::TURN_CLAIM_TOKEN_ENV).ok()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 fn run_message_guard() -> Result<()> {
@@ -1090,6 +1127,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
         super::super::super::update_status(directory.path(), "working", None, None).unwrap();
+        let claim = super::super::super::acquire_turn_claim(directory.path()).unwrap();
+        claim.retain();
         let payload = serde_json::json!({
             "hook_event_name": "Stop",
             "session_id": "claude-session-id",
@@ -1107,6 +1146,39 @@ mod tests {
             Some("claude-session-id")
         );
         assert_eq!(event.turn_id, None);
+    }
+
+    #[test]
+    fn delayed_uncorrelated_stop_cannot_complete_a_later_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("events")).unwrap();
+        super::super::super::update_status(directory.path(), "working", None, None).unwrap();
+        let first_claim = super::super::super::acquire_turn_claim(directory.path()).unwrap();
+        first_claim.retain();
+        let payload = serde_json::json!({
+            "hook_event_name": "Stop",
+            "session_id": "claude-session-id",
+            "last_assistant_message": "initial result",
+        });
+        handle_hook(directory.path(), &payload).unwrap();
+
+        let later_claim = super::super::super::acquire_turn_claim(directory.path()).unwrap();
+        later_claim.retain();
+        super::super::super::update_status(directory.path(), "working", None, None).unwrap();
+        handle_hook(directory.path(), &payload).unwrap();
+
+        assert_eq!(
+            super::super::super::event_paths(directory.path())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            directory
+                .path()
+                .join(super::super::super::TURN_CLAIM_FILE)
+                .exists()
+        );
     }
 
     #[test]

@@ -250,10 +250,71 @@ fn provider_failures_finish_the_bridge_turn_without_reporting_success() {
 }
 
 #[test]
+fn stale_provider_completion_cannot_release_a_replacement_claim() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    let claim = acquire_turn_claim(directory.path()).unwrap();
+    claim.retain();
+
+    record_provider_result_for_claim(
+        directory.path(),
+        FirstPartyCli::Claude,
+        "stale result",
+        Some("claude-session".to_owned()),
+        None,
+        Some("stale-claim-token"),
+    )
+    .unwrap();
+
+    assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+    assert!(event_paths(directory.path()).unwrap().is_empty());
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "working");
+}
+
+#[test]
+fn duplicate_provider_turn_cannot_release_a_replacement_claim() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    let first_claim = acquire_turn_claim(directory.path()).unwrap();
+    first_claim.retain();
+    record_provider_result(
+        directory.path(),
+        FirstPartyCli::Codex,
+        "first result",
+        Some("codex-session".to_owned()),
+        Some("codex-turn".to_owned()),
+    )
+    .unwrap();
+    let replacement_claim = acquire_turn_claim(directory.path()).unwrap();
+    replacement_claim.retain();
+    update_status(directory.path(), "working", None, None).unwrap();
+
+    record_provider_result(
+        directory.path(),
+        FirstPartyCli::Codex,
+        "duplicate result",
+        Some("codex-session".to_owned()),
+        Some("codex-turn".to_owned()),
+    )
+    .unwrap();
+
+    assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+    assert_eq!(event_paths(directory.path()).unwrap().len(), 1);
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "working");
+}
+
+#[test]
 fn correlated_wait_ignores_other_completed_turns() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
-    update_status(directory.path(), "ready", None, None).unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    let claim = acquire_turn_claim(directory.path()).unwrap();
+    let claim_token = claim.token.clone();
+    claim.retain();
     for (turn_id, message) in [
         ("claude-turn-other", "other result"),
         ("claude-turn-expected", "expected result"),
@@ -271,15 +332,152 @@ fn correlated_wait_ignores_other_completed_turns() {
         )
         .unwrap();
     }
+    update_status(directory.path(), "ready", None, None).unwrap();
+    release_turn_claim(directory.path()).unwrap();
 
     let event = wait_for_event_for_turn(
         directory.path(),
         0,
         Some("claude-turn-expected"),
+        Some(&claim_token),
         Duration::from_secs(1),
     )
     .unwrap();
     assert_eq!(event.message, "expected result");
+}
+
+#[test]
+fn completed_event_is_not_published_until_the_session_is_ready() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    write_json_atomic(
+        &directory.path().join(SESSION_OWNER_FILE),
+        &NativeSessionOwner {
+            pid: std::process::id(),
+            windows_process_identity: test_windows_process_identity(std::process::id()),
+            ..NativeSessionOwner::default()
+        },
+    )
+    .unwrap();
+    write_event(
+        directory.path(),
+        &SessionEvent {
+            provider: "codex".to_owned(),
+            message: "completed result".to_owned(),
+            error: None,
+            provider_session_id: Some("codex-session".to_owned()),
+            turn_id: Some("codex-turn".to_owned()),
+            created_unix_ms: unix_ms(),
+        },
+    )
+    .unwrap();
+
+    let error = wait_for_event(directory.path(), 0, Duration::ZERO).unwrap_err();
+
+    assert!(format!("{error:#}").contains("timed out"));
+}
+
+#[test]
+fn completed_event_uses_its_own_released_claim_not_a_later_turns_claim() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    let completed_claim = acquire_turn_claim(directory.path()).unwrap();
+    let completed_token = completed_claim.token.clone();
+    write_event(
+        directory.path(),
+        &SessionEvent {
+            provider: "codex".to_owned(),
+            message: "completed result".to_owned(),
+            error: None,
+            provider_session_id: None,
+            turn_id: None,
+            created_unix_ms: unix_ms(),
+        },
+    )
+    .unwrap();
+    update_status(directory.path(), "ready", None, None).unwrap();
+    release_turn_claim(directory.path()).unwrap();
+    let later_claim = acquire_turn_claim(directory.path()).unwrap();
+    later_claim.retain();
+    update_status(directory.path(), "working", None, None).unwrap();
+
+    let event = wait_for_event_for_turn(
+        directory.path(),
+        0,
+        None,
+        Some(&completed_token),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+
+    assert_eq!(event.message, "completed result");
+}
+
+#[test]
+fn completed_event_waits_for_its_own_claim_to_be_released() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "ready", None, None).unwrap();
+    let claim = acquire_turn_claim(directory.path()).unwrap();
+    let claim_token = claim.token.clone();
+    claim.retain();
+    write_event(
+        directory.path(),
+        &SessionEvent {
+            provider: "codex".to_owned(),
+            message: "completed result".to_owned(),
+            error: None,
+            provider_session_id: None,
+            turn_id: None,
+            created_unix_ms: unix_ms(),
+        },
+    )
+    .unwrap();
+
+    let error = wait_for_event_for_turn(
+        directory.path(),
+        0,
+        None,
+        Some(&claim_token),
+        Duration::ZERO,
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("timed out"));
+}
+
+#[test]
+fn uncorrelated_wait_returns_the_first_event_after_its_baseline() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "ready", None, None).unwrap();
+    for message in ["expected turn", "later turn"] {
+        write_event(
+            directory.path(),
+            &SessionEvent {
+                provider: "codex".to_owned(),
+                message: message.to_owned(),
+                error: None,
+                provider_session_id: None,
+                turn_id: None,
+                created_unix_ms: unix_ms(),
+            },
+        )
+        .unwrap();
+    }
+
+    let event = wait_for_event(directory.path(), 0, Duration::from_secs(1)).unwrap();
+
+    assert_eq!(event.message, "expected turn");
+}
+
+#[test]
+fn supervisor_accepts_a_follow_up_queued_after_initial_completion() {
+    assert!(supervisor_initial_turn_completed("ready"));
+    assert!(supervisor_initial_turn_completed("resume-pending"));
+    assert!(!supervisor_initial_turn_completed("running"));
 }
 
 #[test]
@@ -1288,6 +1486,46 @@ fn stale_turn_claim_cannot_release_a_new_owner() {
     assert!(acquire_turn_claim(directory.path()).is_err());
     drop(current);
     assert!(acquire_turn_claim(directory.path()).is_ok());
+}
+
+#[test]
+fn claim_release_waits_for_the_lifecycle_lock_before_deleting() {
+    let directory = tempfile::tempdir().unwrap();
+    let claim = acquire_turn_claim(directory.path()).unwrap();
+    let path = directory.path().join(TURN_CLAIM_FILE);
+    let lifecycle_lock = lock_turn_claim(&path).unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+
+    let release = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        drop(claim);
+        finished_tx.send(()).unwrap();
+    });
+    started_rx.recv().unwrap();
+    assert!(finished_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+    drop(lifecycle_lock);
+    finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    release.join().unwrap();
+    assert!(!path.exists());
+}
+
+#[test]
+fn unretained_tell_claim_restores_ready_state() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "ready", None, None).unwrap();
+
+    let (claim, baseline) = acquire_ready_turn_claim(directory.path(), "session-test").unwrap();
+    assert_eq!(baseline, 0);
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "claimed");
+
+    drop(claim);
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "ready");
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
 }
 
 #[test]

@@ -447,7 +447,9 @@ fn parse_transcript_line(line: &str) -> Option<(u64, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::{SessionEvent, SessionStatus, event_paths, read_json, update_status};
+    use super::super::super::{
+        SessionEvent, SessionStatus, acquire_turn_claim, event_paths, read_json, update_status,
+    };
     use super::*;
     use std::io::Write;
 
@@ -505,6 +507,8 @@ mod tests {
         )
         .unwrap();
         let mut cursor = TranscriptCursor::new(transcript_path.clone());
+        let claim = acquire_turn_claim(&directory).unwrap();
+        claim.retain();
         cursor.poll(&directory, &brain, id).unwrap();
         cursor.poll(&directory, &brain, id).unwrap();
         assert_eq!(event_paths(&directory).unwrap().len(), 1);
@@ -518,6 +522,9 @@ mod tests {
             ),
         )
         .unwrap();
+        update_status(&directory, "working", None, None).unwrap();
+        let claim = acquire_turn_claim(&directory).unwrap();
+        claim.retain();
         cursor.poll(&directory, &brain, id).unwrap();
         let paths = event_paths(&directory).unwrap();
         assert_eq!(paths.len(), 2);
@@ -533,6 +540,9 @@ mod tests {
             "{{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":4,\"content\":\"second\"}}"
         )
         .unwrap();
+        update_status(&directory, "working", None, None).unwrap();
+        let claim = acquire_turn_claim(&directory).unwrap();
+        claim.retain();
         cursor.poll(&directory, &brain, id).unwrap();
 
         let paths = event_paths(&directory).unwrap();
@@ -575,6 +585,8 @@ mod tests {
         fs::write(&log, format!("Created conversation {first_id}\n")).unwrap();
         let mut monitor = MonitorState::default();
 
+        let claim = acquire_turn_claim(&directory).unwrap();
+        claim.retain();
         monitor.poll(&directory, &log, &brain).unwrap();
         update_status(&directory, "working", None, None).unwrap();
         fs::write(
@@ -582,6 +594,8 @@ mod tests {
             format!("Created conversation {first_id}\n/clear\nCreated conversation {second_id}\n"),
         )
         .unwrap();
+        let claim = acquire_turn_claim(&directory).unwrap();
+        claim.retain();
         monitor.poll(&directory, &log, &brain).unwrap();
 
         let paths = event_paths(&directory).unwrap();
