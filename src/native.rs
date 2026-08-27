@@ -11,7 +11,7 @@ use provider_process::{
 
 use std::{
     ffi::OsString,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::Stdio,
@@ -34,6 +34,8 @@ const SESSION_DIR_ENV: &str = "AGENT_BRIDGE_NATIVE_SESSION_DIR";
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
 const SESSION_SCHEMA: u32 = 1;
 const TURN_CLAIM_FILE: &str = "turn.claim";
+const TURN_CLAIM_LOCK_FILE: &str = "turn.claim.lock";
+const TURN_CLAIM_TOKEN_ENV: &str = "AGENT_BRIDGE_NATIVE_TURN_CLAIM_TOKEN";
 const SESSION_OWNER_FILE: &str = "native-session.json";
 const CLOSED_STATUS_FILE: &str = "closed.json";
 const TERMINAL_HANDLE_FILE: &str = "terminal.json";
@@ -699,6 +701,8 @@ fn run_ask(request: AskRequest) -> Result<()> {
         yolo: request.yolo,
         prompt: native_delegation_prompt(&delegation_source(), &request.prompt),
     })?;
+    let initial_claim = acquire_turn_claim(&created.directory)?;
+    let expected_claim_token = initial_claim.token.clone();
     let executable = std::env::current_exe().context("failed to locate agent-bridge executable")?;
     let bridge_command = bridge_shell_command(
         &created.manifest.workspace,
@@ -740,7 +744,6 @@ fn run_ask(request: AskRequest) -> Result<()> {
             request.timeout,
         )?;
         thread::sleep(provider::initial_prompt_ready_delay(request.provider));
-        let claim = acquire_turn_claim(&created.directory)?;
         let initial_prompt_path = created.directory.join("initial-prompt.txt");
         let initial_prompt = fs::read_to_string(&initial_prompt_path)
             .context("failed to read the preserved initial prompt")?;
@@ -751,18 +754,29 @@ fn run_ask(request: AskRequest) -> Result<()> {
         set_private_file_permissions(prompt_file.as_file())?;
         prompt_file.write_all(&terminal_paste_bytes(&initial_prompt))?;
         prompt_file.flush()?;
-        provider::send_initial_prompt(request.provider, &terminal_session, prompt_file.path())
-            .with_context(|| {
+        update_status(&created.directory, "working", None, None)?;
+        if let Err(error) =
+            provider::send_initial_prompt(request.provider, &terminal_session, prompt_file.path())
+        {
+            let _ = update_status(
+                &created.directory,
+                "awaiting-initial-input",
+                None,
+                Some(format!("{error:#}")),
+            );
+            return Err(error).with_context(|| {
                 format!(
                     "failed to deliver the initial prompt to {} session {}",
                     request.provider.as_str(),
                     created.id
                 )
-            })?;
+            });
+        }
+        initial_claim.retain();
         fs::remove_file(&initial_prompt_path)
             .context("failed to remove the delivered initial prompt")?;
-        update_status(&created.directory, "working", None, None)?;
-        claim.retain();
+    } else {
+        initial_claim.retain();
     }
 
     if request.detach {
@@ -775,7 +789,14 @@ fn run_ask(request: AskRequest) -> Result<()> {
         );
     }
 
-    let event = wait_for_event(&created.directory, 0, request.timeout).with_context(|| {
+    let event = wait_for_event_for_turn(
+        &created.directory,
+        0,
+        None,
+        Some(&expected_claim_token),
+        request.timeout,
+    )
+    .with_context(|| {
         format!(
             "session {} remains open in {}; use `agent-bridge sessions` to inspect it",
             created.id,
@@ -1084,12 +1105,10 @@ fn run_tell(request: TellRequest) -> Result<()> {
     let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
     let directory = session_directory(&request.id)?;
     repair_dead_native_owner(&directory)?;
-    let claim = acquire_turn_claim(&directory)?;
     let manifest = read_manifest(&directory)?;
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
     let terminal_session: terminal::TerminalSession = read_json(&directory.join("terminal.json"))?;
     verify_terminal_surface_ownership(&directory, &request.id, &terminal_session)?;
-    let baseline = event_paths(&directory)?.len();
     let previous_state = read_json::<SessionStatus>(&directory.join("status.json"))?.state;
     if !session_accepts_prompt(&previous_state) {
         bail!(
@@ -1099,6 +1118,8 @@ fn run_tell(request: TellRequest) -> Result<()> {
     }
     let prompt = native_delegation_prompt(&delegation_source(), &request.prompt);
     let follow_up_transport = provider::follow_up_transport(provider);
+    let (claim, baseline) = acquire_ready_turn_claim(&directory, &request.id)?;
+    let claim_token = claim.token.clone();
     let mut expected_turn_id = None;
     match follow_up_transport {
         provider::FollowUpTransport::TerminalPasteFallback => {
@@ -1222,15 +1243,20 @@ fn run_tell(request: TellRequest) -> Result<()> {
         return emit_session_result(request.json, &request.id, &terminal_session, provider, None);
     }
     let remaining = remaining_turn_timeout(deadline, request.timeout)?;
-    let event =
-        wait_for_event_for_turn(&directory, baseline, expected_turn_id.as_deref(), remaining)
-            .with_context(|| {
-                format!(
-                    "session {} remains open in {}; the requested turn did not report completion",
-                    request.id,
-                    terminal_session.kind.display_name()
-                )
-            })?;
+    let event = wait_for_event_for_turn(
+        &directory,
+        baseline,
+        expected_turn_id.as_deref(),
+        Some(&claim_token),
+        remaining,
+    )
+    .with_context(|| {
+        format!(
+            "session {} remains open in {}; the requested turn did not report completion",
+            request.id,
+            terminal_session.kind.display_name()
+        )
+    })?;
     emit_session_result(
         request.json,
         &request.id,
@@ -1785,7 +1811,7 @@ fn run_provider_resume_supervisor(
     fs::remove_file(&initial_prompt_path)
         .context("failed to remove the accepted initial prompt")?;
     let initial_state = read_json::<SessionStatus>(&directory.join("status.json"))?.state;
-    if initial_state != "ready" {
+    if !supervisor_initial_turn_completed(&initial_state) {
         bail!(
             "{} initial turn exited without reporting completion",
             provider.as_str()
@@ -1838,13 +1864,17 @@ fn run_provider_resume_supervisor(
             bail!("{} resume turn exited with {status}", provider.as_str());
         }
         let state = read_json::<SessionStatus>(&directory.join("status.json"))?.state;
-        if state != "ready" {
+        if !supervisor_initial_turn_completed(&state) {
             bail!(
                 "{} resume turn exited without reporting completion",
                 provider.as_str()
             );
         }
     }
+}
+
+fn supervisor_initial_turn_completed(state: &str) -> bool {
+    matches!(state, "ready" | "resume-pending")
 }
 
 fn run_provider_stdin_turn(
@@ -1856,11 +1886,14 @@ fn run_provider_stdin_turn(
     prompt: &str,
 ) -> Result<std::process::ExitStatus> {
     let mut command = provider_process_command(&manifest.provider_path, directory, arguments)?;
+    let claim_token = fs::read_to_string(directory.join(TURN_CLAIM_FILE))
+        .context("provider stdin turn is missing its claim token")?;
     let mut child = command
         .current_dir(&manifest.workspace)
         .env(SESSION_DIR_ENV, directory)
         .env("AGENT_BRIDGE_NATIVE_SESSION_ID", &manifest.id)
         .env("AGENT_BRIDGE_EXECUTABLE", executable)
+        .env(TURN_CLAIM_TOKEN_ENV, claim_token.trim())
         .stdin(Stdio::piped())
         .spawn()
         .with_context(|| {
@@ -1923,6 +1956,84 @@ fn record_provider_result(
     provider_session_id: Option<String>,
     turn_id: Option<String>,
 ) -> Result<()> {
+    record_provider_result_for_claim(
+        directory,
+        provider,
+        message,
+        provider_session_id,
+        turn_id,
+        None,
+    )
+}
+
+fn record_provider_result_for_claim(
+    directory: &Path,
+    provider: FirstPartyCli,
+    message: &str,
+    provider_session_id: Option<String>,
+    turn_id: Option<String>,
+    expected_claim_token: Option<&str>,
+) -> Result<()> {
+    record_provider_result_for_claim_condition(
+        directory,
+        provider,
+        message,
+        provider_session_id,
+        turn_id,
+        expected_claim_token,
+        false,
+    )
+}
+
+fn record_initial_provider_result(
+    directory: &Path,
+    provider: FirstPartyCli,
+    message: &str,
+    provider_session_id: Option<String>,
+    turn_id: Option<String>,
+) -> Result<()> {
+    record_provider_result_for_claim_condition(
+        directory,
+        provider,
+        message,
+        provider_session_id,
+        turn_id,
+        None,
+        true,
+    )
+}
+
+fn record_provider_result_for_claim_condition(
+    directory: &Path,
+    provider: FirstPartyCli,
+    message: &str,
+    provider_session_id: Option<String>,
+    turn_id: Option<String>,
+    expected_claim_token: Option<&str>,
+    require_no_prior_provider_event: bool,
+) -> Result<()> {
+    let expected_claim_token = match expected_claim_token {
+        Some(token) => token.to_owned(),
+        None => match current_turn_claim_token(directory)? {
+            Some(token) => token,
+            None => return Ok(()),
+        },
+    };
+    let expected_claim_token = Some(expected_claim_token.as_str());
+    let claim_path = directory.join(TURN_CLAIM_FILE);
+    let _claim_lock = lock_turn_claim(&claim_path)?;
+    if require_no_prior_provider_event && provider_has_completed_turn(directory, provider)? {
+        return Ok(());
+    }
+    if !provider_completion_is_current(
+        directory,
+        provider,
+        provider_session_id.as_deref(),
+        turn_id.as_deref(),
+        expected_claim_token,
+    )? {
+        return Ok(());
+    }
     let event = SessionEvent {
         provider: provider.as_str().to_owned(),
         message: message.to_owned(),
@@ -1933,7 +2044,7 @@ fn record_provider_result(
     };
     write_event(directory, &event)?;
     update_status(directory, "ready", None, None)?;
-    release_turn_claim(directory)
+    release_provider_completion_claim_locked(&claim_path, expected_claim_token)
 }
 
 fn record_provider_failure(
@@ -1943,6 +2054,84 @@ fn record_provider_failure(
     provider_session_id: Option<String>,
     turn_id: Option<String>,
 ) -> Result<()> {
+    record_provider_failure_for_claim(
+        directory,
+        provider,
+        error,
+        provider_session_id,
+        turn_id,
+        None,
+    )
+}
+
+fn record_provider_failure_for_claim(
+    directory: &Path,
+    provider: FirstPartyCli,
+    error: &str,
+    provider_session_id: Option<String>,
+    turn_id: Option<String>,
+    expected_claim_token: Option<&str>,
+) -> Result<()> {
+    record_provider_failure_for_claim_condition(
+        directory,
+        provider,
+        error,
+        provider_session_id,
+        turn_id,
+        expected_claim_token,
+        false,
+    )
+}
+
+fn record_initial_provider_failure(
+    directory: &Path,
+    provider: FirstPartyCli,
+    error: &str,
+    provider_session_id: Option<String>,
+    turn_id: Option<String>,
+) -> Result<()> {
+    record_provider_failure_for_claim_condition(
+        directory,
+        provider,
+        error,
+        provider_session_id,
+        turn_id,
+        None,
+        true,
+    )
+}
+
+fn record_provider_failure_for_claim_condition(
+    directory: &Path,
+    provider: FirstPartyCli,
+    error: &str,
+    provider_session_id: Option<String>,
+    turn_id: Option<String>,
+    expected_claim_token: Option<&str>,
+    require_no_prior_provider_event: bool,
+) -> Result<()> {
+    let expected_claim_token = match expected_claim_token {
+        Some(token) => token.to_owned(),
+        None => match current_turn_claim_token(directory)? {
+            Some(token) => token,
+            None => return Ok(()),
+        },
+    };
+    let expected_claim_token = Some(expected_claim_token.as_str());
+    let claim_path = directory.join(TURN_CLAIM_FILE);
+    let _claim_lock = lock_turn_claim(&claim_path)?;
+    if require_no_prior_provider_event && provider_has_completed_turn(directory, provider)? {
+        return Ok(());
+    }
+    if !provider_completion_is_current(
+        directory,
+        provider,
+        provider_session_id.as_deref(),
+        turn_id.as_deref(),
+        expected_claim_token,
+    )? {
+        return Ok(());
+    }
     let error = terminal_safe_text(error, true);
     let event = SessionEvent {
         provider: provider.as_str().to_owned(),
@@ -1954,7 +2143,75 @@ fn record_provider_failure(
     };
     write_event(directory, &event)?;
     update_status(directory, "ready", None, Some(error))?;
-    release_turn_claim(directory)
+    release_provider_completion_claim_locked(&claim_path, expected_claim_token)
+}
+
+fn provider_has_completed_turn(directory: &Path, provider: FirstPartyCli) -> Result<bool> {
+    for path in event_paths(directory)? {
+        let event: SessionEvent = read_json(&path)?;
+        if event.provider == provider.as_str() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn current_turn_claim_token(directory: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(directory.join(TURN_CLAIM_FILE)) {
+        Ok(token) => Ok(Some(token.trim().to_owned())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("failed to inspect native turn claim"),
+    }
+}
+
+fn provider_completion_is_current(
+    directory: &Path,
+    provider: FirstPartyCli,
+    provider_session_id: Option<&str>,
+    turn_id: Option<&str>,
+    expected_claim_token: Option<&str>,
+) -> Result<bool> {
+    let status: SessionStatus = read_json(&directory.join("status.json"))?;
+    if !matches!(
+        status.state.as_str(),
+        "running" | "working" | "resume-pending"
+    ) {
+        return Ok(false);
+    }
+    if let Some(expected_claim_token) = expected_claim_token {
+        let current = match fs::read_to_string(directory.join(TURN_CLAIM_FILE)) {
+            Ok(current) => current,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error).context("failed to inspect native turn claim"),
+        };
+        if current.trim() != expected_claim_token {
+            return Ok(false);
+        }
+    }
+    let Some(turn_id) = turn_id else {
+        return Ok(true);
+    };
+    for path in event_paths(directory)? {
+        let event: SessionEvent = read_json(&path)?;
+        if event.provider == provider.as_str()
+            && event.provider_session_id.as_deref() == provider_session_id
+            && event.turn_id.as_deref() == Some(turn_id)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn release_provider_completion_claim_locked(
+    claim_path: &Path,
+    expected_claim_token: Option<&str>,
+) -> Result<()> {
+    if let Some(expected_claim_token) = expected_claim_token {
+        release_turn_claim_token_locked(claim_path, expected_claim_token)
+    } else {
+        remove_turn_claim_locked(claim_path)
+    }
 }
 
 fn read_regular_text_if_present(path: &Path) -> Result<Option<String>> {
@@ -2161,6 +2418,26 @@ struct TurnClaim {
     path: PathBuf,
     token: String,
     retained: bool,
+    rollback_state: Option<&'static str>,
+}
+
+struct TurnClaimLock {
+    _file: File,
+}
+
+fn lock_turn_claim(path: &Path) -> Result<TurnClaimLock> {
+    let lock_path = path.with_file_name(TURN_CLAIM_LOCK_FILE);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open {}", lock_path.display()))?;
+    set_private_file_permissions(&file)?;
+    file.lock()
+        .with_context(|| "failed to lock native turn claim lifecycle")?;
+    Ok(TurnClaimLock { _file: file })
 }
 
 impl TurnClaim {
@@ -2172,13 +2449,57 @@ impl TurnClaim {
 impl Drop for TurnClaim {
     fn drop(&mut self) {
         if !self.retained {
-            let _ = release_turn_claim_token(&self.path, &self.token);
+            if let Some(state) = self.rollback_state {
+                let _ = rollback_turn_claim_token(&self.path, &self.token, state);
+            } else {
+                let _ = release_turn_claim_token(&self.path, &self.token);
+            }
         }
     }
 }
 
+fn rollback_turn_claim_token(path: &Path, expected_token: &str, state: &str) -> Result<()> {
+    let _lock = lock_turn_claim(path)?;
+    let current = match fs::read_to_string(path) {
+        Ok(current) => current,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("failed to inspect native turn claim"),
+    };
+    if current.trim() != expected_token {
+        return Ok(());
+    }
+    remove_turn_claim_locked(path)?;
+    let directory = path
+        .parent()
+        .context("turn claim has no session directory")?;
+    update_status(directory, state, None, None)
+}
+
 fn acquire_turn_claim(directory: &Path) -> Result<TurnClaim> {
     let path = directory.join(TURN_CLAIM_FILE);
+    let _lock = lock_turn_claim(&path)?;
+    create_turn_claim_locked(path)
+}
+
+fn acquire_ready_turn_claim(directory: &Path, session_id: &str) -> Result<(TurnClaim, usize)> {
+    let path = directory.join(TURN_CLAIM_FILE);
+    let _lock = lock_turn_claim(&path)?;
+    let state = read_json::<SessionStatus>(&directory.join("status.json"))?.state;
+    if !session_accepts_prompt(&state) {
+        bail!("session {session_id} is {state}; tell requires the ready state");
+    }
+    let baseline = event_paths(directory)?.len();
+    let mut claim = create_turn_claim_locked(path)?;
+    if let Err(error) = update_status(directory, "claimed", None, None) {
+        let _ = remove_turn_claim_locked(&claim.path);
+        claim.retain();
+        return Err(error);
+    }
+    claim.rollback_state = Some("ready");
+    Ok((claim, baseline))
+}
+
+fn create_turn_claim_locked(path: PathBuf) -> Result<TurnClaim> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -2197,10 +2518,16 @@ fn acquire_turn_claim(directory: &Path) -> Result<TurnClaim> {
         path,
         token,
         retained: false,
+        rollback_state: None,
     })
 }
 
 fn release_turn_claim_token(path: &Path, expected_token: &str) -> Result<()> {
+    let _lock = lock_turn_claim(path)?;
+    release_turn_claim_token_locked(path, expected_token)
+}
+
+fn release_turn_claim_token_locked(path: &Path, expected_token: &str) -> Result<()> {
     let token = match fs::read_to_string(path) {
         Ok(token) => token,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -2217,7 +2544,13 @@ fn release_turn_claim_token(path: &Path, expected_token: &str) -> Result<()> {
 }
 
 fn release_turn_claim(directory: &Path) -> Result<()> {
-    match fs::remove_file(directory.join(TURN_CLAIM_FILE)) {
+    let path = directory.join(TURN_CLAIM_FILE);
+    let _lock = lock_turn_claim(&path)?;
+    remove_turn_claim_locked(&path)
+}
+
+fn remove_turn_claim_locked(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).context("failed to release native turn claim"),
@@ -2366,14 +2699,16 @@ fn wait_for_status(
     }
 }
 
+#[cfg(test)]
 fn wait_for_event(directory: &Path, baseline: usize, timeout: Duration) -> Result<SessionEvent> {
-    wait_for_event_for_turn(directory, baseline, None, timeout)
+    wait_for_event_for_turn(directory, baseline, None, None, timeout)
 }
 
 fn wait_for_event_for_turn(
     directory: &Path,
     baseline: usize,
     expected_turn_id: Option<&str>,
+    expected_claim_token: Option<&str>,
     timeout: Duration,
 ) -> Result<SessionEvent> {
     let deadline = checked_deadline_from(Instant::now(), timeout)?;
@@ -2394,10 +2729,12 @@ fn wait_for_event_for_turn(
                 matched
             } else {
                 Some(read_json(
-                    candidates.last().context("event path disappeared")?,
+                    candidates.first().context("event path disappeared")?,
                 )?)
             };
-            if let Some(event) = event {
+            if let Some(event) = event
+                && turn_completion_was_published(directory, expected_claim_token)?
+            {
                 if let Some(error) = event.error.as_deref() {
                     bail!("{error}");
                 }
@@ -2417,6 +2754,21 @@ fn wait_for_event_for_turn(
         }
         thread::sleep(Duration::from_millis(200));
     }
+}
+
+fn turn_completion_was_published(
+    directory: &Path,
+    expected_claim_token: Option<&str>,
+) -> Result<bool> {
+    if let Some(expected_token) = expected_claim_token {
+        return match fs::read_to_string(directory.join(TURN_CLAIM_FILE)) {
+            Ok(current_token) => Ok(current_token.trim() != expected_token),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error).context("failed to inspect native turn claim"),
+        };
+    }
+    Ok(read_json::<SessionStatus>(&directory.join("status.json"))
+        .is_ok_and(|status| supervisor_initial_turn_completed(&status.state)))
 }
 
 fn unix_ms() -> u128 {

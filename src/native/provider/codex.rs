@@ -85,11 +85,18 @@ impl NativeProviderAdapter for CodexAdapter {
             .map(|message| message.trim())
             .filter(|message| !message.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Codex notify payload has no assistant result"))?;
+        let thread_id = codex_owned_string(payload, "thread-id");
+        if let (Some(established), Some(incoming)) =
+            (established_codex_thread(directory)?, thread_id.as_deref())
+            && established != incoming
+        {
+            return Ok(());
+        }
         super::super::record_provider_result(
             directory,
             FirstPartyCli::Codex,
             message,
-            codex_owned_string(payload, "thread-id"),
+            thread_id,
             codex_owned_string(payload, "turn-id"),
         )
     }
@@ -115,9 +122,24 @@ fn codex_owned_string(payload: &serde_json::Value, key: &str) -> Option<String> 
     codex_string(payload, key).map(str::to_owned)
 }
 
+fn established_codex_thread(directory: &Path) -> Result<Option<String>> {
+    for path in super::super::event_paths(directory)? {
+        let event: super::super::SessionEvent = super::super::read_json(&path)?;
+        if event.provider == FirstPartyCli::Codex.as_str()
+            && let Some(thread_id) = event.provider_session_id
+        {
+            return Ok(Some(thread_id));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::super::{SessionEvent, event_paths, read_json, update_status};
+    use super::super::super::{
+        SessionEvent, SessionStatus, TURN_CLAIM_FILE, acquire_turn_claim, event_paths, read_json,
+        update_status,
+    };
     use super::*;
 
     #[test]
@@ -125,6 +147,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
         update_status(directory.path(), "working", None, None).unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        claim.retain();
         let payload = serde_json::json!({
             "thread-id": "codex-thread",
             "turn-id": "codex-turn",
@@ -138,5 +162,67 @@ mod tests {
         assert_eq!(event.message, "codex result");
         assert_eq!(event.provider_session_id.as_deref(), Some("codex-thread"));
         assert_eq!(event.turn_id.as_deref(), Some("codex-turn"));
+    }
+
+    #[test]
+    fn codex_hook_ignores_notify_events_from_a_different_thread() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let initial_claim = acquire_turn_claim(directory.path()).unwrap();
+        initial_claim.retain();
+        ADAPTER
+            .handle_hook(
+                directory.path(),
+                &serde_json::json!({
+                    "thread-id": "managed-thread",
+                    "turn-id": "managed-turn-1",
+                    "last-assistant-message": "managed result",
+                }),
+            )
+            .unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        claim.retain();
+        update_status(directory.path(), "working", None, None).unwrap();
+
+        ADAPTER
+            .handle_hook(
+                directory.path(),
+                &serde_json::json!({
+                    "thread-id": "title-thread",
+                    "turn-id": "title-turn",
+                    "last-assistant-message": "{\"title\":\"Generated title\"}",
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(event_paths(directory.path()).unwrap().len(), 1);
+        assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state, "working");
+    }
+
+    #[test]
+    fn codex_hook_preserves_a_legitimate_title_shaped_result() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        claim.retain();
+
+        ADAPTER
+            .handle_hook(
+                directory.path(),
+                &serde_json::json!({
+                    "thread-id": "managed-thread",
+                    "turn-id": "managed-turn",
+                    "last-assistant-message": "{\"title\":\"Requested title\"}",
+                }),
+            )
+            .unwrap();
+
+        let paths = event_paths(directory.path()).unwrap();
+        let event: SessionEvent = read_json(&paths[0]).unwrap();
+        assert_eq!(event.message, "{\"title\":\"Requested title\"}");
     }
 }

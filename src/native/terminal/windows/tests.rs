@@ -1,11 +1,20 @@
 use super::security::private_sddl;
 use super::{
-    build_console_input_records, console_creation_flags, query_process_identity,
-    resolve_executable_from_path, verify_control_process_identity, verify_process_identity,
+    build_console_input_records, console_command_line, console_creation_flags,
+    query_process_identity, resolve_executable_from_path, verify_control_process_identity,
+    verify_process_identity,
 };
 use std::fs;
 use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
 use windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE;
+
+#[test]
+fn managed_console_removes_inherited_term_before_starting_the_bridge() {
+    let command = console_command_line("Write-Output 'bridge'");
+
+    assert!(command.contains("Remove-Item Env:TERM"));
+    assert!(command.ends_with("Write-Output 'bridge'"));
+}
 
 #[test]
 fn powershell_resolution_uses_only_absolute_path_entries() {

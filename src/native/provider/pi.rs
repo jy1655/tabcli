@@ -387,6 +387,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
         update_status(directory.path(), "working", None, None).unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        claim.retain();
         let payload = serde_json::json!({
             "session_id": "pi-session",
             "turn_id": "pi-turn",
