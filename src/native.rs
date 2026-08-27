@@ -1118,7 +1118,12 @@ fn run_tell(request: TellRequest) -> Result<()> {
     }
     let prompt = native_delegation_prompt(&delegation_source(), &request.prompt);
     let follow_up_transport = provider::follow_up_transport(provider);
-    let (claim, baseline) = acquire_ready_turn_claim(&directory, &request.id)?;
+    let (claim, baseline) = acquire_ready_turn_claim_after_claim(&directory, &request.id, || {
+        if follow_up_transport == provider::FollowUpTransport::ProviderResumeSupervisor {
+            wait_for_provider_resume_slot(&directory, deadline)?;
+        }
+        Ok(())
+    })?;
     let claim_token = claim.token.clone();
     let mut expected_turn_id = None;
     match follow_up_transport {
@@ -1264,6 +1269,45 @@ fn run_tell(request: TellRequest) -> Result<()> {
         provider,
         Some(&event),
     )
+}
+
+fn wait_for_provider_resume_slot(directory: &Path, deadline: Instant) -> Result<()> {
+    wait_for_provider_resume_slot_after_observed(directory, deadline, || {})
+}
+
+fn wait_for_provider_resume_slot_after_observed<F>(
+    directory: &Path,
+    deadline: Instant,
+    observed: F,
+) -> Result<()>
+where
+    F: FnOnce(),
+{
+    let running = directory.join(RESUME_RUNNING_FILE);
+    let mut observed = Some(observed);
+    while running.try_exists().with_context(|| {
+        format!(
+            "failed to inspect provider resume supervisor slot {}",
+            running.display()
+        )
+    })? {
+        if let Some(observed) = observed.take() {
+            observed();
+        }
+        if repair_dead_native_owner(directory)? {
+            bail!("provider resume supervisor is no longer running");
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .context("timed out waiting for the provider resume supervisor to finish")?;
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .context("timed out waiting for the provider resume supervisor to finish")?;
+    Ok(())
 }
 
 fn remaining_turn_timeout(deadline: Instant, requested: Duration) -> Result<Duration> {
@@ -1539,10 +1583,12 @@ fn close_session_state<F>(directory: &Path, mut close_terminal: F) -> Result<()>
 where
     F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
 {
+    let claim_path = directory.join(TURN_CLAIM_FILE);
+    let _turn_lock = lock_turn_claim(&claim_path)?;
     let status: SessionStatus = read_json(&directory.join("status.json"))?;
     if status.state == "closed" {
         let consume_result = consume_terminal_handle(directory, None);
-        let close_result = mark_session_closed(directory, None);
+        let close_result = mark_session_closed_locked(directory, &claim_path, None);
         consume_result?;
         return close_result;
     }
@@ -1551,7 +1597,7 @@ where
     let closing_path = directory.join(TERMINAL_CLOSING_FILE);
     if directory.join(TERMINAL_TOMBSTONE_FILE).exists() {
         let consume_result = consume_terminal_handle(directory, None);
-        let close_result = mark_session_closed(directory, None);
+        let close_result = mark_session_closed_locked(directory, &claim_path, None);
         consume_result?;
         return close_result;
     }
@@ -1561,7 +1607,7 @@ where
             if closing_path.exists() {
                 return Ok(());
             }
-            return mark_session_closed(directory, None);
+            return mark_session_closed_locked(directory, &claim_path, None);
         }
         Err(error) => {
             return Err(error).with_context(|| {
@@ -1586,7 +1632,7 @@ where
     }
 
     let consume_result = consume_terminal_handle(directory, Some(terminal.kind));
-    let close_result = mark_session_closed(directory, None);
+    let close_result = mark_session_closed_locked(directory, &claim_path, None);
     consume_result?;
     close_result
 }
@@ -1858,19 +1904,29 @@ fn run_provider_resume_supervisor(
             arguments,
             &resume.prompt,
         );
-        remove_file_if_present(&running)?;
-        let status = status?;
-        if !status.success() {
-            bail!("{} resume turn exited with {status}", provider.as_str());
-        }
-        let state = read_json::<SessionStatus>(&directory.join("status.json"))?.state;
-        if !supervisor_initial_turn_completed(&state) {
-            bail!(
-                "{} resume turn exited without reporting completion",
-                provider.as_str()
-            );
-        }
+        finish_provider_resume_turn(&running, || {
+            let status = status?;
+            if !status.success() {
+                bail!("{} resume turn exited with {status}", provider.as_str());
+            }
+            let state = read_json::<SessionStatus>(&directory.join("status.json"))?.state;
+            if !supervisor_initial_turn_completed(&state) {
+                bail!(
+                    "{} resume turn exited without reporting completion",
+                    provider.as_str()
+                );
+            }
+            Ok(())
+        })?;
     }
+}
+
+fn finish_provider_resume_turn<F>(running: &Path, completion: F) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    completion()?;
+    remove_file_if_present(running)
 }
 
 fn supervisor_initial_turn_completed(state: &str) -> bool {
@@ -2481,17 +2537,65 @@ fn acquire_turn_claim(directory: &Path) -> Result<TurnClaim> {
     create_turn_claim_locked(path)
 }
 
+#[cfg(test)]
 fn acquire_ready_turn_claim(directory: &Path, session_id: &str) -> Result<(TurnClaim, usize)> {
+    acquire_ready_turn_claim_after_claim(directory, session_id, || Ok(()))
+}
+
+fn acquire_ready_turn_claim_after_claim<F>(
+    directory: &Path,
+    session_id: &str,
+    after_claim: F,
+) -> Result<(TurnClaim, usize)>
+where
+    F: FnOnce() -> Result<()>,
+{
+    acquire_ready_turn_claim_with_callbacks(directory, session_id, after_claim, || {})
+}
+
+fn acquire_ready_turn_claim_with_callbacks<F, G>(
+    directory: &Path,
+    session_id: &str,
+    after_claim: F,
+    before_publish: G,
+) -> Result<(TurnClaim, usize)>
+where
+    F: FnOnce() -> Result<()>,
+    G: FnOnce(),
+{
     let path = directory.join(TURN_CLAIM_FILE);
+    let state = read_json::<SessionStatus>(&directory.join("status.json"))?.state;
+    if !session_accepts_prompt(&state) {
+        bail!("session {session_id} is {state}; tell requires the ready state");
+    }
+    let mut claim = {
+        let _lock = lock_turn_claim(&path)?;
+        let state = read_json::<SessionStatus>(&directory.join("status.json"))?.state;
+        if !session_accepts_prompt(&state) {
+            bail!("session {session_id} is {state}; tell requires the ready state");
+        }
+        create_turn_claim_locked(path.clone())?
+    };
+    if let Err(error) = after_claim() {
+        let _lock = lock_turn_claim(&path)?;
+        let _ = release_turn_claim_token_locked(&path, &claim.token);
+        claim.retain();
+        return Err(error);
+    }
     let _lock = lock_turn_claim(&path)?;
+    let current = fs::read_to_string(&path)
+        .with_context(|| "native turn claim disappeared before it could start")?;
+    if current.trim() != claim.token {
+        bail!("native turn claim changed before it could start");
+    }
     let state = read_json::<SessionStatus>(&directory.join("status.json"))?.state;
     if !session_accepts_prompt(&state) {
         bail!("session {session_id} is {state}; tell requires the ready state");
     }
     let baseline = event_paths(directory)?.len();
-    let mut claim = create_turn_claim_locked(path)?;
+    before_publish();
     if let Err(error) = update_status(directory, "claimed", None, None) {
-        let _ = remove_turn_claim_locked(&claim.path);
+        let _ = release_turn_claim_token_locked(&path, &claim.token);
         claim.retain();
         return Err(error);
     }
@@ -2558,6 +2662,16 @@ fn remove_turn_claim_locked(path: &Path) -> Result<()> {
 }
 
 fn mark_session_closed(directory: &Path, error: Option<String>) -> Result<()> {
+    let claim_path = directory.join(TURN_CLAIM_FILE);
+    let _lock = lock_turn_claim(&claim_path)?;
+    mark_session_closed_locked(directory, &claim_path, error)
+}
+
+fn mark_session_closed_locked(
+    directory: &Path,
+    claim_path: &Path,
+    error: Option<String>,
+) -> Result<()> {
     let consume_result = if directory.join(TERMINAL_HANDLE_FILE).exists()
         || directory.join(TERMINAL_CLOSING_FILE).exists()
     {
@@ -2566,9 +2680,19 @@ fn mark_session_closed(directory: &Path, error: Option<String>) -> Result<()> {
         Ok(())
     };
     let status_result = update_status(directory, "closed", None, error);
-    let claim_result = release_turn_claim(directory);
+    let (pending_result, running_result, claim_result) = if status_result.is_ok() {
+        (
+            remove_file_if_present(&directory.join(RESUME_PENDING_FILE)),
+            remove_file_if_present(&directory.join(RESUME_RUNNING_FILE)),
+            remove_turn_claim_locked(claim_path),
+        )
+    } else {
+        (Ok(()), Ok(()), Ok(()))
+    };
     consume_result?;
     status_result?;
+    pending_result?;
+    running_result?;
     claim_result
 }
 

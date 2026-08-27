@@ -4,7 +4,8 @@ use std::{
     ffi::OsStr,
     path::Path,
     process::{Command, Output},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(windows)]
@@ -81,6 +82,35 @@ fn required_provider_value(provider: &str, suffix: &str) -> String {
         .unwrap_or_else(|_| panic!("set {key} to a value supported by this provider/model"))
 }
 
+fn wait_for_detached_result(session: &str, minimum_results: u64, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let output = run_bridge(&[OsStr::new("sessions"), OsStr::new("--json")]);
+        assert!(
+            output.status.success(),
+            "native sessions lookup failed while waiting for detached {session}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let sessions: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let current = sessions
+            .as_array()
+            .and_then(|items| items.iter().find(|item| item["id"] == session))
+            .expect("detached native session is missing from the session registry");
+        if current["state"] == "ready"
+            && current["results"]
+                .as_u64()
+                .is_some_and(|results| results >= minimum_results)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "detached native session {session} did not become ready with {minimum_results} results: {current}"
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn cmd_environment_arguments_double_only_trailing_backslashes() {
@@ -149,6 +179,32 @@ fn run_native_adapter_smoke(provider: &str) {
         .as_str()
         .expect("native ask response is missing its session id");
 
+    let detached_marker = format!("{marker}_DETACHED");
+    let detached_prompt =
+        format!("Reply with exactly this marker and nothing else: {detached_marker}");
+    let detached_prompt_path = prompt_directory.path().join("분리 후속 prompt 입력.txt");
+    std::fs::write(&detached_prompt_path, &detached_prompt).unwrap();
+    let detached_output = run_bridge(&[
+        OsStr::new("tell"),
+        OsStr::new(session),
+        OsStr::new("--timeout-secs"),
+        OsStr::new("300"),
+        OsStr::new("--prompt-file"),
+        detached_prompt_path.as_os_str(),
+        OsStr::new("--detach"),
+        OsStr::new("--json"),
+    ]);
+    assert!(
+        detached_output.status.success(),
+        "native {provider} detached follow-up failed: {}",
+        String::from_utf8_lossy(&detached_output.stderr)
+    );
+    let detached_response: serde_json::Value =
+        serde_json::from_slice(&detached_output.stdout).unwrap();
+    assert_eq!(detached_response["session"], session);
+    assert_eq!(detached_response["result"], serde_json::Value::Null);
+    wait_for_detached_result(session, 2, Duration::from_secs(300));
+
     let follow_up_marker = format!("{marker}_FOLLOW_UP");
     let follow_up_prompt =
         format!("Reply with exactly this marker and nothing else: {follow_up_marker}");
@@ -195,6 +251,23 @@ fn run_native_adapter_smoke(provider: &str) {
     assert_eq!(close_response["ok"], true);
     assert_eq!(close_response["closed"], true);
     assert_eq!(close_response["session"], session);
+
+    let repeated_close_output = run_bridge(&[
+        OsStr::new("close-session"),
+        OsStr::new(session),
+        OsStr::new("--explicit"),
+        OsStr::new("--json"),
+    ]);
+    assert!(
+        repeated_close_output.status.success(),
+        "repeated native {provider} close failed: {}",
+        String::from_utf8_lossy(&repeated_close_output.stderr)
+    );
+    let repeated_close_response: serde_json::Value =
+        serde_json::from_slice(&repeated_close_output.stdout).unwrap();
+    assert_eq!(repeated_close_response["ok"], true);
+    assert_eq!(repeated_close_response["closed"], true);
+    assert_eq!(repeated_close_response["session"], session);
 
     let sessions_output = run_bridge(&[OsStr::new("sessions"), OsStr::new("--json")]);
     assert!(
