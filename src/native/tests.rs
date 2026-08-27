@@ -480,6 +480,262 @@ fn supervisor_accepts_a_follow_up_queued_after_initial_completion() {
     assert!(!supervisor_initial_turn_completed("running"));
 }
 
+fn write_resume_wait_owner(directory: &Path, state: &str, pid: u32) {
+    update_status(directory, state, None, None).unwrap();
+    write_json_atomic(
+        &directory.join(SESSION_OWNER_FILE),
+        &NativeSessionOwner {
+            pid,
+            windows_process_identity: test_windows_process_identity(pid),
+            ..NativeSessionOwner::default()
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn provider_resume_waits_for_the_completed_process_to_release_its_slot() {
+    let directory = tempfile::tempdir().unwrap();
+    write_resume_wait_owner(directory.path(), "ready", std::process::id());
+    let running = directory.path().join(RESUME_RUNNING_FILE);
+    fs::write(&running, "claimed").unwrap();
+    let remover = running.clone();
+    let cleanup = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(40));
+        fs::remove_file(remover).unwrap();
+    });
+
+    wait_for_provider_resume_slot(directory.path(), Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    cleanup.join().unwrap();
+}
+
+#[test]
+fn provider_resume_claim_waits_before_publishing_claimed_state() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_resume_wait_owner(directory.path(), "ready", std::process::id());
+    let running = directory.path().join(RESUME_RUNNING_FILE);
+    fs::write(&running, "claimed").unwrap();
+    let observed_directory = directory.path().to_owned();
+    let remover = running.clone();
+    let cleanup = thread::spawn(move || {
+        while !observed_directory.join(TURN_CLAIM_FILE).exists() {
+            thread::yield_now();
+        }
+        let status: SessionStatus = read_json(&observed_directory.join("status.json")).unwrap();
+        assert_eq!(status.state, "ready");
+        fs::remove_file(remover).unwrap();
+    });
+
+    let result =
+        acquire_ready_turn_claim_after_claim(directory.path(), "session-resume123", || {
+            wait_for_provider_resume_slot(directory.path(), Instant::now() + Duration::from_secs(1))
+        });
+    cleanup.join().unwrap();
+    let (_claim, _) = result.unwrap();
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "claimed");
+}
+
+#[test]
+fn provider_resume_slot_is_released_only_after_completion_validation() {
+    let directory = tempfile::tempdir().unwrap();
+    let running = directory.path().join(RESUME_RUNNING_FILE);
+    fs::write(&running, "claimed").unwrap();
+
+    finish_provider_resume_turn(&running, || {
+        assert!(running.exists());
+        Ok(())
+    })
+    .unwrap();
+
+    assert!(!running.exists());
+}
+
+#[test]
+fn failed_provider_resume_validation_keeps_the_slot_claimed() {
+    let directory = tempfile::tempdir().unwrap();
+    let running = directory.path().join(RESUME_RUNNING_FILE);
+    fs::write(&running, "claimed").unwrap();
+
+    assert!(finish_provider_resume_turn(&running, || bail!("invalid completion")).is_err());
+
+    assert!(running.exists());
+}
+
+#[test]
+fn close_during_provider_resume_wait_cannot_resurrect_the_session() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_resume_wait_owner(directory.path(), "ready", std::process::id());
+    let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+    let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+    let waiter_directory = directory.path().to_owned();
+    let waiter = thread::spawn(move || {
+        acquire_ready_turn_claim_after_claim(&waiter_directory, "session-closing123", || {
+            claimed_tx.send(()).unwrap();
+            continue_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            Ok(())
+        })
+    });
+    claimed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    mark_session_closed(directory.path(), None).unwrap();
+    continue_tx.send(()).unwrap();
+    let error = match waiter.join().unwrap() {
+        Ok(_) => panic!("closed session unexpectedly reacquired a turn"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("claim disappeared"));
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "closed");
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+}
+
+#[test]
+fn close_cannot_interleave_between_ready_validation_and_claimed_publication() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_resume_wait_owner(directory.path(), "ready", std::process::id());
+    let (publish_tx, publish_rx) = std::sync::mpsc::channel();
+    let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+    let tell_directory = directory.path().to_owned();
+    let tell = thread::spawn(move || {
+        acquire_ready_turn_claim_with_callbacks(
+            &tell_directory,
+            "session-closing123",
+            || Ok(()),
+            || {
+                publish_tx.send(()).unwrap();
+                continue_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            },
+        )
+    });
+    publish_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let close_directory = directory.path().to_owned();
+    let close = thread::spawn(move || mark_session_closed(&close_directory, None));
+
+    continue_tx.send(()).unwrap();
+    let (claim, _) = tell.join().unwrap().unwrap();
+    drop(claim);
+    close.join().unwrap().unwrap();
+
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "closed");
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+}
+
+#[test]
+fn provider_resume_slot_wait_obeys_the_turn_deadline() {
+    let directory = tempfile::tempdir().unwrap();
+    write_resume_wait_owner(directory.path(), "ready", std::process::id());
+    fs::write(directory.path().join(RESUME_RUNNING_FILE), "claimed").unwrap();
+
+    let error =
+        wait_for_provider_resume_slot(directory.path(), Instant::now() + Duration::from_millis(20))
+            .unwrap_err();
+
+    assert!(error.to_string().contains("resume supervisor"));
+}
+
+#[test]
+fn provider_resume_rejects_an_expired_deadline_after_the_slot_is_free() {
+    let directory = tempfile::tempdir().unwrap();
+
+    let error = wait_for_provider_resume_slot(
+        directory.path(),
+        Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap(),
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("resume supervisor"));
+}
+
+#[test]
+fn provider_resume_slot_repairs_a_supervisor_that_dies_during_the_wait() {
+    let directory = tempfile::tempdir().unwrap();
+    write_resume_wait_owner(directory.path(), "exited", reaped_child_pid());
+    fs::write(directory.path().join(RESUME_RUNNING_FILE), "claimed").unwrap();
+
+    let error =
+        wait_for_provider_resume_slot(directory.path(), Instant::now() + Duration::from_secs(1))
+            .unwrap_err();
+
+    assert!(error.to_string().contains("no longer running"));
+    assert!(!directory.path().join(RESUME_RUNNING_FILE).exists());
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "closed");
+}
+
+#[test]
+fn closing_a_session_publishes_closed_before_releasing_a_resume_waiter() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_resume_wait_owner(directory.path(), "ready", std::process::id());
+    fs::write(directory.path().join(RESUME_RUNNING_FILE), "claimed").unwrap();
+    let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+    let waiter_directory = directory.path().to_owned();
+    let waiter = thread::spawn(move || {
+        wait_for_provider_resume_slot_after_observed(
+            &waiter_directory,
+            Instant::now() + Duration::from_secs(1),
+            || observed_tx.send(()).unwrap(),
+        )?;
+        acquire_ready_turn_claim(&waiter_directory, "session-closing123").map(|_| ())
+    });
+    observed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    mark_session_closed(directory.path(), None).unwrap();
+    let error = waiter.join().unwrap().unwrap_err();
+
+    assert!(error.to_string().contains("closed"));
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+    assert!(!directory.path().join(RESUME_RUNNING_FILE).exists());
+}
+
+#[test]
+fn failed_closed_publication_keeps_resume_and_claim_capabilities() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_resume_wait_owner(directory.path(), "ready", std::process::id());
+    fs::write(directory.path().join(RESUME_PENDING_FILE), "pending").unwrap();
+    fs::write(directory.path().join(RESUME_RUNNING_FILE), "running").unwrap();
+    let claim = acquire_turn_claim(directory.path()).unwrap();
+    fs::remove_file(directory.path().join("status.json")).unwrap();
+    fs::create_dir(directory.path().join("status.json")).unwrap();
+
+    assert!(mark_session_closed(directory.path(), None).is_err());
+
+    assert!(directory.path().join(RESUME_PENDING_FILE).exists());
+    assert!(directory.path().join(RESUME_RUNNING_FILE).exists());
+    assert_eq!(
+        fs::read_to_string(directory.path().join(TURN_CLAIM_FILE))
+            .unwrap()
+            .trim(),
+        claim.token
+    );
+}
+
+#[test]
+fn closed_cleanup_attempts_every_capability_release() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_resume_wait_owner(directory.path(), "ready", std::process::id());
+    fs::create_dir(directory.path().join(RESUME_PENDING_FILE)).unwrap();
+    fs::write(directory.path().join(RESUME_RUNNING_FILE), "running").unwrap();
+    let claim = acquire_turn_claim(directory.path()).unwrap();
+    claim.retain();
+
+    assert!(mark_session_closed(directory.path(), None).is_err());
+
+    assert!(!directory.path().join(RESUME_RUNNING_FILE).exists());
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+}
+
 #[test]
 fn close_is_rejected_without_the_explicit_flag() {
     assert!(parse_args(["close-session", "session-safe123"]).is_err());
@@ -736,6 +992,48 @@ fn concurrent_close_requests_share_one_terminal_handle_claim() {
             .state,
         "closed"
     );
+}
+
+#[test]
+fn tell_cannot_claim_while_explicit_close_owns_the_terminal_lifecycle() {
+    use std::sync::{Arc, Barrier};
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_json_atomic(
+        &directory.path().join(TERMINAL_HANDLE_FILE),
+        &terminal::TerminalSession {
+            kind: terminal::TerminalKind::Iterm2,
+            id: "closing-before-tell".to_owned(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: None,
+            windows_process_identity: None,
+        },
+    )
+    .unwrap();
+    update_status(directory.path(), "ready", None, None).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let close_directory = directory.path().to_owned();
+    let close_barrier = Arc::clone(&barrier);
+    let close = thread::spawn(move || {
+        close_session_state(&close_directory, |_| {
+            close_barrier.wait();
+            Ok(terminal::CloseOutcome::Closed)
+        })
+    });
+
+    barrier.wait();
+    let tell_directory = directory.path().to_owned();
+    let tell = thread::spawn(move || acquire_ready_turn_claim(&tell_directory, "session-close123"));
+    close.join().unwrap().unwrap();
+    let tell_error = match tell.join().unwrap() {
+        Ok(_) => panic!("tell claimed a session while close owned its lifecycle"),
+        Err(error) => error,
+    };
+
+    assert!(tell_error.to_string().contains("closed"));
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
 }
 
 #[test]
