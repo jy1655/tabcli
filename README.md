@@ -29,9 +29,20 @@ Windows는 PowerShell 또는 cmd에서 호출할 수 있으며 PowerShell 7(`pws
 - Agy: 세션 로그와 완료 transcript
 - Pi: 세션 전용 lifecycle 확장
 
+Windows와 macOS의 사용자 기능은 같지만 provider transport는 공식 기능의 플랫폼 지원 여부에 따라 다릅니다.
+
+| Provider | macOS | native Windows |
+| --- | --- | --- |
+| Codex | provider session notify + provider-owned terminal follow-up | 동일한 provider adapter의 notify/result correlation + Windows console follow-up |
+| Claude Code | 지원 버전·backend·설정 gate를 모두 통과할 때 공식 cross-session `ListAgents`/`SendMessage` + `Stop` hook | 공식 `--print --resume <session-id>` + stdin supervisor + `Stop` hook |
+| Agy | transcript/result monitor + provider-owned terminal follow-up | 동일한 provider adapter의 transcript/result monitor + Windows console follow-up |
+| Pi | session lifecycle extension + provider-owned terminal follow-up | 동일한 provider adapter의 lifecycle extension + Windows console follow-up |
+
+Windows Claude supervisor는 Claude Code가 native Windows에 공식 cross-session messaging을 제공할 때 교체할 명시적 fallback입니다. 다른 provider의 console follow-up도 각 adapter 내부에 격리되어 있으며, bridge 공통층이 provider payload나 결과 identity를 추측하지 않습니다.
+
 ## 설치
 
-Rust 1.97.1 이상, 지원하는 macOS 터미널 하나, 그리고 사용할 provider CLI가 필요합니다. Ghostty를 사용하면 1.3 이상이어야 합니다. 각 CLI는 먼저 직접 실행해 로그인과 초기 설정을 완료해야 합니다.
+소스에서 설치할 때는 Rust 1.97.1 이상이 필요합니다. macOS에서는 지원하는 터미널 하나가 필요하고 Ghostty를 사용하면 1.3 이상이어야 합니다. Windows에서는 PowerShell 7이 필요합니다. 두 OS 모두 사용할 provider CLI를 먼저 직접 실행해 로그인과 초기 설정을 완료해야 합니다.
 
 ```sh
 git clone --branch v0.0.2 --depth 1 https://github.com/jy1655/agent-bridge.git
@@ -45,6 +56,25 @@ agent-bridge --version
 Windows 명령줄 한도를 넘는 요청은 `--prompt-file`로 전달합니다. 파일은 UTF-8 텍스트로 읽으며 Agent Bridge가 원본을 삭제하거나 수정하지 않습니다.
 
 기존 설치를 교체할 때는 `cargo install --path . --locked --force`를 사용합니다. 기본 설치 위치인 `~/.cargo/bin`이 `PATH`에 없다면 추가하거나 빌드한 바이너리를 절대 경로로 실행합니다.
+
+GitHub Release에는 Apple Silicon macOS용 `agent-bridge-<version>-aarch64-apple-darwin.tar.gz`와 64비트 Windows용 `agent-bridge-<version>-x86_64-pc-windows-msvc.zip`을 게시하며, 각 archive와 같은 이름의 `.sha256` 파일을 함께 제공합니다. prebuilt archive 설치에는 Rust가 필요하지 않습니다. archive를 푼 뒤 macOS에서는 `agent-bridge`, Windows에서는 `agent-bridge.exe`를 `PATH`에 있는 디렉터리로 옮깁니다. 다운로드한 파일은 실행 전에 체크섬을 검증하세요.
+
+```sh
+shasum -a 256 -c agent-bridge-0.0.2-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf agent-bridge-0.0.2-aarch64-apple-darwin.tar.gz
+./agent-bridge --version
+```
+
+```powershell
+$archive = "agent-bridge-0.0.2-x86_64-pc-windows-msvc.zip"
+$expected = (Get-Content "$archive.sha256").Split()[0]
+$actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "checksum mismatch" }
+Expand-Archive $archive -DestinationPath .\agent-bridge
+.\agent-bridge\agent-bridge.exe --version
+```
+
+Windows에서 Agent Bridge를 호출하는 shell은 `cmd.exe`, Windows PowerShell 5.1, PowerShell 7을 지원합니다. 어느 shell에서 호출하더라도 실제 managed console은 `PATH`의 절대 항목에서 찾은 PowerShell 7(`pwsh.exe`)로 실행되므로 PowerShell 7 설치는 필수입니다. shell별 quoting에 의존하지 않도록 긴 입력, Unicode 입력, 공백이 있는 경로는 `--prompt-file` 사용을 권장합니다.
 
 ## 사용법
 
