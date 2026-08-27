@@ -1,9 +1,75 @@
 #![cfg(any(target_os = "macos", target_os = "windows"))]
 
 use std::{
-    process::Command,
+    ffi::OsStr,
+    path::Path,
+    process::{Command, Output},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(windows)]
+fn shell_quote(value: &OsStr) -> String {
+    format!("'{}'", value.to_string_lossy().replace('\'', "''"))
+}
+
+#[cfg(windows)]
+fn cmd_environment_argument(value: &OsStr) -> String {
+    let mut value = value.to_string_lossy().into_owned();
+    let trailing_backslashes = value
+        .chars()
+        .rev()
+        .take_while(|value| *value == '\\')
+        .count();
+    value.extend(std::iter::repeat_n('\\', trailing_backslashes));
+    value
+}
+
+fn run_bridge(arguments: &[&OsStr]) -> Output {
+    let executable = Path::new(env!("CARGO_BIN_EXE_agent-bridge"));
+    #[cfg(windows)]
+    if let Ok(shell) = std::env::var("AGENT_BRIDGE_LIVE_CALLER_SHELL") {
+        let mut command = match shell.as_str() {
+            "cmd" => {
+                use std::os::windows::process::CommandExt;
+
+                let mut command = Command::new("cmd.exe");
+                command.env("AGENT_BRIDGE_LIVE_EXE", executable);
+                let mut references = Vec::with_capacity(arguments.len());
+                for (index, argument) in arguments.iter().enumerate() {
+                    assert!(!argument.to_string_lossy().contains('"'));
+                    let name = format!("AGENT_BRIDGE_LIVE_ARG_{index}");
+                    command.env(&name, cmd_environment_argument(argument));
+                    references.push(format!("\"%{name}%\""));
+                }
+                let line = format!("\"%AGENT_BRIDGE_LIVE_EXE%\" {}", references.join(" "));
+                command.args(["/d", "/v:off", "/s", "/c"]);
+                command.raw_arg(format!(" \"{line}\""));
+                command
+            }
+            "windows-powershell" | "pwsh" => {
+                let invocation =
+                    std::iter::once(format!("& {}", shell_quote(executable.as_os_str())))
+                        .chain(arguments.iter().map(|value| shell_quote(value)))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                let line = format!(
+                    "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $OutputEncoding=[Text.Encoding]::UTF8; {invocation}"
+                );
+                let program = if shell == "windows-powershell" {
+                    "powershell.exe"
+                } else {
+                    "pwsh.exe"
+                };
+                let mut command = Command::new(program);
+                command.args(["-NoLogo", "-NoProfile", "-Command", &line]);
+                command
+            }
+            other => panic!("unsupported AGENT_BRIDGE_LIVE_CALLER_SHELL: {other}"),
+        };
+        return command.output().unwrap();
+    }
+    Command::new(executable).args(arguments).output().unwrap()
+}
 
 fn required_provider_value(provider: &str, suffix: &str) -> String {
     let key = format!(
@@ -13,6 +79,20 @@ fn required_provider_value(provider: &str, suffix: &str) -> String {
     );
     std::env::var(&key)
         .unwrap_or_else(|_| panic!("set {key} to a value supported by this provider/model"))
+}
+
+#[cfg(windows)]
+#[test]
+fn cmd_environment_arguments_double_only_trailing_backslashes() {
+    assert_eq!(
+        cmd_environment_argument(OsStr::new("plain\\path")),
+        "plain\\path"
+    );
+    assert_eq!(cmd_environment_argument(OsStr::new("C:\\")), "C:\\\\");
+    assert_eq!(
+        cmd_environment_argument(OsStr::new("two\\\\")),
+        "two\\\\\\\\"
+    );
 }
 
 fn run_native_adapter_smoke(provider: &str) {
@@ -26,29 +106,38 @@ fn run_native_adapter_smoke(provider: &str) {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let title = format!("Agent Bridge live {provider} {nonce}");
+    let title = format!("Agent Bridge live {provider} {nonce} 한글");
     let prompt = format!("Reply with exactly this marker and nothing else: {marker}");
-    let selected_terminal = std::env::var("AGENT_BRIDGE_LIVE_TERMINAL").ok();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-bridge"));
-    command.args([
-        "ask",
-        provider,
-        "--workspace",
-        env!("CARGO_MANIFEST_DIR"),
-        "--title",
-        &title,
-        "--model",
-        &model,
-        "--effort",
-        &effort,
-    ]);
-    if let Some(terminal) = selected_terminal.as_deref() {
-        command.args(["--terminal", terminal]);
-    }
-    let output = command
-        .args(["--timeout-secs", "300", "--prompt", &prompt, "--json"])
-        .output()
+    let prompt_directory = tempfile::Builder::new()
+        .prefix("Agent Bridge LIVE prompts ")
+        .tempdir()
         .unwrap();
+    let initial_prompt_path = prompt_directory.path().join("초기 prompt 입력.txt");
+    std::fs::write(&initial_prompt_path, &prompt).unwrap();
+    let selected_terminal = std::env::var("AGENT_BRIDGE_LIVE_TERMINAL").ok();
+    let mut arguments = vec![
+        OsStr::new("ask"),
+        OsStr::new(provider),
+        OsStr::new("--workspace"),
+        OsStr::new(env!("CARGO_MANIFEST_DIR")),
+        OsStr::new("--title"),
+        OsStr::new(&title),
+        OsStr::new("--model"),
+        OsStr::new(&model),
+        OsStr::new("--effort"),
+        OsStr::new(&effort),
+    ];
+    if let Some(terminal) = selected_terminal.as_deref() {
+        arguments.extend([OsStr::new("--terminal"), OsStr::new(terminal)]);
+    }
+    arguments.extend([
+        OsStr::new("--timeout-secs"),
+        OsStr::new("300"),
+        OsStr::new("--prompt-file"),
+        initial_prompt_path.as_os_str(),
+        OsStr::new("--json"),
+    ]);
+    let output = run_bridge(&arguments);
     assert!(
         output.status.success(),
         "native {provider} smoke failed: {}",
@@ -63,18 +152,17 @@ fn run_native_adapter_smoke(provider: &str) {
     let follow_up_marker = format!("{marker}_FOLLOW_UP");
     let follow_up_prompt =
         format!("Reply with exactly this marker and nothing else: {follow_up_marker}");
-    let tell_output = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
-        .args([
-            "tell",
-            session,
-            "--timeout-secs",
-            "300",
-            "--prompt",
-            &follow_up_prompt,
-            "--json",
-        ])
-        .output()
-        .unwrap();
+    let follow_up_prompt_path = prompt_directory.path().join("후속 prompt 입력.txt");
+    std::fs::write(&follow_up_prompt_path, &follow_up_prompt).unwrap();
+    let tell_output = run_bridge(&[
+        OsStr::new("tell"),
+        OsStr::new(session),
+        OsStr::new("--timeout-secs"),
+        OsStr::new("300"),
+        OsStr::new("--prompt-file"),
+        follow_up_prompt_path.as_os_str(),
+        OsStr::new("--json"),
+    ]);
     assert!(
         tell_output.status.success(),
         "native {provider} follow-up failed: {}",
@@ -91,10 +179,12 @@ fn run_native_adapter_smoke(provider: &str) {
         String::from_utf8_lossy(&tell_output.stdout)
     );
 
-    let close_output = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
-        .args(["close-session", session, "--explicit", "--json"])
-        .output()
-        .unwrap();
+    let close_output = run_bridge(&[
+        OsStr::new("close-session"),
+        OsStr::new(session),
+        OsStr::new("--explicit"),
+        OsStr::new("--json"),
+    ]);
     assert!(
         close_output.status.success(),
         "native {provider} close failed: {}",
@@ -106,10 +196,7 @@ fn run_native_adapter_smoke(provider: &str) {
     assert_eq!(close_response["closed"], true);
     assert_eq!(close_response["session"], session);
 
-    let sessions_output = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
-        .args(["sessions", "--json"])
-        .output()
-        .unwrap();
+    let sessions_output = run_bridge(&[OsStr::new("sessions"), OsStr::new("--json")]);
     assert!(
         sessions_output.status.success(),
         "native sessions lookup failed after closing {session}: {}",
