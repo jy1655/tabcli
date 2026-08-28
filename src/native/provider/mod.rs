@@ -23,6 +23,7 @@ pub(super) struct LaunchPlan {
     pub(super) completion_monitor: CompletionMonitor,
 }
 
+#[derive(Clone, Copy)]
 #[cfg_attr(windows, allow(dead_code))]
 pub(super) struct CrossSessionMessageContext<'a> {
     pub(super) bridge_executable: &'a Path,
@@ -37,6 +38,7 @@ pub(super) struct CrossSessionMessageContext<'a> {
 pub(super) struct CrossSessionMessageFailure {
     error: anyhow::Error,
     delivery_may_have_occurred: bool,
+    retryable_discovery_failure: bool,
 }
 
 impl CrossSessionMessageFailure {
@@ -44,6 +46,15 @@ impl CrossSessionMessageFailure {
         Self {
             error,
             delivery_may_have_occurred: false,
+            retryable_discovery_failure: false,
+        }
+    }
+
+    pub(super) fn retryable_discovery_failure(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            delivery_may_have_occurred: false,
+            retryable_discovery_failure: true,
         }
     }
 
@@ -51,11 +62,16 @@ impl CrossSessionMessageFailure {
         Self {
             error,
             delivery_may_have_occurred: true,
+            retryable_discovery_failure: false,
         }
     }
 
     pub(super) fn delivery_may_have_occurred(&self) -> bool {
         self.delivery_may_have_occurred
+    }
+
+    pub(super) fn should_retry_discovery(&self) -> bool {
+        self.retryable_discovery_failure
     }
 
     pub(super) fn into_error(self) -> anyhow::Error {
@@ -112,6 +128,7 @@ pub(super) enum FollowUpTransport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum InitialPromptTransport {
     ProviderArgument,
+    ProviderCrossSessionMessageAfterLaunch,
     TerminalPasteAfterLaunch,
 }
 
@@ -132,6 +149,7 @@ trait NativeProviderAdapter: Sync {
         &self,
         session: &terminal::TerminalSession,
         prompt_path: &Path,
+        timeout: Duration,
     ) -> Result<()>;
     fn terminal_initial_prompt(&self, directory: &Path, prompt: &str) -> Result<String>;
     #[cfg(any(windows, test))]
@@ -148,6 +166,7 @@ trait NativeProviderAdapter: Sync {
         &self,
         session: &terminal::TerminalSession,
         prompt_path: &Path,
+        timeout: Duration,
     ) -> Result<()>;
     fn prepare_terminal_follow_up(
         &self,
@@ -195,8 +214,9 @@ pub(super) fn send_terminal_follow_up(
     provider: FirstPartyCli,
     session: &terminal::TerminalSession,
     prompt_path: &Path,
+    timeout: Duration,
 ) -> Result<()> {
-    adapter(provider).send_terminal_follow_up(session, prompt_path)
+    adapter(provider).send_terminal_follow_up(session, prompt_path, timeout)
 }
 
 pub(super) fn send_cross_session_message(
@@ -226,8 +246,9 @@ pub(super) fn send_initial_prompt(
     provider: FirstPartyCli,
     session: &terminal::TerminalSession,
     prompt_path: &Path,
+    timeout: Duration,
 ) -> Result<()> {
-    adapter(provider).send_initial_prompt(session, prompt_path)
+    adapter(provider).send_initial_prompt(session, prompt_path, timeout)
 }
 
 pub(super) fn terminal_initial_prompt(

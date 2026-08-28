@@ -28,7 +28,6 @@ pub(super) static ADAPTER: AgyAdapter = AgyAdapter;
 pub(super) struct AgyAdapter;
 
 const PENDING_TURN_FILE: &str = "agy-pending-turn.json";
-const PENDING_TURN_CONSUMING_FILE: &str = "agy-pending-turn.consuming.json";
 
 #[derive(Debug, Deserialize, Serialize)]
 struct PendingAgyTurn {
@@ -92,14 +91,15 @@ impl NativeProviderAdapter for AgyAdapter {
         &self,
         session: &terminal::TerminalSession,
         prompt_path: &Path,
+        timeout: Duration,
     ) -> Result<()> {
-        terminal::send_file(session, prompt_path)
+        terminal::send_file(session, prompt_path, timeout)
     }
 
     fn terminal_initial_prompt(&self, directory: &Path, prompt: &str) -> Result<String> {
         let pending = read_pending_turn(directory)?
             .context("Agy initial turn correlation state is missing")?;
-        Ok(correlated_prompt(prompt, &pending))
+        terminal_correlated_prompt(prompt, &pending, cfg!(windows))
     }
 
     #[cfg(any(windows, test))]
@@ -138,8 +138,9 @@ impl NativeProviderAdapter for AgyAdapter {
         &self,
         session: &terminal::TerminalSession,
         prompt_path: &Path,
+        timeout: Duration,
     ) -> Result<()> {
-        terminal::send_file(session, prompt_path)
+        terminal::send_file(session, prompt_path, timeout)
     }
 
     fn prepare_terminal_follow_up(
@@ -149,7 +150,7 @@ impl NativeProviderAdapter for AgyAdapter {
         claim_token: &str,
     ) -> Result<String> {
         let pending = install_pending_turn(directory, claim_token)?;
-        Ok(correlated_prompt(prompt, &pending))
+        terminal_correlated_prompt(prompt, &pending, cfg!(windows))
     }
 
     fn cancel_terminal_follow_up(&self, directory: &Path, claim_token: &str) -> Result<()> {
@@ -171,10 +172,7 @@ fn validate_claim_token(claim_token: &str) -> Result<()> {
 
 fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingAgyTurn> {
     let pending = PendingAgyTurn::new(claim_token)?;
-    super::super::write_private(
-        &directory.join(PENDING_TURN_FILE),
-        &serde_json::to_vec_pretty(&pending)?,
-    )?;
+    super::super::write_json_atomic(&directory.join(PENDING_TURN_FILE), &pending)?;
     Ok(pending)
 }
 
@@ -210,6 +208,21 @@ fn correlated_prompt(prompt: &str, pending: &PendingAgyTurn) -> String {
     )
 }
 
+fn terminal_correlated_prompt(
+    prompt: &str,
+    pending: &PendingAgyTurn,
+    windows: bool,
+) -> Result<String> {
+    if !windows {
+        return Ok(correlated_prompt(prompt, pending));
+    }
+    let encoded = serde_json::to_string(prompt)?;
+    Ok(format!(
+        "[Agent Bridge Agy Windows console turn protocol] Decode the following JSON string as the complete request, preserving escaped newlines and tabs. Complete it as one turn. End the complete final response with the exact marker {} on its own final line; do not alter or omit it. Request JSON: {encoded}",
+        pending.marker
+    ))
+}
+
 fn correlated_response<'a>(message: &'a str, pending: &PendingAgyTurn) -> Result<&'a str> {
     let body = message
         .trim_end()
@@ -240,13 +253,11 @@ impl AgyMonitor {
             .spawn(move || {
                 let result = monitor_session(&directory, &log_path, &brain_root, &stop_for_thread);
                 if let Err(error) = &result {
-                    let _ = super::super::update_status(
+                    let _ = super::super::record_provider_monitor_failure(
                         &error_directory,
-                        "failed",
-                        None,
-                        Some(format!("Agy result monitor failed: {error:#}")),
+                        FirstPartyCli::Agy,
+                        &format!("Agy result monitor failed: {error:#}"),
                     );
-                    let _ = super::super::release_turn_claim(&error_directory);
                 }
                 result
             })
@@ -359,23 +370,15 @@ impl TranscriptCursor {
             if let Some(pending) = read_pending_turn(directory)?
                 && let Ok(message) = correlated_response(&message, &pending)
             {
-                let pending_path = directory.join(PENDING_TURN_FILE);
-                let consuming_path = directory.join(PENDING_TURN_CONSUMING_FILE);
-                super::super::rename_session_file(&pending_path, &consuming_path)
-                    .context("failed to claim the pending Agy turn result")?;
-                let result = super::super::record_provider_result_for_claim(
+                super::super::record_provider_result_for_claim(
                     directory,
                     FirstPartyCli::Agy,
                     message,
                     Some(conversation_id.to_owned()),
                     Some(step.to_string()),
                     Some(&pending.claim_token),
-                );
-                if let Err(error) = result {
-                    let _ = super::super::rename_session_file(&consuming_path, &pending_path);
-                    return Err(error).context("failed to record the correlated Agy result");
-                }
-                let _ = super::super::remove_file_if_present(&consuming_path);
+                )
+                .context("failed to record the correlated Agy result")?;
             }
             self.greatest_result_step = Some(step);
             self.pending_results.pop_front();
@@ -584,6 +587,21 @@ mod tests {
         format!("{message}\n{}", pending.marker)
     }
 
+    #[test]
+    fn windows_console_prompt_preserves_multiline_input_without_raw_submission_keys() {
+        let pending = PendingAgyTurn::new("1-2-3").unwrap();
+        let prompt = "first line\nsecond\tcolumn";
+        let framed = terminal_correlated_prompt(prompt, &pending, true).unwrap();
+
+        assert!(
+            framed
+                .chars()
+                .all(|character| !matches!(character, '\r' | '\n' | '\t'))
+        );
+        assert!(framed.contains(&serde_json::to_string(prompt).unwrap()));
+        assert!(framed.contains(&pending.marker));
+    }
+
     fn planner_line(step: u64, content: &str) -> String {
         serde_json::json!({
             "type": "PLANNER_RESPONSE",
@@ -668,6 +686,7 @@ mod tests {
         cursor.poll(&directory, &brain, id).unwrap();
         cursor.poll(&directory, &brain, id).unwrap();
         assert_eq!(event_paths(&directory).unwrap().len(), 1);
+        assert!(directory.join(PENDING_TURN_FILE).is_file());
 
         update_status(&directory, "claimed", None, None).unwrap();
         update_status(&directory, "working", None, None).unwrap();

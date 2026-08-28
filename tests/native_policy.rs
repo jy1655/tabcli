@@ -208,3 +208,22 @@ fn terminal_output_renders_controls_as_visible_text() {
     assert!(!escaped.contains('\u{1b}'));
     assert!(!escaped.contains('\u{7}'));
 }
+
+#[test]
+fn release_publication_requires_repository_immutable_releases() {
+    let workflow = include_str!("../.github/workflows/release.yml");
+    let guard = workflow
+        .find("immutable-releases")
+        .expect("release workflow has no immutable-release preflight");
+    let publish = workflow
+        .find("gh release create")
+        .expect("release workflow has no publication step");
+
+    assert!(
+        guard < publish,
+        "immutable-release preflight runs after publish"
+    );
+    assert!(workflow.contains(".enabled == true"));
+    assert!(workflow.contains("secrets.IMMUTABLE_RELEASES_READ_TOKEN"));
+    assert!(!workflow.contains("GH_TOKEN: ${{ github.token }}\n          GH_REPO"));
+}

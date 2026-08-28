@@ -15,7 +15,6 @@ pub(super) static ADAPTER: CodexAdapter = CodexAdapter;
 pub(super) struct CodexAdapter;
 
 const PENDING_TURN_FILE: &str = "codex-pending-turn.json";
-const PENDING_TURN_CONSUMING_FILE: &str = "codex-pending-turn.consuming.json";
 
 #[derive(Debug, Deserialize, Serialize)]
 struct PendingCodexTurn {
@@ -80,8 +79,9 @@ impl NativeProviderAdapter for CodexAdapter {
         &self,
         session: &terminal::TerminalSession,
         prompt_path: &Path,
+        timeout: Duration,
     ) -> Result<()> {
-        terminal::send_file(session, prompt_path)
+        terminal::send_file(session, prompt_path, timeout)
     }
 
     fn terminal_initial_prompt(&self, directory: &Path, prompt: &str) -> Result<String> {
@@ -134,24 +134,15 @@ impl NativeProviderAdapter for CodexAdapter {
         {
             return Ok(());
         }
-        let pending_path = directory.join(PENDING_TURN_FILE);
-        let consuming_path = directory.join(PENDING_TURN_CONSUMING_FILE);
-        super::super::rename_session_file(&pending_path, &consuming_path)
-            .context("failed to claim the pending Codex turn result")?;
-        let result = super::super::record_provider_result_for_claim(
+        super::super::record_provider_result_for_claim(
             directory,
             FirstPartyCli::Codex,
             message,
             thread_id,
             codex_owned_string(payload, "turn-id"),
             Some(&pending.claim_token),
-        );
-        if let Err(error) = result {
-            let _ = super::super::rename_session_file(&consuming_path, &pending_path);
-            return Err(error).context("failed to record the correlated Codex result");
-        }
-        let _ = super::super::remove_file_if_present(&consuming_path);
-        Ok(())
+        )
+        .context("failed to record the correlated Codex result")
     }
 
     fn run_control(&self, _arguments: &[String]) -> Result<()> {
@@ -162,8 +153,9 @@ impl NativeProviderAdapter for CodexAdapter {
         &self,
         session: &terminal::TerminalSession,
         prompt_path: &Path,
+        timeout: Duration,
     ) -> Result<()> {
-        terminal::send_file(session, prompt_path)
+        terminal::send_file(session, prompt_path, timeout)
     }
 
     fn prepare_terminal_follow_up(
@@ -195,10 +187,7 @@ fn validate_claim_token(claim_token: &str) -> Result<()> {
 
 fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingCodexTurn> {
     let pending = PendingCodexTurn::new(claim_token)?;
-    super::super::write_private(
-        &directory.join(PENDING_TURN_FILE),
-        &serde_json::to_vec_pretty(&pending)?,
-    )?;
+    super::super::write_json_atomic(&directory.join(PENDING_TURN_FILE), &pending)?;
     Ok(pending)
 }
 
@@ -315,6 +304,7 @@ mod tests {
         assert_eq!(event.message, "codex result");
         assert_eq!(event.provider_session_id.as_deref(), Some("codex-thread"));
         assert_eq!(event.turn_id.as_deref(), Some("codex-turn"));
+        assert!(directory.path().join(PENDING_TURN_FILE).is_file());
     }
 
     #[test]

@@ -12,7 +12,11 @@ pub(super) fn open_tab(_kind: TerminalKind, _command: &str) -> Result<TerminalSe
     bail!("visible terminal sessions are not yet supported on Linux")
 }
 
-pub(super) fn send_file(_session: &TerminalSession, _prompt_path: &Path) -> Result<()> {
+pub(super) fn send_file(
+    _session: &TerminalSession,
+    _prompt_path: &Path,
+    _timeout: std::time::Duration,
+) -> Result<()> {
     bail!("visible terminal sessions are not yet supported on Linux")
 }
 

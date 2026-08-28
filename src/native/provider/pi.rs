@@ -25,7 +25,6 @@ pub(super) struct PiAdapter;
 
 const HOOK_FAILURE_FILE: &str = "pi-hook-failure.json";
 const PENDING_TURN_FILE: &str = "pi-pending-turn.json";
-const PENDING_TURN_CONSUMING_FILE: &str = "pi-pending-turn.consuming.json";
 
 #[derive(Debug, Deserialize, Serialize)]
 struct PendingPiTurn {
@@ -95,14 +94,15 @@ impl NativeProviderAdapter for PiAdapter {
         &self,
         session: &terminal::TerminalSession,
         prompt_path: &Path,
+        timeout: Duration,
     ) -> Result<()> {
-        terminal::send_file(session, prompt_path)
+        terminal::send_file(session, prompt_path, timeout)
     }
 
     fn terminal_initial_prompt(&self, directory: &Path, prompt: &str) -> Result<String> {
         let pending = read_pending_turn(directory)?
             .context("Pi initial turn correlation state is missing")?;
-        Ok(correlated_prompt(prompt, &pending))
+        terminal_correlated_prompt(prompt, &pending, cfg!(windows))
     }
 
     #[cfg(any(windows, test))]
@@ -157,24 +157,15 @@ impl NativeProviderAdapter for PiAdapter {
         let Ok(message) = correlated_response(raw_message, &pending) else {
             return Ok(());
         };
-        let pending_path = directory.join(PENDING_TURN_FILE);
-        let consuming_path = directory.join(PENDING_TURN_CONSUMING_FILE);
-        super::super::rename_session_file(&pending_path, &consuming_path)
-            .context("failed to claim the pending Pi turn result")?;
-        let result = super::super::record_provider_result_for_claim(
+        super::super::record_provider_result_for_claim(
             directory,
             FirstPartyCli::Pi,
             message,
             provider_session_id,
             turn_id,
             Some(&pending.claim_token),
-        );
-        if let Err(error) = result {
-            let _ = super::super::rename_session_file(&consuming_path, &pending_path);
-            return Err(error).context("failed to record the correlated Pi result");
-        }
-        let _ = super::super::remove_file_if_present(&consuming_path);
-        Ok(())
+        )
+        .context("failed to record the correlated Pi result")
     }
 
     fn run_control(&self, _arguments: &[String]) -> Result<()> {
@@ -185,8 +176,9 @@ impl NativeProviderAdapter for PiAdapter {
         &self,
         session: &terminal::TerminalSession,
         prompt_path: &Path,
+        timeout: Duration,
     ) -> Result<()> {
-        terminal::send_file(session, prompt_path)
+        terminal::send_file(session, prompt_path, timeout)
     }
 
     fn prepare_terminal_follow_up(
@@ -196,7 +188,7 @@ impl NativeProviderAdapter for PiAdapter {
         claim_token: &str,
     ) -> Result<String> {
         let pending = install_pending_turn(directory, claim_token)?;
-        Ok(correlated_prompt(prompt, &pending))
+        terminal_correlated_prompt(prompt, &pending, cfg!(windows))
     }
 
     fn cancel_terminal_follow_up(&self, directory: &Path, claim_token: &str) -> Result<()> {
@@ -218,10 +210,7 @@ fn validate_claim_token(claim_token: &str) -> Result<()> {
 
 fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingPiTurn> {
     let pending = PendingPiTurn::new(claim_token)?;
-    super::super::write_private(
-        &directory.join(PENDING_TURN_FILE),
-        &serde_json::to_vec_pretty(&pending)?,
-    )?;
+    super::super::write_json_atomic(&directory.join(PENDING_TURN_FILE), &pending)?;
     Ok(pending)
 }
 
@@ -257,6 +246,21 @@ fn correlated_prompt(prompt: &str, pending: &PendingPiTurn) -> String {
     )
 }
 
+fn terminal_correlated_prompt(
+    prompt: &str,
+    pending: &PendingPiTurn,
+    windows: bool,
+) -> Result<String> {
+    if !windows {
+        return Ok(correlated_prompt(prompt, pending));
+    }
+    let encoded = serde_json::to_string(prompt)?;
+    Ok(format!(
+        "[Agent Bridge Pi Windows console turn protocol] Decode the following JSON string as the complete request, preserving escaped newlines and tabs. Complete it as one turn. End the complete final response with the exact marker {} on its own final line; do not alter or omit it. Request JSON: {encoded}",
+        pending.marker
+    ))
+}
+
 fn correlated_response<'a>(message: &'a str, pending: &PendingPiTurn) -> Result<&'a str> {
     let body = message
         .trim_end()
@@ -276,24 +280,15 @@ fn record_correlated_failure(
     turn_id: Option<String>,
     pending: &PendingPiTurn,
 ) -> Result<()> {
-    let pending_path = directory.join(PENDING_TURN_FILE);
-    let consuming_path = directory.join(PENDING_TURN_CONSUMING_FILE);
-    super::super::rename_session_file(&pending_path, &consuming_path)
-        .context("failed to claim the pending Pi turn failure")?;
-    let result = super::super::record_provider_failure_for_claim(
+    super::super::record_provider_failure_for_claim(
         directory,
         FirstPartyCli::Pi,
         error,
         provider_session_id,
         turn_id,
         Some(&pending.claim_token),
-    );
-    if let Err(error) = result {
-        let _ = super::super::rename_session_file(&consuming_path, &pending_path);
-        return Err(error).context("failed to record the correlated Pi failure");
-    }
-    let _ = super::super::remove_file_if_present(&consuming_path);
-    Ok(())
+    )
+    .context("failed to record the correlated Pi failure")
 }
 
 fn pi_string<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -320,13 +315,11 @@ impl PiFailureMonitor {
             .spawn(move || {
                 let result = monitor_hook_failures(&directory, &stop_for_thread);
                 if let Err(error) = &result {
-                    let _ = super::super::update_status(
+                    let _ = super::super::record_provider_monitor_failure(
                         &error_directory,
-                        "failed",
-                        None,
-                        Some(format!("Pi result recovery monitor failed: {error:#}")),
+                        FirstPartyCli::Pi,
+                        &format!("Pi result recovery monitor failed: {error:#}"),
                     );
-                    let _ = super::super::release_turn_claim(&error_directory);
                 }
                 result
             })
@@ -398,7 +391,7 @@ fn consume_hook_failure(directory: &Path) -> Result<bool> {
 
 fn bridge_extension() -> &'static str {
     r#"import { spawnSync } from "node:child_process";
-	import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 function assistantText(message) {
@@ -452,7 +445,7 @@ async function deliverResult(executable, payload) {
   return { ok: false, detail: detail.slice(0, 1024) };
 }
 
-	function persistHookFailure(payload, detail) {
+function persistHookFailure(payload, detail) {
   const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
   if (!directory) return false;
   const target = join(directory, "pi-hook-failure.json");
@@ -462,10 +455,10 @@ async function deliverResult(executable, payload) {
   );
   const signal = {
     error: `Pi result delivery failed: ${detail}`,
-	    provider_session_id: payload.session_id,
-	    turn_id: payload.turn_id,
-	    claim_token: payload.agent_bridge_claim_token,
-	  };
+    provider_session_id: payload.session_id,
+    turn_id: payload.turn_id,
+    claim_token: payload.agent_bridge_claim_token,
+  };
   try {
     writeFileSync(temporary, JSON.stringify(signal), { encoding: "utf8", flag: "wx", mode: 0o600 });
     renameSync(temporary, target);
@@ -476,42 +469,42 @@ async function deliverResult(executable, payload) {
   }
 }
 
-	export default function (pi) {
-	  let pending;
-	  let undelivered = false;
-	  let activeClaimToken;
+export default function (pi) {
+  let pending;
+  let undelivered = false;
+  let activeClaimToken;
 
-	  function readActiveClaimToken() {
-	    const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
-	    if (!directory) return undefined;
-	    try {
-	      const token = readFileSync(join(directory, "turn.claim"), "utf8").trim();
-	      return token || undefined;
-	    } catch {
-	      return undefined;
-	    }
-	  }
+  function readActiveClaimToken() {
+    const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
+    if (!directory) return undefined;
+    try {
+      const token = readFileSync(join(directory, "turn.claim"), "utf8").trim();
+      return token || undefined;
+    } catch {
+      return undefined;
+    }
+  }
 
-	  pi.on("agent_start", (_event, ctx) => {
+  pi.on("agent_start", (_event, ctx) => {
     if (undelivered && pending) {
       if (!persistHookFailure(pending, "a prior result remained undelivered")) {
         ctx.ui.notify("Agent Bridge still cannot recover the previous Pi result.", "warning");
         return;
       }
       undelivered = false;
-	    }
-	    pending = undefined;
-	    activeClaimToken = readActiveClaimToken();
-	  });
+    }
+    pending = undefined;
+    activeClaimToken = readActiveClaimToken();
+  });
 
   pi.on("agent_end", (event, ctx) => {
     if (undelivered) return;
     pending = {
       ...lastAssistantOutcome(event.messages),
-	      session_id: ctx.sessionManager.getSessionId(),
-	      turn_id: ctx.sessionManager.getLeafId() ?? undefined,
-	      agent_bridge_claim_token: activeClaimToken,
-	    };
+      session_id: ctx.sessionManager.getSessionId(),
+      turn_id: ctx.sessionManager.getLeafId() ?? undefined,
+      agent_bridge_claim_token: activeClaimToken,
+    };
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
@@ -557,6 +550,21 @@ mod tests {
     }
 
     #[test]
+    fn windows_console_prompt_preserves_multiline_input_without_raw_submission_keys() {
+        let pending = PendingPiTurn::new("1-2-3").unwrap();
+        let prompt = "first line\nsecond\tcolumn";
+        let framed = terminal_correlated_prompt(prompt, &pending, true).unwrap();
+
+        assert!(
+            framed
+                .chars()
+                .all(|character| !matches!(character, '\r' | '\n' | '\t'))
+        );
+        assert!(framed.contains(&serde_json::to_string(prompt).unwrap()));
+        assert!(framed.contains(&pending.marker));
+    }
+
+    #[test]
     fn extension_reports_only_settled_results_without_changing_tool_policy() {
         let extension = bridge_extension();
 
@@ -595,6 +603,7 @@ mod tests {
         assert_eq!(event.message, "pi result");
         assert_eq!(event.provider_session_id.as_deref(), Some("pi-session"));
         assert_eq!(event.turn_id.as_deref(), Some("pi-turn"));
+        assert!(directory.path().join(PENDING_TURN_FILE).is_file());
     }
 
     #[test]

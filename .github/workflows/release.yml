@@ -144,6 +144,17 @@ jobs:
           sha256sum -c ./*.sha256
           test "$(tar -tzf agent-bridge-${{ needs.validate.outputs.version }}-aarch64-apple-darwin.tar.gz | sort | tr '\n' ' ')" = "LICENSE agent-bridge "
           test "$(unzip -Z1 agent-bridge-${{ needs.validate.outputs.version }}-x86_64-pc-windows-msvc.zip | sort | tr '\n' ' ')" = "LICENSE agent-bridge.exe "
+      - name: Require immutable releases before publication
+        env:
+          GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          gh api "repos/${GH_REPO}/immutable-releases" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            --jq 'select(.enabled == true) | .enabled' | grep -qx true
       - name: Publish verified release assets
         env:
           GH_TOKEN: ${{ github.token }}

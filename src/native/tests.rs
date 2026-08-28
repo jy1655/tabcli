@@ -29,18 +29,18 @@ fn ask_yolo_is_false_unless_the_child_request_contains_the_flag() {
 fn ask_and_tell_accept_prompt_files_without_putting_prompt_text_in_argv() {
     let directory = tempfile::tempdir().unwrap();
     let prompt_path = directory.path().join("prompt.txt");
-    fs::write(&prompt_path, "long prompt from file").unwrap();
+    fs::write(&prompt_path, "long prompt\r\nfrom file").unwrap();
     let prompt_path = prompt_path.to_string_lossy().into_owned();
 
     let ask = parse_args(["ask", "claude", "--prompt-file", &prompt_path]).unwrap();
     assert!(matches!(
         ask,
-        NativeCommand::Ask(AskRequest { prompt, .. }) if prompt == "long prompt from file"
+        NativeCommand::Ask(AskRequest { prompt, .. }) if prompt == "long prompt\nfrom file"
     ));
     let tell = parse_args(["tell", "session-file123", "--prompt-file", &prompt_path]).unwrap();
     assert!(matches!(
         tell,
-        NativeCommand::Tell(TellRequest { prompt, .. }) if prompt == "long prompt from file"
+        NativeCommand::Tell(TellRequest { prompt, .. }) if prompt == "long prompt\nfrom file"
     ));
     assert!(
         parse_args([
@@ -223,6 +223,26 @@ fn remaining_turn_timeout_rejects_an_exhausted_total_budget() {
     assert!(remaining <= Duration::from_secs(5));
 }
 
+#[cfg(unix)]
+#[test]
+fn bounded_command_output_terminates_a_hung_child_at_the_deadline() {
+    let mut command = Command::new("/bin/sh");
+    // The background child inherits stdout/stderr. A pipe-reader implementation
+    // would still block after killing only the direct shell process.
+    command.args(["-c", "sleep 1 & wait"]);
+    let started = Instant::now();
+
+    let error = command_output_until(
+        &mut command,
+        started + Duration::from_millis(100),
+        "test child",
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("test child timed out"));
+    assert!(started.elapsed() < Duration::from_millis(500));
+}
+
 #[test]
 fn initial_prompt_delay_must_fit_inside_the_original_ask_budget() {
     let deadline = Instant::now() + Duration::from_millis(20);
@@ -292,6 +312,32 @@ fn provider_failures_finish_the_bridge_turn_without_reporting_success() {
 }
 
 #[test]
+fn monitor_failures_are_journaled_against_the_current_claim() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    let claim = acquire_turn_claim(directory.path()).unwrap();
+    claim.retain();
+
+    record_provider_monitor_failure(
+        directory.path(),
+        FirstPartyCli::Pi,
+        "Pi result monitor stopped",
+    )
+    .unwrap();
+
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+    assert!(!directory.path().join(TURN_COMPLETION_FILE).exists());
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "failed");
+    assert_eq!(status.error.as_deref(), Some("Pi result monitor stopped"));
+    let paths = event_paths(directory.path()).unwrap();
+    assert_eq!(paths.len(), 1);
+    let event: SessionEvent = read_json(&paths[0]).unwrap();
+    assert_eq!(event.error.as_deref(), Some("Pi result monitor stopped"));
+}
+
+#[test]
 fn pending_completion_recovery_converges_after_every_partial_mutation() {
     for completed_mutations in 0..=3 {
         let directory = tempfile::tempdir().unwrap();
@@ -348,6 +394,19 @@ fn terminal_status_cannot_regress_and_generation_is_monotonic() {
     let stable: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
     assert_eq!(stable.state, "exited");
     assert_eq!(stable.generation, exited.generation);
+}
+
+#[test]
+fn claimed_session_can_finalize_when_the_provider_exits_before_delivery() {
+    let directory = tempfile::tempdir().unwrap();
+    update_status(directory.path(), "ready", None, None).unwrap();
+    update_status(directory.path(), "claimed", None, None).unwrap();
+
+    finalize_native_session(directory.path(), &Ok(())).unwrap();
+
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "exited");
+    assert_eq!(status.exit_code, Some(0));
 }
 
 #[test]
@@ -930,6 +989,32 @@ fn explicit_close_repairs_failed_launch_without_terminal_record() {
 }
 
 #[test]
+fn explicit_close_remains_available_with_a_corrupt_completion_journal() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    let claim = acquire_turn_claim(directory.path()).unwrap();
+    claim.retain();
+    fs::write(directory.path().join(TURN_COMPLETION_FILE), "not-json").unwrap();
+
+    close_repaired_session_state(directory.path(), |_| {
+        panic!("a missing terminal handle must not call the adapter")
+    })
+    .unwrap();
+
+    assert!(!directory.path().join(TURN_COMPLETION_FILE).exists());
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "closed");
+    assert!(
+        status
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("invalid pending native turn completion"))
+    );
+}
+
+#[test]
 fn explicit_close_consumes_the_handle_and_repeated_close_skips_the_adapter() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
@@ -1050,6 +1135,43 @@ fn concurrent_close_requests_share_one_terminal_handle_claim() {
     first.join().unwrap().unwrap();
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        read_json::<SessionStatus>(&directory.path().join("status.json"))
+            .unwrap()
+            .state,
+        "closed"
+    );
+}
+
+#[test]
+fn interrupted_terminal_close_resumes_from_the_claimed_handle() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_json_atomic(
+        &directory.path().join(TERMINAL_CLOSING_FILE),
+        &terminal::TerminalSession {
+            kind: terminal::TerminalKind::Iterm2,
+            id: "interrupted-close".to_owned(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: None,
+            windows_process_identity: None,
+        },
+    )
+    .unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    let mut calls = 0;
+
+    close_session_state(directory.path(), |session| {
+        calls += 1;
+        assert_eq!(session.id, "interrupted-close");
+        Ok(terminal::CloseOutcome::Closed)
+    })
+    .unwrap();
+
+    assert_eq!(calls, 1);
+    assert!(!directory.path().join(TERMINAL_CLOSING_FILE).exists());
+    assert!(directory.path().join(TERMINAL_TOMBSTONE_FILE).exists());
     assert_eq!(
         read_json::<SessionStatus>(&directory.path().join("status.json"))
             .unwrap()
@@ -1207,8 +1329,10 @@ fn internal_session_ids_cannot_escape_the_state_root() {
 #[test]
 fn iterm_script_keeps_dynamic_values_in_argv() {
     assert!(!terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains("review this"));
-    assert!(terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains("item 1 of argv"));
-    assert!(terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains("write text bridgeCommand"));
+    assert!(!terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains("bridgeCommand"));
+    assert!(!terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains("write text"));
+    assert!(terminal::macos::iterm2::START_SESSION_SCRIPT.contains("item 2 of argv"));
+    assert!(terminal::macos::iterm2::START_SESSION_SCRIPT.contains("write text bridgeCommand"));
 }
 
 #[cfg(target_os = "macos")]
@@ -1261,6 +1385,7 @@ fn terminal_app_window_discovery_snapshots_and_skips_stale_window_references() {
 #[test]
 fn terminal_app_actions_require_the_recorded_window_and_tty() {
     for script in [
+        terminal::macos::apple_terminal::START_SESSION_SCRIPT,
         terminal::macos::apple_terminal::SEND_FILE_SCRIPT,
         terminal::macos::apple_terminal::CLOSE_TAB_SCRIPT,
         terminal::macos::apple_terminal::WAIT_FOR_CLOSE_SCRIPT,
@@ -1268,6 +1393,8 @@ fn terminal_app_actions_require_the_recorded_window_and_tty() {
         assert!(script.contains("wantedWindowId"));
         assert!(script.contains("wantedTty"));
     }
+    assert!(terminal::macos::apple_terminal::OPEN_TAB_SCRIPT.contains("do script \"\""));
+    assert!(!terminal::macos::apple_terminal::OPEN_TAB_SCRIPT.contains("bridgeCommand"));
 }
 
 #[cfg(target_os = "macos")]
@@ -1402,6 +1529,12 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
             "/Applications/iTerm.app",
         ),
         (
+            "iTerm2 start session",
+            terminal::macos::iterm2::START_SESSION_SCRIPT,
+            "iTerm2",
+            "/Applications/iTerm.app",
+        ),
+        (
             "iTerm2 send file",
             terminal::macos::iterm2::SEND_FILE_SCRIPT,
             "iTerm2",
@@ -1422,6 +1555,12 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
         (
             "Terminal.app open tab",
             terminal::macos::apple_terminal::OPEN_TAB_SCRIPT,
+            "Terminal",
+            "/System/Applications/Utilities/Terminal.app",
+        ),
+        (
+            "Terminal.app start session",
+            terminal::macos::apple_terminal::START_SESSION_SCRIPT,
             "Terminal",
             "/System/Applications/Utilities/Terminal.app",
         ),
@@ -1494,6 +1633,12 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
         (
             "Ghostty close tab",
             terminal::macos::ghostty::CLOSE_TAB_SCRIPT,
+            "Ghostty",
+            "/Applications/Ghostty.app",
+        ),
+        (
+            "Ghostty close created tab",
+            terminal::macos::ghostty::CLOSE_CREATED_TAB_SCRIPT,
             "Ghostty",
             "/Applications/Ghostty.app",
         ),
@@ -1661,12 +1806,14 @@ fn windows_console_helper_accepts_only_managed_session_identity() {
             "send",
             "session-owner123",
             "pending-prompt-1.txt",
+            "5000",
         ])
         .unwrap(),
         NativeCommand::ConsoleControl {
             action,
             id,
             input_name: Some(input_name),
+            timeout_ms: Some(5000),
         } if action == "send" && id == "session-owner123" && input_name == "pending-prompt-1.txt"
     ));
     assert!(parse_args(["native-console-control", "close", "1234"]).is_err());
@@ -1676,8 +1823,25 @@ fn windows_console_helper_accepts_only_managed_session_identity() {
             "send",
             "session-owner123",
             "..\\outside.txt",
+            "5000",
         ])
         .is_err()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_terminal_input_requires_the_live_native_session_owner() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = current_native_session_owner("session-owner123").unwrap();
+    write_json_atomic(&directory.path().join(SESSION_OWNER_FILE), &owner).unwrap();
+
+    verified_windows_native_owner(directory.path(), "session-owner123").unwrap();
+    assert!(
+        verified_windows_native_owner(directory.path(), "session-other123")
+            .unwrap_err()
+            .to_string()
+            .contains("not bound")
     );
 }
 
@@ -1709,13 +1873,29 @@ fn bridge_shell_command_quotes_the_workspace_and_executable() {
     #[cfg(unix)]
     assert_eq!(
         command,
-        "cd '/tmp/project; touch nope' && AGENT_BRIDGE_NATIVE_STATE_DIR='/tmp/state root' '/tmp/Agent Bridge/bin' native-session 'session-safe123'"
+        "cd '/tmp/project; touch nope' && AGENT_BRIDGE_NATIVE_STATE_DIR='/tmp/state root' '/tmp/Agent Bridge/bin' native-session 'session-safe123'; bridge_status=$?; exit \"$bridge_status\""
     );
     #[cfg(windows)]
     assert_eq!(
         command,
-        "Set-Location -LiteralPath '/tmp/project; touch nope'; $env:AGENT_BRIDGE_NATIVE_STATE_DIR = '/tmp/state root'; & '/tmp/Agent Bridge/bin' native-session 'session-safe123'"
+        "Set-Location -LiteralPath '/tmp/project; touch nope' -ErrorAction Stop; $env:AGENT_BRIDGE_NATIVE_STATE_DIR = '/tmp/state root'; & '/tmp/Agent Bridge/bin' native-session 'session-safe123'; exit $LASTEXITCODE"
     );
+}
+
+#[test]
+fn managed_shell_exits_after_the_native_session_instead_of_accepting_late_input() {
+    let command = bridge_shell_command(
+        Path::new("/tmp/workspace"),
+        Path::new("/tmp/state"),
+        Path::new("/tmp/bridge"),
+        "session-safe123",
+    )
+    .unwrap();
+
+    #[cfg(unix)]
+    assert!(command.ends_with("bridge_status=$?; exit \"$bridge_status\""));
+    #[cfg(windows)]
+    assert!(command.ends_with("exit $LASTEXITCODE"));
 }
 
 #[cfg(windows)]
@@ -1812,7 +1992,7 @@ fn every_provider_declares_its_initial_prompt_transport() {
         assert_eq!(
             provider::initial_prompt_transport(provider),
             if provider == FirstPartyCli::Claude {
-                provider::InitialPromptTransport::ProviderArgument
+                provider::InitialPromptTransport::ProviderCrossSessionMessageAfterLaunch
             } else {
                 provider::InitialPromptTransport::TerminalPasteAfterLaunch
             }
@@ -1895,6 +2075,22 @@ fn windows_console_separates_codex_paste_confirmation_from_the_text_batch() {
 }
 
 #[test]
+fn windows_console_rejects_a_submit_plan_that_cannot_fit_the_remaining_budget() {
+    assert!(!terminal::windows_console_submit_delays_fit(
+        2,
+        Duration::from_secs(4)
+    ));
+    assert!(terminal::windows_console_submit_delays_fit(
+        2,
+        Duration::from_secs(5)
+    ));
+    assert!(terminal::windows_console_submit_delays_fit(
+        1,
+        Duration::from_millis(1)
+    ));
+}
+
+#[test]
 fn native_turn_claim_is_exclusive_until_the_hook_releases_it() {
     let directory = tempfile::tempdir().unwrap();
     let claim = acquire_turn_claim(directory.path()).unwrap();
@@ -1958,6 +2154,36 @@ fn unretained_tell_claim_restores_ready_state() {
     let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
     assert_eq!(status.state, "ready");
     assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+}
+
+#[test]
+fn initial_prompt_failures_distinguish_safe_abort_from_uncertain_delivery() {
+    for delivery_started in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        update_status(directory.path(), "awaiting-initial-input", None, None).unwrap();
+        let mut claim = acquire_turn_claim(directory.path()).unwrap();
+        if delivery_started {
+            update_status(directory.path(), "working", None, None).unwrap();
+        }
+
+        record_initial_prompt_delivery_failure(
+            directory.path(),
+            &mut claim,
+            delivery_started,
+            &anyhow::anyhow!("terminal delivery failed"),
+        );
+        drop(claim);
+
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        if delivery_started {
+            assert_eq!(status.state, "working");
+            assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+        } else {
+            assert_eq!(status.state, "failed");
+            assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+        }
+        assert_eq!(status.error.as_deref(), Some("terminal delivery failed"));
+    }
 }
 
 #[test]
@@ -2185,6 +2411,66 @@ fn resume_pending_dead_owner_is_repaired_instead_of_stalling() {
     assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
     let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
     assert_eq!(status.state, "closed");
+}
+
+#[test]
+fn claimed_and_awaiting_initial_input_dead_owners_are_repaired() {
+    for state in ["claimed", "awaiting-initial-input"] {
+        let directory = tempfile::tempdir().unwrap();
+        write_owned_terminal_state(directory.path(), state, reaped_child_pid());
+
+        assert!(repair_dead_native_owner(directory.path()).unwrap());
+        assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state, "closed");
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn explicit_close_allows_only_bound_ownerless_launch_failures() {
+    let session = terminal::TerminalSession {
+        kind: if cfg!(windows) {
+            terminal::TerminalKind::WindowsConsole
+        } else {
+            terminal::TerminalKind::Iterm2
+        },
+        id: "launch-surface".to_owned(),
+        tab_id: None,
+        window_id: None,
+        managed_session_id: Some("session-owner123".to_owned()),
+        windows_process_identity: None,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    update_status(
+        directory.path(),
+        "failed",
+        None,
+        Some("startup failed".to_owned()),
+    )
+    .unwrap();
+    assert!(
+        !verify_terminal_close_authority(directory.path(), "session-owner123", &session).unwrap()
+    );
+
+    let ready_directory = tempfile::tempdir().unwrap();
+    update_status(ready_directory.path(), "ready", None, None).unwrap();
+    assert!(
+        verify_terminal_close_authority(ready_directory.path(), "session-owner123", &session)
+            .is_err()
+    );
+
+    let launching_directory = tempfile::tempdir().unwrap();
+    update_status(launching_directory.path(), "launching", None, None).unwrap();
+    assert!(
+        verify_terminal_close_authority(
+            launching_directory.path(),
+            "session-different456",
+            &session,
+        )
+        .is_err()
+    );
 }
 
 #[test]

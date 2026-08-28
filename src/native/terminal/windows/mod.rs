@@ -4,6 +4,7 @@ use std::{
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -42,14 +43,20 @@ pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     }
 }
 
-pub(super) fn open_bound_tab<F>(
+pub(super) fn open_bound_tab<F, U>(
     kind: TerminalKind,
     command: &str,
+    deadline: Instant,
     bind: F,
+    unbind: U,
 ) -> Result<TerminalSession>
 where
     F: FnOnce(&mut TerminalSession) -> Result<()>,
+    U: FnOnce() -> Result<()>,
 {
+    if Instant::now() >= deadline {
+        bail!("Windows console startup timed out before launch");
+    }
     if kind != TerminalKind::WindowsConsole {
         bail!("{} is not available on Windows", kind.display_name());
     }
@@ -119,10 +126,13 @@ where
     };
     let process_handle = process.hProcess;
     let thread_handle = process.hThread;
-    let launch = super::bind_suspended_surface_before_start(
+    let launch = super::bind_surface_before_start(
         &mut session,
         bind,
         || {
+            if Instant::now() >= deadline {
+                bail!("Windows console startup timed out before process resume");
+            }
             if unsafe { ResumeThread(thread_handle) } == u32::MAX {
                 return Err(std::io::Error::last_os_error())
                     .context("failed to start the attested managed Windows console process");
@@ -131,7 +141,9 @@ where
         },
         || unsafe {
             TerminateProcess(process_handle, 1);
+            Ok(())
         },
+        unbind,
     );
     unsafe {
         CloseHandle(thread_handle);
@@ -170,15 +182,19 @@ pub(super) fn powershell_executable() -> Result<PathBuf> {
         .context("PowerShell 7 (pwsh.exe) was not found on an absolute PATH entry")
 }
 
-pub(super) fn send_file(session: &TerminalSession, prompt_path: &Path) -> Result<()> {
+pub(super) fn send_file(
+    session: &TerminalSession,
+    prompt_path: &Path,
+    timeout: Duration,
+) -> Result<()> {
     let prompt_path = prompt_path
         .to_str()
         .context("prompt path is not valid UTF-8")?;
-    run_console_helper("send", session, Some(prompt_path))
+    run_console_helper("send", session, Some(prompt_path), Some(timeout))
 }
 
 pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
-    match run_console_helper("close", session, None) {
+    match run_console_helper("close", session, None, None) {
         Ok(()) => Ok(CloseOutcome::Closed),
         Err(error) if super::windows_console_helper_reports_missing(&error.to_string()) => {
             Ok(CloseOutcome::Missing)
@@ -187,7 +203,12 @@ pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
     }
 }
 
-fn run_console_helper(action: &str, session: &TerminalSession, input: Option<&str>) -> Result<()> {
+fn run_console_helper(
+    action: &str,
+    session: &TerminalSession,
+    input: Option<&str>,
+    timeout: Option<Duration>,
+) -> Result<()> {
     let executable = std::env::current_exe().context("failed to locate agent-bridge executable")?;
     let managed_session_id = session
         .managed_session_id
@@ -201,9 +222,26 @@ fn run_console_helper(action: &str, session: &TerminalSession, input: Option<&st
             .context("prompt path has no file name")?;
         command.arg(input_name);
     }
-    let output = command
-        .output()
-        .context("failed to start Windows console control helper")?;
+    if let Some(timeout) = timeout {
+        let timeout_ms =
+            u64::try_from(timeout.as_millis()).context("Windows console timeout is too large")?;
+        command.arg(timeout_ms.to_string());
+    }
+    let output = match timeout {
+        Some(timeout) => {
+            let deadline = Instant::now()
+                .checked_add(timeout)
+                .context("Windows console helper timeout is too large")?;
+            super::super::command_output_until(
+                &mut command,
+                deadline,
+                "Windows console control helper",
+            )
+        }
+        None => command
+            .output()
+            .context("failed to start Windows console control helper"),
+    }?;
     if output.status.success() {
         return Ok(());
     }
@@ -223,6 +261,7 @@ pub(super) fn console_control(
     session: &TerminalSession,
     input_path: Option<&Path>,
     submit_count: usize,
+    timeout: Option<Duration>,
 ) -> Result<()> {
     let pid = session
         .id
@@ -249,10 +288,19 @@ pub(super) fn console_control(
     let mut console_processes = Vec::new();
     let result = match action {
         "send" => {
+            let timeout = timeout.context("send requires a console-control timeout")?;
+            if !super::windows_console_submit_delays_fit(submit_count, timeout) {
+                bail!(
+                    "Windows console submission delays do not fit inside the remaining turn timeout"
+                );
+            }
+            let deadline = Instant::now()
+                .checked_add(timeout)
+                .context("Windows console input timeout is too large")?;
             let path = input_path.context("send requires a prompt path")?;
             let input = std::fs::read_to_string(path)
                 .with_context(|| format!("failed to read prompt payload {}", path.display()))?;
-            write_console_input(&input, submit_count)
+            write_console_input(&input, submit_count, deadline)
         }
         "close" => {
             console_processes = attached_console_processes()?;
@@ -364,7 +412,7 @@ fn wait_for_console_process_exit(pid: u32, identity: &WindowsProcessIdentity) ->
     }
 }
 
-fn write_console_input(input: &str, submit_count: usize) -> Result<()> {
+fn write_console_input(input: &str, submit_count: usize, deadline: Instant) -> Result<()> {
     let console_name = "CONIN$\0".encode_utf16().collect::<Vec<_>>();
     let handle = unsafe {
         CreateFileW(
@@ -383,12 +431,20 @@ fn write_console_input(input: &str, submit_count: usize) -> Result<()> {
     }
     let result = (|| {
         let first_submit = super::windows_console_immediate_submit_count(submit_count);
+        if Instant::now() >= deadline {
+            bail!("Windows console input timed out before delivery");
+        }
         write_input_records(handle, &build_console_input_records(input, first_submit))?;
         for _ in first_submit..submit_count {
             // Codex detects the fast synthetic text batch as a paste. Keep both
             // its confirmation Return and later submission Return out of that
             // batch so processing speed cannot decide which action they perform.
-            std::thread::sleep(super::windows_console_extra_submit_delay());
+            let delay = super::windows_console_extra_submit_delay();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if delay >= remaining {
+                bail!("Windows console input timed out before the next submission Return");
+            }
+            std::thread::sleep(delay);
             write_input_records(handle, &build_console_input_records("", 1))?;
         }
         Ok(())
