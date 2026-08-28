@@ -52,7 +52,7 @@ impl NativeProviderAdapter for CodexAdapter {
             OsString::from("-c"),
             OsString::from(format!("notify={notify}")),
             OsString::from("-C"),
-            context.workspace.as_os_str().to_owned(),
+            codex_workspace_argument(context.workspace, cfg!(windows)),
         ];
         if !cfg!(windows) {
             arguments.push(OsString::from(correlated_prompt(context.prompt, &pending)));
@@ -177,6 +177,27 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 }
 
+fn codex_workspace_argument(workspace: &Path, windows: bool) -> OsString {
+    if !windows {
+        return workspace.as_os_str().to_owned();
+    }
+    let workspace = workspace.as_os_str().to_string_lossy();
+    if let Some(path) = workspace.strip_prefix(r"\\?\UNC\") {
+        return OsString::from(format!(r"\\{path}"));
+    }
+    if let Some(path) = workspace.strip_prefix(r"\\?\") {
+        let bytes = path.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'\\'
+        {
+            return OsString::from(path);
+        }
+    }
+    OsString::from(workspace.as_ref())
+}
+
 fn validate_claim_token(claim_token: &str) -> Result<()> {
     if claim_token.is_empty()
         || claim_token.len() > 160
@@ -287,6 +308,30 @@ mod tests {
 
     fn marked(message: &str, pending: &PendingCodexTurn) -> String {
         format!("{message}\n{}", pending.marker)
+    }
+
+    #[test]
+    fn windows_codex_workspace_argument_removes_only_the_verbatim_prefix() {
+        assert_eq!(
+            codex_workspace_argument(Path::new(r"\\?\C:\repo"), true),
+            OsString::from(r"C:\repo")
+        );
+        assert_eq!(
+            codex_workspace_argument(Path::new(r"\\?\UNC\server\share\repo"), true),
+            OsString::from(r"\\server\share\repo")
+        );
+        assert_eq!(
+            codex_workspace_argument(Path::new(r"C:\repo"), true),
+            OsString::from(r"C:\repo")
+        );
+        assert_eq!(
+            codex_workspace_argument(Path::new(r"\\?\C:\repo"), false),
+            OsString::from(r"\\?\C:\repo")
+        );
+        assert_eq!(
+            codex_workspace_argument(Path::new(r"\\?\Volume{safe}\repo"), true),
+            OsString::from(r"\\?\Volume{safe}\repo")
+        );
     }
 
     #[test]
