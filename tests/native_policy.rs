@@ -213,17 +213,19 @@ fn terminal_output_renders_controls_as_visible_text() {
 fn release_publication_requires_repository_immutable_releases() {
     let workflow = include_str!("../.github/workflows/release.yml");
     let guard = workflow
-        .find("immutable-releases")
+        .find("- name: Require immutable releases before publication")
         .expect("release workflow has no immutable-release preflight");
     let publish = workflow
-        .find("gh release create")
+        .find("- name: Publish verified release assets")
         .expect("release workflow has no publication step");
+    let guard_step = &workflow[guard..publish];
 
     assert!(
         guard < publish,
         "immutable-release preflight runs after publish"
     );
-    assert!(workflow.contains(".enabled == true"));
-    assert!(workflow.contains("secrets.IMMUTABLE_RELEASES_READ_TOKEN"));
-    assert!(!workflow.contains("GH_TOKEN: ${{ github.token }}\n          GH_REPO"));
+    assert!(guard_step.contains("repos/${GH_REPO}/immutable-releases"));
+    assert!(guard_step.contains(".enabled == true"));
+    assert!(guard_step.contains("GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}"));
+    assert!(!guard_step.contains("GH_TOKEN: ${{ github.token }}"));
 }
