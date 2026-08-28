@@ -5,6 +5,7 @@ use super::{
     verify_process_identity,
 };
 use std::fs;
+use windows_sys::Win32::System::Console::INPUT_RECORD;
 use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
 use windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE;
 
@@ -82,8 +83,22 @@ fn missing_console_process_converges_to_the_standard_missing_result() {
 }
 
 #[test]
-fn codex_paste_detection_and_submission_use_two_real_return_key_events() {
-    let records = build_console_input_records("prompt", 2);
+fn codex_paste_confirmation_and_submission_are_delayed_from_the_text_batch() {
+    let immediate = super::super::windows_console_immediate_submit_count(2);
+    let initial_records = build_console_input_records("prompt", immediate);
+    assert_eq!(return_key_down_count(&initial_records), 0);
+
+    let delayed_batches = (immediate..2)
+        .map(|_| build_console_input_records("", 1))
+        .collect::<Vec<_>>();
+    assert_eq!(delayed_batches.len(), 2);
+    assert!(
+        delayed_batches
+            .iter()
+            .all(|records| return_key_down_count(records) == 1)
+    );
+
+    let records = &delayed_batches[0];
     let down = unsafe { records[records.len() - 2].Event.KeyEvent };
     let up = unsafe { records[records.len() - 1].Event.KeyEvent };
     assert_eq!(down.bKeyDown, 1);
@@ -91,16 +106,6 @@ fn codex_paste_detection_and_submission_use_two_real_return_key_events() {
     assert_eq!(down.wVirtualKeyCode, 0x0d);
     assert_eq!(down.wVirtualScanCode, 0x1c);
     assert_eq!(unsafe { down.uChar.UnicodeChar }, u16::from(b'\r'));
-    assert_eq!(
-        records
-            .iter()
-            .filter(|record| unsafe {
-                record.Event.KeyEvent.bKeyDown == 1 && record.Event.KeyEvent.wVirtualKeyCode == 0x0d
-            })
-            .count(),
-        2,
-        "Codex first confirms the synthetic paste batch and then submits it"
-    );
 }
 
 #[test]
@@ -115,6 +120,15 @@ fn single_submit_provider_gets_one_return_key() {
             .count(),
         1
     );
+}
+
+fn return_key_down_count(records: &[INPUT_RECORD]) -> usize {
+    records
+        .iter()
+        .filter(|record| unsafe {
+            record.Event.KeyEvent.bKeyDown == 1 && record.Event.KeyEvent.wVirtualKeyCode == 0x0d
+        })
+        .count()
 }
 
 #[test]

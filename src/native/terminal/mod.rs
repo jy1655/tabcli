@@ -129,6 +129,11 @@ pub(super) fn windows_console_extra_submit_delay() -> std::time::Duration {
     std::time::Duration::from_secs(2)
 }
 
+#[cfg(any(windows, test))]
+pub(super) fn windows_console_immediate_submit_count(submit_count: usize) -> usize {
+    usize::from(submit_count == 1)
+}
+
 pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     platform::select(preferred)
 }

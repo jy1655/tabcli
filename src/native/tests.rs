@@ -1884,6 +1884,12 @@ fn windows_console_extra_submit_waits_for_paste_confirmation() {
 }
 
 #[test]
+fn windows_console_separates_codex_paste_confirmation_from_the_text_batch() {
+    assert_eq!(terminal::windows_console_immediate_submit_count(1), 1);
+    assert_eq!(terminal::windows_console_immediate_submit_count(2), 0);
+}
+
+#[test]
 fn native_turn_claim_is_exclusive_until_the_hook_releases_it() {
     let directory = tempfile::tempdir().unwrap();
     let claim = acquire_turn_claim(directory.path()).unwrap();

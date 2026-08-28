@@ -382,11 +382,12 @@ fn write_console_input(input: &str, submit_count: usize) -> Result<()> {
             .context("failed to open managed Windows console input");
     }
     let result = (|| {
-        let first_submit = usize::from(submit_count > 0);
+        let first_submit = super::windows_console_immediate_submit_count(submit_count);
         write_input_records(handle, &build_console_input_records(input, first_submit))?;
         for _ in first_submit..submit_count {
-            // Codex detects the fast synthetic key batch as a paste. The first
-            // Return confirms that paste and a later Return submits the composer.
+            // Codex detects the fast synthetic text batch as a paste. Keep both
+            // its confirmation Return and later submission Return out of that
+            // batch so processing speed cannot decide which action they perform.
             std::thread::sleep(super::windows_console_extra_submit_delay());
             write_input_records(handle, &build_console_input_records("", 1))?;
         }
