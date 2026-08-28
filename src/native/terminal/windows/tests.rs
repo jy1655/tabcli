@@ -82,7 +82,7 @@ fn missing_console_process_converges_to_the_standard_missing_result() {
 }
 
 #[test]
-fn submit_is_a_real_windows_return_key_event() {
+fn codex_paste_detection_and_submission_use_two_real_return_key_events() {
     let records = build_console_input_records("prompt", 2);
     let down = unsafe { records[records.len() - 2].Event.KeyEvent };
     let up = unsafe { records[records.len() - 1].Event.KeyEvent };
@@ -99,7 +99,7 @@ fn submit_is_a_real_windows_return_key_event() {
             })
             .count(),
         2,
-        "bracketed paste confirmation and prompt submission require separate Return keys"
+        "Codex first confirms the synthetic paste batch and then submits it"
     );
 }
 

@@ -969,6 +969,43 @@ fn explicit_close_consumes_the_handle_and_repeated_close_skips_the_adapter() {
 }
 
 #[test]
+fn explicit_close_restores_the_terminal_handle_after_adapter_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_json_atomic(
+        &directory.path().join(TERMINAL_HANDLE_FILE),
+        &terminal::TerminalSession {
+            kind: terminal::TerminalKind::WindowsConsole,
+            id: "windows-console-process".to_owned(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: Some("session-windows-close".to_owned()),
+            windows_process_identity: None,
+        },
+    )
+    .unwrap();
+    update_status(directory.path(), "ready", None, None).unwrap();
+
+    let error = close_session_state(directory.path(), |_| {
+        Err(anyhow::anyhow!(
+            "failed to attach to the managed console process: Access is denied"
+        ))
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains("Access is denied"));
+    assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
+    assert!(!directory.path().join(TERMINAL_CLOSING_FILE).exists());
+    assert!(!directory.path().join(TERMINAL_TOMBSTONE_FILE).exists());
+    assert_eq!(
+        read_json::<SessionStatus>(&directory.path().join("status.json"))
+            .unwrap()
+            .state,
+        "ready"
+    );
+}
+
+#[test]
 fn concurrent_close_requests_share_one_terminal_handle_claim() {
     use std::sync::{Arc, Barrier, atomic::AtomicUsize};
 
@@ -1789,7 +1826,6 @@ fn every_provider_declares_its_terminal_submission_count() {
     }
 }
 
-#[cfg(windows)]
 #[test]
 fn windows_initial_prompt_readiness_is_provider_specific() {
     assert_eq!(
@@ -1814,16 +1850,37 @@ fn terminal_input_framing_matches_each_adapter_contract() {
         terminal_input_bytes(terminal::TerminalKind::Ghostty, "line one\nline two"),
         b"line one\nline two"
     );
+    assert_eq!(
+        terminal_input_bytes(terminal::TerminalKind::WindowsConsole, "line one\nline two"),
+        b"line one\nline two"
+    );
     for kind in [
         terminal::TerminalKind::Iterm2,
         terminal::TerminalKind::AppleTerminal,
-        terminal::TerminalKind::WindowsConsole,
     ] {
         assert_eq!(
             terminal_input_bytes(kind, "line one\nline two"),
             b"\x1b[200~line one\nline two\x1b[201~"
         );
     }
+}
+
+#[test]
+fn windows_console_access_denied_is_not_a_missing_surface() {
+    assert!(terminal::windows_console_helper_reports_missing(
+        "Error: console process is no longer available"
+    ));
+    assert!(!terminal::windows_console_helper_reports_missing(
+        "Error: console process is no longer available: Access is denied. (os error 5)"
+    ));
+}
+
+#[test]
+fn windows_console_extra_submit_waits_for_paste_confirmation() {
+    assert_eq!(
+        terminal::windows_console_extra_submit_delay(),
+        Duration::from_secs(2)
+    );
 }
 
 #[test]

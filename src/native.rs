@@ -3279,9 +3279,13 @@ fn native_delegation_prompt(source: &str, prompt: &str) -> String {
 }
 
 fn terminal_input_bytes(kind: terminal::TerminalKind, prompt: &str) -> Vec<u8> {
-    if kind == terminal::TerminalKind::Ghostty {
+    if matches!(
+        kind,
+        terminal::TerminalKind::Ghostty | terminal::TerminalKind::WindowsConsole
+    ) {
         // Ghostty's `input text` command already delivers its argument as a paste.
-        // Adding another bracketed-paste envelope exposes the inner delimiters to the CLI.
+        // WriteConsoleInputW emits key events rather than a terminal paste, so Windows
+        // CLIs also expose a bracketed-paste envelope as literal `[200~...` text.
         prompt.as_bytes().to_vec()
     } else {
         format!("\x1b[200~{prompt}\x1b[201~").into_bytes()

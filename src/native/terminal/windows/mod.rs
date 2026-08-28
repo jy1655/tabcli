@@ -180,11 +180,7 @@ pub(super) fn send_file(session: &TerminalSession, prompt_path: &Path) -> Result
 pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
     match run_console_helper("close", session, None) {
         Ok(()) => Ok(CloseOutcome::Closed),
-        Err(error)
-            if error
-                .to_string()
-                .contains("console process is no longer available") =>
-        {
+        Err(error) if super::windows_console_helper_reports_missing(&error.to_string()) => {
             Ok(CloseOutcome::Missing)
         }
         Err(error) => Err(error),
@@ -243,7 +239,7 @@ pub(super) fn console_control(
         FreeConsole();
         if AttachConsole(pid) == 0 {
             bail!(
-                "console process is no longer available: {}",
+                "failed to attach to the managed console process: {}",
                 std::io::Error::last_os_error()
             );
         }
@@ -389,9 +385,9 @@ fn write_console_input(input: &str, submit_count: usize) -> Result<()> {
         let first_submit = usize::from(submit_count > 0);
         write_input_records(handle, &build_console_input_records(input, first_submit))?;
         for _ in first_submit..submit_count {
-            // Codex first confirms a bracketed paste and only then returns to the
-            // composer. A separately timed Return is required to submit it.
-            std::thread::sleep(std::time::Duration::from_millis(150));
+            // Codex detects the fast synthetic key batch as a paste. The first
+            // Return confirms that paste and a later Return submits the composer.
+            std::thread::sleep(super::windows_console_extra_submit_delay());
             write_input_records(handle, &build_console_input_records("", 1))?;
         }
         Ok(())

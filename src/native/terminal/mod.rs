@@ -116,6 +116,19 @@ pub(super) enum CloseOutcome {
     Missing,
 }
 
+#[cfg(any(windows, test))]
+pub(super) fn windows_console_helper_reports_missing(message: &str) -> bool {
+    matches!(
+        message.trim(),
+        "console process is no longer available" | "Error: console process is no longer available"
+    )
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn windows_console_extra_submit_delay() -> std::time::Duration {
+    std::time::Duration::from_secs(2)
+}
+
 pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     platform::select(preferred)
 }
