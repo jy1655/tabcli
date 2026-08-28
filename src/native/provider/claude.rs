@@ -1670,12 +1670,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_messenger_cannot_run_before_job_assignment() {
-        let root = tempfile::tempdir().unwrap();
-        let marker = root.path().join("ran-before-job-assignment");
         let mut command = Command::new(std::env::var_os("ComSpec").unwrap());
         command
-            .args(["/d", "/c"])
-            .arg(format!("echo started>\"{}\"", marker.display()))
+            .args(["/d", "/c", "exit", "0"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -1684,23 +1681,19 @@ mod tests {
         let mut child = command.spawn().unwrap();
         thread::sleep(Duration::from_millis(200));
         assert!(
-            !marker.exists(),
+            child.try_wait().unwrap().is_none(),
             "messenger executed before it could be assigned to the containment job"
         );
         let process_tree = ClaudeMessengerProcessTree::attach(&child).unwrap();
         terminate_child_tree(&mut child, &process_tree);
-        assert!(!marker.exists());
     }
 
     #[cfg(windows)]
     #[test]
     fn windows_messenger_runs_only_after_containment_resume() {
-        let root = tempfile::tempdir().unwrap();
-        let marker = root.path().join("ran-after-job-assignment");
         let mut command = Command::new(std::env::var_os("ComSpec").unwrap());
         command
-            .args(["/d", "/c"])
-            .arg(format!("echo started>\"{}\"", marker.display()))
+            .args(["/d", "/c", "exit", "0"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -1710,8 +1703,6 @@ mod tests {
         let process_tree = ClaudeMessengerProcessTree::attach(&child).unwrap();
         process_tree.resume(&child).unwrap();
         assert!(child.wait().unwrap().success());
-
-        assert!(marker.exists());
     }
 
     #[cfg(unix)]
