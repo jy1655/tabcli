@@ -861,8 +861,13 @@ fn run_ask(request: AskRequest) -> Result<()> {
                 deadline,
                 request.timeout,
             )?;
-            update_status(&created.directory, "working", None, None)?;
             let send_timeout = remaining_turn_timeout(deadline, request.timeout)?;
+            provider::validate_terminal_send_budget(
+                request.provider,
+                terminal_session.kind,
+                send_timeout,
+            )?;
+            update_status(&created.directory, "working", None, None)?;
             delivery_started = true;
             provider::send_initial_prompt(
                 request.provider,
@@ -1524,6 +1529,19 @@ fn run_tell(request: TellRequest) -> Result<()> {
                     });
                 }
             };
+            if let Err(error) = provider::validate_terminal_send_budget(
+                provider,
+                terminal_session.kind,
+                send_timeout,
+            ) {
+                let _ = provider::cancel_terminal_follow_up(provider, &directory, &claim_token);
+                return Err(error).with_context(|| {
+                    format!(
+                        "provider follow-up transport {} cannot start inside its remaining total timeout",
+                        follow_up_transport.as_str()
+                    )
+                });
+            }
             update_status(&directory, "working", None, None)?;
             if let Err(error) = provider::send_terminal_follow_up(
                 provider,
@@ -3274,6 +3292,18 @@ fn mark_session_closed_locked(
 }
 
 fn repair_dead_native_owner(directory: &Path) -> Result<bool> {
+    repair_dead_native_owner_with_terminal_close(directory, terminal::close_session)
+}
+
+fn repair_dead_native_owner_with_terminal_close<F>(
+    directory: &Path,
+    mut close_terminal: F,
+) -> Result<bool>
+where
+    F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
+{
+    #[cfg(not(windows))]
+    let _ = &mut close_terminal;
     recover_pending_completion(directory)?;
     let status: SessionStatus = read_json(&directory.join("status.json"))?;
     if !matches!(
@@ -3332,7 +3362,7 @@ fn repair_dead_native_owner(directory: &Path) -> Result<bool> {
             if session.kind != terminal::TerminalKind::WindowsConsole {
                 bail!("dead Windows native owner has a non-Windows terminal handle")
             }
-            terminal::close_session(session)
+            close_terminal(session)
         })
         .context("failed to close a Windows console whose native owner exited")?;
         Ok(true)

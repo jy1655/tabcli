@@ -2091,6 +2091,46 @@ fn windows_console_rejects_a_submit_plan_that_cannot_fit_the_remaining_budget() 
 }
 
 #[test]
+fn terminal_delivery_preflight_rejects_only_the_unstarted_windows_submit_plan() {
+    assert!(
+        provider::validate_terminal_send_budget_for_platform(
+            FirstPartyCli::Codex,
+            terminal::TerminalKind::WindowsConsole,
+            Duration::from_secs(4),
+            true,
+        )
+        .is_err()
+    );
+    assert!(
+        provider::validate_terminal_send_budget_for_platform(
+            FirstPartyCli::Codex,
+            terminal::TerminalKind::WindowsConsole,
+            Duration::from_secs(5),
+            true,
+        )
+        .is_ok()
+    );
+    assert!(
+        provider::validate_terminal_send_budget_for_platform(
+            FirstPartyCli::Agy,
+            terminal::TerminalKind::WindowsConsole,
+            Duration::from_millis(1),
+            true,
+        )
+        .is_ok()
+    );
+    assert!(
+        provider::validate_terminal_send_budget_for_platform(
+            FirstPartyCli::Codex,
+            terminal::TerminalKind::Iterm2,
+            Duration::from_millis(1),
+            false,
+        )
+        .is_ok()
+    );
+}
+
+#[test]
 fn native_turn_claim_is_exclusive_until_the_hook_releases_it() {
     let directory = tempfile::tempdir().unwrap();
     let claim = acquire_turn_claim(directory.path()).unwrap();
@@ -2229,15 +2269,29 @@ fn write_owned_terminal_state(directory: &Path, state: &str, owner_pid: u32) {
     update_status(directory, state, None, None).unwrap();
     let claim = acquire_turn_claim(directory).unwrap();
     claim.retain();
+    let windows_process_identity = test_windows_process_identity(owner_pid).or_else(|| {
+        cfg!(windows).then(|| terminal::WindowsProcessIdentity {
+            creation_time: 0,
+            executable_path: String::new(),
+        })
+    });
     write_json_atomic(
         &directory.join(TERMINAL_HANDLE_FILE),
         &terminal::TerminalSession {
-            kind: terminal::TerminalKind::AppleTerminal,
-            id: "/dev/ttys999".to_owned(),
+            kind: if cfg!(windows) {
+                terminal::TerminalKind::WindowsConsole
+            } else {
+                terminal::TerminalKind::AppleTerminal
+            },
+            id: if cfg!(windows) {
+                owner_pid.to_string()
+            } else {
+                "/dev/ttys999".to_owned()
+            },
             tab_id: None,
-            window_id: Some("1001".to_owned()),
+            window_id: (!cfg!(windows)).then(|| "1001".to_owned()),
             managed_session_id: Some("session-owner123".to_owned()),
-            windows_process_identity: None,
+            windows_process_identity: windows_process_identity.clone(),
         },
     )
     .unwrap();
@@ -2246,8 +2300,8 @@ fn write_owned_terminal_state(directory: &Path, state: &str, owner_pid: u32) {
         &NativeSessionOwner {
             pid: owner_pid,
             managed_session_id: Some("session-owner123".to_owned()),
-            terminal_tty: Some("/dev/ttys999".to_owned()),
-            windows_process_identity: test_windows_process_identity(owner_pid),
+            terminal_tty: (!cfg!(windows)).then(|| "/dev/ttys999".to_owned()),
+            windows_process_identity,
             ..NativeSessionOwner::default()
         },
     )
@@ -2419,6 +2473,15 @@ fn claimed_and_awaiting_initial_input_dead_owners_are_repaired() {
         let directory = tempfile::tempdir().unwrap();
         write_owned_terminal_state(directory.path(), state, reaped_child_pid());
 
+        #[cfg(windows)]
+        assert!(
+            repair_dead_native_owner_with_terminal_close(directory.path(), |session| {
+                assert_eq!(session.kind, terminal::TerminalKind::WindowsConsole);
+                Ok(terminal::CloseOutcome::Missing)
+            })
+            .unwrap()
+        );
+        #[cfg(not(windows))]
         assert!(repair_dead_native_owner(directory.path()).unwrap());
         assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
         let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();

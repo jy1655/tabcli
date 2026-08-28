@@ -14,7 +14,10 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE},
+    Foundation::{
+        CloseHandle, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
+    },
     Storage::FileSystem::{
         CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, SYNCHRONIZE,
     },
@@ -32,6 +35,8 @@ mod security;
 pub(super) use process::{query_process_identity, verify_process_identity};
 use process::{query_process_identity_from_handle, verify_control_process_identity};
 pub(super) use security::set_private_permissions;
+
+const STARTUP_CLEANUP_RESERVE: Duration = Duration::from_secs(2);
 
 pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     match preferred {
@@ -54,9 +59,10 @@ where
     F: FnOnce(&mut TerminalSession) -> Result<()>,
     U: FnOnce() -> Result<()>,
 {
-    if Instant::now() >= deadline {
-        bail!("Windows console startup timed out before launch");
-    }
+    let startup_deadline = deadline
+        .checked_sub(STARTUP_CLEANUP_RESERVE)
+        .filter(|candidate| *candidate > Instant::now())
+        .context("Windows console startup timeout leaves no room for exact process cleanup")?;
     if kind != TerminalKind::WindowsConsole {
         bail!("{} is not available on Windows", kind.display_name());
     }
@@ -108,12 +114,22 @@ where
     let identity = match query_process_identity_from_handle(process.hProcess) {
         Ok(identity) => identity,
         Err(error) => {
+            let cleanup = terminate_process_until(
+                process.hProcess,
+                bounded_startup_cleanup_deadline(deadline),
+            );
             unsafe {
-                TerminateProcess(process.hProcess, 1);
                 CloseHandle(process.hThread);
                 CloseHandle(process.hProcess);
             }
-            return Err(error).context("failed to attest the managed Windows console process");
+            return match cleanup {
+                Ok(()) => {
+                    Err(error).context("failed to attest the managed Windows console process")
+                }
+                Err(cleanup_error) => Err(anyhow::anyhow!(
+                    "failed to attest the managed Windows console process: {error:#}; exact process cleanup also failed: {cleanup_error:#}"
+                )),
+            };
         }
     };
     let mut session = TerminalSession {
@@ -130,7 +146,7 @@ where
         &mut session,
         bind,
         || {
-            if Instant::now() >= deadline {
+            if Instant::now() >= startup_deadline {
                 bail!("Windows console startup timed out before process resume");
             }
             if unsafe { ResumeThread(thread_handle) } == u32::MAX {
@@ -139,10 +155,7 @@ where
             }
             Ok(())
         },
-        || unsafe {
-            TerminateProcess(process_handle, 1);
-            Ok(())
-        },
+        || terminate_process_until(process_handle, bounded_startup_cleanup_deadline(deadline)),
         unbind,
     );
     unsafe {
@@ -159,6 +172,48 @@ fn console_command_line(command: &str) -> String {
 
 fn console_creation_flags() -> u32 {
     CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED
+}
+
+fn bounded_startup_cleanup_deadline(deadline: Instant) -> Instant {
+    Instant::now()
+        .checked_add(STARTUP_CLEANUP_RESERVE)
+        .map_or(deadline, |candidate| candidate.min(deadline))
+}
+
+fn terminate_process_until(handle: HANDLE, deadline: Instant) -> Result<()> {
+    match unsafe { WaitForSingleObject(handle, 0) } {
+        WAIT_OBJECT_0 => return Ok(()),
+        WAIT_FAILED => {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to inspect the managed Windows console during cleanup");
+        }
+        _ => {}
+    }
+    let terminated = unsafe { TerminateProcess(handle, 1) };
+    let terminate_error = (terminated == 0).then(std::io::Error::last_os_error);
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .context("managed Windows console cleanup exhausted its deadline")?;
+    let timeout_ms = remaining
+        .as_millis()
+        .saturating_add(1)
+        .min(u128::from(u32::MAX - 1)) as u32;
+    let wait = unsafe { WaitForSingleObject(handle, timeout_ms) };
+    if wait == WAIT_OBJECT_0 {
+        return Ok(());
+    }
+    let wait_error = match wait {
+        WAIT_TIMEOUT => anyhow::anyhow!("managed Windows console cleanup timed out"),
+        WAIT_FAILED => anyhow::Error::new(std::io::Error::last_os_error())
+            .context("failed to wait for managed Windows console cleanup"),
+        other => anyhow::anyhow!("unexpected Windows console cleanup wait result {other}"),
+    };
+    match terminate_error {
+        Some(error) => Err(anyhow::anyhow!(
+            "failed to terminate the managed Windows console: {error}; termination remained unconfirmed: {wait_error:#}"
+        )),
+        None => Err(wait_error),
+    }
 }
 
 fn resolve_executable_from_path(name: &str, path: &OsStr) -> Result<PathBuf> {

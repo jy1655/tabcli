@@ -210,6 +210,40 @@ pub(super) fn terminal_submit_count(provider: FirstPartyCli) -> usize {
     adapter(provider).terminal_submit_count()
 }
 
+pub(super) fn validate_terminal_send_budget(
+    provider: FirstPartyCli,
+    terminal_kind: terminal::TerminalKind,
+    timeout: Duration,
+) -> Result<()> {
+    #[cfg(windows)]
+    {
+        validate_terminal_send_budget_for_platform(provider, terminal_kind, timeout, true)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (provider, terminal_kind, timeout);
+        Ok(())
+    }
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn validate_terminal_send_budget_for_platform(
+    provider: FirstPartyCli,
+    terminal_kind: terminal::TerminalKind,
+    timeout: Duration,
+    windows: bool,
+) -> Result<()> {
+    if windows
+        && terminal_kind == terminal::TerminalKind::WindowsConsole
+        && !terminal::windows_console_submit_delays_fit(terminal_submit_count(provider), timeout)
+    {
+        anyhow::bail!(
+            "Windows console submission delays do not fit inside the remaining turn timeout"
+        )
+    }
+    Ok(())
+}
+
 pub(super) fn send_terminal_follow_up(
     provider: FirstPartyCli,
     session: &terminal::TerminalSession,

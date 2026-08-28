@@ -21,15 +21,22 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::{
+    io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    process::CommandExt,
+};
 #[cfg(windows)]
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE},
+    Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
+    System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    },
     System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
         SetInformationJobObject, TerminateJobObject,
     },
+    System::Threading::{CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
 };
 
 use super::super::terminal;
@@ -513,12 +520,22 @@ fn send_cross_session_message(
 fn send_cross_session_message_with_discovery_retry(
     context: CrossSessionMessageContext<'_>,
 ) -> CrossSessionMessageResult {
+    send_cross_session_message_with_discovery_retry_policy(
+        context,
+        CROSS_SESSION_DISCOVERY_RETRY_WINDOW,
+        CROSS_SESSION_DISCOVERY_RETRY_DELAY,
+    )
+}
+
+fn send_cross_session_message_with_discovery_retry_policy(
+    context: CrossSessionMessageContext<'_>,
+    retry_window: Duration,
+    retry_delay: Duration,
+) -> CrossSessionMessageResult {
     let started = Instant::now();
     let deadline = checked_deadline_from(started, context.timeout)
         .map_err(CrossSessionMessageFailure::not_sent)?;
-    let retry_deadline = started
-        .checked_add(CROSS_SESSION_DISCOVERY_RETRY_WINDOW)
-        .map_or(deadline, |candidate| candidate.min(deadline));
+    let mut retry_deadline = None;
     loop {
         let now = Instant::now();
         let Some(timeout) = deadline.checked_duration_since(now) else {
@@ -535,10 +552,14 @@ fn send_cross_session_message_with_discovery_retry(
             return result;
         }
         let now = Instant::now();
+        let retry_deadline = *retry_deadline.get_or_insert_with(|| {
+            now.checked_add(retry_window)
+                .map_or(deadline, |candidate| candidate.min(deadline))
+        });
         let Some(remaining_retry) = retry_deadline.checked_duration_since(now) else {
             return result;
         };
-        let delay = CROSS_SESSION_DISCOVERY_RETRY_DELAY.min(remaining_retry);
+        let delay = retry_delay.min(remaining_retry);
         if delay.is_zero() || deadline.saturating_duration_since(now) <= delay {
             return result;
         }
@@ -598,6 +619,10 @@ fn send_cross_session_message_inner(
             return Err(CrossSessionMessageFailure::not_sent(error));
         }
     };
+    if let Err(error) = process_tree.resume(&child) {
+        terminate_child_tree(&mut child, &process_tree);
+        return Err(CrossSessionMessageFailure::not_sent(error));
+    }
     let stdin = match child.stdin.take() {
         Some(stdin) => stdin,
         None => {
@@ -698,7 +723,11 @@ fn configure_messenger_process_tree(command: &mut Command) {
     {
         command.process_group(0);
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_SUSPENDED);
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = command;
 }
 
@@ -760,6 +789,18 @@ impl ClaudeMessengerProcessTree {
         }
     }
 
+    fn resume(&self, child: &Child) -> Result<()> {
+        #[cfg(windows)]
+        {
+            resume_suspended_process(child.id())
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (self, child);
+            Ok(())
+        }
+    }
+
     fn terminate(&self) {
         #[cfg(unix)]
         unsafe {
@@ -770,6 +811,47 @@ impl ClaudeMessengerProcessTree {
             TerminateJobObject(self.job, 1);
         }
     }
+}
+
+#[cfg(windows)]
+fn resume_suspended_process(pid: u32) -> Result<()> {
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to enumerate the suspended Claude messenger thread");
+    }
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    if unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect the suspended Claude messenger thread");
+    }
+    loop {
+        if entry.th32OwnerProcessID == pid {
+            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+            if thread.is_null() {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to open the suspended Claude messenger thread");
+            }
+            let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
+            let previous = unsafe { ResumeThread(thread.as_raw_handle()) };
+            if previous == u32::MAX {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to resume the contained Claude messenger process");
+            }
+            if previous != 1 {
+                bail!("contained Claude messenger had unexpected suspension count {previous}");
+            }
+            return Ok(());
+        }
+        if unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } == 0 {
+            break;
+        }
+    }
+    bail!("suspended Claude messenger has no owned primary thread")
 }
 
 #[cfg(windows)]
@@ -1585,6 +1667,53 @@ mod tests {
         assert!(!directory.join("late-delivery").exists());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_messenger_cannot_run_before_job_assignment() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("ran-before-job-assignment");
+        let mut command = Command::new(std::env::var_os("ComSpec").unwrap());
+        command
+            .args(["/d", "/c"])
+            .arg(format!("echo started>\"{}\"", marker.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_messenger_process_tree(&mut command);
+
+        let mut child = command.spawn().unwrap();
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            !marker.exists(),
+            "messenger executed before it could be assigned to the containment job"
+        );
+        let process_tree = ClaudeMessengerProcessTree::attach(&child).unwrap();
+        terminate_child_tree(&mut child, &process_tree);
+        assert!(!marker.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_messenger_runs_only_after_containment_resume() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("ran-after-job-assignment");
+        let mut command = Command::new(std::env::var_os("ComSpec").unwrap());
+        command
+            .args(["/d", "/c"])
+            .arg(format!("echo started>\"{}\"", marker.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_messenger_process_tree(&mut command);
+
+        let mut child = command.spawn().unwrap();
+        let process_tree = ClaudeMessengerProcessTree::attach(&child).unwrap();
+        process_tree.resume(&child).unwrap();
+        assert!(child.wait().unwrap().success());
+
+        assert!(marker.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn messenger_retries_only_a_proven_pre_send_discovery_miss() {
@@ -1634,6 +1763,68 @@ mod tests {
             prompt: "follow-up secret",
             timeout: Duration::from_secs(2),
         })
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(directory.join("attempts")).unwrap(),
+            "xx"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn messenger_retry_window_starts_at_the_first_proven_discovery_miss() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-safe123");
+        std::fs::create_dir(&directory).unwrap();
+        let executable = root.path().join("fake-claude");
+        let pending = PendingCrossSessionTurn::new("claude-turn-safe123").unwrap();
+        let expected_message = cross_session_target_message("follow-up secret", &pending);
+        let trace = format!(
+            concat!(
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"list-1\",\"name\":\"ListAgents\",\"input\":{{}}}}]}}}}\n",
+                "{{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"list-1\",\"content\":\"session-safe123\"}}]}}}}\n",
+                "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"send-1\",\"name\":\"SendMessage\",\"input\":{{\"to\":\"session-safe123\",\"summary\":{},\"message\":{}}}}}]}}}}\n",
+                "{{\"type\":\"user\",\"message\":{{\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"send-1\",\"content\":\"Message sent\"}}]}}}}\n",
+                "{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}}\n"
+            ),
+            serde_json::to_string(CROSS_SESSION_SUMMARY).unwrap(),
+            serde_json::to_string(&expected_message).unwrap(),
+        );
+        std::fs::write(
+            &executable,
+            format!(
+                concat!(
+                    "#!/bin/sh\n",
+                    "cat >/dev/null\n",
+                    "printf x >> \"$PWD/attempts\"\n",
+                    "if [ \"$(wc -c < \"$PWD/attempts\")\" -eq 1 ]; then\n",
+                    "  sleep 0.2\n",
+                    "  printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}}'\n",
+                    "  exit 0\n",
+                    "fi\n",
+                    "printf '%s' '{}'\n"
+                ),
+                trace.replace('\'', "'\"'\"'")
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        send_cross_session_message_with_discovery_retry_policy(
+            CrossSessionMessageContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &directory,
+                provider_path: &executable,
+                request_id: "claude-turn-safe123",
+                prompt: "follow-up secret",
+                timeout: Duration::from_secs(2),
+            },
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+        )
         .unwrap();
 
         assert_eq!(
