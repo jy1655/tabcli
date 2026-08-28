@@ -130,7 +130,7 @@ where
 {
     #[cfg(windows)]
     {
-        return windows::open_bound_tab(kind, command, bind);
+        windows::open_bound_tab(kind, command, bind)
     }
     #[cfg(not(windows))]
     {

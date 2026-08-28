@@ -119,8 +119,10 @@ impl NativeProviderAdapter for CodexAdapter {
         let Some(pending) = read_pending_turn(directory)? else {
             return Ok(());
         };
-        let Ok(message) = correlated_response(raw_message, &pending) else {
-            return Ok(());
+        let message = match correlated_response(raw_message, &pending) {
+            Ok(message) => message,
+            Err(_) if codex_input_correlates(payload, &pending) => raw_message,
+            Err(_) => return Ok(()),
         };
         let thread_id = codex_owned_string(payload, "thread-id");
         if let (Some(established), Some(incoming)) =
@@ -224,7 +226,7 @@ fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result<()> {
 
 fn correlated_prompt(prompt: &str, pending: &PendingCodexTurn) -> String {
     format!(
-        "{prompt}\n\n[Agent Bridge Codex turn protocol]\nComplete this request as one turn. End the complete final response with the exact marker below on its own final line; do not alter or omit it.\n{}",
+        "{prompt}\n\n[Agent Bridge Codex turn metadata; do not include this metadata in the response]\n{}",
         pending.marker
     )
 }
@@ -247,6 +249,17 @@ fn codex_string<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a str
 
 fn codex_owned_string(payload: &serde_json::Value, key: &str) -> Option<String> {
     codex_string(payload, key).map(str::to_owned)
+}
+
+fn codex_input_correlates(payload: &serde_json::Value, pending: &PendingCodexTurn) -> bool {
+    if codex_string(payload, "type") != Some("agent-turn-complete") {
+        return false;
+    }
+    payload
+        .get("input-messages")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|messages| messages.iter().rev().find_map(serde_json::Value::as_str))
+        .is_some_and(|message| message.trim_end().ends_with(&pending.marker))
 }
 
 fn established_codex_thread(directory: &Path) -> Result<Option<String>> {
@@ -297,6 +310,32 @@ mod tests {
         let paths = event_paths(directory.path()).unwrap();
         let event: SessionEvent = read_json(&paths[0]).unwrap();
         assert_eq!(event.message, "codex result");
+        assert_eq!(event.provider_session_id.as_deref(), Some("codex-thread"));
+        assert_eq!(event.turn_id.as_deref(), Some("codex-turn"));
+    }
+
+    #[test]
+    fn codex_hook_correlates_exact_output_from_the_official_input_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let pending = claim_pending_turn(directory.path());
+        let payload = serde_json::json!({
+            "type": "agent-turn-complete",
+            "thread-id": "codex-thread",
+            "turn-id": "codex-turn",
+            "input-messages": [format!(
+                "Reply with exactly EXACT_OUTPUT and nothing else.\n{}",
+                pending.marker
+            )],
+            "last-assistant-message": "EXACT_OUTPUT",
+        });
+
+        ADAPTER.handle_hook(directory.path(), &payload).unwrap();
+
+        let paths = event_paths(directory.path()).unwrap();
+        let event: SessionEvent = read_json(&paths[0]).unwrap();
+        assert_eq!(event.message, "EXACT_OUTPUT");
         assert_eq!(event.provider_session_id.as_deref(), Some("codex-thread"));
         assert_eq!(event.turn_id.as_deref(), Some("codex-turn"));
     }
@@ -407,8 +446,10 @@ mod tests {
             .handle_hook(
                 directory.path(),
                 &serde_json::json!({
+                    "type": "agent-turn-complete",
                     "thread-id": "managed-thread",
                     "turn-id": "delayed-old-turn-with-a-new-id",
+                    "input-messages": [format!("old prompt\n{}", initial_pending.marker)],
                     "last-assistant-message": "delayed old result",
                 }),
             )
