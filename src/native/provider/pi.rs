@@ -14,7 +14,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use super::super::terminal;
@@ -94,9 +94,9 @@ impl NativeProviderAdapter for PiAdapter {
         &self,
         session: &terminal::TerminalSession,
         prompt_path: &Path,
-        timeout: Duration,
+        deadline: Instant,
     ) -> Result<()> {
-        terminal::send_file(session, prompt_path, timeout)
+        terminal::send_file(session, prompt_path, deadline)
     }
 
     fn terminal_initial_prompt(&self, directory: &Path, prompt: &str) -> Result<String> {
@@ -134,6 +134,13 @@ impl NativeProviderAdapter for PiAdapter {
             return Ok(());
         };
         if pi_string(payload, "agent_bridge_claim_token") != Some(pending.claim_token.as_str()) {
+            return Ok(());
+        }
+        if payload
+            .get("agent_bridge_prompt_correlated")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
             return Ok(());
         }
         let provider_session_id = pi_owned_string(payload, "session_id");
@@ -176,9 +183,9 @@ impl NativeProviderAdapter for PiAdapter {
         &self,
         session: &terminal::TerminalSession,
         prompt_path: &Path,
-        timeout: Duration,
+        deadline: Instant,
     ) -> Result<()> {
-        terminal::send_file(session, prompt_path, timeout)
+        terminal::send_file(session, prompt_path, deadline)
     }
 
     fn prepare_terminal_follow_up(
@@ -241,7 +248,7 @@ fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result<()> {
 
 fn correlated_prompt(prompt: &str, pending: &PendingPiTurn) -> String {
     format!(
-        "{prompt}\n\n[Agent Bridge Pi turn protocol]\nComplete this request as one turn. End the complete final response with the exact marker below on its own final line; do not alter or omit it.\n{}",
+        "{prompt}\n\n[Agent Bridge Pi turn protocol]\nCorrelation marker for the Agent Bridge extension:\n{}",
         pending.marker
     )
 }
@@ -256,16 +263,16 @@ fn terminal_correlated_prompt(
     }
     let encoded = serde_json::to_string(prompt)?;
     Ok(format!(
-        "[Agent Bridge Pi Windows console turn protocol] Decode the following JSON string as the complete request, preserving escaped newlines and tabs. Complete it as one turn. End the complete final response with the exact marker {} on its own final line; do not alter or omit it. Request JSON: {encoded}",
+        "[Agent Bridge Pi Windows console turn protocol] Decode the following JSON string as the complete request, preserving escaped newlines and tabs, and complete it as one turn. Request JSON: {encoded} Correlation marker for the Agent Bridge extension: {}",
         pending.marker
     ))
 }
 
 fn correlated_response<'a>(message: &'a str, pending: &PendingPiTurn) -> Result<&'a str> {
+    let message = message.trim_end();
     let body = message
-        .trim_end()
         .strip_suffix(&pending.marker)
-        .context("Pi response did not end with the expected turn marker")?
+        .unwrap_or(message)
         .trim_end();
     if body.is_empty() {
         bail!("Pi correlated response contained no assistant text")
@@ -473,6 +480,7 @@ export default function (pi) {
   let pending;
   let undelivered = false;
   let activeClaimToken;
+  let activePromptCorrelated = false;
 
   function readActiveClaimToken() {
     const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
@@ -485,6 +493,14 @@ export default function (pi) {
     }
   }
 
+  pi.on("before_agent_start", (event) => {
+    activeClaimToken = readActiveClaimToken();
+    activePromptCorrelated = Boolean(
+      activeClaimToken
+      && event.prompt.includes(`<!-- agent-bridge-pi-turn:${activeClaimToken} -->`),
+    );
+  });
+
   pi.on("agent_start", (_event, ctx) => {
     if (undelivered && pending) {
       if (!persistHookFailure(pending, "a prior result remained undelivered")) {
@@ -494,16 +510,20 @@ export default function (pi) {
       undelivered = false;
     }
     pending = undefined;
-    activeClaimToken = readActiveClaimToken();
   });
 
   pi.on("agent_end", (event, ctx) => {
     if (undelivered) return;
+    if (!activePromptCorrelated || !activeClaimToken) {
+      pending = undefined;
+      return;
+    }
     pending = {
       ...lastAssistantOutcome(event.messages),
       session_id: ctx.sessionManager.getSessionId(),
       turn_id: ctx.sessionManager.getLeafId() ?? undefined,
       agent_bridge_claim_token: activeClaimToken,
+      agent_bridge_prompt_correlated: true,
     };
   });
 
@@ -569,11 +589,14 @@ mod tests {
         let extension = bridge_extension();
 
         assert!(extension.contains("agent_start"));
+        assert!(extension.contains("before_agent_start"));
         assert!(extension.contains("agent_end"));
         assert!(extension.contains("agent_settled"));
         assert!(extension.contains("stopReason"));
         assert!(extension.contains("agent_bridge_error"));
         assert!(extension.contains("agent_bridge_claim_token"));
+        assert!(extension.contains("agent_bridge_prompt_correlated"));
+        assert!(extension.contains("event.prompt.includes"));
         assert!(extension.contains("turn.claim"));
         assert!(extension.contains(HOOK_FAILURE_FILE));
         assert!(extension.contains("renameSync"));
@@ -594,6 +617,7 @@ mod tests {
             "turn_id": "pi-turn",
             "last_assistant_message": marked("pi result", &pending),
             "agent_bridge_claim_token": pending.claim_token,
+            "agent_bridge_prompt_correlated": true,
         });
 
         ADAPTER.handle_hook(directory.path(), &payload).unwrap();
@@ -604,6 +628,46 @@ mod tests {
         assert_eq!(event.provider_session_id.as_deref(), Some("pi-session"));
         assert_eq!(event.turn_id.as_deref(), Some("pi-turn"));
         assert!(directory.path().join(PENDING_TURN_FILE).is_file());
+    }
+
+    #[test]
+    fn pi_hook_preserves_an_exact_response_when_the_input_was_correlated() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let pending = claim_pending_turn(directory.path());
+        let payload = serde_json::json!({
+            "session_id": "pi-session",
+            "turn_id": "pi-turn",
+            "last_assistant_message": "EXACT_RESPONSE",
+            "agent_bridge_claim_token": pending.claim_token,
+            "agent_bridge_prompt_correlated": true,
+        });
+
+        ADAPTER.handle_hook(directory.path(), &payload).unwrap();
+
+        let paths = event_paths(directory.path()).unwrap();
+        let event: SessionEvent = read_json(&paths[0]).unwrap();
+        assert_eq!(event.message, "EXACT_RESPONSE");
+    }
+
+    #[test]
+    fn pi_hook_rejects_a_matching_claim_without_input_correlation() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let pending = claim_pending_turn(directory.path());
+        let payload = serde_json::json!({
+            "session_id": "pi-session",
+            "turn_id": "manual-turn",
+            "last_assistant_message": "manual response",
+            "agent_bridge_claim_token": pending.claim_token,
+        });
+
+        ADAPTER.handle_hook(directory.path(), &payload).unwrap();
+
+        assert!(event_paths(directory.path()).unwrap().is_empty());
+        assert!(directory.path().join(TURN_CLAIM_FILE).is_file());
     }
 
     #[test]
@@ -646,6 +710,7 @@ mod tests {
                     "turn_id": "pi-turn-1",
                     "last_assistant_message": marked("first result", &initial_pending),
                     "agent_bridge_claim_token": initial_pending.claim_token,
+                    "agent_bridge_prompt_correlated": true,
                 }),
             )
             .unwrap();
@@ -661,6 +726,7 @@ mod tests {
                     "turn_id": "delayed-old-turn-with-a-new-id",
                     "last_assistant_message": "delayed old result",
                     "agent_bridge_claim_token": initial_pending.claim_token,
+                    "agent_bridge_prompt_correlated": true,
                 }),
             )
             .unwrap();

@@ -240,12 +240,12 @@ pub(super) fn powershell_executable() -> Result<PathBuf> {
 pub(super) fn send_file(
     session: &TerminalSession,
     prompt_path: &Path,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<()> {
     let prompt_path = prompt_path
         .to_str()
         .context("prompt path is not valid UTF-8")?;
-    run_console_helper("send", session, Some(prompt_path), Some(timeout))
+    run_console_helper("send", session, Some(prompt_path), Some(deadline))
 }
 
 pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
@@ -262,7 +262,7 @@ fn run_console_helper(
     action: &str,
     session: &TerminalSession,
     input: Option<&str>,
-    timeout: Option<Duration>,
+    deadline: Option<Instant>,
 ) -> Result<()> {
     let executable = std::env::current_exe().context("failed to locate agent-bridge executable")?;
     let managed_session_id = session
@@ -277,25 +277,16 @@ fn run_console_helper(
             .context("prompt path has no file name")?;
         command.arg(input_name);
     }
-    if let Some(timeout) = timeout {
+    let output = if let Some(deadline) = deadline {
+        let timeout = super::remaining_send_budget_at(deadline, Instant::now())?;
         let timeout_ms =
             u64::try_from(timeout.as_millis()).context("Windows console timeout is too large")?;
-        command.arg(timeout_ms.to_string());
-    }
-    let output = match timeout {
-        Some(timeout) => {
-            let deadline = Instant::now()
-                .checked_add(timeout)
-                .context("Windows console helper timeout is too large")?;
-            super::super::command_output_until(
-                &mut command,
-                deadline,
-                "Windows console control helper",
-            )
-        }
-        None => command
+        command.arg(timeout_ms.max(1).to_string());
+        super::super::command_output_until(&mut command, deadline, "Windows console control helper")
+    } else {
+        command
             .output()
-            .context("failed to start Windows console control helper"),
+            .context("failed to start Windows console control helper")
     }?;
     if output.status.success() {
         return Ok(());

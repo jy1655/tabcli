@@ -6,7 +6,11 @@ use super::{
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::{ffi::OsString, path::Path, time::Duration};
+use std::{
+    ffi::OsString,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use super::super::terminal;
 
@@ -79,9 +83,9 @@ impl NativeProviderAdapter for CodexAdapter {
         &self,
         session: &terminal::TerminalSession,
         prompt_path: &Path,
-        timeout: Duration,
+        deadline: Instant,
     ) -> Result<()> {
-        terminal::send_file(session, prompt_path, timeout)
+        terminal::send_file(session, prompt_path, deadline)
     }
 
     fn terminal_initial_prompt(&self, directory: &Path, prompt: &str) -> Result<String> {
@@ -153,9 +157,9 @@ impl NativeProviderAdapter for CodexAdapter {
         &self,
         session: &terminal::TerminalSession,
         prompt_path: &Path,
-        timeout: Duration,
+        deadline: Instant,
     ) -> Result<()> {
-        terminal::send_file(session, prompt_path, timeout)
+        terminal::send_file(session, prompt_path, deadline)
     }
 
     fn prepare_terminal_follow_up(

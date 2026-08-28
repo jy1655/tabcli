@@ -5,7 +5,12 @@ mod pi;
 
 use agent_bridge::FirstPartyCli;
 use anyhow::Result;
-use std::{ffi::OsString, path::Path, path::PathBuf, time::Duration};
+use std::{
+    ffi::OsString,
+    path::Path,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use super::terminal;
 
@@ -149,7 +154,7 @@ trait NativeProviderAdapter: Sync {
         &self,
         session: &terminal::TerminalSession,
         prompt_path: &Path,
-        timeout: Duration,
+        deadline: Instant,
     ) -> Result<()>;
     fn terminal_initial_prompt(&self, directory: &Path, prompt: &str) -> Result<String>;
     #[cfg(any(windows, test))]
@@ -166,7 +171,7 @@ trait NativeProviderAdapter: Sync {
         &self,
         session: &terminal::TerminalSession,
         prompt_path: &Path,
-        timeout: Duration,
+        deadline: Instant,
     ) -> Result<()>;
     fn prepare_terminal_follow_up(
         &self,
@@ -248,9 +253,9 @@ pub(super) fn send_terminal_follow_up(
     provider: FirstPartyCli,
     session: &terminal::TerminalSession,
     prompt_path: &Path,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<()> {
-    adapter(provider).send_terminal_follow_up(session, prompt_path, timeout)
+    adapter(provider).send_terminal_follow_up(session, prompt_path, deadline)
 }
 
 pub(super) fn send_cross_session_message(
@@ -280,9 +285,9 @@ pub(super) fn send_initial_prompt(
     provider: FirstPartyCli,
     session: &terminal::TerminalSession,
     prompt_path: &Path,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<()> {
-    adapter(provider).send_initial_prompt(session, prompt_path, timeout)
+    adapter(provider).send_initial_prompt(session, prompt_path, deadline)
 }
 
 pub(super) fn terminal_initial_prompt(

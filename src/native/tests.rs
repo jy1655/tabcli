@@ -223,6 +223,18 @@ fn remaining_turn_timeout_rejects_an_exhausted_total_budget() {
     assert!(remaining <= Duration::from_secs(5));
 }
 
+#[test]
+fn terminal_delivery_keeps_the_original_deadline_after_preflight_work() {
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(5);
+
+    assert_eq!(
+        terminal::remaining_send_budget_at(deadline, started + Duration::from_secs(3)).unwrap(),
+        Duration::from_secs(2)
+    );
+    assert!(terminal::remaining_send_budget_at(deadline, deadline).is_err());
+}
+
 #[cfg(unix)]
 #[test]
 fn bounded_command_output_terminates_a_hung_child_at_the_deadline() {

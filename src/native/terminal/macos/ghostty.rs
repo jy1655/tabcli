@@ -576,7 +576,7 @@ fn cleanup_created_tab_until(surface: &CreatedSurface, deadline: Instant) -> Res
 pub(super) fn send_file(
     session: &TerminalSession,
     prompt_path: &Path,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<()> {
     let (tab_id, window_id) = ownership_proof(session)?;
     let prompt_path = prompt_path
@@ -586,7 +586,7 @@ pub(super) fn send_file(
         "Ghostty",
         SEND_FILE_SCRIPT,
         &[&session.id, tab_id, window_id, prompt_path],
-        super::timeout_deadline(timeout)?,
+        deadline,
     )?;
     if response != "sent" {
         bail!("unexpected Ghostty send response: {response:?}");

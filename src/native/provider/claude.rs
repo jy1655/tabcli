@@ -148,7 +148,7 @@ impl NativeProviderAdapter for ClaudeAdapter {
         &self,
         _session: &terminal::TerminalSession,
         _prompt_path: &Path,
-        _timeout: Duration,
+        _deadline: Instant,
     ) -> Result<()> {
         bail!("Claude initial prompts do not use terminal paste")
     }
@@ -200,7 +200,7 @@ impl NativeProviderAdapter for ClaudeAdapter {
         &self,
         _session: &terminal::TerminalSession,
         _prompt_path: &Path,
-        _timeout: Duration,
+        _deadline: Instant,
     ) -> Result<()> {
         bail!("Claude follow-up prompts do not use terminal paste")
     }

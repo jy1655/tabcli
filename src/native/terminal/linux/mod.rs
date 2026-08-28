@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, time::Instant};
 
 use anyhow::{Result, bail};
 
@@ -15,7 +15,7 @@ pub(super) fn open_tab(_kind: TerminalKind, _command: &str) -> Result<TerminalSe
 pub(super) fn send_file(
     _session: &TerminalSession,
     _prompt_path: &Path,
-    _timeout: std::time::Duration,
+    _deadline: Instant,
 ) -> Result<()> {
     bail!("visible terminal sessions are not yet supported on Linux")
 }

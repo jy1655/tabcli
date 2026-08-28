@@ -1,8 +1,4 @@
-use std::{
-    path::Path,
-    str::FromStr,
-    time::{Duration, Instant},
-};
+use std::{path::Path, str::FromStr, time::Instant};
 
 #[cfg(not(any(windows, target_os = "macos")))]
 use anyhow::Context;
@@ -241,22 +237,33 @@ where
 pub(super) fn send_file(
     session: &TerminalSession,
     prompt_path: &Path,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<()> {
     #[cfg(windows)]
     {
-        windows::send_file(session, prompt_path, timeout)
+        windows::send_file(session, prompt_path, deadline)
     }
     #[cfg(not(windows))]
     {
-        platform::send_file(session, prompt_path, timeout)
+        platform::send_file(session, prompt_path, deadline)
+    }
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn remaining_send_budget_at(
+    deadline: Instant,
+    now: Instant,
+) -> Result<std::time::Duration> {
+    match deadline.checked_duration_since(now) {
+        Some(remaining) if !remaining.is_zero() => Ok(remaining),
+        _ => bail!("terminal send deadline is exhausted"),
     }
 }
 
 #[cfg(target_os = "macos")]
 pub(super) fn verify_macos_surface(
     session: &TerminalSession,
-    timeout: Option<Duration>,
+    timeout: Option<std::time::Duration>,
 ) -> Result<Option<String>> {
     macos::verify_surface(session, timeout)
 }

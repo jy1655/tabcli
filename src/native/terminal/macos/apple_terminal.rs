@@ -227,7 +227,7 @@ pub(super) fn start_session(
 pub(super) fn send_file(
     session: &TerminalSession,
     prompt_path: &Path,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<()> {
     let window_id = ownership_proof(session)?;
     let prompt_path = prompt_path
@@ -237,7 +237,7 @@ pub(super) fn send_file(
         "Terminal.app",
         SEND_FILE_SCRIPT,
         &[&session.id, window_id, prompt_path],
-        super::timeout_deadline(timeout)?,
+        deadline,
     )?;
     if response != "sent" {
         bail!("unexpected Terminal.app send response: {response:?}");

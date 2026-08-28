@@ -151,7 +151,7 @@ pub(super) fn start_session(
 pub(super) fn send_file(
     session: &TerminalSession,
     prompt_path: &Path,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<()> {
     let prompt_path = prompt_path
         .to_str()
@@ -160,7 +160,7 @@ pub(super) fn send_file(
         "iTerm2",
         SEND_FILE_SCRIPT,
         &[&session.id, prompt_path],
-        super::timeout_deadline(timeout)?,
+        deadline,
     )?;
     if response != "sent" {
         bail!("unexpected iTerm2 send response: {response:?}");

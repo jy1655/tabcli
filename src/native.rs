@@ -861,19 +861,19 @@ fn run_ask(request: AskRequest) -> Result<()> {
                 deadline,
                 request.timeout,
             )?;
+            update_status(&created.directory, "working", None, None)?;
             let send_timeout = remaining_turn_timeout(deadline, request.timeout)?;
             provider::validate_terminal_send_budget(
                 request.provider,
                 terminal_session.kind,
                 send_timeout,
             )?;
-            update_status(&created.directory, "working", None, None)?;
             delivery_started = true;
             provider::send_initial_prompt(
                 request.provider,
                 &terminal_session,
                 prompt_file.path(),
-                send_timeout,
+                deadline,
             )?;
             initial_claim.retain_in_place();
             fs::remove_file(&initial_prompt_path)
@@ -1517,6 +1517,7 @@ fn run_tell(request: TellRequest) -> Result<()> {
                         });
                 }
             };
+            update_status(&directory, "working", None, None)?;
             let send_timeout = match remaining_turn_timeout(deadline, request.timeout) {
                 Ok(timeout) => timeout,
                 Err(error) => {
@@ -1542,12 +1543,11 @@ fn run_tell(request: TellRequest) -> Result<()> {
                     )
                 });
             }
-            update_status(&directory, "working", None, None)?;
             if let Err(error) = provider::send_terminal_follow_up(
                 provider,
                 &terminal_session,
                 prompt_file.path(),
-                send_timeout,
+                deadline,
             ) {
                 claim.retain_in_place();
                 let _ = update_status(&directory, "working", None, Some(format!("{error:#}")));

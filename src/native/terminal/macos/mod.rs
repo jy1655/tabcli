@@ -74,12 +74,12 @@ where
 pub(super) fn send_file(
     session: &TerminalSession,
     prompt_path: &Path,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<()> {
     match session.kind {
-        TerminalKind::Iterm2 => iterm2::send_file(session, prompt_path, timeout),
-        TerminalKind::AppleTerminal => apple_terminal::send_file(session, prompt_path, timeout),
-        TerminalKind::Ghostty => ghostty::send_file(session, prompt_path, timeout),
+        TerminalKind::Iterm2 => iterm2::send_file(session, prompt_path, deadline),
+        TerminalKind::AppleTerminal => apple_terminal::send_file(session, prompt_path, deadline),
+        TerminalKind::Ghostty => ghostty::send_file(session, prompt_path, deadline),
         TerminalKind::WindowsConsole => bail!("Windows Console is only available on Windows"),
     }
 }

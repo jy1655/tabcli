@@ -18,7 +18,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use super::super::terminal;
@@ -91,9 +91,9 @@ impl NativeProviderAdapter for AgyAdapter {
         &self,
         session: &terminal::TerminalSession,
         prompt_path: &Path,
-        timeout: Duration,
+        deadline: Instant,
     ) -> Result<()> {
-        terminal::send_file(session, prompt_path, timeout)
+        terminal::send_file(session, prompt_path, deadline)
     }
 
     fn terminal_initial_prompt(&self, directory: &Path, prompt: &str) -> Result<String> {
@@ -138,9 +138,9 @@ impl NativeProviderAdapter for AgyAdapter {
         &self,
         session: &terminal::TerminalSession,
         prompt_path: &Path,
-        timeout: Duration,
+        deadline: Instant,
     ) -> Result<()> {
-        terminal::send_file(session, prompt_path, timeout)
+        terminal::send_file(session, prompt_path, deadline)
     }
 
     fn prepare_terminal_follow_up(
