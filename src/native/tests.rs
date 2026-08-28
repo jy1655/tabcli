@@ -2075,6 +2075,29 @@ fn dead_native_session_owner_releases_the_turn_and_closes_state() {
 }
 
 #[test]
+fn terminal_close_transaction_preserves_its_terminal_reason() {
+    let directory = tempfile::tempdir().unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    let claim = acquire_turn_claim(directory.path()).unwrap();
+    claim.retain();
+
+    close_session_state_with_error(
+        directory.path(),
+        Some("native session process stopped".to_owned()),
+        |_| panic!("a missing terminal handle must not call the adapter"),
+    )
+    .unwrap();
+
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "closed");
+    assert_eq!(
+        status.error.as_deref(),
+        Some("native session process stopped")
+    );
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+}
+
+#[test]
 fn resume_pending_dead_owner_is_repaired_instead_of_stalling() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
