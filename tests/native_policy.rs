@@ -25,9 +25,9 @@ fn supported_cli_versions_use_a_minimum_not_an_exact_pin() {
     assert!(cli_version_is_supported(FirstPartyCli::Codex, "codex-cli 0.148.3").unwrap());
     assert!(!cli_version_is_supported(FirstPartyCli::Codex, "codex-cli 0.146.9").unwrap());
 
-    assert!(cli_version_is_supported(FirstPartyCli::Claude, "2.1.232 (Claude Code)").unwrap());
+    assert!(cli_version_is_supported(FirstPartyCli::Claude, "2.1.234 (Claude Code)").unwrap());
     assert!(cli_version_is_supported(FirstPartyCli::Claude, "2.2.0 (Claude Code)").unwrap());
-    assert!(!cli_version_is_supported(FirstPartyCli::Claude, "2.1.231 (Claude Code)").unwrap());
+    assert!(!cli_version_is_supported(FirstPartyCli::Claude, "2.1.233 (Claude Code)").unwrap());
 
     assert!(cli_version_is_supported(FirstPartyCli::Agy, "agy 1.1.12").unwrap());
     assert!(cli_version_is_supported(FirstPartyCli::Agy, "agy 1.2.0").unwrap());

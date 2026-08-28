@@ -1,5 +1,7 @@
 use std::{path::Path, str::FromStr};
 
+#[cfg(not(windows))]
+use anyhow::Context;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -118,12 +120,64 @@ pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     platform::select(preferred)
 }
 
-pub(super) fn open_tab(kind: TerminalKind, command: &str) -> Result<TerminalSession> {
-    platform::open_tab(kind, command)
+pub(super) fn open_bound_tab<F>(
+    kind: TerminalKind,
+    command: &str,
+    bind: F,
+) -> Result<TerminalSession>
+where
+    F: FnOnce(&mut TerminalSession) -> Result<()>,
+{
+    #[cfg(windows)]
+    {
+        return windows::open_bound_tab(kind, command, bind);
+    }
+    #[cfg(not(windows))]
+    {
+        let mut session = platform::open_tab(kind, command)?;
+        if let Err(error) = bind(&mut session) {
+            let cleanup = platform::close_session(&session);
+            return match cleanup {
+                Ok(_) => Err(error).context("failed to bind the created terminal surface"),
+                Err(cleanup_error) => Err(anyhow::anyhow!(
+                    "failed to bind the created terminal surface: {error:#}; exact surface cleanup also failed: {cleanup_error:#}"
+                )),
+            };
+        }
+        Ok(session)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn bind_suspended_surface_before_start<T, Bind, Start, Cleanup>(
+    surface: &mut T,
+    bind: Bind,
+    start: Start,
+    cleanup: Cleanup,
+) -> Result<()>
+where
+    Bind: FnOnce(&mut T) -> Result<()>,
+    Start: FnOnce() -> Result<()>,
+    Cleanup: FnOnce(),
+{
+    if let Err(error) = bind(surface) {
+        cleanup();
+        return Err(error);
+    }
+    if let Err(error) = start() {
+        cleanup();
+        return Err(error);
+    }
+    Ok(())
 }
 
 pub(super) fn send_file(session: &TerminalSession, prompt_path: &Path) -> Result<()> {
     platform::send_file(session, prompt_path)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn verify_macos_surface(session: &TerminalSession) -> Result<Option<String>> {
+    macos::verify_surface(session)
 }
 
 pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
@@ -213,7 +267,11 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     use super::macos;
-    use super::{TerminalKind, TerminalSession, classify_macos_terminal, select_macos_terminal};
+    use super::{
+        TerminalKind, TerminalSession, bind_suspended_surface_before_start,
+        classify_macos_terminal, select_macos_terminal,
+    };
+    use anyhow::bail;
 
     #[test]
     fn macos_terminal_detection_recognizes_each_supported_host() {
@@ -332,6 +390,45 @@ mod tests {
         let bound = serde_json::to_value(bound).unwrap();
         assert_eq!(bound["managed_session_id"], "session-owner123");
         assert!(ghostty.verify_managed_session("session-owner123").is_err());
+    }
+
+    #[test]
+    fn suspended_surface_is_bound_before_start_and_cleaned_on_bind_failure() {
+        use std::cell::RefCell;
+
+        let steps = RefCell::new(Vec::new());
+        bind_suspended_surface_before_start(
+            &mut (),
+            |_| {
+                steps.borrow_mut().push("bind");
+                Ok(())
+            },
+            || {
+                steps.borrow_mut().push("start");
+                Ok(())
+            },
+            || steps.borrow_mut().push("cleanup"),
+        )
+        .unwrap();
+        assert_eq!(*steps.borrow(), ["bind", "start"]);
+
+        steps.borrow_mut().clear();
+        assert!(
+            bind_suspended_surface_before_start(
+                &mut (),
+                |_| {
+                    steps.borrow_mut().push("bind");
+                    bail!("persist failed")
+                },
+                || {
+                    steps.borrow_mut().push("start");
+                    Ok(())
+                },
+                || steps.borrow_mut().push("cleanup"),
+            )
+            .is_err()
+        );
+        assert_eq!(*steps.borrow(), ["bind", "cleanup"]);
     }
 
     #[test]

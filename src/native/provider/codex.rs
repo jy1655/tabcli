@@ -1,10 +1,11 @@
 use super::{
     CompletionMonitor, CrossSessionMessageContext, CrossSessionMessageFailure,
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
-    LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan,
+    LaunchPlan, NativeProviderAdapter,
 };
 use agent_bridge::FirstPartyCli;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::{ffi::OsString, path::Path, time::Duration};
 
 use super::super::terminal;
@@ -13,27 +14,51 @@ pub(super) static ADAPTER: CodexAdapter = CodexAdapter;
 
 pub(super) struct CodexAdapter;
 
+const PENDING_TURN_FILE: &str = "codex-pending-turn.json";
+const PENDING_TURN_CONSUMING_FILE: &str = "codex-pending-turn.consuming.json";
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PendingCodexTurn {
+    schema: u32,
+    claim_token: String,
+    marker: String,
+}
+
+impl PendingCodexTurn {
+    fn new(claim_token: &str) -> Result<Self> {
+        validate_claim_token(claim_token)?;
+        Ok(Self {
+            schema: 1,
+            claim_token: claim_token.to_owned(),
+            marker: format!("<!-- agent-bridge-codex-turn:{claim_token} -->"),
+        })
+    }
+}
+
 impl NativeProviderAdapter for CodexAdapter {
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
+        let claim_token = super::super::current_turn_claim_token(context.directory)?
+            .context("Codex launch has no native turn claim")?;
+        let pending = install_pending_turn(context.directory, &claim_token)?;
         let notify = serde_json::to_string(&[
             context.bridge_executable.to_string_lossy().as_ref(),
             "native-hook",
             "codex",
         ])?;
+        let mut arguments = vec![
+            OsString::from("-c"),
+            OsString::from(format!("notify={notify}")),
+            OsString::from("-C"),
+            context.workspace.as_os_str().to_owned(),
+        ];
+        if !cfg!(windows) {
+            arguments.push(OsString::from(correlated_prompt(context.prompt, &pending)));
+        }
         Ok(LaunchPlan {
-            arguments: vec![
-                OsString::from("-c"),
-                OsString::from(format!("notify={notify}")),
-                OsString::from("-C"),
-                context.workspace.as_os_str().to_owned(),
-            ],
-            prompt_is_positional: true,
+            arguments,
+            prompt_is_positional: false,
             completion_monitor: CompletionMonitor::Hook,
         })
-    }
-
-    fn prepare_resume(&self, _context: ResumeContext<'_>) -> Result<Option<ResumePlan>> {
-        Ok(None)
     }
 
     fn initial_prompt_transport(&self) -> InitialPromptTransport {
@@ -54,6 +79,12 @@ impl NativeProviderAdapter for CodexAdapter {
         prompt_path: &Path,
     ) -> Result<()> {
         terminal::send_file(session, prompt_path)
+    }
+
+    fn terminal_initial_prompt(&self, directory: &Path, prompt: &str) -> Result<String> {
+        let pending = read_pending_turn(directory)?
+            .context("Codex initial turn correlation state is missing")?;
+        Ok(correlated_prompt(prompt, &pending))
     }
 
     #[cfg(any(windows, test))]
@@ -81,10 +112,16 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 
     fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()> {
-        let message = codex_string(payload, "last-assistant-message")
+        let raw_message = codex_string(payload, "last-assistant-message")
             .map(|message| message.trim())
             .filter(|message| !message.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Codex notify payload has no assistant result"))?;
+        let Some(pending) = read_pending_turn(directory)? else {
+            return Ok(());
+        };
+        let Ok(message) = correlated_response(raw_message, &pending) else {
+            return Ok(());
+        };
         let thread_id = codex_owned_string(payload, "thread-id");
         if let (Some(established), Some(incoming)) =
             (established_codex_thread(directory)?, thread_id.as_deref())
@@ -92,13 +129,24 @@ impl NativeProviderAdapter for CodexAdapter {
         {
             return Ok(());
         }
-        super::super::record_provider_result(
+        let pending_path = directory.join(PENDING_TURN_FILE);
+        let consuming_path = directory.join(PENDING_TURN_CONSUMING_FILE);
+        super::super::rename_session_file(&pending_path, &consuming_path)
+            .context("failed to claim the pending Codex turn result")?;
+        let result = super::super::record_provider_result_for_claim(
             directory,
             FirstPartyCli::Codex,
             message,
             thread_id,
             codex_owned_string(payload, "turn-id"),
-        )
+            Some(&pending.claim_token),
+        );
+        if let Err(error) = result {
+            let _ = super::super::rename_session_file(&consuming_path, &pending_path);
+            return Err(error).context("failed to record the correlated Codex result");
+        }
+        let _ = super::super::remove_file_if_present(&consuming_path);
+        Ok(())
     }
 
     fn run_control(&self, _arguments: &[String]) -> Result<()> {
@@ -112,6 +160,85 @@ impl NativeProviderAdapter for CodexAdapter {
     ) -> Result<()> {
         terminal::send_file(session, prompt_path)
     }
+
+    fn prepare_terminal_follow_up(
+        &self,
+        directory: &Path,
+        prompt: &str,
+        claim_token: &str,
+    ) -> Result<String> {
+        let pending = install_pending_turn(directory, claim_token)?;
+        Ok(correlated_prompt(prompt, &pending))
+    }
+
+    fn cancel_terminal_follow_up(&self, directory: &Path, claim_token: &str) -> Result<()> {
+        cancel_pending_turn(directory, claim_token)
+    }
+}
+
+fn validate_claim_token(claim_token: &str) -> Result<()> {
+    if claim_token.is_empty()
+        || claim_token.len() > 160
+        || !claim_token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-')
+    {
+        bail!("invalid Codex turn claim token")
+    }
+    Ok(())
+}
+
+fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingCodexTurn> {
+    let pending = PendingCodexTurn::new(claim_token)?;
+    super::super::write_private(
+        &directory.join(PENDING_TURN_FILE),
+        &serde_json::to_vec_pretty(&pending)?,
+    )?;
+    Ok(pending)
+}
+
+fn read_pending_turn(directory: &Path) -> Result<Option<PendingCodexTurn>> {
+    let Some(text) =
+        super::super::read_regular_text_if_present(&directory.join(PENDING_TURN_FILE))?
+    else {
+        return Ok(None);
+    };
+    let pending: PendingCodexTurn =
+        serde_json::from_str(&text).context("failed to parse the pending Codex turn")?;
+    let expected = PendingCodexTurn::new(&pending.claim_token)?;
+    if pending.schema != expected.schema || pending.marker != expected.marker {
+        bail!("Agent Bridge rejected invalid Codex turn correlation state")
+    }
+    Ok(Some(pending))
+}
+
+fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result<()> {
+    let Some(pending) = read_pending_turn(directory)? else {
+        return Ok(());
+    };
+    if pending.claim_token != claim_token {
+        return Ok(());
+    }
+    super::super::remove_file_if_present(&directory.join(PENDING_TURN_FILE))
+}
+
+fn correlated_prompt(prompt: &str, pending: &PendingCodexTurn) -> String {
+    format!(
+        "{prompt}\n\n[Agent Bridge Codex turn protocol]\nComplete this request as one turn. End the complete final response with the exact marker below on its own final line; do not alter or omit it.\n{}",
+        pending.marker
+    )
+}
+
+fn correlated_response<'a>(message: &'a str, pending: &PendingCodexTurn) -> Result<&'a str> {
+    let body = message
+        .trim_end()
+        .strip_suffix(&pending.marker)
+        .context("Codex response did not end with the expected turn marker")?
+        .trim_end();
+    if body.is_empty() {
+        bail!("Codex correlated response contained no assistant text")
+    }
+    Ok(body)
 }
 
 fn codex_string<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -142,17 +269,27 @@ mod tests {
     };
     use super::*;
 
+    fn claim_pending_turn(directory: &Path) -> PendingCodexTurn {
+        let claim = acquire_turn_claim(directory).unwrap();
+        let token = claim.token.clone();
+        claim.retain();
+        install_pending_turn(directory, &token).unwrap()
+    }
+
+    fn marked(message: &str, pending: &PendingCodexTurn) -> String {
+        format!("{message}\n{}", pending.marker)
+    }
+
     #[test]
     fn codex_hook_owns_the_official_notify_payload_schema() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
         update_status(directory.path(), "working", None, None).unwrap();
-        let claim = acquire_turn_claim(directory.path()).unwrap();
-        claim.retain();
+        let pending = claim_pending_turn(directory.path());
         let payload = serde_json::json!({
             "thread-id": "codex-thread",
             "turn-id": "codex-turn",
-            "last-assistant-message": "codex result",
+            "last-assistant-message": marked("codex result", &pending),
         });
 
         ADAPTER.handle_hook(directory.path(), &payload).unwrap();
@@ -169,20 +306,19 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
         update_status(directory.path(), "working", None, None).unwrap();
-        let initial_claim = acquire_turn_claim(directory.path()).unwrap();
-        initial_claim.retain();
+        let initial_pending = claim_pending_turn(directory.path());
         ADAPTER
             .handle_hook(
                 directory.path(),
                 &serde_json::json!({
                     "thread-id": "managed-thread",
                     "turn-id": "managed-turn-1",
-                    "last-assistant-message": "managed result",
+                    "last-assistant-message": marked("managed result", &initial_pending),
                 }),
             )
             .unwrap();
-        let claim = acquire_turn_claim(directory.path()).unwrap();
-        claim.retain();
+        let _pending = claim_pending_turn(directory.path());
+        update_status(directory.path(), "claimed", None, None).unwrap();
         update_status(directory.path(), "working", None, None).unwrap();
 
         ADAPTER
@@ -207,8 +343,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
         update_status(directory.path(), "working", None, None).unwrap();
-        let claim = acquire_turn_claim(directory.path()).unwrap();
-        claim.retain();
+        let pending = claim_pending_turn(directory.path());
 
         ADAPTER
             .handle_hook(
@@ -216,7 +351,7 @@ mod tests {
                 &serde_json::json!({
                     "thread-id": "managed-thread",
                     "turn-id": "managed-turn",
-                    "last-assistant-message": "{\"title\":\"Requested title\"}",
+                    "last-assistant-message": marked("{\"title\":\"Requested title\"}", &pending),
                 }),
             )
             .unwrap();
@@ -224,5 +359,62 @@ mod tests {
         let paths = event_paths(directory.path()).unwrap();
         let event: SessionEvent = read_json(&paths[0]).unwrap();
         assert_eq!(event.message, "{\"title\":\"Requested title\"}");
+    }
+
+    #[test]
+    fn codex_hook_does_not_bind_the_first_foreign_notify_event() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let _pending = claim_pending_turn(directory.path());
+
+        ADAPTER
+            .handle_hook(
+                directory.path(),
+                &serde_json::json!({
+                    "thread-id": "foreign-title-thread",
+                    "turn-id": "foreign-title-turn",
+                    "last-assistant-message": "{\"title\":\"Generated title\"}",
+                }),
+            )
+            .unwrap();
+
+        assert!(event_paths(directory.path()).unwrap().is_empty());
+        assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+    }
+
+    #[test]
+    fn codex_hook_does_not_bind_a_delayed_new_turn_to_a_later_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let initial_pending = claim_pending_turn(directory.path());
+        ADAPTER
+            .handle_hook(
+                directory.path(),
+                &serde_json::json!({
+                    "thread-id": "managed-thread",
+                    "turn-id": "managed-turn-1",
+                    "last-assistant-message": marked("first result", &initial_pending),
+                }),
+            )
+            .unwrap();
+        let _later_pending = claim_pending_turn(directory.path());
+        update_status(directory.path(), "claimed", None, None).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+
+        ADAPTER
+            .handle_hook(
+                directory.path(),
+                &serde_json::json!({
+                    "thread-id": "managed-thread",
+                    "turn-id": "delayed-old-turn-with-a-new-id",
+                    "last-assistant-message": "delayed old result",
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(event_paths(directory.path()).unwrap().len(), 1);
+        assert!(directory.path().join(TURN_CLAIM_FILE).exists());
     }
 }

@@ -23,16 +23,6 @@ pub(super) struct LaunchPlan {
     pub(super) completion_monitor: CompletionMonitor,
 }
 
-pub(super) struct ResumeContext<'a> {
-    pub(super) bridge_executable: &'a Path,
-    pub(super) directory: &'a Path,
-    pub(super) provider_session_id: &'a str,
-}
-
-pub(super) struct ResumePlan {
-    pub(super) arguments: Vec<OsString>,
-}
-
 #[cfg_attr(windows, allow(dead_code))]
 pub(super) struct CrossSessionMessageContext<'a> {
     pub(super) bridge_executable: &'a Path,
@@ -57,7 +47,6 @@ impl CrossSessionMessageFailure {
         }
     }
 
-    #[cfg(not(windows))]
     pub(super) fn delivery_uncertain(error: anyhow::Error) -> Self {
         Self {
             error,
@@ -117,14 +106,12 @@ impl ActiveCompletionMonitor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FollowUpTransport {
     TerminalPasteFallback,
-    ProviderResumeSupervisor,
     ProviderCrossSessionMessage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum InitialPromptTransport {
     ProviderArgument,
-    ProviderStdin,
     TerminalPasteAfterLaunch,
 }
 
@@ -132,7 +119,6 @@ impl FollowUpTransport {
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::TerminalPasteFallback => "terminal-paste-fallback",
-            Self::ProviderResumeSupervisor => "provider-resume-supervisor",
             Self::ProviderCrossSessionMessage => "provider-cross-session-message",
         }
     }
@@ -140,7 +126,6 @@ impl FollowUpTransport {
 
 trait NativeProviderAdapter: Sync {
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan>;
-    fn prepare_resume(&self, context: ResumeContext<'_>) -> Result<Option<ResumePlan>>;
     fn initial_prompt_transport(&self) -> InitialPromptTransport;
     fn initial_prompt_ready_delay(&self) -> Duration;
     fn send_initial_prompt(
@@ -148,6 +133,7 @@ trait NativeProviderAdapter: Sync {
         session: &terminal::TerminalSession,
         prompt_path: &Path,
     ) -> Result<()>;
+    fn terminal_initial_prompt(&self, directory: &Path, prompt: &str) -> Result<String>;
     #[cfg(any(windows, test))]
     fn terminal_submit_count(&self) -> usize;
     fn follow_up_transport(&self) -> FollowUpTransport;
@@ -163,6 +149,13 @@ trait NativeProviderAdapter: Sync {
         session: &terminal::TerminalSession,
         prompt_path: &Path,
     ) -> Result<()>;
+    fn prepare_terminal_follow_up(
+        &self,
+        directory: &Path,
+        prompt: &str,
+        claim_token: &str,
+    ) -> Result<String>;
+    fn cancel_terminal_follow_up(&self, directory: &Path, claim_token: &str) -> Result<()>;
 }
 
 fn adapter(provider: FirstPartyCli) -> &'static dyn NativeProviderAdapter {
@@ -179,13 +172,6 @@ pub(super) fn prepare_launch(
     context: LaunchContext<'_>,
 ) -> Result<LaunchPlan> {
     adapter(provider).prepare_launch(context)
-}
-
-pub(super) fn prepare_resume(
-    provider: FirstPartyCli,
-    context: ResumeContext<'_>,
-) -> Result<Option<ResumePlan>> {
-    adapter(provider).prepare_resume(context)
 }
 
 pub(super) fn follow_up_transport(provider: FirstPartyCli) -> FollowUpTransport {
@@ -242,4 +228,29 @@ pub(super) fn send_initial_prompt(
     prompt_path: &Path,
 ) -> Result<()> {
     adapter(provider).send_initial_prompt(session, prompt_path)
+}
+
+pub(super) fn terminal_initial_prompt(
+    provider: FirstPartyCli,
+    directory: &Path,
+    prompt: &str,
+) -> Result<String> {
+    adapter(provider).terminal_initial_prompt(directory, prompt)
+}
+
+pub(super) fn prepare_terminal_follow_up(
+    provider: FirstPartyCli,
+    directory: &Path,
+    prompt: &str,
+    claim_token: &str,
+) -> Result<String> {
+    adapter(provider).prepare_terminal_follow_up(directory, prompt, claim_token)
+}
+
+pub(super) fn cancel_terminal_follow_up(
+    provider: FirstPartyCli,
+    directory: &Path,
+    claim_token: &str,
+) -> Result<()> {
+    adapter(provider).cancel_terminal_follow_up(directory, claim_token)
 }

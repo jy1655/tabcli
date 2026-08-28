@@ -14,7 +14,6 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{IsTerminal, Read, Write},
     path::{Path, PathBuf},
-    process::Stdio,
     str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
     thread,
@@ -35,14 +34,17 @@ const DEFAULT_TIMEOUT_SECS: u64 = 900;
 const SESSION_SCHEMA: u32 = 1;
 const TURN_CLAIM_FILE: &str = "turn.claim";
 const TURN_CLAIM_LOCK_FILE: &str = "turn.claim.lock";
-const TURN_CLAIM_TOKEN_ENV: &str = "AGENT_BRIDGE_NATIVE_TURN_CLAIM_TOKEN";
+const TURN_COMPLETION_FILE: &str = "turn.completion.json";
+const STATUS_LOCK_FILE: &str = "status.lock";
 const SESSION_OWNER_FILE: &str = "native-session.json";
 const CLOSED_STATUS_FILE: &str = "closed.json";
 const TERMINAL_HANDLE_FILE: &str = "terminal.json";
 const TERMINAL_CLOSING_FILE: &str = "terminal.closing.json";
 const TERMINAL_TOMBSTONE_FILE: &str = "terminal.closed.json";
-const RESUME_PENDING_FILE: &str = "resume.pending.json";
-const RESUME_RUNNING_FILE: &str = "resume.running.json";
+// v0.0.2 native-Windows Claude sessions may still carry these files. New sessions never
+// create them; explicit close and prune consume them so an upgrade cannot strand state.
+const LEGACY_RESUME_PENDING_FILE: &str = "resume.pending.json";
+const LEGACY_RESUME_RUNNING_FILE: &str = "resume.running.json";
 static TURN_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -128,21 +130,16 @@ struct SessionManifest {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct ResumeRequest {
-    id: String,
-    provider_session_id: String,
-    prompt: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
 struct SessionStatus {
     state: String,
+    #[serde(default)]
+    generation: u64,
     updated_unix_ms: u128,
     exit_code: Option<i32>,
     error: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct SessionEvent {
     provider: String,
     message: String,
@@ -151,6 +148,30 @@ struct SessionEvent {
     provider_session_id: Option<String>,
     turn_id: Option<String>,
     created_unix_ms: u128,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PendingTurnCompletion {
+    schema: u32,
+    claim_token: String,
+    event_file: String,
+    event: SessionEvent,
+    status_error: Option<String>,
+}
+
+impl PendingTurnCompletion {
+    fn new(claim_token: &str, event: SessionEvent, status_error: Option<String>) -> Result<Self> {
+        if !valid_turn_claim_token(claim_token) {
+            bail!("invalid native completion claim token")
+        }
+        Ok(Self {
+            schema: 1,
+            claim_token: claim_token.to_owned(),
+            event_file: new_event_file_name()?,
+            event,
+            status_error,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -395,6 +416,7 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
     if prompt.trim().is_empty() {
         bail!("--prompt cannot be empty");
     }
+    validate_terminal_input(&prompt, "--prompt")?;
     if model.as_ref().is_some_and(|value| value.trim().is_empty()) {
         bail!("--model cannot be empty");
     }
@@ -670,6 +692,7 @@ fn run_windows_console_control(_action: &str, _id: &str, _input_name: Option<&st
 }
 
 fn run_ask(request: AskRequest) -> Result<()> {
+    let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
     let terminal_kind = terminal::select(request.terminal)?;
     let workspace = request.workspace.canonicalize().with_context(|| {
         format!(
@@ -713,40 +736,52 @@ fn run_ask(request: AskRequest) -> Result<()> {
         &executable,
         &created.id,
     )?;
-    let mut terminal_session = match terminal::open_tab(terminal_kind, &bridge_command) {
-        Ok(session) => session,
-        Err(error) => {
-            let _ = fs::remove_file(created.directory.join("initial-prompt.txt"));
-            let _ = update_status(
-                &created.directory,
-                "failed",
-                None,
-                Some(format!("{error:#}")),
-            );
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to open {} surface for session {}",
-                    terminal_kind.display_name(),
-                    created.id
-                )
-            });
-        }
-    };
-    terminal_session.managed_session_id = Some(created.id.clone());
-    write_json_atomic(&created.directory.join("terminal.json"), &terminal_session)?;
-
+    let terminal_session =
+        match terminal::open_bound_tab(terminal_kind, &bridge_command, |session| {
+            session.managed_session_id = Some(created.id.clone());
+            write_json_atomic(&created.directory.join(TERMINAL_HANDLE_FILE), session)
+        }) {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = fs::remove_file(created.directory.join("initial-prompt.txt"));
+                let _ = update_status(
+                    &created.directory,
+                    "failed",
+                    None,
+                    Some(format!("{error:#}")),
+                );
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to open {} surface for session {}",
+                        terminal_kind.display_name(),
+                        created.id
+                    )
+                });
+            }
+        };
     if provider::initial_prompt_transport(request.provider)
         == provider::InitialPromptTransport::TerminalPasteAfterLaunch
     {
         wait_for_status(
             &created.directory,
             "awaiting-initial-input",
+            deadline,
             request.timeout,
         )?;
-        thread::sleep(provider::initial_prompt_ready_delay(request.provider));
+        let readiness_delay = initial_prompt_delay_within_budget(
+            deadline,
+            provider::initial_prompt_ready_delay(request.provider),
+            request.timeout,
+        )?;
+        thread::sleep(readiness_delay);
         let initial_prompt_path = created.directory.join("initial-prompt.txt");
         let initial_prompt = fs::read_to_string(&initial_prompt_path)
             .context("failed to read the preserved initial prompt")?;
+        let initial_prompt = provider::terminal_initial_prompt(
+            request.provider,
+            &created.directory,
+            &initial_prompt,
+        )?;
         let mut prompt_file = tempfile::Builder::new()
             .prefix("pending-prompt-")
             .suffix(".txt")
@@ -755,6 +790,7 @@ fn run_ask(request: AskRequest) -> Result<()> {
         prompt_file.write_all(&terminal_paste_bytes(&initial_prompt))?;
         prompt_file.flush()?;
         update_status(&created.directory, "working", None, None)?;
+        verify_terminal_surface_ownership(&created.directory, &created.id, &terminal_session)?;
         if let Err(error) =
             provider::send_initial_prompt(request.provider, &terminal_session, prompt_file.path())
         {
@@ -789,11 +825,12 @@ fn run_ask(request: AskRequest) -> Result<()> {
         );
     }
 
-    let event = wait_for_event_for_turn(
+    let event = wait_for_event_for_turn_until(
         &created.directory,
         0,
         None,
         Some(&expected_claim_token),
+        deadline,
         request.timeout,
     )
     .with_context(|| {
@@ -818,19 +855,65 @@ fn verify_terminal_surface_ownership(
     session: &terminal::TerminalSession,
 ) -> Result<()> {
     session.verify_managed_session(expected_session_id)?;
-    if session.kind == terminal::TerminalKind::AppleTerminal {
-        verify_apple_terminal_owner(directory, expected_session_id, session)?;
+    #[cfg(not(target_os = "macos"))]
+    let _ = directory;
+    #[cfg(target_os = "macos")]
+    {
+        let surface_tty = terminal::verify_macos_surface(session)?;
+        verified_macos_terminal_owner(
+            directory,
+            expected_session_id,
+            session,
+            surface_tty.as_deref(),
+        )?;
     }
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn verify_apple_terminal_owner(
+fn verified_macos_terminal_owner(
     directory: &Path,
     expected_session_id: &str,
     session: &terminal::TerminalSession,
-) -> Result<()> {
-    verified_apple_terminal_owner(directory, expected_session_id, session).map(|_| ())
+    surface_tty: Option<&str>,
+) -> Result<(NativeSessionOwner, NativeProcessIdentity)> {
+    let owner_path = directory.join(SESSION_OWNER_FILE);
+    let owner_text = read_regular_text_if_present(&owner_path)?
+        .with_context(|| "Terminal.app ownership requires a live native-session owner")?;
+    let owner: NativeSessionOwner = serde_json::from_str(&owner_text)
+        .with_context(|| format!("invalid JSON in {}", owner_path.display()))?;
+    let live = live_native_process_identity(owner.pid)?;
+    session.verify_managed_session(expected_session_id)?;
+    if owner.managed_session_id.as_deref() != Some(expected_session_id) {
+        bail!("native-session owner is not bound to this managed session")
+    }
+    if !matches!(
+        (
+            owner.terminal_tty_device,
+            owner.process_start_seconds,
+            owner.process_start_microseconds,
+            owner.process_group,
+            owner.terminal_process_group,
+        ),
+        (Some(_), Some(_), Some(_), Some(_), Some(_))
+    ) || !native_owner_identity_matches(&owner, &live)
+    {
+        bail!("native-session owner birth, TTY, or foreground identity changed")
+    }
+    let owner_tty = owner
+        .terminal_tty
+        .as_deref()
+        .context("native-session owner is missing its controlling TTY")?;
+    if surface_tty.is_some_and(|tty| tty != owner_tty) {
+        bail!("terminal surface is attached to a different native-session TTY")
+    }
+    if terminal_tty_device(Path::new(owner_tty))? != live.terminal_tty_device {
+        bail!("native-session owner TTY path no longer identifies its controlling TTY")
+    }
+    verified_terminal_owner_process_group(&owner, &live)?;
+    let live_shell = live_native_process_identity(live.parent_pid)?;
+    verified_terminal_shell_process_group(&owner, &live, &live_shell)?;
+    Ok((owner, live))
 }
 
 #[cfg(target_os = "macos")]
@@ -839,21 +922,12 @@ fn verified_apple_terminal_owner(
     expected_session_id: &str,
     session: &terminal::TerminalSession,
 ) -> Result<(NativeSessionOwner, NativeProcessIdentity)> {
-    let owner_path = directory.join(SESSION_OWNER_FILE);
-    let owner_text = read_regular_text_if_present(&owner_path)?
-        .with_context(|| "Terminal.app ownership requires a live native-session owner")?;
-    let owner: NativeSessionOwner = serde_json::from_str(&owner_text)
-        .with_context(|| format!("invalid JSON in {}", owner_path.display()))?;
-    let live = live_native_process_identity(owner.pid)?;
-    let surface_tty_device = terminal_tty_device(Path::new(&session.id))?;
-    verify_terminal_owner_attestation(
-        expected_session_id,
-        session,
-        &owner,
-        &live,
-        surface_tty_device,
-    )?;
-    Ok((owner, live))
+    if session.kind != terminal::TerminalKind::AppleTerminal {
+        bail!("Terminal.app ownership proof received a different terminal kind")
+    }
+    let surface_tty = terminal::verify_macos_surface(session)?
+        .context("Terminal.app ownership proof did not return a TTY")?;
+    verified_macos_terminal_owner(directory, expected_session_id, session, Some(&surface_tty))
 }
 
 #[cfg(target_os = "macos")]
@@ -869,16 +943,7 @@ fn terminate_apple_terminal_owner(
     terminal::macos::apple_terminal::terminate_process_groups(process_group, shell_process_group)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn verify_apple_terminal_owner(
-    _directory: &Path,
-    _expected_session_id: &str,
-    _session: &terminal::TerminalSession,
-) -> Result<()> {
-    bail!("Terminal.app ownership proof is only available on macOS")
-}
-
-#[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn verify_terminal_owner_attestation(
     expected_session_id: &str,
     session: &terminal::TerminalSession,
@@ -1045,6 +1110,64 @@ fn live_native_process_identity(pid: u32) -> Result<NativeProcessIdentity> {
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn native_owner_identity_matches(owner: &NativeSessionOwner, live: &NativeProcessIdentity) -> bool {
+    if owner.pid != live.pid {
+        return false;
+    }
+    match (
+        owner.terminal_tty_device,
+        owner.process_start_seconds,
+        owner.process_start_microseconds,
+        owner.process_group,
+        owner.terminal_process_group,
+    ) {
+        (None, None, None, None, None) => true,
+        (
+            Some(terminal_tty_device),
+            Some(process_start_seconds),
+            Some(process_start_microseconds),
+            Some(process_group),
+            Some(terminal_process_group),
+        ) => {
+            terminal_tty_device == live.terminal_tty_device
+                && process_start_seconds == live.process_start_seconds
+                && process_start_microseconds == live.process_start_microseconds
+                && process_group == live.process_group
+                && terminal_process_group == live.terminal_process_group
+        }
+        _ => false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_native_owner_is_live(owner: &NativeSessionOwner) -> Result<bool> {
+    if matches!(
+        (
+            owner.terminal_tty_device,
+            owner.process_start_seconds,
+            owner.process_start_microseconds,
+            owner.process_group,
+            owner.terminal_process_group,
+        ),
+        (None, None, None, None, None)
+    ) {
+        // Pre-0.0.3 owner records had only a PID. Preserve their historical liveness
+        // behavior; every newly launched macOS session records the strong identity below.
+        return Ok(process_is_alive(owner.pid));
+    }
+    match live_native_process_identity(owner.pid) {
+        Ok(live) => Ok(native_owner_identity_matches(owner, &live)),
+        Err(error) if process_is_alive(owner.pid) => Err(error).with_context(|| {
+            format!(
+                "failed to verify the birth identity of live native-session process {}",
+                owner.pid
+            )
+        }),
+        Err(_) => Ok(false),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn verified_terminal_owner_process_group(
     owner: &NativeSessionOwner,
     live: &NativeProcessIdentity,
@@ -1104,6 +1227,7 @@ fn verified_terminal_shell_process_group(
 fn run_tell(request: TellRequest) -> Result<()> {
     let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
     let directory = session_directory(&request.id)?;
+    recover_pending_completion(&directory)?;
     repair_dead_native_owner(&directory)?;
     let manifest = read_manifest(&directory)?;
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
@@ -1118,27 +1242,31 @@ fn run_tell(request: TellRequest) -> Result<()> {
     }
     let prompt = native_delegation_prompt(&delegation_source(), &request.prompt);
     let follow_up_transport = provider::follow_up_transport(provider);
-    let (claim, baseline) = acquire_ready_turn_claim_after_claim(&directory, &request.id, || {
-        if follow_up_transport == provider::FollowUpTransport::ProviderResumeSupervisor {
-            wait_for_provider_resume_slot(&directory, deadline)?;
-        }
-        Ok(())
-    })?;
+    let (claim, baseline) = acquire_ready_turn_claim(&directory, &request.id)?;
     let claim_token = claim.token.clone();
     let mut expected_turn_id = None;
     match follow_up_transport {
         provider::FollowUpTransport::TerminalPasteFallback => {
             update_status(&directory, "working", None, None)?;
-            let mut prompt_file = tempfile::Builder::new()
-                .prefix("pending-prompt-")
-                .suffix(".txt")
-                .tempfile_in(&directory)?;
-            set_private_file_permissions(prompt_file.as_file())?;
-            prompt_file.write_all(&terminal_paste_bytes(&prompt))?;
-            prompt_file.flush()?;
-            if let Err(error) =
+            let delivery = (|| -> Result<()> {
+                let correlated_prompt = provider::prepare_terminal_follow_up(
+                    provider,
+                    &directory,
+                    &prompt,
+                    &claim_token,
+                )?;
+                let mut prompt_file = tempfile::Builder::new()
+                    .prefix("pending-prompt-")
+                    .suffix(".txt")
+                    .tempfile_in(&directory)?;
+                set_private_file_permissions(prompt_file.as_file())?;
+                prompt_file.write_all(&terminal_paste_bytes(&correlated_prompt))?;
+                prompt_file.flush()?;
+                verify_terminal_surface_ownership(&directory, &request.id, &terminal_session)?;
                 provider::send_terminal_follow_up(provider, &terminal_session, prompt_file.path())
-            {
+            })();
+            if let Err(error) = delivery {
+                let _ = provider::cancel_terminal_follow_up(provider, &directory, &claim_token);
                 let _ = update_status(
                     &directory,
                     &previous_state,
@@ -1159,43 +1287,6 @@ fn run_tell(request: TellRequest) -> Result<()> {
                             follow_up_transport.as_str()
                         )
                     });
-            }
-        }
-        provider::FollowUpTransport::ProviderResumeSupervisor => {
-            let latest = event_paths(&directory)?
-                .last()
-                .cloned()
-                .context("provider resume requires a completed initial turn")?;
-            let event: SessionEvent = read_json(&latest)?;
-            let provider_session_id = event
-                .provider_session_id
-                .context("provider resume requires a provider session id")?;
-            let resume = ResumeRequest {
-                id: format!(
-                    "resume-{}-{}",
-                    unix_ms(),
-                    TURN_CLAIM_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-                ),
-                provider_session_id,
-                prompt,
-            };
-            if directory.join(RESUME_PENDING_FILE).exists()
-                || directory.join(RESUME_RUNNING_FILE).exists()
-            {
-                bail!(
-                    "provider resume request already exists for session {}",
-                    request.id
-                );
-            }
-            update_status(&directory, "resume-pending", None, None)?;
-            if let Err(error) = write_json_atomic(&directory.join(RESUME_PENDING_FILE), &resume) {
-                let _ = update_status(
-                    &directory,
-                    &previous_state,
-                    None,
-                    Some(format!("{error:#}")),
-                );
-                return Err(error).context("failed to publish provider resume request");
             }
         }
         provider::FollowUpTransport::ProviderCrossSessionMessage => {
@@ -1247,13 +1338,13 @@ fn run_tell(request: TellRequest) -> Result<()> {
     if request.detach {
         return emit_session_result(request.json, &request.id, &terminal_session, provider, None);
     }
-    let remaining = remaining_turn_timeout(deadline, request.timeout)?;
-    let event = wait_for_event_for_turn(
+    let event = wait_for_event_for_turn_until(
         &directory,
         baseline,
         expected_turn_id.as_deref(),
         Some(&claim_token),
-        remaining,
+        deadline,
+        request.timeout,
     )
     .with_context(|| {
         format!(
@@ -1271,50 +1362,27 @@ fn run_tell(request: TellRequest) -> Result<()> {
     )
 }
 
-fn wait_for_provider_resume_slot(directory: &Path, deadline: Instant) -> Result<()> {
-    wait_for_provider_resume_slot_after_observed(directory, deadline, || {})
-}
-
-fn wait_for_provider_resume_slot_after_observed<F>(
-    directory: &Path,
-    deadline: Instant,
-    observed: F,
-) -> Result<()>
-where
-    F: FnOnce(),
-{
-    let running = directory.join(RESUME_RUNNING_FILE);
-    let mut observed = Some(observed);
-    while running.try_exists().with_context(|| {
-        format!(
-            "failed to inspect provider resume supervisor slot {}",
-            running.display()
-        )
-    })? {
-        if let Some(observed) = observed.take() {
-            observed();
-        }
-        if repair_dead_native_owner(directory)? {
-            bail!("provider resume supervisor is no longer running");
-        }
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .context("timed out waiting for the provider resume supervisor to finish")?;
-        thread::sleep(remaining.min(Duration::from_millis(10)));
-    }
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
-        .context("timed out waiting for the provider resume supervisor to finish")?;
-    Ok(())
-}
-
 fn remaining_turn_timeout(deadline: Instant, requested: Duration) -> Result<Duration> {
     deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
         .with_context(|| format!("timed out after {} seconds", requested.as_secs()))
+}
+
+fn initial_prompt_delay_within_budget(
+    deadline: Instant,
+    delay: Duration,
+    requested: Duration,
+) -> Result<Duration> {
+    let remaining = remaining_turn_timeout(deadline, requested)?;
+    if delay >= remaining {
+        bail!(
+            "initial prompt readiness delay of {} seconds does not fit inside the {} second ask timeout",
+            delay.as_secs(),
+            requested.as_secs()
+        )
+    }
+    Ok(delay)
 }
 
 fn run_sessions(json: bool) -> Result<()> {
@@ -1331,6 +1399,7 @@ fn run_sessions(json: bool) -> Result<()> {
                 continue;
             }
             let directory = entry.path();
+            let _ = recover_pending_completion(&directory);
             let _ = repair_dead_native_owner(&directory);
             let Ok(manifest) = read_manifest(&directory) else {
                 continue;
@@ -1479,8 +1548,9 @@ fn has_active_session_capability(directory: &Path) -> bool {
         TERMINAL_HANDLE_FILE,
         TERMINAL_CLOSING_FILE,
         TURN_CLAIM_FILE,
-        RESUME_PENDING_FILE,
-        RESUME_RUNNING_FILE,
+        TURN_COMPLETION_FILE,
+        LEGACY_RESUME_PENDING_FILE,
+        LEGACY_RESUME_RUNNING_FILE,
     ]
     .into_iter()
     .any(|name| fs::symlink_metadata(directory.join(name)).is_ok())
@@ -1602,7 +1672,7 @@ where
         return close_result;
     }
     match fs::rename(&terminal_path, &closing_path) {
-        Ok(()) => {}
+        Ok(()) => sync_parent_directory(&closing_path)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if closing_path.exists() {
                 return Ok(());
@@ -1638,7 +1708,7 @@ where
 }
 
 fn restore_terminal_handle(closing_path: &Path, terminal_path: &Path) -> Result<()> {
-    fs::rename(closing_path, terminal_path).with_context(|| {
+    rename_session_file(closing_path, terminal_path).with_context(|| {
         format!(
             "failed to restore terminal handle {} after close failure",
             terminal_path.display()
@@ -1666,10 +1736,20 @@ fn consume_terminal_handle(
 
 fn remove_file_if_present(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_parent_directory(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
     }
+}
+
+pub(super) fn rename_session_file(from: &Path, to: &Path) -> Result<()> {
+    fs::rename(from, to)
+        .with_context(|| format!("failed to rename {} to {}", from.display(), to.display()))?;
+    sync_parent_directory(to)?;
+    if from.parent() != to.parent() {
+        sync_parent_directory(from)?;
+    }
+    Ok(())
 }
 
 fn emit_session_result(
@@ -1715,11 +1795,31 @@ fn run_session(id: &str) -> Result<()> {
     let owner = current_native_session_owner(id)?;
     write_json_atomic(&directory.join(SESSION_OWNER_FILE), &owner)?;
     let result = run_session_inner(&directory);
-    let _ = release_turn_claim(&directory);
-    if let Err(error) = &result {
-        let _ = update_status(&directory, "failed", None, Some(format!("{error:#}")));
+    if let Err(finalization_error) = finalize_native_session(&directory, &result) {
+        return match result {
+            Ok(()) => Err(finalization_error),
+            Err(run_error) => Err(anyhow::anyhow!(
+                "{run_error:#}; native session finalization also failed: {finalization_error:#}"
+            )),
+        };
     }
     result
+}
+
+fn finalize_native_session(directory: &Path, result: &Result<()>) -> Result<()> {
+    let claim_path = directory.join(TURN_CLAIM_FILE);
+    let _claim_lock = lock_turn_claim(&claim_path)?;
+    recover_pending_completion_locked(directory, &claim_path)?;
+    let status: SessionStatus = read_json(&directory.join("status.json"))?;
+    if !matches!(status.state.as_str(), "closed" | "exited" | "failed") {
+        match result {
+            Ok(()) => update_status(directory, "exited", Some(0), None)?,
+            Err(error) => {
+                update_status(directory, "failed", None, Some(format!("{error:#}")))?;
+            }
+        }
+    }
+    remove_turn_claim_locked(&claim_path)
 }
 
 fn run_session_inner(directory: &Path) -> Result<()> {
@@ -1771,18 +1871,6 @@ fn run_session_inner(directory: &Path) -> Result<()> {
         arguments.push(OsString::from(prompt.clone()));
     }
 
-    if provider::follow_up_transport(provider)
-        == provider::FollowUpTransport::ProviderResumeSupervisor
-    {
-        return run_provider_resume_supervisor(
-            directory,
-            &manifest,
-            &executable,
-            policy_arguments,
-            arguments,
-        );
-    }
-
     let completion_monitor = completion_monitor.start(directory)?;
     let mut provider_command =
         provider_process_command(&manifest.provider_path, directory, arguments)?;
@@ -1808,9 +1896,6 @@ fn run_session_inner(directory: &Path) -> Result<()> {
         provider::InitialPromptTransport::TerminalPasteAfterLaunch => {
             update_status(directory, "awaiting-initial-input", None, None)?;
         }
-        provider::InitialPromptTransport::ProviderStdin => {
-            bail!("provider stdin transport requires a resume supervisor")
-        }
     }
     let status = child.wait();
     completion_monitor.stop()?;
@@ -1821,162 +1906,10 @@ fn run_session_inner(directory: &Path) -> Result<()> {
             manifest.provider_path.display()
         )
     })?;
-    update_status(directory, "exited", status.code(), None)?;
     if !status.success() {
         bail!("{} exited with {status}", provider.as_str());
     }
     Ok(())
-}
-
-fn run_provider_resume_supervisor(
-    directory: &Path,
-    manifest: &SessionManifest,
-    executable: &Path,
-    policy_arguments: Vec<OsString>,
-    initial_arguments: Vec<OsString>,
-) -> Result<()> {
-    let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
-    let initial_prompt_path = directory.join("initial-prompt.txt");
-    let initial_prompt = fs::read_to_string(&initial_prompt_path)
-        .context("failed to read supervisor initial prompt")?;
-    update_status(directory, "running", None, None)?;
-    let initial_status = run_provider_stdin_turn(
-        directory,
-        manifest,
-        provider,
-        executable,
-        initial_arguments,
-        &initial_prompt,
-    )?;
-    if !initial_status.success() {
-        bail!(
-            "{} initial turn exited with {initial_status}",
-            provider.as_str()
-        );
-    }
-    fs::remove_file(&initial_prompt_path)
-        .context("failed to remove the accepted initial prompt")?;
-    let initial_state = read_json::<SessionStatus>(&directory.join("status.json"))?.state;
-    if !supervisor_initial_turn_completed(&initial_state) {
-        bail!(
-            "{} initial turn exited without reporting completion",
-            provider.as_str()
-        );
-    }
-
-    loop {
-        if directory.join(CLOSED_STATUS_FILE).is_file() {
-            return Ok(());
-        }
-        let pending = directory.join(RESUME_PENDING_FILE);
-        if !pending.is_file() {
-            thread::sleep(Duration::from_millis(50));
-            continue;
-        }
-        let running = directory.join(RESUME_RUNNING_FILE);
-        fs::rename(&pending, &running).context("failed to claim provider resume request")?;
-        let resume: ResumeRequest = read_json(&running)?;
-        let latest = event_paths(directory)?
-            .last()
-            .cloned()
-            .context("provider resume requires a completed prior turn")?;
-        let prior_event: SessionEvent = read_json(&latest)?;
-        if prior_event.provider_session_id.as_deref() != Some(&resume.provider_session_id) {
-            bail!("provider resume session identity changed before launch");
-        }
-        let plan = provider::prepare_resume(
-            provider,
-            provider::ResumeContext {
-                bridge_executable: executable,
-                directory,
-                provider_session_id: &resume.provider_session_id,
-            },
-        )?
-        .context("provider declared resume supervision without a resume plan")?;
-        let mut arguments = policy_arguments.clone();
-        arguments.extend(plan.arguments);
-        update_status(directory, "working", None, None)?;
-        let status = run_provider_stdin_turn(
-            directory,
-            manifest,
-            provider,
-            executable,
-            arguments,
-            &resume.prompt,
-        );
-        finish_provider_resume_turn(&running, || {
-            let status = status?;
-            if !status.success() {
-                bail!("{} resume turn exited with {status}", provider.as_str());
-            }
-            let state = read_json::<SessionStatus>(&directory.join("status.json"))?.state;
-            if !supervisor_initial_turn_completed(&state) {
-                bail!(
-                    "{} resume turn exited without reporting completion",
-                    provider.as_str()
-                );
-            }
-            Ok(())
-        })?;
-    }
-}
-
-fn finish_provider_resume_turn<F>(running: &Path, completion: F) -> Result<()>
-where
-    F: FnOnce() -> Result<()>,
-{
-    completion()?;
-    remove_file_if_present(running)
-}
-
-fn supervisor_initial_turn_completed(state: &str) -> bool {
-    matches!(state, "ready" | "resume-pending")
-}
-
-fn run_provider_stdin_turn(
-    directory: &Path,
-    manifest: &SessionManifest,
-    provider: FirstPartyCli,
-    executable: &Path,
-    arguments: Vec<OsString>,
-    prompt: &str,
-) -> Result<std::process::ExitStatus> {
-    let mut command = provider_process_command(&manifest.provider_path, directory, arguments)?;
-    let claim_token = fs::read_to_string(directory.join(TURN_CLAIM_FILE))
-        .context("provider stdin turn is missing its claim token")?;
-    let mut child = command
-        .current_dir(&manifest.workspace)
-        .env(SESSION_DIR_ENV, directory)
-        .env("AGENT_BRIDGE_NATIVE_SESSION_ID", &manifest.id)
-        .env("AGENT_BRIDGE_EXECUTABLE", executable)
-        .env(TURN_CLAIM_TOKEN_ENV, claim_token.trim())
-        .stdin(Stdio::piped())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to start {} at {}",
-                provider.as_str(),
-                manifest.provider_path.display()
-            )
-        })?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("provider stdin pipe was not created")?;
-    if let Err(error) = stdin.write_all(prompt.as_bytes()) {
-        drop(stdin);
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error).context("failed to deliver provider prompt over stdin");
-    }
-    drop(stdin);
-    child.wait().with_context(|| {
-        format!(
-            "failed to wait for {} at {}",
-            provider.as_str(),
-            manifest.provider_path.display()
-        )
-    })
 }
 
 fn run_hook(provider: FirstPartyCli, argument_payload: Option<&str>) -> Result<()> {
@@ -2005,6 +1938,7 @@ fn run_hook(provider: FirstPartyCli, argument_payload: Option<&str>) -> Result<(
     provider::handle_hook(provider, &directory, &payload)
 }
 
+#[cfg(test)]
 fn record_provider_result(
     directory: &Path,
     provider: FirstPartyCli,
@@ -2078,6 +2012,7 @@ fn record_provider_result_for_claim_condition(
     let expected_claim_token = Some(expected_claim_token.as_str());
     let claim_path = directory.join(TURN_CLAIM_FILE);
     let _claim_lock = lock_turn_claim(&claim_path)?;
+    recover_pending_completion_locked(directory, &claim_path)?;
     if require_no_prior_provider_event && provider_has_completed_turn(directory, provider)? {
         return Ok(());
     }
@@ -2098,11 +2033,16 @@ fn record_provider_result_for_claim_condition(
         turn_id,
         created_unix_ms: unix_ms(),
     };
-    write_event(directory, &event)?;
-    update_status(directory, "ready", None, None)?;
-    release_provider_completion_claim_locked(&claim_path, expected_claim_token)
+    commit_provider_completion_locked(
+        directory,
+        &claim_path,
+        expected_claim_token.context("provider completion has no claim token")?,
+        event,
+        None,
+    )
 }
 
+#[cfg(test)]
 fn record_provider_failure(
     directory: &Path,
     provider: FirstPartyCli,
@@ -2176,6 +2116,7 @@ fn record_provider_failure_for_claim_condition(
     let expected_claim_token = Some(expected_claim_token.as_str());
     let claim_path = directory.join(TURN_CLAIM_FILE);
     let _claim_lock = lock_turn_claim(&claim_path)?;
+    recover_pending_completion_locked(directory, &claim_path)?;
     if require_no_prior_provider_event && provider_has_completed_turn(directory, provider)? {
         return Ok(());
     }
@@ -2197,9 +2138,13 @@ fn record_provider_failure_for_claim_condition(
         turn_id,
         created_unix_ms: unix_ms(),
     };
-    write_event(directory, &event)?;
-    update_status(directory, "ready", None, Some(error))?;
-    release_provider_completion_claim_locked(&claim_path, expected_claim_token)
+    commit_provider_completion_locked(
+        directory,
+        &claim_path,
+        expected_claim_token.context("provider completion has no claim token")?,
+        event,
+        Some(error),
+    )
 }
 
 fn provider_has_completed_turn(directory: &Path, provider: FirstPartyCli) -> Result<bool> {
@@ -2259,15 +2204,20 @@ fn provider_completion_is_current(
     Ok(true)
 }
 
-fn release_provider_completion_claim_locked(
+fn commit_provider_completion_locked(
+    directory: &Path,
     claim_path: &Path,
-    expected_claim_token: Option<&str>,
+    claim_token: &str,
+    event: SessionEvent,
+    status_error: Option<String>,
 ) -> Result<()> {
-    if let Some(expected_claim_token) = expected_claim_token {
-        release_turn_claim_token_locked(claim_path, expected_claim_token)
-    } else {
-        remove_turn_claim_locked(claim_path)
-    }
+    let pending = PendingTurnCompletion::new(claim_token, event, status_error)?;
+    write_private(
+        &directory.join(TURN_COMPLETION_FILE),
+        &serde_json::to_vec_pretty(&pending)?,
+    )?;
+    recover_pending_completion_locked(directory, claim_path)?;
+    Ok(())
 }
 
 fn read_regular_text_if_present(path: &Path) -> Result<Option<String>> {
@@ -2413,10 +2363,13 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     set_private_file_permissions(temporary.as_file())?;
     temporary.write_all(&serde_json::to_vec_pretty(value)?)?;
     temporary.flush()?;
-    temporary
+    temporary.as_file().sync_all()?;
+    let persisted = temporary
         .persist(path)
         .map_err(|error| error.error)
         .with_context(|| format!("failed to persist {}", path.display()))?;
+    persisted.sync_all()?;
+    sync_parent_directory(path)?;
     Ok(())
 }
 
@@ -2429,6 +2382,40 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     set_private_file_permissions(&file)?;
     file.write_all(bytes)?;
     file.flush()?;
+    file.sync_all()?;
+    sync_parent_directory(path)?;
+    Ok(())
+}
+
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("state path has no parent directory")?;
+    sync_directory(parent)
+        .with_context(|| format!("failed to sync state directory {}", parent.display()))
+}
+
+#[cfg(unix)]
+fn sync_directory(directory: &Path) -> Result<()> {
+    File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn sync_directory(directory: &Path) -> Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    OpenOptions::new()
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(directory)?
+        .sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_directory(_directory: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -2438,26 +2425,92 @@ fn update_status(
     exit_code: Option<i32>,
     error: Option<String>,
 ) -> Result<()> {
+    let _status_lock = lock_status(directory)?;
+    update_status_locked(directory, state, exit_code, error)
+}
+
+struct StatusLock {
+    _file: File,
+}
+
+fn lock_status(directory: &Path) -> Result<StatusLock> {
+    let path = directory.join(STATUS_LOCK_FILE);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    set_private_file_permissions(&file)?;
+    file.lock()
+        .with_context(|| "failed to lock native session status")?;
+    Ok(StatusLock { _file: file })
+}
+
+fn update_status_locked(
+    directory: &Path,
+    state: &str,
+    exit_code: Option<i32>,
+    error: Option<String>,
+) -> Result<()> {
+    let status_path = directory.join("status.json");
+    let closed_path = directory.join(CLOSED_STATUS_FILE);
+    if let Some(closed) = read_status_if_present(&closed_path)? {
+        if state != "closed" {
+            return write_json_atomic(&status_path, &closed);
+        }
+        return write_json_atomic(&status_path, &closed);
+    }
+    let current = read_status_if_present(&status_path)?;
+    if let Some(current) = &current
+        && !valid_status_transition(&current.state, state)
+    {
+        bail!(
+            "invalid native session status transition {} -> {state}",
+            current.state
+        )
+    }
+    let generation = current
+        .as_ref()
+        .map_or(0, |status| status.generation)
+        .checked_add(1)
+        .context("native session status generation overflowed")?;
     let status = SessionStatus {
         state: state.to_owned(),
+        generation,
         updated_unix_ms: unix_ms(),
         exit_code,
         error,
     };
-    let status_path = directory.join("status.json");
-    let closed_path = directory.join(CLOSED_STATUS_FILE);
     if state == "closed" {
         write_json_atomic(&closed_path, &status)?;
         return write_json_atomic(&status_path, &status);
     }
-    if let Some(closed) = read_status_if_present(&closed_path)? {
-        return write_json_atomic(&status_path, &closed);
-    }
-    write_json_atomic(&status_path, &status)?;
-    if let Some(closed) = read_status_if_present(&closed_path)? {
-        write_json_atomic(&status_path, &closed)?;
-    }
-    Ok(())
+    write_json_atomic(&status_path, &status)
+}
+
+fn valid_status_transition(current: &str, next: &str) -> bool {
+    current == next
+        || matches!(
+            (current, next),
+            (
+                "launching",
+                "running" | "awaiting-initial-input" | "failed" | "closed"
+            ) | (
+                "awaiting-initial-input",
+                "working" | "exited" | "failed" | "closed"
+            ) | ("running", "ready" | "exited" | "failed" | "closed")
+                | ("ready", "claimed" | "exited" | "failed" | "closed")
+                | ("claimed", "working" | "ready" | "failed" | "closed")
+                | ("working", "ready" | "exited" | "failed" | "closed")
+                | (
+                    "resume-pending",
+                    "working" | "ready" | "exited" | "failed" | "closed"
+                )
+                | ("exited" | "failed", "closed")
+                | ("closed", "closed")
+        )
 }
 
 fn read_status_if_present(path: &Path) -> Result<Option<SessionStatus>> {
@@ -2537,7 +2590,6 @@ fn acquire_turn_claim(directory: &Path) -> Result<TurnClaim> {
     create_turn_claim_locked(path)
 }
 
-#[cfg(test)]
 fn acquire_ready_turn_claim(directory: &Path, session_id: &str) -> Result<(TurnClaim, usize)> {
     acquire_ready_turn_claim_after_claim(directory, session_id, || Ok(()))
 }
@@ -2618,6 +2670,8 @@ fn create_turn_claim_locked(path: PathBuf) -> Result<TurnClaim> {
     );
     writeln!(file, "{token}")?;
     file.flush()?;
+    file.sync_all()?;
+    sync_parent_directory(&path)?;
     Ok(TurnClaim {
         path,
         token,
@@ -2640,11 +2694,7 @@ fn release_turn_claim_token_locked(path: &Path, expected_token: &str) -> Result<
     if token.trim() != expected_token {
         return Ok(());
     }
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).context("failed to release native turn claim"),
-    }
+    remove_file_if_present(path).context("failed to release native turn claim")
 }
 
 fn release_turn_claim(directory: &Path) -> Result<()> {
@@ -2654,11 +2704,87 @@ fn release_turn_claim(directory: &Path) -> Result<()> {
 }
 
 fn remove_turn_claim_locked(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).context("failed to release native turn claim"),
+    remove_file_if_present(path).context("failed to release native turn claim")
+}
+
+fn valid_turn_claim_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 160
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-')
+}
+
+fn recover_pending_completion(directory: &Path) -> Result<bool> {
+    let claim_path = directory.join(TURN_CLAIM_FILE);
+    let _lock = lock_turn_claim(&claim_path)?;
+    recover_pending_completion_locked(directory, &claim_path)
+}
+
+fn recover_pending_completion_locked(directory: &Path, claim_path: &Path) -> Result<bool> {
+    let completion_path = directory.join(TURN_COMPLETION_FILE);
+    let Some(text) = read_regular_text_if_present(&completion_path)? else {
+        return Ok(false);
+    };
+    let pending: PendingTurnCompletion =
+        serde_json::from_str(&text).context("invalid pending native turn completion")?;
+    validate_pending_completion(&pending)?;
+    if directory.join(CLOSED_STATUS_FILE).is_file() {
+        remove_file_if_present(&completion_path)?;
+        return Ok(true);
     }
+
+    match fs::read_to_string(claim_path) {
+        Ok(current) if current.trim() == pending.claim_token => {
+            write_pending_completion_event(directory, &pending)?;
+            update_status(directory, "ready", None, pending.status_error.clone())?;
+            release_turn_claim_token_locked(claim_path, &pending.claim_token)?;
+            remove_file_if_present(&completion_path)?;
+            Ok(true)
+        }
+        Ok(_) => bail!("pending native completion belongs to a different turn claim"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let event_path = directory.join("events").join(&pending.event_file);
+            let stored: SessionEvent = read_json(&event_path)
+                .context("claim-free pending completion has no committed event")?;
+            if stored != pending.event {
+                bail!("claim-free pending completion event does not match its journal")
+            }
+            let status: SessionStatus = read_json(&directory.join("status.json"))?;
+            if status.state != "ready" || status.error != pending.status_error {
+                bail!("claim-free pending completion has no matching ready status")
+            }
+            remove_file_if_present(&completion_path)?;
+            Ok(true)
+        }
+        Err(error) => Err(error).context("failed to inspect pending completion turn claim"),
+    }
+}
+
+fn validate_pending_completion(pending: &PendingTurnCompletion) -> Result<()> {
+    if pending.schema != 1 || !valid_turn_claim_token(&pending.claim_token) {
+        bail!("invalid pending native completion identity")
+    }
+    if !valid_event_file_name(&pending.event_file) {
+        bail!("invalid pending native completion event file")
+    }
+    if pending.event.error != pending.status_error {
+        bail!("pending native completion status does not match its event")
+    }
+    Ok(())
+}
+
+fn write_pending_completion_event(directory: &Path, pending: &PendingTurnCompletion) -> Result<()> {
+    validate_pending_completion(pending)?;
+    let path = directory.join("events").join(&pending.event_file);
+    if path.exists() {
+        let stored: SessionEvent = read_json(&path)?;
+        if stored != pending.event {
+            bail!("pending native completion event file contains different data")
+        }
+        return Ok(());
+    }
+    write_json_atomic(&path, &pending.event)
 }
 
 fn mark_session_closed(directory: &Path, error: Option<String>) -> Result<()> {
@@ -2682,8 +2808,9 @@ fn mark_session_closed_locked(
     let status_result = update_status(directory, "closed", None, error);
     let (pending_result, running_result, claim_result) = if status_result.is_ok() {
         (
-            remove_file_if_present(&directory.join(RESUME_PENDING_FILE)),
-            remove_file_if_present(&directory.join(RESUME_RUNNING_FILE)),
+            remove_file_if_present(&directory.join(TURN_COMPLETION_FILE))
+                .and_then(|_| remove_file_if_present(&directory.join(LEGACY_RESUME_PENDING_FILE))),
+            remove_file_if_present(&directory.join(LEGACY_RESUME_RUNNING_FILE)),
             remove_turn_claim_locked(claim_path),
         )
     } else {
@@ -2697,6 +2824,7 @@ fn mark_session_closed_locked(
 }
 
 fn repair_dead_native_owner(directory: &Path) -> Result<bool> {
+    recover_pending_completion(directory)?;
     let status: SessionStatus = read_json(&directory.join("status.json"))?;
     if !matches!(
         status.state.as_str(),
@@ -2719,7 +2847,11 @@ fn repair_dead_native_owner(directory: &Path) -> Result<bool> {
     {
         return Ok(false);
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    if mac_native_owner_is_live(&owner)? {
+        return Ok(false);
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     if process_is_alive(owner.pid) {
         return Ok(false);
     }
@@ -2763,14 +2895,30 @@ fn repair_dead_native_owner(directory: &Path) -> Result<bool> {
     }
 }
 
+#[cfg(test)]
 fn write_event(directory: &Path, event: &SessionEvent) -> Result<()> {
-    let events = directory.join("events");
-    let name = format!(
+    write_json_atomic(
+        &directory.join("events").join(new_event_file_name()?),
+        event,
+    )
+}
+
+fn new_event_file_name() -> Result<String> {
+    Ok(format!(
         "event-{}-{}.json",
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
         std::process::id()
-    );
-    write_json_atomic(&events.join(name), event)
+    ))
+}
+
+fn valid_event_file_name(name: &str) -> bool {
+    name.starts_with("event-")
+        && name.ends_with(".json")
+        && name.len() <= 128
+        && Path::new(name).file_name().and_then(|value| value.to_str()) == Some(name)
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
 }
 
 fn event_paths(directory: &Path) -> Result<Vec<PathBuf>> {
@@ -2785,7 +2933,7 @@ fn event_paths(directory: &Path) -> Result<Vec<PathBuf>> {
             && entry
                 .file_name()
                 .to_str()
-                .is_some_and(|name| name.starts_with("event-") && name.ends_with(".json"))
+                .is_some_and(valid_event_file_name)
         {
             paths.push(entry.path());
         }
@@ -2797,10 +2945,11 @@ fn event_paths(directory: &Path) -> Result<Vec<PathBuf>> {
 fn wait_for_status(
     directory: &Path,
     expected_state: &str,
-    timeout: Duration,
+    deadline: Instant,
+    requested: Duration,
 ) -> Result<SessionStatus> {
-    let deadline = checked_deadline_from(Instant::now(), timeout)?;
     loop {
+        recover_pending_completion(directory)?;
         repair_dead_native_owner(directory)?;
         if let Ok(status) = read_json::<SessionStatus>(&directory.join("status.json")) {
             if status.state == expected_state {
@@ -2813,13 +2962,16 @@ fn wait_for_status(
                 bail!("{reason}");
             }
         }
-        if Instant::now() >= deadline {
-            bail!(
-                "timed out after {} seconds waiting for session state {expected_state}",
-                timeout.as_secs()
-            );
-        }
-        thread::sleep(Duration::from_millis(50));
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .with_context(|| {
+                format!(
+                    "timed out after {} seconds waiting for session state {expected_state}",
+                    requested.as_secs()
+                )
+            })?;
+        thread::sleep(remaining.min(Duration::from_millis(50)));
     }
 }
 
@@ -2828,6 +2980,7 @@ fn wait_for_event(directory: &Path, baseline: usize, timeout: Duration) -> Resul
     wait_for_event_for_turn(directory, baseline, None, None, timeout)
 }
 
+#[cfg(test)]
 fn wait_for_event_for_turn(
     directory: &Path,
     baseline: usize,
@@ -2836,7 +2989,26 @@ fn wait_for_event_for_turn(
     timeout: Duration,
 ) -> Result<SessionEvent> {
     let deadline = checked_deadline_from(Instant::now(), timeout)?;
+    wait_for_event_for_turn_until(
+        directory,
+        baseline,
+        expected_turn_id,
+        expected_claim_token,
+        deadline,
+        timeout,
+    )
+}
+
+fn wait_for_event_for_turn_until(
+    directory: &Path,
+    baseline: usize,
+    expected_turn_id: Option<&str>,
+    expected_claim_token: Option<&str>,
+    deadline: Instant,
+    requested: Duration,
+) -> Result<SessionEvent> {
     loop {
+        recover_pending_completion(directory)?;
         repair_dead_native_owner(directory)?;
         let paths = event_paths(directory)?;
         if paths.len() > baseline {
@@ -2873,10 +3045,11 @@ fn wait_for_event_for_turn(
                 .unwrap_or_else(|| format!("session entered state {}", status.state));
             bail!("{reason}");
         }
-        if Instant::now() >= deadline {
-            bail!("timed out after {} seconds", timeout.as_secs());
-        }
-        thread::sleep(Duration::from_millis(200));
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .with_context(|| format!("timed out after {} seconds", requested.as_secs()))?;
+        thread::sleep(remaining.min(Duration::from_millis(200)));
     }
 }
 
@@ -2892,7 +3065,7 @@ fn turn_completion_was_published(
         };
     }
     Ok(read_json::<SessionStatus>(&directory.join("status.json"))
-        .is_ok_and(|status| supervisor_initial_turn_completed(&status.state)))
+        .is_ok_and(|status| status.state == "ready"))
 }
 
 fn unix_ms() -> u128 {

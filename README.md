@@ -34,24 +34,24 @@ Windows와 macOS의 사용자 기능은 같지만 provider transport는 공식 �
 | Provider | macOS | native Windows |
 | --- | --- | --- |
 | Codex | provider session notify + provider-owned terminal follow-up | 동일한 provider adapter의 notify/result correlation + Windows console follow-up |
-| Claude Code | 지원 버전·backend·설정 gate를 모두 통과할 때 공식 cross-session `ListAgents`/`SendMessage` + `Stop` hook | 공식 `--print --resume <session-id>` + stdin supervisor + `Stop` hook |
+| Claude Code | 지원 버전·backend·설정 gate를 모두 통과할 때 공식 cross-session `ListAgents`/`SendMessage` + `Stop` hook | Claude Code 2.1.234+의 공식 named-pipe cross-session `ListAgents`/`SendMessage` + `Stop` hook |
 | Agy | transcript/result monitor + provider-owned terminal follow-up | 동일한 provider adapter의 transcript/result monitor + Windows console follow-up |
 | Pi | session lifecycle extension + provider-owned terminal follow-up | 동일한 provider adapter의 lifecycle extension + Windows console follow-up |
 
-Windows Claude supervisor는 Claude Code가 native Windows에 공식 cross-session messaging을 제공할 때 교체할 명시적 fallback입니다. 다른 provider의 console follow-up도 각 adapter 내부에 격리되어 있으며, bridge 공통층이 provider payload나 결과 identity를 추측하지 않습니다.
+다른 provider의 console follow-up은 각 adapter 내부에 격리되어 있으며, bridge 공통층이 provider payload나 결과 identity를 추측하지 않습니다. Claude의 공식 cross-session 기능을 runtime gate 때문에 사용할 수 없으면 terminal injection으로 우회하지 않고 실패합니다.
 
 ## 설치
 
 소스에서 설치할 때는 Rust 1.97.1 이상이 필요합니다. macOS에서는 지원하는 터미널 하나가 필요하고 Ghostty를 사용하면 1.3 이상이어야 합니다. Windows에서는 PowerShell 7이 필요합니다. 두 OS 모두 사용할 provider CLI를 먼저 직접 실행해 로그인과 초기 설정을 완료해야 합니다.
 
 ```sh
-git clone --branch v0.0.2 --depth 1 https://github.com/jy1655/agent-bridge.git
+git clone --branch v0.0.3 --depth 1 https://github.com/jy1655/agent-bridge.git
 cd agent-bridge
 cargo install --path . --locked
 agent-bridge --version
 ```
 
-마지막 명령은 `agent-bridge 0.0.2`를 출력해야 합니다. 개발 중인 `main`이 아니라 릴리스 tag에서 설치해야 설치본과 소스의 경계가 명확합니다.
+마지막 명령은 `agent-bridge 0.0.3`을 출력해야 합니다. 개발 중인 `main`이 아니라 릴리스 tag에서 설치해야 설치본과 소스의 경계가 명확합니다.
 
 Windows 명령줄 한도를 넘는 요청은 `--prompt-file`로 전달합니다. 파일은 UTF-8 텍스트로 읽으며 Agent Bridge가 원본을 삭제하거나 수정하지 않습니다.
 
@@ -60,13 +60,13 @@ Windows 명령줄 한도를 넘는 요청은 `--prompt-file`로 전달합니다.
 GitHub Release에는 Apple Silicon macOS용 `agent-bridge-<version>-aarch64-apple-darwin.tar.gz`와 64비트 Windows용 `agent-bridge-<version>-x86_64-pc-windows-msvc.zip`을 게시하며, 각 archive와 같은 이름의 `.sha256` 파일을 함께 제공합니다. prebuilt archive 설치에는 Rust가 필요하지 않습니다. archive를 푼 뒤 macOS에서는 `agent-bridge`, Windows에서는 `agent-bridge.exe`를 `PATH`에 있는 디렉터리로 옮깁니다. 다운로드한 파일은 실행 전에 체크섬을 검증하세요.
 
 ```sh
-shasum -a 256 -c agent-bridge-0.0.2-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf agent-bridge-0.0.2-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c agent-bridge-0.0.3-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf agent-bridge-0.0.3-aarch64-apple-darwin.tar.gz
 ./agent-bridge --version
 ```
 
 ```powershell
-$archive = "agent-bridge-0.0.2-x86_64-pc-windows-msvc.zip"
+$archive = "agent-bridge-0.0.3-x86_64-pc-windows-msvc.zip"
 $expected = (Get-Content "$archive.sha256").Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "checksum mismatch" }
@@ -112,7 +112,7 @@ agent-bridge prune-sessions --closed-before-days 30 --explicit
 agent-bridge close-session session-XXXXXXXX --explicit
 ```
 
-`ask`와 `tell`은 기본적으로 다음 provider 결과를 최대 900초 기다립니다. `tell --timeout-secs`는 provider-native 전송과 결과 대기를 합친 전체 시간 제한입니다. 제한을 바꾸거나, 결과를 기다리지 않고 탭만 열려면 `--detach`를 사용합니다. 대기 실패나 timeout은 이미 열린 탭을 자동으로 닫지 않습니다.
+`ask`와 `tell`은 기본적으로 다음 provider 결과를 최대 900초 기다립니다. `ask --timeout-secs`는 준비 검사, terminal 시작, provider별 초기 입력 준비 지연, 결과 대기를 합친 전체 시간 제한이고, `tell --timeout-secs`는 provider-native 전송과 결과 대기를 합친 전체 시간 제한입니다. 제한을 바꾸거나, 결과를 기다리지 않고 탭만 열려면 `--detach`를 사용합니다. 대기 실패나 timeout은 이미 열린 탭을 자동으로 닫지 않습니다.
 
 전체 명령은 다음과 같습니다.
 
@@ -129,22 +129,22 @@ agent-bridge --help | --version
 
 ## 권한과 세션 경계
 
-- Agent Bridge는 같은 `ask` 작업에서 새로 만든 surface만 기록합니다. 새 handle은 managed session ID와 host가 제공하는 stable ID를 결합하며 `tell`과 `close-session` 직전에 live wrapper와 함께 다시 검증합니다. Terminal.app은 전용 window ID·TTY에 target `native-session` owner의 managed session ID·PID·controlling TTY device·process start fingerprint를 결합하고, 새 owner에는 managed process group과 전용 login shell의 PID·process group·시작 fingerprint도 기록합니다. Windows는 console root와 `native-session` owner의 PID 생성 시각·실행 파일 identity를 함께 검증해 PID 재사용을 fail-closed합니다. 호출 당시 터미널을 재감지하거나 복원된 front/current/selected surface를 채택하지 않습니다.
+- Agent Bridge는 같은 `ask` 작업에서 새로 만든 surface만 기록합니다. 새 handle은 managed session ID와 host가 제공하는 stable ID를 결합하며 `tell`과 `close-session` 직전에 live wrapper와 함께 다시 검증합니다. macOS의 세 adapter 모두 target `native-session` owner의 managed session ID·PID·controlling TTY device·process start fingerprint·foreground process group과 전용 login shell identity를 검증합니다. iTerm2와 Terminal.app은 surface가 보고하는 TTY까지 owner와 일치시켜야 하고, Ghostty는 terminal·tab·window ID 복합체와 live owner를 함께 확인합니다. Windows는 console root와 `native-session` owner의 PID 생성 시각·실행 파일 identity를 함께 검증해 PID 재사용을 fail-closed하며, suspended console의 identity-bound handle을 private state에 내구성 있게 기록한 뒤에만 실행을 재개합니다. 호출 당시 터미널을 재감지하거나 복원된 front/current/selected surface를 채택하지 않습니다.
 - 새 세션의 `--model`, `--effort`, `--yolo`는 부모 CLI에서 추측하거나 상속하지 않습니다. 해당 `ask` 요청에 명시된 값만 사용합니다.
 - `--yolo`는 Codex의 `--dangerously-bypass-approvals-and-sandbox`, Claude와 Agy의 `--dangerously-skip-permissions`를 전달합니다. Pi에서는 해당 실행의 project-local files를 신뢰하는 `--approve`를 전달하며 Pi 자체 tool 정책은 유지합니다.
-- `tell`은 세션별 한 턴만 허용합니다. macOS Claude Code 2.1.232 이상은 별도의 비영속·격리 설정 print-mode Claude 프로세스에서 공식 `ListAgents`로 고유 managed session name을 찾고 `SendMessage`로 전달합니다. cross-session 기능 자체는 2.1.224에 도입됐지만, 여기서 사용하는 단일 bare name 확정 전송은 2.1.232부터의 계약입니다. 같은 non-Windows provider 경계는 향후 Linux/WSL terminal adapter가 추가돼도 이 공식 경로를 사용합니다. 메시지는 stdin JSON으로만 전달하고, 임시 `PreToolUse` hook이 정확한 local session name·요약·본문을 실행 전에 검증하며 `isolatePeerMachines`로 cross-machine 전송을 막고 실제 tool call과 성공 결과도 다시 일치해야 전송 성공으로 인정합니다. 대상 세션의 `Stop` hook은 요청별 고유 Claude turn ID와 정확한 최종 마커가 일치한 응답만 결과로 기록하고 반환값에서는 마커를 제거합니다. 마커가 다른 수동·비상관 턴에는 개입하지 않고 pending claim을 유지합니다. 이 provider 전용 상관관계 프로토콜은 Claude가 대상 turn identity를 공식 결과로 제공하면 교체할 경계입니다. 이 provider-native 전송에는 `tell`마다 별도의 Claude transport turn이 한 번 필요합니다. provider·feature-flag·정책 설정 때문에 공식 기능을 사용할 수 없으면 terminal injection으로 자동 전환하지 않고 전송 전에 실패합니다. 전송을 시도한 뒤 성공 여부를 확인할 수 없으면 중복 재전송을 막기 위해 turn claim을 유지하며, 대상 결과가 도착하거나 `close-session --explicit`으로 닫을 때 해제됩니다. native Windows Claude는 visible console supervisor 안에서 공식 `--resume <session-id>`와 stdin을 사용하며, upstream이 native Windows cross-session messaging을 제공하면 이 supervisor를 교체합니다. Codex·Pi·Agy는 각 provider adapter가 소유한 terminal paste fallback을 사용합니다. Enter·ESC 같은 별도 터미널 동작을 만들 수 있는 제어문자는 거부합니다.
+- `tell`은 세션별 한 턴만 허용합니다. Claude Code 2.1.234 이상은 macOS와 native Windows 모두 별도의 비영속·격리 설정 print-mode Claude 프로세스에서 공식 `ListAgents`로 고유 managed session name을 찾고 `SendMessage`로 전달합니다. Claude의 공식 cross-session 기능은 macOS·Linux에서 2.1.224부터, native Windows에서 per-session named pipe를 사용하는 2.1.234부터 제공됩니다. 메시지는 stdin JSON으로만 전달하고, 임시 `PreToolUse` hook이 정확한 local session name·요약·본문을 실행 전에 검증하며 `isolatePeerMachines`로 cross-machine 전송을 막고 실제 tool call과 성공 결과도 다시 일치해야 전송 성공으로 인정합니다. 대상 세션의 `Stop` hook은 요청별 고유 Claude turn ID와 정확한 최종 마커가 일치한 응답만 결과로 기록하고 반환값에서는 마커를 제거합니다. 마커가 다른 수동·비상관 턴에는 개입하지 않고 pending claim을 유지합니다. 이 provider 전용 상관관계 프로토콜은 Claude가 대상 turn identity를 공식 결과로 제공하면 교체할 경계입니다. 이 provider-native 전송에는 `tell`마다 별도의 Claude transport turn이 한 번 필요합니다. provider·feature-flag·정책 설정 때문에 공식 기능을 사용할 수 없으면 terminal injection으로 자동 전환하지 않고 전송 전에 실패합니다. 전송을 시도한 뒤 성공 여부를 확인할 수 없으면 중복 재전송을 막기 위해 turn claim을 유지하며, 대상 결과가 도착하거나 `close-session --explicit`으로 닫을 때 해제됩니다. Codex·Pi·Agy는 각 provider adapter가 소유한 terminal paste fallback을 사용합니다. 각 fallback turn은 claim token과 정확한 final marker가 일치한 결과만 수락합니다. Enter·ESC 같은 별도 터미널 동작을 만들 수 있는 제어문자는 거부합니다.
 - 모든 bridge 프롬프트에는 source provenance가 붙습니다. 사람이 읽는 결과의 터미널 제어문자는 가시적인 문자열로 이스케이프합니다.
 - 결과가 돌아온 뒤 탭은 열린 채 유지되어 사용자가 직접 이어서 작업할 수 있습니다. terminal paste fallback을 쓰는 provider에서는 진행 중인 bridge 요청과 같은 탭의 수동 입력을 겹치면 수동 턴 결과가 bridge 요청의 결과로 먼저 인식될 수 있으므로 동시에 입력하지 않아야 합니다.
 - `close-session`은 `--explicit`이 있어야 합니다. Terminal.app은 live `native-session` owner attestation과 전용 window ID·TTY가 모두 일치하고 owner가 현재 terminal foreground process group의 leader임을 확인합니다. 이어 같은 TTY의 실제 parent login shell이 별도 process-group leader이고 owner를 foreground group으로 보고하는지도 검증한 뒤, managed group에는 `SIGTERM`, 전용 shell group에는 `SIGKILL`을 보내 Terminal.app이 idle 전이를 관찰한 경우에만 전용 window를 닫습니다. 과거 owner record에 process-group·shell 필드가 없어도 PID·시작시각·parent 관계·TTY가 일치하는 live identity에서 같은 관계를 모두 증명해야 하며, terminal control character나 UI scripting은 사용하지 않습니다. close finality에서는 `terminal.json` handle을 `terminal.closed.json` tombstone으로 소진하며, 이미 `closed`인 세션의 반복 close는 terminal adapter를 호출하지 않습니다.
 - `prune-sessions`도 `--explicit`이 있어야 합니다. `closed.json` 시각이 보존 기간보다 오래됐고 현재 status도 `closed`이며 terminal handle, pending resume, turn claim, live owner가 없는 관리 디렉터리만 삭제합니다. 열린 세션이나 판별할 수 없는 owner는 유지하며 자동 보존 기간이나 암묵적 삭제는 없습니다.
-- 세션별 상태와 결과는 권한을 제한한 `~/.agent-bridge/native-sessions` 아래에 저장합니다. Windows는 사용자 지정 state root에서도 ACL 상속을 제거하고 현재 사용자 전용 ACL을 적용합니다. provider의 전역 설정이나 workspace hook 파일은 수정하지 않습니다. Agent Bridge가 만든 Claude 세션의 private `--settings` 파일에는 `Stop`·`StopFailure` hook을 기록하고, 공식 cross-session follow-up이 있는 non-Windows에서만 `crossSessionInbound: "accept"`를 추가합니다. Messenger의 `PreToolUse` guard 설정과 기대 payload 파일은 해당 `tell` 동안만 같은 private 세션 디렉터리에 존재하고 종료 시 제거합니다. 요청별 pending turn 레코드는 상관된 결과에서 제거하며, 상관관계를 확인할 수 없는 오류에서는 보존합니다.
+- 세션별 상태와 결과는 권한을 제한한 `~/.agent-bridge/native-sessions` 아래에 저장합니다. 상태·event·turn claim은 파일과 상위 디렉터리까지 동기화하고, 중간 완료 journal을 복구한 뒤 event·ready 상태·claim 해제를 한 lifecycle lock 아래에서 수렴시킵니다. Windows는 사용자 지정 state root에서도 ACL 상속을 제거하고 현재 사용자 전용 ACL을 적용합니다. provider의 전역 설정이나 workspace hook 파일은 수정하지 않습니다. Agent Bridge가 만든 Claude 세션의 private `--settings` 파일에는 모든 지원 OS에서 `crossSessionInbound: "accept"`와 `Stop`·`StopFailure` hook을 기록합니다. Messenger의 `PreToolUse` guard 설정과 기대 payload 파일은 해당 `tell` 동안만 같은 private 세션 디렉터리에 존재하고 종료 시 제거합니다. 요청별 pending turn 레코드는 상관된 결과에서 제거하며, 상관관계를 확인할 수 없는 오류에서는 보존합니다.
 
 최소 지원 버전은 다음과 같습니다. 더 새로운 버전은 허용합니다.
 
 | Provider | 최소 버전 |
 | --- | --- |
 | Codex | 0.147.0 |
-| Claude Code | 2.1.232 |
+| Claude Code | 2.1.234 |
 | Agy | 1.1.12 |
 | Pi | 0.84.1 |
 
@@ -173,6 +173,12 @@ src/native/tests.rs            provider-neutral native orchestration 단위 테�
 새 CLI를 추가할 때는 provider registry와 두 provider adapter를 추가하고, model/effort/권한 및 실제 결과 회수 계약을 각각 테스트합니다. 새 터미널은 해당 OS 디렉터리에 adapter를 추가하고 OS dispatcher에 등록합니다. 새 OS는 독립 디렉터리에서 같은 `detect/open_tab/send_file/close_session` 계약을 구현합니다. launch command quoting은 POSIX shell과 Windows PowerShell을 분리해 유지합니다. 공통화가 플랫폼의 native 동작을 약화한다면 플랫폼별 구현을 우선합니다.
 
 기존 `{"iterm_session_id":"..."}` 형식의 `terminal.json`은 iTerm2 세션으로 계속 읽습니다. 새 세션은 terminal-neutral한 `terminal`, `session_id`, 선택적 `tab_id`·`window_id`와 내부 `managed_session_id` binding을 기록합니다. 가시적인 terminal title은 설정하거나 ownership record에 저장하지 않습니다. Terminal.app의 추가 owner attestation은 target `native-session`이 별도 private record에 기록합니다.
+
+## 0.0.3 업데이트
+
+0.0.3은 native Windows를 macOS와 같은 관리형 세션 계약으로 배포하는 첫 릴리스입니다. `cmd.exe`, Windows PowerShell 5.1, PowerShell 7에서 Codex·Claude·Agy·Pi의 `ask → result → tell → result → sessions → explicit close` 흐름을 지원하며, 호출 shell과 분리된 PowerShell 7 visible console을 사용합니다. Claude Code 2.1.234+의 공식 native-Windows cross-session messaging으로 구형 resume supervisor를 대체했고, 모든 provider의 turn correlation, crash-recovery journal, 단조 상태 전이, 전체 timeout 예산, PID/TTY 소유권 검증을 보강했습니다.
+
+GitHub Release는 Apple Silicon macOS와 64비트 Windows archive 및 SHA-256 checksum을 함께 게시합니다. Linux transport, 독립 실행 중인 CLI에 대한 사후 attach, provider 간 workspace trust 공유는 이번 릴리스 범위에 포함되지 않습니다.
 
 ## 0.0.2 업데이트
 

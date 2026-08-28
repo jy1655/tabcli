@@ -42,7 +42,14 @@ pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     }
 }
 
-pub(super) fn open_tab(kind: TerminalKind, command: &str) -> Result<TerminalSession> {
+pub(super) fn open_bound_tab<F>(
+    kind: TerminalKind,
+    command: &str,
+    bind: F,
+) -> Result<TerminalSession>
+where
+    F: FnOnce(&mut TerminalSession) -> Result<()>,
+{
     if kind != TerminalKind::WindowsConsole {
         bail!("{} is not available on Windows", kind.display_name());
     }
@@ -102,27 +109,36 @@ pub(super) fn open_tab(kind: TerminalKind, command: &str) -> Result<TerminalSess
             return Err(error).context("failed to attest the managed Windows console process");
         }
     };
-    if unsafe { ResumeThread(process.hThread) } == u32::MAX {
-        let error = std::io::Error::last_os_error();
-        unsafe {
-            TerminateProcess(process.hProcess, 1);
-            CloseHandle(process.hThread);
-            CloseHandle(process.hProcess);
-        }
-        return Err(error).context("failed to start the attested managed Windows console process");
-    }
-    unsafe {
-        CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
-    }
-    Ok(TerminalSession {
+    let mut session = TerminalSession {
         kind,
         id: process.dwProcessId.to_string(),
         tab_id: None,
         window_id: None,
         managed_session_id: None,
         windows_process_identity: Some(identity),
-    })
+    };
+    let process_handle = process.hProcess;
+    let thread_handle = process.hThread;
+    let launch = super::bind_suspended_surface_before_start(
+        &mut session,
+        bind,
+        || {
+            if unsafe { ResumeThread(thread_handle) } == u32::MAX {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to start the attested managed Windows console process");
+            }
+            Ok(())
+        },
+        || unsafe {
+            TerminateProcess(process_handle, 1);
+        },
+    );
+    unsafe {
+        CloseHandle(thread_handle);
+        CloseHandle(process_handle);
+    }
+    launch.context("failed to bind the suspended Windows console before startup")?;
+    Ok(session)
 }
 
 fn console_command_line(command: &str) -> String {

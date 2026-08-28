@@ -3,31 +3,41 @@ name: CI
 on:
   push:
     branches: [main]
+
+permissions:
+  contents: read
   pull_request:
     branches: [main]
 
 jobs:
   msrv:
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: 1.97.1
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          components: rustfmt, clippy
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt,clippy
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all-targets --all-features
 
   rust:
+    env:
+      RUSTUP_TOOLCHAIN: stable
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          components: rustfmt, clippy
+          persist-credentials: false
+      - name: Install stable Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --component rustfmt,clippy
       - name: Install macOS terminal apps for AppleScript compile tests
         if: runner.os == 'macOS'
         run: |
@@ -46,8 +56,10 @@ jobs:
         include:
           - os: macos-15
             target: aarch64-apple-darwin
+            archive: agent-bridge-0.0.3-aarch64-apple-darwin.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            archive: agent-bridge-0.0.3-x86_64-pc-windows-msvc.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -57,3 +69,46 @@ jobs:
         shell: pwsh
         run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --target ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package and verify macOS candidate
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="${{ matrix.archive }}"
+          stage="$RUNNER_TEMP/agent-bridge-package"
+          verify="$RUNNER_TEMP/agent-bridge-verify"
+          mkdir -p "$stage" "$verify"
+          cp "target/${{ matrix.target }}/release/agent-bridge" "$stage/agent-bridge"
+          cp LICENSE "$stage/LICENSE"
+          tar -C "$stage" -czf "$archive" agent-bridge LICENSE
+          shasum -a 256 "$archive" > "$archive.sha256"
+          shasum -a 256 -c "$archive.sha256"
+          tar -C "$verify" -xzf "$archive"
+          test -f "$verify/LICENSE"
+          test "$("$verify/agent-bridge" --version)" = "agent-bridge 0.0.3"
+      - name: Package and verify Windows candidate
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive = "${{ matrix.archive }}"
+          $stage = Join-Path $env:RUNNER_TEMP "agent-bridge-package"
+          $verify = Join-Path $env:RUNNER_TEMP "agent-bridge-verify"
+          New-Item -ItemType Directory -Force -Path $stage, $verify | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/agent-bridge.exe" "$stage/agent-bridge.exe"
+          Copy-Item LICENSE "$stage/LICENSE"
+          Compress-Archive -LiteralPath "$stage/agent-bridge.exe", "$stage/LICENSE" -DestinationPath $archive
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          "$hash  $archive" | Set-Content -Encoding ascii -NoNewline "$archive.sha256"
+          $expected = (Get-Content "$archive.sha256").Split()[0]
+          if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant() -ne $expected) { throw "checksum mismatch" }
+          Expand-Archive -LiteralPath $archive -DestinationPath $verify
+          if (-not (Test-Path "$verify/LICENSE")) { throw "LICENSE missing from archive" }
+          $actual = & "$verify/agent-bridge.exe" --version
+          if ($actual.Trim() -ne "agent-bridge 0.0.3") { throw "unexpected binary version: $actual" }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-candidate-${{ matrix.target }}
+          path: |
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
+          if-no-files-found: error

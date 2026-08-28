@@ -48,7 +48,7 @@ Session policy:
   native bypass flags. Pi receives --approve for project-local trust while its
   native tool policy remains in effect.
 
-  Supported CLI minimums: Codex 0.147.0, Claude 2.1.232, Agy 1.1.12, Pi 0.84.1.
+  Supported CLI minimums: Codex 0.147.0, Claude 2.1.234, Agy 1.1.12, Pi 0.84.1.
   Session state is stored privately under ~/.agent-bridge/native-sessions.
   Closed records remain until prune-sessions explicitly removes quiescent records
   older than the requested retention window.

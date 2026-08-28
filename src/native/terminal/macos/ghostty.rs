@@ -166,6 +166,32 @@ on run argv
 end run
 "#;
 
+pub(in crate::native) const VERIFY_SURFACE_SCRIPT: &str = r#"
+on run argv
+    set wantedTerminalId to item 1 of argv
+    set wantedTabId to item 2 of argv
+    set wantedWindowId to item 3 of argv
+    tell application "Ghostty"
+        try
+            set targetWindow to first window whose id is wantedWindowId
+        on error
+            return "missing"
+        end try
+        set matchCount to 0
+        repeat with targetTab in tabs of targetWindow
+            if id of targetTab is wantedTabId then
+                repeat with candidateTerminal in terminals of targetTab
+                    if id of candidateTerminal is wantedTerminalId then set matchCount to matchCount + 1
+                end repeat
+            end if
+        end repeat
+        if matchCount is 1 then return "present"
+        if matchCount is 0 then return "missing"
+        error "Agent Bridge Ghostty ownership proof matched multiple terminal surfaces"
+    end tell
+end run
+"#;
+
 pub(in crate::native) const CLOSE_TAB_SCRIPT: &str = r#"
 on run argv
     set wantedTerminalId to item 1 of argv
@@ -449,6 +475,19 @@ pub(super) fn send_file(session: &TerminalSession, prompt_path: &Path) -> Result
     )?;
     if response != "sent" {
         bail!("unexpected Ghostty send response: {response:?}");
+    }
+    Ok(())
+}
+
+pub(super) fn verify_surface(session: &TerminalSession) -> Result<()> {
+    let (tab_id, window_id) = ownership_proof(session)?;
+    let response = applescript::run(
+        "Ghostty",
+        VERIFY_SURFACE_SCRIPT,
+        &[&session.id, tab_id, window_id],
+    )?;
+    if response != "present" {
+        bail!("Agent Bridge Ghostty owned terminal surface is missing");
     }
     Ok(())
 }

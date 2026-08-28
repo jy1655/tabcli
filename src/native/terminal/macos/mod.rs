@@ -39,6 +39,15 @@ pub(super) fn send_file(session: &TerminalSession, prompt_path: &Path) -> Result
     }
 }
 
+pub(super) fn verify_surface(session: &TerminalSession) -> Result<Option<String>> {
+    match session.kind {
+        TerminalKind::Iterm2 => iterm2::verify_session(session).map(Some),
+        TerminalKind::AppleTerminal => apple_terminal::verify_tab(session).map(Some),
+        TerminalKind::Ghostty => ghostty::verify_surface(session).map(|()| None),
+        TerminalKind::WindowsConsole => bail!("Windows Console is only available on Windows"),
+    }
+}
+
 pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
     match session.kind {
         TerminalKind::Iterm2 => iterm2::close_session(session),

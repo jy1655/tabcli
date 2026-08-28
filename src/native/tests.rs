@@ -56,6 +56,25 @@ fn ask_and_tell_accept_prompt_files_without_putting_prompt_text_in_argv() {
 }
 
 #[test]
+fn ask_rejects_terminal_control_sequences_from_inline_and_file_prompts() {
+    let directory = tempfile::tempdir().unwrap();
+    let prompt_path = directory.path().join("prompt.txt");
+    fs::write(&prompt_path, "unsafe\rprompt").unwrap();
+    let prompt_path = prompt_path.to_string_lossy().into_owned();
+
+    for arguments in [
+        vec!["ask", "codex", "--prompt", "unsafe\u{1b}prompt"],
+        vec!["ask", "pi", "--prompt-file", prompt_path.as_str()],
+    ] {
+        let error = parse_args(arguments).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("terminal control"),
+            "unexpected rejection: {error:#}"
+        );
+    }
+}
+
+#[test]
 fn ask_model_is_supported_by_every_native_provider() {
     for provider in ["codex", "claude", "agy", "pi"] {
         let command = parse_args([
@@ -205,6 +224,29 @@ fn remaining_turn_timeout_rejects_an_exhausted_total_budget() {
 }
 
 #[test]
+fn initial_prompt_delay_must_fit_inside_the_original_ask_budget() {
+    let deadline = Instant::now() + Duration::from_millis(20);
+    let error = initial_prompt_delay_within_budget(
+        deadline,
+        Duration::from_secs(12),
+        Duration::from_secs(1),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("initial prompt readiness delay"));
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    assert_eq!(
+        initial_prompt_delay_within_budget(
+            deadline,
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+        Duration::from_millis(10)
+    );
+}
+
+#[test]
 fn effort_uses_each_provider_native_session_option() {
     assert_eq!(
         provider_effort_args(FirstPartyCli::Codex, "xhigh").unwrap(),
@@ -250,6 +292,135 @@ fn provider_failures_finish_the_bridge_turn_without_reporting_success() {
 }
 
 #[test]
+fn pending_completion_recovery_converges_after_every_partial_mutation() {
+    for completed_mutations in 0..=3 {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        let claim_token = claim.token.clone();
+        claim.retain();
+        let event = SessionEvent {
+            provider: FirstPartyCli::Codex.as_str().to_owned(),
+            message: "committed result".to_owned(),
+            error: None,
+            provider_session_id: Some("provider-session".to_owned()),
+            turn_id: Some("provider-turn".to_owned()),
+            created_unix_ms: 1,
+        };
+        let pending = PendingTurnCompletion::new(&claim_token, event, None).unwrap();
+        write_json_atomic(&directory.path().join(TURN_COMPLETION_FILE), &pending).unwrap();
+        if completed_mutations >= 1 {
+            write_pending_completion_event(directory.path(), &pending).unwrap();
+        }
+        if completed_mutations >= 2 {
+            update_status(directory.path(), "ready", None, None).unwrap();
+        }
+        if completed_mutations >= 3 {
+            release_turn_claim_token(&directory.path().join(TURN_CLAIM_FILE), &claim_token)
+                .unwrap();
+        }
+
+        assert!(recover_pending_completion(directory.path()).unwrap());
+
+        let paths = event_paths(directory.path()).unwrap();
+        assert_eq!(paths.len(), 1);
+        let stored: SessionEvent = read_json(&paths[0]).unwrap();
+        assert_eq!(stored.message, "committed result");
+        assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+        assert!(!directory.path().join(TURN_COMPLETION_FILE).exists());
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state, "ready");
+    }
+}
+
+#[test]
+fn terminal_status_cannot_regress_and_generation_is_monotonic() {
+    let directory = tempfile::tempdir().unwrap();
+    update_status(directory.path(), "launching", None, None).unwrap();
+    update_status(directory.path(), "running", None, None).unwrap();
+    let running: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    update_status(directory.path(), "exited", Some(0), None).unwrap();
+    let exited: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+
+    assert!(exited.generation > running.generation);
+    assert!(update_status(directory.path(), "ready", None, None).is_err());
+    let stable: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(stable.state, "exited");
+    assert_eq!(stable.generation, exited.generation);
+}
+
+#[test]
+fn native_finalization_is_idempotent_after_a_terminal_status() {
+    for state in ["exited", "failed", "closed"] {
+        let directory = tempfile::tempdir().unwrap();
+        update_status(directory.path(), "launching", None, None).unwrap();
+        if state != "closed" {
+            update_status(directory.path(), "running", None, None).unwrap();
+        }
+        match state {
+            "exited" => update_status(directory.path(), state, Some(0), None).unwrap(),
+            "failed" => update_status(
+                directory.path(),
+                state,
+                None,
+                Some("provider failed".to_owned()),
+            )
+            .unwrap(),
+            "closed" => update_status(directory.path(), state, None, None).unwrap(),
+            _ => unreachable!(),
+        }
+        let before: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+
+        finalize_native_session(directory.path(), &Ok(())).unwrap();
+
+        let after: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(after.state, state);
+        assert_eq!(after.generation, before.generation);
+    }
+}
+
+#[test]
+fn completion_and_process_exit_converge_in_either_serialized_order() {
+    for completion_first in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "launching", None, None).unwrap();
+        update_status(directory.path(), "running", None, None).unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        let claim_token = claim.token.clone();
+        claim.retain();
+
+        let complete = || {
+            record_provider_result_for_claim(
+                directory.path(),
+                FirstPartyCli::Codex,
+                "completed result",
+                Some("codex-session".to_owned()),
+                Some("codex-turn".to_owned()),
+                Some(&claim_token),
+            )
+            .unwrap();
+        };
+        if completion_first {
+            complete();
+            finalize_native_session(directory.path(), &Ok(())).unwrap();
+        } else {
+            finalize_native_session(directory.path(), &Ok(())).unwrap();
+            complete();
+        }
+
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state, "exited");
+        assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+        assert_eq!(
+            event_paths(directory.path()).unwrap().len(),
+            usize::from(completion_first)
+        );
+    }
+}
+
+#[test]
 fn stale_provider_completion_cannot_release_a_replacement_claim() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
@@ -290,6 +461,7 @@ fn duplicate_provider_turn_cannot_release_a_replacement_claim() {
     .unwrap();
     let replacement_claim = acquire_turn_claim(directory.path()).unwrap();
     replacement_claim.retain();
+    update_status(directory.path(), "claimed", None, None).unwrap();
     update_status(directory.path(), "working", None, None).unwrap();
 
     record_provider_result(
@@ -401,6 +573,7 @@ fn completed_event_uses_its_own_released_claim_not_a_later_turns_claim() {
     release_turn_claim(directory.path()).unwrap();
     let later_claim = acquire_turn_claim(directory.path()).unwrap();
     later_claim.retain();
+    update_status(directory.path(), "claimed", None, None).unwrap();
     update_status(directory.path(), "working", None, None).unwrap();
 
     let event = wait_for_event_for_turn(
@@ -473,13 +646,6 @@ fn uncorrelated_wait_returns_the_first_event_after_its_baseline() {
     assert_eq!(event.message, "expected turn");
 }
 
-#[test]
-fn supervisor_accepts_a_follow_up_queued_after_initial_completion() {
-    assert!(supervisor_initial_turn_completed("ready"));
-    assert!(supervisor_initial_turn_completed("resume-pending"));
-    assert!(!supervisor_initial_turn_completed("running"));
-}
-
 fn write_resume_wait_owner(directory: &Path, state: &str, pid: u32) {
     update_status(directory, state, None, None).unwrap();
     write_json_atomic(
@@ -494,78 +660,7 @@ fn write_resume_wait_owner(directory: &Path, state: &str, pid: u32) {
 }
 
 #[test]
-fn provider_resume_waits_for_the_completed_process_to_release_its_slot() {
-    let directory = tempfile::tempdir().unwrap();
-    write_resume_wait_owner(directory.path(), "ready", std::process::id());
-    let running = directory.path().join(RESUME_RUNNING_FILE);
-    fs::write(&running, "claimed").unwrap();
-    let remover = running.clone();
-    let cleanup = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(40));
-        fs::remove_file(remover).unwrap();
-    });
-
-    wait_for_provider_resume_slot(directory.path(), Instant::now() + Duration::from_secs(1))
-        .unwrap();
-    cleanup.join().unwrap();
-}
-
-#[test]
-fn provider_resume_claim_waits_before_publishing_claimed_state() {
-    let directory = tempfile::tempdir().unwrap();
-    fs::create_dir(directory.path().join("events")).unwrap();
-    write_resume_wait_owner(directory.path(), "ready", std::process::id());
-    let running = directory.path().join(RESUME_RUNNING_FILE);
-    fs::write(&running, "claimed").unwrap();
-    let observed_directory = directory.path().to_owned();
-    let remover = running.clone();
-    let cleanup = thread::spawn(move || {
-        while !observed_directory.join(TURN_CLAIM_FILE).exists() {
-            thread::yield_now();
-        }
-        let status: SessionStatus = read_json(&observed_directory.join("status.json")).unwrap();
-        assert_eq!(status.state, "ready");
-        fs::remove_file(remover).unwrap();
-    });
-
-    let result =
-        acquire_ready_turn_claim_after_claim(directory.path(), "session-resume123", || {
-            wait_for_provider_resume_slot(directory.path(), Instant::now() + Duration::from_secs(1))
-        });
-    cleanup.join().unwrap();
-    let (_claim, _) = result.unwrap();
-    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
-    assert_eq!(status.state, "claimed");
-}
-
-#[test]
-fn provider_resume_slot_is_released_only_after_completion_validation() {
-    let directory = tempfile::tempdir().unwrap();
-    let running = directory.path().join(RESUME_RUNNING_FILE);
-    fs::write(&running, "claimed").unwrap();
-
-    finish_provider_resume_turn(&running, || {
-        assert!(running.exists());
-        Ok(())
-    })
-    .unwrap();
-
-    assert!(!running.exists());
-}
-
-#[test]
-fn failed_provider_resume_validation_keeps_the_slot_claimed() {
-    let directory = tempfile::tempdir().unwrap();
-    let running = directory.path().join(RESUME_RUNNING_FILE);
-    fs::write(&running, "claimed").unwrap();
-
-    assert!(finish_provider_resume_turn(&running, || bail!("invalid completion")).is_err());
-
-    assert!(running.exists());
-}
-
-#[test]
-fn close_during_provider_resume_wait_cannot_resurrect_the_session() {
+fn close_during_turn_claim_cannot_resurrect_the_session() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
     write_resume_wait_owner(directory.path(), "ready", std::process::id());
@@ -628,90 +723,20 @@ fn close_cannot_interleave_between_ready_validation_and_claimed_publication() {
 }
 
 #[test]
-fn provider_resume_slot_wait_obeys_the_turn_deadline() {
-    let directory = tempfile::tempdir().unwrap();
-    write_resume_wait_owner(directory.path(), "ready", std::process::id());
-    fs::write(directory.path().join(RESUME_RUNNING_FILE), "claimed").unwrap();
-
-    let error =
-        wait_for_provider_resume_slot(directory.path(), Instant::now() + Duration::from_millis(20))
-            .unwrap_err();
-
-    assert!(error.to_string().contains("resume supervisor"));
-}
-
-#[test]
-fn provider_resume_rejects_an_expired_deadline_after_the_slot_is_free() {
-    let directory = tempfile::tempdir().unwrap();
-
-    let error = wait_for_provider_resume_slot(
-        directory.path(),
-        Instant::now()
-            .checked_sub(Duration::from_millis(1))
-            .unwrap(),
-    )
-    .unwrap_err();
-
-    assert!(error.to_string().contains("resume supervisor"));
-}
-
-#[test]
-fn provider_resume_slot_repairs_a_supervisor_that_dies_during_the_wait() {
-    let directory = tempfile::tempdir().unwrap();
-    write_resume_wait_owner(directory.path(), "exited", reaped_child_pid());
-    fs::write(directory.path().join(RESUME_RUNNING_FILE), "claimed").unwrap();
-
-    let error =
-        wait_for_provider_resume_slot(directory.path(), Instant::now() + Duration::from_secs(1))
-            .unwrap_err();
-
-    assert!(error.to_string().contains("no longer running"));
-    assert!(!directory.path().join(RESUME_RUNNING_FILE).exists());
-    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
-    assert_eq!(status.state, "closed");
-}
-
-#[test]
-fn closing_a_session_publishes_closed_before_releasing_a_resume_waiter() {
+fn failed_closed_publication_keeps_legacy_resume_and_claim_capabilities() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
     write_resume_wait_owner(directory.path(), "ready", std::process::id());
-    fs::write(directory.path().join(RESUME_RUNNING_FILE), "claimed").unwrap();
-    let (observed_tx, observed_rx) = std::sync::mpsc::channel();
-    let waiter_directory = directory.path().to_owned();
-    let waiter = thread::spawn(move || {
-        wait_for_provider_resume_slot_after_observed(
-            &waiter_directory,
-            Instant::now() + Duration::from_secs(1),
-            || observed_tx.send(()).unwrap(),
-        )?;
-        acquire_ready_turn_claim(&waiter_directory, "session-closing123").map(|_| ())
-    });
-    observed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-
-    mark_session_closed(directory.path(), None).unwrap();
-    let error = waiter.join().unwrap().unwrap_err();
-
-    assert!(error.to_string().contains("closed"));
-    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
-    assert!(!directory.path().join(RESUME_RUNNING_FILE).exists());
-}
-
-#[test]
-fn failed_closed_publication_keeps_resume_and_claim_capabilities() {
-    let directory = tempfile::tempdir().unwrap();
-    fs::create_dir(directory.path().join("events")).unwrap();
-    write_resume_wait_owner(directory.path(), "ready", std::process::id());
-    fs::write(directory.path().join(RESUME_PENDING_FILE), "pending").unwrap();
-    fs::write(directory.path().join(RESUME_RUNNING_FILE), "running").unwrap();
+    fs::write(directory.path().join(LEGACY_RESUME_PENDING_FILE), "pending").unwrap();
+    fs::write(directory.path().join(LEGACY_RESUME_RUNNING_FILE), "running").unwrap();
     let claim = acquire_turn_claim(directory.path()).unwrap();
     fs::remove_file(directory.path().join("status.json")).unwrap();
     fs::create_dir(directory.path().join("status.json")).unwrap();
 
     assert!(mark_session_closed(directory.path(), None).is_err());
 
-    assert!(directory.path().join(RESUME_PENDING_FILE).exists());
-    assert!(directory.path().join(RESUME_RUNNING_FILE).exists());
+    assert!(directory.path().join(LEGACY_RESUME_PENDING_FILE).exists());
+    assert!(directory.path().join(LEGACY_RESUME_RUNNING_FILE).exists());
     assert_eq!(
         fs::read_to_string(directory.path().join(TURN_CLAIM_FILE))
             .unwrap()
@@ -721,18 +746,18 @@ fn failed_closed_publication_keeps_resume_and_claim_capabilities() {
 }
 
 #[test]
-fn closed_cleanup_attempts_every_capability_release() {
+fn closed_cleanup_attempts_every_legacy_capability_release() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
     write_resume_wait_owner(directory.path(), "ready", std::process::id());
-    fs::create_dir(directory.path().join(RESUME_PENDING_FILE)).unwrap();
-    fs::write(directory.path().join(RESUME_RUNNING_FILE), "running").unwrap();
+    fs::create_dir(directory.path().join(LEGACY_RESUME_PENDING_FILE)).unwrap();
+    fs::write(directory.path().join(LEGACY_RESUME_RUNNING_FILE), "running").unwrap();
     let claim = acquire_turn_claim(directory.path()).unwrap();
     claim.retain();
 
     assert!(mark_session_closed(directory.path(), None).is_err());
 
-    assert!(!directory.path().join(RESUME_RUNNING_FILE).exists());
+    assert!(!directory.path().join(LEGACY_RESUME_RUNNING_FILE).exists());
     assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
 }
 
@@ -777,6 +802,7 @@ fn write_prune_test_session(
     .unwrap();
     let status = SessionStatus {
         state: state.to_owned(),
+        generation: 1,
         updated_unix_ms: closed_unix_ms.unwrap_or(1_000),
         exit_code: None,
         error: None,
@@ -787,6 +813,7 @@ fn write_prune_test_session(
             &directory.join(CLOSED_STATUS_FILE),
             &SessionStatus {
                 state: "closed".to_owned(),
+                generation: 1,
                 updated_unix_ms,
                 exit_code: None,
                 error: None,
@@ -1232,6 +1259,7 @@ fn terminal_app_close_waits_for_attested_process_group_shutdown_without_key_inje
 #[test]
 fn stable_iterm_and_ghostty_ids_do_not_depend_on_mutable_display_titles() {
     for script in [
+        terminal::macos::iterm2::VERIFY_SESSION_SCRIPT,
         terminal::macos::iterm2::SEND_FILE_SCRIPT,
         terminal::macos::iterm2::CLOSE_SESSION_SCRIPT,
     ] {
@@ -1240,6 +1268,7 @@ fn stable_iterm_and_ghostty_ids_do_not_depend_on_mutable_display_titles() {
         assert!(!script.contains("name of targetSession"));
     }
     for script in [
+        terminal::macos::ghostty::VERIFY_SURFACE_SCRIPT,
         terminal::macos::ghostty::SEND_FILE_SCRIPT,
         terminal::macos::ghostty::CLOSE_TAB_SCRIPT,
     ] {
@@ -1256,6 +1285,10 @@ fn stable_iterm_and_ghostty_ids_do_not_depend_on_mutable_display_titles() {
 fn macos_terminal_adapters_never_set_or_verify_display_titles() {
     for (name, script) in [
         ("iTerm2 open", terminal::macos::iterm2::OPEN_TAB_SCRIPT),
+        (
+            "iTerm2 verify",
+            terminal::macos::iterm2::VERIFY_SESSION_SCRIPT,
+        ),
         ("iTerm2 send", terminal::macos::iterm2::SEND_FILE_SCRIPT),
         (
             "iTerm2 close",
@@ -1277,6 +1310,10 @@ fn macos_terminal_adapters_never_set_or_verify_display_titles() {
             "Ghostty press Enter",
             terminal::macos::ghostty::PRESS_ENTER_SCRIPT,
         ),
+        (
+            "Ghostty verify",
+            terminal::macos::ghostty::VERIFY_SURFACE_SCRIPT,
+        ),
         ("Ghostty send", terminal::macos::ghostty::SEND_FILE_SCRIPT),
         ("Ghostty close", terminal::macos::ghostty::CLOSE_TAB_SCRIPT),
         (
@@ -1286,6 +1323,10 @@ fn macos_terminal_adapters_never_set_or_verify_display_titles() {
         (
             "Terminal.app send",
             terminal::macos::apple_terminal::SEND_FILE_SCRIPT,
+        ),
+        (
+            "Terminal.app verify",
+            terminal::macos::apple_terminal::VERIFY_TAB_SCRIPT,
         ),
         (
             "Terminal.app close",
@@ -1329,6 +1370,12 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
             "/Applications/iTerm.app",
         ),
         (
+            "iTerm2 verify session",
+            terminal::macos::iterm2::VERIFY_SESSION_SCRIPT,
+            "iTerm2",
+            "/Applications/iTerm.app",
+        ),
+        (
             "iTerm2 close session",
             terminal::macos::iterm2::CLOSE_SESSION_SCRIPT,
             "iTerm2",
@@ -1343,6 +1390,12 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
         (
             "Terminal.app send file",
             terminal::macos::apple_terminal::SEND_FILE_SCRIPT,
+            "Terminal",
+            "/System/Applications/Utilities/Terminal.app",
+        ),
+        (
+            "Terminal.app verify tab",
+            terminal::macos::apple_terminal::VERIFY_TAB_SCRIPT,
             "Terminal",
             "/System/Applications/Utilities/Terminal.app",
         ),
@@ -1389,6 +1442,12 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
             "/Applications/Ghostty.app",
         ),
         (
+            "Ghostty verify surface",
+            terminal::macos::ghostty::VERIFY_SURFACE_SCRIPT,
+            "Ghostty",
+            "/Applications/Ghostty.app",
+        ),
+        (
             "Ghostty close tab",
             terminal::macos::ghostty::CLOSE_TAB_SCRIPT,
             "Ghostty",
@@ -1420,6 +1479,7 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
 fn status_updates_replace_atomically() {
     let directory = tempfile::tempdir().unwrap();
     update_status(directory.path(), "launching", None, None).unwrap();
+    update_status(directory.path(), "running", None, None).unwrap();
     update_status(directory.path(), "ready", None, None).unwrap();
 
     let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
@@ -1692,11 +1752,7 @@ fn every_provider_declares_its_current_follow_up_transport() {
     }
     assert_eq!(
         provider::follow_up_transport(FirstPartyCli::Claude).as_str(),
-        if cfg!(windows) {
-            "provider-resume-supervisor"
-        } else {
-            "provider-cross-session-message"
-        }
+        "provider-cross-session-message"
     );
 }
 
@@ -1712,7 +1768,7 @@ fn every_provider_declares_its_initial_prompt_transport() {
         assert_eq!(
             provider::initial_prompt_transport(provider),
             if provider == FirstPartyCli::Claude {
-                provider::InitialPromptTransport::ProviderStdin
+                provider::InitialPromptTransport::ProviderArgument
             } else {
                 provider::InitialPromptTransport::TerminalPasteAfterLaunch
             }
@@ -2102,6 +2158,8 @@ fn terminal_owner_proof_rejects_record_only_ids_and_reused_surfaces() {
         process_start_microseconds: 201,
         ..live
     };
+    assert!(native_owner_identity_matches(&owner, &live));
+    assert!(!native_owner_identity_matches(&owner, &reused_process));
     assert!(
         verify_terminal_owner_attestation(
             "session-owner123",
@@ -2294,7 +2352,11 @@ fn native_session_executes_the_provider_with_policy_and_provenance() {
     )
     .unwrap();
 
-    run_session_inner(&directory).unwrap();
+    let claim = acquire_turn_claim(&directory).unwrap();
+    claim.retain();
+    let result = run_session_inner(&directory);
+    finalize_native_session(&directory, &result).unwrap();
+    result.unwrap();
 
     let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
     assert!(arguments.contains("--dangerously-bypass-approvals-and-sandbox"));
@@ -2325,7 +2387,7 @@ fn claude_session_forwards_requested_model() {
     let provider = root.path().join("fake-claude");
     fs::write(
             &provider,
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '2.1.232 (Claude Code)\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" > \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/argv.txt\"\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '2.1.234 (Claude Code)\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" > \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/argv.txt\"\n",
         )
         .unwrap();
     fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
@@ -2342,7 +2404,7 @@ fn claude_session_forwards_requested_model() {
             id: "session-safe123".to_owned(),
             provider: "claude".to_owned(),
             provider_path: provider,
-            provider_version: "2.1.232 (Claude Code)".to_owned(),
+            provider_version: "2.1.234 (Claude Code)".to_owned(),
             workspace,
             title: "Claude test".to_owned(),
             model: Some("Fable5".to_owned()),
@@ -2354,7 +2416,11 @@ fn claude_session_forwards_requested_model() {
     .unwrap();
     write_private(&directory.join("initial-prompt.txt"), b"claude prompt").unwrap();
 
-    run_session_inner(&directory).unwrap();
+    let claim = acquire_turn_claim(&directory).unwrap();
+    claim.retain();
+    let result = run_session_inner(&directory);
+    finalize_native_session(&directory, &result).unwrap();
+    result.unwrap();
 
     let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
     assert!(arguments.contains("--model\nFable"));
@@ -2402,7 +2468,11 @@ fn agy_session_uses_interactive_prompt_model_log_and_explicit_yolo() {
     .unwrap();
     write_private(&directory.join("initial-prompt.txt"), b"agy prompt").unwrap();
 
-    run_session_inner(&directory).unwrap();
+    let claim = acquire_turn_claim(&directory).unwrap();
+    claim.retain();
+    let result = run_session_inner(&directory);
+    finalize_native_session(&directory, &result).unwrap();
+    result.unwrap();
 
     let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
     assert!(arguments.contains("--dangerously-skip-permissions"));
@@ -2451,14 +2521,19 @@ fn pi_session_loads_the_result_extension_and_explicit_project_approval() {
     .unwrap();
     write_private(&directory.join("initial-prompt.txt"), b"pi prompt").unwrap();
 
-    run_session_inner(&directory).unwrap();
+    let claim = acquire_turn_claim(&directory).unwrap();
+    claim.retain();
+    let result = run_session_inner(&directory);
+    finalize_native_session(&directory, &result).unwrap();
+    result.unwrap();
 
     let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
     assert!(arguments.contains("--model\nanthropic/claude-fable-5"));
     assert!(arguments.contains("--thinking\nminimal"));
     assert!(arguments.contains("--extension"));
     assert!(arguments.contains("--name\nPi test"));
-    assert!(arguments.ends_with("pi prompt\n"));
+    assert!(arguments.contains("pi prompt"));
+    assert!(arguments.contains("[Agent Bridge Pi turn protocol]"));
     assert!(arguments.contains("--approve"));
     assert!(!arguments.contains("dangerously"));
     let extension = fs::read_to_string(directory.join("pi-agent-bridge.js")).unwrap();

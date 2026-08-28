@@ -72,6 +72,27 @@ on run argv
 end run
 "#;
 
+pub(in crate::native) const VERIFY_TAB_SCRIPT: &str = r#"
+on run argv
+    set wantedTty to item 1 of argv
+    set wantedWindowId to item 2 of argv as integer
+    tell application "Terminal"
+        try
+            set targetWindow to first window whose id is wantedWindowId
+        on error
+            return "missing"
+        end try
+        set matchCount to 0
+        repeat with candidateTab in tabs of targetWindow
+            if tty of candidateTab is wantedTty then set matchCount to matchCount + 1
+        end repeat
+        if matchCount is 1 then return wantedTty
+        if matchCount is 0 then return "missing"
+        error "Agent Bridge Terminal.app ownership proof matched multiple tabs"
+    end tell
+end run
+"#;
+
 pub(in crate::native) const CLOSE_TAB_SCRIPT: &str = r#"
 on run argv
     set wantedTty to item 1 of argv
@@ -171,6 +192,15 @@ pub(super) fn send_file(session: &TerminalSession, prompt_path: &Path) -> Result
         bail!("unexpected Terminal.app send response: {response:?}");
     }
     Ok(())
+}
+
+pub(super) fn verify_tab(session: &TerminalSession) -> Result<String> {
+    let window_id = ownership_proof(session)?;
+    let response = applescript::run("Terminal.app", VERIFY_TAB_SCRIPT, &[&session.id, window_id])?;
+    if response != session.id {
+        bail!("Agent Bridge Terminal.app owned tab is missing");
+    }
+    Ok(response)
 }
 
 pub(in crate::native) fn process_group_signal_target(process_group: u32) -> Result<libc::pid_t> {

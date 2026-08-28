@@ -53,6 +53,29 @@ on run argv
 end run
 "#;
 
+pub(in crate::native) const VERIFY_SESSION_SCRIPT: &str = r#"
+on run argv
+    set wantedId to item 1 of argv
+    set matchedTty to missing value
+    set matchCount to 0
+    tell application "iTerm2"
+        repeat with targetWindow in windows
+            repeat with targetTab in tabs of targetWindow
+                repeat with targetSession in sessions of targetTab
+                    if unique ID of targetSession is wantedId then
+                        set matchedTty to tty of targetSession
+                        set matchCount to matchCount + 1
+                    end if
+                end repeat
+            end repeat
+        end repeat
+    end tell
+    if matchCount is not 1 then error "Agent Bridge iTerm2 ownership proof did not match exactly one session"
+    if matchedTty is missing value or matchedTty is "" then error "Agent Bridge iTerm2 session has no tty"
+    return matchedTty
+end run
+"#;
+
 pub(in crate::native) const CLOSE_SESSION_SCRIPT: &str = r#"
 on run argv
     set wantedId to item 1 of argv
@@ -96,6 +119,14 @@ pub(super) fn send_file(session: &TerminalSession, prompt_path: &Path) -> Result
         bail!("unexpected iTerm2 send response: {response:?}");
     }
     Ok(())
+}
+
+pub(super) fn verify_session(session: &TerminalSession) -> Result<String> {
+    let tty = applescript::run("iTerm2", VERIFY_SESSION_SCRIPT, &[&session.id])?;
+    if tty.is_empty() {
+        bail!("iTerm2 ownership proof returned an empty tty");
+    }
+    Ok(tty)
 }
 
 pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
