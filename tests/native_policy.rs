@@ -232,7 +232,7 @@ fn release_publication_requires_repository_immutable_releases() {
 
 #[test]
 fn release_artifact_job_is_isolated_from_mutable_terminal_app_installs() {
-    let workflow = include_str!("../.github/workflows/release.yml");
+    let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
     let build = workflow
         .find("\n  build:\n")
         .expect("release workflow has no build job");
