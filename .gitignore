@@ -1,4 +1,5 @@
 /target/
+/.agent-bridge-review-prompts/
 *.log
 
 # 로컬 전용 작업 노트 (TODO.local.md 등)

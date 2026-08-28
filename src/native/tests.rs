@@ -29,18 +29,18 @@ fn ask_yolo_is_false_unless_the_child_request_contains_the_flag() {
 fn ask_and_tell_accept_prompt_files_without_putting_prompt_text_in_argv() {
     let directory = tempfile::tempdir().unwrap();
     let prompt_path = directory.path().join("prompt.txt");
-    fs::write(&prompt_path, "long prompt from file").unwrap();
+    fs::write(&prompt_path, "long prompt\r\nfrom file").unwrap();
     let prompt_path = prompt_path.to_string_lossy().into_owned();
 
     let ask = parse_args(["ask", "claude", "--prompt-file", &prompt_path]).unwrap();
     assert!(matches!(
         ask,
-        NativeCommand::Ask(AskRequest { prompt, .. }) if prompt == "long prompt from file"
+        NativeCommand::Ask(AskRequest { prompt, .. }) if prompt == "long prompt\nfrom file"
     ));
     let tell = parse_args(["tell", "session-file123", "--prompt-file", &prompt_path]).unwrap();
     assert!(matches!(
         tell,
-        NativeCommand::Tell(TellRequest { prompt, .. }) if prompt == "long prompt from file"
+        NativeCommand::Tell(TellRequest { prompt, .. }) if prompt == "long prompt\nfrom file"
     ));
     assert!(
         parse_args([
@@ -53,6 +53,25 @@ fn ask_and_tell_accept_prompt_files_without_putting_prompt_text_in_argv() {
         ])
         .is_err()
     );
+}
+
+#[test]
+fn ask_rejects_terminal_control_sequences_from_inline_and_file_prompts() {
+    let directory = tempfile::tempdir().unwrap();
+    let prompt_path = directory.path().join("prompt.txt");
+    fs::write(&prompt_path, "unsafe\rprompt").unwrap();
+    let prompt_path = prompt_path.to_string_lossy().into_owned();
+
+    for arguments in [
+        vec!["ask", "codex", "--prompt", "unsafe\u{1b}prompt"],
+        vec!["ask", "pi", "--prompt-file", prompt_path.as_str()],
+    ] {
+        let error = parse_args(arguments).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("terminal control"),
+            "unexpected rejection: {error:#}"
+        );
+    }
 }
 
 #[test]
@@ -205,6 +224,79 @@ fn remaining_turn_timeout_rejects_an_exhausted_total_budget() {
 }
 
 #[test]
+fn terminal_delivery_keeps_the_original_deadline_after_preflight_work() {
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(5);
+
+    assert_eq!(
+        terminal::remaining_send_budget_at(deadline, started + Duration::from_secs(3)).unwrap(),
+        Duration::from_secs(2)
+    );
+    assert!(terminal::remaining_send_budget_at(deadline, deadline).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_command_output_terminates_a_hung_child_at_the_deadline() {
+    let mut command = Command::new("/bin/sh");
+    // The background child inherits stdout/stderr. A pipe-reader implementation
+    // would still block after killing only the direct shell process.
+    command.args(["-c", "sleep 1 & wait"]);
+    let started = Instant::now();
+
+    let failure = command_output_until_classified(
+        &mut command,
+        started + Duration::from_millis(100),
+        "test child",
+    )
+    .unwrap_err();
+    assert!(failure.process_started());
+    let error = failure.into_error();
+
+    assert!(format!("{error:#}").contains("test child timed out"));
+    assert!(started.elapsed() < Duration::from_millis(500));
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_command_output_identifies_a_pre_spawn_failure() {
+    let mut command = Command::new("/definitely/not/an/agent-bridge-executable");
+
+    let failure = command_output_until_classified(
+        &mut command,
+        Instant::now() + Duration::from_secs(1),
+        "missing test child",
+    )
+    .unwrap_err();
+
+    assert!(!failure.process_started());
+    assert!(format!("{:#}", failure.into_error()).contains("failed to start missing test child"));
+}
+
+#[test]
+fn initial_prompt_delay_must_fit_inside_the_original_ask_budget() {
+    let deadline = Instant::now() + Duration::from_millis(20);
+    let error = initial_prompt_delay_within_budget(
+        deadline,
+        Duration::from_secs(12),
+        Duration::from_secs(1),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("initial prompt readiness delay"));
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    assert_eq!(
+        initial_prompt_delay_within_budget(
+            deadline,
+            Duration::from_millis(10),
+            Duration::from_secs(1),
+        )
+        .unwrap(),
+        Duration::from_millis(10)
+    );
+}
+
+#[test]
 fn effort_uses_each_provider_native_session_option() {
     assert_eq!(
         provider_effort_args(FirstPartyCli::Codex, "xhigh").unwrap(),
@@ -250,6 +342,174 @@ fn provider_failures_finish_the_bridge_turn_without_reporting_success() {
 }
 
 #[test]
+fn monitor_failures_are_journaled_against_the_current_claim() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    let claim = acquire_turn_claim(directory.path()).unwrap();
+    claim.retain();
+
+    record_provider_monitor_failure(
+        directory.path(),
+        FirstPartyCli::Pi,
+        "Pi result monitor stopped",
+    )
+    .unwrap();
+
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+    assert!(!directory.path().join(TURN_COMPLETION_FILE).exists());
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "failed");
+    assert_eq!(status.error.as_deref(), Some("Pi result monitor stopped"));
+    let paths = event_paths(directory.path()).unwrap();
+    assert_eq!(paths.len(), 1);
+    let event: SessionEvent = read_json(&paths[0]).unwrap();
+    assert_eq!(event.error.as_deref(), Some("Pi result monitor stopped"));
+}
+
+#[test]
+fn pending_completion_recovery_converges_after_every_partial_mutation() {
+    for completed_mutations in 0..=3 {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        let claim_token = claim.token.clone();
+        claim.retain();
+        let event = SessionEvent {
+            provider: FirstPartyCli::Codex.as_str().to_owned(),
+            message: "committed result".to_owned(),
+            error: None,
+            provider_session_id: Some("provider-session".to_owned()),
+            turn_id: Some("provider-turn".to_owned()),
+            created_unix_ms: 1,
+        };
+        let pending = PendingTurnCompletion::new(&claim_token, event, None).unwrap();
+        write_json_atomic(&directory.path().join(TURN_COMPLETION_FILE), &pending).unwrap();
+        if completed_mutations >= 1 {
+            write_pending_completion_event(directory.path(), &pending).unwrap();
+        }
+        if completed_mutations >= 2 {
+            update_status(directory.path(), "ready", None, None).unwrap();
+        }
+        if completed_mutations >= 3 {
+            release_turn_claim_token(&directory.path().join(TURN_CLAIM_FILE), &claim_token)
+                .unwrap();
+        }
+
+        assert!(recover_pending_completion(directory.path()).unwrap());
+
+        let paths = event_paths(directory.path()).unwrap();
+        assert_eq!(paths.len(), 1);
+        let stored: SessionEvent = read_json(&paths[0]).unwrap();
+        assert_eq!(stored.message, "committed result");
+        assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+        assert!(!directory.path().join(TURN_COMPLETION_FILE).exists());
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state, "ready");
+    }
+}
+
+#[test]
+fn terminal_status_cannot_regress_and_generation_is_monotonic() {
+    let directory = tempfile::tempdir().unwrap();
+    update_status(directory.path(), "launching", None, None).unwrap();
+    update_status(directory.path(), "running", None, None).unwrap();
+    let running: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    update_status(directory.path(), "exited", Some(0), None).unwrap();
+    let exited: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+
+    assert!(exited.generation > running.generation);
+    assert!(update_status(directory.path(), "ready", None, None).is_err());
+    let stable: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(stable.state, "exited");
+    assert_eq!(stable.generation, exited.generation);
+}
+
+#[test]
+fn claimed_session_can_finalize_when_the_provider_exits_before_delivery() {
+    let directory = tempfile::tempdir().unwrap();
+    update_status(directory.path(), "ready", None, None).unwrap();
+    update_status(directory.path(), "claimed", None, None).unwrap();
+
+    finalize_native_session(directory.path(), &Ok(())).unwrap();
+
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "exited");
+    assert_eq!(status.exit_code, Some(0));
+}
+
+#[test]
+fn native_finalization_is_idempotent_after_a_terminal_status() {
+    for state in ["exited", "failed", "closed"] {
+        let directory = tempfile::tempdir().unwrap();
+        update_status(directory.path(), "launching", None, None).unwrap();
+        if state != "closed" {
+            update_status(directory.path(), "running", None, None).unwrap();
+        }
+        match state {
+            "exited" => update_status(directory.path(), state, Some(0), None).unwrap(),
+            "failed" => update_status(
+                directory.path(),
+                state,
+                None,
+                Some("provider failed".to_owned()),
+            )
+            .unwrap(),
+            "closed" => update_status(directory.path(), state, None, None).unwrap(),
+            _ => unreachable!(),
+        }
+        let before: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+
+        finalize_native_session(directory.path(), &Ok(())).unwrap();
+
+        let after: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(after.state, state);
+        assert_eq!(after.generation, before.generation);
+    }
+}
+
+#[test]
+fn completion_and_process_exit_converge_in_either_serialized_order() {
+    for completion_first in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "launching", None, None).unwrap();
+        update_status(directory.path(), "running", None, None).unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        let claim_token = claim.token.clone();
+        claim.retain();
+
+        let complete = || {
+            record_provider_result_for_claim(
+                directory.path(),
+                FirstPartyCli::Codex,
+                "completed result",
+                Some("codex-session".to_owned()),
+                Some("codex-turn".to_owned()),
+                Some(&claim_token),
+            )
+            .unwrap();
+        };
+        if completion_first {
+            complete();
+            finalize_native_session(directory.path(), &Ok(())).unwrap();
+        } else {
+            finalize_native_session(directory.path(), &Ok(())).unwrap();
+            complete();
+        }
+
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state, "exited");
+        assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+        assert_eq!(
+            event_paths(directory.path()).unwrap().len(),
+            usize::from(completion_first)
+        );
+    }
+}
+
+#[test]
 fn stale_provider_completion_cannot_release_a_replacement_claim() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
@@ -290,6 +550,7 @@ fn duplicate_provider_turn_cannot_release_a_replacement_claim() {
     .unwrap();
     let replacement_claim = acquire_turn_claim(directory.path()).unwrap();
     replacement_claim.retain();
+    update_status(directory.path(), "claimed", None, None).unwrap();
     update_status(directory.path(), "working", None, None).unwrap();
 
     record_provider_result(
@@ -401,6 +662,7 @@ fn completed_event_uses_its_own_released_claim_not_a_later_turns_claim() {
     release_turn_claim(directory.path()).unwrap();
     let later_claim = acquire_turn_claim(directory.path()).unwrap();
     later_claim.retain();
+    update_status(directory.path(), "claimed", None, None).unwrap();
     update_status(directory.path(), "working", None, None).unwrap();
 
     let event = wait_for_event_for_turn(
@@ -473,13 +735,6 @@ fn uncorrelated_wait_returns_the_first_event_after_its_baseline() {
     assert_eq!(event.message, "expected turn");
 }
 
-#[test]
-fn supervisor_accepts_a_follow_up_queued_after_initial_completion() {
-    assert!(supervisor_initial_turn_completed("ready"));
-    assert!(supervisor_initial_turn_completed("resume-pending"));
-    assert!(!supervisor_initial_turn_completed("running"));
-}
-
 fn write_resume_wait_owner(directory: &Path, state: &str, pid: u32) {
     update_status(directory, state, None, None).unwrap();
     write_json_atomic(
@@ -494,78 +749,7 @@ fn write_resume_wait_owner(directory: &Path, state: &str, pid: u32) {
 }
 
 #[test]
-fn provider_resume_waits_for_the_completed_process_to_release_its_slot() {
-    let directory = tempfile::tempdir().unwrap();
-    write_resume_wait_owner(directory.path(), "ready", std::process::id());
-    let running = directory.path().join(RESUME_RUNNING_FILE);
-    fs::write(&running, "claimed").unwrap();
-    let remover = running.clone();
-    let cleanup = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(40));
-        fs::remove_file(remover).unwrap();
-    });
-
-    wait_for_provider_resume_slot(directory.path(), Instant::now() + Duration::from_secs(1))
-        .unwrap();
-    cleanup.join().unwrap();
-}
-
-#[test]
-fn provider_resume_claim_waits_before_publishing_claimed_state() {
-    let directory = tempfile::tempdir().unwrap();
-    fs::create_dir(directory.path().join("events")).unwrap();
-    write_resume_wait_owner(directory.path(), "ready", std::process::id());
-    let running = directory.path().join(RESUME_RUNNING_FILE);
-    fs::write(&running, "claimed").unwrap();
-    let observed_directory = directory.path().to_owned();
-    let remover = running.clone();
-    let cleanup = thread::spawn(move || {
-        while !observed_directory.join(TURN_CLAIM_FILE).exists() {
-            thread::yield_now();
-        }
-        let status: SessionStatus = read_json(&observed_directory.join("status.json")).unwrap();
-        assert_eq!(status.state, "ready");
-        fs::remove_file(remover).unwrap();
-    });
-
-    let result =
-        acquire_ready_turn_claim_after_claim(directory.path(), "session-resume123", || {
-            wait_for_provider_resume_slot(directory.path(), Instant::now() + Duration::from_secs(1))
-        });
-    cleanup.join().unwrap();
-    let (_claim, _) = result.unwrap();
-    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
-    assert_eq!(status.state, "claimed");
-}
-
-#[test]
-fn provider_resume_slot_is_released_only_after_completion_validation() {
-    let directory = tempfile::tempdir().unwrap();
-    let running = directory.path().join(RESUME_RUNNING_FILE);
-    fs::write(&running, "claimed").unwrap();
-
-    finish_provider_resume_turn(&running, || {
-        assert!(running.exists());
-        Ok(())
-    })
-    .unwrap();
-
-    assert!(!running.exists());
-}
-
-#[test]
-fn failed_provider_resume_validation_keeps_the_slot_claimed() {
-    let directory = tempfile::tempdir().unwrap();
-    let running = directory.path().join(RESUME_RUNNING_FILE);
-    fs::write(&running, "claimed").unwrap();
-
-    assert!(finish_provider_resume_turn(&running, || bail!("invalid completion")).is_err());
-
-    assert!(running.exists());
-}
-
-#[test]
-fn close_during_provider_resume_wait_cannot_resurrect_the_session() {
+fn close_during_turn_claim_cannot_resurrect_the_session() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
     write_resume_wait_owner(directory.path(), "ready", std::process::id());
@@ -628,90 +812,20 @@ fn close_cannot_interleave_between_ready_validation_and_claimed_publication() {
 }
 
 #[test]
-fn provider_resume_slot_wait_obeys_the_turn_deadline() {
-    let directory = tempfile::tempdir().unwrap();
-    write_resume_wait_owner(directory.path(), "ready", std::process::id());
-    fs::write(directory.path().join(RESUME_RUNNING_FILE), "claimed").unwrap();
-
-    let error =
-        wait_for_provider_resume_slot(directory.path(), Instant::now() + Duration::from_millis(20))
-            .unwrap_err();
-
-    assert!(error.to_string().contains("resume supervisor"));
-}
-
-#[test]
-fn provider_resume_rejects_an_expired_deadline_after_the_slot_is_free() {
-    let directory = tempfile::tempdir().unwrap();
-
-    let error = wait_for_provider_resume_slot(
-        directory.path(),
-        Instant::now()
-            .checked_sub(Duration::from_millis(1))
-            .unwrap(),
-    )
-    .unwrap_err();
-
-    assert!(error.to_string().contains("resume supervisor"));
-}
-
-#[test]
-fn provider_resume_slot_repairs_a_supervisor_that_dies_during_the_wait() {
-    let directory = tempfile::tempdir().unwrap();
-    write_resume_wait_owner(directory.path(), "exited", reaped_child_pid());
-    fs::write(directory.path().join(RESUME_RUNNING_FILE), "claimed").unwrap();
-
-    let error =
-        wait_for_provider_resume_slot(directory.path(), Instant::now() + Duration::from_secs(1))
-            .unwrap_err();
-
-    assert!(error.to_string().contains("no longer running"));
-    assert!(!directory.path().join(RESUME_RUNNING_FILE).exists());
-    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
-    assert_eq!(status.state, "closed");
-}
-
-#[test]
-fn closing_a_session_publishes_closed_before_releasing_a_resume_waiter() {
+fn failed_closed_publication_keeps_legacy_resume_and_claim_capabilities() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
     write_resume_wait_owner(directory.path(), "ready", std::process::id());
-    fs::write(directory.path().join(RESUME_RUNNING_FILE), "claimed").unwrap();
-    let (observed_tx, observed_rx) = std::sync::mpsc::channel();
-    let waiter_directory = directory.path().to_owned();
-    let waiter = thread::spawn(move || {
-        wait_for_provider_resume_slot_after_observed(
-            &waiter_directory,
-            Instant::now() + Duration::from_secs(1),
-            || observed_tx.send(()).unwrap(),
-        )?;
-        acquire_ready_turn_claim(&waiter_directory, "session-closing123").map(|_| ())
-    });
-    observed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-
-    mark_session_closed(directory.path(), None).unwrap();
-    let error = waiter.join().unwrap().unwrap_err();
-
-    assert!(error.to_string().contains("closed"));
-    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
-    assert!(!directory.path().join(RESUME_RUNNING_FILE).exists());
-}
-
-#[test]
-fn failed_closed_publication_keeps_resume_and_claim_capabilities() {
-    let directory = tempfile::tempdir().unwrap();
-    fs::create_dir(directory.path().join("events")).unwrap();
-    write_resume_wait_owner(directory.path(), "ready", std::process::id());
-    fs::write(directory.path().join(RESUME_PENDING_FILE), "pending").unwrap();
-    fs::write(directory.path().join(RESUME_RUNNING_FILE), "running").unwrap();
+    fs::write(directory.path().join(LEGACY_RESUME_PENDING_FILE), "pending").unwrap();
+    fs::write(directory.path().join(LEGACY_RESUME_RUNNING_FILE), "running").unwrap();
     let claim = acquire_turn_claim(directory.path()).unwrap();
     fs::remove_file(directory.path().join("status.json")).unwrap();
     fs::create_dir(directory.path().join("status.json")).unwrap();
 
     assert!(mark_session_closed(directory.path(), None).is_err());
 
-    assert!(directory.path().join(RESUME_PENDING_FILE).exists());
-    assert!(directory.path().join(RESUME_RUNNING_FILE).exists());
+    assert!(directory.path().join(LEGACY_RESUME_PENDING_FILE).exists());
+    assert!(directory.path().join(LEGACY_RESUME_RUNNING_FILE).exists());
     assert_eq!(
         fs::read_to_string(directory.path().join(TURN_CLAIM_FILE))
             .unwrap()
@@ -721,18 +835,18 @@ fn failed_closed_publication_keeps_resume_and_claim_capabilities() {
 }
 
 #[test]
-fn closed_cleanup_attempts_every_capability_release() {
+fn closed_cleanup_attempts_every_legacy_capability_release() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
     write_resume_wait_owner(directory.path(), "ready", std::process::id());
-    fs::create_dir(directory.path().join(RESUME_PENDING_FILE)).unwrap();
-    fs::write(directory.path().join(RESUME_RUNNING_FILE), "running").unwrap();
+    fs::create_dir(directory.path().join(LEGACY_RESUME_PENDING_FILE)).unwrap();
+    fs::write(directory.path().join(LEGACY_RESUME_RUNNING_FILE), "running").unwrap();
     let claim = acquire_turn_claim(directory.path()).unwrap();
     claim.retain();
 
     assert!(mark_session_closed(directory.path(), None).is_err());
 
-    assert!(!directory.path().join(RESUME_RUNNING_FILE).exists());
+    assert!(!directory.path().join(LEGACY_RESUME_RUNNING_FILE).exists());
     assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
 }
 
@@ -777,6 +891,7 @@ fn write_prune_test_session(
     .unwrap();
     let status = SessionStatus {
         state: state.to_owned(),
+        generation: 1,
         updated_unix_ms: closed_unix_ms.unwrap_or(1_000),
         exit_code: None,
         error: None,
@@ -787,6 +902,7 @@ fn write_prune_test_session(
             &directory.join(CLOSED_STATUS_FILE),
             &SessionStatus {
                 state: "closed".to_owned(),
+                generation: 1,
                 updated_unix_ms,
                 exit_code: None,
                 error: None,
@@ -903,6 +1019,32 @@ fn explicit_close_repairs_failed_launch_without_terminal_record() {
 }
 
 #[test]
+fn explicit_close_remains_available_with_a_corrupt_completion_journal() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    let claim = acquire_turn_claim(directory.path()).unwrap();
+    claim.retain();
+    fs::write(directory.path().join(TURN_COMPLETION_FILE), "not-json").unwrap();
+
+    close_repaired_session_state(directory.path(), |_| {
+        panic!("a missing terminal handle must not call the adapter")
+    })
+    .unwrap();
+
+    assert!(!directory.path().join(TURN_COMPLETION_FILE).exists());
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "closed");
+    assert!(
+        status
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("invalid pending native turn completion"))
+    );
+}
+
+#[test]
 fn explicit_close_consumes_the_handle_and_repeated_close_skips_the_adapter() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
@@ -939,6 +1081,43 @@ fn explicit_close_consumes_the_handle_and_repeated_close_skips_the_adapter() {
     assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
     let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
     assert_eq!(status.state, "closed");
+}
+
+#[test]
+fn explicit_close_restores_the_terminal_handle_after_adapter_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_json_atomic(
+        &directory.path().join(TERMINAL_HANDLE_FILE),
+        &terminal::TerminalSession {
+            kind: terminal::TerminalKind::WindowsConsole,
+            id: "windows-console-process".to_owned(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: Some("session-windows-close".to_owned()),
+            windows_process_identity: None,
+        },
+    )
+    .unwrap();
+    update_status(directory.path(), "ready", None, None).unwrap();
+
+    let error = close_session_state(directory.path(), |_| {
+        Err(anyhow::anyhow!(
+            "failed to attach to the managed console process: Access is denied"
+        ))
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains("Access is denied"));
+    assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
+    assert!(!directory.path().join(TERMINAL_CLOSING_FILE).exists());
+    assert!(!directory.path().join(TERMINAL_TOMBSTONE_FILE).exists());
+    assert_eq!(
+        read_json::<SessionStatus>(&directory.path().join("status.json"))
+            .unwrap()
+            .state,
+        "ready"
+    );
 }
 
 #[test]
@@ -986,6 +1165,43 @@ fn concurrent_close_requests_share_one_terminal_handle_claim() {
     first.join().unwrap().unwrap();
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        read_json::<SessionStatus>(&directory.path().join("status.json"))
+            .unwrap()
+            .state,
+        "closed"
+    );
+}
+
+#[test]
+fn interrupted_terminal_close_resumes_from_the_claimed_handle() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_json_atomic(
+        &directory.path().join(TERMINAL_CLOSING_FILE),
+        &terminal::TerminalSession {
+            kind: terminal::TerminalKind::Iterm2,
+            id: "interrupted-close".to_owned(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: None,
+            windows_process_identity: None,
+        },
+    )
+    .unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    let mut calls = 0;
+
+    close_session_state(directory.path(), |session| {
+        calls += 1;
+        assert_eq!(session.id, "interrupted-close");
+        Ok(terminal::CloseOutcome::Closed)
+    })
+    .unwrap();
+
+    assert_eq!(calls, 1);
+    assert!(!directory.path().join(TERMINAL_CLOSING_FILE).exists());
+    assert!(directory.path().join(TERMINAL_TOMBSTONE_FILE).exists());
     assert_eq!(
         read_json::<SessionStatus>(&directory.path().join("status.json"))
             .unwrap()
@@ -1143,8 +1359,10 @@ fn internal_session_ids_cannot_escape_the_state_root() {
 #[test]
 fn iterm_script_keeps_dynamic_values_in_argv() {
     assert!(!terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains("review this"));
-    assert!(terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains("item 1 of argv"));
-    assert!(terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains("write text bridgeCommand"));
+    assert!(!terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains("bridgeCommand"));
+    assert!(!terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains("write text"));
+    assert!(terminal::macos::iterm2::START_SESSION_SCRIPT.contains("item 2 of argv"));
+    assert!(terminal::macos::iterm2::START_SESSION_SCRIPT.contains("write text bridgeCommand"));
 }
 
 #[cfg(target_os = "macos")]
@@ -1197,6 +1415,7 @@ fn terminal_app_window_discovery_snapshots_and_skips_stale_window_references() {
 #[test]
 fn terminal_app_actions_require_the_recorded_window_and_tty() {
     for script in [
+        terminal::macos::apple_terminal::START_SESSION_SCRIPT,
         terminal::macos::apple_terminal::SEND_FILE_SCRIPT,
         terminal::macos::apple_terminal::CLOSE_TAB_SCRIPT,
         terminal::macos::apple_terminal::WAIT_FOR_CLOSE_SCRIPT,
@@ -1204,6 +1423,8 @@ fn terminal_app_actions_require_the_recorded_window_and_tty() {
         assert!(script.contains("wantedWindowId"));
         assert!(script.contains("wantedTty"));
     }
+    assert!(terminal::macos::apple_terminal::OPEN_TAB_SCRIPT.contains("do script \"\""));
+    assert!(!terminal::macos::apple_terminal::OPEN_TAB_SCRIPT.contains("bridgeCommand"));
 }
 
 #[cfg(target_os = "macos")]
@@ -1232,6 +1453,7 @@ fn terminal_app_close_waits_for_attested_process_group_shutdown_without_key_inje
 #[test]
 fn stable_iterm_and_ghostty_ids_do_not_depend_on_mutable_display_titles() {
     for script in [
+        terminal::macos::iterm2::VERIFY_SESSION_SCRIPT,
         terminal::macos::iterm2::SEND_FILE_SCRIPT,
         terminal::macos::iterm2::CLOSE_SESSION_SCRIPT,
     ] {
@@ -1240,6 +1462,7 @@ fn stable_iterm_and_ghostty_ids_do_not_depend_on_mutable_display_titles() {
         assert!(!script.contains("name of targetSession"));
     }
     for script in [
+        terminal::macos::ghostty::VERIFY_SURFACE_SCRIPT,
         terminal::macos::ghostty::SEND_FILE_SCRIPT,
         terminal::macos::ghostty::CLOSE_TAB_SCRIPT,
     ] {
@@ -1256,11 +1479,16 @@ fn stable_iterm_and_ghostty_ids_do_not_depend_on_mutable_display_titles() {
 fn macos_terminal_adapters_never_set_or_verify_display_titles() {
     for (name, script) in [
         ("iTerm2 open", terminal::macos::iterm2::OPEN_TAB_SCRIPT),
+        (
+            "iTerm2 verify",
+            terminal::macos::iterm2::VERIFY_SESSION_SCRIPT,
+        ),
         ("iTerm2 send", terminal::macos::iterm2::SEND_FILE_SCRIPT),
         (
             "iTerm2 close",
             terminal::macos::iterm2::CLOSE_SESSION_SCRIPT,
         ),
+        ("Ghostty version", terminal::macos::ghostty::VERSION_SCRIPT),
         (
             "Ghostty create",
             terminal::macos::ghostty::CREATE_SURFACE_SCRIPT,
@@ -1277,6 +1505,10 @@ fn macos_terminal_adapters_never_set_or_verify_display_titles() {
             "Ghostty press Enter",
             terminal::macos::ghostty::PRESS_ENTER_SCRIPT,
         ),
+        (
+            "Ghostty verify",
+            terminal::macos::ghostty::VERIFY_SURFACE_SCRIPT,
+        ),
         ("Ghostty send", terminal::macos::ghostty::SEND_FILE_SCRIPT),
         ("Ghostty close", terminal::macos::ghostty::CLOSE_TAB_SCRIPT),
         (
@@ -1286,6 +1518,10 @@ fn macos_terminal_adapters_never_set_or_verify_display_titles() {
         (
             "Terminal.app send",
             terminal::macos::apple_terminal::SEND_FILE_SCRIPT,
+        ),
+        (
+            "Terminal.app verify",
+            terminal::macos::apple_terminal::VERIFY_TAB_SCRIPT,
         ),
         (
             "Terminal.app close",
@@ -1323,8 +1559,20 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
             "/Applications/iTerm.app",
         ),
         (
+            "iTerm2 start session",
+            terminal::macos::iterm2::START_SESSION_SCRIPT,
+            "iTerm2",
+            "/Applications/iTerm.app",
+        ),
+        (
             "iTerm2 send file",
             terminal::macos::iterm2::SEND_FILE_SCRIPT,
+            "iTerm2",
+            "/Applications/iTerm.app",
+        ),
+        (
+            "iTerm2 verify session",
+            terminal::macos::iterm2::VERIFY_SESSION_SCRIPT,
             "iTerm2",
             "/Applications/iTerm.app",
         ),
@@ -1341,8 +1589,20 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
             "/System/Applications/Utilities/Terminal.app",
         ),
         (
+            "Terminal.app start session",
+            terminal::macos::apple_terminal::START_SESSION_SCRIPT,
+            "Terminal",
+            "/System/Applications/Utilities/Terminal.app",
+        ),
+        (
             "Terminal.app send file",
             terminal::macos::apple_terminal::SEND_FILE_SCRIPT,
+            "Terminal",
+            "/System/Applications/Utilities/Terminal.app",
+        ),
+        (
+            "Terminal.app verify tab",
+            terminal::macos::apple_terminal::VERIFY_TAB_SCRIPT,
             "Terminal",
             "/System/Applications/Utilities/Terminal.app",
         ),
@@ -1357,6 +1617,12 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
             terminal::macos::apple_terminal::WAIT_FOR_CLOSE_SCRIPT,
             "Terminal",
             "/System/Applications/Utilities/Terminal.app",
+        ),
+        (
+            "Ghostty version",
+            terminal::macos::ghostty::VERSION_SCRIPT,
+            "Ghostty",
+            "/Applications/Ghostty.app",
         ),
         (
             "Ghostty create surface",
@@ -1389,8 +1655,20 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
             "/Applications/Ghostty.app",
         ),
         (
+            "Ghostty verify surface",
+            terminal::macos::ghostty::VERIFY_SURFACE_SCRIPT,
+            "Ghostty",
+            "/Applications/Ghostty.app",
+        ),
+        (
             "Ghostty close tab",
             terminal::macos::ghostty::CLOSE_TAB_SCRIPT,
+            "Ghostty",
+            "/Applications/Ghostty.app",
+        ),
+        (
+            "Ghostty close created tab",
+            terminal::macos::ghostty::CLOSE_CREATED_TAB_SCRIPT,
             "Ghostty",
             "/Applications/Ghostty.app",
         ),
@@ -1420,6 +1698,7 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
 fn status_updates_replace_atomically() {
     let directory = tempfile::tempdir().unwrap();
     update_status(directory.path(), "launching", None, None).unwrap();
+    update_status(directory.path(), "running", None, None).unwrap();
     update_status(directory.path(), "ready", None, None).unwrap();
 
     let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
@@ -1557,12 +1836,14 @@ fn windows_console_helper_accepts_only_managed_session_identity() {
             "send",
             "session-owner123",
             "pending-prompt-1.txt",
+            "5000",
         ])
         .unwrap(),
         NativeCommand::ConsoleControl {
             action,
             id,
             input_name: Some(input_name),
+            timeout_ms: Some(5000),
         } if action == "send" && id == "session-owner123" && input_name == "pending-prompt-1.txt"
     ));
     assert!(parse_args(["native-console-control", "close", "1234"]).is_err());
@@ -1572,8 +1853,25 @@ fn windows_console_helper_accepts_only_managed_session_identity() {
             "send",
             "session-owner123",
             "..\\outside.txt",
+            "5000",
         ])
         .is_err()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_terminal_input_requires_the_live_native_session_owner() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = current_native_session_owner("session-owner123").unwrap();
+    write_json_atomic(&directory.path().join(SESSION_OWNER_FILE), &owner).unwrap();
+
+    verified_windows_native_owner(directory.path(), "session-owner123").unwrap();
+    assert!(
+        verified_windows_native_owner(directory.path(), "session-other123")
+            .unwrap_err()
+            .to_string()
+            .contains("not bound")
     );
 }
 
@@ -1605,13 +1903,29 @@ fn bridge_shell_command_quotes_the_workspace_and_executable() {
     #[cfg(unix)]
     assert_eq!(
         command,
-        "cd '/tmp/project; touch nope' && AGENT_BRIDGE_NATIVE_STATE_DIR='/tmp/state root' '/tmp/Agent Bridge/bin' native-session 'session-safe123'"
+        "cd '/tmp/project; touch nope' && AGENT_BRIDGE_NATIVE_STATE_DIR='/tmp/state root' '/tmp/Agent Bridge/bin' native-session 'session-safe123'; bridge_status=$?; exit \"$bridge_status\""
     );
     #[cfg(windows)]
     assert_eq!(
         command,
-        "Set-Location -LiteralPath '/tmp/project; touch nope'; $env:AGENT_BRIDGE_NATIVE_STATE_DIR = '/tmp/state root'; & '/tmp/Agent Bridge/bin' native-session 'session-safe123'"
+        "Set-Location -LiteralPath '/tmp/project; touch nope' -ErrorAction Stop; $env:AGENT_BRIDGE_NATIVE_STATE_DIR = '/tmp/state root'; & '/tmp/Agent Bridge/bin' native-session 'session-safe123'; exit $LASTEXITCODE"
     );
+}
+
+#[test]
+fn managed_shell_exits_after_the_native_session_instead_of_accepting_late_input() {
+    let command = bridge_shell_command(
+        Path::new("/tmp/workspace"),
+        Path::new("/tmp/state"),
+        Path::new("/tmp/bridge"),
+        "session-safe123",
+    )
+    .unwrap();
+
+    #[cfg(unix)]
+    assert!(command.ends_with("bridge_status=$?; exit \"$bridge_status\""));
+    #[cfg(windows)]
+    assert!(command.ends_with("exit $LASTEXITCODE"));
 }
 
 #[cfg(windows)]
@@ -1692,11 +2006,7 @@ fn every_provider_declares_its_current_follow_up_transport() {
     }
     assert_eq!(
         provider::follow_up_transport(FirstPartyCli::Claude).as_str(),
-        if cfg!(windows) {
-            "provider-resume-supervisor"
-        } else {
-            "provider-cross-session-message"
-        }
+        "provider-cross-session-message"
     );
 }
 
@@ -1712,7 +2022,7 @@ fn every_provider_declares_its_initial_prompt_transport() {
         assert_eq!(
             provider::initial_prompt_transport(provider),
             if provider == FirstPartyCli::Claude {
-                provider::InitialPromptTransport::ProviderStdin
+                provider::InitialPromptTransport::ProviderCrossSessionMessageAfterLaunch
             } else {
                 provider::InitialPromptTransport::TerminalPasteAfterLaunch
             }
@@ -1733,18 +2043,15 @@ fn every_provider_declares_its_terminal_submission_count() {
     }
 }
 
-#[cfg(windows)]
 #[test]
 fn windows_initial_prompt_readiness_is_provider_specific() {
-    assert_eq!(
-        provider::initial_prompt_ready_delay(FirstPartyCli::Agy),
-        Duration::from_secs(12)
-    );
-    for provider in [
-        FirstPartyCli::Codex,
-        FirstPartyCli::Claude,
-        FirstPartyCli::Pi,
-    ] {
+    for provider in [FirstPartyCli::Codex, FirstPartyCli::Agy] {
+        assert_eq!(
+            provider::initial_prompt_ready_delay(provider),
+            Duration::from_secs(12)
+        );
+    }
+    for provider in [FirstPartyCli::Claude, FirstPartyCli::Pi] {
         assert_eq!(
             provider::initial_prompt_ready_delay(provider),
             Duration::from_secs(2)
@@ -1753,10 +2060,103 @@ fn windows_initial_prompt_readiness_is_provider_specific() {
 }
 
 #[test]
-fn follow_up_prompt_is_one_bracketed_paste_payload() {
+fn terminal_input_framing_matches_each_adapter_contract() {
     assert_eq!(
-        terminal_paste_bytes("line one\nline two"),
-        b"\x1b[200~line one\nline two\x1b[201~"
+        terminal_input_bytes(terminal::TerminalKind::Ghostty, "line one\nline two"),
+        b"line one\nline two"
+    );
+    assert_eq!(
+        terminal_input_bytes(terminal::TerminalKind::WindowsConsole, "line one\nline two"),
+        b"line one\nline two"
+    );
+    for kind in [
+        terminal::TerminalKind::Iterm2,
+        terminal::TerminalKind::AppleTerminal,
+    ] {
+        assert_eq!(
+            terminal_input_bytes(kind, "line one\nline two"),
+            b"\x1b[200~line one\nline two\x1b[201~"
+        );
+    }
+}
+
+#[test]
+fn windows_console_access_denied_is_not_a_missing_surface() {
+    assert!(terminal::windows_console_helper_reports_missing(
+        "Error: console process is no longer available"
+    ));
+    assert!(!terminal::windows_console_helper_reports_missing(
+        "Error: console process is no longer available: Access is denied. (os error 5)"
+    ));
+}
+
+#[test]
+fn windows_console_extra_submit_waits_for_paste_confirmation() {
+    assert_eq!(
+        terminal::windows_console_extra_submit_delay(),
+        Duration::from_secs(2)
+    );
+}
+
+#[test]
+fn windows_console_separates_codex_paste_confirmation_from_the_text_batch() {
+    assert_eq!(terminal::windows_console_immediate_submit_count(1), 1);
+    assert_eq!(terminal::windows_console_immediate_submit_count(2), 0);
+}
+
+#[test]
+fn windows_console_rejects_a_submit_plan_that_cannot_fit_the_remaining_budget() {
+    assert!(!terminal::windows_console_submit_delays_fit(
+        2,
+        Duration::from_secs(4)
+    ));
+    assert!(terminal::windows_console_submit_delays_fit(
+        2,
+        Duration::from_secs(5)
+    ));
+    assert!(terminal::windows_console_submit_delays_fit(
+        1,
+        Duration::from_millis(1)
+    ));
+}
+
+#[test]
+fn terminal_delivery_preflight_rejects_only_the_unstarted_windows_submit_plan() {
+    assert!(
+        provider::validate_terminal_send_budget_for_platform(
+            FirstPartyCli::Codex,
+            terminal::TerminalKind::WindowsConsole,
+            Duration::from_secs(4),
+            true,
+        )
+        .is_err()
+    );
+    assert!(
+        provider::validate_terminal_send_budget_for_platform(
+            FirstPartyCli::Codex,
+            terminal::TerminalKind::WindowsConsole,
+            Duration::from_secs(5),
+            true,
+        )
+        .is_ok()
+    );
+    assert!(
+        provider::validate_terminal_send_budget_for_platform(
+            FirstPartyCli::Agy,
+            terminal::TerminalKind::WindowsConsole,
+            Duration::from_millis(1),
+            true,
+        )
+        .is_ok()
+    );
+    assert!(
+        provider::validate_terminal_send_budget_for_platform(
+            FirstPartyCli::Codex,
+            terminal::TerminalKind::Iterm2,
+            Duration::from_millis(1),
+            false,
+        )
+        .is_ok()
     );
 }
 
@@ -1827,6 +2227,70 @@ fn unretained_tell_claim_restores_ready_state() {
 }
 
 #[test]
+fn initial_prompt_failures_distinguish_safe_abort_from_uncertain_delivery() {
+    for delivery_started in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        update_status(directory.path(), "awaiting-initial-input", None, None).unwrap();
+        let mut claim = acquire_turn_claim(directory.path()).unwrap();
+        if delivery_started {
+            update_status(directory.path(), "working", None, None).unwrap();
+        }
+
+        record_initial_prompt_delivery_failure(
+            directory.path(),
+            &mut claim,
+            delivery_started,
+            &anyhow::anyhow!("terminal delivery failed"),
+        );
+        drop(claim);
+
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        if delivery_started {
+            assert_eq!(status.state, "working");
+            assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+        } else {
+            assert_eq!(status.state, "failed");
+            assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+        }
+        assert_eq!(status.error.as_deref(), Some("terminal delivery failed"));
+    }
+}
+
+#[test]
+fn follow_up_terminal_send_failure_releases_only_confirmed_not_started_claims() {
+    for delivery_may_have_occurred in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "ready", None, None).unwrap();
+        let (mut claim, _) = acquire_ready_turn_claim(directory.path(), "session-test").unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let failure = if delivery_may_have_occurred {
+            terminal::TerminalSendFailure::delivery_uncertain(anyhow::anyhow!(
+                "terminal delivery uncertain"
+            ))
+        } else {
+            terminal::TerminalSendFailure::not_sent(anyhow::anyhow!(
+                "terminal delivery did not start"
+            ))
+        };
+
+        record_follow_up_terminal_delivery_failure(directory.path(), &mut claim, &failure);
+        drop(claim);
+
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        if delivery_may_have_occurred {
+            assert_eq!(status.state, "working");
+            assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+            assert_eq!(status.error.as_deref(), Some("terminal delivery uncertain"));
+        } else {
+            assert_eq!(status.state, "ready");
+            assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+            assert_eq!(status.error, None);
+        }
+    }
+}
+
+#[test]
 fn event_commit_does_not_create_a_racy_latest_cache() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
@@ -1869,15 +2333,29 @@ fn write_owned_terminal_state(directory: &Path, state: &str, owner_pid: u32) {
     update_status(directory, state, None, None).unwrap();
     let claim = acquire_turn_claim(directory).unwrap();
     claim.retain();
+    let windows_process_identity = test_windows_process_identity(owner_pid).or_else(|| {
+        cfg!(windows).then(|| terminal::WindowsProcessIdentity {
+            creation_time: 0,
+            executable_path: String::new(),
+        })
+    });
     write_json_atomic(
         &directory.join(TERMINAL_HANDLE_FILE),
         &terminal::TerminalSession {
-            kind: terminal::TerminalKind::AppleTerminal,
-            id: "/dev/ttys999".to_owned(),
+            kind: if cfg!(windows) {
+                terminal::TerminalKind::WindowsConsole
+            } else {
+                terminal::TerminalKind::AppleTerminal
+            },
+            id: if cfg!(windows) {
+                owner_pid.to_string()
+            } else {
+                "/dev/ttys999".to_owned()
+            },
             tab_id: None,
-            window_id: Some("1001".to_owned()),
+            window_id: (!cfg!(windows)).then(|| "1001".to_owned()),
             managed_session_id: Some("session-owner123".to_owned()),
-            windows_process_identity: None,
+            windows_process_identity: windows_process_identity.clone(),
         },
     )
     .unwrap();
@@ -1886,8 +2364,8 @@ fn write_owned_terminal_state(directory: &Path, state: &str, owner_pid: u32) {
         &NativeSessionOwner {
             pid: owner_pid,
             managed_session_id: Some("session-owner123".to_owned()),
-            terminal_tty: Some("/dev/ttys999".to_owned()),
-            windows_process_identity: test_windows_process_identity(owner_pid),
+            terminal_tty: (!cfg!(windows)).then(|| "/dev/ttys999".to_owned()),
+            windows_process_identity,
             ..NativeSessionOwner::default()
         },
     )
@@ -2009,6 +2487,29 @@ fn dead_native_session_owner_releases_the_turn_and_closes_state() {
 }
 
 #[test]
+fn terminal_close_transaction_preserves_its_terminal_reason() {
+    let directory = tempfile::tempdir().unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    let claim = acquire_turn_claim(directory.path()).unwrap();
+    claim.retain();
+
+    close_session_state_with_error(
+        directory.path(),
+        Some("native session process stopped".to_owned()),
+        |_| panic!("a missing terminal handle must not call the adapter"),
+    )
+    .unwrap();
+
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "closed");
+    assert_eq!(
+        status.error.as_deref(),
+        Some("native session process stopped")
+    );
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+}
+
+#[test]
 fn resume_pending_dead_owner_is_repaired_instead_of_stalling() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
@@ -2028,6 +2529,75 @@ fn resume_pending_dead_owner_is_repaired_instead_of_stalling() {
     assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
     let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
     assert_eq!(status.state, "closed");
+}
+
+#[test]
+fn claimed_and_awaiting_initial_input_dead_owners_are_repaired() {
+    for state in ["claimed", "awaiting-initial-input"] {
+        let directory = tempfile::tempdir().unwrap();
+        write_owned_terminal_state(directory.path(), state, reaped_child_pid());
+
+        #[cfg(windows)]
+        assert!(
+            repair_dead_native_owner_with_terminal_close(directory.path(), |session| {
+                assert_eq!(session.kind, terminal::TerminalKind::WindowsConsole);
+                Ok(terminal::CloseOutcome::Missing)
+            })
+            .unwrap()
+        );
+        #[cfg(not(windows))]
+        assert!(repair_dead_native_owner(directory.path()).unwrap());
+        assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state, "closed");
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn explicit_close_allows_only_bound_ownerless_launch_failures() {
+    let session = terminal::TerminalSession {
+        kind: if cfg!(windows) {
+            terminal::TerminalKind::WindowsConsole
+        } else {
+            terminal::TerminalKind::Iterm2
+        },
+        id: "launch-surface".to_owned(),
+        tab_id: None,
+        window_id: None,
+        managed_session_id: Some("session-owner123".to_owned()),
+        windows_process_identity: None,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    update_status(
+        directory.path(),
+        "failed",
+        None,
+        Some("startup failed".to_owned()),
+    )
+    .unwrap();
+    assert!(
+        !verify_terminal_close_authority(directory.path(), "session-owner123", &session).unwrap()
+    );
+
+    let ready_directory = tempfile::tempdir().unwrap();
+    update_status(ready_directory.path(), "ready", None, None).unwrap();
+    assert!(
+        verify_terminal_close_authority(ready_directory.path(), "session-owner123", &session)
+            .is_err()
+    );
+
+    let launching_directory = tempfile::tempdir().unwrap();
+    update_status(launching_directory.path(), "launching", None, None).unwrap();
+    assert!(
+        verify_terminal_close_authority(
+            launching_directory.path(),
+            "session-different456",
+            &session,
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -2102,6 +2672,8 @@ fn terminal_owner_proof_rejects_record_only_ids_and_reused_surfaces() {
         process_start_microseconds: 201,
         ..live
     };
+    assert!(native_owner_identity_matches(&owner, &live));
+    assert!(!native_owner_identity_matches(&owner, &reused_process));
     assert!(
         verify_terminal_owner_attestation(
             "session-owner123",
@@ -2294,7 +2866,11 @@ fn native_session_executes_the_provider_with_policy_and_provenance() {
     )
     .unwrap();
 
-    run_session_inner(&directory).unwrap();
+    let claim = acquire_turn_claim(&directory).unwrap();
+    claim.retain();
+    let result = run_session_inner(&directory);
+    finalize_native_session(&directory, &result).unwrap();
+    result.unwrap();
 
     let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
     assert!(arguments.contains("--dangerously-bypass-approvals-and-sandbox"));
@@ -2325,7 +2901,7 @@ fn claude_session_forwards_requested_model() {
     let provider = root.path().join("fake-claude");
     fs::write(
             &provider,
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '2.1.232 (Claude Code)\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" > \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/argv.txt\"\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '2.1.234 (Claude Code)\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" > \"$AGENT_BRIDGE_NATIVE_SESSION_DIR/argv.txt\"\n",
         )
         .unwrap();
     fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
@@ -2342,7 +2918,7 @@ fn claude_session_forwards_requested_model() {
             id: "session-safe123".to_owned(),
             provider: "claude".to_owned(),
             provider_path: provider,
-            provider_version: "2.1.232 (Claude Code)".to_owned(),
+            provider_version: "2.1.234 (Claude Code)".to_owned(),
             workspace,
             title: "Claude test".to_owned(),
             model: Some("Fable5".to_owned()),
@@ -2354,7 +2930,11 @@ fn claude_session_forwards_requested_model() {
     .unwrap();
     write_private(&directory.join("initial-prompt.txt"), b"claude prompt").unwrap();
 
-    run_session_inner(&directory).unwrap();
+    let claim = acquire_turn_claim(&directory).unwrap();
+    claim.retain();
+    let result = run_session_inner(&directory);
+    finalize_native_session(&directory, &result).unwrap();
+    result.unwrap();
 
     let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
     assert!(arguments.contains("--model\nFable"));
@@ -2402,7 +2982,11 @@ fn agy_session_uses_interactive_prompt_model_log_and_explicit_yolo() {
     .unwrap();
     write_private(&directory.join("initial-prompt.txt"), b"agy prompt").unwrap();
 
-    run_session_inner(&directory).unwrap();
+    let claim = acquire_turn_claim(&directory).unwrap();
+    claim.retain();
+    let result = run_session_inner(&directory);
+    finalize_native_session(&directory, &result).unwrap();
+    result.unwrap();
 
     let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
     assert!(arguments.contains("--dangerously-skip-permissions"));
@@ -2451,14 +3035,19 @@ fn pi_session_loads_the_result_extension_and_explicit_project_approval() {
     .unwrap();
     write_private(&directory.join("initial-prompt.txt"), b"pi prompt").unwrap();
 
-    run_session_inner(&directory).unwrap();
+    let claim = acquire_turn_claim(&directory).unwrap();
+    claim.retain();
+    let result = run_session_inner(&directory);
+    finalize_native_session(&directory, &result).unwrap();
+    result.unwrap();
 
     let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
     assert!(arguments.contains("--model\nanthropic/claude-fable-5"));
     assert!(arguments.contains("--thinking\nminimal"));
     assert!(arguments.contains("--extension"));
     assert!(arguments.contains("--name\nPi test"));
-    assert!(arguments.ends_with("pi prompt\n"));
+    assert!(arguments.contains("pi prompt"));
+    assert!(arguments.contains("[Agent Bridge Pi turn protocol]"));
     assert!(arguments.contains("--approve"));
     assert!(!arguments.contains("dangerously"));
     let extension = fs::read_to_string(directory.join("pi-agent-bridge.js")).unwrap();

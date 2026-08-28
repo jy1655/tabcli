@@ -1,11 +1,12 @@
 use super::{
     CompletionMonitor, CrossSessionMessageContext, CrossSessionMessageFailure,
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
-    LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan,
+    LaunchPlan, NativeProviderAdapter,
 };
 use agent_bridge::FirstPartyCli;
 use anyhow::Context;
 use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     ffi::OsString,
@@ -17,7 +18,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use super::super::terminal;
@@ -26,8 +27,31 @@ pub(super) static ADAPTER: AgyAdapter = AgyAdapter;
 
 pub(super) struct AgyAdapter;
 
+const PENDING_TURN_FILE: &str = "agy-pending-turn.json";
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PendingAgyTurn {
+    schema: u32,
+    claim_token: String,
+    marker: String,
+}
+
+impl PendingAgyTurn {
+    fn new(claim_token: &str) -> Result<Self> {
+        validate_claim_token(claim_token)?;
+        Ok(Self {
+            schema: 1,
+            claim_token: claim_token.to_owned(),
+            marker: format!("<!-- agent-bridge-agy-turn:{claim_token} -->"),
+        })
+    }
+}
+
 impl NativeProviderAdapter for AgyAdapter {
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
+        let claim_token = super::super::current_turn_claim_token(context.directory)?
+            .context("Agy launch has no native turn claim")?;
+        let pending = install_pending_turn(context.directory, &claim_token)?;
         let log_path = context.directory.join("agy.log");
         let mut arguments = vec![
             OsString::from("--log-file"),
@@ -36,7 +60,7 @@ impl NativeProviderAdapter for AgyAdapter {
         if !cfg!(windows) {
             arguments.extend([
                 OsString::from("--prompt-interactive"),
-                OsString::from(context.prompt),
+                OsString::from(correlated_prompt(context.prompt, &pending)),
             ]);
         }
         Ok(LaunchPlan {
@@ -46,10 +70,6 @@ impl NativeProviderAdapter for AgyAdapter {
             // per-turn completion callback with session and turn identity.
             completion_monitor: CompletionMonitor::AgyTranscript { log_path },
         })
-    }
-
-    fn prepare_resume(&self, _context: ResumeContext<'_>) -> Result<Option<ResumePlan>> {
-        Ok(None)
     }
 
     fn initial_prompt_transport(&self) -> InitialPromptTransport {
@@ -71,8 +91,15 @@ impl NativeProviderAdapter for AgyAdapter {
         &self,
         session: &terminal::TerminalSession,
         prompt_path: &Path,
-    ) -> Result<()> {
-        terminal::send_file(session, prompt_path)
+        deadline: Instant,
+    ) -> terminal::TerminalSendResult {
+        terminal::send_file(session, prompt_path, deadline)
+    }
+
+    fn terminal_initial_prompt(&self, directory: &Path, prompt: &str) -> Result<String> {
+        let pending = read_pending_turn(directory)?
+            .context("Agy initial turn correlation state is missing")?;
+        terminal_correlated_prompt(prompt, &pending, cfg!(windows))
     }
 
     #[cfg(any(windows, test))]
@@ -111,9 +138,101 @@ impl NativeProviderAdapter for AgyAdapter {
         &self,
         session: &terminal::TerminalSession,
         prompt_path: &Path,
-    ) -> Result<()> {
-        terminal::send_file(session, prompt_path)
+        deadline: Instant,
+    ) -> terminal::TerminalSendResult {
+        terminal::send_file(session, prompt_path, deadline)
     }
+
+    fn prepare_terminal_follow_up(
+        &self,
+        directory: &Path,
+        prompt: &str,
+        claim_token: &str,
+    ) -> Result<String> {
+        let pending = install_pending_turn(directory, claim_token)?;
+        terminal_correlated_prompt(prompt, &pending, cfg!(windows))
+    }
+
+    fn cancel_terminal_follow_up(&self, directory: &Path, claim_token: &str) -> Result<()> {
+        cancel_pending_turn(directory, claim_token)
+    }
+}
+
+fn validate_claim_token(claim_token: &str) -> Result<()> {
+    if claim_token.is_empty()
+        || claim_token.len() > 160
+        || !claim_token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-')
+    {
+        bail!("invalid Agy turn claim token")
+    }
+    Ok(())
+}
+
+fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingAgyTurn> {
+    let pending = PendingAgyTurn::new(claim_token)?;
+    super::super::write_json_atomic(&directory.join(PENDING_TURN_FILE), &pending)?;
+    Ok(pending)
+}
+
+fn read_pending_turn(directory: &Path) -> Result<Option<PendingAgyTurn>> {
+    let Some(text) =
+        super::super::read_regular_text_if_present(&directory.join(PENDING_TURN_FILE))?
+    else {
+        return Ok(None);
+    };
+    let pending: PendingAgyTurn =
+        serde_json::from_str(&text).context("failed to parse the pending Agy turn")?;
+    let expected = PendingAgyTurn::new(&pending.claim_token)?;
+    if pending.schema != expected.schema || pending.marker != expected.marker {
+        bail!("Agent Bridge rejected invalid Agy turn correlation state")
+    }
+    Ok(Some(pending))
+}
+
+fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result<()> {
+    let Some(pending) = read_pending_turn(directory)? else {
+        return Ok(());
+    };
+    if pending.claim_token != claim_token {
+        return Ok(());
+    }
+    super::super::remove_file_if_present(&directory.join(PENDING_TURN_FILE))
+}
+
+fn correlated_prompt(prompt: &str, pending: &PendingAgyTurn) -> String {
+    format!(
+        "{prompt}\n\n[Agent Bridge Agy turn protocol]\nComplete this request as one turn. End the complete final response with the exact marker below on its own final line; do not alter or omit it.\n{}",
+        pending.marker
+    )
+}
+
+fn terminal_correlated_prompt(
+    prompt: &str,
+    pending: &PendingAgyTurn,
+    windows: bool,
+) -> Result<String> {
+    if !windows {
+        return Ok(correlated_prompt(prompt, pending));
+    }
+    let encoded = serde_json::to_string(prompt)?;
+    Ok(format!(
+        "[Agent Bridge Agy Windows console turn protocol] Decode the following JSON string as the complete request, preserving escaped newlines and tabs. Complete it as one turn. End the complete final response with the exact marker {} on its own final line; do not alter or omit it. Request JSON: {encoded}",
+        pending.marker
+    ))
+}
+
+fn correlated_response<'a>(message: &'a str, pending: &PendingAgyTurn) -> Result<&'a str> {
+    let body = message
+        .trim_end()
+        .strip_suffix(&pending.marker)
+        .context("Agy response did not end with the expected turn marker")?
+        .trim_end();
+    if body.is_empty() {
+        bail!("Agy correlated response contained no assistant text")
+    }
+    Ok(body)
 }
 
 pub(super) struct AgyMonitor {
@@ -134,13 +253,11 @@ impl AgyMonitor {
             .spawn(move || {
                 let result = monitor_session(&directory, &log_path, &brain_root, &stop_for_thread);
                 if let Err(error) = &result {
-                    let _ = super::super::update_status(
+                    let _ = super::super::record_provider_monitor_failure(
                         &error_directory,
-                        "failed",
-                        None,
-                        Some(format!("Agy result monitor failed: {error:#}")),
+                        FirstPartyCli::Agy,
+                        &format!("Agy result monitor failed: {error:#}"),
                     );
-                    let _ = super::super::release_turn_claim(&error_directory);
                 }
                 result
             })
@@ -250,13 +367,19 @@ impl TranscriptCursor {
                 result.message.clone()
             };
             let step = result.step;
-            super::super::record_provider_result(
-                directory,
-                FirstPartyCli::Agy,
-                &message,
-                Some(conversation_id.to_owned()),
-                Some(step.to_string()),
-            )?;
+            if let Some(pending) = read_pending_turn(directory)?
+                && let Ok(message) = correlated_response(&message, &pending)
+            {
+                super::super::record_provider_result_for_claim(
+                    directory,
+                    FirstPartyCli::Agy,
+                    message,
+                    Some(conversation_id.to_owned()),
+                    Some(step.to_string()),
+                    Some(&pending.claim_token),
+                )
+                .context("failed to record the correlated Agy result")?;
+            }
             self.greatest_result_step = Some(step);
             self.pending_results.pop_front();
         }
@@ -453,6 +576,43 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn claim_pending_turn(directory: &Path) -> PendingAgyTurn {
+        let claim = acquire_turn_claim(directory).unwrap();
+        let token = claim.token.clone();
+        claim.retain();
+        install_pending_turn(directory, &token).unwrap()
+    }
+
+    fn marked(message: &str, pending: &PendingAgyTurn) -> String {
+        format!("{message}\n{}", pending.marker)
+    }
+
+    #[test]
+    fn windows_console_prompt_preserves_multiline_input_without_raw_submission_keys() {
+        let pending = PendingAgyTurn::new("1-2-3").unwrap();
+        let prompt = "first line\nsecond\tcolumn";
+        let framed = terminal_correlated_prompt(prompt, &pending, true).unwrap();
+
+        assert!(
+            framed
+                .chars()
+                .all(|character| !matches!(character, '\r' | '\n' | '\t'))
+        );
+        assert!(framed.contains(&serde_json::to_string(prompt).unwrap()));
+        assert!(framed.contains(&pending.marker));
+    }
+
+    fn planner_line(step: u64, content: &str) -> String {
+        serde_json::json!({
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "source": "MODEL",
+            "step_index": step,
+            "content": content,
+        })
+        .to_string()
+    }
+
     #[test]
     fn log_and_transcript_parsers_accept_only_completed_results() {
         let id = "3e166585-bc21-43b7-b3d1-dec5e67688b3";
@@ -497,34 +657,49 @@ mod tests {
             .join("logs")
             .join("transcript.jsonl");
         fs::create_dir_all(transcript_path.parent().unwrap()).unwrap();
-        fs::write(
-            &transcript_path,
-            concat!(
-                "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":1,\"content\":\"first\"}\n",
-                "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":2,\"content\":\"still working\",\"tool_calls\":[{\"name\":\"run_command\"}]}\n",
-                "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":3,\"content\":\"short...\",\"is_truncated\":true}\n"
-            ),
-        )
-        .unwrap();
+        let first_pending = claim_pending_turn(&directory);
+        let transcript = [
+            planner_line(1, &marked("first", &first_pending)),
+            serde_json::json!({
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "source": "MODEL",
+                "step_index": 2,
+                "content": "still working",
+                "tool_calls": [{"name": "run_command"}],
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "source": "MODEL",
+                "step_index": 3,
+                "content": "short...",
+                "is_truncated": true,
+            })
+            .to_string(),
+        ]
+        .join("\n")
+            + "\n";
+        fs::write(&transcript_path, transcript).unwrap();
         let mut cursor = TranscriptCursor::new(transcript_path.clone());
-        let claim = acquire_turn_claim(&directory).unwrap();
-        claim.retain();
         cursor.poll(&directory, &brain, id).unwrap();
         cursor.poll(&directory, &brain, id).unwrap();
         assert_eq!(event_paths(&directory).unwrap().len(), 1);
+        assert!(directory.join(PENDING_TURN_FILE).is_file());
 
+        update_status(&directory, "claimed", None, None).unwrap();
+        update_status(&directory, "working", None, None).unwrap();
+        let second_pending = claim_pending_turn(&directory);
         fs::write(
             transcript_path.with_file_name("transcript_full.jsonl"),
-            concat!(
-                "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":1,\"content\":\"first\"}\n",
-                "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":2,\"content\":\"still working\",\"tool_calls\":[{\"name\":\"run_command\"}]}\n",
-                "{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":3,\"content\":\"complete long response\"}\n"
+            format!(
+                "{}\n{}\n",
+                planner_line(1, &marked("first", &first_pending)),
+                planner_line(3, &marked("complete long response", &second_pending)),
             ),
         )
         .unwrap();
-        update_status(&directory, "working", None, None).unwrap();
-        let claim = acquire_turn_claim(&directory).unwrap();
-        claim.retain();
         cursor.poll(&directory, &brain, id).unwrap();
         let paths = event_paths(&directory).unwrap();
         assert_eq!(paths.len(), 2);
@@ -535,14 +710,15 @@ mod tests {
             .append(true)
             .open(&transcript_path)
             .unwrap();
+        update_status(&directory, "claimed", None, None).unwrap();
+        update_status(&directory, "working", None, None).unwrap();
+        let third_pending = claim_pending_turn(&directory);
         writeln!(
             transcript,
-            "{{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":4,\"content\":\"second\"}}"
+            "{}",
+            planner_line(4, &marked("second", &third_pending))
         )
         .unwrap();
-        update_status(&directory, "working", None, None).unwrap();
-        let claim = acquire_turn_claim(&directory).unwrap();
-        claim.retain();
         cursor.poll(&directory, &brain, id).unwrap();
 
         let paths = event_paths(&directory).unwrap();
@@ -566,36 +742,48 @@ mod tests {
         let log = directory.join("agy.log");
         let first_id = "11111111-1111-1111-1111-111111111111";
         let second_id = "22222222-2222-2222-2222-222222222222";
-        for (id, message) in [(first_id, "before clear"), (second_id, "after clear")] {
+        for id in [first_id, second_id] {
             let transcript = brain
                 .join(id)
                 .join(".system_generated")
                 .join("logs")
                 .join("transcript.jsonl");
             fs::create_dir_all(transcript.parent().unwrap()).unwrap();
-            fs::write(
-                transcript,
-                format!(
-                    "{{\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"source\":\"MODEL\",\"step_index\":1,\"content\":{}}}\n",
-                    serde_json::to_string(message).unwrap()
-                ),
-            )
-            .unwrap();
+            fs::write(transcript, "").unwrap();
         }
+        let first_pending = claim_pending_turn(&directory);
+        fs::write(
+            brain
+                .join(first_id)
+                .join(".system_generated/logs/transcript.jsonl"),
+            format!(
+                "{}\n",
+                planner_line(1, &marked("before clear", &first_pending))
+            ),
+        )
+        .unwrap();
         fs::write(&log, format!("Created conversation {first_id}\n")).unwrap();
         let mut monitor = MonitorState::default();
 
-        let claim = acquire_turn_claim(&directory).unwrap();
-        claim.retain();
         monitor.poll(&directory, &log, &brain).unwrap();
+        update_status(&directory, "claimed", None, None).unwrap();
         update_status(&directory, "working", None, None).unwrap();
+        let second_pending = claim_pending_turn(&directory);
+        fs::write(
+            brain
+                .join(second_id)
+                .join(".system_generated/logs/transcript.jsonl"),
+            format!(
+                "{}\n",
+                planner_line(1, &marked("after clear", &second_pending))
+            ),
+        )
+        .unwrap();
         fs::write(
             &log,
             format!("Created conversation {first_id}\n/clear\nCreated conversation {second_id}\n"),
         )
         .unwrap();
-        let claim = acquire_turn_claim(&directory).unwrap();
-        claim.retain();
         monitor.poll(&directory, &log, &brain).unwrap();
 
         let paths = event_paths(&directory).unwrap();

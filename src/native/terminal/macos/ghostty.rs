@@ -1,8 +1,24 @@
-use std::{path::Path, thread, time::Duration};
+use std::{
+    path::Path,
+    thread,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(test)]
+use semver::Version;
 
-use super::{CloseOutcome, TerminalKind, TerminalSession, applescript, close_response};
+use super::{
+    CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession,
+    applescript, close_response,
+};
+
+#[cfg(test)]
+pub(in crate::native) const VERSION_SCRIPT: &str = r#"
+on run
+    tell application "Ghostty" to return version
+end run
+"#;
 
 pub(in crate::native) const CREATE_SURFACE_SCRIPT: &str = r#"
 on run
@@ -166,6 +182,32 @@ on run argv
 end run
 "#;
 
+pub(in crate::native) const VERIFY_SURFACE_SCRIPT: &str = r#"
+on run argv
+    set wantedTerminalId to item 1 of argv
+    set wantedTabId to item 2 of argv
+    set wantedWindowId to item 3 of argv
+    tell application "Ghostty"
+        try
+            set targetWindow to first window whose id is wantedWindowId
+        on error
+            return "missing"
+        end try
+        set matchCount to 0
+        repeat with targetTab in tabs of targetWindow
+            if id of targetTab is wantedTabId then
+                repeat with candidateTerminal in terminals of targetTab
+                    if id of candidateTerminal is wantedTerminalId then set matchCount to matchCount + 1
+                end repeat
+            end if
+        end repeat
+        if matchCount is 1 then return "present"
+        if matchCount is 0 then return "missing"
+        error "Agent Bridge Ghostty ownership proof matched multiple terminal surfaces"
+    end tell
+end run
+"#;
+
 pub(in crate::native) const CLOSE_TAB_SCRIPT: &str = r#"
 on run argv
     set wantedTerminalId to item 1 of argv
@@ -187,6 +229,27 @@ on run argv
                     end if
                 end repeat
                 if not terminalMatches then return "missing"
+                close tab targetTab
+                return "closed"
+            end if
+        end repeat
+    end tell
+    return "missing"
+end run
+"#;
+
+pub(in crate::native) const CLOSE_CREATED_TAB_SCRIPT: &str = r#"
+on run argv
+    set wantedTabId to item 1 of argv
+    set wantedWindowId to item 2 of argv
+    tell application "Ghostty"
+        try
+            set targetWindow to first window whose id is wantedWindowId
+        on error
+            return "missing"
+        end try
+        repeat with targetTab in tabs of targetWindow
+            if id of targetTab is wantedTabId then
                 close tab targetTab
                 return "closed"
             end if
@@ -221,18 +284,88 @@ enum QueueOutcome {
     Missing,
 }
 
-pub(super) fn open_tab(command: &str) -> Result<TerminalSession> {
-    open_tab_with_operations(
-        command,
-        create_surface,
-        discover_terminal,
-        queue_command,
-        press_enter,
-        cleanup_created_surface,
-        thread::sleep,
+pub(super) fn create_tab(_deadline: Instant) -> Result<TerminalSession> {
+    bail!(
+        "unsupported Ghostty terminal; Agent Bridge v0.0.3 has no currently verified Ghostty release because the available 1.3.1 build cannot initialize an AppleScript-created terminal surface and 1.3.0 has no current positive runtime evidence; use --terminal iterm2 or --terminal terminal"
     )
 }
 
+// Kept isolated for re-enabling the provider adapter after a Ghostty release has positive
+// runtime evidence. v0.0.3 never calls this path because create_tab fails before AppleScript.
+#[allow(dead_code)]
+fn create_tab_after_version_gate(deadline: Instant) -> Result<TerminalSession> {
+    let surface = create_surface(deadline)?;
+    let terminal_id = (|| -> Result<String> {
+        for attempt in 0..DISCOVERY_ATTEMPTS {
+            match discover_terminal(&surface, deadline)? {
+                Discovery::Ready(id) => return Ok(id),
+                Discovery::NotReady => {}
+                Discovery::Missing => {
+                    bail!("created Ghostty surface disappeared before terminal discovery")
+                }
+            }
+            if attempt + 1 < DISCOVERY_ATTEMPTS {
+                pause_until(deadline, DISCOVERY_DELAY, "Ghostty terminal discovery")?;
+            }
+        }
+        bail!("Ghostty terminal surface did not become ready")
+    })();
+    let terminal_id = match terminal_id {
+        Ok(terminal_id) => terminal_id,
+        Err(error) => {
+            return match cleanup_created_tab_until(&surface, deadline) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(anyhow!(
+                    "{error:#}; exact created Ghostty tab cleanup also failed: {cleanup_error:#}"
+                )),
+            };
+        }
+    };
+    Ok(TerminalSession {
+        kind: TerminalKind::Ghostty,
+        id: terminal_id,
+        tab_id: Some(surface.tab_id),
+        window_id: Some(surface.window_id),
+        managed_session_id: None,
+        windows_process_identity: None,
+    })
+}
+
+pub(super) fn start_session(
+    session: &TerminalSession,
+    command: &str,
+    deadline: Instant,
+) -> Result<()> {
+    let (tab_id, window_id) = ownership_proof(session)?;
+    let surface = CreatedSurface {
+        tab_id: tab_id.to_owned(),
+        window_id: window_id.to_owned(),
+    };
+    for attempt in 0..QUEUE_ATTEMPTS {
+        match queue_command(&surface, &session.id, command, deadline)? {
+            QueueOutcome::Queued => return press_enter(&surface, &session.id, deadline),
+            QueueOutcome::NotReady => {}
+            QueueOutcome::Missing => {
+                bail!("created Ghostty surface disappeared before command queue")
+            }
+        }
+        if attempt + 1 < QUEUE_ATTEMPTS {
+            pause_until(deadline, QUEUE_DELAY, "Ghostty command queue")?;
+        }
+    }
+    bail!("Ghostty terminal surface did not accept command input")
+}
+
+#[cfg(test)]
+fn validate_ghostty_version(raw_version: &str) -> Result<()> {
+    let version = Version::parse(raw_version)
+        .with_context(|| format!("Ghostty returned an invalid version {raw_version:?}"))?;
+    bail!(
+        "unsupported Ghostty version {version}; Agent Bridge v0.0.3 has no currently verified Ghostty release because the available 1.3.1 build cannot initialize an AppleScript-created terminal surface and 1.3.0 has no current positive runtime evidence; use --terminal iterm2 or --terminal terminal"
+    )
+}
+
+#[cfg(test)]
 fn open_tab_with_operations<Create, Discover, Queue, PressEnter, Cleanup, Pause>(
     command: &str,
     mut create_surface: Create,
@@ -333,6 +466,7 @@ where
     })
 }
 
+#[cfg(test)]
 fn failure_after_cleanup<Cleanup>(
     phase: &'static str,
     error: anyhow::Error,
@@ -351,8 +485,8 @@ where
     }
 }
 
-fn create_surface() -> Result<CreatedSurface> {
-    let response = applescript::run("Ghostty", CREATE_SURFACE_SCRIPT, &[])?;
+fn create_surface(deadline: Instant) -> Result<CreatedSurface> {
+    let response = applescript::run_until("Ghostty", CREATE_SURFACE_SCRIPT, &[], deadline)?;
     let mut ids = response.lines();
     let tab_id = ids
         .next()
@@ -371,11 +505,12 @@ fn create_surface() -> Result<CreatedSurface> {
     })
 }
 
-fn discover_terminal(surface: &CreatedSurface) -> Result<Discovery> {
-    let response = applescript::run(
+fn discover_terminal(surface: &CreatedSurface, deadline: Instant) -> Result<Discovery> {
+    let response = applescript::run_until(
         "Ghostty",
         DISCOVER_TERMINAL_SCRIPT,
         &[&surface.tab_id, &surface.window_id],
+        deadline,
     )?;
     match response.as_str() {
         "not-ready" => Ok(Discovery::NotReady),
@@ -401,11 +536,13 @@ fn queue_command(
     surface: &CreatedSurface,
     terminal_id: &str,
     command: &str,
+    deadline: Instant,
 ) -> Result<QueueOutcome> {
-    let response = applescript::run(
+    let response = applescript::run_until(
         "Ghostty",
         QUEUE_COMMAND_SCRIPT,
         &[terminal_id, &surface.tab_id, &surface.window_id, command],
+        deadline,
     )?;
     match response.as_str() {
         "queued" => Ok(QueueOutcome::Queued),
@@ -415,11 +552,12 @@ fn queue_command(
     }
 }
 
-fn press_enter(surface: &CreatedSurface, terminal_id: &str) -> Result<()> {
-    let response = applescript::run(
+fn press_enter(surface: &CreatedSurface, terminal_id: &str, deadline: Instant) -> Result<()> {
+    let response = applescript::run_until(
         "Ghostty",
         PRESS_ENTER_SCRIPT,
         &[terminal_id, &surface.tab_id, &surface.window_id],
+        deadline,
     )?;
     if response != "pressed" {
         bail!("unexpected Ghostty Enter response: {response:?}");
@@ -427,28 +565,58 @@ fn press_enter(surface: &CreatedSurface, terminal_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn cleanup_created_surface(surface: &CreatedSurface, terminal_id: &str) -> Result<()> {
-    let response = applescript::run(
+fn cleanup_created_tab_until(surface: &CreatedSurface, deadline: Instant) -> Result<()> {
+    let response = applescript::run_until(
         "Ghostty",
-        CLOSE_TAB_SCRIPT,
-        &[terminal_id, &surface.tab_id, &surface.window_id],
+        CLOSE_CREATED_TAB_SCRIPT,
+        &[&surface.tab_id, &surface.window_id],
+        deadline,
     )?;
     close_response(TerminalKind::Ghostty, &response)?;
     Ok(())
 }
 
-pub(super) fn send_file(session: &TerminalSession, prompt_path: &Path) -> Result<()> {
-    let (tab_id, window_id) = ownership_proof(session)?;
+pub(super) fn send_file(
+    session: &TerminalSession,
+    prompt_path: &Path,
+    deadline: Instant,
+) -> TerminalSendResult {
+    let (tab_id, window_id) = ownership_proof(session).map_err(TerminalSendFailure::not_sent)?;
     let prompt_path = prompt_path
         .to_str()
-        .context("prompt path is not valid UTF-8")?;
-    let response = applescript::run(
+        .context("prompt path is not valid UTF-8")
+        .map_err(TerminalSendFailure::not_sent)?;
+    let response = applescript::run_send_until(
         "Ghostty",
         SEND_FILE_SCRIPT,
         &[&session.id, tab_id, window_id, prompt_path],
+        deadline,
     )?;
     if response != "sent" {
-        bail!("unexpected Ghostty send response: {response:?}");
+        return Err(TerminalSendFailure::delivery_uncertain(anyhow::anyhow!(
+            "unexpected Ghostty send response: {response:?}"
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn verify_surface(session: &TerminalSession, timeout: Option<Duration>) -> Result<()> {
+    let (tab_id, window_id) = ownership_proof(session)?;
+    let response = match timeout {
+        Some(timeout) => applescript::run_until(
+            "Ghostty",
+            VERIFY_SURFACE_SCRIPT,
+            &[&session.id, tab_id, window_id],
+            super::timeout_deadline(timeout)?,
+        ),
+        None => applescript::run(
+            "Ghostty",
+            VERIFY_SURFACE_SCRIPT,
+            &[&session.id, tab_id, window_id],
+        ),
+    }?;
+    if response != "present" {
+        bail!("Agent Bridge Ghostty owned terminal surface is missing");
     }
     Ok(())
 }
@@ -461,6 +629,29 @@ pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
         &[&session.id, tab_id, window_id],
     )?;
     close_response(TerminalKind::Ghostty, &response)
+}
+
+pub(super) fn close_session_until(
+    session: &TerminalSession,
+    deadline: Instant,
+) -> Result<CloseOutcome> {
+    let (tab_id, window_id) = ownership_proof(session)?;
+    let response = applescript::run_until(
+        "Ghostty",
+        CLOSE_TAB_SCRIPT,
+        &[&session.id, tab_id, window_id],
+        deadline,
+    )?;
+    close_response(TerminalKind::Ghostty, &response)
+}
+
+fn pause_until(deadline: Instant, delay: Duration, phase: &str) -> Result<()> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if delay >= remaining {
+        bail!("{phase} timed out");
+    }
+    thread::sleep(delay);
+    Ok(())
 }
 
 fn ownership_proof(session: &TerminalSession) -> Result<(&str, &str)> {
@@ -483,8 +674,20 @@ mod tests {
 
     use super::{
         CreatedSurface, DISCOVERY_ATTEMPTS, DISCOVERY_DELAY, Discovery, QUEUE_ATTEMPTS,
-        QUEUE_DELAY, QueueOutcome, open_tab_with_operations,
+        QUEUE_DELAY, QueueOutcome, open_tab_with_operations, validate_ghostty_version,
     };
+
+    #[test]
+    fn ghostty_version_gate_rejects_every_release_until_a_working_path_is_verified() {
+        for version in ["1.2.3", "1.3.0", "1.3.1", "1.3.2", "2.0.0"] {
+            let error = validate_ghostty_version(version).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains(version));
+            assert!(message.contains("no currently verified Ghostty release"));
+            assert!(message.contains("--terminal iterm2"));
+            assert!(message.contains("--terminal terminal"));
+        }
+    }
 
     #[test]
     fn rust_discovery_loop_is_bounded_and_fail_closed_before_terminal_uuid() {

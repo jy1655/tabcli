@@ -1,8 +1,14 @@
-use std::path::Path;
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail};
 
-use super::{CloseOutcome, TerminalKind, TerminalSession, applescript, close_response};
+use super::{
+    CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession,
+    applescript, close_response,
+};
 
 pub(in crate::native) const OPEN_TAB_SCRIPT: &str = r#"
 on windowIdForTty(wantedTty)
@@ -27,11 +33,10 @@ on windowIdForTty(wantedTty)
 end windowIdForTty
 
 on run argv
-    set bridgeCommand to item 1 of argv
     tell application "Terminal"
         -- Untargeted do script creates a dedicated window and returns its new tab.
         -- Never derive ownership from a restored front/current/selected surface.
-        set targetTab to do script bridgeCommand
+        set targetTab to do script ""
         set targetTty to tty of targetTab
         set targetWindowId to my windowIdForTty(targetTty)
         set targetWindow to first window whose id is targetWindowId
@@ -39,6 +44,32 @@ on run argv
         if tty of targetTab is not targetTty then error "Agent Bridge lost its newly created Terminal.app tty"
         activate
         return targetTty & linefeed & (targetWindowId as text)
+    end tell
+end run
+"#;
+
+pub(in crate::native) const START_SESSION_SCRIPT: &str = r#"
+on run argv
+    set wantedTty to item 1 of argv
+    set wantedWindowId to item 2 of argv as integer
+    set bridgeCommand to item 3 of argv
+    tell application "Terminal"
+        try
+            set targetWindow to first window whose id is wantedWindowId
+        on error
+            error "Agent Bridge Terminal.app window not found before startup"
+        end try
+        set targetTab to missing value
+        set matchCount to 0
+        repeat with candidateTab in tabs of targetWindow
+            if tty of candidateTab is wantedTty then
+                set targetTab to candidateTab
+                set matchCount to matchCount + 1
+            end if
+        end repeat
+        if matchCount is not 1 then error "Agent Bridge Terminal.app startup proof did not match exactly one tab"
+        do script bridgeCommand in targetTab
+        return "started"
     end tell
 end run
 "#;
@@ -68,6 +99,27 @@ on run argv
         if tty of targetTab is not wantedTty then error "Agent Bridge Terminal.app tty identity changed"
         do script promptText in targetTab
         return "sent"
+    end tell
+end run
+"#;
+
+pub(in crate::native) const VERIFY_TAB_SCRIPT: &str = r#"
+on run argv
+    set wantedTty to item 1 of argv
+    set wantedWindowId to item 2 of argv as integer
+    tell application "Terminal"
+        try
+            set targetWindow to first window whose id is wantedWindowId
+        on error
+            return "missing"
+        end try
+        set matchCount to 0
+        repeat with candidateTab in tabs of targetWindow
+            if tty of candidateTab is wantedTty then set matchCount to matchCount + 1
+        end repeat
+        if matchCount is 1 then return wantedTty
+        if matchCount is 0 then return "missing"
+        error "Agent Bridge Terminal.app ownership proof matched multiple tabs"
     end tell
 end run
 "#;
@@ -139,8 +191,8 @@ on run argv
 end run
 "#;
 
-pub(super) fn open_tab(command: &str) -> Result<TerminalSession> {
-    let response = applescript::run("Terminal.app", OPEN_TAB_SCRIPT, &[command])?;
+pub(super) fn create_tab(deadline: Instant) -> Result<TerminalSession> {
+    let response = applescript::run_until("Terminal.app", OPEN_TAB_SCRIPT, &[], deadline)?;
     let mut ids = response.lines();
     let id = ids.next().filter(|value| !value.is_empty());
     let window_id = ids.next().filter(|value| !value.is_empty());
@@ -157,20 +209,59 @@ pub(super) fn open_tab(command: &str) -> Result<TerminalSession> {
     })
 }
 
-pub(super) fn send_file(session: &TerminalSession, prompt_path: &Path) -> Result<()> {
+pub(super) fn start_session(
+    session: &TerminalSession,
+    command: &str,
+    deadline: Instant,
+) -> Result<()> {
     let window_id = ownership_proof(session)?;
+    let response = applescript::run_until(
+        "Terminal.app",
+        START_SESSION_SCRIPT,
+        &[&session.id, window_id, command],
+        deadline,
+    )?;
+    if response != "started" {
+        bail!("unexpected Terminal.app start response: {response:?}");
+    }
+    Ok(())
+}
+
+pub(super) fn send_file(
+    session: &TerminalSession,
+    prompt_path: &Path,
+    deadline: Instant,
+) -> TerminalSendResult {
+    let window_id = ownership_proof(session).map_err(TerminalSendFailure::not_sent)?;
     let prompt_path = prompt_path
         .to_str()
-        .context("prompt path is not valid UTF-8")?;
-    let response = applescript::run(
+        .context("prompt path is not valid UTF-8")
+        .map_err(TerminalSendFailure::not_sent)?;
+    let response = applescript::run_send_until(
         "Terminal.app",
         SEND_FILE_SCRIPT,
         &[&session.id, window_id, prompt_path],
+        deadline,
     )?;
     if response != "sent" {
-        bail!("unexpected Terminal.app send response: {response:?}");
+        return Err(TerminalSendFailure::delivery_uncertain(anyhow::anyhow!(
+            "unexpected Terminal.app send response: {response:?}"
+        )));
     }
     Ok(())
+}
+
+pub(super) fn verify_tab(session: &TerminalSession, timeout: Option<Duration>) -> Result<String> {
+    let window_id = ownership_proof(session)?;
+    let response = run_terminal_automation(
+        VERIFY_TAB_SCRIPT,
+        &[&session.id, window_id],
+        timeout.map(super::timeout_deadline).transpose()?,
+    )?;
+    if response != session.id {
+        bail!("Agent Bridge Terminal.app owned tab is missing");
+    }
+    Ok(response)
 }
 
 pub(in crate::native) fn process_group_signal_target(process_group: u32) -> Result<libc::pid_t> {
@@ -227,17 +318,31 @@ pub(in crate::native) fn terminate_process_groups(
 }
 
 pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
+    close_session_with_deadline(session, None)
+}
+
+pub(super) fn close_session_until(
+    session: &TerminalSession,
+    deadline: Instant,
+) -> Result<CloseOutcome> {
+    close_session_with_deadline(session, Some(deadline))
+}
+
+fn close_session_with_deadline(
+    session: &TerminalSession,
+    deadline: Option<Instant>,
+) -> Result<CloseOutcome> {
     let window_id = ownership_proof(session)?;
-    let response = applescript::run("Terminal.app", CLOSE_TAB_SCRIPT, &[&session.id, window_id])?;
+    let response = run_terminal_automation(CLOSE_TAB_SCRIPT, &[&session.id, window_id], deadline)?;
     let outcome = close_response(TerminalKind::AppleTerminal, &response)?;
     if outcome == CloseOutcome::Missing {
         return Ok(outcome);
     }
 
-    let verification = applescript::run(
-        "Terminal.app",
+    let verification = run_terminal_automation(
         WAIT_FOR_CLOSE_SCRIPT,
         &[&session.id, window_id, "20"],
+        deadline,
     )?;
     if verification == "missing" {
         return Ok(CloseOutcome::Closed);
@@ -246,14 +351,14 @@ pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
     // Terminal may consume the first close request by terminating the foreground
     // process while leaving its shell surface alive. Retry only the same owned
     // window/TTY proof, then verify from a separate AppleScript transaction.
-    let retry = applescript::run("Terminal.app", CLOSE_TAB_SCRIPT, &[&session.id, window_id])?;
+    let retry = run_terminal_automation(CLOSE_TAB_SCRIPT, &[&session.id, window_id], deadline)?;
     if close_response(TerminalKind::AppleTerminal, &retry)? == CloseOutcome::Missing {
         return Ok(CloseOutcome::Closed);
     }
-    let verification = applescript::run(
-        "Terminal.app",
+    let verification = run_terminal_automation(
         WAIT_FOR_CLOSE_SCRIPT,
         &[&session.id, window_id, "100"],
+        deadline,
     )?;
     if verification != "missing" {
         bail!(
@@ -262,6 +367,17 @@ pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
         );
     }
     Ok(CloseOutcome::Closed)
+}
+
+fn run_terminal_automation(
+    script: &str,
+    arguments: &[&str],
+    deadline: Option<Instant>,
+) -> Result<String> {
+    match deadline {
+        Some(deadline) => applescript::run_until("Terminal.app", script, arguments, deadline),
+        None => applescript::run("Terminal.app", script, arguments),
+    }
 }
 
 fn ownership_proof(session: &TerminalSession) -> Result<&str> {

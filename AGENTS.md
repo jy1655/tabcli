@@ -36,14 +36,12 @@ launch, observe, continue, and close without replacing the capabilities those CL
 ## Current Claude Boundary
 
 - Claude Code v2.1.224+ provides official cross-session messaging on macOS and Linux,
-  including WSL 2, through its session messaging facilities. Prefer that official path
-  when all Claude availability gates pass.
-- Claude Code does not currently provide cross-session messaging on native Windows.
-  On native Windows, keep the visible Agent Bridge console under a Claude-specific
-  supervisor and run turns through Claude's official `--print` and
-  `--resume <session-id>` session continuity. Prompts travel over stdin, not terminal
-  key injection or provider argv. Replace this supervisor with Claude cross-session
-  messaging when upstream adds native Windows support.
+  including WSL 2. Native Windows support is official from v2.1.234 and uses a
+  per-session named pipe. Prefer the official path only when every runtime availability
+  gate passes.
+- Use the official `ListAgents` and `SendMessage` path on every supported Agent Bridge
+  platform. Do not restore the removed native-Windows `--print --resume` supervisor or
+  silently fall back to terminal input when official messaging is unavailable.
 - Do not emulate Claude result correlation with a generic message hash. Identical valid
   responses can occur in separate turns; correlation must use Claude-owned identity or a
   provider-specific protocol with an explicit replacement boundary.

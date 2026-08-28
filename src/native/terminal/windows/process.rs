@@ -1,8 +1,12 @@
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
 use anyhow::{Context, Result, bail};
 use windows_sys::Win32::{
-    Foundation::CloseHandle,
+    Foundation::{CloseHandle, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Storage::FileSystem::SYNCHRONIZE,
     System::Threading::{
-        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW, WaitForSingleObject,
     },
 };
 
@@ -19,6 +23,33 @@ pub(super) fn verify_control_process_identity(
         }
         Err(error) => Err(error),
     }
+}
+
+pub(super) fn open_verified_control_process(
+    pid: u32,
+    identity: &WindowsProcessIdentity,
+) -> Result<OwnedHandle> {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        if !agent_bridge::process_is_alive(pid) {
+            bail!("console process is no longer available")
+        }
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to retain Windows console process {pid}"));
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    match unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } {
+        WAIT_OBJECT_0 => bail!("console process is no longer available"),
+        WAIT_TIMEOUT => {}
+        WAIT_FAILED => {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to inspect retained Windows console process");
+        }
+        other => bail!("unexpected retained Windows console wait result {other}"),
+    }
+    let live = query_process_identity_from_handle(handle.as_raw_handle())?;
+    verify_identity_values(&live, identity.creation_time, &identity.executable_path)?;
+    Ok(handle)
 }
 
 pub(in crate::native::terminal) fn query_process_identity(
@@ -66,6 +97,14 @@ pub(in crate::native::terminal) fn verify_process_identity(
     executable_path: &str,
 ) -> Result<()> {
     let live = query_process_identity(pid)?;
+    verify_identity_values(&live, creation_time, executable_path)
+}
+
+fn verify_identity_values(
+    live: &WindowsProcessIdentity,
+    creation_time: u64,
+    executable_path: &str,
+) -> Result<()> {
     if live.creation_time != creation_time {
         bail!("Windows console process id was reused");
     }

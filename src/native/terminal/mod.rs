@@ -1,5 +1,7 @@
-use std::{path::Path, str::FromStr};
+use std::{path::Path, str::FromStr, time::Instant};
 
+#[cfg(not(any(windows, target_os = "macos")))]
+use anyhow::Context;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -114,16 +116,209 @@ pub(super) enum CloseOutcome {
     Missing,
 }
 
+#[derive(Debug)]
+pub(super) struct TerminalSendFailure {
+    error: anyhow::Error,
+    delivery_may_have_occurred: bool,
+}
+
+impl TerminalSendFailure {
+    pub(super) fn not_sent(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            delivery_may_have_occurred: false,
+        }
+    }
+
+    #[cfg_attr(
+        not(any(target_os = "windows", target_os = "macos", test)),
+        allow(dead_code)
+    )]
+    pub(super) fn delivery_uncertain(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            delivery_may_have_occurred: true,
+        }
+    }
+
+    pub(super) fn delivery_may_have_occurred(&self) -> bool {
+        self.delivery_may_have_occurred
+    }
+
+    pub(super) fn error(&self) -> &anyhow::Error {
+        &self.error
+    }
+
+    pub(super) fn into_error(self) -> anyhow::Error {
+        self.error
+    }
+}
+
+pub(super) type TerminalSendResult = std::result::Result<(), TerminalSendFailure>;
+
+#[cfg(any(windows, test))]
+pub(super) fn windows_console_helper_reports_missing(message: &str) -> bool {
+    matches!(
+        message.trim(),
+        "console process is no longer available" | "Error: console process is no longer available"
+    )
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn windows_console_helper_reports_send_not_started(message: &str) -> bool {
+    matches!(
+        message.trim(),
+        "Windows console submission delays do not fit inside the remaining turn timeout"
+            | "Error: Windows console submission delays do not fit inside the remaining turn timeout"
+    )
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn windows_console_extra_submit_delay() -> std::time::Duration {
+    std::time::Duration::from_secs(2)
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn windows_console_immediate_submit_count(submit_count: usize) -> usize {
+    usize::from(submit_count == 1)
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn windows_console_submit_delays_fit(
+    submit_count: usize,
+    budget: std::time::Duration,
+) -> bool {
+    let delayed = submit_count.saturating_sub(windows_console_immediate_submit_count(submit_count));
+    u32::try_from(delayed)
+        .ok()
+        .and_then(|count| windows_console_extra_submit_delay().checked_mul(count))
+        .is_some_and(|required| required < budget)
+}
+
 pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     platform::select(preferred)
 }
 
-pub(super) fn open_tab(kind: TerminalKind, command: &str) -> Result<TerminalSession> {
-    platform::open_tab(kind, command)
+pub(super) fn open_bound_tab<F, U>(
+    kind: TerminalKind,
+    command: &str,
+    deadline: Instant,
+    bind: F,
+    unbind: U,
+) -> Result<TerminalSession>
+where
+    F: FnOnce(&mut TerminalSession) -> Result<()>,
+    U: FnOnce() -> Result<()>,
+{
+    #[cfg(windows)]
+    {
+        windows::open_bound_tab(kind, command, deadline, bind, unbind)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::open_bound_tab(kind, command, deadline, bind, unbind)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = deadline;
+        let mut session = platform::open_tab(kind, command)?;
+        if let Err(error) = bind(&mut session) {
+            let cleanup = platform::close_session(&session);
+            return match cleanup {
+                Ok(_) => match unbind() {
+                    Ok(()) => Err(error).context("failed to bind the created terminal surface"),
+                    Err(unbind_error) => Err(anyhow::anyhow!(
+                        "failed to bind the created terminal surface: {error:#}; surface cleanup succeeded but its durable binding could not be removed: {unbind_error:#}"
+                    )),
+                },
+                Err(cleanup_error) => Err(anyhow::anyhow!(
+                    "failed to bind the created terminal surface: {error:#}; exact surface cleanup also failed: {cleanup_error:#}"
+                )),
+            };
+        }
+        Ok(session)
+    }
 }
 
-pub(super) fn send_file(session: &TerminalSession, prompt_path: &Path) -> Result<()> {
-    platform::send_file(session, prompt_path)
+#[cfg(any(windows, target_os = "macos", test))]
+fn bind_surface_before_start<T, Bind, Start, Cleanup, Unbind>(
+    surface: &mut T,
+    bind: Bind,
+    start: Start,
+    cleanup: Cleanup,
+    unbind: Unbind,
+) -> Result<()>
+where
+    Bind: FnOnce(&mut T) -> Result<()>,
+    Start: FnOnce() -> Result<()>,
+    Cleanup: FnOnce() -> Result<()>,
+    Unbind: FnOnce() -> Result<()>,
+{
+    if let Err(error) = bind(surface) {
+        return match cleanup() {
+            Ok(()) => match unbind() {
+                Ok(()) => Err(error),
+                Err(unbind_error) => Err(anyhow::anyhow!(
+                    "{error:#}; exact surface cleanup succeeded but its durable binding could not be removed: {unbind_error:#}"
+                )),
+            },
+            Err(cleanup_error) => Err(anyhow::anyhow!(
+                "{error:#}; exact surface cleanup also failed: {cleanup_error:#}"
+            )),
+        };
+    }
+    if let Err(error) = start() {
+        return match cleanup() {
+            Ok(()) => match unbind() {
+                Ok(()) => Err(error),
+                Err(unbind_error) => Err(anyhow::anyhow!(
+                    "{error:#}; exact surface cleanup succeeded but its durable binding could not be removed: {unbind_error:#}"
+                )),
+            },
+            Err(cleanup_error) => Err(anyhow::anyhow!(
+                "{error:#}; exact surface cleanup also failed: {cleanup_error:#}"
+            )),
+        };
+    }
+    Ok(())
+}
+
+pub(super) fn send_file(
+    session: &TerminalSession,
+    prompt_path: &Path,
+    deadline: Instant,
+) -> TerminalSendResult {
+    #[cfg(windows)]
+    {
+        windows::send_file(session, prompt_path, deadline)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::send_file(session, prompt_path, deadline)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        platform::send_file(session, prompt_path, deadline).map_err(TerminalSendFailure::not_sent)
+    }
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn remaining_send_budget_at(
+    deadline: Instant,
+    now: Instant,
+) -> Result<std::time::Duration> {
+    match deadline.checked_duration_since(now) {
+        Some(remaining) if !remaining.is_zero() => Ok(remaining),
+        _ => bail!("terminal send deadline is exhausted"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn verify_macos_surface(
+    session: &TerminalSession,
+    timeout: Option<std::time::Duration>,
+) -> Result<Option<String>> {
+    macos::verify_surface(session, timeout)
 }
 
 pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
@@ -136,8 +331,9 @@ pub(super) fn windows_console_control(
     session: &TerminalSession,
     input_path: Option<&Path>,
     submit_count: usize,
+    timeout: Option<std::time::Duration>,
 ) -> Result<()> {
-    windows::console_control(action, session, input_path, submit_count)
+    windows::console_control(action, session, input_path, submit_count, timeout)
 }
 
 #[cfg(target_os = "windows")]
@@ -195,16 +391,20 @@ pub(super) fn select_macos_terminal(
     has_iterm_session_id: bool,
     has_term_session_id: bool,
 ) -> TerminalKind {
-    preferred
-        .or_else(|| {
-            classify_macos_terminal(
-                term_program,
-                term,
-                has_iterm_session_id,
-                has_term_session_id,
-            )
-        })
-        .unwrap_or(TerminalKind::AppleTerminal)
+    if let Some(preferred) = preferred {
+        return preferred;
+    }
+    match classify_macos_terminal(
+        term_program,
+        term,
+        has_iterm_session_id,
+        has_term_session_id,
+    ) {
+        // Ghostty is explicitly unsupported in v0.0.3. Auto-detection falls back to the
+        // supported Terminal.app adapter; an explicit --terminal ghostty still fails closed.
+        Some(TerminalKind::Ghostty) | None => TerminalKind::AppleTerminal,
+        Some(kind) => kind,
+    }
 }
 
 #[cfg(test)]
@@ -213,7 +413,77 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     use super::macos;
-    use super::{TerminalKind, TerminalSession, classify_macos_terminal, select_macos_terminal};
+    use super::{
+        TerminalKind, TerminalSendFailure, TerminalSession, bind_surface_before_start,
+        classify_macos_terminal, select_macos_terminal,
+        windows_console_helper_reports_send_not_started,
+    };
+    use anyhow::bail;
+
+    #[test]
+    fn terminal_send_failure_distinguishes_not_started_from_uncertain_delivery() {
+        let not_started = TerminalSendFailure::not_sent(anyhow::anyhow!("deadline exhausted"));
+        assert!(!not_started.delivery_may_have_occurred());
+        assert_eq!(not_started.error().to_string(), "deadline exhausted");
+
+        let uncertain =
+            TerminalSendFailure::delivery_uncertain(anyhow::anyhow!("helper timed out"));
+        assert!(uncertain.delivery_may_have_occurred());
+        assert_eq!(uncertain.error().to_string(), "helper timed out");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_expired_send_deadline_is_confirmed_not_started() {
+        let failure = super::send_file(
+            &macos_test_iterm_session(),
+            std::path::Path::new("/private/tmp/agent-bridge-expired-prompt"),
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+
+        assert!(!failure.delivery_may_have_occurred());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unrepresentable_prompt_path_is_confirmed_not_started() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+            b"/private/tmp/agent-bridge-prompt-\xff",
+        ));
+        let failure = super::send_file(
+            &macos_test_iterm_session(),
+            &path,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+
+        assert!(!failure.delivery_may_have_occurred());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_test_iterm_session() -> TerminalSession {
+        TerminalSession {
+            kind: TerminalKind::Iterm2,
+            id: "test-session".to_owned(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: None,
+            windows_process_identity: None,
+        }
+    }
+
+    #[test]
+    fn windows_helper_budget_rejection_proves_send_never_started() {
+        assert!(windows_console_helper_reports_send_not_started(
+            "Error: Windows console submission delays do not fit inside the remaining turn timeout"
+        ));
+        assert!(!windows_console_helper_reports_send_not_started(
+            "Error: Windows console control helper timed out"
+        ));
+    }
 
     #[test]
     fn macos_terminal_detection_recognizes_each_supported_host() {
@@ -257,6 +527,10 @@ mod tests {
         );
         assert_eq!(
             select_macos_terminal(None, None, None, false, false),
+            TerminalKind::AppleTerminal
+        );
+        assert_eq!(
+            select_macos_terminal(None, Some("ghostty"), Some("xterm-ghostty"), false, false,),
             TerminalKind::AppleTerminal
         );
     }
@@ -335,6 +609,84 @@ mod tests {
     }
 
     #[test]
+    fn suspended_surface_is_bound_before_start_and_cleaned_on_bind_failure() {
+        use std::cell::RefCell;
+
+        let steps = RefCell::new(Vec::new());
+        bind_surface_before_start(
+            &mut (),
+            |_| {
+                steps.borrow_mut().push("bind");
+                Ok(())
+            },
+            || {
+                steps.borrow_mut().push("start");
+                Ok(())
+            },
+            || {
+                steps.borrow_mut().push("cleanup");
+                Ok(())
+            },
+            || {
+                steps.borrow_mut().push("unbind");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*steps.borrow(), ["bind", "start"]);
+
+        steps.borrow_mut().clear();
+        assert!(
+            bind_surface_before_start(
+                &mut (),
+                |_| {
+                    steps.borrow_mut().push("bind");
+                    bail!("persist failed")
+                },
+                || {
+                    steps.borrow_mut().push("start");
+                    Ok(())
+                },
+                || {
+                    steps.borrow_mut().push("cleanup");
+                    Ok(())
+                },
+                || {
+                    steps.borrow_mut().push("unbind");
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(*steps.borrow(), ["bind", "cleanup", "unbind"]);
+
+        steps.borrow_mut().clear();
+        assert!(
+            bind_surface_before_start(
+                &mut (),
+                |_| {
+                    steps.borrow_mut().push("bind");
+                    Ok(())
+                },
+                || {
+                    steps.borrow_mut().push("start");
+                    bail!("start failed")
+                },
+                || {
+                    steps.borrow_mut().push("cleanup");
+                    bail!("cleanup failed")
+                },
+                || {
+                    steps.borrow_mut().push("unbind");
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(*steps.borrow(), ["bind", "start", "cleanup"]);
+    }
+
+    #[test]
     fn terminal_records_discard_legacy_visible_title_metadata() {
         let session: TerminalSession = serde_json::from_value(serde_json::json!({
             "terminal": "apple-terminal",
@@ -352,6 +704,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn ghostty_open_uses_separate_create_discover_queue_and_enter_transactions() {
+        let version = macos::ghostty::VERSION_SCRIPT;
+        assert!(version.contains("return version"));
+        assert!(!version.contains("new tab"));
+        assert!(!version.contains("new window"));
+
         let create = macos::ghostty::CREATE_SURFACE_SCRIPT;
         assert!(create.contains("set targetWindow to new window"));
         assert!(create.contains("set targetTab to new tab in targetWindow"));
@@ -434,19 +791,21 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn apple_terminal_adapter_targets_only_its_created_tty() {
-        assert!(macos::apple_terminal::OPEN_TAB_SCRIPT.contains("item 1 of argv"));
-        assert!(macos::apple_terminal::OPEN_TAB_SCRIPT.contains("do script bridgeCommand"));
+        assert!(macos::apple_terminal::OPEN_TAB_SCRIPT.contains("set targetTab to do script \"\""));
+        assert!(!macos::apple_terminal::OPEN_TAB_SCRIPT.contains("bridgeCommand"));
+        assert!(macos::apple_terminal::START_SESSION_SCRIPT.contains("item 1 of argv"));
+        assert!(macos::apple_terminal::START_SESSION_SCRIPT.contains("item 3 of argv"));
         assert!(
-            !macos::apple_terminal::OPEN_TAB_SCRIPT
+            macos::apple_terminal::START_SESSION_SCRIPT
+                .contains("do script bridgeCommand in targetTab")
+        );
+        assert!(
+            !macos::apple_terminal::START_SESSION_SCRIPT
                 .contains("do script bridgeCommand in front window")
         );
         assert!(!macos::apple_terminal::OPEN_TAB_SCRIPT.contains("System Events"));
         assert!(!macos::apple_terminal::OPEN_TAB_SCRIPT.contains("front window"));
         assert!(!macos::apple_terminal::OPEN_TAB_SCRIPT.contains("selected tab"));
-        assert!(
-            macos::apple_terminal::OPEN_TAB_SCRIPT
-                .contains("set targetTab to do script bridgeCommand")
-        );
         assert!(macos::apple_terminal::OPEN_TAB_SCRIPT.contains("tty of targetTab"));
         assert!(macos::apple_terminal::OPEN_TAB_SCRIPT.contains("windowIdForTty(targetTty)"));
         assert!(macos::apple_terminal::OPEN_TAB_SCRIPT.contains("id of targetWindow"));

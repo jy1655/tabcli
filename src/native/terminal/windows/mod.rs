@@ -4,6 +4,7 @@ use std::{
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -13,7 +14,10 @@ use windows_sys::Win32::System::Console::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE},
+    Foundation::{
+        CloseHandle, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
+    },
     Storage::FileSystem::{
         CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, SYNCHRONIZE,
     },
@@ -28,9 +32,14 @@ use super::{CloseOutcome, TerminalKind, TerminalSession, WindowsProcessIdentity}
 
 mod process;
 mod security;
+use process::{
+    open_verified_control_process, query_process_identity_from_handle,
+    verify_control_process_identity,
+};
 pub(super) use process::{query_process_identity, verify_process_identity};
-use process::{query_process_identity_from_handle, verify_control_process_identity};
 pub(super) use security::set_private_permissions;
+
+const STARTUP_CLEANUP_RESERVE: Duration = Duration::from_secs(2);
 
 pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     match preferred {
@@ -42,7 +51,21 @@ pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     }
 }
 
-pub(super) fn open_tab(kind: TerminalKind, command: &str) -> Result<TerminalSession> {
+pub(super) fn open_bound_tab<F, U>(
+    kind: TerminalKind,
+    command: &str,
+    deadline: Instant,
+    bind: F,
+    unbind: U,
+) -> Result<TerminalSession>
+where
+    F: FnOnce(&mut TerminalSession) -> Result<()>,
+    U: FnOnce() -> Result<()>,
+{
+    let startup_deadline = deadline
+        .checked_sub(STARTUP_CLEANUP_RESERVE)
+        .filter(|candidate| *candidate > Instant::now())
+        .context("Windows console startup timeout leaves no room for exact process cleanup")?;
     if kind != TerminalKind::WindowsConsole {
         bail!("{} is not available on Windows", kind.display_name());
     }
@@ -94,35 +117,56 @@ pub(super) fn open_tab(kind: TerminalKind, command: &str) -> Result<TerminalSess
     let identity = match query_process_identity_from_handle(process.hProcess) {
         Ok(identity) => identity,
         Err(error) => {
+            let cleanup = terminate_process_until(
+                process.hProcess,
+                bounded_startup_cleanup_deadline(deadline),
+            );
             unsafe {
-                TerminateProcess(process.hProcess, 1);
                 CloseHandle(process.hThread);
                 CloseHandle(process.hProcess);
             }
-            return Err(error).context("failed to attest the managed Windows console process");
+            return match cleanup {
+                Ok(()) => {
+                    Err(error).context("failed to attest the managed Windows console process")
+                }
+                Err(cleanup_error) => Err(anyhow::anyhow!(
+                    "failed to attest the managed Windows console process: {error:#}; exact process cleanup also failed: {cleanup_error:#}"
+                )),
+            };
         }
     };
-    if unsafe { ResumeThread(process.hThread) } == u32::MAX {
-        let error = std::io::Error::last_os_error();
-        unsafe {
-            TerminateProcess(process.hProcess, 1);
-            CloseHandle(process.hThread);
-            CloseHandle(process.hProcess);
-        }
-        return Err(error).context("failed to start the attested managed Windows console process");
-    }
-    unsafe {
-        CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
-    }
-    Ok(TerminalSession {
+    let mut session = TerminalSession {
         kind,
         id: process.dwProcessId.to_string(),
         tab_id: None,
         window_id: None,
         managed_session_id: None,
         windows_process_identity: Some(identity),
-    })
+    };
+    let process_handle = process.hProcess;
+    let thread_handle = process.hThread;
+    let launch = super::bind_surface_before_start(
+        &mut session,
+        bind,
+        || {
+            if Instant::now() >= startup_deadline {
+                bail!("Windows console startup timed out before process resume");
+            }
+            if unsafe { ResumeThread(thread_handle) } == u32::MAX {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to start the attested managed Windows console process");
+            }
+            Ok(())
+        },
+        || terminate_process_until(process_handle, bounded_startup_cleanup_deadline(deadline)),
+        unbind,
+    );
+    unsafe {
+        CloseHandle(thread_handle);
+        CloseHandle(process_handle);
+    }
+    launch.context("failed to bind the suspended Windows console before startup")?;
+    Ok(session)
 }
 
 fn console_command_line(command: &str) -> String {
@@ -131,6 +175,48 @@ fn console_command_line(command: &str) -> String {
 
 fn console_creation_flags() -> u32 {
     CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED
+}
+
+fn bounded_startup_cleanup_deadline(deadline: Instant) -> Instant {
+    Instant::now()
+        .checked_add(STARTUP_CLEANUP_RESERVE)
+        .map_or(deadline, |candidate| candidate.min(deadline))
+}
+
+fn terminate_process_until(handle: HANDLE, deadline: Instant) -> Result<()> {
+    match unsafe { WaitForSingleObject(handle, 0) } {
+        WAIT_OBJECT_0 => return Ok(()),
+        WAIT_FAILED => {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to inspect the managed Windows console during cleanup");
+        }
+        _ => {}
+    }
+    let terminated = unsafe { TerminateProcess(handle, 1) };
+    let terminate_error = (terminated == 0).then(std::io::Error::last_os_error);
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .context("managed Windows console cleanup exhausted its deadline")?;
+    let timeout_ms = remaining
+        .as_millis()
+        .saturating_add(1)
+        .min(u128::from(u32::MAX - 1)) as u32;
+    let wait = unsafe { WaitForSingleObject(handle, timeout_ms) };
+    if wait == WAIT_OBJECT_0 {
+        return Ok(());
+    }
+    let wait_error = match wait {
+        WAIT_TIMEOUT => anyhow::anyhow!("managed Windows console cleanup timed out"),
+        WAIT_FAILED => anyhow::Error::new(std::io::Error::last_os_error())
+            .context("failed to wait for managed Windows console cleanup"),
+        other => anyhow::anyhow!("unexpected Windows console cleanup wait result {other}"),
+    };
+    match terminate_error {
+        Some(error) => Err(anyhow::anyhow!(
+            "failed to terminate the managed Windows console: {error}; termination remained unconfirmed: {wait_error:#}"
+        )),
+        None => Err(wait_error),
+    }
 }
 
 fn resolve_executable_from_path(name: &str, path: &OsStr) -> Result<PathBuf> {
@@ -154,28 +240,81 @@ pub(super) fn powershell_executable() -> Result<PathBuf> {
         .context("PowerShell 7 (pwsh.exe) was not found on an absolute PATH entry")
 }
 
-pub(super) fn send_file(session: &TerminalSession, prompt_path: &Path) -> Result<()> {
+pub(super) fn send_file(
+    session: &TerminalSession,
+    prompt_path: &Path,
+    deadline: Instant,
+) -> super::TerminalSendResult {
     let prompt_path = prompt_path
         .to_str()
-        .context("prompt path is not valid UTF-8")?;
-    run_console_helper("send", session, Some(prompt_path))
+        .context("prompt path is not valid UTF-8")
+        .map_err(super::TerminalSendFailure::not_sent)?;
+    run_console_send_helper(session, prompt_path, deadline)
 }
 
 pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
     match run_console_helper("close", session, None) {
         Ok(()) => Ok(CloseOutcome::Closed),
-        Err(error)
-            if error
-                .to_string()
-                .contains("console process is no longer available") =>
-        {
+        Err(error) if super::windows_console_helper_reports_missing(&error.to_string()) => {
             Ok(CloseOutcome::Missing)
         }
         Err(error) => Err(error),
     }
 }
 
+fn run_console_send_helper(
+    session: &TerminalSession,
+    input: &str,
+    deadline: Instant,
+) -> super::TerminalSendResult {
+    let mut command = console_helper_command("send", session, Some(input))
+        .map_err(super::TerminalSendFailure::not_sent)?;
+    let timeout = super::remaining_send_budget_at(deadline, Instant::now())
+        .map_err(super::TerminalSendFailure::not_sent)?;
+    let timeout_ms = u64::try_from(timeout.as_millis())
+        .context("Windows console timeout is too large")
+        .map_err(super::TerminalSendFailure::not_sent)?;
+    command.arg(timeout_ms.max(1).to_string());
+    let output = super::super::command_output_until_classified(
+        &mut command,
+        deadline,
+        "Windows console control helper",
+    )
+    .map_err(|failure| {
+        if failure.process_started() {
+            super::TerminalSendFailure::delivery_uncertain(failure.into_error())
+        } else {
+            super::TerminalSendFailure::not_sent(failure.into_error())
+        }
+    })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let message = console_helper_failure_message(&output);
+    let error = anyhow::anyhow!(message);
+    if super::windows_console_helper_reports_send_not_started(&error.to_string()) {
+        Err(super::TerminalSendFailure::not_sent(error))
+    } else {
+        Err(super::TerminalSendFailure::delivery_uncertain(error))
+    }
+}
+
 fn run_console_helper(action: &str, session: &TerminalSession, input: Option<&str>) -> Result<()> {
+    let mut command = console_helper_command(action, session, input)?;
+    let output = command
+        .output()
+        .context("failed to start Windows console control helper")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    bail!("{}", console_helper_failure_message(&output))
+}
+
+fn console_helper_command(
+    action: &str,
+    session: &TerminalSession,
+    input: Option<&str>,
+) -> Result<Command> {
     let executable = std::env::current_exe().context("failed to locate agent-bridge executable")?;
     let managed_session_id = session
         .managed_session_id
@@ -189,21 +328,16 @@ fn run_console_helper(action: &str, session: &TerminalSession, input: Option<&st
             .context("prompt path has no file name")?;
         command.arg(input_name);
     }
-    let output = command
-        .output()
-        .context("failed to start Windows console control helper")?;
-    if output.status.success() {
-        return Ok(());
-    }
+    Ok(command)
+}
+
+fn console_helper_failure_message(output: &std::process::Output) -> String {
     let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    bail!(
-        "{}",
-        if message.is_empty() {
-            "Windows console control helper failed"
-        } else {
-            &message
-        }
-    )
+    if message.is_empty() {
+        "Windows console control helper failed".to_owned()
+    } else {
+        message
+    }
 }
 
 pub(super) fn console_control(
@@ -211,6 +345,7 @@ pub(super) fn console_control(
     session: &TerminalSession,
     input_path: Option<&Path>,
     submit_count: usize,
+    timeout: Option<Duration>,
 ) -> Result<()> {
     let pid = session
         .id
@@ -220,14 +355,14 @@ pub(super) fn console_control(
         .windows_process_identity
         .as_ref()
         .context("Windows console handle is missing its process identity")?;
-    verify_control_process_identity(pid, identity)?;
+    let _retained_owner = open_verified_control_process(pid, identity)?;
     // This runs only in the short-lived helper process so detaching its inherited
     // console cannot disturb the user's invoking PowerShell or cmd session.
     unsafe {
         FreeConsole();
         if AttachConsole(pid) == 0 {
             bail!(
-                "console process is no longer available: {}",
+                "failed to attach to the managed console process: {}",
                 std::io::Error::last_os_error()
             );
         }
@@ -237,10 +372,19 @@ pub(super) fn console_control(
     let mut console_processes = Vec::new();
     let result = match action {
         "send" => {
+            let timeout = timeout.context("send requires a console-control timeout")?;
+            if !super::windows_console_submit_delays_fit(submit_count, timeout) {
+                bail!(
+                    "Windows console submission delays do not fit inside the remaining turn timeout"
+                );
+            }
+            let deadline = Instant::now()
+                .checked_add(timeout)
+                .context("Windows console input timeout is too large")?;
             let path = input_path.context("send requires a prompt path")?;
             let input = std::fs::read_to_string(path)
                 .with_context(|| format!("failed to read prompt payload {}", path.display()))?;
-            write_console_input(&input, submit_count)
+            write_console_input(&input, submit_count, deadline)
         }
         "close" => {
             console_processes = attached_console_processes()?;
@@ -352,7 +496,7 @@ fn wait_for_console_process_exit(pid: u32, identity: &WindowsProcessIdentity) ->
     }
 }
 
-fn write_console_input(input: &str, submit_count: usize) -> Result<()> {
+fn write_console_input(input: &str, submit_count: usize, deadline: Instant) -> Result<()> {
     let console_name = "CONIN$\0".encode_utf16().collect::<Vec<_>>();
     let handle = unsafe {
         CreateFileW(
@@ -370,12 +514,21 @@ fn write_console_input(input: &str, submit_count: usize) -> Result<()> {
             .context("failed to open managed Windows console input");
     }
     let result = (|| {
-        let first_submit = usize::from(submit_count > 0);
+        let first_submit = super::windows_console_immediate_submit_count(submit_count);
+        if Instant::now() >= deadline {
+            bail!("Windows console input timed out before delivery");
+        }
         write_input_records(handle, &build_console_input_records(input, first_submit))?;
         for _ in first_submit..submit_count {
-            // Codex first confirms a bracketed paste and only then returns to the
-            // composer. A separately timed Return is required to submit it.
-            std::thread::sleep(std::time::Duration::from_millis(150));
+            // Codex detects the fast synthetic text batch as a paste. Keep both
+            // its confirmation Return and later submission Return out of that
+            // batch so processing speed cannot decide which action they perform.
+            let delay = super::windows_console_extra_submit_delay();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if delay >= remaining {
+                bail!("Windows console input timed out before the next submission Return");
+            }
+            std::thread::sleep(delay);
             write_input_records(handle, &build_console_input_records("", 1))?;
         }
         Ok(())

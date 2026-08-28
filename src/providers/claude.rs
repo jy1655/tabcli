@@ -17,7 +17,7 @@ impl ProviderAdapter for ClaudeAdapter {
     }
 
     fn minimum_version(&self) -> Version {
-        Version::new(2, 1, 232)
+        Version::new(2, 1, 234)
     }
 
     fn yolo_args(&self) -> &'static [&'static str] {

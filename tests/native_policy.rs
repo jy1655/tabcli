@@ -25,9 +25,9 @@ fn supported_cli_versions_use_a_minimum_not_an_exact_pin() {
     assert!(cli_version_is_supported(FirstPartyCli::Codex, "codex-cli 0.148.3").unwrap());
     assert!(!cli_version_is_supported(FirstPartyCli::Codex, "codex-cli 0.146.9").unwrap());
 
-    assert!(cli_version_is_supported(FirstPartyCli::Claude, "2.1.232 (Claude Code)").unwrap());
+    assert!(cli_version_is_supported(FirstPartyCli::Claude, "2.1.234 (Claude Code)").unwrap());
     assert!(cli_version_is_supported(FirstPartyCli::Claude, "2.2.0 (Claude Code)").unwrap());
-    assert!(!cli_version_is_supported(FirstPartyCli::Claude, "2.1.231 (Claude Code)").unwrap());
+    assert!(!cli_version_is_supported(FirstPartyCli::Claude, "2.1.233 (Claude Code)").unwrap());
 
     assert!(cli_version_is_supported(FirstPartyCli::Agy, "agy 1.1.12").unwrap());
     assert!(cli_version_is_supported(FirstPartyCli::Agy, "agy 1.2.0").unwrap());
@@ -207,4 +207,46 @@ fn terminal_output_renders_controls_as_visible_text() {
     assert_eq!(escaped, "ok\\u{1b}]52;clipboard\\u{7}\nnext");
     assert!(!escaped.contains('\u{1b}'));
     assert!(!escaped.contains('\u{7}'));
+}
+
+#[test]
+fn release_publication_requires_repository_immutable_releases() {
+    let workflow = include_str!("../.github/workflows/release.yml");
+    let guard = workflow
+        .find("- name: Require immutable releases before publication")
+        .expect("release workflow has no immutable-release preflight");
+    let publish = workflow
+        .find("- name: Publish verified release assets")
+        .expect("release workflow has no publication step");
+    let guard_step = &workflow[guard..publish];
+
+    assert!(
+        guard < publish,
+        "immutable-release preflight runs after publish"
+    );
+    assert!(guard_step.contains("repos/${GH_REPO}/immutable-releases"));
+    assert!(guard_step.contains(".enabled == true"));
+    assert!(guard_step.contains("GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}"));
+    assert!(!guard_step.contains("GH_TOKEN: ${{ github.token }}"));
+}
+
+#[test]
+fn release_artifact_job_is_isolated_from_mutable_terminal_app_installs() {
+    let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
+    let build = workflow
+        .find("\n  build:\n")
+        .expect("release workflow has no build job");
+    let publish = workflow
+        .find("\n  publish:\n")
+        .expect("release workflow has no publish job");
+    let build_job = &workflow[build..publish];
+
+    assert!(
+        build_job.contains("needs: [validate, test]"),
+        "artifact build must wait for the isolated release test job"
+    );
+    assert!(
+        !build_job.contains("brew install --cask"),
+        "mutable terminal app installers must not run in the artifact-producing job"
+    );
 }
