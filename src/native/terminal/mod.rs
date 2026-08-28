@@ -467,6 +467,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn ghostty_open_uses_separate_create_discover_queue_and_enter_transactions() {
+        let version = macos::ghostty::VERSION_SCRIPT;
+        assert!(version.contains("return version"));
+        assert!(!version.contains("new tab"));
+        assert!(!version.contains("new window"));
+
         let create = macos::ghostty::CREATE_SURFACE_SCRIPT;
         assert!(create.contains("set targetWindow to new window"));
         assert!(create.contains("set targetTab to new tab in targetWindow"));

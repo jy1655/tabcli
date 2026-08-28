@@ -1,8 +1,15 @@
 use std::{path::Path, thread, time::Duration};
 
 use anyhow::{Context, Result, anyhow, bail};
+use semver::Version;
 
 use super::{CloseOutcome, TerminalKind, TerminalSession, applescript, close_response};
+
+pub(in crate::native) const VERSION_SCRIPT: &str = r#"
+on run
+    tell application "Ghostty" to return version
+end run
+"#;
 
 pub(in crate::native) const CREATE_SURFACE_SCRIPT: &str = r#"
 on run
@@ -248,6 +255,10 @@ enum QueueOutcome {
 }
 
 pub(super) fn open_tab(command: &str) -> Result<TerminalSession> {
+    let version = applescript::run("Ghostty", VERSION_SCRIPT, &[])
+        .context("failed to read Ghostty version before creating a terminal surface")?;
+    validate_ghostty_version(&version)?;
+
     open_tab_with_operations(
         command,
         create_surface,
@@ -257,6 +268,17 @@ pub(super) fn open_tab(command: &str) -> Result<TerminalSession> {
         cleanup_created_surface,
         thread::sleep,
     )
+}
+
+fn validate_ghostty_version(raw_version: &str) -> Result<()> {
+    let version = Version::parse(raw_version)
+        .with_context(|| format!("Ghostty returned an invalid version {raw_version:?}"))?;
+    if version != Version::new(1, 3, 0) {
+        bail!(
+            "unsupported Ghostty version {version}; Agent Bridge v0.0.3 supports Ghostty 1.3.0 only because Ghostty 1.3.1 has an AppleScript-created terminal surface regression and later releases are not yet verified; use --terminal iterm2 or --terminal terminal"
+        );
+    }
+    Ok(())
 }
 
 fn open_tab_with_operations<Create, Discover, Queue, PressEnter, Cleanup, Pause>(
@@ -522,8 +544,22 @@ mod tests {
 
     use super::{
         CreatedSurface, DISCOVERY_ATTEMPTS, DISCOVERY_DELAY, Discovery, QUEUE_ATTEMPTS,
-        QUEUE_DELAY, QueueOutcome, open_tab_with_operations,
+        QUEUE_DELAY, QueueOutcome, open_tab_with_operations, validate_ghostty_version,
     };
+
+    #[test]
+    fn ghostty_version_gate_accepts_only_the_verified_applescript_release() {
+        validate_ghostty_version("1.3.0").unwrap();
+
+        for version in ["1.2.3", "1.3.1", "1.3.2", "2.0.0"] {
+            let error = validate_ghostty_version(version).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains(version));
+            assert!(message.contains("Ghostty 1.3.0"));
+            assert!(message.contains("--terminal iterm2"));
+            assert!(message.contains("--terminal terminal"));
+        }
+    }
 
     #[test]
     fn rust_discovery_loop_is_bounded_and_fail_closed_before_terminal_uuid() {

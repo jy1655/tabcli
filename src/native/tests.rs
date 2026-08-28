@@ -1331,6 +1331,7 @@ fn macos_terminal_adapters_never_set_or_verify_display_titles() {
             "iTerm2 close",
             terminal::macos::iterm2::CLOSE_SESSION_SCRIPT,
         ),
+        ("Ghostty version", terminal::macos::ghostty::VERSION_SCRIPT),
         (
             "Ghostty create",
             terminal::macos::ghostty::CREATE_SURFACE_SCRIPT,
@@ -1447,6 +1448,12 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
             terminal::macos::apple_terminal::WAIT_FOR_CLOSE_SCRIPT,
             "Terminal",
             "/System/Applications/Utilities/Terminal.app",
+        ),
+        (
+            "Ghostty version",
+            terminal::macos::ghostty::VERSION_SCRIPT,
+            "Ghostty",
+            "/Applications/Ghostty.app",
         ),
         (
             "Ghostty create surface",
