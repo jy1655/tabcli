@@ -1809,11 +1809,21 @@ fn windows_initial_prompt_readiness_is_provider_specific() {
 }
 
 #[test]
-fn follow_up_prompt_is_one_bracketed_paste_payload() {
+fn terminal_input_framing_matches_each_adapter_contract() {
     assert_eq!(
-        terminal_paste_bytes("line one\nline two"),
-        b"\x1b[200~line one\nline two\x1b[201~"
+        terminal_input_bytes(terminal::TerminalKind::Ghostty, "line one\nline two"),
+        b"line one\nline two"
     );
+    for kind in [
+        terminal::TerminalKind::Iterm2,
+        terminal::TerminalKind::AppleTerminal,
+        terminal::TerminalKind::WindowsConsole,
+    ] {
+        assert_eq!(
+            terminal_input_bytes(kind, "line one\nline two"),
+            b"\x1b[200~line one\nline two\x1b[201~"
+        );
+    }
 }
 
 #[test]

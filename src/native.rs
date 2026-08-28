@@ -787,7 +787,10 @@ fn run_ask(request: AskRequest) -> Result<()> {
             .suffix(".txt")
             .tempfile_in(&created.directory)?;
         set_private_file_permissions(prompt_file.as_file())?;
-        prompt_file.write_all(&terminal_paste_bytes(&initial_prompt))?;
+        prompt_file.write_all(&terminal_input_bytes(
+            terminal_session.kind,
+            &initial_prompt,
+        ))?;
         prompt_file.flush()?;
         update_status(&created.directory, "working", None, None)?;
         verify_terminal_surface_ownership(&created.directory, &created.id, &terminal_session)?;
@@ -1260,7 +1263,10 @@ fn run_tell(request: TellRequest) -> Result<()> {
                     .suffix(".txt")
                     .tempfile_in(&directory)?;
                 set_private_file_permissions(prompt_file.as_file())?;
-                prompt_file.write_all(&terminal_paste_bytes(&correlated_prompt))?;
+                prompt_file.write_all(&terminal_input_bytes(
+                    terminal_session.kind,
+                    &correlated_prompt,
+                ))?;
                 prompt_file.flush()?;
                 verify_terminal_surface_ownership(&directory, &request.id, &terminal_session)?;
                 provider::send_terminal_follow_up(provider, &terminal_session, prompt_file.path())
@@ -3262,8 +3268,14 @@ fn native_delegation_prompt(source: &str, prompt: &str) -> String {
     )
 }
 
-fn terminal_paste_bytes(prompt: &str) -> Vec<u8> {
-    format!("\x1b[200~{prompt}\x1b[201~").into_bytes()
+fn terminal_input_bytes(kind: terminal::TerminalKind, prompt: &str) -> Vec<u8> {
+    if kind == terminal::TerminalKind::Ghostty {
+        // Ghostty's `input text` command already delivers its argument as a paste.
+        // Adding another bracketed-paste envelope exposes the inner delimiters to the CLI.
+        prompt.as_bytes().to_vec()
+    } else {
+        format!("\x1b[200~{prompt}\x1b[201~").into_bytes()
+    }
 }
 
 fn sanitize_title(value: &str) -> Result<String> {
