@@ -175,6 +175,7 @@ where
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
+        let _ = deadline;
         let mut session = platform::open_tab(kind, command)?;
         if let Err(error) = bind(&mut session) {
             let cleanup = platform::close_session(&session);
