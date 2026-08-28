@@ -8,7 +8,10 @@ use anyhow::{Context, Result, anyhow, bail};
 #[cfg(test)]
 use semver::Version;
 
-use super::{CloseOutcome, TerminalKind, TerminalSession, applescript, close_response};
+use super::{
+    CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession,
+    applescript, close_response,
+};
 
 #[cfg(test)]
 pub(in crate::native) const VERSION_SCRIPT: &str = r#"
@@ -577,19 +580,22 @@ pub(super) fn send_file(
     session: &TerminalSession,
     prompt_path: &Path,
     deadline: Instant,
-) -> Result<()> {
-    let (tab_id, window_id) = ownership_proof(session)?;
+) -> TerminalSendResult {
+    let (tab_id, window_id) = ownership_proof(session).map_err(TerminalSendFailure::not_sent)?;
     let prompt_path = prompt_path
         .to_str()
-        .context("prompt path is not valid UTF-8")?;
-    let response = applescript::run_until(
+        .context("prompt path is not valid UTF-8")
+        .map_err(TerminalSendFailure::not_sent)?;
+    let response = applescript::run_send_until(
         "Ghostty",
         SEND_FILE_SCRIPT,
         &[&session.id, tab_id, window_id, prompt_path],
         deadline,
     )?;
     if response != "sent" {
-        bail!("unexpected Ghostty send response: {response:?}");
+        return Err(TerminalSendFailure::delivery_uncertain(anyhow::anyhow!(
+            "unexpected Ghostty send response: {response:?}"
+        )));
     }
     Ok(())
 }

@@ -244,15 +244,33 @@ fn bounded_command_output_terminates_a_hung_child_at_the_deadline() {
     command.args(["-c", "sleep 1 & wait"]);
     let started = Instant::now();
 
-    let error = command_output_until(
+    let failure = command_output_until_classified(
         &mut command,
         started + Duration::from_millis(100),
         "test child",
     )
     .unwrap_err();
+    assert!(failure.process_started());
+    let error = failure.into_error();
 
     assert!(format!("{error:#}").contains("test child timed out"));
     assert!(started.elapsed() < Duration::from_millis(500));
+}
+
+#[cfg(unix)]
+#[test]
+fn bounded_command_output_identifies_a_pre_spawn_failure() {
+    let mut command = Command::new("/definitely/not/an/agent-bridge-executable");
+
+    let failure = command_output_until_classified(
+        &mut command,
+        Instant::now() + Duration::from_secs(1),
+        "missing test child",
+    )
+    .unwrap_err();
+
+    assert!(!failure.process_started());
+    assert!(format!("{:#}", failure.into_error()).contains("failed to start missing test child"));
 }
 
 #[test]

@@ -6,7 +6,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use super::{CloseOutcome, TerminalKind, TerminalSession, select_macos_terminal};
+use super::{
+    CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession,
+    select_macos_terminal,
+};
 
 const STARTUP_CLEANUP_RESERVE: Duration = Duration::from_secs(2);
 
@@ -75,12 +78,14 @@ pub(super) fn send_file(
     session: &TerminalSession,
     prompt_path: &Path,
     deadline: Instant,
-) -> Result<()> {
+) -> TerminalSendResult {
     match session.kind {
         TerminalKind::Iterm2 => iterm2::send_file(session, prompt_path, deadline),
         TerminalKind::AppleTerminal => apple_terminal::send_file(session, prompt_path, deadline),
         TerminalKind::Ghostty => ghostty::send_file(session, prompt_path, deadline),
-        TerminalKind::WindowsConsole => bail!("Windows Console is only available on Windows"),
+        TerminalKind::WindowsConsole => Err(TerminalSendFailure::not_sent(anyhow::anyhow!(
+            "Windows Console is only available on Windows"
+        ))),
     }
 }
 

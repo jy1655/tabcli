@@ -1655,17 +1655,85 @@ fn remaining_turn_timeout(deadline: Instant, requested: Duration) -> Result<Dura
         .with_context(|| format!("timed out after {} seconds", requested.as_secs()))
 }
 
+#[derive(Debug)]
+struct CommandOutputFailure {
+    error: anyhow::Error,
+    #[cfg_attr(
+        not(any(target_os = "windows", target_os = "macos", test)),
+        allow(dead_code)
+    )]
+    process_started: bool,
+}
+
+impl CommandOutputFailure {
+    fn not_started(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            process_started: false,
+        }
+    }
+
+    fn started(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            process_started: true,
+        }
+    }
+
+    #[cfg_attr(
+        not(any(target_os = "windows", target_os = "macos", test)),
+        allow(dead_code)
+    )]
+    fn process_started(&self) -> bool {
+        self.process_started
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        self.error
+    }
+}
+
 fn command_output_until(command: &mut Command, deadline: Instant, label: &str) -> Result<Output> {
+    command_output_until_classified(command, deadline, label)
+        .map_err(CommandOutputFailure::into_error)
+}
+
+fn command_output_until_classified(
+    command: &mut Command,
+    deadline: Instant,
+    label: &str,
+) -> std::result::Result<Output, CommandOutputFailure> {
+    if Instant::now() >= deadline {
+        return Err(CommandOutputFailure::not_started(anyhow::anyhow!(
+            "{label} timed out before it started"
+        )));
+    }
     let mut stdout = tempfile::tempfile()
-        .with_context(|| format!("failed to create bounded stdout storage for {label}"))?;
+        .with_context(|| format!("failed to create bounded stdout storage for {label}"))
+        .map_err(CommandOutputFailure::not_started)?;
     let mut stderr = tempfile::tempfile()
-        .with_context(|| format!("failed to create bounded stderr storage for {label}"))?;
+        .with_context(|| format!("failed to create bounded stderr storage for {label}"))
+        .map_err(CommandOutputFailure::not_started)?;
+    let child_stdout = stdout
+        .try_clone()
+        .with_context(|| format!("failed to clone bounded stdout storage for {label}"))
+        .map_err(CommandOutputFailure::not_started)?;
+    let child_stderr = stderr
+        .try_clone()
+        .with_context(|| format!("failed to clone bounded stderr storage for {label}"))
+        .map_err(CommandOutputFailure::not_started)?;
+    if Instant::now() >= deadline {
+        return Err(CommandOutputFailure::not_started(anyhow::anyhow!(
+            "{label} timed out before it started"
+        )));
+    }
     let mut child = command
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout.try_clone()?))
-        .stderr(Stdio::from(stderr.try_clone()?))
+        .stdout(Stdio::from(child_stdout))
+        .stderr(Stdio::from(child_stderr))
         .spawn()
-        .with_context(|| format!("failed to start {label}"))?;
+        .with_context(|| format!("failed to start {label}"))
+        .map_err(CommandOutputFailure::not_started)?;
 
     let status = loop {
         match child.try_wait() {
@@ -1677,21 +1745,37 @@ fn command_output_until(command: &mut Command, deadline: Instant, label: &str) -
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                bail!("{label} timed out");
+                return Err(CommandOutputFailure::started(anyhow::anyhow!(
+                    "{label} timed out"
+                )));
             }
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(error).with_context(|| format!("failed to wait for {label}"));
+                return Err(CommandOutputFailure::started(
+                    anyhow::Error::new(error).context(format!("failed to wait for {label}")),
+                ));
             }
         }
     };
-    stdout.seek(SeekFrom::Start(0))?;
-    stderr.seek(SeekFrom::Start(0))?;
+    stdout
+        .seek(SeekFrom::Start(0))
+        .with_context(|| format!("failed to rewind bounded stdout storage for {label}"))
+        .map_err(CommandOutputFailure::started)?;
+    stderr
+        .seek(SeekFrom::Start(0))
+        .with_context(|| format!("failed to rewind bounded stderr storage for {label}"))
+        .map_err(CommandOutputFailure::started)?;
     let mut stdout_bytes = Vec::new();
     let mut stderr_bytes = Vec::new();
-    stdout.read_to_end(&mut stdout_bytes)?;
-    stderr.read_to_end(&mut stderr_bytes)?;
+    stdout
+        .read_to_end(&mut stdout_bytes)
+        .with_context(|| format!("failed to read bounded stdout storage for {label}"))
+        .map_err(CommandOutputFailure::started)?;
+    stderr
+        .read_to_end(&mut stderr_bytes)
+        .with_context(|| format!("failed to read bounded stderr storage for {label}"))
+        .map_err(CommandOutputFailure::started)?;
     Ok(Output {
         status,
         stdout: stdout_bytes,

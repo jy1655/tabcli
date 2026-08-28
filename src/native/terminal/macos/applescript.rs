@@ -2,6 +2,8 @@ use std::{process::Command, time::Instant};
 
 use anyhow::{Context, Result, bail};
 
+use super::super::TerminalSendFailure;
+
 pub(super) fn run(application: &str, script: &str, arguments: &[&str]) -> Result<String> {
     let output = command(script, arguments)
         .output()
@@ -25,6 +27,33 @@ pub(super) fn run_until(
         &format!("{application} automation"),
     )?;
     parse_output(application, output)
+}
+
+pub(super) fn run_send_until(
+    application: &str,
+    script: &str,
+    arguments: &[&str],
+    deadline: Instant,
+) -> std::result::Result<String, TerminalSendFailure> {
+    if Instant::now() >= deadline {
+        return Err(TerminalSendFailure::not_sent(anyhow::anyhow!(
+            "{application} automation timed out before it started"
+        )));
+    }
+    let mut command = command(script, arguments);
+    let output = crate::native::command_output_until_classified(
+        &mut command,
+        deadline,
+        &format!("{application} automation"),
+    )
+    .map_err(|failure| {
+        if failure.process_started() {
+            TerminalSendFailure::delivery_uncertain(failure.into_error())
+        } else {
+            TerminalSendFailure::not_sent(failure.into_error())
+        }
+    })?;
+    parse_output(application, output).map_err(TerminalSendFailure::delivery_uncertain)
 }
 
 fn command(script: &str, arguments: &[&str]) -> Command {

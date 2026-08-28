@@ -5,7 +5,10 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 
-use super::{CloseOutcome, TerminalKind, TerminalSession, applescript, close_response};
+use super::{
+    CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession,
+    applescript, close_response,
+};
 
 pub(in crate::native) const OPEN_TAB_SCRIPT: &str = r#"
 on run
@@ -152,18 +155,21 @@ pub(super) fn send_file(
     session: &TerminalSession,
     prompt_path: &Path,
     deadline: Instant,
-) -> Result<()> {
+) -> TerminalSendResult {
     let prompt_path = prompt_path
         .to_str()
-        .context("prompt path is not valid UTF-8")?;
-    let response = applescript::run_until(
+        .context("prompt path is not valid UTF-8")
+        .map_err(TerminalSendFailure::not_sent)?;
+    let response = applescript::run_send_until(
         "iTerm2",
         SEND_FILE_SCRIPT,
         &[&session.id, prompt_path],
         deadline,
     )?;
     if response != "sent" {
-        bail!("unexpected iTerm2 send response: {response:?}");
+        return Err(TerminalSendFailure::delivery_uncertain(anyhow::anyhow!(
+            "unexpected iTerm2 send response: {response:?}"
+        )));
     }
     Ok(())
 }

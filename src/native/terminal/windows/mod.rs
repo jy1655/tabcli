@@ -275,12 +275,18 @@ fn run_console_send_helper(
         .context("Windows console timeout is too large")
         .map_err(super::TerminalSendFailure::not_sent)?;
     command.arg(timeout_ms.max(1).to_string());
-    let output = super::super::command_output_until(
+    let output = super::super::command_output_until_classified(
         &mut command,
         deadline,
         "Windows console control helper",
     )
-    .map_err(super::TerminalSendFailure::delivery_uncertain)?;
+    .map_err(|failure| {
+        if failure.process_started() {
+            super::TerminalSendFailure::delivery_uncertain(failure.into_error())
+        } else {
+            super::TerminalSendFailure::not_sent(failure.into_error())
+        }
+    })?;
     if output.status.success() {
         return Ok(());
     }

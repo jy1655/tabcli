@@ -130,6 +130,10 @@ impl TerminalSendFailure {
         }
     }
 
+    #[cfg_attr(
+        not(any(target_os = "windows", target_os = "macos", test)),
+        allow(dead_code)
+    )]
     pub(super) fn delivery_uncertain(error: anyhow::Error) -> Self {
         Self {
             error,
@@ -288,10 +292,13 @@ pub(super) fn send_file(
     {
         windows::send_file(session, prompt_path, deadline)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
-        platform::send_file(session, prompt_path, deadline)
-            .map_err(TerminalSendFailure::delivery_uncertain)
+        macos::send_file(session, prompt_path, deadline)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        platform::send_file(session, prompt_path, deadline).map_err(TerminalSendFailure::not_sent)
     }
 }
 
@@ -423,6 +430,49 @@ mod tests {
             TerminalSendFailure::delivery_uncertain(anyhow::anyhow!("helper timed out"));
         assert!(uncertain.delivery_may_have_occurred());
         assert_eq!(uncertain.error().to_string(), "helper timed out");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_expired_send_deadline_is_confirmed_not_started() {
+        let failure = super::send_file(
+            &macos_test_iterm_session(),
+            std::path::Path::new("/private/tmp/agent-bridge-expired-prompt"),
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+
+        assert!(!failure.delivery_may_have_occurred());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_unrepresentable_prompt_path_is_confirmed_not_started() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+            b"/private/tmp/agent-bridge-prompt-\xff",
+        ));
+        let failure = super::send_file(
+            &macos_test_iterm_session(),
+            &path,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+
+        assert!(!failure.delivery_may_have_occurred());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_test_iterm_session() -> TerminalSession {
+        TerminalSession {
+            kind: TerminalKind::Iterm2,
+            id: "test-session".to_owned(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: None,
+            windows_process_identity: None,
+        }
     }
 
     #[test]
