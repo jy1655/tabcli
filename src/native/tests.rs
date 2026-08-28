@@ -1835,15 +1835,13 @@ fn every_provider_declares_its_terminal_submission_count() {
 
 #[test]
 fn windows_initial_prompt_readiness_is_provider_specific() {
-    assert_eq!(
-        provider::initial_prompt_ready_delay(FirstPartyCli::Agy),
-        Duration::from_secs(12)
-    );
-    for provider in [
-        FirstPartyCli::Codex,
-        FirstPartyCli::Claude,
-        FirstPartyCli::Pi,
-    ] {
+    for provider in [FirstPartyCli::Codex, FirstPartyCli::Agy] {
+        assert_eq!(
+            provider::initial_prompt_ready_delay(provider),
+            Duration::from_secs(12)
+        );
+    }
+    for provider in [FirstPartyCli::Claude, FirstPartyCli::Pi] {
         assert_eq!(
             provider::initial_prompt_ready_delay(provider),
             Duration::from_secs(2)

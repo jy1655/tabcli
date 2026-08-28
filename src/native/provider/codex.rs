@@ -70,7 +70,10 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 
     fn initial_prompt_ready_delay(&self) -> Duration {
-        Duration::from_secs(2)
+        // Codex can render its composer before cold-start MCP and extension
+        // initialization settles. Returns delivered during that redraw window
+        // can be ignored while leaving the pasted prompt in the composer.
+        Duration::from_secs(12)
     }
 
     fn send_initial_prompt(
