@@ -92,7 +92,7 @@ impl NativeProviderAdapter for AgyAdapter {
         session: &terminal::TerminalSession,
         prompt_path: &Path,
         deadline: Instant,
-    ) -> Result<()> {
+    ) -> terminal::TerminalSendResult {
         terminal::send_file(session, prompt_path, deadline)
     }
 
@@ -139,7 +139,7 @@ impl NativeProviderAdapter for AgyAdapter {
         session: &terminal::TerminalSession,
         prompt_path: &Path,
         deadline: Instant,
-    ) -> Result<()> {
+    ) -> terminal::TerminalSendResult {
         terminal::send_file(session, prompt_path, deadline)
     }
 

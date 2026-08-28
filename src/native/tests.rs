@@ -2239,6 +2239,40 @@ fn initial_prompt_failures_distinguish_safe_abort_from_uncertain_delivery() {
 }
 
 #[test]
+fn follow_up_terminal_send_failure_releases_only_confirmed_not_started_claims() {
+    for delivery_may_have_occurred in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "ready", None, None).unwrap();
+        let (mut claim, _) = acquire_ready_turn_claim(directory.path(), "session-test").unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let failure = if delivery_may_have_occurred {
+            terminal::TerminalSendFailure::delivery_uncertain(anyhow::anyhow!(
+                "terminal delivery uncertain"
+            ))
+        } else {
+            terminal::TerminalSendFailure::not_sent(anyhow::anyhow!(
+                "terminal delivery did not start"
+            ))
+        };
+
+        record_follow_up_terminal_delivery_failure(directory.path(), &mut claim, &failure);
+        drop(claim);
+
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        if delivery_may_have_occurred {
+            assert_eq!(status.state, "working");
+            assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+            assert_eq!(status.error.as_deref(), Some("terminal delivery uncertain"));
+        } else {
+            assert_eq!(status.state, "ready");
+            assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+            assert_eq!(status.error, None);
+        }
+    }
+}
+
+#[test]
 fn event_commit_does_not_create_a_racy_latest_cache() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();

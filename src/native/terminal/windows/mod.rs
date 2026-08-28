@@ -32,8 +32,11 @@ use super::{CloseOutcome, TerminalKind, TerminalSession, WindowsProcessIdentity}
 
 mod process;
 mod security;
+use process::{
+    open_verified_control_process, query_process_identity_from_handle,
+    verify_control_process_identity,
+};
 pub(super) use process::{query_process_identity, verify_process_identity};
-use process::{query_process_identity_from_handle, verify_control_process_identity};
 pub(super) use security::set_private_permissions;
 
 const STARTUP_CLEANUP_RESERVE: Duration = Duration::from_secs(2);
@@ -241,15 +244,16 @@ pub(super) fn send_file(
     session: &TerminalSession,
     prompt_path: &Path,
     deadline: Instant,
-) -> Result<()> {
+) -> super::TerminalSendResult {
     let prompt_path = prompt_path
         .to_str()
-        .context("prompt path is not valid UTF-8")?;
-    run_console_helper("send", session, Some(prompt_path), Some(deadline))
+        .context("prompt path is not valid UTF-8")
+        .map_err(super::TerminalSendFailure::not_sent)?;
+    run_console_send_helper(session, prompt_path, deadline)
 }
 
 pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
-    match run_console_helper("close", session, None, None) {
+    match run_console_helper("close", session, None) {
         Ok(()) => Ok(CloseOutcome::Closed),
         Err(error) if super::windows_console_helper_reports_missing(&error.to_string()) => {
             Ok(CloseOutcome::Missing)
@@ -258,12 +262,53 @@ pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
     }
 }
 
-fn run_console_helper(
+fn run_console_send_helper(
+    session: &TerminalSession,
+    input: &str,
+    deadline: Instant,
+) -> super::TerminalSendResult {
+    let mut command = console_helper_command("send", session, Some(input))
+        .map_err(super::TerminalSendFailure::not_sent)?;
+    let timeout = super::remaining_send_budget_at(deadline, Instant::now())
+        .map_err(super::TerminalSendFailure::not_sent)?;
+    let timeout_ms = u64::try_from(timeout.as_millis())
+        .context("Windows console timeout is too large")
+        .map_err(super::TerminalSendFailure::not_sent)?;
+    command.arg(timeout_ms.max(1).to_string());
+    let output = super::super::command_output_until(
+        &mut command,
+        deadline,
+        "Windows console control helper",
+    )
+    .map_err(super::TerminalSendFailure::delivery_uncertain)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let message = console_helper_failure_message(&output);
+    let error = anyhow::anyhow!(message);
+    if super::windows_console_helper_reports_send_not_started(&error.to_string()) {
+        Err(super::TerminalSendFailure::not_sent(error))
+    } else {
+        Err(super::TerminalSendFailure::delivery_uncertain(error))
+    }
+}
+
+fn run_console_helper(action: &str, session: &TerminalSession, input: Option<&str>) -> Result<()> {
+    let mut command = console_helper_command(action, session, input)?;
+    let output = command
+        .output()
+        .context("failed to start Windows console control helper")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    bail!("{}", console_helper_failure_message(&output))
+}
+
+fn console_helper_command(
     action: &str,
     session: &TerminalSession,
     input: Option<&str>,
-    deadline: Option<Instant>,
-) -> Result<()> {
+) -> Result<Command> {
     let executable = std::env::current_exe().context("failed to locate agent-bridge executable")?;
     let managed_session_id = session
         .managed_session_id
@@ -277,29 +322,16 @@ fn run_console_helper(
             .context("prompt path has no file name")?;
         command.arg(input_name);
     }
-    let output = if let Some(deadline) = deadline {
-        let timeout = super::remaining_send_budget_at(deadline, Instant::now())?;
-        let timeout_ms =
-            u64::try_from(timeout.as_millis()).context("Windows console timeout is too large")?;
-        command.arg(timeout_ms.max(1).to_string());
-        super::super::command_output_until(&mut command, deadline, "Windows console control helper")
-    } else {
-        command
-            .output()
-            .context("failed to start Windows console control helper")
-    }?;
-    if output.status.success() {
-        return Ok(());
-    }
+    Ok(command)
+}
+
+fn console_helper_failure_message(output: &std::process::Output) -> String {
     let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    bail!(
-        "{}",
-        if message.is_empty() {
-            "Windows console control helper failed"
-        } else {
-            &message
-        }
-    )
+    if message.is_empty() {
+        "Windows console control helper failed".to_owned()
+    } else {
+        message
+    }
 }
 
 pub(super) fn console_control(
@@ -317,7 +349,7 @@ pub(super) fn console_control(
         .windows_process_identity
         .as_ref()
         .context("Windows console handle is missing its process identity")?;
-    verify_control_process_identity(pid, identity)?;
+    let _retained_owner = open_verified_control_process(pid, identity)?;
     // This runs only in the short-lived helper process so detaching its inherited
     // console cannot disturb the user's invoking PowerShell or cmd session.
     unsafe {

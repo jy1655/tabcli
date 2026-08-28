@@ -36,7 +36,7 @@ pub(super) struct CrossSessionMessageContext<'a> {
     pub(super) provider_path: &'a Path,
     pub(super) request_id: &'a str,
     pub(super) prompt: &'a str,
-    pub(super) timeout: Duration,
+    pub(super) deadline: Instant,
 }
 
 #[derive(Debug)]
@@ -155,7 +155,7 @@ trait NativeProviderAdapter: Sync {
         session: &terminal::TerminalSession,
         prompt_path: &Path,
         deadline: Instant,
-    ) -> Result<()>;
+    ) -> terminal::TerminalSendResult;
     fn terminal_initial_prompt(&self, directory: &Path, prompt: &str) -> Result<String>;
     #[cfg(any(windows, test))]
     fn terminal_submit_count(&self) -> usize;
@@ -172,7 +172,7 @@ trait NativeProviderAdapter: Sync {
         session: &terminal::TerminalSession,
         prompt_path: &Path,
         deadline: Instant,
-    ) -> Result<()>;
+    ) -> terminal::TerminalSendResult;
     fn prepare_terminal_follow_up(
         &self,
         directory: &Path,
@@ -254,7 +254,7 @@ pub(super) fn send_terminal_follow_up(
     session: &terminal::TerminalSession,
     prompt_path: &Path,
     deadline: Instant,
-) -> Result<()> {
+) -> terminal::TerminalSendResult {
     adapter(provider).send_terminal_follow_up(session, prompt_path, deadline)
 }
 
@@ -286,7 +286,7 @@ pub(super) fn send_initial_prompt(
     session: &terminal::TerminalSession,
     prompt_path: &Path,
     deadline: Instant,
-) -> Result<()> {
+) -> terminal::TerminalSendResult {
     adapter(provider).send_initial_prompt(session, prompt_path, deadline)
 }
 

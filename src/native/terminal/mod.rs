@@ -116,11 +116,56 @@ pub(super) enum CloseOutcome {
     Missing,
 }
 
+#[derive(Debug)]
+pub(super) struct TerminalSendFailure {
+    error: anyhow::Error,
+    delivery_may_have_occurred: bool,
+}
+
+impl TerminalSendFailure {
+    pub(super) fn not_sent(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            delivery_may_have_occurred: false,
+        }
+    }
+
+    pub(super) fn delivery_uncertain(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            delivery_may_have_occurred: true,
+        }
+    }
+
+    pub(super) fn delivery_may_have_occurred(&self) -> bool {
+        self.delivery_may_have_occurred
+    }
+
+    pub(super) fn error(&self) -> &anyhow::Error {
+        &self.error
+    }
+
+    pub(super) fn into_error(self) -> anyhow::Error {
+        self.error
+    }
+}
+
+pub(super) type TerminalSendResult = std::result::Result<(), TerminalSendFailure>;
+
 #[cfg(any(windows, test))]
 pub(super) fn windows_console_helper_reports_missing(message: &str) -> bool {
     matches!(
         message.trim(),
         "console process is no longer available" | "Error: console process is no longer available"
+    )
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn windows_console_helper_reports_send_not_started(message: &str) -> bool {
+    matches!(
+        message.trim(),
+        "Windows console submission delays do not fit inside the remaining turn timeout"
+            | "Error: Windows console submission delays do not fit inside the remaining turn timeout"
     )
 }
 
@@ -238,7 +283,7 @@ pub(super) fn send_file(
     session: &TerminalSession,
     prompt_path: &Path,
     deadline: Instant,
-) -> Result<()> {
+) -> TerminalSendResult {
     #[cfg(windows)]
     {
         windows::send_file(session, prompt_path, deadline)
@@ -246,6 +291,7 @@ pub(super) fn send_file(
     #[cfg(not(windows))]
     {
         platform::send_file(session, prompt_path, deadline)
+            .map_err(TerminalSendFailure::delivery_uncertain)
     }
 }
 
@@ -361,10 +407,33 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::macos;
     use super::{
-        TerminalKind, TerminalSession, bind_surface_before_start, classify_macos_terminal,
-        select_macos_terminal,
+        TerminalKind, TerminalSendFailure, TerminalSession, bind_surface_before_start,
+        classify_macos_terminal, select_macos_terminal,
+        windows_console_helper_reports_send_not_started,
     };
     use anyhow::bail;
+
+    #[test]
+    fn terminal_send_failure_distinguishes_not_started_from_uncertain_delivery() {
+        let not_started = TerminalSendFailure::not_sent(anyhow::anyhow!("deadline exhausted"));
+        assert!(!not_started.delivery_may_have_occurred());
+        assert_eq!(not_started.error().to_string(), "deadline exhausted");
+
+        let uncertain =
+            TerminalSendFailure::delivery_uncertain(anyhow::anyhow!("helper timed out"));
+        assert!(uncertain.delivery_may_have_occurred());
+        assert_eq!(uncertain.error().to_string(), "helper timed out");
+    }
+
+    #[test]
+    fn windows_helper_budget_rejection_proves_send_never_started() {
+        assert!(windows_console_helper_reports_send_not_started(
+            "Error: Windows console submission delays do not fit inside the remaining turn timeout"
+        ));
+        assert!(!windows_console_helper_reports_send_not_started(
+            "Error: Windows console control helper timed out"
+        ));
+    }
 
     #[test]
     fn macos_terminal_detection_recognizes_each_supported_host() {

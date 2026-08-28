@@ -822,7 +822,7 @@ fn run_ask(request: AskRequest) -> Result<()> {
     let initial_prompt_transport = provider::initial_prompt_transport(request.provider);
     let mut expected_turn_id = None;
     if initial_prompt_transport == provider::InitialPromptTransport::TerminalPasteAfterLaunch {
-        let mut delivery_started = false;
+        let mut delivery_may_have_occurred = false;
         let delivery = (|| -> Result<()> {
             wait_for_status(
                 &created.directory,
@@ -868,13 +868,18 @@ fn run_ask(request: AskRequest) -> Result<()> {
                 terminal_session.kind,
                 send_timeout,
             )?;
-            delivery_started = true;
-            provider::send_initial_prompt(
+            match provider::send_initial_prompt(
                 request.provider,
                 &terminal_session,
                 prompt_file.path(),
                 deadline,
-            )?;
+            ) {
+                Ok(()) => delivery_may_have_occurred = true,
+                Err(failure) => {
+                    delivery_may_have_occurred = failure.delivery_may_have_occurred();
+                    return Err(failure.into_error());
+                }
+            }
             initial_claim.retain_in_place();
             fs::remove_file(&initial_prompt_path)
                 .context("failed to remove the delivered initial prompt")?;
@@ -884,7 +889,7 @@ fn run_ask(request: AskRequest) -> Result<()> {
             record_initial_prompt_delivery_failure(
                 &created.directory,
                 &mut initial_claim,
-                delivery_started,
+                delivery_may_have_occurred,
                 &error,
             );
             return Err(error).with_context(|| {
@@ -917,7 +922,7 @@ fn run_ask(request: AskRequest) -> Result<()> {
                 .context("failed to read the preserved initial prompt")?;
             let bridge_executable =
                 std::env::current_exe().context("failed to locate agent-bridge executable")?;
-            let transport_timeout = remaining_turn_timeout(deadline, request.timeout)?;
+            remaining_turn_timeout(deadline, request.timeout)?;
             update_status(&created.directory, "working", None, None)?;
             match provider::send_cross_session_message(
                 request.provider,
@@ -927,7 +932,7 @@ fn run_ask(request: AskRequest) -> Result<()> {
                     provider_path: &created.manifest.provider_path,
                     request_id: &request_id,
                     prompt: &prompt,
-                    timeout: transport_timeout,
+                    deadline,
                 },
             ) {
                 Ok(()) => {
@@ -1543,14 +1548,17 @@ fn run_tell(request: TellRequest) -> Result<()> {
                     )
                 });
             }
-            if let Err(error) = provider::send_terminal_follow_up(
+            if let Err(failure) = provider::send_terminal_follow_up(
                 provider,
                 &terminal_session,
                 prompt_file.path(),
                 deadline,
             ) {
-                claim.retain_in_place();
-                let _ = update_status(&directory, "working", None, Some(format!("{error:#}")));
+                if !failure.delivery_may_have_occurred() {
+                    let _ = provider::cancel_terminal_follow_up(provider, &directory, &claim_token);
+                }
+                record_follow_up_terminal_delivery_failure(&directory, &mut claim, &failure);
+                let error = failure.into_error();
                 return Err(error)
                     .with_context(|| {
                         format!(
@@ -1568,7 +1576,7 @@ fn run_tell(request: TellRequest) -> Result<()> {
             }
         }
         provider::FollowUpTransport::ProviderCrossSessionMessage => {
-            let transport_timeout = remaining_turn_timeout(deadline, request.timeout)?;
+            remaining_turn_timeout(deadline, request.timeout)?;
             let request_id = provider::new_cross_session_turn_id(provider)?;
             let bridge_executable =
                 std::env::current_exe().context("failed to locate agent-bridge executable")?;
@@ -1581,7 +1589,7 @@ fn run_tell(request: TellRequest) -> Result<()> {
                     provider_path: &manifest.provider_path,
                     request_id: &request_id,
                     prompt: &prompt,
-                    timeout: transport_timeout,
+                    deadline,
                 },
             ) {
                 if failure.delivery_may_have_occurred() {
@@ -3011,6 +3019,18 @@ fn record_initial_prompt_delivery_failure(
         let _ = update_status(directory, "working", None, Some(error));
     } else {
         let _ = update_status(directory, "failed", None, Some(error));
+    }
+}
+
+fn record_follow_up_terminal_delivery_failure(
+    directory: &Path,
+    claim: &mut TurnClaim,
+    failure: &terminal::TerminalSendFailure,
+) {
+    if failure.delivery_may_have_occurred() {
+        claim.retain_in_place();
+        let error = terminal_safe_text(&format!("{:#}", failure.error()), true);
+        let _ = update_status(directory, "working", None, Some(error));
     }
 }
 

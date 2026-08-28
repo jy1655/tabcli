@@ -3,7 +3,6 @@ use super::{
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
     LaunchPlan, NativeProviderAdapter,
 };
-use agent_bridge::checked_deadline_from;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -149,8 +148,10 @@ impl NativeProviderAdapter for ClaudeAdapter {
         _session: &terminal::TerminalSession,
         _prompt_path: &Path,
         _deadline: Instant,
-    ) -> Result<()> {
-        bail!("Claude initial prompts do not use terminal paste")
+    ) -> terminal::TerminalSendResult {
+        Err(terminal::TerminalSendFailure::not_sent(anyhow::anyhow!(
+            "Claude initial prompts do not use terminal paste"
+        )))
     }
 
     fn terminal_initial_prompt(&self, _directory: &Path, _prompt: &str) -> Result<String> {
@@ -201,8 +202,10 @@ impl NativeProviderAdapter for ClaudeAdapter {
         _session: &terminal::TerminalSession,
         _prompt_path: &Path,
         _deadline: Instant,
-    ) -> Result<()> {
-        bail!("Claude follow-up prompts do not use terminal paste")
+    ) -> terminal::TerminalSendResult {
+        Err(terminal::TerminalSendFailure::not_sent(anyhow::anyhow!(
+            "Claude follow-up prompts do not use terminal paste"
+        )))
     }
 
     fn prepare_terminal_follow_up(
@@ -532,19 +535,16 @@ fn send_cross_session_message_with_discovery_retry_policy(
     retry_window: Duration,
     retry_delay: Duration,
 ) -> CrossSessionMessageResult {
-    let started = Instant::now();
-    let deadline = checked_deadline_from(started, context.timeout)
-        .map_err(CrossSessionMessageFailure::not_sent)?;
+    let deadline = context.deadline;
     let mut retry_deadline = None;
     loop {
         let now = Instant::now();
-        let Some(timeout) = deadline.checked_duration_since(now) else {
+        if now >= deadline {
             return Err(CrossSessionMessageFailure::not_sent(anyhow::anyhow!(
                 "Claude cross-session discovery exhausted the total delivery timeout"
             )));
-        };
-        let result =
-            send_cross_session_message_inner(CrossSessionMessageContext { timeout, ..context });
+        }
+        let result = send_cross_session_message_inner(context);
         let should_retry = result
             .as_ref()
             .is_err_and(|failure| failure.should_retry_discovery());
@@ -570,8 +570,7 @@ fn send_cross_session_message_with_discovery_retry_policy(
 fn send_cross_session_message_inner(
     context: CrossSessionMessageContext<'_>,
 ) -> CrossSessionMessageResult {
-    let deadline = checked_deadline_from(Instant::now(), context.timeout)
-        .map_err(CrossSessionMessageFailure::not_sent)?;
+    let deadline = context.deadline;
     let plan = cross_session_message_plan(context.directory, context.request_id, context.prompt)
         .map_err(CrossSessionMessageFailure::not_sent)?;
     let _guard_files =
@@ -1584,7 +1583,7 @@ mod tests {
             provider_path: &executable,
             request_id: "claude-turn-safe123",
             prompt: "follow-up secret",
-            timeout: Duration::from_secs(2),
+            deadline: Instant::now() + Duration::from_secs(2),
         })
         .unwrap();
 
@@ -1621,11 +1620,42 @@ mod tests {
             provider_path: &executable,
             request_id: "claude-turn-safe123",
             prompt: "follow-up secret",
-            timeout: Duration::from_secs(2),
+            deadline: Instant::now() + Duration::from_secs(2),
         })
         .unwrap_err();
 
         assert!(!error.delivery_may_have_occurred());
+        assert!(!directory.join(PENDING_TURN_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_cross_session_deadline_never_starts_the_messenger() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-safe123");
+        std::fs::create_dir(&directory).unwrap();
+        let executable = root.path().join("fake-claude");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf started > \"$PWD/messenger-started\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = send_cross_session_message(CrossSessionMessageContext {
+            bridge_executable: Path::new("/opt/agent-bridge"),
+            directory: &directory,
+            provider_path: &executable,
+            request_id: "claude-turn-safe123",
+            prompt: "follow-up secret",
+            deadline: Instant::now(),
+        })
+        .unwrap_err();
+
+        assert!(!error.delivery_may_have_occurred());
+        assert!(!directory.join("messenger-started").exists());
         assert!(!directory.join(PENDING_TURN_FILE).exists());
     }
 
@@ -1642,7 +1672,7 @@ mod tests {
             &executable,
             concat!(
                 "#!/bin/sh\n",
-                "(sleep 0.4; printf late > \"$PWD/late-delivery\") &\n",
+                "(sleep 2.5; printf late > \"$PWD/late-delivery\") &\n",
                 "cat >/dev/null\n",
                 "sleep 5\n"
             ),
@@ -1657,13 +1687,13 @@ mod tests {
             provider_path: &executable,
             request_id: "claude-turn-safe123",
             prompt: "follow-up secret",
-            timeout: Duration::from_millis(100),
+            deadline: Instant::now() + Duration::from_secs(2),
         })
         .unwrap_err();
 
         assert!(error.delivery_may_have_occurred());
-        assert!(started.elapsed() < Duration::from_millis(300));
-        thread::sleep(Duration::from_millis(500));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        thread::sleep(Duration::from_millis(700));
         assert!(!directory.join("late-delivery").exists());
     }
 
@@ -1752,7 +1782,7 @@ mod tests {
             provider_path: &executable,
             request_id: "claude-turn-safe123",
             prompt: "follow-up secret",
-            timeout: Duration::from_secs(2),
+            deadline: Instant::now() + Duration::from_secs(2),
         })
         .unwrap();
 
@@ -1811,7 +1841,7 @@ mod tests {
                 provider_path: &executable,
                 request_id: "claude-turn-safe123",
                 prompt: "follow-up secret",
-                timeout: Duration::from_secs(2),
+                deadline: Instant::now() + Duration::from_secs(2),
             },
             Duration::from_millis(50),
             Duration::from_millis(10),
@@ -1851,7 +1881,7 @@ mod tests {
             provider_path: &executable,
             request_id: "claude-turn-safe123",
             prompt: "follow-up secret",
-            timeout: Duration::from_secs(2),
+            deadline: Instant::now() + Duration::from_secs(2),
         })
         .unwrap_err();
 

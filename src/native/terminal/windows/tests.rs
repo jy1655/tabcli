@@ -1,8 +1,8 @@
 use super::security::private_sddl;
 use super::{
     build_console_input_records, console_command_line, console_creation_flags,
-    query_process_identity, resolve_executable_from_path, verify_control_process_identity,
-    verify_process_identity,
+    open_verified_control_process, query_process_identity, query_process_identity_from_handle,
+    resolve_executable_from_path, verify_control_process_identity, verify_process_identity,
 };
 use std::fs;
 use std::os::windows::{
@@ -10,9 +10,10 @@ use std::os::windows::{
     process::CommandExt,
 };
 use std::time::{Duration, Instant};
+use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Console::INPUT_RECORD;
-use windows_sys::Win32::System::Threading::{CREATE_SUSPENDED, OpenProcess};
+use windows_sys::Win32::System::Threading::{CREATE_SUSPENDED, OpenProcess, WaitForSingleObject};
 use windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE;
 
 #[test]
@@ -99,6 +100,34 @@ fn process_identity_rejects_reused_pid_creation_time() {
             &identity.executable_path,
         )
         .is_err()
+    );
+}
+
+#[test]
+fn verified_control_handle_retains_the_exact_process_object_after_exit() {
+    let mut child = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 30",
+        ])
+        .spawn()
+        .unwrap();
+    let identity = query_process_identity(child.id()).unwrap();
+    let retained = open_verified_control_process(child.id(), &identity).unwrap();
+    assert_eq!(
+        query_process_identity_from_handle(retained.as_raw_handle()).unwrap(),
+        identity
+    );
+
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    assert_eq!(
+        unsafe { WaitForSingleObject(retained.as_raw_handle(), 0) },
+        WAIT_OBJECT_0
     );
 }
 

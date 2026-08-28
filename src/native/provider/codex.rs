@@ -43,20 +43,13 @@ impl NativeProviderAdapter for CodexAdapter {
         let claim_token = super::super::current_turn_claim_token(context.directory)?
             .context("Codex launch has no native turn claim")?;
         let pending = install_pending_turn(context.directory, &claim_token)?;
-        let notify = serde_json::to_string(&[
-            context.bridge_executable.to_string_lossy().as_ref(),
-            "native-hook",
-            "codex",
-        ])?;
-        let mut arguments = vec![
-            OsString::from("-c"),
-            OsString::from(format!("notify={notify}")),
-            OsString::from("-C"),
-            codex_workspace_argument(context.workspace, cfg!(windows)),
-        ];
-        if !cfg!(windows) {
-            arguments.push(OsString::from(correlated_prompt(context.prompt, &pending)));
-        }
+        let arguments = codex_launch_arguments(
+            context.bridge_executable,
+            context.workspace,
+            context.prompt,
+            &pending,
+            cfg!(windows),
+        )?;
         Ok(LaunchPlan {
             arguments,
             prompt_is_positional: false,
@@ -84,7 +77,7 @@ impl NativeProviderAdapter for CodexAdapter {
         session: &terminal::TerminalSession,
         prompt_path: &Path,
         deadline: Instant,
-    ) -> Result<()> {
+    ) -> terminal::TerminalSendResult {
         terminal::send_file(session, prompt_path, deadline)
     }
 
@@ -158,7 +151,7 @@ impl NativeProviderAdapter for CodexAdapter {
         session: &terminal::TerminalSession,
         prompt_path: &Path,
         deadline: Instant,
-    ) -> Result<()> {
+    ) -> terminal::TerminalSendResult {
         terminal::send_file(session, prompt_path, deadline)
     }
 
@@ -177,25 +170,30 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 }
 
-fn codex_workspace_argument(workspace: &Path, windows: bool) -> OsString {
+fn codex_launch_arguments(
+    bridge_executable: &Path,
+    workspace: &Path,
+    prompt: &str,
+    pending: &PendingCodexTurn,
+    windows: bool,
+) -> Result<Vec<OsString>> {
+    let notify = serde_json::to_string(&[
+        bridge_executable.to_string_lossy().as_ref(),
+        "native-hook",
+        "codex",
+    ])?;
+    let mut arguments = vec![
+        OsString::from("-c"),
+        OsString::from(format!("notify={notify}")),
+    ];
     if !windows {
-        return workspace.as_os_str().to_owned();
+        arguments.extend([
+            OsString::from("-C"),
+            workspace.as_os_str().to_owned(),
+            OsString::from(correlated_prompt(prompt, pending)),
+        ]);
     }
-    let workspace = workspace.as_os_str().to_string_lossy();
-    if let Some(path) = workspace.strip_prefix(r"\\?\UNC\") {
-        return OsString::from(format!(r"\\{path}"));
-    }
-    if let Some(path) = workspace.strip_prefix(r"\\?\") {
-        let bytes = path.as_bytes();
-        if bytes.len() >= 3
-            && bytes[0].is_ascii_alphabetic()
-            && bytes[1] == b':'
-            && bytes[2] == b'\\'
-        {
-            return OsString::from(path);
-        }
-    }
-    OsString::from(workspace.as_ref())
+    Ok(arguments)
 }
 
 fn validate_claim_token(claim_token: &str) -> Result<()> {
@@ -311,26 +309,33 @@ mod tests {
     }
 
     #[test]
-    fn windows_codex_workspace_argument_removes_only_the_verbatim_prefix() {
+    fn windows_codex_inherits_the_exact_workspace_without_a_c_override() {
+        let pending = PendingCodexTurn::new("1-2-3").unwrap();
+        let workspace = Path::new(r"\\?\C:\repo\trailing.");
+        let windows = codex_launch_arguments(
+            Path::new(r"C:\agent-bridge.exe"),
+            workspace,
+            "prompt",
+            &pending,
+            true,
+        )
+        .unwrap();
+        assert!(!windows.iter().any(|argument| argument == "-C"));
+        assert!(!windows.iter().any(|argument| argument == workspace));
+
+        let non_windows = codex_launch_arguments(
+            Path::new("/opt/agent-bridge"),
+            workspace,
+            "prompt",
+            &pending,
+            false,
+        )
+        .unwrap();
+        assert_eq!(non_windows[2], OsString::from("-C"));
+        assert_eq!(non_windows[3], workspace.as_os_str());
         assert_eq!(
-            codex_workspace_argument(Path::new(r"\\?\C:\repo"), true),
-            OsString::from(r"C:\repo")
-        );
-        assert_eq!(
-            codex_workspace_argument(Path::new(r"\\?\UNC\server\share\repo"), true),
-            OsString::from(r"\\server\share\repo")
-        );
-        assert_eq!(
-            codex_workspace_argument(Path::new(r"C:\repo"), true),
-            OsString::from(r"C:\repo")
-        );
-        assert_eq!(
-            codex_workspace_argument(Path::new(r"\\?\C:\repo"), false),
-            OsString::from(r"\\?\C:\repo")
-        );
-        assert_eq!(
-            codex_workspace_argument(Path::new(r"\\?\Volume{safe}\repo"), true),
-            OsString::from(r"\\?\Volume{safe}\repo")
+            non_windows.last(),
+            Some(&OsString::from(correlated_prompt("prompt", &pending)))
         );
     }
 

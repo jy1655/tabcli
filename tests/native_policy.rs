@@ -229,3 +229,24 @@ fn release_publication_requires_repository_immutable_releases() {
     assert!(guard_step.contains("GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}"));
     assert!(!guard_step.contains("GH_TOKEN: ${{ github.token }}"));
 }
+
+#[test]
+fn release_artifact_job_is_isolated_from_mutable_terminal_app_installs() {
+    let workflow = include_str!("../.github/workflows/release.yml");
+    let build = workflow
+        .find("\n  build:\n")
+        .expect("release workflow has no build job");
+    let publish = workflow
+        .find("\n  publish:\n")
+        .expect("release workflow has no publish job");
+    let build_job = &workflow[build..publish];
+
+    assert!(
+        build_job.contains("needs: [validate, test]"),
+        "artifact build must wait for the isolated release test job"
+    );
+    assert!(
+        !build_job.contains("brew install --cask"),
+        "mutable terminal app installers must not run in the artifact-producing job"
+    );
+}
