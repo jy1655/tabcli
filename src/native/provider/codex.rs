@@ -5,10 +5,14 @@ use super::{
 };
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsString,
+    io::{Read, Seek, SeekFrom},
     path::Path,
+    process::{ExitStatus, Stdio},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -19,6 +23,37 @@ pub(super) static ADAPTER: CodexAdapter = CodexAdapter;
 pub(super) struct CodexAdapter;
 
 const PENDING_TURN_FILE: &str = "codex-pending-turn.json";
+const MAX_NATIVE_QUEUE_OUTPUT_BYTES: usize = 1024 * 1024;
+
+fn codex_version_supports_native_queue(output: &str) -> Result<bool> {
+    let installed = output
+        .split_whitespace()
+        .filter_map(|token| {
+            let candidate = token
+                .trim_matches(|character: char| !character.is_ascii_alphanumeric())
+                .strip_prefix('v')
+                .unwrap_or(
+                    token.trim_matches(|character: char| !character.is_ascii_alphanumeric()),
+                );
+            Version::parse(candidate).ok()
+        })
+        .next()
+        .ok_or_else(|| {
+            anyhow::anyhow!("could not parse a semantic Codex version from {output:?}")
+        })?;
+    Ok(installed >= Version::new(0, 149, 0))
+}
+
+fn valid_codex_thread_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct PendingCodexTurn {
@@ -93,9 +128,10 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 
     fn follow_up_transport(&self) -> FollowUpTransport {
-        // Replace this fallback when the supported Codex CLI exposes a verified
-        // first-party cross-session input path for a live interactive session.
-        FollowUpTransport::TerminalPasteFallback
+        // Remove the terminal fallback only when the minimum supported Codex has queue support,
+        // every supported platform has an official always-available local queue path, and the
+        // queue-to-notify flow has authenticated LIVE evidence for bridge-launched sessions.
+        FollowUpTransport::ProviderCrossSessionMessageWithTerminalPasteFallback
     }
 
     fn new_cross_session_turn_id(&self) -> Result<String> {
@@ -104,11 +140,9 @@ impl NativeProviderAdapter for CodexAdapter {
 
     fn send_cross_session_message(
         &self,
-        _context: CrossSessionMessageContext<'_>,
+        context: CrossSessionMessageContext<'_>,
     ) -> CrossSessionMessageResult {
-        Err(CrossSessionMessageFailure::not_sent(anyhow::anyhow!(
-            "Codex does not support provider cross-session messages"
-        )))
+        send_native_queue_message(context)
     }
 
     fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()> {
@@ -125,9 +159,10 @@ impl NativeProviderAdapter for CodexAdapter {
             Err(_) => return Ok(()),
         };
         let thread_id = codex_owned_string(payload, "thread-id");
-        if let (Some(established), Some(incoming)) =
-            (established_codex_thread(directory)?, thread_id.as_deref())
-            && established != incoming
+        let established_thread = established_codex_thread(directory)?;
+        if established_thread
+            .as_deref()
+            .is_some_and(|established| thread_id.as_deref() != Some(established))
         {
             return Ok(());
         }
@@ -196,6 +231,404 @@ fn codex_launch_arguments(
     Ok(arguments)
 }
 
+fn codex_queue_arguments(
+    thread_id: &str,
+    prompt: &str,
+    pending: &PendingCodexTurn,
+) -> Vec<OsString> {
+    vec![
+        OsString::from("queue"),
+        OsString::from("--thread"),
+        OsString::from(thread_id),
+        OsString::from("--message"),
+        OsString::from(correlated_prompt(prompt, pending)),
+    ]
+}
+
+#[derive(Debug)]
+struct BoundedCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    truncated: bool,
+}
+
+#[derive(Debug)]
+struct CodexCommandFailure {
+    error: anyhow::Error,
+    delivery_may_have_started: bool,
+}
+
+impl CodexCommandFailure {
+    fn not_started(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            delivery_may_have_started: false,
+        }
+    }
+
+    fn started(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            delivery_may_have_started: true,
+        }
+    }
+
+    fn before_resume(error: anyhow::Error, created_suspended: bool) -> Self {
+        Self {
+            error,
+            delivery_may_have_started: !created_suspended,
+        }
+    }
+}
+
+fn send_native_queue_message(context: CrossSessionMessageContext<'_>) -> CrossSessionMessageResult {
+    let manifest = super::super::read_manifest(context.directory)
+        .map_err(CrossSessionMessageFailure::not_sent)?;
+    match codex_version_supports_native_queue(&manifest.provider_version) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(CrossSessionMessageFailure::terminal_fallback(
+                anyhow::anyhow!(
+                    "Codex {} predates native queue support in 0.149.0",
+                    manifest.provider_version
+                ),
+            ));
+        }
+        Err(error) => return Err(CrossSessionMessageFailure::not_sent(error)),
+    }
+    let thread_id = established_codex_thread(context.directory)
+        .map_err(CrossSessionMessageFailure::not_sent)?
+        .ok_or_else(|| {
+            CrossSessionMessageFailure::terminal_fallback(anyhow::anyhow!(
+                "Codex session has no established provider thread id"
+            ))
+        })?;
+    if !valid_codex_thread_id(&thread_id) {
+        return Err(CrossSessionMessageFailure::terminal_fallback(
+            anyhow::anyhow!("Codex session provider identity is not a thread UUID"),
+        ));
+    }
+    // This is a conservative transport-selection gate, not proof that the visible TUI has the
+    // thread loaded. `codex queue` persists accepted input in Codex's own queue store; the notify
+    // hook remains the only completion proof.
+    require_compatible_local_daemon(context, &manifest.provider_version, &manifest.workspace)?;
+
+    let pending =
+        PendingCodexTurn::new(context.request_id).map_err(CrossSessionMessageFailure::not_sent)?;
+    let arguments = codex_queue_arguments(&thread_id, context.prompt, &pending);
+    let mut command = super::super::provider_process::command(
+        context.provider_path,
+        context.directory,
+        arguments,
+    )
+    .map_err(|error| {
+        CrossSessionMessageFailure::terminal_fallback(
+            error.context("failed to prepare the Codex queue command"),
+        )
+    })?;
+    command
+        .current_dir(&manifest.workspace)
+        .env(super::super::SESSION_DIR_ENV, context.directory);
+    write_pending_turn(context.directory, &pending)
+        .map_err(CrossSessionMessageFailure::not_sent)?;
+    let result = match run_bounded_command_until(&mut command, context.deadline, "Codex queue") {
+        Ok(output) => classify_codex_queue_output(
+            output.status.success(),
+            &output.stdout,
+            &output.stderr,
+            output.truncated,
+            &thread_id,
+        ),
+        Err(failure) if !failure.delivery_may_have_started => {
+            Err(CrossSessionMessageFailure::terminal_fallback(failure.error))
+        }
+        Err(failure) => Err(CrossSessionMessageFailure::delivery_uncertain(
+            failure.error,
+        )),
+    };
+    if result
+        .as_ref()
+        .is_err_and(|failure| !failure.delivery_may_have_occurred())
+    {
+        let _ = cancel_pending_turn(context.directory, context.request_id);
+    }
+    result
+}
+
+fn require_compatible_local_daemon(
+    context: CrossSessionMessageContext<'_>,
+    provider_version: &str,
+    workspace: &Path,
+) -> CrossSessionMessageResult {
+    let mut command = super::super::provider_process::command(
+        context.provider_path,
+        context.directory,
+        vec![
+            OsString::from("app-server"),
+            OsString::from("daemon"),
+            OsString::from("version"),
+        ],
+    )
+    .map_err(|error| {
+        CrossSessionMessageFailure::terminal_fallback(
+            error.context("failed to prepare the Codex local daemon probe"),
+        )
+    })?;
+    command
+        .current_dir(workspace)
+        .env(super::super::SESSION_DIR_ENV, context.directory);
+    let output = run_bounded_command_until(&mut command, context.deadline, "Codex daemon probe")
+        .map_err(|failure| CrossSessionMessageFailure::terminal_fallback(failure.error))?;
+    classify_codex_daemon_probe(
+        output.status.success(),
+        &output.stdout,
+        &output.stderr,
+        output.truncated,
+        provider_version,
+    )
+}
+
+fn classify_codex_daemon_probe(
+    success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+    output_truncated: bool,
+    provider_version: &str,
+) -> CrossSessionMessageResult {
+    if output_truncated {
+        return Err(CrossSessionMessageFailure::terminal_fallback(
+            anyhow::anyhow!("Codex daemon probe output exceeded the safety limit"),
+        ));
+    }
+    if !success {
+        return Err(CrossSessionMessageFailure::terminal_fallback(
+            anyhow::anyhow!(
+                "Codex local app-server daemon is unavailable for {provider_version}: {}",
+                String::from_utf8_lossy(stderr).trim()
+            ),
+        ));
+    }
+    let payload: serde_json::Value = serde_json::from_slice(stdout).map_err(|error| {
+        CrossSessionMessageFailure::terminal_fallback(
+            anyhow::Error::new(error).context("Codex daemon probe returned invalid JSON"),
+        )
+    })?;
+    if payload.get("status").and_then(serde_json::Value::as_str) != Some("running") {
+        return Err(CrossSessionMessageFailure::terminal_fallback(
+            anyhow::anyhow!("Codex local app-server daemon did not report running status"),
+        ));
+    }
+    let app_server_version = payload
+        .get("appServerVersion")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            CrossSessionMessageFailure::terminal_fallback(anyhow::anyhow!(
+                "Codex daemon probe did not report an app-server version"
+            ))
+        })?;
+    match codex_version_supports_native_queue(app_server_version) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(CrossSessionMessageFailure::terminal_fallback(
+            anyhow::anyhow!(
+                "Codex local app-server {app_server_version} predates native queue support in 0.149.0"
+            ),
+        )),
+        Err(error) => Err(CrossSessionMessageFailure::terminal_fallback(
+            error.context("Codex daemon reported an invalid app-server version"),
+        )),
+    }
+}
+
+fn run_bounded_command_until(
+    command: &mut std::process::Command,
+    deadline: Instant,
+    label: &str,
+) -> std::result::Result<BoundedCommandOutput, CodexCommandFailure> {
+    if Instant::now() >= deadline {
+        return Err(CodexCommandFailure::not_started(anyhow::anyhow!(
+            "{label} timed out before it started"
+        )));
+    }
+    let mut stdout = tempfile::tempfile()
+        .with_context(|| format!("failed to create bounded stdout storage for {label}"))
+        .map_err(CodexCommandFailure::not_started)?;
+    let mut stderr = tempfile::tempfile()
+        .with_context(|| format!("failed to create bounded stderr storage for {label}"))
+        .map_err(CodexCommandFailure::not_started)?;
+    let stdout_sink = stdout
+        .try_clone()
+        .with_context(|| format!("failed to clone bounded stdout storage for {label}"))
+        .map_err(CodexCommandFailure::not_started)?;
+    let stderr_sink = stderr
+        .try_clone()
+        .with_context(|| format!("failed to clone bounded stderr storage for {label}"))
+        .map_err(CodexCommandFailure::not_started)?;
+    super::super::provider_process::configure_process_tree(command);
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_sink))
+        .stderr(Stdio::from(stderr_sink))
+        .spawn()
+        .with_context(|| format!("failed to start {label}"))
+        .map_err(CodexCommandFailure::not_started)?;
+    let process_tree = match super::super::provider_process::ProviderProcessTree::attach(&child) {
+        Ok(process_tree) => process_tree,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            // Windows creates this child suspended, so an attach failure precedes any delivery.
+            // Unix children are already running here and remain delivery-uncertain.
+            return Err(CodexCommandFailure::before_resume(
+                error.context(format!("failed to contain {label}")),
+                cfg!(windows),
+            ));
+        }
+    };
+    if let Err(error) = process_tree.resume(&child) {
+        terminate_bounded_process(&mut child, &process_tree);
+        return Err(CodexCommandFailure::started(
+            error.context(format!("failed to resume {label}")),
+        ));
+    }
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(20)),
+                );
+            }
+            Ok(None) => {
+                terminate_bounded_process(&mut child, &process_tree);
+                return Err(CodexCommandFailure::started(anyhow::anyhow!(
+                    "{label} timed out"
+                )));
+            }
+            Err(error) => {
+                terminate_bounded_process(&mut child, &process_tree);
+                return Err(CodexCommandFailure::started(
+                    anyhow::Error::new(error).context(format!("failed to wait for {label}")),
+                ));
+            }
+        }
+    };
+    process_tree.terminate();
+    let mut remaining_output_bytes = MAX_NATIVE_QUEUE_OUTPUT_BYTES;
+    let (stdout, stdout_truncated) = read_capped_output(&mut stdout, &mut remaining_output_bytes)
+        .with_context(|| format!("failed to read bounded stdout storage for {label}"))
+        .map_err(CodexCommandFailure::started)?;
+    let (stderr, stderr_truncated) = read_capped_output(&mut stderr, &mut remaining_output_bytes)
+        .with_context(|| format!("failed to read bounded stderr storage for {label}"))
+        .map_err(CodexCommandFailure::started)?;
+    Ok(BoundedCommandOutput {
+        status,
+        stdout,
+        stderr,
+        truncated: stdout_truncated || stderr_truncated,
+    })
+}
+
+fn terminate_bounded_process(
+    child: &mut std::process::Child,
+    process_tree: &super::super::provider_process::ProviderProcessTree,
+) {
+    process_tree.terminate();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn read_capped_output(
+    reader: &mut std::fs::File,
+    remaining_bytes: &mut usize,
+) -> Result<(Vec<u8>, bool)> {
+    reader.seek(SeekFrom::Start(0))?;
+    let mut output = Vec::new();
+    reader
+        .take(remaining_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut output)?;
+    let truncated = output.len() > *remaining_bytes;
+    output.truncate(*remaining_bytes);
+    *remaining_bytes -= output.len();
+    Ok((output, truncated))
+}
+
+fn classify_codex_queue_output(
+    success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+    output_truncated: bool,
+    thread_id: &str,
+) -> CrossSessionMessageResult {
+    if output_truncated {
+        return Err(CrossSessionMessageFailure::delivery_uncertain(
+            anyhow::anyhow!("Codex queue output exceeded the safety limit"),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(stdout);
+    if success {
+        let prefix = "Queued message ";
+        let suffix = format!(" for thread {thread_id}.");
+        let submission_id = stdout
+            .trim()
+            .strip_prefix(prefix)
+            .and_then(|output| output.strip_suffix(&suffix));
+        if submission_id.is_some_and(|id| !id.is_empty() && !id.chars().any(char::is_whitespace)) {
+            return Ok(());
+        }
+        return Err(CrossSessionMessageFailure::delivery_uncertain(
+            anyhow::anyhow!(
+                "Codex queue reported success without the expected thread confirmation"
+            ),
+        ));
+    }
+
+    let stderr = String::from_utf8_lossy(stderr);
+    let target_missing = stderr.contains(&format!("thread not found: {thread_id}"))
+        || stderr.contains(&format!("no rollout found for thread id {thread_id}"));
+    let native_queue_unavailable = stderr
+        .contains("local app-server daemon does not support thread/queue/add")
+        || stderr.contains("user message queue is unavailable")
+        || stderr.contains(
+            "cannot queue through an embedded app server while a local app-server daemon is running",
+        );
+    let rejected_before_enqueue = codex_queue_rejected_before_enqueue(&stderr, thread_id);
+    let error = anyhow::anyhow!("Codex queue failed: {}", stderr.trim());
+    if target_missing || native_queue_unavailable || rejected_before_enqueue {
+        Err(CrossSessionMessageFailure::terminal_fallback(error))
+    } else {
+        Err(CrossSessionMessageFailure::delivery_uncertain(error))
+    }
+}
+
+fn codex_queue_rejected_before_enqueue(stderr: &str, thread_id: &str) -> bool {
+    if !stderr.contains("thread/queue/add failed:") {
+        return false;
+    }
+
+    // Codex returns these before QueuedItemService::enqueue writes to the queue store.
+    let invalid_request = stderr.contains("(code -32600)")
+        && (stderr.contains("invalid thread id:")
+            || stderr.contains(&format!(
+                "ephemeral thread does not support queued submissions: {thread_id}"
+            ))
+            || stderr.contains(&format!("session {thread_id} is archived."))
+            || stderr
+                .contains("direct app-server input is not allowed for multi-agent v2 sub-agents")
+            || stderr.contains(
+                "direct app-server input is not allowed for unloaded spawned sub-agents",
+            )
+            || stderr.contains("queue cannot contain more than "));
+    let input_too_large = stderr.contains("(code -32602)")
+        && stderr.contains("Input exceeds the maximum length of 1048576 characters.");
+    let thread_read_failed =
+        stderr.contains("(code -32603)") && stderr.contains("failed to read thread:");
+    invalid_request || input_too_large || thread_read_failed
+}
+
 fn validate_claim_token(claim_token: &str) -> Result<()> {
     if claim_token.is_empty()
         || claim_token.len() > 160
@@ -210,8 +643,13 @@ fn validate_claim_token(claim_token: &str) -> Result<()> {
 
 fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingCodexTurn> {
     let pending = PendingCodexTurn::new(claim_token)?;
-    super::super::write_json_atomic(&directory.join(PENDING_TURN_FILE), &pending)?;
+    write_pending_turn(directory, &pending)?;
     Ok(pending)
+}
+
+fn write_pending_turn(directory: &Path, pending: &PendingCodexTurn) -> Result<()> {
+    super::super::write_json_atomic(&directory.join(PENDING_TURN_FILE), pending)?;
+    Ok(())
 }
 
 fn read_pending_turn(directory: &Path) -> Result<Option<PendingCodexTurn>> {
@@ -291,11 +729,89 @@ fn established_codex_thread(directory: &Path) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::super::super::{SESSION_SCHEMA, SessionManifest, write_json_atomic};
     use super::super::super::{
         SessionEvent, SessionStatus, TURN_CLAIM_FILE, acquire_turn_claim, event_paths, read_json,
         update_status,
     };
     use super::*;
+
+    #[cfg(unix)]
+    fn write_successful_queue_provider(directory: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let provider = directory.join("fake-codex");
+        std::fs::write(
+            &provider,
+            r#"#!/bin/sh
+if [ "$1" = "app-server" ]; then
+  printf '%s\0' "$@" > "$AGENT_BRIDGE_NATIVE_SESSION_DIR/daemon-argv.bin"
+  pwd > "$AGENT_BRIDGE_NATIVE_SESSION_DIR/daemon-cwd.txt"
+  printf '%s\n' '{"status":"running","appServerVersion":"0.153.2"}'
+  exit 0
+fi
+if [ "$1" = "queue" ]; then
+  printf '%s\0' "$@" > "$AGENT_BRIDGE_NATIVE_SESSION_DIR/queue-argv.bin"
+  pwd > "$AGENT_BRIDGE_NATIVE_SESSION_DIR/queue-cwd.txt"
+  printf 'Queued message queued-id for thread %s.\n' "$3"
+  exit 0
+fi
+exit 91
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        provider
+    }
+
+    #[cfg(unix)]
+    fn write_queue_manifest(directory: &Path, provider: &Path, version: &str) {
+        write_queue_manifest_for_workspace(directory, provider, version, directory);
+    }
+
+    #[cfg(unix)]
+    fn write_queue_manifest_for_workspace(
+        directory: &Path,
+        provider: &Path,
+        version: &str,
+        workspace: &Path,
+    ) {
+        write_json_atomic(
+            &directory.join("manifest.json"),
+            &SessionManifest {
+                schema: SESSION_SCHEMA,
+                id: "session-codexqueue".to_owned(),
+                provider: "codex".to_owned(),
+                provider_path: provider.to_owned(),
+                provider_version: version.to_owned(),
+                workspace: workspace.to_owned(),
+                title: "Codex queue test".to_owned(),
+                model: None,
+                effort: None,
+                yolo: false,
+                created_unix_ms: 1,
+            },
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_established_thread(directory: &Path, thread_id: &str) {
+        std::fs::create_dir_all(directory.join("events")).unwrap();
+        write_json_atomic(
+            &directory.join("events/event-1.json"),
+            &SessionEvent {
+                provider: "codex".to_owned(),
+                message: "initial result".to_owned(),
+                error: None,
+                provider_session_id: Some(thread_id.to_owned()),
+                turn_id: Some("initial-turn".to_owned()),
+                created_unix_ms: 1,
+            },
+        )
+        .unwrap();
+    }
 
     fn claim_pending_turn(directory: &Path) -> PendingCodexTurn {
         let claim = acquire_turn_claim(directory).unwrap();
@@ -306,6 +822,500 @@ mod tests {
 
     fn marked(message: &str, pending: &PendingCodexTurn) -> String {
         format!("{message}\n{}", pending.marker)
+    }
+
+    #[test]
+    fn codex_native_queue_requires_version_0_149_or_newer() {
+        for version in ["codex-cli 0.147.0", "codex-cli 0.148.9"] {
+            assert!(!codex_version_supports_native_queue(version).unwrap());
+        }
+        for version in ["codex-cli 0.149.0", "codex-cli 0.153.2"] {
+            assert!(codex_version_supports_native_queue(version).unwrap());
+        }
+        assert!(codex_version_supports_native_queue("codex unknown").is_err());
+    }
+
+    #[test]
+    fn codex_daemon_probe_requires_a_running_compatible_app_server() {
+        assert!(
+            classify_codex_daemon_probe(
+                true,
+                br#"{"status":"running","appServerVersion":"0.149.0"}"#,
+                b"",
+                false,
+                "codex-cli 0.153.2",
+            )
+            .is_ok()
+        );
+
+        for (success, stdout, stderr, truncated) in [
+            (false, b"".as_slice(), b"socket missing".as_slice(), false),
+            (
+                true,
+                br#"{"status":"running","appServerVersion":"0.153.2"}"#.as_slice(),
+                b"".as_slice(),
+                true,
+            ),
+            (true, b"not json".as_slice(), b"".as_slice(), false),
+            (
+                true,
+                br#"{"status":"stopped","appServerVersion":"0.153.2"}"#.as_slice(),
+                b"".as_slice(),
+                false,
+            ),
+            (
+                true,
+                br#"{"status":"running"}"#.as_slice(),
+                b"".as_slice(),
+                false,
+            ),
+            (
+                true,
+                br#"{"status":"running","appServerVersion":"0.148.9"}"#.as_slice(),
+                b"".as_slice(),
+                false,
+            ),
+        ] {
+            let failure = classify_codex_daemon_probe(
+                success,
+                stdout,
+                stderr,
+                truncated,
+                "codex-cli 0.153.2",
+            )
+            .unwrap_err();
+            assert!(failure.allows_terminal_fallback());
+            assert!(!failure.delivery_may_have_occurred());
+        }
+    }
+
+    #[test]
+    fn codex_command_failure_distinguishes_creation_from_possible_delivery() {
+        let suspended =
+            CodexCommandFailure::before_resume(anyhow::anyhow!("containment failed"), true);
+        assert!(!suspended.delivery_may_have_started);
+
+        let already_running =
+            CodexCommandFailure::before_resume(anyhow::anyhow!("containment failed"), false);
+        assert!(already_running.delivery_may_have_started);
+    }
+
+    #[test]
+    fn codex_native_queue_uses_the_authoritative_thread_and_claim_marker() {
+        let pending = PendingCodexTurn::new("1-2-3").unwrap();
+        assert_eq!(
+            codex_queue_arguments(
+                "018f0000-0000-7000-8000-000000000001",
+                "follow up",
+                &pending
+            ),
+            vec![
+                OsString::from("queue"),
+                OsString::from("--thread"),
+                OsString::from("018f0000-0000-7000-8000-000000000001"),
+                OsString::from("--message"),
+                OsString::from(correlated_prompt("follow up", &pending)),
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_queue_accepts_only_the_expected_thread_confirmation() {
+        let thread_id = "018f0000-0000-7000-8000-000000000001";
+        assert!(
+            classify_codex_queue_output(
+                true,
+                format!("Queued message queued-id for thread {thread_id}.\n").as_bytes(),
+                b"",
+                false,
+                thread_id,
+            )
+            .is_ok()
+        );
+
+        for (stdout, truncated) in [
+            (b"unexpected success".as_slice(), false),
+            (b"".as_slice(), true),
+        ] {
+            let failure =
+                classify_codex_queue_output(true, stdout, b"", truncated, thread_id).unwrap_err();
+            assert!(failure.delivery_may_have_occurred());
+            assert!(!failure.allows_terminal_fallback());
+        }
+    }
+
+    #[test]
+    fn codex_queue_falls_back_only_for_explicit_pre_delivery_unavailability() {
+        let thread_id = "018f0000-0000-7000-8000-000000000001";
+        for stderr in [
+            format!(
+                "Error: failed to queue session message: thread/queue/add failed: thread not found: {thread_id} (code -32600)"
+            ),
+            "Error: the local app-server daemon does not support thread/queue/add; update or restart the local app-server daemon: failed to queue session message: thread/queue/add failed: Method not found (code -32601)".to_owned(),
+            "Error: failed to queue session message: thread/queue/add failed: user message queue is unavailable (code -32600)".to_owned(),
+            format!(
+                "Error: failed to queue session message: thread/queue/add failed: ephemeral thread does not support queued submissions: {thread_id} (code -32600)"
+            ),
+            format!(
+                "Error: failed to queue session message: thread/queue/add failed: session {thread_id} is archived. Run `codex unarchive {thread_id}` to unarchive it first. (code -32600)"
+            ),
+            "Error: failed to queue session message: thread/queue/add failed: direct app-server input is not allowed for multi-agent v2 sub-agents (code -32600)".to_owned(),
+            "Error: failed to queue session message: thread/queue/add failed: direct app-server input is not allowed for unloaded spawned sub-agents (code -32600)".to_owned(),
+            "Error: failed to queue session message: thread/queue/add failed: queue cannot contain more than 100 submissions (code -32600)".to_owned(),
+            "Error: failed to queue session message: thread/queue/add failed: Input exceeds the maximum length of 1048576 characters. (code -32602)".to_owned(),
+            "Error: failed to queue session message: thread/queue/add failed: failed to read thread: database unavailable (code -32603)".to_owned(),
+        ] {
+            let failure =
+                classify_codex_queue_output(false, b"", stderr.as_bytes(), false, thread_id)
+                    .unwrap_err();
+            assert!(failure.allows_terminal_fallback(), "{stderr}");
+            assert!(!failure.delivery_may_have_occurred(), "{stderr}");
+        }
+
+        let failure = classify_codex_queue_output(
+            false,
+            b"",
+            b"Error: failed to queue session message: thread/queue/add transport error: transport closed after request",
+            false,
+            thread_id,
+        )
+        .unwrap_err();
+        assert!(failure.delivery_may_have_occurred());
+        assert!(!failure.allows_terminal_fallback());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_native_queue_runs_the_provider_command_with_the_claim_marker() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-codexqueue");
+        std::fs::create_dir(&directory).unwrap();
+        let provider = write_successful_queue_provider(&directory);
+        write_queue_manifest(&directory, &provider, "codex-cli 0.153.2");
+        let thread_id = "018f0000-0000-7000-8000-000000000001";
+        write_established_thread(&directory, thread_id);
+        update_status(&directory, "working", None, None).unwrap();
+        let claim = acquire_turn_claim(&directory).unwrap();
+        let claim_token = claim.token.clone();
+        claim.retain();
+
+        ADAPTER
+            .send_cross_session_message(CrossSessionMessageContext {
+                bridge_executable: Path::new("/unused/agent-bridge"),
+                directory: &directory,
+                provider_path: &provider,
+                request_id: &claim_token,
+                prompt: "follow up",
+                deadline: Instant::now() + Duration::from_secs(2),
+            })
+            .unwrap();
+
+        let arguments = std::fs::read(directory.join("queue-argv.bin")).unwrap();
+        let arguments = arguments
+            .split(|byte| *byte == 0)
+            .filter(|value| !value.is_empty())
+            .map(|value| String::from_utf8(value.to_vec()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &arguments[..4],
+            ["queue", "--thread", thread_id, "--message"]
+        );
+        assert_eq!(
+            arguments[4],
+            format!(
+                "follow up\n\n[Agent Bridge Codex turn metadata; do not include this metadata in the response]\n<!-- agent-bridge-codex-turn:{claim_token} -->"
+            )
+        );
+        let daemon_arguments = std::fs::read(directory.join("daemon-argv.bin")).unwrap();
+        let daemon_arguments = daemon_arguments
+            .split(|byte| *byte == 0)
+            .filter(|value| !value.is_empty())
+            .map(|value| String::from_utf8(value.to_vec()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(daemon_arguments, ["app-server", "daemon", "version"]);
+        assert!(directory.join(PENDING_TURN_FILE).is_file());
+        assert!(directory.join(TURN_CLAIM_FILE).is_file());
+        assert_eq!(event_paths(&directory).unwrap().len(), 1);
+
+        let pending = read_pending_turn(&directory).unwrap().unwrap();
+        let completion = serde_json::json!({
+            "type": "agent-turn-complete",
+            "thread-id": thread_id,
+            "turn-id": "queued-turn",
+            "input-messages": [correlated_prompt("follow up", &pending)],
+            "last-assistant-message": "queued result",
+        });
+        ADAPTER.handle_hook(&directory, &completion).unwrap();
+        let paths = event_paths(&directory).unwrap();
+        assert_eq!(paths.len(), 2);
+        let event: SessionEvent = read_json(paths.last().unwrap()).unwrap();
+        assert_eq!(event.message, "queued result");
+        assert_eq!(event.provider_session_id.as_deref(), Some(thread_id));
+        assert!(!directory.join(TURN_CLAIM_FILE).exists());
+        let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+        assert_eq!(status.state, "ready");
+
+        ADAPTER.handle_hook(&directory, &completion).unwrap();
+        assert_eq!(event_paths(&directory).unwrap().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_queue_and_daemon_probe_run_in_the_original_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-codexqueue");
+        let workspace = root.path().join("original-workspace");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let provider = write_successful_queue_provider(&directory);
+        write_queue_manifest_for_workspace(&directory, &provider, "codex-cli 0.153.2", &workspace);
+        write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
+        let claim = acquire_turn_claim(&directory).unwrap();
+        let claim_token = claim.token.clone();
+        claim.retain();
+
+        ADAPTER
+            .send_cross_session_message(CrossSessionMessageContext {
+                bridge_executable: Path::new("/unused/agent-bridge"),
+                directory: &directory,
+                provider_path: &provider,
+                request_id: &claim_token,
+                prompt: "follow up",
+                deadline: Instant::now() + Duration::from_secs(2),
+            })
+            .unwrap();
+
+        let expected = format!("{}\n", workspace.canonicalize().unwrap().display());
+        assert_eq!(
+            std::fs::read_to_string(directory.join("daemon-cwd.txt")).unwrap(),
+            expected
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.join("queue-cwd.txt")).unwrap(),
+            expected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_queue_falls_back_before_start_for_old_versions_or_missing_threads() {
+        for (version, include_thread) in [("codex-cli 0.148.9", true), ("codex-cli 0.153.2", false)]
+        {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("session-codexqueue");
+            std::fs::create_dir(&directory).unwrap();
+            let provider = directory.join("provider-must-not-run");
+            write_queue_manifest(&directory, &provider, version);
+            if include_thread {
+                write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
+            }
+            let claim = acquire_turn_claim(&directory).unwrap();
+            let claim_token = claim.token.clone();
+            claim.retain();
+
+            let failure = ADAPTER
+                .send_cross_session_message(CrossSessionMessageContext {
+                    bridge_executable: Path::new("/unused/agent-bridge"),
+                    directory: &directory,
+                    provider_path: &provider,
+                    request_id: &claim_token,
+                    prompt: "follow up",
+                    deadline: Instant::now() + Duration::from_secs(1),
+                })
+                .unwrap_err();
+
+            assert!(failure.allows_terminal_fallback(), "{version}");
+            assert!(!failure.delivery_may_have_occurred(), "{version}");
+            assert!(!directory.join(PENDING_TURN_FILE).exists(), "{version}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_queue_never_treats_a_non_uuid_provider_identity_as_a_session_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-codexqueue");
+        std::fs::create_dir(&directory).unwrap();
+        let provider = directory.join("provider-must-not-run");
+        std::fs::write(
+            &provider,
+            r#"#!/bin/sh
+: > "$AGENT_BRIDGE_NATIVE_SESSION_DIR/provider-ran"
+exit 91
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_queue_manifest(&directory, &provider, "codex-cli 0.153.2");
+        write_established_thread(&directory, "human-readable-session-name");
+        let claim = acquire_turn_claim(&directory).unwrap();
+        let claim_token = claim.token.clone();
+        claim.retain();
+
+        let failure = ADAPTER
+            .send_cross_session_message(CrossSessionMessageContext {
+                bridge_executable: Path::new("/unused/agent-bridge"),
+                directory: &directory,
+                provider_path: &provider,
+                request_id: &claim_token,
+                prompt: "follow up",
+                deadline: Instant::now() + Duration::from_secs(1),
+            })
+            .unwrap_err();
+
+        assert!(failure.allows_terminal_fallback());
+        assert!(!failure.delivery_may_have_occurred());
+        assert!(
+            !directory.join("provider-ran").exists(),
+            "native queue attempted to resolve a non-UUID target as an exact session name"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_queue_does_not_run_when_the_local_daemon_gate_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-codexqueue");
+        std::fs::create_dir(&directory).unwrap();
+        let provider = directory.join("fake-codex");
+        std::fs::write(
+            &provider,
+            r#"#!/bin/sh
+if [ "$1" = "app-server" ]; then
+  printf '%s\0' "$@" > "$AGENT_BRIDGE_NATIVE_SESSION_DIR/daemon-argv.bin"
+  printf '%s\n' 'daemon socket is missing' >&2
+  exit 1
+fi
+if [ "$1" = "queue" ]; then
+  : > "$AGENT_BRIDGE_NATIVE_SESSION_DIR/queue-ran"
+fi
+exit 91
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_queue_manifest(&directory, &provider, "codex-cli 0.153.2");
+        write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
+        let claim = acquire_turn_claim(&directory).unwrap();
+        let claim_token = claim.token.clone();
+        claim.retain();
+
+        let failure = ADAPTER
+            .send_cross_session_message(CrossSessionMessageContext {
+                bridge_executable: Path::new("/unused/agent-bridge"),
+                directory: &directory,
+                provider_path: &provider,
+                request_id: &claim_token,
+                prompt: "follow up",
+                deadline: Instant::now() + Duration::from_secs(1),
+            })
+            .unwrap_err();
+
+        assert!(failure.allows_terminal_fallback());
+        assert!(!failure.delivery_may_have_occurred());
+        assert!(!directory.join("queue-ran").exists());
+        assert!(!directory.join(PENDING_TURN_FILE).exists());
+        let daemon_arguments = std::fs::read(directory.join("daemon-argv.bin")).unwrap();
+        assert_eq!(
+            daemon_arguments,
+            b"app-server\0daemon\0version\0".as_slice()
+        );
+    }
+
+    #[test]
+    fn codex_command_output_reader_enforces_its_byte_limit() {
+        let mut exact = tempfile::tempfile().unwrap();
+        exact.set_len(MAX_NATIVE_QUEUE_OUTPUT_BYTES as u64).unwrap();
+        let mut remaining = MAX_NATIVE_QUEUE_OUTPUT_BYTES;
+        let (output, truncated) = read_capped_output(&mut exact, &mut remaining).unwrap();
+        assert_eq!(output.len(), MAX_NATIVE_QUEUE_OUTPUT_BYTES);
+        assert!(!truncated);
+        assert_eq!(remaining, 0);
+
+        let mut oversized = tempfile::tempfile().unwrap();
+        oversized
+            .set_len((MAX_NATIVE_QUEUE_OUTPUT_BYTES + 1) as u64)
+            .unwrap();
+        let mut remaining = MAX_NATIVE_QUEUE_OUTPUT_BYTES;
+        let (output, truncated) = read_capped_output(&mut oversized, &mut remaining).unwrap();
+        assert_eq!(output.len(), MAX_NATIVE_QUEUE_OUTPUT_BYTES);
+        assert!(truncated);
+        assert_eq!(remaining, 0);
+
+        let mut stdout = tempfile::tempfile().unwrap();
+        stdout
+            .set_len((MAX_NATIVE_QUEUE_OUTPUT_BYTES / 2 + 1) as u64)
+            .unwrap();
+        let mut stderr = tempfile::tempfile().unwrap();
+        stderr
+            .set_len((MAX_NATIVE_QUEUE_OUTPUT_BYTES / 2 + 1) as u64)
+            .unwrap();
+        let mut remaining = MAX_NATIVE_QUEUE_OUTPUT_BYTES;
+        let (stdout, stdout_truncated) = read_capped_output(&mut stdout, &mut remaining).unwrap();
+        let (stderr, stderr_truncated) = read_capped_output(&mut stderr, &mut remaining).unwrap();
+        assert!(stdout.len() + stderr.len() <= MAX_NATIVE_QUEUE_OUTPUT_BYTES);
+        assert!(stdout_truncated || stderr_truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_queue_timeout_terminates_wrapper_descendants_and_retains_the_claim() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-codexqueue");
+        std::fs::create_dir(&directory).unwrap();
+        let provider = directory.join("fake-codex");
+        std::fs::write(
+            &provider,
+            r#"#!/bin/sh
+if [ "$1" = "app-server" ]; then
+  printf '%s\n' '{"status":"running","appServerVersion":"0.153.2"}'
+  exit 0
+fi
+if [ "$1" = "queue" ]; then
+  : > "$AGENT_BRIDGE_NATIVE_SESSION_DIR/queue-started"
+  (
+    sleep 0.80
+    : > "$AGENT_BRIDGE_NATIVE_SESSION_DIR/descendant-survived"
+  ) &
+  wait
+fi
+exit 91
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_queue_manifest(&directory, &provider, "codex-cli 0.153.2");
+        write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
+        let claim = acquire_turn_claim(&directory).unwrap();
+        let claim_token = claim.token.clone();
+        claim.retain();
+
+        let failure = ADAPTER
+            .send_cross_session_message(CrossSessionMessageContext {
+                bridge_executable: Path::new("/unused/agent-bridge"),
+                directory: &directory,
+                provider_path: &provider,
+                request_id: &claim_token,
+                prompt: "follow up",
+                deadline: Instant::now() + Duration::from_millis(500),
+            })
+            .unwrap_err();
+
+        assert!(failure.delivery_may_have_occurred());
+        assert!(!failure.allows_terminal_fallback());
+        assert!(directory.join(PENDING_TURN_FILE).is_file());
+        assert!(directory.join("queue-started").is_file());
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !directory.join("descendant-survived").exists(),
+            "a timed-out provider wrapper left a message-delivery descendant running"
+        );
     }
 
     #[test]
@@ -414,6 +1424,42 @@ mod tests {
                     "thread-id": "title-thread",
                     "turn-id": "title-turn",
                     "last-assistant-message": "{\"title\":\"Generated title\"}",
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(event_paths(directory.path()).unwrap().len(), 1);
+        assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state, "working");
+    }
+
+    #[test]
+    fn codex_hook_requires_the_established_thread_id_on_a_queued_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let initial_pending = claim_pending_turn(directory.path());
+        ADAPTER
+            .handle_hook(
+                directory.path(),
+                &serde_json::json!({
+                    "thread-id": "managed-thread",
+                    "turn-id": "managed-turn-1",
+                    "last-assistant-message": marked("managed result", &initial_pending),
+                }),
+            )
+            .unwrap();
+        let pending = claim_pending_turn(directory.path());
+        update_status(directory.path(), "claimed", None, None).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+
+        ADAPTER
+            .handle_hook(
+                directory.path(),
+                &serde_json::json!({
+                    "turn-id": "unproven-turn",
+                    "last-assistant-message": marked("unproven result", &pending),
                 }),
             )
             .unwrap();

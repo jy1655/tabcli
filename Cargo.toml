@@ -1,6 +1,6 @@
 [package]
 name = "agent-bridge"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 description = "Visible terminal bridge for Codex, Claude, Agy, and Pi CLIs"
 license = "MIT"

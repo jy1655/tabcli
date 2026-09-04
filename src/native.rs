@@ -1447,6 +1447,29 @@ fn verified_terminal_shell_process_group(
     Ok(live_shell.process_group)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CrossSessionFailureAction {
+    TerminalFallback,
+    RetainClaim,
+    ReturnError,
+}
+
+fn cross_session_failure_action(
+    transport: provider::FollowUpTransport,
+    failure: &provider::CrossSessionMessageFailure,
+) -> CrossSessionFailureAction {
+    if transport
+        == provider::FollowUpTransport::ProviderCrossSessionMessageWithTerminalPasteFallback
+        && failure.allows_terminal_fallback()
+    {
+        CrossSessionFailureAction::TerminalFallback
+    } else if failure.delivery_may_have_occurred() {
+        CrossSessionFailureAction::RetainClaim
+    } else {
+        CrossSessionFailureAction::ReturnError
+    }
+}
+
 fn run_tell(request: TellRequest) -> Result<()> {
     let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
     let directory = session_directory(&request.id)?;
@@ -1476,123 +1499,72 @@ fn run_tell(request: TellRequest) -> Result<()> {
     let mut expected_turn_id = None;
     match follow_up_transport {
         provider::FollowUpTransport::TerminalPasteFallback => {
-            let prepared_prompt = (|| -> Result<tempfile::NamedTempFile> {
-                let correlated_prompt = provider::prepare_terminal_follow_up(
-                    provider,
-                    &directory,
-                    &prompt,
-                    &claim_token,
-                )?;
-                let mut prompt_file = tempfile::Builder::new()
-                    .prefix("pending-prompt-")
-                    .suffix(".txt")
-                    .tempfile_in(&directory)?;
-                set_private_file_permissions(prompt_file.as_file())?;
-                prompt_file.write_all(&terminal_input_bytes(
-                    terminal_session.kind,
-                    &correlated_prompt,
-                ))?;
-                prompt_file.flush()?;
-                verify_terminal_surface_ownership_until(
-                    &directory,
-                    &request.id,
-                    &terminal_session,
-                    deadline,
-                    request.timeout,
-                )?;
-                Ok(prompt_file)
-            })();
-            let prompt_file = match prepared_prompt {
-                Ok(prompt_file) => prompt_file,
-                Err(error) => {
-                    let _ = provider::cancel_terminal_follow_up(provider, &directory, &claim_token);
-                    return Err(error)
-                        .with_context(|| {
-                            format!(
-                                "failed to prepare input for visible {} session {}",
-                                terminal_session.kind.display_name(),
-                                request.id
-                            )
-                        })
-                        .with_context(|| {
-                            format!(
-                                "provider follow-up transport {} failed",
-                                follow_up_transport.as_str()
-                            )
-                        });
-                }
-            };
-            update_status(&directory, "working", None, None)?;
-            let send_timeout = match remaining_turn_timeout(deadline, request.timeout) {
-                Ok(timeout) => timeout,
-                Err(error) => {
-                    let _ = provider::cancel_terminal_follow_up(provider, &directory, &claim_token);
-                    return Err(error).with_context(|| {
-                        format!(
-                            "provider follow-up transport {} exhausted its total timeout before delivery",
-                            follow_up_transport.as_str()
-                        )
-                    });
-                }
-            };
-            if let Err(error) = provider::validate_terminal_send_budget(
+            deliver_terminal_follow_up(
                 provider,
-                terminal_session.kind,
-                send_timeout,
-            ) {
-                let _ = provider::cancel_terminal_follow_up(provider, &directory, &claim_token);
-                return Err(error).with_context(|| {
-                    format!(
-                        "provider follow-up transport {} cannot start inside its remaining total timeout",
-                        follow_up_transport.as_str()
-                    )
-                });
-            }
-            if let Err(failure) = provider::send_terminal_follow_up(
-                provider,
+                follow_up_transport,
+                &directory,
+                &request.id,
                 &terminal_session,
-                prompt_file.path(),
+                &prompt,
+                &claim_token,
+                &mut claim,
                 deadline,
-            ) {
-                if !failure.delivery_may_have_occurred() {
-                    let _ = provider::cancel_terminal_follow_up(provider, &directory, &claim_token);
-                }
-                record_follow_up_terminal_delivery_failure(&directory, &mut claim, &failure);
-                let error = failure.into_error();
-                return Err(error)
-                    .with_context(|| {
-                        format!(
-                            "failed to type into visible {} session {}",
-                            terminal_session.kind.display_name(),
-                            request.id
-                        )
-                    })
-                    .with_context(|| {
-                        format!(
-                            "provider follow-up transport {} failed",
-                            follow_up_transport.as_str()
-                        )
-                    });
-            }
+                request.timeout,
+            )?;
         }
-        provider::FollowUpTransport::ProviderCrossSessionMessage => {
+        provider::FollowUpTransport::ProviderCrossSessionMessage
+        | provider::FollowUpTransport::ProviderCrossSessionMessageWithTerminalPasteFallback => {
             remaining_turn_timeout(deadline, request.timeout)?;
-            let request_id = provider::new_cross_session_turn_id(provider)?;
+            let provider_turn_id = if follow_up_transport
+                == provider::FollowUpTransport::ProviderCrossSessionMessage
+            {
+                Some(provider::new_cross_session_turn_id(provider)?)
+            } else {
+                None
+            };
+            let correlation_id = provider_turn_id.as_deref().unwrap_or(&claim_token);
             let bridge_executable =
                 std::env::current_exe().context("failed to locate agent-bridge executable")?;
             update_status(&directory, "working", None, None)?;
-            if let Err(failure) = provider::send_cross_session_message(
+            match provider::send_cross_session_message(
                 provider,
                 provider::CrossSessionMessageContext {
                     bridge_executable: &bridge_executable,
                     directory: &directory,
                     provider_path: &manifest.provider_path,
-                    request_id: &request_id,
+                    request_id: correlation_id,
                     prompt: &prompt,
                     deadline,
                 },
             ) {
-                if failure.delivery_may_have_occurred() {
+                Ok(()) => expected_turn_id = provider_turn_id,
+                Err(failure)
+                    if cross_session_failure_action(follow_up_transport, &failure)
+                        == CrossSessionFailureAction::TerminalFallback =>
+                {
+                    let unavailable = failure.into_error();
+                    deliver_terminal_follow_up(
+                        provider,
+                        follow_up_transport,
+                        &directory,
+                        &request.id,
+                        &terminal_session,
+                        &prompt,
+                        &claim_token,
+                        &mut claim,
+                        deadline,
+                        request.timeout,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "provider native follow-up was unavailable ({unavailable:#}); terminal fallback also failed"
+                        )
+                    })?;
+                }
+                Err(failure)
+                    if cross_session_failure_action(follow_up_transport, &failure)
+                        == CrossSessionFailureAction::RetainClaim =>
+                {
                     let error = failure.into_error();
                     claim.retain_in_place();
                     return Err(error).with_context(|| {
@@ -1602,21 +1574,22 @@ fn run_tell(request: TellRequest) -> Result<()> {
                         )
                     });
                 }
-                let error = failure.into_error();
-                let _ = update_status(
-                    &directory,
-                    &previous_state,
-                    None,
-                    Some(format!("{error:#}")),
-                );
-                return Err(error).with_context(|| {
-                    format!(
-                        "provider follow-up transport {} failed",
-                        follow_up_transport.as_str()
-                    )
-                });
+                Err(failure) => {
+                    let error = failure.into_error();
+                    let _ = update_status(
+                        &directory,
+                        &previous_state,
+                        None,
+                        Some(format!("{error:#}")),
+                    );
+                    return Err(error).with_context(|| {
+                        format!(
+                            "provider follow-up transport {} failed",
+                            follow_up_transport.as_str()
+                        )
+                    });
+                }
             }
-            expected_turn_id = Some(request_id);
         }
     }
     claim.retain();
@@ -1646,6 +1619,109 @@ fn run_tell(request: TellRequest) -> Result<()> {
         provider,
         Some(&event),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deliver_terminal_follow_up(
+    provider: FirstPartyCli,
+    follow_up_transport: provider::FollowUpTransport,
+    directory: &Path,
+    session_id: &str,
+    terminal_session: &terminal::TerminalSession,
+    prompt: &str,
+    claim_token: &str,
+    claim: &mut TurnClaim,
+    deadline: Instant,
+    requested_timeout: Duration,
+) -> Result<()> {
+    let prepared_prompt = (|| -> Result<tempfile::NamedTempFile> {
+        let correlated_prompt =
+            provider::prepare_terminal_follow_up(provider, directory, prompt, claim_token)?;
+        let mut prompt_file = tempfile::Builder::new()
+            .prefix("pending-prompt-")
+            .suffix(".txt")
+            .tempfile_in(directory)?;
+        set_private_file_permissions(prompt_file.as_file())?;
+        prompt_file.write_all(&terminal_input_bytes(
+            terminal_session.kind,
+            &correlated_prompt,
+        ))?;
+        prompt_file.flush()?;
+        verify_terminal_surface_ownership_until(
+            directory,
+            session_id,
+            terminal_session,
+            deadline,
+            requested_timeout,
+        )?;
+        Ok(prompt_file)
+    })();
+    let prompt_file = match prepared_prompt {
+        Ok(prompt_file) => prompt_file,
+        Err(error) => {
+            let _ = provider::cancel_terminal_follow_up(provider, directory, claim_token);
+            return Err(error)
+                .with_context(|| {
+                    format!(
+                        "failed to prepare input for visible {} session {session_id}",
+                        terminal_session.kind.display_name()
+                    )
+                })
+                .with_context(|| {
+                    format!(
+                        "provider follow-up transport {} failed",
+                        follow_up_transport.as_str()
+                    )
+                });
+        }
+    };
+    update_status(directory, "working", None, None)?;
+    let send_timeout = match remaining_turn_timeout(deadline, requested_timeout) {
+        Ok(timeout) => timeout,
+        Err(error) => {
+            let _ = provider::cancel_terminal_follow_up(provider, directory, claim_token);
+            return Err(error).with_context(|| {
+                format!(
+                    "provider follow-up transport {} exhausted its total timeout before delivery",
+                    follow_up_transport.as_str()
+                )
+            });
+        }
+    };
+    if let Err(error) =
+        provider::validate_terminal_send_budget(provider, terminal_session.kind, send_timeout)
+    {
+        let _ = provider::cancel_terminal_follow_up(provider, directory, claim_token);
+        return Err(error).with_context(|| {
+            format!(
+                "provider follow-up transport {} cannot start inside its remaining total timeout",
+                follow_up_transport.as_str()
+            )
+        });
+    }
+    if let Err(failure) =
+        provider::send_terminal_follow_up(provider, terminal_session, prompt_file.path(), deadline)
+    {
+        if !failure.delivery_may_have_occurred() {
+            let _ = provider::cancel_terminal_follow_up(provider, directory, claim_token);
+        }
+        record_follow_up_terminal_delivery_failure(directory, claim, &failure);
+        let error = failure.into_error();
+        return Err(error)
+            .with_context(|| {
+                format!(
+                    "failed to type into visible {} session {session_id}",
+                    terminal_session.kind.display_name()
+                )
+            })
+            .with_context(|| {
+                format!(
+                    "provider follow-up transport {} failed",
+                    follow_up_transport.as_str()
+                )
+            });
+    }
+    Ok(())
 }
 
 fn remaining_turn_timeout(deadline: Instant, requested: Duration) -> Result<Duration> {
