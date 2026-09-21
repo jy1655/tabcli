@@ -1566,7 +1566,9 @@ fn run_tell(request: TellRequest) -> Result<()> {
                         == CrossSessionFailureAction::RetainClaim =>
                 {
                     let error = failure.into_error();
-                    claim.retain_in_place();
+                    record_follow_up_cross_session_delivery_uncertainty(
+                        &directory, &mut claim, &error,
+                    );
                     return Err(error).with_context(|| {
                         format!(
                             "provider follow-up transport {} could not confirm delivery; the turn remains claimed until the target reports completion or the session is explicitly closed",
@@ -3192,6 +3194,26 @@ fn record_follow_up_terminal_delivery_failure(
         let error = terminal_safe_text(&format!("{:#}", failure.error()), true);
         let _ = update_status(directory, "working", None, Some(error));
     }
+}
+
+// A turn that stays claimed looks like ordinary work from the state alone, so the status
+// keeps the reason until the target completes the turn or the session is closed. The target
+// can complete a delivered turn before its sender stops settling; the session status then
+// belongs to whichever turn holds the claim now, not to this report.
+fn record_follow_up_cross_session_delivery_uncertainty(
+    directory: &Path,
+    claim: &mut TurnClaim,
+    error: &anyhow::Error,
+) {
+    claim.retain_in_place();
+    let Ok(_lock) = lock_turn_claim(&claim.path) else {
+        return;
+    };
+    if !matches!(current_turn_claim_token(directory), Ok(Some(token)) if token == claim.token) {
+        return;
+    }
+    let error = terminal_safe_text(&format!("{error:#}"), true);
+    let _ = update_status(directory, "working", None, Some(error));
 }
 
 impl Drop for TurnClaim {
