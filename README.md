@@ -236,6 +236,19 @@ cargo test --test native_live \
   -- --ignored --exact --nocapture
 ```
 
+### 릴리스 리허설
+
+Release workflow는 `v*` tag push로 실행되며 그 경로만 릴리스를 만들고 게시합니다. 같은 workflow를 `workflow_dispatch`로 실행하면 이미 있는 tag에 대한 리허설이 됩니다. 리허설은 tag 검증, macOS·Windows test, 두 release archive의 build, checksum과 archive 구성 검증까지 모두 실행하지만 릴리스를 만들거나 게시하지 않습니다.
+
+tag 검증은 tag가 원격에서 annotated tag인지, tag가 가리키는 commit이 checkout된 commit과 같고 `main`에 포함되는지, tag·Cargo version·릴리스 노트 파일이 일치하는지를 확인합니다. annotated tag 여부를 로컬 ref가 아니라 GitHub API로 확인하는 이유는 `actions/checkout`이 로컬 tag ref를 commit으로 바꿔 놓기 때문입니다.
+
+```sh
+gh workflow run release.yml -f tag=v0.0.5
+gh workflow run release.yml --ref <branch> -f tag=v0.0.5
+```
+
+첫 명령은 `main`의 workflow로 리허설하며, 둘째 명령은 workflow를 고친 branch의 workflow로 리허설하여 merge 전에 변경을 검증할 때 씁니다. Release workflow나 release packaging을 바꿨을 때는 새 tag를 push하기 전에 리허설을 먼저 실행합니다. 리허설에서는 `IMMUTABLE_RELEASES_READ_TOKEN` secret이 없어도 경고만 남기고 계속하지만, 실제 tag push에서는 같은 secret이 없거나 저장소의 immutable releases 설정을 확인할 수 없으면 test와 build를 시작하기 전에 실패하고 게시 직전에 같은 확인을 다시 합니다. 게시 단계는 draft에 올라간 asset의 이름과 digest를 build 결과와 대조한 뒤 게시하고, 게시된 릴리스가 immutable인지 확인합니다.
+
 ## License
 
 [MIT](LICENSE)

@@ -70,3 +70,8 @@ launch, observe, continue, and close without replacing the capabilities those CL
   and `git diff --check` before claiming completion.
 - Tests requiring authenticated CLIs and visible terminal surfaces remain manual live
   tests; do not represent ignored live tests as runtime verification.
+- For Release workflow or release packaging changes, run the rehearsal
+  (`gh workflow run release.yml --ref <branch> -f tag=<existing tag>`) and read its
+  result before relying on a tag push. Only a tag push publishes, a published release is
+  immutable, and `actions/checkout` rewrites the local tag ref to the commit, so tag
+  properties are verified through the GitHub API rather than local refs.

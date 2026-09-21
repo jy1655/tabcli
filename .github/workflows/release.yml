@@ -81,6 +81,7 @@ jobs:
             --jq 'select(.enabled == true) | .enabled' | grep -qx true
 
   test:
+    needs: validate
     env:
       RUSTUP_TOOLCHAIN: 1.97.1
     strategy:

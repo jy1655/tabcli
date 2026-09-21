@@ -294,6 +294,10 @@ fn release_stops_before_building_when_immutable_releases_cannot_be_confirmed() {
     assert!(gate_step.contains("GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}"));
     assert!(!gate_step.contains("GH_TOKEN: ${{ github.token }}"));
     assert!(
+        release_workflow_job(&workflow, "test", "build").contains("\n    needs: validate\n"),
+        "tests must not spend runners before the gate has passed"
+    );
+    assert!(
         release_workflow_job(&workflow, "build", "publish").contains("needs: [validate, test]"),
         "artifacts must not be built before the gate has passed"
     );
