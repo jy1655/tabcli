@@ -1618,10 +1618,13 @@ mod tests {
                 .any(|value| value.contains("literal follow-up"))
         );
         assert!(!plan.stdin.contains("literal follow-up"));
+        assert_eq!(
+            plan.files.settings,
+            Path::new("/tmp/session-safe123")
+                .join("claude-message-settings.claude-turn-safe123.json")
+        );
         assert!(arguments.windows(2).any(|pair| {
-            pair[0] == "--settings"
-                && pair[1]
-                    == "/tmp/session-safe123/claude-message-settings.claude-turn-safe123.json"
+            pair[0] == "--settings" && Path::new(pair[1].as_ref()) == plan.files.settings
         }));
         let envelope: serde_json::Value = serde_json::from_str(&plan.stdin).unwrap();
         assert_eq!(envelope["recipient"], "session-safe123");
