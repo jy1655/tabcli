@@ -2352,6 +2352,59 @@ fn follow_up_terminal_send_failure_releases_only_confirmed_not_started_claims() 
 }
 
 #[test]
+fn follow_up_cross_session_uncertainty_keeps_the_claim_and_records_its_reason() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "ready", None, None).unwrap();
+    let (mut claim, _) = acquire_ready_turn_claim(directory.path(), "session-test").unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+
+    record_follow_up_cross_session_delivery_uncertainty(
+        directory.path(),
+        &mut claim,
+        &anyhow::anyhow!("executed input was not reported").context("delivery unconfirmed"),
+    );
+    drop(claim);
+
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "working");
+    assert_eq!(
+        status.error.as_deref(),
+        Some("delivery unconfirmed: executed input was not reported")
+    );
+    assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+}
+
+#[test]
+fn late_cross_session_uncertainty_cannot_write_into_a_newer_turn() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "ready", None, None).unwrap();
+    let (mut delivered, _) = acquire_ready_turn_claim(directory.path(), "session-test").unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    // The target completed the delivered turn while its sender was still settling.
+    release_turn_claim(directory.path()).unwrap();
+    update_status(directory.path(), "ready", None, None).unwrap();
+    let (newer, _) = acquire_ready_turn_claim(directory.path(), "session-test").unwrap();
+
+    record_follow_up_cross_session_delivery_uncertainty(
+        directory.path(),
+        &mut delivered,
+        &anyhow::anyhow!("late report for the completed turn"),
+    );
+    drop(delivered);
+
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "claimed");
+    assert_eq!(status.error, None);
+    assert_eq!(
+        current_turn_claim_token(directory.path()).unwrap(),
+        Some(newer.token.clone())
+    );
+    newer.retain();
+}
+
+#[test]
 fn event_commit_does_not_create_a_racy_latest_cache() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();

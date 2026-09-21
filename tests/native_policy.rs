@@ -20,6 +20,28 @@ fn claude_message_guard_control_fails_closed_without_managed_state() {
 }
 
 #[test]
+fn claude_message_receipt_control_records_nothing_without_managed_state() {
+    let state = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        .args([
+            "native-provider-control",
+            "claude",
+            "message-receipt",
+            "claude-turn-safe123",
+        ])
+        .env_remove("AGENT_BRIDGE_NATIVE_SESSION_DIR")
+        .env("AGENT_BRIDGE_NATIVE_STATE_DIR", state.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+
+    // A PostToolUse hook cannot undo a send; failing leaves the delivery unconfirmed.
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(std::fs::read_dir(state.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn supported_cli_versions_use_a_minimum_not_an_exact_pin() {
     assert!(cli_version_is_supported(FirstPartyCli::Codex, "codex-cli 0.147.0").unwrap());
     assert!(cli_version_is_supported(FirstPartyCli::Codex, "codex-cli 0.148.3").unwrap());

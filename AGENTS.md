@@ -45,6 +45,20 @@ launch, observe, continue, and close without replacing the capabilities those CL
 - Do not emulate Claude result correlation with a generic message hash. Identical valid
   responses can occur in separate turns; correlation must use Claude-owned identity or a
   provider-specific protocol with an explicit replacement boundary.
+- Keep the follow-up payload out of the messenger model. The provider can stop or refuse
+  a model response that carries arbitrary prompt text, which truncates the payload or
+  skips `SendMessage` (observed 2026-09-18 with Claude Code 2.1.276-2.1.278). The
+  messenger presents only a per-request reference, the `PreToolUse` guard supplies the
+  addressed payload through the official `updatedInput`, and delivery counts only when
+  the `PostToolUse` report of the executed input matches that payload.
+- `SendMessage` is not permission-gated, even in `dontAsk` mode, and Claude discards the
+  output of a hook that outlives its timeout and then runs the call unguarded. Neither a
+  missing guard approval, the guard's own decision, nor an error result proves that
+  nothing was sent: retry only when the guard approved nothing, Claude reported no
+  executed call, and Claude itself reported every `SendMessage` call in the stream as
+  blocked before it ran (denied with the guard's reason, or stopped by the provider).
+- Give every request its own messenger files. The target can complete a delivered turn,
+  and the next `tell` can start, while the previous sender is still settling.
 
 ## Change and Verification Rules
 
