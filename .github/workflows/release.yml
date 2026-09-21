@@ -4,9 +4,19 @@ on:
   push:
     tags:
       - "v*"
+  # A rehearsal runs every check and build for an existing tag and never publishes.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to rehearse, for example v0.0.5
+        required: true
+        type: string
 
 permissions:
   contents: read
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
   validate:
@@ -17,25 +27,58 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
           fetch-depth: 0
           persist-credentials: false
       - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
-          tag_version="${GITHUB_REF_NAME#v}"
+          fail() { echo "::error::$*"; exit 1; }
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "release tag '$RELEASE_TAG' is not vMAJOR.MINOR.PATCH"
+          tag_version="${RELEASE_TAG#v}"
           cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
-          test -n "$tag_version"
-          test "$tag_version" = "$cargo_version"
-          test "$(git cat-file -t "$GITHUB_REF_NAME")" = "tag"
-          tag_commit="$(git rev-list -n 1 "$GITHUB_REF_NAME")"
-          test "$tag_commit" = "$(git rev-parse "$GITHUB_SHA^{commit}")"
-          git fetch --no-tags origin main:refs/remotes/origin/main
-          git merge-base --is-ancestor "$tag_commit" origin/main
+          test "$tag_version" = "$cargo_version" || fail "tag $RELEASE_TAG does not match Cargo version $cargo_version"
+          # actions/checkout rewrites the local tag ref to the commit, and no credentials
+          # remain for another fetch, so the annotated tag is verified on the remote.
+          read -r ref_type ref_sha < <(gh api "repos/${GH_REPO}/git/ref/tags/${RELEASE_TAG}" --jq '[.object.type, .object.sha] | @tsv') \
+            || fail "tag $RELEASE_TAG does not exist on the remote"
+          test "$ref_type" = "tag" || fail "tag $RELEASE_TAG is not an annotated tag"
+          read -r tag_name target_type tag_commit < <(gh api "repos/${GH_REPO}/git/tags/${ref_sha}" --jq '[.tag, .object.type, .object.sha] | @tsv') \
+            || fail "annotated tag object $ref_sha could not be read"
+          test "$tag_name" = "$RELEASE_TAG" || fail "tag object names '$tag_name'"
+          test "$target_type" = "commit" || fail "tag $RELEASE_TAG points at a $target_type"
+          test "$tag_commit" = "$(git rev-parse 'HEAD^{commit}')" || fail "checked-out commit is not the commit of $RELEASE_TAG"
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            test "$tag_commit" = "$(git rev-parse "$GITHUB_SHA^{commit}")" || fail "pushed ref is not the commit of $RELEASE_TAG"
+          fi
+          git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null || fail "origin/main was not fetched"
+          git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main || fail "commit of $RELEASE_TAG is not contained in main"
           notes="docs/releases/$tag_version.md"
-          test -f "$notes"
+          test -f "$notes" || fail "$notes is missing"
           echo "version=$tag_version" >> "$GITHUB_OUTPUT"
           echo "notes=$notes" >> "$GITHUB_OUTPUT"
+      - name: Require immutable releases before building
+        env:
+          GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+              echo "::warning::IMMUTABLE_RELEASES_READ_TOKEN is not configured; a real release stops here."
+              exit 0
+            fi
+            echo "::error::IMMUTABLE_RELEASES_READ_TOKEN is not configured."
+            exit 1
+          fi
+          gh api "repos/${GH_REPO}/immutable-releases" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            --jq 'select(.enabled == true) | .enabled' | grep -qx true
 
   test:
     env:
@@ -48,6 +91,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
           persist-credentials: false
       - name: Install pinned Rust toolchain
         shell: pwsh
@@ -80,6 +124,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
           persist-credentials: false
       - name: Install pinned Rust toolchain
         shell: pwsh
@@ -146,6 +191,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
           persist-credentials: false
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
@@ -158,8 +204,8 @@ jobs:
           cd dist
           test "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" = "4"
           sha256sum -c ./*.sha256
-          test "$(tar -tzf agent-bridge-${{ needs.validate.outputs.version }}-aarch64-apple-darwin.tar.gz | sort | tr '\n' ' ')" = "LICENSE agent-bridge "
-          test "$(unzip -Z1 agent-bridge-${{ needs.validate.outputs.version }}-x86_64-pc-windows-msvc.zip | sort | tr '\n' ' ')" = "LICENSE agent-bridge.exe "
+          test "$(tar -tzf agent-bridge-${{ needs.validate.outputs.version }}-aarch64-apple-darwin.tar.gz | LC_ALL=C sort | tr '\n' ' ')" = "LICENSE agent-bridge "
+          test "$(unzip -Z1 agent-bridge-${{ needs.validate.outputs.version }}-x86_64-pc-windows-msvc.zip | LC_ALL=C sort | tr '\n' ' ')" = "LICENSE agent-bridge.exe "
       - name: Require immutable releases before publication
         env:
           GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
@@ -167,29 +213,40 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$GH_TOKEN"
+          if [ -z "$GH_TOKEN" ]; then
+            if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+              echo "::warning::IMMUTABLE_RELEASES_READ_TOKEN is not configured; a real release stops here."
+              exit 0
+            fi
+            echo "::error::IMMUTABLE_RELEASES_READ_TOKEN is not configured."
+            exit 1
+          fi
           gh api "repos/${GH_REPO}/immutable-releases" \
             -H "X-GitHub-Api-Version: 2026-03-10" \
             --jq 'select(.enabled == true) | .enabled' | grep -qx true
       - name: Publish verified release assets
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: >-
-          gh release create "$GITHUB_REF_NAME" dist/*
+          gh release create "$RELEASE_TAG" dist/*
           --verify-tag
           --generate-notes
           --notes-file "${{ needs.validate.outputs.notes }}"
-          --title "$GITHUB_REF_NAME"
+          --title "$RELEASE_TAG"
           --draft
       - name: Verify draft assets and publish
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
-          expected="$(find dist -maxdepth 1 -type f -exec basename {} \; | sort)"
-          actual="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | sort)"
+          expected="$(cd dist && for asset in *; do echo "$asset sha256:$(sha256sum "$asset" | cut -d ' ' -f 1)"; done | LC_ALL=C sort)"
+          actual="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[] | "\(.name) \(.digest)"' | LC_ALL=C sort)"
           test "$actual" = "$expected"
-          gh release edit "$GITHUB_REF_NAME" --draft=false
+          gh release edit "$RELEASE_TAG" --draft=false
+          # A published release must already be immutable; publication cannot be undone.
+          test "$(gh release view "$RELEASE_TAG" --json isDraft,isImmutable --jq '[.isDraft, .isImmutable] | @tsv')" = "$(printf 'false\ttrue')"

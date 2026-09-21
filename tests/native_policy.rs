@@ -252,6 +252,80 @@ fn release_publication_requires_repository_immutable_releases() {
     assert!(!guard_step.contains("GH_TOKEN: ${{ github.token }}"));
 }
 
+fn release_workflow_job<'a>(workflow: &'a str, job: &str, next_job: &str) -> &'a str {
+    let start = workflow
+        .find(&format!("\n  {job}:\n"))
+        .unwrap_or_else(|| panic!("release workflow has no {job} job"));
+    let end = workflow
+        .find(&format!("\n  {next_job}:\n"))
+        .unwrap_or_else(|| panic!("release workflow has no {next_job} job"));
+    &workflow[start..end]
+}
+
+#[test]
+fn release_validation_checks_the_annotated_tag_on_the_remote() {
+    let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
+    let validate = release_workflow_job(&workflow, "validate", "test");
+
+    // actions/checkout rewrites the local tag ref to the commit and, without persisted
+    // credentials, nothing can be fetched again from a private repository.
+    assert!(validate.contains("persist-credentials: false"));
+    assert!(validate.contains("git/ref/tags/${RELEASE_TAG}"));
+    assert!(validate.contains("git/tags/${ref_sha}"));
+    assert!(validate.contains("is not an annotated tag"));
+    assert!(!validate.contains("git cat-file"));
+    assert!(!validate.contains("git fetch"));
+    assert!(
+        validate.contains("git merge-base --is-ancestor \"$tag_commit\" refs/remotes/origin/main")
+    );
+}
+
+#[test]
+fn release_stops_before_building_when_immutable_releases_cannot_be_confirmed() {
+    let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
+    let validate = release_workflow_job(&workflow, "validate", "test");
+    let gate = validate
+        .find("- name: Require immutable releases before building")
+        .expect("release validation has no early immutable-release gate");
+    let gate_step = &validate[gate..];
+
+    assert!(gate_step.contains("repos/${GH_REPO}/immutable-releases"));
+    assert!(gate_step.contains(".enabled == true"));
+    assert!(gate_step.contains("GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}"));
+    assert!(!gate_step.contains("GH_TOKEN: ${{ github.token }}"));
+    assert!(
+        release_workflow_job(&workflow, "build", "publish").contains("needs: [validate, test]"),
+        "artifacts must not be built before the gate has passed"
+    );
+}
+
+#[test]
+fn release_rehearsal_never_publishes() {
+    let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
+    assert!(workflow.contains("\n  workflow_dispatch:\n"));
+
+    let release_steps = workflow
+        .split("\n      - ")
+        .filter(|step| step.contains("gh release create") || step.contains("gh release edit"))
+        .collect::<Vec<_>>();
+    assert_eq!(release_steps.len(), 2);
+    for step in release_steps {
+        assert!(
+            step.contains("\n        if: github.event_name == 'push'\n"),
+            "a rehearsal could reach: {step}"
+        );
+    }
+
+    // Only a rehearsal may continue without the immutable-release token.
+    for tolerated in workflow.match_indices("exit 0") {
+        let before = &workflow[..tolerated.0];
+        let condition = before
+            .rfind("if [ \"$GITHUB_EVENT_NAME\" = \"workflow_dispatch\" ]; then")
+            .expect("a missing token is tolerated outside a rehearsal");
+        assert!(!before[condition..].contains("\n            fi\n"));
+    }
+}
+
 #[test]
 fn release_artifact_job_is_isolated_from_mutable_terminal_app_installs() {
     let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
