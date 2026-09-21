@@ -240,7 +240,7 @@ cargo test --test native_live \
 
 Release workflow는 `v*` tag push로 실행되며 그 경로만 릴리스를 만들고 게시합니다. 같은 workflow를 `workflow_dispatch`로 실행하면 이미 있는 tag에 대한 리허설이 됩니다. 리허설은 tag 검증, macOS·Windows test, 두 release archive의 build, checksum과 archive 구성 검증까지 모두 실행하지만 릴리스를 만들거나 게시하지 않습니다.
 
-tag 검증은 tag가 원격에서 annotated tag인지, tag가 가리키는 commit이 checkout된 commit과 같고 `main`에 포함되는지, tag·Cargo version·릴리스 노트 파일이 일치하는지를 확인합니다. annotated tag 여부를 로컬 ref가 아니라 GitHub API로 확인하는 이유는 `actions/checkout`이 로컬 tag ref를 commit으로 바꿔 놓기 때문입니다.
+tag 검증은 tag가 원격에서 annotated tag인지, tag가 가리키는 commit이 checkout된 commit과 같고 `main`에 포함되는지, tag·Cargo version·릴리스 노트 파일이 일치하는지를 확인합니다. annotated tag 여부와 tag의 commit은 로컬 ref가 아니라 GitHub API로 확인합니다. 그 이유는 두 가지로, tag push에서 기본 `actions/checkout`은 로컬 tag ref를 commit으로 바꿔 놓고, credential을 남기지 않는 checkout 뒤에는 private 저장소에서 다시 fetch할 수 없기 때문입니다. tag 이름은 검증 job만 해석하며, test·build·게시 job은 tag 이름이 아니라 검증된 commit을 checkout합니다. 실행 도중 tag가 옮겨질 수 있으므로, 게시 job은 draft를 만들기 직전과 게시 직전, 게시 직후에 원격 tag가 여전히 검증된 tag object인지 다시 확인하고, 달라졌으면 릴리스를 만들거나 게시하지 않습니다.
 
 ```sh
 gh workflow run release.yml -f tag=v0.0.5
