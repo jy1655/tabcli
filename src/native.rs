@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests;
 
+mod doctor;
 mod provider;
 mod provider_process;
 mod query;
@@ -59,6 +60,7 @@ pub(crate) enum NativeCommand {
         json: bool,
     },
     Result(query::ResultRequest),
+    Doctor(doctor::DoctorRequest),
     Sessions(SessionsRequest),
     Prune(PruneRequest),
     Close(CloseRequest),
@@ -319,6 +321,7 @@ pub(crate) fn is_command(value: &str) -> bool {
             | "sessions"
             | "inspect"
             | "result"
+            | "doctor"
             | "prune-sessions"
             | "close-session"
             | "native-session"
@@ -343,6 +346,7 @@ where
         "tell" => parse_tell(rest),
         "inspect" => query::parse_inspect(rest),
         "result" => query::parse_result(rest),
+        "doctor" => doctor::parse_args(rest),
         "sessions" => parse_sessions(rest),
         "prune-sessions" => parse_prune(rest),
         "close-session" => parse_close(rest),
@@ -737,6 +741,7 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
         NativeCommand::Tell(request) => run_tell(request),
         NativeCommand::Inspect { id, json } => query::run_inspect(&id, json),
         NativeCommand::Result(request) => query::run_result(request),
+        NativeCommand::Doctor(request) => doctor::run(request),
         NativeCommand::Sessions(request) => run_sessions(request),
         NativeCommand::Prune(request) => run_prune(request),
         NativeCommand::Close(request) => run_close(request),

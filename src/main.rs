@@ -27,6 +27,8 @@ Usage:
   agent-bridge inspect <session> [--json]
   agent-bridge result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
       [--wait --timeout-secs N]
+  agent-bridge doctor <session> [--probe] [--json]
+  agent-bridge doctor --provider <codex|claude|agy|pi> [--probe] [--json]
   agent-bridge prune-sessions --closed-before-days N --explicit [--json]
   agent-bridge close-session <session> --explicit [--json]
   agent-bridge --help | --version
@@ -210,6 +212,7 @@ mod tests {
             "sessions [--workspace PATH]",
             "inspect <session>",
             "result <session>",
+            "doctor <session> [--probe] [--json]",
             "prune-sessions --closed-before-days N --explicit",
             "close-session <session> --explicit",
             "macOS detects Ghostty, iTerm2, or Terminal.app",

@@ -98,7 +98,7 @@ pub(super) fn parse_result(args: &[String]) -> Result<NativeCommand> {
 }
 
 #[derive(Debug)]
-struct SnapshotBusy;
+pub(super) struct SnapshotBusy;
 impl std::fmt::Display for SnapshotBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "session records are changing; retry the read-only query")
@@ -109,16 +109,16 @@ impl std::error::Error for SnapshotBusy {}
 pub(super) struct Snapshot {
     pub(super) manifest: SessionManifest,
     pub(super) status: SessionStatus,
-    receipts: Vec<requests::Receipt>,
-    unreadable_requests: usize,
-    request_index_error: Option<String>,
+    pub(super) receipts: Vec<requests::Receipt>,
+    pub(super) unreadable_requests: usize,
+    pub(super) request_index_error: Option<String>,
     paths: Vec<PathBuf>,
-    claim: Option<String>,
-    pending: Option<PendingTurnCompletion>,
+    pub(super) claim: Option<String>,
+    pub(super) pending: Option<PendingTurnCompletion>,
     _lock: Option<File>,
 }
 
-fn optional_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
+pub(super) fn optional_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
     read_regular_text_if_present(path)?
         .map(|text| {
             serde_json::from_str(&text)
@@ -209,7 +209,7 @@ impl Snapshot {
         optional_json(&directory.join("events").join(name))
     }
 
-    fn result(&self, directory: &Path, selector: &Selector) -> Result<Value> {
+    pub(super) fn result(&self, directory: &Path, selector: &Selector) -> Result<Value> {
         let receipt = match selector {
             Selector::Request(id) => Some(
                 self.receipts
@@ -281,7 +281,7 @@ impl Snapshot {
     }
 }
 
-fn observe_snapshot(directory: &Path) -> Result<Snapshot> {
+pub(super) fn observe_snapshot(directory: &Path) -> Result<Snapshot> {
     let deadline = Instant::now() + Duration::from_millis(250);
     loop {
         match Snapshot::read(directory) {
@@ -294,13 +294,13 @@ fn observe_snapshot(directory: &Path) -> Result<Snapshot> {
 }
 
 #[derive(Default, Serialize)]
-struct OwnerObservation {
-    process_alive: Option<bool>,
-    identity_matches: Option<bool>,
-    error: Option<String>,
+pub(super) struct OwnerObservation {
+    pub(super) process_alive: Option<bool>,
+    pub(super) identity_matches: Option<bool>,
+    pub(super) error: Option<String>,
 }
 
-fn observe_owner(directory: &Path) -> OwnerObservation {
+pub(super) fn observe_owner(directory: &Path) -> OwnerObservation {
     let owner = match optional_json::<NativeSessionOwner>(&directory.join(SESSION_OWNER_FILE)) {
         Ok(Some(owner)) => owner,
         Ok(None) => return OwnerObservation::default(),
@@ -311,6 +311,10 @@ fn observe_owner(directory: &Path) -> OwnerObservation {
             };
         }
     };
+    observe_owner_record(&owner)
+}
+
+pub(super) fn observe_owner_record(owner: &NativeSessionOwner) -> OwnerObservation {
     let observation = OwnerObservation {
         process_alive: Some(process_is_alive(owner.pid)),
         ..OwnerObservation::default()
@@ -324,7 +328,7 @@ fn observe_owner(directory: &Path) -> OwnerObservation {
         && owner.terminal_tty_device.is_some()
         && owner.process_group.is_some()
         && owner.terminal_process_group.is_some())
-    .then(|| mac_native_owner_is_live(&owner));
+    .then(|| mac_native_owner_is_live(owner));
     #[cfg(windows)]
     let identity = owner.windows_process_identity.as_ref().map(|identity| {
         terminal::verify_windows_process_identity(owner.pid, identity).map(|()| true)

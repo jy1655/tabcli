@@ -33,6 +33,15 @@ pub(crate) enum TerminalKind {
 }
 
 impl TerminalKind {
+    pub(super) const fn supported_on_this_platform(self) -> bool {
+        match self {
+            Self::Iterm2 | Self::AppleTerminal => cfg!(target_os = "macos"),
+            Self::WindowsConsole => cfg!(windows),
+            // Ghostty cannot establish creation-time surface ownership in this build.
+            Self::Ghostty => false,
+        }
+    }
+
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Iterm2 => "iterm2",

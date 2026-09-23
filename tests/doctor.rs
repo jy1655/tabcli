@@ -1,0 +1,465 @@
+use serde_json::{Value, json};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Output},
+};
+
+struct Fixture {
+    root: tempfile::TempDir,
+    directory: PathBuf,
+}
+
+impl Fixture {
+    fn new(provider: &str) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-doctor");
+        fs::create_dir(&directory).unwrap();
+        fs::create_dir(directory.join("events")).unwrap();
+        let version = match provider {
+            "codex" => "0.153.2",
+            "claude" => "2.1.280",
+            "agy" => "1.1.12",
+            _ => "0.84.1",
+        };
+        write(
+            &directory.join("manifest.json"),
+            &json!({
+                "schema": 1, "id": "session-doctor", "provider": provider,
+                "provider_path": root.path().join("provider"), "provider_version": version,
+                "workspace": root.path(), "title": "doctor fixture", "model": "recorded-model",
+                "effort": null, "yolo": false, "created_unix_ms": 1
+            }),
+        );
+        write(
+            &directory.join("status.json"),
+            &json!({"state":"ready", "generation":2,
+            "updated_unix_ms":2, "exit_code":null, "error":null}),
+        );
+        Self { root, directory }
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+            .args(args)
+            .env("AGENT_BRIDGE_NATIVE_STATE_DIR", self.root.path())
+            .output()
+            .unwrap()
+    }
+
+    fn doctor(&self) -> Value {
+        report(self.run(&["doctor", "session-doctor", "--json"]))
+    }
+
+    fn claim(&self, error: Option<&str>) {
+        fs::write(self.directory.join("turn.claim"), "123-456-0\n").unwrap();
+        fs::create_dir(self.directory.join("requests")).unwrap();
+        write(
+            &self.directory.join("requests/123-456-0.json"),
+            &json!({
+                "schema":1, "request_id":"request-exact", "claim_token":"123-456-0",
+                "event_file":"event-1.json", "created_unix_ms":3
+            }),
+        );
+        write(
+            &self.directory.join("status.json"),
+            &json!({"state":"working", "generation":3,
+            "updated_unix_ms":3, "exit_code":null, "error":error}),
+        );
+    }
+}
+
+fn write(path: &Path, value: &Value) {
+    fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
+}
+fn report(output: Output) -> Value {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["ok"], true);
+    report
+}
+fn check<'a>(report: &'a Value, id: &str) -> &'a Value {
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == id)
+        .unwrap()
+}
+fn files(path: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut result = Vec::new();
+    for entry in fs::read_dir(path).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            result.extend(files(&path));
+        } else {
+            result.push((path.clone(), fs::read(path).unwrap()));
+        }
+    }
+    result.sort();
+    result
+}
+
+#[test]
+fn diagnostics_preserve_uncertain_delivery_and_address_the_exact_request() {
+    let fixture = Fixture::new("claude");
+    fixture.claim(Some("delivery could not be confirmed"));
+    write(
+        &fixture.directory.join("claude-settings.json"),
+        &json!({"crossSessionInbound":"accept"}),
+    );
+    let before = files(fixture.root.path());
+    let value = fixture.doctor();
+    assert_eq!(check(&value, "turn")["availability"], "unknown");
+    assert_eq!(check(&value, "turn")["reason_code"], "delivery_unconfirmed");
+    assert_eq!(
+        check(&value, "turn")["next_action"],
+        "agent-bridge result session-doctor --request request-exact --json"
+    );
+    assert_eq!(check(&value, "claude_messaging")["availability"], "unknown");
+    assert_eq!(
+        check(&value, "claude_inbound_setting")["reason_code"],
+        "claude_inbound_configured"
+    );
+    assert_eq!(value["configured"]["model"], "recorded-model");
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[test]
+fn active_and_recovery_states_are_diagnosed_without_repair() {
+    let fixture = Fixture::new("codex");
+    fixture.claim(None);
+    assert_eq!(
+        check(&fixture.doctor(), "turn")["reason_code"],
+        "turn_in_progress"
+    );
+    write(
+        &fixture.directory.join("turn.completion.json"),
+        &json!({
+            "schema":1,"claim_token":"123-456-0","event_file":"event-1.json",
+            "event":{"provider":"codex","message":"not published","error":null,
+                "provider_session_id":null,"turn_id":null,"created_unix_ms":4},
+            "status_error":null,"status_state":"ready"
+        }),
+    );
+    let before = files(fixture.root.path());
+    let value = fixture.doctor();
+    assert_eq!(
+        check(&value, "completion")["reason_code"],
+        "recovery_required"
+    );
+    assert_eq!(
+        check(&value, "completion")["next_command"],
+        json!([
+            "agent-bridge",
+            "sessions",
+            "--workspace",
+            fixture.root.path(),
+            "--json"
+        ])
+    );
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[test]
+fn missing_corrupt_and_locked_records_produce_unknown_without_writes() {
+    let fixture = Fixture::new("claude");
+    let absent = report(fixture.run(&["doctor", "session-absent", "--json"]));
+    assert_eq!(
+        check(&absent, "session_records")["reason_code"],
+        "session_unavailable"
+    );
+    assert!(!fixture.root.path().join("session-absent").exists());
+    let lock = fs::File::create(fixture.directory.join("turn.claim.lock")).unwrap();
+    lock.lock().unwrap();
+    let before = files(fixture.root.path());
+    assert_eq!(
+        check(&fixture.doctor(), "session_records")["availability"],
+        "unknown"
+    );
+    for id in ["turn", "completion", "session_state"] {
+        assert_eq!(check(&fixture.doctor(), id)["availability"], "unknown");
+    }
+    assert_eq!(files(fixture.root.path()), before);
+    drop(lock);
+    fs::write(fixture.directory.join("status.json"), "not json").unwrap();
+    let before = files(fixture.root.path());
+    assert_eq!(
+        check(&fixture.doctor(), "session_records")["reason_code"],
+        "records_unreadable"
+    );
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[test]
+fn owner_missing_dead_or_bound_elsewhere_is_not_reported_as_live() {
+    let fixture = Fixture::new("pi");
+    assert_eq!(check(&fixture.doctor(), "owner")["availability"], "unknown");
+    write(
+        &fixture.directory.join("native-session.json"),
+        &json!({"pid":0,"managed_session_id":"session-doctor"}),
+    );
+    assert_eq!(
+        check(&fixture.doctor(), "owner")["reason_code"],
+        "owner_exited"
+    );
+    write(
+        &fixture.directory.join("native-session.json"),
+        &json!({"pid":std::process::id(),"managed_session_id":"session-unrelated"}),
+    );
+    assert_eq!(
+        check(&fixture.doctor(), "owner")["reason_code"],
+        "owner_session_mismatch"
+    );
+    fs::write(fixture.directory.join("native-session.json"), "bad owner").unwrap();
+    assert_eq!(check(&fixture.doctor(), "owner")["availability"], "unknown");
+}
+
+#[test]
+fn provider_fallbacks_and_unreadable_request_index_remain_explicit() {
+    for provider in ["agy", "pi"] {
+        let fixture = Fixture::new(provider);
+        fs::create_dir(fixture.directory.join("requests")).unwrap();
+        fs::write(
+            fixture.directory.join("requests/123-456-0.json"),
+            "bad receipt",
+        )
+        .unwrap();
+        let value = fixture.doctor();
+        assert_eq!(
+            check(&value, &format!("{provider}_follow_up"))["reason_code"],
+            format!("{provider}_terminal_fallback")
+        );
+        assert_eq!(check(&value, "request_index")["availability"], "unknown");
+    }
+}
+
+#[test]
+fn doctor_requires_an_explicit_unambiguous_target() {
+    let fixture = Fixture::new("codex");
+    for args in [
+        vec!["doctor"],
+        vec!["doctor", "../session-doctor"],
+        vec!["doctor", "session-doctor", "--provider", "codex"],
+        vec!["doctor", "--provider", "codex", "--probe", "--probe"],
+        vec!["doctor", "session-doctor", "session-other"],
+        vec!["doctor", "--provider", "other"],
+    ] {
+        assert!(!fixture.run(&args).status.success(), "{args:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn only_opt_in_probe_executes_local_cli_and_keeps_session_records_identical() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new("codex");
+    let executable = fixture.root.path().join("provider");
+    // Any extra invocation (queue, login, daemon start, etc.) fails the reported check.
+    fs::write(&executable, "#!/bin/sh\ncase \"$*\" in\n--version) printf 'codex-cli 0.153.2\\n';;\n'app-server daemon version') printf '{\"status\":\"running\",\"appServerVersion\":\"0.153.2\"}\\n';;\n*) exit 99;;\nesac\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    write(
+        &fixture.directory.join("events/event-1.json"),
+        &json!({
+            "provider":"codex","message":"complete","error":null,
+            "provider_session_id":"00000000-0000-0000-0000-000000000123","turn_id":"turn-1","created_unix_ms":3
+        }),
+    );
+    let before = files(fixture.root.path());
+    let passive = fixture.doctor();
+    assert_eq!(
+        check(&passive, "provider_version")["availability"],
+        "unknown"
+    );
+    assert_eq!(
+        check(&passive, "codex_daemon")["reason_code"],
+        "probe_not_requested"
+    );
+    let value = report(fixture.run(&["doctor", "session-doctor", "--probe", "--json"]));
+    assert_eq!(
+        check(&value, "provider_version")["reason_code"],
+        "version_supported"
+    );
+    assert_eq!(
+        check(&value, "codex_daemon")["reason_code"],
+        "codex_daemon_compatible"
+    );
+    assert_eq!(
+        check(&value, "codex_thread")["reason_code"],
+        "codex_thread_recorded"
+    );
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn default_never_invokes_provider_even_when_executable_would_mutate_state() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new("claude");
+    let executable = fixture.root.path().join("provider");
+    fs::write(
+        &executable,
+        "#!/bin/sh\nprintf called > \"$0.called\"\nexit 99\n",
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let before = files(fixture.root.path());
+    fixture.doctor();
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[test]
+fn provider_only_diagnostics_do_not_create_or_scan_a_session_store() {
+    let root = tempfile::tempdir().unwrap();
+    let missing = root.path().join("absent-store");
+    let value = report(
+        Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+            .args(["doctor", "--provider", "claude", "--json"])
+            .env("AGENT_BRIDGE_NATIVE_STATE_DIR", &missing)
+            .output()
+            .unwrap(),
+    );
+    assert!(value["session"].is_null());
+    assert_eq!(check(&value, "claude_messaging")["availability"], "unknown");
+    assert!(!missing.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn probe_does_not_hold_the_completion_lifecycle_lock() {
+    use std::{
+        os::unix::fs::PermissionsExt,
+        process::Stdio,
+        thread,
+        time::{Duration, Instant},
+    };
+    let fixture = Fixture::new("claude");
+    let executable = fixture.root.path().join("provider");
+    fs::write(
+        &executable,
+        r#"#!/bin/sh
+test "$1" = --version || exit 99
+: > "$AB_DOCTOR_TEST_DIR/probe-started"
+while test ! -f "$AB_DOCTOR_TEST_DIR/probe-release"; do sleep 0.02; done
+printf '2.1.280\n'
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let lock = fs::File::create(fixture.directory.join("turn.claim.lock")).unwrap();
+    let before = files(&fixture.directory);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        .args(["doctor", "session-doctor", "--probe", "--json"])
+        .env("AGENT_BRIDGE_NATIVE_STATE_DIR", fixture.root.path())
+        .env("AB_DOCTOR_TEST_DIR", fixture.root.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !fixture.root.path().join("probe-started").exists() {
+        if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!(
+                "probe did not reach the handshake: {:?}",
+                child.wait_with_output().unwrap()
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    // The probe is deliberately paused: this assertion does not depend on a fast CLI.
+    let acquired = lock.try_lock().is_ok();
+    if acquired {
+        lock.unlock().unwrap();
+    }
+    fs::write(fixture.root.path().join("probe-release"), b"continue").unwrap();
+    let value = report(child.wait_with_output().unwrap());
+    assert!(acquired, "doctor blocked completion writers while probing");
+    assert_eq!(
+        check(&value, "provider_version")["reason_code"],
+        "version_supported"
+    );
+    assert_eq!(files(&fixture.directory), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_workspace_does_not_hide_the_installed_version_or_probe_another_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new("codex");
+    let executable = fixture.root.path().join("provider");
+    fs::write(&executable, "#!/bin/sh\nif test \"$1\" = --version; then printf 'codex-cli 0.156.0\\n'; else printf called > \"$0.daemon-called\"; exit 99; fi\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = fixture.directory.join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["workspace"] = json!(fixture.root.path().join("removed-worktree"));
+    write(&path, &manifest);
+    let before = files(fixture.root.path());
+    let value = report(fixture.run(&["doctor", "session-doctor", "--probe", "--json"]));
+    assert_eq!(
+        check(&value, "provider_version")["reason_code"],
+        "version_supported"
+    );
+    assert_eq!(check(&value, "workspace")["availability"], "unavailable");
+    assert_eq!(
+        check(&value, "codex_daemon")["reason_code"],
+        "workspace_unavailable"
+    );
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[test]
+fn terminal_close_markers_are_reported_without_consuming_or_resuming_them() {
+    let fixture = Fixture::new("claude");
+    write(
+        &fixture.directory.join("terminal.closing.json"),
+        &json!({
+            "terminal":"iterm2", "session_id":"owned-surface", "managed_session_id":"session-doctor"
+        }),
+    );
+    let before = files(fixture.root.path());
+    assert_eq!(
+        check(&fixture.doctor(), "terminal_record")["reason_code"],
+        "terminal_close_in_progress"
+    );
+    assert_eq!(files(fixture.root.path()), before);
+    write(
+        &fixture.directory.join("terminal.closed.json"),
+        &json!({"consumed":true,"terminal":"iterm2"}),
+    );
+    let before = files(fixture.root.path());
+    assert_eq!(
+        check(&fixture.doctor(), "terminal_record")["reason_code"],
+        "terminal_consumed"
+    );
+    assert_eq!(files(fixture.root.path()), before);
+    write(
+        &fixture.directory.join("native-session.json"),
+        &json!({"pid":0}),
+    );
+    let value = fixture.doctor();
+    assert_eq!(
+        check(&value, "owner")["reason_code"],
+        "owner_unbound_legacy"
+    );
+    assert_eq!(check(&value, "owner")["evidence"]["process_alive"], false);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn legacy_iterm_handle_uses_the_existing_binding_contract() {
+    let fixture = Fixture::new("claude");
+    write(
+        &fixture.directory.join("terminal.json"),
+        &json!({"iterm_session_id":"legacy-surface"}),
+    );
+    assert_eq!(
+        check(&fixture.doctor(), "terminal_record")["reason_code"],
+        "terminal_record_found"
+    );
+    assert_eq!(check(&fixture.doctor(), "owner")["availability"], "unknown");
+}

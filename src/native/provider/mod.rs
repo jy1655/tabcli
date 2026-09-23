@@ -168,6 +168,7 @@ impl FollowUpTransport {
 }
 
 trait NativeProviderAdapter: Sync {
+    fn diagnose(&self, context: super::doctor::Context<'_>) -> Vec<super::doctor::Check>;
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan>;
     fn initial_prompt_transport(&self) -> InitialPromptTransport;
     fn initial_prompt_ready_delay(&self) -> Duration;
@@ -210,6 +211,13 @@ fn adapter(provider: FirstPartyCli) -> &'static dyn NativeProviderAdapter {
         FirstPartyCli::Agy => &agy::ADAPTER,
         FirstPartyCli::Pi => &pi::ADAPTER,
     }
+}
+
+pub(super) fn diagnose(
+    provider: FirstPartyCli,
+    context: super::doctor::Context<'_>,
+) -> Vec<super::doctor::Check> {
+    adapter(provider).diagnose(context)
 }
 
 pub(super) fn prepare_launch(

@@ -194,6 +194,42 @@ enum MessageGuardDecision {
 }
 
 impl NativeProviderAdapter for ClaudeAdapter {
+    fn diagnose(
+        &self,
+        context: super::super::doctor::Context<'_>,
+    ) -> Vec<super::super::doctor::Check> {
+        use super::super::{
+            doctor::{Availability::*, Check},
+            query,
+        };
+        let setting = context.directory.map(|directory| {
+            query::optional_json::<serde_json::Value>(&directory.join("claude-settings.json"))
+        });
+        let (availability, reason, detail) = match setting {
+            Some(Ok(Some(value))) if value.get("crossSessionInbound").and_then(serde_json::Value::as_str) == Some("accept") =>
+                (Available, "claude_inbound_configured", "The session settings record crossSessionInbound=accept. This does not prove the running CLI loaded it.".to_owned()),
+            Some(Ok(Some(_))) => (Unknown, "claude_inbound_unverified", "The session file does not establish inbound acceptance; effective provider policy is unknown.".to_owned()),
+            Some(Err(error)) => (Unknown, "claude_settings_unreadable", format!("{error:#}")),
+            _ => (Unknown, "claude_settings_unavailable", "No managed session settings were observed.".to_owned()),
+        };
+        vec![
+            Check::new(
+                "claude_inbound_setting",
+                availability,
+                reason,
+                detail,
+                "Inspect the session settings and provider policy; doctor does not change either.",
+            ),
+            Check::new(
+                "claude_messaging",
+                Unknown,
+                "claude_runtime_gates_unverified",
+                "Follow-up uses official ListAgents/SendMessage. Backend, feature flags, policy, and live discovery have not been verified; --probe only reads the CLI version.",
+                "Use the official provider's availability diagnostics. Doctor never calls a messenger/model or substitutes terminal injection.",
+            ),
+        ]
+    }
+
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
         prepare_launch_for_platform(context, cfg!(windows))
     }
@@ -1390,6 +1426,40 @@ pub(super) fn hook_settings(executable: &Path) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_never_promote_configured_inbound_to_runtime_messaging() {
+        use super::super::super::doctor::{Availability, Context};
+        let directory = tempfile::tempdir().unwrap();
+        for settings in [
+            serde_json::json!({}),
+            serde_json::json!({"crossSessionInbound":"accept"}),
+        ] {
+            std::fs::write(
+                directory.path().join("claude-settings.json"),
+                settings.to_string(),
+            )
+            .unwrap();
+            let checks = ADAPTER.diagnose(Context {
+                directory: Some(directory.path()),
+                manifest: None,
+                executable: None,
+                current_version: Some("2.1.280"),
+                workspace: directory.path(),
+                probe: true,
+                deadline: Instant::now(),
+            });
+            assert_eq!(
+                checks
+                    .iter()
+                    .find(|c| c.id == "claude_messaging")
+                    .unwrap()
+                    .availability,
+                Availability::Unknown
+            );
+            assert!(!directory.path().join("claude-pending-turn.json").exists());
+        }
+    }
 
     const TEST_REQUEST: &str = "claude-turn-safe123";
     const TEST_REFERENCE: &str = "agent-bridge-payload:claude-turn-safe123";

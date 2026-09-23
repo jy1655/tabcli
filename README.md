@@ -126,6 +126,8 @@ agent-bridge sessions [--workspace PATH] [--provider <codex|claude|agy|pi>] [--s
 agent-bridge inspect <session> [--json]
 agent-bridge result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
     [--wait --timeout-secs N]
+agent-bridge doctor <session> [--probe] [--json]
+agent-bridge doctor --provider <codex|claude|agy|pi> [--probe] [--json]
 agent-bridge prune-sessions --closed-before-days N --explicit [--json]
 agent-bridge close-session <session> --explicit [--json]
 agent-bridge --help | --version
@@ -193,6 +195,50 @@ JSON은 원문 채널이며 사람이 읽는 출력의 terminal 제어문자는 
 수행한 뒤 다시 조회합니다. `sessions`의 기존 복구 동작은 유지되므로 읽기 전용 명령은 아닙니다.
 조회 timeout은 요청을 취소하거나 세션을 닫지 않습니다. 결과를 다음 작업의 참고 자료로 보낼 때는
 정확한 결과를 조회해 출처와 함께 `--prompt-file`에 넣고 기존 `ask/tell`을 사용합니다.
+
+### 기능 가용성과 다음 조치 진단
+
+`doctor`는 특정 세션 또는 provider의 상태를 설명합니다. 기본 실행은 저장된 설정·상태·요청,
+owner process의 생존·identity, terminal 기록, 설치 경로를 읽습니다. 세션을 지정하지 않으면
+세션 저장소를 탐색하지 않습니다.
+
+```bash
+agent-bridge doctor session-XXXXXXXX --json
+agent-bridge doctor session-XXXXXXXX --probe --json
+agent-bridge doctor --provider codex --probe --json
+```
+
+현재 설치된 CLI 버전은 `--probe`가 있을 때만 `<provider> --version`으로 확인합니다.
+Codex는 추가로 `codex app-server daemon version`을 실행합니다. 두 조회는 총 5초 예산을 공유하고
+출력은 각 조회별 stdout·stderr 합산 64 KiB로 제한합니다. probe helper와 그 자식 process는 종료 시 회수하며 Windows batch shim의
+임시 파일은 세션 디렉터리 밖에 둡니다. 모델 호출, 메시지 전송, daemon 시작, terminal 앱 제어,
+설정 변경은 하지 않습니다. 외부 CLI를 실행하는 probe와 기본 로컬 관측은 출력의 `probe`로 구분합니다.
+
+JSON의 `ok: true`와 exit 0은 진단 보고서를 만들었다는 뜻입니다. 각 `checks` 항목의
+`availability`(`available` / `unavailable` / `unknown`), `reason_code`, `observed_unix_ms`,
+`evidence`, `next_action`을 함께 읽어야 합니다. 각 항목은 이름에 명시된 조건만 설명하며,
+모든 관측이 성공해도 메시지 전달·모델 실행·완료까지 보증하지 않습니다. 잘못된 인자는 nonzero입니다.
+손상·경합 중인 저장 기록은 가능한 나머지 진단과 함께 미확인으로 보고하며 자동 복구하지 않습니다.
+
+- Codex는 실제 sender와 같은 launch-version·thread identity·daemon 판정을 재사용합니다.
+  시작 때 기록한 버전과 probe로 읽은 현재 버전은 별도로 표시하며, daemon 통과가 TUI의 thread
+  표시나 queue 소비를 증명하지는 않습니다. 읽기 실패와 daemon 부재를 같은 사실로 취급하지 않습니다.
+  probe 실행·해석 실패는 `unknown`, CLI가 nonzero로 응답해 native queue gate를 통과하지 못한
+  경우는 `unavailable`입니다. 이 응답만으로 daemon process 자체의 부재를 단정하지 않습니다.
+- Claude의 `crossSessionInbound: accept`는 저장된 설정입니다. 실제 backend·feature flag·정책·
+  `ListAgents` discovery를 확인하지 않았으므로 공식 메시징의 현재 가용성은 `unknown`입니다.
+  진단을 위해 messenger를 호출하거나 terminal 입력으로 우회하지 않습니다.
+- Agy와 Pi는 각 adapter가 소유한 terminal fallback과 결과 확인 방식을 설명합니다.
+  진단만으로 실제 입력 가능 여부를 확정하지 않습니다.
+
+진행 중이거나 전송 여부가 불확실한 요청에는 같은 `request_id`의 `result` 조회를 안내합니다.
+잠금을 오래 유지하지 않으며, 완료 journal 복구·재전송·close·trust/permission 변경은 수행하지 않습니다.
+안내된 `next_action`도 자동 실행하지 않습니다. 저장된 model/effort/yolo는 `configured`,
+상태와 정확한 active request 참조는 `observations`에서 확인할 수 있습니다.
+복구 안내의 `next_command`는 실제 workspace를 담은 argv 배열이며, `sessions`는 journal 복구뿐
+아니라 해당 workspace의 dead-owner 세션 정리도 수행합니다. 닫는 중인 handle과 소진된 tombstone은
+단순 누락과 구별합니다. 삭제된 workspace는 별도 진단하며 버전 조회는 임시 디렉터리에서 계속할 수
+있지만, Codex daemon 조회는 원래 workspace를 사용할 수 있을 때만 실행합니다.
 
 ## 권한과 세션 경계
 

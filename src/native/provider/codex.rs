@@ -74,6 +74,13 @@ impl PendingCodexTurn {
 }
 
 impl NativeProviderAdapter for CodexAdapter {
+    fn diagnose(
+        &self,
+        context: super::super::doctor::Context<'_>,
+    ) -> Vec<super::super::doctor::Check> {
+        diagnose_codex(context)
+    }
+
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
         let claim_token = super::super::current_turn_claim_token(context.directory)?
             .context("Codex launch has no native turn claim")?;
@@ -354,6 +361,131 @@ fn send_native_queue_message(context: CrossSessionMessageContext<'_>) -> CrossSe
         let _ = cancel_pending_turn(context.directory, context.request_id);
     }
     result
+}
+
+fn diagnose_codex(context: super::super::doctor::Context<'_>) -> Vec<super::super::doctor::Check> {
+    use super::super::doctor::{self, Availability::*, Check};
+    let mut checks = Vec::new();
+    let version = context
+        .manifest
+        .map(|m| m.provider_version.as_str())
+        .or(context.current_version);
+    let (availability, reason) = match version.map(codex_version_supports_native_queue) {
+        Some(Ok(true)) => (Available, "codex_queue_version_supported"),
+        Some(Ok(false)) => (Unavailable, "codex_queue_version_unsupported"),
+        _ => (Unknown, "codex_queue_version_unknown"),
+    };
+    checks.push(Check::new("codex_queue_version", availability, reason,
+        "Native queue requires Codex 0.149+. Existing sessions select transport using their launch-recorded version.",
+        "The adapter retains terminal fallback when native queue prerequisites are unavailable; do not resend an uncertain turn.")
+        .evidence(serde_json::json!({"version": version, "source": if context.manifest.is_some() { "launch_record" } else { "current_probe" }})));
+    if let Some(current) = context.current_version {
+        let (availability, reason) = match codex_version_supports_native_queue(current) {
+            Ok(true) => (Available, "codex_current_queue_version_supported"),
+            Ok(false) => (Unavailable, "codex_current_queue_version_unsupported"),
+            Err(_) => (Unknown, "codex_current_queue_version_unknown"),
+        };
+        checks.push(Check::new("codex_current_queue_version", availability, reason,
+            "Currently installed queue client version; this does not replace the session's launch-recorded gate.",
+            "Inspect both the launch version and current executable when an installation changes.")
+            .evidence(serde_json::json!({"version": current})));
+    }
+    let thread = context.directory.map(established_codex_thread);
+    let (availability, reason, evidence) = match thread {
+        Some(Ok(Some(id))) if valid_codex_thread_id(&id) => (
+            Available,
+            "codex_thread_recorded",
+            serde_json::json!({"thread_id": id}),
+        ),
+        Some(Ok(Some(_))) => (Unavailable, "codex_thread_invalid", serde_json::Value::Null),
+        Some(Ok(None)) => (Unavailable, "codex_thread_missing", serde_json::Value::Null),
+        Some(Err(error)) => (
+            Unknown,
+            "codex_thread_unreadable",
+            serde_json::json!({"error": format!("{error:#}")}),
+        ),
+        None => (Unknown, "session_required", serde_json::Value::Null),
+    };
+    checks.push(Check::new("codex_thread", availability, reason,
+        "Uses the same provider-owned event identity lookup as the queue sender. It does not prove a TUI currently has that thread loaded.",
+        "Select a managed session with a recorded Codex result; a queue acceptance is not a completion.").evidence(evidence));
+    let daemon = if !context.probe {
+        Check::new(
+            "codex_daemon",
+            Unknown,
+            "probe_not_requested",
+            "The local daemon has not been queried.",
+            "Add --probe to run codex app-server daemon version; doctor never starts the daemon.",
+        )
+    } else if !context.workspace.is_dir() {
+        Check::new(
+            "codex_daemon",
+            Unknown,
+            "workspace_unavailable",
+            "The workspace-relative daemon gate cannot be queried because the working directory is unavailable.",
+            "Inspect the workspace check; doctor does not probe a daemon from a different workspace.",
+        )
+    } else if let Some(executable) = context.executable {
+        match doctor::probe(
+            executable,
+            &["app-server", "daemon", "version"],
+            Some(context.workspace),
+            context.deadline,
+        ) {
+            Ok(output) => diagnose_daemon_output(&output, version.unwrap_or("unknown")),
+            Err(error) => Check::new(
+                "codex_daemon",
+                Unknown,
+                "codex_daemon_probe_failed",
+                format!("{error:#}"),
+                "Inspect the local daemon separately; a failed observation does not prove its state.",
+            ),
+        }
+    } else {
+        Check::new(
+            "codex_daemon",
+            Unknown,
+            "executable_unavailable",
+            "The recorded provider executable cannot be probed.",
+            "Check the provider executable before inspecting the daemon.",
+        )
+    };
+    checks.push(daemon);
+    checks
+}
+
+fn diagnose_daemon_output(
+    output: &std::process::Output,
+    version: &str,
+) -> super::super::doctor::Check {
+    use super::super::doctor::{Availability::*, Check};
+    // Reuse the actual sender's acceptance predicate; failed observation is not proof of absence.
+    let classified = classify_codex_daemon_probe(
+        output.status.success(),
+        &output.stdout,
+        &output.stderr,
+        false,
+        version,
+    );
+    let (availability, reason, detail) = match classified {
+        Ok(()) => (Available, "codex_daemon_compatible", "A running compatible local daemon was observed. TUI liveness, queue acceptance, and completion were not tested.".to_owned()),
+        Err(failure) if !output.status.success() => (Unavailable, "codex_daemon_unavailable", format!("The CLI rejected the daemon probe, so the sender's native queue gate did not pass. This does not establish whether a daemon process exists. {:#}", failure.into_error())),
+        Err(failure) => {
+            let value = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
+            let known = output.status.success() && value.as_ref().is_some_and(|v| {
+                v.get("status").and_then(serde_json::Value::as_str).is_some_and(|status| status != "running")
+                    || v.get("appServerVersion").and_then(serde_json::Value::as_str).is_some_and(|v| matches!(codex_version_supports_native_queue(v), Ok(false)))
+            });
+            (if known { Unavailable } else { Unknown }, if known { "codex_daemon_incompatible" } else { "codex_daemon_unverified" }, format!("{:#}", failure.into_error()))
+        }
+    };
+    Check::new(
+        "codex_daemon",
+        availability,
+        reason,
+        detail,
+        "The sender rechecks daemon eligibility and owns any permitted fallback. Never resend a delivery-uncertain request.",
+    ).evidence(serde_json::json!({"exit_code": output.status.code(), "stderr": String::from_utf8_lossy(&output.stderr).trim()}))
 }
 
 fn require_compatible_local_daemon(
@@ -729,6 +861,96 @@ fn established_codex_thread(directory: &Path) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostics_keep_launch_version_and_unprobed_daemon_gates_explicit() {
+        use super::super::super::doctor::{Availability, Context};
+        for (version, expected) in [
+            (Some("0.148.0"), Availability::Unavailable),
+            (Some("0.153.2"), Availability::Available),
+            (Some("unknown"), Availability::Unknown),
+            (None, Availability::Unknown),
+        ] {
+            let checks = super::diagnose_codex(Context {
+                directory: None,
+                manifest: None,
+                executable: None,
+                current_version: version,
+                workspace: std::path::Path::new("."),
+                probe: false,
+                deadline: std::time::Instant::now(),
+            });
+            assert_eq!(
+                checks
+                    .iter()
+                    .find(|c| c.id == "codex_queue_version")
+                    .unwrap()
+                    .availability,
+                expected
+            );
+            assert_eq!(
+                checks
+                    .iter()
+                    .find(|c| c.id == "codex_daemon")
+                    .unwrap()
+                    .availability,
+                Availability::Unknown
+            );
+            assert_eq!(
+                checks
+                    .iter()
+                    .find(|c| c.id == "codex_thread")
+                    .unwrap()
+                    .reason_code,
+                "session_required"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn diagnostic_daemon_availability_uses_the_senders_acceptance_predicate() {
+        use super::super::super::doctor::Availability::*;
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+        for (success, payload, expected) in [
+            (
+                true,
+                r#"{"status":"running","appServerVersion":"0.153.2"}"#,
+                Available,
+            ),
+            (true, r#"{"status":"stopped"}"#, Unavailable),
+            (
+                true,
+                r#"{"status":"running","appServerVersion":"0.148.0"}"#,
+                Unavailable,
+            ),
+            (true, r#"{"status":"running"}"#, Unknown),
+            (true, "invalid json", Unknown),
+            (false, "", Unavailable),
+        ] {
+            let output = std::process::Output {
+                status: std::process::ExitStatus::from_raw(if success { 0 } else { 256 }),
+                stdout: payload.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            };
+            let check = super::diagnose_daemon_output(&output, "0.153.2");
+            assert_eq!(check.availability, expected, "{payload}");
+            assert_eq!(
+                check.availability == Available,
+                super::classify_codex_daemon_probe(
+                    success,
+                    &output.stdout,
+                    &output.stderr,
+                    false,
+                    "0.153.2"
+                )
+                .is_ok()
+            );
+        }
+    }
+
     #[cfg(unix)]
     use super::super::super::{SESSION_SCHEMA, SessionManifest, write_json_atomic};
     use super::super::super::{

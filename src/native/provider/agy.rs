@@ -48,6 +48,20 @@ impl PendingAgyTurn {
 }
 
 impl NativeProviderAdapter for AgyAdapter {
+    fn diagnose(
+        &self,
+        _context: super::super::doctor::Context<'_>,
+    ) -> Vec<super::super::doctor::Check> {
+        use super::super::doctor::{Availability::Unknown, Check};
+        vec![Check::new(
+            "agy_follow_up",
+            Unknown,
+            "agy_terminal_fallback",
+            "Agy owns terminal-paste follow-up and transcript result monitoring. No verified first-party input path into a running interactive session is integrated.",
+            "Inspect the managed owner and terminal. Live input was not tested; retain this fallback until Agy offers a verified native path.",
+        )]
+    }
+
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
         let claim_token = super::super::current_turn_claim_token(context.directory)?
             .context("Agy launch has no native turn claim")?;
@@ -570,6 +584,23 @@ fn parse_transcript_line(line: &str) -> Option<(u64, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostics_describe_agy_owned_fallback_without_claiming_live_delivery() {
+        use super::super::super::doctor::{Availability, Context};
+        use super::NativeProviderAdapter;
+        let checks = super::ADAPTER.diagnose(Context {
+            directory: None,
+            manifest: None,
+            executable: None,
+            current_version: None,
+            workspace: std::path::Path::new("."),
+            probe: false,
+            deadline: std::time::Instant::now(),
+        });
+        assert_eq!(checks[0].reason_code, "agy_terminal_fallback");
+        assert_eq!(checks[0].availability, Availability::Unknown);
+    }
+
     use super::super::super::{
         SessionEvent, SessionStatus, acquire_turn_claim, event_paths, read_json, update_status,
     };
