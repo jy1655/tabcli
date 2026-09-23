@@ -175,17 +175,20 @@ fn missing_corrupt_and_locked_records_produce_unknown_without_writes() {
     );
     assert!(!fixture.root.path().join("session-absent").exists());
     let lock = fs::File::create(fixture.directory.join("turn.claim.lock")).unwrap();
-    lock.lock().unwrap();
     let before = files(fixture.root.path());
+    lock.lock().unwrap();
+    let value = fixture.doctor();
+    assert_eq!(check(&value, "session_records")["availability"], "unknown");
     assert_eq!(
-        check(&fixture.doctor(), "session_records")["availability"],
-        "unknown"
+        check(&value, "session_records")["reason_code"],
+        "records_busy"
     );
     for id in ["turn", "completion", "session_state"] {
-        assert_eq!(check(&fixture.doctor(), id)["availability"], "unknown");
+        assert_eq!(check(&value, id)["availability"], "unknown");
     }
-    assert_eq!(files(fixture.root.path()), before);
+    // Windows locks also prevent a second handle from reading the locked bytes.
     drop(lock);
+    assert_eq!(files(fixture.root.path()), before);
     fs::write(fixture.directory.join("status.json"), "not json").unwrap();
     let before = files(fixture.root.path());
     assert_eq!(
