@@ -121,11 +121,78 @@ agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --pro
     [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|windows-console>]
     [--yolo] [--timeout-secs N] [--detach] [--json]
 agent-bridge tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
-agent-bridge sessions [--json]
+agent-bridge sessions [--workspace PATH] [--provider <codex|claude|agy|pi>] [--state STATE]
+    [--sort <id|updated>] [--json]
+agent-bridge inspect <session> [--json]
+agent-bridge result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
+    [--wait --timeout-secs N]
 agent-bridge prune-sessions --closed-before-days N --explicit [--json]
 agent-bridge close-session <session> --explicit [--json]
 agent-bridge --help | --version
 ```
+
+### 상태 확인과 요청별 결과 회수
+
+`inspect`는 저장된 상태·마지막 오류·생성/갱신 시각, 시작할 때 지정한 model/effort/yolo,
+owner 프로세스 생존 여부와 결과·요청 주소를 보여줍니다. `configured`는 저장된 시작 설정이며
+현재 provider 설정을 다시 읽은 값이 아닙니다. `owner_process_alive`도 PID 생존 관측일 뿐
+provider 응답 가능 여부나 terminal 소유권 검증을 뜻하지 않습니다.
+
+```sh
+agent-bridge sessions --workspace . --provider claude --sort updated --json
+agent-bridge inspect session-XXXXXXXX --json
+agent-bridge result session-XXXXXXXX --list --json
+agent-bridge result session-XXXXXXXX --latest --json
+agent-bridge result session-XXXXXXXX --event event-123-456.json --json
+```
+
+`--sort updated`는 최근 갱신 순, 기본 정렬은 session ID 순입니다. `sessions --json`은 기존 배열
+형태를 유지합니다. 새 조회 명령의 JSON 객체와 `ask/tell` 응답에는 `schema_version: 1`이 있습니다.
+`result --list --json`의 `events`와 `requests`는 본문을 제외한 참조 목록입니다. 본문은 정확한
+`--event` 또는 `--request`로 읽습니다. event ID는 `.json`을 포함한 보존 파일명입니다.
+
+새 `ask/tell`은 provider에 보내기 전에 공개 `request_id`를 저장합니다. 이 ID는 provider의
+session/turn ID 또는 내부 claim token을 대체하지 않습니다. `--detach`는 접수 뒤 반환하며
+`request_state: accepted`, `result: null`입니다. 이미 완료됐을 수도 있으므로 실제 결과는
+요청 ID로 조회합니다. timeout이나 전송 오류가 발생해도 접수 기록이 생성됐다면 stdout JSON에
+session과 request ID를 반환하고 exit code는 0이 아닙니다. 접수 전 거부에는 요청 ID가 없습니다.
+
+```sh
+agent-bridge ask codex --workspace . --prompt "변경을 검토해줘" --detach --json
+# 위 응답의 session과 request_id를 사용합니다.
+agent-bridge result session-XXXXXXXX --request request-XXXXXXXX \
+  --wait --timeout-secs 300 --json
+```
+
+Codex가 메인이든 Claude가 메인이든 같은 흐름을 사용합니다. 부모 도구의 제한 시간보다 짧은
+`--timeout-secs`를 지정하거나 `--detach` 후 결과를 기다리면, 부모 도구가 종료되면서 영수증을
+받지 못하는 일을 줄일 수 있습니다. 호출자가 사라져도 `inspect`와 `result --list --json`에서
+저장된 요청 주소를 찾을 수 있습니다. 다음 요청이 먼저 끝나거나 응답 본문이 같아도 과거의
+요청 ID는 그 요청에 연결된 결과만 반환합니다. 기존 기록에는 `request_id: null`을 표시하며
+연결을 추측하지 않습니다. 닫힌 세션의 보존 결과도 조회할 수 있습니다.
+
+| `request_state` | 의미 |
+| --- | --- |
+| `completed` / `failed` | provider가 검증한 완료 결과 또는 실패 결과가 게시됨 |
+| `pending` | 해당 요청이 현재 claim을 보유하고 완료 결과를 기다리는 중 |
+| `recovery_required` | 완료 journal이 남아 있어 게시 완료를 확정하지 않음 |
+| `unresolved` | 게시된 결과 없이 claim이 해제됐거나 owner가 종료됨. 재전송이 안전하다는 뜻이 아님 |
+| `unavailable` | 조회할 최근 결과가 없음 |
+| `busy` / `unknown` | 일관된 snapshot을 아직 얻지 못했거나 오류 응답 시 상태 확인 실패 |
+
+`--wait`는 정확한 `--request`에만 사용할 수 있습니다. 성공 결과를 회수하면 exit 0,
+실패 결과·미해결 요청·복구 필요·timeout이면 JSON을 출력하고 nonzero로 끝납니다.
+대기 없이 조회하면 exit 0은 조회 성공을 뜻하므로 결과의 `request_state`도 확인해야 합니다.
+`--latest` 또는 `--event`에서 읽을 게시 결과가 없어도 nonzero로 끝납니다. 손상된 영수증은
+`unreadable_requests`, 읽을 수 없는 요청 디렉터리는 `request_index_error`로 알리고 개별 event
+조회는 유지합니다. `inspect`의 요청 목록에는 호출 출처 `source`도 남습니다.
+JSON은 원문 채널이며 사람이 읽는 출력의 terminal 제어문자는 기존 정책대로 이스케이프합니다.
+
+`inspect`와 `result`는 `--wait`에서도 파일·상태를 변경하거나 요청을 전송·재전송하지 않습니다.
+완료 journal의 복구가 필요하면 기존 `sessions --workspace PATH`로 해당 workspace의 복구를
+수행한 뒤 다시 조회합니다. `sessions`의 기존 복구 동작은 유지되므로 읽기 전용 명령은 아닙니다.
+조회 timeout은 요청을 취소하거나 세션을 닫지 않습니다. 결과를 다음 작업의 참고 자료로 보낼 때는
+정확한 결과를 조회해 출처와 함께 `--prompt-file`에 넣고 기존 `ask/tell`을 사용합니다.
 
 ## 권한과 세션 경계
 

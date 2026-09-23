@@ -22,7 +22,11 @@ Usage:
       [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|windows-console>]
       [--yolo] [--timeout-secs N] [--detach] [--json]
   agent-bridge tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
-  agent-bridge sessions [--json]
+  agent-bridge sessions [--workspace PATH] [--provider <codex|claude|agy|pi>] [--state STATE]
+      [--sort <id|updated>] [--json]
+  agent-bridge inspect <session> [--json]
+  agent-bridge result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
+      [--wait --timeout-secs N]
   agent-bridge prune-sessions --closed-before-days N --explicit [--json]
   agent-bridge close-session <session> --explicit [--json]
   agent-bridge --help | --version
@@ -155,7 +159,10 @@ mod tests {
         ));
         assert!(matches!(
             parse_args_from([OsString::from("sessions")]).unwrap(),
-            Launch::Native(native::NativeCommand::Sessions { json: false })
+            Launch::Native(native::NativeCommand::Sessions(native::SessionsRequest {
+                json: false,
+                ..
+            }))
         ));
     }
 
@@ -200,7 +207,9 @@ mod tests {
         for expected in [
             "ask <codex|claude|agy|pi>",
             "tell <session>",
-            "sessions [--json]",
+            "sessions [--workspace PATH]",
+            "inspect <session>",
+            "result <session>",
             "prune-sessions --closed-before-days N --explicit",
             "close-session <session> --explicit",
             "macOS detects Ghostty, iTerm2, or Terminal.app",

@@ -3,6 +3,8 @@ mod tests;
 
 mod provider;
 mod provider_process;
+mod query;
+mod requests;
 mod terminal;
 
 use provider_process::{
@@ -52,9 +54,12 @@ static TURN_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) enum NativeCommand {
     Ask(AskRequest),
     Tell(TellRequest),
-    Sessions {
+    Inspect {
+        id: String,
         json: bool,
     },
+    Result(query::ResultRequest),
+    Sessions(SessionsRequest),
     Prune(PruneRequest),
     Close(CloseRequest),
     RunSession {
@@ -98,6 +103,15 @@ pub(crate) struct TellRequest {
     timeout: Duration,
     detach: bool,
     json: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct SessionsRequest {
+    pub(crate) json: bool,
+    workspace: Option<PathBuf>,
+    provider: Option<FirstPartyCli>,
+    state: Option<String>,
+    sort_updated: bool,
 }
 
 #[derive(Debug)]
@@ -303,6 +317,8 @@ pub(crate) fn is_command(value: &str) -> bool {
         "ask"
             | "tell"
             | "sessions"
+            | "inspect"
+            | "result"
             | "prune-sessions"
             | "close-session"
             | "native-session"
@@ -325,6 +341,8 @@ where
     match command.as_str() {
         "ask" => parse_ask(rest),
         "tell" => parse_tell(rest),
+        "inspect" => query::parse_inspect(rest),
+        "result" => query::parse_result(rest),
         "sessions" => parse_sessions(rest),
         "prune-sessions" => parse_prune(rest),
         "close-session" => parse_close(rest),
@@ -530,11 +548,60 @@ fn read_prompt_option(
 }
 
 fn parse_sessions(args: &[String]) -> Result<NativeCommand> {
-    match args {
-        [] => Ok(NativeCommand::Sessions { json: false }),
-        [option] if option == "--json" => Ok(NativeCommand::Sessions { json: true }),
-        _ => bail!("sessions accepts only --json"),
+    let mut json = false;
+    let mut workspace = None;
+    let mut provider = None;
+    let mut state = None;
+    let mut sort = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => set_flag_once(&mut json, "--json")?,
+            "--workspace" => set_once(
+                &mut workspace,
+                PathBuf::from(option_value(args, &mut index, "--workspace")?),
+                "--workspace",
+            )?,
+            "--provider" => set_once(
+                &mut provider,
+                FirstPartyCli::from_str(option_value(args, &mut index, "--provider")?)
+                    .map_err(anyhow::Error::msg)?,
+                "--provider",
+            )?,
+            "--state" => set_once(
+                &mut state,
+                option_value(args, &mut index, "--state")?.to_owned(),
+                "--state",
+            )?,
+            "--sort" => {
+                let value = option_value(args, &mut index, "--sort")?;
+                if !matches!(value, "id" | "updated") {
+                    bail!("--sort must be id or updated")
+                }
+                set_once(&mut sort, value.to_owned(), "--sort")?;
+            }
+            option => bail!("unknown sessions option: {option}"),
+        }
+        index += 1;
     }
+    let workspace = workspace
+        .map(|path| {
+            path.canonicalize().or_else(|_| {
+                if path.is_absolute() {
+                    Ok(path)
+                } else {
+                    std::env::current_dir().map(|cwd| cwd.join(path))
+                }
+            })
+        })
+        .transpose()?;
+    Ok(NativeCommand::Sessions(SessionsRequest {
+        json,
+        workspace,
+        provider,
+        state,
+        sort_updated: sort.as_deref() == Some("updated"),
+    }))
 }
 
 fn parse_prune(args: &[String]) -> Result<NativeCommand> {
@@ -668,7 +735,9 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
     match command {
         NativeCommand::Ask(request) => run_ask(request),
         NativeCommand::Tell(request) => run_tell(request),
-        NativeCommand::Sessions { json } => run_sessions(json),
+        NativeCommand::Inspect { id, json } => query::run_inspect(&id, json),
+        NativeCommand::Result(request) => query::run_result(request),
+        NativeCommand::Sessions(request) => run_sessions(request),
         NativeCommand::Prune(request) => run_prune(request),
         NativeCommand::Close(request) => run_close(request),
         NativeCommand::RunSession { id } => run_session(&id),
@@ -745,6 +814,16 @@ fn run_windows_console_control(
 }
 
 fn run_ask(request: AskRequest) -> Result<()> {
+    let json = request.json;
+    let mut address = None;
+    let outcome = run_ask_inner(request, &mut address);
+    match address {
+        Some((session, request_id)) => finish_request(outcome, json, &session, &request_id),
+        None => outcome,
+    }
+}
+
+fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) -> Result<()> {
     let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
     let terminal_kind = terminal::select(request.terminal)?;
     let workspace = request.workspace.canonicalize().with_context(|| {
@@ -780,6 +859,8 @@ fn run_ask(request: AskRequest) -> Result<()> {
     })?;
     let mut initial_claim = acquire_turn_claim(&created.directory)?;
     let expected_claim_token = initial_claim.token.clone();
+    let receipt = initial_claim.receipt.clone();
+    *address = Some((created.id.clone(), receipt.request_id.clone()));
     let executable = std::env::current_exe().context("failed to locate agent-bridge executable")?;
     let bridge_command = bridge_shell_command(
         &created.manifest.workspace,
@@ -996,6 +1077,7 @@ fn run_ask(request: AskRequest) -> Result<()> {
             &created.id,
             &terminal_session,
             request.provider,
+            &receipt.request_id,
             None,
         );
     }
@@ -1020,6 +1102,7 @@ fn run_ask(request: AskRequest) -> Result<()> {
         &created.id,
         &terminal_session,
         request.provider,
+        &receipt.request_id,
         Some(&event),
     )
 }
@@ -1471,6 +1554,16 @@ fn cross_session_failure_action(
 }
 
 fn run_tell(request: TellRequest) -> Result<()> {
+    let json = request.json;
+    let mut address = None;
+    let outcome = run_tell_inner(request, &mut address);
+    match address {
+        Some((session, request_id)) => finish_request(outcome, json, &session, &request_id),
+        None => outcome,
+    }
+}
+
+fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) -> Result<()> {
     let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
     let directory = session_directory(&request.id)?;
     recover_pending_completion(&directory)?;
@@ -1496,6 +1589,8 @@ fn run_tell(request: TellRequest) -> Result<()> {
     let follow_up_transport = provider::follow_up_transport(provider);
     let (mut claim, baseline) = acquire_ready_turn_claim(&directory, &request.id)?;
     let claim_token = claim.token.clone();
+    let receipt = claim.receipt.clone();
+    *address = Some((request.id.clone(), receipt.request_id.clone()));
     let mut expected_turn_id = None;
     match follow_up_transport {
         provider::FollowUpTransport::TerminalPasteFallback => {
@@ -1597,7 +1692,14 @@ fn run_tell(request: TellRequest) -> Result<()> {
     claim.retain();
 
     if request.detach {
-        return emit_session_result(request.json, &request.id, &terminal_session, provider, None);
+        return emit_session_result(
+            request.json,
+            &request.id,
+            &terminal_session,
+            provider,
+            &receipt.request_id,
+            None,
+        );
     }
     let event = wait_for_event_for_turn_until(
         &directory,
@@ -1619,6 +1721,7 @@ fn run_tell(request: TellRequest) -> Result<()> {
         &request.id,
         &terminal_session,
         provider,
+        &receipt.request_id,
         Some(&event),
     )
 }
@@ -1877,7 +1980,7 @@ fn initial_prompt_delay_within_budget(
     Ok(delay)
 }
 
-fn run_sessions(json: bool) -> Result<()> {
+fn run_sessions(request: SessionsRequest) -> Result<()> {
     let root = state_root()?;
     let mut sessions = Vec::new();
     if root.is_dir() {
@@ -1891,12 +1994,29 @@ fn run_sessions(json: bool) -> Result<()> {
                 continue;
             }
             let directory = entry.path();
-            let _ = recover_pending_completion(&directory);
-            let _ = repair_dead_native_owner(&directory);
             let Ok(manifest) = read_manifest(&directory) else {
                 continue;
             };
+            if request
+                .workspace
+                .as_ref()
+                .is_some_and(|workspace| workspace != &manifest.workspace)
+                || request
+                    .provider
+                    .is_some_and(|provider| provider.as_str() != manifest.provider)
+            {
+                continue;
+            }
+            let _ = recover_pending_completion(&directory);
+            let _ = repair_dead_native_owner(&directory);
             let status = read_json::<SessionStatus>(&directory.join("status.json")).ok();
+            let state = status
+                .as_ref()
+                .map(|value| value.state.as_str())
+                .unwrap_or("unknown");
+            if request.state.as_ref().is_some_and(|filter| filter != state) {
+                continue;
+            }
             let terminal =
                 read_json::<terminal::TerminalSession>(&directory.join("terminal.json")).ok();
             sessions.push(serde_json::json!({
@@ -1913,12 +2033,27 @@ fn run_sessions(json: bool) -> Result<()> {
                 "iterm_session_id": terminal.as_ref()
                     .filter(|value| value.kind == terminal::TerminalKind::Iterm2)
                     .map(|value| value.id.as_str()),
+                "created_unix_ms": manifest.created_unix_ms,
+                "updated_unix_ms": status.as_ref().map(|value| value.updated_unix_ms),
+                "error": status.as_ref().and_then(|value| value.error.as_deref()),
+                "model": manifest.model,
+                "effort": manifest.effort,
                 "results": event_paths(&directory).map(|paths| paths.len()).unwrap_or(0),
             }));
         }
     }
-    sessions.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
-    if json {
+    sessions.sort_by(|left, right| {
+        let by_id = left["id"].as_str().cmp(&right["id"].as_str());
+        if request.sort_updated {
+            right["updated_unix_ms"]
+                .as_u64()
+                .cmp(&left["updated_unix_ms"].as_u64())
+                .then(by_id)
+        } else {
+            by_id
+        }
+    });
+    if request.json {
         println!("{}", serde_json::to_string_pretty(&sessions)?);
     } else if sessions.is_empty() {
         println!("no native Agent Bridge sessions");
@@ -2300,11 +2435,34 @@ pub(super) fn rename_session_file(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+fn finish_request(outcome: Result<()>, json: bool, session: &str, request_id: &str) -> Result<()> {
+    if let Err(error) = outcome {
+        if json {
+            let mut value = session_directory(session)
+                .and_then(|directory| query::request_result(&directory, request_id))
+                .unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "schema_version": 1, "session": session, "request_id": request_id,
+                        "request_state": "unknown", "result": null
+                    })
+                });
+            value["ok"] = serde_json::json!(false);
+            value["error"] = serde_json::json!(format!("{error:#}"));
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        return Err(error).with_context(|| format!(
+            "session {session}, request {request_id}; inspect with `agent-bridge result {session} --request {request_id} --json`; this error alone is not proof of non-delivery; inspect the recorded outcome before deciding whether to retry"
+        ));
+    }
+    Ok(())
+}
+
 fn emit_session_result(
     json: bool,
     id: &str,
     terminal_session: &terminal::TerminalSession,
     provider: FirstPartyCli,
+    request_id: &str,
     event: Option<&SessionEvent>,
 ) -> Result<()> {
     if json {
@@ -2312,7 +2470,10 @@ fn emit_session_result(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "ok": true,
+                "schema_version": 1,
                 "session": id,
+                "request_id": request_id,
+                "request_state": if event.is_some() { "completed" } else { "accepted" },
                 "provider": provider.as_str(),
                 "terminal": terminal_session.kind.as_str(),
                 "terminal_session_id": terminal_session.id,
@@ -2326,7 +2487,7 @@ fn emit_session_result(
             }))?
         );
     } else {
-        println!("session: {id}");
+        println!("session: {id}\nrequest: {request_id}");
         if let Some(event) = event {
             println!();
             println!("{}", terminal_safe_text(&event.message, true));
@@ -2817,8 +2978,13 @@ fn commit_provider_completion_with_status_locked(
     status_error: Option<String>,
     status_state: &str,
 ) -> Result<()> {
-    let pending =
+    let mut pending =
         PendingTurnCompletion::new_with_status(claim_token, event, status_error, status_state)?;
+    // Request indexing must not prevent a provider-verified completion from publishing.
+    // A missing or damaged receipt remains explicitly unresolved in request queries.
+    if let Ok(Some(receipt)) = requests::for_claim(directory, claim_token) {
+        pending.event_file = receipt.event_file;
+    }
     write_private(
         &directory.join(TURN_COMPLETION_FILE),
         &serde_json::to_vec_pretty(&pending)?,
@@ -3136,6 +3302,7 @@ fn read_status_if_present(path: &Path) -> Result<Option<SessionStatus>> {
 struct TurnClaim {
     path: PathBuf,
     token: String,
+    receipt: requests::Receipt,
     retained: bool,
     rollback_state: Option<&'static str>,
 }
@@ -3333,9 +3500,20 @@ fn create_turn_claim_locked(path: PathBuf) -> Result<TurnClaim> {
     file.flush()?;
     file.sync_all()?;
     sync_parent_directory(&path)?;
+    let directory = path
+        .parent()
+        .context("turn claim has no session directory")?;
+    let receipt = match requests::create(directory, &token) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            let _ = remove_turn_claim_locked(&path);
+            return Err(error).context("failed to persist request receipt before dispatch");
+        }
+    };
     Ok(TurnClaim {
         path,
         token,
+        receipt,
         retained: false,
         rollback_state: None,
     })
