@@ -121,11 +121,124 @@ agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --pro
     [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|windows-console>]
     [--yolo] [--timeout-secs N] [--detach] [--json]
 agent-bridge tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
-agent-bridge sessions [--json]
+agent-bridge sessions [--workspace PATH] [--provider <codex|claude|agy|pi>] [--state STATE]
+    [--sort <id|updated>] [--json]
+agent-bridge inspect <session> [--json]
+agent-bridge result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
+    [--wait --timeout-secs N]
+agent-bridge doctor <session> [--probe] [--json]
+agent-bridge doctor --provider <codex|claude|agy|pi> [--probe] [--json]
 agent-bridge prune-sessions --closed-before-days N --explicit [--json]
 agent-bridge close-session <session> --explicit [--json]
 agent-bridge --help | --version
 ```
+
+### 상태 확인과 요청별 결과 회수
+
+`inspect`는 저장된 상태·마지막 오류·생성/갱신 시각, 시작할 때 지정한 model/effort/yolo,
+owner 프로세스 생존 여부와 결과·요청 주소를 보여줍니다. `configured`는 저장된 시작 설정이며
+현재 provider 설정을 다시 읽은 값이 아닙니다. `owner_process_alive`도 PID 생존 관측일 뿐
+provider 응답 가능 여부나 terminal 소유권 검증을 뜻하지 않습니다.
+
+```sh
+agent-bridge sessions --workspace . --provider claude --sort updated --json
+agent-bridge inspect session-XXXXXXXX --json
+agent-bridge result session-XXXXXXXX --list --json
+agent-bridge result session-XXXXXXXX --latest --json
+agent-bridge result session-XXXXXXXX --event event-123-456.json --json
+```
+
+`--sort updated`는 최근 갱신 순, 기본 정렬은 session ID 순입니다. `sessions --json`은 기존 배열
+형태를 유지합니다. 새 조회 명령의 JSON 객체와 `ask/tell` 응답에는 `schema_version: 1`이 있습니다.
+`result --list --json`의 `events`와 `requests`는 본문을 제외한 참조 목록입니다. 본문은 정확한
+`--event` 또는 `--request`로 읽습니다. event ID는 `.json`을 포함한 보존 파일명입니다.
+
+새 `ask/tell`은 provider에 보내기 전에 공개 `request_id`를 저장합니다. 이 ID는 provider의
+session/turn ID 또는 내부 claim token을 대체하지 않습니다. `--detach`는 접수 뒤 반환하며
+`request_state: accepted`, `result: null`입니다. 이미 완료됐을 수도 있으므로 실제 결과는
+요청 ID로 조회합니다. timeout이나 전송 오류가 발생해도 접수 기록이 생성됐다면 stdout JSON에
+session과 request ID를 반환하고 exit code는 0이 아닙니다. 접수 전 거부에는 요청 ID가 없습니다.
+
+```sh
+agent-bridge ask codex --workspace . --prompt "변경을 검토해줘" --detach --json
+# 위 응답의 session과 request_id를 사용합니다.
+agent-bridge result session-XXXXXXXX --request request-XXXXXXXX \
+  --wait --timeout-secs 300 --json
+```
+
+Codex가 메인이든 Claude가 메인이든 같은 흐름을 사용합니다. 부모 도구의 제한 시간보다 짧은
+`--timeout-secs`를 지정하거나 `--detach` 후 결과를 기다리면, 부모 도구가 종료되면서 영수증을
+받지 못하는 일을 줄일 수 있습니다. 호출자가 사라져도 `inspect`와 `result --list --json`에서
+저장된 요청 주소를 찾을 수 있습니다. 다음 요청이 먼저 끝나거나 응답 본문이 같아도 과거의
+요청 ID는 그 요청에 연결된 결과만 반환합니다. 기존 기록에는 `request_id: null`을 표시하며
+연결을 추측하지 않습니다. 닫힌 세션의 보존 결과도 조회할 수 있습니다.
+
+| `request_state` | 의미 |
+| --- | --- |
+| `completed` / `failed` | provider가 검증한 완료 결과 또는 실패 결과가 게시됨 |
+| `pending` | 해당 요청이 현재 claim을 보유하고 완료 결과를 기다리는 중 |
+| `recovery_required` | 완료 journal이 남아 있어 게시 완료를 확정하지 않음 |
+| `unresolved` | 게시된 결과 없이 claim이 해제됐거나 owner가 종료됨. 재전송이 안전하다는 뜻이 아님 |
+| `unavailable` | 조회할 최근 결과가 없음 |
+| `busy` / `unknown` | 일관된 snapshot을 아직 얻지 못했거나 오류 응답 시 상태 확인 실패 |
+
+`--wait`는 정확한 `--request`에만 사용할 수 있습니다. 성공 결과를 회수하면 exit 0,
+실패 결과·미해결 요청·복구 필요·timeout이면 JSON을 출력하고 nonzero로 끝납니다.
+대기 없이 조회하면 exit 0은 조회 성공을 뜻하므로 결과의 `request_state`도 확인해야 합니다.
+`--latest` 또는 `--event`에서 읽을 게시 결과가 없어도 nonzero로 끝납니다. 손상된 영수증은
+`unreadable_requests`, 읽을 수 없는 요청 디렉터리는 `request_index_error`로 알리고 개별 event
+조회는 유지합니다. `inspect`의 요청 목록에는 호출 출처 `source`도 남습니다.
+JSON은 원문 채널이며 사람이 읽는 출력의 terminal 제어문자는 기존 정책대로 이스케이프합니다.
+
+`inspect`와 `result`는 `--wait`에서도 파일·상태를 변경하거나 요청을 전송·재전송하지 않습니다.
+완료 journal의 복구가 필요하면 기존 `sessions --workspace PATH`로 해당 workspace의 복구를
+수행한 뒤 다시 조회합니다. `sessions`의 기존 복구 동작은 유지되므로 읽기 전용 명령은 아닙니다.
+조회 timeout은 요청을 취소하거나 세션을 닫지 않습니다. 결과를 다음 작업의 참고 자료로 보낼 때는
+정확한 결과를 조회해 출처와 함께 `--prompt-file`에 넣고 기존 `ask/tell`을 사용합니다.
+
+### 기능 가용성과 다음 조치 진단
+
+`doctor`는 특정 세션 또는 provider의 상태를 설명합니다. 기본 실행은 저장된 설정·상태·요청,
+owner process의 생존·identity, terminal 기록, 설치 경로를 읽습니다. 세션을 지정하지 않으면
+세션 저장소를 탐색하지 않습니다.
+
+```bash
+agent-bridge doctor session-XXXXXXXX --json
+agent-bridge doctor session-XXXXXXXX --probe --json
+agent-bridge doctor --provider codex --probe --json
+```
+
+현재 설치된 CLI 버전은 `--probe`가 있을 때만 `<provider> --version`으로 확인합니다.
+Codex는 추가로 `codex app-server daemon version`을 실행합니다. 두 조회는 총 5초 예산을 공유하고
+출력은 각 조회별 stdout·stderr 합산 64 KiB로 제한합니다. probe helper와 그 자식 process는 종료 시 회수하며 Windows batch shim의
+임시 파일은 세션 디렉터리 밖에 둡니다. 모델 호출, 메시지 전송, daemon 시작, terminal 앱 제어,
+설정 변경은 하지 않습니다. 외부 CLI를 실행하는 probe와 기본 로컬 관측은 출력의 `probe`로 구분합니다.
+
+JSON의 `ok: true`와 exit 0은 진단 보고서를 만들었다는 뜻입니다. 각 `checks` 항목의
+`availability`(`available` / `unavailable` / `unknown`), `reason_code`, `observed_unix_ms`,
+`evidence`, `next_action`을 함께 읽어야 합니다. 각 항목은 이름에 명시된 조건만 설명하며,
+모든 관측이 성공해도 메시지 전달·모델 실행·완료까지 보증하지 않습니다. 잘못된 인자는 nonzero입니다.
+손상·경합 중인 저장 기록은 가능한 나머지 진단과 함께 미확인으로 보고하며 자동 복구하지 않습니다.
+
+- Codex는 실제 sender와 같은 launch-version·thread identity·daemon 판정을 재사용합니다.
+  시작 때 기록한 버전과 probe로 읽은 현재 버전은 별도로 표시하며, daemon 통과가 TUI의 thread
+  표시나 queue 소비를 증명하지는 않습니다. 읽기 실패와 daemon 부재를 같은 사실로 취급하지 않습니다.
+  probe 실행·해석 실패는 `unknown`, CLI가 nonzero로 응답해 native queue gate를 통과하지 못한
+  경우는 `unavailable`입니다. 이 응답만으로 daemon process 자체의 부재를 단정하지 않습니다.
+- Claude의 `crossSessionInbound: accept`는 저장된 설정입니다. 실제 backend·feature flag·정책·
+  `ListAgents` discovery를 확인하지 않았으므로 공식 메시징의 현재 가용성은 `unknown`입니다.
+  진단을 위해 messenger를 호출하거나 terminal 입력으로 우회하지 않습니다.
+- Agy와 Pi는 각 adapter가 소유한 terminal fallback과 결과 확인 방식을 설명합니다.
+  진단만으로 실제 입력 가능 여부를 확정하지 않습니다.
+
+진행 중이거나 전송 여부가 불확실한 요청에는 같은 `request_id`의 `result` 조회를 안내합니다.
+잠금을 오래 유지하지 않으며, 완료 journal 복구·재전송·close·trust/permission 변경은 수행하지 않습니다.
+안내된 `next_action`도 자동 실행하지 않습니다. 저장된 model/effort/yolo는 `configured`,
+상태와 정확한 active request 참조는 `observations`에서 확인할 수 있습니다.
+복구 안내의 `next_command`는 실제 workspace를 담은 argv 배열이며, `sessions`는 journal 복구뿐
+아니라 해당 workspace의 dead-owner 세션 정리도 수행합니다. 닫는 중인 handle과 소진된 tombstone은
+단순 누락과 구별합니다. 삭제된 workspace는 별도 진단하며 버전 조회는 임시 디렉터리에서 계속할 수
+있지만, Codex daemon 조회는 원래 workspace를 사용할 수 있을 때만 실행합니다.
 
 ## 권한과 세션 경계
 

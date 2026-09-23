@@ -54,6 +54,20 @@ struct HookFailureSignal {
 }
 
 impl NativeProviderAdapter for PiAdapter {
+    fn diagnose(
+        &self,
+        _context: super::super::doctor::Context<'_>,
+    ) -> Vec<super::super::doctor::Check> {
+        use super::super::doctor::{Availability::Unknown, Check};
+        vec![Check::new(
+            "pi_follow_up",
+            Unknown,
+            "pi_terminal_fallback",
+            "Pi owns terminal-paste follow-up and a session completion extension. No verified first-party external input path into a running interactive session is integrated.",
+            "Inspect the managed owner and terminal. Live input was not tested; replace this fallback when Pi provides the required native path.",
+        )]
+    }
+
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
         let claim_token = super::super::current_turn_claim_token(context.directory)?
             .context("Pi launch has no native turn claim")?;
@@ -550,6 +564,23 @@ export default function (pi) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostics_describe_pi_owned_fallback_without_claiming_live_delivery() {
+        use super::super::super::doctor::{Availability, Context};
+        use super::NativeProviderAdapter;
+        let checks = super::ADAPTER.diagnose(Context {
+            directory: None,
+            manifest: None,
+            executable: None,
+            current_version: None,
+            workspace: std::path::Path::new("."),
+            probe: false,
+            deadline: std::time::Instant::now(),
+        });
+        assert_eq!(checks[0].reason_code, "pi_terminal_fallback");
+        assert_eq!(checks[0].availability, Availability::Unknown);
+    }
+
     use std::fs;
 
     use super::super::super::{
