@@ -2,13 +2,13 @@
 
 로컬에 설치되고 로그인된 `codex`, `claude`, `agy`, `pi` CLI를 사용자가 볼 수 있는 실제 터미널 세션에서 연결하는 브리지입니다. API 키나 로그인 토큰을 대신 소유하지 않고 각 CLI의 기존 인증·설정·대화형 UI를 그대로 사용합니다.
 
-첫 설치 가능 릴리스는 **v0.0.1**이며 최신 설치 가이드는 **v0.0.5** tag를 기준으로 합니다. macOS에서는 iTerm2와 내장 Terminal.app을 지원합니다. Agent Bridge는 자신을 실행한 터미널을 감지해 같은 앱의 새 surface에서 세션을 시작하고, 자신이 만든 surface만 제어합니다. Terminal.app에서는 기존 tab/window를 사용하지 않고 항상 전용 새 window를 엽니다. 감지할 수 없는 호스트에서는 Terminal.app으로 안전하게 fallback합니다. 이미 독립적으로 실행 중인 임의의 CLI에는 사후 attach하지 않습니다.
+첫 설치 가능 릴리스는 **v0.0.1**이며 최신 설치 가이드는 **v0.0.6** tag를 기준으로 합니다. macOS에서는 iTerm2와 내장 Terminal.app을 지원합니다. Agent Bridge는 자신을 실행한 터미널을 감지해 같은 앱의 새 surface에서 세션을 시작하고, 자신이 만든 surface만 제어합니다. Terminal.app에서는 기존 tab/window를 사용하지 않고 항상 전용 새 window를 엽니다. 감지할 수 없는 호스트에서는 Terminal.app으로 안전하게 fallback합니다. 이미 독립적으로 실행 중인 임의의 CLI에는 사후 attach하지 않습니다.
 
 ## 지원 범위
 
 | 환경 | 상태 | transport |
 | --- | --- | --- |
-| macOS + Ghostty | v0.0.5 미지원 | 현재 설치 가능한 1.3.1은 AppleScript surface 회귀가 있고 1.3.0은 이번 후보의 양성 runtime 근거가 없어 모든 버전을 surface 생성 전에 fail-closed |
+| macOS + Ghostty | v0.0.6 미지원 | 현재 설치 가능한 1.3.1은 AppleScript surface 회귀가 있고 1.3.0은 이번 후보의 양성 runtime 근거가 없어 모든 버전을 surface 생성 전에 fail-closed |
 | macOS + iTerm2 | 지원 | iTerm2 AppleScript 직접 제어 |
 | macOS + Terminal.app | 지원 | Terminal AppleScript 직접 제어 |
 | macOS의 다른 터미널 | fallback | 별도 adapter가 없으면 Terminal.app에서 시작 |
@@ -18,7 +18,7 @@
 
 macOS에서는 `TERM_PROGRAM`, `TERM`, `ITERM_SESSION_ID`, `TERM_SESSION_ID` 순으로 현재 호스트를 식별합니다. `--terminal ghostty|iterm2|terminal`로 명시 선택할 수 있고, 선택을 생략한 상태에서 호스트를 식별하지 못하면 내장 Terminal.app을 엽니다. Terminal.app은 복원되거나 기존에 열린 surface를 채택하지 않고 항상 전용 새 window를 만듭니다. 명시 선택한 adapter가 실패하면 다른 앱으로 조용히 우회하지 않고 오류를 반환합니다.
 
-Ghostty의 AppleScript는 1.3에서 추가된 preview API이며 macOS Automation 권한이 필요합니다. [Ghostty 1.3.1에는 AppleScript로 만든 tab의 terminal surface가 초기화되지 않는 회귀](https://github.com/ghostty-org/ghostty/issues/12730)가 있고, 1.3.0은 이번 릴리스 후보에서 다시 확인한 양성 runtime 근거가 없습니다. 따라서 Agent Bridge v0.0.5는 명시적인 `--terminal ghostty`를 AppleScript 실행 전에 거부하고, Ghostty 환경 자동 감지는 지원되는 Terminal.app으로 대체합니다. `--terminal iterm2` 또는 `--terminal terminal`을 사용하세요. Terminal.app은 기존 tab이나 UI scripting을 사용하지 않고 native AppleScript로 항상 전용 새 window를 만듭니다.
+Ghostty의 AppleScript는 1.3에서 추가된 preview API이며 macOS Automation 권한이 필요합니다. [Ghostty 1.3.1에는 AppleScript로 만든 tab의 terminal surface가 초기화되지 않는 회귀](https://github.com/ghostty-org/ghostty/issues/12730)가 있고, 1.3.0은 이번 릴리스 후보에서 다시 확인한 양성 runtime 근거가 없습니다. 따라서 Agent Bridge v0.0.6는 명시적인 `--terminal ghostty`를 AppleScript 실행 전에 거부하고, Ghostty 환경 자동 감지는 지원되는 Terminal.app으로 대체합니다. `--terminal iterm2` 또는 `--terminal terminal`을 사용하세요. Terminal.app은 기존 tab이나 UI scripting을 사용하지 않고 native AppleScript로 항상 전용 새 window를 만듭니다.
 
 Windows는 PowerShell 또는 cmd에서 호출할 수 있으며 PowerShell 7(`pwsh.exe`)이 설치되어 있어야 합니다. bridge는 absolute PATH entry에서 찾은 `pwsh.exe`의 절대 경로를 `CreateProcessW`에 전달하고, `CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED`로 전용 visible console을 만든 뒤 identity-bound handle을 기록한 후에만 실행을 재개합니다. 후속 입력과 explicit close는 managed session ID, PID 생성 시각, 실행 파일 identity가 모두 일치할 때만 전달합니다. npm provider shim은 `.exe`, `.ps1`, `.cmd`, `.bat` 순으로 찾고 PowerShell shim을 우선해 `%NAME%`의 `cmd.exe` 확장을 피합니다. Linux는 아직 미지원입니다. provider/session 계약은 공유하되 OS와 terminal transport는 각각 독립 모듈로 유지합니다. provider 간에도 transport 구현을 억지로 공통화하지 않습니다. 각 provider adapter가 공식 session messaging·follow-up·result identity를 우선 사용하고, upstream에서 제공하지 않는 플랫폼·버전에만 같은 의미론의 fallback을 소유합니다. upstream 지원이 추가되면 공통층을 늘리는 대신 해당 fallback을 삭제·교체합니다.
 
@@ -29,7 +29,7 @@ Windows는 PowerShell 또는 cmd에서 호출할 수 있으며 PowerShell 7(`pws
 - Agy: 세션 로그와 완료 transcript
 - Pi: 세션 전용 lifecycle 확장
 
-Windows와 macOS는 같은 세션 계약을 구현하지만 provider transport와 v0.0.5의 authenticated live 검증 범위는 다릅니다. 아래의 `구현·CI 검증`은 정적·단위·CI 근거를 뜻하며, 별도 표기 없는 Windows provider를 authenticated runtime 검증 완료로 해석하면 안 됩니다.
+Windows와 macOS는 같은 세션 계약을 구현하지만 provider transport와 v0.0.6의 authenticated live 검증 범위는 다릅니다. 아래의 `구현·CI 검증`은 정적·단위·CI 근거를 뜻하며, 별도 표기 없는 Windows provider를 authenticated runtime 검증 완료로 해석하면 안 됩니다.
 
 | Provider | macOS transport | native Windows transport | authenticated Windows live 근거 |
 | --- | --- | --- | --- |
@@ -42,16 +42,16 @@ provider별 console follow-up은 각 adapter 내부에 격리되어 있으며, b
 
 ## 설치
 
-소스에서 설치할 때는 Rust 1.97.1 이상이 필요합니다. macOS에서는 iTerm2 또는 Terminal.app이 필요하며 v0.0.5의 Ghostty adapter는 fail-closed입니다. Windows에서는 PowerShell 7이 필요합니다. 두 OS 모두 사용할 provider CLI를 먼저 직접 실행해 로그인과 초기 설정을 완료해야 합니다.
+소스에서 설치할 때는 Rust 1.97.1 이상이 필요합니다. macOS에서는 iTerm2 또는 Terminal.app이 필요하며 v0.0.6의 Ghostty adapter는 fail-closed입니다. Windows에서는 PowerShell 7이 필요합니다. 두 OS 모두 사용할 provider CLI를 먼저 직접 실행해 로그인과 초기 설정을 완료해야 합니다.
 
 ```sh
-git clone --branch v0.0.5 --depth 1 https://github.com/jy1655/agent-bridge.git
+git clone --branch v0.0.6 --depth 1 https://github.com/jy1655/agent-bridge.git
 cd agent-bridge
 cargo install --path . --locked
 agent-bridge --version
 ```
 
-마지막 명령은 `agent-bridge 0.0.5`를 출력해야 합니다. 개발 중인 `main`이 아니라 릴리스 tag에서 설치해야 설치본과 소스의 경계가 명확합니다.
+마지막 명령은 `agent-bridge 0.0.6`를 출력해야 합니다. 개발 중인 `main`이 아니라 릴리스 tag에서 설치해야 설치본과 소스의 경계가 명확합니다.
 
 Windows 명령줄 한도를 넘는 요청은 `--prompt-file`로 전달합니다. 파일은 UTF-8 텍스트로 읽고 CRLF는 LF로 정규화하며, Agent Bridge가 원본을 삭제하거나 수정하지 않습니다. 단독 CR과 그 밖의 제출·escape 제어문자는 거부합니다.
 
@@ -60,13 +60,13 @@ Windows 명령줄 한도를 넘는 요청은 `--prompt-file`로 전달합니다.
 GitHub Release에는 Apple Silicon macOS용 `agent-bridge-<version>-aarch64-apple-darwin.tar.gz`와 64비트 Windows용 `agent-bridge-<version>-x86_64-pc-windows-msvc.zip`을 게시하며, 각 archive와 같은 이름의 `.sha256` 파일을 함께 제공합니다. prebuilt archive 설치에는 Rust가 필요하지 않습니다. archive를 푼 뒤 macOS에서는 `agent-bridge`, Windows에서는 `agent-bridge.exe`를 `PATH`에 있는 디렉터리로 옮깁니다. 다운로드한 파일은 실행 전에 체크섬을 검증하세요.
 
 ```sh
-shasum -a 256 -c agent-bridge-0.0.5-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf agent-bridge-0.0.5-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c agent-bridge-0.0.6-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf agent-bridge-0.0.6-aarch64-apple-darwin.tar.gz
 ./agent-bridge --version
 ```
 
 ```powershell
-$archive = "agent-bridge-0.0.5-x86_64-pc-windows-msvc.zip"
+$archive = "agent-bridge-0.0.6-x86_64-pc-windows-msvc.zip"
 $expected = (Get-Content "$archive.sha256").Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "checksum mismatch" }
@@ -242,7 +242,7 @@ JSON의 `ok: true`와 exit 0은 진단 보고서를 만들었다는 뜻입니다
 
 ## 권한과 세션 경계
 
-- Agent Bridge는 같은 `ask` 작업에서 새로 만든 surface만 기록합니다. 새 handle은 managed session ID와 host가 제공하는 stable ID를 결합하며 `tell`과 `close-session` 직전에 다시 검증합니다. 지원되는 macOS iTerm2·Terminal.app 경로는 target `native-session` owner의 managed session ID·PID·controlling TTY device·process start fingerprint·foreground process group과 전용 login shell identity를 검증하고, surface가 보고하는 TTY도 owner와 일치해야 합니다. 시작 명령을 보내기 전에 handle을 내구성 있게 기록하고, 시작 실패 시 전체 timeout 안에 예약한 정리 구간에서 정확한 surface를 닫은 뒤 handle을 제거합니다. 정리가 실패한 경우에만 `launching`/`failed` 상태의 bound handle을 남겨 명시적 `close-session --explicit`이 stable ID로 회수할 수 있습니다. 비활성화된 Ghostty adapter 코드는 terminal·tab·window ID 복합체와 live owner 검증 경계를 유지하지만 v0.0.5에서는 선택될 수 없습니다. Windows 입력과 close는 console root와 `native-session` owner 각각의 PID 생성 시각·실행 파일 identity를 검증하고, console root의 검증된 process handle을 `AttachConsole`과 control이 끝날 때까지 유지해 PID 재사용을 fail-closed합니다. suspended console의 identity-bound handle은 private state에 내구성 있게 기록한 뒤에만 실행을 재개합니다. Windows Codex adapter는 정확한 canonical workspace를 provider process의 inherited current directory로 유지하고, verbatim 경로를 거부하는 Codex에는 의미가 달라질 수 있는 정규화 경로를 `-C`로 다시 전달하지 않습니다. 호출 당시 터미널을 재감지하거나 복원된 front/current/selected surface를 채택하지 않습니다.
+- Agent Bridge는 같은 `ask` 작업에서 새로 만든 surface만 기록합니다. 새 handle은 managed session ID와 host가 제공하는 stable ID를 결합하며 `tell`과 `close-session` 직전에 다시 검증합니다. 지원되는 macOS iTerm2·Terminal.app 경로는 target `native-session` owner의 managed session ID·PID·controlling TTY device·process start fingerprint·foreground process group과 전용 login shell identity를 검증하고, surface가 보고하는 TTY도 owner와 일치해야 합니다. 시작 명령을 보내기 전에 handle을 내구성 있게 기록하고, 시작 실패 시 전체 timeout 안에 예약한 정리 구간에서 정확한 surface를 닫은 뒤 handle을 제거합니다. 정리가 실패한 경우에만 `launching`/`failed` 상태의 bound handle을 남겨 명시적 `close-session --explicit`이 stable ID로 회수할 수 있습니다. 비활성화된 Ghostty adapter 코드는 terminal·tab·window ID 복합체와 live owner 검증 경계를 유지하지만 v0.0.6에서는 선택될 수 없습니다. Windows 입력과 close는 console root와 `native-session` owner 각각의 PID 생성 시각·실행 파일 identity를 검증하고, console root의 검증된 process handle을 `AttachConsole`과 control이 끝날 때까지 유지해 PID 재사용을 fail-closed합니다. suspended console의 identity-bound handle은 private state에 내구성 있게 기록한 뒤에만 실행을 재개합니다. Windows Codex adapter는 정확한 canonical workspace를 provider process의 inherited current directory로 유지하고, verbatim 경로를 거부하는 Codex에는 의미가 달라질 수 있는 정규화 경로를 `-C`로 다시 전달하지 않습니다. 호출 당시 터미널을 재감지하거나 복원된 front/current/selected surface를 채택하지 않습니다.
 - 새 세션의 `--model`, `--effort`, `--yolo`는 부모 CLI에서 추측하거나 상속하지 않습니다. 해당 `ask` 요청에 명시된 값만 사용합니다.
 - `--yolo`는 Codex의 `--dangerously-bypass-approvals-and-sandbox`, Claude와 Agy의 `--dangerously-skip-permissions`를 전달합니다. Pi에서는 해당 실행의 project-local files를 신뢰하는 `--approve`를 전달하며 Pi 자체 tool 정책은 유지합니다.
 - `tell`은 세션별 한 턴만 허용합니다. Claude Code 2.1.234 이상은 macOS와 native Windows 모두 별도의 비영속·격리 설정 print-mode Claude 프로세스에서 공식 `ListAgents`로 고유 managed session name을 찾고 `SendMessage`로 전달합니다. Claude의 공식 cross-session 기능은 macOS·Linux에서 2.1.224부터, native Windows에서 per-session named pipe를 사용하는 2.1.234부터 제공됩니다. messenger의 stdin JSON에는 본문 대신 요청별 짧은 전달 참조 `agent-bridge-payload:<Claude turn ID>`만 들어가며, 본문은 messenger의 argv에도 stdin에도 들어가지 않고 messenger model을 통과하지 않습니다. messenger model이 본문을 `SendMessage` 입력으로 옮겨 적는 방식에서는 provider가 그 응답을 도중에 중단하거나 입력을 거부하면 본문이 잘리거나 `SendMessage`가 실행되지 않기 때문입니다. 임시 `PreToolUse` hook(guard)은 정확한 local session name·요약·전달 참조를 실행 전에 검증하여 일치하면 공식 hook 출력 `updatedInput`으로 정확한 본문을 실제 실행 입력으로 넣고 일치하지 않으면 호출을 거부합니다. guard는 요청 하나에 `SendMessage` 호출을 한 번만 승인하며, 승인 기록을 먼저 남긴 뒤에만 승인합니다. 임시 `PostToolUse` hook은 Claude가 보고한 실제 실행 입력이 본문과 일치하는지를 실행 영수증으로 남깁니다. 같은 임시 설정의 `isolatePeerMachines`로 cross-machine 전송도 막습니다. 출력 stream에서 확인한 discovery와 단일 `SendMessage` 성공 결과, guard의 승인 기록, 실행 영수증이 모두 일치해야 전송 성공으로 인정합니다. messenger는 Unix process group 안에 격리하며, Windows에서는 정지 상태로 생성해 Job Object에 먼저 할당한 뒤 재개합니다. timeout 때 messenger의 하위 프로세스까지 종료하며, 재시도는 `SendMessage`가 실행되지 않았다고 증명된 시도에만 합니다. 증명 조건은 승인 기록과 실행 영수증이 모두 없고, 출력의 모든 `SendMessage` 호출이 각각 한 번만 나타나며 Claude의 차단 보고로만 끝났거나, `SendMessage` 호출이 전혀 없었던(discovery miss) 경우입니다. 차단 보고는 guard의 거부 사유가 그대로 담긴 오류 결과, 또는 provider가 응답을 중단해 그 호출이 실행되지 않았다고 Claude가 알리는 오류 결과의 두 가지이며, 그 밖의 오류 결과는 호출이 실행된 뒤에 나온 것일 수 있으므로 미전송의 증거로 보지 않습니다. Claude는 hook이 timeout을 넘기면 그 출력을 버리고 호출을 guard 없이 실행하며 `SendMessage`는 권한 승인 대상이 아니어서 그렇게 실행될 수 있으므로, guard 자신의 거부 결정도 증거로 쓰지 않습니다. 재시도는 첫 실패 시점부터 시작하는 5초 창과 전체 timeout 안에서만 하며, 끝내 전송하지 못한 `tell`은 turn claim을 해제하고 세션을 `ready`로 되돌리므로 같은 세션에 다시 `tell`할 수 있습니다. 대상 세션의 `Stop` hook은 요청별 고유 Claude turn ID와 정확한 최종 마커가 일치한 응답만 결과로 기록하고 반환값에서는 마커를 제거합니다. 마커가 다른 수동·비상관 턴에는 개입하지 않고 pending claim을 유지합니다. 이 provider 전용 상관관계 프로토콜은 Claude가 대상 turn identity를 공식 결과로 제공하면 교체할 경계입니다. 이 provider-native 전송에는 `tell`마다 별도의 Claude transport turn이 한 번 필요합니다. provider·feature-flag·정책 설정 때문에 공식 기능을 사용할 수 없으면 terminal injection으로 자동 전환하지 않고 전송 전에 실패합니다. 전송을 시도한 뒤 성공 여부를 확인할 수 없으면 중복 재전송을 막기 위해 turn claim을 유지하며, 정상적으로 진행 중인 `working` 세션과 구분할 수 있도록 그 이유를 세션 `status.json`의 `error`에 기록합니다. turn claim은 대상 결과가 도착하거나 `close-session --explicit`으로 닫을 때 해제됩니다. Codex 0.149 이상은 저장된 provider 버전, 기존 완료 event의 authoritative thread UUID, 실행 중인 0.149+ local app-server daemon을 확인한 뒤 `codex queue --thread <UUID> --message <TEXT>`를 사용합니다. queue 성공 출력은 메시지 수락만 증명하며 turn 완료로 간주하지 않습니다. 최종 완료는 기존 Codex notify가 같은 thread UUID와 현재 claim marker를 함께 증명할 때만 기록됩니다. 구버전, 확립되지 않은 thread, 사용할 수 없거나 호환되지 않는 local daemon, 또는 server가 미수락을 명확히 보고한 경우에만 terminal fallback으로 전환합니다. queue 실행 뒤 결과가 불명확하면 terminal로 재전송하지 않고 claim을 유지하며, queue/probe helper는 Unix process group 또는 Windows Job Object 안에서 실행해 timeout 시 하위 프로세스까지 종료합니다. Agent Bridge는 global daemon을 시작·종료하거나 remote target을 선택하지 않습니다. Pi·Agy는 각 provider adapter가 소유한 terminal paste fallback을 계속 사용합니다. Codex는 공식 notify의 `input-messages`에 든 claim marker로 turn을 확인해 exact-output 응답 본문을 바꾸지 않습니다. Pi의 세션 확장은 `before_agent_start`의 실제 입력에 현재 claim marker가 포함됐는지 확인하고 그 claim token과 함께 settled result를 제출하므로 exact-output 본문을 바꾸지 않으며, Agy는 claim token과 정확한 final marker가 일치한 결과만 수락합니다. Enter·ESC 같은 별도 터미널 동작을 만들 수 있는 제어문자는 거부합니다.
@@ -289,6 +289,12 @@ src/native/tests.rs            provider-neutral native orchestration 단위 테�
 새 CLI를 추가할 때는 provider registry와 두 provider adapter를 추가하고, model/effort/권한 및 실제 결과 회수 계약을 각각 테스트합니다. 새 터미널은 해당 OS 디렉터리에 adapter를 추가하고 OS dispatcher에 등록합니다. 새 OS는 독립 디렉터리에서 같은 `detect/open_tab/send_file/close_session` 계약을 구현합니다. launch command quoting은 POSIX shell과 Windows PowerShell을 분리해 유지합니다. 공통화가 플랫폼의 native 동작을 약화한다면 플랫폼별 구현을 우선합니다.
 
 기존 `{"iterm_session_id":"..."}` 형식의 `terminal.json`은 iTerm2 세션으로 계속 읽습니다. 새 세션은 terminal-neutral한 `terminal`, `session_id`, 선택적 `tab_id`·`window_id`와 내부 `managed_session_id` binding을 기록합니다. 가시적인 terminal title은 설정하거나 ownership record에 저장하지 않습니다. Terminal.app의 추가 owner attestation은 target `native-session`이 별도 private record에 기록합니다.
+
+## 0.0.6 업데이트
+
+0.0.6은 세션 상태와 특정 요청의 결과를 다시 확인하고, 후속 작업에 필요한 조건을 진단하는 명령을 추가합니다. `inspect`는 저장 설정·상태·owner 관측을, `result`는 정확한 요청 또는 event의 결과를 보여줍니다. `ask/tell`이 반환하는 `request_id`로 timeout 뒤에도 같은 요청을 조회할 수 있으며 `result --wait`는 재전송하거나 세션을 변경하지 않습니다. `sessions`에는 provider·상태 필터와 갱신 시각 정렬을 추가했습니다.
+
+`doctor <session>` 또는 `doctor --provider <name>`은 조건별 가용성·근거·다음 조치를 안내합니다. 기본은 로컬 관측이며 `--probe`로 CLI 버전과 Codex daemon 정보를 추가 조회합니다. 확인하지 못한 Claude runtime 조건은 `unknown`으로 유지하고, delivery-uncertain은 같은 request 결과 확인을 안내합니다. 기존 provider 전송·완료 판정·권한 계약은 유지합니다. 자세한 동작과 검증 범위는 [0.0.6 릴리스 노트](docs/releases/0.0.6.md)에 있습니다.
 
 ## 0.0.5 업데이트
 
