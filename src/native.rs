@@ -2134,6 +2134,19 @@ fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
     let manifest = read_manifest(directory)?;
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
     verify_reopen_source_is_closed(directory, id)?;
+    // The lifecycle readers' contract for `events`: it is a real directory inside the
+    // session, or absent, before anything under it is opened. A link or a non-directory
+    // planted there would carry the reads below outside the session, and the shared
+    // listing would present it as "no events", which the identity gate would then report
+    // as a source without an identity. Neither can prove what the source delivered. An
+    // absent directory is not rejected here: it holds no event, so the receipt and identity
+    // gates below refuse for what is actually missing.
+    events_directory_state(directory).map_err(|error| {
+        reopen_refusal(
+            "request-unresolved",
+            format!("the recorded results of session {id} cannot be read: {error:#}"),
+        )
+    })?;
     let index = requests::list(directory)?;
     if index.unreadable > 0 {
         return Err(reopen_refusal(

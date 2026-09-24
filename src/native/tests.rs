@@ -6983,6 +6983,47 @@ fn late_hook_carrying_the_previous_marker_into_the_new_directory_is_ignored() {
 }
 
 #[test]
+fn reopen_refuses_a_source_whose_events_path_is_not_a_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let source = write_closed_reopen_source(
+        root.path(),
+        "session-reopenevfile",
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    // The closed source is otherwise healthy; only its `events` path is damaged. The
+    // shared listing would report such a path as "no events", which is not an
+    // identity-less source but an unreadable one.
+    let events = source.join("events");
+    fs::remove_dir_all(&events).unwrap();
+    fs::write(&events, b"not a directory").unwrap();
+    let error = inspect_reopen_source(&source, "session-reopenevfile").unwrap_err();
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some("request-unresolved"),
+        "{error:#}"
+    );
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("events is not a directory"), "{rendered}");
+    assert!(!rendered.contains("source-identity-missing"), "{rendered}");
+
+    // An absent `events` directory is not rejected by the directory gate: the source holds
+    // no event, so the later gates name what is actually missing. This source recorded a
+    // request, so its receipt is what no longer resolves.
+    fs::remove_file(&events).unwrap();
+    let error = inspect_reopen_source(&source, "session-reopenevfile").unwrap_err();
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some("request-unresolved"),
+        "{error:#}"
+    );
+    let rendered = format!("{error:#}");
+    assert!(rendered.contains("has no recorded result"), "{rendered}");
+    assert!(!rendered.contains("cannot be read"), "{rendered}");
+}
+
+#[test]
 fn reopened_session_close_consumes_only_its_own_handle_and_leaves_the_source_tombstone() {
     let root = tempfile::tempdir().unwrap();
     let source_id = "session-reopensrc3";
