@@ -290,7 +290,11 @@ fn correlated_response<'a>(message: &'a str, pending: &PendingAgyTurn) -> Result
 //   completed`, never logged the deferred reload, and went silent). The gate never
 //   waits for a hooks completion after a reload; the startup reload of session-IQHEwf
 //   had none. A reload that arrives after both windows is caught by the input
-//   receipt below, not by the gate.
+//   receipt below, not by the gate. The gate also keeps the byte length and the
+//   leading bytes of the newest read: a log that disappears, shrinks, or no longer
+//   begins with those bytes was replaced or rotated, so every settlement instant is
+//   discarded and re-measured from the new content, and a second discontinuity
+//   fails the paste as `not_sent` (review round 5).
 // - input receipt: a complete `HandleUserInput called with text: "..."` line
 //   (input_loop.go) that starts after the byte length of agy.log observed
 //   immediately before the paste and whose text carries the Windows protocol prefix
@@ -596,8 +600,84 @@ struct ReadinessTiming {
     deferred_reload_window: Duration,
 }
 
+// The settlement instants are only evidence about the log they were measured
+// against. Agy appends to its `--log-file`, so every read must extend the previous
+// one; a log that disappears, shrinks, or no longer begins with the bytes observed
+// earlier was replaced or rotated, and the indices of its `CLI startup completed`
+// and activity lines can coincide with the old ones while the composer behind it
+// is fresh. The gate therefore keeps the byte length and the leading bytes of the
+// newest read, the way the receipt check keeps the pre-paste offset, and on a
+// discontinuity discards every settlement instant and starts over from the new
+// content: the quiet period and the deferred reload window are timed from the new
+// observation. A replacement that keeps the observed leading bytes and at least the
+// observed length is indistinguishable from continuation; the leading bytes hold
+// several glog lines with microsecond timestamps and thread ids, so a fresh Agy
+// process never reproduces them.
+const LOG_CONTINUITY_PREFIX_LEN: usize = 4096;
+// One restart is tolerated: the log may be replaced once (for example by a rotation
+// during startup) and the gate re-establishes readiness from the new content. A
+// second discontinuity fails the paste as `not_sent`, because a log that keeps
+// changing under the gate cannot prove a settled composer.
+const LOG_DISCONTINUITY_RESTARTS: usize = 1;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LogContinuity {
+    len: usize,
+    prefix: Vec<u8>,
+}
+
+impl LogContinuity {
+    fn of(log: &[u8]) -> Self {
+        Self {
+            len: log.len(),
+            prefix: log[..log.len().min(LOG_CONTINUITY_PREFIX_LEN)].to_vec(),
+        }
+    }
+
+    // Whether `log` continues the observed content, or how it breaks from it.
+    fn discontinuity(&self, log: &[u8]) -> Option<LogDiscontinuity> {
+        if log.len() < self.len {
+            Some(LogDiscontinuity::Shrunk {
+                from: self.len,
+                to: log.len(),
+            })
+        } else if !log.starts_with(&self.prefix) {
+            Some(LogDiscontinuity::Replaced { observed: self.len })
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogDiscontinuity {
+    // The log disappeared after content had been observed.
+    Missing { observed: usize },
+    // The log is shorter than the observed content (rotated or truncated).
+    Shrunk { from: usize, to: usize },
+    // The log no longer begins with the observed leading bytes (replaced).
+    Replaced { observed: usize },
+}
+
+impl LogDiscontinuity {
+    fn describe(self) -> String {
+        match self {
+            Self::Missing { observed } => {
+                format!("agy.log disappeared after {observed} bytes had been observed")
+            }
+            Self::Shrunk { from, to } => {
+                format!("agy.log shrank from {from} to {to} bytes (rotated or truncated)")
+            }
+            Self::Replaced { observed } => format!(
+                "agy.log no longer begins with the bytes observed earlier ({observed} bytes had been observed; replaced)"
+            ),
+        }
+    }
+}
+
 struct ReadinessGate {
     timing: ReadinessTiming,
+    started_at: Instant,
     settle_line: Option<usize>,
     settled_at: Instant,
     quiet_reached: bool,
@@ -606,28 +686,70 @@ struct ReadinessGate {
     startup_seen_at: Option<Instant>,
     deferred_reload_settled: bool,
     last_observation: Option<StartupObservation>,
+    // The newest observed log content; `None` until a log has been read and after
+    // it disappears.
+    continuity: Option<LogContinuity>,
+    // Every discontinuity so far, with the time since the gate started.
+    discontinuities: Vec<(Duration, LogDiscontinuity)>,
 }
 
 impl ReadinessGate {
     fn new(now: Instant, timing: ReadinessTiming) -> Self {
         Self {
             timing,
+            started_at: now,
             settle_line: None,
             settled_at: now,
             quiet_reached: false,
             startup_seen_at: None,
             deferred_reload_settled: false,
             last_observation: None,
+            continuity: None,
+            discontinuities: Vec::new(),
         }
+    }
+
+    // Discards every settlement instant: the next observation starts over as if the
+    // gate had just been created, with the quiet period and the deferred reload
+    // window timed from `now`.
+    fn restart_after(&mut self, discontinuity: LogDiscontinuity, now: Instant) {
+        self.discontinuities.push((
+            now.saturating_duration_since(self.started_at),
+            discontinuity,
+        ));
+        self.settle_line = None;
+        self.settled_at = now;
+        self.quiet_reached = false;
+        self.startup_seen_at = None;
+        self.deferred_reload_settled = false;
+        self.last_observation = None;
+        self.continuity = None;
+    }
+
+    fn discontinuity_limit_exceeded(&self) -> bool {
+        self.discontinuities.len() > LOG_DISCONTINUITY_RESTARTS
     }
 
     fn observe(&mut self, log: Option<&[u8]>, now: Instant) -> ReadinessState {
         let Some(log) = log else {
-            self.last_observation = None;
-            self.quiet_reached = false;
-            self.deferred_reload_settled = false;
+            if let Some(previous) = self.continuity.take() {
+                self.restart_after(
+                    LogDiscontinuity::Missing {
+                        observed: previous.len,
+                    },
+                    now,
+                );
+            }
             return ReadinessState::AwaitingLog;
         };
+        if let Some(discontinuity) = self
+            .continuity
+            .as_ref()
+            .and_then(|previous| previous.discontinuity(log))
+        {
+            self.restart_after(discontinuity, now);
+        }
+        self.continuity = Some(LogContinuity::of(log));
         let observation = observe_startup(log);
         if observation.settle_line != self.settle_line {
             self.settle_line = observation.settle_line;
@@ -673,11 +795,38 @@ impl ReadinessGate {
         } else {
             missing.join(", ")
         };
+        let restarted = if self.discontinuities.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; the readiness evidence was restarted after a log discontinuity ({})",
+                self.describe_discontinuities()
+            )
+        };
         format!(
-            "Agy did not report startup readiness before the deadline: {}; missing markers: {missing}; the quiet period is {} ms and the deferred reload window is {} ms; the initial prompt was not pasted",
+            "Agy did not report startup readiness before the deadline: {}; missing markers: {missing}; the quiet period is {} ms and the deferred reload window is {} ms{restarted}; the initial prompt was not pasted",
             state.describe(),
             self.timing.quiet_period.as_millis(),
             self.timing.deferred_reload_window.as_millis()
+        )
+    }
+
+    fn describe_discontinuities(&self) -> String {
+        self.discontinuities
+            .iter()
+            .map(|(at, discontinuity)| {
+                format!("{} at {} ms", discontinuity.describe(), at.as_millis())
+            })
+            .collect::<Vec<_>>()
+            .join("; then ")
+    }
+
+    fn discontinuity_report(&self) -> String {
+        format!(
+            "Agy startup readiness could not be established: agy.log was replaced or rotated {} times while the gate waited ({}); settlement evidence from a replaced log is discarded and only {} restart is tolerated; the initial prompt was not pasted",
+            self.discontinuities.len(),
+            self.describe_discontinuities(),
+            LOG_DISCONTINUITY_RESTARTS
         )
     }
 }
@@ -698,6 +847,9 @@ where
         let log = read_log().context("Agy startup readiness could not be observed")?;
         let now = clock.now();
         let state = gate.observe(log.as_deref(), now);
+        if gate.discontinuity_limit_exceeded() {
+            bail!("{}", gate.discontinuity_report());
+        }
         if state == ReadinessState::Ready {
             return Ok(());
         }
@@ -892,7 +1044,7 @@ where
 fn input_receipt_check(directory: Option<&Path>) -> super::super::doctor::Check {
     use super::super::doctor::{Availability::Unknown, Check};
     const CHECK_ID: &str = "agy_input_receipt";
-    const NEXT_ACTION: &str = "Observation only. Windows console delivery pastes after CLI startup completed, a Full redraw completed after it, the deferred skills reload (Reloading system slash commands and skills after startup) or a 20 s window since startup, and a quiet period without reload, redraw, or hooks lines, and requires a HandleUserInput receipt carrying the complete pending turn marker; a missing receipt leaves delivery uncertain with the session working and the reason in status.error, and the paste is never repeated. Inspect the session and close it explicitly or launch a new one.";
+    const NEXT_ACTION: &str = "Observation only. Windows console delivery pastes after CLI startup completed, a Full redraw completed after it, the deferred skills reload (Reloading system slash commands and skills after startup) or a 20 s window since startup, and a quiet period without reload, redraw, or hooks lines, re-measured from the new content if agy.log is replaced or rotated once (twice fails the paste), and requires a HandleUserInput receipt carrying the complete pending turn marker; a missing receipt leaves delivery uncertain with the session working and the reason in status.error, and the paste is never repeated. Inspect the session and close it explicitly or launch a new one.";
     let Some(directory) = directory else {
         return Check::new(
             CHECK_ID,
@@ -1616,9 +1768,10 @@ I0924 17:53:04.677160     651 http_helpers.go:305] URL: https://daily-cloudcode-
     // Replays a recorded log against the fake clock: each complete line becomes
     // visible at its own glog timestamp, with the first timestamped line at `start`,
     // so the readiness instants the tests assert are the ones Agy recorded. A line
-    // without a timestamp (`CLI ready for user input`) and a line stamped earlier
-    // than its predecessor (threads log out of order by a few milliseconds) appear
-    // together with the line before them.
+    // without a timestamp (`CLI ready for user input`, or a header before the first
+    // timestamped line) and a line stamped earlier than its predecessor (threads log
+    // out of order by a few milliseconds) appear together with the line before them;
+    // untimestamped lines before the first timestamp appear at `start`.
     struct LogReplay {
         start: Instant,
         first: Duration,
@@ -1627,18 +1780,20 @@ I0924 17:53:04.677160     651 http_helpers.go:305] URL: https://daily-cloudcode-
 
     impl LogReplay {
         fn new(text: &str, start: Instant) -> Self {
-            let mut first = None;
-            let mut previous = Duration::ZERO;
+            let first = text
+                .lines()
+                .find_map(glog_time_of_day)
+                .expect("a recorded log has a timestamped line");
+            let mut previous = first;
             let mut lines = Vec::new();
             for line in text.lines() {
                 let stamp = glog_time_of_day(line).unwrap_or(previous).max(previous);
-                let first = *first.get_or_insert(stamp);
                 previous = stamp;
                 lines.push((start + (stamp - first), format!("{line}\n")));
             }
             Self {
                 start,
-                first: first.expect("a recorded log has a timestamped line"),
+                first,
                 lines,
             }
         }
@@ -2205,6 +2360,392 @@ I0924 17:53:04.677160     651 http_helpers.go:305] URL: https://daily-cloudcode-
         assert_eq!(
             no_startup.observe(Some(redraw_only.as_bytes()), at(10_000)),
             ReadinessState::AwaitingStartup
+        );
+    }
+
+    #[test]
+    fn log_continuity_accepts_only_a_log_that_extends_the_observed_content() {
+        let observed = successful_startup_log();
+        let continuity = LogContinuity::of(observed.as_bytes());
+        assert_eq!(continuity.len, observed.len());
+        assert_eq!(continuity.prefix, observed.as_bytes());
+
+        // Growth, including a partial trailing line that later completes, continues.
+        let grown = observed.clone() + "I0924 16:42:30.000000     540 manager.go:1308] Reloading";
+        assert_eq!(continuity.discontinuity(grown.as_bytes()), None);
+        assert_eq!(
+            LogContinuity::of(grown.as_bytes())
+                .discontinuity((grown.clone() + " system slash commands\n").as_bytes()),
+            None
+        );
+        assert_eq!(continuity.discontinuity(observed.as_bytes()), None);
+
+        // A shorter file, or one with different leading bytes, does not.
+        assert_eq!(
+            continuity.discontinuity(&observed.as_bytes()[..observed.len() - 1]),
+            Some(LogDiscontinuity::Shrunk {
+                from: observed.len(),
+                to: observed.len() - 1
+            })
+        );
+        let replaced = observed.replace("16:42:24", "16:52:24");
+        assert_eq!(replaced.len(), observed.len());
+        assert_eq!(
+            continuity.discontinuity(replaced.as_bytes()),
+            Some(LogDiscontinuity::Replaced {
+                observed: observed.len()
+            })
+        );
+
+        // Only the first LOG_CONTINUITY_PREFIX_LEN bytes are compared: a change
+        // beyond them in a log of at least the observed length is continuation.
+        let long = REAL_QUIET_STARTUP.to_owned() + REAL_DEFERRED_RELOAD_STARTUP;
+        assert!(long.len() > LOG_CONTINUITY_PREFIX_LEN);
+        let continuity = LogContinuity::of(long.as_bytes());
+        assert_eq!(continuity.prefix.len(), LOG_CONTINUITY_PREFIX_LEN);
+        let changed_late = long.replace("17:47:13.468286", "17:47:13.468287");
+        assert_ne!(changed_late, long);
+        assert_eq!(continuity.discontinuity(changed_late.as_bytes()), None);
+        let changed_early = long.replacen("17:20:28.610124", "17:20:28.610125", 1);
+        assert_eq!(
+            continuity.discontinuity(changed_early.as_bytes()),
+            Some(LogDiscontinuity::Replaced {
+                observed: long.len()
+            })
+        );
+    }
+
+    #[test]
+    fn readiness_gate_restarts_its_evidence_when_the_log_is_replaced() {
+        let start = Instant::now();
+        let at = |millis: u64| start + Duration::from_millis(millis);
+        let timing = STARTUP_READINESS_TIMING;
+        let startup_redraw = glog(
+            "16:41:07.830345",
+            1,
+            "analytics.go:187",
+            "CLI startup completed (took 1ms)",
+        ) + &glog("16:41:07.876154", 269, "manager.go:934", FULL_REDRAW);
+
+        // The review scenario: startup and redraw at t=0, the log missing at t=19.9,
+        // and at t=20 a replacement with the same content at the same indices. The
+        // round-4 gate kept `startup_seen_at` from t=0 and the settle line index
+        // matched, so it was ready at once although the fresh redraw had no quiet
+        // period. The evidence now restarts at the disappearance: the replacement
+        // is a new startup, and the window and the quiet period count from t=20.
+        let mut gate = ReadinessGate::new(start, timing);
+        assert_eq!(
+            gate.observe(Some(startup_redraw.as_bytes()), at(0)),
+            ReadinessState::AwaitingDeferredReload
+        );
+        assert_eq!(gate.observe(None, at(19_900)), ReadinessState::AwaitingLog);
+        assert_eq!(
+            gate.discontinuities,
+            vec![(
+                Duration::from_millis(19_900),
+                LogDiscontinuity::Missing {
+                    observed: startup_redraw.len()
+                }
+            )]
+        );
+        assert_eq!(
+            gate.observe(Some(startup_redraw.as_bytes()), at(20_000)),
+            ReadinessState::AwaitingDeferredReload,
+            "a replacement with identical indices at t=20 is not ready"
+        );
+        assert_eq!(gate.startup_seen_at, Some(at(20_000)));
+        assert_eq!(gate.settled_at, at(20_000));
+        assert_eq!(
+            gate.observe(Some(startup_redraw.as_bytes()), at(39_900)),
+            ReadinessState::AwaitingDeferredReload
+        );
+        assert_eq!(
+            gate.observe(Some(startup_redraw.as_bytes()), at(40_000)),
+            ReadinessState::Ready,
+            "the replacement is ready when its own 20 s window ends"
+        );
+        assert_eq!(
+            gate.discontinuities.len(),
+            1,
+            "the reappearance is not counted again"
+        );
+        assert!(!gate.discontinuity_limit_exceeded());
+
+        // Replacement without an observed missing interval: the same lines at the
+        // same indices and the same length, re-stamped by a fresh process. The
+        // leading bytes differ, so the evidence restarts at t=20 as well.
+        let restamped = startup_redraw.replace("16:41:07", "16:51:07");
+        assert_eq!(restamped.len(), startup_redraw.len());
+        let mut gate = ReadinessGate::new(start, timing);
+        assert_eq!(
+            gate.observe(Some(startup_redraw.as_bytes()), at(0)),
+            ReadinessState::AwaitingDeferredReload
+        );
+        assert_eq!(
+            gate.observe(Some(startup_redraw.as_bytes()), at(19_900)),
+            ReadinessState::AwaitingDeferredReload
+        );
+        assert_eq!(
+            gate.observe(Some(restamped.as_bytes()), at(20_000)),
+            ReadinessState::AwaitingDeferredReload,
+            "a replaced log with identical indices at t=20 is not ready"
+        );
+        assert_eq!(
+            gate.discontinuities,
+            vec![(
+                Duration::from_millis(20_000),
+                LogDiscontinuity::Replaced {
+                    observed: startup_redraw.len()
+                }
+            )]
+        );
+        assert_eq!(
+            gate.observe(Some(restamped.as_bytes()), at(39_900)),
+            ReadinessState::AwaitingDeferredReload
+        );
+        assert_eq!(
+            gate.observe(Some(restamped.as_bytes()), at(40_000)),
+            ReadinessState::Ready
+        );
+
+        // A replacement whose skills reload after startup would have satisfied the
+        // deferred-reload condition still owes a full quiet period from the
+        // observation of the new content, not from the old settle instant.
+        let reloaded = startup_redraw.clone()
+            + &glog("16:41:12.000000", 410, "manager.go:1331", SKILLS_RELOAD)
+            + &glog("16:41:12.000000", 410, "manager.go:1308", SLASH_RELOAD);
+        let mut gate = ReadinessGate::new(start, timing);
+        assert_eq!(
+            gate.observe(Some(reloaded.as_bytes()), at(0)),
+            ReadinessState::Settling
+        );
+        assert_eq!(
+            gate.observe(Some(reloaded.as_bytes()), at(3_500)),
+            ReadinessState::Ready
+        );
+        let fresh = reloaded.replace("16:41:", "16:51:");
+        assert_eq!(
+            gate.observe(Some(fresh.as_bytes()), at(3_600)),
+            ReadinessState::Settling,
+            "a fresh reload at the old index is not settled"
+        );
+        assert_eq!(
+            gate.observe(Some(fresh.as_bytes()), at(7_099)),
+            ReadinessState::Settling
+        );
+        assert_eq!(
+            gate.observe(Some(fresh.as_bytes()), at(7_100)),
+            ReadinessState::Ready
+        );
+
+        // Rotation to a shorter file: the tail of session-udT6uY without its startup
+        // is a new log with no startup line, and a startup appended to it later is a
+        // new startup.
+        let observed = successful_startup_log();
+        let tail: String = observed
+            .lines()
+            .skip(8)
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert!(tail.len() < observed.len());
+        assert!(!tail.contains(STARTUP_COMPLETED_MARKER));
+        let mut gate = ReadinessGate::new(start, timing);
+        assert_eq!(
+            gate.observe(Some(observed.as_bytes()), at(0)),
+            ReadinessState::Settling
+        );
+        assert_eq!(
+            gate.observe(Some(tail.as_bytes()), at(5_000)),
+            ReadinessState::AwaitingStartup
+        );
+        assert_eq!(
+            gate.discontinuities,
+            vec![(
+                Duration::from_secs(5),
+                LogDiscontinuity::Shrunk {
+                    from: observed.len(),
+                    to: tail.len()
+                }
+            )]
+        );
+        assert_eq!(gate.startup_seen_at, None);
+        let rotated_startup = tail.clone()
+            + &glog(
+                "16:42:35.000000",
+                1,
+                "analytics.go:187",
+                "CLI startup completed (took 1ms)",
+            )
+            + &glog("16:42:35.050000", 269, "manager.go:934", FULL_REDRAW);
+        assert_eq!(
+            gate.observe(Some(rotated_startup.as_bytes()), at(6_000)),
+            ReadinessState::AwaitingDeferredReload
+        );
+        assert_eq!(gate.startup_seen_at, Some(at(6_000)));
+        assert_eq!(
+            gate.observe(Some(rotated_startup.as_bytes()), at(25_900)),
+            ReadinessState::AwaitingDeferredReload
+        );
+        assert_eq!(
+            gate.observe(Some(rotated_startup.as_bytes()), at(26_000)),
+            ReadinessState::Ready
+        );
+        assert_eq!(gate.discontinuities.len(), 1);
+
+        // A log that is missing before it was ever observed is not a discontinuity.
+        let mut gate = ReadinessGate::new(start, timing);
+        assert_eq!(gate.observe(None, at(0)), ReadinessState::AwaitingLog);
+        assert_eq!(gate.observe(None, at(100)), ReadinessState::AwaitingLog);
+        assert_eq!(
+            gate.observe(Some(startup_redraw.as_bytes()), at(200)),
+            ReadinessState::AwaitingDeferredReload
+        );
+        assert!(gate.discontinuities.is_empty());
+    }
+
+    #[test]
+    fn readiness_wait_fails_not_sent_on_a_second_log_discontinuity() {
+        let start = Instant::now();
+        let poll = Duration::from_millis(100);
+        let deadline = start + Duration::from_secs(300);
+        let observed = successful_startup_log();
+        let half = &observed[..observed.len() / 2];
+
+        // Disappearance, reappearance, then rotation: the second discontinuity ends
+        // the wait at once, long before the deadline, and names both.
+        let mut clock = FakeClock::new(start);
+        let error = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![
+                some_log(&observed),
+                Ok(None),
+                some_log(&observed),
+                some_log(half),
+            ]),
+            deadline,
+            STARTUP_READINESS_TIMING,
+            poll,
+            &mut clock,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("Agy startup readiness could not be established"));
+        assert!(message.contains("agy.log was replaced or rotated 2 times while the gate waited"));
+        assert!(message.contains(&format!(
+            "agy.log disappeared after {} bytes had been observed at 100 ms; then agy.log shrank from {} to {} bytes (rotated or truncated) at 300 ms",
+            observed.len(),
+            observed.len(),
+            half.len()
+        )));
+        assert!(message.contains("only 1 restart is tolerated"));
+        assert!(message.contains("the initial prompt was not pasted"));
+        assert_eq!(clock.slept, Duration::from_millis(300));
+
+        // Two replacements without a missing interval fail the same way.
+        let restamped = observed.replace("16:42:24", "16:52:24");
+        let restamped_again = observed.replace("16:42:24", "17:02:24");
+        let mut clock = FakeClock::new(start);
+        let error = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![
+                some_log(&observed),
+                some_log(&restamped),
+                some_log(&restamped_again),
+            ]),
+            deadline,
+            STARTUP_READINESS_TIMING,
+            poll,
+            &mut clock,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("agy.log was replaced or rotated 2 times"));
+        assert!(message.contains("no longer begins with the bytes observed earlier"));
+        assert_eq!(clock.slept, Duration::from_millis(200));
+
+        // A single replacement restarts the wait: the restamped log is ready one
+        // quiet period after it was first observed, not at once.
+        let mut clock = FakeClock::new(start);
+        wait_for_startup_readiness_with(
+            &mut log_sequence(vec![
+                some_log(&observed),
+                some_log(&observed),
+                some_log(&observed),
+                some_log(&restamped),
+            ]),
+            deadline,
+            STARTUP_READINESS_TIMING,
+            poll,
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(
+            clock.slept,
+            Duration::from_millis(300) + STARTUP_QUIET_PERIOD
+        );
+
+        // The deadline report names a single discontinuity that was tolerated.
+        let mut clock = FakeClock::new(start);
+        let error = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(&observed), Ok(None), some_log(&observed)]),
+            start + Duration::from_secs(2),
+            STARTUP_READINESS_TIMING,
+            poll,
+            &mut clock,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("Agy did not report startup readiness before the deadline"));
+        assert!(message.contains(&format!(
+            "the readiness evidence was restarted after a log discontinuity (agy.log disappeared after {} bytes had been observed at 100 ms)",
+            observed.len()
+        )));
+        assert!(message.contains(&format!(
+            "missing markers: {QUIET_PERIOD_DESCRIPTION}; the quiet period"
+        )));
+    }
+
+    #[test]
+    fn log_replay_anchors_its_origin_to_the_first_timestamped_line() {
+        // A glog file header before the first timestamped line: the replay used to
+        // take zero as the origin, scheduling the startup line 16 h 42 min after
+        // `start` and past the 300 s replay deadline.
+        let header = "Log line format: [IWEF]mmdd hh:mm:ss.uuuuuu threadid file:line] msg\n";
+        assert_eq!(glog_time_of_day(header.trim_end()), None);
+        let start = Instant::now();
+        let replay = LogReplay::new(&format!("{header}{REAL_SUCCESS_STARTUP}"), start);
+        assert_eq!(replay.lines[0], (start, header.to_owned()));
+        assert_eq!(
+            replay.lines[1].0, start,
+            "the first timestamped line is the origin"
+        );
+        assert!(replay.lines[1].1.starts_with("I0924 16:42:24.068931"));
+        let (startup_at, startup_line) = replay
+            .lines
+            .iter()
+            .find(|(_, line)| line.contains(STARTUP_COMPLETED_MARKER))
+            .unwrap();
+        assert!(startup_line.starts_with("I0924 16:42:24.080467"));
+        assert_eq!(
+            *startup_at,
+            start + Duration::from_micros(11_536),
+            "16:42:24.080467 is 11.536 ms after the first timestamp 16:42:24.068931"
+        );
+        assert_eq!(*startup_at, replay.recorded("16:42:24.080467"));
+        let visible = String::from_utf8(replay.visible_at(start).unwrap()).unwrap();
+        assert!(visible.starts_with(header));
+        assert!(visible.contains("16:42:24.068931"));
+        assert!(!visible.contains(STARTUP_COMPLETED_MARKER));
+
+        let ready = replay_readiness(&replay, STARTUP_READINESS_TIMING);
+        assert_ready_at(
+            &replay,
+            ready,
+            "16:42:32.604592",
+            "session-udT6uY with a header",
+        );
+        let without_header = LogReplay::new(REAL_SUCCESS_STARTUP, start);
+        assert_eq!(
+            replay_readiness(&without_header, STARTUP_READINESS_TIMING),
+            ready
         );
     }
 
