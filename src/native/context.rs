@@ -763,18 +763,20 @@ mod tests {
         let directory = fixture_session(root.path(), "session-src", "closed");
         fixture_event(&directory, "event-a.json", "answer", None);
         fixture_receipt(&directory, "1-2-3", "request-alias", "event-A.json");
-        // On a case-insensitive filesystem the snapshot opens event-a.json for both of
-        // these; resolution must still refuse the alias. Elsewhere the file is absent.
+        // On a case-insensitive filesystem (Windows, and macOS APFS by default) the snapshot
+        // opens event-a.json for both of these; resolution must still refuse the alias.
+        // On a case-sensitive filesystem the aliased file is simply absent.
+        let case_insensitive = directory.join("events").join("event-A.json").exists();
         let error = resolve_error(root.path(), "session-src/event-A.json");
         assert!(error.contains("request_state is unreadable"), "{error}");
-        if cfg!(windows) {
+        if case_insensitive {
             assert!(
                 error.contains("event-A.json does not match an events/ entry exactly"),
                 "{error}"
             );
         }
         let error = resolve_error(root.path(), "session-src/request-alias");
-        if cfg!(windows) {
+        if case_insensitive {
             assert!(
                 error.contains("request_state is unreadable")
                     && error.contains("event-A.json does not match an events/ entry exactly"),
