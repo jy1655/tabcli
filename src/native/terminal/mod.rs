@@ -409,7 +409,7 @@ pub(super) fn select_macos_terminal(
         has_iterm_session_id,
         has_term_session_id,
     ) {
-        // Ghostty is explicitly unsupported in v0.0.6. Auto-detection falls back to the
+        // Ghostty is explicitly unsupported in v0.0.7. Auto-detection falls back to the
         // supported Terminal.app adapter; an explicit --terminal ghostty still fails closed.
         Some(TerminalKind::Ghostty) | None => TerminalKind::AppleTerminal,
         Some(kind) => kind,
