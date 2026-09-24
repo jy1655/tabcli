@@ -58,12 +58,17 @@ const UNPUBLISHED_EVENT_PREFIX: &str = "unpublished-";
 const STATE_ROOT_DURABLE_FILE: &str = "state-root.durable";
 /// Upper bound on the directory entries the state-root ancestry walk makes durable.
 const STATE_ROOT_ANCESTRY_SYNC_LIMIT: usize = 16;
+// Written into a closed source session by the one reopen that won its turn-claim lock. It is
+// the only file a reopen ever adds to the source; the source's tombstone, events, and
+// requests stay byte-for-byte intact.
+const REOPEN_MARKER_FILE: &str = "reopen.marker.json";
 static TURN_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 pub(crate) enum NativeCommand {
     Ask(AskRequest),
     Tell(TellRequest),
+    Reopen(ReopenRequest),
     Inspect {
         id: String,
         json: bool,
@@ -117,6 +122,22 @@ pub(crate) struct TellRequest {
     detach: bool,
     json: bool,
     context_results: Vec<context::ContextResultRef>,
+}
+
+// Continues a closed session's provider conversation in a new session. Model, effort, and
+// yolo are never inherited from the source manifest; only the options stated here apply.
+#[derive(Debug)]
+pub(crate) struct ReopenRequest {
+    pub(crate) id: String,
+    pub(crate) prompt: String,
+    pub(crate) title: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+    pub(crate) terminal: Option<terminal::TerminalKind>,
+    pub(crate) yolo: bool,
+    pub(crate) timeout: Duration,
+    pub(crate) detach: bool,
+    pub(crate) json: bool,
 }
 
 #[derive(Debug)]
@@ -177,6 +198,36 @@ struct SessionEvent {
     error: Option<String>,
     provider_session_id: Option<String>,
     turn_id: Option<String>,
+    created_unix_ms: u128,
+}
+
+// Where a reopened session's provider conversation came from: the closed Bridge session and
+// the event whose provider session id was passed to the provider's official resume.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ResumedFrom {
+    session: String,
+    provider_session_id: String,
+    event_id: String,
+}
+
+// Reopen provenance is an optional `resumed_from` object stored in the schema-1 manifest
+// beside the fields every reader knows. It is read through this sibling type so a reader
+// that does not know the field keeps parsing the manifest unchanged.
+#[derive(Debug, Default, Deserialize)]
+struct ReopenProvenance {
+    #[serde(default)]
+    resumed_from: Option<ResumedFrom>,
+}
+
+// The record a winning reopen leaves in its closed source. `reopened_by` is filled once the
+// new session exists; until then the marker still excludes every other reopen attempt.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ReopenMarker {
+    schema: u32,
+    claim: String,
+    provider_session_id: String,
+    #[serde(default)]
+    reopened_by: Option<String>,
     created_unix_ms: u128,
 }
 
@@ -330,6 +381,7 @@ pub(crate) fn is_command(value: &str) -> bool {
         value,
         "ask"
             | "tell"
+            | "reopen"
             | "sessions"
             | "inspect"
             | "result"
@@ -357,6 +409,7 @@ where
     match command.as_str() {
         "ask" => parse_ask(rest),
         "tell" => parse_tell(rest),
+        "reopen" => parse_reopen(rest),
         "inspect" => query::parse_inspect(rest),
         "result" => query::parse_result(rest),
         "search" => query::parse_search(rest),
@@ -559,6 +612,91 @@ fn parse_tell(args: &[String]) -> Result<NativeCommand> {
         detach,
         json,
         context_results,
+    }))
+}
+
+fn parse_reopen(args: &[String]) -> Result<NativeCommand> {
+    let (id, options) = args
+        .split_first()
+        .context("reopen requires one closed session id")?;
+    require_valid_session_id(id)?;
+    let mut prompt = None;
+    let mut prompt_file = None;
+    let mut title = None;
+    let mut model = None;
+    let mut effort = None;
+    let mut terminal = None;
+    let mut yolo = false;
+    let mut timeout = None;
+    let mut detach = false;
+    let mut json = false;
+    let mut index = 0;
+    while index < options.len() {
+        match options[index].as_str() {
+            "--prompt" => set_once(
+                &mut prompt,
+                option_value(options, &mut index, "--prompt")?.to_owned(),
+                "--prompt",
+            )?,
+            "--prompt-file" => set_once(
+                &mut prompt_file,
+                PathBuf::from(option_value(options, &mut index, "--prompt-file")?),
+                "--prompt-file",
+            )?,
+            "--title" => set_once(
+                &mut title,
+                option_value(options, &mut index, "--title")?.to_owned(),
+                "--title",
+            )?,
+            "--model" => set_once(
+                &mut model,
+                option_value(options, &mut index, "--model")?.to_owned(),
+                "--model",
+            )?,
+            "--effort" => set_once(
+                &mut effort,
+                option_value(options, &mut index, "--effort")?.to_owned(),
+                "--effort",
+            )?,
+            "--terminal" => set_once(
+                &mut terminal,
+                terminal::TerminalKind::from_str(option_value(options, &mut index, "--terminal")?)
+                    .map_err(anyhow::Error::msg)?,
+                "--terminal",
+            )?,
+            "--timeout-secs" => {
+                let value = option_value(options, &mut index, "--timeout-secs")?;
+                set_once(&mut timeout, parse_timeout(value)?, "--timeout-secs")?;
+            }
+            "--yolo" => set_flag_once(&mut yolo, "--yolo")?,
+            "--detach" => set_flag_once(&mut detach, "--detach")?,
+            "--json" => set_flag_once(&mut json, "--json")?,
+            option => bail!("unknown reopen option: {option}"),
+        }
+        index += 1;
+    }
+    let prompt = read_prompt_option(prompt, prompt_file, "reopen")?;
+    if prompt.trim().is_empty() {
+        bail!("--prompt cannot be empty");
+    }
+    validate_terminal_input(&prompt, "--prompt")?;
+    if model.as_ref().is_some_and(|value| value.trim().is_empty()) {
+        bail!("--model cannot be empty");
+    }
+    if effort.as_ref().is_some_and(|value| value.trim().is_empty()) {
+        bail!("--effort cannot be empty");
+    }
+    Ok(NativeCommand::Reopen(ReopenRequest {
+        id: id.to_owned(),
+        prompt,
+        title,
+        model,
+        effort,
+        terminal,
+        yolo,
+        timeout: timeout.unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
+        detach,
+        json,
     }))
 }
 
@@ -765,6 +903,7 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
     match command {
         NativeCommand::Ask(request) => run_ask(request),
         NativeCommand::Tell(request) => run_tell(request),
+        NativeCommand::Reopen(request) => run_reopen(request),
         NativeCommand::Inspect { id, json } => query::run_inspect(&id, json),
         NativeCommand::Result(request) => query::run_result(request),
         NativeCommand::Search(request) => query::run_search(request),
@@ -895,7 +1034,54 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
             &attached.prompt_with_attachments(&request.prompt),
         ),
     })?;
-    let mut initial_claim = acquire_turn_claim_with_context(&created.directory, &attached.sources)?;
+    launch_created_session(
+        SessionLaunch {
+            created,
+            provider: request.provider,
+            terminal_kind,
+            deadline,
+            timeout: request.timeout,
+            detach: request.detach,
+            json: request.json,
+            context_sources: &attached.sources,
+            result_extra: serde_json::Map::new(),
+        },
+        address,
+    )
+}
+
+// A created session that is ready to be launched. `ask` and `reopen` share everything from
+// the initial turn claim onwards: terminal opening, launch-failure cleanup, initial prompt
+// delivery, and result waiting. `result_extra` carries command-specific fields into the
+// emitted JSON response.
+struct SessionLaunch<'a> {
+    created: CreatedSession,
+    provider: FirstPartyCli,
+    terminal_kind: terminal::TerminalKind,
+    deadline: Instant,
+    timeout: Duration,
+    detach: bool,
+    json: bool,
+    context_sources: &'a [requests::ContextSource],
+    result_extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn launch_created_session(
+    launch: SessionLaunch<'_>,
+    address: &mut Option<(String, String)>,
+) -> Result<()> {
+    let SessionLaunch {
+        created,
+        provider,
+        terminal_kind,
+        deadline,
+        timeout,
+        detach,
+        json,
+        context_sources,
+        result_extra,
+    } = launch;
+    let mut initial_claim = acquire_turn_claim_with_context(&created.directory, context_sources)?;
     let expected_claim_token = initial_claim.token.clone();
     let receipt = initial_claim.receipt.clone();
     *address = Some((created.id.clone(), receipt.request_id.clone()));
@@ -938,7 +1124,7 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
             });
         }
     };
-    let initial_prompt_transport = provider::initial_prompt_transport(request.provider);
+    let initial_prompt_transport = provider::initial_prompt_transport(provider);
     let mut expected_turn_id = None;
     if initial_prompt_transport == provider::InitialPromptTransport::TerminalPasteAfterLaunch {
         let mut delivery_may_have_occurred = false;
@@ -947,22 +1133,19 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
                 &created.directory,
                 "awaiting-initial-input",
                 deadline,
-                request.timeout,
+                timeout,
             )?;
             let readiness_delay = initial_prompt_delay_within_budget(
                 deadline,
-                provider::initial_prompt_ready_delay(request.provider),
-                request.timeout,
+                provider::initial_prompt_ready_delay(provider),
+                timeout,
             )?;
             thread::sleep(readiness_delay);
             let initial_prompt_path = created.directory.join("initial-prompt.txt");
             let initial_prompt = fs::read_to_string(&initial_prompt_path)
                 .context("failed to read the preserved initial prompt")?;
-            let initial_prompt = provider::terminal_initial_prompt(
-                request.provider,
-                &created.directory,
-                &initial_prompt,
-            )?;
+            let initial_prompt =
+                provider::terminal_initial_prompt(provider, &created.directory, &initial_prompt)?;
             let mut prompt_file = tempfile::Builder::new()
                 .prefix("pending-prompt-")
                 .suffix(".txt")
@@ -978,17 +1161,13 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
                 &created.id,
                 &terminal_session,
                 deadline,
-                request.timeout,
+                timeout,
             )?;
             update_status(&created.directory, "working", None, None)?;
-            let send_timeout = remaining_turn_timeout(deadline, request.timeout)?;
-            provider::validate_terminal_send_budget(
-                request.provider,
-                terminal_session.kind,
-                send_timeout,
-            )?;
+            let send_timeout = remaining_turn_timeout(deadline, timeout)?;
+            provider::validate_terminal_send_budget(provider, terminal_session.kind, send_timeout)?;
             match provider::send_initial_prompt(
-                request.provider,
+                provider,
                 &terminal_session,
                 prompt_file.path(),
                 deadline,
@@ -1014,7 +1193,7 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
             return Err(error).with_context(|| {
                 format!(
                     "failed to deliver the initial prompt to {} session {}",
-                    request.provider.as_str(),
+                    provider.as_str(),
                     created.id
                 )
             });
@@ -1027,24 +1206,24 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
                 &created.directory,
                 "awaiting-initial-input",
                 deadline,
-                request.timeout,
+                timeout,
             )?;
             let readiness_delay = initial_prompt_delay_within_budget(
                 deadline,
-                provider::initial_prompt_ready_delay(request.provider),
-                request.timeout,
+                provider::initial_prompt_ready_delay(provider),
+                timeout,
             )?;
             thread::sleep(readiness_delay);
-            let request_id = provider::new_cross_session_turn_id(request.provider)?;
+            let request_id = provider::new_cross_session_turn_id(provider)?;
             let prompt_path = created.directory.join("initial-prompt.txt");
             let prompt = fs::read_to_string(&prompt_path)
                 .context("failed to read the preserved initial prompt")?;
             let bridge_executable =
                 std::env::current_exe().context("failed to locate agent-bridge executable")?;
-            remaining_turn_timeout(deadline, request.timeout)?;
+            remaining_turn_timeout(deadline, timeout)?;
             update_status(&created.directory, "working", None, None)?;
             match provider::send_cross_session_message(
-                request.provider,
+                provider,
                 provider::CrossSessionMessageContext {
                     bridge_executable: &bridge_executable,
                     directory: &created.directory,
@@ -1097,7 +1276,7 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
                 return Err(error).with_context(|| {
                     format!(
                         "failed to deliver the initial prompt to {} session {}",
-                        request.provider.as_str(),
+                        provider.as_str(),
                         created.id
                     )
                 });
@@ -1107,14 +1286,15 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
         initial_claim.retain();
     }
 
-    if request.detach {
-        return emit_session_result(
-            request.json,
+    if detach {
+        return emit_session_result_with(
+            json,
             &created.id,
             &terminal_session,
-            request.provider,
+            provider,
             &receipt,
             None,
+            &result_extra,
         );
     }
 
@@ -1124,7 +1304,7 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
         expected_turn_id.as_deref(),
         Some(&expected_claim_token),
         deadline,
-        request.timeout,
+        timeout,
     )
     .with_context(|| {
         format!(
@@ -1133,14 +1313,392 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
             terminal_session.kind.display_name()
         )
     })?;
-    emit_session_result(
-        request.json,
+    emit_session_result_with(
+        json,
         &created.id,
         &terminal_session,
-        request.provider,
+        provider,
         &receipt,
         Some(&event),
+        &result_extra,
     )
+}
+
+// A reopen that fails a pre-launch gate. The gate name reaches the JSON response so a caller
+// can tell a refused reopen from a launch or delivery failure of the new session.
+#[derive(Debug)]
+struct ReopenRefusal {
+    gate: &'static str,
+    detail: String,
+}
+
+impl std::fmt::Display for ReopenRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "reopen refused ({}): {}", self.gate, self.detail)
+    }
+}
+
+impl std::error::Error for ReopenRefusal {}
+
+fn reopen_refusal(gate: &'static str, detail: String) -> anyhow::Error {
+    anyhow::Error::new(ReopenRefusal { gate, detail })
+}
+
+fn reopen_refusal_gate(error: &anyhow::Error) -> Option<&'static str> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ReopenRefusal>())
+        .map(|refusal| refusal.gate)
+}
+
+// What the read-only gates established about a closed source session.
+#[derive(Debug)]
+struct ReopenSource {
+    manifest: SessionManifest,
+    provider: FirstPartyCli,
+    provider_session_id: String,
+    event_id: String,
+}
+
+fn run_reopen(request: ReopenRequest) -> Result<()> {
+    let json = request.json;
+    let source = request.id.clone();
+    let mut address = None;
+    let outcome = run_reopen_inner(request, &mut address);
+    match address {
+        Some((session, request_id)) => finish_request(outcome, json, &session, &request_id),
+        None => {
+            if let Err(error) = &outcome
+                && json
+            {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": 1,
+                        "ok": false,
+                        "source_session": source,
+                        "session": null,
+                        "request_id": null,
+                        "gate": reopen_refusal_gate(error),
+                        "error": format!("{error:#}"),
+                    }))?
+                );
+            }
+            outcome
+        }
+    }
+}
+
+fn run_reopen_inner(request: ReopenRequest, address: &mut Option<(String, String)>) -> Result<()> {
+    let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
+    let terminal_kind = terminal::select(request.terminal)?;
+    let source_directory = session_directory(&request.id)?;
+    // Every check against the source is read-only. Pending-completion recovery and dead-owner
+    // repair are never run on it: a closed session has nothing to converge, and reopen must not
+    // alter the record it continues from.
+    let source = inspect_reopen_source(&source_directory, &request.id)?;
+    provider::verify_reopen_available(source.provider, &source.provider_session_id)
+        .map_err(|error| reopen_refusal("provider-unsupported", format!("{error:#}")))?;
+    let workspace = source.manifest.workspace.canonicalize().with_context(|| {
+        format!(
+            "source workspace does not exist or cannot be resolved: {}",
+            source.manifest.workspace.display()
+        )
+    })?;
+    if !workspace.is_dir() {
+        bail!(
+            "source workspace is not a directory: {}",
+            workspace.display()
+        );
+    }
+    let provider_path = resolve_provider(source.provider)?;
+    let provider_version =
+        check_provider_version_until(source.provider, &provider_path, Some(deadline))?;
+    let requested_title = request.title.unwrap_or_else(|| {
+        let workspace_name = workspace
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace");
+        format!(
+            "{} · {workspace_name} (reopened {})",
+            source.provider.as_str(),
+            request.id
+        )
+    });
+    let title = sanitize_title(&requested_title)?;
+    let marker = claim_reopen_marker(&source_directory, &request.id, &source.provider_session_id)?;
+    let created = create_session(SessionSpec {
+        provider: source.provider,
+        provider_path,
+        provider_version,
+        workspace,
+        title,
+        model: request.model,
+        effort: request.effort,
+        yolo: request.yolo,
+        prompt: native_delegation_prompt(&delegation_source(), &request.prompt),
+    })?;
+    let resumed_from = ResumedFrom {
+        session: request.id.clone(),
+        provider_session_id: source.provider_session_id.clone(),
+        event_id: source.event_id.clone(),
+    };
+    if let Err(error) = record_resumed_from(&created.directory, &created.manifest, &resumed_from)
+        .and_then(|()| marker.finalize(&created.id))
+    {
+        let _ = update_status(
+            &created.directory,
+            "failed",
+            None,
+            Some(format!("{error:#}")),
+        );
+        return Err(error).with_context(|| {
+            format!(
+                "failed to record reopen provenance for session {}",
+                created.id
+            )
+        });
+    }
+    let mut result_extra = serde_json::Map::new();
+    result_extra.insert(
+        "source_session".to_owned(),
+        serde_json::Value::String(request.id.clone()),
+    );
+    result_extra.insert(
+        "resumed_from".to_owned(),
+        serde_json::to_value(&resumed_from)?,
+    );
+    launch_created_session(
+        SessionLaunch {
+            created,
+            provider: source.provider,
+            terminal_kind,
+            deadline,
+            timeout: request.timeout,
+            detach: request.detach,
+            json: request.json,
+            context_sources: &[],
+            result_extra,
+        },
+        address,
+    )
+}
+
+// Read-only gates on the closed source: it is closed with its tombstone and nothing of its
+// lifecycle is left open, a provider event supplies the conversation identity, and every
+// request record resolves to a recorded event. Each refusal names its gate.
+fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
+    let manifest = read_manifest(directory)?;
+    let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
+    verify_reopen_source_is_closed(directory, id)?;
+    let (event_id, provider_session_id) = latest_provider_event_identity(directory, provider)?
+        .ok_or_else(|| {
+            reopen_refusal(
+                "source-identity-missing",
+                format!(
+                    "session {id} has no {} event that records a provider session id; a session whose only turn failed cannot be reopened",
+                    provider.as_str()
+                ),
+            )
+        })?;
+    let index = requests::list(directory)?;
+    if index.unreadable > 0 {
+        return Err(reopen_refusal(
+            "request-unresolved",
+            format!(
+                "session {id} has {} unreadable request record(s); their delivery outcome cannot be verified",
+                index.unreadable
+            ),
+        ));
+    }
+    for receipt in &index.receipts {
+        if !is_regular_file(&directory.join("events").join(&receipt.event_file))? {
+            return Err(reopen_refusal(
+                "request-unresolved",
+                format!(
+                    "request {} of session {id} has no recorded result; its delivery outcome is uncertain",
+                    receipt.request_id
+                ),
+            ));
+        }
+    }
+    Ok(ReopenSource {
+        manifest,
+        provider,
+        provider_session_id,
+        event_id,
+    })
+}
+
+fn verify_reopen_source_is_closed(directory: &Path, id: &str) -> Result<()> {
+    let closed = read_regular_status_if_present(&directory.join(CLOSED_STATUS_FILE))?;
+    let status = read_regular_status_if_present(&directory.join("status.json"))?;
+    let state = status
+        .as_ref()
+        .map_or("unknown", |status| status.state.as_str());
+    if state != "closed"
+        || closed
+            .as_ref()
+            .is_none_or(|closed| closed.state != "closed")
+    {
+        return Err(reopen_refusal(
+            "source-not-closed",
+            format!(
+                "session {id} is {state}; reopen requires a session closed with its closed tombstone"
+            ),
+        ));
+    }
+    for name in [
+        TURN_CLAIM_FILE,
+        TURN_COMPLETION_FILE,
+        TERMINAL_HANDLE_FILE,
+        TERMINAL_CLOSING_FILE,
+    ] {
+        if fs::symlink_metadata(directory.join(name)).is_ok() {
+            return Err(reopen_refusal(
+                "source-not-converged",
+                format!("session {id} still carries {name}; its close has not converged"),
+            ));
+        }
+    }
+    if let Some(text) = read_regular_text_if_present(&directory.join(REOPEN_MARKER_FILE))? {
+        let reopened_by = serde_json::from_str::<ReopenMarker>(&text)
+            .ok()
+            .and_then(|marker| marker.reopened_by);
+        return Err(reopen_refusal(
+            "already-reopened",
+            match reopened_by {
+                Some(new_id) => format!("session {id} was already reopened as {new_id}"),
+                None => format!("a reopen of session {id} is already in progress"),
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn latest_provider_event_identity(
+    directory: &Path,
+    provider: FirstPartyCli,
+) -> Result<Option<(String, String)>> {
+    for path in event_paths(directory)?.into_iter().rev() {
+        let event: SessionEvent = read_json(&path)?;
+        if event.provider != provider.as_str() {
+            continue;
+        }
+        if let Some(provider_session_id) = event.provider_session_id
+            && !provider_session_id.trim().is_empty()
+        {
+            let event_id = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("event path has no file name")?
+                .to_owned();
+            return Ok(Some((event_id, provider_session_id)));
+        }
+    }
+    Ok(None)
+}
+
+fn read_resumed_from(directory: &Path) -> Result<Option<ResumedFrom>> {
+    let provenance: ReopenProvenance = read_json(&directory.join("manifest.json"))?;
+    Ok(provenance.resumed_from)
+}
+
+fn record_resumed_from(
+    directory: &Path,
+    manifest: &SessionManifest,
+    resumed_from: &ResumedFrom,
+) -> Result<()> {
+    let mut value = serde_json::to_value(manifest)?;
+    value
+        .as_object_mut()
+        .context("session manifest is not a JSON object")?
+        .insert(
+            "resumed_from".to_owned(),
+            serde_json::to_value(resumed_from)?,
+        );
+    write_json_atomic(&directory.join("manifest.json"), &value)
+}
+
+// The winner's hold on a closed source. Dropping it before `finalize` removes the marker
+// again, so a reopen that never created its session leaves the source reopenable.
+#[derive(Debug)]
+struct ReopenMarkerClaim {
+    path: PathBuf,
+    claim: String,
+    finalized: bool,
+}
+
+impl ReopenMarkerClaim {
+    fn finalize(mut self, new_session_id: &str) -> Result<()> {
+        let _lock = lock_turn_claim(&self.path.with_file_name(TURN_CLAIM_FILE))?;
+        let text = read_regular_text_if_present(&self.path)?
+            .context("reopen marker disappeared before the new session was recorded")?;
+        let mut marker: ReopenMarker =
+            serde_json::from_str(&text).context("invalid reopen marker")?;
+        if marker.claim != self.claim {
+            bail!("reopen marker belongs to a different reopen attempt");
+        }
+        marker.reopened_by = Some(new_session_id.to_owned());
+        write_json_atomic(&self.path, &marker)?;
+        self.finalized = true;
+        Ok(())
+    }
+}
+
+impl Drop for ReopenMarkerClaim {
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        let Ok(_lock) = lock_turn_claim(&self.path.with_file_name(TURN_CLAIM_FILE)) else {
+            return;
+        };
+        let current = read_regular_text_if_present(&self.path)
+            .ok()
+            .flatten()
+            .and_then(|text| serde_json::from_str::<ReopenMarker>(&text).ok());
+        if current.is_some_and(|marker| marker.claim == self.claim) {
+            let _ = remove_file_if_present(&self.path);
+        }
+    }
+}
+
+// Serializes concurrent reopens of one closed source under the source's own turn-claim lock:
+// the closed gates are re-checked under the lock and the marker is created with
+// `create_new`, so exactly one attempt can hold it.
+fn claim_reopen_marker(
+    directory: &Path,
+    id: &str,
+    provider_session_id: &str,
+) -> Result<ReopenMarkerClaim> {
+    let path = directory.join(REOPEN_MARKER_FILE);
+    let _lock = lock_turn_claim(&directory.join(TURN_CLAIM_FILE))?;
+    verify_reopen_source_is_closed(directory, id)?;
+    let claim = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        TURN_CLAIM_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let marker = ReopenMarker {
+        schema: 1,
+        claim: claim.clone(),
+        provider_session_id: provider_session_id.to_owned(),
+        reopened_by: None,
+        created_unix_ms: unix_ms(),
+    };
+    write_private(&path, &serde_json::to_vec_pretty(&marker)?).map_err(|error| {
+        reopen_refusal(
+            "already-reopened",
+            format!("could not claim session {id} for reopen: {error:#}"),
+        )
+    })?;
+    Ok(ReopenMarkerClaim {
+        path,
+        claim,
+        finalized: false,
+    })
 }
 
 fn verify_terminal_surface_ownership(
@@ -2105,6 +2663,7 @@ fn sessions_in(root: &Path, request: &SessionsRequest) -> Result<Vec<serde_json:
                 "error": status.as_ref().and_then(|value| value.error.as_deref()),
                 "model": manifest.model,
                 "effort": manifest.effort,
+                "resumed_from": read_resumed_from(&directory).ok().flatten(),
                 "results": event_paths(&directory).map(|paths| paths.len()).unwrap_or(0),
             }));
         }
@@ -2524,11 +3083,29 @@ fn emit_session_result(
     receipt: &requests::Receipt,
     event: Option<&SessionEvent>,
 ) -> Result<()> {
+    emit_session_result_with(
+        json,
+        id,
+        terminal_session,
+        provider,
+        receipt,
+        event,
+        &serde_json::Map::new(),
+    )
+}
+
+fn emit_session_result_with(
+    json: bool,
+    id: &str,
+    terminal_session: &terminal::TerminalSession,
+    provider: FirstPartyCli,
+    receipt: &requests::Receipt,
+    event: Option<&SessionEvent>,
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
     let request_id = &receipt.request_id;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+        let mut value = serde_json::json!({
                 "ok": true,
                 "schema_version": 1,
                 "session": id,
@@ -2545,10 +3122,18 @@ fn emit_session_result(
                 "result": event.map(|value| value.message.as_str()),
                 "provider_session_id": event.and_then(|value| value.provider_session_id.as_deref()),
                 "turn_id": event.and_then(|value| value.turn_id.as_deref()),
-            }))?
-        );
+        });
+        for (key, field) in extra {
+            value[key.as_str()] = field.clone();
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!("session: {id}\nrequest: {request_id}");
+        for (key, field) in extra {
+            if let Some(field) = field.as_str() {
+                println!("{}: {}", key, terminal_safe_text(field, false));
+            }
+        }
         if let Some(event) = event {
             println!();
             println!("{}", terminal_safe_text(&event.message, true));
@@ -2619,21 +3204,50 @@ fn run_session_inner(directory: &Path) -> Result<()> {
                 .map(OsString::from),
         );
     }
-    let provider::LaunchPlan {
-        arguments: provider_arguments,
-        prompt_is_positional,
-        completion_monitor,
-        environment_removals,
-    } = provider::prepare_launch(
-        provider,
-        provider::LaunchContext {
-            bridge_executable: &executable,
-            directory,
-            workspace: &manifest.workspace,
-            title: &manifest.title,
-            prompt: &prompt,
-        },
-    )?;
+    // A reopened session launches through the adapter's resume plan. The plan carries no
+    // prompt: the initial prompt reaches the reopened process through the same transport a
+    // fresh launch uses, so `prompt_is_positional` is false here by construction.
+    let (provider_arguments, prompt_is_positional, completion_monitor, environment_removals) =
+        match read_resumed_from(directory)? {
+            Some(resumed_from) => {
+                let provider::ResumePlan {
+                    arguments,
+                    completion_monitor,
+                    environment_removals,
+                } = provider::prepare_resume(
+                    provider,
+                    provider::ResumeContext {
+                        bridge_executable: &executable,
+                        directory,
+                        provider_session_id: &resumed_from.provider_session_id,
+                    },
+                )?;
+                (arguments, false, completion_monitor, environment_removals)
+            }
+            None => {
+                let provider::LaunchPlan {
+                    arguments,
+                    prompt_is_positional,
+                    completion_monitor,
+                    environment_removals,
+                } = provider::prepare_launch(
+                    provider,
+                    provider::LaunchContext {
+                        bridge_executable: &executable,
+                        directory,
+                        workspace: &manifest.workspace,
+                        title: &manifest.title,
+                        prompt: &prompt,
+                    },
+                )?;
+                (
+                    arguments,
+                    prompt_is_positional,
+                    completion_monitor,
+                    environment_removals,
+                )
+            }
+        };
     let mut arguments = policy_arguments.clone();
     arguments.extend(provider_arguments);
     if initial_prompt_transport == provider::InitialPromptTransport::ProviderArgument

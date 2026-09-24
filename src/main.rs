@@ -23,6 +23,9 @@ Usage:
       [--yolo] [--timeout-secs N] [--detach] [--json] [--context-result <session>/<request-id>]...
   agent-bridge tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
       [--context-result <session>/<request-id>]...
+  agent-bridge reopen <closed-session> (--prompt TEXT | --prompt-file PATH) [--title NAME]
+      [--model MODEL] [--effort EFFORT] [--terminal <windows-console>] [--yolo] [--timeout-secs N]
+      [--detach] [--json]
   agent-bridge sessions [--workspace PATH] [--provider <codex|claude|agy|pi>] [--state STATE]
       [--sort <id|updated>] [--json]
   agent-bridge inspect <session> [--json]
@@ -56,6 +59,18 @@ Session policy:
   it and the provider has a matching option. Codex, Claude, and Agy receive their
   native bypass flags. Pi receives --approve for project-local trust while its
   native tool policy remains in effect.
+
+  reopen continues a closed session's provider conversation in a new session with a
+  new id, terminal, and private settings, launched through the provider's official
+  resume. This release supports only Claude Code on native Windows: its conversation
+  UUID is recorded in every Bridge event and its live-session registry proves
+  ownership by pid and process start time. Codex is refused until its thread
+  writer-lock and queue gates exist; Agy and Pi are refused because they expose no
+  verifiable ownership evidence. Reopen refuses a source that is not closed, has no
+  Claude event with a conversation id, has an unresolved request, or is held by a
+  live Claude process. --model, --effort, and --yolo are never inherited from the
+  source; the source is left unchanged except for a reopen marker that admits one
+  reopen. inspect and sessions --json report resumed_from for the new session.
 
   --context-result attaches a previously recorded result, addressed exactly as
   <session>/<request-id> (or <session>/<event-id> for records without a receipt),
@@ -219,6 +234,8 @@ mod tests {
         for expected in [
             "ask <codex|claude|agy|pi>",
             "tell <session>",
+            "reopen <closed-session> (--prompt TEXT | --prompt-file PATH)",
+            "supports only Claude Code on native Windows",
             "sessions [--workspace PATH]",
             "inspect <session>",
             "result <session>",

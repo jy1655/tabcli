@@ -6385,3 +6385,765 @@ fn claim_free_recovery_syncs_the_committed_event_before_discarding_its_journal()
     // Barrier, journal removal, and the removal's sync: no other boundary exists.
     assert_eq!(labels.len(), 3, "{labels:?}");
 }
+
+// ---------------------------------------------------------------------------------------
+// `reopen`: continuing a closed session's provider conversation in a new session.
+// ---------------------------------------------------------------------------------------
+
+const REOPEN_TEST_CONVERSATION: &str = "6928ca1c-1234-4abc-8def-0123456789ab";
+
+fn write_reopen_test_manifest(
+    directory: &Path,
+    id: &str,
+    provider: &str,
+    provider_path: PathBuf,
+    workspace: PathBuf,
+    with_policy: bool,
+) {
+    write_json_atomic(
+        &directory.join("manifest.json"),
+        &SessionManifest {
+            schema: SESSION_SCHEMA,
+            id: id.to_owned(),
+            provider: provider.to_owned(),
+            provider_path,
+            provider_version: "2.1.281".to_owned(),
+            workspace,
+            title: id.to_owned(),
+            model: with_policy.then(|| "Fable5".to_owned()),
+            effort: with_policy.then(|| "max".to_owned()),
+            yolo: with_policy,
+            created_unix_ms: 1,
+        },
+    )
+    .unwrap();
+}
+
+fn reopen_test_terminal(id: &str) -> terminal::TerminalSession {
+    terminal::TerminalSession {
+        kind: terminal::TerminalKind::Iterm2,
+        id: format!("{id}-terminal"),
+        tab_id: None,
+        window_id: None,
+        managed_session_id: Some(id.to_owned()),
+        windows_process_identity: None,
+    }
+}
+
+// A closed session with one resolved request: its turn completed (or failed, when
+// `completed` is false) with the given provider session id, its terminal handle was
+// consumed into the tombstone, and its status is `closed` with `closed.json`. The source
+// manifest deliberately carries yolo, model, and effort so inheritance would be visible.
+fn write_closed_reopen_source(
+    root: &Path,
+    id: &str,
+    provider: &str,
+    provider_session_id: Option<&str>,
+    completed: bool,
+) -> PathBuf {
+    let directory = root.join(id);
+    fs::create_dir(&directory).unwrap();
+    fs::create_dir(directory.join("events")).unwrap();
+    write_reopen_test_manifest(
+        &directory,
+        id,
+        provider,
+        PathBuf::from("/opt/provider"),
+        root.to_owned(),
+        true,
+    );
+    write_json_atomic(
+        &directory.join(TERMINAL_HANDLE_FILE),
+        &reopen_test_terminal(id),
+    )
+    .unwrap();
+    update_status(&directory, "running", None, None).unwrap();
+    let claim = acquire_turn_claim(&directory).unwrap();
+    let token = claim.token.clone();
+    claim.retain();
+    let provider = FirstPartyCli::from_str(provider).unwrap();
+    if completed {
+        record_provider_result_for_claim(
+            &directory,
+            provider,
+            "done",
+            provider_session_id.map(str::to_owned),
+            Some("turn-1".to_owned()),
+            Some(&token),
+        )
+        .unwrap();
+    } else {
+        record_provider_failure_for_claim(
+            &directory,
+            provider,
+            "the only turn failed",
+            provider_session_id.map(str::to_owned),
+            None,
+            Some(&token),
+        )
+        .unwrap();
+    }
+    close_session_state(&directory, |_| Ok(terminal::CloseOutcome::Closed)).unwrap();
+    assert!(directory.join(CLOSED_STATUS_FILE).is_file());
+    assert!(directory.join(TERMINAL_TOMBSTONE_FILE).is_file());
+    directory
+}
+
+fn snapshot_directory(directory: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn visit(root: &Path, current: &Path, files: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for entry in fs::read_dir(current).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(root, &path, files);
+            } else {
+                let name = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                files.insert(name, fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    visit(directory, directory, &mut files);
+    files
+}
+
+#[test]
+fn reopen_parses_only_explicit_policy_and_rejects_ask_only_options() {
+    let NativeCommand::Reopen(request) =
+        parse_args(["reopen", "session-src1", "--prompt", "continue"]).unwrap()
+    else {
+        panic!("expected reopen");
+    };
+    assert_eq!(request.id, "session-src1");
+    assert_eq!(request.prompt, "continue");
+    assert!(!request.yolo);
+    assert_eq!(request.model, None);
+    assert_eq!(request.effort, None);
+    assert_eq!(request.title, None);
+    assert_eq!(request.timeout, Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+    assert!(!request.detach && !request.json);
+
+    let NativeCommand::Reopen(request) = parse_args([
+        "reopen",
+        "session-src1",
+        "--prompt",
+        "continue",
+        "--yolo",
+        "--model",
+        "Fable5",
+        "--effort",
+        "max",
+        "--title",
+        "again",
+        "--timeout-secs",
+        "30",
+        "--detach",
+        "--json",
+    ])
+    .unwrap() else {
+        panic!("expected reopen");
+    };
+    assert!(request.yolo);
+    assert_eq!(request.model.as_deref(), Some("Fable5"));
+    assert_eq!(request.effort.as_deref(), Some("max"));
+    assert_eq!(request.title.as_deref(), Some("again"));
+    assert_eq!(request.timeout, Duration::from_secs(30));
+    assert!(request.detach && request.json);
+
+    for arguments in [
+        vec!["reopen"],
+        vec!["reopen", "session-src1"],
+        vec!["reopen", "session-src1", "--prompt", " "],
+        vec!["reopen", "not-a-session", "--prompt", "x"],
+        vec![
+            "reopen",
+            "session-src1",
+            "--prompt",
+            "x",
+            "--workspace",
+            ".",
+        ],
+        vec![
+            "reopen",
+            "session-src1",
+            "--prompt",
+            "x",
+            "--context-result",
+            "session-a/request-1",
+        ],
+        vec![
+            "reopen",
+            "session-src1",
+            "--prompt",
+            "x",
+            "--yolo",
+            "--yolo",
+        ],
+    ] {
+        assert!(parse_args(arguments.clone()).is_err(), "{arguments:?}");
+    }
+}
+
+#[test]
+fn concurrent_reopen_of_one_closed_session_admits_exactly_one_winner_and_leaves_the_source_unchanged()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let id = "session-reopensrc1";
+    let source = write_closed_reopen_source(
+        root.path(),
+        id,
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let before = snapshot_directory(&source);
+
+    let attempts = (0..8)
+        .map(|_| {
+            let source = source.clone();
+            thread::spawn(move || claim_reopen_marker(&source, id, REOPEN_TEST_CONVERSATION))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|attempt| attempt.join().unwrap())
+        .collect::<Vec<_>>();
+    let (winners, losers): (Vec<_>, Vec<_>) = attempts.into_iter().partition(Result::is_ok);
+    assert_eq!(winners.len(), 1);
+    assert_eq!(losers.len(), 7);
+    for loser in &losers {
+        let error = loser.as_ref().unwrap_err();
+        assert_eq!(
+            reopen_refusal_gate(error),
+            Some("already-reopened"),
+            "{error:#}"
+        );
+    }
+    let winner = winners.into_iter().next().unwrap().unwrap();
+    winner.finalize("session-reopennew1").unwrap();
+
+    let mut after = snapshot_directory(&source);
+    let marker_text = after
+        .remove(REOPEN_MARKER_FILE)
+        .expect("the winner leaves its marker in the source");
+    assert_eq!(after, before);
+    let marker: ReopenMarker = serde_json::from_slice(&marker_text).unwrap();
+    assert_eq!(marker.schema, 1);
+    assert_eq!(marker.reopened_by.as_deref(), Some("session-reopennew1"));
+    assert_eq!(marker.provider_session_id, REOPEN_TEST_CONVERSATION);
+
+    let refused = claim_reopen_marker(&source, id, REOPEN_TEST_CONVERSATION).unwrap_err();
+    assert_eq!(reopen_refusal_gate(&refused), Some("already-reopened"));
+    assert!(
+        format!("{refused:#}").contains("already reopened as session-reopennew1"),
+        "{refused:#}"
+    );
+    let refused = inspect_reopen_source(&source, id).unwrap_err();
+    assert_eq!(reopen_refusal_gate(&refused), Some("already-reopened"));
+}
+
+#[test]
+fn reopen_marker_is_released_when_the_new_session_is_never_created() {
+    let root = tempfile::tempdir().unwrap();
+    let id = "session-reopensrc2";
+    let source = write_closed_reopen_source(
+        root.path(),
+        id,
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    {
+        let _claim = claim_reopen_marker(&source, id, REOPEN_TEST_CONVERSATION).unwrap();
+        assert!(source.join(REOPEN_MARKER_FILE).is_file());
+        assert_eq!(
+            reopen_refusal_gate(
+                &claim_reopen_marker(&source, id, REOPEN_TEST_CONVERSATION).unwrap_err()
+            ),
+            Some("already-reopened")
+        );
+    }
+    assert!(!source.join(REOPEN_MARKER_FILE).exists());
+    let claim = claim_reopen_marker(&source, id, REOPEN_TEST_CONVERSATION).unwrap();
+    claim.finalize("session-reopennew2").unwrap();
+    assert!(source.join(REOPEN_MARKER_FILE).is_file());
+}
+
+#[test]
+fn reopen_gates_refuse_open_unconverged_identity_less_and_delivery_uncertain_sources() {
+    let root = tempfile::tempdir().unwrap();
+
+    let open = root.path().join("session-reopenopen");
+    fs::create_dir(&open).unwrap();
+    fs::create_dir(open.join("events")).unwrap();
+    write_reopen_test_manifest(
+        &open,
+        "session-reopenopen",
+        "claude",
+        PathBuf::from("/opt/claude"),
+        root.path().to_owned(),
+        false,
+    );
+    update_status(&open, "ready", None, None).unwrap();
+    let error = inspect_reopen_source(&open, "session-reopenopen").unwrap_err();
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some("source-not-closed"),
+        "{error:#}"
+    );
+    assert!(format!("{error:#}").contains("is ready"));
+
+    let lingering = write_closed_reopen_source(
+        root.path(),
+        "session-reopenclaim",
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    fs::write(lingering.join(TURN_CLAIM_FILE), "1-2-3\n").unwrap();
+    let error = inspect_reopen_source(&lingering, "session-reopenclaim").unwrap_err();
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some("source-not-converged"),
+        "{error:#}"
+    );
+
+    let no_identity =
+        write_closed_reopen_source(root.path(), "session-reopennoid", "claude", None, true);
+    let error = inspect_reopen_source(&no_identity, "session-reopennoid").unwrap_err();
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some("source-identity-missing"),
+        "{error:#}"
+    );
+
+    let only_failed =
+        write_closed_reopen_source(root.path(), "session-reopenfail", "claude", None, false);
+    let error = inspect_reopen_source(&only_failed, "session-reopenfail").unwrap_err();
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some("source-identity-missing"),
+        "{error:#}"
+    );
+
+    let unresolved = write_closed_reopen_source(
+        root.path(),
+        "session-reopenunres",
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let receipt = requests::create(&unresolved, "9-9-9", &[]).unwrap();
+    assert!(!unresolved.join("events").join(&receipt.event_file).exists());
+    let error = inspect_reopen_source(&unresolved, "session-reopenunres").unwrap_err();
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some("request-unresolved"),
+        "{error:#}"
+    );
+    assert!(format!("{error:#}").contains(&receipt.request_id));
+
+    let healthy = write_closed_reopen_source(
+        root.path(),
+        "session-reopenok",
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let source = inspect_reopen_source(&healthy, "session-reopenok").unwrap();
+    assert_eq!(source.provider, FirstPartyCli::Claude);
+    assert_eq!(source.provider_session_id, REOPEN_TEST_CONVERSATION);
+    assert!(valid_event_file_name(&source.event_id));
+    assert!(healthy.join("events").join(&source.event_id).is_file());
+    assert_eq!(source.manifest.id, "session-reopenok");
+    assert!(!healthy.join(REOPEN_MARKER_FILE).exists());
+}
+
+#[test]
+fn non_claude_sources_are_refused_with_each_adapters_own_reason() {
+    let root = tempfile::tempdir().unwrap();
+    let codex = write_closed_reopen_source(
+        root.path(),
+        "session-reopencodex",
+        "codex",
+        Some("01a0d22a-e41e-7661-b666-229f7f1e6435"),
+        true,
+    );
+    let source = inspect_reopen_source(&codex, "session-reopencodex").unwrap();
+    assert_eq!(source.provider, FirstPartyCli::Codex);
+    let error = provider::verify_reopen_available(source.provider, &source.provider_session_id)
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").starts_with("reopen unsupported: Codex"),
+        "{error:#}"
+    );
+
+    for (provider, expected) in [
+        (FirstPartyCli::Agy, "reopen unsupported: Agy"),
+        (FirstPartyCli::Pi, "reopen unsupported: Pi"),
+    ] {
+        let error =
+            provider::verify_reopen_available(provider, "5e58ec26-0000-4000-8000-000000000000")
+                .unwrap_err();
+        assert!(format!("{error:#}").starts_with(expected), "{error:#}");
+    }
+    for provider in [FirstPartyCli::Codex, FirstPartyCli::Agy, FirstPartyCli::Pi] {
+        let error = provider::prepare_resume(
+            provider,
+            provider::ResumeContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: root.path(),
+                provider_session_id: REOPEN_TEST_CONVERSATION,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").starts_with("reopen unsupported: "),
+            "{error:#}"
+        );
+    }
+}
+
+#[test]
+fn late_hook_into_a_closed_source_records_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let source = write_closed_reopen_source(
+        root.path(),
+        "session-reopenlate",
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let old_marker = "<!-- agent-bridge-claude-turn:claude-turn-1-1-1 -->";
+    write_json_atomic(
+        &source.join("claude-pending-turn.json"),
+        &serde_json::json!({
+            "schema": 1,
+            "request_id": "claude-turn-1-1-1",
+            "marker": old_marker,
+        }),
+    )
+    .unwrap();
+    let stop = serde_json::json!({
+        "hook_event_name": "Stop",
+        "session_id": REOPEN_TEST_CONVERSATION,
+        "last_assistant_message": format!("late answer\n{old_marker}"),
+    });
+    let stop_failure = serde_json::json!({
+        "hook_event_name": "StopFailure",
+        "session_id": REOPEN_TEST_CONVERSATION,
+        "error": "late failure",
+    });
+
+    let before = snapshot_directory(&source);
+    provider::handle_hook(FirstPartyCli::Claude, &source, &stop).unwrap();
+    provider::handle_hook(FirstPartyCli::Claude, &source, &stop_failure).unwrap();
+    assert_eq!(snapshot_directory(&source), before);
+
+    fs::remove_file(source.join("claude-pending-turn.json")).unwrap();
+    let before = snapshot_directory(&source);
+    provider::handle_hook(FirstPartyCli::Claude, &source, &stop).unwrap();
+    provider::handle_hook(FirstPartyCli::Claude, &source, &stop_failure).unwrap();
+    assert_eq!(snapshot_directory(&source), before);
+    assert_eq!(event_paths(&source).unwrap().len(), 1);
+    assert_eq!(
+        read_json::<SessionStatus>(&source.join("status.json"))
+            .unwrap()
+            .state,
+        "closed"
+    );
+}
+
+#[test]
+fn late_hook_carrying_the_previous_marker_into_the_new_directory_is_ignored() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    let claim = acquire_turn_claim(directory.path()).unwrap();
+    let token = claim.token.clone();
+    claim.retain();
+    let new_request = "claude-turn-2-2-2";
+    write_json_atomic(
+        &directory.path().join("claude-pending-turn.json"),
+        &serde_json::json!({
+            "schema": 1,
+            "request_id": new_request,
+            "marker": format!("<!-- agent-bridge-claude-turn:{new_request} -->"),
+        }),
+    )
+    .unwrap();
+
+    provider::handle_hook(
+        FirstPartyCli::Claude,
+        directory.path(),
+        &serde_json::json!({
+            "hook_event_name": "Stop",
+            "session_id": REOPEN_TEST_CONVERSATION,
+            "last_assistant_message":
+                "answer to the closed source\n<!-- agent-bridge-claude-turn:claude-turn-1-1-1 -->",
+        }),
+    )
+    .unwrap();
+    assert!(event_paths(directory.path()).unwrap().is_empty());
+    assert_eq!(
+        current_turn_claim_token(directory.path())
+            .unwrap()
+            .as_deref(),
+        Some(token.as_str())
+    );
+    assert_eq!(
+        read_json::<SessionStatus>(&directory.path().join("status.json"))
+            .unwrap()
+            .state,
+        "working"
+    );
+
+    provider::handle_hook(
+        FirstPartyCli::Claude,
+        directory.path(),
+        &serde_json::json!({
+            "hook_event_name": "Stop",
+            "session_id": REOPEN_TEST_CONVERSATION,
+            "last_assistant_message":
+                format!("answer to the reopened request\n<!-- agent-bridge-claude-turn:{new_request} -->"),
+        }),
+    )
+    .unwrap();
+    let paths = event_paths(directory.path()).unwrap();
+    assert_eq!(paths.len(), 1);
+    let event: SessionEvent = read_json(&paths[0]).unwrap();
+    assert_eq!(event.message, "answer to the reopened request");
+    assert_eq!(event.turn_id.as_deref(), Some(new_request));
+    assert_eq!(
+        event.provider_session_id.as_deref(),
+        Some(REOPEN_TEST_CONVERSATION)
+    );
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+    assert_eq!(
+        read_json::<SessionStatus>(&directory.path().join("status.json"))
+            .unwrap()
+            .state,
+        "ready"
+    );
+}
+
+#[test]
+fn reopened_session_close_consumes_only_its_own_handle_and_leaves_the_source_tombstone() {
+    let root = tempfile::tempdir().unwrap();
+    let source_id = "session-reopensrc3";
+    let source = write_closed_reopen_source(
+        root.path(),
+        source_id,
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let new_id = "session-reopennew3";
+    let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    claim.finalize(new_id).unwrap();
+    let new = root.path().join(new_id);
+    fs::create_dir(&new).unwrap();
+    fs::create_dir(new.join("events")).unwrap();
+    write_reopen_test_manifest(
+        &new,
+        new_id,
+        "claude",
+        PathBuf::from("/opt/claude"),
+        root.path().to_owned(),
+        false,
+    );
+    record_resumed_from(
+        &new,
+        &read_manifest(&new).unwrap(),
+        &ResumedFrom {
+            session: source_id.to_owned(),
+            provider_session_id: REOPEN_TEST_CONVERSATION.to_owned(),
+            event_id: "event-1-1.json".to_owned(),
+        },
+    )
+    .unwrap();
+    write_json_atomic(
+        &new.join(TERMINAL_HANDLE_FILE),
+        &reopen_test_terminal(new_id),
+    )
+    .unwrap();
+    update_status(&new, "running", None, None).unwrap();
+    let source_before = snapshot_directory(&source);
+
+    let mut closed_terminals = Vec::new();
+    close_session_state(&new, |session| {
+        closed_terminals.push(session.id.clone());
+        Ok(terminal::CloseOutcome::Closed)
+    })
+    .unwrap();
+    assert_eq!(closed_terminals, [format!("{new_id}-terminal")]);
+    assert!(new.join(TERMINAL_TOMBSTONE_FILE).is_file());
+    assert!(!new.join(TERMINAL_HANDLE_FILE).exists());
+    assert_eq!(snapshot_directory(&source), source_before);
+
+    update_status(&new, "exited", Some(1), None).unwrap();
+    update_status(
+        &new,
+        "failed",
+        None,
+        Some("provider exited after close".to_owned()),
+    )
+    .unwrap();
+    let status: SessionStatus = read_json(&new.join("status.json")).unwrap();
+    assert_eq!(status.state, "closed");
+    assert_eq!(status.exit_code, None);
+    assert_eq!(status.error, None);
+
+    let mut close_calls = 0;
+    close_session_state(&new, |_| {
+        close_calls += 1;
+        Ok(terminal::CloseOutcome::Closed)
+    })
+    .unwrap();
+    assert_eq!(close_calls, 0);
+    assert_eq!(snapshot_directory(&source), source_before);
+
+    let mut close_calls = 0;
+    close_session_state(&source, |_| {
+        close_calls += 1;
+        Ok(terminal::CloseOutcome::Closed)
+    })
+    .unwrap();
+    assert_eq!(close_calls, 0);
+    assert_eq!(
+        read_json::<SessionStatus>(&source.join("status.json"))
+            .unwrap()
+            .state,
+        "closed"
+    );
+    let marker: ReopenMarker = read_json(&source.join(REOPEN_MARKER_FILE)).unwrap();
+    assert_eq!(marker.reopened_by.as_deref(), Some(new_id));
+    assert_eq!(read_resumed_from(&source).unwrap(), None);
+}
+
+#[test]
+fn inspect_reports_resumed_from_for_reopened_sessions_and_schema_one_readers_still_parse() {
+    let root = tempfile::tempdir().unwrap();
+    let id = "session-reopeninsp";
+    let directory = root.path().join(id);
+    fs::create_dir(&directory).unwrap();
+    fs::create_dir(directory.join("events")).unwrap();
+    write_reopen_test_manifest(
+        &directory,
+        id,
+        "claude",
+        PathBuf::from("/opt/claude"),
+        root.path().to_owned(),
+        false,
+    );
+    update_status(&directory, "ready", None, None).unwrap();
+    assert_eq!(
+        query::inspect_value(&directory, id).unwrap()["resumed_from"],
+        serde_json::Value::Null
+    );
+    assert_eq!(read_resumed_from(&directory).unwrap(), None);
+
+    let resumed_from = ResumedFrom {
+        session: "session-reopensrc4".to_owned(),
+        provider_session_id: REOPEN_TEST_CONVERSATION.to_owned(),
+        event_id: "event-1-1.json".to_owned(),
+    };
+    record_resumed_from(
+        &directory,
+        &read_manifest(&directory).unwrap(),
+        &resumed_from,
+    )
+    .unwrap();
+    let value = query::inspect_value(&directory, id).unwrap();
+    assert_eq!(
+        value["resumed_from"],
+        serde_json::json!({
+            "session": "session-reopensrc4",
+            "provider_session_id": REOPEN_TEST_CONVERSATION,
+            "event_id": "event-1-1.json",
+        })
+    );
+    assert_eq!(value["configured"]["yolo"], false);
+    assert_eq!(value["configured"]["model"], serde_json::Value::Null);
+    assert_eq!(read_resumed_from(&directory).unwrap(), Some(resumed_from));
+    let manifest = read_manifest(&directory).unwrap();
+    assert_eq!(manifest.schema, SESSION_SCHEMA);
+    assert_eq!(manifest.id, id);
+    assert_eq!(manifest.model, None);
+    assert!(!manifest.yolo);
+    let raw: serde_json::Value = read_json(&directory.join("manifest.json")).unwrap();
+    assert_eq!(raw["schema"], 1);
+    assert_eq!(raw["resumed_from"]["session"], "session-reopensrc4");
+}
+
+#[cfg(windows)]
+#[test]
+fn resumed_session_launch_uses_the_official_resume_plan_with_only_the_new_manifest_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let provider = root.path().join("claude.cmd");
+    write_private(
+        &provider,
+        b"@echo off\r\nif \"%~1\"==\"--version\" (\r\n  echo 2.1.281\r\n  exit /b 0\r\n)\r\necho %*> \"%AGENT_BRIDGE_NATIVE_SESSION_DIR%\\argv.txt\"\r\n",
+    )
+    .unwrap();
+    let id = "session-reopenlaunch";
+    let directory = root.path().join(id);
+    fs::create_dir(&directory).unwrap();
+    fs::create_dir(directory.join("events")).unwrap();
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    write_reopen_test_manifest(
+        &directory,
+        id,
+        "claude",
+        provider.clone(),
+        workspace.clone(),
+        false,
+    );
+    record_resumed_from(
+        &directory,
+        &read_manifest(&directory).unwrap(),
+        &ResumedFrom {
+            session: "session-reopensrc9".to_owned(),
+            provider_session_id: REOPEN_TEST_CONVERSATION.to_owned(),
+            event_id: "event-1-1.json".to_owned(),
+        },
+    )
+    .unwrap();
+    write_private(
+        &directory.join("initial-prompt.txt"),
+        native_delegation_prompt("parent", "review this again").as_bytes(),
+    )
+    .unwrap();
+    update_status(&directory, "launching", None, None).unwrap();
+    let claim = acquire_turn_claim(&directory).unwrap();
+    claim.retain();
+
+    let result = run_session_inner(&directory);
+    finalize_native_session(&directory, &result).unwrap();
+    result.unwrap();
+
+    let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
+    assert!(arguments.contains("--resume"), "{arguments}");
+    assert!(arguments.contains(REOPEN_TEST_CONVERSATION), "{arguments}");
+    assert!(arguments.contains("--name"), "{arguments}");
+    assert!(arguments.contains(id), "{arguments}");
+    assert!(arguments.contains("--settings"), "{arguments}");
+    for inherited in [
+        "--dangerously-skip-permissions",
+        "--model",
+        "--effort",
+        "Fable",
+        "review this again",
+    ] {
+        assert!(
+            !arguments.contains(inherited),
+            "{inherited} leaked into {arguments}"
+        );
+    }
+    let settings: serde_json::Value = read_json(&directory.join("claude-settings.json")).unwrap();
+    assert_eq!(settings["crossSessionInbound"], "accept");
+    assert!(directory.join("initial-prompt.txt").is_file());
+}

@@ -1,7 +1,7 @@
 use super::{
     CompletionMonitor, CrossSessionMessageContext, CrossSessionMessageFailure,
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
-    LaunchPlan, NativeProviderAdapter,
+    LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan,
 };
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
@@ -73,6 +73,12 @@ impl PendingCodexTurn {
     }
 }
 
+// Codex `resume <thread>` is official, but reopen needs two file-level gates this slice
+// does not implement: the exclusive thread writer lock under ~/.codex/thread-writer-locks
+// and rows for the thread in the queue store, whose accepted inputs would execute inside
+// the reopened TUI. The resume-while-held behavior also needs a live check first.
+const CODEX_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Codex reopen is not implemented in this slice; it requires the thread writer-lock and queued_items gates and a live check of resume-while-held behavior";
+
 impl NativeProviderAdapter for CodexAdapter {
     fn diagnose(
         &self,
@@ -98,6 +104,14 @@ impl NativeProviderAdapter for CodexAdapter {
             completion_monitor: CompletionMonitor::Hook,
             environment_removals: &[],
         })
+    }
+
+    fn verify_reopen_available(&self, _provider_session_id: &str) -> Result<()> {
+        bail!("{CODEX_REOPEN_UNSUPPORTED}")
+    }
+
+    fn prepare_resume(&self, _context: ResumeContext<'_>) -> Result<ResumePlan> {
+        bail!("{CODEX_REOPEN_UNSUPPORTED}")
     }
 
     fn initial_prompt_transport(&self) -> InitialPromptTransport {
@@ -1773,5 +1787,34 @@ exit 91
 
         assert_eq!(event_paths(directory.path()).unwrap().len(), 1);
         assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+    }
+
+    #[test]
+    fn reopen_is_refused_with_the_adapters_own_reason() {
+        let error = ADAPTER
+            .verify_reopen_available("5e58ec26-0000-4000-8000-000000000000")
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with("reopen unsupported: Codex"),
+            "{error}"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let error = ADAPTER
+            .prepare_resume(ResumeContext {
+                bridge_executable: std::path::Path::new("/opt/agent-bridge"),
+                directory: directory.path(),
+                provider_session_id: "5e58ec26-0000-4000-8000-000000000000",
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with("reopen unsupported: Codex"),
+            "{error}"
+        );
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 }

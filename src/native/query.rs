@@ -669,35 +669,7 @@ pub(super) fn run_inspect(id: &str, json: bool) -> Result<()> {
 
 fn inspect_inner(id: &str, json: bool) -> Result<()> {
     let directory = session_directory(id)?;
-    let snapshot = observe_snapshot(&directory)?;
-    let owner = observe_owner(&directory);
-    let mut latest = snapshot.result(&directory, &Selector::Latest)?;
-    latest.as_object_mut().unwrap().remove("result");
-    let request_refs = snapshot
-        .receipts
-        .iter()
-        .map(|receipt| {
-            json!({
-                "request_id": receipt.request_id, "created_unix_ms": receipt.created_unix_ms, "source": receipt.source,
-                "event_id": receipt.event_file, "context_sources": receipt.context_sources,
-                "active": snapshot.claim.as_deref() == Some(&receipt.claim_token),
-            })
-        })
-        .collect::<Vec<_>>();
-    let value = json!({
-        "schema_version": 1, "ok": true, "session": id, "provider": snapshot.manifest.provider,
-        "workspace": snapshot.manifest.workspace, "title": snapshot.manifest.title,
-        "stored_state": snapshot.status.state, "generation": snapshot.status.generation,
-        "created_unix_ms": snapshot.manifest.created_unix_ms, "updated_unix_ms": snapshot.status.updated_unix_ms,
-        "error": snapshot.status.error, "exit_code": snapshot.status.exit_code,
-        "configured": {"model": snapshot.manifest.model, "effort": snapshot.manifest.effort,
-            "yolo": snapshot.manifest.yolo, "provider_version_at_launch": snapshot.manifest.provider_version},
-        "owner_process_alive": owner.process_alive, "owner_identity_verified": owner.identity_matches == Some(true), "owner": owner,
-        "recovery_required": snapshot.pending.is_some(), "turn_claimed": snapshot.claim.is_some(),
-        "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error,
-        "recorded_events": snapshot.paths.len(), "latest_result": latest, "requests": request_refs,
-    });
-    drop(snapshot);
+    let value = inspect_value(&directory, id)?;
     if json {
         return print_json(&value);
     }
@@ -712,6 +684,9 @@ fn inspect_inner(id: &str, json: bool) -> Result<()> {
         "owner process alive: {}\nrecovery required: {}",
         value["owner_process_alive"], value["recovery_required"]
     );
+    if let Some(source) = value["resumed_from"]["session"].as_str() {
+        println!("resumed from: {}", terminal_safe_text(source, false));
+    }
     if let Some(error) = value["error"].as_str() {
         println!("error: {}", terminal_safe_text(error, true));
     }
@@ -722,6 +697,39 @@ fn inspect_inner(id: &str, json: bool) -> Result<()> {
         println!("request: {}", request["request_id"].as_str().unwrap_or("?"));
     }
     Ok(())
+}
+
+pub(super) fn inspect_value(directory: &Path, id: &str) -> Result<Value> {
+    let snapshot = observe_snapshot(directory)?;
+    let owner = observe_owner(directory);
+    let resumed_from = read_resumed_from(directory)?;
+    let mut latest = snapshot.result(directory, &Selector::Latest)?;
+    latest.as_object_mut().unwrap().remove("result");
+    let request_refs = snapshot
+        .receipts
+        .iter()
+        .map(|receipt| {
+            json!({
+                "request_id": receipt.request_id, "created_unix_ms": receipt.created_unix_ms, "source": receipt.source,
+                "event_id": receipt.event_file, "context_sources": receipt.context_sources,
+                "active": snapshot.claim.as_deref() == Some(&receipt.claim_token),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "schema_version": 1, "ok": true, "session": id, "provider": snapshot.manifest.provider,
+        "workspace": snapshot.manifest.workspace, "title": snapshot.manifest.title,
+        "stored_state": snapshot.status.state, "generation": snapshot.status.generation,
+        "created_unix_ms": snapshot.manifest.created_unix_ms, "updated_unix_ms": snapshot.status.updated_unix_ms,
+        "error": snapshot.status.error, "exit_code": snapshot.status.exit_code,
+        "configured": {"model": snapshot.manifest.model, "effort": snapshot.manifest.effort,
+            "yolo": snapshot.manifest.yolo, "provider_version_at_launch": snapshot.manifest.provider_version},
+        "resumed_from": resumed_from,
+        "owner_process_alive": owner.process_alive, "owner_identity_verified": owner.identity_matches == Some(true), "owner": owner,
+        "recovery_required": snapshot.pending.is_some(), "turn_claimed": snapshot.claim.is_some(),
+        "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error,
+        "recorded_events": snapshot.paths.len(), "latest_result": latest, "requests": request_refs,
+    }))
 }
 
 // ---------------------------------------------------------------------------------------

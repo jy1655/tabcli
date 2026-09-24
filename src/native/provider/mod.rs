@@ -31,6 +31,25 @@ pub(super) struct LaunchPlan {
     pub(super) environment_removals: &'static [&'static str],
 }
 
+// Launch inputs for a session that continues a closed session's provider conversation.
+// The provider conversation identity comes from the closed session's recorded event; the
+// directory is the new session's own private state, never the source's.
+pub(super) struct ResumeContext<'a> {
+    pub(super) bridge_executable: &'a Path,
+    pub(super) directory: &'a Path,
+    pub(super) provider_session_id: &'a str,
+}
+
+// The provider arguments that reopen a conversation. A resume plan never carries an initial
+// prompt: the reopened session receives it through the provider's initial-prompt transport,
+// exactly as a fresh `ask` does, so the same delivery evidence applies.
+#[derive(Debug)]
+pub(super) struct ResumePlan {
+    pub(super) arguments: Vec<OsString>,
+    pub(super) completion_monitor: CompletionMonitor,
+    pub(super) environment_removals: &'static [&'static str],
+}
+
 #[derive(Clone, Copy)]
 #[cfg_attr(windows, allow(dead_code))]
 pub(super) struct CrossSessionMessageContext<'a> {
@@ -106,6 +125,7 @@ impl CrossSessionMessageFailure {
 
 pub(super) type CrossSessionMessageResult = std::result::Result<(), CrossSessionMessageFailure>;
 
+#[derive(Debug)]
 pub(super) enum CompletionMonitor {
     Hook,
     AgyTranscript { log_path: PathBuf },
@@ -173,6 +193,12 @@ impl FollowUpTransport {
 trait NativeProviderAdapter: Sync {
     fn diagnose(&self, context: super::doctor::Context<'_>) -> Vec<super::doctor::Check>;
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan>;
+    // Read-only reopen gate. Each adapter states whether the recorded provider conversation
+    // can be continued in a new process on this platform and whether the provider's own
+    // ownership evidence shows the conversation is still held by a live process. There is no
+    // shared default: an adapter that cannot prove ownership must refuse with its reason.
+    fn verify_reopen_available(&self, provider_session_id: &str) -> Result<()>;
+    fn prepare_resume(&self, context: ResumeContext<'_>) -> Result<ResumePlan>;
     fn initial_prompt_transport(&self) -> InitialPromptTransport;
     fn initial_prompt_ready_delay(&self) -> Duration;
     fn send_initial_prompt(
@@ -228,6 +254,20 @@ pub(super) fn prepare_launch(
     context: LaunchContext<'_>,
 ) -> Result<LaunchPlan> {
     adapter(provider).prepare_launch(context)
+}
+
+pub(super) fn verify_reopen_available(
+    provider: FirstPartyCli,
+    provider_session_id: &str,
+) -> Result<()> {
+    adapter(provider).verify_reopen_available(provider_session_id)
+}
+
+pub(super) fn prepare_resume(
+    provider: FirstPartyCli,
+    context: ResumeContext<'_>,
+) -> Result<ResumePlan> {
+    adapter(provider).prepare_resume(context)
 }
 
 // Applies an adapter's caller-environment removals to a provider process before it

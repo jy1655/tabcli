@@ -1,7 +1,7 @@
 use super::{
     CompletionMonitor, CrossSessionMessageContext, CrossSessionMessageFailure,
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
-    LaunchPlan, NativeProviderAdapter,
+    LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -284,6 +284,24 @@ impl NativeProviderAdapter for ClaudeAdapter {
         prepare_launch_for_platform(context, cfg!(windows))
     }
 
+    fn verify_reopen_available(&self, provider_session_id: &str) -> Result<()> {
+        verify_reopen_available_for_platform(provider_session_id, cfg!(windows))?;
+        let registry = claude_sessions_registry_dir()?;
+        if let Some(pid) =
+            live_conversation_writer(&registry, provider_session_id, live_process_creation_time)?
+        {
+            bail!(
+                "reopen unsupported: Claude conversation {provider_session_id} is held by live Claude Code process {pid} registered under {}",
+                registry.display()
+            )
+        }
+        Ok(())
+    }
+
+    fn prepare_resume(&self, context: ResumeContext<'_>) -> Result<ResumePlan> {
+        prepare_resume_for_platform(context, cfg!(windows))
+    }
+
     fn initial_prompt_transport(&self) -> InitialPromptTransport {
         claude_initial_prompt_transport(cfg!(windows))
     }
@@ -395,6 +413,166 @@ fn claude_initial_prompt_transport(windows: bool) -> InitialPromptTransport {
     } else {
         InitialPromptTransport::ProviderArgument
     }
+}
+
+// Official `claude --resume <uuid>` continues a conversation in a new interactive process.
+// The plan registers the new session's own private settings and cross-session name, so the
+// reopened process reports only into its own directory, exactly like a fresh launch. Policy
+// arguments (yolo, model, effort) are not part of the plan: the shared wrapper derives them
+// from the new manifest, which records only what the reopen request stated.
+fn prepare_resume_for_platform(context: ResumeContext<'_>, windows: bool) -> Result<ResumePlan> {
+    verify_reopen_available_for_platform(context.provider_session_id, windows)?;
+    let settings_path = context.directory.join("claude-settings.json");
+    super::super::write_json_atomic(&settings_path, &hook_settings(context.bridge_executable))?;
+    Ok(ResumePlan {
+        arguments: vec![
+            OsString::from("--resume"),
+            OsString::from(context.provider_session_id),
+            OsString::from("--settings"),
+            settings_path.into_os_string(),
+            OsString::from("--name"),
+            OsString::from(managed_session_name(context.directory)?),
+        ],
+        completion_monitor: CompletionMonitor::Hook,
+        environment_removals: CLAUDE_CODE_SESSION_MARKERS,
+    })
+}
+
+// Removable per platform once the macOS ownership check against the session registry has
+// been verified live; the Windows check reuses the process creation-time identity that the
+// console transport already verifies.
+fn verify_reopen_available_for_platform(provider_session_id: &str, windows: bool) -> Result<()> {
+    if !valid_claude_conversation_id(provider_session_id) {
+        bail!(
+            "reopen unsupported: recorded Claude conversation id {provider_session_id:?} is not a Claude session UUID"
+        )
+    }
+    if !windows {
+        bail!(
+            "reopen unsupported: Claude reopen is implemented only for native Windows in this slice; the macOS check of ~/.claude/sessions ownership has not been verified live"
+        )
+    }
+    Ok(())
+}
+
+fn valid_claude_conversation_id(value: &str) -> bool {
+    value.len() == 36
+        && value.char_indices().all(|(index, character)| match index {
+            8 | 13 | 18 | 23 => character == '-',
+            _ => character.is_ascii_hexdigit(),
+        })
+}
+
+// Claude Code registers every live interactive session as `<config dir>/sessions/<pid>.json`
+// with `pid`, `sessionId`, and `procStart`, the process creation FILETIME on Windows. The
+// `<pid>.<hash>.key` files beside those records are secrets and are never opened.
+#[derive(Deserialize)]
+struct SessionRegistryEntry {
+    pid: u32,
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    #[serde(rename = "procStart", default)]
+    proc_start: Option<serde_json::Value>,
+}
+
+fn claude_sessions_registry_dir() -> Result<PathBuf> {
+    let config_dir = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => {
+            let home = std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .context("neither HOME nor USERPROFILE is set")?;
+            PathBuf::from(home).join(".claude")
+        }
+    };
+    Ok(config_dir.join("sessions"))
+}
+
+// The pid of a registered live Claude Code process that still holds the conversation, if
+// any. `live_creation_time` answers `Ok(None)` for a dead pid, `Ok(Some(_))` with the live
+// process's creation time, and `Err` when the process exists but cannot be inspected, which
+// refuses the reopen rather than treating the entry as stale.
+fn live_conversation_writer(
+    registry: &Path,
+    provider_session_id: &str,
+    live_creation_time: impl Fn(u32) -> Result<Option<u64>>,
+) -> Result<Option<u32>> {
+    let entries = match std::fs::read_dir(registry) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read the Claude session registry {}",
+                    registry.display()
+                )
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if stem.is_empty() || !stem.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let path = entry.path();
+        let Some(text) = super::super::read_regular_text_if_present(&path)? else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<SessionRegistryEntry>(&text) else {
+            continue;
+        };
+        if record.session_id != provider_session_id {
+            continue;
+        }
+        let Some(live) = live_creation_time(record.pid).with_context(|| {
+            format!(
+                "failed to verify the Claude Code process {} registered at {}",
+                record.pid,
+                path.display()
+            )
+        })?
+        else {
+            continue;
+        };
+        match record.proc_start.as_ref().and_then(proc_start_filetime) {
+            Some(recorded) if recorded == live => return Ok(Some(record.pid)),
+            Some(_) => continue,
+            None => bail!(
+                "reopen unsupported: Claude session registry entry {} names live process {} without a verifiable procStart",
+                path.display(),
+                record.pid
+            ),
+        }
+    }
+    Ok(None)
+}
+
+fn proc_start_filetime(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::String(text) => text.trim().parse().ok(),
+        serde_json::Value::Number(number) => number.as_u64(),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn live_process_creation_time(pid: u32) -> Result<Option<u64>> {
+    if !agent_bridge::process_is_alive(pid) {
+        return Ok(None);
+    }
+    terminal::windows_process_identity(pid).map(|identity| Some(identity.creation_time))
+}
+
+#[cfg(not(windows))]
+fn live_process_creation_time(pid: u32) -> Result<Option<u64>> {
+    bail!("Claude process {pid} creation time is only verified on native Windows")
 }
 
 fn cross_session_message_plan(
@@ -2748,5 +2926,240 @@ mod tests {
 
         assert!(!error.delivery_may_have_occurred());
         assert!(!directory.join(PENDING_TURN_FILE).exists());
+    }
+
+    const REOPEN_TEST_CONVERSATION: &str = "6928ca1c-1234-4abc-8def-0123456789ab";
+
+    #[test]
+    fn resume_plan_uses_the_official_resume_with_private_settings_and_managed_name_only() {
+        let root = tempfile::tempdir().unwrap();
+        let session = root.path().join("session-reopenplan");
+        std::fs::create_dir(&session).unwrap();
+        let plan = prepare_resume_for_platform(
+            ResumeContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &session,
+                provider_session_id: REOPEN_TEST_CONVERSATION,
+            },
+            true,
+        )
+        .unwrap();
+        let settings_path = session.join("claude-settings.json");
+        assert_eq!(
+            plan.arguments,
+            vec![
+                OsString::from("--resume"),
+                OsString::from(REOPEN_TEST_CONVERSATION),
+                OsString::from("--settings"),
+                settings_path.clone().into_os_string(),
+                OsString::from("--name"),
+                OsString::from("session-reopenplan"),
+            ]
+        );
+        assert!(matches!(plan.completion_monitor, CompletionMonitor::Hook));
+        assert_eq!(plan.environment_removals, CLAUDE_CODE_SESSION_MARKERS);
+        for forbidden in [
+            "--dangerously-skip-permissions",
+            "--model",
+            "--effort",
+            "--fork-session",
+            "--session-id",
+            "--print",
+        ] {
+            assert!(
+                !plan.arguments.iter().any(|argument| argument == forbidden),
+                "{forbidden} in resume plan"
+            );
+        }
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(settings["crossSessionInbound"], "accept");
+        assert!(settings["hooks"]["Stop"].is_array());
+        assert!(settings["hooks"]["StopFailure"].is_array());
+    }
+
+    #[test]
+    fn resume_is_refused_off_native_windows_and_for_non_uuid_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let session = root.path().join("session-reopenplan2");
+        std::fs::create_dir(&session).unwrap();
+        let error = prepare_resume_for_platform(
+            ResumeContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &session,
+                provider_session_id: REOPEN_TEST_CONVERSATION,
+            },
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().starts_with(
+                "reopen unsupported: Claude reopen is implemented only for native Windows"
+            ),
+            "{error}"
+        );
+        assert!(!session.join("claude-settings.json").exists());
+        assert_eq!(
+            verify_reopen_available_for_platform(REOPEN_TEST_CONVERSATION, false)
+                .unwrap_err()
+                .to_string(),
+            error.to_string()
+        );
+        for bad in [
+            "",
+            "not-a-uuid",
+            "6928ca1c-1234-4abc-8def-0123456789ab-extra",
+            "6928ca1c_1234_4abc_8def_0123456789ab",
+            "../../../../../../../../../../etc/pw",
+        ] {
+            let error = verify_reopen_available_for_platform(bad, true).unwrap_err();
+            assert!(
+                error.to_string().contains("not a Claude session UUID"),
+                "{bad:?}: {error}"
+            );
+        }
+        verify_reopen_available_for_platform(REOPEN_TEST_CONVERSATION, true).unwrap();
+        verify_reopen_available_for_platform("6928CA1C-1234-4ABC-8DEF-0123456789AB", true).unwrap();
+    }
+
+    #[test]
+    fn registry_entry_with_live_pid_and_matching_start_is_the_writer_and_stale_entries_are_not() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path();
+        let entry = |pid: u32, session: &str, proc_start: serde_json::Value| {
+            serde_json::json!({
+                "pid": pid,
+                "sessionId": session,
+                "cwd": "D:\\Dev\\project",
+                "startedAt": 1_790_231_893_451_u64,
+                "procStart": proc_start,
+                "version": "2.1.281",
+                "name": "agent-bridge-a0",
+                "status": "idle",
+            })
+            .to_string()
+        };
+        std::fs::write(
+            registry.join("4242.json"),
+            entry(4242, REOPEN_TEST_CONVERSATION, "134347054929920616".into()),
+        )
+        .unwrap();
+        // The secret beside a registry entry is never opened: a directory in its place would
+        // make any read attempt fail loudly.
+        std::fs::create_dir(registry.join("4242.94cd6ac7033609ded4e5043f998182dc.key")).unwrap();
+        std::fs::write(
+            registry.join("4243.json"),
+            entry(4243, "5e58ec26-0000-4000-8000-000000000000", "1".into()),
+        )
+        .unwrap();
+        std::fs::write(registry.join("garbage.json"), "not json").unwrap();
+        std::fs::write(registry.join("4244.json"), "{\"pid\": 4244}").unwrap();
+
+        let live_and_matching = |pid: u32| Ok((pid == 4242).then_some(134_347_054_929_920_616_u64));
+        assert_eq!(
+            live_conversation_writer(registry, REOPEN_TEST_CONVERSATION, live_and_matching)
+                .unwrap(),
+            Some(4242)
+        );
+        assert_eq!(
+            live_conversation_writer(
+                registry,
+                "5e58ec26-0000-4000-8000-000000000000",
+                live_and_matching
+            )
+            .unwrap(),
+            None
+        );
+        // A reused pid whose live creation time differs from procStart is not a writer.
+        assert_eq!(
+            live_conversation_writer(registry, REOPEN_TEST_CONVERSATION, |_| Ok(Some(1))).unwrap(),
+            None
+        );
+        // A dead pid is not a writer.
+        assert_eq!(
+            live_conversation_writer(registry, REOPEN_TEST_CONVERSATION, |_| Ok(None)).unwrap(),
+            None
+        );
+        // A live pid that cannot be inspected refuses instead of passing as stale.
+        let error = live_conversation_writer(registry, REOPEN_TEST_CONVERSATION, |_| {
+            Err(anyhow::anyhow!("access denied"))
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("4242"), "{error:#}");
+        assert!(format!("{error:#}").contains("access denied"), "{error:#}");
+        // No registry means no writer.
+        assert_eq!(
+            live_conversation_writer(&registry.join("missing"), REOPEN_TEST_CONVERSATION, |_| {
+                Ok(Some(1))
+            })
+            .unwrap(),
+            None
+        );
+        // A live pid without a verifiable procStart cannot be cleared.
+        std::fs::write(
+            registry.join("4245.json"),
+            serde_json::json!({"pid": 4245, "sessionId": REOPEN_TEST_CONVERSATION}).to_string(),
+        )
+        .unwrap();
+        let error = live_conversation_writer(registry, REOPEN_TEST_CONVERSATION, |pid| {
+            Ok((pid == 4245).then_some(7))
+        })
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("without a verifiable procStart"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_creation_time_check_distinguishes_the_live_process_from_a_stale_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path();
+        let pid = std::process::id();
+        let live = live_process_creation_time(pid).unwrap().unwrap();
+        let write_entry = |pid: u32, proc_start: u64| {
+            std::fs::write(
+                registry.join(format!("{pid}.json")),
+                serde_json::json!({
+                    "pid": pid,
+                    "sessionId": REOPEN_TEST_CONVERSATION,
+                    "procStart": proc_start.to_string(),
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        write_entry(pid, live);
+        assert_eq!(
+            live_conversation_writer(
+                registry,
+                REOPEN_TEST_CONVERSATION,
+                live_process_creation_time
+            )
+            .unwrap(),
+            Some(pid)
+        );
+        write_entry(pid, live - 1);
+        assert_eq!(
+            live_conversation_writer(
+                registry,
+                REOPEN_TEST_CONVERSATION,
+                live_process_creation_time
+            )
+            .unwrap(),
+            None
+        );
+        std::fs::remove_file(registry.join(format!("{pid}.json"))).unwrap();
+        write_entry(4_294_967_294, live);
+        assert_eq!(
+            live_conversation_writer(
+                registry,
+                REOPEN_TEST_CONVERSATION,
+                live_process_creation_time
+            )
+            .unwrap(),
+            None
+        );
     }
 }

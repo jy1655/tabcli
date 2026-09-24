@@ -1,7 +1,7 @@
 use super::{
     CompletionMonitor, CrossSessionMessageContext, CrossSessionMessageFailure,
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
-    LaunchPlan, NativeProviderAdapter,
+    LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan,
 };
 use agent_bridge::FirstPartyCli;
 use anyhow::Context;
@@ -47,6 +47,12 @@ impl PendingAgyTurn {
     }
 }
 
+// Agy 1.2.10 writes a presence lock for every conversation but no running process holds it,
+// so presence cannot prove ownership, and the transcript monitor binds only to a newly
+// created conversation. Replace this refusal when Agy exposes a live-session registry or
+// held lock and a resumable transcript marker.
+const AGY_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Agy exposes no verifiable ownership evidence for a conversation (presence locks are not held by the running process) and its transcript monitor binds only to a newly created conversation";
+
 impl NativeProviderAdapter for AgyAdapter {
     fn diagnose(
         &self,
@@ -88,6 +94,14 @@ impl NativeProviderAdapter for AgyAdapter {
             completion_monitor: CompletionMonitor::AgyTranscript { log_path },
             environment_removals: &[],
         })
+    }
+
+    fn verify_reopen_available(&self, _provider_session_id: &str) -> Result<()> {
+        bail!("{AGY_REOPEN_UNSUPPORTED}")
+    }
+
+    fn prepare_resume(&self, _context: ResumeContext<'_>) -> Result<ResumePlan> {
+        bail!("{AGY_REOPEN_UNSUPPORTED}")
     }
 
     fn initial_prompt_transport(&self) -> InitialPromptTransport {
@@ -4244,6 +4258,35 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         assert_eq!(
             default_brain_root(None, Some(std::ffi::OsStr::new(r"C:\Users\agy-user"))).unwrap(),
             PathBuf::from(r"C:\Users\agy-user\.gemini\antigravity-cli\brain")
+        );
+    }
+
+    #[test]
+    fn reopen_is_refused_with_the_adapters_own_reason() {
+        let error = ADAPTER
+            .verify_reopen_available("5e58ec26-0000-4000-8000-000000000000")
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with("reopen unsupported: Agy"),
+            "{error}"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let error = ADAPTER
+            .prepare_resume(ResumeContext {
+                bridge_executable: std::path::Path::new("/opt/agent-bridge"),
+                directory: directory.path(),
+                provider_session_id: "5e58ec26-0000-4000-8000-000000000000",
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with("reopen unsupported: Agy"),
+            "{error}"
+        );
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .next()
+                .is_none()
         );
     }
 }

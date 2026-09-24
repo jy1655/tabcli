@@ -1,7 +1,7 @@
 use super::{
     CompletionMonitor, CrossSessionMessageContext, CrossSessionMessageFailure,
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
-    LaunchPlan, NativeProviderAdapter,
+    LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan,
 };
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
@@ -53,6 +53,11 @@ struct HookFailureSignal {
     claim_token: Option<String>,
 }
 
+// Pi 0.84.4 keeps only transcript files under ~/.pi; no lock, pid, or registry identifies
+// a live writer, and a transcript-based heuristic is not ownership evidence. Replace this
+// refusal when Pi exposes a live-session registry or a held session lock.
+const PI_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Pi exposes no verifiable ownership evidence for a session (no lock, pid, or registry under ~/.pi identifies a live writer)";
+
 impl NativeProviderAdapter for PiAdapter {
     fn diagnose(
         &self,
@@ -91,6 +96,14 @@ impl NativeProviderAdapter for PiAdapter {
             completion_monitor: CompletionMonitor::PiHookFailure,
             environment_removals: &[],
         })
+    }
+
+    fn verify_reopen_available(&self, _provider_session_id: &str) -> Result<()> {
+        bail!("{PI_REOPEN_UNSUPPORTED}")
+    }
+
+    fn prepare_resume(&self, _context: ResumeContext<'_>) -> Result<ResumePlan> {
+        bail!("{PI_REOPEN_UNSUPPORTED}")
     }
 
     fn initial_prompt_transport(&self) -> InitialPromptTransport {
@@ -765,5 +778,34 @@ mod tests {
 
         assert_eq!(event_paths(directory.path()).unwrap().len(), 1);
         assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+    }
+
+    #[test]
+    fn reopen_is_refused_with_the_adapters_own_reason() {
+        let error = ADAPTER
+            .verify_reopen_available("5e58ec26-0000-4000-8000-000000000000")
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with("reopen unsupported: Pi"),
+            "{error}"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let error = ADAPTER
+            .prepare_resume(ResumeContext {
+                bridge_executable: std::path::Path::new("/opt/agent-bridge"),
+                directory: directory.path(),
+                provider_session_id: "5e58ec26-0000-4000-8000-000000000000",
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with("reopen unsupported: Pi"),
+            "{error}"
+        );
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 }
