@@ -2015,10 +2015,34 @@ fn initial_prompt_delay_within_budget(
 }
 
 fn run_sessions(request: SessionsRequest) -> Result<()> {
-    let root = state_root()?;
+    let sessions = sessions_in(&state_root()?, &request)?;
+    if request.json {
+        println!("{}", serde_json::to_string_pretty(&sessions)?);
+    } else if sessions.is_empty() {
+        println!("no native Agent Bridge sessions");
+    } else {
+        for session in sessions {
+            println!(
+                "{}\t{}\t{}\t{}\tterminal={}\tyolo={}\t{} result(s)",
+                session["id"].as_str().unwrap_or("?"),
+                terminal_safe_text(session["state"].as_str().unwrap_or("unknown"), false),
+                terminal_safe_text(session["provider"].as_str().unwrap_or("?"), false),
+                terminal_safe_text(session["workspace"].as_str().unwrap_or("?"), false),
+                session["terminal"].as_str().unwrap_or("unknown"),
+                session["yolo"].as_bool().unwrap_or(false),
+                session["results"].as_u64().unwrap_or(0),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The `sessions` listing over one state root. Listing is also a lifecycle-lock holder: it
+/// converges interrupted completions and closes and repairs dead owners before it reads.
+fn sessions_in(root: &Path, request: &SessionsRequest) -> Result<Vec<serde_json::Value>> {
     let mut sessions = Vec::new();
     if root.is_dir() {
-        for entry in fs::read_dir(&root)? {
+        for entry in fs::read_dir(root)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
                 continue;
@@ -2087,25 +2111,7 @@ fn run_sessions(request: SessionsRequest) -> Result<()> {
             by_id
         }
     });
-    if request.json {
-        println!("{}", serde_json::to_string_pretty(&sessions)?);
-    } else if sessions.is_empty() {
-        println!("no native Agent Bridge sessions");
-    } else {
-        for session in sessions {
-            println!(
-                "{}\t{}\t{}\t{}\tterminal={}\tyolo={}\t{} result(s)",
-                session["id"].as_str().unwrap_or("?"),
-                terminal_safe_text(session["state"].as_str().unwrap_or("unknown"), false),
-                terminal_safe_text(session["provider"].as_str().unwrap_or("?"), false),
-                terminal_safe_text(session["workspace"].as_str().unwrap_or("?"), false),
-                session["terminal"].as_str().unwrap_or("unknown"),
-                session["yolo"].as_bool().unwrap_or(false),
-                session["results"].as_u64().unwrap_or(0),
-            );
-        }
-    }
-    Ok(())
+    Ok(sessions)
 }
 
 fn run_prune(request: PruneRequest) -> Result<()> {
@@ -2388,7 +2394,10 @@ where
     }
     fault_point("claiming the terminal handle for close")?;
     match fs::rename(&terminal_path, &closing_path) {
-        Ok(()) => sync_parent_directory(&closing_path)?,
+        Ok(()) => {
+            fault_point("syncing the claimed terminal handle's directory")?;
+            sync_parent_directory(&closing_path)?
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if !closing_path.exists() {
                 return mark_session_closed_locked(directory, &claim_path, close_error);
@@ -3902,9 +3911,13 @@ fn recover_pending_completion(directory: &Path) -> Result<bool> {
 ///
 /// Two transitions are journaled and therefore recoverable: a provider completion (journal
 /// -> event -> status -> claim release -> journal removal) and an explicit or repair close
-/// (tombstone -> status -> journal removal -> claim release). The `closed.json` tombstone is
-/// the durable commit point of a close: once it exists the session is closed even when the
-/// later cleanup steps never ran, so recovery finishes those steps instead of publishing.
+/// (tombstone -> status -> set aside an unverified event -> claim release -> journal
+/// removal). The `closed.json` tombstone is the durable commit point of a close: once it
+/// exists the session is closed even when the later cleanup steps never ran, so recovery
+/// finishes those steps instead of publishing. Both sequences release the claim before they
+/// remove the journal: while the claim is installed the journal is the only evidence that
+/// the event at its path is the provider's committed result, so no interruption may leave
+/// the claim without the journal.
 fn recover_pending_completion_locked(directory: &Path, claim_path: &Path) -> Result<bool> {
     let completion_path = directory.join(TURN_COMPLETION_FILE);
     if let Some(tombstone) = read_status_if_present(&directory.join(CLOSED_STATUS_FILE))? {
@@ -3932,11 +3945,16 @@ fn recover_pending_completion_locked(directory: &Path, claim_path: &Path) -> Res
         }
         Ok(_) => bail!("pending native completion belongs to a different turn claim"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let event_path = directory.join("events").join(&pending.event_file);
-            let stored: SessionEvent = read_json(&event_path)
-                .context("claim-free pending completion has no committed event")?;
-            if stored != pending.event {
-                bail!("claim-free pending completion event does not match its journal")
+            // The same byte-match predicate every other lifecycle path uses: a semantically
+            // equal event stored in another encoding is not the journal's committed write.
+            match journaled_event_state(directory, &pending)? {
+                JournaledEventState::Committed => (),
+                JournaledEventState::Absent => {
+                    bail!("claim-free pending completion has no committed event")
+                }
+                JournaledEventState::Mismatched | JournaledEventState::Oversized(_) => {
+                    bail!("claim-free pending completion event does not match its journal")
+                }
             }
             let status: SessionStatus = read_json(&directory.join("status.json"))?;
             if status.state != pending.status_state || status.error != pending.status_error {
@@ -3951,10 +3969,11 @@ fn recover_pending_completion_locked(directory: &Path, claim_path: &Path) -> Res
 
 // Finishes a close whose tombstone was written but whose later cleanup steps did not run.
 // The tombstone is preserved unchanged: status.json is rewritten from it (update_status
-// copies the tombstone whenever one exists), and the journal, legacy resume markers, and
-// turn claim are removed. A journaled completion is settled exactly as the uninterrupted
-// close settles it: an event it already wrote stays published when it matches the
-// journal, is set aside when it does not, and a journal without an event is discarded.
+// copies the tombstone whenever one exists), and the turn claim, the journal, and the
+// legacy resume markers are removed in the same order the uninterrupted close uses. A
+// journaled completion is settled exactly as that close settles it: an event it already
+// wrote stays published when it matches the journal, is set aside when it does not, and a
+// journal without an event is discarded.
 fn converge_interrupted_close_locked(
     directory: &Path,
     claim_path: &Path,
@@ -3971,10 +3990,16 @@ fn converge_interrupted_close_locked(
         update_status(directory, "closed", None, tombstone.error.clone())?;
         changed = true;
     }
-    if directory.join(TURN_COMPLETION_FILE).exists() {
-        settle_completion_journal_for_close(directory)?;
+    let completion_path = directory.join(TURN_COMPLETION_FILE);
+    if completion_path.exists() {
+        set_aside_unverified_completion_event_for_close(directory)?;
         changed = true;
     }
+    if claim_path.exists() {
+        remove_turn_claim_locked(claim_path)?;
+        changed = true;
+    }
+    remove_file_if_present(&completion_path)?;
     for name in [LEGACY_RESUME_PENDING_FILE, LEGACY_RESUME_RUNNING_FILE] {
         let path = directory.join(name);
         if path.exists() {
@@ -3982,12 +4007,13 @@ fn converge_interrupted_close_locked(
             changed = true;
         }
     }
-    if claim_path.exists() {
-        remove_turn_claim_locked(claim_path)?;
-        changed = true;
-    }
     Ok(changed)
 }
+
+/// Largest event the publication predicate compares with its journal. It is the byte
+/// budget of a whole `search`, so no read-only query ever reads more of one record than a
+/// search may read in total; a larger journaled event is never published.
+const EVENT_READ_LIMIT: u64 = 64 * 1024 * 1024;
 
 /// How the file at a journal's event path relates to the journal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3999,38 +4025,119 @@ enum JournaledEventState {
     Committed,
     /// A different record occupies the journal's event path.
     Mismatched,
+    /// The file at the journal's event path is larger than the caller's read limit (its
+    /// size in bytes), so it was not compared and is never treated as published.
+    Oversized(u64),
 }
 
+/// The publication predicate's verdict together with what it cost: the bytes it read, and
+/// the stored text when they are the journal's, so a budgeted caller can charge the read
+/// once and search the record without reading it again.
+struct JournaledEventRead {
+    state: JournaledEventState,
+    bytes_read: u64,
+    committed_text: Option<String>,
+}
+
+/// The single byte-match predicate: a journaled event is committed exactly when its file
+/// holds the bytes the journal would write. Every lifecycle path (completion recovery,
+/// claim-free recovery, close, interrupted close) and every read-only query decide
+/// publication with this comparison.
 fn journaled_event_state(
     directory: &Path,
     pending: &PendingTurnCompletion,
 ) -> Result<JournaledEventState> {
+    Ok(journaled_event_state_within(directory, pending, EVENT_READ_LIMIT)?.state)
+}
+
+/// [`journaled_event_state`] that never reads more than `limit` bytes of the event: the
+/// size is checked before the file is opened and the read is cut after `limit` bytes, so a
+/// file that grows under the read is still reported as oversized.
+fn journaled_event_state_within(
+    directory: &Path,
+    pending: &PendingTurnCompletion,
+    limit: u64,
+) -> Result<JournaledEventRead> {
+    use std::io::Read as _;
     let path = directory.join("events").join(&pending.event_file);
-    let Some(stored) = read_regular_bytes_if_present(&path)? else {
-        return Ok(JournaledEventState::Absent);
+    let outcome = |state, bytes_read, committed_text| JournaledEventRead {
+        state,
+        bytes_read,
+        committed_text,
     };
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(outcome(JournaledEventState::Absent, 0, None));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("refusing non-regular session file: {}", path.display());
+    }
+    if metadata.len() > limit {
+        return Ok(outcome(
+            JournaledEventState::Oversized(metadata.len()),
+            0,
+            None,
+        ));
+    }
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(outcome(JournaledEventState::Absent, 0, None));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let mut stored = Vec::with_capacity(metadata.len() as usize);
+    file.take(limit + 1)
+        .read_to_end(&mut stored)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes_read = stored.len() as u64;
+    if bytes_read > limit {
+        return Ok(outcome(
+            JournaledEventState::Oversized(bytes_read),
+            bytes_read,
+            None,
+        ));
+    }
     Ok(if stored == serde_json::to_vec_pretty(&pending.event)? {
-        JournaledEventState::Committed
+        // The journal's bytes are canonical JSON, so the stored text is valid UTF-8.
+        let text = String::from_utf8_lossy(&stored).into_owned();
+        outcome(JournaledEventState::Committed, bytes_read, Some(text))
     } else {
-        JournaledEventState::Mismatched
+        outcome(JournaledEventState::Mismatched, bytes_read, None)
     })
 }
 
-/// Settles the completion journal that a close finds in place. The tombstone is the close's
-/// commit point, but an event the interrupted completion already wrote is the provider's
-/// authoritative result: when it matches the journal byte for byte it stays published (the
-/// receipt already maps the request to it), and when it does not match it is moved aside
-/// under an `unpublished-` name that no query reads. A journal whose event was never
-/// written is discarded. The journal itself is removed in every case, and every step is
-/// idempotent so an interrupted settlement converges on the next run.
-fn settle_completion_journal_for_close(directory: &Path) -> Result<()> {
+/// The first settlement step of a close that finds a completion journal in place. The
+/// tombstone is the close's commit point, but an event the interrupted completion already
+/// wrote is the provider's authoritative result: when it matches the journal byte for byte
+/// it stays published (the receipt already maps the request to it), and when it does not
+/// match, or is too large to compare, it is moved aside under an `unpublished-` name that
+/// no query reads. A journal whose event was never written needs no step here and is
+/// discarded when the close removes the journal. The move is idempotent, so an interrupted
+/// close converges on the next run.
+///
+/// The close removes the journal only after this step and after the turn claim is
+/// released: while the claim is installed, the journal is the evidence that the event at
+/// its path is the committed result, so an interruption before claim release would
+/// otherwise hide a published result until the next recovery.
+fn set_aside_unverified_completion_event_for_close(directory: &Path) -> Result<()> {
     let completion_path = directory.join(TURN_COMPLETION_FILE);
     let Some(text) = read_regular_text_if_present(&completion_path)? else {
         return Ok(());
     };
     if let Ok(pending) = serde_json::from_str::<PendingTurnCompletion>(&text)
         && validate_pending_completion(&pending).is_ok()
-        && journaled_event_state(directory, &pending)? == JournaledEventState::Mismatched
+        && matches!(
+            journaled_event_state(directory, &pending)?,
+            JournaledEventState::Mismatched | JournaledEventState::Oversized(_)
+        )
     {
         let events = directory.join("events");
         rename_session_file(
@@ -4039,7 +4146,7 @@ fn settle_completion_journal_for_close(directory: &Path) -> Result<()> {
         )
         .context("failed to set aside a completion event that disagrees with its journal")?;
     }
-    remove_file_if_present(&completion_path)
+    Ok(())
 }
 
 fn validate_pending_completion(pending: &PendingTurnCompletion) -> Result<()> {
@@ -4064,6 +4171,11 @@ fn write_pending_completion_event(directory: &Path, pending: &PendingTurnComplet
         JournaledEventState::Committed => Ok(()),
         JournaledEventState::Mismatched => {
             bail!("pending native completion event file contains different data")
+        }
+        JournaledEventState::Oversized(size) => {
+            bail!(
+                "pending native completion event file is {size} bytes, over the {EVENT_READ_LIMIT} byte read limit"
+            )
         }
         JournaledEventState::Absent => write_json_atomic(
             &directory.join("events").join(&pending.event_file),
@@ -4092,11 +4204,22 @@ fn mark_session_closed_locked(
     };
     let status_result = update_status(directory, "closed", None, error);
     let (pending_result, running_result, claim_result) = if status_result.is_ok() {
+        // An event the journal disagrees with is set aside first, then the claim is
+        // released, and only then is the journal removed: every interruption of this order
+        // leaves a state in which a committed event stays published and an unverified one
+        // stays hidden. The journal is kept whenever an earlier step failed.
+        let claim_result = set_aside_unverified_completion_event_for_close(directory)
+            .and_then(|()| remove_turn_claim_locked(claim_path));
+        let pending_result = if claim_result.is_ok() {
+            remove_file_if_present(&directory.join(TURN_COMPLETION_FILE))
+        } else {
+            Ok(())
+        }
+        .and_then(|()| remove_file_if_present(&directory.join(LEGACY_RESUME_PENDING_FILE)));
         (
-            settle_completion_journal_for_close(directory)
-                .and_then(|_| remove_file_if_present(&directory.join(LEGACY_RESUME_PENDING_FILE))),
+            pending_result,
             remove_file_if_present(&directory.join(LEGACY_RESUME_RUNNING_FILE)),
-            remove_turn_claim_locked(claim_path),
+            claim_result,
         )
     } else {
         (Ok(()), Ok(()), Ok(()))

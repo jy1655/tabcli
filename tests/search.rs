@@ -277,11 +277,18 @@ fn pending_claimed_and_failed_events_are_not_results() {
     let before = files(fixture.root.path());
 
     let found = fixture.search(&["text"]);
-    assert_eq!(found["incomplete"], false);
     let hits = found["hits"].as_array().unwrap();
     assert_eq!(hits.len(), 1, "{found}");
     assert_eq!(hits[0]["event_id"], "event-4.json");
-    assert_eq!(found["scanned"]["events"], 2);
+    // The journaled event was read to decide publication (its key order differs from
+    // the journal's write), skipped, and reported; the read counts as a scanned event.
+    assert_eq!(found["incomplete"], true, "{found}");
+    assert_eq!(found["scanned"]["events"], 3, "{found}");
+    assert_eq!(
+        found["incomplete_reasons"],
+        json!([{"session": "session-a", "reason":
+            "event-3.json: skipped; the event differs from its pending completion journal and is not published"}])
+    );
     assert!(
         fixture.search(&["pending"])["hits"]
             .as_array()
@@ -734,4 +741,53 @@ fn damaged_session_directories_are_incomplete_not_empty() {
         stdout.contains("session-missing: events directory is missing"),
         "{stdout}"
     );
+}
+
+/// The event exactly as a completion writes it: pretty JSON in record field order, the
+/// byte form that publication compares with the journal.
+fn journaled_event_text(name: &str, message: &str) -> String {
+    format!(
+        "{{\n  \"provider\": \"claude\",\n  \"message\": \"{message}\",\n  \"error\": null,\n  \"provider_session_id\": \"native-session\",\n  \"turn_id\": \"{name}\",\n  \"created_unix_ms\": 5\n}}"
+    )
+}
+
+#[test]
+fn publication_checks_read_journaled_events_within_the_byte_budget() {
+    // A completion that wrote its journal and event and still holds its claim: deciding
+    // whether the event is published means comparing the whole record with the journal.
+    let fixture = Fixture::new();
+    let a = fixture.session("session-a", "claude", &fixture.workspace_a);
+    let message = format!("needle {}", "x".repeat(4200));
+    let text = journaled_event_text("event-1.json", &message);
+    fs::write(a.join("events").join("event-1.json"), &text).unwrap();
+    receipt(&a, "1-1-1", "request-1", "event-1.json");
+    fs::write(a.join("turn.claim"), "1-1-1").unwrap();
+    write(
+        &a.join("turn.completion.json"),
+        &json!({"schema": 1, "claim_token": "1-1-1", "event_file": "event-1.json",
+            "event": serde_json::from_str::<Value>(&text).unwrap(),
+            "status_error": null, "status_state": "ready"}),
+    );
+    let size = text.len();
+
+    // With one byte of budget the comparison cannot run; the record is not read past
+    // the budget, and the scan reports the record it could not verify.
+    let starved = fixture.search(&["needle", "--max-bytes", "1"]);
+    assert_eq!(starved["hits"], json!([]));
+    assert_eq!(starved["incomplete"], true, "{starved}");
+    assert_eq!(starved["scanned"]["events"], 0, "{starved}");
+    let reasons = starved["incomplete_reasons"].to_string();
+    assert!(
+        reasons.contains(&format!(
+            "journaled event session-a/event-1.json is {size} bytes with 1 bytes remaining"
+        )),
+        "{reasons}"
+    );
+
+    // The full budget verifies the record, charges it once, and searches it.
+    let found = fixture.search(&["needle", "--max-bytes", &size.to_string()]);
+    assert_eq!(sessions(&found), ["session-a"]);
+    assert_eq!(found["hits"][0]["request_id"], "request-1");
+    assert_eq!(found["incomplete"], false, "{found}");
+    assert_eq!(found["scanned"]["events"], 1, "{found}");
 }
