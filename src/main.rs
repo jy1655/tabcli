@@ -73,12 +73,15 @@ Session policy:
   best-effort detection, not exclusion: it runs again immediately before the
   reopened process is spawned, after launch once the process has registered,
   immediately before the initial prompt is sent, and immediately before every tell
-  to the reopened session. Another live holder found at any of those points
-  refuses that delivery with gate reopen-conflict; a check that cannot complete
-  refuses with gate reopen-verification-failed. After launch either gate fails the
-  new session and closes only its surface before any prompt is delivered, and
-  releases the source's reopen marker so the source can be reopened again; before a
-  tell either gate refuses the delivery and leaves the session ready. A foreign
+  to the reopened session. A live holder found before the process is spawned
+  refuses with gate provider-unsupported, the same gate as the first check, and no
+  process is started. At the three later points another live holder refuses that
+  delivery with gate reopen-conflict, and a check that cannot complete refuses with
+  gate reopen-verification-failed. After launch either of those gates fails the new
+  session and closes only its surface before any prompt is delivered; every refusal
+  after the new session exists releases the source's reopen marker so the source can
+  be reopened again. Before a tell either gate refuses the delivery and leaves the
+  session ready. A foreign
   claude --resume can still register between two checks and interleave until the
   next one. doctor reports the other live holders of a reopened session's
   conversation. Nothing is copied from the source manifest: only an explicit --model,

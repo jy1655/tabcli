@@ -7279,6 +7279,60 @@ fn reopen_refuses_receipts_whose_recorded_result_is_empty_malformed_or_foreign()
     assert!(format!("{error:#}").contains("event-9-9.json"), "{error:#}");
     fs::remove_file(&legacy_path).unwrap();
     assert!(inspect_reopen_source(&source, id).is_ok());
+
+    // An older legacy record that no receipt points at is validated too, even though the
+    // newest usable identity is found in a later event: identity discovery reads every
+    // recorded event rather than stopping at the newest one it can use.
+    let older_legacy_path = source.join("events").join("event-0-0.json");
+    for (label, contents) in [
+        ("empty", ""),
+        ("truncated", "{\"provider\": \"claude\", \"mess"),
+    ] {
+        fs::write(&older_legacy_path, contents).unwrap();
+        assert_eq!(
+            requests::list(&source)
+                .unwrap()
+                .receipts
+                .iter()
+                .filter(|receipt| receipt.event_file == "event-0-0.json")
+                .count(),
+            0,
+            "{label}: no receipt points at the legacy record"
+        );
+        let error = inspect_reopen_source(&source, id).unwrap_err();
+        assert_eq!(
+            reopen_refusal_gate(&error),
+            Some("request-unresolved"),
+            "{label}: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("event-0-0.json"),
+            "{label}: {error:#}"
+        );
+        let error = latest_provider_event_identity(&source, FirstPartyCli::Claude, id).unwrap_err();
+        assert_eq!(
+            reopen_refusal_gate(&error),
+            Some("request-unresolved"),
+            "{label}: {error:#}"
+        );
+    }
+    // A readable older event without an identity leaves the newest usable identity in place.
+    fs::write(
+        &older_legacy_path,
+        serde_json::json!({
+            "provider": "claude",
+            "message": "the first turn failed",
+            "provider_session_id": null,
+            "turn_id": null,
+            "created_unix_ms": 1,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let resolved = inspect_reopen_source(&source, id).unwrap();
+    assert_eq!(resolved.event_id, latest_event);
+    assert_eq!(resolved.provider_session_id, REOPEN_TEST_CONVERSATION);
+    fs::remove_file(&older_legacy_path).unwrap();
 }
 
 #[test]
@@ -7717,6 +7771,85 @@ fn post_launch_holder_conflict_fails_the_reopened_session_under_its_own_gate() {
     provider::override_claude_session_registry_for_test(None);
 }
 
+// A refused follow-up records its reason only while the turn is still its own. Between the
+// refusal being decided and being recorded, the refused claim can already be gone (a dead
+// owner repair, or the pre-fix code that released the claim before writing the reason) and
+// a second `tell` can claim the turn and enter `working`. Recording the old refusal then
+// must not roll that turn back to `ready`: its claim, its receipt, and its status stay
+// intact, and only the refused request's receipt remains unresolved.
+#[test]
+fn a_refused_follow_up_never_overwrites_the_status_of_the_turn_that_claimed_after_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path();
+    fs::create_dir(directory.join("events")).unwrap();
+    update_status(directory, "ready", None, None).unwrap();
+    let (mut refused, _) = acquire_ready_turn_claim(directory, "session-test").unwrap();
+    let refused_request = refused.receipt.request_id.clone();
+    let refusal = anyhow::anyhow!("reopen refused (reopen-conflict): held by pid 4242");
+
+    // The refused claim is released out from under the refusal before it is recorded, and
+    // the next `tell` claims the turn and starts working.
+    release_turn_claim(directory).unwrap();
+    update_status(directory, "ready", None, None).unwrap();
+    let (next, _) = acquire_ready_turn_claim(directory, "session-test").unwrap();
+    let next_token = next.token.clone();
+    let next_request = next.receipt.request_id.clone();
+    update_status(directory, "working", None, None).unwrap();
+
+    let reported = record_follow_up_refusal("session-test", &mut refused, "ready", refusal);
+    drop(refused);
+    assert_eq!(
+        format!("{reported:#}"),
+        "the turn claim of session session-test already belonged to another request; its status was left unchanged: reopen refused (reopen-conflict): held by pid 4242"
+    );
+
+    let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+    assert_eq!(status.state, "working", "{status:?}");
+    assert_eq!(status.error, None, "{status:?}");
+    assert_eq!(
+        fs::read_to_string(directory.join(TURN_CLAIM_FILE))
+            .unwrap()
+            .trim(),
+        next_token
+    );
+    let receipts = requests::list(directory).unwrap();
+    assert_eq!(receipts.unreadable, 0);
+    let mut recorded: Vec<&str> = receipts
+        .receipts
+        .iter()
+        .map(|receipt| receipt.request_id.as_str())
+        .collect();
+    recorded.sort_unstable();
+    let mut expected = [refused_request.as_str(), next_request.as_str()];
+    expected.sort_unstable();
+    assert_eq!(recorded, expected);
+    for receipt in &receipts.receipts {
+        assert!(
+            !directory.join("events").join(&receipt.event_file).exists(),
+            "{}: no result was recorded for either request",
+            receipt.request_id
+        );
+    }
+    next.retain();
+    assert!(directory.join(TURN_CLAIM_FILE).is_file());
+
+    // With the turn still its own, the refusal releases the claim and publishes its reason
+    // in the same write.
+    release_turn_claim(directory).unwrap();
+    update_status(directory, "ready", None, None).unwrap();
+    let (mut refused, _) = acquire_ready_turn_claim(directory, "session-test").unwrap();
+    let refusal = anyhow::anyhow!("reopen refused (reopen-conflict): held by pid 4242");
+    let reported = record_follow_up_refusal("session-test", &mut refused, "ready", refusal);
+    drop(refused);
+    let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+    assert_eq!(status.state, "ready", "{status:?}");
+    assert_eq!(
+        status.error.as_deref(),
+        Some(format!("{reported:#}").as_str())
+    );
+    assert!(!directory.join(TURN_CLAIM_FILE).exists());
+}
+
 // The post-launch scan returns as soon as the reopened process has registered. A foreign
 // resume that registers after that scan is caught by the re-scan immediately before the
 // initial prompt is sent, and the same re-scan refuses a later `tell` while keeping the
@@ -8051,7 +8184,19 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
         // A subsequent reopen of the same source passes its gates and claims the marker.
         provider::override_claude_session_registry_for_test(Some(empty_registry.clone()));
         inspect_reopen_source(&source, source_id).unwrap();
-        provider::verify_reopen_available(FirstPartyCli::Claude, REOPEN_TEST_CONVERSATION).unwrap();
+        // The adapter admits the conversation only on native Windows; elsewhere it refuses
+        // before consulting the registry, and the marker gates below are platform-neutral.
+        let availability =
+            provider::verify_reopen_available(FirstPartyCli::Claude, REOPEN_TEST_CONVERSATION);
+        if cfg!(windows) {
+            availability.unwrap();
+        } else {
+            assert!(
+                format!("{:#}", availability.unwrap_err())
+                    .contains("implemented only for native Windows"),
+                "{label}"
+            );
+        }
         let next = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
         drop(next);
         assert!(!source.join(REOPEN_MARKER_FILE).exists(), "{label}");

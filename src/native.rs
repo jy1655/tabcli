@@ -1916,12 +1916,15 @@ fn verify_reopen_source_is_closed(directory: &Path, id: &str) -> Result<()> {
 
 // A recorded event that cannot be read is a turn whose outcome cannot be verified, so it
 // refuses under `request-unresolved` even when no receipt points at it (legacy sessions).
+// Every recorded event is read, not only those newer than the identity that is returned: an
+// older unreadable event is as unverifiable as a newer one.
 fn latest_provider_event_identity(
     directory: &Path,
     provider: FirstPartyCli,
     id: &str,
 ) -> Result<Option<(String, String)>> {
-    for path in event_paths(directory)?.into_iter().rev() {
+    let mut newest = None;
+    for path in event_paths(directory)? {
         let event: SessionEvent = read_json(&path).map_err(|error| {
             reopen_refusal(
                 "request-unresolved",
@@ -1944,10 +1947,10 @@ fn latest_provider_event_identity(
                 .and_then(|name| name.to_str())
                 .context("event path has no file name")?
                 .to_owned();
-            return Ok(Some((event_id, provider_session_id)));
+            newest = Some((event_id, provider_session_id));
         }
     }
-    Ok(None)
+    Ok(newest)
 }
 
 fn read_resumed_from(directory: &Path) -> Result<Option<ResumedFrom>> {
@@ -2693,12 +2696,10 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
 }
 
 // A resumed session's conversation is re-checked immediately before every follow-up
-// delivery. A refusal sends nothing: the claim is released here, before the reason is
-// recorded, because releasing it rolls the status back to `previous_state` (ready) and
-// would otherwise clear that reason. The session therefore stays ready with the refusal in
-// its status, and its receipt stays unresolved. This is the same best-effort detection the
-// launch ran; a foreign resume that registers after this point is caught only by the next
-// delivery.
+// delivery. A refusal sends nothing: the claim is released and the reason is recorded in
+// one status write, so the session stays ready with the refusal in its status and its
+// receipt stays unresolved. This is the same best-effort detection the launch ran; a
+// foreign resume that registers after this point is caught only by the next delivery.
 #[allow(clippy::too_many_arguments)]
 fn refuse_follow_up_to_shared_conversation(
     provider: FirstPartyCli,
@@ -2721,14 +2722,28 @@ fn refuse_follow_up_to_shared_conversation(
     let error = error.context(format!(
         "follow-up to reopened session {id} was refused before delivery"
     ));
-    let error = match claim.release_now() {
-        Ok(()) => error,
+    Err(record_follow_up_refusal(id, claim, previous_state, error))
+}
+
+// The claim is released and the refusal reason is published in one write under the
+// lifecycle lock, and only while the claim is still this request's. Once another `tell`
+// owns the turn, nothing is written: that turn keeps its claim, receipt, and status, and
+// the refused request's receipt stays unresolved.
+fn record_follow_up_refusal(
+    id: &str,
+    claim: &mut TurnClaim,
+    previous_state: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match claim.release_now_with_reason(previous_state, format!("{error:#}")) {
+        Ok(true) => error,
+        Ok(false) => error.context(format!(
+            "the turn claim of session {id} already belonged to another request; its status was left unchanged"
+        )),
         Err(release_error) => error.context(format!(
             "the turn claim of session {id} could not be released: {release_error:#}"
         )),
-    };
-    let _ = update_status(directory, previous_state, None, Some(format!("{error:#}")));
-    Err(error)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4874,18 +4889,16 @@ impl TurnClaim {
         self.retained = true;
     }
 
-    // Releases the claim now, exactly as dropping it unretained would, so the caller can
-    // record a status reason afterwards that the status rollback of the release would
-    // otherwise overwrite. Dropping the claim later does nothing more.
-    fn release_now(&mut self) -> Result<()> {
+    // Releases the claim now and publishes `state` with `reason` in the same status write,
+    // under the lifecycle lock and only while the claim file still holds this token. Returns
+    // whether that write happened; a claim that another request already owns is left alone
+    // together with the status it published. Dropping the claim later does nothing more.
+    fn release_now_with_reason(&mut self, state: &str, reason: String) -> Result<bool> {
         if self.retained {
-            return Ok(());
+            return Ok(false);
         }
         self.retained = true;
-        match self.rollback_state {
-            Some(state) => rollback_turn_claim_token(&self.path, &self.token, state),
-            None => release_turn_claim_token(&self.path, &self.token),
-        }
+        rollback_turn_claim_token_with_error(&self.path, &self.token, state, Some(reason))
     }
 
     fn retain(mut self) {
@@ -4985,20 +4998,36 @@ impl Drop for TurnClaim {
 }
 
 fn rollback_turn_claim_token(path: &Path, expected_token: &str, state: &str) -> Result<()> {
+    rollback_turn_claim_token_with_error(path, expected_token, state, None).map(|_| ())
+}
+
+// Under the lifecycle lock: the claim is removed and the status is rolled back to `state`
+// (carrying `error`) only while the claim file still holds `expected_token`. Returns
+// whether that happened. The reliability branch introduces `update_status_for_turn` for
+// claim-checked status writes; this helper is the equivalent for the rollback path.
+fn rollback_turn_claim_token_with_error(
+    path: &Path,
+    expected_token: &str,
+    state: &str,
+    error: Option<String>,
+) -> Result<bool> {
     let _lock = lock_turn_claim(path)?;
     let current = match fs::read_to_string(path) {
         Ok(current) => current,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).context("failed to inspect native turn claim"),
+        Err(read_error) if read_error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(read_error) => return Err(read_error).context("failed to inspect native turn claim"),
     };
     if current.trim() != expected_token {
-        return Ok(());
+        return Ok(false);
     }
     remove_turn_claim_locked(path)?;
     let directory = path
         .parent()
         .context("turn claim has no session directory")?;
-    update_status(directory, state, None, None)
+    update_status(directory, state, None, error)?;
+    Ok(true)
 }
 
 #[cfg(test)]
