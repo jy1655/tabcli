@@ -51,6 +51,13 @@ const TERMINAL_TOMBSTONE_FILE: &str = "terminal.closed.json";
 const LEGACY_RESUME_PENDING_FILE: &str = "resume.pending.json";
 const LEGACY_RESUME_RUNNING_FILE: &str = "resume.running.json";
 const UNPUBLISHED_EVENT_PREFIX: &str = "unpublished-";
+/// The state root's durability receipt. It exists only after some creator synced the
+/// directory entry of the root and of every ancestor up to the filesystem root or the
+/// user's home directory, so a root that lacks it is not assumed durable merely because
+/// it exists: the creator that made it may have stopped before those syncs.
+const STATE_ROOT_DURABLE_FILE: &str = "state-root.durable";
+/// Upper bound on the directory entries the state-root ancestry walk makes durable.
+const STATE_ROOT_ANCESTRY_SYNC_LIMIT: usize = 16;
 static TURN_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -3130,7 +3137,18 @@ fn create_session(spec: SessionSpec) -> Result<CreatedSession> {
 }
 
 fn create_session_in(root: &Path, spec: SessionSpec) -> Result<CreatedSession> {
-    create_state_root(root)?;
+    create_session_within(root, &home_directories(), spec)
+}
+
+/// [`create_session_in`] with the directories whose own entries are taken as durable
+/// (the user's home directory in production), so the state-root ancestry walk stops
+/// there instead of at the filesystem root.
+fn create_session_within(
+    root: &Path,
+    durable_directories: &[PathBuf],
+    spec: SessionSpec,
+) -> Result<CreatedSession> {
+    let ancestry_error = create_state_root(root, durable_directories)?;
     let temp = tempfile::Builder::new()
         .prefix("session-")
         .tempdir_in(root)?;
@@ -3169,7 +3187,9 @@ fn create_session_in(root: &Path, spec: SessionSpec) -> Result<CreatedSession> {
         &directory.join("initial-prompt.txt"),
         spec.prompt.as_bytes(),
     )?;
-    update_status(&directory, "launching", None, None)?;
+    // An ancestry sync failure never blocks the session: the root lacks its receipt, so
+    // the next creation repeats the walk, and the launch status records what failed.
+    update_status(&directory, "launching", None, ancestry_error)?;
     Ok(CreatedSession {
         id,
         directory,
@@ -3177,11 +3197,33 @@ fn create_session_in(root: &Path, spec: SessionSpec) -> Result<CreatedSession> {
     })
 }
 
-/// Creates the state root and every missing ancestor, then syncs the parent of each
-/// directory it created, deepest first. A directory entry is a record like the files inside
-/// it: the session directory is only durable once the root's entry is, and the root's entry
-/// is only durable once every newly created ancestor's entry is.
-fn create_state_root(root: &Path) -> Result<()> {
+/// The receipt stored at `STATE_ROOT_DURABLE_FILE`. Only its existence as a regular file
+/// carries meaning; the fields describe the walk that wrote it.
+#[derive(Serialize)]
+struct StateRootDurabilityReceipt {
+    schema: u32,
+    synced_unix_ms: u128,
+}
+
+/// Creates the state root and every missing ancestor, then makes the root's ancestry
+/// durable unless the durability receipt already proves it is. A directory entry is a
+/// record like the files inside it: the session directory is only durable once the root's
+/// entry is, and the root's entry is only durable once every ancestor's entry is.
+///
+/// The walk does not depend on who created the directories. A creator that made the root
+/// or an ancestor and stopped before the parent-directory syncs leaves an existing root
+/// whose ancestry is not durable, and a creator that probed while another was still
+/// creating sees only part of what the other made. So every creation that finds no
+/// receipt syncs the entry of the root and of each ancestor above it, nearest first, up to
+/// and including the entry that sits directly in the filesystem root or in one of
+/// `durable_directories`, whichever comes first, bounded by
+/// `STATE_ROOT_ANCESTRY_SYNC_LIMIT` entries. Concurrent creators may both walk; the syncs
+/// are idempotent. The receipt is written through [`write_json_atomic`], which also syncs
+/// the root, only after the walk succeeded.
+///
+/// Returns the walk's failure, if any, for the session's launch status: a missing receipt
+/// never blocks creation, and the receipt stays absent so the next creation walks again.
+fn create_state_root(root: &Path, durable_directories: &[PathBuf]) -> Result<Option<String>> {
     let mut created = Vec::new();
     let mut probe = root;
     loop {
@@ -3202,7 +3244,8 @@ fn create_state_root(root: &Path) -> Result<()> {
         }
     }
     for directory in created.iter().rev() {
-        // A concurrent creator may win the race; its entry is synced below all the same.
+        // A concurrent creator may win the race; the ancestry walk below covers its
+        // entries and this creator's alike.
         if let Err(error) = fs::create_dir(directory)
             && !directory.is_dir()
         {
@@ -3212,15 +3255,80 @@ fn create_state_root(root: &Path) -> Result<()> {
         }
     }
     set_private_directory_permissions(root)?;
-    for directory in &created {
-        let parent = directory
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        sync_directory(parent)
-            .with_context(|| format!("failed to sync state directory {}", parent.display()))?;
+    if state_root_durability_receipt_present(root) {
+        return Ok(None);
+    }
+    fault_point("syncing the state root's ancestry")?;
+    if let Err(error) = sync_state_root_ancestry(root, durable_directories) {
+        return Ok(Some(format!(
+            "state root ancestry was not made durable: {error:#}"
+        )));
+    }
+    let receipt = StateRootDurabilityReceipt {
+        schema: 1,
+        synced_unix_ms: unix_ms(),
+    };
+    write_json_atomic(&root.join(STATE_ROOT_DURABLE_FILE), &receipt)?;
+    Ok(None)
+}
+
+/// Whether the state root carries its durability receipt. Only a regular file counts; a
+/// missing, unreadable, or non-regular entry means the ancestry walk runs again, which is
+/// harmless when the ancestry was in fact durable.
+fn state_root_durability_receipt_present(root: &Path) -> bool {
+    fs::symlink_metadata(root.join(STATE_ROOT_DURABLE_FILE))
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+}
+
+/// Syncs the directory that holds the entry of `root`, then the one that holds its
+/// parent's entry, and so on. The walk stops after the sync that makes durable an entry
+/// sitting directly in the filesystem root or in one of `durable_directories`, whose own
+/// entries are not the bridge's to establish, or after `STATE_ROOT_ANCESTRY_SYNC_LIMIT`
+/// entries.
+fn sync_state_root_ancestry(root: &Path, durable_directories: &[PathBuf]) -> Result<()> {
+    let mut entry = root;
+    for _ in 0..STATE_ROOT_ANCESTRY_SYNC_LIMIT {
+        let Some(parent) = entry.parent() else {
+            break;
+        };
+        let holder = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        sync_directory(holder)
+            .with_context(|| format!("failed to sync state directory {}", holder.display()))?;
+        let holder_is_filesystem_root = parent.as_os_str().is_empty() || parent.parent().is_none();
+        if holder_is_filesystem_root
+            || durable_directories
+                .iter()
+                .any(|durable| same_directory(parent, durable))
+        {
+            break;
+        }
+        entry = parent;
     }
     Ok(())
+}
+
+/// Whether two paths name the same directory, by spelling or after canonicalisation.
+fn same_directory(left: &Path, right: &Path) -> bool {
+    left == right
+        || matches!(
+            (left.canonicalize(), right.canonicalize()),
+            (Ok(left), Ok(right)) if left == right
+        )
+}
+
+/// The directories whose own entries the state-root ancestry walk takes as durable: the
+/// user's home directory under either of the variables `default_state_root` reads.
+fn home_directories() -> Vec<PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .collect()
 }
 
 fn state_root() -> Result<PathBuf> {
@@ -3306,16 +3414,20 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
 // record on a POSIX file system that honours fsync. See README "권한과 세션 경계" for the
 // classification of which records go through these helpers and the platform limits.
 //
-// Under `cfg(test)` two thread-local hooks observe these helpers: `fault_point` refuses
+// Under `cfg(test)` three thread-local hooks observe these helpers: `fault_point` refuses
 // the next filesystem mutation once an injected budget is spent, which models a process
-// that died between two mutations, and `record_sync` logs every sync call in order.
-// Both are inert outside tests.
+// that died between two mutations, `record_sync` logs every sync call in order, and
+// `sync_directory` refuses the directories named by `with_sync_failure`, which models a
+// sync the operating system rejects. All are inert outside tests.
 
 #[cfg(test)]
 thread_local! {
     static FAULT_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static SYNC_LOG: std::cell::RefCell<Option<Vec<SyncRecord>>> =
         const { std::cell::RefCell::new(None) };
+    /// Directories whose sync fails with an injected error while `with_sync_failure` runs.
+    static SYNC_FAILURES: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Every journaled event the publication predicate opened, in order, so a test can
     /// prove when a search reads a journaled event and when it does not read it at all.
     static PUBLICATION_READ_LOG: std::cell::RefCell<Option<Vec<PathBuf>>> =
@@ -3372,6 +3484,21 @@ fn with_sync_log<T>(run: impl FnOnce() -> T) -> (T, Vec<SyncRecord>) {
     let outcome = run();
     let records = SYNC_LOG.with(|log| log.borrow_mut().take().unwrap_or_default());
     (outcome, records)
+}
+
+/// Runs `run` while every sync of `directory` on this thread fails with an injected
+/// error. The sync is still logged first, so a test sees that it was attempted.
+#[cfg(test)]
+fn with_sync_failure<T>(directory: &Path, run: impl FnOnce() -> T) -> T {
+    SYNC_FAILURES.with(|failures| failures.borrow_mut().push(directory.to_path_buf()));
+    let outcome = run();
+    SYNC_FAILURES.with(|failures| failures.borrow_mut().clear());
+    outcome
+}
+
+#[cfg(test)]
+fn injected_sync_failure(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("injected sync failure for")
 }
 
 /// Runs `run` and returns, in order, the path of every journaled event the publication
@@ -3498,6 +3625,10 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
 
 fn sync_directory(directory: &Path) -> Result<()> {
     record_sync(SyncKind::Directory, directory);
+    #[cfg(test)]
+    if SYNC_FAILURES.with(|failures| failures.borrow().iter().any(|failed| failed == directory)) {
+        bail!("injected sync failure for {}", directory.display());
+    }
     sync_directory_entries(directory)
 }
 
@@ -4104,8 +4235,11 @@ const EVENT_READ_LIMIT: u64 = 64 * 1024 * 1024;
 enum JournaledEventState {
     /// No event file exists at the journal's event path: nothing was published.
     Absent,
-    /// The event file holds exactly the bytes the journal would write, so the provider
-    /// result is already durably published under its receipt's immutable event name.
+    /// The event file holds exactly the bytes the journal would write, so it is the
+    /// provider result under its receipt's immutable event name. Byte equality alone does
+    /// not make it durable: the completion that wrote it may have stopped between the
+    /// rename and the sync of `events/`, so every lifecycle path syncs `events/` before it
+    /// discards the journal of a committed event (`sync_committed_event_directory`).
     Committed,
     /// A different record occupies the journal's event path.
     Mismatched,

@@ -3899,9 +3899,12 @@ fn private_write_claim_creation_and_removal_sync_file_then_parent() {
 #[test]
 fn session_directory_creation_syncs_the_state_root_before_its_records() {
     let root = tempfile::tempdir().unwrap();
+    // The root's parent is taken as durable, so the ancestry walk syncs it once and stops.
+    let durable = [root.path().parent().unwrap().to_path_buf()];
     let (outcome, log) = with_sync_log(|| {
-        create_session_in(
+        create_session_within(
             root.path(),
+            &durable,
             SessionSpec {
                 provider: FirstPartyCli::Codex,
                 provider_path: PathBuf::from("codex"),
@@ -3917,22 +3920,34 @@ fn session_directory_creation_syncs_the_state_root_before_its_records() {
     });
     let created = outcome.unwrap();
 
+    // The root's own entry, then its durability receipt (which syncs the root), then the
+    // root again for the session entry, then the session directory, before any record.
     assert_eq!(
         log.first(),
-        Some(&SyncRecord::Directory(root.path().to_path_buf()))
+        Some(&SyncRecord::Directory(durable[0].clone()))
     );
+    let receipt_index = log
+        .iter()
+        .position(|record| *record == SyncRecord::File(root.path().join(STATE_ROOT_DURABLE_FILE)))
+        .expect("receipt sync");
     assert_eq!(
-        log.get(1),
-        Some(&SyncRecord::Directory(created.directory.clone()))
+        log[receipt_index + 1..receipt_index + 4],
+        [
+            SyncRecord::Directory(root.path().to_path_buf()),
+            SyncRecord::Directory(root.path().to_path_buf()),
+            SyncRecord::Directory(created.directory.clone()),
+        ],
+        "{log:?}"
     );
     assert!(created.directory.join("events").is_dir());
     let manifest_index = log
         .iter()
         .position(|record| *record == SyncRecord::File(created.directory.join("manifest.json")))
         .expect("manifest sync");
-    assert!(manifest_index > 1);
+    assert!(manifest_index > receipt_index + 3);
     let status: SessionStatus = read_json(&created.directory.join("status.json")).unwrap();
     assert_eq!(status.state, "launching");
+    assert_eq!(status.error, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -4136,44 +4151,343 @@ fn initial_cross_session_uncertainty_keeps_its_own_claim_and_records_its_reason(
     );
 }
 
+/// A state root two levels below a pre-existing base directory, with the base taken as
+/// durable so the ancestry walk stops there.
+struct NestedStateRoot {
+    base: tempfile::TempDir,
+    ancestor: PathBuf,
+    root: PathBuf,
+}
+
+impl NestedStateRoot {
+    fn new() -> Self {
+        let base = tempfile::tempdir().unwrap();
+        let ancestor = base.path().join("custom");
+        let root = ancestor.join("native-sessions");
+        Self {
+            base,
+            ancestor,
+            root,
+        }
+    }
+
+    fn spec(&self) -> SessionSpec {
+        SessionSpec {
+            provider: FirstPartyCli::Codex,
+            provider_path: PathBuf::from("codex"),
+            provider_version: "0.147.0".to_owned(),
+            workspace: self.base.path().to_path_buf(),
+            title: "durability".to_owned(),
+            model: None,
+            effort: None,
+            yolo: false,
+            prompt: "prompt".to_owned(),
+        }
+    }
+
+    fn durable(&self) -> Vec<PathBuf> {
+        vec![self.base.path().to_path_buf()]
+    }
+
+    fn create(&self) -> Result<CreatedSession> {
+        create_session_within(&self.root, &self.durable(), self.spec())
+    }
+
+    fn receipt(&self) -> PathBuf {
+        self.root.join(STATE_ROOT_DURABLE_FILE)
+    }
+
+    fn receipt_present(&self) -> bool {
+        state_root_durability_receipt_present(&self.root)
+    }
+
+    /// The sync log of a creation that establishes the ancestry: the root's entry in its
+    /// parent, the parent's entry in the base, the receipt (a temporary file, the receipt
+    /// itself, then the root), the root again for the session entry, then the session.
+    fn assert_established_ancestry(&self, log: &[SyncRecord], session: &Path) {
+        assert_eq!(
+            log[..2],
+            [
+                SyncRecord::Directory(self.ancestor.clone()),
+                SyncRecord::Directory(self.base.path().to_path_buf()),
+            ],
+            "{log:?}"
+        );
+        assert!(
+            matches!(&log[2], SyncRecord::File(temporary) if temporary.parent() == Some(self.root.as_path())),
+            "{log:?}"
+        );
+        assert_eq!(
+            log[3..7],
+            [
+                SyncRecord::File(self.receipt()),
+                SyncRecord::Directory(self.root.clone()),
+                SyncRecord::Directory(self.root.clone()),
+                SyncRecord::Directory(session.to_path_buf()),
+            ],
+            "{log:?}"
+        );
+    }
+
+    /// The sync log of a creation that found the receipt: the root's entry for the new
+    /// session directory only, nothing above the root and no receipt.
+    fn assert_trusted_receipt(&self, log: &[SyncRecord], session: &Path) {
+        assert_eq!(
+            log[..2],
+            [
+                SyncRecord::Directory(self.root.clone()),
+                SyncRecord::Directory(session.to_path_buf()),
+            ],
+            "{log:?}"
+        );
+        assert!(
+            !log.contains(&SyncRecord::Directory(self.ancestor.clone())),
+            "{log:?}"
+        );
+        assert!(
+            !log.contains(&SyncRecord::Directory(self.base.path().to_path_buf())),
+            "{log:?}"
+        );
+        assert!(!log.contains(&SyncRecord::File(self.receipt())), "{log:?}");
+    }
+}
+
 #[test]
 fn session_directory_creation_syncs_newly_created_state_root_ancestors() {
-    let base = tempfile::tempdir().unwrap();
-    let ancestor = base.path().join("custom");
-    let root = ancestor.join("native-sessions");
-    let spec = || SessionSpec {
-        provider: FirstPartyCli::Codex,
-        provider_path: PathBuf::from("codex"),
-        provider_version: "0.147.0".to_owned(),
-        workspace: base.path().to_path_buf(),
-        title: "durability".to_owned(),
-        model: None,
-        effort: None,
-        yolo: false,
-        prompt: "prompt".to_owned(),
-    };
-    let (outcome, log) = with_sync_log(|| create_session_in(&root, spec()));
+    let nested = NestedStateRoot::new();
+    let (outcome, log) = with_sync_log(|| nested.create());
     let created = outcome.unwrap();
 
-    // Deepest newly created entry first: the root's entry in its parent, then the
-    // parent's entry in the pre-existing base, then the root itself for the session entry.
+    // Nearest entry first: the root's entry in its parent, then the parent's entry in the
+    // pre-existing base, then the receipt, then the root itself for the session entry.
+    nested.assert_established_ancestry(&log, &created.directory);
+    assert!(created.directory.join("events").is_dir());
+    assert!(nested.receipt_present());
+
+    // A root with its receipt syncs nothing above itself.
+    let (outcome, log) = with_sync_log(|| nested.create());
+    let created = outcome.unwrap();
+    nested.assert_trusted_receipt(&log, &created.directory);
+}
+
+// ---------------------------------------------------------------------------
+// Review round 8: state-root ancestry durability independent of who created it
+// ---------------------------------------------------------------------------
+
+const STATE_ROOT_ANCESTRY_SYNC_LABEL: &str = "syncing the state root's ancestry";
+
+#[test]
+fn a_later_creator_establishes_the_ancestry_its_stopped_creator_left_unsynced() {
+    // Creator A stops right before the ancestry syncs: the root and its ancestor exist,
+    // nothing was synced, and no receipt claims otherwise.
+    let nested = NestedStateRoot::new();
+    let (outcome, log) = with_sync_log(|| with_fault_budget(0, || nested.create()));
+    let error = outcome.err().expect("creator A stopped");
+    assert!(injected_fault(&error), "{error:#}");
+    assert!(
+        format!("{error:#}").contains(STATE_ROOT_ANCESTRY_SYNC_LABEL),
+        "{error:#}"
+    );
+    assert!(log.is_empty(), "{log:?}");
+    assert!(nested.root.is_dir());
+    assert!(!nested.receipt_present());
+
+    // Creator B finds an existing root and still performs every ancestry sync before it
+    // writes the receipt and its own session.
+    let (outcome, log) = with_sync_log(|| nested.create());
+    let created = outcome.unwrap();
+    nested.assert_established_ancestry(&log, &created.directory);
+    assert!(nested.receipt_present());
+    let status: SessionStatus = read_json(&created.directory.join("status.json")).unwrap();
+    assert_eq!((status.state.as_str(), status.error), ("launching", None));
+
+    // With the receipt present, creator C syncs only the root entry for its session.
+    let (outcome, log) = with_sync_log(|| nested.create());
+    let created = outcome.unwrap();
+    nested.assert_trusted_receipt(&log, &created.directory);
+
+    // Every stop of creator A: the receipt exists only after both ancestry syncs, and a
+    // creator that finds no receipt redoes the walk however far A got.
+    for budget in 0.. {
+        let nested = NestedStateRoot::new();
+        let (outcome, a_log) = with_sync_log(|| with_fault_budget(budget, || nested.create()));
+        let receipt_after_a = nested.receipt_present();
+        // A stop right after the receipt's rename leaves an unsynced receipt behind, which
+        // is safe: both ancestry syncs precede the first write under the root, so a
+        // receipt that survives never outlives the durability it attests to.
+        if receipt_after_a {
+            assert_eq!(
+                a_log[..2],
+                [
+                    SyncRecord::Directory(nested.ancestor.clone()),
+                    SyncRecord::Directory(nested.base.path().to_path_buf()),
+                ],
+                "budget {budget}: the receipt was written before the ancestry syncs: {a_log:?}"
+            );
+        }
+        let (outcome_b, b_log) = with_sync_log(|| nested.create());
+        let created_b = outcome_b.unwrap();
+        assert!(nested.receipt_present(), "budget {budget}");
+        if receipt_after_a {
+            nested.assert_trusted_receipt(&b_log, &created_b.directory);
+        } else {
+            nested.assert_established_ancestry(&b_log, &created_b.directory);
+        }
+        match outcome {
+            Ok(_) => {
+                assert!(receipt_after_a, "budget {budget}");
+                break;
+            }
+            Err(error) => assert!(injected_fault(&error), "budget {budget}: {error:#}"),
+        }
+    }
+}
+
+#[test]
+fn the_ancestry_walk_covers_ancestors_this_creator_did_not_make() {
+    // Another creator made the ancestor and stopped before making the root or syncing
+    // anything. This creator makes only the root, yet the ancestor's entry in the base is
+    // synced as well: the walk is over the root's ancestry, not over what was created here.
+    let nested = NestedStateRoot::new();
+    fs::create_dir(&nested.ancestor).unwrap();
+    let (outcome, log) = with_sync_log(|| nested.create());
+    let created = outcome.unwrap();
+    nested.assert_established_ancestry(&log, &created.directory);
+    assert!(nested.receipt_present());
+}
+
+#[test]
+fn the_ancestry_walk_is_bounded() {
+    let base = tempfile::tempdir().unwrap();
+    let mut levels = Vec::new();
+    let mut root = base.path().to_path_buf();
+    for level in 1..=18 {
+        root = root.join(format!("l{level}"));
+        levels.push(root.clone());
+    }
+    root = root.join("native-sessions");
+    let durable = [base.path().to_path_buf()];
+    let (outcome, log) = with_sync_log(|| {
+        create_session_within(
+            &root,
+            &durable,
+            SessionSpec {
+                provider: FirstPartyCli::Codex,
+                provider_path: PathBuf::from("codex"),
+                provider_version: "0.147.0".to_owned(),
+                workspace: base.path().to_path_buf(),
+                title: "durability".to_owned(),
+                model: None,
+                effort: None,
+                yolo: false,
+                prompt: "prompt".to_owned(),
+            },
+        )
+    });
+    outcome.unwrap();
+    let receipt_index = log
+        .iter()
+        .position(|record| *record == SyncRecord::File(root.join(STATE_ROOT_DURABLE_FILE)))
+        .expect("receipt sync");
+    let walked: Vec<&SyncRecord> = log[..receipt_index]
+        .iter()
+        .filter(|record| matches!(record, SyncRecord::Directory(_)))
+        .collect();
+    // The nearest sixteen holders: l18 (the root's entry) down to l3; l2, l1, and the
+    // base are beyond the bound.
+    let expected: Vec<SyncRecord> = levels
+        .iter()
+        .rev()
+        .take(STATE_ROOT_ANCESTRY_SYNC_LIMIT)
+        .map(|level| SyncRecord::Directory(level.clone()))
+        .collect();
+    assert_eq!(walked.len(), STATE_ROOT_ANCESTRY_SYNC_LIMIT, "{log:?}");
+    assert!(
+        walked
+            .iter()
+            .zip(&expected)
+            .all(|(walked, expected)| *walked == expected),
+        "{log:?}"
+    );
+    assert!(
+        !log.contains(&SyncRecord::Directory(levels[1].clone())),
+        "{log:?}"
+    );
+    assert!(
+        !log.contains(&SyncRecord::Directory(base.path().to_path_buf())),
+        "{log:?}"
+    );
+    assert!(state_root_durability_receipt_present(&root));
+}
+
+#[test]
+fn an_ancestry_sync_failure_never_blocks_session_creation_and_leaves_no_receipt() {
+    let nested = NestedStateRoot::new();
+    let (outcome, log) =
+        with_sync_failure(nested.base.path(), || with_sync_log(|| nested.create()));
+    let created = outcome.unwrap();
+    // Both syncs were attempted, in order; the failure stopped the walk before the receipt.
     assert_eq!(
-        log[..4],
+        log[..2],
         [
-            SyncRecord::Directory(ancestor.clone()),
-            SyncRecord::Directory(base.path().to_path_buf()),
-            SyncRecord::Directory(root.clone()),
-            SyncRecord::Directory(created.directory.clone()),
+            SyncRecord::Directory(nested.ancestor.clone()),
+            SyncRecord::Directory(nested.base.path().to_path_buf()),
         ],
         "{log:?}"
     );
-    assert!(created.directory.join("events").is_dir());
+    assert!(
+        !log.contains(&SyncRecord::File(nested.receipt())),
+        "{log:?}"
+    );
+    assert_eq!(
+        log[2],
+        SyncRecord::Directory(nested.root.clone()),
+        "{log:?}"
+    );
+    assert!(!nested.receipt_present());
+    assert!(created.directory.join("manifest.json").is_file());
+    let status: SessionStatus = read_json(&created.directory.join("status.json")).unwrap();
+    assert_eq!(status.state, "launching");
+    let error = status
+        .error
+        .expect("the launch status records the failed walk");
+    assert!(
+        error.contains("state root ancestry was not made durable"),
+        "{error}"
+    );
+    assert!(error.contains("injected sync failure for"), "{error}");
+    assert!(
+        error.contains(&nested.base.path().display().to_string()),
+        "{error}"
+    );
 
-    // An existing root syncs nothing above itself.
-    let (outcome, log) = with_sync_log(|| create_session_in(&root, spec()));
-    outcome.unwrap();
-    assert_eq!(log[0], SyncRecord::Directory(root.clone()));
-    assert!(!log.contains(&SyncRecord::Directory(base.path().to_path_buf())));
+    // The next creation walks again, and this time writes the receipt.
+    let (outcome, log) = with_sync_log(|| nested.create());
+    let created = outcome.unwrap();
+    nested.assert_established_ancestry(&log, &created.directory);
+    assert!(nested.receipt_present());
+    let status: SessionStatus = read_json(&created.directory.join("status.json")).unwrap();
+    assert_eq!(status.error, None);
+}
+
+#[test]
+fn a_non_regular_receipt_is_not_trusted() {
+    // A directory at the receipt's path proves nothing; the walk runs, and the receipt
+    // write then fails loudly rather than silently accepting the impostor.
+    let nested = NestedStateRoot::new();
+    fs::create_dir_all(nested.receipt()).unwrap();
+    let (outcome, log) = with_sync_log(|| nested.create());
+    let error = outcome.err().expect("the receipt write fails");
+    assert!(!injected_sync_failure(&error), "{error:#}");
+    assert_eq!(
+        log[..2],
+        [
+            SyncRecord::Directory(nested.ancestor.clone()),
+            SyncRecord::Directory(nested.base.path().to_path_buf()),
+        ],
+        "{log:?}"
+    );
+    assert!(!nested.receipt_present());
 }
 
 #[test]
@@ -5939,4 +6253,135 @@ fn close_syncs_a_committed_event_before_discarding_its_journal() {
         stopped_before_barrier,
         "no close boundary stopped after the tombstone and before the committed event's directory sync"
     );
+}
+
+/// A completion whose event is committed, whose terminal status is written, and whose
+/// claim is released, but whose `events/` entry was never synced: the run that released
+/// the claim stopped before it removed the journal, and the sync between the event's
+/// rename and the status write did not happen either (or is not trusted to have). Only
+/// the journal still says the event is the result, so the claim-free recovery must sync
+/// `events/` before it removes the journal, without any earlier sync helping it.
+fn seed_claim_free_completion_with_an_unsynced_event() -> UnsyncedCommittedEvent {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-claimfree");
+    fs::create_dir_all(directory.join("events")).unwrap();
+    write_test_manifest(&directory);
+    update_status(&directory, "working", None, None).unwrap();
+    let claim = acquire_turn_claim(&directory).unwrap();
+    let request_id = claim.receipt.request_id.clone();
+    let mut pending = sample_completion(&claim.token, "late result");
+    pending.event_file = claim.receipt.event_file.clone();
+    claim.retain();
+    write_json_atomic(&directory.join(TURN_COMPLETION_FILE), &pending).unwrap();
+    let event_path = directory.join("events").join(&pending.event_file);
+    // The journal's exact bytes at the event path, written without a sync of `events/`.
+    fs::write(
+        &event_path,
+        serde_json::to_vec_pretty(&pending.event).unwrap(),
+    )
+    .unwrap();
+    update_status(&directory, "ready", None, None).unwrap();
+    fs::remove_file(directory.join(TURN_CLAIM_FILE)).unwrap();
+    assert_eq!(
+        journaled_event_state(&directory, &pending).unwrap(),
+        JournaledEventState::Committed
+    );
+    UnsyncedCommittedEvent {
+        _root: root,
+        directory,
+        request_id,
+        event_path,
+    }
+}
+
+#[test]
+fn claim_free_recovery_syncs_the_committed_event_before_discarding_its_journal() {
+    // The claim-free path has no session record to rewrite and no claim to release, so
+    // its whole sync log is the barrier followed by the journal removal's own sync.
+    let fixture = seed_claim_free_completion_with_an_unsynced_event();
+    let events = fixture.directory.join("events");
+    // Read-only queries already report the byte-identical event as published; what the
+    // recovery adds is the durability of its entry before the journal goes.
+    assert_eq!(
+        request_state(&fixture.directory, &fixture.request_id),
+        ("completed".to_owned(), "ready".to_owned())
+    );
+    let (changed, log) = with_sync_log(|| recover_pending_completion(&fixture.directory));
+    assert!(changed.unwrap());
+    assert_eq!(
+        log,
+        [
+            SyncRecord::Directory(events.clone()),
+            SyncRecord::Directory(fixture.directory.clone()),
+        ],
+        "{log:?}"
+    );
+    assert!(fixture.event_path.exists());
+    assert!(!fixture.directory.join(TURN_COMPLETION_FILE).exists());
+    assert_eq!(
+        request_state(&fixture.directory, &fixture.request_id),
+        ("completed".to_owned(), "ready".to_owned())
+    );
+    let (again, log) = with_sync_log(|| recover_pending_completion(&fixture.directory));
+    assert!(!again.unwrap());
+    assert!(log.is_empty(), "{log:?}");
+
+    // Every interruption: the journal never goes before `events/` was synced, the first
+    // boundary the path can stop at is the barrier itself, and the next holder converges
+    // through the same barrier whenever the journal is still there.
+    let mut labels = Vec::new();
+    for budget in 0.. {
+        let fixture = seed_claim_free_completion_with_an_unsynced_event();
+        let events = fixture.directory.join("events");
+        let completion_path = fixture.directory.join(TURN_COMPLETION_FILE);
+        let (outcome, log) = with_sync_log(|| {
+            with_fault_budget(budget, || recover_pending_completion(&fixture.directory))
+        });
+        let journal_kept = completion_path.exists();
+        if !journal_kept {
+            assert!(
+                log.contains(&SyncRecord::Directory(events.clone())),
+                "budget {budget}: the journal was discarded before events/ was synced: {log:?}"
+            );
+        }
+        match outcome {
+            Ok(changed) => {
+                assert!(changed);
+                assert!(!journal_kept);
+                break;
+            }
+            Err(error) => {
+                assert!(injected_fault(&error), "{error:#}");
+                labels.push(format!("{error:#}"));
+                assert!(fixture.event_path.exists());
+                let (recovered, log) =
+                    with_sync_log(|| recover_pending_completion(&fixture.directory));
+                let recovered = recovered.unwrap();
+                assert_eq!(recovered, journal_kept, "budget {budget}");
+                if journal_kept {
+                    assert_eq!(
+                        log[0],
+                        SyncRecord::Directory(events.clone()),
+                        "budget {budget}: {log:?}"
+                    );
+                } else {
+                    assert!(log.is_empty(), "budget {budget}: {log:?}");
+                }
+                assert!(!completion_path.exists());
+                assert!(fixture.event_path.exists());
+                assert_eq!(
+                    request_state(&fixture.directory, &fixture.request_id),
+                    ("completed".to_owned(), "ready".to_owned())
+                );
+            }
+        }
+    }
+    assert!(
+        labels
+            .first()
+            .is_some_and(|label| label.contains(COMMITTED_EVENT_SYNC_LABEL)),
+        "the first claim-free boundary is not the committed event's directory sync: {labels:?}"
+    );
+    // Barrier, journal removal, and the removal's sync: no other boundary exists.
+    assert_eq!(labels.len(), 3, "{labels:?}");
 }
