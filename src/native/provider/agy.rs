@@ -307,17 +307,21 @@ fn correlated_response<'a>(message: &'a str, pending: &PendingAgyTurn) -> Result
 //   that showed the newest activity line, and the gate is ready on the first read
 //   at which every condition holds. A healthy Agy that never logs the deferred
 //   reload and has been quiet since its startup burst is therefore ready at
-//   startup + 35 s exactly, not at startup + 35 s + 3.5 s; only an activity line
+//   startup + 45 s exactly, not at startup + 45 s + 3.5 s; only an activity line
 //   inside the last 3.5 s of the window pushes readiness past its end.
 //   Deferred-reload settlement means either a `Reloading system slash commands and
-//   skills` line after `CLI startup completed` (Agy 1.2.10 defers its skills reload
-//   to roughly 10-22 s after startup, and that reload clears the composer: the
-//   session-IEKjtC paste at +9.5 s, 2026-09-24 17:47, the session-fMqSQc paste at
-//   +12 s, 2026-09-24 16:41, and the session-ql5TVc paste at +20.1 s, 2026-09-24
-//   18:48, were all discarded by it) or 35 s since the gate first saw `CLI startup
-//   completed` (the deferred reload is not coming: a healthy session-IQHEwf,
-//   2026-09-24 17:20, logged its startup reload before `CLI startup completed`,
-//   never logged the deferred reload, and went silent). The gate never
+//   skills` line stamped at least 1 s after `CLI startup completed` (Agy 1.2.10
+//   defers its skills reload to roughly 10-37 s after startup, and that reload
+//   clears the composer: the session-IEKjtC paste at +9.5 s, 2026-09-24 17:47, the
+//   session-fMqSQc paste at +12 s, 2026-09-24 16:41, the session-ql5TVc paste at
+//   +20.1 s, 2026-09-24 18:48, and the session-uqraap paste at +35 s, 2026-09-24
+//   20:44, were all discarded by it; a skills reload stamped within 1 s of startup
+//   is the startup reload, which Agy logs on either side of `CLI startup
+//   completed`, and it never settles the condition: session-M8QFPp, 2026-09-24
+//   20:37, logged it 1.6 ms after startup) or 45 s since the gate first saw `CLI
+//   startup completed` (the deferred reload is not coming: a healthy
+//   session-IQHEwf, 2026-09-24 17:20, logged its startup reload before `CLI
+//   startup completed`, never logged the deferred reload, and went silent). The gate never
 //   waits for a hooks completion after a reload; the startup reload of session-IQHEwf
 //   had none. A reload that arrives after both windows is caught by the input
 //   receipt below, not by the gate. The gate also keeps the byte length and a
@@ -372,30 +376,56 @@ const HOOKS_LOADED_SOURCE: &str = "hooks_manager.go";
 const FULL_REDRAW_MARKER: &str = "Full redraw completed";
 const REDRAW_AFTER_STARTUP_DESCRIPTION: &str =
     "`Full redraw completed` after `CLI startup completed`";
-const DEFERRED_RELOAD_DESCRIPTION: &str = "deferred skills reload or the 35 s window (no `Reloading system slash commands and skills` line after `CLI startup completed` and less than 35 s since `CLI startup completed` was observed)";
+const DEFERRED_RELOAD_DESCRIPTION: &str = "deferred skills reload or the 45 s window (no `Reloading system slash commands and skills` line stamped at least 1 s after `CLI startup completed` and less than 45 s since `CLI startup completed` was observed)";
 const QUIET_PERIOD_DESCRIPTION: &str = "quiet period not reached (no `Reloading system slash commands`, `Full redraw completed`, or `hooks_manager.go` line for the quiet period after the newest one)";
 const INPUT_RECEIPT_MARKER: &str = "HandleUserInput called with text: \"";
 const WINDOWS_PROTOCOL_PREFIX: &str = "[Agent Bridge Agy Windows console turn protocol]";
 // Observed post-login reload bursts arrive about 3.0 seconds apart; the quiet period
 // must outlast that cadence so the paste does not land between two of them.
 const STARTUP_QUIET_PERIOD: Duration = Duration::from_millis(3500);
-// The deferred skills reload arrived 9.8 s (session-IEKjtC), 13.0 s (session-fMqSQc)
-// and 21.4 s (session-ql5TVc) after `CLI startup completed` in the fixtures, 12.9 to
-// 13.2 s in nine more logs on this machine (2026-09-24, see the latency table in the
-// tests), and never within five minutes in session-IQHEwf. The former 20 s window
-// pasted session-ql5TVc at +20.1 s, 1.3 s before its reload cleared the composer
-// (2026-09-24 18:48), so the window must outlast 21.4 s with margin. The trade-off
-// is latency for a healthy Agy that never logs the deferred reload: it now pastes
-// at startup + 35 s instead of + 20 s (the quiet period runs concurrently with the
-// window and has ended long before, unless an activity line lands inside the
-// window's last 3.5 s).
-const DEFERRED_RELOAD_WINDOW: Duration = Duration::from_secs(35);
+// Deferred skills reload latency after `CLI startup completed`, Agy 1.2.10 on this
+// machine, 2026-09-24 KST (the fixtures in the tests):
+//
+// | session        | latency | window at the time | paste                       |
+// |----------------|---------|--------------------|-----------------------------|
+// | session-IEKjtC |  9.8 s  | none (fixed 12 s)  | +9.5 s, lost                |
+// | session-fMqSQc | 13.0 s  | none (fixed 12 s)  | +12 s, lost                 |
+// | session-ql5TVc | 21.4 s  | 20 s               | +20.1 s, lost               |
+// | session-Cf1FBY | 36.4 s  | 35 s               | +35 s, lost (heavy CPU load)|
+// | session-uqraap | 36.4 s  | 35 s               | +35 s, lost (CPU idle)      |
+// | session-IQHEwf | never   | -                  | none (round-1 gate)         |
+//
+// Nine more logs put it at 12.9 to 13.2 s. The latencies form two clusters, one
+// near 10-21 s and a second near 36 s that arrived under heavy load and on an idle
+// CPU alike (two Agy launches overlapped in the idle case), so the second cluster
+// looks timer-driven rather than load-driven, and a 35 s window pasted right before
+// it twice. The window must outlast 36.4 s with margin. The trade-off is latency
+// for a healthy Agy that never logs the deferred reload: it now pastes at startup
+// + 45 s instead of + 35 s (the quiet period runs concurrently with the window and
+// has ended long before, unless an activity line lands inside the window's last
+// 3.5 s).
+const DEFERRED_RELOAD_WINDOW: Duration = Duration::from_secs(45);
+// A `Reloading system slash commands and skills` line stamped less than this long
+// after `CLI startup completed` is the startup reload, not the deferred one. Agy
+// logs its startup reload on either side of `CLI startup completed`: 3.5 ms before
+// it in session-fMqSQc, 0.5 ms after it in session-udT6uY and 1.6 ms after it in
+// session-M8QFPp (2026-09-24 20:37), where the former rule took it for the deferred
+// reload and settled the condition at once. The deferred reload has never arrived
+// earlier than 9.8 s after startup.
+const DEFERRED_RELOAD_MIN_LATENCY: Duration = Duration::from_secs(1);
 const STARTUP_READINESS_TIMING: ReadinessTiming = ReadinessTiming {
     quiet_period: STARTUP_QUIET_PERIOD,
     deferred_reload_window: DEFERRED_RELOAD_WINDOW,
 };
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const INPUT_RECEIPT_WINDOW: Duration = Duration::from_secs(15);
+// Agy logs `HandleUserInput` when it processes the pasted line, not when the console
+// receives it, and that processing is slow under load: session-M8QFPp (2026-09-24
+// 20:37) logged the receipt 18.0 s after the paste, outside the former 15 s window,
+// so the adapter reported delivery-uncertain although the paste had landed;
+// session-8WjG3m logged it about 10 s after its paste. The receipt is still capped
+// by the deadline, and a lost paste still ends as delivery-uncertain, only 45 s
+// later than before.
+const INPUT_RECEIPT_WINDOW: Duration = Duration::from_secs(60);
 const INPUT_RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 trait Clock {
@@ -551,19 +581,56 @@ fn strip_terminal_noise(line: &str) -> String {
     clean
 }
 
+// The glog `[IWEF]MMDD HH:MM:SS.uuuuuu` stamp of a line as an offset from an
+// arbitrary epoch (months counted as 31 days); only the difference between two
+// stamps of the same log is meaningful, and a difference across a year boundary is
+// not. Agy stamps in local time. A line without a stamp (`CLI ready for user
+// input`, a file header, console noise) yields `None`.
+fn glog_timestamp(line: &str) -> Option<Duration> {
+    let bytes = line.as_bytes();
+    if !matches!(bytes.first(), Some(b'I' | b'W' | b'E' | b'F')) || bytes.get(5) != Some(&b' ') {
+        return None;
+    }
+    let date = line.get(1..5)?;
+    let month: u64 = date.get(..2)?.parse().ok()?;
+    let day: u64 = date.get(2..)?.parse().ok()?;
+    let stamp = line.get(6..21)?;
+    let (hours, rest) = stamp.split_once(':')?;
+    let (minutes, seconds) = rest.split_once(':')?;
+    let (seconds, micros) = seconds.split_once('.')?;
+    if micros.len() != 6 {
+        return None;
+    }
+    let hours: u64 = hours.parse().ok()?;
+    let minutes: u64 = minutes.parse().ok()?;
+    let seconds: u64 = seconds.parse().ok()?;
+    let micros: u64 = micros.parse().ok()?;
+    Some(
+        Duration::from_secs((month * 31 + day) * 86_400 + hours * 3600 + minutes * 60 + seconds)
+            + Duration::from_micros(micros),
+    )
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct StartupObservation {
     // Line index of the first `CLI startup completed` line.
     startup_line: Option<usize>,
+    // The glog stamp of that line; `None` when it carries none, in which case no
+    // skills reload can be proven deferred and only the window settles the condition.
+    startup_stamp: Option<Duration>,
     // Line index of the first `Full redraw completed` line after the startup line.
     // Agy redraws the composer once the TUI is up; the redraw before startup, when
     // there is one, does not count.
     redraw_after_startup: Option<usize>,
     // Line index of the first `Reloading system slash commands and skills` line
-    // after the startup line: the deferred skills reload that clears the composer.
-    // The startup reload, which Agy may log before `CLI startup completed`, does not
-    // count.
+    // after the startup line that is stamped at least `DEFERRED_RELOAD_MIN_LATENCY`
+    // after it: the deferred skills reload that clears the composer. The startup
+    // reload, which Agy logs a few milliseconds before or after `CLI startup
+    // completed`, does not count on either side of it.
     deferred_reload_after_startup: Option<usize>,
+    // Line index of the first skills reload after the startup line that was too
+    // early to be the deferred reload (diagnostics only).
+    startup_reload_after_startup: Option<usize>,
     // Line index of the newest activity line: any `Reloading system slash commands`
     // line (with or without "and skills"), `Full redraw completed` line, or
     // `hooks_manager.go` line, wherever it sits. The quiet period restarts whenever
@@ -605,6 +672,7 @@ fn observe_startup(log: &[u8]) -> StartupObservation {
     for (index, line) in complete_log_lines(log).enumerate() {
         if observation.startup_line.is_none() && line.contains(STARTUP_COMPLETED_MARKER) {
             observation.startup_line = Some(index);
+            observation.startup_stamp = glog_timestamp(&line);
         }
         if observation.startup_line.is_some()
             && observation.redraw_after_startup.is_none()
@@ -618,7 +686,20 @@ fn observe_startup(log: &[u8]) -> StartupObservation {
             && observation.deferred_reload_after_startup.is_none()
             && line.contains(SKILLS_RELOAD_MARKER)
         {
-            observation.deferred_reload_after_startup = Some(index);
+            // Threads stamp out of order by a few milliseconds, so the reload's
+            // stamp can precede the startup stamp; a stamp that cannot be read
+            // proves nothing and the reload is taken for the startup one.
+            let deferred = match (observation.startup_stamp, glog_timestamp(&line)) {
+                (Some(startup), Some(reload)) => {
+                    reload.saturating_sub(startup) >= DEFERRED_RELOAD_MIN_LATENCY
+                }
+                _ => false,
+            };
+            if deferred {
+                observation.deferred_reload_after_startup = Some(index);
+            } else if observation.startup_reload_after_startup.is_none() {
+                observation.startup_reload_after_startup = Some(index);
+            }
         }
         if is_activity_line(&line) {
             observation.activity_lines += 1;
@@ -648,7 +729,7 @@ impl ReadinessState {
                 "agy.log has no `Full redraw completed` line after `CLI startup completed`"
             }
             Self::AwaitingDeferredReload => {
-                "agy.log has no `Reloading system slash commands and skills` line after `CLI startup completed` and the deferred reload window since `CLI startup completed` has not elapsed"
+                "agy.log has no `Reloading system slash commands and skills` line stamped at least 1 s after `CLI startup completed` and the deferred reload window since `CLI startup completed` has not elapsed"
             }
             Self::Settling => {
                 "agy.log logged a reload, redraw, or hooks line within the quiet period"
@@ -1110,7 +1191,7 @@ where
 fn input_receipt_check(directory: Option<&Path>) -> super::super::doctor::Check {
     use super::super::doctor::{Availability::Unknown, Check};
     const CHECK_ID: &str = "agy_input_receipt";
-    const NEXT_ACTION: &str = "Observation only. Windows console delivery pastes after CLI startup completed, a Full redraw completed after it, the deferred skills reload (Reloading system slash commands and skills after startup) or a 35 s window since startup, and a quiet period without reload, redraw, or hooks lines, re-measured from the new content whenever agy.log disappears, shrinks, or no longer holds the bytes observed earlier (any number of times within the timeout), pasted right after the read that passed the gate with that read's length as the receipt offset, and requires a HandleUserInput receipt carrying the complete pending turn marker; a missing receipt leaves delivery uncertain with the session working and the reason in status.error, and the paste is never repeated. Inspect the session and close it explicitly or launch a new one.";
+    const NEXT_ACTION: &str = "Observation only. Windows console delivery pastes after CLI startup completed, a Full redraw completed after it, the deferred skills reload (Reloading system slash commands and skills stamped at least 1 s after startup; an earlier one is the startup reload) or a 45 s window since startup, and a quiet period without reload, redraw, or hooks lines, re-measured from the new content whenever agy.log disappears, shrinks, or no longer holds the bytes observed earlier (any number of times within the timeout), pasted right after the read that passed the gate with that read's length as the receipt offset, and requires a HandleUserInput receipt carrying the complete pending turn marker within 60 s of the paste (Agy logs the receipt when it processes the paste, which took 18 s under load); a missing receipt leaves delivery uncertain with the session working and the reason in status.error, and the paste is never repeated. Inspect the session and close it explicitly or launch a new one.";
     let Some(directory) = directory else {
         return Check::new(
             CHECK_ID,
@@ -1161,7 +1242,7 @@ fn input_receipt_check(directory: Option<&Path>) -> super::super::doctor::Check 
     let (reason, detail) = match (startup.markers_observed(), last) {
         (false, _) => (
             "agy_startup_markers_missing",
-            "agy.log does not yet show the startup markers (CLI startup completed followed by a Full redraw completed); the paste gate also waits for the deferred skills reload or a 35 s window since startup and, concurrently, for a 3.5 s quiet period without reload, redraw, or hooks lines; it pastes on the first read at which both hold, so a quiet startup that never logs the deferred reload pastes at startup + 35 s.",
+            "agy.log does not yet show the startup markers (CLI startup completed followed by a Full redraw completed); the paste gate also waits for the deferred skills reload (stamped at least 1 s after startup) or a 45 s window since startup and, concurrently, for a 3.5 s quiet period without reload, redraw, or hooks lines; it pastes on the first read at which both hold, so a quiet startup that never logs the deferred reload pastes at startup + 45 s.",
         ),
         (true, None) => (
             "agy_no_input_receipt",
@@ -1177,6 +1258,7 @@ fn input_receipt_check(directory: Option<&Path>) -> super::super::doctor::Check 
         "startup_completed": startup.startup_completed(),
         "redraw_after_startup_observed": startup.redraw_after_startup.is_some(),
         "deferred_reload_after_startup_observed": startup.deferred_reload_after_startup.is_some(),
+        "startup_reload_after_startup_ignored": startup.startup_reload_after_startup.is_some(),
         "activity_lines": startup.activity_lines,
         "input_receipts": receipts.len(),
         "last_receipt_text": last.map(|receipt| {
@@ -1621,7 +1703,9 @@ mod tests {
     //
     // session-udT6uY (initial paste delivered): lines 91, 100, 101, 119-123, 134, 147
     // and 153 are the startup. The main thread's hooks line (91) precedes the startup
-    // reload (120), whose own hooks completion (122) follows at once.
+    // reload (120), whose own hooks completion (122) follows at once. That startup
+    // reload is stamped 0.5 ms after `CLI startup completed`, so it is the startup
+    // reload, not the deferred one, and the gate waits for the window on this log.
     const REAL_SUCCESS_STARTUP: &str = r"I0924 16:42:24.068931       1 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
 I0924 16:42:24.073126       1 common.go:438] Starting CLI program
 CLI ready for user input
@@ -1685,7 +1769,7 @@ I0924 16:41:20.816140     410 manager.go:1312] Slash commands unchanged, skippin
     // `... and skills` reload never came, and after three plain reloads within 6.4 s
     // the log was silent for five minutes. A healthy session, so the reload/hooks
     // pair cannot be the readiness discriminator, and the deferred reload cannot be
-    // required unconditionally: the gate pastes when its 35 s window ends.
+    // required unconditionally: the gate pastes when its 45 s window ends.
     const REAL_QUIET_STARTUP: &str = r#"E0924 17:20:28.610124     222 errorreport.go:224] error getting token source: You are not logged into Antigravity.
 W0924 17:20:28.610124     222 cache.go:135] Cache(userInfo): Singleflight refresh failed: failed to get load code assist response: error getting token source: You are not logged into Antigravity.
 E0924 17:20:28.610124     222 errorreport.go:224] failed to get load code assist response: error getting token source: You are not logged into Antigravity.
@@ -1854,18 +1938,144 @@ I0924 18:48:25.482515     375 hooks_manager.go:53] loaded 0 named hooks from 0 h
 I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skipping update
 "#;
 
+    // session-uqraap (this machine, 2026-09-24 20:44, Agy 1.2.10, CPU idle, a second
+    // Agy launch overlapping; the round-8 build pasted at about 20:44:36.5, when its
+    // 35 s window ended, and lost the paste): lines 96-149 (the end of the file)
+    // verbatim after the ANSI strip, with the account email redacted. The startup
+    // reload precedes `CLI startup completed`; two plain reloads follow within 5 s;
+    // the quiet period ended at 20:44:09.93; the 35 s window ended at 20:44:36.44
+    // and the gate pasted; and the deferred skills reload with its hooks line
+    // arrived at 20:44:37.855815, 36.4 s after startup, clearing the composer.
+    // session-Cf1FBY (20:36, heavy CPU load) logged the same reload at +36.4 s and
+    // lost its paste the same way. Nothing was logged after it: no HandleUserInput
+    // receipt, so the adapter reported delivery-uncertain.
+    const REAL_SECOND_CLUSTER_RELOAD_STARTUP: &str = r#"I0924 20:44:01.434843       1 common.go:438] Starting CLI program
+CLI ready for user input
+W0924 20:44:01.434843     187 cache.go:135] Cache(loadCodeAssistResponse): Singleflight refresh failed: error getting token source: You are not logged into Antigravity.
+E0924 20:44:01.434843     187 errorreport.go:224] error getting token source: You are not logged into Antigravity.
+W0924 20:44:01.434843     187 cache.go:135] Cache(userInfo): Singleflight refresh failed: failed to get load code assist response: error getting token source: You are not logged into Antigravity.
+E0924 20:44:01.434843     187 errorreport.go:224] failed to get load code assist response: error getting token source: You are not logged into Antigravity.
+W0924 20:44:01.434843     187 cache.go:135] Cache(loadCodeAssistResponse): Singleflight refresh failed: error getting token source: You are not logged into Antigravity.
+E0924 20:44:01.434843     187 errorreport.go:224] error getting token source: You are not logged into Antigravity.
+W0924 20:44:01.434843     187 cache.go:135] Cache(userInfo): Singleflight refresh failed: failed to get load code assist response: error getting token source: You are not logged into Antigravity.
+E0924 20:44:01.434843     187 errorreport.go:224] failed to get load code assist response: error getting token source: You are not logged into Antigravity.
+I0924 20:44:01.441059     296 manager.go:1331] Reloading system slash commands and skills
+I0924 20:44:01.441059     296 manager.go:1308] Reloading system slash commands
+I0924 20:44:01.441059     296 manager.go:1312] Slash commands unchanged, skipping update
+I0924 20:44:01.441059     291 gemini_extensions.go:28] Detecting Gemini extensions in C:\Users\user\.gemini\extensions
+I0924 20:44:01.441567     291 gemini_extensions.go:49] No extensions found
+I0924 20:44:01.442107      75 keyring.go:64] keyringAuth: loaded token, expiry=2026-09-24 21:30:53.5504966 +0900 KST expired=false
+I0924 20:44:01.442107      74 auth.go:157] ChainedAuth: authenticated via keyring (effective: keyring)
+I0924 20:44:01.442107      74 server_oauth.go:196] applyAuthResult: email=<email>, authMethod=consumer, quotaProject=
+I0924 20:44:01.442107      74 server_oauth.go:201] OAuth: authenticated successfully as <email>
+I0924 20:44:01.442107      74 server_oauth.go:207] b.codeAssistClient.AuthProvider (0x2a7b00ba00f0) is same as b.cliAuth (0x2a7b00ba00f0)
+W0924 20:44:01.442107     322 cache.go:163] Failed to refresh cache in background: admin controls not applicable
+W0924 20:44:01.442107     343 cache.go:163] Failed to refresh cache in background: admin controls not applicable
+I0924 20:44:01.443214       1 analytics.go:187] CLI startup completed (took 233.4541ms)
+I0924 20:44:01.490907     375 manager.go:934] Full redraw completed (rerenderAll) for conversation  (epoch 0, items 1)
+I0924 20:44:03.314578      81 http_helpers.go:305] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist Trace: 0x64962e4d65df3a83
+I0924 20:44:03.945369      78 http_helpers.go:305] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels Trace: 0x18e64b39b3fcc68a
+I0924 20:44:03.987146      74 model_resolver.go:93] Resolving model gemini-3.8-flash-high
+I0924 20:44:03.987146      74 model_config_manager.go:327] Propagating selected model override to backend: label="Gemini 3.8 Flash (High)"
+I0924 20:44:03.987146     245 quota_manager.go:45] doRefreshQuota: starting reload (force=true)
+I0924 20:44:03.987146     246 experiment_manager.go:66] Starting experiment refresh after login
+I0924 20:44:04.176021     246 remote_agent.go:156] Remote agent fastpush pin gate changed: false -> true
+I0924 20:44:04.176021     246 server.go:3769] [RemoteControl] Session toggle is off, staying disconnected
+I0924 20:44:04.176021     246 server.go:3480] [RemoteControl] Resolved proxyServerURL: ""
+I0924 20:44:04.176021     246 experiment_manager.go:70] Experiments refreshed after login
+I0924 20:44:04.176592     429 manager.go:1308] Reloading system slash commands
+I0924 20:44:05.022530     422 http_helpers.go:305] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist Trace: 0xe8d8c908fb469f5d
+I0924 20:44:06.141949     422 http_helpers.go:305] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist Trace: 0xf0c9ea8cbfd8e96a
+I0924 20:44:06.342958     422 model_resolver.go:93] Resolving model gemini-3.8-flash-high
+I0924 20:44:06.342958     422 model_config_manager.go:327] Propagating selected model override to backend: label="Gemini 3.8 Flash (High)"
+I0924 20:44:06.342958     245 quota_manager.go:45] doRefreshQuota: starting reload (force=true)
+I0924 20:44:06.342958     439 model_resolver.go:93] Resolving model gemini-3.8-flash-high
+I0924 20:44:06.342958     439 model_config_manager.go:327] Propagating selected model override to backend: label="Gemini 3.8 Flash (High)"
+I0924 20:44:06.342958     246 experiment_manager.go:66] Starting experiment refresh after login
+I0924 20:44:06.427564     246 server.go:3769] [RemoteControl] Session toggle is off, staying disconnected
+I0924 20:44:06.427564     246 server.go:3480] [RemoteControl] Resolved proxyServerURL: ""
+I0924 20:44:06.427564     246 experiment_manager.go:70] Experiments refreshed after login
+I0924 20:44:06.427564     445 manager.go:1308] Reloading system slash commands
+I0924 20:44:06.428584     445 manager.go:1312] Slash commands unchanged, skipping update
+I0924 20:44:06.643486     245 quota_manager.go:45] doRefreshQuota: starting reload (force=true)
+I0924 20:44:07.314437     438 http_helpers.go:305] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist Trace: 0xcb0bf3ebb06517e2
+I0924 20:44:37.855815     516 manager.go:1331] Reloading system slash commands and skills
+I0924 20:44:37.855815     516 manager.go:1308] Reloading system slash commands
+I0924 20:44:37.856320     355 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
+I0924 20:44:37.857983     516 manager.go:1312] Slash commands unchanged, skipping update
+"#;
+
+    // session-M8QFPp (this machine, 2026-09-24 20:37, Agy 1.2.10, heavy CPU load;
+    // the paste was accepted but reported delivery-uncertain): lines 123-157
+    // verbatim after the ANSI strip, with the account email redacted. The startup
+    // reload follows `CLI startup completed` by 1.6 ms with its hooks line, and the
+    // round-8 rule took it for the deferred reload, so the gate was ready 3.5 s
+    // after the last plain reload at 20:37:45.65 and pasted at about 20:37:49.15.
+    // The HandleUserInput receipt (line 160, not reproduced) was logged at
+    // 20:38:07.152165, 18.0 s after the paste and outside the former 15 s receipt
+    // window. No deferred skills reload was logged before it; the skills reload at
+    // 20:38:07.160926 is the conversation reload.
+    const REAL_STARTUP_RELOAD_AFTER_STARTUP: &str = r#"I0924 20:37:40.653251       1 analytics.go:187] CLI startup completed (took 241.0837ms)
+I0924 20:37:40.654897     338 manager.go:1331] Reloading system slash commands and skills
+I0924 20:37:40.654897     338 manager.go:1308] Reloading system slash commands
+I0924 20:37:40.656148      96 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
+I0924 20:37:40.700886     142 manager.go:934] Full redraw completed (rerenderAll) for conversation  (epoch 0, items 1)
+I0924 20:37:42.065160     297 http_helpers.go:305] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist Trace: 0x4e9df0103680b301
+I0924 20:37:42.456755     297 http_helpers.go:305] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels Trace: 0x17d08bd806d2a0c2
+I0924 20:37:42.496252     293 model_resolver.go:93] Resolving model gemini-3.8-flash-high
+I0924 20:37:42.496252     293 model_config_manager.go:327] Propagating selected model override to backend: label="Gemini 3.8 Flash (High)"
+I0924 20:37:42.496252     252 quota_manager.go:45] doRefreshQuota: starting reload (force=true)
+I0924 20:37:42.496252     253 experiment_manager.go:66] Starting experiment refresh after login
+I0924 20:37:42.678109     253 remote_agent.go:156] Remote agent fastpush pin gate changed: false -> true
+I0924 20:37:42.678109     253 server.go:3769] [RemoteControl] Session toggle is off, staying disconnected
+I0924 20:37:42.678109     253 server.go:3480] [RemoteControl] Resolved proxyServerURL: ""
+I0924 20:37:42.678109     253 experiment_manager.go:70] Experiments refreshed after login
+I0924 20:37:42.678621     411 manager.go:1308] Reloading system slash commands
+I0924 20:37:43.588140     288 http_helpers.go:305] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist Trace: 0xab7203296c667660
+I0924 20:37:45.048591     288 http_helpers.go:305] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist Trace: 0xe1422278db03c287
+I0924 20:37:45.218409     288 model_resolver.go:93] Resolving model gemini-3.8-flash-high
+I0924 20:37:45.218409     288 model_config_manager.go:327] Propagating selected model override to backend: label="Gemini 3.8 Flash (High)"
+I0924 20:37:45.218409     252 quota_manager.go:45] doRefreshQuota: starting reload (force=true)
+I0924 20:37:45.218409     253 experiment_manager.go:66] Starting experiment refresh after login
+I0924 20:37:45.218409     483 model_resolver.go:93] Resolving model gemini-3.8-flash-high
+I0924 20:37:45.218409     483 model_config_manager.go:327] Propagating selected model override to backend: label="Gemini 3.8 Flash (High)"
+I0924 20:37:45.515277     253 server.go:3769] [RemoteControl] Session toggle is off, staying disconnected
+I0924 20:37:45.515277     253 server.go:3480] [RemoteControl] Resolved proxyServerURL: ""
+I0924 20:37:45.515277     253 experiment_manager.go:70] Experiments refreshed after login
+I0924 20:37:45.515277     253 experiment_manager.go:66] Starting experiment refresh after login
+I0924 20:37:45.515277     417 manager.go:1308] Reloading system slash commands
+I0924 20:37:45.517352     417 manager.go:1312] Slash commands unchanged, skipping update
+I0924 20:37:45.646941     253 server.go:3769] [RemoteControl] Session toggle is off, staying disconnected
+I0924 20:37:45.646941     253 server.go:3480] [RemoteControl] Resolved proxyServerURL: ""
+I0924 20:37:45.646941     253 experiment_manager.go:70] Experiments refreshed after login
+I0924 20:37:45.646941     498 manager.go:1308] Reloading system slash commands
+I0924 20:37:45.649546     498 manager.go:1312] Slash commands unchanged, skipping update
+I0924 20:37:45.892979     252 quota_manager.go:45] doRefreshQuota: starting reload (force=true)
+I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist Trace: 0x7c00680e8820122f
+"#;
+
     // Deferred skills reload latency (`Reloading system slash commands and skills`
-    // after `CLI startup completed`, measured from the startup line) in the fixtures
-    // above, all Agy 1.2.10 on this machine, 2026-09-24 KST, for the next window
-    // adjustment:
+    // stamped at least 1 s after `CLI startup completed`, measured from the startup
+    // line) in the fixtures above, all Agy 1.2.10 on this machine, 2026-09-24 KST,
+    // for the next window adjustment:
     //
     // | fixture        | startup reload  | deferred reload      | latency  | paste                 |
     // |----------------|-----------------|----------------------|----------|-----------------------|
-    // | session-udT6uY | after startup   | none before the paste| -        | +26.1 s, delivered    |
+    // | session-udT6uY | +0.5 ms         | none before the paste| -        | +26.1 s, delivered    |
     // | session-fMqSQc | before startup  | 16:41:20.813553      | 12.983 s | +12 s, lost           |
     // | session-IQHEwf | before startup  | none in 5 minutes    | -        | none (round-1 gate)   |
     // | session-IEKjtC | before startup  | 17:47:13.468286      | 9.848 s  | +9.5 s, lost          |
     // | session-ql5TVc | before startup  | 18:48:25.481988      | 21.367 s | +20.1 s, lost         |
+    // | session-M8QFPp | +1.6 ms         | none before the paste| -        | +8.5 s, delivered     |
+    // | session-uqraap | before startup  | 20:44:37.855815      | 36.413 s | +35 s, lost           |
+    //
+    // session-Cf1FBY (20:36, heavy CPU load, not a fixture) logged its deferred
+    // reload at +36.4 s as well and lost the 35 s window's paste the same way; the
+    // observed latencies are 9.8, 13.0, 21.4, 36.4 and 36.4 s, a second cluster near
+    // 36 s under load and idle alike. session-8WjG3m (not a fixture) logged
+    // its receipt 49 s after startup, about 10 s after the paste at the window's
+    // end, and was delivered; session-M8QFPp logged its receipt 18.0 s after the
+    // paste, outside the former 15 s receipt window.
     //
     // The udT6uY `... and skills` line at 16:42:50.228104 (+26.15 s) followed the
     // receipt and `Starting new conversation` by 15 ms, so it is the conversation
@@ -1896,29 +2106,21 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         quiet_period: STARTUP_QUIET_PERIOD,
         deferred_reload_window: Duration::from_secs(20),
     };
+    // Round 8's rule, for contrast: the same quiet period with the former 35 s
+    // deferred-reload window, which the 36.4 s reloads of session-uqraap and
+    // session-Cf1FBY outlasted.
+    const ROUND_8_TIMING: ReadinessTiming = ReadinessTiming {
+        quiet_period: STARTUP_QUIET_PERIOD,
+        deferred_reload_window: Duration::from_secs(35),
+    };
+    // Round 8's receipt window, which session-M8QFPp's 18.0 s receipt outlasted.
+    const ROUND_8_RECEIPT_WINDOW: Duration = Duration::from_secs(15);
     const REPLAY_POLL: Duration = Duration::from_millis(100);
 
-    // The glog `HH:MM:SS.ffffff` of a line, as a time of day.
+    // The glog stamp of a line, on the adapter's own parser, so the replay and the
+    // deferred-reload rule read the same instants.
     fn glog_time_of_day(line: &str) -> Option<Duration> {
-        let bytes = line.as_bytes();
-        if !matches!(bytes.first(), Some(b'I' | b'W' | b'E')) || bytes.get(5) != Some(&b' ') {
-            return None;
-        }
-        let stamp = line.get(6..21)?;
-        let (hours, rest) = stamp.split_once(':')?;
-        let (minutes, seconds) = rest.split_once(':')?;
-        let (seconds, micros) = seconds.split_once('.')?;
-        if micros.len() != 6 {
-            return None;
-        }
-        let hours: u64 = hours.parse().ok()?;
-        let minutes: u64 = minutes.parse().ok()?;
-        let seconds: u64 = seconds.parse().ok()?;
-        let micros: u64 = micros.parse().ok()?;
-        Some(
-            Duration::from_secs(hours * 3600 + minutes * 60 + seconds)
-                + Duration::from_micros(micros),
-        )
+        glog_timestamp(line)
     }
 
     // Replays a recorded log against the fake clock: each complete line becomes
@@ -2036,6 +2238,20 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         REAL_FAILURE_LATE_RELOAD.to_owned()
     }
 
+    // session-fMqSQc with its deferred reload logged: the deferred-reload condition
+    // is settled, so the gate is ready one quiet period after the newest activity
+    // line (the reload's hooks line). The tests about the quiet period, continuity,
+    // and the paste offset use this shape, which is ready long before the window.
+    fn settled_startup_log() -> String {
+        late_reload_startup_log() + &late_reload_completion()
+    }
+
+    // The bytes of `log` before its `Full redraw completed` line: startup observed,
+    // the redraw not yet.
+    fn before_redraw(log: &str) -> &str {
+        &log[..log.find(FULL_REDRAW_MARKER).unwrap()]
+    }
+
     // Go `%q` formatting as observed in the HandleUserInput lines.
     fn go_quoted(text: &str) -> String {
         let mut quoted = String::from("\"");
@@ -2127,12 +2343,16 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         // hooks line, redraw, three plain reloads.
         let observation = observe_startup(successful_startup_log().as_bytes());
         assert_eq!(observation.startup_line, Some(3));
+        assert_eq!(
+            observation.startup_stamp,
+            glog_timestamp("I0924 16:42:24.080467       1 analytics.go:187] CLI startup completed")
+        );
         assert_eq!(observation.redraw_after_startup, Some(7));
         assert_eq!(
-            observation.deferred_reload_after_startup,
-            Some(4),
-            "the skills reload logged right after startup counts as the deferred one"
+            observation.deferred_reload_after_startup, None,
+            "the skills reload stamped 0.5 ms after startup is the startup reload, not the deferred one"
         );
+        assert_eq!(observation.startup_reload_after_startup, Some(4));
         assert_eq!(observation.settle_line, Some(10));
         assert_eq!(observation.activity_lines, 8);
         assert!(observation.markers_observed());
@@ -2146,17 +2366,19 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         assert_eq!(observation.startup_line, Some(6));
         assert_eq!(observation.redraw_after_startup, Some(7));
         assert_eq!(observation.deferred_reload_after_startup, None);
+        assert_eq!(observation.startup_reload_after_startup, None);
         assert_eq!(observation.settle_line, Some(9));
         assert_eq!(observation.activity_lines, 6);
         assert!(observation.markers_observed());
 
-        // The late reload is the deferred skills reload; it and its hooks line are
-        // also activity.
+        // The late reload (13.0 s after startup) is the deferred skills reload; it and
+        // its hooks line are also activity.
         let completed = late + &late_reload_completion();
         let observation = observe_startup(completed.as_bytes());
         assert_eq!(observation.startup_line, Some(6));
         assert_eq!(observation.redraw_after_startup, Some(7));
         assert_eq!(observation.deferred_reload_after_startup, Some(11));
+        assert_eq!(observation.startup_reload_after_startup, None);
         assert_eq!(observation.settle_line, Some(13));
         assert_eq!(observation.activity_lines, 9);
 
@@ -2178,6 +2400,85 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         assert_eq!(observation.settle_line, Some(48));
         assert_eq!(observation.activity_lines, 9);
         assert!(observation.markers_observed());
+
+        // session-M8QFPp: the startup reload follows startup by 1.6 ms with its hooks
+        // line; it is not the deferred reload, and no deferred reload follows.
+        let observation = observe_startup(REAL_STARTUP_RELOAD_AFTER_STARTUP.as_bytes());
+        assert_eq!(observation.startup_line, Some(0));
+        assert_eq!(observation.redraw_after_startup, Some(4));
+        assert_eq!(observation.deferred_reload_after_startup, None);
+        assert_eq!(observation.startup_reload_after_startup, Some(1));
+        assert_eq!(observation.settle_line, Some(33));
+        assert_eq!(observation.activity_lines, 7);
+        assert!(observation.markers_observed());
+
+        // session-uqraap: the startup reload precedes startup; the deferred skills
+        // reload and its hooks line come 36.4 s later.
+        let observation = observe_startup(REAL_SECOND_CLUSTER_RELOAD_STARTUP.as_bytes());
+        assert_eq!(observation.startup_line, Some(22));
+        assert_eq!(observation.redraw_after_startup, Some(23));
+        assert_eq!(observation.deferred_reload_after_startup, Some(50));
+        assert_eq!(observation.startup_reload_after_startup, None);
+        assert_eq!(observation.settle_line, Some(52));
+        assert_eq!(observation.activity_lines, 8);
+        assert!(observation.markers_observed());
+
+        // The 1 s rule on synthetic stamps: 999 ms after startup is the startup
+        // reload, 1.000 s is the deferred one, a reload stamped a few milliseconds
+        // before startup by another thread is the startup reload, and a reload
+        // without a stamp proves nothing.
+        let startup = glog(
+            "16:41:07.830345",
+            1,
+            "analytics.go:187",
+            "CLI startup completed (took 1ms)",
+        );
+        for (stamp, deferred) in [
+            ("16:41:07.826763", false),
+            ("16:41:08.830344", false),
+            ("16:41:08.830345", true),
+            ("16:41:20.813553", true),
+        ] {
+            let log = startup.clone() + &glog(stamp, 410, "manager.go:1331", SKILLS_RELOAD);
+            let observation = observe_startup(log.as_bytes());
+            assert_eq!(
+                observation.deferred_reload_after_startup.is_some(),
+                deferred,
+                "a skills reload stamped {stamp} after startup at 16:41:07.830345"
+            );
+            assert_eq!(
+                observation.startup_reload_after_startup.is_some(),
+                !deferred
+            );
+        }
+        let unstamped = startup.clone() + "manager.go:1331] " + SKILLS_RELOAD + "\n";
+        assert_eq!(
+            observe_startup(unstamped.as_bytes()).deferred_reload_after_startup,
+            None
+        );
+        let startup_unstamped = "CLI startup completed (took 1ms)\n".to_owned()
+            + &glog("16:41:20.813553", 410, "manager.go:1331", SKILLS_RELOAD);
+        let observation = observe_startup(startup_unstamped.as_bytes());
+        assert_eq!(observation.startup_stamp, None);
+        assert_eq!(observation.deferred_reload_after_startup, None);
+        // A stamp across midnight still measures the latency.
+        let midnight = "I0924 23:59:59.500000       1 analytics.go:187] CLI startup completed\n"
+            .to_owned()
+            + "I0925 00:00:12.500000     410 manager.go:1331] Reloading system slash commands and skills\n";
+        assert_eq!(
+            observe_startup(midnight.as_bytes()).deferred_reload_after_startup,
+            Some(1)
+        );
+        assert_eq!(
+            glog_timestamp("F0924 16:42:24.080467       1 x.go:1] fatal").map(|stamp| stamp
+                - glog_timestamp("I0924 16:42:24.080467       1 x.go:1] info").unwrap()),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(glog_timestamp("CLI ready for user input"), None);
+        assert_eq!(
+            glog_timestamp("I0924 16:42:24.08046        1 x.go:1] short"),
+            None
+        );
 
         // A redraw before startup does not satisfy the second marker.
         let redraw_first = glog("16:41:07.000000", 269, "manager.go:934", FULL_REDRAW)
@@ -2295,16 +2596,22 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
             "the old readiness discriminator never appears in this healthy log"
         );
 
-        // The deferred skills reload never comes either, so the gate is ready 35 s
-        // after `CLI startup completed` (17:20:28.616574): 35.0 s of waiting, well
+        // The deferred skills reload never comes either, so the gate is ready 45 s
+        // after `CLI startup completed` (17:20:28.616574): 45.0 s of waiting, well
         // inside any deadline. The quiet period runs concurrently with the window
         // and had ended at 17:20:38.45, 3.5 s after the last plain reload, which is
         // when the round-3 rule was ready; the window's end is the ready instant,
         // not window + quiet period. The former 20 s window would have pasted at
-        // 17:20:48.62.
+        // 17:20:48.62 and the former 35 s window at 17:21:03.62.
         let replay = LogReplay::new(REAL_QUIET_STARTUP, Instant::now());
         let ready = replay_readiness(&replay, STARTUP_READINESS_TIMING);
-        assert_ready_at(&replay, ready, "17:21:03.616574", "session-IQHEwf");
+        assert_ready_at(&replay, ready, "17:21:13.616574", "session-IQHEwf");
+        assert_ready_at(
+            &replay,
+            replay_readiness(&replay, ROUND_8_TIMING),
+            "17:21:03.616574",
+            "session-IQHEwf, round 8",
+        );
         let round_3 = replay_readiness(&replay, ROUND_3_TIMING);
         assert_ready_at(
             &replay,
@@ -2328,13 +2635,15 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
                     "17:20:34.950075",
                     "17:20:38.450075",
                     "17:20:48.616574",
-                    "17:21:03.616573",
                     "17:21:03.616574",
+                    "17:21:13.616573",
+                    "17:21:13.616574",
                 ]
             ),
             vec![
                 ReadinessState::AwaitingStartup,
                 ReadinessState::AwaitingRedraw,
+                ReadinessState::AwaitingDeferredReload,
                 ReadinessState::AwaitingDeferredReload,
                 ReadinessState::AwaitingDeferredReload,
                 ReadinessState::AwaitingDeferredReload,
@@ -2357,14 +2666,14 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         let start = Instant::now();
         let timing = ReadinessTiming {
             quiet_period: Duration::from_millis(3500),
-            deferred_reload_window: Duration::from_secs(35),
+            deferred_reload_window: Duration::from_secs(45),
         };
         let at = |millis: u64| start + Duration::from_millis(millis);
 
-        // session-udT6uY: markers complete at once and the startup pair satisfies the
-        // deferred-reload condition; ready after one quiet period.
+        // session-fMqSQc with its deferred reload logged: markers complete and the
+        // deferred-reload condition settled; ready after one quiet period.
         let mut gate = ReadinessGate::new(start, timing);
-        let success = successful_startup_log();
+        let success = settled_startup_log();
         assert_eq!(
             gate.observe(Some(success.as_bytes()), at(0)),
             ReadinessState::Settling
@@ -2441,24 +2750,24 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
             ReadinessState::AwaitingRedraw
         );
         assert_eq!(
-            no_redraw.observe(Some(startup_only.as_bytes()), at(45_000)),
+            no_redraw.observe(Some(startup_only.as_bytes()), at(55_000)),
             ReadinessState::AwaitingRedraw
         );
         let redrawn =
-            startup_only.clone() + &glog("16:41:52.000000", 269, "manager.go:934", FULL_REDRAW);
+            startup_only.clone() + &glog("16:42:02.000000", 269, "manager.go:934", FULL_REDRAW);
         assert_eq!(
-            no_redraw.observe(Some(redrawn.as_bytes()), at(45_100)),
+            no_redraw.observe(Some(redrawn.as_bytes()), at(55_100)),
             ReadinessState::Settling,
             "the deferred-reload window ended 10 s ago, counted from when startup was first seen"
         );
         assert_eq!(
-            no_redraw.observe(Some(redrawn.as_bytes()), at(48_600)),
+            no_redraw.observe(Some(redrawn.as_bytes()), at(58_600)),
             ReadinessState::Ready
         );
 
         // Startup and redraw without a skills reload after them wait for the window
         // even though the quiet period ends at 3.5 s; the two run concurrently, so
-        // the window's end at 35.0 s is the ready instant.
+        // the window's end at 45.0 s is the ready instant.
         let startup_redraw =
             startup_only.clone() + &glog("16:41:07.876154", 269, "manager.go:934", FULL_REDRAW);
         let mut windowed = ReadinessGate::new(start, timing);
@@ -2467,11 +2776,33 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
             ReadinessState::AwaitingDeferredReload
         );
         assert_eq!(
-            windowed.observe(Some(startup_redraw.as_bytes()), at(34_900)),
+            windowed.observe(Some(startup_redraw.as_bytes()), at(44_900)),
             ReadinessState::AwaitingDeferredReload
         );
         assert_eq!(
-            windowed.observe(Some(startup_redraw.as_bytes()), at(35_000)),
+            windowed.observe(Some(startup_redraw.as_bytes()), at(45_000)),
+            ReadinessState::Ready
+        );
+
+        // A skills reload stamped within 1 s of startup is the startup reload: it
+        // restarts the quiet period but never settles the deferred-reload condition
+        // (session-udT6uY at +0.5 ms, session-M8QFPp at +1.6 ms).
+        let mut early = ReadinessGate::new(start, timing);
+        let startup_reload_after = startup_only.clone()
+            + &glog("16:41:07.831997", 338, "manager.go:1331", SKILLS_RELOAD)
+            + &glog("16:41:07.831997", 338, "manager.go:1308", SLASH_RELOAD)
+            + &glog("16:41:07.833248", 96, "hooks_manager.go:53", HOOKS_LOADED)
+            + &glog("16:41:07.876154", 269, "manager.go:934", FULL_REDRAW);
+        assert_eq!(
+            early.observe(Some(startup_reload_after.as_bytes()), at(0)),
+            ReadinessState::AwaitingDeferredReload
+        );
+        assert_eq!(
+            early.observe(Some(startup_reload_after.as_bytes()), at(44_900)),
+            ReadinessState::AwaitingDeferredReload
+        );
+        assert_eq!(
+            early.observe(Some(startup_reload_after.as_bytes()), at(45_000)),
             ReadinessState::Ready
         );
 
@@ -2509,11 +2840,11 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
             ReadinessState::AwaitingDeferredReload
         );
         assert_eq!(
-            startup_reload.observe(Some(reload_first.as_bytes()), at(34_900)),
+            startup_reload.observe(Some(reload_first.as_bytes()), at(44_900)),
             ReadinessState::AwaitingDeferredReload
         );
         assert_eq!(
-            startup_reload.observe(Some(reload_first.as_bytes()), at(35_000)),
+            startup_reload.observe(Some(reload_first.as_bytes()), at(45_000)),
             ReadinessState::Ready
         );
 
@@ -2652,13 +2983,13 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         assert_eq!(gate.startup_seen_at, Some(at(20_000)));
         assert_eq!(gate.settled_at, at(20_000));
         assert_eq!(
-            gate.observe(Some(startup_redraw.as_bytes()), at(54_900)),
+            gate.observe(Some(startup_redraw.as_bytes()), at(64_900)),
             ReadinessState::AwaitingDeferredReload
         );
         assert_eq!(
-            gate.observe(Some(startup_redraw.as_bytes()), at(55_000)),
+            gate.observe(Some(startup_redraw.as_bytes()), at(65_000)),
             ReadinessState::Ready,
-            "the replacement is ready when its own 35 s window ends"
+            "the replacement is ready when its own 45 s window ends"
         );
         assert_eq!(
             gate.discontinuities.len(),
@@ -2695,11 +3026,11 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
             )]
         );
         assert_eq!(
-            gate.observe(Some(restamped.as_bytes()), at(54_900)),
+            gate.observe(Some(restamped.as_bytes()), at(64_900)),
             ReadinessState::AwaitingDeferredReload
         );
         assert_eq!(
-            gate.observe(Some(restamped.as_bytes()), at(55_000)),
+            gate.observe(Some(restamped.as_bytes()), at(65_000)),
             ReadinessState::Ready
         );
 
@@ -2736,7 +3067,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         // Rotation to a shorter file: the tail of session-udT6uY without its startup
         // is a new log with no startup line, and a startup appended to it later is a
         // new startup.
-        let observed = successful_startup_log();
+        let observed = settled_startup_log();
         let tail: String = observed
             .lines()
             .skip(8)
@@ -2778,11 +3109,11 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         );
         assert_eq!(gate.startup_seen_at, Some(at(6_000)));
         assert_eq!(
-            gate.observe(Some(rotated_startup.as_bytes()), at(40_900)),
+            gate.observe(Some(rotated_startup.as_bytes()), at(50_900)),
             ReadinessState::AwaitingDeferredReload
         );
         assert_eq!(
-            gate.observe(Some(rotated_startup.as_bytes()), at(41_000)),
+            gate.observe(Some(rotated_startup.as_bytes()), at(51_000)),
             ReadinessState::Ready
         );
         assert_eq!(gate.discontinuities.len(), 1);
@@ -2803,8 +3134,8 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         let start = Instant::now();
         let poll = Duration::from_millis(100);
         let deadline = start + Duration::from_secs(300);
-        let observed = successful_startup_log();
-        let half = &observed[..observed.len() / 2];
+        let observed = settled_startup_log();
+        let half = before_redraw(&observed);
         assert!(half.contains(STARTUP_COMPLETED_MARKER));
         assert!(!half.contains(FULL_REDRAW_MARKER));
 
@@ -2812,8 +3143,8 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         // and the log observed after the second one is ready one quiet period after
         // it was first seen. The round-5 gate failed `not_sent` at 200 ms here. The
         // returned offset is the length of the read that passed.
-        let restamped = observed.replace("16:42:24", "16:52:24");
-        let restamped_again = observed.replace("16:42:24", "17:02:24");
+        let restamped = observed.replace("16:41:", "16:51:");
+        let restamped_again = observed.replace("16:41:", "17:01:");
         let mut clock = FakeClock::new(start);
         let offset = wait_for_startup_readiness_with(
             &mut log_sequence(vec![
@@ -2939,10 +3270,10 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         let start = Instant::now();
         let deadline = start + Duration::from_secs(300);
         let poll = Duration::from_millis(100);
-        let startup = successful_startup_log();
+        let startup = settled_startup_log();
         let fresh_reload = glog("16:42:32.000000", 540, "manager.go:1308", SLASH_RELOAD);
         let reloaded = startup.clone() + &fresh_reload;
-        let restamped = startup.replace("16:42:24", "16:52:24");
+        let restamped = startup.replace("16:41:", "16:51:");
         assert_eq!(restamped.len(), startup.len());
         let pending = PendingAgyTurn::new("1-2-3").unwrap();
         // The static startup log is ready when its quiet period ends.
@@ -3080,11 +3411,14 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         assert!(visible.contains("16:42:24.068931"));
         assert!(!visible.contains(STARTUP_COMPLETED_MARKER));
 
+        // session-udT6uY logs no deferred reload before its receipt, so the gate
+        // is ready when the 45 s window ends, counted from the first read at which
+        // startup was visible.
         let ready = replay_readiness(&replay, STARTUP_READINESS_TIMING);
         assert_ready_at(
             &replay,
             ready,
-            "16:42:32.604592",
+            "16:43:09.080467",
             "session-udT6uY with a header",
         );
         let without_header = LogReplay::new(REAL_SUCCESS_STARTUP, start);
@@ -3099,7 +3433,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         // session-fMqSQc: the round-3 rule was ready at 16:41:17.24, 3.5 s after the
         // 16:41:13 reload, and the fixed 12 s delay pasted at about 16:41:19; the
         // deferred skills reload at 16:41:20.81 discarded that paste. It arrived
-        // 13.0 s after startup, inside the 35 s window, so the gate now waits for it
+        // 13.0 s after startup, inside the 45 s window, so the gate now waits for it
         // and is ready 3.5 s after its hooks line.
         let log = late_reload_startup_log() + &late_reload_completion();
         let replay = LogReplay::new(&log, Instant::now());
@@ -3226,7 +3560,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         // 18:48:08.65 plain reload, and the round-6 rule's 20 s window ended at
         // 18:48:24.12, when it pasted. The deferred skills reload at 18:48:25.481988
         // (21.4 s after startup) then cleared the composer and no receipt followed.
-        // The 35 s window is still open at that reload, so the gate waits for it and
+        // The 45 s window is still open at that reload, so the gate waits for it and
         // is ready 3.5 s after its hooks line.
         let replay = LogReplay::new(REAL_LATE_DEFERRED_RELOAD_STARTUP, Instant::now());
         let startup = replay.recorded("18:48:04.115440");
@@ -3234,7 +3568,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         assert!(
             deferred_reload - startup > Duration::from_secs(21)
                 && deferred_reload - startup < DEFERRED_RELOAD_WINDOW,
-            "the reload arrived 21.4 s after startup, inside the 35 s window"
+            "the reload arrived 21.4 s after startup, inside the 45 s window"
         );
         let round_6 = replay_readiness(&replay, ROUND_6_TIMING);
         assert_ready_at(
@@ -3251,7 +3585,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         assert_ready_at(&replay, ready, "18:48:28.982515", "session-ql5TVc");
         assert!(
             ready > replay.recorded("18:48:25.485154"),
-            "the 35 s window waits past the deferred reload, its hooks line, and its completion"
+            "the 45 s window waits past the deferred reload, its hooks line, and its completion"
         );
         assert_eq!(
             replay.states(
@@ -3307,18 +3641,21 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
     }
 
     #[test]
-    fn readiness_gate_is_ready_after_the_delivered_fixture_quiet_period() {
-        // session-udT6uY: the skills reload right after `CLI startup completed`
-        // already satisfies the deferred-reload condition, so the gate is ready 3.5 s
-        // after the last plain reload at 16:42:29.10, as under the round-3 rule. The
-        // receipt came at 16:42:50.21, 17.6 s later, from the fixed 12 s delay.
+    fn readiness_gate_waits_for_the_window_when_the_startup_reload_follows_startup() {
+        // session-udT6uY: the skills reload 0.5 ms after `CLI startup completed` is
+        // the startup reload. The round-3 rule (and rounds 4-8, which took that
+        // reload for the deferred one) was ready 3.5 s after the last plain reload
+        // at 16:42:29.10; the gate now waits for the 45 s window, which ends at
+        // 16:43:09.08. The paste was delivered either way: the receipt came at
+        // 16:42:50.21 from the fixed 12 s delay, and no deferred reload preceded it.
         let replay = LogReplay::new(REAL_SUCCESS_STARTUP, Instant::now());
         let ready = replay_readiness(&replay, STARTUP_READINESS_TIMING);
-        assert_ready_at(&replay, ready, "16:42:32.604592", "session-udT6uY");
-        assert_eq!(
+        assert_ready_at(&replay, ready, "16:43:09.080467", "session-udT6uY");
+        assert_ready_at(
+            &replay,
             replay_readiness(&replay, ROUND_3_TIMING),
-            ready,
-            "the deferred-reload condition costs nothing when the startup pair is logged"
+            "16:42:32.604592",
+            "session-udT6uY, round 3",
         );
         assert_eq!(
             replay.states(
@@ -3329,19 +3666,185 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
                     "16:42:25.848949",
                     "16:42:28.530216",
                     "16:42:29.104592",
-                    "16:42:32.604591",
                     "16:42:32.604592",
+                    "16:43:09.080466",
+                    "16:43:09.080467",
                 ]
             ),
             vec![
                 ReadinessState::AwaitingRedraw,
-                ReadinessState::Settling,
-                ReadinessState::Settling,
-                ReadinessState::Settling,
+                ReadinessState::AwaitingDeferredReload,
+                ReadinessState::AwaitingDeferredReload,
+                ReadinessState::AwaitingDeferredReload,
+                ReadinessState::AwaitingDeferredReload,
+                ReadinessState::AwaitingDeferredReload,
+                ReadinessState::AwaitingDeferredReload,
+                ReadinessState::Ready,
+            ]
+        );
+
+        // session-M8QFPp: the same shape 1.6 ms after startup, with the hooks line.
+        // The round-8 rule pasted at 20:37:49.15, 3.5 s after the last plain reload
+        // (the round-3 rule's instant, since the startup reload settled its window);
+        // the gate now waits until the window ends at 20:38:25.65.
+        let replay = LogReplay::new(REAL_STARTUP_RELOAD_AFTER_STARTUP, Instant::now());
+        let ready = replay_readiness(&replay, STARTUP_READINESS_TIMING);
+        assert_ready_at(&replay, ready, "20:38:25.653251", "session-M8QFPp");
+        assert_ready_at(
+            &replay,
+            replay_readiness(&replay, ROUND_3_TIMING),
+            "20:37:49.146941",
+            "session-M8QFPp, round 3 (the round-8 paste instant)",
+        );
+        assert_eq!(
+            replay.states(
+                STARTUP_READINESS_TIMING,
+                &[
+                    "20:37:40.653251",
+                    "20:37:40.700886",
+                    "20:37:45.646941",
+                    "20:37:49.146941",
+                    "20:38:25.653250",
+                    "20:38:25.653251",
+                ]
+            ),
+            vec![
+                ReadinessState::AwaitingRedraw,
+                ReadinessState::AwaitingDeferredReload,
+                ReadinessState::AwaitingDeferredReload,
+                ReadinessState::AwaitingDeferredReload,
+                ReadinessState::AwaitingDeferredReload,
+                ReadinessState::Ready,
+            ]
+        );
+    }
+
+    #[test]
+    fn readiness_gate_waits_past_the_second_cluster_deferred_reload() {
+        // session-uqraap: the quiet period ended at 20:44:09.93, 3.5 s after the
+        // 20:44:06.43 plain reload, and the round-8 rule's 35 s window ended at
+        // 20:44:36.44, when it pasted. The deferred skills reload at 20:44:37.855815
+        // (36.4 s after startup) then cleared the composer and no receipt followed.
+        // The 45 s window is still open at that reload, so the gate waits for it and
+        // is ready 3.5 s after its hooks line.
+        let replay = LogReplay::new(REAL_SECOND_CLUSTER_RELOAD_STARTUP, Instant::now());
+        let startup = replay.recorded("20:44:01.443214");
+        let deferred_reload = replay.recorded("20:44:37.855815");
+        assert!(
+            deferred_reload - startup > ROUND_8_TIMING.deferred_reload_window
+                && deferred_reload - startup < DEFERRED_RELOAD_WINDOW,
+            "the reload arrived 36.4 s after startup, past the 35 s window and inside the 45 s window"
+        );
+        let round_8 = replay_readiness(&replay, ROUND_8_TIMING);
+        assert_ready_at(
+            &replay,
+            round_8,
+            "20:44:36.443214",
+            "session-uqraap, round 8",
+        );
+        assert!(
+            round_8 < deferred_reload,
+            "the 35 s window pasted before the deferred reload"
+        );
+        let ready = replay_readiness(&replay, STARTUP_READINESS_TIMING);
+        assert_ready_at(&replay, ready, "20:44:41.356320", "session-uqraap");
+        assert!(
+            ready > replay.recorded("20:44:37.857983"),
+            "the 45 s window waits past the deferred reload, its hooks line, and its completion"
+        );
+        assert_eq!(
+            replay.states(
+                STARTUP_READINESS_TIMING,
+                &[
+                    "20:44:01.443214",
+                    "20:44:01.490907",
+                    "20:44:04.176592",
+                    "20:44:06.427564",
+                    "20:44:09.927564",
+                    "20:44:36.443214",
+                    "20:44:37.856320",
+                    "20:44:41.356319",
+                    "20:44:41.356320",
+                ]
+            ),
+            vec![
+                ReadinessState::AwaitingRedraw,
+                ReadinessState::AwaitingDeferredReload,
+                ReadinessState::AwaitingDeferredReload,
+                ReadinessState::AwaitingDeferredReload,
+                ReadinessState::AwaitingDeferredReload,
+                ReadinessState::AwaitingDeferredReload,
                 ReadinessState::Settling,
                 ReadinessState::Settling,
                 ReadinessState::Ready,
             ]
+        );
+        assert_eq!(
+            replay.states(
+                ROUND_8_TIMING,
+                &[
+                    "20:44:01.443214",
+                    "20:44:09.927564",
+                    "20:44:36.443213",
+                    "20:44:36.443214",
+                ]
+            ),
+            vec![
+                ReadinessState::AwaitingRedraw,
+                ReadinessState::AwaitingDeferredReload,
+                ReadinessState::AwaitingDeferredReload,
+                ReadinessState::Ready
+            ],
+            "the round-8 window ended 1.4 s before the reload"
+        );
+    }
+
+    // session-M8QFPp: the paste at 20:37:49.15 was accepted, and Agy logged its
+    // HandleUserInput receipt at 20:38:07.152165, 18.0 s later, under heavy CPU
+    // load. The former 15 s receipt window had ended, so the adapter reported
+    // delivery-uncertain for a delivered paste; the 60 s window sees the receipt.
+    #[test]
+    fn receipt_watch_outlasts_the_slow_processing_observed_under_load() {
+        let pending = PendingAgyTurn::new("1-2-3").unwrap();
+        let startup = REAL_STARTUP_RELOAD_AFTER_STARTUP.to_owned();
+        let receipt_latency = glog_timestamp("I0924 20:38:07.152165     595 input_loop.go:107] x")
+            .unwrap()
+            - glog_timestamp("I0924 20:37:49.146941       1 x.go:1] x").unwrap();
+        assert!(receipt_latency > ROUND_8_RECEIPT_WINDOW);
+        assert!(receipt_latency < INPUT_RECEIPT_WINDOW);
+        let framed = terminal_correlated_prompt("hello", &pending, true).unwrap();
+        let receipt = format!(
+            "I0924 20:38:07.152165     595 input_loop.go:107] HandleUserInput called with text: {}\n",
+            go_quoted(&framed)
+        );
+        let pasted_at = Instant::now();
+        let mut clock = FakeClock::new(pasted_at);
+        let now = clock.shared();
+        let mut read_log = {
+            let startup = startup.clone();
+            move || -> Result<Option<Vec<u8>>> {
+                if now.get().saturating_duration_since(pasted_at) < receipt_latency {
+                    some_log(&startup)
+                } else {
+                    some_log(&(startup.clone() + &receipt))
+                }
+            }
+        };
+        confirm_input_receipt_with(
+            &mut read_log,
+            &pending,
+            startup.len(),
+            pasted_at,
+            pasted_at + Duration::from_secs(300),
+            Duration::from_millis(100),
+            &mut clock,
+        )
+        .unwrap();
+        assert!(clock.slept >= receipt_latency);
+        assert!(clock.slept < receipt_latency + Duration::from_millis(100));
+        assert!(
+            clock.slept > ROUND_8_RECEIPT_WINDOW,
+            "the round-8 window had ended before the receipt"
         );
     }
 
@@ -3372,7 +3875,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         )));
         assert!(
             message
-                .contains("the quiet period is 3500 ms and the deferred reload window is 35000 ms, timed concurrently")
+                .contains("the quiet period is 3500 ms and the deferred reload window is 45000 ms, timed concurrently")
         );
         assert!(message.contains("the initial prompt was not pasted"));
         assert!(!message.contains("hooks completion"));
@@ -3430,7 +3933,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         .unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains(
-            "agy.log has no `Reloading system slash commands and skills` line after `CLI startup completed` and the deferred reload window since `CLI startup completed` has not elapsed"
+            "agy.log has no `Reloading system slash commands and skills` line stamped at least 1 s after `CLI startup completed` and the deferred reload window since `CLI startup completed` has not elapsed"
         ));
         assert!(message.contains(&format!(
             "missing markers: {DEFERRED_RELOAD_DESCRIPTION}, {QUIET_PERIOD_DESCRIPTION}; the quiet period"
@@ -3449,11 +3952,11 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
             "missing markers: {DEFERRED_RELOAD_DESCRIPTION}; the quiet period"
         )));
 
-        // session-udT6uY: the startup pair settles the deferred reload, so only the
-        // quiet period is missing at 1 s.
+        // session-fMqSQc with its deferred reload logged: the reload settles the
+        // condition, so only the quiet period is missing at 1 s.
         let mut clock = FakeClock::new(start);
         let error = wait_for_startup_readiness_with(
-            &mut log_sequence(vec![some_log(&successful_startup_log())]),
+            &mut log_sequence(vec![some_log(&settled_startup_log())]),
             deadline,
             STARTUP_READINESS_TIMING,
             poll,
@@ -3467,7 +3970,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         )));
 
         // Startup seen at once, the redraw a poll later, no skills reload: ready when
-        // the 35 s window ends, long after the concurrent quiet period at 3.6 s.
+        // the 45 s window ends, long after the concurrent quiet period at 3.6 s.
         let mut clock = FakeClock::new(start);
         wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&startup_only), some_log(&startup_redraw)]),
@@ -3477,7 +3980,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
             &mut clock,
         )
         .unwrap();
-        assert_eq!(clock.slept, Duration::from_secs(35));
+        assert_eq!(clock.slept, Duration::from_secs(45));
 
         let error = wait_for_startup_readiness_with(
             &mut log_sequence(vec![Err(anyhow::anyhow!(
@@ -3494,7 +3997,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
 
     // The concurrent rule, stated as deadlines: with startup and its redraw already
     // logged and nothing after them, the quiet period ends at 3.5 s and the window
-    // at 35 s, so the gate is ready at exactly 35 s. A deadline one second past the
+    // at 45 s, so the gate is ready at exactly 45 s. A deadline one second past the
     // window reaches the paste; a deadline one second short of it fails `not_sent`
     // naming the window as the only missing condition.
     #[test]
@@ -3511,7 +4014,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         let mut clock = FakeClock::new(start);
         let offset = wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&startup_redraw)]),
-            start + Duration::from_secs(36),
+            start + Duration::from_secs(46),
             STARTUP_READINESS_TIMING,
             poll,
             &mut clock,
@@ -3520,25 +4023,25 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         assert_eq!(offset, startup_redraw.len());
         assert_eq!(
             clock.slept, DEFERRED_RELOAD_WINDOW,
-            "ready at startup + 35 s, not + 35 s + the quiet period"
+            "ready at startup + 45 s, not + 45 s + the quiet period"
         );
 
         let mut clock = FakeClock::new(start);
         let error = wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&startup_redraw)]),
-            start + Duration::from_secs(34),
+            start + Duration::from_secs(44),
             STARTUP_READINESS_TIMING,
             poll,
             &mut clock,
         )
         .unwrap_err();
-        assert_eq!(clock.slept, Duration::from_secs(34));
+        assert_eq!(clock.slept, Duration::from_secs(44));
         let message = format!("{error:#}");
         assert!(message.contains(
-            "agy.log has no `Reloading system slash commands and skills` line after `CLI startup completed` and the deferred reload window since `CLI startup completed` has not elapsed"
+            "agy.log has no `Reloading system slash commands and skills` line stamped at least 1 s after `CLI startup completed` and the deferred reload window since `CLI startup completed` has not elapsed"
         ));
         assert!(message.contains(&format!(
-            "missing markers: {DEFERRED_RELOAD_DESCRIPTION}; the quiet period is 3500 ms and the deferred reload window is 35000 ms, timed concurrently"
+            "missing markers: {DEFERRED_RELOAD_DESCRIPTION}; the quiet period is 3500 ms and the deferred reload window is 45000 ms, timed concurrently"
         )));
         assert!(
             !message.contains(QUIET_PERIOD_DESCRIPTION),
@@ -3576,7 +4079,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
             &pending,
             startup.len(),
             pasted_at,
-            pasted_at + Duration::from_secs(60),
+            pasted_at + Duration::from_secs(120),
             Duration::from_millis(100),
             &mut clock,
         )
@@ -3799,7 +4302,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         let startup = successful_startup_log();
         let receipt = framed_receipt_line("hello", &pending);
         let pasted_at = Instant::now();
-        let deadline = pasted_at + Duration::from_secs(60);
+        let deadline = pasted_at + Duration::from_secs(120);
         let poll = Duration::from_millis(100);
 
         let mut clock = FakeClock::new(pasted_at);
@@ -3835,7 +4338,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         let startup = successful_startup_log();
         let receipt = framed_receipt_line("hello", &pending);
         let pasted_at = Instant::now();
-        let deadline = pasted_at + Duration::from_secs(60);
+        let deadline = pasted_at + Duration::from_secs(120);
         let poll = Duration::from_secs(5);
         let uncertain = |logs: Vec<Result<Option<Vec<u8>>>>,
                          pre_paste_len: usize,
@@ -3866,7 +4369,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         // proves the input was drained, so non-delivery is not proven.
         let (message, clock) = uncertain(vec![some_log(&startup)], startup.len(), deadline);
         assert!(message.contains("no HandleUserInput receipt in the 0 bytes appended"));
-        assert!(message.contains("within 15 seconds"));
+        assert!(message.contains("within 60 seconds"));
         assert!(message.contains("non-delivery cannot be proven"));
         assert_eq!(clock.slept, INPUT_RECEIPT_WINDOW);
 
@@ -3884,7 +4387,8 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         )));
         assert!(message.contains("non-delivery cannot be proven"));
 
-        // A receipt appended between the last read and the deadline check is not
+        // A receipt appended between the last read (the 13th, at 60 s with a 5 s poll)
+        // and the deadline check is not
         // seen; the outcome is still uncertain, never not_sent.
         let mut reads = 0;
         let receipt_after_last_read = {
@@ -3892,7 +4396,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
             let receipt = receipt.clone();
             move || {
                 reads += 1;
-                if reads <= 4 {
+                if reads <= 13 {
                     some_log(&startup)
                 } else {
                     some_log(&(startup.clone() + &receipt))
@@ -3919,7 +4423,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
             "the receipt landed right after the last read"
         );
 
-        // A deadline-capped window that ends before 15 s elapsed.
+        // A deadline-capped window that ends before 60 s elapsed.
         let (message, clock) = uncertain(
             vec![some_log(&startup)],
             startup.len(),
@@ -3927,7 +4431,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         );
         assert!(
             message
-                .contains("the deadline ended the receipt window after 3 of the 15 second window")
+                .contains("the deadline ended the receipt window after 3 of the 60 second window")
         );
         assert_eq!(clock.slept, Duration::from_secs(3));
 
@@ -3997,6 +4501,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         assert_eq!(evidence["startup_completed"], true);
         assert_eq!(evidence["redraw_after_startup_observed"], false);
         assert_eq!(evidence["deferred_reload_after_startup_observed"], false);
+        assert_eq!(evidence["startup_reload_after_startup_ignored"], false);
         assert_eq!(evidence["activity_lines"], 0);
         assert!(evidence.get("latest_reload_completed").is_none());
 
@@ -4004,6 +4509,9 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
             REAL_QUIET_STARTUP.to_owned(),
             REAL_DEFERRED_RELOAD_STARTUP.to_owned(),
             late_reload_startup_log(),
+            settled_startup_log(),
+            REAL_SECOND_CLUSTER_RELOAD_STARTUP.to_owned(),
+            REAL_STARTUP_RELOAD_AFTER_STARTUP.to_owned(),
             successful_startup_log(),
         ] {
             fs::write(&log_path, log).unwrap();
@@ -4012,7 +4520,15 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
                 "agy_no_input_receipt"
             );
         }
+        // session-udT6uY: the skills reload 0.5 ms after startup is reported as the
+        // ignored startup reload, not as the deferred one.
+        let evidence =
+            serde_json::to_value(input_receipt_check(Some(&directory))).unwrap()["evidence"]
+                .clone();
+        assert_eq!(evidence["deferred_reload_after_startup_observed"], false);
+        assert_eq!(evidence["startup_reload_after_startup_ignored"], true);
 
+        fs::write(&log_path, settled_startup_log()).unwrap();
         let pending = claim_pending_turn(&directory);
         let mut log = OpenOptions::new().append(true).open(&log_path).unwrap();
         write!(log, "{}", framed_receipt_line("hello", &pending)).unwrap();
@@ -4023,6 +4539,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         assert_eq!(evidence["startup_completed"], true);
         assert_eq!(evidence["redraw_after_startup_observed"], true);
         assert_eq!(evidence["deferred_reload_after_startup_observed"], true);
+        assert_eq!(evidence["startup_reload_after_startup_ignored"], false);
         assert_eq!(evidence["input_receipts"], 1);
         assert_eq!(evidence["last_receipt_truncated"], false);
         assert_eq!(evidence["pending_marker_received"], true);
@@ -4032,7 +4549,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
     }
 
     // The launcher path for a lost initial paste: the gate passes (here the startup
-    // log of session-fMqSQc stays static, so the 35 s window ends without its
+    // log of session-fMqSQc stays static, so the 45 s window ends without its
     // deferred reload), the paste lands in a reload that arrives after the gate, no
     // receipt follows, and the launcher records the delivery-uncertain reason without
     // touching the claim or the composer.
