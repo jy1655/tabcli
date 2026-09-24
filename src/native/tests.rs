@@ -7355,8 +7355,42 @@ fn reopen_refusal_record_carries_the_gate_and_only_a_holder_check_failure_closes
     );
     let record: RecordedReopenRefusal =
         read_json(&directory.path().join(REOPEN_REFUSAL_FILE)).unwrap();
-    assert_eq!(record.schema, 1);
+    assert_eq!(record.schema, 2);
+    assert_eq!(record.phase, "launch");
     assert_eq!(record.detail, "a holder registered after the initial scan");
+
+    // Only a launch-phase record of the current schema names a gate: a record of another
+    // phase, or one without a phase, is not a launch refusal.
+    for (label, record) in [
+        (
+            "follow-up phase",
+            serde_json::json!({
+                "schema": 2,
+                "phase": "follow-up",
+                "gate": "reopen-conflict",
+                "detail": "held by pid 4242",
+                "created_unix_ms": 1,
+            }),
+        ),
+        (
+            "schema without a phase",
+            serde_json::json!({
+                "schema": 1,
+                "gate": "reopen-conflict",
+                "detail": "held by pid 4242",
+                "created_unix_ms": 1,
+            }),
+        ),
+    ] {
+        write_json_atomic(&directory.path().join(REOPEN_REFUSAL_FILE), &record).unwrap();
+        assert_eq!(read_reopen_refusal_gate(directory.path()), None, "{label}");
+    }
+    fs::remove_file(directory.path().join(REOPEN_REFUSAL_FILE)).unwrap();
+    let error = record_reopen_refusal(
+        directory.path(),
+        REOPEN_LAUNCH_GATE,
+        "a holder registered after the initial scan".to_owned(),
+    );
 
     // A non-conflict failure reaches the caller unchanged and touches no session state.
     let before = snapshot_directory(directory.path());
@@ -7377,7 +7411,7 @@ fn reopen_refusal_record_carries_the_gate_and_only_a_holder_check_failure_closes
     // A session without a resumed_from has no conversation to check at either boundary.
     for check in [
         ResumedHolderCheck::AfterLaunch,
-        ResumedHolderCheck::BeforeDelivery,
+        ResumedHolderCheck::BeforeInitialDelivery,
     ] {
         verify_reopened_conversation_exclusive(
             FirstPartyCli::Claude,
@@ -7595,7 +7629,6 @@ fn reopen_lifecycle_interleavings_each_admit_one_outcome_and_keep_the_source_tom
     }
 }
 
-#[cfg(windows)]
 fn write_reopen_launch_session(root: &Path, id: &str, provider: &Path) -> PathBuf {
     let directory = root.join(id);
     fs::create_dir(&directory).unwrap();
@@ -7719,7 +7752,7 @@ fn post_launch_holder_conflict_fails_the_reopened_session_under_its_own_gate() {
     write_live_registry_entry(&registry, std::process::id(), id);
     for check in [
         ResumedHolderCheck::AfterLaunch,
-        ResumedHolderCheck::BeforeDelivery,
+        ResumedHolderCheck::BeforeInitialDelivery,
     ] {
         verify_reopened_conversation_exclusive(
             FirstPartyCli::Claude,
@@ -7768,6 +7801,147 @@ fn post_launch_holder_conflict_fails_the_reopened_session_under_its_own_gate() {
     );
     let record: RecordedReopenRefusal = read_json(&directory.join(REOPEN_REFUSAL_FILE)).unwrap();
     assert!(!record.detail.contains("closed"), "{}", record.detail);
+    provider::override_claude_session_registry_for_test(None);
+}
+
+// Round 5 reproduction: the initial prompt was delivered and its turn completed while the
+// initial messenger was still settling; a later `tell` was refused by its holder check; the
+// session was closed; the initial messenger finally reported only that delivery is
+// uncertain. The reopen command must not read the `tell` refusal as a refusal of its own
+// launch: no launch-phase refusal was recorded, so the response names no gate and the
+// source's reopen marker stays consumed. Only a launch-phase record releases it.
+#[test]
+fn a_later_tell_refusal_never_releases_the_marker_of_a_delivered_initial_prompt() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = root.path().join("sessions");
+    fs::create_dir(&registry).unwrap();
+    provider::override_claude_session_registry_for_test(Some(registry.clone()));
+    let source_id = "session-reopensrc13";
+    let source = write_closed_reopen_source(
+        root.path(),
+        source_id,
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let new_id = "session-reopennew13";
+    let new = write_reopen_launch_session(root.path(), new_id, Path::new("/opt/claude"));
+    let resumed_from = read_resumed_from(&new).unwrap().unwrap();
+    let marker = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    marker.finalize(new_id).unwrap();
+    let marker_before = fs::read(source.join(REOPEN_MARKER_FILE)).unwrap();
+    let resolve = |id: &str| session_directory_in(root.path(), id);
+
+    // Both launch-phase holder checks passed: the managed process registered alone.
+    #[cfg(windows)]
+    write_live_registry_entry(&registry, std::process::id(), new_id);
+    #[cfg(windows)]
+    for check in [
+        ResumedHolderCheck::AfterLaunch,
+        ResumedHolderCheck::BeforeInitialDelivery,
+    ] {
+        verify_reopened_conversation_exclusive(
+            FirstPartyCli::Claude,
+            &new,
+            Some(&resumed_from),
+            Instant::now() + Duration::from_secs(5),
+            check,
+        )
+        .unwrap();
+    }
+    assert!(!new.join(REOPEN_REFUSAL_FILE).exists());
+
+    // The initial prompt was delivered and its turn completed.
+    fs::remove_file(new.join("initial-prompt.txt")).unwrap();
+    for state in ["awaiting-initial-input", "working", "ready"] {
+        update_status(&new, state, None, None).unwrap();
+    }
+
+    // A later `tell` is refused by its holder check. On native Windows a foreign resume
+    // holds the conversation; elsewhere the adapter cannot verify the conversation at all.
+    #[cfg(windows)]
+    let mut foreign = std::process::Command::new("cmd.exe")
+        .args(["/c", "pause"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    #[cfg(windows)]
+    write_live_registry_entry(&registry, foreign.id(), "foreign-resume");
+    let (mut claim, _) = acquire_ready_turn_claim_with_context(&new, new_id, &[]).unwrap();
+    let error = refuse_follow_up_to_shared_conversation(
+        FirstPartyCli::Claude,
+        &new,
+        new_id,
+        Some(&resumed_from),
+        Instant::now() + Duration::from_secs(5),
+        &mut claim,
+        "ready",
+    )
+    .unwrap_err();
+    drop(claim);
+    #[cfg(windows)]
+    {
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        assert_eq!(reopen_refusal_gate(&error), Some("reopen-conflict"));
+    }
+    #[cfg(not(windows))]
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some("reopen-verification-failed")
+    );
+    let status: SessionStatus = read_json(&new.join("status.json")).unwrap();
+    assert_eq!(status.state, "ready");
+    let tell_reason = status.error.clone().unwrap();
+    assert!(tell_reason.contains("reopen refused"), "{tell_reason}");
+    // The refusal lives in the status alone: nothing was persisted as a launch refusal.
+    assert!(
+        !new.join(REOPEN_REFUSAL_FILE).exists(),
+        "a follow-up refusal was recorded as a launch refusal"
+    );
+    assert_eq!(read_reopen_refusal_gate(&new), None);
+
+    // The session is closed with that reason, and only then does the initial messenger
+    // report that its delivery could not be confirmed.
+    update_status(&new, "closed", None, Some(tell_reason)).unwrap();
+    let uncertain = || {
+        anyhow::anyhow!(
+            "Claude initial cross-session delivery could not be confirmed; the turn remains claimed until completion or explicit close"
+        )
+    };
+    let (outcome, gate) = settle_reopen_outcome(resolve, source_id, new_id, Err(uncertain()));
+    assert_eq!(gate, None);
+    assert_eq!(
+        format!("{:#}", outcome.unwrap_err()),
+        format!("{:#}", uncertain())
+    );
+    assert_eq!(
+        fs::read(source.join(REOPEN_MARKER_FILE)).unwrap(),
+        marker_before,
+        "the reopen marker was released by a follow-up refusal"
+    );
+    assert!(
+        claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).is_err(),
+        "a second reopen was admitted"
+    );
+
+    // The same uncertain report with a launch-phase refusal recorded in the session is the
+    // launch refusal it looks like: the gate is named and the marker is released.
+    let recorded = record_reopen_refusal(
+        &new,
+        REOPEN_CONFLICT_GATE,
+        "held by another live process; no prompt was delivered".to_owned(),
+    );
+    assert_eq!(reopen_refusal_gate(&recorded), Some("reopen-conflict"));
+    let (outcome, gate) = settle_reopen_outcome(resolve, source_id, new_id, Err(uncertain()));
+    assert_eq!(gate.as_deref(), Some("reopen-conflict"));
+    assert_eq!(
+        format!("{:#}", outcome.unwrap_err()),
+        format!("{:#}", uncertain())
+    );
+    assert!(!source.join(REOPEN_MARKER_FILE).exists());
     provider::override_claude_session_registry_for_test(None);
 }
 
@@ -7891,7 +8065,7 @@ fn a_holder_that_registers_after_the_post_launch_scan_is_caught_before_the_initi
         &directory,
         Some(&resumed_from),
         Instant::now() + Duration::from_secs(5),
-        ResumedHolderCheck::BeforeDelivery,
+        ResumedHolderCheck::BeforeInitialDelivery,
     )
     .unwrap_err();
     assert_eq!(reopen_refusal_gate(&error), Some("reopen-conflict"));
@@ -7914,6 +8088,7 @@ fn a_holder_that_registers_after_the_post_launch_scan_is_caught_before_the_initi
             .state,
         "claimed"
     );
+    let launch_record_before = fs::read(directory.join(REOPEN_REFUSAL_FILE)).unwrap();
     let error = refuse_follow_up_to_shared_conversation(
         FirstPartyCli::Claude,
         &directory,
@@ -7932,6 +8107,11 @@ fn a_holder_that_registers_after_the_post_launch_scan_is_caught_before_the_initi
         "{error:#}"
     );
     assert!(!directory.join(TURN_CLAIM_FILE).exists());
+    // The follow-up refusal is not a launch refusal: the launch record is left as it was.
+    assert_eq!(
+        fs::read(directory.join(REOPEN_REFUSAL_FILE)).unwrap(),
+        launch_record_before
+    );
     drop(claim);
     let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
     assert_eq!(status.state, "ready");

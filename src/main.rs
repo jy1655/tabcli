@@ -78,10 +78,12 @@ Session policy:
   process is started. At the three later points another live holder refuses that
   delivery with gate reopen-conflict, and a check that cannot complete refuses with
   gate reopen-verification-failed. After launch either of those gates fails the new
-  session and closes only its surface before any prompt is delivered; every refusal
-  after the new session exists releases the source's reopen marker so the source can
-  be reopened again. Before a tell either gate refuses the delivery and leaves the
-  session ready. A foreign
+  session and closes only its surface before any prompt is delivered. Only a refusal
+  at those launch gates (the pre-spawn recheck, the post-launch check, and the check
+  before the initial prompt) releases the source's reopen marker so the source can
+  be reopened again; a later tell refusal and an ordinary launch or delivery failure
+  leave the marker consumed. Before a tell either gate refuses the delivery and leaves
+  the session ready. A foreign
   claude --resume can still register between two checks and interleave until the
   next one. doctor reports the other live holders of a reopened session's
   conversation. Nothing is copied from the source manifest: only an explicit --model,

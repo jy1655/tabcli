@@ -1187,7 +1187,7 @@ fn launch_created_session(
                 &created.directory,
                 resumed_from.as_ref(),
                 deadline,
-                ResumedHolderCheck::BeforeDelivery,
+                ResumedHolderCheck::BeforeInitialDelivery,
             )?;
             update_status(&created.directory, "working", None, None)?;
             match provider::send_initial_prompt(
@@ -1262,7 +1262,7 @@ fn launch_created_session(
                 &created.directory,
                 resumed_from.as_ref(),
                 deadline,
-                ResumedHolderCheck::BeforeDelivery,
+                ResumedHolderCheck::BeforeInitialDelivery,
             )?;
             update_status(&created.directory, "working", None, None)?;
             match provider::send_cross_session_message(
@@ -1411,20 +1411,31 @@ const REOPEN_POST_CREATION_GATES: [&str; 3] = [
     REOPEN_VERIFICATION_FAILED_GATE,
 ];
 
+// The only phase whose refusals are persisted. The record exists so the reopen command can
+// name a gate that failed in the launch wrapper, in another process; every writer of it is
+// a launch-phase gate (the pre-spawn recheck, the post-launch holder check, and the holder
+// check immediately before the initial prompt is sent), and the reader accepts nothing
+// else. A refused later `tell` keeps its reason in the session status and its own response
+// only: it must never be mistaken for a refusal of the initial delivery, whose uncertain
+// outcome is decided from this record.
+const REOPEN_REFUSAL_LAUNCH_PHASE: &str = "launch";
+
 #[derive(Debug, Deserialize, Serialize)]
 struct RecordedReopenRefusal {
     schema: u32,
+    phase: String,
     gate: String,
     detail: String,
     created_unix_ms: u128,
 }
 
-// Records a gate refusal that happened after the new session existed, then returns the
-// typed refusal. The record is what lets the reopen command name the gate when the refusal
-// happened inside the launch wrapper, in another process.
+// Records a launch-phase gate refusal that happened after the new session existed, then
+// returns the typed refusal. Only the launch phase writes this record; follow-up refusals
+// go through `record_follow_up_refusal`, which touches the session status alone.
 fn record_reopen_refusal(directory: &Path, gate: &'static str, detail: String) -> anyhow::Error {
     let record = RecordedReopenRefusal {
-        schema: 1,
+        schema: 2,
+        phase: REOPEN_REFUSAL_LAUNCH_PHASE.to_owned(),
         gate: gate.to_owned(),
         detail: detail.clone(),
         created_unix_ms: unix_ms(),
@@ -1438,12 +1449,15 @@ fn record_reopen_refusal(directory: &Path, gate: &'static str, detail: String) -
     reopen_refusal(gate, detail)
 }
 
+// The gate of the launch-phase refusal recorded in a reopened session, if there is one. A
+// record of any other schema or phase is not a launch refusal and yields nothing, so the
+// caller treats the launch as not refused.
 fn read_reopen_refusal_gate(directory: &Path) -> Option<String> {
     let text = read_regular_text_if_present(&directory.join(REOPEN_REFUSAL_FILE))
         .ok()
         .flatten()?;
     let record: RecordedReopenRefusal = serde_json::from_str(&text).ok()?;
-    (record.schema == 1).then_some(record.gate)
+    (record.schema == 2 && record.phase == REOPEN_REFUSAL_LAUNCH_PHASE).then_some(record.gate)
 }
 
 // Which boundary a resumed session's holder check runs at. The provider grants no
@@ -1454,9 +1468,23 @@ enum ResumedHolderCheck {
     // In the initial-prompt readiness window: the reopened process exists and has not
     // received a prompt. The adapter waits for the provider's own registration of it.
     AfterLaunch,
-    // Immediately before a prompt is sent to the already registered process: the initial
-    // prompt, and every later `tell`. The adapter answers from the registry as it is now.
-    BeforeDelivery,
+    // Immediately before the initial prompt is sent to the already registered process. The
+    // adapter answers from the registry as it is now.
+    BeforeInitialDelivery,
+    // Immediately before a later `tell` is sent. Same answer as the initial check, but a
+    // refusal here is a follow-up refusal: it is never persisted as a launch refusal.
+    BeforeFollowUp,
+}
+
+impl ResumedHolderCheck {
+    // The launch-phase checks persist their refusal for the reopen command; see
+    // `REOPEN_REFUSAL_LAUNCH_PHASE`.
+    fn persists_refusal(self) -> bool {
+        match self {
+            Self::AfterLaunch | Self::BeforeInitialDelivery => true,
+            Self::BeforeFollowUp => false,
+        }
+    }
 }
 
 // The holder check of a reopened session. The adapter reports every other live holder of the
@@ -1464,11 +1492,11 @@ enum ResumedHolderCheck {
 // `reopen-conflict`. Any failure to complete the check (unreadable registry, a live record
 // that cannot be verified, an uninspectable process, a duplicate managed name, a registration
 // that never came) refuses under `reopen-verification-failed`: an unverifiable conversation
-// is treated as shared, never as exclusive. Both refusals are recorded in the session so the
-// gate survives the process boundary. The recorded detail states only what was detected;
-// whether the new surface was then closed is reported by the caller once that outcome is
-// known. A foreign resume that registers between two checks is not detected until the next
-// one.
+// is treated as shared, never as exclusive. At the launch-phase boundaries both refusals are
+// recorded in the session so the gate survives the process boundary; a follow-up refusal is
+// returned unrecorded. The recorded detail states only what was detected; whether the new
+// surface was then closed is reported by the caller once that outcome is known. A foreign
+// resume that registers between two checks is not detected until the next one.
 fn verify_reopened_conversation_exclusive(
     provider: FirstPartyCli,
     directory: &Path,
@@ -1478,6 +1506,13 @@ fn verify_reopened_conversation_exclusive(
 ) -> Result<()> {
     let Some(resumed_from) = resumed_from else {
         return Ok(());
+    };
+    let refuse = |gate: &'static str, detail: String| {
+        if check.persists_refusal() {
+            record_reopen_refusal(directory, gate, detail)
+        } else {
+            reopen_refusal(gate, detail)
+        }
     };
     let others = match provider::other_resumed_conversation_holders(
         provider,
@@ -1490,8 +1525,7 @@ fn verify_reopened_conversation_exclusive(
     ) {
         Ok(others) => others,
         Err(error) => {
-            return Err(record_reopen_refusal(
-                directory,
+            return Err(refuse(
                 REOPEN_VERIFICATION_FAILED_GATE,
                 format!(
                     "could not verify that the reopened {} conversation {} has no other live holder: {error:#}; no prompt was delivered",
@@ -1504,8 +1538,7 @@ fn verify_reopened_conversation_exclusive(
     if others.is_empty() {
         return Ok(());
     }
-    Err(record_reopen_refusal(
-        directory,
+    Err(refuse(
         REOPEN_CONFLICT_GATE,
         format!(
             "{} conversation {} is also held by live {} process(es) {}; no prompt was delivered",
@@ -1593,33 +1626,8 @@ fn run_reopen(request: ReopenRequest) -> Result<()> {
     let outcome = run_reopen_inner(request, &mut address);
     match address {
         Some((session, request_id)) => {
-            // A gate that failed after the session existed is typed in this process (the
-            // post-launch holder check) or recorded by the launch wrapper in the new
-            // session (the pre-spawn recheck); either way the response names it.
-            let gate = outcome.as_ref().err().and_then(|error| {
-                reopen_refusal_gate(error).map(str::to_owned).or_else(|| {
-                    session_directory(&session)
-                        .ok()
-                        .and_then(|directory| read_reopen_refusal_gate(&directory))
-                })
-            });
-            let outcome = match gate.as_deref() {
-                Some(gate) if REOPEN_POST_CREATION_GATES.contains(&gate) => {
-                    match (session_directory(&source), session_directory(&session)) {
-                        (Ok(source_directory), Ok(refused_directory)) => {
-                            release_reopen_marker_after_refusal(
-                                &source_directory,
-                                &refused_directory,
-                                outcome,
-                            )
-                        }
-                        (Err(error), _) | (_, Err(error)) => outcome.context(format!(
-                            "the reopen marker of source session {source} was not released: {error:#}"
-                        )),
-                    }
-                }
-                _ => outcome,
-            };
+            let (outcome, gate) =
+                settle_reopen_outcome(session_directory, &source, &session, outcome);
             let mut extra = serde_json::Map::new();
             extra.insert("source_session".to_owned(), serde_json::json!(source));
             extra.insert("gate".to_owned(), serde_json::json!(gate));
@@ -1645,6 +1653,50 @@ fn run_reopen(request: ReopenRequest) -> Result<()> {
             outcome
         }
     }
+}
+
+// Decides, once the reopened session exists, whether the reopen was refused at a
+// post-creation gate and whether that refusal releases the source's reopen marker. The gate
+// is typed in this process (the post-launch and pre-initial-delivery holder checks) or
+// recorded by the launch wrapper in the new session (the pre-spawn recheck); either way the
+// response names it. Only a launch-phase refusal counts: the initial delivery can complete
+// while its messenger is still settling, a later `tell` can then be refused and the session
+// closed, and the initial messenger can finally report only that delivery is uncertain.
+// That `tell` refusal lives in the session status, never in the launch refusal record, so
+// the uncertain outcome finds no gate here and the marker stays consumed: a prompt may
+// have reached the conversation, and a second reopen must not be permitted on the strength
+// of a refusal that was not the launch's.
+fn settle_reopen_outcome(
+    session_directory: impl Fn(&str) -> Result<PathBuf>,
+    source: &str,
+    session: &str,
+    outcome: Result<()>,
+) -> (Result<()>, Option<String>) {
+    let gate = outcome.as_ref().err().and_then(|error| {
+        reopen_refusal_gate(error).map(str::to_owned).or_else(|| {
+            session_directory(session)
+                .ok()
+                .and_then(|directory| read_reopen_refusal_gate(&directory))
+        })
+    });
+    let outcome = match gate.as_deref() {
+        Some(gate) if REOPEN_POST_CREATION_GATES.contains(&gate) => {
+            match (session_directory(source), session_directory(session)) {
+                (Ok(source_directory), Ok(refused_directory)) => {
+                    release_reopen_marker_after_refusal(
+                        &source_directory,
+                        &refused_directory,
+                        outcome,
+                    )
+                }
+                (Err(error), _) | (_, Err(error)) => outcome.context(format!(
+                    "the reopen marker of source session {source} was not released: {error:#}"
+                )),
+            }
+        }
+        _ => outcome,
+    };
+    (outcome, gate)
 }
 
 fn run_reopen_inner(request: ReopenRequest, address: &mut Option<(String, String)>) -> Result<()> {
@@ -2715,7 +2767,7 @@ fn refuse_follow_up_to_shared_conversation(
         directory,
         resumed_from,
         deadline,
-        ResumedHolderCheck::BeforeDelivery,
+        ResumedHolderCheck::BeforeFollowUp,
     ) else {
         return Ok(());
     };
@@ -5005,6 +5057,13 @@ fn rollback_turn_claim_token(path: &Path, expected_token: &str, state: &str) -> 
 // (carrying `error`) only while the claim file still holds `expected_token`. Returns
 // whether that happened. The reliability branch introduces `update_status_for_turn` for
 // claim-checked status writes; this helper is the equivalent for the rollback path.
+//
+// Merge reconciliation note: this must remain one lifecycle critical section that does the
+// ownership check, the status publication, and the claim removal under a single hold of the
+// lock. It is not a drop-in for `update_status_for_turn` followed by removal: that helper
+// takes the same lock (calling it from inside this section would lock recursively), and
+// calling the claim-checking helper after the removal would find no claim and report the
+// write as not owned. Keep all three steps here, under the one lock.
 fn rollback_turn_claim_token_with_error(
     path: &Path,
     expected_token: &str,
