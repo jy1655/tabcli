@@ -545,9 +545,16 @@ fn case_aliases_of_a_recorded_event_name_never_pass_resolution() {
         Value::Null,
     );
     let before = fixture.files();
+    // Windows and macOS APFS resolve the alias to event-a.json, so the exact-name check
+    // must refuse it; on a case-sensitive filesystem the aliased file is simply absent.
+    let case_insensitive = fixture
+        .directory(SOURCE)
+        .join("events")
+        .join("event-A.json")
+        .exists();
     let address = format!("{SOURCE}/event-A.json");
     let output = tell_with(&fixture, &address);
-    if cfg!(windows) {
+    if case_insensitive {
         assert!(
             stderr(&output).contains("does not match an events/ entry exactly"),
             "{}",
@@ -558,7 +565,7 @@ fn case_aliases_of_a_recorded_event_name_never_pass_resolution() {
     assert_eq!(fixture.files(), before);
     let address = format!("{SOURCE}/request-alias");
     let output = tell_with(&fixture, &address);
-    let state = if cfg!(windows) {
+    let state = if case_insensitive {
         "unreadable"
     } else {
         "unresolved"
