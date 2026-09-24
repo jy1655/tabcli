@@ -1681,7 +1681,12 @@ fn refused_launch_cleanup(refused_directory: &Path, gate: &str) -> Result<Refuse
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
-    let state = read_json::<SessionStatus>(&refused_directory.join("status.json"))?.state;
+    // The refused session's own status decides whether cleanup is even possible, so it is
+    // read like the other evidence here: a link at `status.json` is refused, not followed.
+    let status_path = refused_directory.join("status.json");
+    let state = read_regular_status_if_present(&status_path)?
+        .with_context(|| format!("failed to read {}", status_path.display()))?
+        .state;
     if session_accepts_prompt(&state) || state == "working" {
         return Ok(RefusedLaunchCleanup::Pending(format!(
             "refused session {refused_session} is {state}"

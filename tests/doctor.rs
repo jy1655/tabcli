@@ -646,3 +646,43 @@ fn reopen_marker_is_reported_with_its_release_condition_without_writes() {
     fs::write(fixture.directory.join("reopen.marker.json"), "not json").unwrap();
     observe("reopen_marker_unreadable", "unknown");
 }
+
+// A probe is a bridge-run provider process like any other: the adapter's removal list is
+// applied to it, so a `claude --version` started from inside Claude Code does not carry
+// the caller's session markers, while a Codex probe (empty list) inherits its caller's
+// environment unchanged (Codex review of PR #44).
+#[cfg(unix)]
+#[test]
+fn version_probes_drop_the_adapters_environment_removals() {
+    use std::os::unix::fs::PermissionsExt;
+    for (provider, expected_version, expected_reason) in [
+        ("claude", "2.1.281 (Claude Code)", "version_supported"),
+        (
+            "codex",
+            "nested CLAUDE_CODE_CHILD_SESSION=1",
+            "version_unrecognized",
+        ),
+    ] {
+        let fixture = Fixture::new(provider);
+        let executable = fixture.root.path().join("provider");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nif [ -n \"$CLAUDE_CODE_CHILD_SESSION\" ]; then echo \"nested CLAUDE_CODE_CHILD_SESSION=$CLAUDE_CODE_CHILD_SESSION\"; else echo '2.1.281 (Claude Code)'; fi\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let report = report(fixture.run_with_env(
+            &["doctor", "session-doctor", "--probe", "--json"],
+            &[("CLAUDE_CODE_CHILD_SESSION", Some("1"))],
+        ));
+        let version = check(&report, "provider_version");
+        assert_eq!(
+            version["evidence"]["current_version"], expected_version,
+            "{provider}: {version}"
+        );
+        assert_eq!(
+            version["reason_code"], expected_reason,
+            "{provider}: {version}"
+        );
+    }
+}
