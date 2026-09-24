@@ -206,6 +206,10 @@ impl FollowUpTransport {
 
 trait NativeProviderAdapter: Sync {
     fn diagnose(&self, context: super::doctor::Context<'_>) -> Vec<super::doctor::Check>;
+    // Caller-environment variables removed from every short-lived provider query the
+    // bridge runs (version preflight, doctor probes). Each adapter states its own list;
+    // there is no shared default.
+    fn probe_environment_removals(&self) -> &'static [&'static str];
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan>;
     // Read-only reopen gate. Each adapter states whether the recorded provider conversation
     // can be continued in a new process on this platform and whether the provider's own
@@ -287,6 +291,10 @@ pub(super) fn verify_reopen_available(
     provider_session_id: &str,
 ) -> Result<()> {
     adapter(provider).verify_reopen_available(provider_session_id)
+}
+
+pub(super) fn probe_environment_removals(provider: FirstPartyCli) -> &'static [&'static str] {
+    adapter(provider).probe_environment_removals()
 }
 
 pub(super) fn prepare_resume(

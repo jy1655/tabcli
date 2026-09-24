@@ -59,6 +59,11 @@ struct HookFailureSignal {
 const PI_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Pi exposes no verifiable ownership evidence for a session (no lock, pid, or registry under ~/.pi identifies a live writer)";
 
 impl NativeProviderAdapter for PiAdapter {
+    fn probe_environment_removals(&self) -> &'static [&'static str] {
+        // Pi derives no session identity from the caller's environment.
+        &[]
+    }
+
     fn diagnose(
         &self,
         _context: super::super::doctor::Context<'_>,

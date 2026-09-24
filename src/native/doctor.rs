@@ -250,7 +250,13 @@ pub(super) fn run(request: DoctorRequest) -> Result<()> {
         }
         if request.probe {
             if let Some(path) = &executable {
-                match probe(path, &["--version"], None, deadline) {
+                match probe(
+                    path,
+                    &["--version"],
+                    None,
+                    provider::probe_environment_removals(provider),
+                    deadline,
+                ) {
                     Ok(output) if output.status.success() => {
                         let mut version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
                         if version.is_empty() {
@@ -710,6 +716,7 @@ pub(super) fn probe(
     executable: &Path,
     arguments: &[&str],
     workspace: Option<&Path>,
+    environment_removals: &[&str],
     deadline: Instant,
 ) -> Result<Output> {
     if Instant::now() >= deadline {
@@ -730,6 +737,7 @@ pub(super) fn probe(
     command
         .current_dir(workspace.unwrap_or(scratch.path()))
         .env_remove(SESSION_DIR_ENV);
+    provider::apply_environment_removals(&mut command, environment_removals);
     provider_process::configure_process_tree(&mut command);
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
@@ -795,6 +803,55 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    // A probe is a bridge-run provider process like any other: the adapter's removal
+    // list is applied to it, so a `claude --version` started from inside Claude Code
+    // does not carry the caller's session markers (Codex review of PR #44).
+    #[cfg(unix)]
+    #[test]
+    fn local_probes_drop_the_adapters_environment_removals() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("provider");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf 'child=%s kept=%s\\n' \"${CLAUDE_CODE_CHILD_SESSION:-unset}\" \"${AGENT_BRIDGE_PROBE_KEPT:-unset}\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        // SAFETY: single-threaded test-local environment mutation, undone below.
+        unsafe {
+            std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "1");
+            std::env::set_var("AGENT_BRIDGE_PROBE_KEPT", "yes");
+        }
+        let removed = probe(
+            &executable,
+            &["--version"],
+            Some(directory.path()),
+            provider::probe_environment_removals(FirstPartyCli::Claude),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        let inherited = probe(
+            &executable,
+            &["--version"],
+            Some(directory.path()),
+            provider::probe_environment_removals(FirstPartyCli::Codex),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("CLAUDE_CODE_CHILD_SESSION");
+            std::env::remove_var("AGENT_BRIDGE_PROBE_KEPT");
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&removed.stdout).trim(),
+            "child=unset kept=yes"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&inherited.stdout).trim(),
+            "child=1 kept=yes"
+        );
+    }
+
     #[test]
     fn local_probes_bound_output_and_stop_a_hung_cli() {
         let directory = tempfile::tempdir().unwrap();
@@ -805,6 +862,7 @@ mod tests {
             &executable,
             &["--version"],
             Some(directory.path()),
+            &[],
             Instant::now() + Duration::from_secs(5),
         )
         .unwrap_err();
@@ -814,6 +872,7 @@ mod tests {
             &executable,
             &["--version"],
             Some(directory.path()),
+            &[],
             Instant::now() + Duration::from_secs(1),
         )
         .unwrap_err();

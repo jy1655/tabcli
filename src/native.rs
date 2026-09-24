@@ -4881,7 +4881,15 @@ fn validate_hook_directory(directory: &Path) -> Result<()> {
 }
 
 fn read_manifest(directory: &Path) -> Result<SessionManifest> {
-    let manifest: SessionManifest = read_json(&directory.join("manifest.json"))?;
+    // The manifest decides a session's scope (workspace, provider) for every read-only
+    // query, so it is read like every other session record: a link at `manifest.json`
+    // would let content outside the state root steer a search or an attach, and is
+    // refused rather than followed.
+    let path = directory.join("manifest.json");
+    let bytes = read_regular_bytes_if_present(&path)?
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let manifest: SessionManifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?;
     if manifest.schema != SESSION_SCHEMA {
         bail!(
             "unsupported session schema {} for {}",
@@ -6411,6 +6419,10 @@ fn check_provider_version_until(
 ) -> Result<String> {
     let mut command = provider_version_command(executable)?;
     command.arg("--version");
+    provider::apply_environment_removals(
+        &mut command,
+        provider::probe_environment_removals(provider),
+    );
     let label = format!("{} --version", executable.display());
     let output = match deadline {
         Some(deadline) => command_output_until(&mut command, deadline, &label),

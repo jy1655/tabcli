@@ -54,6 +54,11 @@ impl PendingAgyTurn {
 const AGY_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Agy exposes no verifiable ownership evidence for a conversation (presence locks are not held by the running process) and its transcript monitor binds only to a newly created conversation";
 
 impl NativeProviderAdapter for AgyAdapter {
+    fn probe_environment_removals(&self) -> &'static [&'static str] {
+        // Agy derives no session identity from the caller's environment.
+        &[]
+    }
+
     fn diagnose(
         &self,
         context: super::super::doctor::Context<'_>,
@@ -64,8 +69,8 @@ impl NativeProviderAdapter for AgyAdapter {
                 "agy_follow_up",
                 Unknown,
                 "agy_terminal_fallback",
-                "Agy owns terminal-paste follow-up and transcript result monitoring. No verified first-party input path into a running interactive session is integrated.",
-                "Inspect the managed owner and terminal. Live input was not tested; retain this fallback until Agy offers a verified native path.",
+                "Agy owns terminal-paste follow-up and transcript result monitoring. No verified first-party input path into a running interactive session is integrated. Every paste (the Windows initial prompt and every follow-up on Windows and macOS) waits for Agy's own log to show readiness and requires a HandleUserInput receipt; the macOS initial prompt is a launch argument and never waits.",
+                "Inspect the managed owner and terminal; retain this fallback until Agy offers a verified native path.",
             ),
             input_receipt_check(context.directory),
         ]
@@ -126,7 +131,7 @@ impl NativeProviderAdapter for AgyAdapter {
         // and a paste that lands inside a reload is discarded (issue #43). A paste
         // lost to a reload after the gate ends as delivery-uncertain, never as a
         // second paste. Non-Windows delivers the initial prompt as an argument and
-        // never waits.
+        // never waits; its first paste is the first follow-up, which gates itself.
         Duration::ZERO
     }
 
@@ -137,8 +142,16 @@ impl NativeProviderAdapter for AgyAdapter {
         deadline: Instant,
     ) -> terminal::TerminalSendResult {
         if cfg!(windows) {
-            deliver_windows_console_turn(session, prompt_path, deadline, true)
+            deliver_terminal_turn(
+                session,
+                prompt_path,
+                deadline,
+                Some(WINDOWS_STARTUP_READINESS_TIMING),
+            )
         } else {
+            // Unreachable while `initial_prompt_transport` is `ProviderArgument` off
+            // Windows; kept as the plain paste so the transport decision stays in one
+            // place.
             terminal::send_file(session, prompt_path, deadline)
         }
     }
@@ -188,9 +201,23 @@ impl NativeProviderAdapter for AgyAdapter {
         deadline: Instant,
     ) -> terminal::TerminalSendResult {
         if cfg!(windows) {
-            deliver_windows_console_turn(session, prompt_path, deadline, false)
+            // The Windows initial paste already waited for startup readiness, so a
+            // follow-up only takes its receipt offset and pastes.
+            deliver_terminal_turn(session, prompt_path, deadline, None)
         } else {
-            terminal::send_file(session, prompt_path, deadline)
+            // On macOS the initial prompt was a launch argument, so the first
+            // follow-up is the first paste and lands in the same startup burst that
+            // discards Windows initial pastes (issue #43): session-QMFk6F, 2026-09-24
+            // 21:32, lost its `tell` pasted 10.3 s after `CLI startup completed`, 0.85 s
+            // before the deferred skills reload. Every follow-up therefore waits for the
+            // macOS readiness rule and requires the receipt; a gate that has already
+            // settled passes after one quiet period.
+            deliver_terminal_turn(
+                session,
+                prompt_path,
+                deadline,
+                Some(MACOS_FOLLOW_UP_READINESS_TIMING),
+            )
         }
     }
 
@@ -365,6 +392,29 @@ fn correlated_response<'a>(message: &'a str, pending: &PendingAgyTurn) -> Result
 //   session with `close-session --explicit` or launch a new one; the bridge never
 //   re-pastes or cleans up on its own.
 //
+// macOS follow-up delivery (iTerm2/Terminal.app paste, 2026-09-24 21:32, Agy
+// 1.2.10): the initial prompt is a `--prompt-interactive` argument, so the first
+// paste is the first `tell`, and it meets the same startup burst. Two differences
+// from the Windows console:
+//
+// - Agy on macOS logs no `Full redraw completed` line at all (session-QMFk6F and
+//   session-7IgCnx, this machine), so the macOS rule (`MACOS_FOLLOW_UP_READINESS_TIMING`)
+//   does not require the redraw marker; every other condition is the same.
+// - The argument-delivered initial prompt starts a conversation a few seconds after
+//   startup, and Agy logs a `Reloading system slash commands and skills` line a few
+//   milliseconds after `Starting new conversation` (7 ms in session-QMFk6F at +2.9 s,
+//   26 ms in session-7IgCnx at +2.7 s). That is the conversation reload, not the
+//   deferred startup reload, which still followed at +11.2 s in session-QMFk6F and
+//   cleared the composer under the smoke's `tell` (pasted at +10.3 s, no receipt,
+//   session left `working`). A skills reload stamped within
+//   `CONVERSATION_RELOAD_MAX_LATENCY` after the newest `Starting new conversation`
+//   line therefore never settles the deferred-reload condition, on either platform.
+//
+// The receipt is the same Go-quoted `HandleUserInput` line: a multi-line paste
+// through iTerm2 is logged as one record with `\n` escapes and the complete marker
+// (session-QMFk6F, 21:42:19). It carries the macOS framing header instead of the
+// Windows one, and `receipt_matches` accepts either adapter-owned framing.
+//
 // Delete this section, `initial_prompt_ready_delay`, and the receipt branches of
 // `send_initial_prompt`/`send_terminal_follow_up` when Agy provides such a signal
 // or an input API; the transcript result monitor is unaffected.
@@ -376,10 +426,18 @@ const HOOKS_LOADED_SOURCE: &str = "hooks_manager.go";
 const FULL_REDRAW_MARKER: &str = "Full redraw completed";
 const REDRAW_AFTER_STARTUP_DESCRIPTION: &str =
     "`Full redraw completed` after `CLI startup completed`";
-const DEFERRED_RELOAD_DESCRIPTION: &str = "deferred skills reload or the 45 s window (no `Reloading system slash commands and skills` line stamped at least 1 s after `CLI startup completed` and less than 45 s since `CLI startup completed` was observed)";
+const DEFERRED_RELOAD_DESCRIPTION: &str = "deferred skills reload or the deferred reload window (no `Reloading system slash commands and skills` line stamped at least 1 s after `CLI startup completed` and outside 1 s after a `Starting new conversation` line, and the window since `CLI startup completed` was observed has not elapsed)";
 const QUIET_PERIOD_DESCRIPTION: &str = "quiet period not reached (no `Reloading system slash commands`, `Full redraw completed`, or `hooks_manager.go` line for the quiet period after the newest one)";
+const CONVERSATION_START_MARKER: &str = "Starting new conversation";
 const INPUT_RECEIPT_MARKER: &str = "HandleUserInput called with text: \"";
 const WINDOWS_PROTOCOL_PREFIX: &str = "[Agent Bridge Agy Windows console turn protocol]";
+// The framing header of `correlated_prompt`, which macOS pastes verbatim.
+const TURN_PROTOCOL_HEADER: &str = "[Agent Bridge Agy turn protocol]";
+// A skills reload stamped at most this long after the newest `Starting new
+// conversation` line is the reload the new conversation triggers (7 ms and 26 ms
+// after it on macOS; 15 ms after the receipt on Windows, session-udT6uY), never the
+// deferred startup reload, whose shortest observed latency after startup is 9.8 s.
+const CONVERSATION_RELOAD_MAX_LATENCY: Duration = Duration::from_secs(1);
 // Observed post-login reload bursts arrive about 3.0 seconds apart; the quiet period
 // must outlast that cadence so the paste does not land between two of them.
 const STARTUP_QUIET_PERIOD: Duration = Duration::from_millis(3500);
@@ -413,9 +471,27 @@ const DEFERRED_RELOAD_WINDOW: Duration = Duration::from_secs(45);
 // reload and settled the condition at once. The deferred reload has never arrived
 // earlier than 9.8 s after startup.
 const DEFERRED_RELOAD_MIN_LATENCY: Duration = Duration::from_secs(1);
-const STARTUP_READINESS_TIMING: ReadinessTiming = ReadinessTiming {
+// The Windows console rule: Agy redraws the console composer once the TUI is up, so
+// the redraw after startup is required.
+const WINDOWS_STARTUP_READINESS_TIMING: ReadinessTiming = ReadinessTiming {
     quiet_period: STARTUP_QUIET_PERIOD,
     deferred_reload_window: DEFERRED_RELOAD_WINDOW,
+    redraw_required: true,
+};
+// Deferred skills reload latency after `CLI startup completed` on macOS (iTerm2,
+// this Mac, 2026-09-24 KST, Agy 1.2.10): 11.2 s in session-QMFk6F and 55.4 s in
+// session-S7qq65, whose first `tell` the 45 s window pasted at +45 s and the reload
+// cleared 8 s later (reported delivery-uncertain, no receipt). The macOS window
+// therefore outlasts 55.4 s with margin; a healthy session that never logs the
+// deferred reload pastes its first follow-up at startup + 60 s, and every later
+// follow-up passes after one quiet period because the condition is already settled.
+const MACOS_DEFERRED_RELOAD_WINDOW: Duration = Duration::from_secs(60);
+// The macOS follow-up rule: the same quiet period, the longer window, and no redraw
+// marker, which Agy never logs on macOS.
+const MACOS_FOLLOW_UP_READINESS_TIMING: ReadinessTiming = ReadinessTiming {
+    quiet_period: STARTUP_QUIET_PERIOD,
+    deferred_reload_window: MACOS_DEFERRED_RELOAD_WINDOW,
+    redraw_required: false,
 };
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 // Agy logs `HandleUserInput` when it processes the pasted line, not when the console
@@ -449,11 +525,15 @@ fn read_log_bytes(log_path: &Path) -> Result<Option<Vec<u8>>> {
     super::super::read_regular_bytes_if_present(log_path)
 }
 
-fn deliver_windows_console_turn(
+// Pastes one framed turn into the managed terminal and confirms its receipt. With a
+// readiness rule the paste waits for Agy's startup burst to settle first (the Windows
+// initial prompt, every macOS follow-up); without one it pastes at once (a Windows
+// follow-up, whose initial paste already waited).
+fn deliver_terminal_turn(
     session: &terminal::TerminalSession,
     prompt_path: &Path,
     deadline: Instant,
-    gate_on_startup: bool,
+    readiness: Option<ReadinessTiming>,
 ) -> terminal::TerminalSendResult {
     use terminal::TerminalSendFailure;
     let directory = session_directory_of(session).map_err(TerminalSendFailure::not_sent)?;
@@ -463,14 +543,14 @@ fn deliver_windows_console_turn(
         .map_err(TerminalSendFailure::not_sent)?;
     // The paste is issued right after the read that supplies `pre_paste_len`, so
     // only lines that start after this offset can be evidence for this submission.
-    // The initial paste takes the offset from the very read that passed the readiness
+    // A gated paste takes the offset from the very read that passed the readiness
     // gate: there is no later read whose discontinuity or fresh activity could go
     // unjudged between the ready decision and the paste.
-    let pre_paste_len = if gate_on_startup {
+    let pre_paste_len = if let Some(timing) = readiness {
         wait_for_startup_readiness_with(
             &mut || read_log_bytes(&log_path),
             deadline,
-            STARTUP_READINESS_TIMING,
+            timing,
             STARTUP_POLL_INTERVAL,
             &mut SystemClock,
         )
@@ -631,6 +711,12 @@ struct StartupObservation {
     // Line index of the first skills reload after the startup line that was too
     // early to be the deferred reload (diagnostics only).
     startup_reload_after_startup: Option<usize>,
+    // Line index of the first skills reload after the startup line that followed a
+    // `Starting new conversation` line within `CONVERSATION_RELOAD_MAX_LATENCY`: the
+    // reload a new conversation triggers, not the deferred one (diagnostics only).
+    conversation_reload_after_startup: Option<usize>,
+    // The glog stamp of the newest `Starting new conversation` line so far.
+    conversation_start_stamp: Option<Duration>,
     // Line index of the newest activity line: any `Reloading system slash commands`
     // line (with or without "and skills"), `Full redraw completed` line, or
     // `hooks_manager.go` line, wherever it sits. The quiet period restarts whenever
@@ -638,6 +724,11 @@ struct StartupObservation {
     settle_line: Option<usize>,
     // Activity lines seen so far (diagnostics only).
     activity_lines: usize,
+    // The newest glog stamp in the log: how long Agy itself says it has been running
+    // since `CLI startup completed`. A follow-up gated long after startup settles the
+    // deferred-reload window from this, not from the gate's own clock, so it does not
+    // wait a whole window for a reload that would already have been logged.
+    newest_stamp: Option<Duration>,
 }
 
 impl StartupObservation {
@@ -645,16 +736,18 @@ impl StartupObservation {
         self.startup_line.is_some()
     }
 
-    fn markers_observed(&self) -> bool {
-        self.startup_completed() && self.redraw_after_startup.is_some()
+    // The startup markers the platform rule requires: startup everywhere, plus the
+    // redraw where Agy logs one (the Windows console).
+    fn markers_observed(&self, redraw_required: bool) -> bool {
+        self.startup_completed() && (!redraw_required || self.redraw_after_startup.is_some())
     }
 
-    fn missing_markers(&self) -> Vec<&'static str> {
+    fn missing_markers(&self, redraw_required: bool) -> Vec<&'static str> {
         let mut missing = Vec::new();
         if self.startup_line.is_none() {
             missing.push("`CLI startup completed`");
         }
-        if self.redraw_after_startup.is_none() {
+        if redraw_required && self.redraw_after_startup.is_none() {
             missing.push(REDRAW_AFTER_STARTUP_DESCRIPTION);
         }
         missing
@@ -670,6 +763,11 @@ fn is_activity_line(line: &str) -> bool {
 fn observe_startup(log: &[u8]) -> StartupObservation {
     let mut observation = StartupObservation::default();
     for (index, line) in complete_log_lines(log).enumerate() {
+        if let Some(stamp) = glog_timestamp(&line)
+            && observation.newest_stamp.is_none_or(|newest| stamp > newest)
+        {
+            observation.newest_stamp = Some(stamp);
+        }
         if observation.startup_line.is_none() && line.contains(STARTUP_COMPLETED_MARKER) {
             observation.startup_line = Some(index);
             observation.startup_stamp = glog_timestamp(&line);
@@ -680,6 +778,11 @@ fn observe_startup(log: &[u8]) -> StartupObservation {
         {
             observation.redraw_after_startup = Some(index);
         }
+        if line.contains(CONVERSATION_START_MARKER)
+            && let Some(stamp) = glog_timestamp(&line)
+        {
+            observation.conversation_start_stamp = Some(stamp);
+        }
         if observation
             .startup_line
             .is_some_and(|startup| startup < index)
@@ -689,13 +792,28 @@ fn observe_startup(log: &[u8]) -> StartupObservation {
             // Threads stamp out of order by a few milliseconds, so the reload's
             // stamp can precede the startup stamp; a stamp that cannot be read
             // proves nothing and the reload is taken for the startup one.
-            let deferred = match (observation.startup_stamp, glog_timestamp(&line)) {
+            let reload_stamp = glog_timestamp(&line);
+            let deferred = match (observation.startup_stamp, reload_stamp) {
                 (Some(startup), Some(reload)) => {
                     reload.saturating_sub(startup) >= DEFERRED_RELOAD_MIN_LATENCY
                 }
                 _ => false,
             };
-            if deferred {
+            // A reload right after a conversation start is that conversation's
+            // reload: the argument-delivered macOS initial prompt starts one a few
+            // seconds after startup, before the deferred reload.
+            let conversation_reload = match (observation.conversation_start_stamp, reload_stamp) {
+                (Some(started), Some(reload)) => {
+                    reload >= started
+                        && reload.saturating_sub(started) <= CONVERSATION_RELOAD_MAX_LATENCY
+                }
+                _ => false,
+            };
+            if conversation_reload {
+                if observation.conversation_reload_after_startup.is_none() {
+                    observation.conversation_reload_after_startup = Some(index);
+                }
+            } else if deferred {
                 observation.deferred_reload_after_startup = Some(index);
             } else if observation.startup_reload_after_startup.is_none() {
                 observation.startup_reload_after_startup = Some(index);
@@ -742,6 +860,9 @@ impl ReadinessState {
 struct ReadinessTiming {
     quiet_period: Duration,
     deferred_reload_window: Duration,
+    // Whether a `Full redraw completed` line after startup is required. Agy logs it
+    // on the Windows console and never on macOS.
+    redraw_required: bool,
 }
 
 // The settlement instants are only evidence about the log they were measured
@@ -909,13 +1030,26 @@ impl ReadinessGate {
         if observation.startup_completed() && self.startup_seen_at.is_none() {
             self.startup_seen_at = Some(now);
         }
+        // The window is measured on the gate's clock from the first read that showed
+        // startup, and also on Agy's own clock from the startup stamp to the newest
+        // stamp: a session that has already logged a window's worth of runtime cannot
+        // still be inside its startup burst (session-bbNK3d, macOS, 2026-09-24 22:03,
+        // never logged the deferred reload and waited the whole window on each of two
+        // follow-ups minutes after startup).
+        let logged_window_elapsed = match (observation.startup_stamp, observation.newest_stamp) {
+            (Some(startup), Some(newest)) => {
+                newest.saturating_sub(startup) >= self.timing.deferred_reload_window
+            }
+            _ => false,
+        };
         self.deferred_reload_settled = observation.deferred_reload_after_startup.is_some()
+            || logged_window_elapsed
             || self.startup_seen_at.is_some_and(|seen| {
                 now.saturating_duration_since(seen) >= self.timing.deferred_reload_window
             });
         let state = if !observation.startup_completed() {
             ReadinessState::AwaitingStartup
-        } else if observation.redraw_after_startup.is_none() {
+        } else if self.timing.redraw_required && observation.redraw_after_startup.is_none() {
             ReadinessState::AwaitingRedraw
         } else if !self.deferred_reload_settled {
             ReadinessState::AwaitingDeferredReload
@@ -930,8 +1064,8 @@ impl ReadinessGate {
 
     fn deadline_report(&self, state: ReadinessState) -> String {
         let mut missing = match &self.last_observation {
-            Some(observation) => observation.missing_markers(),
-            None => StartupObservation::default().missing_markers(),
+            Some(observation) => observation.missing_markers(self.timing.redraw_required),
+            None => StartupObservation::default().missing_markers(self.timing.redraw_required),
         };
         if !self.deferred_reload_settled {
             missing.push(DEFERRED_RELOAD_DESCRIPTION);
@@ -956,7 +1090,7 @@ impl ReadinessGate {
             ),
         };
         format!(
-            "Agy did not report startup readiness before the deadline: {}; missing markers: {missing}; the quiet period is {} ms and the deferred reload window is {} ms, timed concurrently (the window from the first read with `CLI startup completed`, the quiet period from the newest reload, redraw, or hooks line; ready when both hold){restarted}; the initial prompt was not pasted",
+            "Agy did not report startup readiness before the deadline: {}; missing markers: {missing}; the quiet period is {} ms and the deferred reload window is {} ms, timed concurrently (the window from the first read with `CLI startup completed`, the quiet period from the newest reload, redraw, or hooks line; ready when both hold){restarted}; the prompt was not pasted",
             state.describe(),
             self.timing.quiet_period.as_millis(),
             self.timing.deferred_reload_window.as_millis()
@@ -1041,8 +1175,12 @@ fn input_receipts(log: &[u8]) -> Vec<InputReceipt> {
 // The complete marker (`<!-- agent-bridge-agy-turn:<token> -->`) is unique to this
 // submission; a visible prefix is not, because another turn's token can share it. A
 // receipt that Agy cut before the closing ` -->` therefore never confirms delivery.
+// The framing header proves the record is the adapter's own paste rather than a line
+// typed into the composer that happens to quote the marker; either adapter-owned
+// framing (the Windows JSON envelope, the macOS verbatim prompt) qualifies.
 fn receipt_matches(receipt: &InputReceipt, pending: &PendingAgyTurn) -> bool {
-    receipt.text.contains(WINDOWS_PROTOCOL_PREFIX) && receipt.text.contains(&pending.marker)
+    (receipt.text.contains(WINDOWS_PROTOCOL_PREFIX) || receipt.text.contains(TURN_PROTOCOL_HEADER))
+        && receipt.text.contains(&pending.marker)
 }
 
 // Byte offset of the first line that begins at or after the pre-paste offset. A line
@@ -1189,9 +1327,22 @@ where
 }
 
 fn input_receipt_check(directory: Option<&Path>) -> super::super::doctor::Check {
+    input_receipt_check_for_platform(directory, cfg!(windows))
+}
+
+fn input_receipt_check_for_platform(
+    directory: Option<&Path>,
+    windows: bool,
+) -> super::super::doctor::Check {
     use super::super::doctor::{Availability::Unknown, Check};
     const CHECK_ID: &str = "agy_input_receipt";
-    const NEXT_ACTION: &str = "Observation only. Windows console delivery pastes after CLI startup completed, a Full redraw completed after it, the deferred skills reload (Reloading system slash commands and skills stamped at least 1 s after startup; an earlier one is the startup reload) or a 45 s window since startup, and a quiet period without reload, redraw, or hooks lines, re-measured from the new content whenever agy.log disappears, shrinks, or no longer holds the bytes observed earlier (any number of times within the timeout), pasted right after the read that passed the gate with that read's length as the receipt offset, and requires a HandleUserInput receipt carrying the complete pending turn marker within 60 s of the paste (Agy logs the receipt when it processes the paste, which took 18 s under load); a missing receipt leaves delivery uncertain with the session working and the reason in status.error, and the paste is never repeated. Inspect the session and close it explicitly or launch a new one.";
+    const NEXT_ACTION: &str = "Observation only. A gated paste (the Windows initial prompt, every macOS follow-up) waits for CLI startup completed (on the Windows console also a Full redraw completed after it), the deferred skills reload (Reloading system slash commands and skills stamped at least 1 s after startup and not within 1 s after a Starting new conversation line; an earlier one is the startup reload, a later one right after a conversation start is that conversation's reload) or the platform's deferred reload window since startup (45 s on the Windows console, 60 s on macOS), and a quiet period without reload, redraw, or hooks lines, re-measured from the new content whenever agy.log disappears, shrinks, or no longer holds the bytes observed earlier (any number of times within the timeout), pasted right after the read that passed the gate with that read's length as the receipt offset; every paste requires a HandleUserInput receipt carrying the complete pending turn marker within 60 s of the paste (Agy logs the receipt when it processes the paste, which took 18 s under load); a missing receipt leaves delivery uncertain with the session working and the reason in status.error, and the paste is never repeated. Inspect the session and close it explicitly or launch a new one.";
+    let redraw_required = windows;
+    let startup_markers = if windows {
+        "CLI startup completed followed by a Full redraw completed"
+    } else {
+        "CLI startup completed; macOS logs no Full redraw completed and none is required"
+    };
     let Some(directory) = directory else {
         return Check::new(
             CHECK_ID,
@@ -1239,26 +1390,28 @@ fn input_receipt_check(directory: Option<&Path>) -> super::super::doctor::Check 
     // The doctor reads the log once, so it reports the two startup markers only; the
     // deferred reload window and the quiet period are timed live and concurrently
     // by the paste gate and cannot be judged here.
-    let (reason, detail) = match (startup.markers_observed(), last) {
+    let (reason, detail) = match (startup.markers_observed(redraw_required), last) {
         (false, _) => (
             "agy_startup_markers_missing",
-            "agy.log does not yet show the startup markers (CLI startup completed followed by a Full redraw completed); the paste gate also waits for the deferred skills reload (stamped at least 1 s after startup) or a 45 s window since startup and, concurrently, for a 3.5 s quiet period without reload, redraw, or hooks lines; it pastes on the first read at which both hold, so a quiet startup that never logs the deferred reload pastes at startup + 45 s.",
+            format!("agy.log does not yet show the startup markers ({startup_markers}); the paste gate also waits for the deferred skills reload (stamped at least 1 s after startup and not right after a conversation start) or the platform's deferred reload window since startup (45 s on the Windows console, 60 s on macOS) and, concurrently, for a 3.5 s quiet period without reload, redraw, or hooks lines; it pastes on the first read at which both hold, so a quiet startup that never logs the deferred reload pastes when the window ends."),
         ),
         (true, None) => (
             "agy_no_input_receipt",
-            "agy.log shows the startup markers but no HandleUserInput receipt.",
+            "agy.log shows the startup markers but no HandleUserInput receipt.".to_owned(),
         ),
         (true, Some(_)) => (
             "agy_input_receipt_observed",
-            "agy.log shows the startup markers and at least one HandleUserInput receipt; the evidence states whether any receipt carries the complete pending turn marker.",
+            "agy.log shows the startup markers and at least one HandleUserInput receipt; the evidence states whether any receipt carries the complete pending turn marker.".to_owned(),
         ),
     };
     Check::new(CHECK_ID, Unknown, reason, detail, NEXT_ACTION).evidence(serde_json::json!({
         "log": log_path,
         "startup_completed": startup.startup_completed(),
+        "redraw_required": redraw_required,
         "redraw_after_startup_observed": startup.redraw_after_startup.is_some(),
         "deferred_reload_after_startup_observed": startup.deferred_reload_after_startup.is_some(),
         "startup_reload_after_startup_ignored": startup.startup_reload_after_startup.is_some(),
+        "conversation_reload_after_startup_ignored": startup.conversation_reload_after_startup.is_some(),
         "activity_lines": startup.activity_lines,
         "input_receipts": receipts.len(),
         "last_receipt_text": last.map(|receipt| {
@@ -2054,6 +2207,97 @@ I0924 20:37:45.892979     252 quota_manager.go:45] doRefreshQuota: starting relo
 I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist Trace: 0x7c00680e8820122f
 "#;
 
+    // session-QMFk6F (this Mac, macOS 26.6 + iTerm2, 2026-09-24 21:32, Agy 1.2.10; the
+    // live smoke lost its first `tell`): the startup and the argument-delivered initial
+    // turn verbatim from line 100 of agy.log, with the account email redacted and the
+    // HTTP trace and latency-breakdown lines omitted. Agy logs no `Full redraw
+    // completed` line at all on macOS. The startup reload precedes `CLI startup
+    // completed`; `Starting new conversation` (+2.9 s) is followed 7 ms later by the
+    // conversation reload, which the former rule took for the deferred reload; the
+    // real deferred reload and its hooks line come at +11.2 s. The smoke pasted its
+    // follow-up at 21:32:18.79 (+10.3 s), 0.85 s before that reload, and no
+    // `HandleUserInput` receipt followed.
+    const REAL_MACOS_INITIAL_TURN: &str = r#"E0924 21:32:08.448630     204 errorreport.go:224] failed to get load code assist response: error getting token source: You are not logged into Antigravity.
+W0924 21:32:08.448718     204 cache.go:135] Cache(loadCodeAssistResponse): Singleflight refresh failed: error getting token source: You are not logged into Antigravity.
+E0924 21:32:08.448740     204 errorreport.go:224] error getting token source: You are not logged into Antigravity.
+W0924 21:32:08.448803     204 cache.go:135] Cache(userInfo): Singleflight refresh failed: failed to get load code assist response: error getting token source: You are not logged into Antigravity.
+E0924 21:32:08.448822     204 errorreport.go:224] failed to get load code assist response: error getting token source: You are not logged into Antigravity.
+I0924 21:32:08.452158     261 manager.go:1331] Reloading system slash commands and skills
+I0924 21:32:08.452191     261 manager.go:1308] Reloading system slash commands
+I0924 21:32:08.452164     128 gemini_extensions.go:28] Detecting Gemini extensions in /Users/jyh/.gemini/extensions
+I0924 21:32:08.452226     128 gemini_extensions.go:49] No extensions found
+I0924 21:32:08.452205     261 manager.go:1312] Slash commands unchanged, skipping update
+I0924 21:32:08.458864     258 encoder_embed.go:85] Installing/updating embedded webm_encoder binary to /Users/jyh/.gemini/antigravity-cli/bin/webm_encoder
+I0924 21:32:08.459241       1 analytics.go:187] CLI startup completed (took 285.555917ms)
+W0924 21:32:08.461411     204 cache.go:135] Cache(loadCodeAssistResponse): Singleflight refresh failed: error getting token source: You are not logged into Antigravity.
+E0924 21:32:08.461511     204 errorreport.go:224] error getting token source: You are not logged into Antigravity.
+W0924 21:32:08.461629     204 cache.go:135] Cache(userInfo): Singleflight refresh failed: failed to get load code assist response: error getting token source: You are not logged into Antigravity.
+E0924 21:32:08.461662     204 errorreport.go:224] failed to get load code assist response: error getting token source: You are not logged into Antigravity.
+I0924 21:32:08.478694     264 keyring.go:64] keyringAuth: loaded token, expiry=2026-09-24 22:02:58.773153 +0900 KST expired=false
+I0924 21:32:08.666372     263 auth.go:157] ChainedAuth: authenticated via keyring (effective: keyring)
+I0924 21:32:08.666556     263 server_oauth.go:196] applyAuthResult: email=<email>, authMethod=consumer, quotaProject=
+I0924 21:32:08.666624     263 server_oauth.go:201] OAuth: authenticated successfully as <email>
+I0924 21:32:08.666650     263 server_oauth.go:207] b.codeAssistClient.AuthProvider (0x2ea62b5ca0f0) is same as b.cliAuth (0x2ea62b5ca0f0)
+W0924 21:32:08.667313      62 cache.go:163] Failed to refresh cache in background: admin controls not applicable
+W0924 21:32:08.667432     340 cache.go:163] Failed to refresh cache in background: admin controls not applicable
+I0924 21:32:11.027320     263 model_resolver.go:93] Resolving model gemini-3.8-flash-high
+I0924 21:32:11.027444     263 model_config_manager.go:327] Propagating selected model override to backend: label="Gemini 3.8 Flash (High)"
+I0924 21:32:11.027734     215 experiment_manager.go:66] Starting experiment refresh after login
+I0924 21:32:11.027741     214 quota_manager.go:45] doRefreshQuota: starting reload (force=true)
+I0924 21:32:11.355480     215 remote_agent.go:156] Remote agent fastpush pin gate changed: false -> true
+I0924 21:32:11.355712     215 server.go:3769] [RemoteControl] Session toggle is off, staying disconnected
+I0924 21:32:11.355726     215 server.go:3480] [RemoteControl] Resolved proxyServerURL: ""
+I0924 21:32:11.355735     215 experiment_manager.go:70] Experiments refreshed after login
+I0924 21:32:11.355788     321 manager.go:1308] Reloading system slash commands
+I0924 21:32:11.355776     337 conversation_manager.go:512] Starting new conversation (agent=false)
+I0924 21:32:11.355858     337 server.go:1204] Creating new cascade trajectory (agentScript=false)
+I0924 21:32:11.355870     337 server.go:1207] Conversation using project ID: default-cli-project
+I0924 21:32:11.361291     337 server.go:1239] Created conversation 087c73bd-a900-4e13-9231-183e7a901038
+I0924 21:32:11.361349     337 server.go:3211] GetConversationDetail: found conversation 087c73bd-a900-4e13-9231-183e7a901038 (active=true)
+I0924 21:32:11.362358     337 server.go:3211] GetConversationDetail: found conversation 087c73bd-a900-4e13-9231-183e7a901038 (active=true)
+I0924 21:32:11.362421     337 conversation_manager.go:559] project: switching to conversation belonging to project ID: default-cli-project
+I0924 21:32:11.362516     337 server.go:2211] Backend project ID updated dynamically to: default-cli-project
+I0924 21:32:11.362528     337 cli_setting_manager.go:218] ApplyProjectPermissionGrants: no grants for project "CLI Project", cleared project permissions
+I0924 21:32:11.362540     337 conversation_manager.go:605] project: synced active project to "CLI Project" (id=default-cli-project) from conversation switch
+I0924 21:32:11.362551     337 conversation_manager.go:887] Streaming conversation 087c73bd-a900-4e13-9231-183e7a901038
+I0924 21:32:11.362602     337 server.go:3211] GetConversationDetail: found conversation 087c73bd-a900-4e13-9231-183e7a901038 (active=true)
+I0924 21:32:11.362782     423 manager.go:1331] Reloading system slash commands and skills
+I0924 21:32:11.362834     423 manager.go:1308] Reloading system slash commands
+I0924 21:32:11.363063     337 server.go:1248] Starting conversation update stream for 087c73bd-a900-4e13-9231-183e7a901038
+I0924 21:32:11.363493     424 manager.go:538] Ignoring IDLE update because we are waiting for RUNNING
+I0924 21:32:11.368788     423 manager.go:1312] Slash commands unchanged, skipping update
+I0924 21:32:14.526713     352 model_resolver.go:93] Resolving model gemini-3.8-flash-high
+I0924 21:32:14.526830     352 model_config_manager.go:327] Propagating selected model override to backend: label="Gemini 3.8 Flash (High)"
+I0924 21:32:14.527039      76 model_resolver.go:93] Resolving model gemini-3.8-flash-high
+I0924 21:32:14.527148      76 model_config_manager.go:327] Propagating selected model override to backend: label="Gemini 3.8 Flash (High)"
+I0924 21:32:14.527201     215 experiment_manager.go:66] Starting experiment refresh after login
+I0924 21:32:14.527908     214 quota_manager.go:45] doRefreshQuota: starting reload (force=true)
+I0924 21:32:14.538154     337 conversation_manager.go:699] Forwarding user message to conversation 087c73bd-a900-4e13-9231-183e7a901038 (items=1, media=0)
+I0924 21:32:14.538352     337 server.go:1846] Sending user message to conversation 087c73bd-a900-4e13-9231-183e7a901038 (items=1, media=0)
+I0924 21:32:14.562896     466 monitor_config_manager_external.go:53] externalMonitorConfigManager: initialized with embedded config (2 monitors)
+I0924 21:32:14.563249     466 monitoring.go:318] [Sonar] Resolved active tags: [policy_guardian] (detected surface: "")
+I0924 21:32:14.563357     466 monitoring.go:318] [Sonar] Resolved active tags: [policy_guardian] (detected surface: "")
+W0924 21:32:14.563381     466 declarative_config_loader.go:272] skipping component during resolution: empty component: prompt section "mcp_servers"
+W0924 21:32:14.563439     466 declarative_config_loader.go:272] skipping component during resolution: empty component: prompt section "user_rules"
+W0924 21:32:14.563451     466 declarative_config_loader.go:272] skipping component during resolution: empty component: prompt section "subagent_reminder"
+W0924 21:32:14.563462     466 declarative_config_loader.go:272] skipping component during resolution: empty component: prompt section "terminal_sandbox"
+W0924 21:32:14.563491     466 declarative_config_loader.go:272] skipping component during resolution: empty component: pre-tool hook "command_assessor" is empty
+W0924 21:32:14.563508     466 declarative_config_loader.go:272] skipping component during resolution: empty component: post-tool hook "command_assessor" is empty
+I0924 21:32:14.738775     215 server.go:3769] [RemoteControl] Session toggle is off, staying disconnected
+I0924 21:32:14.738929     215 server.go:3480] [RemoteControl] Resolved proxyServerURL: ""
+I0924 21:32:14.738961     215 experiment_manager.go:70] Experiments refreshed after login
+I0924 21:32:14.739083     654 manager.go:1308] Reloading system slash commands
+I0924 21:32:14.748952     654 manager.go:1312] Slash commands unchanged, skipping update
+I0924 21:32:18.266684     214 quota_manager.go:41] doRefreshQuota: skipped (throttled)
+I0924 21:32:19.637013     623 manager.go:1331] Reloading system slash commands and skills
+I0924 21:32:19.637228     623 manager.go:1308] Reloading system slash commands
+I0924 21:32:19.637963     616 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
+I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skipping update
+"#;
+    const REAL_MACOS_STARTUP_LINE: usize = 11;
+    const REAL_MACOS_CONVERSATION_RELOAD_LINE: usize = 44;
+    const REAL_MACOS_DEFERRED_RELOAD_LINE: usize = 72;
+
     // Deferred skills reload latency (`Reloading system slash commands and skills`
     // stamped at least 1 s after `CLI startup completed`, measured from the startup
     // line) in the fixtures above, all Agy 1.2.10 on this machine, 2026-09-24 KST,
@@ -2099,12 +2343,14 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
     const ROUND_3_TIMING: ReadinessTiming = ReadinessTiming {
         quiet_period: STARTUP_QUIET_PERIOD,
         deferred_reload_window: Duration::ZERO,
+        redraw_required: true,
     };
     // Round 6's rule, for contrast: the same quiet period with the former 20 s
     // deferred-reload window, which session-ql5TVc's 21.4 s reload outlasted.
     const ROUND_6_TIMING: ReadinessTiming = ReadinessTiming {
         quiet_period: STARTUP_QUIET_PERIOD,
         deferred_reload_window: Duration::from_secs(20),
+        redraw_required: true,
     };
     // Round 8's rule, for contrast: the same quiet period with the former 35 s
     // deferred-reload window, which the 36.4 s reloads of session-uqraap and
@@ -2112,6 +2358,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
     const ROUND_8_TIMING: ReadinessTiming = ReadinessTiming {
         quiet_period: STARTUP_QUIET_PERIOD,
         deferred_reload_window: Duration::from_secs(35),
+        redraw_required: true,
     };
     // Round 8's receipt window, which session-M8QFPp's 18.0 s receipt outlasted.
     const ROUND_8_RECEIPT_WINDOW: Duration = Duration::from_secs(15);
@@ -2355,8 +2602,8 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         assert_eq!(observation.startup_reload_after_startup, Some(4));
         assert_eq!(observation.settle_line, Some(10));
         assert_eq!(observation.activity_lines, 8);
-        assert!(observation.markers_observed());
-        assert!(observation.missing_markers().is_empty());
+        assert!(observation.markers_observed(true));
+        assert!(observation.missing_markers(true).is_empty());
 
         // session-fMqSQc: the startup reload precedes startup and has no hooks line;
         // the markers are still complete, the newest activity is the last reload, and
@@ -2369,7 +2616,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         assert_eq!(observation.startup_reload_after_startup, None);
         assert_eq!(observation.settle_line, Some(9));
         assert_eq!(observation.activity_lines, 6);
-        assert!(observation.markers_observed());
+        assert!(observation.markers_observed(true));
 
         // The late reload (13.0 s after startup) is the deferred skills reload; it and
         // its hooks line are also activity.
@@ -2389,7 +2636,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         assert_eq!(observation.deferred_reload_after_startup, None);
         assert_eq!(observation.settle_line, Some(47));
         assert_eq!(observation.activity_lines, 6);
-        assert!(observation.markers_observed());
+        assert!(observation.markers_observed(true));
 
         // session-IEKjtC: the startup reload precedes startup; the deferred skills
         // reload and its hooks line come 9.8 s later.
@@ -2399,7 +2646,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         assert_eq!(observation.deferred_reload_after_startup, Some(46));
         assert_eq!(observation.settle_line, Some(48));
         assert_eq!(observation.activity_lines, 9);
-        assert!(observation.markers_observed());
+        assert!(observation.markers_observed(true));
 
         // session-M8QFPp: the startup reload follows startup by 1.6 ms with its hooks
         // line; it is not the deferred reload, and no deferred reload follows.
@@ -2410,7 +2657,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         assert_eq!(observation.startup_reload_after_startup, Some(1));
         assert_eq!(observation.settle_line, Some(33));
         assert_eq!(observation.activity_lines, 7);
-        assert!(observation.markers_observed());
+        assert!(observation.markers_observed(true));
 
         // session-uqraap: the startup reload precedes startup; the deferred skills
         // reload and its hooks line come 36.4 s later.
@@ -2421,7 +2668,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         assert_eq!(observation.startup_reload_after_startup, None);
         assert_eq!(observation.settle_line, Some(52));
         assert_eq!(observation.activity_lines, 8);
-        assert!(observation.markers_observed());
+        assert!(observation.markers_observed(true));
 
         // The 1 s rule on synthetic stamps: 999 ms after startup is the startup
         // reload, 1.000 s is the deferred one, a reload stamped a few milliseconds
@@ -2493,7 +2740,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         assert_eq!(observation.redraw_after_startup, None);
         assert_eq!(observation.settle_line, Some(0));
         assert_eq!(
-            observation.missing_markers(),
+            observation.missing_markers(true),
             vec![REDRAW_AFTER_STARTUP_DESCRIPTION]
         );
 
@@ -2502,7 +2749,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         assert!(!observation.startup_completed());
         assert_eq!(observation.redraw_after_startup, None);
         assert_eq!(
-            StartupObservation::default().missing_markers(),
+            StartupObservation::default().missing_markers(true),
             vec!["`CLI startup completed`", REDRAW_AFTER_STARTUP_DESCRIPTION]
         );
     }
@@ -2604,7 +2851,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         // not window + quiet period. The former 20 s window would have pasted at
         // 17:20:48.62 and the former 35 s window at 17:21:03.62.
         let replay = LogReplay::new(REAL_QUIET_STARTUP, Instant::now());
-        let ready = replay_readiness(&replay, STARTUP_READINESS_TIMING);
+        let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
         assert_ready_at(&replay, ready, "17:21:13.616574", "session-IQHEwf");
         assert_ready_at(
             &replay,
@@ -2625,7 +2872,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         // and the window counts from when the gate first saw startup.
         assert_eq!(
             replay.states(
-                STARTUP_READINESS_TIMING,
+                WINDOWS_STARTUP_READINESS_TIMING,
                 &[
                     "17:20:28.610124",
                     "17:20:28.616574",
@@ -2654,7 +2901,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
                 ReadinessState::Ready,
             ]
         );
-        let mut gate = ReadinessGate::new(replay.start, STARTUP_READINESS_TIMING);
+        let mut gate = ReadinessGate::new(replay.start, WINDOWS_STARTUP_READINESS_TIMING);
         assert_eq!(
             gate.observe(None, replay.start),
             ReadinessState::AwaitingLog
@@ -2667,6 +2914,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         let timing = ReadinessTiming {
             quiet_period: Duration::from_millis(3500),
             deferred_reload_window: Duration::from_secs(45),
+            redraw_required: true,
         };
         let at = |millis: u64| start + Duration::from_millis(millis);
 
@@ -2946,7 +3194,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
     fn readiness_gate_restarts_its_evidence_when_the_log_is_replaced() {
         let start = Instant::now();
         let at = |millis: u64| start + Duration::from_millis(millis);
-        let timing = STARTUP_READINESS_TIMING;
+        let timing = WINDOWS_STARTUP_READINESS_TIMING;
         let startup_redraw = glog(
             "16:41:07.830345",
             1,
@@ -3153,7 +3401,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
                 some_log(&restamped_again),
             ]),
             deadline,
-            STARTUP_READINESS_TIMING,
+            WINDOWS_STARTUP_READINESS_TIMING,
             poll,
             &mut clock,
         )
@@ -3176,7 +3424,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
                 some_log(half),
             ]),
             start + Duration::from_secs(2),
-            STARTUP_READINESS_TIMING,
+            WINDOWS_STARTUP_READINESS_TIMING,
             poll,
             &mut clock,
         )
@@ -3192,7 +3440,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         assert!(message.contains(&format!(
             "missing markers: {REDRAW_AFTER_STARTUP_DESCRIPTION}, "
         )));
-        assert!(message.contains("the initial prompt was not pasted"));
+        assert!(message.contains("the prompt was not pasted"));
         assert!(!message.contains("tolerated"));
         assert_eq!(clock.slept, Duration::from_secs(2));
 
@@ -3207,7 +3455,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
                 some_log(&restamped_again),
             ]),
             deadline,
-            STARTUP_READINESS_TIMING,
+            WINDOWS_STARTUP_READINESS_TIMING,
             poll,
             &mut clock,
         )
@@ -3229,7 +3477,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
                 some_log(&restamped),
             ]),
             deadline,
-            STARTUP_READINESS_TIMING,
+            WINDOWS_STARTUP_READINESS_TIMING,
             poll,
             &mut clock,
         )
@@ -3245,7 +3493,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         let error = wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&observed), Ok(None), some_log(&observed)]),
             start + Duration::from_secs(2),
-            STARTUP_READINESS_TIMING,
+            WINDOWS_STARTUP_READINESS_TIMING,
             poll,
             &mut clock,
         )
@@ -3282,7 +3530,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         let offset = wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&startup)]),
             deadline,
-            STARTUP_READINESS_TIMING,
+            WINDOWS_STARTUP_READINESS_TIMING,
             poll,
             &mut clock,
         )
@@ -3313,7 +3561,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
             let offset = wait_for_startup_readiness_with(
                 &mut read_log,
                 deadline,
-                STARTUP_READINESS_TIMING,
+                WINDOWS_STARTUP_READINESS_TIMING,
                 poll,
                 &mut clock,
             )
@@ -3414,7 +3662,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         // session-udT6uY logs no deferred reload before its receipt, so the gate
         // is ready when the 45 s window ends, counted from the first read at which
         // startup was visible.
-        let ready = replay_readiness(&replay, STARTUP_READINESS_TIMING);
+        let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
         assert_ready_at(
             &replay,
             ready,
@@ -3423,7 +3671,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         );
         let without_header = LogReplay::new(REAL_SUCCESS_STARTUP, start);
         assert_eq!(
-            replay_readiness(&without_header, STARTUP_READINESS_TIMING),
+            replay_readiness(&without_header, WINDOWS_STARTUP_READINESS_TIMING),
             ready
         );
     }
@@ -3448,12 +3696,12 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
             round_3 < replay.recorded("16:41:20.813553"),
             "the round-3 rule pasted before the deferred reload"
         );
-        let ready = replay_readiness(&replay, STARTUP_READINESS_TIMING);
+        let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
         assert_ready_at(&replay, ready, "16:41:24.314059", "session-fMqSQc");
         assert!(ready > replay.recorded("16:41:20.816140"));
         assert_eq!(
             replay.states(
-                STARTUP_READINESS_TIMING,
+                WINDOWS_STARTUP_READINESS_TIMING,
                 &[
                     "16:41:07.876154",
                     "16:41:17.237805",
@@ -3475,7 +3723,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         // deferred-reload condition; a hooks line after it is never demanded.
         let start = Instant::now();
         let at = |millis: u64| start + Duration::from_millis(millis);
-        let mut gate = ReadinessGate::new(start, STARTUP_READINESS_TIMING);
+        let mut gate = ReadinessGate::new(start, WINDOWS_STARTUP_READINESS_TIMING);
         let late = late_reload_startup_log();
         assert_eq!(
             gate.observe(Some(late.as_bytes()), at(0)),
@@ -3519,7 +3767,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
             round_3 < deferred_reload,
             "the round-3 rule pasted before the deferred reload"
         );
-        let ready = replay_readiness(&replay, STARTUP_READINESS_TIMING);
+        let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
         assert_ready_at(&replay, ready, "17:47:16.968806", "session-IEKjtC");
         assert!(
             ready > replay.recorded("17:47:13.470456"),
@@ -3527,7 +3775,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         );
         assert_eq!(
             replay.states(
-                STARTUP_READINESS_TIMING,
+                WINDOWS_STARTUP_READINESS_TIMING,
                 &[
                     "17:47:03.620082",
                     "17:47:03.666570",
@@ -3581,7 +3829,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
             round_6 < deferred_reload,
             "the 20 s window pasted before the deferred reload"
         );
-        let ready = replay_readiness(&replay, STARTUP_READINESS_TIMING);
+        let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
         assert_ready_at(&replay, ready, "18:48:28.982515", "session-ql5TVc");
         assert!(
             ready > replay.recorded("18:48:25.485154"),
@@ -3589,7 +3837,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         );
         assert_eq!(
             replay.states(
-                STARTUP_READINESS_TIMING,
+                WINDOWS_STARTUP_READINESS_TIMING,
                 &[
                     "18:48:04.115440",
                     "18:48:04.161713",
@@ -3649,7 +3897,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         // 16:43:09.08. The paste was delivered either way: the receipt came at
         // 16:42:50.21 from the fixed 12 s delay, and no deferred reload preceded it.
         let replay = LogReplay::new(REAL_SUCCESS_STARTUP, Instant::now());
-        let ready = replay_readiness(&replay, STARTUP_READINESS_TIMING);
+        let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
         assert_ready_at(&replay, ready, "16:43:09.080467", "session-udT6uY");
         assert_ready_at(
             &replay,
@@ -3659,7 +3907,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         );
         assert_eq!(
             replay.states(
-                STARTUP_READINESS_TIMING,
+                WINDOWS_STARTUP_READINESS_TIMING,
                 &[
                     "16:42:24.080467",
                     "16:42:24.127839",
@@ -3688,7 +3936,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         // (the round-3 rule's instant, since the startup reload settled its window);
         // the gate now waits until the window ends at 20:38:25.65.
         let replay = LogReplay::new(REAL_STARTUP_RELOAD_AFTER_STARTUP, Instant::now());
-        let ready = replay_readiness(&replay, STARTUP_READINESS_TIMING);
+        let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
         assert_ready_at(&replay, ready, "20:38:25.653251", "session-M8QFPp");
         assert_ready_at(
             &replay,
@@ -3698,7 +3946,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         );
         assert_eq!(
             replay.states(
-                STARTUP_READINESS_TIMING,
+                WINDOWS_STARTUP_READINESS_TIMING,
                 &[
                     "20:37:40.653251",
                     "20:37:40.700886",
@@ -3746,7 +3994,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
             round_8 < deferred_reload,
             "the 35 s window pasted before the deferred reload"
         );
-        let ready = replay_readiness(&replay, STARTUP_READINESS_TIMING);
+        let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
         assert_ready_at(&replay, ready, "20:44:41.356320", "session-uqraap");
         assert!(
             ready > replay.recorded("20:44:37.857983"),
@@ -3754,7 +4002,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         );
         assert_eq!(
             replay.states(
-                STARTUP_READINESS_TIMING,
+                WINDOWS_STARTUP_READINESS_TIMING,
                 &[
                     "20:44:01.443214",
                     "20:44:01.490907",
@@ -3855,14 +4103,14 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         let deadline = start + Duration::from_secs(1);
         let no_quiet_period = ReadinessTiming {
             quiet_period: Duration::ZERO,
-            ..STARTUP_READINESS_TIMING
+            ..WINDOWS_STARTUP_READINESS_TIMING
         };
 
         let mut clock = FakeClock::new(start);
         let error = wait_for_startup_readiness_with(
             &mut log_sequence(vec![Ok(None)]),
             deadline,
-            STARTUP_READINESS_TIMING,
+            WINDOWS_STARTUP_READINESS_TIMING,
             poll,
             &mut clock,
         )
@@ -3877,7 +4125,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
             message
                 .contains("the quiet period is 3500 ms and the deferred reload window is 45000 ms, timed concurrently")
         );
-        assert!(message.contains("the initial prompt was not pasted"));
+        assert!(message.contains("the prompt was not pasted"));
         assert!(!message.contains("hooks completion"));
         assert_eq!(clock.slept, Duration::from_secs(1));
 
@@ -3926,7 +4174,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         let error = wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&startup_redraw)]),
             deadline,
-            STARTUP_READINESS_TIMING,
+            WINDOWS_STARTUP_READINESS_TIMING,
             poll,
             &mut clock,
         )
@@ -3942,7 +4190,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         let error = wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&startup_redraw)]),
             start + Duration::from_secs(5),
-            STARTUP_READINESS_TIMING,
+            WINDOWS_STARTUP_READINESS_TIMING,
             poll,
             &mut clock,
         )
@@ -3958,7 +4206,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         let error = wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&settled_startup_log())]),
             deadline,
-            STARTUP_READINESS_TIMING,
+            WINDOWS_STARTUP_READINESS_TIMING,
             poll,
             &mut clock,
         )
@@ -3975,7 +4223,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&startup_only), some_log(&startup_redraw)]),
             start + Duration::from_secs(60),
-            STARTUP_READINESS_TIMING,
+            WINDOWS_STARTUP_READINESS_TIMING,
             poll,
             &mut clock,
         )
@@ -4015,7 +4263,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         let offset = wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&startup_redraw)]),
             start + Duration::from_secs(46),
-            STARTUP_READINESS_TIMING,
+            WINDOWS_STARTUP_READINESS_TIMING,
             poll,
             &mut clock,
         )
@@ -4030,7 +4278,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         let error = wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&startup_redraw)]),
             start + Duration::from_secs(44),
-            STARTUP_READINESS_TIMING,
+            WINDOWS_STARTUP_READINESS_TIMING,
             poll,
             &mut clock,
         )
@@ -4047,7 +4295,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
             !message.contains(QUIET_PERIOD_DESCRIPTION),
             "the quiet period ended at 3.5 s and is not missing"
         );
-        assert!(message.contains("the initial prompt was not pasted"));
+        assert!(message.contains("the prompt was not pasted"));
         let failure = terminal::TerminalSendFailure::not_sent(error);
         assert!(
             !failure.delivery_may_have_occurred(),
@@ -4488,7 +4736,8 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
             "CLI startup completed (took 1ms)",
         );
         fs::write(&log_path, &startup_only).unwrap();
-        let check = input_receipt_check(Some(&directory));
+        // The Windows console rule requires the redraw after startup.
+        let check = input_receipt_check_for_platform(Some(&directory), true);
         assert_eq!(check.reason_code, "agy_startup_markers_missing");
         let check = serde_json::to_value(&check).unwrap();
         assert!(
@@ -4499,11 +4748,32 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         );
         let evidence = check["evidence"].clone();
         assert_eq!(evidence["startup_completed"], true);
+        assert_eq!(evidence["redraw_required"], true);
         assert_eq!(evidence["redraw_after_startup_observed"], false);
         assert_eq!(evidence["deferred_reload_after_startup_observed"], false);
         assert_eq!(evidence["startup_reload_after_startup_ignored"], false);
+        assert_eq!(evidence["conversation_reload_after_startup_ignored"], false);
         assert_eq!(evidence["activity_lines"], 0);
         assert!(evidence.get("latest_reload_completed").is_none());
+        // The macOS rule does not: startup alone completes the markers there.
+        let check = input_receipt_check_for_platform(Some(&directory), false);
+        assert_eq!(check.reason_code, "agy_no_input_receipt");
+        let evidence = serde_json::to_value(&check).unwrap()["evidence"].clone();
+        assert_eq!(evidence["redraw_required"], false);
+        assert_eq!(evidence["redraw_after_startup_observed"], false);
+        // The real macOS log: the conversation reload is reported as ignored, the
+        // deferred one as observed, and the smoke's lost paste left no receipt.
+        fs::write(&log_path, REAL_MACOS_INITIAL_TURN).unwrap();
+        let check = input_receipt_check_for_platform(Some(&directory), false);
+        assert_eq!(check.reason_code, "agy_no_input_receipt");
+        let evidence = serde_json::to_value(&check).unwrap()["evidence"].clone();
+        assert_eq!(evidence["conversation_reload_after_startup_ignored"], true);
+        assert_eq!(evidence["deferred_reload_after_startup_observed"], true);
+        assert_eq!(
+            input_receipt_check_for_platform(Some(&directory), true).reason_code,
+            "agy_startup_markers_missing",
+            "the same log never satisfies the Windows rule"
+        );
 
         for log in [
             REAL_QUIET_STARTUP.to_owned(),
@@ -4516,14 +4786,15 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         ] {
             fs::write(&log_path, log).unwrap();
             assert_eq!(
-                input_receipt_check(Some(&directory)).reason_code,
+                input_receipt_check_for_platform(Some(&directory), true).reason_code,
                 "agy_no_input_receipt"
             );
         }
         // session-udT6uY: the skills reload 0.5 ms after startup is reported as the
         // ignored startup reload, not as the deferred one.
         let evidence =
-            serde_json::to_value(input_receipt_check(Some(&directory))).unwrap()["evidence"]
+            serde_json::to_value(input_receipt_check_for_platform(Some(&directory), true)).unwrap()
+                ["evidence"]
                 .clone();
         assert_eq!(evidence["deferred_reload_after_startup_observed"], false);
         assert_eq!(evidence["startup_reload_after_startup_ignored"], true);
@@ -4533,7 +4804,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         let mut log = OpenOptions::new().append(true).open(&log_path).unwrap();
         write!(log, "{}", framed_receipt_line("hello", &pending)).unwrap();
         drop(log);
-        let check = input_receipt_check(Some(&directory));
+        let check = input_receipt_check_for_platform(Some(&directory), true);
         assert_eq!(check.reason_code, "agy_input_receipt_observed");
         let evidence = serde_json::to_value(&check).unwrap()["evidence"].clone();
         assert_eq!(evidence["startup_completed"], true);
@@ -4569,7 +4840,7 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
         let pre_paste_len = wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&startup)]),
             start + Duration::from_secs(300),
-            STARTUP_READINESS_TIMING,
+            WINDOWS_STARTUP_READINESS_TIMING,
             Duration::from_millis(100),
             &mut clock,
         )
@@ -4618,6 +4889,297 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
             "the turn claim stays until the caller closes or the target completes"
         );
         assert!(read_pending_turn(&directory).unwrap().is_some());
+    }
+
+    // The macOS follow-up rule on the real macOS log: the conversation reload never
+    // settles the deferred-reload condition, the redraw is not required, and the gate
+    // is ready one quiet period after the deferred reload's hooks line, past the
+    // instant at which the smoke lost its paste. The Windows rule never passes this
+    // log because no redraw line ever arrives.
+    #[test]
+    fn macos_follow_up_gate_ignores_the_conversation_reload_and_waits_past_the_deferred_reload() {
+        let observation = observe_startup(REAL_MACOS_INITIAL_TURN.as_bytes());
+        assert_eq!(observation.startup_line, Some(REAL_MACOS_STARTUP_LINE));
+        assert_eq!(
+            observation.redraw_after_startup, None,
+            "Agy logs no Full redraw completed on macOS"
+        );
+        assert_eq!(
+            observation.conversation_reload_after_startup,
+            Some(REAL_MACOS_CONVERSATION_RELOAD_LINE)
+        );
+        assert_eq!(
+            observation.deferred_reload_after_startup,
+            Some(REAL_MACOS_DEFERRED_RELOAD_LINE)
+        );
+        assert_eq!(observation.startup_reload_after_startup, None);
+        assert!(observation.markers_observed(false));
+        assert!(observation.missing_markers(false).is_empty());
+        assert!(!observation.markers_observed(true));
+        assert_eq!(
+            observation.missing_markers(true),
+            vec![REDRAW_AFTER_STARTUP_DESCRIPTION]
+        );
+
+        let replay = LogReplay::new(REAL_MACOS_INITIAL_TURN, Instant::now());
+        // At the instant of the lost paste the deferred reload is still pending: the
+        // conversation reload at +2.9 s did not settle it.
+        assert_eq!(
+            replay.states(MACOS_FOLLOW_UP_READINESS_TIMING, &["21:32:18.790000"]),
+            vec![ReadinessState::AwaitingDeferredReload]
+        );
+        let ready = replay_readiness(&replay, MACOS_FOLLOW_UP_READINESS_TIMING);
+        assert_ready_at(
+            &replay,
+            ready,
+            "21:32:23.137963",
+            "session-QMFk6F, macOS rule",
+        );
+        assert!(ready > replay.recorded("21:32:19.637013"));
+
+        let mut clock = FakeClock::new(replay.start);
+        let error = wait_for_startup_readiness_with(
+            &mut replay.reader(clock.shared()),
+            replay.start + Duration::from_secs(120),
+            WINDOWS_STARTUP_READINESS_TIMING,
+            REPLAY_POLL,
+            &mut clock,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(REDRAW_AFTER_STARTUP_DESCRIPTION),
+            "{message}"
+        );
+        assert!(message.contains("the prompt was not pasted"), "{message}");
+    }
+
+    // A skills reload right after a conversation start is the conversation reload on
+    // Windows too, and a reload that follows a conversation start by more than the
+    // latency bound is still the deferred one.
+    #[test]
+    fn conversation_reload_rule_is_bounded_by_its_latency() {
+        let startup = glog(
+            "21:32:08.459241",
+            1,
+            "analytics.go:187",
+            "CLI startup completed (took 285.555917ms)",
+        );
+        let started = glog(
+            "21:32:11.355776",
+            337,
+            "conversation_manager.go:512",
+            "Starting new conversation (agent=false)",
+        );
+        let prompt_reload = glog("21:32:11.362782", 423, "manager.go:1331", SKILLS_RELOAD);
+        let log = startup.clone() + &started + &prompt_reload;
+        let observation = observe_startup(log.as_bytes());
+        assert_eq!(observation.conversation_reload_after_startup, Some(2));
+        assert_eq!(observation.deferred_reload_after_startup, None);
+
+        let late_reload = glog("21:32:12.400000", 623, "manager.go:1331", SKILLS_RELOAD);
+        let log = startup.clone() + &started + &late_reload;
+        let observation = observe_startup(log.as_bytes());
+        assert_eq!(observation.conversation_reload_after_startup, None);
+        assert_eq!(
+            observation.deferred_reload_after_startup,
+            Some(2),
+            "1.04 s after the conversation start is past the bound"
+        );
+
+        // A reload stamped before the conversation start (threads out of order) is
+        // judged against startup only.
+        let early_reload = glog("21:32:11.300000", 623, "manager.go:1331", SKILLS_RELOAD);
+        let log = startup + &started + &early_reload;
+        let observation = observe_startup(log.as_bytes());
+        assert_eq!(observation.conversation_reload_after_startup, None);
+        assert_eq!(observation.deferred_reload_after_startup, Some(2));
+    }
+
+    // The macOS paste is the verbatim `correlated_prompt`; iTerm2 pastes it as one
+    // multi-line record and Agy logs it Go-quoted with `\n` escapes and the complete
+    // marker (session-QMFk6F, 21:42:19). A composer line that merely quotes the marker
+    // carries neither framing and never confirms delivery.
+    #[test]
+    fn macos_receipt_matches_the_verbatim_framed_follow_up() {
+        let pending = PendingAgyTurn::new("20087-1790253138785843000-0").unwrap();
+        let framed = terminal_correlated_prompt(
+            "Reply with exactly this marker and nothing else: AGENT_BRIDGE_NATIVE_AGY_RESULT_OK_DETACHED",
+            &pending,
+            false,
+        )
+        .unwrap();
+        assert!(framed.contains(TURN_PROTOCOL_HEADER));
+        assert!(!framed.contains(WINDOWS_PROTOCOL_PREFIX));
+        let quoted = go_quoted(&framed);
+        assert!(quoted.contains("\\n[Agent Bridge Agy turn protocol]\\n"));
+        let pre_paste_len = REAL_MACOS_INITIAL_TURN.len();
+        let delivered = REAL_MACOS_INITIAL_TURN.to_owned() + &receipt_line(&quoted);
+        assert_eq!(
+            observe_input_receipt(Some(delivered.as_bytes()), pre_paste_len, &pending),
+            ReceiptEvidence::Delivered
+        );
+        let typed = REAL_MACOS_INITIAL_TURN.to_owned()
+            + &receipt_line(&go_quoted(&format!("please echo {}", pending.marker)));
+        assert!(matches!(
+            observe_input_receipt(Some(typed.as_bytes()), pre_paste_len, &pending),
+            ReceiptEvidence::NoReceipt { .. }
+        ));
+        // The Windows framing still matches, so a Windows session's receipt is judged
+        // by the same rule.
+        let windows = REAL_MACOS_INITIAL_TURN.to_owned() + &framed_receipt_line("x", &pending);
+        assert_eq!(
+            observe_input_receipt(Some(windows.as_bytes()), pre_paste_len, &pending),
+            ReceiptEvidence::Delivered
+        );
+    }
+
+    // The launcher path for the smoke's lost macOS follow-up: with the log as it stood
+    // before the deferred reload the gate waits the full window (the conversation reload
+    // does not settle it), the paste lands in the reload that arrives after the gate,
+    // no receipt follows, and the follow-up is recorded delivery-uncertain with the
+    // claim retained.
+    #[test]
+    fn lost_macos_follow_up_paste_ends_delivery_uncertain_with_the_reason_in_status_json() {
+        use super::super::super::{TURN_CLAIM_FILE, record_follow_up_terminal_delivery_failure};
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-QMFk6F");
+        fs::create_dir_all(directory.join("events")).unwrap();
+        update_status(&directory, "ready", None, None).unwrap();
+        // A follow-up claims the ready session before it prepares the paste.
+        update_status(&directory, "claimed", None, None).unwrap();
+        let mut claim = acquire_turn_claim(&directory).unwrap();
+        let pending = install_pending_turn(&directory, &claim.token).unwrap();
+
+        let before_reload = &REAL_MACOS_INITIAL_TURN[..REAL_MACOS_INITIAL_TURN
+            .rfind("I0924 21:32:19.637013")
+            .unwrap()];
+        let start = Instant::now();
+        let mut clock = FakeClock::new(start);
+        let pre_paste_len = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(before_reload)]),
+            start + Duration::from_secs(300),
+            MACOS_FOLLOW_UP_READINESS_TIMING,
+            Duration::from_millis(100),
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(
+            clock.slept, MACOS_DEFERRED_RELOAD_WINDOW,
+            "a static macOS log without the deferred reload waits the 60 s window"
+        );
+        assert_eq!(pre_paste_len, before_reload.len());
+        update_status(&directory, "working", None, None).unwrap();
+        let pasted_at = clock.now();
+        let failure = confirm_input_receipt_with(
+            &mut log_sequence(vec![
+                some_log(before_reload),
+                some_log(REAL_MACOS_INITIAL_TURN),
+            ]),
+            &pending,
+            pre_paste_len,
+            pasted_at,
+            start + Duration::from_secs(300),
+            Duration::from_millis(100),
+            &mut clock,
+        )
+        .unwrap_err();
+        assert!(failure.delivery_may_have_occurred());
+
+        record_follow_up_terminal_delivery_failure(&directory, &mut claim, &failure);
+        drop(claim);
+
+        let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+        assert_eq!(status.state, "working");
+        let error = status
+            .error
+            .expect("the reason is recorded in status.error");
+        assert!(error.contains(&format!(
+            "Agy input receipt for turn marker {} was not confirmed",
+            pending.marker
+        )));
+        assert!(error.contains("no HandleUserInput receipt in the"));
+        assert!(
+            directory.join(TURN_CLAIM_FILE).exists(),
+            "the turn claim stays until the caller closes or the target completes"
+        );
+        assert!(read_pending_turn(&directory).unwrap().is_some());
+    }
+
+    // A follow-up minutes after startup on a session that never logged the deferred
+    // reload: Agy's own stamps prove a window's worth of runtime, so the gate settles
+    // the window from the log and pastes after one quiet period instead of waiting the
+    // whole window on its own clock (session-bbNK3d, macOS, 2026-09-24 22:03: two
+    // follow-ups each waited 60 s). A log whose newest stamp is inside the window still
+    // waits on the gate's clock.
+    #[test]
+    fn follow_up_gate_settles_the_window_from_the_logged_runtime() {
+        let before_reload = &REAL_MACOS_INITIAL_TURN[..REAL_MACOS_INITIAL_TURN
+            .rfind("I0924 21:32:19.637013")
+            .unwrap()];
+        let quota_line = glog(
+            "21:33:20.001000",
+            214,
+            "quota_manager.go:41",
+            "doRefreshQuota: skipped (throttled)",
+        );
+        let aged = before_reload.to_owned() + &quota_line;
+        let observation = observe_startup(aged.as_bytes());
+        assert_eq!(observation.deferred_reload_after_startup, None);
+        assert_eq!(
+            observation.newest_stamp,
+            glog_timestamp(&quota_line),
+            "the newest stamp is the quota line, 71.5 s after startup"
+        );
+
+        let start = Instant::now();
+        let mut clock = FakeClock::new(start);
+        let pre_paste_len = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(&aged)]),
+            start + Duration::from_secs(300),
+            MACOS_FOLLOW_UP_READINESS_TIMING,
+            Duration::from_millis(100),
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(pre_paste_len, aged.len());
+        assert_eq!(
+            clock.slept, STARTUP_QUIET_PERIOD,
+            "only the quiet period from the newest activity line, seen at the first read"
+        );
+
+        // The same log without the aged line is still inside the window on Agy's clock
+        // (newest stamp 14.7 s after startup), so the gate waits on its own clock.
+        let mut clock = FakeClock::new(start);
+        wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(before_reload)]),
+            start + Duration::from_secs(300),
+            MACOS_FOLLOW_UP_READINESS_TIMING,
+            Duration::from_millis(100),
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(clock.slept, MACOS_DEFERRED_RELOAD_WINDOW);
+
+        // The Windows rule shares the measurement: an aged Windows startup log with a
+        // redraw and no deferred reload settles from its stamps too.
+        let aged_windows = REAL_QUIET_STARTUP.to_owned()
+            + &glog(
+                "17:21:20.000000",
+                248,
+                "quota_manager.go:41",
+                "doRefreshQuota: skipped (throttled)",
+            );
+        let mut clock = FakeClock::new(start);
+        wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(&aged_windows)]),
+            start + Duration::from_secs(300),
+            WINDOWS_STARTUP_READINESS_TIMING,
+            Duration::from_millis(100),
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(clock.slept, STARTUP_QUIET_PERIOD);
     }
 
     #[test]

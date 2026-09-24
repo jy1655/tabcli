@@ -214,6 +214,13 @@ enum MessageGuardDecision {
 }
 
 impl NativeProviderAdapter for ClaudeAdapter {
+    fn probe_environment_removals(&self) -> &'static [&'static str] {
+        // A `claude --version` or doctor probe is not an interactive session, but it is
+        // still a `claude` started by the bridge: it drops the same markers so that no
+        // bridge-run Claude process is classified by an inherited session identity.
+        CLAUDE_CODE_SESSION_MARKERS
+    }
+
     fn diagnose(
         &self,
         context: super::super::doctor::Context<'_>,
@@ -2256,6 +2263,18 @@ mod tests {
                 .iter()
                 .any(|argument| argument == "Human title")
         );
+    }
+
+    #[test]
+    fn probe_and_version_queries_drop_the_same_markers_as_managed_launches() {
+        use super::super::{FirstPartyCli, probe_environment_removals};
+        assert_eq!(
+            probe_environment_removals(FirstPartyCli::Claude),
+            CLAUDE_CODE_SESSION_MARKERS
+        );
+        for other in [FirstPartyCli::Codex, FirstPartyCli::Agy, FirstPartyCli::Pi] {
+            assert!(probe_environment_removals(other).is_empty(), "{other:?}");
+        }
     }
 
     #[test]

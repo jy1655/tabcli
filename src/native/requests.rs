@@ -103,9 +103,37 @@ pub(super) fn create(
     Ok(receipt)
 }
 
+/// Whether the session's `requests` directory exists as a real directory. A link or a
+/// non-directory at that path is refused: `read_dir` and the receipt reads would follow
+/// a link out of the state root, and a receipt read from there would supply request
+/// identity for the session's events.
+fn requests_directory_present(directory: &Path) -> Result<bool> {
+    let root = directory.join(REQUESTS_DIRECTORY);
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!(
+                "failed to read Bridge requests: refusing linked requests directory: {}",
+                root.display()
+            )
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            bail!(
+                "failed to read Bridge requests: refusing non-directory requests path: {}",
+                root.display()
+            )
+        }
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", root.display())),
+    }
+}
+
 pub(super) fn for_claim(directory: &Path, claim_token: &str) -> Result<Option<Receipt>> {
     if !valid_turn_claim_token(claim_token) {
         bail!("invalid request claim token")
+    }
+    if !requests_directory_present(directory)? {
+        return Ok(None);
     }
     let path = directory
         .join(REQUESTS_DIRECTORY)
@@ -128,6 +156,9 @@ pub(super) struct Index {
 }
 
 pub(super) fn list(directory: &Path) -> Result<Index> {
+    if !requests_directory_present(directory)? {
+        return Ok(Index::default());
+    }
     let root = directory.join(REQUESTS_DIRECTORY);
     let entries = match fs::read_dir(&root) {
         Ok(entries) => entries,
@@ -160,6 +191,47 @@ pub(super) fn list(directory: &Path) -> Result<Index> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A `requests` path that is a link (or a file) is refused by both the index and the
+    // per-claim read, so no receipt outside the state root can name a request.
+    #[cfg(unix)]
+    #[test]
+    fn linked_requests_directory_is_refused_by_the_index_and_the_claim_read() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-linked");
+        fs::create_dir_all(directory.join("events")).unwrap();
+        fs::write(
+            outside.path().join("1-2-3.json"),
+            r#"{"schema":1,"request_id":"request-external","claim_token":"1-2-3","event_file":"event-1.json","created_unix_ms":5,"source":"external","context_sources":[]}"#,
+        )
+        .unwrap();
+        symlink(outside.path(), directory.join(REQUESTS_DIRECTORY)).unwrap();
+
+        let error = list(&directory).err().expect("refused").to_string();
+        assert!(
+            error.contains("refusing linked requests directory"),
+            "{error}"
+        );
+        let error = for_claim(&directory, "1-2-3").unwrap_err().to_string();
+        assert!(
+            error.contains("refusing linked requests directory"),
+            "{error}"
+        );
+
+        // A regular file at the path is refused too; a missing path is an empty index.
+        fs::remove_file(directory.join(REQUESTS_DIRECTORY)).unwrap();
+        fs::write(directory.join(REQUESTS_DIRECTORY), b"").unwrap();
+        let error = list(&directory).err().expect("refused").to_string();
+        assert!(
+            error.contains("refusing non-directory requests path"),
+            "{error}"
+        );
+        fs::remove_file(directory.join(REQUESTS_DIRECTORY)).unwrap();
+        assert!(list(&directory).unwrap().receipts.is_empty());
+        assert!(for_claim(&directory, "1-2-3").unwrap().is_none());
+    }
 
     #[test]
     fn receipt_is_durable_before_dispatch_and_does_not_replace_provider_identity() {

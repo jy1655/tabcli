@@ -838,3 +838,96 @@ fn publication_checks_read_journaled_events_within_the_byte_budget() {
     assert_eq!(found["incomplete"], false, "{found}");
     assert_eq!(found["scanned"]["events"], 1, "{found}");
 }
+
+// A link at `manifest.json` or at `requests/` would let content outside the state root
+// decide a session's scope or supply request identity for its events. Both are refused
+// before anything is read through them, and the session is reported, not silently
+// dropped: the linked manifest makes the session unreadable, and the linked requests
+// directory makes its index incomplete, so its events are never presented as hits.
+#[cfg(unix)]
+#[test]
+fn linked_manifest_and_requests_directory_are_refused_not_followed() {
+    use std::os::unix::fs::symlink;
+    let fixture = Fixture::new();
+    let outside = tempfile::tempdir().unwrap();
+    let a = fixture.session("session-a", "codex", &fixture.workspace_a);
+    event(&a, "event-1.json", "needle in a", 5);
+
+    // session-b: manifest.json is a link to a manifest kept outside the state root.
+    let b = fixture.session("session-b", "codex", &fixture.workspace_a);
+    event(&b, "event-1.json", "needle in b", 6);
+    let external_manifest = outside.path().join("manifest.json");
+    fs::rename(b.join("manifest.json"), &external_manifest).unwrap();
+    symlink(&external_manifest, b.join("manifest.json")).unwrap();
+
+    // session-c: requests/ is a link to a directory outside the state root that holds
+    // a well-formed receipt for the session's event.
+    let c = fixture.session("session-c", "codex", &fixture.workspace_a);
+    event(&c, "event-1.json", "needle in c", 7);
+    let external_requests = outside.path().join("requests");
+    fs::create_dir(&external_requests).unwrap();
+    write(
+        &external_requests.join("1-2-3.json"),
+        &json!({
+            "schema": 1, "request_id": "request-external", "claim_token": "1-2-3",
+            "event_file": "event-1.json", "created_unix_ms": 7, "source": "external",
+            "context_sources": []
+        }),
+    );
+    symlink(&external_requests, c.join("requests")).unwrap();
+
+    let before_b = files(&b);
+    let before_c = files(&c.join("events"));
+    let found = fixture.search(&["needle"]);
+    assert_eq!(sessions(&found), ["session-a"], "{found}");
+    assert!(
+        !found.to_string().contains("request-external"),
+        "the external receipt must never supply request identity: {found}"
+    );
+    assert_eq!(found["incomplete"], true, "{found}");
+    let b_reasons = reasons_for(&found, Some("session-b")).join("; ");
+    assert!(
+        b_reasons.contains("refusing non-regular session file")
+            && b_reasons.contains("manifest.json"),
+        "{b_reasons}"
+    );
+    let c_reasons = reasons_for(&found, Some("session-c")).join("; ");
+    assert!(
+        c_reasons.contains("request index incomplete")
+            && c_reasons.contains("1 event(s) without a readable receipt skipped"),
+        "{c_reasons}"
+    );
+    assert_eq!(files(&b), before_b);
+    assert_eq!(files(&c.join("events")), before_c);
+    assert!(
+        fs::symlink_metadata(c.join("requests"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    // `result` refuses the same links instead of serving the external receipt.
+    let output = fixture.run(&[
+        "result",
+        "session-c",
+        "--request",
+        "request-external",
+        "--json",
+    ]);
+    assert!(
+        !output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let output = fixture.run(&["result", "session-b", "--list", "--json"]);
+    assert!(
+        !output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("refusing non-regular session file"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

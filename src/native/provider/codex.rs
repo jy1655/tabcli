@@ -80,6 +80,11 @@ impl PendingCodexTurn {
 const CODEX_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Codex reopen is not implemented in this slice; it requires the thread writer-lock and queued_items gates and a live check of resume-while-held behavior";
 
 impl NativeProviderAdapter for CodexAdapter {
+    fn probe_environment_removals(&self) -> &'static [&'static str] {
+        // Codex derives no session identity from the caller's environment.
+        &[]
+    }
+
     fn diagnose(
         &self,
         context: super::super::doctor::Context<'_>,
@@ -452,6 +457,7 @@ fn diagnose_codex(context: super::super::doctor::Context<'_>) -> Vec<super::supe
             executable,
             &["app-server", "daemon", "version"],
             Some(context.workspace),
+            ADAPTER.probe_environment_removals(),
             context.deadline,
         ) {
             Ok(output) => diagnose_daemon_output(&output, version.unwrap_or("unknown")),

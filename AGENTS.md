@@ -68,6 +68,26 @@ launch, observe, continue, and close without replacing the capabilities those CL
   fails (issue #42, observed 2026-09-24 with Claude Code 2.1.281). The removal list is
   adapter-owned launch configuration; the shared launcher only applies it.
 
+## Current Agy Boundary
+
+- Agy has no first-party input path into a running interactive session and no per-turn
+  accepted signal, so every paste into its TUI is a fallback that must be proven by Agy's
+  own `--log-file`: a readiness gate before the paste and a `HandleUserInput` receipt
+  after it. This holds for the native Windows initial prompt and for every follow-up on
+  native Windows and macOS; the macOS initial prompt is a launch argument and never waits.
+- Agy 1.2.10 discards a paste that lands in its deferred skills reload (10-37 s after
+  `CLI startup completed` on Windows, 11-55 s on macOS, sometimes never). The gate's
+  window is per platform (45 s Windows console, 60 s macOS); a reload outside it is
+  caught by the receipt, not the gate. On macOS the argument-delivered initial
+  prompt starts a conversation a few seconds after startup, and the reload logged right
+  after `Starting new conversation` is that conversation's reload, not the deferred one;
+  the gate must not settle on it (observed 2026-09-24 21:32, macOS smoke: `tell` pasted at
+  +10.3 s, lost to the reload at +11.2 s, reported as delivered). Agy logs `Full redraw
+  completed` on the Windows console only, so the macOS rule does not require it.
+- A missing receipt is delivery-uncertain, never a second paste; the claim is kept and the
+  reason lands in `status.error`. Delete the gate and the receipt when Agy exposes an
+  input API or an accepted-turn signal; the transcript result monitor is unaffected.
+
 ## Change and Verification Rules
 
 - For provider behavior changes, add or update tests in that provider's adapter and prove
