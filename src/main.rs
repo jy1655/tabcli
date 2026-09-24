@@ -27,6 +27,8 @@ Usage:
   agent-bridge inspect <session> [--json]
   agent-bridge result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
       [--wait --timeout-secs N]
+  agent-bridge search <query> [--workspace PATH | --all-workspaces] [--provider <codex|claude|agy|pi>]
+      [--limit N] [--json]
   agent-bridge doctor <session> [--probe] [--json]
   agent-bridge doctor --provider <codex|claude|agy|pi> [--probe] [--json]
   agent-bridge prune-sessions --closed-before-days N --explicit [--json]
@@ -212,6 +214,7 @@ mod tests {
             "sessions [--workspace PATH]",
             "inspect <session>",
             "result <session>",
+            "search <query> [--workspace PATH | --all-workspaces]",
             "doctor <session> [--probe] [--json]",
             "prune-sessions --closed-before-days N --explicit",
             "close-session <session> --explicit",

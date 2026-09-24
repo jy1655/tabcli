@@ -863,6 +863,49 @@ fn prune_sessions_requires_an_explicit_positive_retention_window() {
     assert!(parse_args(["prune-sessions", "--closed-before-days", "30", "--explicit",]).is_ok());
 }
 
+#[test]
+fn search_rejects_empty_queries_conflicting_scopes_and_out_of_range_limits() {
+    for args in [
+        vec!["search"],
+        vec!["search", ""],
+        vec!["search", " 	 "],
+        vec!["search", "needle", "--workspace", ".", "--all-workspaces"],
+        vec!["search", "needle", "--all-workspaces", "--all-workspaces"],
+        vec!["search", "needle", "--limit", "0"],
+        vec!["search", "needle", "--limit", "201"],
+        vec!["search", "needle", "--limit", "many"],
+        vec!["search", "needle", "--limit"],
+        vec!["search", "needle", "--provider", "gpt"],
+        vec!["search", "needle", "--unknown"],
+    ] {
+        assert!(parse_args(args.clone()).is_err(), "{args:?}");
+    }
+    let error = parse_args(["search", "needle", "--workspace", ".", "--all-workspaces"])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("only one of --workspace or --all-workspaces"),
+        "{error}"
+    );
+    let error = parse_args(["search", "needle", "--limit", "201"])
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("between 1 and 200"), "{error}");
+    assert!(matches!(
+        parse_args([
+            "search",
+            "needle",
+            "--all-workspaces",
+            "--limit",
+            "200",
+            "--json"
+        ])
+        .unwrap(),
+        NativeCommand::Search(_)
+    ));
+    assert!(parse_args(["search", "needle", "--workspace", "."]).is_ok());
+}
+
 fn write_prune_test_session(
     root: &Path,
     id: &str,

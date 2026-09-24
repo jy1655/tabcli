@@ -126,6 +126,8 @@ agent-bridge sessions [--workspace PATH] [--provider <codex|claude|agy|pi>] [--s
 agent-bridge inspect <session> [--json]
 agent-bridge result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
     [--wait --timeout-secs N]
+agent-bridge search <query> [--workspace PATH | --all-workspaces] [--provider <codex|claude|agy|pi>]
+    [--limit N] [--json]
 agent-bridge doctor <session> [--probe] [--json]
 agent-bridge doctor --provider <codex|claude|agy|pi> [--probe] [--json]
 agent-bridge prune-sessions --closed-before-days N --explicit [--json]
@@ -195,6 +197,53 @@ JSON은 원문 채널이며 사람이 읽는 출력의 terminal 제어문자는 
 수행한 뒤 다시 조회합니다. `sessions`의 기존 복구 동작은 유지되므로 읽기 전용 명령은 아닙니다.
 조회 timeout은 요청을 취소하거나 세션을 닫지 않습니다. 결과를 다음 작업의 참고 자료로 보낼 때는
 정확한 결과를 조회해 출처와 함께 `--prompt-file`에 넣고 기존 `ask/tell`을 사용합니다.
+
+### 결과 검색
+
+`search <query>`는 Agent Bridge가 이미 저장한 결과 본문(게시된 event의 `message`)에서 부분 문자열을 찾으며, 세션 ID를 몰라도 과거 리뷰·수정 결과의 정확한 session/request/event 주소를 얻을 수 있습니다. query는 필수이며 공백만으로는 안 됩니다. 정규식이 아닌 literal 부분 문자열이고, 양쪽을 Unicode 소문자로 바꿔 대소문자를 구분하지 않고 비교하며, 세션 title은 검색 대상이 아니라 hit의 metadata로만 나타납니다. 기본 범위는 현재 디렉터리의 workspace이며, `sessions --workspace`와 같은 canonical 경로 형태로 manifest의 workspace와 비교합니다. `--workspace PATH`는 다른 workspace를, `--all-workspaces`는 모든 workspace를 대상으로 하며 두 옵션을 함께 주면 오류이고, `--provider`는 provider로 거르고 `--limit N`은 기본 20, 1 이상 200 이하입니다.
+
+검색 대상은 `result`가 `completed`로 돌려줄 게시된 결과뿐입니다. 현재 claim이 보유한 pending event, 복구가 필요한 completion journal의 event, `error`가 있는 실패 결과는 검색되지 않습니다. 영수증이 없는 기존 event도 검색되며 `request_id: null`과 `--event` 기준의 `result_command`로 표시합니다. 본문이 같은 두 요청은 두 개의 hit으로 따로 나타나며 합치지 않습니다. 정렬은 `created_unix_ms` 내림차순, 같으면 session ID 오름차순, 그다음 event ID 오름차순입니다.
+
+`search`는 읽기 전용입니다. 복구·전송·닫기·기록을 하지 않으며 `~/.agent-bridge/native-sessions`(또는 `AGENT_BRIDGE_NATIVE_STATE_DIR`) 아래의 session record만 읽고, provider의 native transcript나 홈 디렉터리의 다른 파일은 읽지 않습니다. 예산으로 event 5,000개, event 파일 64 MiB, 10초 중 하나를 넘으면 scan을 멈추고 `incomplete: true`로 표시합니다. 세션 snapshot이 250 ms 재시도 뒤에도 바쁘거나, manifest·status·event 파일을 읽을 수 없거나 손상됐거나, scan 중 디렉터리가 사라져도(동시 prune) 세션별 사유와 함께 `incomplete`가 되며, 읽을 수 없는 세션은 "결과 없음"이 아니라 불완전으로 셉니다. `truncated`(hit이 `--limit`보다 많았음)와 `incomplete`(범위를 다 살피지 못함)는 구분되어, hit이 0개여도 `incomplete`이면 "no results"로 표시하지 않고 scan이 불완전했다는 사실과 사유를 출력합니다.
+
+명령이 실행됐다면 hit이 0개이거나 불완전해도 exit 0입니다. 인수 오류와 state root 자체를 읽을 수 없는 경우만 nonzero이며, `--json`에서는 `result --json`처럼 `{"schema_version":1,"ok":false,"error":...}`를 출력합니다. `excerpt`는 첫 번째 일치를 중심으로 최대 200자이며 잘린 쪽에 `…`를 붙이고 제어문자는 이스케이프됩니다. 전체 본문은 포함하지 않으므로 hit의 `result_command`(정확한 `--request` 또는 `--event`)로 다시 읽습니다. JSON이 아닌 출력은 hit마다 `session`, `provider`, `created_unix_ms`, request ID(없으면 event ID), `excerpt`를 탭으로 구분한 한 줄이고, 마지막에 hit 수·`truncated`·`incomplete` 사유를 요약한 줄이 붙습니다.
+
+```sh
+agent-bridge search "native queue" --json
+agent-bridge search "native queue" --workspace ~/Dev/project --provider codex --limit 5 --json
+agent-bridge search "native queue" --all-workspaces
+```
+
+`--json` 출력의 안정적인 형태는 다음과 같습니다.
+
+```json
+{
+  "schema_version": 1,
+  "ok": true,
+  "query": "native queue",
+  "filters": { "workspace": "/Users/me/Dev/project", "all_workspaces": false, "provider": null },
+  "limit": 20,
+  "hits": [
+    {
+      "session": "session-XXXXXXXX",
+      "provider": "codex",
+      "workspace": "/Users/me/Dev/project",
+      "title": "Codex reviewer",
+      "request_id": "request-XXXXXXXX",
+      "event_id": "event-123-456.json",
+      "created_unix_ms": 1790232089204,
+      "excerpt": "…native queue…",
+      "result_command": "agent-bridge result session-XXXXXXXX --request request-XXXXXXXX --json"
+    }
+  ],
+  "truncated": false,
+  "incomplete": false,
+  "incomplete_reasons": [],
+  "scanned": { "sessions": 12, "events": 40 }
+}
+```
+
+`filters.workspace`는 `--all-workspaces`일 때 `null`이고, Windows에서는 `sessions`와 같은 `\\?\` 접두사가 붙은 canonical 경로입니다. `request_id`가 없는 기존 event의 `result_command`는 `--event <event ID>` 형식이며, `incomplete_reasons`의 각 항목은 `session`(scan 전체의 사유이면 `null`)과 `reason`을 가집니다.
 
 ### 기능 가용성과 다음 조치 진단
 
