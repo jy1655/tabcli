@@ -100,10 +100,12 @@ impl NativeProviderAdapter for AgyAdapter {
 
     fn initial_prompt_ready_delay(&self) -> Duration {
         // The Windows console paste waits on Agy's own startup log instead of a
-        // fixed delay (see `wait_for_startup_readiness`): the former 12 second
-        // delay was shorter than Agy's skills/hooks reload under CPU contention,
-        // and a paste that lands before that reload is discarded (issue #43).
-        // Non-Windows delivers the initial prompt as an argument and never waits.
+        // fixed delay (see `wait_for_startup_readiness_with`): the former 12 second
+        // delay was shorter than Agy's startup reload burst under CPU contention,
+        // and a paste that lands inside a reload is discarded (issue #43). A paste
+        // lost to a reload after the gate ends as delivery-uncertain, never as a
+        // second paste. Non-Windows delivers the initial prompt as an argument and
+        // never waits.
         Duration::ZERO
     }
 
@@ -273,13 +275,17 @@ fn correlated_response<'a>(message: &'a str, pending: &PendingAgyTurn) -> Result
 // first-party input path or a per-turn ready/accepted signal, this adapter reads
 // Agy's own `--log-file` output (glog lines) as the only available evidence:
 //
-// - readiness gate: `CLI startup completed` (analytics.go) and the latest
-//   `Reloading system slash commands and skills` (manager.go) line followed by its
-//   `hooks_manager.go ... loaded N named hooks` completion, then a quiet period that
-//   starts at that completion and restarts on every later
-//   `Reloading system slash commands`/`Full redraw completed` line. A later reload
-//   without its completion resets readiness. An Agy version that never logs the
-//   hooks completion after its skills reload is unsupported by this gate.
+// - readiness gate: `CLI startup completed` (analytics.go), at least one
+//   `Full redraw completed` (manager.go) line after it, and then a quiet period in
+//   which no `Reloading system slash commands` line (with or without "and skills"),
+//   no `Full redraw completed` line, and no `hooks_manager.go` line arrives,
+//   measured from the newest such line. The gate does not wait for a skills reload
+//   or for a hooks completion after one: a healthy Agy 1.2.10 (session-IQHEwf,
+//   2026-09-24 17:20) logged its startup reload before `CLI startup completed` with
+//   no hooks line after it, never logged the deferred `... and skills` reload, and
+//   then went silent, so the reload/hooks pair cannot discriminate readiness. A
+//   reload that arrives after the quiet period (the session-fMqSQc late reload that
+//   discarded a paste) is caught by the input receipt below, not by the gate.
 // - input receipt: a complete `HandleUserInput called with text: "..."` line
 //   (input_loop.go) that starts after the byte length of agy.log observed
 //   immediately before the paste and whose text carries the Windows protocol prefix
@@ -295,19 +301,25 @@ fn correlated_response<'a>(message: &'a str, pending: &PendingAgyTurn) -> Result
 //   missing receipt at the end of the window, a deadline-capped window, an
 //   unreadable or missing log, a log shorter than the pre-paste offset (rotated or
 //   truncated), and a partial trailing line all stay uncertain and never `not_sent`.
-//   The paste is never repeated.
+//   The paste is never repeated. A lost paste therefore ends as delivery-uncertain:
+//   the launcher keeps the turn claim, leaves the session `working`, and writes the
+//   receipt error to `status.error` (`record_initial_prompt_delivery_failure` for
+//   the initial prompt, `record_follow_up_terminal_delivery_failure` for `tell`).
+//   The caller must inspect that error (or `doctor <session>`) and then close the
+//   session with `close-session --explicit` or launch a new one; the bridge never
+//   re-pastes or cleans up on its own.
 //
 // Delete this section, `initial_prompt_ready_delay`, and the receipt branches of
 // `send_initial_prompt`/`send_terminal_follow_up` when Agy provides such a signal
 // or an input API; the transcript result monitor is unaffected.
 const AGY_LOG_FILE: &str = "agy.log";
 const STARTUP_COMPLETED_MARKER: &str = "CLI startup completed";
-const SKILLS_RELOAD_MARKER: &str = "Reloading system slash commands and skills";
 const SLASH_RELOAD_MARKER: &str = "Reloading system slash commands";
 const HOOKS_LOADED_SOURCE: &str = "hooks_manager.go";
-const HOOKS_LOADED_MARKER: &str = " named hooks";
-const HOOKS_COMPLETION_DESCRIPTION: &str = "`hooks_manager.go ... named hooks` after the latest `Reloading system slash commands and skills`";
 const FULL_REDRAW_MARKER: &str = "Full redraw completed";
+const REDRAW_AFTER_STARTUP_DESCRIPTION: &str =
+    "`Full redraw completed` after `CLI startup completed`";
+const QUIET_PERIOD_DESCRIPTION: &str = "quiet period not reached (no `Reloading system slash commands`, `Full redraw completed`, or `hooks_manager.go` line for the quiet period after the newest one)";
 const INPUT_RECEIPT_MARKER: &str = "HandleUserInput called with text: \"";
 const WINDOWS_PROTOCOL_PREFIX: &str = "[Agent Bridge Agy Windows console turn protocol]";
 // Observed post-login reload bursts arrive about 3.0 seconds apart; the quiet period
@@ -459,60 +471,63 @@ fn strip_terminal_noise(line: &str) -> String {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct StartupObservation {
-    startup_completed: bool,
-    // Line index of the latest `Reloading system slash commands and skills` line.
-    latest_reload: Option<usize>,
-    // Line index of the hooks-loaded line that followed the latest reload. The main
-    // thread also logs a hooks-loaded line before the first reload; that earlier
-    // line does not count, which is what separates a late reload from a completed
-    // one, and a later reload without its own completion clears this again.
-    latest_reload_completion: Option<usize>,
-    // Line index of the newest settling event: the latest reload's completion or a
-    // reload/redraw line after it. The quiet period starts when this changes.
+    // Line index of the first `CLI startup completed` line.
+    startup_line: Option<usize>,
+    // Line index of the first `Full redraw completed` line after the startup line.
+    // Agy redraws the composer once the TUI is up; the redraw before startup, when
+    // there is one, does not count.
+    redraw_after_startup: Option<usize>,
+    // Line index of the newest activity line: any `Reloading system slash commands`
+    // line (with or without "and skills"), `Full redraw completed` line, or
+    // `hooks_manager.go` line, wherever it sits. The quiet period restarts whenever
+    // this changes.
     settle_line: Option<usize>,
-    // Reload and redraw lines seen so far (diagnostics only).
+    // Activity lines seen so far (diagnostics only).
     activity_lines: usize,
 }
 
 impl StartupObservation {
+    fn startup_completed(&self) -> bool {
+        self.startup_line.is_some()
+    }
+
+    fn markers_observed(&self) -> bool {
+        self.startup_completed() && self.redraw_after_startup.is_some()
+    }
+
     fn missing_markers(&self) -> Vec<&'static str> {
         let mut missing = Vec::new();
-        if !self.startup_completed {
+        if self.startup_line.is_none() {
             missing.push("`CLI startup completed`");
         }
-        if self.latest_reload.is_none() {
-            missing.push("`Reloading system slash commands and skills`");
-        }
-        if self.latest_reload_completion.is_none() {
-            missing.push(HOOKS_COMPLETION_DESCRIPTION);
+        if self.redraw_after_startup.is_none() {
+            missing.push(REDRAW_AFTER_STARTUP_DESCRIPTION);
         }
         missing
     }
 }
 
+fn is_activity_line(line: &str) -> bool {
+    line.contains(SLASH_RELOAD_MARKER)
+        || line.contains(FULL_REDRAW_MARKER)
+        || line.contains(HOOKS_LOADED_SOURCE)
+}
+
 fn observe_startup(log: &[u8]) -> StartupObservation {
     let mut observation = StartupObservation::default();
     for (index, line) in complete_log_lines(log).enumerate() {
-        if line.contains(STARTUP_COMPLETED_MARKER) {
-            observation.startup_completed = true;
+        if observation.startup_line.is_none() && line.contains(STARTUP_COMPLETED_MARKER) {
+            observation.startup_line = Some(index);
         }
-        if line.contains(SKILLS_RELOAD_MARKER) {
-            observation.latest_reload = Some(index);
-            observation.latest_reload_completion = None;
-            observation.settle_line = None;
-        } else if observation.latest_reload.is_some()
-            && observation.latest_reload_completion.is_none()
-            && line.contains(HOOKS_LOADED_SOURCE)
-            && line.contains(HOOKS_LOADED_MARKER)
+        if observation.startup_line.is_some()
+            && observation.redraw_after_startup.is_none()
+            && line.contains(FULL_REDRAW_MARKER)
         {
-            observation.latest_reload_completion = Some(index);
-            observation.settle_line = Some(index);
+            observation.redraw_after_startup = Some(index);
         }
-        if line.contains(SLASH_RELOAD_MARKER) || line.contains(FULL_REDRAW_MARKER) {
+        if is_activity_line(&line) {
             observation.activity_lines += 1;
-            if observation.latest_reload_completion.is_some() {
-                observation.settle_line = Some(index);
-            }
+            observation.settle_line = Some(index);
         }
     }
     observation
@@ -523,8 +538,7 @@ enum ReadinessState {
     Ready,
     AwaitingLog,
     AwaitingStartup,
-    AwaitingSkillsReload,
-    AwaitingHooksCompletion,
+    AwaitingRedraw,
     Settling,
 }
 
@@ -534,14 +548,11 @@ impl ReadinessState {
             Self::Ready => "startup readiness observed",
             Self::AwaitingLog => "agy.log has not been created",
             Self::AwaitingStartup => "agy.log has no `CLI startup completed` line",
-            Self::AwaitingSkillsReload => {
-                "agy.log has no `Reloading system slash commands and skills` line"
-            }
-            Self::AwaitingHooksCompletion => {
-                "the latest skills reload in agy.log has no hooks completion after it"
+            Self::AwaitingRedraw => {
+                "agy.log has no `Full redraw completed` line after `CLI startup completed`"
             }
             Self::Settling => {
-                "agy.log was still reloading or redrawing during the quiet period after the hooks completion"
+                "agy.log logged a reload, redraw, or hooks line within the quiet period"
             }
         }
     }
@@ -551,6 +562,7 @@ struct ReadinessGate {
     quiet_period: Duration,
     settle_line: Option<usize>,
     settled_at: Instant,
+    quiet_reached: bool,
     last_observation: Option<StartupObservation>,
 }
 
@@ -560,6 +572,7 @@ impl ReadinessGate {
             quiet_period,
             settle_line: None,
             settled_at: now,
+            quiet_reached: false,
             last_observation: None,
         }
     }
@@ -567,6 +580,7 @@ impl ReadinessGate {
     fn observe(&mut self, log: Option<&[u8]>, now: Instant) -> ReadinessState {
         let Some(log) = log else {
             self.last_observation = None;
+            self.quiet_reached = false;
             return ReadinessState::AwaitingLog;
         };
         let observation = observe_startup(log);
@@ -574,13 +588,12 @@ impl ReadinessGate {
             self.settle_line = observation.settle_line;
             self.settled_at = now;
         }
-        let state = if !observation.startup_completed {
+        self.quiet_reached = now.saturating_duration_since(self.settled_at) >= self.quiet_period;
+        let state = if !observation.startup_completed() {
             ReadinessState::AwaitingStartup
-        } else if observation.latest_reload.is_none() {
-            ReadinessState::AwaitingSkillsReload
-        } else if observation.latest_reload_completion.is_none() {
-            ReadinessState::AwaitingHooksCompletion
-        } else if now.saturating_duration_since(self.settled_at) < self.quiet_period {
+        } else if observation.redraw_after_startup.is_none() {
+            ReadinessState::AwaitingRedraw
+        } else if !self.quiet_reached {
             ReadinessState::Settling
         } else {
             ReadinessState::Ready
@@ -590,18 +603,22 @@ impl ReadinessGate {
     }
 
     fn deadline_report(&self, state: ReadinessState) -> String {
-        let missing = match &self.last_observation {
+        let mut missing = match &self.last_observation {
             Some(observation) => observation.missing_markers(),
             None => StartupObservation::default().missing_markers(),
         };
+        if !self.quiet_reached {
+            missing.push(QUIET_PERIOD_DESCRIPTION);
+        }
         let missing = if missing.is_empty() {
             "none".to_owned()
         } else {
             missing.join(", ")
         };
         format!(
-            "Agy did not report startup readiness before the deadline: {}; missing markers: {missing}; an Agy version that never logs the {HOOKS_COMPLETION_DESCRIPTION} completion is unsupported by this gate; the initial prompt was not pasted",
-            state.describe()
+            "Agy did not report startup readiness before the deadline: {}; missing markers: {missing}; the quiet period is {} ms; the initial prompt was not pasted",
+            state.describe(),
+            self.quiet_period.as_millis()
         )
     }
 }
@@ -816,7 +833,7 @@ where
 fn input_receipt_check(directory: Option<&Path>) -> super::super::doctor::Check {
     use super::super::doctor::{Availability::Unknown, Check};
     const CHECK_ID: &str = "agy_input_receipt";
-    const NEXT_ACTION: &str = "Observation only. Windows console delivery pastes after the startup readiness markers and requires a HandleUserInput receipt carrying the complete pending turn marker; a missing receipt leaves delivery uncertain and the paste is never repeated.";
+    const NEXT_ACTION: &str = "Observation only. Windows console delivery pastes after CLI startup completed, a Full redraw completed after it, and a quiet period without reload, redraw, or hooks lines, and requires a HandleUserInput receipt carrying the complete pending turn marker; a missing receipt leaves delivery uncertain with the session working and the reason in status.error, and the paste is never repeated. Inspect the session and close it explicitly or launch a new one.";
     let Some(directory) = directory else {
         return Check::new(
             CHECK_ID,
@@ -861,26 +878,26 @@ fn input_receipt_check(directory: Option<&Path>) -> super::super::doctor::Check 
             .iter()
             .any(|receipt| receipt_matches(receipt, pending))
     });
-    let ready = startup.startup_completed && startup.latest_reload_completion.is_some();
-    let (reason, detail) = match (ready, last) {
+    // The doctor reads the log once, so it reports the two startup markers only; the
+    // quiet period is timed live by the paste gate and cannot be judged here.
+    let (reason, detail) = match (startup.markers_observed(), last) {
         (false, _) => (
-            "agy_startup_not_ready",
-            "agy.log does not yet show startup readiness (CLI startup completed plus a skills reload with its hooks completion).",
+            "agy_startup_markers_missing",
+            "agy.log does not yet show the startup markers (CLI startup completed followed by a Full redraw completed); the paste gate also waits for a quiet period without reload, redraw, or hooks lines.",
         ),
         (true, None) => (
             "agy_no_input_receipt",
-            "agy.log shows startup readiness but no HandleUserInput receipt.",
+            "agy.log shows the startup markers but no HandleUserInput receipt.",
         ),
         (true, Some(_)) => (
             "agy_input_receipt_observed",
-            "agy.log shows startup readiness and at least one HandleUserInput receipt; the evidence states whether any receipt carries the complete pending turn marker.",
+            "agy.log shows the startup markers and at least one HandleUserInput receipt; the evidence states whether any receipt carries the complete pending turn marker.",
         ),
     };
     Check::new(CHECK_ID, Unknown, reason, detail, NEXT_ACTION).evidence(serde_json::json!({
         "log": log_path,
-        "startup_completed": startup.startup_completed,
-        "skills_reload_observed": startup.latest_reload.is_some(),
-        "latest_reload_completed": startup.latest_reload_completion.is_some(),
+        "startup_completed": startup.startup_completed(),
+        "redraw_after_startup_observed": startup.redraw_after_startup.is_some(),
         "activity_lines": startup.activity_lines,
         "input_receipts": receipts.len(),
         "last_receipt_text": last.map(|receipt| {
@@ -1351,7 +1368,9 @@ I0924 16:42:50.228760     580 manager.go:1308] Reloading system slash commands
     // session-fMqSQc (initial paste lost): lines 95, 104, 105, 114-116, 126, 127, 138,
     // 150 and 151. The startup reload (114) skipped its hooks pass, so the only hooks
     // line before 16:41:20 is the main thread's (95). The fixed 12 second delay pasted
-    // at about 16:41:19.
+    // at about 16:41:19. The current gate reports ready 3.5 s after the 16:41:13
+    // reload, before the late reload below: this case is caught by the input receipt
+    // check (no receipt, delivery-uncertain), not by the gate.
     const REAL_FAILURE_STARTUP: &str = r"I0924 16:41:07.819578       1 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
 I0924 16:41:07.823186       1 common.go:438] Starting CLI program
 CLI ready for user input
@@ -1376,6 +1395,77 @@ I0924 16:41:20.816140     410 manager.go:1312] Slash commands unchanged, skippin
 ";
 
     const REAL_SUCCESS_TOKEN: &str = "28404-1790235743098225800-0";
+
+    // session-IQHEwf (this machine, 2026-09-24 17:20, Agy 1.2.10; the round-1 gate
+    // waited the full deadline and never pasted): the startup verbatim after the ANSI
+    // strip, with the account email redacted. The startup reload precedes
+    // `CLI startup completed` and no hooks_manager.go line follows it, the deferred
+    // `... and skills` reload never came, and after three plain reloads within 6.4 s
+    // the log was silent for five minutes. A healthy session, so the reload/hooks
+    // pair cannot be the readiness discriminator.
+    const REAL_QUIET_STARTUP: &str = r#"E0924 17:20:28.610124     222 errorreport.go:224] error getting token source: You are not logged into Antigravity.
+W0924 17:20:28.610124     222 cache.go:135] Cache(userInfo): Singleflight refresh failed: failed to get load code assist response: error getting token source: You are not logged into Antigravity.
+E0924 17:20:28.610124     222 errorreport.go:224] failed to get load code assist response: error getting token source: You are not logged into Antigravity.
+I0924 17:20:28.613199     270 manager.go:1331] Reloading system slash commands and skills
+I0924 17:20:28.613199     270 manager.go:1308] Reloading system slash commands
+I0924 17:20:28.613199     270 manager.go:1312] Slash commands unchanged, skipping update
+I0924 17:20:28.614019     232 keyring.go:64] keyringAuth: loaded token, expiry=2026-09-24 17:30:33.268465 +0900 KST expired=false
+I0924 17:20:28.614522     231 auth.go:157] ChainedAuth: authenticated via keyring (effective: keyring)
+I0924 17:20:28.614522     231 server_oauth.go:196] applyAuthResult: email=<email>, authMethod=consumer, quotaProject=
+I0924 17:20:28.614522     231 server_oauth.go:201] OAuth: authenticated successfully as <email>
+I0924 17:20:28.614522     231 server_oauth.go:207] b.codeAssistClient.AuthProvider (0x35cfc40fc0f0) is same as b.cliAuth (0x35cfc40fc0f0)
+W0924 17:20:28.615030     239 cache.go:163] Failed to refresh cache in background: admin controls not applicable
+I0924 17:20:28.613199     265 gemini_extensions.go:28] Detecting Gemini extensions in C:\Users\user\.gemini\extensions
+I0924 17:20:28.615030     265 gemini_extensions.go:49] No extensions found
+W0924 17:20:28.615030     204 cache.go:163] Failed to refresh cache in background: admin controls not applicable
+I0924 17:20:28.616574       1 analytics.go:187] CLI startup completed (took 227.1451ms)
+I0924 17:20:28.663151     342 manager.go:934] Full redraw completed (rerenderAll) for conversation  (epoch 0, items 1)
+I0924 17:20:29.582022     238 http_helpers.go:305] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist Trace: 0x1e5c99c8fa1790b0
+I0924 17:20:30.023964     235 http_helpers.go:305] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels Trace: 0x524ece174cc9e1c6
+W0924 17:20:30.061976     231 model_config_manager.go:67] Failed to resolve model flag "gemini-3.8-flash-high": --model gemini-3.8-flash-high conflicts with --effort=low
+I0924 17:20:30.062976     231 model_config_manager.go:327] Propagating selected model override to backend: label="Gemini 3.8 Flash (High)"
+I0924 17:20:30.063573     248 quota_manager.go:45] doRefreshQuota: starting reload (force=true)
+I0924 17:20:30.063573     249 experiment_manager.go:66] Starting experiment refresh after login
+I0924 17:20:30.480483     249 remote_agent.go:156] Remote agent fastpush pin gate changed: false -> true
+I0924 17:20:30.481001     249 server.go:3769] [RemoteControl] Session toggle is off, staying disconnected
+I0924 17:20:30.481001     249 server.go:3480] [RemoteControl] Resolved proxyServerURL: ""
+I0924 17:20:30.481001     249 experiment_manager.go:70] Experiments refreshed after login
+I0924 17:20:30.481001     332 manager.go:1308] Reloading system slash commands
+I0924 17:20:31.485622     387 http_helpers.go:305] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist Trace: 0xe68c0b26c4c162eb
+I0924 17:20:32.802591     387 http_helpers.go:305] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist Trace: 0x46f67b480998ff4b
+W0924 17:20:33.025968     387 model_config_manager.go:67] Failed to resolve model flag "gemini-3.8-flash-high": --model gemini-3.8-flash-high conflicts with --effort=low
+I0924 17:20:33.025968     387 model_config_manager.go:327] Propagating selected model override to backend: label="Gemini 3.8 Flash (High)"
+I0924 17:20:33.025968     249 experiment_manager.go:66] Starting experiment refresh after login
+I0924 17:20:33.025968     248 quota_manager.go:45] doRefreshQuota: starting reload (force=true)
+W0924 17:20:33.025968     390 model_config_manager.go:67] Failed to resolve model flag "gemini-3.8-flash-high": --model gemini-3.8-flash-high conflicts with --effort=low
+I0924 17:20:33.026470     390 model_config_manager.go:327] Propagating selected model override to backend: label="Gemini 3.8 Flash (High)"
+I0924 17:20:33.155749     249 server.go:3769] [RemoteControl] Session toggle is off, staying disconnected
+I0924 17:20:33.155749     249 server.go:3480] [RemoteControl] Resolved proxyServerURL: ""
+I0924 17:20:33.155749     249 experiment_manager.go:70] Experiments refreshed after login
+I0924 17:20:33.155749     249 experiment_manager.go:66] Starting experiment refresh after login
+I0924 17:20:33.155749     422 manager.go:1308] Reloading system slash commands
+I0924 17:20:33.161144     422 manager.go:1312] Slash commands unchanged, skipping update
+I0924 17:20:34.044434     389 http_helpers.go:305] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist Trace: 0x5dfcd4420938bfd
+I0924 17:20:34.759982     248 quota_manager.go:45] doRefreshQuota: starting reload (force=true)
+I0924 17:20:34.950075     249 server.go:3769] [RemoteControl] Session toggle is off, staying disconnected
+I0924 17:20:34.950075     249 server.go:3480] [RemoteControl] Resolved proxyServerURL: ""
+I0924 17:20:34.950075     249 experiment_manager.go:70] Experiments refreshed after login
+I0924 17:20:34.950075     430 manager.go:1308] Reloading system slash commands
+I0924 17:20:34.952107     430 manager.go:1312] Slash commands unchanged, skipping update
+"#;
+
+    // Growth points of the session-IQHEwf log as the gate would have polled it: up to
+    // and including each of the three plain reloads after startup.
+    fn quiet_startup_snapshots() -> [String; 3] {
+        let cut = |marker: &str| {
+            REAL_QUIET_STARTUP[..REAL_QUIET_STARTUP.find(marker).unwrap()].to_owned()
+        };
+        [
+            cut("I0924 17:20:31.485622"),
+            cut("I0924 17:20:34.044434"),
+            REAL_QUIET_STARTUP.to_owned(),
+        ]
+    }
 
     fn glog(time: &str, thread: u32, source: &str, message: &str) -> String {
         format!("I0924 {time} {thread:>7} {source}] {message}\n")
@@ -1480,56 +1570,67 @@ I0924 16:41:20.816140     410 manager.go:1312] Slash commands unchanged, skippin
     }
 
     #[test]
-    fn startup_readiness_requires_a_hooks_completion_after_the_latest_skills_reload() {
+    fn startup_observation_tracks_the_markers_and_the_newest_activity_line() {
+        // session-udT6uY: main-thread hooks line, startup, skills reload with its
+        // hooks line, redraw, three plain reloads.
         let observation = observe_startup(successful_startup_log().as_bytes());
-        assert!(observation.startup_completed);
-        assert_eq!(observation.latest_reload, Some(4));
-        assert_eq!(
-            observation.latest_reload_completion,
-            Some(6),
-            "the main thread's hooks line before the reload must not count"
-        );
+        assert_eq!(observation.startup_line, Some(3));
+        assert_eq!(observation.redraw_after_startup, Some(7));
         assert_eq!(observation.settle_line, Some(10));
-        assert_eq!(observation.activity_lines, 6);
+        assert_eq!(observation.activity_lines, 8);
+        assert!(observation.markers_observed());
+        assert!(observation.missing_markers().is_empty());
 
+        // session-fMqSQc: the startup reload precedes startup and has no hooks line;
+        // the markers are still complete and the newest activity is the last reload.
         let late = late_reload_startup_log();
         let observation = observe_startup(late.as_bytes());
-        assert!(observation.startup_completed);
-        assert_eq!(observation.latest_reload, Some(3));
-        assert_eq!(observation.latest_reload_completion, None);
-        assert_eq!(observation.settle_line, None);
-        assert_eq!(observation.activity_lines, 5);
+        assert_eq!(observation.startup_line, Some(6));
+        assert_eq!(observation.redraw_after_startup, Some(7));
+        assert_eq!(observation.settle_line, Some(9));
+        assert_eq!(observation.activity_lines, 6);
+        assert!(observation.markers_observed());
 
+        // The late reload and its hooks line are activity, nothing more.
         let completed = late + &late_reload_completion();
         let observation = observe_startup(completed.as_bytes());
-        assert_eq!(observation.latest_reload, Some(11));
-        assert_eq!(observation.latest_reload_completion, Some(13));
+        assert_eq!(observation.startup_line, Some(6));
+        assert_eq!(observation.redraw_after_startup, Some(7));
         assert_eq!(observation.settle_line, Some(13));
-        assert_eq!(observation.activity_lines, 7);
+        assert_eq!(observation.activity_lines, 9);
 
-        // A later reload without its own completion clears readiness again.
-        let reloading_again = successful_startup_log()
-            + &glog("16:42:50.228104", 580, "manager.go:1331", SKILLS_RELOAD)
-            + &glog("16:42:50.228760", 580, "manager.go:1308", SLASH_RELOAD);
-        let observation = observe_startup(reloading_again.as_bytes());
-        assert_eq!(observation.latest_reload, Some(11));
-        assert_eq!(observation.latest_reload_completion, None);
-        assert_eq!(observation.settle_line, None);
-        let completed_again =
-            reloading_again + &glog("16:42:50.229000", 581, "hooks_manager.go:53", HOOKS_LOADED);
-        let observation = observe_startup(completed_again.as_bytes());
-        assert_eq!(observation.latest_reload_completion, Some(13));
-        assert_eq!(observation.settle_line, Some(13));
+        // session-IQHEwf: the healthy startup that never logs the reload/hooks pair.
+        let observation = observe_startup(REAL_QUIET_STARTUP.as_bytes());
+        assert_eq!(observation.startup_line, Some(15));
+        assert_eq!(observation.redraw_after_startup, Some(16));
+        assert_eq!(observation.settle_line, Some(47));
+        assert_eq!(observation.activity_lines, 6);
+        assert!(observation.markers_observed());
+
+        // A redraw before startup does not satisfy the second marker.
+        let redraw_first = glog("16:41:07.000000", 269, "manager.go:934", FULL_REDRAW)
+            + &glog(
+                "16:41:07.830345",
+                1,
+                "analytics.go:187",
+                "CLI startup completed (took 1ms)",
+            );
+        let observation = observe_startup(redraw_first.as_bytes());
+        assert_eq!(observation.startup_line, Some(1));
+        assert_eq!(observation.redraw_after_startup, None);
+        assert_eq!(observation.settle_line, Some(0));
+        assert_eq!(
+            observation.missing_markers(),
+            vec![REDRAW_AFTER_STARTUP_DESCRIPTION]
+        );
 
         let no_startup = successful_startup_log().replace("CLI startup completed", "CLI startup");
-        assert!(!observe_startup(no_startup.as_bytes()).startup_completed);
+        let observation = observe_startup(no_startup.as_bytes());
+        assert!(!observation.startup_completed());
+        assert_eq!(observation.redraw_after_startup, None);
         assert_eq!(
             StartupObservation::default().missing_markers(),
-            vec![
-                "`CLI startup completed`",
-                "`Reloading system slash commands and skills`",
-                HOOKS_COMPLETION_DESCRIPTION,
-            ]
+            vec!["`CLI startup completed`", REDRAW_AFTER_STARTUP_DESCRIPTION]
         );
     }
 
@@ -1540,13 +1641,24 @@ I0924 16:41:20.816140     410 manager.go:1312] Slash commands unchanged, skippin
             "I0924 16:41:20.813553     410 manager.go:1331] Reloading system slash commands and skills\nI0924 16:41:20.814059     406 hooks_manager.go:53] loaded 0 named ho",
         );
         let observation = observe_startup(partial.as_bytes());
-        assert_eq!(observation.latest_reload_completion, None);
-        assert_eq!(observation.activity_lines, 6);
+        assert_eq!(observation.settle_line, Some(11));
+        assert_eq!(observation.activity_lines, 7);
         partial.push_str("oks from 0 hooks.json file(s)\n");
-        assert!(
-            observe_startup(partial.as_bytes())
-                .latest_reload_completion
-                .is_some()
+        let observation = observe_startup(partial.as_bytes());
+        assert_eq!(
+            observation.settle_line,
+            Some(12),
+            "a hooks line restarts the quiet period once it is complete"
+        );
+        assert_eq!(observation.activity_lines, 8);
+
+        let mut partial_startup = REAL_QUIET_STARTUP
+            [..REAL_QUIET_STARTUP.find("I0924 17:20:28.663151").unwrap()]
+            .to_owned();
+        partial_startup.push_str("I0924 17:20:28.663151     342 manager.go:934] Full redraw comp");
+        assert_eq!(
+            observe_startup(partial_startup.as_bytes()).redraw_after_startup,
+            None
         );
 
         let noisy = successful_startup_log()
@@ -1554,11 +1666,14 @@ I0924 16:41:20.816140     410 manager.go:1312] Slash commands unchanged, skippin
             .map(|line| format!("\u{1b}[32m{line}\u{1b}[0m\r\n"))
             .collect::<String>()
             .replace("CLI startup", "CLI\u{1b}]0;title\u{7} startup")
-            .replace("and skills", "and\u{1b}]8;;file:///x\u{1b}\\ skills");
+            .replace(
+                "redraw completed",
+                "redraw\u{1b}]8;;file:///x\u{1b}\\ completed",
+            );
         let observation = observe_startup(noisy.as_bytes());
-        assert!(observation.startup_completed);
-        assert!(observation.latest_reload_completion.is_some());
-        assert_eq!(observation.activity_lines, 6);
+        assert!(observation.startup_completed());
+        assert_eq!(observation.redraw_after_startup, Some(7));
+        assert_eq!(observation.activity_lines, 8);
         assert_eq!(strip_terminal_noise("a\u{1b}[1;31mb\u{1b}Kc\r"), "abc");
         assert_eq!(
             strip_terminal_noise("\u{1b}]0;title\u{1b}\\CLI startup completed"),
@@ -1591,98 +1706,80 @@ I0924 16:41:20.816140     410 manager.go:1312] Slash commands unchanged, skippin
     }
 
     #[test]
-    fn readiness_gate_starts_the_quiet_period_at_the_hooks_completion() {
+    fn readiness_gate_becomes_ready_on_the_quiet_healthy_startup_without_the_hooks_pair() {
+        // session-IQHEwf: the round-1/2 rule required a hooks_manager.go line after
+        // the latest `... and skills` reload. This log has none, so that rule would
+        // have waited until the deadline; the receipt-less silence was a healthy
+        // idle composer.
+        let lines: Vec<String> = complete_log_lines(REAL_QUIET_STARTUP.as_bytes()).collect();
+        let latest_skills_reload = lines
+            .iter()
+            .rposition(|line| line.contains("Reloading system slash commands and skills"))
+            .unwrap();
+        assert!(
+            lines[latest_skills_reload..]
+                .iter()
+                .all(|line| !line.contains(HOOKS_LOADED_SOURCE)),
+            "the old readiness discriminator never appears in this healthy log"
+        );
+
+        // As the gate polls the growing log, every plain reload restarts the quiet
+        // period, and the gate is ready 3.5 s after the last one: 3.7 s of waiting,
+        // well inside any deadline, followed by the paste.
         let start = Instant::now();
-        let quiet = Duration::from_millis(3500);
+        let poll = Duration::from_millis(100);
+        let mut clock = FakeClock::new(start);
+        let [first, second, third] = quiet_startup_snapshots();
+        assert!(first.len() < second.len() && second.len() < third.len());
+        wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(&first), some_log(&second), some_log(&third)]),
+            start + Duration::from_secs(300),
+            STARTUP_QUIET_PERIOD,
+            poll,
+            &mut clock,
+        )
+        .expect("the healthy quiet startup passes the gate");
+        assert_eq!(clock.slept, Duration::from_millis(3700));
+
+        // State by state on the growing log.
         let at = |millis: u64| start + Duration::from_millis(millis);
-        let mut gate = ReadinessGate::new(start, quiet);
+        let mut gate = ReadinessGate::new(start, STARTUP_QUIET_PERIOD);
         assert_eq!(gate.observe(None, start), ReadinessState::AwaitingLog);
-
-        let late = late_reload_startup_log();
         assert_eq!(
-            gate.observe(Some(late.as_bytes()), at(100)),
-            ReadinessState::AwaitingHooksCompletion
-        );
-        let completed = late + &late_reload_completion();
-        assert_eq!(
-            gate.observe(Some(completed.as_bytes()), at(13_000)),
+            gate.observe(Some(first.as_bytes()), at(100)),
             ReadinessState::Settling
         );
         assert_eq!(
-            gate.observe(Some(completed.as_bytes()), at(16_400)),
+            gate.observe(Some(second.as_bytes()), at(2_800)),
             ReadinessState::Settling
         );
         assert_eq!(
-            gate.observe(Some(completed.as_bytes()), at(16_500)),
-            ReadinessState::Ready
-        );
-
-        let redrawn = completed + &glog("16:41:24.000000", 420, "manager.go:934", FULL_REDRAW);
-        assert_eq!(
-            gate.observe(Some(redrawn.as_bytes()), at(16_600)),
+            gate.observe(Some(second.as_bytes()), at(6_200)),
             ReadinessState::Settling,
-            "a redraw after the completion restarts the quiet period"
+            "the second reload restarted the quiet period at 2.8 s"
         );
         assert_eq!(
-            gate.observe(Some(redrawn.as_bytes()), at(20_100)),
+            gate.observe(Some(second.as_bytes()), at(6_300)),
             ReadinessState::Ready
         );
-
-        let mut immediate = ReadinessGate::new(start, quiet);
-        let success = successful_startup_log();
         assert_eq!(
-            immediate.observe(Some(success.as_bytes()), at(0)),
-            ReadinessState::Settling
+            gate.observe(Some(third.as_bytes()), at(6_400)),
+            ReadinessState::Settling,
+            "a later reload restarts the quiet period again"
         );
         assert_eq!(
-            immediate.observe(Some(success.as_bytes()), at(3_500)),
-            ReadinessState::Ready
-        );
-
-        // Delayed hooks: reload and redraw activity long ago does not make readiness
-        // immediate once the completion finally appears.
-        let mut delayed = ReadinessGate::new(start, quiet);
-        let without_hooks = [
-            glog(
-                "16:41:07.830345",
-                1,
-                "analytics.go:187",
-                "CLI startup completed (took 1ms)",
-            ),
-            glog("16:41:07.840000", 280, "manager.go:1331", SKILLS_RELOAD),
-            glog("16:41:07.840000", 280, "manager.go:1308", SLASH_RELOAD),
-            glog("16:41:07.876154", 269, "manager.go:934", FULL_REDRAW),
-        ]
-        .concat();
-        assert_eq!(
-            delayed.observe(Some(without_hooks.as_bytes()), at(0)),
-            ReadinessState::AwaitingHooksCompletion
-        );
-        assert_eq!(
-            delayed.observe(Some(without_hooks.as_bytes()), at(8_000)),
-            ReadinessState::AwaitingHooksCompletion
-        );
-        let hooks_late =
-            without_hooks + &glog("16:41:15.840000", 300, "hooks_manager.go:53", HOOKS_LOADED);
-        assert_eq!(
-            delayed.observe(Some(hooks_late.as_bytes()), at(8_000)),
-            ReadinessState::Settling
-        );
-        assert_eq!(
-            delayed.observe(Some(hooks_late.as_bytes()), at(11_400)),
-            ReadinessState::Settling
-        );
-        assert_eq!(
-            delayed.observe(Some(hooks_late.as_bytes()), at(11_500)),
+            gate.observe(Some(third.as_bytes()), at(9_900)),
             ReadinessState::Ready
         );
     }
 
     #[test]
-    fn readiness_gate_resets_on_a_later_reload_without_its_hooks_completion() {
+    fn readiness_gate_starts_the_quiet_period_at_the_newest_activity_line() {
         let start = Instant::now();
         let quiet = Duration::from_millis(3500);
         let at = |millis: u64| start + Duration::from_millis(millis);
+
+        // session-udT6uY: markers complete at once; ready after one quiet period.
         let mut gate = ReadinessGate::new(start, quiet);
         let success = successful_startup_log();
         assert_eq!(
@@ -1690,36 +1787,142 @@ I0924 16:41:20.816140     410 manager.go:1312] Slash commands unchanged, skippin
             ReadinessState::Settling
         );
         assert_eq!(
+            gate.observe(Some(success.as_bytes()), at(3_400)),
+            ReadinessState::Settling
+        );
+        assert_eq!(
             gate.observe(Some(success.as_bytes()), at(3_500)),
             ReadinessState::Ready
         );
 
-        let reloading = success.clone()
-            + &glog("16:42:29.500000", 600, "manager.go:1331", SKILLS_RELOAD)
-            + &glog("16:42:29.500000", 600, "manager.go:1308", SLASH_RELOAD);
+        // Any activity line restarts the quiet period: a plain reload, a skills
+        // reload, a hooks line, or a redraw.
+        let mut restarted = success.clone();
+        for (millis, line) in [
+            (
+                3_600,
+                glog("16:42:29.500000", 600, "manager.go:1308", SLASH_RELOAD),
+            ),
+            (
+                7_200,
+                glog("16:42:33.100000", 601, "manager.go:1331", SKILLS_RELOAD),
+            ),
+            (
+                10_800,
+                glog("16:42:36.700000", 602, "hooks_manager.go:53", HOOKS_LOADED),
+            ),
+            (
+                14_400,
+                glog("16:42:40.300000", 603, "manager.go:934", FULL_REDRAW),
+            ),
+        ] {
+            restarted.push_str(&line);
+            assert_eq!(
+                gate.observe(Some(restarted.as_bytes()), at(millis)),
+                ReadinessState::Settling,
+                "{line:?} restarts the quiet period"
+            );
+            assert_eq!(
+                gate.observe(Some(restarted.as_bytes()), at(millis + 3_499)),
+                ReadinessState::Settling
+            );
+            assert_eq!(
+                gate.observe(Some(restarted.as_bytes()), at(millis + 3_500)),
+                ReadinessState::Ready
+            );
+        }
+
+        // The quiet period counts from when the gate first saw the newest activity
+        // line, so a log that is already old when the gate starts is ready after one
+        // quiet period, not immediately.
+        let mut aged = ReadinessGate::new(start, quiet);
         assert_eq!(
-            gate.observe(Some(reloading.as_bytes()), at(3_600)),
-            ReadinessState::AwaitingHooksCompletion
+            aged.observe(Some(success.as_bytes()), at(60_000)),
+            ReadinessState::Settling
         );
         assert_eq!(
-            gate.observe(Some(reloading.as_bytes()), at(10_000)),
-            ReadinessState::AwaitingHooksCompletion,
-            "silence after an incomplete reload is not readiness"
+            aged.observe(Some(success.as_bytes()), at(63_500)),
+            ReadinessState::Ready
         );
 
-        let completed =
-            reloading + &glog("16:42:36.000000", 601, "hooks_manager.go:53", HOOKS_LOADED);
+        // Startup without a redraw after it is not ready however quiet the log is.
+        let mut no_redraw = ReadinessGate::new(start, quiet);
+        let startup_only = glog(
+            "16:41:07.830345",
+            1,
+            "analytics.go:187",
+            "CLI startup completed (took 1ms)",
+        );
         assert_eq!(
-            gate.observe(Some(completed.as_bytes()), at(10_100)),
+            no_redraw.observe(Some(startup_only.as_bytes()), at(0)),
+            ReadinessState::AwaitingRedraw
+        );
+        assert_eq!(
+            no_redraw.observe(Some(startup_only.as_bytes()), at(30_000)),
+            ReadinessState::AwaitingRedraw
+        );
+        let redrawn = startup_only + &glog("16:41:40.000000", 269, "manager.go:934", FULL_REDRAW);
+        assert_eq!(
+            no_redraw.observe(Some(redrawn.as_bytes()), at(30_100)),
             ReadinessState::Settling
         );
         assert_eq!(
-            gate.observe(Some(completed.as_bytes()), at(13_500)),
-            ReadinessState::Settling
-        );
-        assert_eq!(
-            gate.observe(Some(completed.as_bytes()), at(13_600)),
+            no_redraw.observe(Some(redrawn.as_bytes()), at(33_600)),
             ReadinessState::Ready
+        );
+
+        let mut no_startup = ReadinessGate::new(start, quiet);
+        let redraw_only = glog("16:41:07.876154", 269, "manager.go:934", FULL_REDRAW);
+        assert_eq!(
+            no_startup.observe(Some(redraw_only.as_bytes()), at(10_000)),
+            ReadinessState::AwaitingStartup
+        );
+    }
+
+    #[test]
+    fn readiness_gate_passes_the_lost_fixture_before_its_late_reload() {
+        // session-fMqSQc: the gate is ready 3.5 s after the 16:41:13 reload, and the
+        // reload that discarded the paste arrived 7 s later. The gate cannot see
+        // that future; the paste that lands in it produces no HandleUserInput
+        // receipt and the receipt check reports delivery-uncertain (see
+        // `lost_initial_paste_ends_delivery_uncertain_with_the_reason_in_status_json`).
+        let start = Instant::now();
+        let poll = Duration::from_millis(100);
+        let mut clock = FakeClock::new(start);
+        wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(&late_reload_startup_log())]),
+            start + Duration::from_secs(300),
+            STARTUP_QUIET_PERIOD,
+            poll,
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(clock.slept, Duration::from_millis(3500));
+
+        // Had the late reload arrived during the quiet period instead, it would only
+        // have restarted the period, never demanded a hooks line.
+        let at = |millis: u64| start + Duration::from_millis(millis);
+        let mut gate = ReadinessGate::new(start, STARTUP_QUIET_PERIOD);
+        let late = late_reload_startup_log();
+        assert_eq!(
+            gate.observe(Some(late.as_bytes()), at(0)),
+            ReadinessState::Settling
+        );
+        let reloading = late.clone()
+            + &glog("16:41:15.000000", 410, "manager.go:1331", SKILLS_RELOAD)
+            + &glog("16:41:15.000000", 410, "manager.go:1308", SLASH_RELOAD);
+        assert_eq!(
+            gate.observe(Some(reloading.as_bytes()), at(1_300)),
+            ReadinessState::Settling
+        );
+        assert_eq!(
+            gate.observe(Some(reloading.as_bytes()), at(4_700)),
+            ReadinessState::Settling
+        );
+        assert_eq!(
+            gate.observe(Some(reloading.as_bytes()), at(4_800)),
+            ReadinessState::Ready,
+            "silence after a reload without a hooks line is readiness"
         );
     }
 
@@ -1728,13 +1931,12 @@ I0924 16:41:20.816140     410 manager.go:1312] Slash commands unchanged, skippin
         let start = Instant::now();
         let poll = Duration::from_millis(100);
         let deadline = start + Duration::from_secs(1);
-        let compatibility = "unsupported by this gate";
 
         let mut clock = FakeClock::new(start);
         let error = wait_for_startup_readiness_with(
             &mut log_sequence(vec![Ok(None)]),
             deadline,
-            Duration::ZERO,
+            Duration::from_millis(3500),
             poll,
             &mut clock,
         )
@@ -1742,27 +1944,13 @@ I0924 16:41:20.816140     410 manager.go:1312] Slash commands unchanged, skippin
         let message = format!("{error:#}");
         assert!(message.contains("Agy did not report startup readiness before the deadline"));
         assert!(message.contains("agy.log has not been created"));
-        assert!(message.contains("`CLI startup completed`"));
-        assert!(message.contains("`Reloading system slash commands and skills`"));
-        assert!(message.contains(HOOKS_COMPLETION_DESCRIPTION));
-        assert!(message.contains(compatibility));
+        assert!(message.contains(&format!(
+            "missing markers: `CLI startup completed`, {REDRAW_AFTER_STARTUP_DESCRIPTION}, {QUIET_PERIOD_DESCRIPTION}"
+        )));
+        assert!(message.contains("the quiet period is 3500 ms"));
         assert!(message.contains("the initial prompt was not pasted"));
+        assert!(!message.contains("hooks completion"));
         assert_eq!(clock.slept, Duration::from_secs(1));
-
-        let mut clock = FakeClock::new(start);
-        let error = wait_for_startup_readiness_with(
-            &mut log_sequence(vec![some_log(&late_reload_startup_log())]),
-            deadline,
-            Duration::ZERO,
-            poll,
-            &mut clock,
-        )
-        .unwrap_err();
-        let message = format!("{error:#}");
-        assert!(message.contains("no hooks completion after it"));
-        assert!(!message.contains("missing markers: `CLI startup completed`"));
-        assert!(message.contains(&format!("missing markers: {HOOKS_COMPLETION_DESCRIPTION}")));
-        assert!(message.contains(compatibility));
 
         let startup_only = glog(
             "16:41:07.830345",
@@ -1780,9 +1968,26 @@ I0924 16:41:20.816140     410 manager.go:1312] Slash commands unchanged, skippin
         )
         .unwrap_err();
         let message = format!("{error:#}");
-        assert!(message.contains("no `Reloading system slash commands and skills` line"));
+        assert!(message.contains("no `Full redraw completed` line after `CLI startup completed`"));
+        assert!(!message.contains("missing markers: `CLI startup completed`"));
         assert!(message.contains(&format!(
-            "missing markers: `Reloading system slash commands and skills`, {HOOKS_COMPLETION_DESCRIPTION}"
+            "missing markers: {REDRAW_AFTER_STARTUP_DESCRIPTION}; the quiet period"
+        )));
+
+        let redraw_only = glog("16:41:07.876154", 269, "manager.go:934", FULL_REDRAW);
+        let mut clock = FakeClock::new(start);
+        let error = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(&redraw_only)]),
+            deadline,
+            Duration::ZERO,
+            poll,
+            &mut clock,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("agy.log has no `CLI startup completed` line"));
+        assert!(message.contains(&format!(
+            "missing markers: `CLI startup completed`, {REDRAW_AFTER_STARTUP_DESCRIPTION}; the quiet period"
         )));
 
         let mut clock = FakeClock::new(start);
@@ -1795,14 +2000,14 @@ I0924 16:41:20.816140     410 manager.go:1312] Slash commands unchanged, skippin
         )
         .unwrap_err();
         let message = format!("{error:#}");
-        assert!(message.contains("still reloading or redrawing during the quiet period"));
-        assert!(message.contains("missing markers: none"));
+        assert!(message.contains("logged a reload, redraw, or hooks line within the quiet period"));
+        assert!(message.contains(&format!("missing markers: {QUIET_PERIOD_DESCRIPTION}")));
 
         let mut clock = FakeClock::new(start);
         wait_for_startup_readiness_with(
             &mut log_sequence(vec![
-                some_log(&late_reload_startup_log()),
-                some_log(&(late_reload_startup_log() + &late_reload_completion())),
+                some_log(&startup_only),
+                some_log(&(startup_only.clone() + &redraw_only)),
             ]),
             start + Duration::from_secs(30),
             Duration::from_millis(3500),
@@ -2218,18 +2423,39 @@ I0924 16:41:20.816140     410 manager.go:1312] Slash commands unchanged, skippin
         );
 
         let log_path = directory.join(AGY_LOG_FILE);
-        fs::write(&log_path, late_reload_startup_log()).unwrap();
-        let check = input_receipt_check(Some(&directory));
-        assert_eq!(check.reason_code, "agy_startup_not_ready");
-        let evidence = serde_json::to_value(&check).unwrap()["evidence"].clone();
-        assert_eq!(evidence["skills_reload_observed"], true);
-        assert_eq!(evidence["latest_reload_completed"], false);
-
-        fs::write(&log_path, successful_startup_log()).unwrap();
-        assert_eq!(
-            input_receipt_check(Some(&directory)).reason_code,
-            "agy_no_input_receipt"
+        let startup_only = glog(
+            "16:41:07.830345",
+            1,
+            "analytics.go:187",
+            "CLI startup completed (took 1ms)",
         );
+        fs::write(&log_path, &startup_only).unwrap();
+        let check = input_receipt_check(Some(&directory));
+        assert_eq!(check.reason_code, "agy_startup_markers_missing");
+        let check = serde_json::to_value(&check).unwrap();
+        assert!(
+            check["detail"]
+                .as_str()
+                .unwrap()
+                .contains("Full redraw completed")
+        );
+        let evidence = check["evidence"].clone();
+        assert_eq!(evidence["startup_completed"], true);
+        assert_eq!(evidence["redraw_after_startup_observed"], false);
+        assert_eq!(evidence["activity_lines"], 0);
+        assert!(evidence.get("latest_reload_completed").is_none());
+
+        for log in [
+            REAL_QUIET_STARTUP.to_owned(),
+            late_reload_startup_log(),
+            successful_startup_log(),
+        ] {
+            fs::write(&log_path, log).unwrap();
+            assert_eq!(
+                input_receipt_check(Some(&directory)).reason_code,
+                "agy_no_input_receipt"
+            );
+        }
 
         let pending = claim_pending_turn(&directory);
         let mut log = OpenOptions::new().append(true).open(&log_path).unwrap();
@@ -2239,13 +2465,81 @@ I0924 16:41:20.816140     410 manager.go:1312] Slash commands unchanged, skippin
         assert_eq!(check.reason_code, "agy_input_receipt_observed");
         let evidence = serde_json::to_value(&check).unwrap()["evidence"].clone();
         assert_eq!(evidence["startup_completed"], true);
-        assert_eq!(evidence["latest_reload_completed"], true);
+        assert_eq!(evidence["redraw_after_startup_observed"], true);
         assert_eq!(evidence["input_receipts"], 1);
         assert_eq!(evidence["last_receipt_truncated"], false);
         assert_eq!(evidence["pending_marker_received"], true);
         assert_eq!(evidence["pending_marker"], pending.marker);
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
         assert_eq!(status.state, "working");
+    }
+
+    // The launcher path for a lost initial paste (session-fMqSQc): the gate passes,
+    // the paste lands in the late reload, no receipt follows, and the launcher records
+    // the delivery-uncertain reason without touching the claim or the composer.
+    #[test]
+    fn lost_initial_paste_ends_delivery_uncertain_with_the_reason_in_status_json() {
+        use super::super::super::{TURN_CLAIM_FILE, record_initial_prompt_delivery_failure};
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-fMqSQc");
+        fs::create_dir_all(directory.join("events")).unwrap();
+        update_status(&directory, "awaiting-initial-input", None, None).unwrap();
+        let mut claim = acquire_turn_claim(&directory).unwrap();
+        let pending = install_pending_turn(&directory, &claim.token).unwrap();
+
+        let startup = late_reload_startup_log();
+        let start = Instant::now();
+        let mut clock = FakeClock::new(start);
+        wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(&startup)]),
+            start + Duration::from_secs(300),
+            STARTUP_QUIET_PERIOD,
+            Duration::from_millis(100),
+            &mut clock,
+        )
+        .unwrap();
+        // The launcher marks the session working before the paste; the pre-paste
+        // offset is the whole startup log.
+        update_status(&directory, "working", None, None).unwrap();
+        let pasted_at = clock.now();
+        let after_paste = startup.clone() + &late_reload_completion();
+        let failure = confirm_input_receipt_with(
+            &mut log_sequence(vec![some_log(&startup), some_log(&after_paste)]),
+            &pending,
+            startup.len(),
+            pasted_at,
+            start + Duration::from_secs(300),
+            Duration::from_millis(100),
+            &mut clock,
+        )
+        .unwrap_err();
+        assert!(failure.delivery_may_have_occurred());
+
+        record_initial_prompt_delivery_failure(
+            &directory,
+            &mut claim,
+            failure.delivery_may_have_occurred(),
+            failure.error(),
+        );
+        drop(claim);
+
+        let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+        assert_eq!(status.state, "working");
+        let error = status
+            .error
+            .expect("the reason is recorded in status.error");
+        assert!(error.contains(&format!(
+            "Agy input receipt for turn marker {} was not confirmed",
+            pending.marker
+        )));
+        assert!(error.contains("no HandleUserInput receipt in the"));
+        assert!(error.contains("non-delivery cannot be proven"));
+        assert!(error.contains("the console paste may have been accepted and is not repeated"));
+        assert!(
+            directory.join(TURN_CLAIM_FILE).exists(),
+            "the turn claim stays until the caller closes or the target completes"
+        );
+        assert!(read_pending_turn(&directory).unwrap().is_some());
     }
 
     #[test]
