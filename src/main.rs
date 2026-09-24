@@ -68,12 +68,20 @@ Session policy:
   writer-lock and queue gates exist; Agy and Pi are refused because they expose no
   verifiable ownership evidence. Reopen refuses a source that is not closed, has no
   Claude event with a conversation id, has a request whose recorded result is
-  missing or unreadable, or is held by a live Claude process. The ownership check
-  runs again immediately before the reopened process is spawned, and once more
-  after launch: Claude permits concurrent resumes, so a foreign claude --resume
-  started in that window is detected, not prevented, and the new session is then
-  failed with gate reopen-conflict and its surface closed before any prompt is
-  delivered. Nothing is copied from the source manifest: only an explicit --model,
+  missing or unreadable, or is held by a live Claude process. Claude permits
+  concurrent resumes and offers no exclusive hold, so the ownership check is
+  best-effort detection, not exclusion: it runs again immediately before the
+  reopened process is spawned, after launch once the process has registered,
+  immediately before the initial prompt is sent, and immediately before every tell
+  to the reopened session. Another live holder found at any of those points
+  refuses that delivery with gate reopen-conflict; a check that cannot complete
+  refuses with gate reopen-verification-failed. After launch either gate fails the
+  new session and closes only its surface before any prompt is delivered, and
+  releases the source's reopen marker so the source can be reopened again; before a
+  tell either gate refuses the delivery and leaves the session ready. A foreign
+  claude --resume can still register between two checks and interleave until the
+  next one. doctor reports the other live holders of a reopened session's
+  conversation. Nothing is copied from the source manifest: only an explicit --model,
   --effort, or --yolo is passed. Without --model, Claude's own resume restores the
   model the conversation was using. Claude also restores the saved permission mode
   except bypass, so bypass is active only with --yolo; Claude documents no restored

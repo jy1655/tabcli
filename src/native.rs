@@ -1070,7 +1070,8 @@ struct SessionLaunch<'a> {
     context_sources: &'a [requests::ContextSource],
     result_extra: serde_json::Map<String, serde_json::Value>,
     // Set for `reopen`: the provider conversation the new session continues. Its holder
-    // check runs after launch, once the process exists and before the first prompt is sent.
+    // check runs after launch, once the process exists, and again immediately before the
+    // first prompt is sent.
     resumed_from: Option<ResumedFrom>,
 }
 
@@ -1155,6 +1156,7 @@ fn launch_created_session(
                 &created.directory,
                 resumed_from.as_ref(),
                 deadline,
+                ResumedHolderCheck::AfterLaunch,
             )?;
             let initial_prompt_path = created.directory.join("initial-prompt.txt");
             let initial_prompt = fs::read_to_string(&initial_prompt_path)
@@ -1178,9 +1180,16 @@ fn launch_created_session(
                 deadline,
                 timeout,
             )?;
-            update_status(&created.directory, "working", None, None)?;
             let send_timeout = remaining_turn_timeout(deadline, timeout)?;
             provider::validate_terminal_send_budget(provider, terminal_session.kind, send_timeout)?;
+            verify_reopened_conversation_exclusive(
+                provider,
+                &created.directory,
+                resumed_from.as_ref(),
+                deadline,
+                ResumedHolderCheck::BeforeDelivery,
+            )?;
+            update_status(&created.directory, "working", None, None)?;
             match provider::send_initial_prompt(
                 provider,
                 &terminal_session,
@@ -1205,7 +1214,11 @@ fn launch_created_session(
                 delivery_may_have_occurred,
                 &error,
             );
-            let error = close_surface_after_reopen_conflict(&created.directory, &created.id, error);
+            let error = close_surface_after_reopen_verification_failure(
+                &created.directory,
+                &created.id,
+                error,
+            );
             return Err(error).with_context(|| {
                 format!(
                     "failed to deliver the initial prompt to {} session {}",
@@ -1235,6 +1248,7 @@ fn launch_created_session(
                 &created.directory,
                 resumed_from.as_ref(),
                 deadline,
+                ResumedHolderCheck::AfterLaunch,
             )?;
             let request_id = provider::new_cross_session_turn_id(provider)?;
             let prompt_path = created.directory.join("initial-prompt.txt");
@@ -1243,6 +1257,13 @@ fn launch_created_session(
             let bridge_executable =
                 std::env::current_exe().context("failed to locate agent-bridge executable")?;
             remaining_turn_timeout(deadline, timeout)?;
+            verify_reopened_conversation_exclusive(
+                provider,
+                &created.directory,
+                resumed_from.as_ref(),
+                deadline,
+                ResumedHolderCheck::BeforeDelivery,
+            )?;
             update_status(&created.directory, "working", None, None)?;
             match provider::send_cross_session_message(
                 provider,
@@ -1295,8 +1316,11 @@ fn launch_created_session(
                         Some(format!("{error:#}")),
                     );
                 }
-                let error =
-                    close_surface_after_reopen_conflict(&created.directory, &created.id, error);
+                let error = close_surface_after_reopen_verification_failure(
+                    &created.directory,
+                    &created.id,
+                    error,
+                );
                 return Err(error).with_context(|| {
                     format!(
                         "failed to deliver the initial prompt to {} session {}",
@@ -1377,6 +1401,15 @@ fn reopen_refusal_gate(error: &anyhow::Error) -> Option<&'static str> {
 
 const REOPEN_LAUNCH_GATE: &str = "provider-unsupported";
 const REOPEN_CONFLICT_GATE: &str = "reopen-conflict";
+const REOPEN_VERIFICATION_FAILED_GATE: &str = "reopen-verification-failed";
+
+// The gates a reopen can fail after its session exists. Each one leaves the new session
+// failed with no prompt delivered, so each one releases the source's reopen marker again.
+const REOPEN_POST_CREATION_GATES: [&str; 3] = [
+    REOPEN_LAUNCH_GATE,
+    REOPEN_CONFLICT_GATE,
+    REOPEN_VERIFICATION_FAILED_GATE,
+];
 
 #[derive(Debug, Deserialize, Serialize)]
 struct RecordedReopenRefusal {
@@ -1413,36 +1446,61 @@ fn read_reopen_refusal_gate(directory: &Path) -> Option<String> {
     (record.schema == 1).then_some(record.gate)
 }
 
-// The post-launch holder check of a reopened session, run in the initial-prompt readiness
-// window: the reopened process exists and has not received a prompt. The adapter waits for
-// the provider's own registration of that process and reports every other live holder of the
-// conversation. Claude permits concurrent resumes, so a foreign resume started inside the
-// spawn window can only be detected here; a detected conflict fails the new session under
-// its own gate before anything is delivered.
+// Which boundary a resumed session's holder check runs at. The provider grants no
+// exclusive hold on a conversation, so the check is best-effort detection repeated at every
+// point Bridge is about to act on the conversation, never a reservation of it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ResumedHolderCheck {
+    // In the initial-prompt readiness window: the reopened process exists and has not
+    // received a prompt. The adapter waits for the provider's own registration of it.
+    AfterLaunch,
+    // Immediately before a prompt is sent to the already registered process: the initial
+    // prompt, and every later `tell`. The adapter answers from the registry as it is now.
+    BeforeDelivery,
+}
+
+// The holder check of a reopened session. The adapter reports every other live holder of the
+// conversation; a non-empty answer is a detected conflict and refuses under
+// `reopen-conflict`. Any failure to complete the check (unreadable registry, a live record
+// that cannot be verified, an uninspectable process, a duplicate managed name, a registration
+// that never came) refuses under `reopen-verification-failed`: an unverifiable conversation
+// is treated as shared, never as exclusive. Both refusals are recorded in the session so the
+// gate survives the process boundary. The recorded detail states only what was detected;
+// whether the new surface was then closed is reported by the caller once that outcome is
+// known. A foreign resume that registers between two checks is not detected until the next
+// one.
 fn verify_reopened_conversation_exclusive(
     provider: FirstPartyCli,
     directory: &Path,
     resumed_from: Option<&ResumedFrom>,
     deadline: Instant,
+    check: ResumedHolderCheck,
 ) -> Result<()> {
     let Some(resumed_from) = resumed_from else {
         return Ok(());
     };
-    let others = provider::other_resumed_conversation_holders(
+    let others = match provider::other_resumed_conversation_holders(
         provider,
         provider::ResumedSessionContext {
             directory,
             provider_session_id: &resumed_from.provider_session_id,
             deadline,
+            wait_for_registration: check == ResumedHolderCheck::AfterLaunch,
         },
-    )
-    .with_context(|| {
-        format!(
-            "could not verify that the reopened {} conversation {} has no other live holder",
-            provider.as_str(),
-            resumed_from.provider_session_id
-        )
-    })?;
+    ) {
+        Ok(others) => others,
+        Err(error) => {
+            return Err(record_reopen_refusal(
+                directory,
+                REOPEN_VERIFICATION_FAILED_GATE,
+                format!(
+                    "could not verify that the reopened {} conversation {} has no other live holder: {error:#}; no prompt was delivered",
+                    provider.as_str(),
+                    resumed_from.provider_session_id
+                ),
+            ));
+        }
+    };
     if others.is_empty() {
         return Ok(());
     }
@@ -1450,7 +1508,7 @@ fn verify_reopened_conversation_exclusive(
         directory,
         REOPEN_CONFLICT_GATE,
         format!(
-            "{} conversation {} is also held by live {} process(es) {}; the reopened session was closed before any prompt was delivered",
+            "{} conversation {} is also held by live {} process(es) {}; no prompt was delivered",
             provider.as_str(),
             resumed_from.provider_session_id,
             provider.as_str(),
@@ -1463,23 +1521,41 @@ fn verify_reopened_conversation_exclusive(
     ))
 }
 
-// A detected holder conflict is the one launch failure that also closes the new surface:
-// the reopened process is a second live writer of the conversation, and leaving it open
-// would keep the interleaving the gate exists to prevent. Every other launch failure keeps
-// the existing behavior of marking only the new session failed. Only the new session's own
-// handle is ever closed; the source keeps its tombstone.
-fn close_surface_after_reopen_conflict(
+// A failed holder check, whether a detected conflict or a verification the adapter could
+// not complete, is the launch failure that also closes the new surface: the reopened
+// process is a second live writer of the conversation (or cannot be shown not to be), and
+// leaving it open would keep the interleaving the gate exists to detect. Every other launch
+// failure keeps the existing behavior of marking only the new session failed. Only the new
+// session's own handle is ever closed; the source keeps its tombstone. The returned error
+// reports the close outcome only after it is known.
+fn close_surface_after_reopen_verification_failure(
     directory: &Path,
     id: &str,
     error: anyhow::Error,
 ) -> anyhow::Error {
-    if reopen_refusal_gate(&error) != Some(REOPEN_CONFLICT_GATE) {
+    close_surface_after_reopen_verification_failure_with(id, error, |detected| {
+        close_session_surface(directory, id, Some(format!("{detected:#}")))
+    })
+}
+
+// `close` receives the detected refusal so the closed status can keep it as its reason.
+fn close_surface_after_reopen_verification_failure_with(
+    id: &str,
+    error: anyhow::Error,
+    close: impl FnOnce(&anyhow::Error) -> Result<()>,
+) -> anyhow::Error {
+    if !matches!(
+        reopen_refusal_gate(&error),
+        Some(REOPEN_CONFLICT_GATE | REOPEN_VERIFICATION_FAILED_GATE)
+    ) {
         return error;
     }
-    match close_session_surface(directory, id, Some(format!("{error:#}"))) {
-        Ok(()) => error,
+    match close(&error) {
+        Ok(()) => error.context(format!(
+            "the reopened session {id} was closed before any prompt was delivered"
+        )),
         Err(close_error) => error.context(format!(
-            "the conflicting reopened session {id} could not be closed: {close_error:#}"
+            "the reopened session {id} could not be closed and may still hold the conversation: {close_error:#}"
         )),
     }
 }
@@ -1527,6 +1603,23 @@ fn run_reopen(request: ReopenRequest) -> Result<()> {
                         .and_then(|directory| read_reopen_refusal_gate(&directory))
                 })
             });
+            let outcome = match gate.as_deref() {
+                Some(gate) if REOPEN_POST_CREATION_GATES.contains(&gate) => {
+                    match (session_directory(&source), session_directory(&session)) {
+                        (Ok(source_directory), Ok(refused_directory)) => {
+                            release_reopen_marker_after_refusal(
+                                &source_directory,
+                                &refused_directory,
+                                outcome,
+                            )
+                        }
+                        (Err(error), _) | (_, Err(error)) => outcome.context(format!(
+                            "the reopen marker of source session {source} was not released: {error:#}"
+                        )),
+                    }
+                }
+                _ => outcome,
+            };
             let mut extra = serde_json::Map::new();
             extra.insert("source_session".to_owned(), serde_json::json!(source));
             extra.insert("gate".to_owned(), serde_json::json!(gate));
@@ -1650,23 +1743,67 @@ fn run_reopen_inner(request: ReopenRequest, address: &mut Option<(String, String
     )
 }
 
+// A reopen refused after its session existed delivered nothing to the conversation: the
+// pre-spawn recheck started no process, and both post-launch gates refuse before the first
+// prompt and close the new surface. Bridge therefore established no conversation writer,
+// and the source's reopen marker is released so the source can be reopened again once the
+// cause is gone. The refused session keeps its `resumed_from` as provenance. Release happens
+// only when the marker still names the refused session and that session is no longer
+// accepting prompts; a live holder that survived a failed close is still caught by the
+// registry gate of the next reopen.
+fn release_reopen_marker_after_refusal(
+    source_directory: &Path,
+    refused_directory: &Path,
+    outcome: Result<()>,
+) -> Result<()> {
+    let refused_session = refused_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let released = (|| -> Result<()> {
+        let state = read_json::<SessionStatus>(&refused_directory.join("status.json"))?.state;
+        if session_accepts_prompt(&state) || state == "working" {
+            bail!("refused session {refused_session} is {state}");
+        }
+        let marker_path = source_directory.join(REOPEN_MARKER_FILE);
+        let _lock = lock_turn_claim(&source_directory.join(TURN_CLAIM_FILE))?;
+        let Some(text) = read_regular_text_if_present(&marker_path)? else {
+            return Ok(());
+        };
+        let marker: ReopenMarker = serde_json::from_str(&text).context("invalid reopen marker")?;
+        if marker.reopened_by.as_deref() != Some(refused_session) {
+            bail!(
+                "reopen marker names {:?}, not the refused session {refused_session}",
+                marker.reopened_by
+            );
+        }
+        remove_file_if_present(&marker_path)
+    })();
+    let Err(release_error) = released else {
+        return outcome;
+    };
+    let release_error = release_error.context(format!(
+        "the reopen marker of source session {} was not released",
+        source_directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+    ));
+    match outcome {
+        Ok(()) => Err(release_error),
+        Err(error) => Err(error.context(format!("{release_error:#}"))),
+    }
+}
+
 // Read-only gates on the closed source: it is closed with its tombstone and nothing of its
-// lifecycle is left open, a provider event supplies the conversation identity, and every
-// request record resolves to a recorded event. Each refusal names its gate.
+// lifecycle is left open, every request record resolves to a recorded event, and a provider
+// event supplies the conversation identity. Each refusal names its gate. Receipts are
+// validated before the identity is read, so a corrupt newest event refuses under
+// `request-unresolved` whether or not a receipt points at it.
 fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
     let manifest = read_manifest(directory)?;
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
     verify_reopen_source_is_closed(directory, id)?;
-    let (event_id, provider_session_id) = latest_provider_event_identity(directory, provider)?
-        .ok_or_else(|| {
-            reopen_refusal(
-                "source-identity-missing",
-                format!(
-                    "session {id} has no {} event that records a provider session id; a session whose only turn failed cannot be reopened",
-                    provider.as_str()
-                ),
-            )
-        })?;
     let index = requests::list(directory)?;
     if index.unreadable > 0 {
         return Err(reopen_refusal(
@@ -1713,6 +1850,16 @@ fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
             ));
         }
     }
+    let (event_id, provider_session_id) =
+        latest_provider_event_identity(directory, provider, id)?.ok_or_else(|| {
+            reopen_refusal(
+                "source-identity-missing",
+                format!(
+                    "session {id} has no {} event that records a provider session id; a session whose only turn failed cannot be reopened",
+                    provider.as_str()
+                ),
+            )
+        })?;
     Ok(ReopenSource {
         manifest,
         provider,
@@ -1767,12 +1914,25 @@ fn verify_reopen_source_is_closed(directory: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
+// A recorded event that cannot be read is a turn whose outcome cannot be verified, so it
+// refuses under `request-unresolved` even when no receipt points at it (legacy sessions).
 fn latest_provider_event_identity(
     directory: &Path,
     provider: FirstPartyCli,
+    id: &str,
 ) -> Result<Option<(String, String)>> {
     for path in event_paths(directory)?.into_iter().rev() {
-        let event: SessionEvent = read_json(&path)?;
+        let event: SessionEvent = read_json(&path).map_err(|error| {
+            reopen_refusal(
+                "request-unresolved",
+                format!(
+                    "session {id} has a recorded result {} that cannot be read: {error:#}",
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default()
+                ),
+            )
+        })?;
         if event.provider != provider.as_str() {
             continue;
         }
@@ -2343,7 +2503,13 @@ fn run_tell(request: TellRequest) -> Result<()> {
     let mut address = None;
     let outcome = run_tell_inner(request, &mut address);
     match address {
-        Some((session, request_id)) => finish_request(outcome, json, &session, &request_id),
+        Some((session, request_id)) => {
+            let mut extra = serde_json::Map::new();
+            if let Some(gate) = outcome.as_ref().err().and_then(reopen_refusal_gate) {
+                extra.insert("gate".to_owned(), serde_json::json!(gate));
+            }
+            finish_request_with_extra(outcome, json, &session, &request_id, extra)
+        }
         None => outcome,
     }
 }
@@ -2378,11 +2544,21 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
         &attached.prompt_with_attachments(&request.prompt),
     );
     let follow_up_transport = provider::follow_up_transport(provider);
+    let resumed_from = read_resumed_from(&directory)?;
     let (mut claim, baseline) =
         acquire_ready_turn_claim_with_context(&directory, &request.id, &attached.sources)?;
     let claim_token = claim.token.clone();
     let receipt = claim.receipt.clone();
     *address = Some((request.id.clone(), receipt.request_id.clone()));
+    refuse_follow_up_to_shared_conversation(
+        provider,
+        &directory,
+        &request.id,
+        resumed_from.as_ref(),
+        deadline,
+        &mut claim,
+        &previous_state,
+    )?;
     let mut expected_turn_id = None;
     match follow_up_transport {
         provider::FollowUpTransport::TerminalPasteFallback => {
@@ -2514,6 +2690,45 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
         &receipt,
         Some(&event),
     )
+}
+
+// A resumed session's conversation is re-checked immediately before every follow-up
+// delivery. A refusal sends nothing: the claim is released here, before the reason is
+// recorded, because releasing it rolls the status back to `previous_state` (ready) and
+// would otherwise clear that reason. The session therefore stays ready with the refusal in
+// its status, and its receipt stays unresolved. This is the same best-effort detection the
+// launch ran; a foreign resume that registers after this point is caught only by the next
+// delivery.
+#[allow(clippy::too_many_arguments)]
+fn refuse_follow_up_to_shared_conversation(
+    provider: FirstPartyCli,
+    directory: &Path,
+    id: &str,
+    resumed_from: Option<&ResumedFrom>,
+    deadline: Instant,
+    claim: &mut TurnClaim,
+    previous_state: &str,
+) -> Result<()> {
+    let Err(error) = verify_reopened_conversation_exclusive(
+        provider,
+        directory,
+        resumed_from,
+        deadline,
+        ResumedHolderCheck::BeforeDelivery,
+    ) else {
+        return Ok(());
+    };
+    let error = error.context(format!(
+        "follow-up to reopened session {id} was refused before delivery"
+    ));
+    let error = match claim.release_now() {
+        Ok(()) => error,
+        Err(release_error) => error.context(format!(
+            "the turn claim of session {id} could not be released: {release_error:#}"
+        )),
+    };
+    let _ = update_status(directory, previous_state, None, Some(format!("{error:#}")));
+    Err(error)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4657,6 +4872,20 @@ fn lock_turn_claim(path: &Path) -> Result<TurnClaimLock> {
 impl TurnClaim {
     fn retain_in_place(&mut self) {
         self.retained = true;
+    }
+
+    // Releases the claim now, exactly as dropping it unretained would, so the caller can
+    // record a status reason afterwards that the status rollback of the release would
+    // otherwise overwrite. Dropping the claim later does nothing more.
+    fn release_now(&mut self) -> Result<()> {
+        if self.retained {
+            return Ok(());
+        }
+        self.retained = true;
+        match self.rollback_state {
+            Some(state) => rollback_turn_claim_token(&self.path, &self.token, state),
+            None => release_turn_claim_token(&self.path, &self.token),
+        }
     }
 
     fn retain(mut self) {

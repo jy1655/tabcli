@@ -6809,6 +6809,7 @@ fn non_claude_sources_are_refused_with_each_adapters_own_reason() {
                 directory: root.path(),
                 provider_session_id: REOPEN_TEST_CONVERSATION,
                 deadline: Instant::now() + Duration::from_secs(1),
+                wait_for_registration: true,
             },
         )
         .unwrap_err();
@@ -7198,7 +7199,7 @@ fn reopen_refuses_receipts_whose_recorded_result_is_empty_malformed_or_foreign()
     )
     .unwrap();
     let (latest_event, latest_identity) =
-        latest_provider_event_identity(&source, FirstPartyCli::Claude)
+        latest_provider_event_identity(&source, FirstPartyCli::Claude, id)
             .unwrap()
             .unwrap();
     assert_ne!(latest_event, older_event);
@@ -7250,10 +7251,38 @@ fn reopen_refuses_receipts_whose_recorded_result_is_empty_malformed_or_foreign()
     .unwrap();
     let resolved = inspect_reopen_source(&source, id).unwrap();
     assert_eq!(resolved.event_id, latest_event);
+
+    // The newest event, which the receipt of the source's own turn points at, is corrupt:
+    // receipt validation runs before identity discovery, so the typed gate is returned.
+    let latest_path = source.join("events").join(&latest_event);
+    let latest_contents = fs::read(&latest_path).unwrap();
+    fs::write(&latest_path, "{\"provider\": \"claude\", \"mess").unwrap();
+    let error = inspect_reopen_source(&source, id).unwrap_err();
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some("request-unresolved"),
+        "{error:#}"
+    );
+    assert!(format!("{error:#}").contains(&latest_event), "{error:#}");
+
+    // A corrupt newest event that no receipt points at (a legacy record) still refuses under
+    // the same gate from identity discovery itself.
+    fs::write(&latest_path, latest_contents).unwrap();
+    let legacy_path = source.join("events").join("event-9-9.json");
+    fs::write(&legacy_path, "").unwrap();
+    let error = inspect_reopen_source(&source, id).unwrap_err();
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some("request-unresolved"),
+        "{error:#}"
+    );
+    assert!(format!("{error:#}").contains("event-9-9.json"), "{error:#}");
+    fs::remove_file(&legacy_path).unwrap();
+    assert!(inspect_reopen_source(&source, id).is_ok());
 }
 
 #[test]
-fn reopen_refusal_record_carries_the_gate_and_only_a_conflict_closes_the_surface() {
+fn reopen_refusal_record_carries_the_gate_and_only_a_holder_check_failure_closes_the_surface() {
     let directory = tempfile::tempdir().unwrap();
     assert_eq!(read_reopen_refusal_gate(directory.path()), None);
     let error = record_reopen_refusal(
@@ -7277,25 +7306,71 @@ fn reopen_refusal_record_carries_the_gate_and_only_a_conflict_closes_the_surface
 
     // A non-conflict failure reaches the caller unchanged and touches no session state.
     let before = snapshot_directory(directory.path());
-    let passed = close_surface_after_reopen_conflict(
+    let passed = close_surface_after_reopen_verification_failure(
         directory.path(),
         "session-reopenrefuse",
         anyhow::anyhow!("delivery failed"),
     );
     assert_eq!(format!("{passed:#}"), "delivery failed");
-    let passed =
-        close_surface_after_reopen_conflict(directory.path(), "session-reopenrefuse", error);
+    let passed = close_surface_after_reopen_verification_failure(
+        directory.path(),
+        "session-reopenrefuse",
+        error,
+    );
     assert_eq!(reopen_refusal_gate(&passed), Some("provider-unsupported"));
     assert_eq!(snapshot_directory(directory.path()), before);
 
-    // A session without a resumed_from has no conversation to check.
-    verify_reopened_conversation_exclusive(
-        FirstPartyCli::Claude,
-        directory.path(),
-        None,
-        Instant::now() + Duration::from_secs(1),
-    )
-    .unwrap();
+    // A session without a resumed_from has no conversation to check at either boundary.
+    for check in [
+        ResumedHolderCheck::AfterLaunch,
+        ResumedHolderCheck::BeforeDelivery,
+    ] {
+        verify_reopened_conversation_exclusive(
+            FirstPartyCli::Claude,
+            directory.path(),
+            None,
+            Instant::now() + Duration::from_secs(1),
+            check,
+        )
+        .unwrap();
+    }
+    assert_eq!(snapshot_directory(directory.path()), before);
+
+    // The close outcome is reported only after it is known; the detected refusal itself
+    // never claims a closure.
+    for gate in [REOPEN_CONFLICT_GATE, REOPEN_VERIFICATION_FAILED_GATE] {
+        let detected = reopen_refusal(gate, "detected; no prompt was delivered".to_owned());
+        let mut closed_with = None;
+        let reported = close_surface_after_reopen_verification_failure_with(
+            "session-reopenrefuse",
+            detected,
+            |detected| {
+                closed_with = Some(format!("{detected:#}"));
+                Ok(())
+            },
+        );
+        assert_eq!(
+            closed_with.as_deref(),
+            Some(format!("reopen refused ({gate}): detected; no prompt was delivered").as_str())
+        );
+        assert_eq!(reopen_refusal_gate(&reported), Some(gate));
+        assert!(
+            format!("{reported:#}").starts_with(
+                "the reopened session session-reopenrefuse was closed before any prompt was delivered: reopen refused"
+            ),
+            "{reported:#}"
+        );
+        let detected = reopen_refusal(gate, "detected; no prompt was delivered".to_owned());
+        let reported = close_surface_after_reopen_verification_failure_with(
+            "session-reopenrefuse",
+            detected,
+            |_| Err(anyhow::anyhow!("terminal adapter unavailable")),
+        );
+        assert_eq!(reopen_refusal_gate(&reported), Some(gate));
+        let text = format!("{reported:#}");
+        assert!(text.starts_with("the reopened session session-reopenrefuse could not be closed and may still hold the conversation: terminal adapter unavailable"), "{text}");
+        assert!(!text.contains("was closed"), "{text}");
+    }
 }
 
 // Marker claim, session creation, and an explicit close of the source are interleaved in
@@ -7585,15 +7660,22 @@ fn post_launch_holder_conflict_fails_the_reopened_session_under_its_own_gate() {
     let directory = write_reopen_launch_session(root.path(), id, Path::new("/opt/claude"));
     let resumed_from = read_resumed_from(&directory).unwrap().unwrap();
 
-    // The reopened process (stood in for by this test process) registers alone: exclusive.
+    // The reopened process (stood in for by this test process) registers alone: exclusive
+    // at the post-launch scan and at the delivery re-scan.
     write_live_registry_entry(&registry, std::process::id(), id);
-    verify_reopened_conversation_exclusive(
-        FirstPartyCli::Claude,
-        &directory,
-        Some(&resumed_from),
-        Instant::now() + Duration::from_secs(5),
-    )
-    .unwrap();
+    for check in [
+        ResumedHolderCheck::AfterLaunch,
+        ResumedHolderCheck::BeforeDelivery,
+    ] {
+        verify_reopened_conversation_exclusive(
+            FirstPartyCli::Claude,
+            &directory,
+            Some(&resumed_from),
+            Instant::now() + Duration::from_secs(5),
+            check,
+        )
+        .unwrap();
+    }
     assert_eq!(read_reopen_refusal_gate(&directory), None);
 
     // A foreign live process resumes the same conversation.
@@ -7610,6 +7692,7 @@ fn post_launch_holder_conflict_fails_the_reopened_session_under_its_own_gate() {
         &directory,
         Some(&resumed_from),
         Instant::now() + Duration::from_secs(5),
+        ResumedHolderCheck::AfterLaunch,
     )
     .unwrap_err();
     let _ = foreign.kill();
@@ -7619,13 +7702,394 @@ fn post_launch_holder_conflict_fails_the_reopened_session_under_its_own_gate() {
         format!("{error:#}").contains(&foreign.id().to_string()),
         "{error:#}"
     );
+    // Detection is recorded without claiming a closure that has not happened yet.
     assert!(
-        format!("{error:#}").contains("closed before any prompt was delivered"),
+        format!("{error:#}").ends_with("; no prompt was delivered"),
         "{error:#}"
     );
+    assert!(!format!("{error:#}").contains("closed"), "{error:#}");
     assert_eq!(
         read_reopen_refusal_gate(&directory).as_deref(),
         Some("reopen-conflict")
     );
+    let record: RecordedReopenRefusal = read_json(&directory.join(REOPEN_REFUSAL_FILE)).unwrap();
+    assert!(!record.detail.contains("closed"), "{}", record.detail);
+    provider::override_claude_session_registry_for_test(None);
+}
+
+// The post-launch scan returns as soon as the reopened process has registered. A foreign
+// resume that registers after that scan is caught by the re-scan immediately before the
+// initial prompt is sent, and the same re-scan refuses a later `tell` while keeping the
+// session ready. Detection is per boundary: nothing prevents the registration itself.
+#[cfg(windows)]
+#[test]
+fn a_holder_that_registers_after_the_post_launch_scan_is_caught_before_the_initial_prompt_and_before_a_tell()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let registry = root.path().join("sessions");
+    fs::create_dir(&registry).unwrap();
+    provider::override_claude_session_registry_for_test(Some(registry.clone()));
+    let id = "session-reopenlate2";
+    let directory = write_reopen_launch_session(root.path(), id, Path::new("/opt/claude"));
+    let resumed_from = read_resumed_from(&directory).unwrap().unwrap();
+
+    // The post-launch scan finds the managed process registered alone and returns.
+    write_live_registry_entry(&registry, std::process::id(), id);
+    verify_reopened_conversation_exclusive(
+        FirstPartyCli::Claude,
+        &directory,
+        Some(&resumed_from),
+        Instant::now() + Duration::from_secs(5),
+        ResumedHolderCheck::AfterLaunch,
+    )
+    .unwrap();
+
+    // A foreign resume registers only now, after that scan and before the initial delivery.
+    let mut foreign = std::process::Command::new("cmd.exe")
+        .args(["/c", "pause"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    write_live_registry_entry(&registry, foreign.id(), "foreign-resume");
+    let error = verify_reopened_conversation_exclusive(
+        FirstPartyCli::Claude,
+        &directory,
+        Some(&resumed_from),
+        Instant::now() + Duration::from_secs(5),
+        ResumedHolderCheck::BeforeDelivery,
+    )
+    .unwrap_err();
+    assert_eq!(reopen_refusal_gate(&error), Some("reopen-conflict"));
+    assert!(
+        format!("{error:#}").contains(&foreign.id().to_string()),
+        "{error:#}"
+    );
+
+    // The same session, later ready and being told: the re-scan refuses before delivery,
+    // the claim is released with its receipt unresolved, the session stays ready, and the
+    // status keeps the reason.
+    for state in ["awaiting-initial-input", "working", "ready"] {
+        update_status(&directory, state, None, None).unwrap();
+    }
+    let (mut claim, _) = acquire_ready_turn_claim_with_context(&directory, id, &[]).unwrap();
+    let refused_request = claim.receipt.request_id.clone();
+    assert_eq!(
+        read_json::<SessionStatus>(&directory.join("status.json"))
+            .unwrap()
+            .state,
+        "claimed"
+    );
+    let error = refuse_follow_up_to_shared_conversation(
+        FirstPartyCli::Claude,
+        &directory,
+        id,
+        Some(&resumed_from),
+        Instant::now() + Duration::from_secs(5),
+        &mut claim,
+        "ready",
+    )
+    .unwrap_err();
+    assert_eq!(reopen_refusal_gate(&error), Some("reopen-conflict"));
+    assert!(
+        format!("{error:#}").starts_with(&format!(
+            "follow-up to reopened session {id} was refused before delivery: reopen refused (reopen-conflict)"
+        )),
+        "{error:#}"
+    );
+    assert!(!directory.join(TURN_CLAIM_FILE).exists());
+    drop(claim);
+    let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+    assert_eq!(status.state, "ready");
+    assert!(
+        status
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains(&foreign.id().to_string()),
+        "{status:?}"
+    );
+    let result = query::request_result(&directory, &refused_request).unwrap();
+    assert_eq!(result["request_state"], "unresolved", "{result}");
+    assert_eq!(result["session_state"], "ready", "{result}");
+
+    // Once the foreign holder is gone, the next delivery is admitted again and the claim
+    // is left to the delivery.
+    let _ = foreign.kill();
+    let _ = foreign.wait();
+    let (mut claim, _) = acquire_ready_turn_claim_with_context(&directory, id, &[]).unwrap();
+    refuse_follow_up_to_shared_conversation(
+        FirstPartyCli::Claude,
+        &directory,
+        id,
+        Some(&resumed_from),
+        Instant::now() + Duration::from_secs(5),
+        &mut claim,
+        "ready",
+    )
+    .unwrap();
+    assert!(directory.join(TURN_CLAIM_FILE).is_file());
+    drop(claim);
+    assert!(!directory.join(TURN_CLAIM_FILE).exists());
+
+    // The managed registration disappearing is a verification failure, not exclusivity.
+    fs::remove_file(registry.join(format!("{}.json", std::process::id()))).unwrap();
+    let (mut claim, _) = acquire_ready_turn_claim_with_context(&directory, id, &[]).unwrap();
+    let error = refuse_follow_up_to_shared_conversation(
+        FirstPartyCli::Claude,
+        &directory,
+        id,
+        Some(&resumed_from),
+        Instant::now() + Duration::from_secs(5),
+        &mut claim,
+        "ready",
+    )
+    .unwrap_err();
+    drop(claim);
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some("reopen-verification-failed"),
+        "{error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("no longer registered"),
+        "{error:#}"
+    );
+    let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+    assert_eq!(status.state, "ready");
+    assert!(
+        status
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("reopen-verification-failed"),
+        "{status:?}"
+    );
+    provider::override_claude_session_registry_for_test(None);
+}
+
+// Every failure to complete the post-launch holder check takes the conflict path: the
+// gate is recorded, the initial claim is released with its receipt unresolved, only the new
+// surface is closed, and the source's marker is released so it can be reopened again.
+#[test]
+fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the_source_marker() {
+    let root = tempfile::tempdir().unwrap();
+    let unreadable_registry = root.path().join("sessions-as-a-file");
+    fs::write(&unreadable_registry, "not a directory").unwrap();
+    let empty_registry = root.path().join("sessions-empty");
+    fs::create_dir(&empty_registry).unwrap();
+    let source_id = "session-reopensrc10";
+    let source = write_closed_reopen_source(
+        root.path(),
+        source_id,
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+
+    for (label, registry, expected_detail, close_succeeds) in [
+        (
+            "unreadable registry, surface closed",
+            &unreadable_registry,
+            "failed to read the Claude session registry",
+            true,
+        ),
+        (
+            "registration timeout, surface closed",
+            &empty_registry,
+            "did not register",
+            true,
+        ),
+        (
+            "unreadable registry, close failed",
+            &unreadable_registry,
+            "failed to read the Claude session registry",
+            false,
+        ),
+    ] {
+        provider::override_claude_session_registry_for_test(Some(registry.clone()));
+        let new_id = "session-reopennew10";
+        let new = root.path().join(new_id);
+        let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+        claim.finalize(new_id).unwrap();
+        let source_before = snapshot_directory(&source);
+        fs::create_dir(&new).unwrap();
+        fs::create_dir(new.join("events")).unwrap();
+        write_reopen_test_manifest(
+            &new,
+            new_id,
+            "claude",
+            PathBuf::from("/opt/claude"),
+            root.path().to_owned(),
+            false,
+        );
+        let resumed_from = ResumedFrom {
+            session: source_id.to_owned(),
+            provider_session_id: REOPEN_TEST_CONVERSATION.to_owned(),
+            event_id: "event-1-1.json".to_owned(),
+        };
+        record_resumed_from(&new, &read_manifest(&new).unwrap(), &resumed_from).unwrap();
+        write_json_atomic(
+            &new.join(TERMINAL_HANDLE_FILE),
+            &reopen_test_terminal(new_id),
+        )
+        .unwrap();
+        update_status(&new, "launching", None, None).unwrap();
+        let mut initial_claim = acquire_turn_claim(&new).unwrap();
+        let request_id = initial_claim.receipt.request_id.clone();
+        update_status(&new, "awaiting-initial-input", None, None).unwrap();
+
+        let error = verify_reopened_conversation_exclusive(
+            FirstPartyCli::Claude,
+            &new,
+            Some(&resumed_from),
+            Instant::now() + Duration::from_millis(200),
+            ResumedHolderCheck::AfterLaunch,
+        )
+        .unwrap_err();
+        assert_eq!(
+            reopen_refusal_gate(&error),
+            Some("reopen-verification-failed"),
+            "{label}: {error:#}"
+        );
+        if cfg!(windows) {
+            assert!(
+                format!("{error:#}").contains(expected_detail),
+                "{label}: {error:#}"
+            );
+        }
+        assert!(
+            format!("{error:#}").ends_with("; no prompt was delivered"),
+            "{label}: {error:#}"
+        );
+        assert_eq!(
+            read_reopen_refusal_gate(&new).as_deref(),
+            Some("reopen-verification-failed"),
+            "{label}"
+        );
+
+        // The launch path: the delivery failure is recorded, the surface is closed through
+        // the same path a detected conflict takes, and the initial claim is released.
+        record_initial_prompt_delivery_failure(&new, &mut initial_claim, false, &error);
+        let mut closed_terminals = Vec::new();
+        let reported =
+            close_surface_after_reopen_verification_failure_with(new_id, error, |detected| {
+                if !close_succeeds {
+                    anyhow::bail!("terminal adapter unavailable");
+                }
+                close_session_state_with_error(&new, Some(format!("{detected:#}")), |session| {
+                    closed_terminals.push(session.id.clone());
+                    Ok(terminal::CloseOutcome::Closed)
+                })
+            });
+        drop(initial_claim);
+        assert_eq!(
+            reopen_refusal_gate(&reported),
+            Some("reopen-verification-failed")
+        );
+        let status: SessionStatus = read_json(&new.join("status.json")).unwrap();
+        if close_succeeds {
+            assert_eq!(closed_terminals, [format!("{new_id}-terminal")], "{label}");
+            assert!(
+                format!("{reported:#}").starts_with(&format!(
+                    "the reopened session {new_id} was closed before any prompt was delivered"
+                )),
+                "{label}: {reported:#}"
+            );
+            assert_eq!(status.state, "closed", "{label}");
+            assert!(
+                status
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("reopen refused (reopen-verification-failed)"),
+                "{label}: {status:?}"
+            );
+            assert!(new.join(TERMINAL_TOMBSTONE_FILE).is_file(), "{label}");
+            assert!(!new.join(TERMINAL_HANDLE_FILE).exists(), "{label}");
+        } else {
+            assert!(closed_terminals.is_empty(), "{label}");
+            assert!(
+                format!("{reported:#}").starts_with(&format!(
+                    "the reopened session {new_id} could not be closed and may still hold the conversation"
+                )),
+                "{label}: {reported:#}"
+            );
+            assert_eq!(status.state, "failed", "{label}");
+            assert!(new.join(TERMINAL_HANDLE_FILE).is_file(), "{label}");
+        }
+        assert!(
+            !new.join(TURN_CLAIM_FILE).exists(),
+            "{label}: claim not released"
+        );
+        // The receipt survives with its outcome unresolved: nothing was delivered.
+        let result = query::request_result(&new, &request_id).unwrap();
+        assert_eq!(result["request_state"], "unresolved", "{label}: {result}");
+        assert_eq!(result["result"], serde_json::Value::Null, "{label}");
+
+        // The source is untouched except for its marker, which the refusal releases.
+        let mut source_after = snapshot_directory(&source);
+        assert!(
+            source_after.remove("reopen.marker.json").is_some(),
+            "{label}: marker missing before release"
+        );
+        let mut expected = source_before.clone();
+        expected.remove("reopen.marker.json");
+        assert_eq!(source_after, expected, "{label}");
+        let outcome =
+            release_reopen_marker_after_refusal(&source, &new, Err(anyhow::anyhow!("refused")));
+        let outcome = outcome.unwrap_err();
+        assert_eq!(format!("{outcome:#}"), "refused", "{label}");
+        assert!(!source.join(REOPEN_MARKER_FILE).exists(), "{label}");
+        assert_eq!(snapshot_directory(&source), expected, "{label}");
+        assert_eq!(
+            read_resumed_from(&new).unwrap().as_ref(),
+            Some(&resumed_from),
+            "{label}: provenance of the refused session is kept"
+        );
+        // A subsequent reopen of the same source passes its gates and claims the marker.
+        provider::override_claude_session_registry_for_test(Some(empty_registry.clone()));
+        inspect_reopen_source(&source, source_id).unwrap();
+        provider::verify_reopen_available(FirstPartyCli::Claude, REOPEN_TEST_CONVERSATION).unwrap();
+        let next = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+        drop(next);
+        assert!(!source.join(REOPEN_MARKER_FILE).exists(), "{label}");
+        fs::remove_dir_all(&new).unwrap();
+    }
+
+    // Release is refused while the refused session still accepts prompts, and when the
+    // marker names another reopen.
+    let new_id = "session-reopennew11";
+    let new = root.path().join(new_id);
+    fs::create_dir(&new).unwrap();
+    write_reopen_test_manifest(
+        &new,
+        new_id,
+        "claude",
+        PathBuf::from("/opt/claude"),
+        root.path().to_owned(),
+        false,
+    );
+    let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    claim.finalize(new_id).unwrap();
+    update_status(&new, "ready", None, None).unwrap();
+    let outcome = release_reopen_marker_after_refusal(&source, &new, Ok(())).unwrap_err();
+    assert!(format!("{outcome:#}").contains("is ready"), "{outcome:#}");
+    assert!(source.join(REOPEN_MARKER_FILE).is_file());
+    update_status(&new, "failed", None, Some("refused".to_owned())).unwrap();
+    let other = root.path().join("session-reopennew12");
+    fs::create_dir(&other).unwrap();
+    update_status(&other, "failed", None, Some("refused".to_owned())).unwrap();
+    let outcome = release_reopen_marker_after_refusal(&source, &other, Ok(())).unwrap_err();
+    assert!(
+        format!("{outcome:#}").contains("not the refused session"),
+        "{outcome:#}"
+    );
+    assert!(source.join(REOPEN_MARKER_FILE).is_file());
+    release_reopen_marker_after_refusal(&source, &new, Ok(())).unwrap();
+    assert!(!source.join(REOPEN_MARKER_FILE).exists());
+    // Releasing an already released marker is not an error.
+    release_reopen_marker_after_refusal(&source, &new, Ok(())).unwrap();
     provider::override_claude_session_registry_for_test(None);
 }

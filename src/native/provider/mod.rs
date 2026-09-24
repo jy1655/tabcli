@@ -50,14 +50,18 @@ pub(super) struct ResumePlan {
     pub(super) environment_removals: &'static [&'static str],
 }
 
-// A reopened session whose provider process is running and has not yet received its
-// initial prompt. `directory` is the new session's own state; `deadline` bounds how long
-// the adapter may wait for the provider's own registration of that process.
+// A reopened session whose provider process is running. `directory` is the new session's
+// own state. With `wait_for_registration` the adapter waits until `deadline` for the
+// provider's own registration of that process (the post-launch check, before the initial
+// prompt exists in the process); without it the adapter answers from the registry as it is
+// now and treats a missing registration as a failure (the re-scan immediately before the
+// initial prompt and before every follow-up delivery).
 #[derive(Clone, Copy)]
 pub(super) struct ResumedSessionContext<'a> {
     pub(super) directory: &'a Path,
     pub(super) provider_session_id: &'a str,
     pub(super) deadline: Instant,
+    pub(super) wait_for_registration: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -209,11 +213,14 @@ trait NativeProviderAdapter: Sync {
     // shared default: an adapter that cannot prove ownership must refuse with its reason.
     fn verify_reopen_available(&self, provider_session_id: &str) -> Result<()>;
     fn prepare_resume(&self, context: ResumeContext<'_>) -> Result<ResumePlan>;
-    // Post-launch ownership check for a reopened session. Once the provider's own evidence
-    // shows the new process registered as the conversation's holder, the adapter reports
-    // every OTHER live process that holds the same conversation. A non-empty answer is a
-    // conflict the shared layer fails the new session for; an adapter that refuses reopen
-    // refuses here as well, because this call is only reachable after its resume plan ran.
+    // Ownership check for a reopened session, run after launch and again at every delivery
+    // boundary. Once the provider's own evidence shows the new process registered as the
+    // conversation's holder, the adapter reports every OTHER live process that holds the
+    // same conversation. A non-empty answer is a conflict the shared layer refuses the
+    // delivery for; an error is a verification failure the shared layer also refuses for,
+    // because an unverifiable conversation is treated as shared. This is best-effort
+    // detection at each call, not exclusion. An adapter that refuses reopen refuses here as
+    // well, because this call is only reachable after its resume plan ran.
     fn other_resumed_conversation_holders(
         &self,
         context: ResumedSessionContext<'_>,

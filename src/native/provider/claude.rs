@@ -254,7 +254,7 @@ impl NativeProviderAdapter for ClaudeAdapter {
                 ),
             )
         };
-        vec![
+        let mut checks = vec![
             Check::new(
                 "claude_inbound_setting",
                 availability,
@@ -277,7 +277,14 @@ impl NativeProviderAdapter for ClaudeAdapter {
                 "Follow-up uses official ListAgents/SendMessage. Backend, feature flags, policy, and live discovery have not been verified; --probe only reads the CLI version.",
                 "Use the official provider's availability diagnostics. Doctor never calls a messenger/model or substitutes terminal injection.",
             ),
-        ]
+        ];
+        if let Some(check) = context
+            .directory
+            .and_then(resumed_conversation_holders_check)
+        {
+            checks.push(check);
+        }
+        checks
     }
 
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
@@ -309,13 +316,22 @@ impl NativeProviderAdapter for ClaudeAdapter {
         verify_reopen_available_for_platform(context.provider_session_id, cfg!(windows))?;
         let registry = claude_sessions_registry_dir()?;
         let managed_name = managed_session_name(context.directory)?;
-        wait_for_resumed_conversation_holders(
-            &registry,
-            context.provider_session_id,
-            &managed_name,
-            live_process_creation_time,
-            context.deadline,
-        )
+        if context.wait_for_registration {
+            wait_for_resumed_conversation_holders(
+                &registry,
+                context.provider_session_id,
+                &managed_name,
+                live_process_creation_time,
+                context.deadline,
+            )
+        } else {
+            recheck_resumed_conversation_holders(
+                &registry,
+                context.provider_session_id,
+                &managed_name,
+                live_process_creation_time,
+            )
+        }
     }
 
     fn initial_prompt_transport(&self) -> InitialPromptTransport {
@@ -447,12 +463,15 @@ fn claude_initial_prompt_transport(windows: bool) -> InitialPromptTransport {
 //
 // Claude offers no exclusive hold on a conversation: resuming one session in two terminals
 // is permitted and interleaves both into one transcript
-// (https://code.claude.com/docs/en/sessions#branch-a-session). The registry gate therefore
-// runs three times: read-only before the source is claimed, again immediately before the
-// process is spawned, and once more after launch, when the new process has registered and
-// every other live holder of the same conversation is a detected conflict. A foreign
-// `claude --resume` that starts inside the remaining spawn window is detected by that last
-// check, not prevented.
+// (https://code.claude.com/docs/en/sessions#branch-a-session). The registry gate is
+// therefore best-effort detection, never exclusion. It runs read-only before the source is
+// claimed, again immediately before the process is spawned, after launch once the new
+// process has registered under its managed `--name`, again immediately before the initial
+// prompt is sent, and again immediately before every `tell` to the resumed session. At each
+// of those points every other live holder of the same conversation is a detected conflict
+// that refuses the delivery. A foreign `claude --resume` can still register between two
+// checks and interleave into the transcript until the next boundary catches it; only a
+// provider-owned exclusive hold would close that window, and Claude does not offer one.
 fn prepare_resume_for_platform(context: ResumeContext<'_>, windows: bool) -> Result<ResumePlan> {
     verify_reopen_available_for_platform(context.provider_session_id, windows)?;
     let settings_path = context.directory.join("claude-settings.json");
@@ -539,6 +558,51 @@ fn claude_sessions_registry_dir() -> Result<PathBuf> {
     Ok(config_dir.join("sessions"))
 }
 
+// A registry record whose identity fields all validated against the file it was read from.
+struct ValidatedRegistryRecord {
+    pid: u32,
+    session_id: String,
+    proc_start: u64,
+    name: Option<String>,
+}
+
+// Parses and validates one `<pid>.json` record; `stem` is the file name's numeric stem.
+// Every defect is reported as text so the caller can apply the file-name-pid refusal rule.
+// A deserialized record is never trusted before its `pid`, `sessionId`, and `procStart` are
+// checked: a structurally valid record with a foreign or reused identity would otherwise
+// clear a live holder of the conversation.
+fn validated_registry_record(
+    stem: &str,
+    text: &str,
+) -> std::result::Result<ValidatedRegistryRecord, String> {
+    let record =
+        serde_json::from_str::<SessionRegistryEntry>(text).map_err(|error| error.to_string())?;
+    if stem.parse::<u32>().ok() != Some(record.pid) {
+        return Err(format!(
+            "payload pid {} does not match the file name pid {stem}",
+            record.pid
+        ));
+    }
+    if !valid_claude_conversation_id(&record.session_id) {
+        return Err(format!(
+            "sessionId {:?} is not a Claude session UUID",
+            record.session_id
+        ));
+    }
+    let proc_start = record
+        .proc_start
+        .as_ref()
+        .ok_or_else(|| "procStart is missing".to_owned())?;
+    let proc_start = proc_start_filetime(proc_start)
+        .ok_or_else(|| format!("procStart {proc_start} is not a process creation FILETIME"))?;
+    Ok(ValidatedRegistryRecord {
+        pid: record.pid,
+        session_id: record.session_id,
+        proc_start,
+        name: record.name,
+    })
+}
+
 // A registered Claude Code process that is alive and whose creation time still matches its
 // record, so the record describes that process and not a reused pid.
 #[derive(Debug, Eq, PartialEq)]
@@ -565,10 +629,13 @@ fn live_conversation_writer(
 }
 
 // Every registered live process that holds the conversation. The scan fails closed: a
-// numeric `<pid>.json` whose record cannot be parsed or lacks a required field is judged by
-// the pid in its file name, because that record could belong to a live holder of this very
-// conversation. A dead pid clears it; a live or uninspectable pid refuses the reopen and
-// names the record.
+// numeric `<pid>.json` whose record cannot be parsed, lacks a required field, or carries an
+// identity that does not describe the file it sits in (a payload `pid` other than the file
+// name's, a `sessionId` that is not a Claude session UUID, or a `procStart` that is missing
+// or not a FILETIME) is judged by the pid in its file name, because that record could belong
+// to a live holder of this very conversation. A dead pid clears it; a live or uninspectable
+// pid refuses the reopen and names the record. Only a record whose identity fields all
+// validate is ever compared against the conversation.
 fn live_conversation_holders(
     registry: &Path,
     provider_session_id: &str,
@@ -603,24 +670,24 @@ fn live_conversation_holders(
         let Some(text) = super::super::read_regular_text_if_present(&path)? else {
             continue;
         };
-        let record = match serde_json::from_str::<SessionRegistryEntry>(&text) {
+        let record = match validated_registry_record(stem, &text) {
             Ok(record) => record,
-            Err(parse_error) => {
+            Err(defect) => {
                 let Ok(file_pid) = stem.parse::<u32>() else {
                     bail!(
-                        "reopen unsupported: Claude session registry entry {} is malformed ({parse_error}) and its file name is not a pid",
+                        "reopen unsupported: Claude session registry entry {} is malformed ({defect}) and its file name is not a pid",
                         path.display()
                     )
                 };
                 let live = live_creation_time(file_pid).with_context(|| {
                     format!(
-                        "reopen unsupported: Claude session registry entry {} is malformed ({parse_error}) and process {file_pid} could not be inspected",
+                        "reopen unsupported: Claude session registry entry {} is malformed ({defect}) and process {file_pid} could not be inspected",
                         path.display()
                     )
                 })?;
                 if live.is_some() {
                     bail!(
-                        "reopen unsupported: Claude session registry entry {} is malformed ({parse_error}) and names live process {file_pid}; the conversation it holds cannot be verified",
+                        "reopen unsupported: Claude session registry entry {} is malformed ({defect}) and names live process {file_pid}; the conversation it holds cannot be verified",
                         path.display()
                     )
                 }
@@ -640,17 +707,11 @@ fn live_conversation_holders(
         else {
             continue;
         };
-        match record.proc_start.as_ref().and_then(proc_start_filetime) {
-            Some(recorded) if recorded == live => holders.push(LiveConversationHolder {
+        if record.proc_start == live {
+            holders.push(LiveConversationHolder {
                 pid: record.pid,
                 name: record.name,
-            }),
-            Some(_) => continue,
-            None => bail!(
-                "reopen unsupported: Claude session registry entry {} names live process {} without a verifiable procStart",
-                path.display(),
-                record.pid
-            ),
+            });
         }
     }
     holders.sort_by_key(|holder| holder.pid);
@@ -688,6 +749,31 @@ fn wait_for_resumed_conversation_holders(
         };
         thread::sleep(remaining.min(Duration::from_millis(100)));
     }
+}
+
+// The delivery-boundary re-scan of a reopened session that already registered. It does not
+// wait: a registration that has disappeared means the reopened process is no longer a
+// verifiable holder, and nothing may be delivered to it. This is the check that runs
+// immediately before the initial prompt and before every `tell`; a foreign resume that
+// registered since the previous scan is reported here.
+fn recheck_resumed_conversation_holders(
+    registry: &Path,
+    provider_session_id: &str,
+    managed_name: &str,
+    live_creation_time: impl Fn(u32) -> Result<Option<u64>>,
+) -> Result<Vec<u32>> {
+    other_resumed_conversation_holders_once(
+        registry,
+        provider_session_id,
+        managed_name,
+        live_creation_time,
+    )?
+    .with_context(|| {
+        format!(
+            "reopened Claude session {managed_name} is no longer registered for conversation {provider_session_id} under {}",
+            registry.display()
+        )
+    })
 }
 
 // `Ok(None)` while the reopened process has not registered yet; otherwise the pids of every
@@ -728,6 +814,72 @@ fn proc_start_filetime(value: &serde_json::Value) -> Option<u64> {
         serde_json::Value::Number(number) => number.as_u64(),
         _ => None,
     }
+}
+
+// Doctor's view of a reopened session: every other live Claude Code process registered for
+// the conversation the session resumed. This is the same best-effort registry scan the
+// delivery boundaries run, taken at doctor time only; it proves nothing about the interval
+// between two scans. `None` for a session that did not resume a conversation.
+fn resumed_conversation_holders_check(directory: &Path) -> Option<super::super::doctor::Check> {
+    use super::super::{
+        doctor::{Availability::*, Check},
+        query,
+    };
+    let manifest = query::optional_json::<serde_json::Value>(&directory.join("manifest.json"))
+        .ok()
+        .flatten()?;
+    let provider_session_id = manifest
+        .get("resumed_from")?
+        .get("provider_session_id")?
+        .as_str()?
+        .to_owned();
+    let managed_name = managed_session_name(directory).ok()?;
+    let scan = claude_sessions_registry_dir().and_then(|registry| {
+        recheck_resumed_conversation_holders(
+            &registry,
+            &provider_session_id,
+            &managed_name,
+            live_process_creation_time,
+        )
+    });
+    let next_action = "Detection is best-effort and taken only at launch, before each delivery, and now; a foreign claude --resume can still interleave between checks. Close the other holder before the next tell, or accept the shared transcript.";
+    Some(match scan {
+        Ok(others) if others.is_empty() => Check::new(
+            "claude_resumed_conversation_holders",
+            Available,
+            "claude_resumed_conversation_exclusive_now",
+            format!(
+                "No other live Claude Code process is registered for resumed conversation {provider_session_id} at this moment."
+            ),
+            next_action,
+        )
+        .evidence(serde_json::json!({ "provider_session_id": provider_session_id, "other_holders": [] })),
+        Ok(others) => Check::new(
+            "claude_resumed_conversation_holders",
+            Unavailable,
+            "claude_resumed_conversation_shared",
+            format!(
+                "Resumed conversation {provider_session_id} is also held by live Claude Code process(es) {}; the next tell to this session will be refused with gate reopen-conflict while they stay registered.",
+                others
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            next_action,
+        )
+        .evidence(serde_json::json!({ "provider_session_id": provider_session_id, "other_holders": others })),
+        Err(error) => Check::new(
+            "claude_resumed_conversation_holders",
+            Unknown,
+            "claude_resumed_conversation_unverified",
+            format!(
+                "The registry scan for resumed conversation {provider_session_id} failed: {error:#}; the next tell to this session will be refused with gate reopen-verification-failed until it succeeds."
+            ),
+            next_action,
+        )
+        .evidence(serde_json::json!({ "provider_session_id": provider_session_id })),
+    })
 }
 
 #[cfg(windows)]
@@ -1857,6 +2009,115 @@ mod tests {
             );
             assert!(!directory.path().join("claude-pending-turn.json").exists());
         }
+    }
+
+    // Doctor lists the other live holders of a resumed conversation from the same registry
+    // scan the delivery boundaries use, and says nothing for a session that resumed none.
+    #[cfg(windows)]
+    #[test]
+    fn doctor_reports_other_live_holders_of_a_resumed_conversation() {
+        use super::super::super::doctor::{Availability, Context};
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("sessions");
+        std::fs::create_dir(&registry).unwrap();
+        override_session_registry_for_test(Some(registry.clone()));
+        let directory = root.path().join("session-reopendoc1");
+        std::fs::create_dir(&directory).unwrap();
+        let diagnose = |directory: &Path| {
+            ADAPTER.diagnose(Context {
+                directory: Some(directory),
+                manifest: None,
+                executable: None,
+                current_version: Some("2.1.281"),
+                workspace: directory,
+                probe: false,
+                deadline: Instant::now(),
+            })
+        };
+        let holders_check = |directory: &Path| {
+            diagnose(directory)
+                .into_iter()
+                .find(|check| check.id == "claude_resumed_conversation_holders")
+        };
+        // No manifest, then a manifest without resumed_from: no check at all.
+        assert!(holders_check(&directory).is_none());
+        std::fs::write(
+            directory.join("manifest.json"),
+            serde_json::json!({"schema": 1, "id": "session-reopendoc1"}).to_string(),
+        )
+        .unwrap();
+        assert!(holders_check(&directory).is_none());
+
+        std::fs::write(
+            directory.join("manifest.json"),
+            serde_json::json!({
+                "schema": 1,
+                "id": "session-reopendoc1",
+                "resumed_from": {
+                    "session": "session-reopendoc0",
+                    "provider_session_id": REOPEN_TEST_CONVERSATION,
+                    "event_id": "event-1-1.json",
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let write_live_entry = |pid: u32, name: &str| {
+            let identity = terminal::windows_process_identity(pid).unwrap();
+            std::fs::write(
+                registry.join(format!("{pid}.json")),
+                serde_json::json!({
+                    "pid": pid,
+                    "sessionId": REOPEN_TEST_CONVERSATION,
+                    "procStart": identity.creation_time.to_string(),
+                    "name": name,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        // The managed process (this test process) is registered alone.
+        write_live_entry(std::process::id(), "session-reopendoc1");
+        let check = holders_check(&directory).unwrap();
+        assert_eq!(check.availability, Availability::Available);
+        assert_eq!(
+            check.reason_code,
+            "claude_resumed_conversation_exclusive_now"
+        );
+
+        // A foreign live resume is listed by pid.
+        let mut foreign = std::process::Command::new("cmd.exe")
+            .args(["/c", "pause"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        write_live_entry(foreign.id(), "foreign-resume");
+        let check = holders_check(&directory).unwrap();
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        assert_eq!(check.availability, Availability::Unavailable);
+        assert_eq!(check.reason_code, "claude_resumed_conversation_shared");
+        let rendered = serde_json::to_value(&check).unwrap();
+        assert_eq!(
+            rendered["evidence"]["other_holders"],
+            serde_json::json!([foreign.id()])
+        );
+        assert!(
+            rendered["detail"]
+                .as_str()
+                .unwrap()
+                .contains("gate reopen-conflict"),
+            "{rendered}"
+        );
+
+        // A scan that cannot complete is reported as unknown, never as exclusive.
+        std::fs::remove_file(registry.join(format!("{}.json", std::process::id()))).unwrap();
+        let check = holders_check(&directory).unwrap();
+        assert_eq!(check.availability, Availability::Unknown);
+        assert_eq!(check.reason_code, "claude_resumed_conversation_unverified");
+        override_session_registry_for_test(None);
     }
 
     const TEST_REQUEST: &str = "claude-turn-safe123";
@@ -3273,8 +3534,138 @@ mod tests {
         })
         .unwrap_err();
         assert!(
-            format!("{error:#}").contains("without a verifiable procStart"),
+            format!("{error:#}").contains("procStart is missing"),
             "{error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains("live process 4245"),
+            "{error:#}"
+        );
+    }
+
+    // A record that deserializes is still judged by its file-name pid when its identity
+    // fields do not describe that file: the payload pid, the sessionId, and procStart are
+    // validated before the record is compared against any conversation.
+    #[test]
+    fn structurally_valid_records_with_inconsistent_identities_fail_closed_by_file_pid() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path();
+        let fixtures: [(&str, serde_json::Value, &str); 8] = [
+            (
+                "8001.json",
+                serde_json::json!({"pid": 8999, "sessionId": REOPEN_TEST_CONVERSATION, "procStart": "8001"}),
+                "payload pid 8999 does not match the file name pid 8001",
+            ),
+            (
+                "8002.json",
+                serde_json::json!({"pid": 8002, "sessionId": "", "procStart": "8002"}),
+                "sessionId \"\" is not a Claude session UUID",
+            ),
+            (
+                "8003.json",
+                serde_json::json!({"pid": 8003, "sessionId": "not-a-uuid", "procStart": "8003"}),
+                "sessionId \"not-a-uuid\" is not a Claude session UUID",
+            ),
+            (
+                "8004.json",
+                serde_json::json!({"pid": 8004, "sessionId": REOPEN_TEST_CONVERSATION}),
+                "procStart is missing",
+            ),
+            (
+                "8005.json",
+                serde_json::json!({"pid": 8005, "sessionId": REOPEN_TEST_CONVERSATION, "procStart": "later"}),
+                "procStart \"later\" is not a process creation FILETIME",
+            ),
+            (
+                "8006.json",
+                serde_json::json!({"pid": 8006, "sessionId": REOPEN_TEST_CONVERSATION, "procStart": []}),
+                "procStart [] is not a process creation FILETIME",
+            ),
+            (
+                "8007.json",
+                serde_json::json!({"pid": 8007, "sessionId": REOPEN_TEST_CONVERSATION, "procStart": -1}),
+                "procStart -1 is not a process creation FILETIME",
+            ),
+            (
+                "8008.json",
+                serde_json::json!({"pid": 8008, "sessionId": "5e58ec26-0000-4000-8000-00000000000", "procStart": "8008"}),
+                "is not a Claude session UUID",
+            ),
+        ];
+        for (name, record, _) in &fixtures {
+            std::fs::write(registry.join(name), record.to_string()).unwrap();
+        }
+        // Every inconsistent record names a dead file pid: none is a writer, for this
+        // conversation or any other.
+        for conversation in [
+            REOPEN_TEST_CONVERSATION,
+            "5e58ec26-0000-4000-8000-000000000000",
+        ] {
+            assert_eq!(
+                live_conversation_writer(registry, conversation, |_| Ok(None)).unwrap(),
+                None
+            );
+        }
+        for (name, _, defect) in &fixtures {
+            let file_pid: u32 = name.strip_suffix(".json").unwrap().parse().unwrap();
+            // A live file pid refuses and names the record and its defect, whatever
+            // conversation is asked and whatever the payload pid says.
+            for conversation in [
+                REOPEN_TEST_CONVERSATION,
+                "5e58ec26-0000-4000-8000-000000000000",
+            ] {
+                let error = live_conversation_writer(registry, conversation, |candidate| {
+                    Ok((candidate == file_pid).then_some(u64::from(candidate)))
+                })
+                .unwrap_err();
+                let text = format!("{error:#}");
+                assert!(text.contains("reopen unsupported"), "{name}: {text}");
+                assert!(text.contains(name), "{name}: {text}");
+                assert!(text.contains(defect), "{name}: {text}");
+                assert!(
+                    text.contains(&format!("live process {file_pid}")),
+                    "{name}: {text}"
+                );
+            }
+            // An uninspectable file pid refuses as well.
+            let error = live_conversation_writer(registry, REOPEN_TEST_CONVERSATION, |candidate| {
+                if candidate == file_pid {
+                    Err(anyhow::anyhow!("access denied"))
+                } else {
+                    Ok(None)
+                }
+            })
+            .unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains(name), "{name}: {text}");
+            assert!(text.contains(defect), "{name}: {text}");
+            assert!(text.contains("access denied"), "{name}: {text}");
+        }
+        // The reviewer's case in full: `<livePID>.json` whose payload names a dead pid is
+        // refused by the live file pid, never cleared by the dead payload pid.
+        let error = live_conversation_writer(registry, REOPEN_TEST_CONVERSATION, |candidate| {
+            Ok((candidate == 8001).then_some(1))
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("8001.json"), "{error:#}");
+        // A consistent record beside them is still recognized as the writer.
+        std::fs::write(
+            registry.join("8100.json"),
+            serde_json::json!({"pid": 8100, "sessionId": REOPEN_TEST_CONVERSATION, "procStart": "8100"}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            live_conversation_writer(registry, REOPEN_TEST_CONVERSATION, |candidate| {
+                Ok((candidate == 8100).then_some(8100))
+            })
+            .unwrap(),
+            Some(8100)
+        );
+        assert_eq!(
+            validated_registry_record("8100", "{\"pid\": 8100, \"sessionId\": \"6928CA1C-1234-4ABC-8DEF-0123456789AB\", \"procStart\": 42, \"name\": \"x\"}")
+                .unwrap()
+                .proc_start,
+            42
         );
     }
 
@@ -3474,6 +3865,33 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("7004"), "{error:#}");
+
+        // The delivery re-scan answers from the registry as it is now: a holder that
+        // registered after the post-launch scan is reported, and it never waits.
+        std::fs::remove_file(registry.join("7004.json")).unwrap();
+        assert_eq!(
+            recheck_resumed_conversation_holders(registry, REOPEN_TEST_CONVERSATION, managed, live)
+                .unwrap(),
+            Vec::<u32>::new()
+        );
+        write_entry(7006, REOPEN_TEST_CONVERSATION, "late-foreign-resume");
+        assert_eq!(
+            recheck_resumed_conversation_holders(registry, REOPEN_TEST_CONVERSATION, managed, live)
+                .unwrap(),
+            vec![7006]
+        );
+        std::fs::remove_file(registry.join("7006.json")).unwrap();
+        // A managed registration that disappeared is a failure of the re-scan, not a clean
+        // answer: the reopened process can no longer be shown to hold the conversation.
+        std::fs::remove_file(registry.join("7001.json")).unwrap();
+        let error =
+            recheck_resumed_conversation_holders(registry, REOPEN_TEST_CONVERSATION, managed, live)
+                .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("is no longer registered"),
+            "{error:#}"
+        );
+        write_entry(7001, REOPEN_TEST_CONVERSATION, managed);
 
         // Two live processes under the managed name cannot be told apart.
         write_entry(7005, REOPEN_TEST_CONVERSATION, managed);
