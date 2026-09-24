@@ -2065,7 +2065,9 @@ fn sessions_in(root: &Path, request: &SessionsRequest) -> Result<Vec<serde_json:
             {
                 continue;
             }
-            let _ = recover_pending_completion(&directory);
+            // Repair runs completion recovery first itself, unconditionally and under the
+            // same lifecycle lock, so a listing publishes every finished turn before it
+            // decides on the owner without a separate recovery pass.
             let _ = repair_dead_native_owner(&directory);
             let status = read_json::<SessionStatus>(&directory.join("status.json")).ok();
             let state = status
@@ -3990,7 +3992,9 @@ fn recover_pending_completion(directory: &Path) -> Result<bool> {
 /// finishes those steps instead of publishing. Both sequences release the claim before they
 /// remove the journal: while the claim is installed the journal is the only evidence that
 /// the event at its path is the provider's committed result, so no interruption may leave
-/// the claim without the journal.
+/// the claim without the journal. For the same reason both sequences sync `events/` before
+/// they discard the journal of an event that already matches it: the completion that wrote
+/// the event may have stopped between its rename and that sync.
 fn recover_pending_completion_locked(directory: &Path, claim_path: &Path) -> Result<bool> {
     let completion_path = directory.join(TURN_COMPLETION_FILE);
     if let Some(tombstone) = read_status_if_present(&directory.join(CLOSED_STATUS_FILE))? {
@@ -4033,6 +4037,10 @@ fn recover_pending_completion_locked(directory: &Path, claim_path: &Path) -> Res
             if status.state != pending.status_state || status.error != pending.status_error {
                 bail!("claim-free pending completion has no matching terminal status")
             }
+            // The claim is released only after the event's directory was synced, but the
+            // journal is the last evidence of the result, so its removal is preceded by
+            // the same barrier regardless of which run released the claim.
+            sync_committed_event_directory(directory)?;
             remove_file_if_present(&completion_path)?;
             Ok(true)
         }
@@ -4252,7 +4260,10 @@ fn require_events_directory(directory: &Path) -> Result<()> {
 /// only evidence that a set-aside event was unverified, so the move is made durable
 /// before the journal can be discarded: the rename syncs `events/` itself, and a run that
 /// finds the event already moved aside by an interrupted close, which may have stopped
-/// between the rename and that sync, syncs `events/` again before it returns.
+/// between the rename and that sync, syncs `events/` again before it returns. A committed
+/// event gets the same barrier: the completion that wrote it may have stopped between its
+/// rename and the sync of `events/`, so the close syncs the directory before the journal,
+/// the only proof that the entry is the result, is removed.
 fn set_aside_unverified_completion_event_for_close(directory: &Path) -> Result<()> {
     let completion_path = directory.join(TURN_COMPLETION_FILE);
     let Some(text) = read_regular_text_if_present(&completion_path)? else {
@@ -4283,9 +4294,24 @@ fn set_aside_unverified_completion_event_for_close(directory: &Path) -> Result<(
                 })?;
             }
         }
-        JournaledEventState::Committed => (),
+        JournaledEventState::Committed => sync_committed_event_directory(directory)?,
     }
     Ok(())
+}
+
+/// Makes a committed event's directory entry durable before the journal that proves the
+/// event is the provider's result can be discarded. A completion that stopped between the
+/// event's rename and the sync of `events/` leaves the entry unsynced while the journal
+/// still exists; every lifecycle path that discards the journal of a committed event
+/// (completion recovery, claim-free recovery, close, interrupted close) syncs `events/`
+/// first, so a later crash cannot lose the event together with its evidence. The sync is
+/// idempotent when the completion already made the entry durable, and it is a fault
+/// boundary like every other sync that follows a rename.
+fn sync_committed_event_directory(directory: &Path) -> Result<()> {
+    fault_point("syncing a committed completion event's directory")?;
+    let events = directory.join("events");
+    sync_directory(&events)
+        .with_context(|| format!("failed to sync state directory {}", events.display()))
 }
 
 fn validate_pending_completion(pending: &PendingTurnCompletion) -> Result<()> {
@@ -4307,7 +4333,10 @@ fn validate_pending_completion(pending: &PendingTurnCompletion) -> Result<()> {
 fn write_pending_completion_event(directory: &Path, pending: &PendingTurnCompletion) -> Result<()> {
     validate_pending_completion(pending)?;
     match journaled_event_state(directory, pending)? {
-        JournaledEventState::Committed => Ok(()),
+        // The completion that wrote this event may have stopped between its rename and
+        // the sync of `events/`; the journal is discarded once this returns, so the
+        // entry is made durable here.
+        JournaledEventState::Committed => sync_committed_event_directory(directory),
         JournaledEventState::Mismatched => {
             bail!("pending native completion event file contains different data")
         }

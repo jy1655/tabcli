@@ -5683,3 +5683,260 @@ fn a_live_owner_keeps_unrecoverable_journal_damage_as_a_repair_error() {
     assert!(!fixture.directory.join(CLOSED_STATUS_FILE).exists());
     assert!(fixture.directory.join(TERMINAL_HANDLE_FILE).exists());
 }
+
+// ---------------------------------------------------------------------------
+// Review round 7: a committed event's directory entry is made durable before the
+// journal that proves it is discarded
+// ---------------------------------------------------------------------------
+
+/// A completion stopped at the write boundary between the event's rename and the sync of
+/// its directory entry: the event stands at its journal's path and matches it byte for
+/// byte, the claim and the journal are still installed, and `events/` has not been synced
+/// since the rename. Without a barrier, both recovery and close would accept the event as
+/// committed and durably remove the journal, and a later crash could then lose the
+/// event's directory entry together with the only evidence that it was the result.
+struct UnsyncedCommittedEvent {
+    _root: tempfile::TempDir,
+    directory: PathBuf,
+    request_id: String,
+    event_path: PathBuf,
+}
+
+fn seed_completion_stopped_before_its_events_sync() -> UnsyncedCommittedEvent {
+    for budget in 0.. {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-fault");
+        fs::create_dir_all(directory.join("events")).unwrap();
+        write_test_manifest(&directory);
+        update_status(&directory, "working", None, None).unwrap();
+        let claim = acquire_turn_claim(&directory).unwrap();
+        let claim_token = claim.token.clone();
+        let request_id = claim.receipt.request_id.clone();
+        let event_path = directory.join("events").join(&claim.receipt.event_file);
+        claim.retain();
+        let (outcome, log) = with_sync_log(|| {
+            with_fault_budget(budget, || {
+                record_provider_result_for_claim(
+                    &directory,
+                    FirstPartyCli::Codex,
+                    "committed result",
+                    Some("provider-session".to_owned()),
+                    Some("provider-turn".to_owned()),
+                    Some(&claim_token),
+                )
+            })
+        });
+        let error =
+            outcome.expect_err("the completion finished before it stopped between rename and sync");
+        assert!(injected_fault(&error), "{error:#}");
+        // The boundary is recognised by its state: the event exists at its final path and
+        // no sync of `events/` has happened. Every earlier budget stops before the event's
+        // rename; every later one has synced the directory.
+        if !event_path.exists() || log.contains(&SyncRecord::Directory(directory.join("events"))) {
+            continue;
+        }
+        assert!(directory.join(TURN_CLAIM_FILE).exists());
+        assert!(directory.join(TURN_COMPLETION_FILE).exists());
+        return UnsyncedCommittedEvent {
+            _root: root,
+            directory,
+            request_id,
+            event_path,
+        };
+    }
+    unreachable!("the fault budget sweep never ends without returning or panicking")
+}
+
+const COMMITTED_EVENT_SYNC_LABEL: &str = "syncing a committed completion event's directory";
+
+#[test]
+fn recovery_syncs_a_committed_event_before_discarding_its_journal() {
+    // An uninterrupted recovery syncs `events/` before it touches any session record: the
+    // status rewrite, the claim release, and the journal removal all sync the session
+    // directory, and the events sync must come first.
+    let fixture = seed_completion_stopped_before_its_events_sync();
+    let events = fixture.directory.join("events");
+    let (changed, log) = with_sync_log(|| recover_pending_completion(&fixture.directory));
+    assert!(changed.unwrap());
+    let events_synced = log
+        .iter()
+        .position(|record| record == &SyncRecord::Directory(events.clone()));
+    let session_synced = log
+        .iter()
+        .position(|record| record == &SyncRecord::Directory(fixture.directory.clone()));
+    assert!(
+        matches!(
+            (events_synced, session_synced),
+            (Some(events), Some(session)) if events < session
+        ),
+        "the committed event was not made durable before the session records changed: {log:?}"
+    );
+    assert!(fixture.event_path.exists());
+    assert!(!fixture.directory.join(TURN_CLAIM_FILE).exists());
+    assert!(!fixture.directory.join(TURN_COMPLETION_FILE).exists());
+    let status: SessionStatus = read_json(&fixture.directory.join("status.json")).unwrap();
+    assert_eq!(status.state, "ready");
+    assert_eq!(
+        request_state(&fixture.directory, &fixture.request_id),
+        ("completed".to_owned(), "ready".to_owned())
+    );
+    // Converged: a repeated recovery changes nothing and syncs nothing.
+    let (again, log) = with_sync_log(|| recover_pending_completion(&fixture.directory));
+    assert!(!again.unwrap());
+    assert!(log.is_empty(), "{log:?}");
+
+    // Every interruption of that recovery: the claim and the journal outlive the event's
+    // unsynced entry. Whenever either is gone, `events/` was synced first, and the very
+    // first boundary the recovery can stop at is the sync itself.
+    let mut labels = Vec::new();
+    for budget in 0.. {
+        let fixture = seed_completion_stopped_before_its_events_sync();
+        let events = fixture.directory.join("events");
+        let (outcome, log) = with_sync_log(|| {
+            with_fault_budget(budget, || recover_pending_completion(&fixture.directory))
+        });
+        let claim_kept = fixture.directory.join(TURN_CLAIM_FILE).exists();
+        let journal_kept = fixture.directory.join(TURN_COMPLETION_FILE).exists();
+        if !(claim_kept && journal_kept) {
+            assert!(
+                log.contains(&SyncRecord::Directory(events.clone())),
+                "budget {budget}: recovery discarded the journal's evidence before syncing events/: {log:?}"
+            );
+        }
+        match outcome {
+            Ok(changed) => {
+                assert!(changed);
+                assert!(!claim_kept && !journal_kept);
+                break;
+            }
+            Err(error) => {
+                assert!(injected_fault(&error), "{error:#}");
+                labels.push(format!("{error:#}"));
+                assert!(fixture.event_path.exists());
+                // The next holder converges (a stop after the journal's removal leaves it
+                // nothing to change).
+                recover_pending_completion(&fixture.directory).unwrap();
+                assert!(!fixture.directory.join(TURN_CLAIM_FILE).exists());
+                assert!(!fixture.directory.join(TURN_COMPLETION_FILE).exists());
+                assert_eq!(
+                    request_state(&fixture.directory, &fixture.request_id),
+                    ("completed".to_owned(), "ready".to_owned())
+                );
+            }
+        }
+    }
+    // Recovery reports its own first failure, so the label is exact here.
+    assert!(
+        labels
+            .first()
+            .is_some_and(|label| label.contains(COMMITTED_EVENT_SYNC_LABEL)),
+        "the first recovery boundary is not the committed event's directory sync: {labels:?}"
+    );
+}
+
+#[test]
+fn close_syncs_a_committed_event_before_discarding_its_journal() {
+    // A close of the same interrupted session writes its tombstone first, so the events
+    // sync cannot precede every session-directory sync; the property is that no
+    // interruption of the close, nor of the recovery that finishes an interrupted close,
+    // removes the claim or the journal before `events/` was synced. The finished close
+    // leaves the event published and nothing for a later recovery to sync. The close
+    // reports the later cleanup steps' faults rather than the barrier's own, so the
+    // boundary is recognised by its state: tombstone written, claim and journal kept,
+    // `events/` not yet synced.
+    let mut stopped_before_barrier = false;
+    for budget in 0.. {
+        let fixture = seed_completion_stopped_before_its_events_sync();
+        let events = fixture.directory.join("events");
+        let claim_path = fixture.directory.join(TURN_CLAIM_FILE);
+        let completion_path = fixture.directory.join(TURN_COMPLETION_FILE);
+        let (outcome, close_log) = with_sync_log(|| {
+            with_fault_budget(budget, || {
+                close_session_state_with_error(
+                    &fixture.directory,
+                    Some("closed by the maintainer".to_owned()),
+                    |_| Ok(terminal::CloseOutcome::Closed),
+                )
+            })
+        });
+        let events_synced = close_log.contains(&SyncRecord::Directory(events.clone()));
+        if !(claim_path.exists() && completion_path.exists()) {
+            assert!(
+                events_synced,
+                "budget {budget}: close discarded the journal's evidence before syncing events/: {close_log:?}"
+            );
+        }
+        match outcome {
+            Ok(()) => {
+                assert!(events_synced);
+                assert!(!claim_path.exists());
+                assert!(!completion_path.exists());
+                assert!(fixture.event_path.exists());
+                assert_eq!(
+                    request_state(&fixture.directory, &fixture.request_id),
+                    ("completed".to_owned(), "closed".to_owned())
+                );
+                let (again, log) = with_sync_log(|| recover_pending_completion(&fixture.directory));
+                assert!(!again.unwrap());
+                assert!(log.is_empty(), "{log:?}");
+                break;
+            }
+            Err(error) => {
+                assert!(injected_fault(&error), "{error:#}");
+            }
+        }
+        // Between the status rewrite and the barrier: the recovery that finishes this
+        // close has no session record to rewrite before it reaches the barrier.
+        let at_barrier = fixture.directory.join(CLOSED_STATUS_FILE).exists()
+            && read_json::<SessionStatus>(&fixture.directory.join("status.json"))
+                .is_ok_and(|status| status.state == "closed")
+            && claim_path.exists()
+            && completion_path.exists()
+            && !events_synced;
+        stopped_before_barrier |= at_barrier;
+        // The next lifecycle-lock holder finishes the interrupted close (or, before the
+        // tombstone, publishes the completion); either way it must not discard the
+        // journal without the barrier having run in one of the two passes.
+        let (recovered, recovery_log) =
+            with_sync_log(|| recover_pending_completion(&fixture.directory));
+        recovered.unwrap();
+        assert!(!completion_path.exists());
+        assert!(!claim_path.exists());
+        assert!(
+            events_synced || recovery_log.contains(&SyncRecord::Directory(events.clone())),
+            "budget {budget}: neither the close nor its recovery synced events/: {close_log:?} {recovery_log:?}"
+        );
+        if at_barrier {
+            let events_synced = recovery_log
+                .iter()
+                .position(|record| record == &SyncRecord::Directory(events.clone()));
+            let session_synced = recovery_log
+                .iter()
+                .position(|record| record == &SyncRecord::Directory(fixture.directory.clone()));
+            assert!(
+                matches!(
+                    (events_synced, session_synced),
+                    (Some(events), Some(session)) if events < session
+                ),
+                "budget {budget}: the interrupted close's recovery changed session records before syncing events/: {recovery_log:?}"
+            );
+        }
+        assert!(fixture.event_path.exists());
+        // Before the tombstone the close never committed, so recovery published the
+        // completion on a session that stays ready; after it, the close is finished.
+        let session_state = if fixture.directory.join(CLOSED_STATUS_FILE).exists() {
+            "closed"
+        } else {
+            "ready"
+        };
+        assert_eq!(
+            request_state(&fixture.directory, &fixture.request_id),
+            ("completed".to_owned(), session_state.to_owned()),
+            "budget {budget}"
+        );
+    }
+    assert!(
+        stopped_before_barrier,
+        "no close boundary stopped after the tombstone and before the committed event's directory sync"
+    );
+}
