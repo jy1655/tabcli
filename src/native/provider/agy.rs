@@ -273,12 +273,29 @@ fn correlated_response<'a>(message: &'a str, pending: &PendingAgyTurn) -> Result
 // first-party input path or a per-turn ready/accepted signal, this adapter reads
 // Agy's own `--log-file` output (glog lines) as the only available evidence:
 //
-// - readiness gate: `CLI startup completed` (analytics.go) and a
-//   `Reloading system slash commands and skills` (manager.go) line that is followed
-//   by a `hooks_manager.go ... loaded N named hooks` line, then a quiet period without
-//   further `Reloading system slash commands`/`Full redraw completed` lines;
-// - input receipt: `HandleUserInput called with text: "..."` (input_loop.go) whose
-//   text carries the Windows protocol prefix and the pending turn marker.
+// - readiness gate: `CLI startup completed` (analytics.go) and the latest
+//   `Reloading system slash commands and skills` (manager.go) line followed by its
+//   `hooks_manager.go ... loaded N named hooks` completion, then a quiet period that
+//   starts at that completion and restarts on every later
+//   `Reloading system slash commands`/`Full redraw completed` line. A later reload
+//   without its completion resets readiness. An Agy version that never logs the
+//   hooks completion after its skills reload is unsupported by this gate.
+// - input receipt: a complete `HandleUserInput called with text: "..."` line
+//   (input_loop.go) that starts after the byte length of agy.log observed
+//   immediately before the paste and whose text carries the Windows protocol prefix
+//   and the complete pending turn marker.
+//
+// Delivery classification after a paste (issue #43 review):
+//
+// - delivered: such a receipt line exists after the pre-paste offset;
+// - delivery-uncertain: everything else. Non-delivery would have to be proven by a
+//   line Agy logs after draining its console input without a receipt, and the real
+//   logs contain no such marker (session-fMqSQc, 2026-09-24: after the discarded
+//   paste Agy logged only its late reload and then nothing for a minute), so a
+//   missing receipt at the end of the window, a deadline-capped window, an
+//   unreadable or missing log, a log shorter than the pre-paste offset (rotated or
+//   truncated), and a partial trailing line all stay uncertain and never `not_sent`.
+//   The paste is never repeated.
 //
 // Delete this section, `initial_prompt_ready_delay`, and the receipt branches of
 // `send_initial_prompt`/`send_terminal_follow_up` when Agy provides such a signal
@@ -289,16 +306,37 @@ const SKILLS_RELOAD_MARKER: &str = "Reloading system slash commands and skills";
 const SLASH_RELOAD_MARKER: &str = "Reloading system slash commands";
 const HOOKS_LOADED_SOURCE: &str = "hooks_manager.go";
 const HOOKS_LOADED_MARKER: &str = " named hooks";
+const HOOKS_COMPLETION_DESCRIPTION: &str = "`hooks_manager.go ... named hooks` after the latest `Reloading system slash commands and skills`";
 const FULL_REDRAW_MARKER: &str = "Full redraw completed";
 const INPUT_RECEIPT_MARKER: &str = "HandleUserInput called with text: \"";
 const WINDOWS_PROTOCOL_PREFIX: &str = "[Agent Bridge Agy Windows console turn protocol]";
-const TURN_MARKER_HEAD: &str = "<!-- agent-bridge-agy-turn:";
 // Observed post-login reload bursts arrive about 3.0 seconds apart; the quiet period
 // must outlast that cadence so the paste does not land between two of them.
 const STARTUP_QUIET_PERIOD: Duration = Duration::from_millis(3500);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const INPUT_RECEIPT_WINDOW: Duration = Duration::from_secs(15);
 const INPUT_RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+trait Clock {
+    fn now(&mut self) -> Instant;
+    fn sleep(&mut self, duration: Duration);
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&mut self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
+
+fn read_log_bytes(log_path: &Path) -> Result<Option<Vec<u8>>> {
+    super::super::read_regular_bytes_if_present(log_path)
+}
 
 fn deliver_windows_console_turn(
     session: &terminal::TerminalSession,
@@ -313,21 +351,32 @@ fn deliver_windows_console_turn(
         .and_then(|pending| pending.context("Agy turn correlation state is missing"))
         .map_err(TerminalSendFailure::not_sent)?;
     if gate_on_startup {
-        wait_for_startup_readiness_until(
-            &log_path,
+        wait_for_startup_readiness_with(
+            &mut || read_log_bytes(&log_path),
             deadline,
             STARTUP_QUIET_PERIOD,
             STARTUP_POLL_INTERVAL,
+            &mut SystemClock,
         )
         .map_err(TerminalSendFailure::not_sent)?;
     }
+    // The paste is issued only after this read, so only lines that start after this
+    // offset can be evidence for this submission.
+    let pre_paste_len = read_log_bytes(&log_path)
+        .context("Agy log could not be read before the console paste")
+        .map_err(TerminalSendFailure::not_sent)?
+        .map_or(0, |log| log.len());
     terminal::send_file(session, prompt_path, deadline)?;
+    let pasted_at = Instant::now();
     // The composer state after an unconfirmed paste is unknown; never paste again.
-    confirm_input_receipt_until(
-        &log_path,
+    confirm_input_receipt_with(
+        &mut || read_log_bytes(&log_path),
         &pending,
-        input_receipt_window_end(Instant::now(), deadline),
+        pre_paste_len,
+        pasted_at,
+        deadline,
         INPUT_RECEIPT_POLL_INTERVAL,
+        &mut SystemClock,
     )
 }
 
@@ -347,41 +396,62 @@ fn input_receipt_window_end(now: Instant, deadline: Instant) -> Instant {
 // Complete log lines only: a line without its terminating newline may still be
 // written, so it is neither a marker nor a receipt yet. Terminal escape sequences and
 // carriage returns are dropped so a marker is recognised through console noise.
-fn complete_log_lines(log: &str) -> impl Iterator<Item = String> + '_ {
-    let complete = match log.rfind('\n') {
+fn complete_log_lines(log: &[u8]) -> impl Iterator<Item = String> + '_ {
+    let complete = match log.iter().rposition(|byte| *byte == b'\n') {
         Some(end) => &log[..end],
-        None => "",
+        None => &log[..0],
     };
     complete
-        .split('\n')
+        .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
-        .map(strip_terminal_noise)
+        .map(|line| strip_terminal_noise(&String::from_utf8_lossy(line)))
 }
 
 fn strip_terminal_noise(line: &str) -> String {
+    let characters: Vec<char> = line.chars().collect();
     let mut clean = String::with_capacity(line.len());
-    let mut characters = line.chars();
-    while let Some(character) = characters.next() {
-        match character {
-            '\u{1b}' => match characters.next() {
-                Some('[') => {
-                    for next in characters.by_ref() {
-                        if ('\u{40}'..='\u{7e}').contains(&next) {
-                            break;
+    let mut index = 0;
+    while index < characters.len() {
+        match characters[index] {
+            '\u{1b}' => {
+                index += 1;
+                match characters.get(index) {
+                    Some('[') => {
+                        index += 1;
+                        while let Some(next) = characters.get(index) {
+                            index += 1;
+                            if ('\u{40}'..='\u{7e}').contains(next) {
+                                break;
+                            }
                         }
                     }
-                }
-                Some(']') => {
-                    for next in characters.by_ref() {
-                        if next == '\u{7}' {
-                            break;
+                    Some(']') => {
+                        // OSC ends with BEL or with the string terminator `ESC \`.
+                        // Any other escape ends the OSC and is processed on its own.
+                        index += 1;
+                        while let Some(next) = characters.get(index) {
+                            if *next == '\u{7}' {
+                                index += 1;
+                                break;
+                            }
+                            if *next == '\u{1b}' {
+                                if characters.get(index + 1) == Some(&'\\') {
+                                    index += 2;
+                                }
+                                break;
+                            }
+                            index += 1;
                         }
                     }
+                    Some(_) => index += 1,
+                    None => {}
                 }
-                _ => {}
-            },
-            '\r' => {}
-            _ => clean.push(character),
+            }
+            '\r' => index += 1,
+            other => {
+                clean.push(other);
+                index += 1;
+            }
         }
     }
     clean
@@ -390,32 +460,59 @@ fn strip_terminal_noise(line: &str) -> String {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct StartupObservation {
     startup_completed: bool,
-    // A skills reload line that a hooks-loaded line followed. The main thread also
-    // logs a hooks-loaded line before the first reload; that earlier line does not
-    // count, which is what separates a late reload from a completed one.
-    skills_reloaded: bool,
-    // Reload and redraw lines seen so far; each new one restarts the quiet period.
+    // Line index of the latest `Reloading system slash commands and skills` line.
+    latest_reload: Option<usize>,
+    // Line index of the hooks-loaded line that followed the latest reload. The main
+    // thread also logs a hooks-loaded line before the first reload; that earlier
+    // line does not count, which is what separates a late reload from a completed
+    // one, and a later reload without its own completion clears this again.
+    latest_reload_completion: Option<usize>,
+    // Line index of the newest settling event: the latest reload's completion or a
+    // reload/redraw line after it. The quiet period starts when this changes.
+    settle_line: Option<usize>,
+    // Reload and redraw lines seen so far (diagnostics only).
     activity_lines: usize,
 }
 
-fn observe_startup(log: &str) -> StartupObservation {
+impl StartupObservation {
+    fn missing_markers(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if !self.startup_completed {
+            missing.push("`CLI startup completed`");
+        }
+        if self.latest_reload.is_none() {
+            missing.push("`Reloading system slash commands and skills`");
+        }
+        if self.latest_reload_completion.is_none() {
+            missing.push(HOOKS_COMPLETION_DESCRIPTION);
+        }
+        missing
+    }
+}
+
+fn observe_startup(log: &[u8]) -> StartupObservation {
     let mut observation = StartupObservation::default();
-    let mut reload_awaiting_hooks = false;
-    for line in complete_log_lines(log) {
+    for (index, line) in complete_log_lines(log).enumerate() {
         if line.contains(STARTUP_COMPLETED_MARKER) {
             observation.startup_completed = true;
         }
         if line.contains(SKILLS_RELOAD_MARKER) {
-            reload_awaiting_hooks = true;
-        } else if reload_awaiting_hooks
+            observation.latest_reload = Some(index);
+            observation.latest_reload_completion = None;
+            observation.settle_line = None;
+        } else if observation.latest_reload.is_some()
+            && observation.latest_reload_completion.is_none()
             && line.contains(HOOKS_LOADED_SOURCE)
             && line.contains(HOOKS_LOADED_MARKER)
         {
-            observation.skills_reloaded = true;
-            reload_awaiting_hooks = false;
+            observation.latest_reload_completion = Some(index);
+            observation.settle_line = Some(index);
         }
         if line.contains(SLASH_RELOAD_MARKER) || line.contains(FULL_REDRAW_MARKER) {
             observation.activity_lines += 1;
+            if observation.latest_reload_completion.is_some() {
+                observation.settle_line = Some(index);
+            }
         }
     }
     observation
@@ -427,6 +524,7 @@ enum ReadinessState {
     AwaitingLog,
     AwaitingStartup,
     AwaitingSkillsReload,
+    AwaitingHooksCompletion,
     Settling,
 }
 
@@ -437,71 +535,100 @@ impl ReadinessState {
             Self::AwaitingLog => "agy.log has not been created",
             Self::AwaitingStartup => "agy.log has no `CLI startup completed` line",
             Self::AwaitingSkillsReload => {
-                "agy.log has no completed skills and hooks reload after startup"
+                "agy.log has no `Reloading system slash commands and skills` line"
             }
-            Self::Settling => "agy.log was still reloading or redrawing during the quiet period",
+            Self::AwaitingHooksCompletion => {
+                "the latest skills reload in agy.log has no hooks completion after it"
+            }
+            Self::Settling => {
+                "agy.log was still reloading or redrawing during the quiet period after the hooks completion"
+            }
         }
     }
 }
 
 struct ReadinessGate {
     quiet_period: Duration,
-    activity_lines: usize,
-    activity_seen_at: Instant,
+    settle_line: Option<usize>,
+    settled_at: Instant,
+    last_observation: Option<StartupObservation>,
 }
 
 impl ReadinessGate {
     fn new(now: Instant, quiet_period: Duration) -> Self {
         Self {
             quiet_period,
-            activity_lines: 0,
-            activity_seen_at: now,
+            settle_line: None,
+            settled_at: now,
+            last_observation: None,
         }
     }
 
-    fn observe(&mut self, log: Option<&str>, now: Instant) -> ReadinessState {
+    fn observe(&mut self, log: Option<&[u8]>, now: Instant) -> ReadinessState {
         let Some(log) = log else {
+            self.last_observation = None;
             return ReadinessState::AwaitingLog;
         };
         let observation = observe_startup(log);
-        if observation.activity_lines != self.activity_lines {
-            self.activity_lines = observation.activity_lines;
-            self.activity_seen_at = now;
+        if observation.settle_line != self.settle_line {
+            self.settle_line = observation.settle_line;
+            self.settled_at = now;
         }
-        if !observation.startup_completed {
+        let state = if !observation.startup_completed {
             ReadinessState::AwaitingStartup
-        } else if !observation.skills_reloaded {
+        } else if observation.latest_reload.is_none() {
             ReadinessState::AwaitingSkillsReload
-        } else if now.saturating_duration_since(self.activity_seen_at) < self.quiet_period {
+        } else if observation.latest_reload_completion.is_none() {
+            ReadinessState::AwaitingHooksCompletion
+        } else if now.saturating_duration_since(self.settled_at) < self.quiet_period {
             ReadinessState::Settling
         } else {
             ReadinessState::Ready
-        }
+        };
+        self.last_observation = Some(observation);
+        state
+    }
+
+    fn deadline_report(&self, state: ReadinessState) -> String {
+        let missing = match &self.last_observation {
+            Some(observation) => observation.missing_markers(),
+            None => StartupObservation::default().missing_markers(),
+        };
+        let missing = if missing.is_empty() {
+            "none".to_owned()
+        } else {
+            missing.join(", ")
+        };
+        format!(
+            "Agy did not report startup readiness before the deadline: {}; missing markers: {missing}; an Agy version that never logs the {HOOKS_COMPLETION_DESCRIPTION} completion is unsupported by this gate; the initial prompt was not pasted",
+            state.describe()
+        )
     }
 }
 
-fn wait_for_startup_readiness_until(
-    log_path: &Path,
+fn wait_for_startup_readiness_with<L, C>(
+    read_log: &mut L,
     deadline: Instant,
     quiet_period: Duration,
     poll_interval: Duration,
-) -> Result<()> {
-    let mut gate = ReadinessGate::new(Instant::now(), quiet_period);
+    clock: &mut C,
+) -> Result<()>
+where
+    L: FnMut() -> Result<Option<Vec<u8>>>,
+    C: Clock,
+{
+    let mut gate = ReadinessGate::new(clock.now(), quiet_period);
     loop {
-        let log = super::super::read_regular_text_if_present(log_path)
-            .context("Agy startup readiness could not be observed")?;
-        let now = Instant::now();
+        let log = read_log().context("Agy startup readiness could not be observed")?;
+        let now = clock.now();
         let state = gate.observe(log.as_deref(), now);
         if state == ReadinessState::Ready {
             return Ok(());
         }
         if now >= deadline {
-            bail!(
-                "Agy did not report startup readiness before the deadline: {}; the initial prompt was not pasted",
-                state.describe()
-            );
+            bail!("{}", gate.deadline_report(state));
         }
-        thread::sleep(deadline.saturating_duration_since(now).min(poll_interval));
+        clock.sleep(deadline.saturating_duration_since(now).min(poll_interval));
     }
 }
 
@@ -512,96 +639,184 @@ struct InputReceipt {
 }
 
 // Agy logs the accepted input Go-quoted (`%q`): a complete record ends with the
-// closing quote. Anything else, or a trailing ellipsis, is treated as truncated so
-// a marker cut off by the logger can still be matched by its visible prefix.
-fn input_receipts(log: &str) -> Vec<InputReceipt> {
+// closing quote. Anything else, or a trailing ellipsis, is reported as truncated for
+// diagnostics; matching still requires the complete marker to be visible.
+fn parse_input_receipt(line: &str) -> Option<InputReceipt> {
+    let (_, quoted) = line.split_once(INPUT_RECEIPT_MARKER)?;
+    let (text, truncated) = match quoted.strip_suffix('"') {
+        Some(text) => (text, false),
+        None => (quoted, true),
+    };
+    let (text, truncated) = match text.strip_suffix("...") {
+        Some(text) => (text, true),
+        None => (text, truncated),
+    };
+    Some(InputReceipt {
+        text: text.to_owned(),
+        truncated,
+    })
+}
+
+fn input_receipts(log: &[u8]) -> Vec<InputReceipt> {
     complete_log_lines(log)
-        .filter_map(|line| {
-            let (_, quoted) = line.split_once(INPUT_RECEIPT_MARKER)?;
-            let (text, truncated) = match quoted.strip_suffix('"') {
-                Some(text) => (text, false),
-                None => (quoted, true),
-            };
-            let (text, truncated) = match text.strip_suffix("...") {
-                Some(text) => (text, true),
-                None => (text, truncated),
-            };
-            Some(InputReceipt {
-                text: text.to_owned(),
-                truncated,
-            })
-        })
+        .filter_map(|line| parse_input_receipt(&line))
         .collect()
 }
 
+// The complete marker (`<!-- agent-bridge-agy-turn:<token> -->`) is unique to this
+// submission; a visible prefix is not, because another turn's token can share it. A
+// receipt that Agy cut before the closing ` -->` therefore never confirms delivery.
 fn receipt_matches(receipt: &InputReceipt, pending: &PendingAgyTurn) -> bool {
-    if !receipt.text.contains(WINDOWS_PROTOCOL_PREFIX) {
-        return false;
-    }
-    if receipt.text.contains(&pending.marker) {
-        return true;
-    }
-    if !receipt.truncated {
-        return false;
-    }
-    // The marker is ASCII, so every byte prefix is a character boundary. Require at
-    // least one claim-token character beyond the shared head.
-    (TURN_MARKER_HEAD.len() + 1..pending.marker.len())
-        .rev()
-        .any(|length| receipt.text.ends_with(&pending.marker[..length]))
+    receipt.text.contains(WINDOWS_PROTOCOL_PREFIX) && receipt.text.contains(&pending.marker)
 }
 
-fn find_input_receipt(log: &str, pending: &PendingAgyTurn) -> bool {
-    input_receipts(log)
+// Byte offset of the first line that begins at or after the pre-paste offset. A line
+// that straddles the offset started before the paste and is never evidence.
+fn evidence_start(log: &[u8], pre_paste_len: usize) -> Option<usize> {
+    if pre_paste_len == 0 || log[..pre_paste_len].ends_with(b"\n") {
+        return Some(pre_paste_len);
+    }
+    log[pre_paste_len..]
         .iter()
-        .any(|receipt| receipt_matches(receipt, pending))
+        .position(|byte| *byte == b'\n')
+        .map(|newline| pre_paste_len + newline + 1)
 }
 
-fn confirm_input_receipt_until(
-    log_path: &Path,
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReceiptEvidence {
+    Delivered,
+    LogMissing,
+    LogShrunk { len: usize },
+    NoReceipt { appended: usize, partial_tail: bool },
+}
+
+fn observe_input_receipt(
+    log: Option<&[u8]>,
+    pre_paste_len: usize,
     pending: &PendingAgyTurn,
-    window_end: Instant,
+) -> ReceiptEvidence {
+    let Some(log) = log else {
+        return ReceiptEvidence::LogMissing;
+    };
+    if log.len() < pre_paste_len {
+        return ReceiptEvidence::LogShrunk { len: log.len() };
+    }
+    if let Some(start) = evidence_start(log, pre_paste_len)
+        && complete_log_lines(&log[start..])
+            .filter_map(|line| parse_input_receipt(&line))
+            .any(|receipt| receipt_matches(&receipt, pending))
+    {
+        return ReceiptEvidence::Delivered;
+    }
+    ReceiptEvidence::NoReceipt {
+        appended: log.len() - pre_paste_len,
+        partial_tail: log.last().is_some_and(|byte| *byte != b'\n'),
+    }
+}
+
+fn unconfirmed_receipt_error(
+    evidence: &ReceiptEvidence,
+    pending: &PendingAgyTurn,
+    pre_paste_len: usize,
+    elapsed: Duration,
+    full_window: bool,
+) -> anyhow::Error {
+    let reason = match evidence {
+        ReceiptEvidence::Delivered => unreachable!("a delivered receipt is not unconfirmed"),
+        ReceiptEvidence::LogMissing => "agy.log is missing after the paste".to_owned(),
+        ReceiptEvidence::LogShrunk { len } => format!(
+            "agy.log shrank to {len} bytes below the pre-paste offset {pre_paste_len} (rotated or truncated), so the receipt may have been lost"
+        ),
+        ReceiptEvidence::NoReceipt {
+            appended,
+            partial_tail,
+        } => {
+            let observed = format!(
+                "no HandleUserInput receipt in the {appended} bytes appended after the pre-paste offset {pre_paste_len}"
+            );
+            if !full_window {
+                format!(
+                    "{observed}; the deadline ended the receipt window after {} of the {} second window",
+                    elapsed.as_secs(),
+                    INPUT_RECEIPT_WINDOW.as_secs()
+                )
+            } else if *partial_tail {
+                format!(
+                    "{observed}; agy.log ends with a partial line that may still become the receipt"
+                )
+            } else {
+                format!(
+                    "{observed} within {} seconds; Agy logs no marker that proves the console input was drained without a receipt, so non-delivery cannot be proven",
+                    elapsed.as_secs()
+                )
+            }
+        }
+    };
+    anyhow::anyhow!(
+        "Agy input receipt for turn marker {} was not confirmed: {reason}; the console paste may have been accepted and is not repeated",
+        pending.marker
+    )
+}
+
+fn confirm_input_receipt_with<L, C>(
+    read_log: &mut L,
+    pending: &PendingAgyTurn,
+    pre_paste_len: usize,
+    pasted_at: Instant,
+    deadline: Instant,
     poll_interval: Duration,
-) -> terminal::TerminalSendResult {
+    clock: &mut C,
+) -> terminal::TerminalSendResult
+where
+    L: FnMut() -> Result<Option<Vec<u8>>>,
+    C: Clock,
+{
     use terminal::TerminalSendFailure;
-    let started = Instant::now();
+    let window_end = input_receipt_window_end(pasted_at, deadline);
+    let full_window = window_end.saturating_duration_since(pasted_at) >= INPUT_RECEIPT_WINDOW;
     loop {
-        let log = match super::super::read_regular_text_if_present(log_path) {
+        let log = match read_log() {
             Ok(log) => log,
             Err(error) => {
                 return Err(TerminalSendFailure::delivery_uncertain(error.context(
-                    "Agy input receipt could not be verified because agy.log is unreadable; the console paste may have been accepted",
+                    format!(
+                        "Agy input receipt for turn marker {} could not be verified because agy.log is unreadable; the console paste may have been accepted and is not repeated",
+                        pending.marker
+                    ),
                 )));
             }
         };
-        if log
-            .as_deref()
-            .is_some_and(|log| find_input_receipt(log, pending))
-        {
-            return Ok(());
+        let evidence = observe_input_receipt(log.as_deref(), pre_paste_len, pending);
+        let now = clock.now();
+        let elapsed = now.saturating_duration_since(pasted_at);
+        match evidence {
+            ReceiptEvidence::Delivered => return Ok(()),
+            ReceiptEvidence::LogShrunk { .. } => {
+                return Err(TerminalSendFailure::delivery_uncertain(
+                    unconfirmed_receipt_error(
+                        &evidence,
+                        pending,
+                        pre_paste_len,
+                        elapsed,
+                        full_window,
+                    ),
+                ));
+            }
+            ReceiptEvidence::LogMissing | ReceiptEvidence::NoReceipt { .. } => {}
         }
-        let now = Instant::now();
         if now >= window_end {
-            let elapsed = now.saturating_duration_since(started).as_secs();
-            return Err(match log {
-                Some(_) => TerminalSendFailure::not_sent(anyhow::anyhow!(
-                    "Agy did not log an input receipt (HandleUserInput) for turn marker {} within {elapsed} seconds after the console paste; the input was not accepted",
-                    pending.marker
-                )),
-                None => TerminalSendFailure::delivery_uncertain(anyhow::anyhow!(
-                    "Agy input receipt could not be verified because {} is missing; the console paste may have been accepted",
-                    log_path.display()
-                )),
-            });
+            return Err(TerminalSendFailure::delivery_uncertain(
+                unconfirmed_receipt_error(&evidence, pending, pre_paste_len, elapsed, full_window),
+            ));
         }
-        thread::sleep(window_end.saturating_duration_since(now).min(poll_interval));
+        clock.sleep(window_end.saturating_duration_since(now).min(poll_interval));
     }
 }
 
 fn input_receipt_check(directory: Option<&Path>) -> super::super::doctor::Check {
     use super::super::doctor::{Availability::Unknown, Check};
     const CHECK_ID: &str = "agy_input_receipt";
-    const NEXT_ACTION: &str = "Observation only. Windows console delivery pastes after the startup readiness markers and requires a HandleUserInput receipt for the pending turn marker; a missing receipt is reported as not sent.";
+    const NEXT_ACTION: &str = "Observation only. Windows console delivery pastes after the startup readiness markers and requires a HandleUserInput receipt carrying the complete pending turn marker; a missing receipt leaves delivery uncertain and the paste is never repeated.";
     let Some(directory) = directory else {
         return Check::new(
             CHECK_ID,
@@ -612,7 +827,7 @@ fn input_receipt_check(directory: Option<&Path>) -> super::super::doctor::Check 
         );
     };
     let log_path = directory.join(AGY_LOG_FILE);
-    let log = match super::super::read_regular_text_if_present(&log_path) {
+    let log = match read_log_bytes(&log_path) {
         Ok(Some(log)) => log,
         Ok(None) => {
             return Check::new(
@@ -639,16 +854,18 @@ fn input_receipt_check(directory: Option<&Path>) -> super::super::doctor::Check 
     let receipts = input_receipts(&log);
     let pending = read_pending_turn(directory).ok().flatten();
     let last = receipts.last();
+    // The doctor has no pre-paste offset, so this only states whether the complete
+    // marker appears anywhere in the log.
     let pending_received = pending.as_ref().map(|pending| {
         receipts
             .iter()
             .any(|receipt| receipt_matches(receipt, pending))
     });
-    let ready = startup.startup_completed && startup.skills_reloaded;
+    let ready = startup.startup_completed && startup.latest_reload_completion.is_some();
     let (reason, detail) = match (ready, last) {
         (false, _) => (
             "agy_startup_not_ready",
-            "agy.log does not yet show startup readiness (CLI startup completed plus a skills and hooks reload).",
+            "agy.log does not yet show startup readiness (CLI startup completed plus a skills reload with its hooks completion).",
         ),
         (true, None) => (
             "agy_no_input_receipt",
@@ -656,13 +873,14 @@ fn input_receipt_check(directory: Option<&Path>) -> super::super::doctor::Check 
         ),
         (true, Some(_)) => (
             "agy_input_receipt_observed",
-            "agy.log shows startup readiness and at least one HandleUserInput receipt; the evidence states whether the last one matches the pending turn marker.",
+            "agy.log shows startup readiness and at least one HandleUserInput receipt; the evidence states whether any receipt carries the complete pending turn marker.",
         ),
     };
     Check::new(CHECK_ID, Unknown, reason, detail, NEXT_ACTION).evidence(serde_json::json!({
         "log": log_path,
         "startup_completed": startup.startup_completed,
-        "skills_reloaded": startup.skills_reloaded,
+        "skills_reload_observed": startup.latest_reload.is_some(),
+        "latest_reload_completed": startup.latest_reload_completion.is_some(),
         "activity_lines": startup.activity_lines,
         "input_receipts": receipts.len(),
         "last_receipt_text": last.map(|receipt| {
@@ -1097,7 +1315,68 @@ mod tests {
         assert!(ADAPTER.handle_hook(Path::new("unused"), &payload).is_err());
     }
 
-    // Log fixtures follow the glog lines Agy 1.2.10 wrote on 2026-09-24 (issue #43).
+    // Real log excerpts written by Agy 1.2.10 on 2026-09-24 (issue #43), taken from
+    // `%USERPROFILE%\.agent-bridge\native-sessions\<session>\agy.log`. Every kept line
+    // is verbatim; the listed line numbers are the file positions and the omitted lines
+    // are HTTP, auth, model and quota chatter (the auth lines carry the account email
+    // and are not reproduced). Timestamps are local time (KST).
+    //
+    // session-udT6uY (initial paste delivered): lines 91, 100, 101, 119-123, 134, 147
+    // and 153 are the startup. The main thread's hooks line (91) precedes the startup
+    // reload (120), whose own hooks completion (122) follows at once.
+    const REAL_SUCCESS_STARTUP: &str = r"I0924 16:42:24.068931       1 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
+I0924 16:42:24.073126       1 common.go:438] Starting CLI program
+CLI ready for user input
+I0924 16:42:24.080467       1 analytics.go:187] CLI startup completed (took 230.2044ms)
+I0924 16:42:24.080986     215 manager.go:1331] Reloading system slash commands and skills
+I0924 16:42:24.080986     215 manager.go:1308] Reloading system slash commands
+I0924 16:42:24.081497     200 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
+I0924 16:42:24.127839     402 manager.go:934] Full redraw completed (rerenderAll) for conversation  (epoch 0, items 1)
+I0924 16:42:25.848949     499 manager.go:1308] Reloading system slash commands
+I0924 16:42:28.530216     508 manager.go:1308] Reloading system slash commands
+I0924 16:42:29.104592     531 manager.go:1308] Reloading system slash commands
+";
+
+    // session-udT6uY line 156: the 2,731 byte receipt of the delivered paste, abridged
+    // here after the protocol prefix, the marker and the start of the JSON request.
+    // The original line continues with the Go-quoted request and ends with `\""`.
+    const REAL_SUCCESS_RECEIPT_HEAD: &str = r#"I0924 16:42:50.212542     595 input_loop.go:107] HandleUserInput called with text: "[Agent Bridge Agy Windows console turn protocol] Decode the following JSON string as the complete request, preserving escaped newlines and tabs. Complete it as one turn. End the complete final response with the exact marker <!-- agent-bridge-agy-turn:28404-1790235743098225800-0 --> on its own final line; do not alter or omit it. Request JSON: \"[Agent Bridge native delegation]\\nSource: external"#;
+
+    // session-udT6uY lines 157, 169 and 170: what followed the receipt.
+    const REAL_SUCCESS_AFTER_RECEIPT: &str = r"I0924 16:42:50.213057     141 conversation_manager.go:512] Starting new conversation (agent=false)
+I0924 16:42:50.228104     580 manager.go:1331] Reloading system slash commands and skills
+I0924 16:42:50.228760     580 manager.go:1308] Reloading system slash commands
+";
+
+    // session-fMqSQc (initial paste lost): lines 95, 104, 105, 114-116, 126, 127, 138,
+    // 150 and 151. The startup reload (114) skipped its hooks pass, so the only hooks
+    // line before 16:41:20 is the main thread's (95). The fixed 12 second delay pasted
+    // at about 16:41:19.
+    const REAL_FAILURE_STARTUP: &str = r"I0924 16:41:07.819578       1 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
+I0924 16:41:07.823186       1 common.go:438] Starting CLI program
+CLI ready for user input
+I0924 16:41:07.826763     280 manager.go:1331] Reloading system slash commands and skills
+I0924 16:41:07.826763     280 manager.go:1308] Reloading system slash commands
+I0924 16:41:07.826763     280 manager.go:1312] Slash commands unchanged, skipping update
+I0924 16:41:07.830345       1 analytics.go:187] CLI startup completed (took 226.5353ms)
+I0924 16:41:07.876154     269 manager.go:934] Full redraw completed (rerenderAll) for conversation  (epoch 0, items 1)
+I0924 16:41:10.732767     345 manager.go:1308] Reloading system slash commands
+I0924 16:41:13.737805     383 manager.go:1308] Reloading system slash commands
+I0924 16:41:13.739814     383 manager.go:1312] Slash commands unchanged, skipping update
+";
+
+    // session-fMqSQc lines 153-156, the end of the file: the reload that discarded the
+    // paste, 13 s after startup, and the first hooks completion after a skills reload.
+    // Nothing was logged after line 156 until the session was closed at 16:42:22: no
+    // HandleUserInput receipt and no line that shows the console input was drained.
+    const REAL_FAILURE_LATE_RELOAD: &str = r"I0924 16:41:20.813553     410 manager.go:1331] Reloading system slash commands and skills
+I0924 16:41:20.813553     410 manager.go:1308] Reloading system slash commands
+I0924 16:41:20.814059     406 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
+I0924 16:41:20.816140     410 manager.go:1312] Slash commands unchanged, skipping update
+";
+
+    const REAL_SUCCESS_TOKEN: &str = "28404-1790235743098225800-0";
+
     fn glog(time: &str, thread: u32, source: &str, message: &str) -> String {
         format!("I0924 {time} {thread:>7} {source}] {message}\n")
     }
@@ -1108,65 +1387,16 @@ mod tests {
     const FULL_REDRAW: &str =
         "Full redraw completed (rerenderAll) for conversation  (epoch 0, items 1)";
 
-    // session-udT6uY: the startup reload was followed by its hooks reload at once.
     fn successful_startup_log() -> String {
-        [
-            glog("16:42:24.068931", 1, "hooks_manager.go:53", HOOKS_LOADED),
-            glog(
-                "16:42:24.080467",
-                1,
-                "analytics.go:187",
-                "CLI startup completed (took 230.2044ms)",
-            ),
-            glog("16:42:24.080986", 215, "manager.go:1331", SKILLS_RELOAD),
-            glog("16:42:24.080986", 215, "manager.go:1308", SLASH_RELOAD),
-            glog("16:42:24.081497", 200, "hooks_manager.go:53", HOOKS_LOADED),
-            glog("16:42:24.127839", 402, "manager.go:934", FULL_REDRAW),
-            glog("16:42:25.848949", 499, "manager.go:1308", SLASH_RELOAD),
-        ]
-        .concat()
+        REAL_SUCCESS_STARTUP.to_owned()
     }
 
-    // session-fMqSQc: the main thread's hooks line precedes the startup reload, the
-    // reload itself skipped its hooks pass, and the completed reload came 13 s later.
     fn late_reload_startup_log() -> String {
-        [
-            glog("16:41:07.819578", 1, "hooks_manager.go:53", HOOKS_LOADED),
-            glog(
-                "16:41:07.823186",
-                1,
-                "common.go:438",
-                "Starting CLI program",
-            ),
-            "CLI ready for user input\n".to_owned(),
-            glog("16:41:07.826763", 280, "manager.go:1331", SKILLS_RELOAD),
-            glog("16:41:07.826763", 280, "manager.go:1308", SLASH_RELOAD),
-            glog(
-                "16:41:07.826763",
-                280,
-                "manager.go:1312",
-                "Slash commands unchanged, skipping update",
-            ),
-            glog(
-                "16:41:07.830345",
-                1,
-                "analytics.go:187",
-                "CLI startup completed (took 226.5353ms)",
-            ),
-            glog("16:41:07.876154", 269, "manager.go:934", FULL_REDRAW),
-            glog("16:41:10.732767", 345, "manager.go:1308", SLASH_RELOAD),
-            glog("16:41:13.737805", 383, "manager.go:1308", SLASH_RELOAD),
-        ]
-        .concat()
+        REAL_FAILURE_STARTUP.to_owned()
     }
 
     fn late_reload_completion() -> String {
-        [
-            glog("16:41:20.813553", 410, "manager.go:1331", SKILLS_RELOAD),
-            glog("16:41:20.813553", 410, "manager.go:1308", SLASH_RELOAD),
-            glog("16:41:20.814059", 406, "hooks_manager.go:53", HOOKS_LOADED),
-        ]
-        .concat()
+        REAL_FAILURE_LATE_RELOAD.to_owned()
     }
 
     // Go `%q` formatting as observed in the HandleUserInput lines.
@@ -1191,6 +1421,11 @@ mod tests {
         )
     }
 
+    fn framed_receipt_line(prompt: &str, pending: &PendingAgyTurn) -> String {
+        let framed = terminal_correlated_prompt(prompt, pending, true).unwrap();
+        receipt_line(&go_quoted(&framed))
+    }
+
     fn long_markdown_prompt() -> String {
         let mut prompt = String::from(
             "[Agent Bridge native delegation]\nSource: external\n\nYou are the prose writer for a documentation task. The author has already decided everything about the content. Your job is expression only.\n\n## Input\n\n- `brief.md` in this directory is the Content Brief.\n",
@@ -1203,29 +1438,99 @@ mod tests {
         prompt
     }
 
+    struct FakeClock {
+        now: Instant,
+        slept: Duration,
+    }
+
+    impl FakeClock {
+        fn new(now: Instant) -> Self {
+            Self {
+                now,
+                slept: Duration::ZERO,
+            }
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now(&mut self) -> Instant {
+            self.now
+        }
+
+        fn sleep(&mut self, duration: Duration) {
+            self.now += duration;
+            self.slept += duration;
+        }
+    }
+
+    fn log_sequence(logs: Vec<Result<Option<Vec<u8>>>>) -> impl FnMut() -> Result<Option<Vec<u8>>> {
+        let mut logs = std::collections::VecDeque::from(logs);
+        move || match logs.len() {
+            0 => panic!("the log sequence was exhausted"),
+            1 => match logs.front().unwrap() {
+                Ok(log) => Ok(log.clone()),
+                Err(error) => Err(anyhow::anyhow!("{error:#}")),
+            },
+            _ => logs.pop_front().unwrap(),
+        }
+    }
+
+    fn some_log(text: &str) -> Result<Option<Vec<u8>>> {
+        Ok(Some(text.as_bytes().to_vec()))
+    }
+
     #[test]
-    fn startup_readiness_requires_a_hooks_reload_after_the_skills_reload() {
-        let observation = observe_startup(&successful_startup_log());
+    fn startup_readiness_requires_a_hooks_completion_after_the_latest_skills_reload() {
+        let observation = observe_startup(successful_startup_log().as_bytes());
         assert!(observation.startup_completed);
-        assert!(observation.skills_reloaded);
-        assert_eq!(observation.activity_lines, 4);
+        assert_eq!(observation.latest_reload, Some(4));
+        assert_eq!(
+            observation.latest_reload_completion,
+            Some(6),
+            "the main thread's hooks line before the reload must not count"
+        );
+        assert_eq!(observation.settle_line, Some(10));
+        assert_eq!(observation.activity_lines, 6);
 
         let late = late_reload_startup_log();
-        let observation = observe_startup(&late);
+        let observation = observe_startup(late.as_bytes());
         assert!(observation.startup_completed);
-        assert!(
-            !observation.skills_reloaded,
-            "the hooks line before the reload must not count"
-        );
+        assert_eq!(observation.latest_reload, Some(3));
+        assert_eq!(observation.latest_reload_completion, None);
+        assert_eq!(observation.settle_line, None);
         assert_eq!(observation.activity_lines, 5);
 
         let completed = late + &late_reload_completion();
-        let observation = observe_startup(&completed);
-        assert!(observation.skills_reloaded);
+        let observation = observe_startup(completed.as_bytes());
+        assert_eq!(observation.latest_reload, Some(11));
+        assert_eq!(observation.latest_reload_completion, Some(13));
+        assert_eq!(observation.settle_line, Some(13));
         assert_eq!(observation.activity_lines, 7);
 
+        // A later reload without its own completion clears readiness again.
+        let reloading_again = successful_startup_log()
+            + &glog("16:42:50.228104", 580, "manager.go:1331", SKILLS_RELOAD)
+            + &glog("16:42:50.228760", 580, "manager.go:1308", SLASH_RELOAD);
+        let observation = observe_startup(reloading_again.as_bytes());
+        assert_eq!(observation.latest_reload, Some(11));
+        assert_eq!(observation.latest_reload_completion, None);
+        assert_eq!(observation.settle_line, None);
+        let completed_again =
+            reloading_again + &glog("16:42:50.229000", 581, "hooks_manager.go:53", HOOKS_LOADED);
+        let observation = observe_startup(completed_again.as_bytes());
+        assert_eq!(observation.latest_reload_completion, Some(13));
+        assert_eq!(observation.settle_line, Some(13));
+
         let no_startup = successful_startup_log().replace("CLI startup completed", "CLI startup");
-        assert!(!observe_startup(&no_startup).startup_completed);
+        assert!(!observe_startup(no_startup.as_bytes()).startup_completed);
+        assert_eq!(
+            StartupObservation::default().missing_markers(),
+            vec![
+                "`CLI startup completed`",
+                "`Reloading system slash commands and skills`",
+                HOOKS_COMPLETION_DESCRIPTION,
+            ]
+        );
     }
 
     #[test]
@@ -1234,116 +1539,287 @@ mod tests {
         partial.push_str(
             "I0924 16:41:20.813553     410 manager.go:1331] Reloading system slash commands and skills\nI0924 16:41:20.814059     406 hooks_manager.go:53] loaded 0 named ho",
         );
-        let observation = observe_startup(&partial);
-        assert!(!observation.skills_reloaded);
+        let observation = observe_startup(partial.as_bytes());
+        assert_eq!(observation.latest_reload_completion, None);
         assert_eq!(observation.activity_lines, 6);
         partial.push_str("oks from 0 hooks.json file(s)\n");
-        assert!(observe_startup(&partial).skills_reloaded);
+        assert!(
+            observe_startup(partial.as_bytes())
+                .latest_reload_completion
+                .is_some()
+        );
 
         let noisy = successful_startup_log()
             .lines()
             .map(|line| format!("\u{1b}[32m{line}\u{1b}[0m\r\n"))
             .collect::<String>()
-            .replace("CLI startup", "CLI\u{1b}]0;title\u{7} startup");
-        let observation = observe_startup(&noisy);
+            .replace("CLI startup", "CLI\u{1b}]0;title\u{7} startup")
+            .replace("and skills", "and\u{1b}]8;;file:///x\u{1b}\\ skills");
+        let observation = observe_startup(noisy.as_bytes());
         assert!(observation.startup_completed);
-        assert!(observation.skills_reloaded);
-        assert_eq!(observation.activity_lines, 4);
+        assert!(observation.latest_reload_completion.is_some());
+        assert_eq!(observation.activity_lines, 6);
         assert_eq!(strip_terminal_noise("a\u{1b}[1;31mb\u{1b}Kc\r"), "abc");
+        assert_eq!(
+            strip_terminal_noise("\u{1b}]0;title\u{1b}\\CLI startup completed"),
+            "CLI startup completed",
+            "an OSC sequence ends at the string terminator ESC backslash"
+        );
+        assert_eq!(strip_terminal_noise("a\u{1b}]0;title\u{7}b"), "ab");
+        assert_eq!(
+            strip_terminal_noise("a\u{1b}]0;title\u{1b}[0mb"),
+            "ab",
+            "another escape ends an unterminated OSC and is stripped on its own"
+        );
+        assert_eq!(strip_terminal_noise("a\u{1b}]0;unterminated"), "a");
     }
 
     #[test]
-    fn readiness_gate_waits_for_the_quiet_period_after_the_last_reload_or_redraw() {
+    fn input_receipt_is_recognised_after_an_st_terminated_osc_sequence() {
+        let pending = PendingAgyTurn::new("1-2-3").unwrap();
+        let receipt = framed_receipt_line("hello", &pending);
+        let decorated = format!("\u{1b}]0;agy\u{1b}\\{receipt}");
+        assert_eq!(
+            observe_input_receipt(Some(decorated.as_bytes()), 0, &pending),
+            ReceiptEvidence::Delivered
+        );
+        let bel = format!("\u{1b}]0;agy\u{7}{receipt}");
+        assert_eq!(
+            observe_input_receipt(Some(bel.as_bytes()), 0, &pending),
+            ReceiptEvidence::Delivered
+        );
+    }
+
+    #[test]
+    fn readiness_gate_starts_the_quiet_period_at_the_hooks_completion() {
         let start = Instant::now();
         let quiet = Duration::from_millis(3500);
+        let at = |millis: u64| start + Duration::from_millis(millis);
         let mut gate = ReadinessGate::new(start, quiet);
         assert_eq!(gate.observe(None, start), ReadinessState::AwaitingLog);
 
         let late = late_reload_startup_log();
-        let at = |millis: u64| start + Duration::from_millis(millis);
         assert_eq!(
-            gate.observe(Some(&late), at(100)),
-            ReadinessState::AwaitingSkillsReload
+            gate.observe(Some(late.as_bytes()), at(100)),
+            ReadinessState::AwaitingHooksCompletion
         );
         let completed = late + &late_reload_completion();
         assert_eq!(
-            gate.observe(Some(&completed), at(13_000)),
+            gate.observe(Some(completed.as_bytes()), at(13_000)),
             ReadinessState::Settling
         );
         assert_eq!(
-            gate.observe(Some(&completed), at(16_400)),
+            gate.observe(Some(completed.as_bytes()), at(16_400)),
             ReadinessState::Settling
         );
         assert_eq!(
-            gate.observe(Some(&completed), at(16_500)),
+            gate.observe(Some(completed.as_bytes()), at(16_500)),
             ReadinessState::Ready
         );
 
         let redrawn = completed + &glog("16:41:24.000000", 420, "manager.go:934", FULL_REDRAW);
         assert_eq!(
-            gate.observe(Some(&redrawn), at(16_600)),
+            gate.observe(Some(redrawn.as_bytes()), at(16_600)),
             ReadinessState::Settling,
-            "a new redraw restarts the quiet period"
+            "a redraw after the completion restarts the quiet period"
         );
         assert_eq!(
-            gate.observe(Some(&redrawn), at(20_100)),
+            gate.observe(Some(redrawn.as_bytes()), at(20_100)),
             ReadinessState::Ready
         );
 
         let mut immediate = ReadinessGate::new(start, quiet);
         let success = successful_startup_log();
         assert_eq!(
-            immediate.observe(Some(&success), at(0)),
+            immediate.observe(Some(success.as_bytes()), at(0)),
             ReadinessState::Settling
         );
         assert_eq!(
-            immediate.observe(Some(&success), at(3_500)),
+            immediate.observe(Some(success.as_bytes()), at(3_500)),
+            ReadinessState::Ready
+        );
+
+        // Delayed hooks: reload and redraw activity long ago does not make readiness
+        // immediate once the completion finally appears.
+        let mut delayed = ReadinessGate::new(start, quiet);
+        let without_hooks = [
+            glog(
+                "16:41:07.830345",
+                1,
+                "analytics.go:187",
+                "CLI startup completed (took 1ms)",
+            ),
+            glog("16:41:07.840000", 280, "manager.go:1331", SKILLS_RELOAD),
+            glog("16:41:07.840000", 280, "manager.go:1308", SLASH_RELOAD),
+            glog("16:41:07.876154", 269, "manager.go:934", FULL_REDRAW),
+        ]
+        .concat();
+        assert_eq!(
+            delayed.observe(Some(without_hooks.as_bytes()), at(0)),
+            ReadinessState::AwaitingHooksCompletion
+        );
+        assert_eq!(
+            delayed.observe(Some(without_hooks.as_bytes()), at(8_000)),
+            ReadinessState::AwaitingHooksCompletion
+        );
+        let hooks_late =
+            without_hooks + &glog("16:41:15.840000", 300, "hooks_manager.go:53", HOOKS_LOADED);
+        assert_eq!(
+            delayed.observe(Some(hooks_late.as_bytes()), at(8_000)),
+            ReadinessState::Settling
+        );
+        assert_eq!(
+            delayed.observe(Some(hooks_late.as_bytes()), at(11_400)),
+            ReadinessState::Settling
+        );
+        assert_eq!(
+            delayed.observe(Some(hooks_late.as_bytes()), at(11_500)),
             ReadinessState::Ready
         );
     }
 
     #[test]
-    fn readiness_gate_fails_as_not_pasted_at_the_deadline() {
-        let root = tempfile::tempdir().unwrap();
-        let log_path = root.path().join(AGY_LOG_FILE);
-        let deadline = Instant::now() + Duration::from_millis(150);
-        let error = wait_for_startup_readiness_until(
-            &log_path,
+    fn readiness_gate_resets_on_a_later_reload_without_its_hooks_completion() {
+        let start = Instant::now();
+        let quiet = Duration::from_millis(3500);
+        let at = |millis: u64| start + Duration::from_millis(millis);
+        let mut gate = ReadinessGate::new(start, quiet);
+        let success = successful_startup_log();
+        assert_eq!(
+            gate.observe(Some(success.as_bytes()), at(0)),
+            ReadinessState::Settling
+        );
+        assert_eq!(
+            gate.observe(Some(success.as_bytes()), at(3_500)),
+            ReadinessState::Ready
+        );
+
+        let reloading = success.clone()
+            + &glog("16:42:29.500000", 600, "manager.go:1331", SKILLS_RELOAD)
+            + &glog("16:42:29.500000", 600, "manager.go:1308", SLASH_RELOAD);
+        assert_eq!(
+            gate.observe(Some(reloading.as_bytes()), at(3_600)),
+            ReadinessState::AwaitingHooksCompletion
+        );
+        assert_eq!(
+            gate.observe(Some(reloading.as_bytes()), at(10_000)),
+            ReadinessState::AwaitingHooksCompletion,
+            "silence after an incomplete reload is not readiness"
+        );
+
+        let completed =
+            reloading + &glog("16:42:36.000000", 601, "hooks_manager.go:53", HOOKS_LOADED);
+        assert_eq!(
+            gate.observe(Some(completed.as_bytes()), at(10_100)),
+            ReadinessState::Settling
+        );
+        assert_eq!(
+            gate.observe(Some(completed.as_bytes()), at(13_500)),
+            ReadinessState::Settling
+        );
+        assert_eq!(
+            gate.observe(Some(completed.as_bytes()), at(13_600)),
+            ReadinessState::Ready
+        );
+    }
+
+    #[test]
+    fn readiness_gate_deadline_report_names_every_missing_marker() {
+        let start = Instant::now();
+        let poll = Duration::from_millis(100);
+        let deadline = start + Duration::from_secs(1);
+        let compatibility = "unsupported by this gate";
+
+        let mut clock = FakeClock::new(start);
+        let error = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![Ok(None)]),
             deadline,
             Duration::ZERO,
-            Duration::from_millis(10),
+            poll,
+            &mut clock,
         )
         .unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("Agy did not report startup readiness before the deadline"));
         assert!(message.contains("agy.log has not been created"));
+        assert!(message.contains("`CLI startup completed`"));
+        assert!(message.contains("`Reloading system slash commands and skills`"));
+        assert!(message.contains(HOOKS_COMPLETION_DESCRIPTION));
+        assert!(message.contains(compatibility));
+        assert!(message.contains("the initial prompt was not pasted"));
+        assert_eq!(clock.slept, Duration::from_secs(1));
 
-        fs::write(&log_path, late_reload_startup_log()).unwrap();
-        let deadline = Instant::now() + Duration::from_millis(150);
-        let error = wait_for_startup_readiness_until(
-            &log_path,
+        let mut clock = FakeClock::new(start);
+        let error = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(&late_reload_startup_log())]),
             deadline,
             Duration::ZERO,
-            Duration::from_millis(10),
+            poll,
+            &mut clock,
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("no completed skills and hooks reload"));
+        let message = format!("{error:#}");
+        assert!(message.contains("no hooks completion after it"));
+        assert!(!message.contains("missing markers: `CLI startup completed`"));
+        assert!(message.contains(&format!("missing markers: {HOOKS_COMPLETION_DESCRIPTION}")));
+        assert!(message.contains(compatibility));
 
-        fs::write(&log_path, successful_startup_log()).unwrap();
-        wait_for_startup_readiness_until(
-            &log_path,
-            Instant::now() + Duration::from_secs(5),
+        let startup_only = glog(
+            "16:41:07.830345",
+            1,
+            "analytics.go:187",
+            "CLI startup completed (took 1ms)",
+        );
+        let mut clock = FakeClock::new(start);
+        let error = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(&startup_only)]),
+            deadline,
             Duration::ZERO,
-            Duration::from_millis(10),
+            poll,
+            &mut clock,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("no `Reloading system slash commands and skills` line"));
+        assert!(message.contains(&format!(
+            "missing markers: `Reloading system slash commands and skills`, {HOOKS_COMPLETION_DESCRIPTION}"
+        )));
+
+        let mut clock = FakeClock::new(start);
+        let error = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(&successful_startup_log())]),
+            deadline,
+            Duration::from_millis(3500),
+            poll,
+            &mut clock,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("still reloading or redrawing during the quiet period"));
+        assert!(message.contains("missing markers: none"));
+
+        let mut clock = FakeClock::new(start);
+        wait_for_startup_readiness_with(
+            &mut log_sequence(vec![
+                some_log(&late_reload_startup_log()),
+                some_log(&(late_reload_startup_log() + &late_reload_completion())),
+            ]),
+            start + Duration::from_secs(30),
+            Duration::from_millis(3500),
+            poll,
+            &mut clock,
         )
         .unwrap();
+        assert_eq!(clock.slept, Duration::from_millis(3600));
 
-        fs::create_dir(root.path().join("dir.log")).unwrap();
-        let error = wait_for_startup_readiness_until(
-            &root.path().join("dir.log"),
-            Instant::now() + Duration::from_secs(1),
+        let error = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![Err(anyhow::anyhow!(
+                "refusing non-regular session file"
+            ))]),
+            deadline,
             Duration::ZERO,
-            Duration::from_millis(10),
+            poll,
+            &mut FakeClock::new(start),
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("startup readiness could not be observed"));
@@ -1351,7 +1827,7 @@ mod tests {
 
     #[test]
     fn input_receipt_for_a_long_prompt_carries_the_whole_marker_near_the_front() {
-        let pending = PendingAgyTurn::new("28404-1790235743098225800-0").unwrap();
+        let pending = PendingAgyTurn::new(REAL_SUCCESS_TOKEN).unwrap();
         let prompt = long_markdown_prompt();
         assert!(prompt.len() >= 1600);
         let framed = terminal_correlated_prompt(&prompt, &pending, true).unwrap();
@@ -1365,108 +1841,223 @@ mod tests {
         let prefix_at = line.find(WINDOWS_PROTOCOL_PREFIX).unwrap();
         assert!(prefix_at < marker_at && marker_at < 400);
 
-        let receipts = input_receipts(&line);
+        let receipts = input_receipts(line.as_bytes());
         assert_eq!(receipts.len(), 1);
         assert!(!receipts[0].truncated);
         assert_eq!(receipts[0].text, quoted[1..quoted.len() - 1]);
         assert!(receipt_matches(&receipts[0], &pending));
-        assert!(find_input_receipt(&line, &pending));
+        assert_eq!(
+            observe_input_receipt(Some(line.as_bytes()), 0, &pending),
+            ReceiptEvidence::Delivered
+        );
 
-        let other = PendingAgyTurn::new("28404-1790235743098225800-1").unwrap();
-        assert!(!find_input_receipt(&line, &other));
+        // The real receipt head starts with the same prefix and marker.
+        let real = format!("{REAL_SUCCESS_RECEIPT_HEAD}\n");
+        let receipts = input_receipts(real.as_bytes());
+        assert_eq!(receipts.len(), 1);
+        assert!(receipts[0].truncated, "the fixture is abridged");
+        assert!(receipt_matches(&receipts[0], &pending));
+        let real_marker_at = REAL_SUCCESS_RECEIPT_HEAD.find(&pending.marker).unwrap();
+        let real_prefix_at = REAL_SUCCESS_RECEIPT_HEAD
+            .find(WINDOWS_PROTOCOL_PREFIX)
+            .unwrap();
+        assert!(real_prefix_at < real_marker_at && real_marker_at < 400);
 
         let legacy = format!(
             "ERROR: logging before google.Init: I0827 22:11:28.641211     406 input_loop.go:36] HandleUserInput called with text: {}\n",
             go_quoted(&framed)
         );
-        assert!(find_input_receipt(&legacy, &pending));
+        assert_eq!(
+            observe_input_receipt(Some(legacy.as_bytes()), 0, &pending),
+            ReceiptEvidence::Delivered
+        );
 
         let manual = receipt_line(&go_quoted(&format!("please finish {}", pending.marker)));
-        assert!(
-            !find_input_receipt(&manual, &pending),
+        assert_eq!(
+            observe_input_receipt(Some(manual.as_bytes()), 0, &pending),
+            ReceiptEvidence::NoReceipt {
+                appended: manual.len(),
+                partial_tail: false
+            },
             "a manual turn without the protocol prefix is not this delivery"
         );
     }
 
     #[test]
-    fn input_receipt_matches_a_truncated_line_only_through_the_visible_marker_prefix() {
-        let pending = PendingAgyTurn::new("28404-1790235743098225800-0").unwrap();
-        let framed = terminal_correlated_prompt("short", &pending, true).unwrap();
-        let quoted = go_quoted(&framed);
-        let marker_at = quoted.find(&pending.marker).unwrap();
-        let cut = marker_at + TURN_MARKER_HEAD.len() + 6;
+    fn input_receipt_requires_the_complete_marker_and_never_a_colliding_prefix() {
+        let old = PendingAgyTurn::new("28404-1790235743098225800-1").unwrap();
+        let new = PendingAgyTurn::new("28404-1790235743098225800-10").unwrap();
+        assert!(new.marker.starts_with(old.marker.trim_end_matches(" -->")));
 
-        let truncated_with_ellipsis = receipt_line(&format!("{}...\"", &quoted[..cut]));
-        let receipts = input_receipts(&truncated_with_ellipsis);
+        // Turn 1 was delivered and its receipt is complete.
+        let old_receipt = framed_receipt_line("first", &old);
+        let log = successful_startup_log() + &old_receipt;
+        assert_eq!(
+            observe_input_receipt(Some(log.as_bytes()), 0, &old),
+            ReceiptEvidence::Delivered
+        );
+        assert_eq!(
+            observe_input_receipt(Some(log.as_bytes()), 0, &new),
+            ReceiptEvidence::NoReceipt {
+                appended: log.len(),
+                partial_tail: false
+            },
+            "the complete old marker never confirms the new turn"
+        );
+
+        // Turn 10 is pasted after the offset; the old receipt is before it.
+        let pre_paste_len = log.len();
+        assert_eq!(
+            observe_input_receipt(Some(log.as_bytes()), pre_paste_len, &new),
+            ReceiptEvidence::NoReceipt {
+                appended: 0,
+                partial_tail: false
+            }
+        );
+        // A receipt that Agy cut right after the shared token prefix confirms neither
+        // turn: the complete marker is not visible.
+        let old_framed = terminal_correlated_prompt("first", &old, true).unwrap();
+        let old_quoted = go_quoted(&old_framed);
+        let cut = old_quoted.find(&old.marker).unwrap() + old.marker.len() - " -->".len();
+        let truncated_old = receipt_line(&format!("{}...\"", &old_quoted[..cut]));
+        assert!(truncated_old.contains("-1...\""));
+        let receipts = input_receipts(truncated_old.as_bytes());
         assert!(receipts[0].truncated);
-        assert!(receipt_matches(&receipts[0], &pending));
+        assert!(!receipt_matches(&receipts[0], &old));
+        assert!(!receipt_matches(&receipts[0], &new));
+        let with_truncated = log.clone() + &truncated_old;
+        assert_eq!(
+            observe_input_receipt(Some(with_truncated.as_bytes()), pre_paste_len, &new),
+            ReceiptEvidence::NoReceipt {
+                appended: truncated_old.len(),
+                partial_tail: false
+            }
+        );
+        assert_eq!(
+            observe_input_receipt(Some(with_truncated.as_bytes()), pre_paste_len, &old),
+            ReceiptEvidence::NoReceipt {
+                appended: truncated_old.len(),
+                partial_tail: false
+            }
+        );
 
-        let torn = receipt_line(&quoted[..cut]);
-        let receipts = input_receipts(&torn);
-        assert!(receipts[0].truncated);
-        assert!(receipt_matches(&receipts[0], &pending));
-
-        let before_token = receipt_line(&quoted[..marker_at + TURN_MARKER_HEAD.len()]);
-        assert!(!find_input_receipt(&before_token, &pending));
-        let before_marker = receipt_line(&format!("{}...\"", &quoted[..marker_at - 1]));
-        assert!(!find_input_receipt(&before_marker, &pending));
-
-        let complete_but_different = receipt_line(&quoted.replace("-0 -->", "-7 -->"));
-        assert!(!find_input_receipt(&complete_but_different, &pending));
-
-        let mut partial_write = String::from(&truncated_with_ellipsis);
-        partial_write.truncate(partial_write.len() - 1);
-        assert!(input_receipts(&partial_write).is_empty());
+        // Only the complete new marker after the offset is the new turn's receipt.
+        let new_receipt = framed_receipt_line("second", &new);
+        let delivered = log.clone() + &new_receipt;
+        assert_eq!(
+            observe_input_receipt(Some(delivered.as_bytes()), pre_paste_len, &new),
+            ReceiptEvidence::Delivered
+        );
+        // The same marker before the offset is not evidence for this submission.
+        assert_eq!(
+            observe_input_receipt(Some(delivered.as_bytes()), delivered.len(), &new),
+            ReceiptEvidence::NoReceipt {
+                appended: 0,
+                partial_tail: false
+            }
+        );
+        let different = new_receipt.replace("-10 -->", "-17 -->");
+        let other = log + &different;
+        assert_eq!(
+            observe_input_receipt(Some(other.as_bytes()), pre_paste_len, &new),
+            ReceiptEvidence::NoReceipt {
+                appended: different.len(),
+                partial_tail: false
+            }
+        );
     }
 
     #[test]
-    fn missing_receipt_is_not_sent_but_an_unreadable_log_stays_uncertain() {
-        let root = tempfile::tempdir().unwrap();
+    fn input_receipt_evidence_only_counts_lines_that_start_after_the_offset() {
         let pending = PendingAgyTurn::new("1-2-3").unwrap();
-        let framed = terminal_correlated_prompt("hello", &pending, true).unwrap();
-        let log_path = root.path().join(AGY_LOG_FILE);
-        let poll = Duration::from_millis(10);
+        let receipt = framed_receipt_line("hello", &pending);
 
-        fs::write(&log_path, successful_startup_log()).unwrap();
-        let failure = confirm_input_receipt_until(
-            &log_path,
+        // The pre-paste snapshot ended inside an unrelated line.
+        let snapshot = successful_startup_log()
+            + "I0924 16:42:49.000000     590 quota_manager.go:45] doRefreshQuota";
+        let log = snapshot.clone() + ": starting reload (force=false)\n" + &receipt;
+        assert_eq!(
+            evidence_start(log.as_bytes(), snapshot.len()),
+            Some(snapshot.len() + ": starting reload (force=false)\n".len())
+        );
+        assert_eq!(
+            observe_input_receipt(Some(log.as_bytes()), snapshot.len(), &pending),
+            ReceiptEvidence::Delivered
+        );
+        let unfinished = snapshot.clone() + ": starting";
+        assert_eq!(evidence_start(unfinished.as_bytes(), snapshot.len()), None);
+        assert_eq!(
+            observe_input_receipt(Some(unfinished.as_bytes()), snapshot.len(), &pending),
+            ReceiptEvidence::NoReceipt {
+                appended: ": starting".len(),
+                partial_tail: true
+            }
+        );
+
+        // A line that straddles the offset started before the paste and is never
+        // evidence, even when its tail carries the marker.
+        let (head, tail) = receipt
+            .split_at(receipt.find(INPUT_RECEIPT_MARKER).unwrap() + INPUT_RECEIPT_MARKER.len());
+        let snapshot = successful_startup_log() + head;
+        let straddling = snapshot.clone() + tail;
+        assert_eq!(
+            observe_input_receipt(Some(straddling.as_bytes()), 0, &pending),
+            ReceiptEvidence::Delivered
+        );
+        assert_eq!(
+            observe_input_receipt(Some(straddling.as_bytes()), snapshot.len(), &pending),
+            ReceiptEvidence::NoReceipt {
+                appended: tail.len(),
+                partial_tail: false
+            }
+        );
+
+        // Real sequence: the readiness startup, then the delivered receipt.
+        let real = format!(
+            "{REAL_SUCCESS_STARTUP}{REAL_SUCCESS_RECEIPT_HEAD}\n{REAL_SUCCESS_AFTER_RECEIPT}"
+        );
+        let real_pending = PendingAgyTurn::new(REAL_SUCCESS_TOKEN).unwrap();
+        assert_eq!(
+            observe_input_receipt(
+                Some(real.as_bytes()),
+                REAL_SUCCESS_STARTUP.len(),
+                &real_pending
+            ),
+            ReceiptEvidence::Delivered
+        );
+        assert_eq!(
+            observe_input_receipt(Some(real.as_bytes()), real.len(), &real_pending),
+            ReceiptEvidence::NoReceipt {
+                appended: 0,
+                partial_tail: false
+            }
+        );
+    }
+
+    #[test]
+    fn receipt_watch_confirms_only_a_complete_receipt_after_the_offset() {
+        let pending = PendingAgyTurn::new("1-2-3").unwrap();
+        let startup = successful_startup_log();
+        let receipt = framed_receipt_line("hello", &pending);
+        let pasted_at = Instant::now();
+        let deadline = pasted_at + Duration::from_secs(60);
+        let poll = Duration::from_millis(100);
+
+        let mut clock = FakeClock::new(pasted_at);
+        confirm_input_receipt_with(
+            &mut log_sequence(vec![
+                some_log(&startup),
+                some_log(&(startup.clone() + &receipt)),
+            ]),
             &pending,
-            Instant::now() + Duration::from_millis(120),
+            startup.len(),
+            pasted_at,
+            deadline,
             poll,
+            &mut clock,
         )
-        .unwrap_err();
-        assert!(!failure.delivery_may_have_occurred());
-        let message = format!("{:#}", failure.error());
-        assert!(message.contains("did not log an input receipt"));
-        assert!(message.contains(&pending.marker));
-
-        let mut log = OpenOptions::new().append(true).open(&log_path).unwrap();
-        write!(log, "{}", receipt_line(&go_quoted(&framed))).unwrap();
-        drop(log);
-        confirm_input_receipt_until(&log_path, &pending, Instant::now(), poll).unwrap();
-
-        let missing = root.path().join("absent.log");
-        let failure = confirm_input_receipt_until(
-            &missing,
-            &pending,
-            Instant::now() + Duration::from_millis(60),
-            poll,
-        )
-        .unwrap_err();
-        assert!(failure.delivery_may_have_occurred());
-        assert!(format!("{:#}", failure.error()).contains("is missing"));
-
-        let unreadable = root.path().join("dir.log");
-        fs::create_dir(&unreadable).unwrap();
-        let failure = confirm_input_receipt_until(
-            &unreadable,
-            &pending,
-            Instant::now() + Duration::from_secs(5),
-            poll,
-        )
-        .unwrap_err();
-        assert!(failure.delivery_may_have_occurred());
-        assert!(format!("{:#}", failure.error()).contains("agy.log is unreadable"));
+        .unwrap();
+        assert_eq!(clock.slept, poll);
 
         let now = Instant::now();
         assert_eq!(
@@ -1477,6 +2068,136 @@ mod tests {
             input_receipt_window_end(now, now + Duration::from_secs(3)),
             now + Duration::from_secs(3)
         );
+    }
+
+    #[test]
+    fn receipt_watch_never_reports_not_sent_after_the_paste() {
+        let pending = PendingAgyTurn::new("1-2-3").unwrap();
+        let startup = successful_startup_log();
+        let receipt = framed_receipt_line("hello", &pending);
+        let pasted_at = Instant::now();
+        let deadline = pasted_at + Duration::from_secs(60);
+        let poll = Duration::from_secs(5);
+        let uncertain = |logs: Vec<Result<Option<Vec<u8>>>>,
+                         pre_paste_len: usize,
+                         deadline: Instant|
+         -> (String, FakeClock) {
+            let mut clock = FakeClock::new(pasted_at);
+            let failure = confirm_input_receipt_with(
+                &mut log_sequence(logs),
+                &pending,
+                pre_paste_len,
+                pasted_at,
+                deadline,
+                poll,
+                &mut clock,
+            )
+            .unwrap_err();
+            assert!(
+                failure.delivery_may_have_occurred(),
+                "a paste without a receipt is never not_sent"
+            );
+            let message = format!("{:#}", failure.error());
+            assert!(message.contains(&pending.marker));
+            assert!(message.contains("may have been accepted and is not repeated"));
+            (message, clock)
+        };
+
+        // Continuous, complete log with no receipt for the whole window: no marker
+        // proves the input was drained, so non-delivery is not proven.
+        let (message, clock) = uncertain(vec![some_log(&startup)], startup.len(), deadline);
+        assert!(message.contains("no HandleUserInput receipt in the 0 bytes appended"));
+        assert!(message.contains("within 15 seconds"));
+        assert!(message.contains("non-delivery cannot be proven"));
+        assert_eq!(clock.slept, INPUT_RECEIPT_WINDOW);
+
+        // The real failure log: the late reload after the discarded paste is the only
+        // thing Agy wrote, and it is not a receipt.
+        let failure_log = late_reload_startup_log();
+        let (message, _) = uncertain(
+            vec![some_log(&(failure_log.clone() + &late_reload_completion()))],
+            failure_log.len(),
+            deadline,
+        );
+        assert!(message.contains(&format!(
+            "no HandleUserInput receipt in the {} bytes appended",
+            late_reload_completion().len()
+        )));
+        assert!(message.contains("non-delivery cannot be proven"));
+
+        // A receipt appended between the last read and the deadline check is not
+        // seen; the outcome is still uncertain, never not_sent.
+        let mut reads = 0;
+        let receipt_after_last_read = {
+            let startup = startup.clone();
+            let receipt = receipt.clone();
+            move || {
+                reads += 1;
+                if reads <= 4 {
+                    some_log(&startup)
+                } else {
+                    some_log(&(startup.clone() + &receipt))
+                }
+            }
+        };
+        let mut clock = FakeClock::new(pasted_at);
+        let mut read_log = receipt_after_last_read;
+        let failure = confirm_input_receipt_with(
+            &mut read_log,
+            &pending,
+            startup.len(),
+            pasted_at,
+            deadline,
+            poll,
+            &mut clock,
+        )
+        .unwrap_err();
+        assert!(failure.delivery_may_have_occurred());
+        assert_eq!(clock.slept, INPUT_RECEIPT_WINDOW);
+        assert_eq!(
+            observe_input_receipt(read_log().unwrap().as_deref(), startup.len(), &pending),
+            ReceiptEvidence::Delivered,
+            "the receipt landed right after the last read"
+        );
+
+        // A deadline-capped window that ends before 15 s elapsed.
+        let (message, clock) = uncertain(
+            vec![some_log(&startup)],
+            startup.len(),
+            pasted_at + Duration::from_secs(3),
+        );
+        assert!(
+            message
+                .contains("the deadline ended the receipt window after 3 of the 15 second window")
+        );
+        assert_eq!(clock.slept, Duration::from_secs(3));
+
+        // Rotation or truncation below the pre-paste offset: uncertain at once.
+        let (message, clock) = uncertain(
+            vec![some_log(&startup[..startup.len() / 2])],
+            startup.len(),
+            deadline,
+        );
+        assert!(message.contains("rotated or truncated"));
+        assert!(message.contains(&format!("below the pre-paste offset {}", startup.len())));
+        assert_eq!(clock.slept, Duration::ZERO);
+
+        // A partial trailing line may still become the receipt.
+        let torn = startup.clone() + receipt.trim_end_matches('\n');
+        let (message, _) = uncertain(vec![some_log(&torn)], startup.len(), deadline);
+        assert!(message.contains("ends with a partial line"));
+
+        // Missing and unreadable logs.
+        let (message, clock) = uncertain(vec![Ok(None)], startup.len(), deadline);
+        assert!(message.contains("agy.log is missing after the paste"));
+        assert_eq!(clock.slept, INPUT_RECEIPT_WINDOW);
+        let (message, clock) = uncertain(
+            vec![Err(anyhow::anyhow!("refusing non-regular session file"))],
+            startup.len(),
+            deadline,
+        );
+        assert!(message.contains("agy.log is unreadable"));
+        assert_eq!(clock.slept, Duration::ZERO);
     }
 
     #[test]
@@ -1498,10 +2219,11 @@ mod tests {
 
         let log_path = directory.join(AGY_LOG_FILE);
         fs::write(&log_path, late_reload_startup_log()).unwrap();
-        assert_eq!(
-            input_receipt_check(Some(&directory)).reason_code,
-            "agy_startup_not_ready"
-        );
+        let check = input_receipt_check(Some(&directory));
+        assert_eq!(check.reason_code, "agy_startup_not_ready");
+        let evidence = serde_json::to_value(&check).unwrap()["evidence"].clone();
+        assert_eq!(evidence["skills_reload_observed"], true);
+        assert_eq!(evidence["latest_reload_completed"], false);
 
         fs::write(&log_path, successful_startup_log()).unwrap();
         assert_eq!(
@@ -1510,16 +2232,16 @@ mod tests {
         );
 
         let pending = claim_pending_turn(&directory);
-        let framed = terminal_correlated_prompt("hello", &pending, true).unwrap();
         let mut log = OpenOptions::new().append(true).open(&log_path).unwrap();
-        write!(log, "{}", receipt_line(&go_quoted(&framed))).unwrap();
+        write!(log, "{}", framed_receipt_line("hello", &pending)).unwrap();
         drop(log);
         let check = input_receipt_check(Some(&directory));
         assert_eq!(check.reason_code, "agy_input_receipt_observed");
         let evidence = serde_json::to_value(&check).unwrap()["evidence"].clone();
         assert_eq!(evidence["startup_completed"], true);
-        assert_eq!(evidence["skills_reloaded"], true);
+        assert_eq!(evidence["latest_reload_completed"], true);
         assert_eq!(evidence["input_receipts"], 1);
+        assert_eq!(evidence["last_receipt_truncated"], false);
         assert_eq!(evidence["pending_marker_received"], true);
         assert_eq!(evidence["pending_marker"], pending.marker);
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
