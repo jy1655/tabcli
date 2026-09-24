@@ -3314,6 +3314,10 @@ thread_local! {
     static FAULT_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     static SYNC_LOG: std::cell::RefCell<Option<Vec<SyncRecord>>> =
         const { std::cell::RefCell::new(None) };
+    /// Every journaled event the publication predicate opened, in order, so a test can
+    /// prove when a search reads a journaled event and when it does not read it at all.
+    static PUBLICATION_READ_LOG: std::cell::RefCell<Option<Vec<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -3366,6 +3370,27 @@ fn with_sync_log<T>(run: impl FnOnce() -> T) -> (T, Vec<SyncRecord>) {
     let outcome = run();
     let records = SYNC_LOG.with(|log| log.borrow_mut().take().unwrap_or_default());
     (outcome, records)
+}
+
+/// Runs `run` and returns, in order, the path of every journaled event the publication
+/// predicate opened on this thread while it ran.
+#[cfg(test)]
+fn with_publication_read_log<T>(run: impl FnOnce() -> T) -> (T, Vec<PathBuf>) {
+    PUBLICATION_READ_LOG.with(|log| *log.borrow_mut() = Some(Vec::new()));
+    let outcome = run();
+    let paths = PUBLICATION_READ_LOG.with(|log| log.borrow_mut().take().unwrap_or_default());
+    (outcome, paths)
+}
+
+fn record_publication_read(path: &Path) {
+    #[cfg(test)]
+    PUBLICATION_READ_LOG.with(|log| {
+        if let Some(log) = log.borrow_mut().as_mut() {
+            log.push(path.to_path_buf());
+        }
+    });
+    #[cfg(not(test))]
+    let _ = path;
 }
 
 #[derive(Clone, Copy)]
@@ -4058,9 +4083,12 @@ fn converge_interrupted_close_locked(
     Ok(changed)
 }
 
-/// Largest event the publication predicate compares with its journal. It is the byte
-/// budget of a whole `search`, so no read-only query ever reads more of one record than a
-/// search may read in total; a larger journaled event is never published.
+/// Largest event the publication predicate compares with its journal. It bounds only that
+/// comparison: a larger journaled event is never read for a verdict and never published,
+/// and the size policy at journal creation keeps new completions under it. It is the byte
+/// budget of a whole `search`, so a search can afford at most one such comparison. It
+/// does not bound the read of an ordinary, non-journaled event by `result`, `inspect`, or
+/// `--context-result`; only a search bounds those reads, with its byte budget.
 const EVENT_READ_LIMIT: u64 = 64 * 1024 * 1024;
 
 /// How the file at a journal's event path relates to the journal.
@@ -4145,6 +4173,7 @@ fn journaled_event_state_within(
             return Err(error).with_context(|| format!("failed to read {}", path.display()));
         }
     };
+    record_publication_read(&path);
     let mut stored = Vec::with_capacity(metadata.len() as usize);
     file.take(limit + 1)
         .read_to_end(&mut stored)
@@ -4219,7 +4248,11 @@ fn require_events_directory(directory: &Path) -> Result<()> {
 /// The close removes the journal only after this step and after the turn claim is
 /// released: while the claim is installed, the journal is the evidence that the event at
 /// its path is the committed result, so an interruption before claim release would
-/// otherwise hide a published result until the next recovery.
+/// otherwise hide a published result until the next recovery. The journal is also the
+/// only evidence that a set-aside event was unverified, so the move is made durable
+/// before the journal can be discarded: the rename syncs `events/` itself, and a run that
+/// finds the event already moved aside by an interrupted close, which may have stopped
+/// between the rename and that sync, syncs `events/` again before it returns.
 fn set_aside_unverified_completion_event_for_close(directory: &Path) -> Result<()> {
     let completion_path = directory.join(TURN_COMPLETION_FILE);
     let Some(text) = read_regular_text_if_present(&completion_path)? else {
@@ -4228,19 +4261,29 @@ fn set_aside_unverified_completion_event_for_close(directory: &Path) -> Result<(
     if events_directory_state(directory)? == EventsDirectory::Missing {
         return Ok(());
     }
-    if let Ok(pending) = serde_json::from_str::<PendingTurnCompletion>(&text)
-        && validate_pending_completion(&pending).is_ok()
-        && matches!(
-            journaled_event_state(directory, &pending)?,
-            JournaledEventState::Mismatched | JournaledEventState::Oversized(_)
-        )
-    {
-        let events = directory.join("events");
-        rename_session_file(
-            &events.join(&pending.event_file),
-            &events.join(format!("{UNPUBLISHED_EVENT_PREFIX}{}", pending.event_file)),
-        )
-        .context("failed to set aside a completion event that disagrees with its journal")?;
+    let Ok(pending) = serde_json::from_str::<PendingTurnCompletion>(&text) else {
+        return Ok(());
+    };
+    if validate_pending_completion(&pending).is_err() {
+        return Ok(());
+    }
+    let events = directory.join("events");
+    let set_aside = events.join(format!("{UNPUBLISHED_EVENT_PREFIX}{}", pending.event_file));
+    match journaled_event_state(directory, &pending)? {
+        JournaledEventState::Mismatched | JournaledEventState::Oversized(_) => {
+            rename_session_file(&events.join(&pending.event_file), &set_aside).context(
+                "failed to set aside a completion event that disagrees with its journal",
+            )?;
+        }
+        JournaledEventState::Absent => {
+            if fs::symlink_metadata(&set_aside).is_ok() {
+                fault_point("syncing a set-aside completion event's directory")?;
+                sync_directory(&events).with_context(|| {
+                    format!("failed to sync state directory {}", events.display())
+                })?;
+            }
+        }
+        JournaledEventState::Committed => (),
     }
     Ok(())
 }
@@ -4351,7 +4394,18 @@ where
 {
     #[cfg(not(windows))]
     let _ = &mut close_terminal;
-    recover_pending_completion(directory)?;
+    // Completion recovery runs first so a live owner's finished turn is published before
+    // anything else is decided. Its failure is damage (a missing `events/`, a journal
+    // whose event cannot be compared), not a reason to leave a dead owner's session
+    // installed forever: the owner check still runs, a dead owner's session is closed as
+    // it would be without the damage (the close settles the journal without publishing),
+    // and the damage is reported in the close error. Under a live owner, or when the
+    // owner cannot be shown dead, the damage is the result.
+    let recovery_damage = recover_pending_completion(directory).err();
+    let untouched = |damage: Option<anyhow::Error>| match damage {
+        Some(error) => Err(error),
+        None => Ok(false),
+    };
     let status: SessionStatus = read_json(&directory.join("status.json"))?;
     if !matches!(
         status.state.as_str(),
@@ -4365,13 +4419,15 @@ where
             | "exited"
             | "failed"
     ) {
-        return Ok(false);
+        return untouched(recovery_damage);
     }
     let owner_path = directory.join(SESSION_OWNER_FILE);
     let owner = match fs::read_to_string(&owner_path) {
         Ok(text) => serde_json::from_str::<NativeSessionOwner>(&text)
             .with_context(|| format!("invalid JSON in {}", owner_path.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return untouched(recovery_damage);
+        }
         Err(error) => {
             return Err(error).with_context(|| format!("failed to read {}", owner_path.display()));
         }
@@ -4380,7 +4436,7 @@ where
     match &owner.windows_process_identity {
         Some(identity) => {
             if terminal::verify_windows_process_identity(owner.pid, identity).is_ok() {
-                return Ok(false);
+                return untouched(recovery_damage);
             }
         }
         // Pre-identity (v0.0.2) Windows owner records carry only a PID. Their identity is
@@ -4388,26 +4444,28 @@ where
         // reports `identity_matches: null`; only a dead PID lets repair proceed.
         None => {
             if process_is_alive(owner.pid) {
-                return Ok(false);
+                return untouched(recovery_damage);
             }
         }
     }
     #[cfg(target_os = "macos")]
     if mac_native_owner_is_live(&owner)? {
-        return Ok(false);
+        return untouched(recovery_damage);
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
     if process_is_alive(owner.pid) {
-        return Ok(false);
+        return untouched(recovery_damage);
     }
+    let mut repair_error = status
+        .error
+        .clone()
+        .unwrap_or_else(|| format!("native session process {} is no longer running", owner.pid));
+    if let Some(damage) = &recovery_damage {
+        repair_error = format!("{repair_error}; completion recovery failed: {damage:#}");
+    }
+    let repair_error = Some(repair_error);
     #[cfg(windows)]
     {
-        let repair_error = status.error.clone().or_else(|| {
-            Some(format!(
-                "native session process {} is no longer running",
-                owner.pid
-            ))
-        });
         if matches!(status.state.as_str(), "exited" | "failed") {
             mark_session_closed(directory, repair_error)?;
             return Ok(true);
@@ -4426,15 +4484,7 @@ where
     }
     #[cfg(not(windows))]
     {
-        mark_session_closed(
-            directory,
-            status.error.or_else(|| {
-                Some(format!(
-                    "native session process {} is no longer running",
-                    owner.pid
-                ))
-            }),
-        )?;
+        mark_session_closed(directory, repair_error)?;
         Ok(true)
     }
 }

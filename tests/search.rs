@@ -826,7 +826,7 @@ fn publication_checks_read_journaled_events_within_the_byte_budget() {
     let reasons = starved["incomplete_reasons"].to_string();
     assert!(
         reasons.contains(&format!(
-            "journaled event session-a/event-1.json is {size} bytes with 1 bytes remaining"
+            "session-a/event-1.json is {size} bytes with 1 bytes remaining"
         )),
         "{reasons}"
     );

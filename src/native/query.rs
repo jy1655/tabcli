@@ -116,45 +116,63 @@ pub(super) struct Snapshot {
     pub(super) claim: Option<String>,
     pub(super) pending: Option<PendingTurnCompletion>,
     /// The publication predicate's bounded read of the journal's event file, when a journal
-    /// exists (see `published`). It carries the bytes it cost so a budgeted reader can
-    /// charge them, and the event text when the file holds the journal's bytes.
+    /// exists and the snapshot performed the read (see `published` and
+    /// [`PublicationRead`]); a search defers it to the event's scan position and keeps
+    /// `None` here.
     pending_event: Option<JournaledEventRead>,
     _lock: Option<File>,
 }
 
 #[cfg(test)]
-type PublicationReadHook = Box<dyn FnMut(&Path)>;
+type SnapshotHook = Box<dyn FnMut(&Path)>;
 
 #[cfg(test)]
 thread_local! {
-    /// Runs right after a snapshot's publication read and before its consistency check,
-    /// so a test can change a state record there and force the read to be retried.
-    static AFTER_PUBLICATION_READ: std::cell::RefCell<Option<PublicationReadHook>> =
+    /// Runs inside every snapshot attempt, after its state records and any publication
+    /// read and before its consistency check, so a test can change a state record there
+    /// and force the attempt to be retried.
+    static BEFORE_CONSISTENCY_CHECK: std::cell::RefCell<Option<SnapshotHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// Installs `hook` for the snapshots `run` takes on this thread (see
-/// [`AFTER_PUBLICATION_READ`]) and removes it afterwards.
+/// [`BEFORE_CONSISTENCY_CHECK`]) and removes it afterwards.
 #[cfg(test)]
-pub(super) fn with_publication_read_hook<T>(
+pub(super) fn with_snapshot_hook<T>(
     hook: impl FnMut(&Path) + 'static,
     run: impl FnOnce() -> T,
 ) -> T {
-    AFTER_PUBLICATION_READ.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+    BEFORE_CONSISTENCY_CHECK.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
     let outcome = run();
-    AFTER_PUBLICATION_READ.with(|cell| *cell.borrow_mut() = None);
+    BEFORE_CONSISTENCY_CHECK.with(|cell| *cell.borrow_mut() = None);
     outcome
 }
 
-fn after_publication_read(directory: &Path) {
+fn before_consistency_check(directory: &Path) {
     #[cfg(test)]
-    AFTER_PUBLICATION_READ.with(|cell| {
+    BEFORE_CONSISTENCY_CHECK.with(|cell| {
         if let Some(hook) = cell.borrow_mut().as_mut() {
             hook(directory);
         }
     });
     #[cfg(not(test))]
     let _ = directory;
+}
+
+/// When a snapshot decides the publication of a journaled event.
+#[derive(Clone, Copy, Debug)]
+enum PublicationRead {
+    /// Inside the snapshot, comparing at most this many bytes of the event with its
+    /// journal. Every non-search query uses the fixed [`EVENT_READ_LIMIT`], so it
+    /// publishes exactly what an uncontended read would publish, however many attempts a
+    /// busy retry took.
+    Within(u64),
+    /// Not inside the snapshot: a search reads the journaled event only when its scan
+    /// reaches the event's position in filename order, within the budget left at that
+    /// moment, so the journal's presence never changes which earlier records the scan
+    /// examines, and no retry of the snapshot costs a read. Until the caller performs
+    /// that read, the journaled event counts as unpublished.
+    Deferred,
 }
 
 pub(super) fn optional_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
@@ -168,20 +186,18 @@ pub(super) fn optional_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result
 
 impl Snapshot {
     pub(super) fn read(directory: &Path) -> Result<Self> {
-        Self::read_within(directory, EVENT_READ_LIMIT)
+        Self::read_with(directory, PublicationRead::Within(EVENT_READ_LIMIT))
     }
 
     /// [`Snapshot::read`] whose publication check reads at most `event_limit` bytes of a
-    /// journaled event. A search passes what remains of its byte budget; every other
-    /// query keeps the 64 MiB event limit.
+    /// journaled event.
+    #[cfg(test)]
     pub(super) fn read_within(directory: &Path, event_limit: u64) -> Result<Self> {
-        Self::read_charging(directory, event_limit, &mut 0)
+        Self::read_with(directory, PublicationRead::Within(event_limit))
     }
 
-    /// [`Snapshot::read_within`] that adds the bytes its publication check read to
-    /// `charged` as soon as they are read, before the consistency check can reject the
-    /// attempt: a budgeted caller pays for every attempt, not only for the one it keeps.
-    fn read_charging(directory: &Path, event_limit: u64, charged: &mut u64) -> Result<Self> {
+    /// [`Snapshot::read`] deciding a journaled event's publication as `publication` says.
+    fn read_with(directory: &Path, publication: PublicationRead) -> Result<Self> {
         // Open an existing lifecycle lock without creating it or changing permissions.
         let lock_path = directory.join(TURN_CLAIM_LOCK_FILE);
         let lock = match File::open(&lock_path) {
@@ -208,18 +224,24 @@ impl Snapshot {
         )?;
         let pending: Option<PendingTurnCompletion> =
             before[2].as_deref().map(serde_json::from_str).transpose()?;
-        let pending_event = match &pending {
-            Some(pending) => {
+        let pending_event = match (&pending, publication) {
+            (Some(pending), PublicationRead::Within(event_limit)) => {
                 validate_pending_completion(pending)?;
                 // The predicate validates `events` before it opens anything under it, so
                 // a link planted there is rejected instead of followed by this read.
-                let read = journaled_event_state_within(directory, pending, event_limit)?;
-                *charged += read.bytes_read;
-                after_publication_read(directory);
-                Some(read)
+                Some(journaled_event_state_within(
+                    directory,
+                    pending,
+                    event_limit,
+                )?)
             }
-            None => None,
+            (Some(pending), PublicationRead::Deferred) => {
+                validate_pending_completion(pending)?;
+                None
+            }
+            (None, _) => None,
         };
+        before_consistency_check(directory);
         let (index, request_index_error) = match requests::list(directory) {
             Ok(index) => (index, None),
             Err(error) => (requests::Index::default(), Some(format!("{error:#}"))),
@@ -252,12 +274,11 @@ impl Snapshot {
             .find(|receipt| receipt.event_file == event)
     }
 
-    /// The journal's event file name and the predicate's read of it, when a journal exists.
-    fn pending_event(&self) -> Option<(&str, &JournaledEventRead)> {
-        Some((
-            self.pending.as_ref()?.event_file.as_str(),
-            self.pending_event.as_ref()?,
-        ))
+    /// The completion journal naming `event`, when one exists.
+    fn journal_for(&self, event: &str) -> Option<&PendingTurnCompletion> {
+        self.pending
+            .as_ref()
+            .filter(|pending| pending.event_file == event)
     }
 
     fn published(&self, event: &str) -> bool {
@@ -266,11 +287,13 @@ impl Snapshot {
         // event, and none publishes a journaled event that was never written, differs, or
         // could not be compared within the read limit. The claim does not decide it: a
         // close releases the claim before it removes the journal, so the journal outlives
-        // every interruption that could otherwise hide a committed event.
-        if let Some((name, read)) = self.pending_event()
-            && name == event
-        {
-            return read.state == JournaledEventState::Committed;
+        // every interruption that could otherwise hide a committed event. A snapshot that
+        // deferred the comparison has no verdict yet, and no verdict publishes nothing.
+        if self.journal_for(event).is_some() {
+            return self
+                .pending_event
+                .as_ref()
+                .is_some_and(|read| read.state == JournaledEventState::Committed);
         }
         !self
             .receipt_for_event(event)
@@ -357,41 +380,10 @@ impl Snapshot {
     }
 }
 
+/// The snapshot every non-search query observes: its publication check compares a
+/// journaled event within the fixed [`EVENT_READ_LIMIT`] on every attempt.
 pub(super) fn observe_snapshot(directory: &Path) -> Result<Snapshot> {
-    observe_snapshot_within(directory, PublicationReadLimit::PerEvent).outcome
-}
-
-/// How the publication check of a retried snapshot is bounded. The two callers differ on
-/// purpose: a publication verdict on an unchanged event must not depend on how many
-/// attempts a read-only query needed, while a search must never read past its budget.
-#[derive(Clone, Copy, Debug)]
-enum PublicationReadLimit {
-    /// Every attempt reads within the fixed [`EVENT_READ_LIMIT`]: `result`, `inspect`,
-    /// `--context-result`, and every other non-search query publish exactly what an
-    /// uncontended read would publish, however many attempts the busy retry took.
-    PerEvent,
-    /// A search's remaining byte budget, shared by every attempt: each attempt reads
-    /// within what the earlier attempts left, so a retry can never read past the budget.
-    Cumulative(u64),
-}
-
-impl PublicationReadLimit {
-    fn for_attempt(self, bytes_already_read: u64) -> u64 {
-        match self {
-            Self::PerEvent => EVENT_READ_LIMIT,
-            Self::Cumulative(budget) => budget.saturating_sub(bytes_already_read),
-        }
-    }
-}
-
-/// A snapshot attempt sequence and what it cost, whatever its outcome.
-struct SnapshotAttempt {
-    outcome: Result<Snapshot>,
-    /// Bytes every attempt's publication check read, including attempts that were
-    /// retried or failed after reading: a budgeted caller charges all of them.
-    bytes_read: u64,
-    /// The event limit the final attempt read within.
-    final_limit: u64,
+    observe_snapshot_with(directory, PublicationRead::Within(EVENT_READ_LIMIT))
 }
 
 /// How long a busy snapshot is retried before a read-only query gives up.
@@ -423,25 +415,16 @@ fn snapshot_retry_window() -> Duration {
     SNAPSHOT_RETRY_WINDOW
 }
 
-/// Retries a busy snapshot for [`SNAPSHOT_RETRY_WINDOW`]. Each attempt's publication check
-/// reads within the limit `limit` gives it, and every attempt's bytes are returned for
-/// charging.
-fn observe_snapshot_within(directory: &Path, limit: PublicationReadLimit) -> SnapshotAttempt {
+/// Retries a busy snapshot for [`SNAPSHOT_RETRY_WINDOW`]; every attempt decides a journaled
+/// event's publication as `publication` says.
+fn observe_snapshot_with(directory: &Path, publication: PublicationRead) -> Result<Snapshot> {
     let deadline = Instant::now() + snapshot_retry_window();
-    let mut bytes_read = 0;
     loop {
-        let final_limit = limit.for_attempt(bytes_read);
-        match Snapshot::read_charging(directory, final_limit, &mut bytes_read) {
+        match Snapshot::read_with(directory, publication) {
             Err(error) if error.is::<SnapshotBusy>() && Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(25));
             }
-            outcome => {
-                return SnapshotAttempt {
-                    outcome,
-                    bytes_read,
-                    final_limit,
-                };
-            }
+            outcome => return outcome,
         }
     }
 }
@@ -935,24 +918,13 @@ impl SearchScan {
     }
 
     /// Names the budget that is already exhausted. Checked before every session,
-    /// snapshot, and event read so a scan never works past its limits.
+    /// snapshot, and event read, journaled or not, so a scan never works past its limits.
     fn exhausted_budget(&self) -> Option<String> {
-        self.exhausted_budget_within(true)
-    }
-
-    /// [`exhausted_budget`](Self::exhausted_budget) for a record whose bytes the scan has
-    /// already charged and will not read again: only the byte check is waived, and the
-    /// event-count and time limits still bound the work of processing it.
-    fn exhausted_budget_except_bytes(&self) -> Option<String> {
-        self.exhausted_budget_within(false)
-    }
-
-    fn exhausted_budget_within(&self, check_bytes: bool) -> Option<String> {
         if self.events_read >= SEARCH_EVENT_BUDGET {
             Some(format!(
                 "event budget of {SEARCH_EVENT_BUDGET} reads exhausted"
             ))
-        } else if check_bytes && self.bytes_read >= self.byte_budget {
+        } else if self.bytes_read >= self.byte_budget {
             Some(self.byte_budget_exhausted())
         } else if Instant::now() >= self.deadline {
             Some(format!(
@@ -1114,38 +1086,15 @@ fn search_session(
     if let Some(budget) = scan.exhausted_budget() {
         return Ok(SessionScan::Budget(budget));
     }
-    // `events` is validated before the snapshot can read a journaled event through it.
+    // `events` is validated before anything is read through it, and again after the
+    // snapshot listed it.
     check_events_directory(directory)?;
-    // The snapshot's publication check may read one journaled event per attempt. Every
-    // attempt reads within the remaining byte budget, and every attempt's bytes are
-    // charged here, whether the snapshot was kept, retried, or failed, before anything
-    // else is read.
-    let remaining = scan.byte_budget.saturating_sub(scan.bytes_read);
-    let attempt = observe_snapshot_within(directory, PublicationReadLimit::Cumulative(remaining));
-    scan.bytes_read += attempt.bytes_read;
-    let snapshot = attempt.outcome.map_err(|error| format!("{error:#}"))?;
+    // The snapshot reads no event: a journaled event's publication is decided below, at
+    // the event's own position in the scan, so a busy retry costs nothing and the
+    // journal's presence never changes which records the scan examines before it.
+    let snapshot = observe_snapshot_with(directory, PublicationRead::Deferred)
+        .map_err(|error| format!("{error:#}"))?;
     scan.sessions_scanned += 1;
-    if let Some((name, read)) = snapshot.pending_event() {
-        match read.state {
-            JournaledEventState::Oversized(size) => {
-                return Ok(SessionScan::Budget(format!(
-                    "{}; journaled event {id}/{name} is {size} bytes with {} bytes remaining",
-                    scan.byte_budget_exhausted(),
-                    attempt.final_limit
-                )));
-            }
-            JournaledEventState::Mismatched => {
-                scan.events_read += 1;
-                scan.incomplete(
-                    Some(id),
-                    format!(
-                        "{name}: skipped; the event differs from its pending completion journal and is not published"
-                    ),
-                );
-            }
-            JournaledEventState::Committed | JournaledEventState::Absent => (),
-        }
-    }
     check_events_directory(directory)?;
     // A damaged request index loses event-to-request mappings. Events that still have a
     // readable receipt are searched; the rest are skipped and counted, never reported
@@ -1157,7 +1106,8 @@ fn search_session(
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !snapshot.published(name) {
+        let journal = snapshot.journal_for(name);
+        if journal.is_none() && !snapshot.published(name) {
             continue;
         }
         let receipt = snapshot.receipt_for_event(name);
@@ -1165,33 +1115,44 @@ fn search_session(
             without_receipt += 1;
             continue;
         }
-        // A committed journaled event was already read, and charged, by the publication
-        // check; search its text instead of reading the record a second time, even when
-        // that read consumed the last of the budget. Only the byte check is waived for
-        // it: processing the record is still one event read against the event budget,
-        // and the time budget still applies.
-        let committed = snapshot
-            .pending_event()
-            .filter(|(pending_name, _)| *pending_name == name)
-            .and_then(|(_, read)| read.committed_text.clone());
+        // Every budget, the event count included, is checked before the record is
+        // physically read, whether the read is an ordinary one or the publication
+        // comparison of the journaled event.
+        if let Some(budget) = scan.exhausted_budget() {
+            return Ok(SessionScan::Budget(budget));
+        }
         let remaining = scan.byte_budget.saturating_sub(scan.bytes_read);
-        let read = match committed {
-            Some(text) => {
-                if let Some(budget) = scan.exhausted_budget_except_bytes() {
-                    return Ok(SessionScan::Budget(budget));
-                }
-                Ok(Some(text))
-            }
-            None => {
-                if let Some(budget) = scan.exhausted_budget() {
-                    return Ok(SessionScan::Budget(budget));
-                }
-                read_event_within_budget(path, remaining).inspect(|text| {
-                    if let Some(text) = text {
-                        scan.bytes_read += text.len() as u64;
+        let read = match journal {
+            Some(pending) => {
+                // The publication comparison is the journaled event's one read: it is
+                // charged like any other, and a committed event is searched from the
+                // bytes it compared. A record the budget cannot hold stops the scan with
+                // the same reason an ordinary record would, so the result is the same
+                // once the journal is gone and the event is read the ordinary way.
+                let read = journaled_event_state_within(directory, pending, remaining)
+                    .map_err(|error| format!("{name}: {error:#}"))?;
+                scan.bytes_read += read.bytes_read;
+                match read.state {
+                    JournaledEventState::Committed => Ok(read.committed_text),
+                    JournaledEventState::Absent => Ok(None),
+                    JournaledEventState::Oversized(size) => Err(Ok(size)),
+                    JournaledEventState::Mismatched => {
+                        scan.events_read += 1;
+                        scan.incomplete(
+                            Some(id),
+                            format!(
+                                "{name}: skipped; the event differs from its pending completion journal and is not published"
+                            ),
+                        );
+                        continue;
                     }
-                })
+                }
             }
+            None => read_event_within_budget(path, remaining).inspect(|text| {
+                if let Some(text) = text {
+                    scan.bytes_read += text.len() as u64;
+                }
+            }),
         };
         let event: SessionEvent = match read {
             Ok(Some(text)) => {
