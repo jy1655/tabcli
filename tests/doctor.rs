@@ -524,3 +524,84 @@ fn claude_doctor_reports_inherited_claude_code_session_markers_without_changing_
     );
     assert_eq!(files(fixture.root.path()), before);
 }
+
+#[test]
+fn reopen_marker_is_reported_with_its_release_condition_without_writes() {
+    let fixture = Fixture::new("claude");
+    let refused = fixture.root.path().join("session-reopened");
+    fs::create_dir(&refused).unwrap();
+    write(
+        &refused.join("status.json"),
+        &json!({"state":"failed", "generation":3, "updated_unix_ms":3, "exit_code":null,
+            "error":"reopen refused (reopen-conflict): held by pid 4242"}),
+    );
+    let marker = |reopened_by: Value| {
+        write(
+            &fixture.directory.join("reopen.marker.json"),
+            &json!({"schema":1, "claim":"1-2-3",
+                "provider_session_id":"6928ca1c-1234-4abc-8def-0123456789ab",
+                "reopened_by":reopened_by, "created_unix_ms":1}),
+        );
+    };
+    let refusal = |gate: &str, cleanup: Option<&str>| {
+        write(
+            &refused.join("reopen.refusal.json"),
+            &json!({"schema":2, "phase":"launch", "gate":gate,
+                "detail":"detected; no prompt was delivered", "created_unix_ms":2,
+                "cleanup":cleanup, "cleanup_detail":cleanup.map(|_| "no owner record")}),
+        );
+    };
+    let observe = |reason: &str, availability: &str| -> Value {
+        let before = files(fixture.root.path());
+        let value = fixture.doctor();
+        assert_eq!(files(fixture.root.path()), before, "{reason}");
+        let check = check(&value, "reopen_marker");
+        assert_eq!(check["reason_code"], reason, "{check}");
+        assert_eq!(check["availability"], availability, "{check}");
+        check.clone()
+    };
+    assert!(
+        fixture.doctor()["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| check["id"] != "reopen_marker"),
+        "a session without a marker has no marker check"
+    );
+    marker(Value::Null);
+    observe("reopen_in_progress", "unavailable");
+    marker(json!("session-reopened"));
+    let consumed = observe("reopen_marker_consumed", "unavailable");
+    assert_eq!(consumed["evidence"]["reopened_by"], "session-reopened");
+    assert_eq!(consumed["evidence"]["gate"], Value::Null);
+    refusal("reopen-conflict", Some("pending"));
+    let retained = observe("reopen_marker_retained", "unavailable");
+    assert_eq!(retained["evidence"]["gate"], "reopen-conflict");
+    assert_eq!(retained["evidence"]["recorded_cleanup"], "pending");
+    assert!(
+        retained["evidence"]["cleanup"]
+            .as_str()
+            .unwrap()
+            .contains("no native-session owner record"),
+        "{retained}"
+    );
+    write(
+        &refused.join("native-session.json"),
+        &json!({"pid":0, "managed_session_id":"session-reopened"}),
+    );
+    let reconcilable = observe("reopen_marker_reconcilable", "available");
+    assert_eq!(
+        reconcilable["evidence"]["cleanup"],
+        "native session process 0 is verified gone"
+    );
+    fs::remove_file(refused.join("native-session.json")).unwrap();
+    refusal("provider-unsupported", None);
+    let reconcilable = observe("reopen_marker_reconcilable", "available");
+    assert_eq!(
+        reconcilable["evidence"]["cleanup"],
+        "no provider process was spawned"
+    );
+    assert_eq!(reconcilable["evidence"]["recorded_cleanup"], Value::Null);
+    fs::write(fixture.directory.join("reopen.marker.json"), "not json").unwrap();
+    observe("reopen_marker_unreadable", "unknown");
+}

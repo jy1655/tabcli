@@ -64,7 +64,9 @@ const STATE_ROOT_ANCESTRY_SYNC_LIMIT: usize = 16;
 const REOPEN_MARKER_FILE: &str = "reopen.marker.json";
 // Written into the NEW session by a reopen gate that fails after the session exists: the
 // launch wrapper's pre-spawn ownership recheck or the post-launch holder check. It carries
-// the gate name across the process boundary so the reopen response can still report it.
+// the gate name across the process boundary so the reopen response can still report it,
+// and it is the durable evidence from which a later reopen reconciles a source marker
+// that its parent never settled (`verify_reopen_source_is_closed`).
 const REOPEN_REFUSAL_FILE: &str = "reopen.refusal.json";
 static TURN_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1404,7 +1406,8 @@ const REOPEN_CONFLICT_GATE: &str = "reopen-conflict";
 const REOPEN_VERIFICATION_FAILED_GATE: &str = "reopen-verification-failed";
 
 // The gates a reopen can fail after its session exists. Each one leaves the new session
-// failed with no prompt delivered, so each one releases the source's reopen marker again.
+// failed with no prompt delivered. The source's reopen marker is released again only once
+// the refused launch provably cannot hold the conversation (`RefusedLaunchCleanup`).
 const REOPEN_POST_CREATION_GATES: [&str; 3] = [
     REOPEN_LAUNCH_GATE,
     REOPEN_CONFLICT_GATE,
@@ -1420,6 +1423,12 @@ const REOPEN_POST_CREATION_GATES: [&str; 3] = [
 // outcome is decided from this record.
 const REOPEN_REFUSAL_LAUNCH_PHASE: &str = "launch";
 
+// `cleanup` is written by a marker settlement that found the refused launch may still hold
+// the conversation (a failed close of a spawned process). It is a note for `doctor` and the
+// next reopen attempt; the release decision itself is always taken from the session's live
+// records, never from this field.
+const REOPEN_REFUSAL_CLEANUP_PENDING: &str = "pending";
+
 #[derive(Debug, Deserialize, Serialize)]
 struct RecordedReopenRefusal {
     schema: u32,
@@ -1427,6 +1436,10 @@ struct RecordedReopenRefusal {
     gate: String,
     detail: String,
     created_unix_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cleanup: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cleanup_detail: Option<String>,
 }
 
 // Records a launch-phase gate refusal that happened after the new session existed, then
@@ -1439,6 +1452,8 @@ fn record_reopen_refusal(directory: &Path, gate: &'static str, detail: String) -
         gate: gate.to_owned(),
         detail: detail.clone(),
         created_unix_ms: unix_ms(),
+        cleanup: None,
+        cleanup_detail: None,
     };
     if let Err(error) = write_json_atomic(&directory.join(REOPEN_REFUSAL_FILE), &record) {
         return reopen_refusal(
@@ -1449,15 +1464,126 @@ fn record_reopen_refusal(directory: &Path, gate: &'static str, detail: String) -
     reopen_refusal(gate, detail)
 }
 
-// The gate of the launch-phase refusal recorded in a reopened session, if there is one. A
-// record of any other schema or phase is not a launch refusal and yields nothing, so the
-// caller treats the launch as not refused.
-fn read_reopen_refusal_gate(directory: &Path) -> Option<String> {
+// The launch-phase refusal recorded in a reopened session, if there is one. A record of any
+// other schema or phase is not a launch refusal and yields nothing, so the caller treats the
+// launch as not refused.
+fn read_reopen_launch_refusal(directory: &Path) -> Option<RecordedReopenRefusal> {
     let text = read_regular_text_if_present(&directory.join(REOPEN_REFUSAL_FILE))
         .ok()
         .flatten()?;
     let record: RecordedReopenRefusal = serde_json::from_str(&text).ok()?;
-    (record.schema == 2 && record.phase == REOPEN_REFUSAL_LAUNCH_PHASE).then_some(record.gate)
+    (record.schema == 2 && record.phase == REOPEN_REFUSAL_LAUNCH_PHASE).then_some(record)
+}
+
+fn read_reopen_refusal_gate(directory: &Path) -> Option<String> {
+    read_reopen_launch_refusal(directory).map(|record| record.gate)
+}
+
+// Notes in the launch refusal record that the marker settlement could not establish that
+// the refused launch is gone. A missing record (its write failed when the refusal was
+// decided) leaves nothing to annotate; the retention itself does not depend on the note.
+fn record_reopen_refusal_cleanup_pending(directory: &Path, reason: &str) -> Result<()> {
+    let Some(mut record) = read_reopen_launch_refusal(directory) else {
+        return Ok(());
+    };
+    record.cleanup = Some(REOPEN_REFUSAL_CLEANUP_PENDING.to_owned());
+    record.cleanup_detail = Some(reason.to_owned());
+    write_json_atomic(&directory.join(REOPEN_REFUSAL_FILE), &record)
+}
+
+// Whether a launch-refused reopened session can still hold the provider conversation. The
+// source's reopen marker is released only on the three verified outcomes; `Pending` keeps
+// it consumed, because a refused launch whose process survived (a close that failed, a
+// process that never registered) is exactly the second live writer the gate exists to
+// keep out, and the registry scan of the next reopen would not see an unregistered one.
+#[derive(Debug, PartialEq)]
+enum RefusedLaunchCleanup {
+    // The pre-spawn recheck refused: the launch wrapper started no provider process.
+    NoProcessSpawned,
+    // The new session's surface was closed through the close path (status `closed` with
+    // its tombstone), which is the same success an explicit `close-session` reports.
+    SurfaceClosed,
+    // The native-session owner of the new session is verified gone: its pid is dead or its
+    // recorded identity no longer matches, the same judgment dead-owner repair makes.
+    ProcessDead { pid: u32 },
+    // None of the above can be established from the session's records.
+    Pending(String),
+}
+
+impl RefusedLaunchCleanup {
+    fn releases_marker(&self) -> bool {
+        !matches!(self, Self::Pending(_))
+    }
+}
+
+impl std::fmt::Display for RefusedLaunchCleanup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoProcessSpawned => write!(formatter, "no provider process was spawned"),
+            Self::SurfaceClosed => write!(formatter, "the refused session's surface was closed"),
+            Self::ProcessDead { pid } => {
+                write!(formatter, "native session process {pid} is verified gone")
+            }
+            Self::Pending(reason) => {
+                write!(
+                    formatter,
+                    "the refused launch may still hold the conversation: {reason}"
+                )
+            }
+        }
+    }
+}
+
+// Read-only. Establishes, from the refused session's own records, whether the launch that
+// was refused under `gate` can still hold the conversation. A session that accepts prompts
+// or is working is never a refused launch, whatever its record says.
+fn refused_launch_cleanup(refused_directory: &Path, gate: &str) -> Result<RefusedLaunchCleanup> {
+    let refused_session = refused_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let state = read_json::<SessionStatus>(&refused_directory.join("status.json"))?.state;
+    if session_accepts_prompt(&state) || state == "working" {
+        return Ok(RefusedLaunchCleanup::Pending(format!(
+            "refused session {refused_session} is {state}"
+        )));
+    }
+    if gate == REOPEN_LAUNCH_GATE {
+        return Ok(RefusedLaunchCleanup::NoProcessSpawned);
+    }
+    if state == "closed"
+        && read_regular_status_if_present(&refused_directory.join(CLOSED_STATUS_FILE))?
+            .is_some_and(|closed| closed.state == "closed")
+    {
+        return Ok(RefusedLaunchCleanup::SurfaceClosed);
+    }
+    let Some(owner) =
+        query::optional_json::<NativeSessionOwner>(&refused_directory.join(SESSION_OWNER_FILE))?
+    else {
+        return Ok(RefusedLaunchCleanup::Pending(format!(
+            "refused session {refused_session} is {state} with no native-session owner record, so its process cannot be verified gone"
+        )));
+    };
+    if owner.managed_session_id.as_deref() != Some(refused_session) {
+        return Ok(RefusedLaunchCleanup::Pending(format!(
+            "the native-session owner record of refused session {refused_session} names {:?}",
+            owner.managed_session_id
+        )));
+    }
+    let observed = query::observe_owner_record(&owner);
+    if observed.process_alive == Some(false) || observed.identity_matches == Some(false) {
+        return Ok(RefusedLaunchCleanup::ProcessDead { pid: owner.pid });
+    }
+    Ok(RefusedLaunchCleanup::Pending(match observed.error {
+        Some(error) => format!(
+            "native session process {} of refused session {refused_session} could not be verified: {error}",
+            owner.pid
+        ),
+        None => format!(
+            "native session process {} of refused session {refused_session} is still running",
+            owner.pid
+        ),
+    }))
 }
 
 // Which boundary a resumed session's holder check runs at. The provider grants no
@@ -1686,6 +1812,7 @@ fn settle_reopen_outcome(
                     release_reopen_marker_after_refusal(
                         &source_directory,
                         &refused_directory,
+                        gate,
                         outcome,
                     )
                 }
@@ -1799,13 +1926,17 @@ fn run_reopen_inner(request: ReopenRequest, address: &mut Option<(String, String
 // pre-spawn recheck started no process, and both post-launch gates refuse before the first
 // prompt and close the new surface. Bridge therefore established no conversation writer,
 // and the source's reopen marker is released so the source can be reopened again once the
-// cause is gone. The refused session keeps its `resumed_from` as provenance. Release happens
-// only when the marker still names the refused session and that session is no longer
-// accepting prompts; a live holder that survived a failed close is still caught by the
-// registry gate of the next reopen.
+// cause is gone. The refused session keeps its `resumed_from` as provenance. Release
+// requires that the marker still names the refused session and that the refused launch
+// provably cannot hold the conversation (`refused_launch_cleanup`): a spawned process whose
+// close failed may never have registered, so the registry gate of the next reopen would not
+// catch it. In that case the marker stays consumed, the refusal record is annotated with
+// `cleanup: "pending"`, and the next reopen attempt reconciles the marker once the process
+// is verified gone (`verify_reopen_source_is_closed`).
 fn release_reopen_marker_after_refusal(
     source_directory: &Path,
     refused_directory: &Path,
+    gate: &str,
     outcome: Result<()>,
 ) -> Result<()> {
     let refused_session = refused_directory
@@ -1813,9 +1944,14 @@ fn release_reopen_marker_after_refusal(
         .and_then(|name| name.to_str())
         .unwrap_or_default();
     let released = (|| -> Result<()> {
-        let state = read_json::<SessionStatus>(&refused_directory.join("status.json"))?.state;
-        if session_accepts_prompt(&state) || state == "working" {
-            bail!("refused session {refused_session} is {state}");
+        let cleanup = refused_launch_cleanup(refused_directory, gate)?;
+        if let RefusedLaunchCleanup::Pending(reason) = &cleanup {
+            let note = record_reopen_refusal_cleanup_pending(refused_directory, reason)
+                .err()
+                .map_or(String::new(), |error| {
+                    format!("; the refusal record could not be annotated: {error:#}")
+                });
+            bail!("{cleanup}{note}");
         }
         let marker_path = source_directory.join(REOPEN_MARKER_FILE);
         let _lock = lock_turn_claim(&source_directory.join(TURN_CLAIM_FILE))?;
@@ -1920,7 +2056,27 @@ fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
     })
 }
 
-fn verify_reopen_source_is_closed(directory: &Path, id: &str) -> Result<()> {
+// A reopen marker that names a session whose launch was refused and whose cleanup is now
+// verified. The marker no longer excludes anything: the reopen it recorded delivered no
+// prompt and its process is provably gone, so the next claim under the source lock removes
+// it before writing its own.
+#[derive(Debug)]
+struct StaleReopenMarker {
+    refused_session: String,
+    gate: String,
+    cleanup: RefusedLaunchCleanup,
+}
+
+// Read-only. The source is closed with its tombstone, nothing of its lifecycle is left
+// open, and any reopen marker it carries is either stale (returned, so the claim can
+// release it) or refuses under `already-reopened` naming the blocking condition. A marker
+// is stale only when the session it names carries a durable launch-phase refusal and that
+// refused launch is verified unable to hold the conversation (`refused_launch_cleanup`).
+// This is how a marker whose parent reopen crashed before settlement, or whose launch
+// wrapper recorded its refusal only after the parent timed out, is reconciled: nothing is
+// inferred from the absence of records, and a marker that names a session without a launch
+// refusal, or with a launch refusal whose process may survive, stays consumed.
+fn verify_reopen_source_is_closed(directory: &Path, id: &str) -> Result<Option<StaleReopenMarker>> {
     let closed = read_regular_status_if_present(&directory.join(CLOSED_STATUS_FILE))?;
     let status = read_regular_status_if_present(&directory.join("status.json"))?;
     let state = status
@@ -1951,19 +2107,56 @@ fn verify_reopen_source_is_closed(directory: &Path, id: &str) -> Result<()> {
             ));
         }
     }
-    if let Some(text) = read_regular_text_if_present(&directory.join(REOPEN_MARKER_FILE))? {
-        let reopened_by = serde_json::from_str::<ReopenMarker>(&text)
-            .ok()
-            .and_then(|marker| marker.reopened_by);
-        return Err(reopen_refusal(
-            "already-reopened",
-            match reopened_by {
-                Some(new_id) => format!("session {id} was already reopened as {new_id}"),
-                None => format!("a reopen of session {id} is already in progress"),
-            },
+    let Some(text) = read_regular_text_if_present(&directory.join(REOPEN_MARKER_FILE))? else {
+        return Ok(None);
+    };
+    let refuse = |detail: String| Err(reopen_refusal("already-reopened", detail));
+    let Ok(marker) = serde_json::from_str::<ReopenMarker>(&text) else {
+        return refuse(format!(
+            "session {id} carries a reopen marker that cannot be read; it is treated as consumed"
+        ));
+    };
+    let Some(new_id) = marker.reopened_by else {
+        return refuse(format!("a reopen of session {id} is already in progress"));
+    };
+    let already = format!("session {id} was already reopened as {new_id}");
+    if !valid_session_id(&new_id) {
+        return refuse(format!(
+            "{already}; the marker names an invalid session id, so it is treated as consumed"
         ));
     }
-    Ok(())
+    let refused_directory = directory
+        .parent()
+        .context("session directory has no state root")?
+        .join(&new_id);
+    if !fs::symlink_metadata(&refused_directory).is_ok_and(|metadata| metadata.is_dir()) {
+        return refuse(format!(
+            "{already}; the records of {new_id} are missing, so the marker is treated as consumed"
+        ));
+    }
+    let Some(refusal) = read_reopen_launch_refusal(&refused_directory) else {
+        return refuse(already);
+    };
+    let cleanup = match refused_launch_cleanup(&refused_directory, &refusal.gate) {
+        Ok(cleanup) => cleanup,
+        Err(error) => {
+            return refuse(format!(
+                "{already}; that launch was refused ({}) but its records cannot be verified: {error:#}",
+                refusal.gate
+            ));
+        }
+    };
+    if !cleanup.releases_marker() {
+        return refuse(format!(
+            "{already}; that launch was refused ({}) but {cleanup}",
+            refusal.gate
+        ));
+    }
+    Ok(Some(StaleReopenMarker {
+        refused_session: new_id,
+        gate: refusal.gate,
+        cleanup,
+    }))
 }
 
 // A recorded event that cannot be read is a turn whose outcome cannot be verified, so it
@@ -2080,7 +2273,17 @@ fn claim_reopen_marker(
 ) -> Result<ReopenMarkerClaim> {
     let path = directory.join(REOPEN_MARKER_FILE);
     let _lock = lock_turn_claim(&directory.join(TURN_CLAIM_FILE))?;
-    verify_reopen_source_is_closed(directory, id)?;
+    if let Some(stale) = verify_reopen_source_is_closed(directory, id)? {
+        // The gate re-ran under the lock, so the stale marker still names a refused launch
+        // whose cleanup is verified now; releasing it here is the reconciliation the
+        // crashed or timed-out parent never performed.
+        remove_file_if_present(&path).with_context(|| {
+            format!(
+                "could not release the stale reopen marker of session {id} (reopened as {}, refused at {}, {})",
+                stale.refused_session, stale.gate, stale.cleanup
+            )
+        })?;
+    }
     let claim = format!(
         "{}-{}-{}",
         std::process::id(),

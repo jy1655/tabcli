@@ -7928,7 +7928,8 @@ fn a_later_tell_refusal_never_releases_the_marker_of_a_delivered_initial_prompt(
     );
 
     // The same uncertain report with a launch-phase refusal recorded in the session is the
-    // launch refusal it looks like: the gate is named and the marker is released.
+    // launch refusal it looks like: the gate is named, and because the refused session is
+    // closed the marker is released.
     let recorded = record_reopen_refusal(
         &new,
         REOPEN_CONFLICT_GATE,
@@ -8341,7 +8342,10 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
         assert_eq!(result["request_state"], "unresolved", "{label}: {result}");
         assert_eq!(result["result"], serde_json::Value::Null, "{label}");
 
-        // The source is untouched except for its marker, which the refusal releases.
+        // The source is untouched except for its marker. A refusal whose surface was closed
+        // releases it. A refusal whose close failed keeps it consumed: the spawned process
+        // may survive without ever registering, so the next reopen's registry scan would not
+        // see it. The retention is noted in the refusal record.
         let mut source_after = snapshot_directory(&source);
         assert!(
             source_after.remove("reopen.marker.json").is_some(),
@@ -8350,18 +8354,114 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
         let mut expected = source_before.clone();
         expected.remove("reopen.marker.json");
         assert_eq!(source_after, expected, "{label}");
-        let outcome =
-            release_reopen_marker_after_refusal(&source, &new, Err(anyhow::anyhow!("refused")));
+        let outcome = release_reopen_marker_after_refusal(
+            &source,
+            &new,
+            REOPEN_VERIFICATION_FAILED_GATE,
+            Err(anyhow::anyhow!("refused")),
+        );
         let outcome = outcome.unwrap_err();
-        assert_eq!(format!("{outcome:#}"), "refused", "{label}");
-        assert!(!source.join(REOPEN_MARKER_FILE).exists(), "{label}");
-        assert_eq!(snapshot_directory(&source), expected, "{label}");
+        if close_succeeds {
+            assert_eq!(format!("{outcome:#}"), "refused", "{label}");
+            assert!(!source.join(REOPEN_MARKER_FILE).exists(), "{label}");
+            assert_eq!(snapshot_directory(&source), expected, "{label}");
+            let record: RecordedReopenRefusal = read_json(&new.join(REOPEN_REFUSAL_FILE)).unwrap();
+            assert_eq!(record.cleanup, None, "{label}");
+        } else {
+            let text = format!("{outcome:#}");
+            assert!(
+                text.starts_with(&format!(
+                    "the reopen marker of source session {source_id} was not released: the refused launch may still hold the conversation: refused session {new_id} is failed with no native-session owner record"
+                )) && text.ends_with(": refused"),
+                "{label}: {text}"
+            );
+            assert!(source.join(REOPEN_MARKER_FILE).is_file(), "{label}");
+            let record: RecordedReopenRefusal = read_json(&new.join(REOPEN_REFUSAL_FILE)).unwrap();
+            assert_eq!(record.gate, "reopen-verification-failed", "{label}");
+            assert_eq!(record.cleanup.as_deref(), Some("pending"), "{label}");
+            assert!(
+                record
+                    .cleanup_detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("no native-session owner record"),
+                "{label}: {record:?}"
+            );
+            // Every later reopen is refused naming the blocking condition, under both the
+            // read-only gate and the claim lock, and the marker is left as it is.
+            let marker_before = fs::read(source.join(REOPEN_MARKER_FILE)).unwrap();
+            for owner in [
+                None,
+                Some(NativeSessionOwner {
+                    pid: std::process::id(),
+                    managed_session_id: Some(new_id.to_owned()),
+                    ..NativeSessionOwner::default()
+                }),
+                Some(NativeSessionOwner {
+                    pid: 0,
+                    managed_session_id: Some("session-reopenother".to_owned()),
+                    ..NativeSessionOwner::default()
+                }),
+            ] {
+                match &owner {
+                    Some(owner) => {
+                        write_json_atomic(&new.join(SESSION_OWNER_FILE), owner).unwrap();
+                    }
+                    None => remove_file_if_present(&new.join(SESSION_OWNER_FILE)).unwrap(),
+                }
+                let expected_condition = match &owner {
+                    None => "with no native-session owner record".to_owned(),
+                    Some(owner) if owner.pid == 0 => {
+                        "names Some(\"session-reopenother\")".to_owned()
+                    }
+                    Some(owner) => format!(
+                        "native session process {} of refused session {new_id} is still running",
+                        owner.pid
+                    ),
+                };
+                for refused in [
+                    inspect_reopen_source(&source, source_id)
+                        .expect_err("gate admitted a retained marker"),
+                    claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION)
+                        .expect_err("claim admitted a retained marker"),
+                ] {
+                    assert_eq!(
+                        reopen_refusal_gate(&refused),
+                        Some("already-reopened"),
+                        "{label}: {owner:?}"
+                    );
+                    let text = format!("{refused:#}");
+                    assert!(
+                        text.starts_with(&format!(
+                            "reopen refused (already-reopened): session {source_id} was already reopened as {new_id}; that launch was refused (reopen-verification-failed) but the refused launch may still hold the conversation: "
+                        )) && text.contains(&expected_condition),
+                        "{label}: {owner:?}: {text}"
+                    );
+                }
+                assert_eq!(
+                    fs::read(source.join(REOPEN_MARKER_FILE)).unwrap(),
+                    marker_before,
+                    "{label}: {owner:?}"
+                );
+            }
+            // The process is later found dead: the next reopen reconciles the marker below.
+            write_json_atomic(
+                &new.join(SESSION_OWNER_FILE),
+                &NativeSessionOwner {
+                    pid: 0,
+                    managed_session_id: Some(new_id.to_owned()),
+                    ..NativeSessionOwner::default()
+                },
+            )
+            .unwrap();
+        }
         assert_eq!(
             read_resumed_from(&new).unwrap().as_ref(),
             Some(&resumed_from),
             "{label}: provenance of the refused session is kept"
         );
-        // A subsequent reopen of the same source passes its gates and claims the marker.
+        // A subsequent reopen of the same source passes its gates and claims the marker; a
+        // retained marker whose process is now verified dead is released by that claim.
         provider::override_claude_session_registry_for_test(Some(empty_registry.clone()));
         inspect_reopen_source(&source, source_id).unwrap();
         // The adapter admits the conversation only on native Windows; elsewhere it refuses
@@ -8380,11 +8480,12 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
         let next = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
         drop(next);
         assert!(!source.join(REOPEN_MARKER_FILE).exists(), "{label}");
+        assert_eq!(snapshot_directory(&source), expected, "{label}");
         fs::remove_dir_all(&new).unwrap();
     }
 
-    // Release is refused while the refused session still accepts prompts, and when the
-    // marker names another reopen.
+    // Release is refused while the refused session still accepts prompts, when a spawned
+    // process cannot be verified gone, and when the marker names another reopen.
     let new_id = "session-reopennew11";
     let new = root.path().join(new_id);
     fs::create_dir(&new).unwrap();
@@ -8399,22 +8500,245 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
     let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
     claim.finalize(new_id).unwrap();
     update_status(&new, "ready", None, None).unwrap();
-    let outcome = release_reopen_marker_after_refusal(&source, &new, Ok(())).unwrap_err();
+    let outcome =
+        release_reopen_marker_after_refusal(&source, &new, REOPEN_LAUNCH_GATE, Ok(())).unwrap_err();
     assert!(format!("{outcome:#}").contains("is ready"), "{outcome:#}");
     assert!(source.join(REOPEN_MARKER_FILE).is_file());
     update_status(&new, "failed", None, Some("refused".to_owned())).unwrap();
+    // A post-spawn gate with no verified cleanup retains the marker; the refusal record is
+    // absent here (its write failed when the refusal was decided), so only the retention
+    // itself is observable.
+    let outcome = release_reopen_marker_after_refusal(&source, &new, REOPEN_CONFLICT_GATE, Ok(()))
+        .unwrap_err();
+    assert!(
+        format!("{outcome:#}").contains("may still hold the conversation"),
+        "{outcome:#}"
+    );
+    assert!(source.join(REOPEN_MARKER_FILE).is_file());
+    assert!(!new.join(REOPEN_REFUSAL_FILE).exists());
     let other = root.path().join("session-reopennew12");
     fs::create_dir(&other).unwrap();
     update_status(&other, "failed", None, Some("refused".to_owned())).unwrap();
-    let outcome = release_reopen_marker_after_refusal(&source, &other, Ok(())).unwrap_err();
+    let outcome = release_reopen_marker_after_refusal(&source, &other, REOPEN_LAUNCH_GATE, Ok(()))
+        .unwrap_err();
     assert!(
         format!("{outcome:#}").contains("not the refused session"),
         "{outcome:#}"
     );
     assert!(source.join(REOPEN_MARKER_FILE).is_file());
-    release_reopen_marker_after_refusal(&source, &new, Ok(())).unwrap();
+    // The pre-spawn gate started no process: nothing can hold the conversation.
+    release_reopen_marker_after_refusal(&source, &new, REOPEN_LAUNCH_GATE, Ok(())).unwrap();
     assert!(!source.join(REOPEN_MARKER_FILE).exists());
     // Releasing an already released marker is not an error.
-    release_reopen_marker_after_refusal(&source, &new, Ok(())).unwrap();
+    release_reopen_marker_after_refusal(&source, &new, REOPEN_LAUNCH_GATE, Ok(())).unwrap();
     provider::override_claude_session_registry_for_test(None);
+}
+
+// A marker whose parent reopen never settled is reconciled by the next reopen, under the
+// source lock and from the refused session's durable records alone. A parent that crashed
+// after a post-launch refusal was recorded, and a parent that timed out before the wrapper
+// recorded its pre-spawn refusal, both leave the marker consumed. Nothing is inferred from
+// missing records: a launch refusal must exist, and it releases the marker only once the
+// refused launch is verified unable to hold the conversation.
+#[test]
+fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_verified() {
+    let root = tempfile::tempdir().unwrap();
+    let source_id = "session-reopensrc14";
+    let source = write_closed_reopen_source(
+        root.path(),
+        source_id,
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let source_before = snapshot_directory(&source);
+    let expect_refused = |expected: &str| {
+        let marker_before = fs::read(source.join(REOPEN_MARKER_FILE)).unwrap();
+        for (label, refused) in [
+            ("gate", inspect_reopen_source(&source, source_id).err()),
+            (
+                "claim",
+                claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).err(),
+            ),
+        ] {
+            let refused =
+                refused.unwrap_or_else(|| panic!("the {label} admitted the marker: {expected}"));
+            assert_eq!(
+                reopen_refusal_gate(&refused),
+                Some("already-reopened"),
+                "{label}: {refused:#}"
+            );
+            assert_eq!(
+                format!("{refused:#}"),
+                format!("reopen refused (already-reopened): {expected}"),
+                "{label}"
+            );
+        }
+        assert_eq!(
+            fs::read(source.join(REOPEN_MARKER_FILE)).unwrap(),
+            marker_before,
+            "a refusal altered the marker"
+        );
+    };
+    let reconcile = || {
+        // The read-only gate admits the source; the claim releases the stale marker under
+        // the lock and writes its own in its place.
+        inspect_reopen_source(&source, source_id).unwrap();
+        let stale: ReopenMarker = read_json(&source.join(REOPEN_MARKER_FILE)).unwrap();
+        let next = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+        let marker: ReopenMarker = read_json(&source.join(REOPEN_MARKER_FILE)).unwrap();
+        assert_eq!(marker.reopened_by, None);
+        assert_ne!(marker.claim, stale.claim);
+        drop(next);
+        assert_eq!(snapshot_directory(&source), source_before);
+    };
+    let owner = |pid: u32, session: &str| NativeSessionOwner {
+        pid,
+        managed_session_id: Some(session.to_owned()),
+        ..NativeSessionOwner::default()
+    };
+
+    // The parent crashed after the post-launch holder check recorded its refusal and before
+    // it closed the new surface or settled the marker.
+    let new_id = "session-reopennew14";
+    let new = write_reopen_launch_session(root.path(), new_id, Path::new("/opt/claude"));
+    let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    claim.finalize(new_id).unwrap();
+    write_json_atomic(
+        &new.join(TERMINAL_HANDLE_FILE),
+        &reopen_test_terminal(new_id),
+    )
+    .unwrap();
+    update_status(&new, "awaiting-initial-input", None, None).unwrap();
+    let recorded = record_reopen_refusal(
+        &new,
+        REOPEN_CONFLICT_GATE,
+        "held by pid 4242; no prompt was delivered".to_owned(),
+    );
+    assert_eq!(reopen_refusal_gate(&recorded), Some("reopen-conflict"));
+    expect_refused(&format!(
+        "session {source_id} was already reopened as {new_id}; that launch was refused (reopen-conflict) but the refused launch may still hold the conversation: refused session {new_id} is awaiting-initial-input with no native-session owner record, so its process cannot be verified gone"
+    ));
+    // Its wrapper (stood in for by this process) is still running.
+    write_json_atomic(
+        &new.join(SESSION_OWNER_FILE),
+        &owner(std::process::id(), new_id),
+    )
+    .unwrap();
+    expect_refused(&format!(
+        "session {source_id} was already reopened as {new_id}; that launch was refused (reopen-conflict) but the refused launch may still hold the conversation: native session process {} of refused session {new_id} is still running",
+        std::process::id()
+    ));
+    // The cleanup the crashed parent never performed: an explicit close of the refused
+    // session consumes its handle, and the closed surface releases the marker.
+    let mut closed_terminals = Vec::new();
+    close_session_state_with_error(&new, Some("refused".to_owned()), |session| {
+        closed_terminals.push(session.id.clone());
+        Ok(terminal::CloseOutcome::Closed)
+    })
+    .unwrap();
+    assert_eq!(closed_terminals, [format!("{new_id}-terminal")]);
+    reconcile();
+
+    // The parent timed out while the session was still launching, before the wrapper
+    // recorded anything. The marker stays consumed until a launch refusal is observable,
+    // whatever else happens to the session.
+    let new_id = "session-reopennew16";
+    let new = write_reopen_launch_session(root.path(), new_id, Path::new("/opt/claude"));
+    let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    claim.finalize(new_id).unwrap();
+    let plain = format!("session {source_id} was already reopened as {new_id}");
+    expect_refused(&plain);
+    write_json_atomic(&new.join(SESSION_OWNER_FILE), &owner(0, new_id)).unwrap();
+    update_status(&new, "failed", None, Some("timed out".to_owned())).unwrap();
+    expect_refused(&plain);
+    // A refusal of another phase is not a launch refusal.
+    write_json_atomic(
+        &new.join(REOPEN_REFUSAL_FILE),
+        &serde_json::json!({
+            "schema": 2,
+            "phase": "follow-up",
+            "gate": "reopen-conflict",
+            "detail": "held by pid 4242",
+            "created_unix_ms": 1,
+        }),
+    )
+    .unwrap();
+    expect_refused(&plain);
+    // The wrapper's pre-spawn refusal arrives late: no process was ever spawned.
+    fs::remove_file(new.join(REOPEN_REFUSAL_FILE)).unwrap();
+    let recorded = record_reopen_refusal(
+        &new,
+        REOPEN_LAUNCH_GATE,
+        "a holder registered after the initial scan".to_owned(),
+    );
+    assert_eq!(reopen_refusal_gate(&recorded), Some("provider-unsupported"));
+    reconcile();
+
+    // A post-launch refusal whose parent died before the close: the marker is retained
+    // while the wrapper may be alive or belongs to another session, and released once its
+    // process is verified gone.
+    let new_id = "session-reopennew17";
+    let new = write_reopen_launch_session(root.path(), new_id, Path::new("/opt/claude"));
+    let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    claim.finalize(new_id).unwrap();
+    update_status(&new, "awaiting-initial-input", None, None).unwrap();
+    record_reopen_refusal(
+        &new,
+        REOPEN_VERIFICATION_FAILED_GATE,
+        "could not verify; no prompt was delivered".to_owned(),
+    );
+    let prefix = format!(
+        "session {source_id} was already reopened as {new_id}; that launch was refused (reopen-verification-failed) but the refused launch may still hold the conversation: "
+    );
+    write_json_atomic(
+        &new.join(SESSION_OWNER_FILE),
+        &owner(std::process::id(), new_id),
+    )
+    .unwrap();
+    expect_refused(&format!(
+        "{prefix}native session process {} of refused session {new_id} is still running",
+        std::process::id()
+    ));
+    write_json_atomic(
+        &new.join(SESSION_OWNER_FILE),
+        &owner(0, "session-reopenother"),
+    )
+    .unwrap();
+    expect_refused(&format!(
+        "{prefix}the native-session owner record of refused session {new_id} names Some(\"session-reopenother\")"
+    ));
+    write_json_atomic(&new.join(SESSION_OWNER_FILE), &owner(0, new_id)).unwrap();
+    reconcile();
+
+    // Markers that cannot be resolved to a refused launch are consumed, never released.
+    let marker = |reopened_by: &str| ReopenMarker {
+        schema: 1,
+        claim: "1-2-3".to_owned(),
+        provider_session_id: REOPEN_TEST_CONVERSATION.to_owned(),
+        reopened_by: Some(reopened_by.to_owned()),
+        created_unix_ms: 1,
+    };
+    write_json_atomic(
+        &source.join(REOPEN_MARKER_FILE),
+        &marker("session-reopenmissing"),
+    )
+    .unwrap();
+    expect_refused(&format!(
+        "session {source_id} was already reopened as session-reopenmissing; the records of session-reopenmissing are missing, so the marker is treated as consumed"
+    ));
+    write_json_atomic(
+        &source.join(REOPEN_MARKER_FILE),
+        &marker("../session-reopennew17"),
+    )
+    .unwrap();
+    expect_refused(&format!(
+        "session {source_id} was already reopened as ../session-reopennew17; the marker names an invalid session id, so it is treated as consumed"
+    ));
+    fs::write(source.join(REOPEN_MARKER_FILE), "not json").unwrap();
+    expect_refused(&format!(
+        "session {source_id} carries a reopen marker that cannot be read; it is treated as consumed"
+    ));
+    fs::remove_file(source.join(REOPEN_MARKER_FILE)).unwrap();
+    assert_eq!(snapshot_directory(&source), source_before);
 }

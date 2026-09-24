@@ -451,15 +451,24 @@ fn claude_initial_prompt_transport(windows: bool) -> InitialPromptTransport {
 // The plan registers the new session's own private settings and cross-session name, so the
 // reopened process reports only into its own directory, exactly like a fresh launch. Policy
 // arguments (yolo, model, effort) are not part of the plan: the shared wrapper derives them
-// from the new manifest, which records only what the reopen request stated. What the plan
-// leaves out is then decided by Claude's own resume, not by the Bridge source manifest
+// from the new manifest, which records only what the reopen request stated. That is the
+// whole of what Bridge controls: the flags it forwards. The effective policy of the
+// reopened process is Claude's own, decided from the resumed session, Claude's settings
+// files (re-read at launch), and its environment, none of which Bridge reads or overrides
 // (https://code.claude.com/docs/en/sessions#what-a-resumed-session-restores):
-// - Model: with no `--model`, Claude restores the model the conversation was using; a
-//   `--model` from the reopen request overrides it at launch.
-// - Permission mode: a terminal `--resume <session-id>` restores the saved mode, except that
-//   a conversation that ended in bypassPermissions restarts in the default mode, so bypass is
-//   active only when the reopen request passes `--yolo`.
-// - Effort: the documentation lists no restored effort; only an explicit `--effort` is passed.
+// - Model: Bridge forwards `--model` only when the reopen request states it. Claude
+//   documents that a resumed session continues on its previous model unless a `--model`
+//   flag or an `ANTHROPIC_MODEL`-family environment variable picks one at launch, the model
+//   is retired or not in `availableModels`, or the provider uses deployment ids; the
+//   resolution order is Claude's model configuration, not the Bridge source manifest.
+// - Permission mode: Bridge forwards its bypass flag only when the reopen request passes
+//   `--yolo`. Claude documents that a terminal `--resume <session-id>` restores the saved
+//   mode except that a session which ended in bypassPermissions starts in the mode a new
+//   session would start in, and that a `permissions.defaultMode` from user, `--settings`,
+//   or managed settings takes effect there. Omitting `--yolo` therefore does not by itself
+//   establish that bypass is off: a configured bypass default still applies.
+// - Effort: the documentation lists no restored effort; only an explicit `--effort` is
+//   forwarded, and any effort default in Claude's own configuration applies otherwise.
 //
 // Claude offers no exclusive hold on a conversation: resuming one session in two terminals
 // is permitted and interleaves both into one transcript

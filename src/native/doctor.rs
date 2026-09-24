@@ -202,6 +202,7 @@ pub(super) fn run(request: DoctorRequest) -> Result<()> {
         };
         owner_check(directory, request.session.as_deref().unwrap(), &mut checks);
         terminal_check(directory, request.session.as_deref().unwrap(), &mut checks);
+        reopen_marker_check(directory, request.session.as_deref().unwrap(), &mut checks);
         manifest
     });
     let provider = match manifest
@@ -528,6 +529,89 @@ fn owner_check(directory: &Path, id: &str, checks: &mut Vec<Check>) {
         ),
     };
     checks.push(Check::new("owner", availability, reason, detail, "Inspect the exact request result; do not infer delivery or resend from owner liveness.").evidence(evidence));
+}
+
+// The reopen marker of a closed source session: which reopen consumed it and whether the
+// next reopen can proceed. Read-only, and the same judgment the reopen gate makes under the
+// source lock (`refused_launch_cleanup`); doctor neither releases nor annotates the marker.
+fn reopen_marker_check(directory: &Path, id: &str, checks: &mut Vec<Check>) {
+    use Availability::*;
+    let marker = match query::optional_json::<ReopenMarker>(&directory.join(REOPEN_MARKER_FILE)) {
+        Ok(Some(marker)) => marker,
+        Ok(None) => return,
+        Err(error) => {
+            checks.push(Check::new("reopen_marker", Unknown, "reopen_marker_unreadable", format!("{error:#}"), "reopen treats an unreadable marker as consumed; inspect the marker before any reopen."));
+            return;
+        }
+    };
+    let next_action = "reopen releases a marker only when the session it names recorded a launch refusal and that launch is verified unable to hold the conversation; doctor never releases or repairs it.";
+    let Some(reopened_by) = marker.reopened_by else {
+        checks.push(Check::new("reopen_marker", Unavailable, "reopen_in_progress", format!("A reopen of {id} holds the marker and has not recorded its new session yet; a new reopen is refused with gate already-reopened."), next_action)
+            .evidence(json!({"claim": marker.claim})));
+        return;
+    };
+    let refused_directory = directory.parent().map(|root| root.join(&reopened_by));
+    let refusal = match &refused_directory {
+        Some(refused_directory)
+            if valid_session_id(&reopened_by)
+                && fs::symlink_metadata(refused_directory)
+                    .is_ok_and(|metadata| metadata.is_dir()) =>
+        {
+            read_reopen_launch_refusal(refused_directory)
+        }
+        _ => None,
+    };
+    let (availability, reason, detail, cleanup) = match refusal
+        .as_ref()
+        .zip(refused_directory.as_deref())
+    {
+        None => (
+            Unavailable,
+            "reopen_marker_consumed",
+            format!(
+                "Session {id} was reopened as {reopened_by}, which recorded no launch refusal; a new reopen is refused with gate already-reopened."
+            ),
+            Value::Null,
+        ),
+        Some((refusal, refused_directory)) => {
+            match refused_launch_cleanup(refused_directory, &refusal.gate) {
+                Ok(cleanup) if cleanup.releases_marker() => (
+                    Available,
+                    "reopen_marker_reconcilable",
+                    format!(
+                        "The reopen as {reopened_by} was refused at launch (gate {}) and {cleanup}; the next reopen of {id} releases the marker and proceeds.",
+                        refusal.gate
+                    ),
+                    json!(cleanup.to_string()),
+                ),
+                Ok(cleanup) => (
+                    Unavailable,
+                    "reopen_marker_retained",
+                    format!(
+                        "The reopen as {reopened_by} was refused at launch (gate {}) but {cleanup}; the marker stays consumed and a new reopen is refused with gate already-reopened until that process is verified gone or the session is closed.",
+                        refusal.gate
+                    ),
+                    json!(cleanup.to_string()),
+                ),
+                Err(error) => (
+                    Unknown,
+                    "reopen_marker_unverified",
+                    format!(
+                        "The reopen as {reopened_by} was refused at launch (gate {}) but its records cannot be verified: {error:#}",
+                        refusal.gate
+                    ),
+                    Value::Null,
+                ),
+            }
+        }
+    };
+    checks.push(Check::new("reopen_marker", availability, reason, detail, next_action).evidence(json!({
+        "reopened_by": reopened_by,
+        "gate": refusal.as_ref().map(|refusal| &refusal.gate),
+        "recorded_cleanup": refusal.as_ref().and_then(|refusal| refusal.cleanup.as_ref()),
+        "recorded_cleanup_detail": refusal.as_ref().and_then(|refusal| refusal.cleanup_detail.as_ref()),
+        "cleanup": cleanup,
+    })));
 }
 
 fn terminal_check(directory: &Path, id: &str, checks: &mut Vec<Check>) {
