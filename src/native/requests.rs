@@ -4,6 +4,16 @@ use super::*;
 const REQUESTS_DIRECTORY: &str = "requests";
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// A recorded result that a request was explicitly derived from, pinned at resolution time.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ContextSource {
+    pub(crate) session: String,
+    pub(crate) request_id: Option<String>,
+    pub(crate) event_id: String,
+    pub(crate) provider: String,
+    pub(crate) created_unix_ms: u128,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct Receipt {
     pub(super) schema: u32,
@@ -13,6 +23,9 @@ pub(super) struct Receipt {
     pub(super) created_unix_ms: u128,
     #[serde(default)]
     pub(super) source: Option<String>,
+    // Receipts written before 0.0.7 have no provenance; they still deserialise as empty.
+    #[serde(default)]
+    pub(super) context_sources: Vec<ContextSource>,
 }
 
 pub(super) fn valid_id(value: &str) -> bool {
@@ -29,14 +42,27 @@ fn validate(receipt: &Receipt) -> Result<()> {
         || !valid_id(&receipt.request_id)
         || !valid_turn_claim_token(&receipt.claim_token)
         || !valid_event_file_name(&receipt.event_file)
+        || !receipt.context_sources.iter().all(valid_context_source)
     {
         bail!("invalid Bridge request receipt")
     }
     Ok(())
 }
 
+fn valid_context_source(source: &ContextSource) -> bool {
+    valid_session_id(&source.session)
+        && valid_event_file_name(&source.event_id)
+        && source.request_id.as_deref().is_none_or(valid_id)
+        && !source.provider.is_empty()
+}
+
 // Called while creating the claim under its lifecycle lock, before any dispatch can begin.
-pub(super) fn create(directory: &Path, claim_token: &str) -> Result<Receipt> {
+// Provenance comes from the caller's pinned resolution; it is never re-read here.
+pub(super) fn create(
+    directory: &Path,
+    claim_token: &str,
+    context_sources: &[ContextSource],
+) -> Result<Receipt> {
     let receipt = Receipt {
         schema: 1,
         request_id: format!(
@@ -49,6 +75,7 @@ pub(super) fn create(directory: &Path, claim_token: &str) -> Result<Receipt> {
         event_file: new_event_file_name()?,
         created_unix_ms: unix_ms(),
         source: Some(delegation_source()),
+        context_sources: context_sources.to_vec(),
     };
     validate(&receipt)?;
     let root = directory.join(REQUESTS_DIRECTORY);
@@ -149,6 +176,50 @@ mod tests {
                 .request_id,
             receipt.request_id
         );
+    }
+
+    #[test]
+    fn receipts_round_trip_context_sources_and_old_receipts_still_parse() {
+        let legacy: Receipt = serde_json::from_str(
+            r#"{"schema":1,"request_id":"request-old","claim_token":"1-2-3",
+            "event_file":"event-1.json","created_unix_ms":7}"#,
+        )
+        .unwrap();
+        validate(&legacy).unwrap();
+        assert!(legacy.context_sources.is_empty());
+        assert_eq!(legacy.source, None);
+
+        let source = ContextSource {
+            session: "session-parent".to_owned(),
+            request_id: Some("request-parent-1".to_owned()),
+            event_id: "event-9.json".to_owned(),
+            provider: "codex".to_owned(),
+            created_unix_ms: 42,
+        };
+        let legacy_event = ContextSource {
+            request_id: None,
+            ..source.clone()
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = create(
+            directory.path(),
+            "1-2-3",
+            &[source.clone(), legacy_event.clone()],
+        )
+        .unwrap();
+        let stored = for_claim(directory.path(), "1-2-3").unwrap().unwrap();
+        assert_eq!(stored.request_id, receipt.request_id);
+        assert_eq!(stored.context_sources, vec![source, legacy_event]);
+        let text = fs::read_to_string(directory.path().join("requests/1-2-3.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["context_sources"][1]["request_id"],
+            serde_json::Value::Null
+        );
+
+        let mut broken = stored.clone();
+        broken.context_sources[0].session = "../escape".to_owned();
+        assert!(validate(&broken).is_err());
     }
 
     #[test]

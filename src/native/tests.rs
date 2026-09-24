@@ -56,6 +56,99 @@ fn ask_and_tell_accept_prompt_files_without_putting_prompt_text_in_argv() {
 }
 
 #[test]
+fn ask_and_tell_accept_exact_repeatable_context_result_addresses() {
+    let ask = parse_args([
+        "ask",
+        "codex",
+        "--prompt",
+        "continue",
+        "--context-result",
+        "session-a/request-1",
+        "--context-result",
+        "session-b/event-2.json",
+    ])
+    .unwrap();
+    let NativeCommand::Ask(AskRequest {
+        context_results, ..
+    }) = ask
+    else {
+        panic!("expected ask");
+    };
+    assert_eq!(
+        context_results
+            .iter()
+            .map(context::ContextResultRef::address)
+            .collect::<Vec<_>>(),
+        ["session-a/request-1", "session-b/event-2.json"]
+    );
+    let tell = parse_args([
+        "tell",
+        "session-target",
+        "--prompt",
+        "continue",
+        "--context-result",
+        "session-a/request-1",
+    ])
+    .unwrap();
+    assert!(matches!(
+        tell,
+        NativeCommand::Tell(TellRequest { context_results, .. }) if context_results.len() == 1
+    ));
+    let plain = parse_args(["tell", "session-target", "--prompt", "continue"]).unwrap();
+    assert!(matches!(
+        plain,
+        NativeCommand::Tell(TellRequest { context_results, .. }) if context_results.is_empty()
+    ));
+
+    for (arguments, expected) in [
+        (
+            vec!["tell", "session-t", "--prompt", "x", "--context-result"],
+            "requires a value",
+        ),
+        (
+            vec![
+                "tell",
+                "session-t",
+                "--prompt",
+                "x",
+                "--context-result",
+                "session-a/latest",
+            ],
+            "invalid --context-result",
+        ),
+        (
+            vec![
+                "ask",
+                "codex",
+                "--prompt",
+                "x",
+                "--context-result",
+                "session-a/request-1",
+                "--context-result",
+                "session-a/request-1",
+            ],
+            "more than once",
+        ),
+        (
+            vec!["ask", "codex", "--context-result", "session-a/request-1"],
+            "requires --prompt",
+        ),
+    ] {
+        let error = format!("{:#}", parse_args(arguments).unwrap_err());
+        assert!(error.contains(expected), "{error}");
+    }
+    let mut nine = vec!["ask", "codex", "--prompt", "x"];
+    let addresses = (1..=9)
+        .map(|index| format!("session-a/request-{index}"))
+        .collect::<Vec<_>>();
+    for address in &addresses {
+        nine.push("--context-result");
+        nine.push(address);
+    }
+    assert!(format!("{:#}", parse_args(nine).unwrap_err()).contains("at most 8"));
+}
+
+#[test]
 fn ask_rejects_terminal_control_sequences_from_inline_and_file_prompts() {
     let directory = tempfile::tempdir().unwrap();
     let prompt_path = directory.path().join("prompt.txt");
@@ -795,6 +888,7 @@ fn close_cannot_interleave_between_ready_validation_and_claimed_publication() {
                 publish_tx.send(()).unwrap();
                 continue_rx.recv_timeout(Duration::from_secs(1)).unwrap();
             },
+            &[],
         )
     });
     publish_rx.recv_timeout(Duration::from_secs(1)).unwrap();

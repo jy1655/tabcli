@@ -20,8 +20,9 @@ fn help_text() -> String {
 Usage:
   agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]
       [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|windows-console>]
-      [--yolo] [--timeout-secs N] [--detach] [--json]
+      [--yolo] [--timeout-secs N] [--detach] [--json] [--context-result <session>/<request-id>]...
   agent-bridge tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
+      [--context-result <session>/<request-id>]...
   agent-bridge sessions [--workspace PATH] [--provider <codex|claude|agy|pi>] [--state STATE]
       [--sort <id|updated>] [--json]
   agent-bridge inspect <session> [--json]
@@ -55,6 +56,13 @@ Session policy:
   it and the provider has a matching option. Codex, Claude, and Agy receive their
   native bypass flags. Pi receives --approve for project-local trust while its
   native tool policy remains in effect.
+
+  --context-result attaches a previously recorded result, addressed exactly as
+  <session>/<request-id> (or <session>/<event-id> for records without a receipt),
+  after the prompt as clearly delimited reference material. Up to 8 values are
+  accepted; each must be a published successful result at resolution time or the
+  command fails before anything is created or sent. The new request receipt
+  records the attached sources as context_sources for inspect and result.
 
   Supported CLI minimums: Codex 0.147.0, Claude 2.1.234, Agy 1.1.12, Pi 0.84.1.
   Session state is stored privately under ~/.agent-bridge/native-sessions.
@@ -229,6 +237,8 @@ mod tests {
             "Fable is passed to Pi as anthropic/claude-fable-5",
             "Pi receives --approve for project-local trust",
             "Attaching to an arbitrary CLI",
+            "[--context-result <session>/<request-id>]...",
+            "records the attached sources as context_sources",
         ] {
             assert!(help.contains(expected), "help is missing {expected:?}");
         }

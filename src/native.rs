@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests;
 
+mod context;
 mod doctor;
 mod provider;
 mod provider_process;
@@ -97,6 +98,7 @@ pub(crate) struct AskRequest {
     pub(crate) timeout: Duration,
     pub(crate) detach: bool,
     pub(crate) json: bool,
+    pub(crate) context_results: Vec<context::ContextResultRef>,
 }
 
 #[derive(Debug)]
@@ -106,6 +108,7 @@ pub(crate) struct TellRequest {
     timeout: Duration,
     detach: bool,
     json: bool,
+    context_results: Vec<context::ContextResultRef>,
 }
 
 #[derive(Debug)]
@@ -417,6 +420,7 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
     let mut timeout = None;
     let mut detach = false;
     let mut json = false;
+    let mut context_results = Vec::new();
     let mut index = 0;
     while index < options.len() {
         match options[index].as_str() {
@@ -463,6 +467,10 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
             "--yolo" => set_flag_once(&mut yolo, "--yolo")?,
             "--detach" => set_flag_once(&mut detach, "--detach")?,
             "--json" => set_flag_once(&mut json, "--json")?,
+            "--context-result" => context::push_option(
+                &mut context_results,
+                option_value(options, &mut index, "--context-result")?,
+            )?,
             option => bail!("unknown ask option: {option}"),
         }
         index += 1;
@@ -491,6 +499,7 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
         timeout: timeout.unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
         detach,
         json,
+        context_results,
     }))
 }
 
@@ -502,6 +511,7 @@ fn parse_tell(args: &[String]) -> Result<NativeCommand> {
     let mut timeout = None;
     let mut detach = false;
     let mut json = false;
+    let mut context_results = Vec::new();
     let mut index = 0;
     while index < options.len() {
         match options[index].as_str() {
@@ -521,6 +531,10 @@ fn parse_tell(args: &[String]) -> Result<NativeCommand> {
             }
             "--detach" => set_flag_once(&mut detach, "--detach")?,
             "--json" => set_flag_once(&mut json, "--json")?,
+            "--context-result" => context::push_option(
+                &mut context_results,
+                option_value(options, &mut index, "--context-result")?,
+            )?,
             option => bail!("unknown tell option: {option}"),
         }
         index += 1;
@@ -536,6 +550,7 @@ fn parse_tell(args: &[String]) -> Result<NativeCommand> {
         timeout: timeout.unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
         detach,
         json,
+        context_results,
     }))
 }
 
@@ -834,6 +849,9 @@ fn run_ask(request: AskRequest) -> Result<()> {
 
 fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) -> Result<()> {
     let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
+    // Attached results are resolved and pinned before any session, claim, receipt, terminal,
+    // or delivery exists, so a failed resolution changes nothing.
+    let attached = context::resolve(&request.context_results)?;
     let terminal_kind = terminal::select(request.terminal)?;
     let workspace = request.workspace.canonicalize().with_context(|| {
         format!(
@@ -864,9 +882,12 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
         model: request.model,
         effort: request.effort,
         yolo: request.yolo,
-        prompt: native_delegation_prompt(&delegation_source(), &request.prompt),
+        prompt: native_delegation_prompt(
+            &delegation_source(),
+            &attached.prompt_with_attachments(&request.prompt),
+        ),
     })?;
-    let mut initial_claim = acquire_turn_claim(&created.directory)?;
+    let mut initial_claim = acquire_turn_claim_with_context(&created.directory, &attached.sources)?;
     let expected_claim_token = initial_claim.token.clone();
     let receipt = initial_claim.receipt.clone();
     *address = Some((created.id.clone(), receipt.request_id.clone()));
@@ -1086,7 +1107,7 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
             &created.id,
             &terminal_session,
             request.provider,
-            &receipt.request_id,
+            &receipt,
             None,
         );
     }
@@ -1111,7 +1132,7 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
         &created.id,
         &terminal_session,
         request.provider,
-        &receipt.request_id,
+        &receipt,
         Some(&event),
     )
 }
@@ -1574,6 +1595,9 @@ fn run_tell(request: TellRequest) -> Result<()> {
 
 fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) -> Result<()> {
     let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
+    // Attached results are resolved and pinned before the target is recovered, repaired,
+    // claimed, or sent to, so a failed resolution leaves every session unchanged.
+    let attached = context::resolve(&request.context_results)?;
     let directory = session_directory(&request.id)?;
     recover_pending_completion(&directory)?;
     repair_dead_native_owner(&directory)?;
@@ -1594,9 +1618,13 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
             request.id
         );
     }
-    let prompt = native_delegation_prompt(&delegation_source(), &request.prompt);
+    let prompt = native_delegation_prompt(
+        &delegation_source(),
+        &attached.prompt_with_attachments(&request.prompt),
+    );
     let follow_up_transport = provider::follow_up_transport(provider);
-    let (mut claim, baseline) = acquire_ready_turn_claim(&directory, &request.id)?;
+    let (mut claim, baseline) =
+        acquire_ready_turn_claim_with_context(&directory, &request.id, &attached.sources)?;
     let claim_token = claim.token.clone();
     let receipt = claim.receipt.clone();
     *address = Some((request.id.clone(), receipt.request_id.clone()));
@@ -1706,7 +1734,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
             &request.id,
             &terminal_session,
             provider,
-            &receipt.request_id,
+            &receipt,
             None,
         );
     }
@@ -1730,7 +1758,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
         &request.id,
         &terminal_session,
         provider,
-        &receipt.request_id,
+        &receipt,
         Some(&event),
     )
 }
@@ -2471,9 +2499,10 @@ fn emit_session_result(
     id: &str,
     terminal_session: &terminal::TerminalSession,
     provider: FirstPartyCli,
-    request_id: &str,
+    receipt: &requests::Receipt,
     event: Option<&SessionEvent>,
 ) -> Result<()> {
+    let request_id = &receipt.request_id;
     if json {
         println!(
             "{}",
@@ -2482,6 +2511,7 @@ fn emit_session_result(
                 "schema_version": 1,
                 "session": id,
                 "request_id": request_id,
+                "context_sources": receipt.context_sources,
                 "request_state": if event.is_some() { "completed" } else { "accepted" },
                 "provider": provider.as_str(),
                 "terminal": terminal_session.kind.as_str(),
@@ -3086,8 +3116,12 @@ fn default_state_root(
 }
 
 fn session_directory(id: &str) -> Result<PathBuf> {
+    session_directory_in(&state_root()?, id)
+}
+
+fn session_directory_in(root: &Path, id: &str) -> Result<PathBuf> {
     require_valid_session_id(id)?;
-    let directory = state_root()?.join(id);
+    let directory = root.join(id);
     let metadata = fs::symlink_metadata(&directory)
         .with_context(|| format!("no such Agent Bridge session: {id}"))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -3423,16 +3457,41 @@ fn rollback_turn_claim_token(path: &Path, expected_token: &str, state: &str) -> 
     update_status(directory, state, None, None)
 }
 
+#[cfg(test)]
 fn acquire_turn_claim(directory: &Path) -> Result<TurnClaim> {
-    let path = directory.join(TURN_CLAIM_FILE);
-    let _lock = lock_turn_claim(&path)?;
-    create_turn_claim_locked(path)
+    acquire_turn_claim_with_context(directory, &[])
 }
 
+// The receipt records the pinned context sources the caller already resolved.
+fn acquire_turn_claim_with_context(
+    directory: &Path,
+    context_sources: &[requests::ContextSource],
+) -> Result<TurnClaim> {
+    let path = directory.join(TURN_CLAIM_FILE);
+    let _lock = lock_turn_claim(&path)?;
+    create_turn_claim_locked(path, context_sources)
+}
+
+#[cfg(test)]
 fn acquire_ready_turn_claim(directory: &Path, session_id: &str) -> Result<(TurnClaim, usize)> {
     acquire_ready_turn_claim_after_claim(directory, session_id, || Ok(()))
 }
 
+fn acquire_ready_turn_claim_with_context(
+    directory: &Path,
+    session_id: &str,
+    context_sources: &[requests::ContextSource],
+) -> Result<(TurnClaim, usize)> {
+    acquire_ready_turn_claim_with_callbacks(
+        directory,
+        session_id,
+        || Ok(()),
+        || {},
+        context_sources,
+    )
+}
+
+#[cfg(test)]
 fn acquire_ready_turn_claim_after_claim<F>(
     directory: &Path,
     session_id: &str,
@@ -3441,7 +3500,7 @@ fn acquire_ready_turn_claim_after_claim<F>(
 where
     F: FnOnce() -> Result<()>,
 {
-    acquire_ready_turn_claim_with_callbacks(directory, session_id, after_claim, || {})
+    acquire_ready_turn_claim_with_callbacks(directory, session_id, after_claim, || {}, &[])
 }
 
 fn acquire_ready_turn_claim_with_callbacks<F, G>(
@@ -3449,6 +3508,7 @@ fn acquire_ready_turn_claim_with_callbacks<F, G>(
     session_id: &str,
     after_claim: F,
     before_publish: G,
+    context_sources: &[requests::ContextSource],
 ) -> Result<(TurnClaim, usize)>
 where
     F: FnOnce() -> Result<()>,
@@ -3465,7 +3525,7 @@ where
         if !session_accepts_prompt(&state) {
             bail!("session {session_id} is {state}; tell requires the ready state");
         }
-        create_turn_claim_locked(path.clone())?
+        create_turn_claim_locked(path.clone(), context_sources)?
     };
     if let Err(error) = after_claim() {
         let _lock = lock_turn_claim(&path)?;
@@ -3494,7 +3554,10 @@ where
     Ok((claim, baseline))
 }
 
-fn create_turn_claim_locked(path: PathBuf) -> Result<TurnClaim> {
+fn create_turn_claim_locked(
+    path: PathBuf,
+    context_sources: &[requests::ContextSource],
+) -> Result<TurnClaim> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -3514,7 +3577,7 @@ fn create_turn_claim_locked(path: PathBuf) -> Result<TurnClaim> {
     let directory = path
         .parent()
         .context("turn claim has no session directory")?;
-    let receipt = match requests::create(directory, &token) {
+    let receipt = match requests::create(directory, &token, context_sources) {
         Ok(receipt) => receipt,
         Err(error) => {
             let _ = remove_turn_claim_locked(&path);

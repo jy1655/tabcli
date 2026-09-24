@@ -268,6 +268,7 @@ impl Snapshot {
             "schema_version": 1, "ok": true, "session": self.manifest.id,
             "provider": self.manifest.provider, "workspace": self.manifest.workspace,
             "request_id": receipt.map(|r| &r.request_id), "event_id": name,
+            "context_sources": receipt.map(|r| r.context_sources.as_slice()).unwrap_or_default(),
             "request_state": state, "session_state": self.status.state,
             "result": event.as_ref().map(|e| &e.message),
             "error": event.as_ref().and_then(|e| e.error.as_ref()),
@@ -538,7 +539,7 @@ fn inspect_inner(id: &str, json: bool) -> Result<()> {
         .map(|receipt| {
             json!({
                 "request_id": receipt.request_id, "created_unix_ms": receipt.created_unix_ms, "source": receipt.source,
-                "event_id": receipt.event_file,
+                "event_id": receipt.event_file, "context_sources": receipt.context_sources,
                 "active": snapshot.claim.as_deref() == Some(&receipt.claim_token),
             })
         })
