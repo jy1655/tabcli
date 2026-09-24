@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests;
 
+mod context;
 mod doctor;
 mod provider;
 mod provider_process;
@@ -49,17 +50,44 @@ const TERMINAL_TOMBSTONE_FILE: &str = "terminal.closed.json";
 // create them; explicit close and prune consume them so an upgrade cannot strand state.
 const LEGACY_RESUME_PENDING_FILE: &str = "resume.pending.json";
 const LEGACY_RESUME_RUNNING_FILE: &str = "resume.running.json";
+const UNPUBLISHED_EVENT_PREFIX: &str = "unpublished-";
+/// The state root's durability receipt. It exists only after some creator synced the
+/// directory entry of the root and of every ancestor up to the filesystem root or the
+/// user's home directory, so a root that lacks it is not assumed durable merely because
+/// it exists: the creator that made it may have stopped before those syncs.
+const STATE_ROOT_DURABLE_FILE: &str = "state-root.durable";
+/// Upper bound on the directory entries the state-root ancestry walk makes durable.
+const STATE_ROOT_ANCESTRY_SYNC_LIMIT: usize = 16;
+// Written into a closed source session by the one reopen that won its turn-claim lock. It is
+// the only file a reopen ever adds to the source; the source's tombstone, events, and
+// requests stay byte-for-byte intact.
+const REOPEN_MARKER_FILE: &str = "reopen.marker.json";
+// Written into the NEW session by a reopen gate that fails after the session exists: the
+// launch wrapper's pre-spawn ownership recheck or the post-launch holder check. It carries
+// the gate name across the process boundary so the reopen response can still report it,
+// and it is the durable evidence from which a later reopen reconciles a source marker
+// that its parent never settled (`verify_reopen_source_is_closed`).
+const REOPEN_REFUSAL_FILE: &str = "reopen.refusal.json";
+// Written by the launch wrapper immediately after it spawns the provider process and before
+// the session leaves its launch state: the provider's pid and, on Windows, its creation time
+// and executable path. The provider process is the only process that can hold a resumed
+// conversation (Windows does not end children with their parent, and the wrapper exits
+// after the provider), so a reopen refused after this point releases the source's marker
+// only once the process this record names is verified gone (`refused_launch_cleanup`).
+const PROVIDER_PROCESS_FILE: &str = "provider-process.json";
 static TURN_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 pub(crate) enum NativeCommand {
     Ask(AskRequest),
     Tell(TellRequest),
+    Reopen(ReopenRequest),
     Inspect {
         id: String,
         json: bool,
     },
     Result(query::ResultRequest),
+    Search(query::SearchRequest),
     Doctor(doctor::DoctorRequest),
     Sessions(SessionsRequest),
     Prune(PruneRequest),
@@ -96,6 +124,7 @@ pub(crate) struct AskRequest {
     pub(crate) timeout: Duration,
     pub(crate) detach: bool,
     pub(crate) json: bool,
+    pub(crate) context_results: Vec<context::ContextResultRef>,
 }
 
 #[derive(Debug)]
@@ -105,6 +134,23 @@ pub(crate) struct TellRequest {
     timeout: Duration,
     detach: bool,
     json: bool,
+    context_results: Vec<context::ContextResultRef>,
+}
+
+// Continues a closed session's provider conversation in a new session. Model, effort, and
+// yolo are never inherited from the source manifest; only the options stated here apply.
+#[derive(Debug)]
+pub(crate) struct ReopenRequest {
+    pub(crate) id: String,
+    pub(crate) prompt: String,
+    pub(crate) title: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+    pub(crate) terminal: Option<terminal::TerminalKind>,
+    pub(crate) yolo: bool,
+    pub(crate) timeout: Duration,
+    pub(crate) detach: bool,
+    pub(crate) json: bool,
 }
 
 #[derive(Debug)]
@@ -165,6 +211,36 @@ struct SessionEvent {
     error: Option<String>,
     provider_session_id: Option<String>,
     turn_id: Option<String>,
+    created_unix_ms: u128,
+}
+
+// Where a reopened session's provider conversation came from: the closed Bridge session and
+// the event whose provider session id was passed to the provider's official resume.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ResumedFrom {
+    session: String,
+    provider_session_id: String,
+    event_id: String,
+}
+
+// Reopen provenance is an optional `resumed_from` object stored in the schema-1 manifest
+// beside the fields every reader knows. It is read through this sibling type so a reader
+// that does not know the field keeps parsing the manifest unchanged.
+#[derive(Debug, Default, Deserialize)]
+struct ReopenProvenance {
+    #[serde(default)]
+    resumed_from: Option<ResumedFrom>,
+}
+
+// The record a winning reopen leaves in its closed source. `reopened_by` is filled once the
+// new session exists; until then the marker still excludes every other reopen attempt.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ReopenMarker {
+    schema: u32,
+    claim: String,
+    provider_session_id: String,
+    #[serde(default)]
+    reopened_by: Option<String>,
     created_unix_ms: u128,
 }
 
@@ -318,9 +394,11 @@ pub(crate) fn is_command(value: &str) -> bool {
         value,
         "ask"
             | "tell"
+            | "reopen"
             | "sessions"
             | "inspect"
             | "result"
+            | "search"
             | "doctor"
             | "prune-sessions"
             | "close-session"
@@ -344,8 +422,10 @@ where
     match command.as_str() {
         "ask" => parse_ask(rest),
         "tell" => parse_tell(rest),
+        "reopen" => parse_reopen(rest),
         "inspect" => query::parse_inspect(rest),
         "result" => query::parse_result(rest),
+        "search" => query::parse_search(rest),
         "doctor" => doctor::parse_args(rest),
         "sessions" => parse_sessions(rest),
         "prune-sessions" => parse_prune(rest),
@@ -414,6 +494,7 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
     let mut timeout = None;
     let mut detach = false;
     let mut json = false;
+    let mut context_results = Vec::new();
     let mut index = 0;
     while index < options.len() {
         match options[index].as_str() {
@@ -460,6 +541,10 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
             "--yolo" => set_flag_once(&mut yolo, "--yolo")?,
             "--detach" => set_flag_once(&mut detach, "--detach")?,
             "--json" => set_flag_once(&mut json, "--json")?,
+            "--context-result" => context::push_option(
+                &mut context_results,
+                option_value(options, &mut index, "--context-result")?,
+            )?,
             option => bail!("unknown ask option: {option}"),
         }
         index += 1;
@@ -488,6 +573,7 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
         timeout: timeout.unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
         detach,
         json,
+        context_results,
     }))
 }
 
@@ -499,6 +585,7 @@ fn parse_tell(args: &[String]) -> Result<NativeCommand> {
     let mut timeout = None;
     let mut detach = false;
     let mut json = false;
+    let mut context_results = Vec::new();
     let mut index = 0;
     while index < options.len() {
         match options[index].as_str() {
@@ -518,6 +605,10 @@ fn parse_tell(args: &[String]) -> Result<NativeCommand> {
             }
             "--detach" => set_flag_once(&mut detach, "--detach")?,
             "--json" => set_flag_once(&mut json, "--json")?,
+            "--context-result" => context::push_option(
+                &mut context_results,
+                option_value(options, &mut index, "--context-result")?,
+            )?,
             option => bail!("unknown tell option: {option}"),
         }
         index += 1;
@@ -530,6 +621,92 @@ fn parse_tell(args: &[String]) -> Result<NativeCommand> {
     Ok(NativeCommand::Tell(TellRequest {
         id: id.to_owned(),
         prompt,
+        timeout: timeout.unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
+        detach,
+        json,
+        context_results,
+    }))
+}
+
+fn parse_reopen(args: &[String]) -> Result<NativeCommand> {
+    let (id, options) = args
+        .split_first()
+        .context("reopen requires one closed session id")?;
+    require_valid_session_id(id)?;
+    let mut prompt = None;
+    let mut prompt_file = None;
+    let mut title = None;
+    let mut model = None;
+    let mut effort = None;
+    let mut terminal = None;
+    let mut yolo = false;
+    let mut timeout = None;
+    let mut detach = false;
+    let mut json = false;
+    let mut index = 0;
+    while index < options.len() {
+        match options[index].as_str() {
+            "--prompt" => set_once(
+                &mut prompt,
+                option_value(options, &mut index, "--prompt")?.to_owned(),
+                "--prompt",
+            )?,
+            "--prompt-file" => set_once(
+                &mut prompt_file,
+                PathBuf::from(option_value(options, &mut index, "--prompt-file")?),
+                "--prompt-file",
+            )?,
+            "--title" => set_once(
+                &mut title,
+                option_value(options, &mut index, "--title")?.to_owned(),
+                "--title",
+            )?,
+            "--model" => set_once(
+                &mut model,
+                option_value(options, &mut index, "--model")?.to_owned(),
+                "--model",
+            )?,
+            "--effort" => set_once(
+                &mut effort,
+                option_value(options, &mut index, "--effort")?.to_owned(),
+                "--effort",
+            )?,
+            "--terminal" => set_once(
+                &mut terminal,
+                terminal::TerminalKind::from_str(option_value(options, &mut index, "--terminal")?)
+                    .map_err(anyhow::Error::msg)?,
+                "--terminal",
+            )?,
+            "--timeout-secs" => {
+                let value = option_value(options, &mut index, "--timeout-secs")?;
+                set_once(&mut timeout, parse_timeout(value)?, "--timeout-secs")?;
+            }
+            "--yolo" => set_flag_once(&mut yolo, "--yolo")?,
+            "--detach" => set_flag_once(&mut detach, "--detach")?,
+            "--json" => set_flag_once(&mut json, "--json")?,
+            option => bail!("unknown reopen option: {option}"),
+        }
+        index += 1;
+    }
+    let prompt = read_prompt_option(prompt, prompt_file, "reopen")?;
+    if prompt.trim().is_empty() {
+        bail!("--prompt cannot be empty");
+    }
+    validate_terminal_input(&prompt, "--prompt")?;
+    if model.as_ref().is_some_and(|value| value.trim().is_empty()) {
+        bail!("--model cannot be empty");
+    }
+    if effort.as_ref().is_some_and(|value| value.trim().is_empty()) {
+        bail!("--effort cannot be empty");
+    }
+    Ok(NativeCommand::Reopen(ReopenRequest {
+        id: id.to_owned(),
+        prompt,
+        title,
+        model,
+        effort,
+        terminal,
+        yolo,
         timeout: timeout.unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
         detach,
         json,
@@ -739,8 +916,10 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
     match command {
         NativeCommand::Ask(request) => run_ask(request),
         NativeCommand::Tell(request) => run_tell(request),
+        NativeCommand::Reopen(request) => run_reopen(request),
         NativeCommand::Inspect { id, json } => query::run_inspect(&id, json),
         NativeCommand::Result(request) => query::run_result(request),
+        NativeCommand::Search(request) => query::run_search(request),
         NativeCommand::Doctor(request) => doctor::run(request),
         NativeCommand::Sessions(request) => run_sessions(request),
         NativeCommand::Prune(request) => run_prune(request),
@@ -830,6 +1009,9 @@ fn run_ask(request: AskRequest) -> Result<()> {
 
 fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) -> Result<()> {
     let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
+    // Attached results are resolved and pinned before any session, claim, receipt, terminal,
+    // or delivery exists, so a failed resolution changes nothing.
+    let attached = context::resolve(&request.context_results)?;
     let terminal_kind = terminal::select(request.terminal)?;
     let workspace = request.workspace.canonicalize().with_context(|| {
         format!(
@@ -860,9 +1042,65 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
         model: request.model,
         effort: request.effort,
         yolo: request.yolo,
-        prompt: native_delegation_prompt(&delegation_source(), &request.prompt),
+        prompt: native_delegation_prompt(
+            &delegation_source(),
+            &attached.prompt_with_attachments(&request.prompt),
+        ),
     })?;
-    let mut initial_claim = acquire_turn_claim(&created.directory)?;
+    launch_created_session(
+        SessionLaunch {
+            created,
+            provider: request.provider,
+            terminal_kind,
+            deadline,
+            timeout: request.timeout,
+            detach: request.detach,
+            json: request.json,
+            context_sources: &attached.sources,
+            result_extra: serde_json::Map::new(),
+            resumed_from: None,
+        },
+        address,
+    )
+}
+
+// A created session that is ready to be launched. `ask` and `reopen` share everything from
+// the initial turn claim onwards: terminal opening, launch-failure cleanup, initial prompt
+// delivery, and result waiting. `result_extra` carries command-specific fields into the
+// emitted JSON response.
+struct SessionLaunch<'a> {
+    created: CreatedSession,
+    provider: FirstPartyCli,
+    terminal_kind: terminal::TerminalKind,
+    deadline: Instant,
+    timeout: Duration,
+    detach: bool,
+    json: bool,
+    context_sources: &'a [requests::ContextSource],
+    result_extra: serde_json::Map<String, serde_json::Value>,
+    // Set for `reopen`: the provider conversation the new session continues. Its holder
+    // check runs after launch, once the process exists, and again immediately before the
+    // first prompt is sent.
+    resumed_from: Option<ResumedFrom>,
+}
+
+fn launch_created_session(
+    launch: SessionLaunch<'_>,
+    address: &mut Option<(String, String)>,
+) -> Result<()> {
+    let SessionLaunch {
+        created,
+        provider,
+        terminal_kind,
+        deadline,
+        timeout,
+        detach,
+        json,
+        context_sources,
+        result_extra,
+        resumed_from,
+    } = launch;
+    let mut initial_claim = acquire_turn_claim_with_context(&created.directory, context_sources)?;
     let expected_claim_token = initial_claim.token.clone();
     let receipt = initial_claim.receipt.clone();
     *address = Some((created.id.clone(), receipt.request_id.clone()));
@@ -905,7 +1143,7 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
             });
         }
     };
-    let initial_prompt_transport = provider::initial_prompt_transport(request.provider);
+    let initial_prompt_transport = provider::initial_prompt_transport(provider);
     let mut expected_turn_id = None;
     if initial_prompt_transport == provider::InitialPromptTransport::TerminalPasteAfterLaunch {
         let mut delivery_may_have_occurred = false;
@@ -914,22 +1152,26 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
                 &created.directory,
                 "awaiting-initial-input",
                 deadline,
-                request.timeout,
+                timeout,
             )?;
             let readiness_delay = initial_prompt_delay_within_budget(
                 deadline,
-                provider::initial_prompt_ready_delay(request.provider),
-                request.timeout,
+                provider::initial_prompt_ready_delay(provider),
+                timeout,
             )?;
             thread::sleep(readiness_delay);
+            verify_reopened_conversation_exclusive(
+                provider,
+                &created.directory,
+                resumed_from.as_ref(),
+                deadline,
+                ResumedHolderCheck::AfterLaunch,
+            )?;
             let initial_prompt_path = created.directory.join("initial-prompt.txt");
             let initial_prompt = fs::read_to_string(&initial_prompt_path)
                 .context("failed to read the preserved initial prompt")?;
-            let initial_prompt = provider::terminal_initial_prompt(
-                request.provider,
-                &created.directory,
-                &initial_prompt,
-            )?;
+            let initial_prompt =
+                provider::terminal_initial_prompt(provider, &created.directory, &initial_prompt)?;
             let mut prompt_file = tempfile::Builder::new()
                 .prefix("pending-prompt-")
                 .suffix(".txt")
@@ -945,17 +1187,20 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
                 &created.id,
                 &terminal_session,
                 deadline,
-                request.timeout,
+                timeout,
+            )?;
+            let send_timeout = remaining_turn_timeout(deadline, timeout)?;
+            provider::validate_terminal_send_budget(provider, terminal_session.kind, send_timeout)?;
+            verify_reopened_conversation_exclusive(
+                provider,
+                &created.directory,
+                resumed_from.as_ref(),
+                deadline,
+                ResumedHolderCheck::BeforeInitialDelivery,
             )?;
             update_status(&created.directory, "working", None, None)?;
-            let send_timeout = remaining_turn_timeout(deadline, request.timeout)?;
-            provider::validate_terminal_send_budget(
-                request.provider,
-                terminal_session.kind,
-                send_timeout,
-            )?;
             match provider::send_initial_prompt(
-                request.provider,
+                provider,
                 &terminal_session,
                 prompt_file.path(),
                 deadline,
@@ -978,10 +1223,15 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
                 delivery_may_have_occurred,
                 &error,
             );
+            let error = close_surface_after_reopen_verification_failure(
+                &created.directory,
+                &created.id,
+                error,
+            );
             return Err(error).with_context(|| {
                 format!(
                     "failed to deliver the initial prompt to {} session {}",
-                    request.provider.as_str(),
+                    provider.as_str(),
                     created.id
                 )
             });
@@ -994,24 +1244,38 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
                 &created.directory,
                 "awaiting-initial-input",
                 deadline,
-                request.timeout,
+                timeout,
             )?;
             let readiness_delay = initial_prompt_delay_within_budget(
                 deadline,
-                provider::initial_prompt_ready_delay(request.provider),
-                request.timeout,
+                provider::initial_prompt_ready_delay(provider),
+                timeout,
             )?;
             thread::sleep(readiness_delay);
-            let request_id = provider::new_cross_session_turn_id(request.provider)?;
+            verify_reopened_conversation_exclusive(
+                provider,
+                &created.directory,
+                resumed_from.as_ref(),
+                deadline,
+                ResumedHolderCheck::AfterLaunch,
+            )?;
+            let request_id = provider::new_cross_session_turn_id(provider)?;
             let prompt_path = created.directory.join("initial-prompt.txt");
             let prompt = fs::read_to_string(&prompt_path)
                 .context("failed to read the preserved initial prompt")?;
             let bridge_executable =
                 std::env::current_exe().context("failed to locate agent-bridge executable")?;
-            remaining_turn_timeout(deadline, request.timeout)?;
+            remaining_turn_timeout(deadline, timeout)?;
+            verify_reopened_conversation_exclusive(
+                provider,
+                &created.directory,
+                resumed_from.as_ref(),
+                deadline,
+                ResumedHolderCheck::BeforeInitialDelivery,
+            )?;
             update_status(&created.directory, "working", None, None)?;
             match provider::send_cross_session_message(
-                request.provider,
+                provider,
                 provider::CrossSessionMessageContext {
                     bridge_executable: &bridge_executable,
                     directory: &created.directory,
@@ -1028,13 +1292,11 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
                     Ok(request_id)
                 }
                 Err(failure) if failure.delivery_may_have_occurred() => {
-                    initial_claim.retain_in_place();
                     let error = failure.into_error();
-                    let _ = update_status(
+                    record_cross_session_delivery_uncertainty(
                         &created.directory,
-                        "working",
-                        None,
-                        Some(format!("{error:#}")),
+                        &mut initial_claim,
+                        &error,
                     );
                     Err(error).context(
                         "Claude initial cross-session delivery could not be confirmed; the turn remains claimed until completion or explicit close",
@@ -1063,10 +1325,15 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
                         Some(format!("{error:#}")),
                     );
                 }
+                let error = close_surface_after_reopen_verification_failure(
+                    &created.directory,
+                    &created.id,
+                    error,
+                );
                 return Err(error).with_context(|| {
                     format!(
                         "failed to deliver the initial prompt to {} session {}",
-                        request.provider.as_str(),
+                        provider.as_str(),
                         created.id
                     )
                 });
@@ -1076,14 +1343,15 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
         initial_claim.retain();
     }
 
-    if request.detach {
-        return emit_session_result(
-            request.json,
+    if detach {
+        return emit_session_result_with(
+            json,
             &created.id,
             &terminal_session,
-            request.provider,
-            &receipt.request_id,
+            provider,
+            &receipt,
             None,
+            &result_extra,
         );
     }
 
@@ -1093,7 +1361,7 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
         expected_turn_id.as_deref(),
         Some(&expected_claim_token),
         deadline,
-        request.timeout,
+        timeout,
     )
     .with_context(|| {
         format!(
@@ -1102,14 +1370,1107 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
             terminal_session.kind.display_name()
         )
     })?;
-    emit_session_result(
-        request.json,
+    emit_session_result_with(
+        json,
         &created.id,
         &terminal_session,
-        request.provider,
-        &receipt.request_id,
+        provider,
+        &receipt,
         Some(&event),
+        &result_extra,
     )
+}
+
+// A reopen that fails a pre-launch gate. The gate name reaches the JSON response so a caller
+// can tell a refused reopen from a launch or delivery failure of the new session.
+#[derive(Debug)]
+struct ReopenRefusal {
+    gate: &'static str,
+    detail: String,
+}
+
+impl std::fmt::Display for ReopenRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "reopen refused ({}): {}", self.gate, self.detail)
+    }
+}
+
+impl std::error::Error for ReopenRefusal {}
+
+fn reopen_refusal(gate: &'static str, detail: String) -> anyhow::Error {
+    anyhow::Error::new(ReopenRefusal { gate, detail })
+}
+
+fn reopen_refusal_gate(error: &anyhow::Error) -> Option<&'static str> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ReopenRefusal>())
+        .map(|refusal| refusal.gate)
+}
+
+const REOPEN_LAUNCH_GATE: &str = "provider-unsupported";
+const REOPEN_CONFLICT_GATE: &str = "reopen-conflict";
+const REOPEN_VERIFICATION_FAILED_GATE: &str = "reopen-verification-failed";
+
+// The gates a reopen can fail after its session exists. Each one leaves the new session
+// failed with no prompt delivered. The source's reopen marker is released again only once
+// the refused launch provably cannot hold the conversation (`RefusedLaunchCleanup`).
+const REOPEN_POST_CREATION_GATES: [&str; 3] = [
+    REOPEN_LAUNCH_GATE,
+    REOPEN_CONFLICT_GATE,
+    REOPEN_VERIFICATION_FAILED_GATE,
+];
+
+// The only phase whose refusals are persisted. The record exists so the reopen command can
+// name a gate that failed in the launch wrapper, in another process; every writer of it is
+// a launch-phase gate (the pre-spawn recheck, the post-launch holder check, and the holder
+// check immediately before the initial prompt is sent), and the reader accepts nothing
+// else. A refused later `tell` keeps its reason in the session status and its own response
+// only: it must never be mistaken for a refusal of the initial delivery, whose uncertain
+// outcome is decided from this record.
+const REOPEN_REFUSAL_LAUNCH_PHASE: &str = "launch";
+
+// `cleanup` is written by a marker settlement that found the refused launch may still hold
+// the conversation (a failed close of a spawned process). It is a note for `doctor` and the
+// next reopen attempt; the release decision itself is always taken from the session's live
+// records, never from this field.
+const REOPEN_REFUSAL_CLEANUP_PENDING: &str = "pending";
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RecordedReopenRefusal {
+    schema: u32,
+    phase: String,
+    gate: String,
+    detail: String,
+    created_unix_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cleanup: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cleanup_detail: Option<String>,
+}
+
+// Records a launch-phase gate refusal that happened after the new session existed, then
+// returns the typed refusal. Only the launch phase writes this record; follow-up refusals
+// go through `record_follow_up_refusal`, which touches the session status alone.
+fn record_reopen_refusal(directory: &Path, gate: &'static str, detail: String) -> anyhow::Error {
+    let record = RecordedReopenRefusal {
+        schema: 2,
+        phase: REOPEN_REFUSAL_LAUNCH_PHASE.to_owned(),
+        gate: gate.to_owned(),
+        detail: detail.clone(),
+        created_unix_ms: unix_ms(),
+        cleanup: None,
+        cleanup_detail: None,
+    };
+    if let Err(error) = write_json_atomic(&directory.join(REOPEN_REFUSAL_FILE), &record) {
+        return reopen_refusal(
+            gate,
+            format!("{detail}; the refusal record could not be written: {error:#}"),
+        );
+    }
+    reopen_refusal(gate, detail)
+}
+
+// The launch-phase refusal recorded in a reopened session, if there is one. A record of any
+// other schema or phase is not a launch refusal and yields nothing, so the caller treats the
+// launch as not refused.
+fn read_reopen_launch_refusal(directory: &Path) -> Option<RecordedReopenRefusal> {
+    let text = read_regular_text_if_present(&directory.join(REOPEN_REFUSAL_FILE))
+        .ok()
+        .flatten()?;
+    let record: RecordedReopenRefusal = serde_json::from_str(&text).ok()?;
+    (record.schema == 2 && record.phase == REOPEN_REFUSAL_LAUNCH_PHASE).then_some(record)
+}
+
+fn read_reopen_refusal_gate(directory: &Path) -> Option<String> {
+    read_reopen_launch_refusal(directory).map(|record| record.gate)
+}
+
+// Notes in the launch refusal record that the marker settlement could not establish that
+// the refused launch is gone. A missing record (its write failed when the refusal was
+// decided) leaves nothing to annotate; the retention itself does not depend on the note.
+fn record_reopen_refusal_cleanup_pending(directory: &Path, reason: &str) -> Result<()> {
+    let Some(mut record) = read_reopen_launch_refusal(directory) else {
+        return Ok(());
+    };
+    record.cleanup = Some(REOPEN_REFUSAL_CLEANUP_PENDING.to_owned());
+    record.cleanup_detail = Some(reason.to_owned());
+    write_json_atomic(&directory.join(REOPEN_REFUSAL_FILE), &record)
+}
+
+// The provider process a launch wrapper spawned for its session (`PROVIDER_PROCESS_FILE`).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ProviderProcessRecord {
+    schema: u32,
+    managed_session_id: String,
+    pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    windows_process_identity: Option<terminal::WindowsProcessIdentity>,
+    spawned_unix_ms: u128,
+}
+
+// Records the spawned provider process before the session leaves its launch state. The
+// caller still holds the child handle, so on Windows the pid cannot have been reused
+// between the spawn and the identity query. The record names the process Bridge spawned:
+// for a native executable that is the provider itself; for a `.ps1` or `.cmd` shim it is
+// the shim, which waits on the provider and whose own survival is what the record can
+// verify.
+fn record_provider_process(
+    directory: &Path,
+    managed_session_id: &str,
+    child: &std::process::Child,
+) -> Result<()> {
+    let pid = child.id();
+    #[cfg(windows)]
+    let windows_process_identity = Some(
+        terminal::windows_process_identity(pid)
+            .with_context(|| format!("failed to record the identity of provider process {pid}"))?,
+    );
+    #[cfg(not(windows))]
+    let windows_process_identity = None;
+    write_json_atomic(
+        &directory.join(PROVIDER_PROCESS_FILE),
+        &ProviderProcessRecord {
+            schema: 1,
+            managed_session_id: managed_session_id.to_owned(),
+            pid,
+            windows_process_identity,
+            spawned_unix_ms: unix_ms(),
+        },
+    )
+    .context("failed to record the spawned provider process")
+}
+
+// Why a recorded provider process is known to be gone. Identity mismatches are only
+// observable where the reopen slice runs (native Windows); other targets never build one.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+enum ProviderProcessGone {
+    // Its pid is no longer alive.
+    Exited,
+    // Its pid is alive but belongs to a different process: the pid was reused after the
+    // recorded process exited (Windows creation time or executable path differ).
+    IdentityMismatch(&'static str),
+}
+
+// What can be observed about a recorded provider process now.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+enum ProviderProcessObservation {
+    Gone(ProviderProcessGone),
+    // The pid is alive and, where an identity was recorded, still carries it.
+    Alive,
+    // The pid is alive (or its liveness cannot be denied) but its identity could not be
+    // inspected, so neither survival nor reuse is established.
+    Unknown(String),
+}
+
+// Reopen-local observation of a recorded provider process. Unlike the owner observation
+// used by dead-owner repair (`query::observe_owner_record`), it keeps a confirmed identity
+// mismatch apart from a failure to inspect: the first is a pid reused by another process
+// and releases the marker, the second retains it.
+fn observe_provider_process(record: &ProviderProcessRecord) -> ProviderProcessObservation {
+    #[cfg(windows)]
+    if let Some(identity) = &record.windows_process_identity {
+        return classify_provider_process_identity(
+            record.pid,
+            terminal::check_windows_process_identity(record.pid, identity),
+        );
+    }
+    if process_is_alive(record.pid) {
+        ProviderProcessObservation::Alive
+    } else {
+        ProviderProcessObservation::Gone(ProviderProcessGone::Exited)
+    }
+}
+
+// Maps the typed Windows identity check onto the observation. An inspection failure is
+// `Gone` only when the pid is not alive at all; a pid that is alive (or access-denied, which
+// liveness treats as alive) but uninspectable stays `Unknown`.
+#[cfg(any(windows, test))]
+fn classify_provider_process_identity(
+    pid: u32,
+    check: Result<terminal::WindowsProcessIdentityCheck>,
+) -> ProviderProcessObservation {
+    match check {
+        Ok(terminal::WindowsProcessIdentityCheck::Matches) => ProviderProcessObservation::Alive,
+        Ok(terminal::WindowsProcessIdentityCheck::Mismatch(reason)) => {
+            ProviderProcessObservation::Gone(ProviderProcessGone::IdentityMismatch(reason))
+        }
+        Err(_) if !process_is_alive(pid) => {
+            ProviderProcessObservation::Gone(ProviderProcessGone::Exited)
+        }
+        Err(error) => ProviderProcessObservation::Unknown(format!("{error:#}")),
+    }
+}
+
+// Whether a launch-refused reopened session can still hold the provider conversation. The
+// source's reopen marker is released only on the two verified outcomes; `Pending` keeps it
+// consumed, because a refused launch whose provider process survived (a close that failed
+// or was never performed, a process that ignored the console close, a process that never
+// registered) is exactly the second live writer the gate exists to keep out, and the
+// registry scan of the next reopen would not see an unregistered one. Neither the launch
+// wrapper's liveness nor a closed surface is evidence on its own: Windows does not end a
+// child with its parent, dead-owner repair marks a session closed without any terminal
+// close, and a provider can outlive the console it was started in.
+#[derive(Debug, PartialEq)]
+enum RefusedLaunchCleanup {
+    // The pre-spawn recheck refused and no provider process was recorded: the launch
+    // wrapper started none.
+    NoProcessSpawned,
+    // The provider process the launch wrapper recorded is verified gone: its pid is dead
+    // or the pid is alive under a different identity. `surface_closed` adds that the
+    // refused session's surface was consumed by a close; it is reported, never relied on.
+    ProviderProcessGone {
+        pid: u32,
+        evidence: ProviderProcessGone,
+        surface_closed: bool,
+    },
+    // Neither of the above can be established from the session's records.
+    Pending(String),
+}
+
+impl RefusedLaunchCleanup {
+    fn releases_marker(&self) -> bool {
+        !matches!(self, Self::Pending(_))
+    }
+}
+
+impl std::fmt::Display for RefusedLaunchCleanup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoProcessSpawned => write!(formatter, "no provider process was spawned"),
+            Self::ProviderProcessGone {
+                pid,
+                evidence,
+                surface_closed,
+            } => {
+                write!(formatter, "provider process {pid} is verified gone (")?;
+                match evidence {
+                    ProviderProcessGone::Exited => write!(formatter, "it has exited")?,
+                    ProviderProcessGone::IdentityMismatch(reason) => {
+                        write!(
+                            formatter,
+                            "the pid now belongs to another process: {reason}"
+                        )?;
+                    }
+                }
+                write!(formatter, ")")?;
+                if *surface_closed {
+                    write!(formatter, " and the refused session's surface was closed")?;
+                }
+                Ok(())
+            }
+            Self::Pending(reason) => {
+                write!(
+                    formatter,
+                    "the refused launch may still hold the conversation: {reason}"
+                )
+            }
+        }
+    }
+}
+
+// Read-only. Establishes, from the refused session's own records, whether the launch that
+// was refused under `gate` can still hold the conversation. A session that accepts prompts
+// or is working is never a refused launch, whatever its record says. The pre-spawn gate
+// proves nothing by itself: only the absence of a provider process record shows that no
+// process was spawned, and a record that exists is verified like any other.
+fn refused_launch_cleanup(refused_directory: &Path, gate: &str) -> Result<RefusedLaunchCleanup> {
+    let refused_session = refused_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    // The refused session's own status decides whether cleanup is even possible, so it is
+    // read like the other evidence here: a link at `status.json` is refused, not followed.
+    let status_path = refused_directory.join("status.json");
+    let state = read_regular_status_if_present(&status_path)?
+        .with_context(|| format!("failed to read {}", status_path.display()))?
+        .state;
+    if session_accepts_prompt(&state) || state == "working" {
+        return Ok(RefusedLaunchCleanup::Pending(format!(
+            "refused session {refused_session} is {state}"
+        )));
+    }
+    let record = query::optional_json::<ProviderProcessRecord>(
+        &refused_directory.join(PROVIDER_PROCESS_FILE),
+    )?;
+    let Some(record) = record else {
+        if gate == REOPEN_LAUNCH_GATE {
+            return Ok(RefusedLaunchCleanup::NoProcessSpawned);
+        }
+        return Ok(RefusedLaunchCleanup::Pending(format!(
+            "refused session {refused_session} is {state} with no provider process record ({PROVIDER_PROCESS_FILE}), so the provider process it spawned cannot be verified gone"
+        )));
+    };
+    if record.schema != 1 || record.managed_session_id != refused_session {
+        return Ok(RefusedLaunchCleanup::Pending(format!(
+            "the provider process record of refused session {refused_session} names {:?} (schema {})",
+            record.managed_session_id, record.schema
+        )));
+    }
+    let evidence = match observe_provider_process(&record) {
+        ProviderProcessObservation::Gone(evidence) => evidence,
+        ProviderProcessObservation::Alive => {
+            return Ok(RefusedLaunchCleanup::Pending(format!(
+                "provider process {} of refused session {refused_session} is still running",
+                record.pid
+            )));
+        }
+        ProviderProcessObservation::Unknown(error) => {
+            return Ok(RefusedLaunchCleanup::Pending(format!(
+                "provider process {} of refused session {refused_session} could not be verified: {error}",
+                record.pid
+            )));
+        }
+    };
+    let surface_closed = state == "closed"
+        && is_regular_file(&refused_directory.join(TERMINAL_TOMBSTONE_FILE))?
+        && read_regular_status_if_present(&refused_directory.join(CLOSED_STATUS_FILE))?
+            .is_some_and(|closed| closed.state == "closed");
+    Ok(RefusedLaunchCleanup::ProviderProcessGone {
+        pid: record.pid,
+        evidence,
+        surface_closed,
+    })
+}
+
+// Which boundary a resumed session's holder check runs at. The provider grants no
+// exclusive hold on a conversation, so the check is best-effort detection repeated at every
+// point Bridge is about to act on the conversation, never a reservation of it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ResumedHolderCheck {
+    // In the initial-prompt readiness window: the reopened process exists and has not
+    // received a prompt. The adapter waits for the provider's own registration of it.
+    AfterLaunch,
+    // Immediately before the initial prompt is sent to the already registered process. The
+    // adapter answers from the registry as it is now.
+    BeforeInitialDelivery,
+    // Immediately before a later `tell` is sent. Same answer as the initial check, but a
+    // refusal here is a follow-up refusal: it is never persisted as a launch refusal.
+    BeforeFollowUp,
+}
+
+impl ResumedHolderCheck {
+    // The launch-phase checks persist their refusal for the reopen command; see
+    // `REOPEN_REFUSAL_LAUNCH_PHASE`.
+    fn persists_refusal(self) -> bool {
+        match self {
+            Self::AfterLaunch | Self::BeforeInitialDelivery => true,
+            Self::BeforeFollowUp => false,
+        }
+    }
+}
+
+// The holder check of a reopened session. The adapter reports every other live holder of the
+// conversation; a non-empty answer is a detected conflict and refuses under
+// `reopen-conflict`. Any failure to complete the check (unreadable registry, a live record
+// that cannot be verified, an uninspectable process, a duplicate managed name, a registration
+// that never came) refuses under `reopen-verification-failed`: an unverifiable conversation
+// is treated as shared, never as exclusive. At the launch-phase boundaries both refusals are
+// recorded in the session so the gate survives the process boundary; a follow-up refusal is
+// returned unrecorded. The recorded detail states only what was detected; whether the new
+// surface was then closed is reported by the caller once that outcome is known. A foreign
+// resume that registers between two checks is not detected until the next one.
+fn verify_reopened_conversation_exclusive(
+    provider: FirstPartyCli,
+    directory: &Path,
+    resumed_from: Option<&ResumedFrom>,
+    deadline: Instant,
+    check: ResumedHolderCheck,
+) -> Result<()> {
+    let Some(resumed_from) = resumed_from else {
+        return Ok(());
+    };
+    let refuse = |gate: &'static str, detail: String| {
+        if check.persists_refusal() {
+            record_reopen_refusal(directory, gate, detail)
+        } else {
+            reopen_refusal(gate, detail)
+        }
+    };
+    let others = match provider::other_resumed_conversation_holders(
+        provider,
+        provider::ResumedSessionContext {
+            directory,
+            provider_session_id: &resumed_from.provider_session_id,
+            deadline,
+            wait_for_registration: check == ResumedHolderCheck::AfterLaunch,
+        },
+    ) {
+        Ok(others) => others,
+        Err(error) => {
+            return Err(refuse(
+                REOPEN_VERIFICATION_FAILED_GATE,
+                format!(
+                    "could not verify that the reopened {} conversation {} has no other live holder: {error:#}; no prompt was delivered",
+                    provider.as_str(),
+                    resumed_from.provider_session_id
+                ),
+            ));
+        }
+    };
+    if others.is_empty() {
+        return Ok(());
+    }
+    Err(refuse(
+        REOPEN_CONFLICT_GATE,
+        format!(
+            "{} conversation {} is also held by live {} process(es) {}; no prompt was delivered",
+            provider.as_str(),
+            resumed_from.provider_session_id,
+            provider.as_str(),
+            others
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    ))
+}
+
+// A failed holder check, whether a detected conflict or a verification the adapter could
+// not complete, is the launch failure that also closes the new surface: the reopened
+// process is a second live writer of the conversation (or cannot be shown not to be), and
+// leaving it open would keep the interleaving the gate exists to detect. Every other launch
+// failure keeps the existing behavior of marking only the new session failed. Only the new
+// session's own handle is ever closed; the source keeps its tombstone. The returned error
+// reports the close outcome only after it is known.
+fn close_surface_after_reopen_verification_failure(
+    directory: &Path,
+    id: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    close_surface_after_reopen_verification_failure_with(id, error, |detected| {
+        close_session_surface(directory, id, Some(format!("{detected:#}")))
+    })
+}
+
+// `close` receives the detected refusal so the closed status can keep it as its reason.
+fn close_surface_after_reopen_verification_failure_with(
+    id: &str,
+    error: anyhow::Error,
+    close: impl FnOnce(&anyhow::Error) -> Result<()>,
+) -> anyhow::Error {
+    if !matches!(
+        reopen_refusal_gate(&error),
+        Some(REOPEN_CONFLICT_GATE | REOPEN_VERIFICATION_FAILED_GATE)
+    ) {
+        return error;
+    }
+    match close(&error) {
+        Ok(()) => error.context(format!(
+            "the reopened session {id} was closed before any prompt was delivered"
+        )),
+        Err(close_error) => error.context(format!(
+            "the reopened session {id} could not be closed and may still hold the conversation: {close_error:#}"
+        )),
+    }
+}
+
+// Closes a managed session's own visible surface exactly as an explicit `close-session`
+// does, through the same terminal-close authority checks. `reason` is kept in the closed
+// status when the close itself reports nothing, so a session closed because of a detected
+// conflict still says why.
+fn close_session_surface(directory: &Path, id: &str, reason: Option<String>) -> Result<()> {
+    close_repaired_session_state_with_reason(directory, reason, |session| {
+        let has_native_owner = verify_terminal_close_authority(directory, id, session)?;
+        #[cfg(target_os = "macos")]
+        if has_native_owner && session.kind == terminal::TerminalKind::AppleTerminal {
+            terminate_apple_terminal_owner(directory, id, session)?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = has_native_owner;
+        terminal::close_session(session)
+    })
+}
+
+// What the read-only gates established about a closed source session.
+#[derive(Debug)]
+struct ReopenSource {
+    manifest: SessionManifest,
+    provider: FirstPartyCli,
+    provider_session_id: String,
+    event_id: String,
+}
+
+fn run_reopen(request: ReopenRequest) -> Result<()> {
+    let json = request.json;
+    let source = request.id.clone();
+    let mut address = None;
+    let outcome = run_reopen_inner(request, &mut address);
+    match address {
+        Some((session, request_id)) => {
+            let (outcome, gate) =
+                settle_reopen_outcome(session_directory, &source, &session, outcome);
+            let mut extra = serde_json::Map::new();
+            extra.insert("source_session".to_owned(), serde_json::json!(source));
+            extra.insert("gate".to_owned(), serde_json::json!(gate));
+            finish_request_with_extra(outcome, json, &session, &request_id, extra)
+        }
+        None => {
+            if let Err(error) = &outcome
+                && json
+            {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": 1,
+                        "ok": false,
+                        "source_session": source,
+                        "session": null,
+                        "request_id": null,
+                        "gate": reopen_refusal_gate(error),
+                        "error": format!("{error:#}"),
+                    }))?
+                );
+            }
+            outcome
+        }
+    }
+}
+
+// Decides, once the reopened session exists, whether the reopen was refused at a
+// post-creation gate and whether that refusal releases the source's reopen marker. The gate
+// is typed in this process (the post-launch and pre-initial-delivery holder checks) or
+// recorded by the launch wrapper in the new session (the pre-spawn recheck); either way the
+// response names it. Only a launch-phase refusal counts: the initial delivery can complete
+// while its messenger is still settling, a later `tell` can then be refused and the session
+// closed, and the initial messenger can finally report only that delivery is uncertain.
+// That `tell` refusal lives in the session status, never in the launch refusal record, so
+// the uncertain outcome finds no gate here and the marker stays consumed: a prompt may
+// have reached the conversation, and a second reopen must not be permitted on the strength
+// of a refusal that was not the launch's.
+fn settle_reopen_outcome(
+    session_directory: impl Fn(&str) -> Result<PathBuf>,
+    source: &str,
+    session: &str,
+    outcome: Result<()>,
+) -> (Result<()>, Option<String>) {
+    let gate = outcome.as_ref().err().and_then(|error| {
+        reopen_refusal_gate(error).map(str::to_owned).or_else(|| {
+            session_directory(session)
+                .ok()
+                .and_then(|directory| read_reopen_refusal_gate(&directory))
+        })
+    });
+    let outcome = match gate.as_deref() {
+        Some(gate) if REOPEN_POST_CREATION_GATES.contains(&gate) => {
+            match (session_directory(source), session_directory(session)) {
+                (Ok(source_directory), Ok(refused_directory)) => {
+                    release_reopen_marker_after_refusal(
+                        &source_directory,
+                        &refused_directory,
+                        gate,
+                        outcome,
+                    )
+                }
+                (Err(error), _) | (_, Err(error)) => outcome.context(format!(
+                    "the reopen marker of source session {source} was not released: {error:#}"
+                )),
+            }
+        }
+        _ => outcome,
+    };
+    (outcome, gate)
+}
+
+fn run_reopen_inner(request: ReopenRequest, address: &mut Option<(String, String)>) -> Result<()> {
+    let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
+    let terminal_kind = terminal::select(request.terminal)?;
+    let source_directory = session_directory(&request.id)?;
+    // Every check against the source is read-only. Pending-completion recovery and dead-owner
+    // repair are never run on it: a closed session has nothing to converge, and reopen must not
+    // alter the record it continues from.
+    let source = inspect_reopen_source(&source_directory, &request.id)?;
+    provider::verify_reopen_available(source.provider, &source.provider_session_id)
+        .map_err(|error| reopen_refusal("provider-unsupported", format!("{error:#}")))?;
+    let workspace = source.manifest.workspace.canonicalize().with_context(|| {
+        format!(
+            "source workspace does not exist or cannot be resolved: {}",
+            source.manifest.workspace.display()
+        )
+    })?;
+    if !workspace.is_dir() {
+        bail!(
+            "source workspace is not a directory: {}",
+            workspace.display()
+        );
+    }
+    let provider_path = resolve_provider(source.provider)?;
+    let provider_version =
+        check_provider_version_until(source.provider, &provider_path, Some(deadline))?;
+    let requested_title = request.title.unwrap_or_else(|| {
+        let workspace_name = workspace
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace");
+        format!(
+            "{} · {workspace_name} (reopened {})",
+            source.provider.as_str(),
+            request.id
+        )
+    });
+    let title = sanitize_title(&requested_title)?;
+    let marker = claim_reopen_marker(&source_directory, &request.id, &source.provider_session_id)?;
+    let created = create_session(SessionSpec {
+        provider: source.provider,
+        provider_path,
+        provider_version,
+        workspace,
+        title,
+        model: request.model,
+        effort: request.effort,
+        yolo: request.yolo,
+        prompt: native_delegation_prompt(&delegation_source(), &request.prompt),
+    })?;
+    let resumed_from = ResumedFrom {
+        session: request.id.clone(),
+        provider_session_id: source.provider_session_id.clone(),
+        event_id: source.event_id.clone(),
+    };
+    if let Err(error) = record_resumed_from(&created.directory, &created.manifest, &resumed_from)
+        .and_then(|()| marker.finalize(&created.id))
+    {
+        let _ = update_status(
+            &created.directory,
+            "failed",
+            None,
+            Some(format!("{error:#}")),
+        );
+        return Err(error).with_context(|| {
+            format!(
+                "failed to record reopen provenance for session {}",
+                created.id
+            )
+        });
+    }
+    let mut result_extra = serde_json::Map::new();
+    result_extra.insert(
+        "source_session".to_owned(),
+        serde_json::Value::String(request.id.clone()),
+    );
+    result_extra.insert(
+        "resumed_from".to_owned(),
+        serde_json::to_value(&resumed_from)?,
+    );
+    launch_created_session(
+        SessionLaunch {
+            created,
+            provider: source.provider,
+            terminal_kind,
+            deadline,
+            timeout: request.timeout,
+            detach: request.detach,
+            json: request.json,
+            context_sources: &[],
+            result_extra,
+            resumed_from: Some(resumed_from),
+        },
+        address,
+    )
+}
+
+// A reopen refused after its session existed delivered nothing to the conversation: the
+// pre-spawn recheck started no process, and both post-launch gates refuse before the first
+// prompt and close the new surface. Bridge therefore established no conversation writer,
+// and the source's reopen marker is released so the source can be reopened again once the
+// cause is gone. The refused session keeps its `resumed_from` as provenance. Release
+// requires that the marker still names the refused session and that the refused launch
+// provably cannot hold the conversation (`refused_launch_cleanup`): a spawned provider
+// process may survive the console close and the wrapper without ever registering, so the
+// registry gate of the next reopen would not catch it. Until that process is verified
+// gone the marker stays consumed, the refusal record is annotated with `cleanup:
+// "pending"`, and the next reopen attempt reconciles the marker
+// (`verify_reopen_source_is_closed`).
+fn release_reopen_marker_after_refusal(
+    source_directory: &Path,
+    refused_directory: &Path,
+    gate: &str,
+    outcome: Result<()>,
+) -> Result<()> {
+    let refused_session = refused_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let released = (|| -> Result<()> {
+        let cleanup = refused_launch_cleanup(refused_directory, gate)?;
+        if let RefusedLaunchCleanup::Pending(reason) = &cleanup {
+            let note = record_reopen_refusal_cleanup_pending(refused_directory, reason)
+                .err()
+                .map_or(String::new(), |error| {
+                    format!("; the refusal record could not be annotated: {error:#}")
+                });
+            bail!("{cleanup}{note}");
+        }
+        let marker_path = source_directory.join(REOPEN_MARKER_FILE);
+        let _lock = lock_turn_claim(&source_directory.join(TURN_CLAIM_FILE))?;
+        let Some(text) = read_regular_text_if_present(&marker_path)? else {
+            return Ok(());
+        };
+        let marker: ReopenMarker = serde_json::from_str(&text).context("invalid reopen marker")?;
+        if marker.reopened_by.as_deref() != Some(refused_session) {
+            bail!(
+                "reopen marker names {:?}, not the refused session {refused_session}",
+                marker.reopened_by
+            );
+        }
+        remove_file_if_present(&marker_path)
+    })();
+    let Err(release_error) = released else {
+        return outcome;
+    };
+    let release_error = release_error.context(format!(
+        "the reopen marker of source session {} was not released",
+        source_directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+    ));
+    match outcome {
+        Ok(()) => Err(release_error),
+        Err(error) => Err(error.context(format!("{release_error:#}"))),
+    }
+}
+
+// Read-only gates on the closed source: it is closed with its tombstone and nothing of its
+// lifecycle is left open, every request record resolves to a recorded event, and a provider
+// event supplies the conversation identity. Each refusal names its gate. Receipts are
+// validated before the identity is read, so a corrupt newest event refuses under
+// `request-unresolved` whether or not a receipt points at it.
+fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
+    let manifest = read_manifest(directory)?;
+    let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
+    verify_reopen_source_is_closed(directory, id)?;
+    // The lifecycle readers' contract for `events`: it is a real directory inside the
+    // session, or absent, before anything under it is opened. A link or a non-directory
+    // planted there would carry the reads below outside the session, and the shared
+    // listing would present it as "no events", which the identity gate would then report
+    // as a source without an identity. Neither can prove what the source delivered. An
+    // absent directory is not rejected here: it holds no event, so the receipt and identity
+    // gates below refuse for what is actually missing.
+    events_directory_state(directory).map_err(|error| {
+        reopen_refusal(
+            "request-unresolved",
+            format!("the recorded results of session {id} cannot be read: {error:#}"),
+        )
+    })?;
+    let index = requests::list(directory)?;
+    if index.unreadable > 0 {
+        return Err(reopen_refusal(
+            "request-unresolved",
+            format!(
+                "session {id} has {} unreadable request record(s); their delivery outcome cannot be verified",
+                index.unreadable
+            ),
+        ));
+    }
+    // Every receipt must resolve to a readable, well-formed event of this provider. A
+    // receipt whose event is missing, empty, malformed, or from another provider cannot
+    // prove what that request delivered, whatever the latest event says.
+    for receipt in &index.receipts {
+        let event_path = directory.join("events").join(&receipt.event_file);
+        if !is_regular_file(&event_path)? {
+            return Err(reopen_refusal(
+                "request-unresolved",
+                format!(
+                    "request {} of session {id} has no recorded result; its delivery outcome is uncertain",
+                    receipt.request_id
+                ),
+            ));
+        }
+        let event = read_json::<SessionEvent>(&event_path).map_err(|error| {
+            reopen_refusal(
+                "request-unresolved",
+                format!(
+                    "request {} of session {id} points at recorded result {} that cannot be read: {error:#}",
+                    receipt.request_id, receipt.event_file
+                ),
+            )
+        })?;
+        if event.provider != provider.as_str() {
+            return Err(reopen_refusal(
+                "request-unresolved",
+                format!(
+                    "request {} of session {id} points at recorded result {} of provider {} instead of {}",
+                    receipt.request_id,
+                    receipt.event_file,
+                    event.provider,
+                    provider.as_str()
+                ),
+            ));
+        }
+    }
+    let (event_id, provider_session_id) =
+        latest_provider_event_identity(directory, provider, id)?.ok_or_else(|| {
+            reopen_refusal(
+                "source-identity-missing",
+                format!(
+                    "session {id} has no {} event that records a provider session id; a session whose only turn failed cannot be reopened",
+                    provider.as_str()
+                ),
+            )
+        })?;
+    Ok(ReopenSource {
+        manifest,
+        provider,
+        provider_session_id,
+        event_id,
+    })
+}
+
+// A reopen marker that names a session whose launch was refused and whose cleanup is now
+// verified. The marker no longer excludes anything: the reopen it recorded delivered no
+// prompt and its process is provably gone, so the next claim under the source lock removes
+// it before writing its own.
+#[derive(Debug)]
+struct StaleReopenMarker {
+    refused_session: String,
+    gate: String,
+    cleanup: RefusedLaunchCleanup,
+}
+
+// Read-only. The source is closed with its tombstone, nothing of its lifecycle is left
+// open, and any reopen marker it carries is either stale (returned, so the claim can
+// release it) or refuses under `already-reopened` naming the blocking condition. A marker
+// is stale only when the session it names carries a durable launch-phase refusal and that
+// refused launch is verified unable to hold the conversation (`refused_launch_cleanup`).
+// This is how a marker whose parent reopen crashed before settlement, or whose launch
+// wrapper recorded its refusal only after the parent timed out, is reconciled: nothing is
+// inferred from the absence of records, and a marker that names a session without a launch
+// refusal, or with a launch refusal whose process may survive, stays consumed.
+fn verify_reopen_source_is_closed(directory: &Path, id: &str) -> Result<Option<StaleReopenMarker>> {
+    let closed = read_regular_status_if_present(&directory.join(CLOSED_STATUS_FILE))?;
+    let status = read_regular_status_if_present(&directory.join("status.json"))?;
+    let state = status
+        .as_ref()
+        .map_or("unknown", |status| status.state.as_str());
+    if state != "closed"
+        || closed
+            .as_ref()
+            .is_none_or(|closed| closed.state != "closed")
+    {
+        return Err(reopen_refusal(
+            "source-not-closed",
+            format!(
+                "session {id} is {state}; reopen requires a session closed with its closed tombstone"
+            ),
+        ));
+    }
+    for name in [
+        TURN_CLAIM_FILE,
+        TURN_COMPLETION_FILE,
+        TERMINAL_HANDLE_FILE,
+        TERMINAL_CLOSING_FILE,
+    ] {
+        if fs::symlink_metadata(directory.join(name)).is_ok() {
+            return Err(reopen_refusal(
+                "source-not-converged",
+                format!("session {id} still carries {name}; its close has not converged"),
+            ));
+        }
+    }
+    let Some(text) = read_regular_text_if_present(&directory.join(REOPEN_MARKER_FILE))? else {
+        return Ok(None);
+    };
+    let refuse = |detail: String| Err(reopen_refusal("already-reopened", detail));
+    let Ok(marker) = serde_json::from_str::<ReopenMarker>(&text) else {
+        return refuse(format!(
+            "session {id} carries a reopen marker that cannot be read; it is treated as consumed"
+        ));
+    };
+    let Some(new_id) = marker.reopened_by else {
+        return refuse(format!("a reopen of session {id} is already in progress"));
+    };
+    let already = format!("session {id} was already reopened as {new_id}");
+    if !valid_session_id(&new_id) {
+        return refuse(format!(
+            "{already}; the marker names an invalid session id, so it is treated as consumed"
+        ));
+    }
+    let refused_directory = directory
+        .parent()
+        .context("session directory has no state root")?
+        .join(&new_id);
+    if !fs::symlink_metadata(&refused_directory).is_ok_and(|metadata| metadata.is_dir()) {
+        return refuse(format!(
+            "{already}; the records of {new_id} are missing, so the marker is treated as consumed"
+        ));
+    }
+    let Some(refusal) = read_reopen_launch_refusal(&refused_directory) else {
+        return refuse(already);
+    };
+    let cleanup = match refused_launch_cleanup(&refused_directory, &refusal.gate) {
+        Ok(cleanup) => cleanup,
+        Err(error) => {
+            return refuse(format!(
+                "{already}; that launch was refused ({}) but its records cannot be verified: {error:#}",
+                refusal.gate
+            ));
+        }
+    };
+    if !cleanup.releases_marker() {
+        return refuse(format!(
+            "{already}; that launch was refused ({}) but {cleanup}",
+            refusal.gate
+        ));
+    }
+    Ok(Some(StaleReopenMarker {
+        refused_session: new_id,
+        gate: refusal.gate,
+        cleanup,
+    }))
+}
+
+// A recorded event that cannot be read is a turn whose outcome cannot be verified, so it
+// refuses under `request-unresolved` even when no receipt points at it (legacy sessions).
+// Every recorded event is read, not only those newer than the identity that is returned: an
+// older unreadable event is as unverifiable as a newer one.
+fn latest_provider_event_identity(
+    directory: &Path,
+    provider: FirstPartyCli,
+    id: &str,
+) -> Result<Option<(String, String)>> {
+    let mut newest = None;
+    for path in event_paths(directory)? {
+        let event: SessionEvent = read_json(&path).map_err(|error| {
+            reopen_refusal(
+                "request-unresolved",
+                format!(
+                    "session {id} has a recorded result {} that cannot be read: {error:#}",
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default()
+                ),
+            )
+        })?;
+        if event.provider != provider.as_str() {
+            continue;
+        }
+        if let Some(provider_session_id) = event.provider_session_id
+            && !provider_session_id.trim().is_empty()
+        {
+            let event_id = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("event path has no file name")?
+                .to_owned();
+            newest = Some((event_id, provider_session_id));
+        }
+    }
+    Ok(newest)
+}
+
+fn read_resumed_from(directory: &Path) -> Result<Option<ResumedFrom>> {
+    let provenance: ReopenProvenance = read_json(&directory.join("manifest.json"))?;
+    Ok(provenance.resumed_from)
+}
+
+fn record_resumed_from(
+    directory: &Path,
+    manifest: &SessionManifest,
+    resumed_from: &ResumedFrom,
+) -> Result<()> {
+    let mut value = serde_json::to_value(manifest)?;
+    value
+        .as_object_mut()
+        .context("session manifest is not a JSON object")?
+        .insert(
+            "resumed_from".to_owned(),
+            serde_json::to_value(resumed_from)?,
+        );
+    write_json_atomic(&directory.join("manifest.json"), &value)
+}
+
+// The winner's hold on a closed source. Dropping it before `finalize` removes the marker
+// again, so a reopen that never created its session leaves the source reopenable.
+#[derive(Debug)]
+struct ReopenMarkerClaim {
+    path: PathBuf,
+    claim: String,
+    finalized: bool,
+}
+
+impl ReopenMarkerClaim {
+    fn finalize(mut self, new_session_id: &str) -> Result<()> {
+        let _lock = lock_turn_claim(&self.path.with_file_name(TURN_CLAIM_FILE))?;
+        let text = read_regular_text_if_present(&self.path)?
+            .context("reopen marker disappeared before the new session was recorded")?;
+        let mut marker: ReopenMarker =
+            serde_json::from_str(&text).context("invalid reopen marker")?;
+        if marker.claim != self.claim {
+            bail!("reopen marker belongs to a different reopen attempt");
+        }
+        marker.reopened_by = Some(new_session_id.to_owned());
+        write_json_atomic(&self.path, &marker)?;
+        self.finalized = true;
+        Ok(())
+    }
+}
+
+impl Drop for ReopenMarkerClaim {
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        let Ok(_lock) = lock_turn_claim(&self.path.with_file_name(TURN_CLAIM_FILE)) else {
+            return;
+        };
+        let current = read_regular_text_if_present(&self.path)
+            .ok()
+            .flatten()
+            .and_then(|text| serde_json::from_str::<ReopenMarker>(&text).ok());
+        if current.is_some_and(|marker| marker.claim == self.claim) {
+            let _ = remove_file_if_present(&self.path);
+        }
+    }
+}
+
+// Serializes concurrent reopens of one closed source under the source's own turn-claim lock:
+// the closed gates are re-checked under the lock and the marker is created with
+// `create_new`, so exactly one attempt can hold it.
+fn claim_reopen_marker(
+    directory: &Path,
+    id: &str,
+    provider_session_id: &str,
+) -> Result<ReopenMarkerClaim> {
+    let path = directory.join(REOPEN_MARKER_FILE);
+    let _lock = lock_turn_claim(&directory.join(TURN_CLAIM_FILE))?;
+    if let Some(stale) = verify_reopen_source_is_closed(directory, id)? {
+        // The gate re-ran under the lock, so the stale marker still names a refused launch
+        // whose cleanup is verified now; releasing it here is the reconciliation the
+        // crashed or timed-out parent never performed.
+        remove_file_if_present(&path).with_context(|| {
+            format!(
+                "could not release the stale reopen marker of session {id} (reopened as {}, refused at {}, {})",
+                stale.refused_session, stale.gate, stale.cleanup
+            )
+        })?;
+    }
+    let claim = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
+        TURN_CLAIM_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let marker = ReopenMarker {
+        schema: 1,
+        claim: claim.clone(),
+        provider_session_id: provider_session_id.to_owned(),
+        reopened_by: None,
+        created_unix_ms: unix_ms(),
+    };
+    write_private(&path, &serde_json::to_vec_pretty(&marker)?).map_err(|error| {
+        reopen_refusal(
+            "already-reopened",
+            format!("could not claim session {id} for reopen: {error:#}"),
+        )
+    })?;
+    Ok(ReopenMarkerClaim {
+        path,
+        claim,
+        finalized: false,
+    })
 }
 
 fn verify_terminal_surface_ownership(
@@ -1563,13 +2924,22 @@ fn run_tell(request: TellRequest) -> Result<()> {
     let mut address = None;
     let outcome = run_tell_inner(request, &mut address);
     match address {
-        Some((session, request_id)) => finish_request(outcome, json, &session, &request_id),
+        Some((session, request_id)) => {
+            let mut extra = serde_json::Map::new();
+            if let Some(gate) = outcome.as_ref().err().and_then(reopen_refusal_gate) {
+                extra.insert("gate".to_owned(), serde_json::json!(gate));
+            }
+            finish_request_with_extra(outcome, json, &session, &request_id, extra)
+        }
         None => outcome,
     }
 }
 
 fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) -> Result<()> {
     let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
+    // Attached results are resolved and pinned before the target is recovered, repaired,
+    // claimed, or sent to, so a failed resolution leaves every session unchanged.
+    let attached = context::resolve(&request.context_results)?;
     let directory = session_directory(&request.id)?;
     recover_pending_completion(&directory)?;
     repair_dead_native_owner(&directory)?;
@@ -1590,12 +2960,26 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
             request.id
         );
     }
-    let prompt = native_delegation_prompt(&delegation_source(), &request.prompt);
+    let prompt = native_delegation_prompt(
+        &delegation_source(),
+        &attached.prompt_with_attachments(&request.prompt),
+    );
     let follow_up_transport = provider::follow_up_transport(provider);
-    let (mut claim, baseline) = acquire_ready_turn_claim(&directory, &request.id)?;
+    let resumed_from = read_resumed_from(&directory)?;
+    let (mut claim, baseline) =
+        acquire_ready_turn_claim_with_context(&directory, &request.id, &attached.sources)?;
     let claim_token = claim.token.clone();
     let receipt = claim.receipt.clone();
     *address = Some((request.id.clone(), receipt.request_id.clone()));
+    refuse_follow_up_to_shared_conversation(
+        provider,
+        &directory,
+        &request.id,
+        resumed_from.as_ref(),
+        deadline,
+        &mut claim,
+        &previous_state,
+    )?;
     let mut expected_turn_id = None;
     match follow_up_transport {
         provider::FollowUpTransport::TerminalPasteFallback => {
@@ -1666,9 +3050,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
                         == CrossSessionFailureAction::RetainClaim =>
                 {
                     let error = failure.into_error();
-                    record_follow_up_cross_session_delivery_uncertainty(
-                        &directory, &mut claim, &error,
-                    );
+                    record_cross_session_delivery_uncertainty(&directory, &mut claim, &error);
                     return Err(error).with_context(|| {
                         format!(
                             "provider follow-up transport {} could not confirm delivery; the turn remains claimed until the target reports completion or the session is explicitly closed",
@@ -1702,7 +3084,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
             &request.id,
             &terminal_session,
             provider,
-            &receipt.request_id,
+            &receipt,
             None,
         );
     }
@@ -1726,9 +3108,60 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
         &request.id,
         &terminal_session,
         provider,
-        &receipt.request_id,
+        &receipt,
         Some(&event),
     )
+}
+
+// A resumed session's conversation is re-checked immediately before every follow-up
+// delivery. A refusal sends nothing: the claim is released and the reason is recorded in
+// one status write, so the session stays ready with the refusal in its status and its
+// receipt stays unresolved. This is the same best-effort detection the launch ran; a
+// foreign resume that registers after this point is caught only by the next delivery.
+#[allow(clippy::too_many_arguments)]
+fn refuse_follow_up_to_shared_conversation(
+    provider: FirstPartyCli,
+    directory: &Path,
+    id: &str,
+    resumed_from: Option<&ResumedFrom>,
+    deadline: Instant,
+    claim: &mut TurnClaim,
+    previous_state: &str,
+) -> Result<()> {
+    let Err(error) = verify_reopened_conversation_exclusive(
+        provider,
+        directory,
+        resumed_from,
+        deadline,
+        ResumedHolderCheck::BeforeFollowUp,
+    ) else {
+        return Ok(());
+    };
+    let error = error.context(format!(
+        "follow-up to reopened session {id} was refused before delivery"
+    ));
+    Err(record_follow_up_refusal(id, claim, previous_state, error))
+}
+
+// The claim is released and the refusal reason is published in one write under the
+// lifecycle lock, and only while the claim is still this request's. Once another `tell`
+// owns the turn, nothing is written: that turn keeps its claim, receipt, and status, and
+// the refused request's receipt stays unresolved.
+fn record_follow_up_refusal(
+    id: &str,
+    claim: &mut TurnClaim,
+    previous_state: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    match claim.release_now_with_reason(previous_state, format!("{error:#}")) {
+        Ok(true) => error,
+        Ok(false) => error.context(format!(
+            "the turn claim of session {id} already belonged to another request; its status was left unchanged"
+        )),
+        Err(release_error) => error.context(format!(
+            "the turn claim of session {id} could not be released: {release_error:#}"
+        )),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1986,10 +3419,34 @@ fn initial_prompt_delay_within_budget(
 }
 
 fn run_sessions(request: SessionsRequest) -> Result<()> {
-    let root = state_root()?;
+    let sessions = sessions_in(&state_root()?, &request)?;
+    if request.json {
+        println!("{}", serde_json::to_string_pretty(&sessions)?);
+    } else if sessions.is_empty() {
+        println!("no native Agent Bridge sessions");
+    } else {
+        for session in sessions {
+            println!(
+                "{}\t{}\t{}\t{}\tterminal={}\tyolo={}\t{} result(s)",
+                session["id"].as_str().unwrap_or("?"),
+                terminal_safe_text(session["state"].as_str().unwrap_or("unknown"), false),
+                terminal_safe_text(session["provider"].as_str().unwrap_or("?"), false),
+                terminal_safe_text(session["workspace"].as_str().unwrap_or("?"), false),
+                session["terminal"].as_str().unwrap_or("unknown"),
+                session["yolo"].as_bool().unwrap_or(false),
+                session["results"].as_u64().unwrap_or(0),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The `sessions` listing over one state root. Listing is also a lifecycle-lock holder: it
+/// converges interrupted completions and closes and repairs dead owners before it reads.
+fn sessions_in(root: &Path, request: &SessionsRequest) -> Result<Vec<serde_json::Value>> {
     let mut sessions = Vec::new();
     if root.is_dir() {
-        for entry in fs::read_dir(&root)? {
+        for entry in fs::read_dir(root)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
                 continue;
@@ -2012,7 +3469,9 @@ fn run_sessions(request: SessionsRequest) -> Result<()> {
             {
                 continue;
             }
-            let _ = recover_pending_completion(&directory);
+            // Repair runs completion recovery first itself, unconditionally and under the
+            // same lifecycle lock, so a listing publishes every finished turn before it
+            // decides on the owner without a separate recovery pass.
             let _ = repair_dead_native_owner(&directory);
             let status = read_json::<SessionStatus>(&directory.join("status.json")).ok();
             let state = status
@@ -2043,6 +3502,7 @@ fn run_sessions(request: SessionsRequest) -> Result<()> {
                 "error": status.as_ref().and_then(|value| value.error.as_deref()),
                 "model": manifest.model,
                 "effort": manifest.effort,
+                "resumed_from": read_resumed_from(&directory).ok().flatten(),
                 "results": event_paths(&directory).map(|paths| paths.len()).unwrap_or(0),
             }));
         }
@@ -2058,25 +3518,7 @@ fn run_sessions(request: SessionsRequest) -> Result<()> {
             by_id
         }
     });
-    if request.json {
-        println!("{}", serde_json::to_string_pretty(&sessions)?);
-    } else if sessions.is_empty() {
-        println!("no native Agent Bridge sessions");
-    } else {
-        for session in sessions {
-            println!(
-                "{}\t{}\t{}\t{}\tterminal={}\tyolo={}\t{} result(s)",
-                session["id"].as_str().unwrap_or("?"),
-                terminal_safe_text(session["state"].as_str().unwrap_or("unknown"), false),
-                terminal_safe_text(session["provider"].as_str().unwrap_or("?"), false),
-                terminal_safe_text(session["workspace"].as_str().unwrap_or("?"), false),
-                session["terminal"].as_str().unwrap_or("unknown"),
-                session["yolo"].as_bool().unwrap_or(false),
-                session["results"].as_u64().unwrap_or(0),
-            );
-        }
-    }
-    Ok(())
+    Ok(sessions)
 }
 
 fn run_prune(request: PruneRequest) -> Result<()> {
@@ -2256,17 +3698,8 @@ fn native_owner_blocks_prune(directory: &Path) -> Result<bool> {
 fn run_close(request: CloseRequest) -> Result<()> {
     confirm_explicit_close(request.explicit)?;
     let directory = session_directory(&request.id)?;
-    close_repaired_session_state(&directory, |session| {
-        let has_native_owner = verify_terminal_close_authority(&directory, &request.id, session)?;
-        #[cfg(target_os = "macos")]
-        if has_native_owner && session.kind == terminal::TerminalKind::AppleTerminal {
-            terminate_apple_terminal_owner(&directory, &request.id, session)?;
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = has_native_owner;
-        terminal::close_session(session)
-    })
-    .with_context(|| format!("failed to close visible terminal session {}", request.id))?;
+    close_session_surface(&directory, &request.id, None)
+        .with_context(|| format!("failed to close visible terminal session {}", request.id))?;
     if request.json {
         println!(
             "{}",
@@ -2313,14 +3746,28 @@ fn verify_terminal_close_authority(
     }
 }
 
+#[cfg(test)]
 fn close_repaired_session_state<F>(directory: &Path, close_terminal: F) -> Result<()>
+where
+    F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
+{
+    close_repaired_session_state_with_reason(directory, None, close_terminal)
+}
+
+// Repairs a dead native owner first, then closes. A repair failure is the recorded close
+// error; otherwise `reason` (if any) is kept in the closed status.
+fn close_repaired_session_state_with_reason<F>(
+    directory: &Path,
+    reason: Option<String>,
+    close_terminal: F,
+) -> Result<()>
 where
     F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
 {
     let repair_error = repair_dead_native_owner(directory)
         .err()
         .map(|error| format!("pre-close session repair failed: {error:#}"));
-    close_session_state_with_error(directory, repair_error, close_terminal)
+    close_session_state_with_error(directory, repair_error.or(reason), close_terminal)
 }
 
 #[cfg(test)]
@@ -2357,8 +3804,12 @@ where
         consume_result?;
         return close_result;
     }
+    fault_point("claiming the terminal handle for close")?;
     match fs::rename(&terminal_path, &closing_path) {
-        Ok(()) => sync_parent_directory(&closing_path)?,
+        Ok(()) => {
+            fault_point("syncing the claimed terminal handle's directory")?;
+            sync_parent_directory(&closing_path)?
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if !closing_path.exists() {
                 return mark_session_closed_locked(directory, &claim_path, close_error);
@@ -2423,16 +3874,22 @@ fn consume_terminal_handle(
 }
 
 fn remove_file_if_present(path: &Path) -> Result<()> {
+    fault_point("removing a record file")?;
     match fs::remove_file(path) {
-        Ok(()) => sync_parent_directory(path),
+        Ok(()) => {
+            fault_point("syncing a removed record's directory")?;
+            sync_parent_directory(path)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
     }
 }
 
 pub(super) fn rename_session_file(from: &Path, to: &Path) -> Result<()> {
+    fault_point("renaming a record file")?;
     fs::rename(from, to)
         .with_context(|| format!("failed to rename {} to {}", from.display(), to.display()))?;
+    fault_point("syncing a renamed record's directory")?;
     sync_parent_directory(to)?;
     if from.parent() != to.parent() {
         sync_parent_directory(from)?;
@@ -2441,6 +3898,16 @@ pub(super) fn rename_session_file(from: &Path, to: &Path) -> Result<()> {
 }
 
 fn finish_request(outcome: Result<()>, json: bool, session: &str, request_id: &str) -> Result<()> {
+    finish_request_with_extra(outcome, json, session, request_id, serde_json::Map::new())
+}
+
+fn finish_request_with_extra(
+    outcome: Result<()>,
+    json: bool,
+    session: &str,
+    request_id: &str,
+    extra: serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
     if let Err(error) = outcome {
         if json {
             let mut value = session_directory(session)
@@ -2453,6 +3920,9 @@ fn finish_request(outcome: Result<()>, json: bool, session: &str, request_id: &s
                 });
             value["ok"] = serde_json::json!(false);
             value["error"] = serde_json::json!(format!("{error:#}"));
+            for (key, field) in extra {
+                value[key] = field;
+            }
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
         return Err(error).with_context(|| format!(
@@ -2467,17 +3937,37 @@ fn emit_session_result(
     id: &str,
     terminal_session: &terminal::TerminalSession,
     provider: FirstPartyCli,
-    request_id: &str,
+    receipt: &requests::Receipt,
     event: Option<&SessionEvent>,
 ) -> Result<()> {
+    emit_session_result_with(
+        json,
+        id,
+        terminal_session,
+        provider,
+        receipt,
+        event,
+        &serde_json::Map::new(),
+    )
+}
+
+fn emit_session_result_with(
+    json: bool,
+    id: &str,
+    terminal_session: &terminal::TerminalSession,
+    provider: FirstPartyCli,
+    receipt: &requests::Receipt,
+    event: Option<&SessionEvent>,
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    let request_id = &receipt.request_id;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+        let mut value = serde_json::json!({
                 "ok": true,
                 "schema_version": 1,
                 "session": id,
                 "request_id": request_id,
+                "context_sources": receipt.context_sources,
                 "request_state": if event.is_some() { "completed" } else { "accepted" },
                 "provider": provider.as_str(),
                 "terminal": terminal_session.kind.as_str(),
@@ -2489,10 +3979,18 @@ fn emit_session_result(
                 "result": event.map(|value| value.message.as_str()),
                 "provider_session_id": event.and_then(|value| value.provider_session_id.as_deref()),
                 "turn_id": event.and_then(|value| value.turn_id.as_deref()),
-            }))?
-        );
+        });
+        for (key, field) in extra {
+            value[key.as_str()] = field.clone();
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
     } else {
         println!("session: {id}\nrequest: {request_id}");
+        for (key, field) in extra {
+            if let Some(field) = field.as_str() {
+                println!("{}: {}", key, terminal_safe_text(field, false));
+            }
+        }
         if let Some(event) = event {
             println!();
             println!("{}", terminal_safe_text(&event.message, true));
@@ -2563,20 +4061,51 @@ fn run_session_inner(directory: &Path) -> Result<()> {
                 .map(OsString::from),
         );
     }
-    let provider::LaunchPlan {
-        arguments: provider_arguments,
-        prompt_is_positional,
-        completion_monitor,
-    } = provider::prepare_launch(
-        provider,
-        provider::LaunchContext {
-            bridge_executable: &executable,
-            directory,
-            workspace: &manifest.workspace,
-            title: &manifest.title,
-            prompt: &prompt,
-        },
-    )?;
+    // A reopened session launches through the adapter's resume plan. The plan carries no
+    // prompt: the initial prompt reaches the reopened process through the same transport a
+    // fresh launch uses, so `prompt_is_positional` is false here by construction.
+    let resumed_from = read_resumed_from(directory)?;
+    let (provider_arguments, prompt_is_positional, completion_monitor, environment_removals) =
+        match &resumed_from {
+            Some(resumed_from) => {
+                let provider::ResumePlan {
+                    arguments,
+                    completion_monitor,
+                    environment_removals,
+                } = provider::prepare_resume(
+                    provider,
+                    provider::ResumeContext {
+                        bridge_executable: &executable,
+                        directory,
+                        provider_session_id: &resumed_from.provider_session_id,
+                    },
+                )?;
+                (arguments, false, completion_monitor, environment_removals)
+            }
+            None => {
+                let provider::LaunchPlan {
+                    arguments,
+                    prompt_is_positional,
+                    completion_monitor,
+                    environment_removals,
+                } = provider::prepare_launch(
+                    provider,
+                    provider::LaunchContext {
+                        bridge_executable: &executable,
+                        directory,
+                        workspace: &manifest.workspace,
+                        title: &manifest.title,
+                        prompt: &prompt,
+                    },
+                )?;
+                (
+                    arguments,
+                    prompt_is_positional,
+                    completion_monitor,
+                    environment_removals,
+                )
+            }
+        };
     let mut arguments = policy_arguments.clone();
     arguments.extend(provider_arguments);
     if initial_prompt_transport == provider::InitialPromptTransport::ProviderArgument
@@ -2588,6 +4117,22 @@ fn run_session_inner(directory: &Path) -> Result<()> {
     let completion_monitor = completion_monitor.start(directory)?;
     let mut provider_command =
         provider_process_command(&manifest.provider_path, directory, arguments)?;
+    provider::apply_environment_removals(&mut provider_command, environment_removals);
+    // The reopen ownership gate ran read-only before the source was claimed; the provider
+    // grants no exclusive hold on the conversation, so it runs again here, after every other
+    // preparation and immediately before the process exists. A holder that appeared in
+    // between refuses under the same gate; the record carries the gate to the reopen command.
+    if let Some(resumed_from) = &resumed_from
+        && let Err(error) =
+            provider::verify_reopen_available(provider, &resumed_from.provider_session_id)
+    {
+        let _ = completion_monitor.stop();
+        return Err(record_reopen_refusal(
+            directory,
+            REOPEN_LAUNCH_GATE,
+            format!("{error:#}"),
+        ));
+    }
     let child = provider_command
         .current_dir(&manifest.workspace)
         .env(SESSION_DIR_ENV, directory)
@@ -2601,6 +4146,17 @@ fn run_session_inner(directory: &Path) -> Result<()> {
             manifest.provider_path.display()
         )
     })?;
+    // The process exists from here on. Its identity is recorded before the session leaves
+    // its launch state, so every later judgment about this launch (a reopen refusal, the
+    // source marker) can verify the process itself rather than the wrapper. A process whose
+    // record cannot be written is ended at once: nothing has been delivered to it, and an
+    // unrecorded provider could never be verified gone.
+    if let Err(error) = record_provider_process(directory, &manifest.id, &child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = completion_monitor.stop();
+        return Err(error);
+    }
     match initial_prompt_transport {
         provider::InitialPromptTransport::ProviderArgument => {
             fs::remove_file(&prompt_path)
@@ -2983,6 +4539,30 @@ fn commit_provider_completion_with_status_locked(
     status_error: Option<String>,
     status_state: &str,
 ) -> Result<()> {
+    commit_provider_completion_within_locked(
+        directory,
+        claim_path,
+        claim_token,
+        event,
+        status_error,
+        status_state,
+        EVENT_READ_LIMIT,
+    )
+}
+
+/// [`commit_provider_completion_with_status_locked`] with an explicit event size limit, so
+/// tests exercise the size policy without writing 64 MiB records. Production callers pass
+/// [`EVENT_READ_LIMIT`]: the journal is created under the same limit the publication
+/// predicate reads with, so no interruption can change whether a completion recovers.
+fn commit_provider_completion_within_locked(
+    directory: &Path,
+    claim_path: &Path,
+    claim_token: &str,
+    event: SessionEvent,
+    status_error: Option<String>,
+    status_state: &str,
+    event_limit: u64,
+) -> Result<()> {
     let mut pending =
         PendingTurnCompletion::new_with_status(claim_token, event, status_error, status_state)?;
     // Request indexing must not prevent a provider-verified completion from publishing.
@@ -2990,15 +4570,51 @@ fn commit_provider_completion_with_status_locked(
     if let Ok(Some(receipt)) = requests::for_claim(directory, claim_token) {
         pending.event_file = receipt.event_file;
     }
-    write_private(
-        &directory.join(TURN_COMPLETION_FILE),
-        &serde_json::to_vec_pretty(&pending)?,
-    )?;
+    let pending = bound_pending_completion(pending, event_limit)?;
+    // Every caller recovers under the lifecycle lock first, so a journal that still exists
+    // here belongs to a completion that could not be recovered; refuse to replace it.
+    let completion_path = directory.join(TURN_COMPLETION_FILE);
+    if completion_path.exists() {
+        bail!("a pending native turn completion is still awaiting recovery")
+    }
+    // The journal is published by rename so that a partial journal never exists at its
+    // final path; the temporary file carries the same private permissions.
+    write_json_atomic(&completion_path, &pending)?;
     recover_pending_completion_locked(directory, claim_path)?;
     Ok(())
 }
 
+/// The one size policy, applied where a completion is journaled. An event record larger
+/// than `event_limit` (the bytes the journal would write) is never journaled as
+/// publishable: the publication predicate reads at most that many bytes, so such a record
+/// could be published when the commit stopped before writing it and refused when it
+/// stopped after. The completion is journaled instead as a failure whose error names the
+/// size, keeping the provider identity, so every interruption settles to the same state.
+fn bound_pending_completion(
+    mut pending: PendingTurnCompletion,
+    event_limit: u64,
+) -> Result<PendingTurnCompletion> {
+    let size = serde_json::to_vec_pretty(&pending.event)?.len() as u64;
+    if size <= event_limit {
+        return Ok(pending);
+    }
+    let error =
+        format!("provider result of {size} bytes exceeds the {event_limit} byte event limit");
+    pending.event.message = String::new();
+    pending.event.error = Some(error.clone());
+    pending.status_error = Some(error);
+    pending.status_state = "failed".to_owned();
+    Ok(pending)
+}
+
 fn read_regular_text_if_present(path: &Path) -> Result<Option<String>> {
+    Ok(read_regular_bytes_if_present(path)?
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// The raw bytes of a regular session file, so callers that must not alter a record can
+/// decode it strictly instead of through the lossy snapshot reader.
+fn read_regular_bytes_if_present(path: &Path) -> Result<Option<Vec<u8>>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -3009,20 +4625,37 @@ fn read_regular_text_if_present(path: &Path) -> Result<Option<String>> {
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         bail!("refusing non-regular session file: {}", path.display());
     }
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    fs::read(path)
+        .map(Some)
+        .with_context(|| format!("failed to read {}", path.display()))
 }
 
 fn create_session(spec: SessionSpec) -> Result<CreatedSession> {
-    let root = state_root()?;
-    fs::create_dir_all(&root)
-        .with_context(|| format!("failed to create state directory {}", root.display()))?;
-    set_private_directory_permissions(&root)?;
+    create_session_in(&state_root()?, spec)
+}
+
+fn create_session_in(root: &Path, spec: SessionSpec) -> Result<CreatedSession> {
+    create_session_within(root, &home_directories(), spec)
+}
+
+/// [`create_session_in`] with the directories whose own entries are taken as durable
+/// (the user's home directory in production), so the state-root ancestry walk stops
+/// there instead of at the filesystem root.
+fn create_session_within(
+    root: &Path,
+    durable_directories: &[PathBuf],
+    spec: SessionSpec,
+) -> Result<CreatedSession> {
+    let ancestry_error = create_state_root(root, durable_directories)?;
     let temp = tempfile::Builder::new()
         .prefix("session-")
-        .tempdir_in(&root)?;
+        .tempdir_in(root)?;
     let directory = temp.keep();
     set_private_directory_permissions(&directory)?;
+    // The session directory is itself a record: sync the root so its entry survives a
+    // crash the same way the files written inside it do.
+    sync_directory(root)
+        .with_context(|| format!("failed to sync state root {}", root.display()))?;
     let id = directory
         .file_name()
         .and_then(|name| name.to_str())
@@ -3032,6 +4665,8 @@ fn create_session(spec: SessionSpec) -> Result<CreatedSession> {
     let events = directory.join("events");
     fs::create_dir(&events)?;
     set_private_directory_permissions(&events)?;
+    sync_directory(&directory)
+        .with_context(|| format!("failed to sync session directory {}", directory.display()))?;
     let manifest = SessionManifest {
         schema: SESSION_SCHEMA,
         id: id.clone(),
@@ -3050,12 +4685,148 @@ fn create_session(spec: SessionSpec) -> Result<CreatedSession> {
         &directory.join("initial-prompt.txt"),
         spec.prompt.as_bytes(),
     )?;
-    update_status(&directory, "launching", None, None)?;
+    // An ancestry sync failure never blocks the session: the root lacks its receipt, so
+    // the next creation repeats the walk, and the launch status records what failed.
+    update_status(&directory, "launching", None, ancestry_error)?;
     Ok(CreatedSession {
         id,
         directory,
         manifest,
     })
+}
+
+/// The receipt stored at `STATE_ROOT_DURABLE_FILE`. Only its existence as a regular file
+/// carries meaning; the fields describe the walk that wrote it.
+#[derive(Serialize)]
+struct StateRootDurabilityReceipt {
+    schema: u32,
+    synced_unix_ms: u128,
+}
+
+/// Creates the state root and every missing ancestor, then makes the root's ancestry
+/// durable unless the durability receipt already proves it is. A directory entry is a
+/// record like the files inside it: the session directory is only durable once the root's
+/// entry is, and the root's entry is only durable once every ancestor's entry is.
+///
+/// The walk does not depend on who created the directories. A creator that made the root
+/// or an ancestor and stopped before the parent-directory syncs leaves an existing root
+/// whose ancestry is not durable, and a creator that probed while another was still
+/// creating sees only part of what the other made. So every creation that finds no
+/// receipt syncs the entry of the root and of each ancestor above it, nearest first, up to
+/// and including the entry that sits directly in the filesystem root or in one of
+/// `durable_directories`, whichever comes first, bounded by
+/// `STATE_ROOT_ANCESTRY_SYNC_LIMIT` entries. Concurrent creators may both walk; the syncs
+/// are idempotent. The receipt is written through [`write_json_atomic`], which also syncs
+/// the root, only after the walk succeeded.
+///
+/// Returns the walk's failure, if any, for the session's launch status: a missing receipt
+/// never blocks creation, and the receipt stays absent so the next creation walks again.
+fn create_state_root(root: &Path, durable_directories: &[PathBuf]) -> Result<Option<String>> {
+    let mut created = Vec::new();
+    let mut probe = root;
+    loop {
+        match fs::symlink_metadata(probe) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                created.push(probe.to_path_buf());
+                match probe.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => probe = parent,
+                    _ => break,
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect state directory {}", probe.display())
+                });
+            }
+        }
+    }
+    for directory in created.iter().rev() {
+        // A concurrent creator may win the race; the ancestry walk below covers its
+        // entries and this creator's alike.
+        if let Err(error) = fs::create_dir(directory)
+            && !directory.is_dir()
+        {
+            return Err(error).with_context(|| {
+                format!("failed to create state directory {}", directory.display())
+            });
+        }
+    }
+    set_private_directory_permissions(root)?;
+    if state_root_durability_receipt_present(root) {
+        return Ok(None);
+    }
+    fault_point("syncing the state root's ancestry")?;
+    if let Err(error) = sync_state_root_ancestry(root, durable_directories) {
+        return Ok(Some(format!(
+            "state root ancestry was not made durable: {error:#}"
+        )));
+    }
+    let receipt = StateRootDurabilityReceipt {
+        schema: 1,
+        synced_unix_ms: unix_ms(),
+    };
+    write_json_atomic(&root.join(STATE_ROOT_DURABLE_FILE), &receipt)?;
+    Ok(None)
+}
+
+/// Whether the state root carries its durability receipt. Only a regular file counts; a
+/// missing, unreadable, or non-regular entry means the ancestry walk runs again, which is
+/// harmless when the ancestry was in fact durable.
+fn state_root_durability_receipt_present(root: &Path) -> bool {
+    fs::symlink_metadata(root.join(STATE_ROOT_DURABLE_FILE))
+        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+}
+
+/// Syncs the directory that holds the entry of `root`, then the one that holds its
+/// parent's entry, and so on. The walk stops after the sync that makes durable an entry
+/// sitting directly in the filesystem root or in one of `durable_directories`, whose own
+/// entries are not the bridge's to establish, or after `STATE_ROOT_ANCESTRY_SYNC_LIMIT`
+/// entries.
+fn sync_state_root_ancestry(root: &Path, durable_directories: &[PathBuf]) -> Result<()> {
+    let mut entry = root;
+    for _ in 0..STATE_ROOT_ANCESTRY_SYNC_LIMIT {
+        let Some(parent) = entry.parent() else {
+            break;
+        };
+        let holder = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        sync_directory(holder)
+            .with_context(|| format!("failed to sync state directory {}", holder.display()))?;
+        let holder_is_filesystem_root = parent.as_os_str().is_empty() || parent.parent().is_none();
+        if holder_is_filesystem_root
+            || durable_directories
+                .iter()
+                .any(|durable| same_directory(parent, durable))
+        {
+            break;
+        }
+        entry = parent;
+    }
+    Ok(())
+}
+
+/// Whether two paths name the same directory, by spelling or after canonicalisation.
+fn same_directory(left: &Path, right: &Path) -> bool {
+    left == right
+        || matches!(
+            (left.canonicalize(), right.canonicalize()),
+            (Ok(left), Ok(right)) if left == right
+        )
+}
+
+/// The directories whose own entries the state-root ancestry walk takes as durable: the
+/// user's home directory under either of the variables `default_state_root` reads.
+fn home_directories() -> Vec<PathBuf> {
+    ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .collect()
 }
 
 fn state_root() -> Result<PathBuf> {
@@ -3080,8 +4851,12 @@ fn default_state_root(
 }
 
 fn session_directory(id: &str) -> Result<PathBuf> {
+    session_directory_in(&state_root()?, id)
+}
+
+fn session_directory_in(root: &Path, id: &str) -> Result<PathBuf> {
     require_valid_session_id(id)?;
-    let directory = state_root()?.join(id);
+    let directory = root.join(id);
     let metadata = fs::symlink_metadata(&directory)
         .with_context(|| format!("no such Agent Bridge session: {id}"))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -3111,7 +4886,15 @@ fn validate_hook_directory(directory: &Path) -> Result<()> {
 }
 
 fn read_manifest(directory: &Path) -> Result<SessionManifest> {
-    let manifest: SessionManifest = read_json(&directory.join("manifest.json"))?;
+    // The manifest decides a session's scope (workspace, provider) for every read-only
+    // query, so it is read like every other session record: a link at `manifest.json`
+    // would let content outside the state root steer a search or an attach, and is
+    // refused rather than followed.
+    let path = directory.join("manifest.json");
+    let bytes = read_regular_bytes_if_present(&path)?
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let manifest: SessionManifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid JSON in {}", path.display()))?;
     if manifest.schema != SESSION_SCHEMA {
         bail!(
             "unsupported session schema {} for {}",
@@ -3132,35 +4915,208 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     serde_json::from_str(&text).with_context(|| format!("invalid JSON in {}", path.display()))
 }
 
+// Durable record writes. Every helper below syncs the file it changed and then the
+// directory that holds its entry, so a crash after the helper returns cannot lose the
+// record on a POSIX file system that honours fsync. See README "권한과 세션 경계" for the
+// classification of which records go through these helpers and the platform limits.
+//
+// Under `cfg(test)` three thread-local hooks observe these helpers: `fault_point` refuses
+// the next filesystem mutation once an injected budget is spent, which models a process
+// that died between two mutations, `record_sync` logs every sync call in order, and
+// `sync_directory` refuses the directories named by `with_sync_failure`, which models a
+// sync the operating system rejects. All are inert outside tests.
+
+#[cfg(test)]
+thread_local! {
+    static FAULT_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static SYNC_LOG: std::cell::RefCell<Option<Vec<SyncRecord>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Directories whose sync fails with an injected error while `with_sync_failure` runs.
+    static SYNC_FAILURES: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Every journaled event the publication predicate opened, in order, so a test can
+    /// prove when a search reads a journaled event and when it does not read it at all.
+    static PUBLICATION_READ_LOG: std::cell::RefCell<Option<Vec<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SyncRecord {
+    File(PathBuf),
+    Directory(PathBuf),
+}
+
+/// Refuses the step that follows it once the injected fault budget reaches zero. A budget of
+/// `k` lets exactly `k` boundaries pass and then fails every later one, like a process that
+/// stopped there. Boundaries sit before each record mutation (temporary-file creation,
+/// permission and content writes, rename, removal) and between a rename or removal and the
+/// sync that makes it durable; a fault after a temporary file exists leaves it behind.
+fn fault_point(label: &str) -> Result<()> {
+    #[cfg(test)]
+    {
+        FAULT_BUDGET.with(|budget| match budget.get() {
+            None => Ok(()),
+            Some(0) => bail!("injected fault before {label}"),
+            Some(remaining) => {
+                budget.set(Some(remaining - 1));
+                Ok(())
+            }
+        })
+    }
+    #[cfg(not(test))]
+    {
+        let _ = label;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn injected_fault(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("injected fault before")
+}
+
+#[cfg(test)]
+fn with_fault_budget<T>(budget: usize, run: impl FnOnce() -> T) -> T {
+    FAULT_BUDGET.with(|cell| cell.set(Some(budget)));
+    let outcome = run();
+    FAULT_BUDGET.with(|cell| cell.set(None));
+    outcome
+}
+
+#[cfg(test)]
+fn with_sync_log<T>(run: impl FnOnce() -> T) -> (T, Vec<SyncRecord>) {
+    SYNC_LOG.with(|log| *log.borrow_mut() = Some(Vec::new()));
+    let outcome = run();
+    let records = SYNC_LOG.with(|log| log.borrow_mut().take().unwrap_or_default());
+    (outcome, records)
+}
+
+/// Runs `run` while every sync of `directory` on this thread fails with an injected
+/// error. The sync is still logged first, so a test sees that it was attempted.
+#[cfg(test)]
+fn with_sync_failure<T>(directory: &Path, run: impl FnOnce() -> T) -> T {
+    SYNC_FAILURES.with(|failures| failures.borrow_mut().push(directory.to_path_buf()));
+    let outcome = run();
+    SYNC_FAILURES.with(|failures| failures.borrow_mut().clear());
+    outcome
+}
+
+#[cfg(test)]
+fn injected_sync_failure(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("injected sync failure for")
+}
+
+/// Runs `run` and returns, in order, the path of every journaled event the publication
+/// predicate opened on this thread while it ran.
+#[cfg(test)]
+fn with_publication_read_log<T>(run: impl FnOnce() -> T) -> (T, Vec<PathBuf>) {
+    PUBLICATION_READ_LOG.with(|log| *log.borrow_mut() = Some(Vec::new()));
+    let outcome = run();
+    let paths = PUBLICATION_READ_LOG.with(|log| log.borrow_mut().take().unwrap_or_default());
+    (outcome, paths)
+}
+
+fn record_publication_read(path: &Path) {
+    #[cfg(test)]
+    PUBLICATION_READ_LOG.with(|log| {
+        if let Some(log) = log.borrow_mut().as_mut() {
+            log.push(path.to_path_buf());
+        }
+    });
+    #[cfg(not(test))]
+    let _ = path;
+}
+
+#[derive(Clone, Copy)]
+enum SyncKind {
+    File,
+    Directory,
+}
+
+fn record_sync(kind: SyncKind, path: &Path) {
+    #[cfg(test)]
+    SYNC_LOG.with(|log| {
+        if let Some(log) = log.borrow_mut().as_mut() {
+            log.push(match kind {
+                SyncKind::File => SyncRecord::File(path.to_path_buf()),
+                SyncKind::Directory => SyncRecord::Directory(path.to_path_buf()),
+            });
+        }
+    });
+    #[cfg(not(test))]
+    {
+        let _ = (kind, path);
+    }
+}
+
+fn sync_file(file: &File, path: &Path) -> Result<()> {
+    record_sync(SyncKind::File, path);
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", path.display()))
+}
+
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path.parent().context("JSON path has no parent")?;
-    let mut temporary = tempfile::Builder::new()
+    fault_point("creating a temporary record file")?;
+    let temporary = tempfile::Builder::new()
         .prefix(".agent-bridge-")
         .suffix(".tmp")
         .tempfile_in(parent)?;
+    let mut temporary = fault_point_keeping_temporary(
+        "writing a temporary record's permissions and content",
+        temporary,
+    )?;
     set_private_file_permissions(temporary.as_file())?;
     temporary.write_all(&serde_json::to_vec_pretty(value)?)?;
     temporary.flush()?;
-    temporary.as_file().sync_all()?;
+    sync_file(temporary.as_file(), temporary.path())?;
+    let temporary = fault_point_keeping_temporary(
+        "renaming a temporary record over its final path",
+        temporary,
+    )?;
     let persisted = temporary
         .persist(path)
         .map_err(|error| error.error)
         .with_context(|| format!("failed to persist {}", path.display()))?;
-    persisted.sync_all()?;
+    fault_point("syncing a renamed record")?;
+    sync_file(&persisted, path)?;
     sync_parent_directory(path)?;
     Ok(())
 }
 
+/// A fault at a boundary after the temporary file exists leaves that file behind, exactly
+/// as an abrupt stop would; ordinary errors still remove it when the handle drops.
+fn fault_point_keeping_temporary(
+    label: &str,
+    temporary: tempfile::NamedTempFile,
+) -> Result<tempfile::NamedTempFile> {
+    match fault_point(label) {
+        Ok(()) => Ok(temporary),
+        Err(error) => {
+            #[cfg(test)]
+            {
+                let _ = temporary.keep();
+            }
+            Err(error)
+        }
+    }
+}
+
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    fault_point("creating a private record file")?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
         .with_context(|| format!("failed to create {}", path.display()))?;
+    // The file now exists at its final path; a fault here leaves it empty, as a stop would.
+    fault_point("writing a private record's permissions and content")?;
     set_private_file_permissions(&file)?;
     file.write_all(bytes)?;
     file.flush()?;
-    file.sync_all()?;
+    fault_point("syncing a private record")?;
+    sync_file(&file, path)?;
     sync_parent_directory(path)?;
     Ok(())
 }
@@ -3173,14 +5129,26 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
         .with_context(|| format!("failed to sync state directory {}", parent.display()))
 }
 
-#[cfg(unix)]
 fn sync_directory(directory: &Path) -> Result<()> {
+    record_sync(SyncKind::Directory, directory);
+    #[cfg(test)]
+    if SYNC_FAILURES.with(|failures| failures.borrow().iter().any(|failed| failed == directory)) {
+        bail!("injected sync failure for {}", directory.display());
+    }
+    sync_directory_entries(directory)
+}
+
+#[cfg(unix)]
+fn sync_directory_entries(directory: &Path) -> Result<()> {
     File::open(directory)?.sync_all()?;
     Ok(())
 }
 
+// Windows flushes the directory's metadata through a handle opened with backup semantics.
+// NTFS journals directory entries, so this is a best-effort flush of the volume's cached
+// metadata rather than the POSIX guarantee that the entry itself reached stable storage.
 #[cfg(windows)]
-fn sync_directory(directory: &Path) -> Result<()> {
+fn sync_directory_entries(directory: &Path) -> Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
@@ -3192,8 +5160,10 @@ fn sync_directory(directory: &Path) -> Result<()> {
     Ok(())
 }
 
+// No supported transport exists on other targets; the directory entry is left to the
+// operating system's own write-back and the records are not claimed durable there.
 #[cfg(not(any(unix, windows)))]
-fn sync_directory(_directory: &Path) -> Result<()> {
+fn sync_directory_entries(_directory: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -3234,10 +5204,9 @@ fn update_status_locked(
 ) -> Result<()> {
     let status_path = directory.join("status.json");
     let closed_path = directory.join(CLOSED_STATUS_FILE);
+    // The tombstone is the close's commit point: every later write, whatever state it
+    // asks for, restores the tombstone unchanged and does not advance the generation.
     if let Some(closed) = read_status_if_present(&closed_path)? {
-        if state != "closed" {
-            return write_json_atomic(&status_path, &closed);
-        }
         return write_json_atomic(&status_path, &closed);
     }
     let current = read_status_if_present(&status_path)?;
@@ -3268,6 +5237,27 @@ fn update_status_locked(
     write_json_atomic(&status_path, &status)
 }
 
+/// The session status transition contract. A same-state write is always allowed (it
+/// refreshes the timestamp or error and still takes a new generation); every other write
+/// must appear in this table or `update_status` rejects it without advancing the
+/// generation. `exited`, `failed`, and `closed` are terminal except that the first two may
+/// still be closed; `closed` accepts nothing else. The one exception to the generation
+/// increment is the `closed.json` tombstone: once it exists, `update_status` no longer
+/// consults this table and rewrites `status.json` as a copy of the tombstone, so the
+/// tombstone's generation, timestamp, and error are preserved rather than advanced. The
+/// README section "권한과 세션 경계" carries the same table for operators.
+///
+/// | From                    | To                                                 |
+/// | ----------------------- | -------------------------------------------------- |
+/// | `launching`             | `running`, `awaiting-initial-input`, `failed`, `closed` |
+/// | `awaiting-initial-input`| `working`, `exited`, `failed`, `closed`            |
+/// | `running`               | `ready`, `exited`, `failed`, `closed`              |
+/// | `ready`                 | `claimed`, `exited`, `failed`, `closed`            |
+/// | `claimed`               | `working`, `ready`, `exited`, `failed`, `closed`   |
+/// | `working`               | `ready`, `exited`, `failed`, `closed`              |
+/// | `resume-pending`        | `working`, `ready`, `exited`, `failed`, `closed`   |
+/// | `exited`, `failed`      | `closed`                                           |
+/// | `closed`                | (none)                                             |
 fn valid_status_transition(current: &str, next: &str) -> bool {
     current == next
         || matches!(
@@ -3336,9 +5326,54 @@ impl TurnClaim {
         self.retained = true;
     }
 
+    // Releases the claim now and publishes `state` with `reason` in the same status write,
+    // under the lifecycle lock and only while the claim file still holds this token. Returns
+    // whether that write happened; a claim that another request already owns is left alone
+    // together with the status it published. Dropping the claim later does nothing more.
+    fn release_now_with_reason(&mut self, state: &str, reason: String) -> Result<bool> {
+        if self.retained {
+            return Ok(false);
+        }
+        self.retained = true;
+        rollback_turn_claim_token_with_error(&self.path, &self.token, state, Some(reason))
+    }
+
     fn retain(mut self) {
         self.retain_in_place();
     }
+}
+
+/// Compare-and-set status write on behalf of one turn: the status changes only while the
+/// claim named by `claim_token` is still the installed claim, checked and written under
+/// the turn-claim lifecycle lock. A writer whose turn has already been released or
+/// replaced is rejected with `Ok(false)` and leaves the status generation untouched.
+///
+/// Every status writer that reports about a specific turn (delivery failures, delivery
+/// uncertainty) goes through this helper; writers that report about the session as a
+/// whole (process exit, monitor failure, close) use `update_status` under their own
+/// guards.
+fn update_status_for_turn(
+    directory: &Path,
+    claim_token: &str,
+    state: &str,
+    error: Option<String>,
+) -> Result<bool> {
+    let claim_path = directory.join(TURN_CLAIM_FILE);
+    let _lock = lock_turn_claim(&claim_path)?;
+    update_status_for_turn_locked(directory, claim_token, state, error)
+}
+
+fn update_status_for_turn_locked(
+    directory: &Path,
+    claim_token: &str,
+    state: &str,
+    error: Option<String>,
+) -> Result<bool> {
+    if current_turn_claim_token(directory)?.as_deref() != Some(claim_token) {
+        return Ok(false);
+    }
+    update_status(directory, state, None, error)?;
+    Ok(true)
 }
 
 fn record_initial_prompt_delivery_failure(
@@ -3350,12 +5385,15 @@ fn record_initial_prompt_delivery_failure(
     let error = terminal_safe_text(&format!("{error:#}"), true);
     if delivery_started {
         claim.retain_in_place();
-        let _ = update_status(directory, "working", None, Some(error));
+        let _ = update_status_for_turn(directory, &claim.token, "working", Some(error));
     } else {
         let _ = update_status(directory, "failed", None, Some(error));
     }
 }
 
+// The send can outlive the turn: the target may complete the delivered turn and a later
+// tell may claim the session before this sender learns that its paste timed out. The
+// failure then belongs to a released turn and must not touch the current turn's status.
 fn record_follow_up_terminal_delivery_failure(
     directory: &Path,
     claim: &mut TurnClaim,
@@ -3364,28 +5402,24 @@ fn record_follow_up_terminal_delivery_failure(
     if failure.delivery_may_have_occurred() {
         claim.retain_in_place();
         let error = terminal_safe_text(&format!("{:#}", failure.error()), true);
-        let _ = update_status(directory, "working", None, Some(error));
+        let _ = update_status_for_turn(directory, &claim.token, "working", Some(error));
     }
 }
 
 // A turn that stays claimed looks like ordinary work from the state alone, so the status
 // keeps the reason until the target completes the turn or the session is closed. The target
 // can complete a delivered turn before its sender stops settling; the session status then
-// belongs to whichever turn holds the claim now, not to this report.
-fn record_follow_up_cross_session_delivery_uncertainty(
+// belongs to whichever turn holds the claim now, not to this report. The initial messenger
+// is no exception: on Windows the initial turn can complete and a later `tell` can install
+// a replacement claim before the initial messenger reports its uncertainty.
+fn record_cross_session_delivery_uncertainty(
     directory: &Path,
     claim: &mut TurnClaim,
     error: &anyhow::Error,
 ) {
     claim.retain_in_place();
-    let Ok(_lock) = lock_turn_claim(&claim.path) else {
-        return;
-    };
-    if !matches!(current_turn_claim_token(directory), Ok(Some(token)) if token == claim.token) {
-        return;
-    }
     let error = terminal_safe_text(&format!("{error:#}"), true);
-    let _ = update_status(directory, "working", None, Some(error));
+    let _ = update_status_for_turn(directory, &claim.token, "working", Some(error));
 }
 
 impl Drop for TurnClaim {
@@ -3401,32 +5435,80 @@ impl Drop for TurnClaim {
 }
 
 fn rollback_turn_claim_token(path: &Path, expected_token: &str, state: &str) -> Result<()> {
+    rollback_turn_claim_token_with_error(path, expected_token, state, None).map(|_| ())
+}
+
+// Under the lifecycle lock: the claim is removed and the status is rolled back to `state`
+// (carrying `error`) only while the claim file still holds `expected_token`. Returns
+// whether that happened. The reliability branch introduces `update_status_for_turn` for
+// claim-checked status writes; this helper is the equivalent for the rollback path.
+//
+// Merge reconciliation note: this must remain one lifecycle critical section that does the
+// ownership check, the status publication, and the claim removal under a single hold of the
+// lock. It is not a drop-in for `update_status_for_turn` followed by removal: that helper
+// takes the same lock (calling it from inside this section would lock recursively), and
+// calling the claim-checking helper after the removal would find no claim and report the
+// write as not owned. Keep all three steps here, under the one lock.
+fn rollback_turn_claim_token_with_error(
+    path: &Path,
+    expected_token: &str,
+    state: &str,
+    error: Option<String>,
+) -> Result<bool> {
     let _lock = lock_turn_claim(path)?;
     let current = match fs::read_to_string(path) {
         Ok(current) => current,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).context("failed to inspect native turn claim"),
+        Err(read_error) if read_error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false);
+        }
+        Err(read_error) => return Err(read_error).context("failed to inspect native turn claim"),
     };
     if current.trim() != expected_token {
-        return Ok(());
+        return Ok(false);
     }
     remove_turn_claim_locked(path)?;
     let directory = path
         .parent()
         .context("turn claim has no session directory")?;
-    update_status(directory, state, None, None)
+    update_status(directory, state, None, error)?;
+    Ok(true)
 }
 
+#[cfg(test)]
 fn acquire_turn_claim(directory: &Path) -> Result<TurnClaim> {
+    acquire_turn_claim_with_context(directory, &[])
+}
+
+// The receipt records the pinned context sources the caller already resolved.
+fn acquire_turn_claim_with_context(
+    directory: &Path,
+    context_sources: &[requests::ContextSource],
+) -> Result<TurnClaim> {
     let path = directory.join(TURN_CLAIM_FILE);
     let _lock = lock_turn_claim(&path)?;
-    create_turn_claim_locked(path)
+    create_turn_claim_locked(path, context_sources)
 }
 
+#[cfg(test)]
 fn acquire_ready_turn_claim(directory: &Path, session_id: &str) -> Result<(TurnClaim, usize)> {
     acquire_ready_turn_claim_after_claim(directory, session_id, || Ok(()))
 }
 
+fn acquire_ready_turn_claim_with_context(
+    directory: &Path,
+    session_id: &str,
+    context_sources: &[requests::ContextSource],
+) -> Result<(TurnClaim, usize)> {
+    acquire_ready_turn_claim_with_callbacks(
+        directory,
+        session_id,
+        || Ok(()),
+        || {},
+        context_sources,
+    )
+}
+
+#[cfg(test)]
 fn acquire_ready_turn_claim_after_claim<F>(
     directory: &Path,
     session_id: &str,
@@ -3435,7 +5517,7 @@ fn acquire_ready_turn_claim_after_claim<F>(
 where
     F: FnOnce() -> Result<()>,
 {
-    acquire_ready_turn_claim_with_callbacks(directory, session_id, after_claim, || {})
+    acquire_ready_turn_claim_with_callbacks(directory, session_id, after_claim, || {}, &[])
 }
 
 fn acquire_ready_turn_claim_with_callbacks<F, G>(
@@ -3443,6 +5525,7 @@ fn acquire_ready_turn_claim_with_callbacks<F, G>(
     session_id: &str,
     after_claim: F,
     before_publish: G,
+    context_sources: &[requests::ContextSource],
 ) -> Result<(TurnClaim, usize)>
 where
     F: FnOnce() -> Result<()>,
@@ -3459,7 +5542,7 @@ where
         if !session_accepts_prompt(&state) {
             bail!("session {session_id} is {state}; tell requires the ready state");
         }
-        create_turn_claim_locked(path.clone())?
+        create_turn_claim_locked(path.clone(), context_sources)?
     };
     if let Err(error) = after_claim() {
         let _lock = lock_turn_claim(&path)?;
@@ -3488,7 +5571,11 @@ where
     Ok((claim, baseline))
 }
 
-fn create_turn_claim_locked(path: PathBuf) -> Result<TurnClaim> {
+fn create_turn_claim_locked(
+    path: PathBuf,
+    context_sources: &[requests::ContextSource],
+) -> Result<TurnClaim> {
+    fault_point("creating the turn claim")?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -3503,12 +5590,12 @@ fn create_turn_claim_locked(path: PathBuf) -> Result<TurnClaim> {
     );
     writeln!(file, "{token}")?;
     file.flush()?;
-    file.sync_all()?;
+    sync_file(&file, &path)?;
     sync_parent_directory(&path)?;
     let directory = path
         .parent()
         .context("turn claim has no session directory")?;
-    let receipt = match requests::create(directory, &token) {
+    let receipt = match requests::create(directory, &token, context_sources) {
         Ok(receipt) => receipt,
         Err(error) => {
             let _ = remove_turn_claim_locked(&path);
@@ -3566,18 +5653,31 @@ fn recover_pending_completion(directory: &Path) -> Result<bool> {
     recover_pending_completion_locked(directory, &claim_path)
 }
 
+/// Converges every partial lifecycle transition that a stopped process can leave behind,
+/// under the turn-claim lifecycle lock. Returns whether any record changed.
+///
+/// Two transitions are journaled and therefore recoverable: a provider completion (journal
+/// -> event -> status -> claim release -> journal removal) and an explicit or repair close
+/// (tombstone -> status -> set aside an unverified event -> claim release -> journal
+/// removal). The `closed.json` tombstone is the durable commit point of a close: once it
+/// exists the session is closed even when the later cleanup steps never ran, so recovery
+/// finishes those steps instead of publishing. Both sequences release the claim before they
+/// remove the journal: while the claim is installed the journal is the only evidence that
+/// the event at its path is the provider's committed result, so no interruption may leave
+/// the claim without the journal. For the same reason both sequences sync `events/` before
+/// they discard the journal of an event that already matches it: the completion that wrote
+/// the event may have stopped between its rename and that sync.
 fn recover_pending_completion_locked(directory: &Path, claim_path: &Path) -> Result<bool> {
     let completion_path = directory.join(TURN_COMPLETION_FILE);
+    if let Some(tombstone) = read_status_if_present(&directory.join(CLOSED_STATUS_FILE))? {
+        return converge_interrupted_close_locked(directory, claim_path, &tombstone);
+    }
     let Some(text) = read_regular_text_if_present(&completion_path)? else {
         return Ok(false);
     };
     let pending: PendingTurnCompletion =
         serde_json::from_str(&text).context("invalid pending native turn completion")?;
     validate_pending_completion(&pending)?;
-    if directory.join(CLOSED_STATUS_FILE).is_file() {
-        remove_file_if_present(&completion_path)?;
-        return Ok(true);
-    }
 
     match fs::read_to_string(claim_path) {
         Ok(current) if current.trim() == pending.claim_token => {
@@ -3594,21 +5694,299 @@ fn recover_pending_completion_locked(directory: &Path, claim_path: &Path) -> Res
         }
         Ok(_) => bail!("pending native completion belongs to a different turn claim"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let event_path = directory.join("events").join(&pending.event_file);
-            let stored: SessionEvent = read_json(&event_path)
-                .context("claim-free pending completion has no committed event")?;
-            if stored != pending.event {
-                bail!("claim-free pending completion event does not match its journal")
+            // The same byte-match predicate every other lifecycle path uses: a semantically
+            // equal event stored in another encoding is not the journal's committed write.
+            match journaled_event_state(directory, &pending)? {
+                JournaledEventState::Committed => (),
+                JournaledEventState::Absent => {
+                    bail!("claim-free pending completion has no committed event")
+                }
+                JournaledEventState::Mismatched | JournaledEventState::Oversized(_) => {
+                    bail!("claim-free pending completion event does not match its journal")
+                }
             }
             let status: SessionStatus = read_json(&directory.join("status.json"))?;
             if status.state != pending.status_state || status.error != pending.status_error {
                 bail!("claim-free pending completion has no matching terminal status")
             }
+            // The claim is released only after the event's directory was synced, but the
+            // journal is the last evidence of the result, so its removal is preceded by
+            // the same barrier regardless of which run released the claim.
+            sync_committed_event_directory(directory)?;
             remove_file_if_present(&completion_path)?;
             Ok(true)
         }
         Err(error) => Err(error).context("failed to inspect pending completion turn claim"),
     }
+}
+
+// Finishes a close whose tombstone was written but whose later cleanup steps did not run.
+// The tombstone is preserved unchanged: status.json is rewritten from it (update_status
+// copies the tombstone whenever one exists), and the turn claim, the journal, and the
+// legacy resume markers are removed in the same order the uninterrupted close uses. A
+// journaled completion is settled exactly as that close settles it: an event it already
+// wrote stays published when it matches the journal, is set aside when it does not, and a
+// journal without an event is discarded.
+fn converge_interrupted_close_locked(
+    directory: &Path,
+    claim_path: &Path,
+    tombstone: &SessionStatus,
+) -> Result<bool> {
+    let mut changed = false;
+    let status_path = directory.join("status.json");
+    let status_matches = read_status_if_present(&status_path)?.is_some_and(|status| {
+        status.state == tombstone.state
+            && status.generation == tombstone.generation
+            && status.error == tombstone.error
+    });
+    if !status_matches {
+        update_status(directory, "closed", None, tombstone.error.clone())?;
+        changed = true;
+    }
+    let completion_path = directory.join(TURN_COMPLETION_FILE);
+    if completion_path.exists() {
+        set_aside_unverified_completion_event_for_close(directory)?;
+        changed = true;
+    }
+    if claim_path.exists() {
+        remove_turn_claim_locked(claim_path)?;
+        changed = true;
+    }
+    remove_file_if_present(&completion_path)?;
+    for name in [LEGACY_RESUME_PENDING_FILE, LEGACY_RESUME_RUNNING_FILE] {
+        let path = directory.join(name);
+        if path.exists() {
+            remove_file_if_present(&path)?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+/// Largest event the publication predicate compares with its journal. It bounds only that
+/// comparison: a larger journaled event is never read for a verdict and never published,
+/// and the size policy at journal creation keeps new completions under it. It is the byte
+/// budget of a whole `search`, so a search can afford at most one such comparison. It
+/// does not bound the read of an ordinary, non-journaled event by `result`, `inspect`, or
+/// `--context-result`; only a search bounds those reads, with its byte budget.
+const EVENT_READ_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// How the file at a journal's event path relates to the journal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JournaledEventState {
+    /// No event file exists at the journal's event path: nothing was published.
+    Absent,
+    /// The event file holds exactly the bytes the journal would write, so it is the
+    /// provider result under its receipt's immutable event name. Byte equality alone does
+    /// not make it durable: the completion that wrote it may have stopped between the
+    /// rename and the sync of `events/`, so every lifecycle path syncs `events/` before it
+    /// discards the journal of a committed event (`sync_committed_event_directory`).
+    Committed,
+    /// A different record occupies the journal's event path.
+    Mismatched,
+    /// The file at the journal's event path is larger than the caller's read limit (its
+    /// size in bytes), so it was not compared and is never treated as published.
+    Oversized(u64),
+}
+
+/// The publication predicate's verdict together with what it cost: the bytes it read, and
+/// the stored text when they are the journal's, so a budgeted caller can charge the read
+/// once and search the record without reading it again.
+struct JournaledEventRead {
+    state: JournaledEventState,
+    bytes_read: u64,
+    committed_text: Option<String>,
+}
+
+/// The single byte-match predicate: a journaled event is committed exactly when its file
+/// holds the bytes the journal would write. Every lifecycle path (completion recovery,
+/// claim-free recovery, close, interrupted close) and every read-only query decide
+/// publication with this comparison.
+fn journaled_event_state(
+    directory: &Path,
+    pending: &PendingTurnCompletion,
+) -> Result<JournaledEventState> {
+    Ok(journaled_event_state_within(directory, pending, EVENT_READ_LIMIT)?.state)
+}
+
+/// [`journaled_event_state`] that reads at most `limit + 1` bytes of the event. The size
+/// is checked before the file is opened, and a file that grows under the read is still
+/// reported as oversized: the read is cut after `limit + 1` bytes, and that one extra byte
+/// is what detects the overflow, so a caller charging a byte budget may see one byte more
+/// than `limit` in `bytes_read`. The `events` directory is validated before anything under
+/// it is opened, so a link planted there is never followed by a publication read.
+fn journaled_event_state_within(
+    directory: &Path,
+    pending: &PendingTurnCompletion,
+    limit: u64,
+) -> Result<JournaledEventRead> {
+    use std::io::Read as _;
+    require_events_directory(directory)?;
+    let path = directory.join("events").join(&pending.event_file);
+    let outcome = |state, bytes_read, committed_text| JournaledEventRead {
+        state,
+        bytes_read,
+        committed_text,
+    };
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(outcome(JournaledEventState::Absent, 0, None));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("refusing non-regular session file: {}", path.display());
+    }
+    if metadata.len() > limit {
+        return Ok(outcome(
+            JournaledEventState::Oversized(metadata.len()),
+            0,
+            None,
+        ));
+    }
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(outcome(JournaledEventState::Absent, 0, None));
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    record_publication_read(&path);
+    let mut stored = Vec::with_capacity(metadata.len() as usize);
+    file.take(limit + 1)
+        .read_to_end(&mut stored)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes_read = stored.len() as u64;
+    if bytes_read > limit {
+        return Ok(outcome(
+            JournaledEventState::Oversized(bytes_read),
+            bytes_read,
+            None,
+        ));
+    }
+    Ok(if stored == serde_json::to_vec_pretty(&pending.event)? {
+        // The journal's bytes are canonical JSON, so the stored text is valid UTF-8.
+        let text = String::from_utf8_lossy(&stored).into_owned();
+        outcome(JournaledEventState::Committed, bytes_read, Some(text))
+    } else {
+        outcome(JournaledEventState::Mismatched, bytes_read, None)
+    })
+}
+
+/// What stands at a session's `events` path when it is safe to say anything about it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventsDirectory {
+    /// A real directory inside the session directory.
+    Present,
+    /// Nothing at all: the session holds no event record.
+    Missing,
+}
+
+/// Inspects a session's `events` path with `symlink_metadata`, so a symlink or Windows
+/// junction is rejected rather than followed, as is a non-directory file or an unreadable
+/// entry. A missing path is reported, not rejected: readers and lifecycle steps decide
+/// what an absent directory means for them.
+fn events_directory_state(directory: &Path) -> Result<EventsDirectory> {
+    let events = directory.join("events");
+    match fs::symlink_metadata(&events) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("events directory is a symlink")
+        }
+        Ok(metadata) if !metadata.is_dir() => bail!("events is not a directory"),
+        Ok(_) => Ok(EventsDirectory::Present),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(EventsDirectory::Missing),
+        Err(error) => bail!("events directory is unreadable: {error}"),
+    }
+}
+
+/// A session's `events` must be a real directory inside the session directory before any
+/// record under it is opened: the shared event listing turns a missing or non-directory
+/// `events` path into an empty list, a search must not present that damage as "no
+/// results", and a link planted there would carry a publication read outside the state
+/// root. Built on [`events_directory_state`], so a link is rejected rather than followed.
+fn require_events_directory(directory: &Path) -> Result<()> {
+    match events_directory_state(directory)? {
+        EventsDirectory::Present => Ok(()),
+        EventsDirectory::Missing => bail!("events directory is missing"),
+    }
+}
+
+/// The first settlement step of a close that finds a completion journal in place. The
+/// tombstone is the close's commit point, but an event the interrupted completion already
+/// wrote is the provider's authoritative result: when it matches the journal byte for byte
+/// it stays published (the receipt already maps the request to it), and when it does not
+/// match, or is too large to compare, it is moved aside under an `unpublished-` name that
+/// no query reads. A journal whose event was never written needs no step here and is
+/// discarded when the close removes the journal; a session whose `events` directory is
+/// missing altogether holds no event to verify and settles the same way, so a close is
+/// never left permanently unsettled by that damage. A link or a non-directory at `events`
+/// is still rejected, and the journal then stays in place with the claim. The move is
+/// idempotent, so an interrupted close converges on the next run.
+///
+/// The close removes the journal only after this step and after the turn claim is
+/// released: while the claim is installed, the journal is the evidence that the event at
+/// its path is the committed result, so an interruption before claim release would
+/// otherwise hide a published result until the next recovery. The journal is also the
+/// only evidence that a set-aside event was unverified, so the move is made durable
+/// before the journal can be discarded: the rename syncs `events/` itself, and a run that
+/// finds the event already moved aside by an interrupted close, which may have stopped
+/// between the rename and that sync, syncs `events/` again before it returns. A committed
+/// event gets the same barrier: the completion that wrote it may have stopped between its
+/// rename and the sync of `events/`, so the close syncs the directory before the journal,
+/// the only proof that the entry is the result, is removed.
+fn set_aside_unverified_completion_event_for_close(directory: &Path) -> Result<()> {
+    let completion_path = directory.join(TURN_COMPLETION_FILE);
+    let Some(text) = read_regular_text_if_present(&completion_path)? else {
+        return Ok(());
+    };
+    if events_directory_state(directory)? == EventsDirectory::Missing {
+        return Ok(());
+    }
+    let Ok(pending) = serde_json::from_str::<PendingTurnCompletion>(&text) else {
+        return Ok(());
+    };
+    if validate_pending_completion(&pending).is_err() {
+        return Ok(());
+    }
+    let events = directory.join("events");
+    let set_aside = events.join(format!("{UNPUBLISHED_EVENT_PREFIX}{}", pending.event_file));
+    match journaled_event_state(directory, &pending)? {
+        JournaledEventState::Mismatched | JournaledEventState::Oversized(_) => {
+            rename_session_file(&events.join(&pending.event_file), &set_aside).context(
+                "failed to set aside a completion event that disagrees with its journal",
+            )?;
+        }
+        JournaledEventState::Absent => {
+            if fs::symlink_metadata(&set_aside).is_ok() {
+                fault_point("syncing a set-aside completion event's directory")?;
+                sync_directory(&events).with_context(|| {
+                    format!("failed to sync state directory {}", events.display())
+                })?;
+            }
+        }
+        JournaledEventState::Committed => sync_committed_event_directory(directory)?,
+    }
+    Ok(())
+}
+
+/// Makes a committed event's directory entry durable before the journal that proves the
+/// event is the provider's result can be discarded. A completion that stopped between the
+/// event's rename and the sync of `events/` leaves the entry unsynced while the journal
+/// still exists; every lifecycle path that discards the journal of a committed event
+/// (completion recovery, claim-free recovery, close, interrupted close) syncs `events/`
+/// first, so a later crash cannot lose the event together with its evidence. The sync is
+/// idempotent when the completion already made the entry durable, and it is a fault
+/// boundary like every other sync that follows a rename.
+fn sync_committed_event_directory(directory: &Path) -> Result<()> {
+    fault_point("syncing a committed completion event's directory")?;
+    let events = directory.join("events");
+    sync_directory(&events)
+        .with_context(|| format!("failed to sync state directory {}", events.display()))
 }
 
 fn validate_pending_completion(pending: &PendingTurnCompletion) -> Result<()> {
@@ -3629,15 +6007,35 @@ fn validate_pending_completion(pending: &PendingTurnCompletion) -> Result<()> {
 
 fn write_pending_completion_event(directory: &Path, pending: &PendingTurnCompletion) -> Result<()> {
     validate_pending_completion(pending)?;
-    let path = directory.join("events").join(&pending.event_file);
-    if path.exists() {
-        let stored: SessionEvent = read_json(&path)?;
-        if stored != pending.event {
+    match journaled_event_state(directory, pending)? {
+        // The completion that wrote this event may have stopped between its rename and
+        // the sync of `events/`; the journal is discarded once this returns, so the
+        // entry is made durable here.
+        JournaledEventState::Committed => sync_committed_event_directory(directory),
+        JournaledEventState::Mismatched => {
             bail!("pending native completion event file contains different data")
         }
-        return Ok(());
+        JournaledEventState::Oversized(size) => {
+            bail!(
+                "pending native completion event file is {size} bytes, over the {EVENT_READ_LIMIT} byte read limit"
+            )
+        }
+        JournaledEventState::Absent => {
+            // The same size policy the journal was created under, re-checked for a
+            // journal an earlier version wrote: an event the predicate could never compare
+            // is not written, so the absent and present orders settle the same way.
+            let size = serde_json::to_vec_pretty(&pending.event)?.len() as u64;
+            if size > EVENT_READ_LIMIT {
+                bail!(
+                    "pending native completion event is {size} bytes, over the {EVENT_READ_LIMIT} byte read limit"
+                )
+            }
+            write_json_atomic(
+                &directory.join("events").join(&pending.event_file),
+                &pending.event,
+            )
+        }
     }
-    write_json_atomic(&path, &pending.event)
 }
 
 fn mark_session_closed(directory: &Path, error: Option<String>) -> Result<()> {
@@ -3660,11 +6058,22 @@ fn mark_session_closed_locked(
     };
     let status_result = update_status(directory, "closed", None, error);
     let (pending_result, running_result, claim_result) = if status_result.is_ok() {
-        (
+        // An event the journal disagrees with is set aside first, then the claim is
+        // released, and only then is the journal removed: every interruption of this order
+        // leaves a state in which a committed event stays published and an unverified one
+        // stays hidden. The journal is kept whenever an earlier step failed.
+        let claim_result = set_aside_unverified_completion_event_for_close(directory)
+            .and_then(|()| remove_turn_claim_locked(claim_path));
+        let pending_result = if claim_result.is_ok() {
             remove_file_if_present(&directory.join(TURN_COMPLETION_FILE))
-                .and_then(|_| remove_file_if_present(&directory.join(LEGACY_RESUME_PENDING_FILE))),
+        } else {
+            Ok(())
+        }
+        .and_then(|()| remove_file_if_present(&directory.join(LEGACY_RESUME_PENDING_FILE)));
+        (
+            pending_result,
             remove_file_if_present(&directory.join(LEGACY_RESUME_RUNNING_FILE)),
-            remove_turn_claim_locked(claim_path),
+            claim_result,
         )
     } else {
         (Ok(()), Ok(()), Ok(()))
@@ -3689,7 +6098,18 @@ where
 {
     #[cfg(not(windows))]
     let _ = &mut close_terminal;
-    recover_pending_completion(directory)?;
+    // Completion recovery runs first so a live owner's finished turn is published before
+    // anything else is decided. Its failure is damage (a missing `events/`, a journal
+    // whose event cannot be compared), not a reason to leave a dead owner's session
+    // installed forever: the owner check still runs, a dead owner's session is closed as
+    // it would be without the damage (the close settles the journal without publishing),
+    // and the damage is reported in the close error. Under a live owner, or when the
+    // owner cannot be shown dead, the damage is the result.
+    let recovery_damage = recover_pending_completion(directory).err();
+    let untouched = |damage: Option<anyhow::Error>| match damage {
+        Some(error) => Err(error),
+        None => Ok(false),
+    };
     let status: SessionStatus = read_json(&directory.join("status.json"))?;
     if !matches!(
         status.state.as_str(),
@@ -3703,39 +6123,53 @@ where
             | "exited"
             | "failed"
     ) {
-        return Ok(false);
+        return untouched(recovery_damage);
     }
     let owner_path = directory.join(SESSION_OWNER_FILE);
     let owner = match fs::read_to_string(&owner_path) {
         Ok(text) => serde_json::from_str::<NativeSessionOwner>(&text)
             .with_context(|| format!("invalid JSON in {}", owner_path.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return untouched(recovery_damage);
+        }
         Err(error) => {
             return Err(error).with_context(|| format!("failed to read {}", owner_path.display()));
         }
     };
     #[cfg(windows)]
-    if let Some(identity) = &owner.windows_process_identity
-        && terminal::verify_windows_process_identity(owner.pid, identity).is_ok()
-    {
-        return Ok(false);
+    match &owner.windows_process_identity {
+        Some(identity) => {
+            if terminal::verify_windows_process_identity(owner.pid, identity).is_ok() {
+                return untouched(recovery_damage);
+            }
+        }
+        // Pre-identity (v0.0.2) Windows owner records carry only a PID. Their identity is
+        // unknown, not dead: while the PID is alive the session is left alone and inspect
+        // reports `identity_matches: null`; only a dead PID lets repair proceed.
+        None => {
+            if process_is_alive(owner.pid) {
+                return untouched(recovery_damage);
+            }
+        }
     }
     #[cfg(target_os = "macos")]
     if mac_native_owner_is_live(&owner)? {
-        return Ok(false);
+        return untouched(recovery_damage);
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
     if process_is_alive(owner.pid) {
-        return Ok(false);
+        return untouched(recovery_damage);
     }
+    let mut repair_error = status
+        .error
+        .clone()
+        .unwrap_or_else(|| format!("native session process {} is no longer running", owner.pid));
+    if let Some(damage) = &recovery_damage {
+        repair_error = format!("{repair_error}; completion recovery failed: {damage:#}");
+    }
+    let repair_error = Some(repair_error);
     #[cfg(windows)]
     {
-        let repair_error = status.error.clone().or_else(|| {
-            Some(format!(
-                "native session process {} is no longer running",
-                owner.pid
-            ))
-        });
         if matches!(status.state.as_str(), "exited" | "failed") {
             mark_session_closed(directory, repair_error)?;
             return Ok(true);
@@ -3754,15 +6188,7 @@ where
     }
     #[cfg(not(windows))]
     {
-        mark_session_closed(
-            directory,
-            status.error.or_else(|| {
-                Some(format!(
-                    "native session process {} is no longer running",
-                    owner.pid
-                ))
-            }),
-        )?;
+        mark_session_closed(directory, repair_error)?;
         Ok(true)
     }
 }
@@ -3998,6 +6424,10 @@ fn check_provider_version_until(
 ) -> Result<String> {
     let mut command = provider_version_command(executable)?;
     command.arg("--version");
+    provider::apply_environment_removals(
+        &mut command,
+        provider::probe_environment_removals(provider),
+    );
     let label = format!("{} --version", executable.display());
     let output = match deadline {
         Some(deadline) => command_output_until(&mut command, deadline, &label),

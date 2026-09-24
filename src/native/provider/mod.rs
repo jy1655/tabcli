@@ -26,6 +26,42 @@ pub(super) struct LaunchPlan {
     pub(super) arguments: Vec<OsString>,
     pub(super) prompt_is_positional: bool,
     pub(super) completion_monitor: CompletionMonitor,
+    // Caller environment variables the adapter refuses to pass to its provider process.
+    // Each adapter owns this list; the shared launcher only applies it.
+    pub(super) environment_removals: &'static [&'static str],
+}
+
+// Launch inputs for a session that continues a closed session's provider conversation.
+// The provider conversation identity comes from the closed session's recorded event; the
+// directory is the new session's own private state, never the source's.
+pub(super) struct ResumeContext<'a> {
+    pub(super) bridge_executable: &'a Path,
+    pub(super) directory: &'a Path,
+    pub(super) provider_session_id: &'a str,
+}
+
+// The provider arguments that reopen a conversation. A resume plan never carries an initial
+// prompt: the reopened session receives it through the provider's initial-prompt transport,
+// exactly as a fresh `ask` does, so the same delivery evidence applies.
+#[derive(Debug)]
+pub(super) struct ResumePlan {
+    pub(super) arguments: Vec<OsString>,
+    pub(super) completion_monitor: CompletionMonitor,
+    pub(super) environment_removals: &'static [&'static str],
+}
+
+// A reopened session whose provider process is running. `directory` is the new session's
+// own state. With `wait_for_registration` the adapter waits until `deadline` for the
+// provider's own registration of that process (the post-launch check, before the initial
+// prompt exists in the process); without it the adapter answers from the registry as it is
+// now and treats a missing registration as a failure (the re-scan immediately before the
+// initial prompt and before every follow-up delivery).
+#[derive(Clone, Copy)]
+pub(super) struct ResumedSessionContext<'a> {
+    pub(super) directory: &'a Path,
+    pub(super) provider_session_id: &'a str,
+    pub(super) deadline: Instant,
+    pub(super) wait_for_registration: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -103,6 +139,7 @@ impl CrossSessionMessageFailure {
 
 pub(super) type CrossSessionMessageResult = std::result::Result<(), CrossSessionMessageFailure>;
 
+#[derive(Debug)]
 pub(super) enum CompletionMonitor {
     Hook,
     AgyTranscript { log_path: PathBuf },
@@ -169,7 +206,29 @@ impl FollowUpTransport {
 
 trait NativeProviderAdapter: Sync {
     fn diagnose(&self, context: super::doctor::Context<'_>) -> Vec<super::doctor::Check>;
+    // Caller-environment variables removed from every short-lived provider query the
+    // bridge runs (version preflight, doctor probes). Each adapter states its own list;
+    // there is no shared default.
+    fn probe_environment_removals(&self) -> &'static [&'static str];
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan>;
+    // Read-only reopen gate. Each adapter states whether the recorded provider conversation
+    // can be continued in a new process on this platform and whether the provider's own
+    // ownership evidence shows the conversation is still held by a live process. There is no
+    // shared default: an adapter that cannot prove ownership must refuse with its reason.
+    fn verify_reopen_available(&self, provider_session_id: &str) -> Result<()>;
+    fn prepare_resume(&self, context: ResumeContext<'_>) -> Result<ResumePlan>;
+    // Ownership check for a reopened session, run after launch and again at every delivery
+    // boundary. Once the provider's own evidence shows the new process registered as the
+    // conversation's holder, the adapter reports every OTHER live process that holds the
+    // same conversation. A non-empty answer is a conflict the shared layer refuses the
+    // delivery for; an error is a verification failure the shared layer also refuses for,
+    // because an unverifiable conversation is treated as shared. This is best-effort
+    // detection at each call, not exclusion. An adapter that refuses reopen refuses here as
+    // well, because this call is only reachable after its resume plan ran.
+    fn other_resumed_conversation_holders(
+        &self,
+        context: ResumedSessionContext<'_>,
+    ) -> Result<Vec<u32>>;
     fn initial_prompt_transport(&self) -> InitialPromptTransport;
     fn initial_prompt_ready_delay(&self) -> Duration;
     fn send_initial_prompt(
@@ -225,6 +284,48 @@ pub(super) fn prepare_launch(
     context: LaunchContext<'_>,
 ) -> Result<LaunchPlan> {
     adapter(provider).prepare_launch(context)
+}
+
+pub(super) fn verify_reopen_available(
+    provider: FirstPartyCli,
+    provider_session_id: &str,
+) -> Result<()> {
+    adapter(provider).verify_reopen_available(provider_session_id)
+}
+
+pub(super) fn probe_environment_removals(provider: FirstPartyCli) -> &'static [&'static str] {
+    adapter(provider).probe_environment_removals()
+}
+
+pub(super) fn prepare_resume(
+    provider: FirstPartyCli,
+    context: ResumeContext<'_>,
+) -> Result<ResumePlan> {
+    adapter(provider).prepare_resume(context)
+}
+
+pub(super) fn other_resumed_conversation_holders(
+    provider: FirstPartyCli,
+    context: ResumedSessionContext<'_>,
+) -> Result<Vec<u32>> {
+    adapter(provider).other_resumed_conversation_holders(context)
+}
+
+// Points the Claude adapter's session-registry reads at a fixture for the calling thread,
+// so a launch-boundary test can mutate the registry between the reopen gates without
+// touching the real `~/.claude/sessions`.
+#[cfg(test)]
+pub(super) fn override_claude_session_registry_for_test(registry: Option<PathBuf>) {
+    claude::override_session_registry_for_test(registry);
+}
+
+// Applies an adapter's caller-environment removals to a provider process before it
+// starts. Removal is recorded on the command itself so a test can prove the variable
+// never reaches the child without spawning it.
+pub(super) fn apply_environment_removals(command: &mut std::process::Command, removals: &[&str]) {
+    for variable in removals {
+        command.env_remove(variable);
+    }
 }
 
 pub(super) fn follow_up_transport(provider: FirstPartyCli) -> FollowUpTransport {
@@ -342,4 +443,28 @@ pub(super) fn cancel_terminal_follow_up(
     claim_token: &str,
 ) -> Result<()> {
     adapter(provider).cancel_terminal_follow_up(directory, claim_token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_removals_are_recorded_on_the_command_before_spawn() {
+        let mut command = std::process::Command::new("provider");
+        command.env("CLAUDE_CODE_CHILD_SESSION", "1");
+        apply_environment_removals(&mut command, &["CLAUDE_CODE_CHILD_SESSION", "CLAUDECODE"]);
+        let removed = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            removed,
+            vec![
+                std::ffi::OsString::from("CLAUDECODE"),
+                std::ffi::OsString::from("CLAUDE_CODE_CHILD_SESSION"),
+            ]
+        );
+    }
 }

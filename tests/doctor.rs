@@ -47,6 +47,20 @@ impl Fixture {
             .unwrap()
     }
 
+    fn run_with_env(&self, args: &[&str], env: &[(&str, Option<&str>)]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-bridge"));
+        command
+            .args(args)
+            .env("AGENT_BRIDGE_NATIVE_STATE_DIR", self.root.path());
+        for (key, value) in env {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+        command.output().unwrap()
+    }
+
     fn doctor(&self) -> Value {
         report(self.run(&["doctor", "session-doctor", "--json"]))
     }
@@ -465,4 +479,210 @@ fn legacy_iterm_handle_uses_the_existing_binding_contract() {
         "terminal_record_found"
     );
     assert_eq!(check(&fixture.doctor(), "owner")["availability"], "unknown");
+}
+
+#[test]
+fn claude_doctor_reports_inherited_claude_code_session_markers_without_changing_files() {
+    let fixture = Fixture::new("claude");
+    let before = files(fixture.root.path());
+    // The test process itself may run inside a Claude Code session, so every marker is
+    // cleared first and only the two under test are reintroduced.
+    const MARKERS: [&str; 10] = [
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDECODE",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_PID",
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+        "CLAUDE_CODE_SESSION_ATTENDED",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_EXECPATH",
+        "CLAUDE_EFFORT",
+    ];
+    let cleared = MARKERS.map(|marker| (marker, None));
+    let mut inside_env = cleared.to_vec();
+    inside_env.extend([
+        ("CLAUDE_CODE_CHILD_SESSION", Some("1")),
+        ("CLAUDECODE", Some("1")),
+    ]);
+    let inside = report(fixture.run_with_env(&["doctor", "session-doctor", "--json"], &inside_env));
+    let markers = check(&inside, "claude_caller_markers");
+    assert_eq!(markers["availability"], "available");
+    assert_eq!(
+        markers["reason_code"],
+        "claude_caller_markers_removed_at_launch"
+    );
+    assert_eq!(
+        markers["evidence"]["inherited"],
+        json!(["CLAUDE_CODE_CHILD_SESSION", "CLAUDECODE"])
+    );
+
+    let outside = report(fixture.run_with_env(&["doctor", "session-doctor", "--json"], &cleared));
+    assert_eq!(
+        check(&outside, "claude_caller_markers")["reason_code"],
+        "claude_caller_markers_absent"
+    );
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[test]
+fn reopen_marker_is_reported_with_its_release_condition_without_writes() {
+    let fixture = Fixture::new("claude");
+    let refused = fixture.root.path().join("session-reopened");
+    fs::create_dir(&refused).unwrap();
+    write(
+        &refused.join("status.json"),
+        &json!({"state":"failed", "generation":3, "updated_unix_ms":3, "exit_code":null,
+            "error":"reopen refused (reopen-conflict): held by pid 4242"}),
+    );
+    let marker = |reopened_by: Value| {
+        write(
+            &fixture.directory.join("reopen.marker.json"),
+            &json!({"schema":1, "claim":"1-2-3",
+                "provider_session_id":"6928ca1c-1234-4abc-8def-0123456789ab",
+                "reopened_by":reopened_by, "created_unix_ms":1}),
+        );
+    };
+    let refusal = |gate: &str, cleanup: Option<&str>| {
+        write(
+            &refused.join("reopen.refusal.json"),
+            &json!({"schema":2, "phase":"launch", "gate":gate,
+                "detail":"detected; no prompt was delivered", "created_unix_ms":2,
+                "cleanup":cleanup, "cleanup_detail":cleanup.map(|_| "no owner record")}),
+        );
+    };
+    let observe = |reason: &str, availability: &str| -> Value {
+        let before = files(fixture.root.path());
+        let value = fixture.doctor();
+        assert_eq!(files(fixture.root.path()), before, "{reason}");
+        let check = check(&value, "reopen_marker");
+        assert_eq!(check["reason_code"], reason, "{check}");
+        assert_eq!(check["availability"], availability, "{check}");
+        check.clone()
+    };
+    assert!(
+        fixture.doctor()["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| check["id"] != "reopen_marker"),
+        "a session without a marker has no marker check"
+    );
+    marker(Value::Null);
+    observe("reopen_in_progress", "unavailable");
+    marker(json!("session-reopened"));
+    let consumed = observe("reopen_marker_consumed", "unavailable");
+    assert_eq!(consumed["evidence"]["reopened_by"], "session-reopened");
+    assert_eq!(consumed["evidence"]["gate"], Value::Null);
+    refusal("reopen-conflict", Some("pending"));
+    let retained = observe("reopen_marker_retained", "unavailable");
+    assert_eq!(retained["evidence"]["gate"], "reopen-conflict");
+    assert_eq!(retained["evidence"]["recorded_cleanup"], "pending");
+    assert!(
+        retained["evidence"]["cleanup"]
+            .as_str()
+            .unwrap()
+            .contains("no provider process record"),
+        "{retained}"
+    );
+    assert!(
+        retained["detail"]
+            .as_str()
+            .unwrap()
+            .contains("until the provider process of session-reopened is verified gone"),
+        "{retained}"
+    );
+    // A dead launch wrapper and a closed surface are not evidence while the recorded
+    // provider process (this test process stands in for it) is still running.
+    write(
+        &refused.join("native-session.json"),
+        &json!({"pid":0, "managed_session_id":"session-reopened"}),
+    );
+    write(
+        &refused.join("status.json"),
+        &json!({"state":"closed", "generation":4, "updated_unix_ms":4, "exit_code":null,
+            "error":"reopen refused (reopen-conflict): held by pid 4242"}),
+    );
+    write(
+        &refused.join("closed.json"),
+        &json!({"state":"closed", "generation":4, "updated_unix_ms":4, "exit_code":null,
+            "error":null}),
+    );
+    write(
+        &refused.join("terminal.closed.json"),
+        &json!({"consumed":true}),
+    );
+    let provider_record = |pid: u32| {
+        write(
+            &refused.join("provider-process.json"),
+            &json!({"schema":1, "managed_session_id":"session-reopened", "pid":pid,
+                "spawned_unix_ms":2}),
+        );
+    };
+    provider_record(std::process::id());
+    let retained = observe("reopen_marker_retained", "unavailable");
+    assert_eq!(
+        retained["evidence"]["cleanup"],
+        format!(
+            "the refused launch may still hold the conversation: provider process {} of refused session session-reopened is still running",
+            std::process::id()
+        )
+    );
+    provider_record(0);
+    let reconcilable = observe("reopen_marker_reconcilable", "available");
+    assert_eq!(
+        reconcilable["evidence"]["cleanup"],
+        "provider process 0 is verified gone (it has exited) and the refused session's surface was closed"
+    );
+    fs::remove_file(refused.join("provider-process.json")).unwrap();
+    fs::remove_file(refused.join("native-session.json")).unwrap();
+    refusal("provider-unsupported", None);
+    let reconcilable = observe("reopen_marker_reconcilable", "available");
+    assert_eq!(
+        reconcilable["evidence"]["cleanup"],
+        "no provider process was spawned"
+    );
+    assert_eq!(reconcilable["evidence"]["recorded_cleanup"], Value::Null);
+    fs::write(fixture.directory.join("reopen.marker.json"), "not json").unwrap();
+    observe("reopen_marker_unreadable", "unknown");
+}
+
+// A probe is a bridge-run provider process like any other: the adapter's removal list is
+// applied to it, so a `claude --version` started from inside Claude Code does not carry
+// the caller's session markers, while a Codex probe (empty list) inherits its caller's
+// environment unchanged (Codex review of PR #44).
+#[cfg(unix)]
+#[test]
+fn version_probes_drop_the_adapters_environment_removals() {
+    use std::os::unix::fs::PermissionsExt;
+    for (provider, expected_version, expected_reason) in [
+        ("claude", "2.1.281 (Claude Code)", "version_supported"),
+        (
+            "codex",
+            "nested CLAUDE_CODE_CHILD_SESSION=1",
+            "version_unrecognized",
+        ),
+    ] {
+        let fixture = Fixture::new(provider);
+        let executable = fixture.root.path().join("provider");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nif [ -n \"$CLAUDE_CODE_CHILD_SESSION\" ]; then echo \"nested CLAUDE_CODE_CHILD_SESSION=$CLAUDE_CODE_CHILD_SESSION\"; else echo '2.1.281 (Claude Code)'; fi\n",
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let report = report(fixture.run_with_env(
+            &["doctor", "session-doctor", "--probe", "--json"],
+            &[("CLAUDE_CODE_CHILD_SESSION", Some("1"))],
+        ));
+        let version = check(&report, "provider_version");
+        assert_eq!(
+            version["evidence"]["current_version"], expected_version,
+            "{provider}: {version}"
+        );
+        assert_eq!(
+            version["reason_code"], expected_reason,
+            "{provider}: {version}"
+        );
+    }
 }

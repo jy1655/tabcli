@@ -20,13 +20,19 @@ fn help_text() -> String {
 Usage:
   agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]
       [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|windows-console>]
-      [--yolo] [--timeout-secs N] [--detach] [--json]
+      [--yolo] [--timeout-secs N] [--detach] [--json] [--context-result <session>/<request-id>]...
   agent-bridge tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
+      [--context-result <session>/<request-id>]...
+  agent-bridge reopen <closed-session> (--prompt TEXT | --prompt-file PATH) [--title NAME]
+      [--model MODEL] [--effort EFFORT] [--terminal <windows-console>] [--yolo] [--timeout-secs N]
+      [--detach] [--json]
   agent-bridge sessions [--workspace PATH] [--provider <codex|claude|agy|pi>] [--state STATE]
       [--sort <id|updated>] [--json]
   agent-bridge inspect <session> [--json]
   agent-bridge result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
       [--wait --timeout-secs N]
+  agent-bridge search <query> [--workspace PATH | --all-workspaces] [--provider <codex|claude|agy|pi>]
+      [--limit N] [--json]
   agent-bridge doctor <session> [--probe] [--json]
   agent-bridge doctor --provider <codex|claude|agy|pi> [--probe] [--json]
   agent-bridge prune-sessions --closed-before-days N --explicit [--json]
@@ -49,10 +55,82 @@ Session policy:
   exact model value Fable is passed to Pi as anthropic/claude-fable-5. All other
   model values are forwarded unchanged.
 
-  --yolo is never inherited. It is forwarded only when the ask command includes
-  it and the provider has a matching option. Codex, Claude, and Agy receive their
-  native bypass flags. Pi receives --approve for project-local trust while its
-  native tool policy remains in effect.
+  --yolo is never inherited. It is forwarded only when the ask or reopen command
+  includes it and the provider has a matching option. Codex, Claude, and Agy
+  receive their native bypass flags. Pi receives --approve for project-local trust
+  while its native tool policy remains in effect.
+
+  reopen continues a closed session's provider conversation in a new session with a
+  new id, terminal, and private settings, launched through the provider's official
+  resume. This release supports only Claude Code on native Windows: its conversation
+  UUID is recorded in every Bridge event and its live-session registry proves
+  ownership by pid and process start time. Codex is refused until its thread
+  writer-lock and queue gates exist; Agy and Pi are refused because they expose no
+  verifiable ownership evidence. Reopen refuses a source that is not closed, has no
+  Claude event with a conversation id, has a request whose recorded result is
+  missing or unreadable, or is held by a live Claude process. Claude permits
+  concurrent resumes and offers no exclusive hold, so the ownership check is
+  best-effort detection, not exclusion: it runs again immediately before the
+  reopened process is spawned, after launch once the process has registered,
+  immediately before the initial prompt is sent, and immediately before every tell
+  to the reopened session. A live holder found before the process is spawned
+  refuses with gate provider-unsupported, the same gate as the first check, and no
+  process is started. At the three later points another live holder refuses that
+  delivery with gate reopen-conflict, and a check that cannot complete refuses with
+  gate reopen-verification-failed. After launch, either post-launch gate fails the new
+  session and closes only its surface before any prompt is delivered. A refusal at a
+  launch gate (the pre-spawn recheck, the post-launch check, and the check before the
+  initial prompt) releases the source's reopen marker only once the refused launch
+  provably cannot hold the conversation. The launch wrapper records the provider
+  process it spawns in the new session's provider-process.json (pid and, on Windows,
+  creation time and executable path) before the session leaves its launch state. The
+  marker is released in two cases: the pre-spawn recheck refused and no provider
+  process was recorded, or the recorded provider process is verified gone, meaning its
+  pid is dead or the pid is alive under a different identity (a reused pid). Neither
+  the exit of the launch wrapper nor a closed surface is evidence on its own: Windows
+  does not end a child with its parent, and a provider can outlive the console it was
+  started in. A post-spawn refusal with no provider-process.json, a provider process
+  that is still running, and one whose identity cannot be inspected all keep the
+  marker consumed, and the new session's reopen.refusal.json records cleanup:
+  \"pending\" with the reason. The next reopen of the same source reconciles the
+  marker under the source lock: a marker naming a session with a recorded launch
+  refusal whose provider process is now verified gone is released and the reopen
+  proceeds; otherwise the reopen is refused with gate already-reopened naming the
+  blocking condition. A parent that crashed before settling the marker, or timed out
+  before the wrapper recorded its refusal, is recovered this way; nothing is inferred
+  from missing records. A later tell refusal and an ordinary launch or delivery
+  failure leave the marker consumed.
+  Before a tell either gate refuses the delivery and leaves the session ready. A
+  foreign claude --resume can still register between two checks and interleave until
+  the next one. doctor reports the other live holders of a reopened session's
+  conversation, and on the source session it reports the marker and, for a retained
+  marker, why it is retained. doctor never releases a marker. Bridge forwards only an
+  explicit --model, --effort, or --yolo and copies nothing from the source manifest.
+  The effective model, permission mode, and effort are Claude's own decision from the
+  resumed session, its settings files, and its environment, which Bridge neither reads
+  nor overrides. Per Claude's documented resume rules, the previous model is restored
+  unless a --model flag or an ANTHROPIC_MODEL-family environment variable picks one at
+  launch or the model is unavailable. A terminal claude --resume <session-id> restores
+  the saved permission mode except in the documented cases: a session that ended in
+  bypassPermissions or in plan mode starts in the mode a new session would start in
+  (bypass is enabled again only by a launch flag or permissions.defaultMode
+  \"bypassPermissions\" in user, --settings, or managed settings), auto mode is
+  restored only while the account still meets the auto mode requirements, and manual
+  mode is restored only when a new session would start in auto mode from the built-in
+  default, a defaultMode from a settings file taking precedence. Claude documents no
+  restored effort. Omitting --yolo therefore does not by itself establish that bypass
+  is off. See https://code.claude.com/docs/en/sessions#permission-mode-on-resume and
+  https://code.claude.com/docs/en/sessions#what-a-resumed-session-restores for the
+  restoration rules. The source is left unchanged except for a reopen marker that
+  admits one reopen. inspect and sessions --json report resumed_from for the new
+  session.
+
+  --context-result attaches a previously recorded result, addressed exactly as
+  <session>/<request-id> (or <session>/<event-id> for records without a receipt),
+  after the prompt as clearly delimited reference material. Up to 8 values are
+  accepted; each must be a published successful result at resolution time or the
+  command fails before anything is created or sent. The new request receipt
+  records the attached sources as context_sources for inspect and result.
 
   Supported CLI minimums: Codex 0.147.0, Claude 2.1.234, Agy 1.1.12, Pi 0.84.1.
   Session state is stored privately under ~/.agent-bridge/native-sessions.
@@ -209,9 +287,12 @@ mod tests {
         for expected in [
             "ask <codex|claude|agy|pi>",
             "tell <session>",
+            "reopen <closed-session> (--prompt TEXT | --prompt-file PATH)",
+            "supports only Claude Code on native Windows",
             "sessions [--workspace PATH]",
             "inspect <session>",
             "result <session>",
+            "search <query> [--workspace PATH | --all-workspaces]",
             "doctor <session> [--probe] [--json]",
             "prune-sessions --closed-before-days N --explicit",
             "close-session <session> --explicit",
@@ -226,6 +307,8 @@ mod tests {
             "Fable is passed to Pi as anthropic/claude-fable-5",
             "Pi receives --approve for project-local trust",
             "Attaching to an arbitrary CLI",
+            "[--context-result <session>/<request-id>]...",
+            "records the attached sources as context_sources",
         ] {
             assert!(help.contains(expected), "help is missing {expected:?}");
         }

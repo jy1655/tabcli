@@ -10,7 +10,7 @@ use windows_sys::Win32::{
     },
 };
 
-use super::WindowsProcessIdentity;
+use super::{WindowsProcessIdentity, WindowsProcessIdentityCheck};
 
 pub(super) fn verify_control_process_identity(
     pid: u32,
@@ -100,16 +100,45 @@ pub(in crate::native::terminal) fn verify_process_identity(
     verify_identity_values(&live, creation_time, executable_path)
 }
 
+// Compares the live process behind `pid` with a recorded identity and keeps the two
+// negative answers apart: an `Err` is a process that could not be inspected and proves
+// nothing, while `Mismatch` is a confirmed observation that the pid now belongs to another
+// process.
+pub(in crate::native::terminal) fn check_process_identity(
+    pid: u32,
+    identity: &WindowsProcessIdentity,
+) -> Result<WindowsProcessIdentityCheck> {
+    let live = query_process_identity(pid)?;
+    Ok(check_identity_values(
+        &live,
+        identity.creation_time,
+        &identity.executable_path,
+    ))
+}
+
 fn verify_identity_values(
     live: &WindowsProcessIdentity,
     creation_time: u64,
     executable_path: &str,
 ) -> Result<()> {
+    match check_identity_values(live, creation_time, executable_path) {
+        WindowsProcessIdentityCheck::Matches => Ok(()),
+        WindowsProcessIdentityCheck::Mismatch(reason) => bail!("{reason}"),
+    }
+}
+
+fn check_identity_values(
+    live: &WindowsProcessIdentity,
+    creation_time: u64,
+    executable_path: &str,
+) -> WindowsProcessIdentityCheck {
     if live.creation_time != creation_time {
-        bail!("Windows console process id was reused");
+        return WindowsProcessIdentityCheck::Mismatch("Windows console process id was reused");
     }
     if !live.executable_path.eq_ignore_ascii_case(executable_path) {
-        bail!("Windows console process executable identity changed");
+        return WindowsProcessIdentityCheck::Mismatch(
+            "Windows console process executable identity changed",
+        );
     }
-    Ok(())
+    WindowsProcessIdentityCheck::Matches
 }

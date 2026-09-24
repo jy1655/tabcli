@@ -4,6 +4,16 @@ use super::*;
 const REQUESTS_DIRECTORY: &str = "requests";
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// A recorded result that a request was explicitly derived from, pinned at resolution time.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ContextSource {
+    pub(crate) session: String,
+    pub(crate) request_id: Option<String>,
+    pub(crate) event_id: String,
+    pub(crate) provider: String,
+    pub(crate) created_unix_ms: u128,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct Receipt {
     pub(super) schema: u32,
@@ -13,6 +23,9 @@ pub(super) struct Receipt {
     pub(super) created_unix_ms: u128,
     #[serde(default)]
     pub(super) source: Option<String>,
+    // Receipts written before 0.0.7 have no provenance; they still deserialise as empty.
+    #[serde(default)]
+    pub(super) context_sources: Vec<ContextSource>,
 }
 
 pub(super) fn valid_id(value: &str) -> bool {
@@ -29,14 +42,43 @@ fn validate(receipt: &Receipt) -> Result<()> {
         || !valid_id(&receipt.request_id)
         || !valid_turn_claim_token(&receipt.claim_token)
         || !valid_event_file_name(&receipt.event_file)
+        || receipt
+            .context_sources
+            .iter()
+            .any(|source| validate_context_source(source).is_err())
     {
         bail!("invalid Bridge request receipt")
     }
     Ok(())
 }
 
+/// The rules a receipt applies to each recorded source. Resolution applies the same
+/// rules before any session state exists, so a receipt never rejects a resolved source.
+pub(super) fn validate_context_source(source: &ContextSource) -> Result<()> {
+    if !valid_session_id(&source.session) {
+        bail!("invalid source session id {:?}", source.session)
+    }
+    if !valid_event_file_name(&source.event_id) {
+        bail!("invalid source event id {:?}", source.event_id)
+    }
+    if let Some(request_id) = source.request_id.as_deref()
+        && !valid_id(request_id)
+    {
+        bail!("invalid source request id {request_id:?}")
+    }
+    if source.provider.is_empty() {
+        bail!("source provider is empty")
+    }
+    Ok(())
+}
+
 // Called while creating the claim under its lifecycle lock, before any dispatch can begin.
-pub(super) fn create(directory: &Path, claim_token: &str) -> Result<Receipt> {
+// Provenance comes from the caller's pinned resolution; it is never re-read here.
+pub(super) fn create(
+    directory: &Path,
+    claim_token: &str,
+    context_sources: &[ContextSource],
+) -> Result<Receipt> {
     let receipt = Receipt {
         schema: 1,
         request_id: format!(
@@ -49,6 +91,7 @@ pub(super) fn create(directory: &Path, claim_token: &str) -> Result<Receipt> {
         event_file: new_event_file_name()?,
         created_unix_ms: unix_ms(),
         source: Some(delegation_source()),
+        context_sources: context_sources.to_vec(),
     };
     validate(&receipt)?;
     let root = directory.join(REQUESTS_DIRECTORY);
@@ -60,9 +103,37 @@ pub(super) fn create(directory: &Path, claim_token: &str) -> Result<Receipt> {
     Ok(receipt)
 }
 
+/// Whether the session's `requests` directory exists as a real directory. A link or a
+/// non-directory at that path is refused: `read_dir` and the receipt reads would follow
+/// a link out of the state root, and a receipt read from there would supply request
+/// identity for the session's events.
+fn requests_directory_present(directory: &Path) -> Result<bool> {
+    let root = directory.join(REQUESTS_DIRECTORY);
+    match fs::symlink_metadata(&root) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!(
+                "failed to read Bridge requests: refusing linked requests directory: {}",
+                root.display()
+            )
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            bail!(
+                "failed to read Bridge requests: refusing non-directory requests path: {}",
+                root.display()
+            )
+        }
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", root.display())),
+    }
+}
+
 pub(super) fn for_claim(directory: &Path, claim_token: &str) -> Result<Option<Receipt>> {
     if !valid_turn_claim_token(claim_token) {
         bail!("invalid request claim token")
+    }
+    if !requests_directory_present(directory)? {
+        return Ok(None);
     }
     let path = directory
         .join(REQUESTS_DIRECTORY)
@@ -85,6 +156,9 @@ pub(super) struct Index {
 }
 
 pub(super) fn list(directory: &Path) -> Result<Index> {
+    if !requests_directory_present(directory)? {
+        return Ok(Index::default());
+    }
     let root = directory.join(REQUESTS_DIRECTORY);
     let entries = match fs::read_dir(&root) {
         Ok(entries) => entries,
@@ -118,6 +192,47 @@ pub(super) fn list(directory: &Path) -> Result<Index> {
 mod tests {
     use super::*;
 
+    // A `requests` path that is a link (or a file) is refused by both the index and the
+    // per-claim read, so no receipt outside the state root can name a request.
+    #[cfg(unix)]
+    #[test]
+    fn linked_requests_directory_is_refused_by_the_index_and_the_claim_read() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-linked");
+        fs::create_dir_all(directory.join("events")).unwrap();
+        fs::write(
+            outside.path().join("1-2-3.json"),
+            r#"{"schema":1,"request_id":"request-external","claim_token":"1-2-3","event_file":"event-1.json","created_unix_ms":5,"source":"external","context_sources":[]}"#,
+        )
+        .unwrap();
+        symlink(outside.path(), directory.join(REQUESTS_DIRECTORY)).unwrap();
+
+        let error = list(&directory).err().expect("refused").to_string();
+        assert!(
+            error.contains("refusing linked requests directory"),
+            "{error}"
+        );
+        let error = for_claim(&directory, "1-2-3").unwrap_err().to_string();
+        assert!(
+            error.contains("refusing linked requests directory"),
+            "{error}"
+        );
+
+        // A regular file at the path is refused too; a missing path is an empty index.
+        fs::remove_file(directory.join(REQUESTS_DIRECTORY)).unwrap();
+        fs::write(directory.join(REQUESTS_DIRECTORY), b"").unwrap();
+        let error = list(&directory).err().expect("refused").to_string();
+        assert!(
+            error.contains("refusing non-directory requests path"),
+            "{error}"
+        );
+        fs::remove_file(directory.join(REQUESTS_DIRECTORY)).unwrap();
+        assert!(list(&directory).unwrap().receipts.is_empty());
+        assert!(for_claim(&directory, "1-2-3").unwrap().is_none());
+    }
+
     #[test]
     fn receipt_is_durable_before_dispatch_and_does_not_replace_provider_identity() {
         let directory = tempfile::tempdir().unwrap();
@@ -149,6 +264,50 @@ mod tests {
                 .request_id,
             receipt.request_id
         );
+    }
+
+    #[test]
+    fn receipts_round_trip_context_sources_and_old_receipts_still_parse() {
+        let legacy: Receipt = serde_json::from_str(
+            r#"{"schema":1,"request_id":"request-old","claim_token":"1-2-3",
+            "event_file":"event-1.json","created_unix_ms":7}"#,
+        )
+        .unwrap();
+        validate(&legacy).unwrap();
+        assert!(legacy.context_sources.is_empty());
+        assert_eq!(legacy.source, None);
+
+        let source = ContextSource {
+            session: "session-parent".to_owned(),
+            request_id: Some("request-parent-1".to_owned()),
+            event_id: "event-9.json".to_owned(),
+            provider: "codex".to_owned(),
+            created_unix_ms: 42,
+        };
+        let legacy_event = ContextSource {
+            request_id: None,
+            ..source.clone()
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = create(
+            directory.path(),
+            "1-2-3",
+            &[source.clone(), legacy_event.clone()],
+        )
+        .unwrap();
+        let stored = for_claim(directory.path(), "1-2-3").unwrap().unwrap();
+        assert_eq!(stored.request_id, receipt.request_id);
+        assert_eq!(stored.context_sources, vec![source, legacy_event]);
+        let text = fs::read_to_string(directory.path().join("requests/1-2-3.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["context_sources"][1]["request_id"],
+            serde_json::Value::Null
+        );
+
+        let mut broken = stored.clone();
+        broken.context_sources[0].session = "../escape".to_owned();
+        assert!(validate(&broken).is_err());
     }
 
     #[test]

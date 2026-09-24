@@ -59,6 +59,34 @@ launch, observe, continue, and close without replacing the capabilities those CL
   blocked before it ran (denied with the guard's reason, or stopped by the provider).
 - Give every request its own messenger files. The target can complete a delivered turn,
   and the next `tell` can start, while the previous sender is still settling.
+- Never let a managed Claude session or a messenger inherit Claude Code session markers
+  (`CLAUDE_CODE_CHILD_SESSION`, `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`,
+  `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`, and the rest of the set in
+  the Claude adapter). Agent Bridge is normally invoked from inside a Claude Code session,
+  and a `claude` that inherits `CLAUDE_CODE_CHILD_SESSION` treats itself as a nested child:
+  it never registers its cross-session inbox, so `ListAgents` cannot find it and delivery
+  fails (issue #42, observed 2026-09-24 with Claude Code 2.1.281). The removal list is
+  adapter-owned launch configuration; the shared launcher only applies it.
+
+## Current Agy Boundary
+
+- Agy has no first-party input path into a running interactive session and no per-turn
+  accepted signal, so every paste into its TUI is a fallback that must be proven by Agy's
+  own `--log-file`: a readiness gate before the paste and a `HandleUserInput` receipt
+  after it. This holds for the native Windows initial prompt and for every follow-up on
+  native Windows and macOS; the macOS initial prompt is a launch argument and never waits.
+- Agy 1.2.10 discards a paste that lands in its deferred skills reload (10-37 s after
+  `CLI startup completed` on Windows, 11-55 s on macOS, sometimes never). The gate's
+  window is per platform (45 s Windows console, 60 s macOS); a reload outside it is
+  caught by the receipt, not the gate. On macOS the argument-delivered initial
+  prompt starts a conversation a few seconds after startup, and the reload logged right
+  after `Starting new conversation` is that conversation's reload, not the deferred one;
+  the gate must not settle on it (observed 2026-09-24 21:32, macOS smoke: `tell` pasted at
+  +10.3 s, lost to the reload at +11.2 s, reported as delivered). Agy logs `Full redraw
+  completed` on the Windows console only, so the macOS rule does not require it.
+- A missing receipt is delivery-uncertain, never a second paste; the claim is kept and the
+  reason lands in `status.error`. Delete the gate and the receipt when Agy exposes an
+  input API or an accepted-turn signal; the transcript result monitor is unaffected.
 
 ## Change and Verification Rules
 
