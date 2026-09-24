@@ -2243,12 +2243,16 @@ fn every_provider_declares_its_terminal_submission_count() {
 
 #[test]
 fn windows_initial_prompt_readiness_is_provider_specific() {
-    for provider in [FirstPartyCli::Codex, FirstPartyCli::Agy] {
-        assert_eq!(
-            provider::initial_prompt_ready_delay(provider),
-            Duration::from_secs(12)
-        );
-    }
+    assert_eq!(
+        provider::initial_prompt_ready_delay(FirstPartyCli::Codex),
+        Duration::from_secs(12)
+    );
+    // Agy gates its Windows console paste on its own startup log inside the adapter
+    // (issue #43); the shared launcher no longer sleeps for it.
+    assert_eq!(
+        provider::initial_prompt_ready_delay(FirstPartyCli::Agy),
+        Duration::ZERO
+    );
     for provider in [FirstPartyCli::Claude, FirstPartyCli::Pi] {
         assert_eq!(
             provider::initial_prompt_ready_delay(provider),
