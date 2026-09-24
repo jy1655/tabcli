@@ -277,9 +277,17 @@ fn correlated_response<'a>(message: &'a str, pending: &PendingAgyTurn) -> Result
 //
 // - readiness gate: `CLI startup completed` (analytics.go), at least one
 //   `Full redraw completed` (manager.go) line after it, deferred-reload settlement,
-//   and then a quiet period in which no `Reloading system slash commands` line
-//   (with or without "and skills"), no `Full redraw completed` line, and no
-//   `hooks_manager.go` line arrives, measured from the newest such line.
+//   and a quiet period in which no `Reloading system slash commands` line (with
+//   or without "and skills"), no `Full redraw completed` line, and no
+//   `hooks_manager.go` line arrives, measured from the newest such line. The
+//   quiet period and the deferred-reload window run concurrently, not in
+//   sequence: both are timed on the gate's clock, the window from the first read
+//   that showed `CLI startup completed` and the quiet period from the first read
+//   that showed the newest activity line, and the gate is ready on the first read
+//   at which every condition holds. A healthy Agy that never logs the deferred
+//   reload and has been quiet since its startup burst is therefore ready at
+//   startup + 35 s exactly, not at startup + 35 s + 3.5 s; only an activity line
+//   inside the last 3.5 s of the window pushes readiness past its end.
 //   Deferred-reload settlement means either a `Reloading system slash commands and
 //   skills` line after `CLI startup completed` (Agy 1.2.10 defers its skills reload
 //   to roughly 10-22 s after startup, and that reload clears the composer: the
@@ -291,11 +299,15 @@ fn correlated_response<'a>(message: &'a str, pending: &PendingAgyTurn) -> Result
 //   never logged the deferred reload, and went silent). The gate never
 //   waits for a hooks completion after a reload; the startup reload of session-IQHEwf
 //   had none. A reload that arrives after both windows is caught by the input
-//   receipt below, not by the gate. The gate also keeps the byte length and the
-//   leading bytes of the newest read: a log that disappears, shrinks, or no longer
-//   begins with those bytes was replaced or rotated, so every settlement instant is
-//   discarded and re-measured from the new content, and a second discontinuity
-//   fails the paste as `not_sent` (review round 5).
+//   receipt below, not by the gate. The gate also keeps the byte length and a
+//   digest of every byte of the newest read (`LogContinuity`): a log that
+//   disappears, shrinks, or no longer reproduces that digest over the observed
+//   length was replaced or rotated, so every settlement instant is discarded and
+//   the quiet period and the window are re-measured from the new content. Any
+//   number of such restarts is tolerated within the deadline: the gate fails the
+//   paste as `not_sent` only when the deadline passes, and the report then lists
+//   every discontinuity in order (review round 6, replacing round 5's leading-bytes
+//   check and its failure on the second discontinuity).
 // - input receipt: a complete `HandleUserInput called with text: "..."` line
 //   (input_loop.go) that starts after the byte length of agy.log observed
 //   immediately before the paste and whose text carries the Windows protocol prefix
@@ -303,7 +315,16 @@ fn correlated_response<'a>(message: &'a str, pending: &PendingAgyTurn) -> Result
 //
 // Delivery classification after a paste (issue #43 review):
 //
-// - delivered: such a receipt line exists after the pre-paste offset;
+// - delivered: such a receipt line exists after the pre-paste offset. Nothing
+//   logged after the receipt revokes it. Agy 1.2.10 logs `Reloading system slash
+//   commands and skills` a few milliseconds after `HandleUserInput` and the
+//   conversation-start lines (`Starting new conversation`, `Created conversation`):
+//   session-udT6uY logged it 15 ms after the receipt (2026-09-24 16:42:50.228), and
+//   both delivered live asks of round 7 showed the same. That is the reload the new
+//   conversation triggers, not the deferred startup reload, so it is never evidence
+//   that the paste was cleared. `observe_input_receipt` looks only for the receipt,
+//   and `confirm_input_receipt_with` returns on the first read that yields
+//   `Delivered`, so a later reload cannot flip a delivered classification;
 // - delivery-uncertain: everything else. Non-delivery would have to be proven by a
 //   line Agy logs after draining its console input without a receipt, and the real
 //   logs contain no such marker (session-fMqSQc, 2026-09-24: after the discarded
@@ -344,7 +365,9 @@ const STARTUP_QUIET_PERIOD: Duration = Duration::from_millis(3500);
 // pasted session-ql5TVc at +20.1 s, 1.3 s before its reload cleared the composer
 // (2026-09-24 18:48), so the window must outlast 21.4 s with margin. The trade-off
 // is latency for a healthy Agy that never logs the deferred reload: it now pastes
-// at startup + 35 s + the quiet period instead of + 20 s.
+// at startup + 35 s instead of + 20 s (the quiet period runs concurrently with the
+// window and has ended long before, unless an activity line lands inside the
+// window's last 3.5 s).
 const DEFERRED_RELOAD_WINDOW: Duration = Duration::from_secs(35);
 const STARTUP_READINESS_TIMING: ReadinessTiming = ReadinessTiming {
     quiet_period: STARTUP_QUIET_PERIOD,
@@ -831,7 +854,7 @@ impl ReadinessGate {
             ),
         };
         format!(
-            "Agy did not report startup readiness before the deadline: {}; missing markers: {missing}; the quiet period is {} ms and the deferred reload window is {} ms{restarted}; the initial prompt was not pasted",
+            "Agy did not report startup readiness before the deadline: {}; missing markers: {missing}; the quiet period is {} ms and the deferred reload window is {} ms, timed concurrently (the window from the first read with `CLI startup completed`, the quiet period from the newest reload, redraw, or hooks line; ready when both hold){restarted}; the initial prompt was not pasted",
             state.describe(),
             self.timing.quiet_period.as_millis(),
             self.timing.deferred_reload_window.as_millis()
@@ -1112,12 +1135,12 @@ fn input_receipt_check(directory: Option<&Path>) -> super::super::doctor::Check 
             .any(|receipt| receipt_matches(receipt, pending))
     });
     // The doctor reads the log once, so it reports the two startup markers only; the
-    // deferred reload window and the quiet period are timed live by the paste gate
-    // and cannot be judged here.
+    // deferred reload window and the quiet period are timed live and concurrently
+    // by the paste gate and cannot be judged here.
     let (reason, detail) = match (startup.markers_observed(), last) {
         (false, _) => (
             "agy_startup_markers_missing",
-            "agy.log does not yet show the startup markers (CLI startup completed followed by a Full redraw completed); the paste gate also waits for the deferred skills reload or a 35 s window since startup, and for a quiet period without reload, redraw, or hooks lines.",
+            "agy.log does not yet show the startup markers (CLI startup completed followed by a Full redraw completed); the paste gate also waits for the deferred skills reload or a 35 s window since startup and, concurrently, for a 3.5 s quiet period without reload, redraw, or hooks lines; it pastes on the first read at which both hold, so a quiet startup that never logs the deferred reload pastes at startup + 35 s.",
         ),
         (true, None) => (
             "agy_no_input_receipt",
@@ -1825,7 +1848,13 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
     //
     // The udT6uY `... and skills` line at 16:42:50.228104 (+26.15 s) followed the
     // receipt and `Starting new conversation` by 15 ms, so it is the conversation
-    // reload, not the deferred one. The other Agy 1.2.10 logs on this machine that
+    // reload, not the deferred one. Every delivered session shows this pattern (the
+    // two round-7 live asks included): a skills reload logged right after
+    // `HandleUserInput` and the conversation-start lines is triggered by the new
+    // conversation and is never evidence that the paste was cleared; the receipt
+    // check returns on the first read holding the receipt and ignores later lines
+    // (`receipt_stays_delivered_when_the_conversation_reload_follows_it`).
+    // The other Agy 1.2.10 logs on this machine that
     // are not fixtures (2026-09-24, read once for this table) logged the deferred
     // reload at 12.933, 12.942, 12.947, 12.949, 12.964, 13.082, 13.124, 13.137 and
     // 13.161 s (nine sessions, none pasted before it), and seven sessions whose
@@ -2228,7 +2257,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
     }
 
     #[test]
-    fn readiness_gate_becomes_ready_on_the_quiet_healthy_startup_when_the_window_ends() {
+    fn readiness_gate_is_ready_when_the_concurrent_window_ends_on_the_quiet_healthy_startup() {
         // session-IQHEwf: the round-1/2 rule required a hooks_manager.go line after
         // the latest `... and skills` reload. This log has none, so that rule would
         // have waited until the deadline; the receipt-less silence was a healthy
@@ -2247,9 +2276,11 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
 
         // The deferred skills reload never comes either, so the gate is ready 35 s
         // after `CLI startup completed` (17:20:28.616574): 35.0 s of waiting, well
-        // inside any deadline. The quiet period had ended at 17:20:38.45, 3.5 s
-        // after the last plain reload, which is when the round-3 rule was ready,
-        // and the former 20 s window would have pasted at 17:20:48.62.
+        // inside any deadline. The quiet period runs concurrently with the window
+        // and had ended at 17:20:38.45, 3.5 s after the last plain reload, which is
+        // when the round-3 rule was ready; the window's end is the ready instant,
+        // not window + quiet period. The former 20 s window would have pasted at
+        // 17:20:48.62.
         let replay = LogReplay::new(REAL_QUIET_STARTUP, Instant::now());
         let ready = replay_readiness(&replay, STARTUP_READINESS_TIMING);
         assert_ready_at(&replay, ready, "17:21:03.616574", "session-IQHEwf");
@@ -2405,7 +2436,8 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         );
 
         // Startup and redraw without a skills reload after them wait for the window
-        // even though the quiet period ends at 3.5 s.
+        // even though the quiet period ends at 3.5 s; the two run concurrently, so
+        // the window's end at 35.0 s is the ready instant.
         let startup_redraw =
             startup_only.clone() + &glog("16:41:07.876154", 269, "manager.go:934", FULL_REDRAW);
         let mut windowed = ReadinessGate::new(start, timing);
@@ -3319,7 +3351,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         )));
         assert!(
             message
-                .contains("the quiet period is 3500 ms and the deferred reload window is 35000 ms")
+                .contains("the quiet period is 3500 ms and the deferred reload window is 35000 ms, timed concurrently")
         );
         assert!(message.contains("the initial prompt was not pasted"));
         assert!(!message.contains("hooks completion"));
@@ -3414,7 +3446,7 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         )));
 
         // Startup seen at once, the redraw a poll later, no skills reload: ready when
-        // the 35 s window ends, long after the quiet period at 3.6 s.
+        // the 35 s window ends, long after the concurrent quiet period at 3.6 s.
         let mut clock = FakeClock::new(start);
         wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&startup_only), some_log(&startup_redraw)]),
@@ -3437,6 +3469,98 @@ I0924 18:48:25.485154     379 manager.go:1312] Slash commands unchanged, skippin
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("startup readiness could not be observed"));
+    }
+
+    // The concurrent rule, stated as deadlines: with startup and its redraw already
+    // logged and nothing after them, the quiet period ends at 3.5 s and the window
+    // at 35 s, so the gate is ready at exactly 35 s. A deadline one second past the
+    // window reaches the paste; a deadline one second short of it fails `not_sent`
+    // naming the window as the only missing condition.
+    #[test]
+    fn readiness_wait_without_a_deferred_reload_pastes_at_the_window_end_and_not_before() {
+        let start = Instant::now();
+        let poll = Duration::from_millis(100);
+        let startup_redraw = glog(
+            "16:41:07.830345",
+            1,
+            "analytics.go:187",
+            "CLI startup completed (took 1ms)",
+        ) + &glog("16:41:07.876154", 269, "manager.go:934", FULL_REDRAW);
+
+        let mut clock = FakeClock::new(start);
+        let offset = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(&startup_redraw)]),
+            start + Duration::from_secs(36),
+            STARTUP_READINESS_TIMING,
+            poll,
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(offset, startup_redraw.len());
+        assert_eq!(
+            clock.slept, DEFERRED_RELOAD_WINDOW,
+            "ready at startup + 35 s, not + 35 s + the quiet period"
+        );
+
+        let mut clock = FakeClock::new(start);
+        let error = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(&startup_redraw)]),
+            start + Duration::from_secs(34),
+            STARTUP_READINESS_TIMING,
+            poll,
+            &mut clock,
+        )
+        .unwrap_err();
+        assert_eq!(clock.slept, Duration::from_secs(34));
+        let message = format!("{error:#}");
+        assert!(message.contains(
+            "agy.log has no `Reloading system slash commands and skills` line after `CLI startup completed` and the deferred reload window since `CLI startup completed` has not elapsed"
+        ));
+        assert!(message.contains(&format!(
+            "missing markers: {DEFERRED_RELOAD_DESCRIPTION}; the quiet period is 3500 ms and the deferred reload window is 35000 ms, timed concurrently"
+        )));
+        assert!(
+            !message.contains(QUIET_PERIOD_DESCRIPTION),
+            "the quiet period ended at 3.5 s and is not missing"
+        );
+        assert!(message.contains("the initial prompt was not pasted"));
+        let failure = terminal::TerminalSendFailure::not_sent(error);
+        assert!(
+            !failure.delivery_may_have_occurred(),
+            "a gate that never passed is not_sent, never uncertain"
+        );
+    }
+
+    // Live observation (session-udT6uY and the round-7 asks): the skills reload that
+    // Agy logs milliseconds after `HandleUserInput` and the conversation-start lines
+    // is triggered by the new conversation, not the deferred startup reload. The
+    // receipt watch returns on the first read that holds the receipt, so the reload
+    // can neither delay nor revoke the delivered classification.
+    #[test]
+    fn receipt_stays_delivered_when_the_conversation_reload_follows_it() {
+        let pending = PendingAgyTurn::new(REAL_SUCCESS_TOKEN).unwrap();
+        let startup = successful_startup_log();
+        let with_receipt = format!("{startup}{REAL_SUCCESS_RECEIPT_HEAD}\n");
+        let with_reload = format!("{with_receipt}{REAL_SUCCESS_AFTER_RECEIPT}");
+        assert!(with_reload[with_receipt.len()..].contains(SKILLS_RELOAD_MARKER));
+        assert_eq!(
+            observe_input_receipt(Some(with_reload.as_bytes()), startup.len(), &pending),
+            ReceiptEvidence::Delivered
+        );
+
+        let pasted_at = Instant::now();
+        let mut clock = FakeClock::new(pasted_at);
+        confirm_input_receipt_with(
+            &mut log_sequence(vec![some_log(&startup), some_log(&with_reload)]),
+            &pending,
+            startup.len(),
+            pasted_at,
+            pasted_at + Duration::from_secs(60),
+            Duration::from_millis(100),
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(clock.slept, Duration::from_millis(100));
     }
 
     #[test]
