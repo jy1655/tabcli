@@ -1,7 +1,7 @@
 use super::{
     CompletionMonitor, CrossSessionMessageContext, CrossSessionMessageFailure,
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
-    LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan,
+    LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
 };
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
@@ -103,6 +103,13 @@ impl NativeProviderAdapter for PiAdapter {
     }
 
     fn prepare_resume(&self, _context: ResumeContext<'_>) -> Result<ResumePlan> {
+        bail!("{PI_REOPEN_UNSUPPORTED}")
+    }
+
+    fn other_resumed_conversation_holders(
+        &self,
+        _context: ResumedSessionContext<'_>,
+    ) -> Result<Vec<u32>> {
         bail!("{PI_REOPEN_UNSUPPORTED}")
     }
 

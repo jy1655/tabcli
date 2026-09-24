@@ -50,6 +50,16 @@ pub(super) struct ResumePlan {
     pub(super) environment_removals: &'static [&'static str],
 }
 
+// A reopened session whose provider process is running and has not yet received its
+// initial prompt. `directory` is the new session's own state; `deadline` bounds how long
+// the adapter may wait for the provider's own registration of that process.
+#[derive(Clone, Copy)]
+pub(super) struct ResumedSessionContext<'a> {
+    pub(super) directory: &'a Path,
+    pub(super) provider_session_id: &'a str,
+    pub(super) deadline: Instant,
+}
+
 #[derive(Clone, Copy)]
 #[cfg_attr(windows, allow(dead_code))]
 pub(super) struct CrossSessionMessageContext<'a> {
@@ -199,6 +209,15 @@ trait NativeProviderAdapter: Sync {
     // shared default: an adapter that cannot prove ownership must refuse with its reason.
     fn verify_reopen_available(&self, provider_session_id: &str) -> Result<()>;
     fn prepare_resume(&self, context: ResumeContext<'_>) -> Result<ResumePlan>;
+    // Post-launch ownership check for a reopened session. Once the provider's own evidence
+    // shows the new process registered as the conversation's holder, the adapter reports
+    // every OTHER live process that holds the same conversation. A non-empty answer is a
+    // conflict the shared layer fails the new session for; an adapter that refuses reopen
+    // refuses here as well, because this call is only reachable after its resume plan ran.
+    fn other_resumed_conversation_holders(
+        &self,
+        context: ResumedSessionContext<'_>,
+    ) -> Result<Vec<u32>>;
     fn initial_prompt_transport(&self) -> InitialPromptTransport;
     fn initial_prompt_ready_delay(&self) -> Duration;
     fn send_initial_prompt(
@@ -268,6 +287,21 @@ pub(super) fn prepare_resume(
     context: ResumeContext<'_>,
 ) -> Result<ResumePlan> {
     adapter(provider).prepare_resume(context)
+}
+
+pub(super) fn other_resumed_conversation_holders(
+    provider: FirstPartyCli,
+    context: ResumedSessionContext<'_>,
+) -> Result<Vec<u32>> {
+    adapter(provider).other_resumed_conversation_holders(context)
+}
+
+// Points the Claude adapter's session-registry reads at a fixture for the calling thread,
+// so a launch-boundary test can mutate the registry between the reopen gates without
+// touching the real `~/.claude/sessions`.
+#[cfg(test)]
+pub(super) fn override_claude_session_registry_for_test(registry: Option<PathBuf>) {
+    claude::override_session_registry_for_test(registry);
 }
 
 // Applies an adapter's caller-environment removals to a provider process before it

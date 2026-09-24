@@ -55,10 +55,10 @@ Session policy:
   exact model value Fable is passed to Pi as anthropic/claude-fable-5. All other
   model values are forwarded unchanged.
 
-  --yolo is never inherited. It is forwarded only when the ask command includes
-  it and the provider has a matching option. Codex, Claude, and Agy receive their
-  native bypass flags. Pi receives --approve for project-local trust while its
-  native tool policy remains in effect.
+  --yolo is never inherited. It is forwarded only when the ask or reopen command
+  includes it and the provider has a matching option. Codex, Claude, and Agy
+  receive their native bypass flags. Pi receives --approve for project-local trust
+  while its native tool policy remains in effect.
 
   reopen continues a closed session's provider conversation in a new session with a
   new id, terminal, and private settings, launched through the provider's official
@@ -67,9 +67,17 @@ Session policy:
   ownership by pid and process start time. Codex is refused until its thread
   writer-lock and queue gates exist; Agy and Pi are refused because they expose no
   verifiable ownership evidence. Reopen refuses a source that is not closed, has no
-  Claude event with a conversation id, has an unresolved request, or is held by a
-  live Claude process. --model, --effort, and --yolo are never inherited from the
-  source; the source is left unchanged except for a reopen marker that admits one
+  Claude event with a conversation id, has a request whose recorded result is
+  missing or unreadable, or is held by a live Claude process. The ownership check
+  runs again immediately before the reopened process is spawned, and once more
+  after launch: Claude permits concurrent resumes, so a foreign claude --resume
+  started in that window is detected, not prevented, and the new session is then
+  failed with gate reopen-conflict and its surface closed before any prompt is
+  delivered. Nothing is copied from the source manifest: only an explicit --model,
+  --effort, or --yolo is passed. Without --model, Claude's own resume restores the
+  model the conversation was using. Claude also restores the saved permission mode
+  except bypass, so bypass is active only with --yolo; Claude documents no restored
+  effort. The source is left unchanged except for a reopen marker that admits one
   reopen. inspect and sessions --json report resumed_from for the new session.
 
   --context-result attaches a previously recorded result, addressed exactly as

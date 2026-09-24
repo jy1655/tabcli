@@ -62,6 +62,10 @@ const STATE_ROOT_ANCESTRY_SYNC_LIMIT: usize = 16;
 // the only file a reopen ever adds to the source; the source's tombstone, events, and
 // requests stay byte-for-byte intact.
 const REOPEN_MARKER_FILE: &str = "reopen.marker.json";
+// Written into the NEW session by a reopen gate that fails after the session exists: the
+// launch wrapper's pre-spawn ownership recheck or the post-launch holder check. It carries
+// the gate name across the process boundary so the reopen response can still report it.
+const REOPEN_REFUSAL_FILE: &str = "reopen.refusal.json";
 static TURN_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -1045,6 +1049,7 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
             json: request.json,
             context_sources: &attached.sources,
             result_extra: serde_json::Map::new(),
+            resumed_from: None,
         },
         address,
     )
@@ -1064,6 +1069,9 @@ struct SessionLaunch<'a> {
     json: bool,
     context_sources: &'a [requests::ContextSource],
     result_extra: serde_json::Map<String, serde_json::Value>,
+    // Set for `reopen`: the provider conversation the new session continues. Its holder
+    // check runs after launch, once the process exists and before the first prompt is sent.
+    resumed_from: Option<ResumedFrom>,
 }
 
 fn launch_created_session(
@@ -1080,6 +1088,7 @@ fn launch_created_session(
         json,
         context_sources,
         result_extra,
+        resumed_from,
     } = launch;
     let mut initial_claim = acquire_turn_claim_with_context(&created.directory, context_sources)?;
     let expected_claim_token = initial_claim.token.clone();
@@ -1141,6 +1150,12 @@ fn launch_created_session(
                 timeout,
             )?;
             thread::sleep(readiness_delay);
+            verify_reopened_conversation_exclusive(
+                provider,
+                &created.directory,
+                resumed_from.as_ref(),
+                deadline,
+            )?;
             let initial_prompt_path = created.directory.join("initial-prompt.txt");
             let initial_prompt = fs::read_to_string(&initial_prompt_path)
                 .context("failed to read the preserved initial prompt")?;
@@ -1190,6 +1205,7 @@ fn launch_created_session(
                 delivery_may_have_occurred,
                 &error,
             );
+            let error = close_surface_after_reopen_conflict(&created.directory, &created.id, error);
             return Err(error).with_context(|| {
                 format!(
                     "failed to deliver the initial prompt to {} session {}",
@@ -1214,6 +1230,12 @@ fn launch_created_session(
                 timeout,
             )?;
             thread::sleep(readiness_delay);
+            verify_reopened_conversation_exclusive(
+                provider,
+                &created.directory,
+                resumed_from.as_ref(),
+                deadline,
+            )?;
             let request_id = provider::new_cross_session_turn_id(provider)?;
             let prompt_path = created.directory.join("initial-prompt.txt");
             let prompt = fs::read_to_string(&prompt_path)
@@ -1273,6 +1295,8 @@ fn launch_created_session(
                         Some(format!("{error:#}")),
                     );
                 }
+                let error =
+                    close_surface_after_reopen_conflict(&created.directory, &created.id, error);
                 return Err(error).with_context(|| {
                     format!(
                         "failed to deliver the initial prompt to {} session {}",
@@ -1351,6 +1375,132 @@ fn reopen_refusal_gate(error: &anyhow::Error) -> Option<&'static str> {
         .map(|refusal| refusal.gate)
 }
 
+const REOPEN_LAUNCH_GATE: &str = "provider-unsupported";
+const REOPEN_CONFLICT_GATE: &str = "reopen-conflict";
+
+#[derive(Debug, Deserialize, Serialize)]
+struct RecordedReopenRefusal {
+    schema: u32,
+    gate: String,
+    detail: String,
+    created_unix_ms: u128,
+}
+
+// Records a gate refusal that happened after the new session existed, then returns the
+// typed refusal. The record is what lets the reopen command name the gate when the refusal
+// happened inside the launch wrapper, in another process.
+fn record_reopen_refusal(directory: &Path, gate: &'static str, detail: String) -> anyhow::Error {
+    let record = RecordedReopenRefusal {
+        schema: 1,
+        gate: gate.to_owned(),
+        detail: detail.clone(),
+        created_unix_ms: unix_ms(),
+    };
+    if let Err(error) = write_json_atomic(&directory.join(REOPEN_REFUSAL_FILE), &record) {
+        return reopen_refusal(
+            gate,
+            format!("{detail}; the refusal record could not be written: {error:#}"),
+        );
+    }
+    reopen_refusal(gate, detail)
+}
+
+fn read_reopen_refusal_gate(directory: &Path) -> Option<String> {
+    let text = read_regular_text_if_present(&directory.join(REOPEN_REFUSAL_FILE))
+        .ok()
+        .flatten()?;
+    let record: RecordedReopenRefusal = serde_json::from_str(&text).ok()?;
+    (record.schema == 1).then_some(record.gate)
+}
+
+// The post-launch holder check of a reopened session, run in the initial-prompt readiness
+// window: the reopened process exists and has not received a prompt. The adapter waits for
+// the provider's own registration of that process and reports every other live holder of the
+// conversation. Claude permits concurrent resumes, so a foreign resume started inside the
+// spawn window can only be detected here; a detected conflict fails the new session under
+// its own gate before anything is delivered.
+fn verify_reopened_conversation_exclusive(
+    provider: FirstPartyCli,
+    directory: &Path,
+    resumed_from: Option<&ResumedFrom>,
+    deadline: Instant,
+) -> Result<()> {
+    let Some(resumed_from) = resumed_from else {
+        return Ok(());
+    };
+    let others = provider::other_resumed_conversation_holders(
+        provider,
+        provider::ResumedSessionContext {
+            directory,
+            provider_session_id: &resumed_from.provider_session_id,
+            deadline,
+        },
+    )
+    .with_context(|| {
+        format!(
+            "could not verify that the reopened {} conversation {} has no other live holder",
+            provider.as_str(),
+            resumed_from.provider_session_id
+        )
+    })?;
+    if others.is_empty() {
+        return Ok(());
+    }
+    Err(record_reopen_refusal(
+        directory,
+        REOPEN_CONFLICT_GATE,
+        format!(
+            "{} conversation {} is also held by live {} process(es) {}; the reopened session was closed before any prompt was delivered",
+            provider.as_str(),
+            resumed_from.provider_session_id,
+            provider.as_str(),
+            others
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    ))
+}
+
+// A detected holder conflict is the one launch failure that also closes the new surface:
+// the reopened process is a second live writer of the conversation, and leaving it open
+// would keep the interleaving the gate exists to prevent. Every other launch failure keeps
+// the existing behavior of marking only the new session failed. Only the new session's own
+// handle is ever closed; the source keeps its tombstone.
+fn close_surface_after_reopen_conflict(
+    directory: &Path,
+    id: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    if reopen_refusal_gate(&error) != Some(REOPEN_CONFLICT_GATE) {
+        return error;
+    }
+    match close_session_surface(directory, id, Some(format!("{error:#}"))) {
+        Ok(()) => error,
+        Err(close_error) => error.context(format!(
+            "the conflicting reopened session {id} could not be closed: {close_error:#}"
+        )),
+    }
+}
+
+// Closes a managed session's own visible surface exactly as an explicit `close-session`
+// does, through the same terminal-close authority checks. `reason` is kept in the closed
+// status when the close itself reports nothing, so a session closed because of a detected
+// conflict still says why.
+fn close_session_surface(directory: &Path, id: &str, reason: Option<String>) -> Result<()> {
+    close_repaired_session_state_with_reason(directory, reason, |session| {
+        let has_native_owner = verify_terminal_close_authority(directory, id, session)?;
+        #[cfg(target_os = "macos")]
+        if has_native_owner && session.kind == terminal::TerminalKind::AppleTerminal {
+            terminate_apple_terminal_owner(directory, id, session)?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = has_native_owner;
+        terminal::close_session(session)
+    })
+}
+
 // What the read-only gates established about a closed source session.
 #[derive(Debug)]
 struct ReopenSource {
@@ -1366,7 +1516,22 @@ fn run_reopen(request: ReopenRequest) -> Result<()> {
     let mut address = None;
     let outcome = run_reopen_inner(request, &mut address);
     match address {
-        Some((session, request_id)) => finish_request(outcome, json, &session, &request_id),
+        Some((session, request_id)) => {
+            // A gate that failed after the session existed is typed in this process (the
+            // post-launch holder check) or recorded by the launch wrapper in the new
+            // session (the pre-spawn recheck); either way the response names it.
+            let gate = outcome.as_ref().err().and_then(|error| {
+                reopen_refusal_gate(error).map(str::to_owned).or_else(|| {
+                    session_directory(&session)
+                        .ok()
+                        .and_then(|directory| read_reopen_refusal_gate(&directory))
+                })
+            });
+            let mut extra = serde_json::Map::new();
+            extra.insert("source_session".to_owned(), serde_json::json!(source));
+            extra.insert("gate".to_owned(), serde_json::json!(gate));
+            finish_request_with_extra(outcome, json, &session, &request_id, extra)
+        }
         None => {
             if let Err(error) = &outcome
                 && json
@@ -1479,6 +1644,7 @@ fn run_reopen_inner(request: ReopenRequest, address: &mut Option<(String, String
             json: request.json,
             context_sources: &[],
             result_extra,
+            resumed_from: Some(resumed_from),
         },
         address,
     )
@@ -1511,13 +1677,38 @@ fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
             ),
         ));
     }
+    // Every receipt must resolve to a readable, well-formed event of this provider. A
+    // receipt whose event is missing, empty, malformed, or from another provider cannot
+    // prove what that request delivered, whatever the latest event says.
     for receipt in &index.receipts {
-        if !is_regular_file(&directory.join("events").join(&receipt.event_file))? {
+        let event_path = directory.join("events").join(&receipt.event_file);
+        if !is_regular_file(&event_path)? {
             return Err(reopen_refusal(
                 "request-unresolved",
                 format!(
                     "request {} of session {id} has no recorded result; its delivery outcome is uncertain",
                     receipt.request_id
+                ),
+            ));
+        }
+        let event = read_json::<SessionEvent>(&event_path).map_err(|error| {
+            reopen_refusal(
+                "request-unresolved",
+                format!(
+                    "request {} of session {id} points at recorded result {} that cannot be read: {error:#}",
+                    receipt.request_id, receipt.event_file
+                ),
+            )
+        })?;
+        if event.provider != provider.as_str() {
+            return Err(reopen_refusal(
+                "request-unresolved",
+                format!(
+                    "request {} of session {id} points at recorded result {} of provider {} instead of {}",
+                    receipt.request_id,
+                    receipt.event_file,
+                    event.provider,
+                    provider.as_str()
                 ),
             ));
         }
@@ -2859,17 +3050,8 @@ fn native_owner_blocks_prune(directory: &Path) -> Result<bool> {
 fn run_close(request: CloseRequest) -> Result<()> {
     confirm_explicit_close(request.explicit)?;
     let directory = session_directory(&request.id)?;
-    close_repaired_session_state(&directory, |session| {
-        let has_native_owner = verify_terminal_close_authority(&directory, &request.id, session)?;
-        #[cfg(target_os = "macos")]
-        if has_native_owner && session.kind == terminal::TerminalKind::AppleTerminal {
-            terminate_apple_terminal_owner(&directory, &request.id, session)?;
-        }
-        #[cfg(not(target_os = "macos"))]
-        let _ = has_native_owner;
-        terminal::close_session(session)
-    })
-    .with_context(|| format!("failed to close visible terminal session {}", request.id))?;
+    close_session_surface(&directory, &request.id, None)
+        .with_context(|| format!("failed to close visible terminal session {}", request.id))?;
     if request.json {
         println!(
             "{}",
@@ -2916,14 +3098,28 @@ fn verify_terminal_close_authority(
     }
 }
 
+#[cfg(test)]
 fn close_repaired_session_state<F>(directory: &Path, close_terminal: F) -> Result<()>
+where
+    F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
+{
+    close_repaired_session_state_with_reason(directory, None, close_terminal)
+}
+
+// Repairs a dead native owner first, then closes. A repair failure is the recorded close
+// error; otherwise `reason` (if any) is kept in the closed status.
+fn close_repaired_session_state_with_reason<F>(
+    directory: &Path,
+    reason: Option<String>,
+    close_terminal: F,
+) -> Result<()>
 where
     F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
 {
     let repair_error = repair_dead_native_owner(directory)
         .err()
         .map(|error| format!("pre-close session repair failed: {error:#}"));
-    close_session_state_with_error(directory, repair_error, close_terminal)
+    close_session_state_with_error(directory, repair_error.or(reason), close_terminal)
 }
 
 #[cfg(test)]
@@ -3054,6 +3250,16 @@ pub(super) fn rename_session_file(from: &Path, to: &Path) -> Result<()> {
 }
 
 fn finish_request(outcome: Result<()>, json: bool, session: &str, request_id: &str) -> Result<()> {
+    finish_request_with_extra(outcome, json, session, request_id, serde_json::Map::new())
+}
+
+fn finish_request_with_extra(
+    outcome: Result<()>,
+    json: bool,
+    session: &str,
+    request_id: &str,
+    extra: serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
     if let Err(error) = outcome {
         if json {
             let mut value = session_directory(session)
@@ -3066,6 +3272,9 @@ fn finish_request(outcome: Result<()>, json: bool, session: &str, request_id: &s
                 });
             value["ok"] = serde_json::json!(false);
             value["error"] = serde_json::json!(format!("{error:#}"));
+            for (key, field) in extra {
+                value[key] = field;
+            }
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
         return Err(error).with_context(|| format!(
@@ -3207,8 +3416,9 @@ fn run_session_inner(directory: &Path) -> Result<()> {
     // A reopened session launches through the adapter's resume plan. The plan carries no
     // prompt: the initial prompt reaches the reopened process through the same transport a
     // fresh launch uses, so `prompt_is_positional` is false here by construction.
+    let resumed_from = read_resumed_from(directory)?;
     let (provider_arguments, prompt_is_positional, completion_monitor, environment_removals) =
-        match read_resumed_from(directory)? {
+        match &resumed_from {
             Some(resumed_from) => {
                 let provider::ResumePlan {
                     arguments,
@@ -3260,6 +3470,21 @@ fn run_session_inner(directory: &Path) -> Result<()> {
     let mut provider_command =
         provider_process_command(&manifest.provider_path, directory, arguments)?;
     provider::apply_environment_removals(&mut provider_command, environment_removals);
+    // The reopen ownership gate ran read-only before the source was claimed; the provider
+    // grants no exclusive hold on the conversation, so it runs again here, after every other
+    // preparation and immediately before the process exists. A holder that appeared in
+    // between refuses under the same gate; the record carries the gate to the reopen command.
+    if let Some(resumed_from) = &resumed_from
+        && let Err(error) =
+            provider::verify_reopen_available(provider, &resumed_from.provider_session_id)
+    {
+        let _ = completion_monitor.stop();
+        return Err(record_reopen_refusal(
+            directory,
+            REOPEN_LAUNCH_GATE,
+            format!("{error:#}"),
+        ));
+    }
     let child = provider_command
         .current_dir(&manifest.workspace)
         .env(SESSION_DIR_ENV, directory)
