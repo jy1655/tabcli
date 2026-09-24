@@ -1541,7 +1541,9 @@ fn record_provider_process(
     .context("failed to record the spawned provider process")
 }
 
-// Why a recorded provider process is known to be gone.
+// Why a recorded provider process is known to be gone. Identity mismatches are only
+// observable where the reopen slice runs (native Windows); other targets never build one.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, PartialEq)]
 enum ProviderProcessGone {
     // Its pid is no longer alive.
@@ -1552,6 +1554,7 @@ enum ProviderProcessGone {
 }
 
 // What can be observed about a recorded provider process now.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, PartialEq)]
 enum ProviderProcessObservation {
     Gone(ProviderProcessGone),
