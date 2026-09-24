@@ -122,6 +122,41 @@ pub(super) struct Snapshot {
     _lock: Option<File>,
 }
 
+#[cfg(test)]
+type PublicationReadHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs right after a snapshot's publication read and before its consistency check,
+    /// so a test can change a state record there and force the read to be retried.
+    static AFTER_PUBLICATION_READ: std::cell::RefCell<Option<PublicationReadHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs `hook` for the snapshots `run` takes on this thread (see
+/// [`AFTER_PUBLICATION_READ`]) and removes it afterwards.
+#[cfg(test)]
+pub(super) fn with_publication_read_hook<T>(
+    hook: impl FnMut(&Path) + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    AFTER_PUBLICATION_READ.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+    let outcome = run();
+    AFTER_PUBLICATION_READ.with(|cell| *cell.borrow_mut() = None);
+    outcome
+}
+
+fn after_publication_read(directory: &Path) {
+    #[cfg(test)]
+    AFTER_PUBLICATION_READ.with(|cell| {
+        if let Some(hook) = cell.borrow_mut().as_mut() {
+            hook(directory);
+        }
+    });
+    #[cfg(not(test))]
+    let _ = directory;
+}
+
 pub(super) fn optional_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
     read_regular_text_if_present(path)?
         .map(|text| {
@@ -140,6 +175,13 @@ impl Snapshot {
     /// journaled event. A search passes what remains of its byte budget; every other
     /// query keeps the 64 MiB event limit.
     pub(super) fn read_within(directory: &Path, event_limit: u64) -> Result<Self> {
+        Self::read_charging(directory, event_limit, &mut 0)
+    }
+
+    /// [`Snapshot::read_within`] that adds the bytes its publication check read to
+    /// `charged` as soon as they are read, before the consistency check can reject the
+    /// attempt: a budgeted caller pays for every attempt, not only for the one it keeps.
+    fn read_charging(directory: &Path, event_limit: u64, charged: &mut u64) -> Result<Self> {
         // Open an existing lifecycle lock without creating it or changing permissions.
         let lock_path = directory.join(TURN_CLAIM_LOCK_FILE);
         let lock = match File::open(&lock_path) {
@@ -169,11 +211,12 @@ impl Snapshot {
         let pending_event = match &pending {
             Some(pending) => {
                 validate_pending_completion(pending)?;
-                Some(journaled_event_state_within(
-                    directory,
-                    pending,
-                    event_limit,
-                )?)
+                // The predicate validates `events` before it opens anything under it, so
+                // a link planted there is rejected instead of followed by this read.
+                let read = journaled_event_state_within(directory, pending, event_limit)?;
+                *charged += read.bytes_read;
+                after_publication_read(directory);
+                Some(read)
             }
             None => None,
         };
@@ -315,17 +358,38 @@ impl Snapshot {
 }
 
 pub(super) fn observe_snapshot(directory: &Path) -> Result<Snapshot> {
-    observe_snapshot_within(directory, EVENT_READ_LIMIT)
+    observe_snapshot_within(directory, EVENT_READ_LIMIT).outcome
 }
 
-fn observe_snapshot_within(directory: &Path, event_limit: u64) -> Result<Snapshot> {
+/// A snapshot attempt sequence and what it cost, whatever its outcome.
+struct SnapshotAttempt {
+    outcome: Result<Snapshot>,
+    /// Bytes every attempt's publication check read, including attempts that were
+    /// retried or failed after reading: the caller charges all of them.
+    bytes_read: u64,
+    /// The event limit the final attempt read within, after earlier attempts' charges.
+    final_limit: u64,
+}
+
+/// Retries a busy snapshot within `event_limit` bytes of publication reads in total: each
+/// attempt reads within what the earlier attempts left, so retries can never read past
+/// the caller's budget, and every attempt's bytes are returned for charging.
+fn observe_snapshot_within(directory: &Path, event_limit: u64) -> SnapshotAttempt {
     let deadline = Instant::now() + Duration::from_millis(250);
+    let mut bytes_read = 0;
     loop {
-        match Snapshot::read_within(directory, event_limit) {
+        let final_limit = event_limit.saturating_sub(bytes_read);
+        match Snapshot::read_charging(directory, final_limit, &mut bytes_read) {
             Err(error) if error.is::<SnapshotBusy>() && Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(25));
             }
-            outcome => return outcome,
+            outcome => {
+                return SnapshotAttempt {
+                    outcome,
+                    bytes_read,
+                    final_limit,
+                };
+            }
         }
     }
 }
@@ -943,18 +1007,7 @@ fn read_event_within_budget(path: &Path, remaining: u64) -> Result<Option<String
 /// The shared event listing turns a missing or non-directory `events` path into an
 /// empty list; a search must not present that damage as "no results".
 fn check_events_directory(directory: &Path) -> Result<(), String> {
-    let events = directory.join("events");
-    match fs::symlink_metadata(&events) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            Err("events directory is a symlink".to_owned())
-        }
-        Ok(metadata) if !metadata.is_dir() => Err("events is not a directory".to_owned()),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Err("events directory is missing".to_owned())
-        }
-        Err(error) => Err(format!("events directory is unreadable: {error}")),
-    }
+    require_events_directory(directory).map_err(|error| format!("{error:#}"))
 }
 
 enum SessionScan {
@@ -985,19 +1038,24 @@ fn search_session(
     if let Some(budget) = scan.exhausted_budget() {
         return Ok(SessionScan::Budget(budget));
     }
-    // The snapshot's publication check may read one journaled event. It reads within the
-    // remaining byte budget and its bytes are charged here, before anything else is read.
-    let remaining = scan.byte_budget - scan.bytes_read;
-    let snapshot =
-        observe_snapshot_within(directory, remaining).map_err(|error| format!("{error:#}"))?;
+    // `events` is validated before the snapshot can read a journaled event through it.
+    check_events_directory(directory)?;
+    // The snapshot's publication check may read one journaled event per attempt. Every
+    // attempt reads within the remaining byte budget, and every attempt's bytes are
+    // charged here, whether the snapshot was kept, retried, or failed, before anything
+    // else is read.
+    let remaining = scan.byte_budget.saturating_sub(scan.bytes_read);
+    let attempt = observe_snapshot_within(directory, remaining);
+    scan.bytes_read += attempt.bytes_read;
+    let snapshot = attempt.outcome.map_err(|error| format!("{error:#}"))?;
     scan.sessions_scanned += 1;
     if let Some((name, read)) = snapshot.pending_event() {
-        scan.bytes_read += read.bytes_read;
         match read.state {
             JournaledEventState::Oversized(size) => {
                 return Ok(SessionScan::Budget(format!(
-                    "{}; journaled event {id}/{name} is {size} bytes with {remaining} bytes remaining",
-                    scan.byte_budget_exhausted()
+                    "{}; journaled event {id}/{name} is {size} bytes with {} bytes remaining",
+                    scan.byte_budget_exhausted(),
+                    attempt.final_limit
                 )));
             }
             JournaledEventState::Mismatched => {
@@ -1038,7 +1096,7 @@ fn search_session(
             .pending_event()
             .filter(|(pending_name, _)| *pending_name == name)
             .and_then(|(_, read)| read.committed_text.clone());
-        let remaining = scan.byte_budget - scan.bytes_read;
+        let remaining = scan.byte_budget.saturating_sub(scan.bytes_read);
         let read = match committed {
             Some(text) => Ok(Some(text)),
             None => {

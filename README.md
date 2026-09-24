@@ -180,7 +180,7 @@ Codex가 메인이든 Claude가 메인이든 같은 흐름을 사용합니다. �
 | --- | --- |
 | `completed` / `failed` | provider가 검증한 완료 결과 또는 실패 결과가 게시됨 |
 | `pending` | 해당 요청이 현재 claim을 보유하고 완료 결과를 기다리는 중 |
-| `recovery_required` | completion journal이 남아 있고 그 journal의 event가 아직 기록되지 않아 게시를 확정하지 않은 상태입니다. journal의 event가 이미 journal과 같은 내용으로 기록돼 있으면 이 상태가 아니라 `completed`(또는 오류가 있으면 `failed`)로 보고됩니다. |
+| `recovery_required` | completion journal이 남아 있고 그 journal의 event를 게시로 확정할 수 없는 상태입니다. event가 아직 기록되지 않았거나, 기록된 event가 journal과 내용이 다르거나, 읽기 한도(64 MiB)를 넘어 비교할 수 없으면 이 상태입니다. journal의 event가 이미 journal과 같은 내용으로 기록돼 있으면 이 상태가 아니라 `completed`(또는 오류가 있으면 `failed`)로 보고됩니다. |
 | `unresolved` | 게시된 결과 없이 claim이 해제됐거나 owner가 종료됨. 재전송이 안전하다는 뜻이 아님 |
 | `unavailable` | 조회할 최근 결과가 없음 |
 | `busy` / `unknown` | 일관된 snapshot을 아직 얻지 못했거나 오류 응답 시 상태 확인 실패 |

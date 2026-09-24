@@ -3032,6 +3032,30 @@ fn commit_provider_completion_with_status_locked(
     status_error: Option<String>,
     status_state: &str,
 ) -> Result<()> {
+    commit_provider_completion_within_locked(
+        directory,
+        claim_path,
+        claim_token,
+        event,
+        status_error,
+        status_state,
+        EVENT_READ_LIMIT,
+    )
+}
+
+/// [`commit_provider_completion_with_status_locked`] with an explicit event size limit, so
+/// tests exercise the size policy without writing 64 MiB records. Production callers pass
+/// [`EVENT_READ_LIMIT`]: the journal is created under the same limit the publication
+/// predicate reads with, so no interruption can change whether a completion recovers.
+fn commit_provider_completion_within_locked(
+    directory: &Path,
+    claim_path: &Path,
+    claim_token: &str,
+    event: SessionEvent,
+    status_error: Option<String>,
+    status_state: &str,
+    event_limit: u64,
+) -> Result<()> {
     let mut pending =
         PendingTurnCompletion::new_with_status(claim_token, event, status_error, status_state)?;
     // Request indexing must not prevent a provider-verified completion from publishing.
@@ -3039,6 +3063,7 @@ fn commit_provider_completion_with_status_locked(
     if let Ok(Some(receipt)) = requests::for_claim(directory, claim_token) {
         pending.event_file = receipt.event_file;
     }
+    let pending = bound_pending_completion(pending, event_limit)?;
     // Every caller recovers under the lifecycle lock first, so a journal that still exists
     // here belongs to a completion that could not be recovered; refuse to replace it.
     let completion_path = directory.join(TURN_COMPLETION_FILE);
@@ -3050,6 +3075,29 @@ fn commit_provider_completion_with_status_locked(
     write_json_atomic(&completion_path, &pending)?;
     recover_pending_completion_locked(directory, claim_path)?;
     Ok(())
+}
+
+/// The one size policy, applied where a completion is journaled. An event record larger
+/// than `event_limit` (the bytes the journal would write) is never journaled as
+/// publishable: the publication predicate reads at most that many bytes, so such a record
+/// could be published when the commit stopped before writing it and refused when it
+/// stopped after. The completion is journaled instead as a failure whose error names the
+/// size, keeping the provider identity, so every interruption settles to the same state.
+fn bound_pending_completion(
+    mut pending: PendingTurnCompletion,
+    event_limit: u64,
+) -> Result<PendingTurnCompletion> {
+    let size = serde_json::to_vec_pretty(&pending.event)?.len() as u64;
+    if size <= event_limit {
+        return Ok(pending);
+    }
+    let error =
+        format!("provider result of {size} bytes exceeds the {event_limit} byte event limit");
+    pending.event.message = String::new();
+    pending.event.error = Some(error.clone());
+    pending.status_error = Some(error);
+    pending.status_state = "failed".to_owned();
+    Ok(pending)
 }
 
 fn read_regular_text_if_present(path: &Path) -> Result<Option<String>> {
@@ -4050,15 +4098,19 @@ fn journaled_event_state(
     Ok(journaled_event_state_within(directory, pending, EVENT_READ_LIMIT)?.state)
 }
 
-/// [`journaled_event_state`] that never reads more than `limit` bytes of the event: the
-/// size is checked before the file is opened and the read is cut after `limit` bytes, so a
-/// file that grows under the read is still reported as oversized.
+/// [`journaled_event_state`] that reads at most `limit + 1` bytes of the event. The size
+/// is checked before the file is opened, and a file that grows under the read is still
+/// reported as oversized: the read is cut after `limit + 1` bytes, and that one extra byte
+/// is what detects the overflow, so a caller charging a byte budget may see one byte more
+/// than `limit` in `bytes_read`. The `events` directory is validated before anything under
+/// it is opened, so a link planted there is never followed by a publication read.
 fn journaled_event_state_within(
     directory: &Path,
     pending: &PendingTurnCompletion,
     limit: u64,
 ) -> Result<JournaledEventRead> {
     use std::io::Read as _;
+    require_events_directory(directory)?;
     let path = directory.join("events").join(&pending.event_file);
     let outcome = |state, bytes_read, committed_text| JournaledEventRead {
         state,
@@ -4112,6 +4164,27 @@ fn journaled_event_state_within(
     } else {
         outcome(JournaledEventState::Mismatched, bytes_read, None)
     })
+}
+
+/// A session's `events` must be a real directory inside the session directory before any
+/// record under it is opened: the shared event listing turns a missing or non-directory
+/// `events` path into an empty list, a search must not present that damage as "no
+/// results", and a link planted there would carry a publication read outside the state
+/// root. Checked with `symlink_metadata`, so a symlink or Windows junction is rejected
+/// rather than followed.
+fn require_events_directory(directory: &Path) -> Result<()> {
+    let events = directory.join("events");
+    match fs::symlink_metadata(&events) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("events directory is a symlink")
+        }
+        Ok(metadata) if !metadata.is_dir() => bail!("events is not a directory"),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("events directory is missing")
+        }
+        Err(error) => bail!("events directory is unreadable: {error}"),
+    }
 }
 
 /// The first settlement step of a close that finds a completion journal in place. The
@@ -4177,10 +4250,21 @@ fn write_pending_completion_event(directory: &Path, pending: &PendingTurnComplet
                 "pending native completion event file is {size} bytes, over the {EVENT_READ_LIMIT} byte read limit"
             )
         }
-        JournaledEventState::Absent => write_json_atomic(
-            &directory.join("events").join(&pending.event_file),
-            &pending.event,
-        ),
+        JournaledEventState::Absent => {
+            // The same size policy the journal was created under, re-checked for a
+            // journal an earlier version wrote: an event the predicate could never compare
+            // is not written, so the absent and present orders settle the same way.
+            let size = serde_json::to_vec_pretty(&pending.event)?.len() as u64;
+            if size > EVENT_READ_LIMIT {
+                bail!(
+                    "pending native completion event is {size} bytes, over the {EVENT_READ_LIMIT} byte read limit"
+                )
+            }
+            write_json_atomic(
+                &directory.join("events").join(&pending.event_file),
+                &pending.event,
+            )
+        }
     }
 }
 

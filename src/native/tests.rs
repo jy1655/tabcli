@@ -4622,6 +4622,411 @@ fn a_journaled_event_over_the_read_limit_is_never_published_or_compared() {
     assert_eq!(value["request_state"], "recovery_required");
 }
 
+fn oversized_sample_event(message: &str) -> SessionEvent {
+    SessionEvent {
+        provider: FirstPartyCli::Codex.as_str().to_owned(),
+        message: message.to_owned(),
+        error: None,
+        provider_session_id: Some("provider-session".to_owned()),
+        turn_id: Some("provider-turn".to_owned()),
+        created_unix_ms: 1,
+    }
+}
+
+/// A working session with a held claim and no completion yet: what a provider completion
+/// commits into. Returns the request address, the claim token, and the receipt's event path.
+fn seed_claimed_session(directory: &Path) -> (String, String, PathBuf) {
+    fs::create_dir_all(directory.join("events")).unwrap();
+    write_test_manifest(directory);
+    update_status(directory, "working", None, None).unwrap();
+    let claim = acquire_turn_claim(directory).unwrap();
+    let request_id = claim.receipt.request_id.clone();
+    let event_path = directory.join("events").join(&claim.receipt.event_file);
+    let token = claim.token.clone();
+    claim.retain();
+    (request_id, token, event_path)
+}
+
+/// Everything a query or a lifecycle step can observe of a settled completion.
+#[derive(Debug, PartialEq)]
+struct SettledCompletion {
+    request: (String, String),
+    status: (String, Option<String>),
+    event: SessionEvent,
+    claim_present: bool,
+    journal_present: bool,
+}
+
+fn settled_completion(directory: &Path, request_id: &str, event_path: &Path) -> SettledCompletion {
+    let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+    SettledCompletion {
+        request: request_state(directory, request_id),
+        status: (status.state, status.error),
+        event: read_json(event_path).unwrap(),
+        claim_present: directory.join(TURN_CLAIM_FILE).exists(),
+        journal_present: directory.join(TURN_COMPLETION_FILE).exists(),
+    }
+}
+
+#[test]
+fn an_oversized_completion_settles_identically_whichever_write_it_stops_after() {
+    // The size policy is applied when the journal is created: a completion whose event
+    // record would exceed the read limit is journaled as a failed completion whose error
+    // names the size. Stopping the commit before every record write, then recovering, must
+    // therefore reach one final state whether the event was written before the stop or not.
+    const LIMIT: u64 = 4096;
+    let event = oversized_sample_event(&"x".repeat(LIMIT as usize));
+    let size = serde_json::to_vec_pretty(&event).unwrap().len() as u64;
+    assert!(size > LIMIT);
+    let expected_error =
+        format!("provider result of {size} bytes exceeds the {LIMIT} byte event limit");
+    let mut journal_only = 0;
+    let mut journal_and_event = 0;
+    let mut settled = Vec::new();
+    for budget in 0.. {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-size");
+        let (request_id, claim_token, event_path) = seed_claimed_session(&directory);
+        let claim_path = directory.join(TURN_CLAIM_FILE);
+        let outcome = with_fault_budget(budget, || {
+            let _lock = lock_turn_claim(&claim_path).unwrap();
+            commit_provider_completion_within_locked(
+                &directory,
+                &claim_path,
+                &claim_token,
+                event.clone(),
+                None,
+                "ready",
+                LIMIT,
+            )
+        });
+        let interrupted = match outcome {
+            Ok(()) => false,
+            Err(error) => {
+                assert!(injected_fault(&error), "{error:#}");
+                true
+            }
+        };
+        let label = format!("budget {budget}");
+        let journal_present = directory.join(TURN_COMPLETION_FILE).exists();
+        if journal_present {
+            // The journal never holds a publishable record over the limit.
+            let pending: PendingTurnCompletion =
+                read_json(&directory.join(TURN_COMPLETION_FILE)).unwrap();
+            assert_eq!(pending.event.message, "", "{label}");
+            assert_eq!(pending.status_state, "failed", "{label}");
+            assert_eq!(
+                pending.event.error.as_deref(),
+                Some(expected_error.as_str()),
+                "{label}"
+            );
+            if event_path.exists() {
+                journal_and_event += 1;
+            } else {
+                journal_only += 1;
+            }
+        } else if !event_path.exists() {
+            // The stop came before the journal: nothing to recover and the claim stays.
+            assert!(interrupted, "{label}");
+            assert!(!recover_pending_completion(&directory).unwrap(), "{label}");
+            assert_eq!(
+                request_state(&directory, &request_id),
+                ("pending".to_owned(), "working".to_owned()),
+                "{label}"
+            );
+            continue;
+        }
+        // Otherwise the journal was created (and possibly already settled and removed):
+        // recovery must converge on the one final state.
+        recover_pending_completion(&directory).unwrap();
+        settled.push(settled_completion(&directory, &request_id, &event_path));
+        assert!(!recover_pending_completion(&directory).unwrap(), "{label}");
+        if !interrupted {
+            break;
+        }
+    }
+    assert!(
+        journal_only >= 1,
+        "no stop between the journal and the event"
+    );
+    assert!(journal_and_event >= 1, "no stop after the event");
+    let first = &settled[0];
+    assert_eq!(first.request, ("failed".to_owned(), "failed".to_owned()));
+    assert_eq!(
+        first.status,
+        ("failed".to_owned(), Some(expected_error.clone()))
+    );
+    assert_eq!(first.event.message, "");
+    assert_eq!(first.event.error.as_deref(), Some(expected_error.as_str()));
+    assert_eq!(
+        first.event.provider_session_id.as_deref(),
+        Some("provider-session")
+    );
+    assert_eq!(first.event.turn_id.as_deref(), Some("provider-turn"));
+    assert!(!first.claim_present);
+    assert!(!first.journal_present);
+    for (index, state) in settled.iter().enumerate() {
+        assert_eq!(state, first, "stop {index} settled differently");
+    }
+}
+
+#[test]
+fn a_completion_over_the_read_limit_is_journaled_as_an_explicit_failure() {
+    // The real limit: a result the publication predicate could never compare is recorded
+    // as a failure that names the size, and the record it publishes stays readable.
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-limit");
+    let (request_id, claim_token, event_path) = seed_claimed_session(&directory);
+    let claim_path = directory.join(TURN_CLAIM_FILE);
+    let event = oversized_sample_event(&"x".repeat(EVENT_READ_LIMIT as usize));
+    {
+        let _lock = lock_turn_claim(&claim_path).unwrap();
+        commit_provider_completion_locked(&directory, &claim_path, &claim_token, event, None)
+            .unwrap();
+    }
+    let settled = settled_completion(&directory, &request_id, &event_path);
+    assert_eq!(settled.request, ("failed".to_owned(), "failed".to_owned()));
+    let error = settled.status.1.clone().unwrap();
+    assert!(
+        error.contains(&format!("exceeds the {EVENT_READ_LIMIT} byte event limit")),
+        "{error}"
+    );
+    assert_eq!(settled.event.error.as_deref(), Some(error.as_str()));
+    assert_eq!(settled.event.message, "");
+    assert!(fs::metadata(&event_path).unwrap().len() < EVENT_READ_LIMIT);
+    assert!(!settled.claim_present);
+    assert!(!settled.journal_present);
+    let value = query::request_result(&directory, &request_id).unwrap();
+    assert_eq!(value["error"], error);
+}
+
+#[test]
+fn a_journal_over_the_read_limit_is_never_published_whichever_write_it_stopped_after() {
+    // A journal written before the size policy existed carries an event over the limit.
+    // Recovery refuses to publish it whether the event file is absent or present, so the
+    // interruption order cannot decide the outcome; a close then settles both the same way.
+    let event = oversized_sample_event(&"x".repeat(EVENT_READ_LIMIT as usize));
+    let event_bytes = serde_json::to_vec_pretty(&event).unwrap();
+    let size = event_bytes.len() as u64;
+    assert!(size > EVENT_READ_LIMIT);
+    let mut outcomes = Vec::new();
+    for event_written in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-legacy");
+        let (request_id, claim_token, event_path) = seed_claimed_session(&directory);
+        let mut pending = PendingTurnCompletion::new(&claim_token, event.clone(), None).unwrap();
+        pending.event_file = event_path.file_name().unwrap().to_str().unwrap().to_owned();
+        write_json_atomic(&directory.join(TURN_COMPLETION_FILE), &pending).unwrap();
+        if event_written {
+            fs::write(&event_path, &event_bytes).unwrap();
+        }
+        let label = format!("event_written={event_written}");
+
+        let error = recover_pending_completion(&directory).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(&format!(
+                "{size} bytes, over the {EVENT_READ_LIMIT} byte read limit"
+            )),
+            "{label}: {text}"
+        );
+        let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+        assert_eq!(status.state, "working", "{label}");
+        assert!(directory.join(TURN_CLAIM_FILE).exists(), "{label}");
+        assert!(directory.join(TURN_COMPLETION_FILE).exists(), "{label}");
+        assert_eq!(event_path.exists(), event_written, "{label}");
+        let before = request_state(&directory, &request_id);
+        assert_eq!(before.0, "recovery_required", "{label}");
+
+        close_session_state(&directory, |_| Ok(terminal::CloseOutcome::Closed)).unwrap();
+        assert!(!event_path.exists(), "{label}");
+        assert!(!directory.join(TURN_CLAIM_FILE).exists(), "{label}");
+        assert!(!directory.join(TURN_COMPLETION_FILE).exists(), "{label}");
+        assert!(event_paths(&directory).unwrap().is_empty(), "{label}");
+        outcomes.push((before, request_state(&directory, &request_id)));
+    }
+    assert_eq!(outcomes[0], outcomes[1]);
+    assert_eq!(
+        outcomes[0].1,
+        ("unresolved".to_owned(), "closed".to_owned())
+    );
+}
+
+#[test]
+fn search_charges_publication_reads_of_retried_and_failed_snapshots() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-retry");
+    let message = format!("needle {}", "x".repeat(4200));
+    let (request_id, event_path) =
+        seed_event_written_completion_with(&directory, &message, &message);
+    let event_id = event_path.file_name().unwrap().to_str().unwrap().to_owned();
+    let size = fs::metadata(&event_path).unwrap().len();
+    // A later session with an ordinary published hit, reached only with budget to spare.
+    let other = root.path().join("session-zzz");
+    fs::create_dir_all(other.join("events")).unwrap();
+    write_test_manifest(&other);
+    update_status(&other, "ready", None, None).unwrap();
+    let mut plain = read_json::<SessionEvent>(&event_path).unwrap();
+    plain.message = "needle in the other session".to_owned();
+    write_json_atomic(&other.join("events").join("event-1.json"), &plain).unwrap();
+
+    // The first snapshot of the journaled session reads its event, then finds the status
+    // changed and is retried; every attempt's read is charged to the scan.
+    let search = |max_bytes: u64, disturb: fn(&Path)| {
+        let mut fired = false;
+        query::with_publication_read_hook(
+            move |directory: &Path| {
+                if !fired {
+                    fired = true;
+                    disturb(directory);
+                }
+            },
+            || {
+                let budget = max_bytes.to_string();
+                cli_search(
+                    root.path(),
+                    &[
+                        "search",
+                        "needle",
+                        "--all-workspaces",
+                        "--max-bytes",
+                        &budget,
+                        "--json",
+                    ],
+                )
+            },
+        )
+    };
+    fn bump_status(directory: &Path) {
+        update_status(directory, "working", None, None).unwrap();
+    }
+    fn drop_manifest(directory: &Path) {
+        fs::remove_file(directory.join("manifest.json")).unwrap();
+    }
+
+    // Budget for exactly one read: the retry has nothing left and must stop, not read
+    // the event a second time.
+    let retried = search(size, bump_status);
+    assert!(retried["hits"].as_array().unwrap().is_empty(), "{retried}");
+    assert_eq!(retried["scanned"]["sessions"], 1, "{retried}");
+    assert_eq!(retried["scanned"]["events"], 0, "{retried}");
+    let reasons = retried["incomplete_reasons"].to_string();
+    assert!(
+        reasons.contains(&format!(
+            "byte budget of {size} bytes exhausted; journaled event session-retry/{event_id} is {size} bytes with 0 bytes remaining"
+        )),
+        "{reasons}"
+    );
+
+    // Budget for both attempts: the retried read is the hit, and the two reads together
+    // consume the budget before the later session.
+    let twice = search(2 * size, bump_status);
+    let hits = twice["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "{twice}");
+    assert_eq!(hits[0]["request_id"], request_id);
+    assert_eq!(hits[0]["event_id"], event_id);
+    assert_eq!(twice["scanned"]["sessions"], 1, "{twice}");
+    assert_eq!(twice["scanned"]["events"], 1, "{twice}");
+    assert!(
+        twice["incomplete_reasons"].to_string().contains(&format!(
+            "scan stopped: byte budget of {} bytes exhausted",
+            2 * size
+        )),
+        "{twice}"
+    );
+
+    // A snapshot that fails after its publication read still charges that read.
+    let failed = search(size, drop_manifest);
+    assert!(failed["hits"].as_array().unwrap().is_empty(), "{failed}");
+    assert_eq!(failed["scanned"]["sessions"], 0, "{failed}");
+    let reasons = failed["incomplete_reasons"].to_string();
+    assert!(reasons.contains("manifest"), "{reasons}");
+    assert!(
+        reasons.contains(&format!(
+            "scan stopped: byte budget of {size} bytes exhausted"
+        )),
+        "{reasons}"
+    );
+}
+
+/// Points `link` at `target` as a directory symlink, or on Windows a junction when
+/// symlinks need a privilege. Returns false where neither can be created.
+fn link_directory(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    let created = std::os::unix::fs::symlink(target, link).is_ok();
+    #[cfg(windows)]
+    let created = std::os::windows::fs::symlink_dir(target, link).is_ok()
+        || Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .is_ok_and(|output| output.status.success());
+    created && fs::symlink_metadata(link).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+#[test]
+fn queries_reject_an_events_directory_link_before_reading_through_it() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-link");
+    let message = format!("needle {}", "x".repeat(64));
+    let (request_id, event_path) =
+        seed_event_written_completion_with(&directory, &message, &message);
+    let event_id = event_path.file_name().unwrap().to_str().unwrap().to_owned();
+    // The committed event now lives outside the state root, behind a link at `events`.
+    let target = outside.path().join("events");
+    fs::rename(directory.join("events"), &target).unwrap();
+    if !link_directory(&target, &directory.join("events")) {
+        eprintln!("skipped: this environment cannot create a directory link");
+        return;
+    }
+    let external_event = target.join(&event_id);
+    assert_eq!(
+        read_json::<SessionEvent>(&external_event).unwrap().message,
+        message
+    );
+
+    // The general snapshot rejects the link instead of reporting the event behind it.
+    let error = query::request_result(&directory, &request_id).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("events directory is a symlink"),
+        "{error:#}"
+    );
+    let search = cli_search(
+        root.path(),
+        &["search", "needle", "--all-workspaces", "--json"],
+    );
+    assert!(search["hits"].as_array().unwrap().is_empty(), "{search}");
+    assert_eq!(search["scanned"]["events"], 0, "{search}");
+    assert!(
+        search["incomplete_reasons"]
+            .to_string()
+            .contains("events directory is a symlink"),
+        "{search}"
+    );
+
+    // Nothing behind the link is opened: a record that could not even be read there
+    // changes neither verdict.
+    fs::remove_file(&external_event).unwrap();
+    fs::create_dir(&external_event).unwrap();
+    let error = query::request_result(&directory, &request_id).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("events directory is a symlink"),
+        "{error:#}"
+    );
+    let search = cli_search(
+        root.path(),
+        &["search", "needle", "--all-workspaces", "--json"],
+    );
+    let reasons = search["incomplete_reasons"].to_string();
+    assert!(
+        reasons.contains("events directory is a symlink"),
+        "{reasons}"
+    );
+    assert!(!reasons.contains("non-regular"), "{reasons}");
+}
+
 #[test]
 fn claim_free_recovery_refuses_an_equivalent_event_in_another_encoding() {
     let root = tempfile::tempdir().unwrap();
