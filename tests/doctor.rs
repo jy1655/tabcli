@@ -47,6 +47,20 @@ impl Fixture {
             .unwrap()
     }
 
+    fn run_with_env(&self, args: &[&str], env: &[(&str, Option<&str>)]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-bridge"));
+        command
+            .args(args)
+            .env("AGENT_BRIDGE_NATIVE_STATE_DIR", self.root.path());
+        for (key, value) in env {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+        command.output().unwrap()
+    }
+
     fn doctor(&self) -> Value {
         report(self.run(&["doctor", "session-doctor", "--json"]))
     }
@@ -465,4 +479,48 @@ fn legacy_iterm_handle_uses_the_existing_binding_contract() {
         "terminal_record_found"
     );
     assert_eq!(check(&fixture.doctor(), "owner")["availability"], "unknown");
+}
+
+#[test]
+fn claude_doctor_reports_inherited_claude_code_session_markers_without_changing_files() {
+    let fixture = Fixture::new("claude");
+    let before = files(fixture.root.path());
+    // The test process itself may run inside a Claude Code session, so every marker is
+    // cleared first and only the two under test are reintroduced.
+    const MARKERS: [&str; 10] = [
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDECODE",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_PID",
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+        "CLAUDE_CODE_SESSION_ATTENDED",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_EXECPATH",
+        "CLAUDE_EFFORT",
+    ];
+    let cleared = MARKERS.map(|marker| (marker, None));
+    let mut inside_env = cleared.to_vec();
+    inside_env.extend([
+        ("CLAUDE_CODE_CHILD_SESSION", Some("1")),
+        ("CLAUDECODE", Some("1")),
+    ]);
+    let inside = report(fixture.run_with_env(&["doctor", "session-doctor", "--json"], &inside_env));
+    let markers = check(&inside, "claude_caller_markers");
+    assert_eq!(markers["availability"], "available");
+    assert_eq!(
+        markers["reason_code"],
+        "claude_caller_markers_removed_at_launch"
+    );
+    assert_eq!(
+        markers["evidence"]["inherited"],
+        json!(["CLAUDE_CODE_CHILD_SESSION", "CLAUDECODE"])
+    );
+
+    let outside = report(fixture.run_with_env(&["doctor", "session-doctor", "--json"], &cleared));
+    assert_eq!(
+        check(&outside, "claude_caller_markers")["reason_code"],
+        "claude_caller_markers_absent"
+    );
+    assert_eq!(files(fixture.root.path()), before);
 }

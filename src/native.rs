@@ -2567,6 +2567,7 @@ fn run_session_inner(directory: &Path) -> Result<()> {
         arguments: provider_arguments,
         prompt_is_positional,
         completion_monitor,
+        environment_removals,
     } = provider::prepare_launch(
         provider,
         provider::LaunchContext {
@@ -2588,6 +2589,7 @@ fn run_session_inner(directory: &Path) -> Result<()> {
     let completion_monitor = completion_monitor.start(directory)?;
     let mut provider_command =
         provider_process_command(&manifest.provider_path, directory, arguments)?;
+    provider::apply_environment_removals(&mut provider_command, environment_removals);
     let child = provider_command
         .current_dir(&manifest.workspace)
         .env(SESSION_DIR_ENV, directory)

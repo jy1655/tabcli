@@ -59,6 +59,14 @@ launch, observe, continue, and close without replacing the capabilities those CL
   blocked before it ran (denied with the guard's reason, or stopped by the provider).
 - Give every request its own messenger files. The target can complete a delivered turn,
   and the next `tell` can start, while the previous sender is still settling.
+- Never let a managed Claude session or a messenger inherit Claude Code session markers
+  (`CLAUDE_CODE_CHILD_SESSION`, `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PID`,
+  `CLAUDE_CODE_MESSAGING_SOCKET`, `CLAUDE_CODE_MESSAGING_TOKEN`, and the rest of the set in
+  the Claude adapter). Agent Bridge is normally invoked from inside a Claude Code session,
+  and a `claude` that inherits `CLAUDE_CODE_CHILD_SESSION` treats itself as a nested child:
+  it never registers its cross-session inbox, so `ListAgents` cannot find it and delivery
+  fails (issue #42, observed 2026-09-24 with Claude Code 2.1.281). The removal list is
+  adapter-owned launch configuration; the shared launcher only applies it.
 
 ## Change and Verification Rules
 

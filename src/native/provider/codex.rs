@@ -96,6 +96,7 @@ impl NativeProviderAdapter for CodexAdapter {
             arguments,
             prompt_is_positional: false,
             completion_monitor: CompletionMonitor::Hook,
+            environment_removals: &[],
         })
     }
 

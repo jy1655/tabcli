@@ -89,6 +89,7 @@ impl NativeProviderAdapter for PiAdapter {
             // Replace the local lifecycle extension when Pi exposes a
             // first-party external completion callback with turn identity.
             completion_monitor: CompletionMonitor::PiHookFailure,
+            environment_removals: &[],
         })
     }
 

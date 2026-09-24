@@ -59,6 +59,26 @@ const MESSAGE_GUARD_DENIAL_REASON: &str =
 const PROVIDER_STOPPED_CALL_RESULT: &str =
     "Not run: the response that made this tool call was stopped by a safety classifier.";
 const PENDING_TURN_FILE: &str = "claude-pending-turn.json";
+// Session markers Claude Code exports into every process it spawns (Bash, hooks, plugin
+// scripts). An interactive `claude` that inherits CLAUDE_CODE_CHILD_SESSION treats itself
+// as a nested child: it disables transcript persistence and never registers its
+// cross-session inbox, so ListAgents cannot discover it and SendMessage cannot reach it.
+// The managed session must be an independent top-level session, and the messenger must
+// not be classified as a child either, so both launches drop the whole marker set. User
+// configuration such as ANTHROPIC_* or CLAUDE_CONFIG_DIR is deliberately left alone.
+// Removable if Claude Code stops deriving session identity from inherited markers.
+const CLAUDE_CODE_SESSION_MARKERS: &[&str] = &[
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDECODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_PID",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_EFFORT",
+];
 
 // The messenger model reads this envelope. Its message is only a reference: a payload that
 // passes through the model can be cut short or refused by the provider before SendMessage
@@ -212,6 +232,28 @@ impl NativeProviderAdapter for ClaudeAdapter {
             Some(Err(error)) => (Unknown, "claude_settings_unreadable", format!("{error:#}")),
             _ => (Unknown, "claude_settings_unavailable", "No managed session settings were observed.".to_owned()),
         };
+        let inherited_markers = CLAUDE_CODE_SESSION_MARKERS
+            .iter()
+            .copied()
+            .filter(|marker| std::env::var_os(marker).is_some())
+            .collect::<Vec<_>>();
+        let (markers_availability, markers_reason, markers_detail) = if inherited_markers.is_empty()
+        {
+            (
+                Available,
+                "claude_caller_markers_absent",
+                "The doctor process inherited no Claude Code session markers.".to_owned(),
+            )
+        } else {
+            (
+                Available,
+                "claude_caller_markers_removed_at_launch",
+                format!(
+                    "The caller is running inside a Claude Code session ({}). Managed launches and messengers drop these markers so the managed session registers as an independent top-level session; an unmanaged nested claude inherits them and stays undiscoverable.",
+                    inherited_markers.join(", ")
+                ),
+            )
+        };
         vec![
             Check::new(
                 "claude_inbound_setting",
@@ -220,6 +262,14 @@ impl NativeProviderAdapter for ClaudeAdapter {
                 detail,
                 "Inspect the session settings and provider policy; doctor does not change either.",
             ),
+            Check::new(
+                "claude_caller_markers",
+                markers_availability,
+                markers_reason,
+                markers_detail,
+                "No action; this observes the doctor's own environment, not the running managed session.",
+            )
+            .evidence(serde_json::json!({ "inherited": inherited_markers })),
             Check::new(
                 "claude_messaging",
                 Unknown,
@@ -335,6 +385,7 @@ fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Res
         arguments,
         prompt_is_positional: !windows,
         completion_monitor: CompletionMonitor::Hook,
+        environment_removals: CLAUDE_CODE_SESSION_MARKERS,
     })
 }
 
@@ -792,6 +843,7 @@ fn send_cross_session_message_inner(
     )
     .map_err(CrossSessionMessageFailure::not_sent)?;
     configure_messenger_process_tree(&mut command);
+    super::apply_environment_removals(&mut command, CLAUDE_CODE_SESSION_MARKERS);
     let mut stdout = tempfile::tempfile()
         .context("failed to create Claude messenger stdout buffer")
         .map_err(CrossSessionMessageFailure::not_sent)?;
@@ -1588,6 +1640,46 @@ mod tests {
                 .iter()
                 .any(|argument| argument == "Human title")
         );
+    }
+
+    #[test]
+    fn managed_launch_drops_inherited_claude_code_session_markers() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-safe123");
+        std::fs::create_dir(&directory).unwrap();
+        for windows in [false, true] {
+            let plan = prepare_launch_for_platform(
+                LaunchContext {
+                    bridge_executable: Path::new("/opt/agent-bridge"),
+                    directory: &directory,
+                    workspace: root.path(),
+                    title: "Human title",
+                    prompt: "review this",
+                },
+                windows,
+            )
+            .unwrap();
+            // The decisive marker: an inherited CLAUDE_CODE_CHILD_SESSION stops the managed
+            // session from registering its cross-session inbox (issue #42).
+            assert!(
+                plan.environment_removals
+                    .contains(&"CLAUDE_CODE_CHILD_SESSION")
+            );
+            for marker in [
+                "CLAUDECODE",
+                "CLAUDE_CODE_SESSION_ID",
+                "CLAUDE_PID",
+                "CLAUDE_CODE_MESSAGING_SOCKET",
+                "CLAUDE_CODE_MESSAGING_TOKEN",
+                "CLAUDE_EFFORT",
+            ] {
+                assert!(plan.environment_removals.contains(&marker), "{marker}");
+            }
+            // User configuration is not the adapter's to strip.
+            for kept in ["ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR", "PATH", "HOME"] {
+                assert!(!plan.environment_removals.contains(&kept), "{kept}");
+            }
+        }
     }
 
     #[test]

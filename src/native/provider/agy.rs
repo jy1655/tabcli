@@ -83,6 +83,7 @@ impl NativeProviderAdapter for AgyAdapter {
             // Replace transcript polling when Agy exposes a first-party
             // per-turn completion callback with session and turn identity.
             completion_monitor: CompletionMonitor::AgyTranscript { log_path },
+            environment_removals: &[],
         })
     }
 
