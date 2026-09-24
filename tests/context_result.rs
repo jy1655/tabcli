@@ -76,8 +76,22 @@ impl Fixture {
             .unwrap()
     }
 
-    fn files(&self) -> Vec<(PathBuf, Vec<u8>)> {
+    fn files(&self) -> Vec<Entry> {
         files(self.root.path())
+    }
+
+    fn ask_with(&self, address: &str) -> Output {
+        self.run(&[
+            "ask",
+            "claude",
+            "--workspace",
+            self.root.path().to_str().unwrap(),
+            "--prompt",
+            "start from the attached result",
+            "--context-result",
+            address,
+            "--json",
+        ])
     }
 }
 
@@ -85,14 +99,19 @@ fn write(path: &Path, value: &Value) {
     fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
 }
 
-fn files(directory: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+/// Every path under the state root: directories carry no content, files carry their bytes,
+/// so an added directory is as visible as an added file.
+type Entry = (PathBuf, Option<Vec<u8>>);
+
+fn files(directory: &Path) -> Vec<Entry> {
     let mut entries = Vec::new();
     for entry in fs::read_dir(directory).unwrap() {
         let entry = entry.unwrap();
         if entry.file_type().unwrap().is_dir() {
+            entries.push((entry.path(), None));
             entries.extend(files(&entry.path()));
         } else {
-            entries.push((entry.path(), fs::read(entry.path()).unwrap()));
+            entries.push((entry.path(), Some(fs::read(entry.path()).unwrap())));
         }
     }
     entries.sort();
@@ -239,17 +258,7 @@ fn every_unpublished_or_unsuccessful_source_fails_before_the_target_is_claimed()
             status_before
         );
     }
-    let output = fixture.run(&[
-        "ask",
-        "claude",
-        "--workspace",
-        fixture.root.path().to_str().unwrap(),
-        "--prompt",
-        "start from the attached result",
-        "--context-result",
-        &format!("{SOURCE}/request-pending"),
-        "--json",
-    ]);
+    let output = fixture.ask_with(&format!("{SOURCE}/request-pending"));
     assert!(!output.status.success());
     assert!(stderr(&output).contains(&format!("{SOURCE}/request-pending")));
     assert_eq!(
@@ -302,7 +311,17 @@ fn published_successful_results_pass_resolution_and_legacy_events_have_no_reques
         let after = fixture
             .files()
             .into_iter()
-            .filter(|(path, _)| path != &lock)
+            .filter(|(path, content)| {
+                if path == &lock {
+                    assert_eq!(
+                        content.as_deref(),
+                        Some(&[][..]),
+                        "{address}: lock has content"
+                    );
+                    return false;
+                }
+                true
+            })
             .collect::<Vec<_>>();
         assert_eq!(after, before, "{address} changed the state root");
         assert!(!fixture.directory(TARGET).join("turn.claim").exists());
@@ -421,5 +440,129 @@ fn context_result_arguments_are_validated_before_any_session_is_read() {
         assert!(!output.status.success());
         assert!(stderr(&output).contains(expected), "{}", stderr(&output));
     }
+    assert_eq!(fixture.files(), before);
+}
+
+#[test]
+fn a_source_the_receipt_would_reject_fails_resolution_before_ask_creates_anything() {
+    let fixture = Fixture::new();
+    let manifest = fixture.directory(SOURCE).join("manifest.json");
+    let mut value: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    value["provider"] = json!("");
+    write(&manifest, &value);
+    fixture.receipt(SOURCE, "1-1-1", "request-done", "event-1.json", Value::Null);
+    fixture.event(SOURCE, "event-1.json", "recorded answer", None);
+    let before = fixture.files();
+    let address = format!("{SOURCE}/request-done");
+    let output = fixture.ask_with(&address);
+    assert!(!output.status.success());
+    let text = stderr(&output);
+    assert!(
+        text.contains(&address)
+            && text.contains("request_state is unreadable")
+            && text.contains("invalid recorded provenance")
+            && !text.contains("invalid Bridge request receipt"),
+        "{text}"
+    );
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        fixture.files(),
+        before,
+        "ask created or changed session state"
+    );
+    let output = tell_with(&fixture, &address);
+    assert_unattachable(&fixture, output, &address, "unreadable");
+    assert_eq!(fixture.files(), before);
+}
+
+#[test]
+fn unmapped_events_are_unverifiable_while_the_source_request_index_is_damaged() {
+    let fixture = Fixture::new();
+    fixture.receipt(SOURCE, "1-1-1", "request-done", "event-1.json", Value::Null);
+    fixture.event(SOURCE, "event-1.json", "recorded answer", None);
+    fixture.event(SOURCE, "event-0.json", "legacy answer", None);
+    fs::write(
+        fixture.directory(SOURCE).join("requests/1-1-9.json"),
+        "invalid",
+    )
+    .unwrap();
+    let before = fixture.files();
+    let address = format!("{SOURCE}/event-0.json");
+    let output = tell_with(&fixture, &address);
+    assert_unattachable(&fixture, output, &address, "unverifiable");
+    assert_eq!(fixture.files(), before);
+    // `result` itself still reports the event as completed; only attachment refuses it.
+    let result = success(fixture.run(&["result", SOURCE, "--event", "event-0.json", "--json"]));
+    assert_eq!(result["request_state"], "completed");
+    assert_eq!(result["unreadable_requests"], 1);
+    // The event with a readable receipt passes resolution through both addresses.
+    for address in [
+        format!("{SOURCE}/request-done"),
+        format!("{SOURCE}/event-1.json"),
+    ] {
+        let output = tell_with(&fixture, &address);
+        let text = stderr(&output);
+        assert!(!text.contains("cannot be attached"), "{address}: {text}");
+        assert!(text.contains("terminal.json"), "{address}: {text}");
+    }
+}
+
+#[test]
+fn invalid_utf8_in_a_recorded_event_is_never_repaired_or_attached() {
+    let fixture = Fixture::new();
+    fixture.receipt(SOURCE, "1-1-1", "request-done", "event-1.json", Value::Null);
+    fs::write(
+        fixture.directory(SOURCE).join("events/event-1.json"),
+        b"{\"provider\":\"codex\",\"message\":\"bad\xfftext\",\"error\":null,\
+          \"provider_session_id\":\"thread\",\"turn_id\":\"t\",\"created_unix_ms\":3}",
+    )
+    .unwrap();
+    let before = fixture.files();
+    let result = success(fixture.run(&["result", SOURCE, "--request", "request-done", "--json"]));
+    assert_eq!(result["request_state"], "completed");
+    for address in [
+        format!("{SOURCE}/request-done"),
+        format!("{SOURCE}/event-1.json"),
+    ] {
+        let output = tell_with(&fixture, &address);
+        let text = stderr(&output);
+        assert!(text.contains("not valid UTF-8"), "{address}: {text}");
+        assert!(!text.contains('\u{fffd}'), "{address}: {text}");
+        assert_unattachable(&fixture, output, &address, "unreadable");
+        assert_eq!(fixture.files(), before);
+    }
+}
+
+#[test]
+fn case_aliases_of_a_recorded_event_name_never_pass_resolution() {
+    let fixture = Fixture::new();
+    fixture.event(SOURCE, "event-a.json", "answer", None);
+    fixture.receipt(
+        SOURCE,
+        "1-1-1",
+        "request-alias",
+        "event-A.json",
+        Value::Null,
+    );
+    let before = fixture.files();
+    let address = format!("{SOURCE}/event-A.json");
+    let output = tell_with(&fixture, &address);
+    if cfg!(windows) {
+        assert!(
+            stderr(&output).contains("does not match an events/ entry exactly"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    assert_unattachable(&fixture, output, &address, "unreadable");
+    assert_eq!(fixture.files(), before);
+    let address = format!("{SOURCE}/request-alias");
+    let output = tell_with(&fixture, &address);
+    let state = if cfg!(windows) {
+        "unreadable"
+    } else {
+        "unresolved"
+    };
+    assert_unattachable(&fixture, output, &address, state);
     assert_eq!(fixture.files(), before);
 }

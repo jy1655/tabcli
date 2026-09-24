@@ -42,18 +42,34 @@ fn validate(receipt: &Receipt) -> Result<()> {
         || !valid_id(&receipt.request_id)
         || !valid_turn_claim_token(&receipt.claim_token)
         || !valid_event_file_name(&receipt.event_file)
-        || !receipt.context_sources.iter().all(valid_context_source)
+        || receipt
+            .context_sources
+            .iter()
+            .any(|source| validate_context_source(source).is_err())
     {
         bail!("invalid Bridge request receipt")
     }
     Ok(())
 }
 
-fn valid_context_source(source: &ContextSource) -> bool {
-    valid_session_id(&source.session)
-        && valid_event_file_name(&source.event_id)
-        && source.request_id.as_deref().is_none_or(valid_id)
-        && !source.provider.is_empty()
+/// The rules a receipt applies to each recorded source. Resolution applies the same
+/// rules before any session state exists, so a receipt never rejects a resolved source.
+pub(super) fn validate_context_source(source: &ContextSource) -> Result<()> {
+    if !valid_session_id(&source.session) {
+        bail!("invalid source session id {:?}", source.session)
+    }
+    if !valid_event_file_name(&source.event_id) {
+        bail!("invalid source event id {:?}", source.event_id)
+    }
+    if let Some(request_id) = source.request_id.as_deref()
+        && !valid_id(request_id)
+    {
+        bail!("invalid source request id {request_id:?}")
+    }
+    if source.provider.is_empty() {
+        bail!("source provider is empty")
+    }
+    Ok(())
 }
 
 // Called while creating the claim under its lifecycle lock, before any dispatch can begin.

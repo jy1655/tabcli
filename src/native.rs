@@ -3035,6 +3035,13 @@ fn commit_provider_completion_with_status_locked(
 }
 
 fn read_regular_text_if_present(path: &Path) -> Result<Option<String>> {
+    Ok(read_regular_bytes_if_present(path)?
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// The raw bytes of a regular session file, so callers that must not alter a record can
+/// decode it strictly instead of through the lossy snapshot reader.
+fn read_regular_bytes_if_present(path: &Path) -> Result<Option<Vec<u8>>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -3045,8 +3052,9 @@ fn read_regular_text_if_present(path: &Path) -> Result<Option<String>> {
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         bail!("refusing non-regular session file: {}", path.display());
     }
-    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    fs::read(path)
+        .map(Some)
+        .with_context(|| format!("failed to read {}", path.display()))
 }
 
 fn create_session(spec: SessionSpec) -> Result<CreatedSession> {
