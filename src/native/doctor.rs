@@ -533,7 +533,9 @@ fn owner_check(directory: &Path, id: &str, checks: &mut Vec<Check>) {
 
 // The reopen marker of a closed source session: which reopen consumed it and whether the
 // next reopen can proceed. Read-only, and the same judgment the reopen gate makes under the
-// source lock (`refused_launch_cleanup`); doctor neither releases nor annotates the marker.
+// source lock (`refused_launch_cleanup`, which verifies the recorded provider process, not
+// the launch wrapper or the closed surface); doctor neither releases nor annotates the
+// marker.
 fn reopen_marker_check(directory: &Path, id: &str, checks: &mut Vec<Check>) {
     use Availability::*;
     let marker = match query::optional_json::<ReopenMarker>(&directory.join(REOPEN_MARKER_FILE)) {
@@ -544,7 +546,7 @@ fn reopen_marker_check(directory: &Path, id: &str, checks: &mut Vec<Check>) {
             return;
         }
     };
-    let next_action = "reopen releases a marker only when the session it names recorded a launch refusal and that launch is verified unable to hold the conversation; doctor never releases or repairs it.";
+    let next_action = "reopen releases a marker only when the session it names recorded a launch refusal and either no provider process was spawned or the provider process recorded in its provider-process.json is verified gone (pid dead, or alive under another identity); doctor never releases or repairs it.";
     let Some(reopened_by) = marker.reopened_by else {
         checks.push(Check::new("reopen_marker", Unavailable, "reopen_in_progress", format!("A reopen of {id} holds the marker and has not recorded its new session yet; a new reopen is refused with gate already-reopened."), next_action)
             .evidence(json!({"claim": marker.claim})));
@@ -588,7 +590,7 @@ fn reopen_marker_check(directory: &Path, id: &str, checks: &mut Vec<Check>) {
                     Unavailable,
                     "reopen_marker_retained",
                     format!(
-                        "The reopen as {reopened_by} was refused at launch (gate {}) but {cleanup}; the marker stays consumed and a new reopen is refused with gate already-reopened until that process is verified gone or the session is closed.",
+                        "The reopen as {reopened_by} was refused at launch (gate {}) but {cleanup}; the marker stays consumed and a new reopen is refused with gate already-reopened until the provider process of {reopened_by} is verified gone. Closing its console or the exit of its launch wrapper is not that evidence on its own.",
                         refusal.gate
                     ),
                     json!(cleanup.to_string()),

@@ -81,17 +81,25 @@ Session policy:
   session and closes only its surface before any prompt is delivered. A refusal at a
   launch gate (the pre-spawn recheck, the post-launch check, and the check before the
   initial prompt) releases the source's reopen marker only once the refused launch
-  provably cannot hold the conversation: no provider process was spawned, the new
-  surface was closed, or the new session's native-session process is verified dead. If
-  the close failed and the process may survive, the marker stays consumed and the new
-  session's reopen.refusal.json records cleanup: \"pending\" with the reason. The next
-  reopen of the same source reconciles the marker under the source lock: a marker
-  naming a session with a recorded launch refusal whose process is now verified gone
-  or whose surface is closed is released and the reopen proceeds; otherwise the reopen
-  is refused with gate already-reopened naming the blocking condition. A parent that
-  crashed before settling the marker, or timed out before the wrapper recorded its
-  refusal, is recovered this way; nothing is inferred from missing records. A later
-  tell refusal and an ordinary launch or delivery failure leave the marker consumed.
+  provably cannot hold the conversation. The launch wrapper records the provider
+  process it spawns in the new session's provider-process.json (pid and, on Windows,
+  creation time and executable path) before the session leaves its launch state. The
+  marker is released in two cases: the pre-spawn recheck refused and no provider
+  process was recorded, or the recorded provider process is verified gone, meaning its
+  pid is dead or the pid is alive under a different identity (a reused pid). Neither
+  the exit of the launch wrapper nor a closed surface is evidence on its own: Windows
+  does not end a child with its parent, and a provider can outlive the console it was
+  started in. A post-spawn refusal with no provider-process.json, a provider process
+  that is still running, and one whose identity cannot be inspected all keep the
+  marker consumed, and the new session's reopen.refusal.json records cleanup:
+  \"pending\" with the reason. The next reopen of the same source reconciles the
+  marker under the source lock: a marker naming a session with a recorded launch
+  refusal whose provider process is now verified gone is released and the reopen
+  proceeds; otherwise the reopen is refused with gate already-reopened naming the
+  blocking condition. A parent that crashed before settling the marker, or timed out
+  before the wrapper recorded its refusal, is recovered this way; nothing is inferred
+  from missing records. A later tell refusal and an ordinary launch or delivery
+  failure leave the marker consumed.
   Before a tell either gate refuses the delivery and leaves the session ready. A
   foreign claude --resume can still register between two checks and interleave until
   the next one. doctor reports the other live holders of a reopened session's
@@ -102,11 +110,16 @@ Session policy:
   resumed session, its settings files, and its environment, which Bridge neither reads
   nor overrides. Per Claude's documented resume rules, the previous model is restored
   unless a --model flag or an ANTHROPIC_MODEL-family environment variable picks one at
-  launch or the model is unavailable, and the saved permission mode is restored except
-  that a session that ended in bypassPermissions starts in the mode a new session
-  would, where a configured permissions.defaultMode of bypassPermissions still
-  applies; Claude documents no restored effort. Omitting --yolo therefore does not by
-  itself establish that bypass is off. See
+  launch or the model is unavailable. A terminal claude --resume <session-id> restores
+  the saved permission mode except in the documented cases: a session that ended in
+  bypassPermissions or in plan mode starts in the mode a new session would start in
+  (bypass is enabled again only by a launch flag or permissions.defaultMode
+  \"bypassPermissions\" in user, --settings, or managed settings), auto mode is
+  restored only while the account still meets the auto mode requirements, and manual
+  mode is restored only when a new session would start in auto mode from the built-in
+  default, a defaultMode from a settings file taking precedence. Claude documents no
+  restored effort. Omitting --yolo therefore does not by itself establish that bypass
+  is off. See https://code.claude.com/docs/en/sessions#permission-mode-on-resume and
   https://code.claude.com/docs/en/sessions#what-a-resumed-session-restores for the
   restoration rules. The source is left unchanged except for a reopen marker that
   admits one reopen. inspect and sessions --json report resumed_from for the new

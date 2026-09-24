@@ -582,18 +582,59 @@ fn reopen_marker_is_reported_with_its_release_condition_without_writes() {
         retained["evidence"]["cleanup"]
             .as_str()
             .unwrap()
-            .contains("no native-session owner record"),
+            .contains("no provider process record"),
         "{retained}"
     );
+    assert!(
+        retained["detail"]
+            .as_str()
+            .unwrap()
+            .contains("until the provider process of session-reopened is verified gone"),
+        "{retained}"
+    );
+    // A dead launch wrapper and a closed surface are not evidence while the recorded
+    // provider process (this test process stands in for it) is still running.
     write(
         &refused.join("native-session.json"),
         &json!({"pid":0, "managed_session_id":"session-reopened"}),
     );
+    write(
+        &refused.join("status.json"),
+        &json!({"state":"closed", "generation":4, "updated_unix_ms":4, "exit_code":null,
+            "error":"reopen refused (reopen-conflict): held by pid 4242"}),
+    );
+    write(
+        &refused.join("closed.json"),
+        &json!({"state":"closed", "generation":4, "updated_unix_ms":4, "exit_code":null,
+            "error":null}),
+    );
+    write(
+        &refused.join("terminal.closed.json"),
+        &json!({"consumed":true}),
+    );
+    let provider_record = |pid: u32| {
+        write(
+            &refused.join("provider-process.json"),
+            &json!({"schema":1, "managed_session_id":"session-reopened", "pid":pid,
+                "spawned_unix_ms":2}),
+        );
+    };
+    provider_record(std::process::id());
+    let retained = observe("reopen_marker_retained", "unavailable");
+    assert_eq!(
+        retained["evidence"]["cleanup"],
+        format!(
+            "the refused launch may still hold the conversation: provider process {} of refused session session-reopened is still running",
+            std::process::id()
+        )
+    );
+    provider_record(0);
     let reconcilable = observe("reopen_marker_reconcilable", "available");
     assert_eq!(
         reconcilable["evidence"]["cleanup"],
-        "native session process 0 is verified gone"
+        "provider process 0 is verified gone (it has exited) and the refused session's surface was closed"
     );
+    fs::remove_file(refused.join("provider-process.json")).unwrap();
     fs::remove_file(refused.join("native-session.json")).unwrap();
     refusal("provider-unsupported", None);
     let reconcilable = observe("reopen_marker_reconcilable", "available");

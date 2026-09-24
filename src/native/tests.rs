@@ -2712,6 +2712,41 @@ fn test_windows_process_identity(_pid: u32) -> Option<terminal::WindowsProcessId
     None
 }
 
+// The provider process record as the launch wrapper writes it, for a process the test
+// controls. Pid 0 stands in for a provider that is verified dead.
+fn write_provider_process_record(directory: &Path, session: &str, pid: u32) {
+    write_json_atomic(
+        &directory.join(PROVIDER_PROCESS_FILE),
+        &ProviderProcessRecord {
+            schema: 1,
+            managed_session_id: session.to_owned(),
+            pid,
+            windows_process_identity: test_windows_process_identity(pid),
+            spawned_unix_ms: 1,
+        },
+    )
+    .unwrap();
+}
+
+// A process that stays alive until the test ends it: it stands in for a provider process
+// that outlived its launch wrapper and its console.
+fn spawn_surviving_process() -> std::process::Child {
+    #[cfg(windows)]
+    let mut command = Command::new("cmd.exe");
+    #[cfg(windows)]
+    command.args(["/c", "pause"]);
+    #[cfg(not(windows))]
+    let mut command = Command::new("/bin/sh");
+    #[cfg(not(windows))]
+    command.args(["-c", "read _"]);
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
 #[test]
 fn dead_native_session_owner_releases_the_turn_and_closes_state() {
     let directory = tempfile::tempdir().unwrap();
@@ -3128,6 +3163,10 @@ fn native_session_executes_the_provider_with_policy_and_provenance() {
     result.unwrap();
 
     let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
+    let record: ProviderProcessRecord = read_json(&directory.join(PROVIDER_PROCESS_FILE)).unwrap();
+    assert_eq!(record.schema, 1);
+    assert_eq!(record.managed_session_id, "session-safe123");
+    assert_ne!(record.pid, 0);
     assert!(arguments.contains("--dangerously-bypass-approvals-and-sandbox"));
     assert!(arguments.contains("--model\ngpt-5.6-sol"));
     assert!(!arguments.contains("openai-codex/gpt-5.6-sol"));
@@ -7146,6 +7185,14 @@ fn resumed_session_launch_passes_the_official_resume_plan_and_no_policy_the_requ
     result.unwrap();
 
     let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
+    // The spawned provider is recorded with its Windows identity before the session leaves
+    // its launch state; the stub has exited by now, so the record verifies it gone.
+    let record: ProviderProcessRecord = read_json(&directory.join(PROVIDER_PROCESS_FILE)).unwrap();
+    assert_eq!(record.schema, 1);
+    assert_eq!(record.managed_session_id, id);
+    assert_ne!(record.pid, 0);
+    assert!(record.windows_process_identity.is_some(), "{record:?}");
+    assert!(record.spawned_unix_ms > 0);
     assert!(arguments.contains("--resume"), "{arguments}");
     assert!(arguments.contains(REOPEN_TEST_CONVERSATION), "{arguments}");
     assert!(arguments.contains("--name"), "{arguments}");
@@ -7715,6 +7762,10 @@ fn resumed_session_launch_refuses_before_spawn_when_a_holder_registered_after_th
         !directory.join("argv.txt").exists(),
         "the provider was spawned"
     );
+    assert!(
+        !directory.join(PROVIDER_PROCESS_FILE).exists(),
+        "a provider process was recorded"
+    );
     assert!(directory.join("initial-prompt.txt").is_file());
     let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
     assert_eq!(status.state, "failed");
@@ -7928,14 +7979,25 @@ fn a_later_tell_refusal_never_releases_the_marker_of_a_delivered_initial_prompt(
     );
 
     // The same uncertain report with a launch-phase refusal recorded in the session is the
-    // launch refusal it looks like: the gate is named, and because the refused session is
-    // closed the marker is released.
+    // launch refusal it looks like: the gate is named. The closed session alone does not
+    // release the marker; the provider process the launch recorded must be verified gone.
     let recorded = record_reopen_refusal(
         &new,
         REOPEN_CONFLICT_GATE,
         "held by another live process; no prompt was delivered".to_owned(),
     );
     assert_eq!(reopen_refusal_gate(&recorded), Some("reopen-conflict"));
+    let (outcome, gate) = settle_reopen_outcome(resolve, source_id, new_id, Err(uncertain()));
+    assert_eq!(gate.as_deref(), Some("reopen-conflict"));
+    let text = format!("{:#}", outcome.unwrap_err());
+    assert!(
+        text.starts_with(&format!(
+            "the reopen marker of source session {source_id} was not released: the refused launch may still hold the conversation: refused session {new_id} is closed with no provider process record"
+        )) && text.ends_with(&format!(": {:#}", uncertain())),
+        "{text}"
+    );
+    assert!(source.join(REOPEN_MARKER_FILE).is_file());
+    write_provider_process_record(&new, new_id, 0);
     let (outcome, gate) = settle_reopen_outcome(resolve, source_id, new_id, Err(uncertain()));
     assert_eq!(gate.as_deref(), Some("reopen-conflict"));
     assert_eq!(
@@ -8185,7 +8247,9 @@ fn a_holder_that_registers_after_the_post_launch_scan_is_caught_before_the_initi
 
 // Every failure to complete the post-launch holder check takes the conflict path: the
 // gate is recorded, the initial claim is released with its receipt unresolved, only the new
-// surface is closed, and the source's marker is released so it can be reopened again.
+// surface is closed, and the source's marker is released once the provider process the
+// launch recorded is verified gone. A closed surface with a provider that survived it, and
+// a refusal with no provider record at all, both keep the marker consumed.
 #[test]
 fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the_source_marker() {
     let root = tempfile::tempdir().unwrap();
@@ -8202,24 +8266,30 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
         true,
     );
 
-    for (label, registry, expected_detail, close_succeeds) in [
+    // `provider` is the pid the launch wrapper recorded for the spawned provider: 0 is a
+    // process verified dead, this process stands in for one that survived, and `None` is a
+    // launch that recorded no process.
+    for (label, registry, expected_detail, close_succeeds, provider) in [
         (
-            "unreadable registry, surface closed",
+            "unreadable registry, surface closed, provider gone",
             &unreadable_registry,
             "failed to read the Claude session registry",
             true,
+            Some(0),
         ),
         (
-            "registration timeout, surface closed",
+            "registration timeout, surface closed, provider survived",
             &empty_registry,
             "did not register",
             true,
+            Some(std::process::id()),
         ),
         (
-            "unreadable registry, close failed",
+            "unreadable registry, close failed, no provider record",
             &unreadable_registry,
             "failed to read the Claude session registry",
             false,
+            None,
         ),
     ] {
         provider::override_claude_session_registry_for_test(Some(registry.clone()));
@@ -8342,10 +8412,12 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
         assert_eq!(result["request_state"], "unresolved", "{label}: {result}");
         assert_eq!(result["result"], serde_json::Value::Null, "{label}");
 
-        // The source is untouched except for its marker. A refusal whose surface was closed
-        // releases it. A refusal whose close failed keeps it consumed: the spawned process
-        // may survive without ever registering, so the next reopen's registry scan would not
-        // see it. The retention is noted in the refusal record.
+        // The source is untouched except for its marker. Only a refusal whose recorded
+        // provider process is verified gone releases it. A closed surface is not that
+        // evidence while the provider survives it, and a refusal with no provider record
+        // keeps the marker consumed: the spawned process may survive without ever
+        // registering, so the next reopen's registry scan would not see it. The retention
+        // is noted in the refusal record.
         let mut source_after = snapshot_directory(&source);
         assert!(
             source_after.remove("reopen.marker.json").is_some(),
@@ -8354,6 +8426,20 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
         let mut expected = source_before.clone();
         expected.remove("reopen.marker.json");
         assert_eq!(source_after, expected, "{label}");
+        match provider {
+            Some(pid) => write_provider_process_record(&new, new_id, pid),
+            None => remove_file_if_present(&new.join(PROVIDER_PROCESS_FILE)).unwrap(),
+        }
+        let released = provider == Some(0);
+        let retained_condition = match provider {
+            None => format!(
+                "refused session {new_id} is {} with no provider process record",
+                status.state
+            ),
+            Some(pid) => {
+                format!("provider process {pid} of refused session {new_id} is still running")
+            }
+        };
         let outcome = release_reopen_marker_after_refusal(
             &source,
             &new,
@@ -8361,7 +8447,7 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
             Err(anyhow::anyhow!("refused")),
         );
         let outcome = outcome.unwrap_err();
-        if close_succeeds {
+        if released {
             assert_eq!(format!("{outcome:#}"), "refused", "{label}");
             assert!(!source.join(REOPEN_MARKER_FILE).exists(), "{label}");
             assert_eq!(snapshot_directory(&source), expected, "{label}");
@@ -8371,7 +8457,7 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
             let text = format!("{outcome:#}");
             assert!(
                 text.starts_with(&format!(
-                    "the reopen marker of source session {source_id} was not released: the refused launch may still hold the conversation: refused session {new_id} is failed with no native-session owner record"
+                    "the reopen marker of source session {source_id} was not released: the refused launch may still hold the conversation: {retained_condition}"
                 )) && text.ends_with(": refused"),
                 "{label}: {text}"
             );
@@ -8384,39 +8470,39 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
                     .cleanup_detail
                     .as_deref()
                     .unwrap_or_default()
-                    .contains("no native-session owner record"),
+                    .contains(&retained_condition),
                 "{label}: {record:?}"
             );
+            // The launch wrapper is dead; that is never evidence about the provider process
+            // it spawned.
+            write_json_atomic(
+                &new.join(SESSION_OWNER_FILE),
+                &NativeSessionOwner {
+                    pid: 0,
+                    managed_session_id: Some(new_id.to_owned()),
+                    ..NativeSessionOwner::default()
+                },
+            )
+            .unwrap();
             // Every later reopen is refused naming the blocking condition, under both the
             // read-only gate and the claim lock, and the marker is left as it is.
             let marker_before = fs::read(source.join(REOPEN_MARKER_FILE)).unwrap();
-            for owner in [
+            for record in [
                 None,
-                Some(NativeSessionOwner {
-                    pid: std::process::id(),
-                    managed_session_id: Some(new_id.to_owned()),
-                    ..NativeSessionOwner::default()
-                }),
-                Some(NativeSessionOwner {
-                    pid: 0,
-                    managed_session_id: Some("session-reopenother".to_owned()),
-                    ..NativeSessionOwner::default()
-                }),
+                Some((std::process::id(), new_id)),
+                Some((0, "session-reopenother")),
             ] {
-                match &owner {
-                    Some(owner) => {
-                        write_json_atomic(&new.join(SESSION_OWNER_FILE), owner).unwrap();
-                    }
-                    None => remove_file_if_present(&new.join(SESSION_OWNER_FILE)).unwrap(),
+                match record {
+                    Some((pid, session)) => write_provider_process_record(&new, session, pid),
+                    None => remove_file_if_present(&new.join(PROVIDER_PROCESS_FILE)).unwrap(),
                 }
-                let expected_condition = match &owner {
-                    None => "with no native-session owner record".to_owned(),
-                    Some(owner) if owner.pid == 0 => {
-                        "names Some(\"session-reopenother\")".to_owned()
-                    }
-                    Some(owner) => format!(
-                        "native session process {} of refused session {new_id} is still running",
-                        owner.pid
+                let expected_condition = match record {
+                    None => "with no provider process record".to_owned(),
+                    Some((0, _)) => format!(
+                        "the provider process record of refused session {new_id} names \"session-reopenother\""
+                    ),
+                    Some((pid, _)) => format!(
+                        "provider process {pid} of refused session {new_id} is still running"
                     ),
                 };
                 for refused in [
@@ -8428,32 +8514,25 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
                     assert_eq!(
                         reopen_refusal_gate(&refused),
                         Some("already-reopened"),
-                        "{label}: {owner:?}"
+                        "{label}: {record:?}"
                     );
                     let text = format!("{refused:#}");
                     assert!(
                         text.starts_with(&format!(
                             "reopen refused (already-reopened): session {source_id} was already reopened as {new_id}; that launch was refused (reopen-verification-failed) but the refused launch may still hold the conversation: "
                         )) && text.contains(&expected_condition),
-                        "{label}: {owner:?}: {text}"
+                        "{label}: {record:?}: {text}"
                     );
                 }
                 assert_eq!(
                     fs::read(source.join(REOPEN_MARKER_FILE)).unwrap(),
                     marker_before,
-                    "{label}: {owner:?}"
+                    "{label}: {record:?}"
                 );
             }
-            // The process is later found dead: the next reopen reconciles the marker below.
-            write_json_atomic(
-                &new.join(SESSION_OWNER_FILE),
-                &NativeSessionOwner {
-                    pid: 0,
-                    managed_session_id: Some(new_id.to_owned()),
-                    ..NativeSessionOwner::default()
-                },
-            )
-            .unwrap();
+            // The provider process is later found dead: the next reopen reconciles the
+            // marker below.
+            write_provider_process_record(&new, new_id, 0);
         }
         assert_eq!(
             read_resumed_from(&new).unwrap().as_ref(),
@@ -8526,7 +8605,21 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
         "{outcome:#}"
     );
     assert!(source.join(REOPEN_MARKER_FILE).is_file());
-    // The pre-spawn gate started no process: nothing can hold the conversation.
+    // The pre-spawn gate is not taken at its word: a recorded provider process that is
+    // still running retains the marker whatever gate the refusal names.
+    write_provider_process_record(&new, new_id, std::process::id());
+    let outcome =
+        release_reopen_marker_after_refusal(&source, &new, REOPEN_LAUNCH_GATE, Ok(())).unwrap_err();
+    assert!(
+        format!("{outcome:#}").contains(&format!(
+            "provider process {} of refused session {new_id} is still running",
+            std::process::id()
+        )),
+        "{outcome:#}"
+    );
+    assert!(source.join(REOPEN_MARKER_FILE).is_file());
+    fs::remove_file(new.join(PROVIDER_PROCESS_FILE)).unwrap();
+    // The pre-spawn gate recorded no process: nothing can hold the conversation.
     release_reopen_marker_after_refusal(&source, &new, REOPEN_LAUNCH_GATE, Ok(())).unwrap();
     assert!(!source.join(REOPEN_MARKER_FILE).exists());
     // Releasing an already released marker is not an error.
@@ -8617,20 +8710,20 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
     );
     assert_eq!(reopen_refusal_gate(&recorded), Some("reopen-conflict"));
     expect_refused(&format!(
-        "session {source_id} was already reopened as {new_id}; that launch was refused (reopen-conflict) but the refused launch may still hold the conversation: refused session {new_id} is awaiting-initial-input with no native-session owner record, so its process cannot be verified gone"
+        "session {source_id} was already reopened as {new_id}; that launch was refused (reopen-conflict) but the refused launch may still hold the conversation: refused session {new_id} is awaiting-initial-input with no provider process record (provider-process.json), so the provider process it spawned cannot be verified gone"
     ));
-    // Its wrapper (stood in for by this process) is still running.
-    write_json_atomic(
-        &new.join(SESSION_OWNER_FILE),
-        &owner(std::process::id(), new_id),
-    )
-    .unwrap();
-    expect_refused(&format!(
-        "session {source_id} was already reopened as {new_id}; that launch was refused (reopen-conflict) but the refused launch may still hold the conversation: native session process {} of refused session {new_id} is still running",
+    // Its wrapper is dead, but the provider process the wrapper spawned (stood in for by
+    // this process) is still running: the wrapper's death is not evidence.
+    write_json_atomic(&new.join(SESSION_OWNER_FILE), &owner(0, new_id)).unwrap();
+    write_provider_process_record(&new, new_id, std::process::id());
+    let still_running = format!(
+        "session {source_id} was already reopened as {new_id}; that launch was refused (reopen-conflict) but the refused launch may still hold the conversation: provider process {} of refused session {new_id} is still running",
         std::process::id()
-    ));
+    );
+    expect_refused(&still_running);
     // The cleanup the crashed parent never performed: an explicit close of the refused
-    // session consumes its handle, and the closed surface releases the marker.
+    // session consumes its handle. The closed surface is not evidence either while the
+    // provider process survives it.
     let mut closed_terminals = Vec::new();
     close_session_state_with_error(&new, Some("refused".to_owned()), |session| {
         closed_terminals.push(session.id.clone());
@@ -8638,6 +8731,17 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
     })
     .unwrap();
     assert_eq!(closed_terminals, [format!("{new_id}-terminal")]);
+    assert!(new.join(TERMINAL_TOMBSTONE_FILE).is_file());
+    expect_refused(&still_running);
+    // Only the provider process being verified gone releases the marker; the closed
+    // surface is reported alongside.
+    write_provider_process_record(&new, new_id, 0);
+    assert_eq!(
+        refused_launch_cleanup(&new, REOPEN_CONFLICT_GATE)
+            .unwrap()
+            .to_string(),
+        "provider process 0 is verified gone (it has exited) and the refused session's surface was closed"
+    );
     reconcile();
 
     // The parent timed out while the session was still launching, before the wrapper
@@ -8691,24 +8795,28 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
     let prefix = format!(
         "session {source_id} was already reopened as {new_id}; that launch was refused (reopen-verification-failed) but the refused launch may still hold the conversation: "
     );
-    write_json_atomic(
-        &new.join(SESSION_OWNER_FILE),
-        &owner(std::process::id(), new_id),
-    )
-    .unwrap();
+    write_json_atomic(&new.join(SESSION_OWNER_FILE), &owner(0, new_id)).unwrap();
+    write_provider_process_record(&new, new_id, std::process::id());
     expect_refused(&format!(
-        "{prefix}native session process {} of refused session {new_id} is still running",
+        "{prefix}provider process {} of refused session {new_id} is still running",
         std::process::id()
     ));
-    write_json_atomic(
-        &new.join(SESSION_OWNER_FILE),
-        &owner(0, "session-reopenother"),
-    )
-    .unwrap();
+    write_provider_process_record(&new, "session-reopenother", 0);
     expect_refused(&format!(
-        "{prefix}the native-session owner record of refused session {new_id} names Some(\"session-reopenother\")"
+        "{prefix}the provider process record of refused session {new_id} names \"session-reopenother\" (schema 1)"
     ));
-    write_json_atomic(&new.join(SESSION_OWNER_FILE), &owner(0, new_id)).unwrap();
+    // A record that cannot be read leaves the launch unverifiable rather than gone.
+    fs::write(new.join(PROVIDER_PROCESS_FILE), "not json").unwrap();
+    let unverifiable = refused_launch_cleanup(&new, REOPEN_VERIFICATION_FAILED_GATE).unwrap_err();
+    assert!(
+        format!("{unverifiable:#}").contains("invalid JSON"),
+        "{unverifiable:#}"
+    );
+    assert_eq!(
+        reopen_refusal_gate(&inspect_reopen_source(&source, source_id).unwrap_err()),
+        Some("already-reopened")
+    );
+    write_provider_process_record(&new, new_id, 0);
     reconcile();
 
     // Markers that cannot be resolved to a refused launch are consumed, never released.
@@ -8741,4 +8849,387 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
     ));
     fs::remove_file(source.join(REOPEN_MARKER_FILE)).unwrap();
     assert_eq!(snapshot_directory(&source), source_before);
+}
+
+// The launch wrapper records the provider process it spawned, and the refusal predicate
+// judges that process: a live one retains the marker under every gate, and the same record
+// verifies it gone once it has exited.
+#[test]
+fn recorded_provider_process_is_verified_from_the_record_until_it_exits() {
+    let root = tempfile::tempdir().unwrap();
+    let id = "session-reopenrecord";
+    let directory = write_reopen_launch_session(root.path(), id, Path::new("/opt/claude"));
+    let mut child = spawn_surviving_process();
+    record_provider_process(&directory, id, &child).unwrap();
+    let record: ProviderProcessRecord = read_json(&directory.join(PROVIDER_PROCESS_FILE)).unwrap();
+    assert_eq!(record.schema, 1);
+    assert_eq!(record.managed_session_id, id);
+    assert_eq!(record.pid, child.id());
+    assert_eq!(
+        record.windows_process_identity,
+        test_windows_process_identity(child.id())
+    );
+    assert!(record.spawned_unix_ms > 0);
+    assert_eq!(
+        observe_provider_process(&record),
+        ProviderProcessObservation::Alive
+    );
+
+    update_status(&directory, "awaiting-initial-input", None, None).unwrap();
+    record_reopen_refusal(
+        &directory,
+        REOPEN_CONFLICT_GATE,
+        "held by pid 4242; no prompt was delivered".to_owned(),
+    );
+    for gate in REOPEN_POST_CREATION_GATES {
+        assert_eq!(
+            refused_launch_cleanup(&directory, gate).unwrap(),
+            RefusedLaunchCleanup::Pending(format!(
+                "provider process {} of refused session {id} is still running",
+                child.id()
+            )),
+            "{gate}"
+        );
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(
+        observe_provider_process(&record),
+        ProviderProcessObservation::Gone(ProviderProcessGone::Exited)
+    );
+    for gate in REOPEN_POST_CREATION_GATES {
+        let cleanup = refused_launch_cleanup(&directory, gate).unwrap();
+        assert_eq!(
+            cleanup,
+            RefusedLaunchCleanup::ProviderProcessGone {
+                pid: record.pid,
+                evidence: ProviderProcessGone::Exited,
+                surface_closed: false,
+            },
+            "{gate}"
+        );
+        assert!(cleanup.releases_marker());
+        assert_eq!(
+            cleanup.to_string(),
+            format!(
+                "provider process {} is verified gone (it has exited)",
+                record.pid
+            )
+        );
+    }
+}
+
+// The case the marker exists for: the launch wrapper died and the refused session's console
+// was closed, but the provider process survived both (Windows does not end a child with its
+// parent). The marker is retained until that process is verified gone, and the next reopen
+// then releases it.
+#[test]
+fn surviving_provider_process_retains_the_source_marker_until_it_is_verified_gone() {
+    let root = tempfile::tempdir().unwrap();
+    let source_id = "session-reopensrc18";
+    let source = write_closed_reopen_source(
+        root.path(),
+        source_id,
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let source_before = snapshot_directory(&source);
+    let new_id = "session-reopennew18";
+    let new = write_reopen_launch_session(root.path(), new_id, Path::new("/opt/claude"));
+    let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    claim.finalize(new_id).unwrap();
+    write_json_atomic(
+        &new.join(TERMINAL_HANDLE_FILE),
+        &reopen_test_terminal(new_id),
+    )
+    .unwrap();
+    // The wrapper recorded its owner record and the provider it spawned, then the
+    // post-launch check refused.
+    let mut provider = spawn_surviving_process();
+    record_provider_process(&new, new_id, &provider).unwrap();
+    update_status(&new, "awaiting-initial-input", None, None).unwrap();
+    let refusal = record_reopen_refusal(
+        &new,
+        REOPEN_CONFLICT_GATE,
+        "held by pid 4242; no prompt was delivered".to_owned(),
+    );
+    // The parent closed the surface (the console is gone) and the wrapper died with it;
+    // the provider ignored the console close.
+    let mut closed_terminals = Vec::new();
+    close_session_state_with_error(&new, Some(format!("{refusal:#}")), |session| {
+        closed_terminals.push(session.id.clone());
+        Ok(terminal::CloseOutcome::Closed)
+    })
+    .unwrap();
+    assert_eq!(closed_terminals, [format!("{new_id}-terminal")]);
+    write_json_atomic(
+        &new.join(SESSION_OWNER_FILE),
+        &NativeSessionOwner {
+            pid: 0,
+            managed_session_id: Some(new_id.to_owned()),
+            ..NativeSessionOwner::default()
+        },
+    )
+    .unwrap();
+    let status: SessionStatus = read_json(&new.join("status.json")).unwrap();
+    assert_eq!(status.state, "closed");
+    assert!(new.join(TERMINAL_TOMBSTONE_FILE).is_file());
+    assert!(query::observe_owner(&new).process_alive == Some(false));
+
+    let condition = format!(
+        "provider process {} of refused session {new_id} is still running",
+        provider.id()
+    );
+    let retained = format!("the refused launch may still hold the conversation: {condition}");
+    // Settlement by the parent retains the marker and notes why.
+    let outcome = release_reopen_marker_after_refusal(&source, &new, REOPEN_CONFLICT_GATE, Ok(()))
+        .unwrap_err();
+    assert!(format!("{outcome:#}").ends_with(&retained), "{outcome:#}");
+    let record: RecordedReopenRefusal = read_json(&new.join(REOPEN_REFUSAL_FILE)).unwrap();
+    assert_eq!(record.cleanup.as_deref(), Some("pending"));
+    assert_eq!(record.cleanup_detail.as_deref(), Some(condition.as_str()));
+    // Every later reopen is refused under the gate and under the lock.
+    let marker_before = fs::read(source.join(REOPEN_MARKER_FILE)).unwrap();
+    for refused in [
+        inspect_reopen_source(&source, source_id).unwrap_err(),
+        claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap_err(),
+    ] {
+        assert_eq!(reopen_refusal_gate(&refused), Some("already-reopened"));
+        assert_eq!(
+            format!("{refused:#}"),
+            format!(
+                "reopen refused (already-reopened): session {source_id} was already reopened as {new_id}; that launch was refused (reopen-conflict) but {retained}"
+            )
+        );
+    }
+    assert_eq!(
+        fs::read(source.join(REOPEN_MARKER_FILE)).unwrap(),
+        marker_before
+    );
+
+    // The provider exits. The next reopen verifies it gone and releases the marker under
+    // the source lock; the closed surface is reported with it.
+    provider.kill().unwrap();
+    provider.wait().unwrap();
+    assert_eq!(
+        refused_launch_cleanup(&new, REOPEN_CONFLICT_GATE)
+            .unwrap()
+            .to_string(),
+        format!(
+            "provider process {} is verified gone (it has exited) and the refused session's surface was closed",
+            provider.id()
+        )
+    );
+    inspect_reopen_source(&source, source_id).unwrap();
+    let next = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    let marker: ReopenMarker = read_json(&source.join(REOPEN_MARKER_FILE)).unwrap();
+    assert_eq!(marker.reopened_by, None);
+    drop(next);
+    assert_eq!(snapshot_directory(&source), source_before);
+}
+
+// The reopen-local observation keeps a confirmed identity mismatch (a reused pid, which
+// proves the recorded process gone) apart from a process that cannot be inspected (which
+// proves nothing and retains the marker), and from a pid that is simply dead.
+#[test]
+fn provider_process_identity_check_separates_reuse_from_uninspectable() {
+    let alive = std::process::id();
+    assert_eq!(
+        classify_provider_process_identity(
+            alive,
+            Ok(terminal::WindowsProcessIdentityCheck::Matches)
+        ),
+        ProviderProcessObservation::Alive
+    );
+    assert_eq!(
+        classify_provider_process_identity(
+            alive,
+            Ok(terminal::WindowsProcessIdentityCheck::Mismatch(
+                "Windows console process id was reused"
+            ))
+        ),
+        ProviderProcessObservation::Gone(ProviderProcessGone::IdentityMismatch(
+            "Windows console process id was reused"
+        ))
+    );
+    assert_eq!(
+        classify_provider_process_identity(alive, Err(anyhow::anyhow!("access is denied"))),
+        ProviderProcessObservation::Unknown("access is denied".to_owned())
+    );
+    assert_eq!(
+        classify_provider_process_identity(0, Err(anyhow::anyhow!("no such process"))),
+        ProviderProcessObservation::Gone(ProviderProcessGone::Exited)
+    );
+}
+
+// A recorded provider pid that is alive under a different creation time or executable is a
+// reused pid: the recorded process is gone and the marker is released. The same pid with
+// its recorded identity is the surviving provider and retains it.
+#[cfg(windows)]
+#[test]
+fn reused_provider_pid_with_a_different_identity_releases_the_marker() {
+    let root = tempfile::tempdir().unwrap();
+    let source_id = "session-reopensrc19";
+    let source = write_closed_reopen_source(
+        root.path(),
+        source_id,
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let source_before = snapshot_directory(&source);
+    let new_id = "session-reopennew19";
+    let new = write_reopen_launch_session(root.path(), new_id, Path::new("/opt/claude"));
+    let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    claim.finalize(new_id).unwrap();
+    update_status(&new, "failed", None, Some("refused".to_owned())).unwrap();
+    record_reopen_refusal(
+        &new,
+        REOPEN_VERIFICATION_FAILED_GATE,
+        "could not verify; no prompt was delivered".to_owned(),
+    );
+    let pid = std::process::id();
+    let identity = terminal::windows_process_identity(pid).unwrap();
+    let record = |identity: terminal::WindowsProcessIdentity| {
+        write_json_atomic(
+            &new.join(PROVIDER_PROCESS_FILE),
+            &ProviderProcessRecord {
+                schema: 1,
+                managed_session_id: new_id.to_owned(),
+                pid,
+                windows_process_identity: Some(identity),
+                spawned_unix_ms: 1,
+            },
+        )
+        .unwrap();
+    };
+    let already = format!(
+        "reopen refused (already-reopened): session {source_id} was already reopened as {new_id}; that launch was refused (reopen-verification-failed) but "
+    );
+
+    record(identity.clone());
+    assert_eq!(
+        refused_launch_cleanup(&new, REOPEN_VERIFICATION_FAILED_GATE).unwrap(),
+        RefusedLaunchCleanup::Pending(format!(
+            "provider process {pid} of refused session {new_id} is still running"
+        ))
+    );
+    assert_eq!(
+        format!(
+            "{:#}",
+            inspect_reopen_source(&source, source_id).unwrap_err()
+        ),
+        format!(
+            "{already}the refused launch may still hold the conversation: provider process {pid} of refused session {new_id} is still running"
+        )
+    );
+
+    for (label, reused, reason) in [
+        (
+            "creation time",
+            terminal::WindowsProcessIdentity {
+                creation_time: identity.creation_time.wrapping_add(1),
+                ..identity.clone()
+            },
+            "Windows console process id was reused",
+        ),
+        (
+            "executable path",
+            terminal::WindowsProcessIdentity {
+                executable_path: format!("{}.other", identity.executable_path),
+                ..identity.clone()
+            },
+            "Windows console process executable identity changed",
+        ),
+    ] {
+        record(reused);
+        let cleanup = refused_launch_cleanup(&new, REOPEN_VERIFICATION_FAILED_GATE).unwrap();
+        assert_eq!(
+            cleanup,
+            RefusedLaunchCleanup::ProviderProcessGone {
+                pid,
+                evidence: ProviderProcessGone::IdentityMismatch(reason),
+                surface_closed: false,
+            },
+            "{label}"
+        );
+        assert_eq!(
+            cleanup.to_string(),
+            format!(
+                "provider process {pid} is verified gone (the pid now belongs to another process: {reason})"
+            ),
+            "{label}"
+        );
+        inspect_reopen_source(&source, source_id).unwrap();
+    }
+    let next = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    drop(next);
+    assert_eq!(snapshot_directory(&source), source_before);
+}
+
+// A recorded provider process whose identity cannot be inspected while its pid is alive is
+// neither verified surviving nor verified gone, and the marker stays consumed. The System
+// process (pid 4) is alive and cannot report an executable image.
+#[cfg(windows)]
+#[test]
+fn uninspectable_provider_process_retains_the_marker() {
+    let root = tempfile::tempdir().unwrap();
+    let source_id = "session-reopensrc20";
+    let source = write_closed_reopen_source(
+        root.path(),
+        source_id,
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let new_id = "session-reopennew20";
+    let new = write_reopen_launch_session(root.path(), new_id, Path::new("/opt/claude"));
+    let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
+    claim.finalize(new_id).unwrap();
+    update_status(&new, "failed", None, Some("refused".to_owned())).unwrap();
+    record_reopen_refusal(
+        &new,
+        REOPEN_CONFLICT_GATE,
+        "held by pid 4242; no prompt was delivered".to_owned(),
+    );
+    let system_pid = 4;
+    assert!(process_is_alive(system_pid));
+    let error = terminal::check_windows_process_identity(
+        system_pid,
+        &terminal::WindowsProcessIdentity {
+            creation_time: 1,
+            executable_path: "C:\\Windows\\System32\\claude.exe".to_owned(),
+        },
+    )
+    .expect_err("the System process reported an identity");
+    write_json_atomic(
+        &new.join(PROVIDER_PROCESS_FILE),
+        &ProviderProcessRecord {
+            schema: 1,
+            managed_session_id: new_id.to_owned(),
+            pid: system_pid,
+            windows_process_identity: Some(terminal::WindowsProcessIdentity {
+                creation_time: 1,
+                executable_path: "C:\\Windows\\System32\\claude.exe".to_owned(),
+            }),
+            spawned_unix_ms: 1,
+        },
+    )
+    .unwrap();
+    let cleanup = refused_launch_cleanup(&new, REOPEN_CONFLICT_GATE).unwrap();
+    assert_eq!(
+        cleanup,
+        RefusedLaunchCleanup::Pending(format!(
+            "provider process {system_pid} of refused session {new_id} could not be verified: {error:#}"
+        ))
+    );
+    assert!(!cleanup.releases_marker());
+    let refused = inspect_reopen_source(&source, source_id).unwrap_err();
+    assert_eq!(reopen_refusal_gate(&refused), Some("already-reopened"));
+    assert!(
+        format!("{refused:#}").contains("could not be verified"),
+        "{refused:#}"
+    );
+    assert!(source.join(REOPEN_MARKER_FILE).is_file());
 }

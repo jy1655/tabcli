@@ -28,15 +28,18 @@ use windows_sys::Win32::{
     },
 };
 
-use super::{CloseOutcome, TerminalKind, TerminalSession, WindowsProcessIdentity};
+use super::{
+    CloseOutcome, TerminalKind, TerminalSession, WindowsProcessIdentity,
+    WindowsProcessIdentityCheck,
+};
 
 mod process;
 mod security;
+pub(super) use process::{check_process_identity, query_process_identity, verify_process_identity};
 use process::{
     open_verified_control_process, query_process_identity_from_handle,
     verify_control_process_identity,
 };
-pub(super) use process::{query_process_identity, verify_process_identity};
 pub(super) use security::set_private_permissions;
 
 const STARTUP_CLEANUP_RESERVE: Duration = Duration::from_secs(2);
