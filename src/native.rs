@@ -2389,6 +2389,7 @@ where
         consume_result?;
         return close_result;
     }
+    fault_point("claiming the terminal handle for close")?;
     match fs::rename(&terminal_path, &closing_path) {
         Ok(()) => sync_parent_directory(&closing_path)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2455,6 +2456,7 @@ fn consume_terminal_handle(
 }
 
 fn remove_file_if_present(path: &Path) -> Result<()> {
+    fault_point("removing a record file")?;
     match fs::remove_file(path) {
         Ok(()) => sync_parent_directory(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -2463,6 +2465,7 @@ fn remove_file_if_present(path: &Path) -> Result<()> {
 }
 
 pub(super) fn rename_session_file(from: &Path, to: &Path) -> Result<()> {
+    fault_point("renaming a record file")?;
     fs::rename(from, to)
         .with_context(|| format!("failed to rename {} to {}", from.display(), to.display()))?;
     sync_parent_directory(to)?;
@@ -3026,10 +3029,15 @@ fn commit_provider_completion_with_status_locked(
     if let Ok(Some(receipt)) = requests::for_claim(directory, claim_token) {
         pending.event_file = receipt.event_file;
     }
-    write_private(
-        &directory.join(TURN_COMPLETION_FILE),
-        &serde_json::to_vec_pretty(&pending)?,
-    )?;
+    // Every caller recovers under the lifecycle lock first, so a journal that still exists
+    // here belongs to a completion that could not be recovered; refuse to replace it.
+    let completion_path = directory.join(TURN_COMPLETION_FILE);
+    if completion_path.exists() {
+        bail!("a pending native turn completion is still awaiting recovery")
+    }
+    // The journal is published by rename so that a partial journal never exists at its
+    // final path; the temporary file carries the same private permissions.
+    write_json_atomic(&completion_path, &pending)?;
     recover_pending_completion_locked(directory, claim_path)?;
     Ok(())
 }
@@ -3058,15 +3066,22 @@ fn read_regular_bytes_if_present(path: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 fn create_session(spec: SessionSpec) -> Result<CreatedSession> {
-    let root = state_root()?;
-    fs::create_dir_all(&root)
+    create_session_in(&state_root()?, spec)
+}
+
+fn create_session_in(root: &Path, spec: SessionSpec) -> Result<CreatedSession> {
+    fs::create_dir_all(root)
         .with_context(|| format!("failed to create state directory {}", root.display()))?;
-    set_private_directory_permissions(&root)?;
+    set_private_directory_permissions(root)?;
     let temp = tempfile::Builder::new()
         .prefix("session-")
-        .tempdir_in(&root)?;
+        .tempdir_in(root)?;
     let directory = temp.keep();
     set_private_directory_permissions(&directory)?;
+    // The session directory is itself a record: sync the root so its entry survives a
+    // crash the same way the files written inside it do.
+    sync_directory(root)
+        .with_context(|| format!("failed to sync state root {}", root.display()))?;
     let id = directory
         .file_name()
         .and_then(|name| name.to_str())
@@ -3076,6 +3091,8 @@ fn create_session(spec: SessionSpec) -> Result<CreatedSession> {
     let events = directory.join("events");
     fs::create_dir(&events)?;
     set_private_directory_permissions(&events)?;
+    sync_directory(&directory)
+        .with_context(|| format!("failed to sync session directory {}", directory.display()))?;
     let manifest = SessionManifest {
         schema: SESSION_SCHEMA,
         id: id.clone(),
@@ -3180,8 +3197,104 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     serde_json::from_str(&text).with_context(|| format!("invalid JSON in {}", path.display()))
 }
 
+// Durable record writes. Every helper below syncs the file it changed and then the
+// directory that holds its entry, so a crash after the helper returns cannot lose the
+// record on a POSIX file system that honours fsync. See README "권한과 세션 경계" for the
+// classification of which records go through these helpers and the platform limits.
+//
+// Under `cfg(test)` two thread-local hooks observe these helpers: `fault_point` refuses
+// the next filesystem mutation once an injected budget is spent, which models a process
+// that died between two mutations, and `record_sync` logs every sync call in order.
+// Both are inert outside tests.
+
+#[cfg(test)]
+thread_local! {
+    static FAULT_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static SYNC_LOG: std::cell::RefCell<Option<Vec<SyncRecord>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SyncRecord {
+    File(PathBuf),
+    Directory(PathBuf),
+}
+
+/// Refuses the mutation that follows it once the injected fault budget reaches zero.
+/// A budget of `k` lets exactly `k` mutation boundaries pass and then fails every later
+/// one, exactly like a process that stopped after its `k`-th mutation.
+fn fault_point(label: &str) -> Result<()> {
+    #[cfg(test)]
+    {
+        FAULT_BUDGET.with(|budget| match budget.get() {
+            None => Ok(()),
+            Some(0) => bail!("injected fault before {label}"),
+            Some(remaining) => {
+                budget.set(Some(remaining - 1));
+                Ok(())
+            }
+        })
+    }
+    #[cfg(not(test))]
+    {
+        let _ = label;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn injected_fault(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("injected fault before")
+}
+
+#[cfg(test)]
+fn with_fault_budget<T>(budget: usize, run: impl FnOnce() -> T) -> T {
+    FAULT_BUDGET.with(|cell| cell.set(Some(budget)));
+    let outcome = run();
+    FAULT_BUDGET.with(|cell| cell.set(None));
+    outcome
+}
+
+#[cfg(test)]
+fn with_sync_log<T>(run: impl FnOnce() -> T) -> (T, Vec<SyncRecord>) {
+    SYNC_LOG.with(|log| *log.borrow_mut() = Some(Vec::new()));
+    let outcome = run();
+    let records = SYNC_LOG.with(|log| log.borrow_mut().take().unwrap_or_default());
+    (outcome, records)
+}
+
+#[derive(Clone, Copy)]
+enum SyncKind {
+    File,
+    Directory,
+}
+
+fn record_sync(kind: SyncKind, path: &Path) {
+    #[cfg(test)]
+    SYNC_LOG.with(|log| {
+        if let Some(log) = log.borrow_mut().as_mut() {
+            log.push(match kind {
+                SyncKind::File => SyncRecord::File(path.to_path_buf()),
+                SyncKind::Directory => SyncRecord::Directory(path.to_path_buf()),
+            });
+        }
+    });
+    #[cfg(not(test))]
+    {
+        let _ = (kind, path);
+    }
+}
+
+fn sync_file(file: &File, path: &Path) -> Result<()> {
+    record_sync(SyncKind::File, path);
+    file.sync_all()
+        .with_context(|| format!("failed to sync {}", path.display()))
+}
+
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path.parent().context("JSON path has no parent")?;
+    fault_point("creating a temporary record file")?;
     let mut temporary = tempfile::Builder::new()
         .prefix(".agent-bridge-")
         .suffix(".tmp")
@@ -3189,17 +3302,19 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     set_private_file_permissions(temporary.as_file())?;
     temporary.write_all(&serde_json::to_vec_pretty(value)?)?;
     temporary.flush()?;
-    temporary.as_file().sync_all()?;
+    sync_file(temporary.as_file(), temporary.path())?;
+    fault_point("renaming a temporary record over its final path")?;
     let persisted = temporary
         .persist(path)
         .map_err(|error| error.error)
         .with_context(|| format!("failed to persist {}", path.display()))?;
-    persisted.sync_all()?;
+    sync_file(&persisted, path)?;
     sync_parent_directory(path)?;
     Ok(())
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    fault_point("creating a private record file")?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -3208,7 +3323,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     set_private_file_permissions(&file)?;
     file.write_all(bytes)?;
     file.flush()?;
-    file.sync_all()?;
+    sync_file(&file, path)?;
     sync_parent_directory(path)?;
     Ok(())
 }
@@ -3221,14 +3336,22 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
         .with_context(|| format!("failed to sync state directory {}", parent.display()))
 }
 
-#[cfg(unix)]
 fn sync_directory(directory: &Path) -> Result<()> {
+    record_sync(SyncKind::Directory, directory);
+    sync_directory_entries(directory)
+}
+
+#[cfg(unix)]
+fn sync_directory_entries(directory: &Path) -> Result<()> {
     File::open(directory)?.sync_all()?;
     Ok(())
 }
 
+// Windows flushes the directory's metadata through a handle opened with backup semantics.
+// NTFS journals directory entries, so this is a best-effort flush of the volume's cached
+// metadata rather than the POSIX guarantee that the entry itself reached stable storage.
 #[cfg(windows)]
-fn sync_directory(directory: &Path) -> Result<()> {
+fn sync_directory_entries(directory: &Path) -> Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
 
@@ -3240,8 +3363,10 @@ fn sync_directory(directory: &Path) -> Result<()> {
     Ok(())
 }
 
+// No supported transport exists on other targets; the directory entry is left to the
+// operating system's own write-back and the records are not claimed durable there.
 #[cfg(not(any(unix, windows)))]
-fn sync_directory(_directory: &Path) -> Result<()> {
+fn sync_directory_entries(_directory: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -3316,6 +3441,24 @@ fn update_status_locked(
     write_json_atomic(&status_path, &status)
 }
 
+/// The session status transition contract. A same-state write is always allowed (it
+/// refreshes the timestamp or error and still takes a new generation); every other write
+/// must appear in this table or `update_status` rejects it without advancing the
+/// generation. `exited`, `failed`, and `closed` are terminal except that the first two may
+/// still be closed; `closed` accepts nothing else. The README section "권한과 세션 경계"
+/// carries the same table for operators.
+///
+/// | From                    | To                                                 |
+/// | ----------------------- | -------------------------------------------------- |
+/// | `launching`             | `running`, `awaiting-initial-input`, `failed`, `closed` |
+/// | `awaiting-initial-input`| `working`, `exited`, `failed`, `closed`            |
+/// | `running`               | `ready`, `exited`, `failed`, `closed`              |
+/// | `ready`                 | `claimed`, `exited`, `failed`, `closed`            |
+/// | `claimed`               | `working`, `ready`, `exited`, `failed`, `closed`   |
+/// | `working`               | `ready`, `exited`, `failed`, `closed`              |
+/// | `resume-pending`        | `working`, `ready`, `exited`, `failed`, `closed`   |
+/// | `exited`, `failed`      | `closed`                                           |
+/// | `closed`                | (none)                                             |
 fn valid_status_transition(current: &str, next: &str) -> bool {
     current == next
         || matches!(
@@ -3389,6 +3532,39 @@ impl TurnClaim {
     }
 }
 
+/// Compare-and-set status write on behalf of one turn: the status changes only while the
+/// claim named by `claim_token` is still the installed claim, checked and written under
+/// the turn-claim lifecycle lock. A writer whose turn has already been released or
+/// replaced is rejected with `Ok(false)` and leaves the status generation untouched.
+///
+/// Every status writer that reports about a specific turn (delivery failures, delivery
+/// uncertainty) goes through this helper; writers that report about the session as a
+/// whole (process exit, monitor failure, close) use `update_status` under their own
+/// guards.
+fn update_status_for_turn(
+    directory: &Path,
+    claim_token: &str,
+    state: &str,
+    error: Option<String>,
+) -> Result<bool> {
+    let claim_path = directory.join(TURN_CLAIM_FILE);
+    let _lock = lock_turn_claim(&claim_path)?;
+    update_status_for_turn_locked(directory, claim_token, state, error)
+}
+
+fn update_status_for_turn_locked(
+    directory: &Path,
+    claim_token: &str,
+    state: &str,
+    error: Option<String>,
+) -> Result<bool> {
+    if current_turn_claim_token(directory)?.as_deref() != Some(claim_token) {
+        return Ok(false);
+    }
+    update_status(directory, state, None, error)?;
+    Ok(true)
+}
+
 fn record_initial_prompt_delivery_failure(
     directory: &Path,
     claim: &mut TurnClaim,
@@ -3398,12 +3574,15 @@ fn record_initial_prompt_delivery_failure(
     let error = terminal_safe_text(&format!("{error:#}"), true);
     if delivery_started {
         claim.retain_in_place();
-        let _ = update_status(directory, "working", None, Some(error));
+        let _ = update_status_for_turn(directory, &claim.token, "working", Some(error));
     } else {
         let _ = update_status(directory, "failed", None, Some(error));
     }
 }
 
+// The send can outlive the turn: the target may complete the delivered turn and a later
+// tell may claim the session before this sender learns that its paste timed out. The
+// failure then belongs to a released turn and must not touch the current turn's status.
 fn record_follow_up_terminal_delivery_failure(
     directory: &Path,
     claim: &mut TurnClaim,
@@ -3412,7 +3591,7 @@ fn record_follow_up_terminal_delivery_failure(
     if failure.delivery_may_have_occurred() {
         claim.retain_in_place();
         let error = terminal_safe_text(&format!("{:#}", failure.error()), true);
-        let _ = update_status(directory, "working", None, Some(error));
+        let _ = update_status_for_turn(directory, &claim.token, "working", Some(error));
     }
 }
 
@@ -3426,14 +3605,8 @@ fn record_follow_up_cross_session_delivery_uncertainty(
     error: &anyhow::Error,
 ) {
     claim.retain_in_place();
-    let Ok(_lock) = lock_turn_claim(&claim.path) else {
-        return;
-    };
-    if !matches!(current_turn_claim_token(directory), Ok(Some(token)) if token == claim.token) {
-        return;
-    }
     let error = terminal_safe_text(&format!("{error:#}"), true);
-    let _ = update_status(directory, "working", None, Some(error));
+    let _ = update_status_for_turn(directory, &claim.token, "working", Some(error));
 }
 
 impl Drop for TurnClaim {
@@ -3566,6 +3739,7 @@ fn create_turn_claim_locked(
     path: PathBuf,
     context_sources: &[requests::ContextSource],
 ) -> Result<TurnClaim> {
+    fault_point("creating the turn claim")?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -3580,7 +3754,7 @@ fn create_turn_claim_locked(
     );
     writeln!(file, "{token}")?;
     file.flush()?;
-    file.sync_all()?;
+    sync_file(&file, &path)?;
     sync_parent_directory(&path)?;
     let directory = path
         .parent()
@@ -3643,18 +3817,25 @@ fn recover_pending_completion(directory: &Path) -> Result<bool> {
     recover_pending_completion_locked(directory, &claim_path)
 }
 
+/// Converges every partial lifecycle transition that a stopped process can leave behind,
+/// under the turn-claim lifecycle lock. Returns whether any record changed.
+///
+/// Two transitions are journaled and therefore recoverable: a provider completion (journal
+/// -> event -> status -> claim release -> journal removal) and an explicit or repair close
+/// (tombstone -> status -> journal removal -> claim release). The `closed.json` tombstone is
+/// the durable commit point of a close: once it exists the session is closed even when the
+/// later cleanup steps never ran, so recovery finishes those steps instead of publishing.
 fn recover_pending_completion_locked(directory: &Path, claim_path: &Path) -> Result<bool> {
     let completion_path = directory.join(TURN_COMPLETION_FILE);
+    if let Some(tombstone) = read_status_if_present(&directory.join(CLOSED_STATUS_FILE))? {
+        return converge_interrupted_close_locked(directory, claim_path, &tombstone);
+    }
     let Some(text) = read_regular_text_if_present(&completion_path)? else {
         return Ok(false);
     };
     let pending: PendingTurnCompletion =
         serde_json::from_str(&text).context("invalid pending native turn completion")?;
     validate_pending_completion(&pending)?;
-    if directory.join(CLOSED_STATUS_FILE).is_file() {
-        remove_file_if_present(&completion_path)?;
-        return Ok(true);
-    }
 
     match fs::read_to_string(claim_path) {
         Ok(current) if current.trim() == pending.claim_token => {
@@ -3686,6 +3867,45 @@ fn recover_pending_completion_locked(directory: &Path, claim_path: &Path) -> Res
         }
         Err(error) => Err(error).context("failed to inspect pending completion turn claim"),
     }
+}
+
+// Finishes a close whose tombstone was written but whose later cleanup steps did not run.
+// The tombstone is preserved unchanged: status.json is rewritten from it (update_status
+// copies the tombstone whenever one exists), and the journal, legacy resume markers, and
+// turn claim are removed. A close discards any journaled completion, exactly as the
+// uninterrupted close does, so the completion is never published here.
+fn converge_interrupted_close_locked(
+    directory: &Path,
+    claim_path: &Path,
+    tombstone: &SessionStatus,
+) -> Result<bool> {
+    let mut changed = false;
+    let status_path = directory.join("status.json");
+    let status_matches = read_status_if_present(&status_path)?.is_some_and(|status| {
+        status.state == tombstone.state
+            && status.generation == tombstone.generation
+            && status.error == tombstone.error
+    });
+    if !status_matches {
+        update_status(directory, "closed", None, tombstone.error.clone())?;
+        changed = true;
+    }
+    for name in [
+        TURN_COMPLETION_FILE,
+        LEGACY_RESUME_PENDING_FILE,
+        LEGACY_RESUME_RUNNING_FILE,
+    ] {
+        let path = directory.join(name);
+        if path.exists() {
+            remove_file_if_present(&path)?;
+            changed = true;
+        }
+    }
+    if claim_path.exists() {
+        remove_turn_claim_locked(claim_path)?;
+        changed = true;
+    }
+    Ok(changed)
 }
 
 fn validate_pending_completion(pending: &PendingTurnCompletion) -> Result<()> {
@@ -3792,10 +4012,20 @@ where
         }
     };
     #[cfg(windows)]
-    if let Some(identity) = &owner.windows_process_identity
-        && terminal::verify_windows_process_identity(owner.pid, identity).is_ok()
-    {
-        return Ok(false);
+    match &owner.windows_process_identity {
+        Some(identity) => {
+            if terminal::verify_windows_process_identity(owner.pid, identity).is_ok() {
+                return Ok(false);
+            }
+        }
+        // Pre-identity (v0.0.2) Windows owner records carry only a PID. Their identity is
+        // unknown, not dead: while the PID is alive the session is left alone and inspect
+        // reports `identity_matches: null`; only a dead PID lets repair proceed.
+        None => {
+            if process_is_alive(owner.pid) {
+                return Ok(false);
+            }
+        }
     }
     #[cfg(target_os = "macos")]
     if mac_native_owner_is_live(&owner)? {

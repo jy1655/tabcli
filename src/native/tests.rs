@@ -3308,3 +3308,570 @@ fn pi_session_loads_the_result_extension_and_explicit_project_approval() {
     let extension = fs::read_to_string(directory.join("pi-agent-bridge.js")).unwrap();
     assert!(extension.contains("agent_settled"));
 }
+
+// ---------------------------------------------------------------------------
+// Lifecycle reliability contracts (#5, #12, #13, #15)
+// ---------------------------------------------------------------------------
+
+fn sample_completion(claim_token: &str, message: &str) -> PendingTurnCompletion {
+    PendingTurnCompletion::new(
+        claim_token,
+        SessionEvent {
+            provider: FirstPartyCli::Codex.as_str().to_owned(),
+            message: message.to_owned(),
+            error: None,
+            provider_session_id: Some("provider-session".to_owned()),
+            turn_id: Some("provider-turn".to_owned()),
+            created_unix_ms: 1,
+        },
+        None,
+    )
+    .unwrap()
+}
+
+fn delivery_uncertain_failure(message: &str) -> terminal::TerminalSendFailure {
+    terminal::TerminalSendFailure::delivery_uncertain(anyhow::anyhow!("{message}"))
+}
+
+#[test]
+fn interrupted_close_converges_when_recovery_runs() {
+    // A close that stopped after writing the tombstone and status but before releasing the
+    // claim and the journal must converge on the next lifecycle-lock holder.
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    let claim = acquire_turn_claim(directory.path()).unwrap();
+    let claim_token = claim.token.clone();
+    claim.retain();
+    let pending = sample_completion(&claim_token, "late result");
+    write_json_atomic(&directory.path().join(TURN_COMPLETION_FILE), &pending).unwrap();
+    update_status(
+        directory.path(),
+        "closed",
+        None,
+        Some("closed by the maintainer".to_owned()),
+    )
+    .unwrap();
+    let tombstone: SessionStatus = read_json(&directory.path().join(CLOSED_STATUS_FILE)).unwrap();
+
+    assert!(recover_pending_completion(directory.path()).unwrap());
+
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+    assert!(!directory.path().join(TURN_COMPLETION_FILE).exists());
+    assert!(event_paths(directory.path()).unwrap().is_empty());
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "closed");
+    assert_eq!(status.generation, tombstone.generation);
+    assert_eq!(status.error.as_deref(), Some("closed by the maintainer"));
+    let preserved: SessionStatus = read_json(&directory.path().join(CLOSED_STATUS_FILE)).unwrap();
+    assert_eq!(preserved.generation, tombstone.generation);
+    assert_eq!(preserved.updated_unix_ms, tombstone.updated_unix_ms);
+    assert!(!recover_pending_completion(directory.path()).unwrap());
+}
+
+#[test]
+fn delayed_terminal_delivery_failure_cannot_overwrite_a_replacement_turn() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    let mut stale_claim = acquire_turn_claim(directory.path()).unwrap();
+    stale_claim.retain_in_place();
+    record_provider_result_for_claim(
+        directory.path(),
+        FirstPartyCli::Codex,
+        "turn A result",
+        Some("codex-session".to_owned()),
+        Some("codex-turn-a".to_owned()),
+        Some(&stale_claim.token),
+    )
+    .unwrap();
+    let replacement = acquire_turn_claim(directory.path()).unwrap();
+    replacement.retain();
+    update_status(directory.path(), "claimed", None, None).unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    let before: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+
+    record_follow_up_terminal_delivery_failure(
+        directory.path(),
+        &mut stale_claim,
+        &delivery_uncertain_failure("turn A paste timed out"),
+    );
+
+    let after: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(after.state, "working");
+    assert_eq!(after.error, None);
+    assert_eq!(after.generation, before.generation);
+    assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+}
+
+#[test]
+fn legacy_owner_without_process_identity_is_repaired_only_when_its_pid_is_dead() {
+    for (pid, expect_repair) in [(std::process::id(), false), (reaped_child_pid(), true)] {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        claim.retain();
+        // Pre-identity owner records carry only a PID on every platform.
+        write_json_atomic(
+            &directory.path().join(SESSION_OWNER_FILE),
+            &serde_json::json!({ "pid": pid }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            repair_dead_native_owner(directory.path()).unwrap(),
+            expect_repair
+        );
+        assert_eq!(
+            directory.path().join(TURN_CLAIM_FILE).exists(),
+            !expect_repair
+        );
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(
+            status.state,
+            if expect_repair { "closed" } else { "working" }
+        );
+    }
+}
+
+fn assert_no_pending_completion(directory: &Path) {
+    assert!(!directory.join(TURN_COMPLETION_FILE).exists());
+    assert!(
+        !fs::read_dir(directory).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }),
+        "a temporary journal file was left behind"
+    );
+}
+
+#[test]
+fn provider_completion_converges_after_a_fault_before_every_mutation() {
+    // Each iteration lets the completion path perform exactly `budget` filesystem
+    // mutations (journal creation included) and refuses the next one, then proves that
+    // the next lifecycle-lock holder converges the session from that state.
+    let mut faulted = 0;
+    let mut unpublished = 0;
+    let mut published = 0;
+    for budget in 0.. {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        let claim_token = claim.token.clone();
+        claim.retain();
+        let complete = || {
+            record_provider_result_for_claim(
+                directory.path(),
+                FirstPartyCli::Codex,
+                "committed result",
+                Some("provider-session".to_owned()),
+                Some("provider-turn".to_owned()),
+                Some(&claim_token),
+            )
+        };
+
+        match with_fault_budget(budget, complete) {
+            Ok(()) => break,
+            Err(error) => assert!(injected_fault(&error), "{error:#}"),
+        }
+        faulted += 1;
+
+        let recovered = recover_pending_completion(directory.path()).unwrap();
+        assert_no_pending_completion(directory.path());
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        let events = event_paths(directory.path()).unwrap();
+        if status.state == "working" {
+            // The journal never reached its final path, so nothing was published and the
+            // turn is still owned by its claim; recovery had nothing to do.
+            assert!(!recovered);
+            assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+            assert!(events.is_empty());
+            unpublished += 1;
+            complete().unwrap();
+        } else {
+            published += 1;
+        }
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state, "ready");
+        assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+        assert_no_pending_completion(directory.path());
+        let events = event_paths(directory.path()).unwrap();
+        assert_eq!(events.len(), 1);
+        let stored: SessionEvent = read_json(&events[0]).unwrap();
+        assert_eq!(stored.message, "committed result");
+        assert!(!recover_pending_completion(directory.path()).unwrap());
+    }
+    assert!(
+        faulted >= 8,
+        "only {faulted} mutation boundaries were exercised"
+    );
+    assert!(
+        unpublished >= 2,
+        "journal creation boundaries were not exercised"
+    );
+    assert!(published >= 5, "post-journal boundaries were not exercised");
+}
+
+fn close_test_terminal() -> terminal::TerminalSession {
+    terminal::TerminalSession {
+        kind: if cfg!(windows) {
+            terminal::TerminalKind::WindowsConsole
+        } else {
+            terminal::TerminalKind::AppleTerminal
+        },
+        id: "4242".to_owned(),
+        tab_id: None,
+        window_id: None,
+        managed_session_id: Some("session-close123".to_owned()),
+        windows_process_identity: None,
+    }
+}
+
+#[test]
+fn explicit_close_converges_after_a_fault_before_every_close_mutation() {
+    let mut faulted = 0;
+    let mut tombstoned = 0;
+    for budget in 0.. {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        let pending = sample_completion(&claim.token, "late result");
+        claim.retain();
+        write_json_atomic(&directory.path().join(TURN_COMPLETION_FILE), &pending).unwrap();
+        write_json_atomic(
+            &directory.path().join(TERMINAL_HANDLE_FILE),
+            &close_test_terminal(),
+        )
+        .unwrap();
+        fs::write(directory.path().join(LEGACY_RESUME_PENDING_FILE), "{}").unwrap();
+        let mut adapter_calls = 0;
+
+        let outcome = with_fault_budget(budget, || {
+            close_session_state_with_error(
+                directory.path(),
+                Some("closed by the maintainer".to_owned()),
+                |_| {
+                    adapter_calls += 1;
+                    Ok(terminal::CloseOutcome::Closed)
+                },
+            )
+        });
+        match outcome {
+            Ok(()) => break,
+            Err(error) => assert!(injected_fault(&error), "{error:#}"),
+        }
+        faulted += 1;
+
+        // Recovery under the lifecycle lock must finish an interrupted close whose
+        // tombstone exists and must never leave a journal behind.
+        recover_pending_completion(directory.path()).unwrap();
+        assert!(!directory.path().join(TURN_COMPLETION_FILE).exists());
+        if directory.path().join(CLOSED_STATUS_FILE).exists() {
+            tombstoned += 1;
+            let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+            assert_eq!(status.state, "closed");
+            assert_eq!(status.error.as_deref(), Some("closed by the maintainer"));
+            assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+            assert!(!directory.path().join(LEGACY_RESUME_PENDING_FILE).exists());
+        }
+
+        close_session_state(directory.path(), |_| {
+            adapter_calls += 1;
+            Ok(terminal::CloseOutcome::Closed)
+        })
+        .unwrap();
+        assert!(
+            adapter_calls <= 2,
+            "the terminal adapter ran {adapter_calls} times"
+        );
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state, "closed");
+        let tombstone: SessionStatus =
+            read_json(&directory.path().join(CLOSED_STATUS_FILE)).unwrap();
+        assert_eq!(tombstone.generation, status.generation);
+        assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+        assert!(!directory.path().join(TURN_COMPLETION_FILE).exists());
+        assert!(!directory.path().join(LEGACY_RESUME_PENDING_FILE).exists());
+        assert!(!directory.path().join(TERMINAL_HANDLE_FILE).exists());
+        assert!(!directory.path().join(TERMINAL_CLOSING_FILE).exists());
+        assert!(directory.path().join(TERMINAL_TOMBSTONE_FILE).exists());
+        assert!(!recover_pending_completion(directory.path()).unwrap());
+    }
+    assert!(
+        faulted >= 12,
+        "only {faulted} close mutation boundaries were exercised"
+    );
+    assert!(
+        tombstoned >= 5,
+        "interrupted post-tombstone cleanup was not exercised"
+    );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TurnEvent {
+    HookCompletion,
+    MonitorFailure,
+    ProcessExit,
+    DelayedDeliveryFailure,
+}
+
+fn permutations<T: Copy>(items: &[T]) -> Vec<Vec<T>> {
+    if items.len() <= 1 {
+        return vec![items.to_vec()];
+    }
+    let mut all = Vec::new();
+    for (index, first) in items.iter().enumerate() {
+        let mut rest = items.to_vec();
+        rest.remove(index);
+        for mut tail in permutations(&rest) {
+            tail.insert(0, *first);
+            all.push(tail);
+        }
+    }
+    all
+}
+
+#[test]
+fn turn_lifecycle_converges_under_every_completion_exit_and_failure_order() {
+    let events = [
+        TurnEvent::HookCompletion,
+        TurnEvent::MonitorFailure,
+        TurnEvent::ProcessExit,
+        TurnEvent::DelayedDeliveryFailure,
+    ];
+    let orders = permutations(&events);
+    assert_eq!(orders.len(), 24);
+    for order in orders {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "launching", None, None).unwrap();
+        update_status(directory.path(), "running", None, None).unwrap();
+        update_status(directory.path(), "ready", None, None).unwrap();
+        let mut claim = acquire_turn_claim(directory.path()).unwrap();
+        claim.retain_in_place();
+        update_status(directory.path(), "claimed", None, None).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let mut previous: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+
+        for event in &order {
+            let claim_present = directory.path().join(TURN_CLAIM_FILE).exists();
+            match event {
+                TurnEvent::HookCompletion => record_provider_result_for_claim(
+                    directory.path(),
+                    FirstPartyCli::Codex,
+                    "hook result",
+                    Some("codex-session".to_owned()),
+                    Some("codex-turn".to_owned()),
+                    Some(&claim.token),
+                )
+                .unwrap(),
+                TurnEvent::MonitorFailure => record_provider_monitor_failure(
+                    directory.path(),
+                    FirstPartyCli::Codex,
+                    "monitor stopped",
+                )
+                .unwrap(),
+                TurnEvent::ProcessExit => {
+                    finalize_native_session(directory.path(), &Ok(())).unwrap()
+                }
+                TurnEvent::DelayedDeliveryFailure => record_follow_up_terminal_delivery_failure(
+                    directory.path(),
+                    &mut claim,
+                    &delivery_uncertain_failure("paste timed out"),
+                ),
+            }
+            let current: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+            assert!(
+                valid_status_transition(&previous.state, &current.state),
+                "{order:?}: {event:?} moved {} -> {}",
+                previous.state,
+                current.state
+            );
+            assert!(
+                current.generation >= previous.generation,
+                "{order:?}: {event:?}"
+            );
+            if *event == TurnEvent::DelayedDeliveryFailure && !claim_present {
+                assert_eq!(current.generation, previous.generation, "{order:?}");
+                assert_eq!(current.error, previous.error, "{order:?}");
+            }
+            assert!(!directory.path().join(TURN_COMPLETION_FILE).exists());
+            previous = current;
+        }
+
+        assert!(
+            !directory.path().join(TURN_CLAIM_FILE).exists(),
+            "{order:?}"
+        );
+        match previous.state.as_str() {
+            "exited" => assert_eq!(previous.error, None, "{order:?}"),
+            "failed" => assert_eq!(
+                previous.error.as_deref(),
+                Some("monitor stopped"),
+                "{order:?}"
+            ),
+            other => panic!("{order:?} ended in {other}"),
+        }
+        let stored = event_paths(directory.path())
+            .unwrap()
+            .iter()
+            .map(|path| read_json::<SessionEvent>(path).unwrap())
+            .collect::<Vec<_>>();
+        assert!(stored.len() <= 2, "{order:?}: {stored:?}");
+        assert!(
+            stored
+                .iter()
+                .filter(|event| event.message == "hook result")
+                .count()
+                <= 1,
+            "{order:?}"
+        );
+        assert!(
+            stored
+                .iter()
+                .all(|event| event.error.as_deref() != Some("paste timed out")),
+            "{order:?}"
+        );
+    }
+}
+
+#[test]
+fn result_wait_repairs_a_dead_owner_and_ends_the_wait() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    let claim = acquire_turn_claim(directory.path()).unwrap();
+    let claim_token = claim.token.clone();
+    claim.retain();
+    write_json_atomic(
+        &directory.path().join(SESSION_OWNER_FILE),
+        &NativeSessionOwner {
+            pid: reaped_child_pid(),
+            ..NativeSessionOwner::default()
+        },
+    )
+    .unwrap();
+
+    let started = Instant::now();
+    let error = wait_for_event_for_turn(
+        directory.path(),
+        0,
+        None,
+        Some(&claim_token),
+        Duration::from_secs(30),
+    )
+    .unwrap_err();
+
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(
+        format!("{error:#}").contains("no longer running"),
+        "{error:#}"
+    );
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "closed");
+}
+
+#[test]
+fn atomic_json_write_syncs_temporary_then_persisted_file_then_parent() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("record.json");
+    let (outcome, log) = with_sync_log(|| write_json_atomic(&path, &serde_json::json!({})));
+    outcome.unwrap();
+
+    assert_eq!(log.len(), 3, "{log:?}");
+    match &log[0] {
+        SyncRecord::File(temporary) => {
+            assert_eq!(temporary.parent(), Some(directory.path()));
+            assert_ne!(temporary, &path);
+            assert!(temporary.extension().is_some_and(|ext| ext == "tmp"));
+        }
+        other => panic!("first sync was {other:?}"),
+    }
+    assert_eq!(log[1], SyncRecord::File(path.clone()));
+    assert_eq!(
+        log[2],
+        SyncRecord::Directory(directory.path().to_path_buf())
+    );
+}
+
+#[test]
+fn private_write_claim_creation_and_removal_sync_file_then_parent() {
+    let directory = tempfile::tempdir().unwrap();
+    let private = directory.path().join("initial-prompt.txt");
+    let (outcome, log) = with_sync_log(|| write_private(&private, b"prompt"));
+    outcome.unwrap();
+    assert_eq!(
+        log,
+        [
+            SyncRecord::File(private.clone()),
+            SyncRecord::Directory(directory.path().to_path_buf()),
+        ]
+    );
+
+    let claim_path = directory.path().join(TURN_CLAIM_FILE);
+    let (outcome, log) = with_sync_log(|| acquire_turn_claim(directory.path()));
+    outcome.unwrap().retain();
+    assert_eq!(
+        log[..2],
+        [
+            SyncRecord::File(claim_path.clone()),
+            SyncRecord::Directory(directory.path().to_path_buf()),
+        ]
+    );
+
+    let (outcome, log) = with_sync_log(|| remove_file_if_present(&private));
+    outcome.unwrap();
+    assert_eq!(log, [SyncRecord::Directory(directory.path().to_path_buf())]);
+    let (outcome, log) = with_sync_log(|| remove_file_if_present(&private));
+    outcome.unwrap();
+    assert!(
+        log.is_empty(),
+        "a missing file must not be reported as synced"
+    );
+}
+
+#[test]
+fn session_directory_creation_syncs_the_state_root_before_its_records() {
+    let root = tempfile::tempdir().unwrap();
+    let (outcome, log) = with_sync_log(|| {
+        create_session_in(
+            root.path(),
+            SessionSpec {
+                provider: FirstPartyCli::Codex,
+                provider_path: PathBuf::from("codex"),
+                provider_version: "0.147.0".to_owned(),
+                workspace: root.path().to_path_buf(),
+                title: "durability".to_owned(),
+                model: None,
+                effort: None,
+                yolo: false,
+                prompt: "prompt".to_owned(),
+            },
+        )
+    });
+    let created = outcome.unwrap();
+
+    assert_eq!(
+        log.first(),
+        Some(&SyncRecord::Directory(root.path().to_path_buf()))
+    );
+    assert_eq!(
+        log.get(1),
+        Some(&SyncRecord::Directory(created.directory.clone()))
+    );
+    assert!(created.directory.join("events").is_dir());
+    let manifest_index = log
+        .iter()
+        .position(|record| *record == SyncRecord::File(created.directory.join("manifest.json")))
+        .expect("manifest sync");
+    assert!(manifest_index > 1);
+    let status: SessionStatus = read_json(&created.directory.join("status.json")).unwrap();
+    assert_eq!(status.state, "launching");
+}
