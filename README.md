@@ -470,11 +470,15 @@ src/native/tests.rs            provider-neutral native orchestration 단위 테�
 
 ## 0.0.7 업데이트
 
-0.0.7은 저장된 결과를 다음 작업에 연결하는 두 명령을 추가합니다. `search <query>`는 workspace 범위에서 게시된 결과 본문을 검색해 정확한 session/request/event 주소를 돌려주고, `ask`/`tell`의 `--context-result <session>/<request-id|event-id>`는 게시된 성공 결과를 검증·고정한 뒤 프롬프트에 데이터로 첨부하며 새 요청 영수증에 `context_sources` 출처를 남깁니다. 두 기능 모두 읽기 전용 snapshot을 재사용하고 기존 provider 전송·완료 판정·권한 계약을 바꾸지 않습니다.
+`search <query>`는 workspace 범위에서 게시된 결과 본문을 검색해 정확한 session/request/event 주소를 돌려주고 읽기 전용이며 예산 초과·손상은 `incomplete`로 구분해 보고합니다. `ask`/`tell`의 `--context-result <session>/<request-id|event-id>`는 게시된 성공 결과를 전송 전에 검증·고정한 뒤 nonce 구분자로 감싼 데이터로 첨부하고 새 요청 영수증에 `context_sources` 출처를 남깁니다.
 
-`reopen <closed-session>`은 닫힌 Claude Code 세션의 대화를 공식 `--resume`으로 새 세션에서 이어갑니다. 이 릴리스에서는 native Windows의 Claude Code만 지원하며 Codex·Agy·Pi는 각 adapter의 사유와 함께 거부합니다. 자세한 조건은 [사용법](#사용법)에 있습니다.
+`reopen <closed-session> --prompt …`는 닫힌 Claude Code 관리 세션의 대화를 공식 `claude --resume`으로 새 관리 세션(재개 세션)에서 이어갑니다. 이번 릴리스에서는 native Windows의 Claude Code만 지원하고 Codex·Agy·Pi는 adapter가 사유와 함께 거부합니다. 소스가 closed이고 수렴됐는지, 대화 UUID가 있는지, 영수증이 모두 읽히는지, Claude 세션 레지스트리에 다른 live holder가 없는지를 읽기 전용으로 확인하고, spawn 직전·launch 직후·매 전달 직전에 holder를 다시 확인하며 충돌은 새 세션만 실패시킵니다. Claude Code가 동시 resume을 허용하므로 이는 배제가 아니라 최선의 감지입니다. 소스당 한 번만 재개되며(`reopen.marker.json`), marker는 기록된 provider 프로세스가 확실히 사라졌을 때만 해제됩니다. model·effort·권한은 Agent Bridge manifest에서 복사하지 않고 Claude의 resume 규칙이 결정합니다. `resumed_from`은 `inspect`에, `reopen_marker`와 `claude_resumed_conversation_holders`는 `doctor`에 나타납니다.
 
-Claude adapter는 Claude Code 세션 안에서 호출됐을 때 상속되는 세션 마커(`CLAUDE_CODE_CHILD_SESSION` 등)를 관리 세션과 messenger 시작 시 제거합니다. 이 마커를 상속한 관리 세션은 cross-session inbox를 등록하지 않아 `ListAgents`로 발견되지 않았고 native Windows에서는 `ask claude`가 곧바로 실패했습니다. `doctor`의 `claude_caller_markers`가 호출자 환경의 마커를 보고합니다. 자세한 동작과 검증 범위는 [0.0.7 릴리스 노트](docs/releases/0.0.7.md)에 있습니다.
+초기 prompt는 Agy 로그의 `CLI startup completed`와 이후 redraw, 지연 skills reload 관측 또는 startup 후 45초, reload/redraw 없는 3.5초 quiet(동시 진행)를 모두 만족한 뒤에만 붙여넣고, 로그 연속성을 전체 바이트로 확인합니다. 모든 paste 뒤에는 turn marker가 든 `HandleUserInput` receipt를 요구하며, receipt가 없으면 delivery-uncertain(claim 유지, 재paste 없음, `working` + `status.error`)이고 paste 전 timeout만 `not_sent`입니다. `doctor`에 `agy_input_receipt`가 추가됐습니다.
+
+Claude Code 세션 안에서 호출됐을 때 상속되는 `CLAUDE_CODE_CHILD_SESSION` 등 마커를 관리 세션과 messenger 시작 시 제거합니다(이 마커를 상속한 관리 세션은 cross-session inbox를 등록하지 않아 `ListAgents`에 잡히지 않았고 native Windows에서는 `ask claude`가 곧바로 실패했습니다). `doctor`의 `claude_caller_markers`가 호출자 환경의 마커를 보고합니다.
+
+`closed.json`을 close의 commit point로 삼아 중단된 close를 수렴하고, completion journal을 원자적으로 만들며 journal을 버리기 전에 `events/`를 sync하고, journal과 다른 event는 `unpublished-*`로 격리하고, 64 MiB를 넘는 결과는 명시적 실패로 기록하며, turn 단위 상태 writer는 claim token compare-and-set으로 보호하고 전이 표를 문서화했습니다. process identity가 없는 Windows owner는 PID가 죽었을 때만 복구하고, 세션 생성 시 state root와 새 조상 디렉터리를 sync하며 `state-root.durable` receipt로 조상 durability를 보장합니다. 이 후보는 native Windows에서 검증했고 macOS 검증은 tag 전에 진행하며 Linux는 이후 버전에서 지원합니다. 자세한 동작과 검증 범위는 [0.0.7 릴리스 노트](docs/releases/0.0.7.md)에 있습니다.
 
 ## 0.0.6 업데이트
 
