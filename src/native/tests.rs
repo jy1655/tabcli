@@ -5027,6 +5027,267 @@ fn queries_reject_an_events_directory_link_before_reading_through_it() {
     assert!(!reasons.contains("non-regular"), "{reasons}");
 }
 
+// ---------------------------------------------------------------------------
+// Review round 5: per-event limits outside search, cached publication reads count,
+// close settles without events/
+// ---------------------------------------------------------------------------
+
+/// A publication-read hook that changes the status record once, so the first snapshot
+/// fails its consistency check and the read is retried exactly once.
+fn bump_status_once() -> impl FnMut(&Path) {
+    let mut fired = false;
+    move |directory: &Path| {
+        if !fired {
+            fired = true;
+            update_status(directory, "working", None, None).unwrap();
+        }
+    }
+}
+
+#[test]
+fn ordinary_queries_keep_the_per_event_limit_across_a_forced_retry() {
+    // A committed 40 MiB event is within the 64 MiB event limit. When the first snapshot
+    // fails its consistency check and is retried, the second attempt must compare the
+    // unchanged event within the same per-event limit: subtracting the first attempt's
+    // read would leave 24 MiB and turn a valid published result into `recovery_required`.
+    // Only a search shares one budget across attempts, and it stops instead.
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-large");
+    let message = format!("needle {}", "x".repeat(40 * 1024 * 1024));
+    let (request_id, event_path) =
+        seed_event_written_completion_with(&directory, &message, &message);
+    let event_id = event_path.file_name().unwrap().to_str().unwrap().to_owned();
+    let size = fs::metadata(&event_path).unwrap().len();
+    assert!(
+        size > EVENT_READ_LIMIT / 2 && size <= EVENT_READ_LIMIT,
+        "{size}"
+    );
+    // Reading 40 MiB twice outlasts the production retry window in a debug build; the
+    // retry itself, not its timing, is under test.
+    let retried = |run: &dyn Fn() -> serde_json::Value| {
+        query::with_snapshot_retry_window(Duration::from_secs(60), || {
+            query::with_publication_read_hook(bump_status_once(), run)
+        })
+    };
+
+    let result = retried(&|| query::request_result(&directory, &request_id).unwrap());
+    assert_eq!(result["request_state"], "completed");
+    assert_eq!(result["event_id"], event_id);
+    assert_eq!(result["result"].as_str().map(str::len), Some(message.len()));
+
+    let latest = retried(&|| {
+        cli_result(
+            root.path(),
+            &["result", "session-large", "--latest", "--json"],
+        )
+    });
+    assert_eq!(latest["request_state"], "completed");
+    assert_eq!(latest["event_id"], event_id);
+    assert_eq!(latest["request_id"], request_id);
+
+    // The same forced retry inside a search draws on one 64 MiB budget for both attempts
+    // (the search byte budget equals the event limit): the record fits once, not twice,
+    // so the search stops and names it rather than publishing a verdict.
+    let search = retried(&|| {
+        cli_search(
+            root.path(),
+            &["search", "needle", "--all-workspaces", "--json"],
+        )
+    });
+    assert!(search["hits"].as_array().unwrap().is_empty());
+    assert_eq!(search["scanned"]["events"], 0);
+    let reasons = search["incomplete_reasons"].to_string();
+    assert!(
+        reasons.contains(&format!(
+            "byte budget of {EVENT_READ_LIMIT} bytes exhausted; journaled event session-large/{event_id} is {size} bytes with {} bytes remaining",
+            EVENT_READ_LIMIT - size
+        )),
+        "{reasons}"
+    );
+}
+
+#[test]
+fn search_counts_a_cached_publication_read_against_the_event_budget() {
+    // 5,000 ordinary events use up the event budget exactly; the committed journaled
+    // event that sorts after them was already read by the publication check. Its bytes
+    // are not charged twice, but it is still one more event than the budget allows, so
+    // the scan must stop before it, exactly as it does once the journal is gone.
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-many");
+    let (request_id, event_path) =
+        seed_event_written_completion_with(&directory, "needle at the end", "needle at the end");
+    let event_id = event_path.file_name().unwrap().to_str().unwrap().to_owned();
+    let filler = serde_json::to_vec_pretty(&oversized_sample_event("filler")).unwrap();
+    for index in 0..5_000 {
+        let name = format!("event-0-{index:05}.json");
+        assert!(
+            name.as_str() < event_id.as_str(),
+            "{name} sorts after {event_id}"
+        );
+        fs::write(directory.join("events").join(name), &filler).unwrap();
+    }
+    let search = || {
+        cli_search(
+            root.path(),
+            &["search", "needle", "--all-workspaces", "--json"],
+        )
+    };
+
+    let journaled = search();
+    assert!(
+        journaled["hits"].as_array().unwrap().is_empty(),
+        "{journaled}"
+    );
+    assert_eq!(journaled["scanned"]["events"], 5_000, "{journaled}");
+    assert_eq!(journaled["incomplete"], true, "{journaled}");
+    assert!(
+        journaled["incomplete_reasons"]
+            .to_string()
+            .contains("scan stopped: event budget of 5000 reads exhausted"),
+        "{journaled}"
+    );
+
+    // `sessions` recovers the completion and removes the journal; the same scan must
+    // report the same events, the same cut-off, and the same reason.
+    cli_sessions(root.path());
+    assert!(!directory.join(TURN_COMPLETION_FILE).exists());
+    assert_eq!(request_state(&directory, &request_id).0, "completed");
+    let published = search();
+    assert_eq!(published["hits"], journaled["hits"]);
+    assert_eq!(published["scanned"], journaled["scanned"]);
+    assert_eq!(published["incomplete"], journaled["incomplete"]);
+    assert_eq!(
+        published["incomplete_reasons"],
+        journaled["incomplete_reasons"]
+    );
+}
+
+#[test]
+fn close_settles_a_journaled_completion_when_the_events_directory_is_missing() {
+    // A journal with no `events` directory has no event to verify: the close keeps its
+    // tombstone, releases the claim, and discards the journal, and the session can then
+    // be listed, closed again, and pruned. Before this fix the directory check failed the
+    // close after the tombstone, leaving claim and journal installed forever.
+    for journaled_event in [JournaledEventState::Committed, JournaledEventState::Absent] {
+        let fixture = seed_close_fixture(journaled_event);
+        let label = format!("{journaled_event:?}");
+        fs::remove_dir_all(fixture.directory.join("events")).unwrap();
+        let close = || {
+            close_session_state_with_error(
+                &fixture.directory,
+                Some("closed by the maintainer".to_owned()),
+                |_| Ok(terminal::CloseOutcome::Closed),
+            )
+        };
+        let assert_settled = |phase: &str| {
+            assert!(
+                fixture.directory.join(CLOSED_STATUS_FILE).exists(),
+                "{label} {phase}"
+            );
+            assert!(
+                !fixture.directory.join(TURN_CLAIM_FILE).exists(),
+                "{label} {phase}"
+            );
+            assert!(
+                !fixture.directory.join(TURN_COMPLETION_FILE).exists(),
+                "{label} {phase}"
+            );
+            assert!(
+                !fixture.directory.join("events").exists(),
+                "{label} {phase}: the close created an events directory"
+            );
+            assert_eq!(
+                request_state(&fixture.directory, &fixture.request_id),
+                ("unresolved".to_owned(), "closed".to_owned()),
+                "{label} {phase}"
+            );
+        };
+
+        close().unwrap();
+        assert_settled("after the close");
+        let tombstone_before = fs::read(fixture.directory.join(CLOSED_STATUS_FILE)).unwrap();
+        let listing = cli_sessions(fixture.root.path());
+        assert_eq!(listing.len(), 1, "{label}: {listing:?}");
+        assert_eq!(listing[0]["state"], "closed", "{label}: {listing:?}");
+        assert_settled("after sessions");
+        close().unwrap();
+        assert_settled("after the second close");
+        assert_eq!(
+            fs::read(fixture.directory.join(CLOSED_STATUS_FILE)).unwrap(),
+            tombstone_before,
+            "{label}: the tombstone changed"
+        );
+        assert_eq!(
+            prune_closed_sessions(fixture.root.path(), u128::MAX).unwrap(),
+            ["session-fault"],
+            "{label}"
+        );
+        assert!(!fixture.directory.exists(), "{label}");
+    }
+
+    // An interrupted close (tombstone written, nothing else) converges the same way.
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    update_status(
+        &fixture.directory,
+        "closed",
+        None,
+        Some("closed by the maintainer".to_owned()),
+    )
+    .unwrap();
+    fs::remove_dir_all(fixture.directory.join("events")).unwrap();
+    assert!(recover_pending_completion(&fixture.directory).unwrap());
+    assert!(!fixture.directory.join(TURN_CLAIM_FILE).exists());
+    assert!(!fixture.directory.join(TURN_COMPLETION_FILE).exists());
+    assert!(!recover_pending_completion(&fixture.directory).unwrap());
+    assert_eq!(
+        request_state(&fixture.directory, &fixture.request_id),
+        ("unresolved".to_owned(), "closed".to_owned())
+    );
+}
+
+#[test]
+fn close_still_rejects_a_linked_events_directory() {
+    // Settling a missing directory must not weaken link rejection: a link at `events`
+    // fails the close, nothing behind the link is opened or moved, and the claim and
+    // journal stay installed as the evidence of the unsettled completion.
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("events");
+    fs::rename(fixture.directory.join("events"), &target).unwrap();
+    if !link_directory(&target, &fixture.directory.join("events")) {
+        eprintln!("skipped: this environment cannot create a directory link");
+        return;
+    }
+    let error = close_session_state_with_error(
+        &fixture.directory,
+        Some("closed by the maintainer".to_owned()),
+        |_| Ok(terminal::CloseOutcome::Closed),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("events directory is a symlink"),
+        "{error:#}"
+    );
+    assert!(fixture.directory.join(TURN_CLAIM_FILE).exists());
+    assert!(fixture.directory.join(TURN_COMPLETION_FILE).exists());
+    assert!(target.join(&fixture.pending.event_file).exists());
+    assert!(
+        !target
+            .join(format!(
+                "{UNPUBLISHED_EVENT_PREFIX}{}",
+                fixture.pending.event_file
+            ))
+            .exists()
+    );
+    // The interrupted-close convergence refuses the link the same way.
+    let error = recover_pending_completion(&fixture.directory).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("events directory is a symlink"),
+        "{error:#}"
+    );
+    assert!(fixture.directory.join(TURN_COMPLETION_FILE).exists());
+}
+
 #[test]
 fn claim_free_recovery_refuses_an_equivalent_event_in_another_encoding() {
     let root = tempfile::tempdir().unwrap();

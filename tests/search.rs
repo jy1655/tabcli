@@ -54,12 +54,26 @@ impl Fixture {
             .args(args)
             .current_dir(cwd)
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", self.root.path())
+            // Opens the undocumented `--max-bytes` test aid, which the release binary
+            // otherwise rejects as an unknown option.
+            .env("AGENT_BRIDGE_TEST_SEARCH_AIDS", "1")
             .output()
             .unwrap()
     }
 
     fn run(&self, args: &[&str]) -> Output {
         self.run_in(&self.workspace_a, args)
+    }
+
+    /// The binary exactly as a user runs it: the test aids are closed.
+    fn run_as_user(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+            .args(args)
+            .current_dir(&self.workspace_a)
+            .env("AGENT_BRIDGE_NATIVE_STATE_DIR", self.root.path())
+            .env_remove("AGENT_BRIDGE_TEST_SEARCH_AIDS")
+            .output()
+            .unwrap()
     }
 
     fn search(&self, args: &[&str]) -> Value {
@@ -443,6 +457,39 @@ fn matching_is_case_insensitive_and_excerpts_are_sanitised() {
         "{line}"
     );
     assert!(!stdout.contains('\x1b'));
+}
+
+#[test]
+fn the_byte_budget_test_aid_is_closed_to_users() {
+    // `--max-bytes` exists only for tests: without the test gate the binary rejects it as
+    // an unknown option, so no user can be told about a search budget the docs omit.
+    let fixture = Fixture::new();
+    let directory = fixture.session("session-a", "claude", &fixture.workspace_a);
+    event(&directory, "event-1.json", "needle", 1);
+    let output = fixture.run_as_user(&["search", "needle", "--max-bytes", "1", "--json"]);
+    assert!(!output.status.success());
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["ok"], false, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown search option: --max-bytes"),
+        "{body}"
+    );
+    // Opened, the aid still cannot raise the budget above the documented limit.
+    let output = fixture.run(&["search", "needle", "--max-bytes", "67108865", "--json"]);
+    assert!(!output.status.success());
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("--max-bytes must be between 1 and 67108864"),
+        "{body}"
+    );
+    let found = fixture.run_as_user(&["search", "needle", "--json"]);
+    assert!(found.status.success());
 }
 
 #[test]

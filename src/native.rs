@@ -4166,24 +4166,41 @@ fn journaled_event_state_within(
     })
 }
 
-/// A session's `events` must be a real directory inside the session directory before any
-/// record under it is opened: the shared event listing turns a missing or non-directory
-/// `events` path into an empty list, a search must not present that damage as "no
-/// results", and a link planted there would carry a publication read outside the state
-/// root. Checked with `symlink_metadata`, so a symlink or Windows junction is rejected
-/// rather than followed.
-fn require_events_directory(directory: &Path) -> Result<()> {
+/// What stands at a session's `events` path when it is safe to say anything about it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventsDirectory {
+    /// A real directory inside the session directory.
+    Present,
+    /// Nothing at all: the session holds no event record.
+    Missing,
+}
+
+/// Inspects a session's `events` path with `symlink_metadata`, so a symlink or Windows
+/// junction is rejected rather than followed, as is a non-directory file or an unreadable
+/// entry. A missing path is reported, not rejected: readers and lifecycle steps decide
+/// what an absent directory means for them.
+fn events_directory_state(directory: &Path) -> Result<EventsDirectory> {
     let events = directory.join("events");
     match fs::symlink_metadata(&events) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             bail!("events directory is a symlink")
         }
         Ok(metadata) if !metadata.is_dir() => bail!("events is not a directory"),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            bail!("events directory is missing")
-        }
+        Ok(_) => Ok(EventsDirectory::Present),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(EventsDirectory::Missing),
         Err(error) => bail!("events directory is unreadable: {error}"),
+    }
+}
+
+/// A session's `events` must be a real directory inside the session directory before any
+/// record under it is opened: the shared event listing turns a missing or non-directory
+/// `events` path into an empty list, a search must not present that damage as "no
+/// results", and a link planted there would carry a publication read outside the state
+/// root. Built on [`events_directory_state`], so a link is rejected rather than followed.
+fn require_events_directory(directory: &Path) -> Result<()> {
+    match events_directory_state(directory)? {
+        EventsDirectory::Present => Ok(()),
+        EventsDirectory::Missing => bail!("events directory is missing"),
     }
 }
 
@@ -4193,8 +4210,11 @@ fn require_events_directory(directory: &Path) -> Result<()> {
 /// it stays published (the receipt already maps the request to it), and when it does not
 /// match, or is too large to compare, it is moved aside under an `unpublished-` name that
 /// no query reads. A journal whose event was never written needs no step here and is
-/// discarded when the close removes the journal. The move is idempotent, so an interrupted
-/// close converges on the next run.
+/// discarded when the close removes the journal; a session whose `events` directory is
+/// missing altogether holds no event to verify and settles the same way, so a close is
+/// never left permanently unsettled by that damage. A link or a non-directory at `events`
+/// is still rejected, and the journal then stays in place with the claim. The move is
+/// idempotent, so an interrupted close converges on the next run.
 ///
 /// The close removes the journal only after this step and after the turn claim is
 /// released: while the claim is installed, the journal is the evidence that the event at
@@ -4205,6 +4225,9 @@ fn set_aside_unverified_completion_event_for_close(directory: &Path) -> Result<(
     let Some(text) = read_regular_text_if_present(&completion_path)? else {
         return Ok(());
     };
+    if events_directory_state(directory)? == EventsDirectory::Missing {
+        return Ok(());
+    }
     if let Ok(pending) = serde_json::from_str::<PendingTurnCompletion>(&text)
         && validate_pending_completion(&pending).is_ok()
         && matches!(

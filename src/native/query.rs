@@ -358,27 +358,79 @@ impl Snapshot {
 }
 
 pub(super) fn observe_snapshot(directory: &Path) -> Result<Snapshot> {
-    observe_snapshot_within(directory, EVENT_READ_LIMIT).outcome
+    observe_snapshot_within(directory, PublicationReadLimit::PerEvent).outcome
+}
+
+/// How the publication check of a retried snapshot is bounded. The two callers differ on
+/// purpose: a publication verdict on an unchanged event must not depend on how many
+/// attempts a read-only query needed, while a search must never read past its budget.
+#[derive(Clone, Copy, Debug)]
+enum PublicationReadLimit {
+    /// Every attempt reads within the fixed [`EVENT_READ_LIMIT`]: `result`, `inspect`,
+    /// `--context-result`, and every other non-search query publish exactly what an
+    /// uncontended read would publish, however many attempts the busy retry took.
+    PerEvent,
+    /// A search's remaining byte budget, shared by every attempt: each attempt reads
+    /// within what the earlier attempts left, so a retry can never read past the budget.
+    Cumulative(u64),
+}
+
+impl PublicationReadLimit {
+    fn for_attempt(self, bytes_already_read: u64) -> u64 {
+        match self {
+            Self::PerEvent => EVENT_READ_LIMIT,
+            Self::Cumulative(budget) => budget.saturating_sub(bytes_already_read),
+        }
+    }
 }
 
 /// A snapshot attempt sequence and what it cost, whatever its outcome.
 struct SnapshotAttempt {
     outcome: Result<Snapshot>,
     /// Bytes every attempt's publication check read, including attempts that were
-    /// retried or failed after reading: the caller charges all of them.
+    /// retried or failed after reading: a budgeted caller charges all of them.
     bytes_read: u64,
-    /// The event limit the final attempt read within, after earlier attempts' charges.
+    /// The event limit the final attempt read within.
     final_limit: u64,
 }
 
-/// Retries a busy snapshot within `event_limit` bytes of publication reads in total: each
-/// attempt reads within what the earlier attempts left, so retries can never read past
-/// the caller's budget, and every attempt's bytes are returned for charging.
-fn observe_snapshot_within(directory: &Path, event_limit: u64) -> SnapshotAttempt {
-    let deadline = Instant::now() + Duration::from_millis(250);
+/// How long a busy snapshot is retried before a read-only query gives up.
+const SNAPSHOT_RETRY_WINDOW: Duration = Duration::from_millis(250);
+
+#[cfg(test)]
+thread_local! {
+    /// Overrides [`SNAPSHOT_RETRY_WINDOW`] on this thread, so a test can force the retry of
+    /// a snapshot whose publication read alone outlasts the production window.
+    static SNAPSHOT_RETRY_WINDOW_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `run` with busy snapshots retried for `window` instead of
+/// [`SNAPSHOT_RETRY_WINDOW`] on this thread.
+#[cfg(test)]
+pub(super) fn with_snapshot_retry_window<T>(window: Duration, run: impl FnOnce() -> T) -> T {
+    SNAPSHOT_RETRY_WINDOW_OVERRIDE.with(|cell| cell.set(Some(window)));
+    let outcome = run();
+    SNAPSHOT_RETRY_WINDOW_OVERRIDE.with(|cell| cell.set(None));
+    outcome
+}
+
+fn snapshot_retry_window() -> Duration {
+    #[cfg(test)]
+    if let Some(window) = SNAPSHOT_RETRY_WINDOW_OVERRIDE.with(std::cell::Cell::get) {
+        return window;
+    }
+    SNAPSHOT_RETRY_WINDOW
+}
+
+/// Retries a busy snapshot for [`SNAPSHOT_RETRY_WINDOW`]. Each attempt's publication check
+/// reads within the limit `limit` gives it, and every attempt's bytes are returned for
+/// charging.
+fn observe_snapshot_within(directory: &Path, limit: PublicationReadLimit) -> SnapshotAttempt {
+    let deadline = Instant::now() + snapshot_retry_window();
     let mut bytes_read = 0;
     loop {
-        let final_limit = event_limit.saturating_sub(bytes_read);
+        let final_limit = limit.for_attempt(bytes_read);
         match Snapshot::read_charging(directory, final_limit, &mut bytes_read) {
             Err(error) if error.is::<SnapshotBusy>() && Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(25));
@@ -738,6 +790,16 @@ pub(super) fn parse_search(args: &[String]) -> Result<NativeCommand> {
     }
 }
 
+/// Environment variable that opens the search test aids (`--max-bytes`) for the
+/// integration tests, which drive the release binary and cannot use `cfg(test)`.
+const SEARCH_TEST_AIDS_ENV: &str = "AGENT_BRIDGE_TEST_SEARCH_AIDS";
+
+/// Whether the undocumented search test aids are parsed: always in unit tests, and in the
+/// binary only when [`SEARCH_TEST_AIDS_ENV`] is set. A production search never sees them.
+fn search_test_aids_enabled() -> bool {
+    cfg!(test) || std::env::var_os(SEARCH_TEST_AIDS_ENV).is_some_and(|value| !value.is_empty())
+}
+
 fn search_error_value(query: Option<&String>, error: &anyhow::Error) -> Value {
     json!({"schema_version": 1, "ok": false, "query": query,
         "error": format!("{error:#}"), "hits": []})
@@ -779,9 +841,12 @@ fn parse_search_options(args: &[String]) -> Result<NativeCommand> {
                 }
                 set_once(&mut limit, parsed, "--limit")?;
             }
-            // Test hook, deliberately absent from help: lowers the byte budget so an
-            // oversized event can be exercised without writing 64 MiB.
-            "--max-bytes" => {
+            // Test aid, deliberately absent from help and the README: lowers the byte
+            // budget so an oversized event can be exercised without writing 64 MiB. It is
+            // parsed only when the test gate is open (see `search_test_aids_enabled`);
+            // otherwise it is an unknown option like any other, and it can never raise the
+            // budget above [`SEARCH_BYTE_BUDGET`].
+            "--max-bytes" if search_test_aids_enabled() => {
                 let value = option_value(options, &mut index, "--max-bytes")?;
                 let parsed = value
                     .parse::<u64>()
@@ -872,11 +937,22 @@ impl SearchScan {
     /// Names the budget that is already exhausted. Checked before every session,
     /// snapshot, and event read so a scan never works past its limits.
     fn exhausted_budget(&self) -> Option<String> {
+        self.exhausted_budget_within(true)
+    }
+
+    /// [`exhausted_budget`](Self::exhausted_budget) for a record whose bytes the scan has
+    /// already charged and will not read again: only the byte check is waived, and the
+    /// event-count and time limits still bound the work of processing it.
+    fn exhausted_budget_except_bytes(&self) -> Option<String> {
+        self.exhausted_budget_within(false)
+    }
+
+    fn exhausted_budget_within(&self, check_bytes: bool) -> Option<String> {
         if self.events_read >= SEARCH_EVENT_BUDGET {
             Some(format!(
                 "event budget of {SEARCH_EVENT_BUDGET} reads exhausted"
             ))
-        } else if self.bytes_read >= self.byte_budget {
+        } else if check_bytes && self.bytes_read >= self.byte_budget {
             Some(self.byte_budget_exhausted())
         } else if Instant::now() >= self.deadline {
             Some(format!(
@@ -1045,7 +1121,7 @@ fn search_session(
     // charged here, whether the snapshot was kept, retried, or failed, before anything
     // else is read.
     let remaining = scan.byte_budget.saturating_sub(scan.bytes_read);
-    let attempt = observe_snapshot_within(directory, remaining);
+    let attempt = observe_snapshot_within(directory, PublicationReadLimit::Cumulative(remaining));
     scan.bytes_read += attempt.bytes_read;
     let snapshot = attempt.outcome.map_err(|error| format!("{error:#}"))?;
     scan.sessions_scanned += 1;
@@ -1091,14 +1167,21 @@ fn search_session(
         }
         // A committed journaled event was already read, and charged, by the publication
         // check; search its text instead of reading the record a second time, even when
-        // that read consumed the last of the budget.
+        // that read consumed the last of the budget. Only the byte check is waived for
+        // it: processing the record is still one event read against the event budget,
+        // and the time budget still applies.
         let committed = snapshot
             .pending_event()
             .filter(|(pending_name, _)| *pending_name == name)
             .and_then(|(_, read)| read.committed_text.clone());
         let remaining = scan.byte_budget.saturating_sub(scan.bytes_read);
         let read = match committed {
-            Some(text) => Ok(Some(text)),
+            Some(text) => {
+                if let Some(budget) = scan.exhausted_budget_except_bytes() {
+                    return Ok(SessionScan::Budget(budget));
+                }
+                Ok(Some(text))
+            }
             None => {
                 if let Some(budget) = scan.exhausted_budget() {
                     return Ok(SessionScan::Budget(budget));

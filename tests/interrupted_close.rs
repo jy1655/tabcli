@@ -34,7 +34,9 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(stop: Stop) -> Self {
+    /// A completion that wrote its journal and event and stopped there, before any close:
+    /// the claim is still held, the journal is in place, and no tombstone exists.
+    fn with_completion() -> Self {
         let fixture = Self {
             root: tempfile::tempdir().unwrap(),
         };
@@ -48,6 +50,16 @@ impl Fixture {
             &json!({"schema": 1, "request_id": REQUEST, "claim_token": CLAIM,
                 "event_file": EVENT, "created_unix_ms": 3}),
         );
+        fs::write(directory.join("turn.claim"), CLAIM).unwrap();
+        write(&directory.join("turn.completion.json"), &journal());
+        fixture
+    }
+
+    fn new(stop: Stop) -> Self {
+        let fixture = Self::with_completion();
+        let directory = fixture.directory(SESSION);
+        fs::remove_file(directory.join("turn.claim")).unwrap();
+        fs::remove_file(directory.join("turn.completion.json")).unwrap();
         write(&directory.join("closed.json"), &tombstone());
         if matches!(stop, Stop::Tombstone) {
             fs::write(directory.join("turn.claim"), CLAIM).unwrap();
@@ -239,4 +251,76 @@ fn a_published_result_stays_completed_across_every_stop_of_an_interrupted_close(
         assert_eq!(status["state"], "closed", "{stop:?}");
         assert_eq!(status["generation"], 3, "{stop:?}");
     }
+}
+
+/// Rewrites a status record's `updated_unix_ms` so the record is older than any retention
+/// window: the test stands in for the days that would otherwise have to pass before prune.
+fn age_status_record(path: &Path) {
+    let mut record: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    record["updated_unix_ms"] = json!(1);
+    write(path, &record);
+}
+
+#[test]
+fn an_explicit_close_settles_a_journal_whose_events_directory_is_missing() {
+    // A completion left its claim and journal behind, and the session's `events`
+    // directory is gone: there is no event to verify, so the close must still settle
+    // (tombstone kept, claim released, journal discarded) instead of failing forever.
+    let fixture = Fixture::with_completion();
+    let directory = fixture.directory(SESSION);
+    fs::remove_dir_all(directory.join("events")).unwrap();
+
+    let closed = success(fixture.run(&["close-session", SESSION, "--explicit", "--json"]));
+    assert_eq!(closed["ok"], true, "{closed}");
+    assert_eq!(closed["closed"], true, "{closed}");
+    let assert_settled = |phase: &str| {
+        assert!(directory.join("closed.json").exists(), "{phase}");
+        assert!(!directory.join("turn.claim").exists(), "{phase}");
+        assert!(!directory.join("turn.completion.json").exists(), "{phase}");
+        assert!(!directory.join("events").exists(), "{phase}");
+        let status: Value =
+            serde_json::from_slice(&fs::read(directory.join("status.json")).unwrap()).unwrap();
+        assert_eq!(status["state"], "closed", "{phase}: {status}");
+    };
+    assert_settled("after the close");
+    let tombstone_before = fs::read(directory.join("closed.json")).unwrap();
+
+    // The close reports the request as unresolved, never as recovery still required.
+    let result = success(fixture.run(&["result", SESSION, "--request", REQUEST, "--json"]));
+    assert_eq!(result["request_state"], "unresolved", "{result}");
+    assert_eq!(result["session_state"], "closed", "{result}");
+    assert_eq!(result["recovery_required"], false, "{result}");
+
+    // Listing converges nothing further, and a repeated close is idempotent.
+    let listing = success(fixture.run(&["sessions", "--json"]));
+    let session = listing
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == SESSION)
+        .unwrap_or_else(|| panic!("{listing}"));
+    assert_eq!(session["state"], "closed", "{listing}");
+    assert_eq!(session["results"], 0, "{listing}");
+    assert_settled("after sessions");
+    let again = success(fixture.run(&["close-session", SESSION, "--explicit", "--json"]));
+    assert_eq!(again["closed"], true, "{again}");
+    assert_settled("after the second close");
+    assert_eq!(
+        fs::read(directory.join("closed.json")).unwrap(),
+        tombstone_before,
+        "the tombstone changed"
+    );
+
+    // With the claim and journal gone the closed session is prunable once it has aged.
+    age_status_record(&directory.join("closed.json"));
+    age_status_record(&directory.join("status.json"));
+    let pruned = success(fixture.run(&[
+        "prune-sessions",
+        "--closed-before-days",
+        "1",
+        "--explicit",
+        "--json",
+    ]));
+    assert_eq!(pruned["pruned"], json!([SESSION]), "{pruned}");
+    assert!(!directory.exists());
 }
