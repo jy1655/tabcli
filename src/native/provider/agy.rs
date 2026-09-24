@@ -381,7 +381,12 @@ fn deliver_windows_console_turn(
     let pending = read_pending_turn(&directory)
         .and_then(|pending| pending.context("Agy turn correlation state is missing"))
         .map_err(TerminalSendFailure::not_sent)?;
-    if gate_on_startup {
+    // The paste is issued right after the read that supplies `pre_paste_len`, so
+    // only lines that start after this offset can be evidence for this submission.
+    // The initial paste takes the offset from the very read that passed the readiness
+    // gate: there is no later read whose discontinuity or fresh activity could go
+    // unjudged between the ready decision and the paste.
+    let pre_paste_len = if gate_on_startup {
         wait_for_startup_readiness_with(
             &mut || read_log_bytes(&log_path),
             deadline,
@@ -389,14 +394,13 @@ fn deliver_windows_console_turn(
             STARTUP_POLL_INTERVAL,
             &mut SystemClock,
         )
-        .map_err(TerminalSendFailure::not_sent)?;
-    }
-    // The paste is issued only after this read, so only lines that start after this
-    // offset can be evidence for this submission.
-    let pre_paste_len = read_log_bytes(&log_path)
-        .context("Agy log could not be read before the console paste")
         .map_err(TerminalSendFailure::not_sent)?
-        .map_or(0, |log| log.len());
+    } else {
+        let log = read_log_bytes(&log_path)
+            .context("Agy log could not be read before the console paste")
+            .map_err(TerminalSendFailure::not_sent)?;
+        follow_up_pre_paste_offset(log.as_deref()).map_err(TerminalSendFailure::not_sent)?
+    };
     terminal::send_file(session, prompt_path, deadline)?;
     let pasted_at = Instant::now();
     // The composer state after an unconfirmed paste is unknown; never paste again.
@@ -408,6 +412,15 @@ fn deliver_windows_console_turn(
         deadline,
         INPUT_RECEIPT_POLL_INTERVAL,
         &mut SystemClock,
+    )
+}
+
+// A follow-up is pasted into a session whose Agy has been logging since launch, so
+// the log it will write the receipt to already exists. A missing log is a
+// discontinuity, never offset zero: pasting against it could only end uncertain.
+fn follow_up_pre_paste_offset(log: Option<&[u8]>) -> Result<usize> {
+    log.map(<[u8]>::len).context(
+        "agy.log is missing before the console paste, so no input receipt could be observed; the follow-up was not pasted",
     )
 }
 
@@ -602,35 +615,38 @@ struct ReadinessTiming {
 
 // The settlement instants are only evidence about the log they were measured
 // against. Agy appends to its `--log-file`, so every read must extend the previous
-// one; a log that disappears, shrinks, or no longer begins with the bytes observed
+// one; a log that disappears, shrinks, or no longer holds every byte observed
 // earlier was replaced or rotated, and the indices of its `CLI startup completed`
 // and activity lines can coincide with the old ones while the composer behind it
-// is fresh. The gate therefore keeps the byte length and the leading bytes of the
-// newest read, the way the receipt check keeps the pre-paste offset, and on a
+// is fresh. The gate therefore keeps the byte length and a digest of every byte of
+// the newest read, the way the receipt check keeps the pre-paste offset, and on a
 // discontinuity discards every settlement instant and starts over from the new
 // content: the quiet period and the deferred reload window are timed from the new
-// observation. A replacement that keeps the observed leading bytes and at least the
-// observed length is indistinguishable from continuation; the leading bytes hold
-// several glog lines with microsecond timestamps and thread ids, so a fresh Agy
-// process never reproduces them.
-const LOG_CONTINUITY_PREFIX_LEN: usize = 4096;
-// One restart is tolerated: the log may be replaced once (for example by a rotation
-// during startup) and the gate re-establishes readiness from the new content. A
-// second discontinuity fails the paste as `not_sent`, because a log that keeps
-// changing under the gate cannot prove a settled composer.
-const LOG_DISCONTINUITY_RESTARTS: usize = 1;
-
+// observation. Any number of discontinuities is tolerated within the deadline; each
+// one restarts the evidence, and the deadline report counts them. A read is a
+// continuation only when it is at least as long as the observed content and its
+// first `len` bytes digest to the same value, so a rewrite anywhere inside the
+// observed content (a re-stamped prefix, a replaced later line, or a suffix rewrite
+// that keeps every line index) is a discontinuity, not just one within a leading
+// window. The log is small, so the prefix is re-digested on every read.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LogContinuity {
     len: usize,
-    prefix: Vec<u8>,
+    digest: u64,
+}
+
+fn log_digest(bytes: &[u8]) -> u64 {
+    use std::hash::{DefaultHasher, Hasher};
+    let mut hasher = DefaultHasher::new();
+    hasher.write(bytes);
+    hasher.finish()
 }
 
 impl LogContinuity {
     fn of(log: &[u8]) -> Self {
         Self {
             len: log.len(),
-            prefix: log[..log.len().min(LOG_CONTINUITY_PREFIX_LEN)].to_vec(),
+            digest: log_digest(log),
         }
     }
 
@@ -641,7 +657,7 @@ impl LogContinuity {
                 from: self.len,
                 to: log.len(),
             })
-        } else if !log.starts_with(&self.prefix) {
+        } else if log_digest(&log[..self.len]) != self.digest {
             Some(LogDiscontinuity::Replaced { observed: self.len })
         } else {
             None
@@ -655,7 +671,7 @@ enum LogDiscontinuity {
     Missing { observed: usize },
     // The log is shorter than the observed content (rotated or truncated).
     Shrunk { from: usize, to: usize },
-    // The log no longer begins with the observed leading bytes (replaced).
+    // The log no longer begins with every byte observed earlier (replaced).
     Replaced { observed: usize },
 }
 
@@ -726,8 +742,10 @@ impl ReadinessGate {
         self.continuity = None;
     }
 
-    fn discontinuity_limit_exceeded(&self) -> bool {
-        self.discontinuities.len() > LOG_DISCONTINUITY_RESTARTS
+    // Byte length of the newest observed log; the receipt baseline when that
+    // observation passed the gate.
+    fn observed_len(&self) -> Option<usize> {
+        self.continuity.as_ref().map(|continuity| continuity.len)
     }
 
     fn observe(&mut self, log: Option<&[u8]>, now: Instant) -> ReadinessState {
@@ -795,13 +813,16 @@ impl ReadinessGate {
         } else {
             missing.join(", ")
         };
-        let restarted = if self.discontinuities.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "; the readiness evidence was restarted after a log discontinuity ({})",
+        let restarted = match self.discontinuities.len() {
+            0 => String::new(),
+            1 => format!(
+                "; the readiness evidence was restarted after 1 log discontinuity ({})",
                 self.describe_discontinuities()
-            )
+            ),
+            count => format!(
+                "; the readiness evidence was restarted after {count} log discontinuities ({})",
+                self.describe_discontinuities()
+            ),
         };
         format!(
             "Agy did not report startup readiness before the deadline: {}; missing markers: {missing}; the quiet period is {} ms and the deferred reload window is {} ms{restarted}; the initial prompt was not pasted",
@@ -820,24 +841,20 @@ impl ReadinessGate {
             .collect::<Vec<_>>()
             .join("; then ")
     }
-
-    fn discontinuity_report(&self) -> String {
-        format!(
-            "Agy startup readiness could not be established: agy.log was replaced or rotated {} times while the gate waited ({}); settlement evidence from a replaced log is discarded and only {} restart is tolerated; the initial prompt was not pasted",
-            self.discontinuities.len(),
-            self.describe_discontinuities(),
-            LOG_DISCONTINUITY_RESTARTS
-        )
-    }
 }
 
+// Waits until one read of the log passes the readiness rule and continues every
+// earlier read, and returns that read's byte length: the caller pastes right after
+// it, so it is the pre-paste offset for the receipt check. A read that shows a
+// discontinuity or new activity is never a baseline; the gate keeps waiting within
+// the deadline until a later read passes both.
 fn wait_for_startup_readiness_with<L, C>(
     read_log: &mut L,
     deadline: Instant,
     timing: ReadinessTiming,
     poll_interval: Duration,
     clock: &mut C,
-) -> Result<()>
+) -> Result<usize>
 where
     L: FnMut() -> Result<Option<Vec<u8>>>,
     C: Clock,
@@ -847,11 +864,10 @@ where
         let log = read_log().context("Agy startup readiness could not be observed")?;
         let now = clock.now();
         let state = gate.observe(log.as_deref(), now);
-        if gate.discontinuity_limit_exceeded() {
-            bail!("{}", gate.discontinuity_report());
-        }
-        if state == ReadinessState::Ready {
-            return Ok(());
+        if state == ReadinessState::Ready
+            && let Some(observed_len) = gate.observed_len()
+        {
+            return Ok(observed_len);
         }
         if now >= deadline {
             bail!("{}", gate.deadline_report(state));
@@ -1044,7 +1060,7 @@ where
 fn input_receipt_check(directory: Option<&Path>) -> super::super::doctor::Check {
     use super::super::doctor::{Availability::Unknown, Check};
     const CHECK_ID: &str = "agy_input_receipt";
-    const NEXT_ACTION: &str = "Observation only. Windows console delivery pastes after CLI startup completed, a Full redraw completed after it, the deferred skills reload (Reloading system slash commands and skills after startup) or a 20 s window since startup, and a quiet period without reload, redraw, or hooks lines, re-measured from the new content if agy.log is replaced or rotated once (twice fails the paste), and requires a HandleUserInput receipt carrying the complete pending turn marker; a missing receipt leaves delivery uncertain with the session working and the reason in status.error, and the paste is never repeated. Inspect the session and close it explicitly or launch a new one.";
+    const NEXT_ACTION: &str = "Observation only. Windows console delivery pastes after CLI startup completed, a Full redraw completed after it, the deferred skills reload (Reloading system slash commands and skills after startup) or a 20 s window since startup, and a quiet period without reload, redraw, or hooks lines, re-measured from the new content whenever agy.log disappears, shrinks, or no longer holds the bytes observed earlier (any number of times within the timeout), pasted right after the read that passed the gate with that read's length as the receipt offset, and requires a HandleUserInput receipt carrying the complete pending turn marker; a missing receipt leaves delivery uncertain with the session working and the reason in status.error, and the paste is never repeated. Inspect the session and close it explicitly or launch a new one.";
     let Some(directory) = directory else {
         return Check::new(
             CHECK_ID,
@@ -2368,7 +2384,7 @@ I0924 17:53:04.677160     651 http_helpers.go:305] URL: https://daily-cloudcode-
         let observed = successful_startup_log();
         let continuity = LogContinuity::of(observed.as_bytes());
         assert_eq!(continuity.len, observed.len());
-        assert_eq!(continuity.prefix, observed.as_bytes());
+        assert_eq!(continuity.digest, log_digest(observed.as_bytes()));
 
         // Growth, including a partial trailing line that later completes, continues.
         let grown = observed.clone() + "I0924 16:42:30.000000     540 manager.go:1308] Reloading";
@@ -2397,21 +2413,55 @@ I0924 17:53:04.677160     651 http_helpers.go:305] URL: https://daily-cloudcode-
             })
         );
 
-        // Only the first LOG_CONTINUITY_PREFIX_LEN bytes are compared: a change
-        // beyond them in a log of at least the observed length is continuation.
+        // Every observed byte is compared, not a leading window: in a log well beyond
+        // 4 KiB, a one-byte change in a late line (the round-5 counterexample, which
+        // the 4 KiB prefix accepted as continuation), a rewrite of the last line that
+        // keeps its index and the length, and a change in the first line are all
+        // discontinuities.
         let long = REAL_QUIET_STARTUP.to_owned() + REAL_DEFERRED_RELOAD_STARTUP;
-        assert!(long.len() > LOG_CONTINUITY_PREFIX_LEN);
+        assert!(long.len() > 4096);
         let continuity = LogContinuity::of(long.as_bytes());
-        assert_eq!(continuity.prefix.len(), LOG_CONTINUITY_PREFIX_LEN);
         let changed_late = long.replace("17:47:13.468286", "17:47:13.468287");
         assert_ne!(changed_late, long);
-        assert_eq!(continuity.discontinuity(changed_late.as_bytes()), None);
+        assert_eq!(changed_late.len(), long.len());
+        assert_eq!(
+            continuity.discontinuity(changed_late.as_bytes()),
+            Some(LogDiscontinuity::Replaced {
+                observed: long.len()
+            }),
+            "a rewrite beyond 4 KiB is a discontinuity"
+        );
+        let last_line = long.lines().last().unwrap();
+        let rewritten_tail = long[..long.len() - last_line.len() - 1].to_owned()
+            + &last_line.chars().rev().collect::<String>()
+            + "\n";
+        assert_eq!(rewritten_tail.len(), long.len());
+        assert_eq!(rewritten_tail.lines().count(), long.lines().count());
+        assert_eq!(
+            continuity.discontinuity(rewritten_tail.as_bytes()),
+            Some(LogDiscontinuity::Replaced {
+                observed: long.len()
+            }),
+            "a suffix rewrite that keeps every line index is a discontinuity"
+        );
+        assert_eq!(
+            continuity.discontinuity((rewritten_tail + "more\n").as_bytes()),
+            Some(LogDiscontinuity::Replaced {
+                observed: long.len()
+            }),
+            "a longer log whose observed prefix was rewritten is a discontinuity"
+        );
         let changed_early = long.replacen("17:20:28.610124", "17:20:28.610125", 1);
         assert_eq!(
             continuity.discontinuity(changed_early.as_bytes()),
             Some(LogDiscontinuity::Replaced {
                 observed: long.len()
             })
+        );
+        assert_eq!(
+            continuity.discontinuity((long.clone() + &changed_late).as_bytes()),
+            None,
+            "only the observed prefix is digested; appended bytes are free"
         );
     }
 
@@ -2469,7 +2519,6 @@ I0924 17:53:04.677160     651 http_helpers.go:305] URL: https://daily-cloudcode-
             1,
             "the reappearance is not counted again"
         );
-        assert!(!gate.discontinuity_limit_exceeded());
 
         // Replacement without an observed missing interval: the same lines at the
         // same indices and the same length, re-stamped by a fresh process. The
@@ -2604,47 +2653,23 @@ I0924 17:53:04.677160     651 http_helpers.go:305] URL: https://daily-cloudcode-
     }
 
     #[test]
-    fn readiness_wait_fails_not_sent_on_a_second_log_discontinuity() {
+    fn readiness_wait_restarts_after_every_log_discontinuity_within_the_deadline() {
         let start = Instant::now();
         let poll = Duration::from_millis(100);
         let deadline = start + Duration::from_secs(300);
         let observed = successful_startup_log();
         let half = &observed[..observed.len() / 2];
+        assert!(half.contains(STARTUP_COMPLETED_MARKER));
+        assert!(!half.contains(FULL_REDRAW_MARKER));
 
-        // Disappearance, reappearance, then rotation: the second discontinuity ends
-        // the wait at once, long before the deadline, and names both.
-        let mut clock = FakeClock::new(start);
-        let error = wait_for_startup_readiness_with(
-            &mut log_sequence(vec![
-                some_log(&observed),
-                Ok(None),
-                some_log(&observed),
-                some_log(half),
-            ]),
-            deadline,
-            STARTUP_READINESS_TIMING,
-            poll,
-            &mut clock,
-        )
-        .unwrap_err();
-        let message = format!("{error:#}");
-        assert!(message.contains("Agy startup readiness could not be established"));
-        assert!(message.contains("agy.log was replaced or rotated 2 times while the gate waited"));
-        assert!(message.contains(&format!(
-            "agy.log disappeared after {} bytes had been observed at 100 ms; then agy.log shrank from {} to {} bytes (rotated or truncated) at 300 ms",
-            observed.len(),
-            observed.len(),
-            half.len()
-        )));
-        assert!(message.contains("only 1 restart is tolerated"));
-        assert!(message.contains("the initial prompt was not pasted"));
-        assert_eq!(clock.slept, Duration::from_millis(300));
-
-        // Two replacements without a missing interval fail the same way.
+        // Two replacements without a missing interval: each restarts the evidence,
+        // and the log observed after the second one is ready one quiet period after
+        // it was first seen. The round-5 gate failed `not_sent` at 200 ms here. The
+        // returned offset is the length of the read that passed.
         let restamped = observed.replace("16:42:24", "16:52:24");
         let restamped_again = observed.replace("16:42:24", "17:02:24");
         let mut clock = FakeClock::new(start);
-        let error = wait_for_startup_readiness_with(
+        let offset = wait_for_startup_readiness_with(
             &mut log_sequence(vec![
                 some_log(&observed),
                 some_log(&restamped),
@@ -2655,16 +2680,71 @@ I0924 17:53:04.677160     651 http_helpers.go:305] URL: https://daily-cloudcode-
             poll,
             &mut clock,
         )
+        .unwrap();
+        assert_eq!(offset, restamped_again.len());
+        assert_eq!(
+            clock.slept,
+            Duration::from_millis(200) + STARTUP_QUIET_PERIOD
+        );
+
+        // Disappearance, reappearance, then rotation to a tail without the redraw:
+        // the wait continues past the second discontinuity and fails only at the
+        // deadline, naming both discontinuities in order and the missing marker.
+        let mut clock = FakeClock::new(start);
+        let error = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![
+                some_log(&observed),
+                Ok(None),
+                some_log(&observed),
+                some_log(half),
+            ]),
+            start + Duration::from_secs(2),
+            STARTUP_READINESS_TIMING,
+            poll,
+            &mut clock,
+        )
         .unwrap_err();
         let message = format!("{error:#}");
-        assert!(message.contains("agy.log was replaced or rotated 2 times"));
-        assert!(message.contains("no longer begins with the bytes observed earlier"));
-        assert_eq!(clock.slept, Duration::from_millis(200));
+        assert!(message.contains("Agy did not report startup readiness before the deadline"));
+        assert!(message.contains(&format!(
+            "the readiness evidence was restarted after 2 log discontinuities (agy.log disappeared after {} bytes had been observed at 100 ms; then agy.log shrank from {} to {} bytes (rotated or truncated) at 300 ms)",
+            observed.len(),
+            observed.len(),
+            half.len()
+        )));
+        assert!(message.contains(&format!(
+            "missing markers: {REDRAW_AFTER_STARTUP_DESCRIPTION}, "
+        )));
+        assert!(message.contains("the initial prompt was not pasted"));
+        assert!(!message.contains("tolerated"));
+        assert_eq!(clock.slept, Duration::from_secs(2));
+
+        // Three discontinuities, then a stable log: still ready within the deadline.
+        let mut clock = FakeClock::new(start);
+        let offset = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![
+                some_log(&observed),
+                some_log(half),
+                Ok(None),
+                some_log(&restamped),
+                some_log(&restamped_again),
+            ]),
+            deadline,
+            STARTUP_READINESS_TIMING,
+            poll,
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(offset, restamped_again.len());
+        assert_eq!(
+            clock.slept,
+            Duration::from_millis(400) + STARTUP_QUIET_PERIOD
+        );
 
         // A single replacement restarts the wait: the restamped log is ready one
         // quiet period after it was first observed, not at once.
         let mut clock = FakeClock::new(start);
-        wait_for_startup_readiness_with(
+        let offset = wait_for_startup_readiness_with(
             &mut log_sequence(vec![
                 some_log(&observed),
                 some_log(&observed),
@@ -2677,6 +2757,7 @@ I0924 17:53:04.677160     651 http_helpers.go:305] URL: https://daily-cloudcode-
             &mut clock,
         )
         .unwrap();
+        assert_eq!(offset, restamped.len());
         assert_eq!(
             clock.slept,
             Duration::from_millis(300) + STARTUP_QUIET_PERIOD
@@ -2695,12 +2776,130 @@ I0924 17:53:04.677160     651 http_helpers.go:305] URL: https://daily-cloudcode-
         let message = format!("{error:#}");
         assert!(message.contains("Agy did not report startup readiness before the deadline"));
         assert!(message.contains(&format!(
-            "the readiness evidence was restarted after a log discontinuity (agy.log disappeared after {} bytes had been observed at 100 ms)",
+            "the readiness evidence was restarted after 1 log discontinuity (agy.log disappeared after {} bytes had been observed at 100 ms)",
             observed.len()
         )));
         assert!(message.contains(&format!(
             "missing markers: {QUIET_PERIOD_DESCRIPTION}; the quiet period"
         )));
+    }
+
+    // The read that supplies the paste offset is a gate observation: when the read
+    // at which the quiet period would end shows a fresh reload, a replacement, or no
+    // log at all, nothing is pasted; the gate waits for a later read that passes
+    // both the readiness rule and continuity and returns that read's length.
+    #[test]
+    fn readiness_wait_pastes_only_after_a_read_that_passes_readiness_and_continuity() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(300);
+        let poll = Duration::from_millis(100);
+        let startup = successful_startup_log();
+        let fresh_reload = glog("16:42:32.000000", 540, "manager.go:1308", SLASH_RELOAD);
+        let reloaded = startup.clone() + &fresh_reload;
+        let restamped = startup.replace("16:42:24", "16:52:24");
+        assert_eq!(restamped.len(), startup.len());
+        let pending = PendingAgyTurn::new("1-2-3").unwrap();
+        // The static startup log is ready when its quiet period ends.
+        let ready_at = STARTUP_QUIET_PERIOD;
+        let mut clock = FakeClock::new(start);
+        let offset = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(&startup)]),
+            deadline,
+            STARTUP_READINESS_TIMING,
+            poll,
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(offset, startup.len());
+        assert_eq!(clock.slept, ready_at);
+
+        // A reader whose observation at `ready_at` is `at_ready`, and `after` from
+        // then on; every earlier read is the startup log.
+        let waited = |at_ready: Result<Option<Vec<u8>>>, after: &str| -> (usize, FakeClock) {
+            let mut clock = FakeClock::new(start);
+            let now = clock.shared();
+            let mut at_ready = Some(at_ready);
+            let after = after.to_owned();
+            let startup = startup.clone();
+            let mut read_log = move || -> Result<Option<Vec<u8>>> {
+                let elapsed = now.get().saturating_duration_since(start);
+                if elapsed < ready_at {
+                    some_log(&startup)
+                } else if elapsed == ready_at {
+                    at_ready
+                        .take()
+                        .expect("the ready-instant read happens once")
+                } else {
+                    some_log(&after)
+                }
+            };
+            let offset = wait_for_startup_readiness_with(
+                &mut read_log,
+                deadline,
+                STARTUP_READINESS_TIMING,
+                poll,
+                &mut clock,
+            )
+            .unwrap();
+            (offset, clock)
+        };
+
+        // The pre-paste read carries a fresh reload: no paste at `ready_at`; the
+        // reload owes its own quiet period, and the offset covers the reload line.
+        let (offset, clock) = waited(some_log(&reloaded), &reloaded);
+        assert_eq!(clock.slept, ready_at + STARTUP_QUIET_PERIOD);
+        assert_eq!(offset, reloaded.len());
+        let receipt = framed_receipt_line("hello", &pending);
+        assert_eq!(
+            observe_input_receipt(
+                Some((reloaded.clone() + &receipt).as_bytes()),
+                offset,
+                &pending
+            ),
+            ReceiptEvidence::Delivered,
+            "the later paste is confirmed by a receipt after the reload line"
+        );
+        assert_eq!(
+            observe_input_receipt(Some(reloaded.as_bytes()), startup.len(), &pending),
+            ReceiptEvidence::NoReceipt {
+                appended: fresh_reload.len(),
+                partial_tail: false
+            },
+            "the reload line is not evidence at the round-5 offset either"
+        );
+
+        // The pre-paste read finds no log: a discontinuity, never offset zero; the
+        // reappearing log is a new observation with its own quiet period.
+        let (offset, clock) = waited(Ok(None), &startup);
+        assert_eq!(clock.slept, ready_at + poll + STARTUP_QUIET_PERIOD);
+        assert_eq!(offset, startup.len());
+
+        // The pre-paste read is a re-stamped replacement of the same length: the
+        // same indices, but a discontinuity that restarts the quiet period.
+        let (offset, clock) = waited(some_log(&restamped), &restamped);
+        assert_eq!(clock.slept, ready_at + STARTUP_QUIET_PERIOD);
+        assert_eq!(offset, restamped.len());
+
+        // The pre-paste read is a plain continuation: pasted at once at its length,
+        // including a partial line appended since the previous read.
+        let grown = startup.clone() + "I0924 16:42:33.000000     560 manager.go:1308] Reloading";
+        let (offset, clock) = waited(some_log(&grown), &grown);
+        assert_eq!(clock.slept, ready_at);
+        assert_eq!(offset, grown.len());
+    }
+
+    #[test]
+    fn follow_up_pre_paste_offset_is_the_log_length_and_never_zero_for_a_missing_log() {
+        let startup = successful_startup_log();
+        assert_eq!(
+            follow_up_pre_paste_offset(Some(startup.as_bytes())).unwrap(),
+            startup.len()
+        );
+        assert_eq!(follow_up_pre_paste_offset(Some(b"")).unwrap(), 0);
+        let error = follow_up_pre_paste_offset(None).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("agy.log is missing before the console paste"));
+        assert!(message.contains("the follow-up was not pasted"));
     }
 
     #[test]
@@ -3526,7 +3725,7 @@ I0924 17:53:04.677160     651 http_helpers.go:305] URL: https://daily-cloudcode-
         let startup = late_reload_startup_log();
         let start = Instant::now();
         let mut clock = FakeClock::new(start);
-        wait_for_startup_readiness_with(
+        let pre_paste_len = wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&startup)]),
             start + Duration::from_secs(300),
             STARTUP_READINESS_TIMING,
@@ -3535,15 +3734,16 @@ I0924 17:53:04.677160     651 http_helpers.go:305] URL: https://daily-cloudcode-
         )
         .unwrap();
         assert_eq!(clock.slept, DEFERRED_RELOAD_WINDOW);
-        // The launcher marks the session working before the paste; the pre-paste
-        // offset is the whole startup log.
+        // The read that passed the gate is the pre-paste offset: the whole startup
+        // log. The launcher marks the session working before the paste.
+        assert_eq!(pre_paste_len, startup.len());
         update_status(&directory, "working", None, None).unwrap();
         let pasted_at = clock.now();
         let after_paste = startup.clone() + &late_reload_completion();
         let failure = confirm_input_receipt_with(
             &mut log_sequence(vec![some_log(&startup), some_log(&after_paste)]),
             &pending,
-            startup.len(),
+            pre_paste_len,
             pasted_at,
             start + Duration::from_secs(300),
             Duration::from_millis(100),
