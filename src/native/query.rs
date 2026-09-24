@@ -115,6 +115,8 @@ pub(super) struct Snapshot {
     paths: Vec<PathBuf>,
     pub(super) claim: Option<String>,
     pub(super) pending: Option<PendingTurnCompletion>,
+    /// Whether the journal's event file already holds the journal's bytes (see `published`).
+    pending_event_committed: bool,
     _lock: Option<File>,
 }
 
@@ -155,9 +157,13 @@ impl Snapshot {
         )?;
         let pending: Option<PendingTurnCompletion> =
             before[2].as_deref().map(serde_json::from_str).transpose()?;
-        if let Some(pending) = &pending {
-            validate_pending_completion(pending)?;
-        }
+        let pending_event_committed = match &pending {
+            Some(pending) => {
+                validate_pending_completion(pending)?;
+                journaled_event_state(directory, pending)? == JournaledEventState::Committed
+            }
+            None => false,
+        };
         let (index, request_index_error) = match requests::list(directory) {
             Ok(index) => (index, None),
             Err(error) => (requests::Index::default(), Some(format!("{error:#}"))),
@@ -171,6 +177,7 @@ impl Snapshot {
             paths: event_paths(directory)?,
             claim: before[1].as_deref().map(|text| text.trim().to_owned()),
             pending,
+            pending_event_committed,
             _lock: lock,
         };
         // Status also has its own writer lock. Check for a moving snapshot even with a
@@ -190,12 +197,15 @@ impl Snapshot {
     }
 
     fn published(&self, event: &str) -> bool {
+        // A journaled event is published exactly when its file already holds the journal's
+        // bytes: every lifecycle path (recovery, close, interrupted close) keeps such an
+        // event, and none publishes a journaled event that was never written or differs.
         if self
             .pending
             .as_ref()
             .is_some_and(|pending| pending.event_file == event)
         {
-            return false;
+            return self.pending_event_committed;
         }
         !self
             .receipt_for_event(event)

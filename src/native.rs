@@ -50,6 +50,7 @@ const TERMINAL_TOMBSTONE_FILE: &str = "terminal.closed.json";
 // create them; explicit close and prune consume them so an upgrade cannot strand state.
 const LEGACY_RESUME_PENDING_FILE: &str = "resume.pending.json";
 const LEGACY_RESUME_RUNNING_FILE: &str = "resume.running.json";
+const UNPUBLISHED_EVENT_PREFIX: &str = "unpublished-";
 static TURN_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -1053,13 +1054,11 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
                     Ok(request_id)
                 }
                 Err(failure) if failure.delivery_may_have_occurred() => {
-                    initial_claim.retain_in_place();
                     let error = failure.into_error();
-                    let _ = update_status(
+                    record_cross_session_delivery_uncertainty(
                         &created.directory,
-                        "working",
-                        None,
-                        Some(format!("{error:#}")),
+                        &mut initial_claim,
+                        &error,
                     );
                     Err(error).context(
                         "Claude initial cross-session delivery could not be confirmed; the turn remains claimed until completion or explicit close",
@@ -1698,9 +1697,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
                         == CrossSessionFailureAction::RetainClaim =>
                 {
                     let error = failure.into_error();
-                    record_follow_up_cross_session_delivery_uncertainty(
-                        &directory, &mut claim, &error,
-                    );
+                    record_cross_session_delivery_uncertainty(&directory, &mut claim, &error);
                     return Err(error).with_context(|| {
                         format!(
                             "provider follow-up transport {} could not confirm delivery; the turn remains claimed until the target reports completion or the session is explicitly closed",
@@ -2458,7 +2455,10 @@ fn consume_terminal_handle(
 fn remove_file_if_present(path: &Path) -> Result<()> {
     fault_point("removing a record file")?;
     match fs::remove_file(path) {
-        Ok(()) => sync_parent_directory(path),
+        Ok(()) => {
+            fault_point("syncing a removed record's directory")?;
+            sync_parent_directory(path)
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
     }
@@ -2468,6 +2468,7 @@ pub(super) fn rename_session_file(from: &Path, to: &Path) -> Result<()> {
     fault_point("renaming a record file")?;
     fs::rename(from, to)
         .with_context(|| format!("failed to rename {} to {}", from.display(), to.display()))?;
+    fault_point("syncing a renamed record's directory")?;
     sync_parent_directory(to)?;
     if from.parent() != to.parent() {
         sync_parent_directory(from)?;
@@ -3070,9 +3071,7 @@ fn create_session(spec: SessionSpec) -> Result<CreatedSession> {
 }
 
 fn create_session_in(root: &Path, spec: SessionSpec) -> Result<CreatedSession> {
-    fs::create_dir_all(root)
-        .with_context(|| format!("failed to create state directory {}", root.display()))?;
-    set_private_directory_permissions(root)?;
+    create_state_root(root)?;
     let temp = tempfile::Builder::new()
         .prefix("session-")
         .tempdir_in(root)?;
@@ -3117,6 +3116,52 @@ fn create_session_in(root: &Path, spec: SessionSpec) -> Result<CreatedSession> {
         directory,
         manifest,
     })
+}
+
+/// Creates the state root and every missing ancestor, then syncs the parent of each
+/// directory it created, deepest first. A directory entry is a record like the files inside
+/// it: the session directory is only durable once the root's entry is, and the root's entry
+/// is only durable once every newly created ancestor's entry is.
+fn create_state_root(root: &Path) -> Result<()> {
+    let mut created = Vec::new();
+    let mut probe = root;
+    loop {
+        match fs::symlink_metadata(probe) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                created.push(probe.to_path_buf());
+                match probe.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => probe = parent,
+                    _ => break,
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect state directory {}", probe.display())
+                });
+            }
+        }
+    }
+    for directory in created.iter().rev() {
+        // A concurrent creator may win the race; its entry is synced below all the same.
+        if let Err(error) = fs::create_dir(directory)
+            && !directory.is_dir()
+        {
+            return Err(error).with_context(|| {
+                format!("failed to create state directory {}", directory.display())
+            });
+        }
+    }
+    set_private_directory_permissions(root)?;
+    for directory in &created {
+        let parent = directory
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        sync_directory(parent)
+            .with_context(|| format!("failed to sync state directory {}", parent.display()))?;
+    }
+    Ok(())
 }
 
 fn state_root() -> Result<PathBuf> {
@@ -3221,9 +3266,11 @@ enum SyncRecord {
     Directory(PathBuf),
 }
 
-/// Refuses the mutation that follows it once the injected fault budget reaches zero.
-/// A budget of `k` lets exactly `k` mutation boundaries pass and then fails every later
-/// one, exactly like a process that stopped after its `k`-th mutation.
+/// Refuses the step that follows it once the injected fault budget reaches zero. A budget of
+/// `k` lets exactly `k` boundaries pass and then fails every later one, like a process that
+/// stopped there. Boundaries sit before each record mutation (temporary-file creation,
+/// permission and content writes, rename, removal) and between a rename or removal and the
+/// sync that makes it durable; a fault after a temporary file exists leaves it behind.
 fn fault_point(label: &str) -> Result<()> {
     #[cfg(test)]
     {
@@ -3295,22 +3342,48 @@ fn sync_file(file: &File, path: &Path) -> Result<()> {
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path.parent().context("JSON path has no parent")?;
     fault_point("creating a temporary record file")?;
-    let mut temporary = tempfile::Builder::new()
+    let temporary = tempfile::Builder::new()
         .prefix(".agent-bridge-")
         .suffix(".tmp")
         .tempfile_in(parent)?;
+    let mut temporary = fault_point_keeping_temporary(
+        "writing a temporary record's permissions and content",
+        temporary,
+    )?;
     set_private_file_permissions(temporary.as_file())?;
     temporary.write_all(&serde_json::to_vec_pretty(value)?)?;
     temporary.flush()?;
     sync_file(temporary.as_file(), temporary.path())?;
-    fault_point("renaming a temporary record over its final path")?;
+    let temporary = fault_point_keeping_temporary(
+        "renaming a temporary record over its final path",
+        temporary,
+    )?;
     let persisted = temporary
         .persist(path)
         .map_err(|error| error.error)
         .with_context(|| format!("failed to persist {}", path.display()))?;
+    fault_point("syncing a renamed record")?;
     sync_file(&persisted, path)?;
     sync_parent_directory(path)?;
     Ok(())
+}
+
+/// A fault at a boundary after the temporary file exists leaves that file behind, exactly
+/// as an abrupt stop would; ordinary errors still remove it when the handle drops.
+fn fault_point_keeping_temporary(
+    label: &str,
+    temporary: tempfile::NamedTempFile,
+) -> Result<tempfile::NamedTempFile> {
+    match fault_point(label) {
+        Ok(()) => Ok(temporary),
+        Err(error) => {
+            #[cfg(test)]
+            {
+                let _ = temporary.keep();
+            }
+            Err(error)
+        }
+    }
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -3320,9 +3393,12 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         .create_new(true)
         .open(path)
         .with_context(|| format!("failed to create {}", path.display()))?;
+    // The file now exists at its final path; a fault here leaves it empty, as a stop would.
+    fault_point("writing a private record's permissions and content")?;
     set_private_file_permissions(&file)?;
     file.write_all(bytes)?;
     file.flush()?;
+    fault_point("syncing a private record")?;
     sync_file(&file, path)?;
     sync_parent_directory(path)?;
     Ok(())
@@ -3407,10 +3483,9 @@ fn update_status_locked(
 ) -> Result<()> {
     let status_path = directory.join("status.json");
     let closed_path = directory.join(CLOSED_STATUS_FILE);
+    // The tombstone is the close's commit point: every later write, whatever state it
+    // asks for, restores the tombstone unchanged and does not advance the generation.
     if let Some(closed) = read_status_if_present(&closed_path)? {
-        if state != "closed" {
-            return write_json_atomic(&status_path, &closed);
-        }
         return write_json_atomic(&status_path, &closed);
     }
     let current = read_status_if_present(&status_path)?;
@@ -3445,8 +3520,11 @@ fn update_status_locked(
 /// refreshes the timestamp or error and still takes a new generation); every other write
 /// must appear in this table or `update_status` rejects it without advancing the
 /// generation. `exited`, `failed`, and `closed` are terminal except that the first two may
-/// still be closed; `closed` accepts nothing else. The README section "권한과 세션 경계"
-/// carries the same table for operators.
+/// still be closed; `closed` accepts nothing else. The one exception to the generation
+/// increment is the `closed.json` tombstone: once it exists, `update_status` no longer
+/// consults this table and rewrites `status.json` as a copy of the tombstone, so the
+/// tombstone's generation, timestamp, and error are preserved rather than advanced. The
+/// README section "권한과 세션 경계" carries the same table for operators.
 ///
 /// | From                    | To                                                 |
 /// | ----------------------- | -------------------------------------------------- |
@@ -3598,8 +3676,10 @@ fn record_follow_up_terminal_delivery_failure(
 // A turn that stays claimed looks like ordinary work from the state alone, so the status
 // keeps the reason until the target completes the turn or the session is closed. The target
 // can complete a delivered turn before its sender stops settling; the session status then
-// belongs to whichever turn holds the claim now, not to this report.
-fn record_follow_up_cross_session_delivery_uncertainty(
+// belongs to whichever turn holds the claim now, not to this report. The initial messenger
+// is no exception: on Windows the initial turn can complete and a later `tell` can install
+// a replacement claim before the initial messenger reports its uncertainty.
+fn record_cross_session_delivery_uncertainty(
     directory: &Path,
     claim: &mut TurnClaim,
     error: &anyhow::Error,
@@ -3872,8 +3952,9 @@ fn recover_pending_completion_locked(directory: &Path, claim_path: &Path) -> Res
 // Finishes a close whose tombstone was written but whose later cleanup steps did not run.
 // The tombstone is preserved unchanged: status.json is rewritten from it (update_status
 // copies the tombstone whenever one exists), and the journal, legacy resume markers, and
-// turn claim are removed. A close discards any journaled completion, exactly as the
-// uninterrupted close does, so the completion is never published here.
+// turn claim are removed. A journaled completion is settled exactly as the uninterrupted
+// close settles it: an event it already wrote stays published when it matches the
+// journal, is set aside when it does not, and a journal without an event is discarded.
 fn converge_interrupted_close_locked(
     directory: &Path,
     claim_path: &Path,
@@ -3890,11 +3971,11 @@ fn converge_interrupted_close_locked(
         update_status(directory, "closed", None, tombstone.error.clone())?;
         changed = true;
     }
-    for name in [
-        TURN_COMPLETION_FILE,
-        LEGACY_RESUME_PENDING_FILE,
-        LEGACY_RESUME_RUNNING_FILE,
-    ] {
+    if directory.join(TURN_COMPLETION_FILE).exists() {
+        settle_completion_journal_for_close(directory)?;
+        changed = true;
+    }
+    for name in [LEGACY_RESUME_PENDING_FILE, LEGACY_RESUME_RUNNING_FILE] {
         let path = directory.join(name);
         if path.exists() {
             remove_file_if_present(&path)?;
@@ -3906,6 +3987,59 @@ fn converge_interrupted_close_locked(
         changed = true;
     }
     Ok(changed)
+}
+
+/// How the file at a journal's event path relates to the journal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JournaledEventState {
+    /// No event file exists at the journal's event path: nothing was published.
+    Absent,
+    /// The event file holds exactly the bytes the journal would write, so the provider
+    /// result is already durably published under its receipt's immutable event name.
+    Committed,
+    /// A different record occupies the journal's event path.
+    Mismatched,
+}
+
+fn journaled_event_state(
+    directory: &Path,
+    pending: &PendingTurnCompletion,
+) -> Result<JournaledEventState> {
+    let path = directory.join("events").join(&pending.event_file);
+    let Some(stored) = read_regular_bytes_if_present(&path)? else {
+        return Ok(JournaledEventState::Absent);
+    };
+    Ok(if stored == serde_json::to_vec_pretty(&pending.event)? {
+        JournaledEventState::Committed
+    } else {
+        JournaledEventState::Mismatched
+    })
+}
+
+/// Settles the completion journal that a close finds in place. The tombstone is the close's
+/// commit point, but an event the interrupted completion already wrote is the provider's
+/// authoritative result: when it matches the journal byte for byte it stays published (the
+/// receipt already maps the request to it), and when it does not match it is moved aside
+/// under an `unpublished-` name that no query reads. A journal whose event was never
+/// written is discarded. The journal itself is removed in every case, and every step is
+/// idempotent so an interrupted settlement converges on the next run.
+fn settle_completion_journal_for_close(directory: &Path) -> Result<()> {
+    let completion_path = directory.join(TURN_COMPLETION_FILE);
+    let Some(text) = read_regular_text_if_present(&completion_path)? else {
+        return Ok(());
+    };
+    if let Ok(pending) = serde_json::from_str::<PendingTurnCompletion>(&text)
+        && validate_pending_completion(&pending).is_ok()
+        && journaled_event_state(directory, &pending)? == JournaledEventState::Mismatched
+    {
+        let events = directory.join("events");
+        rename_session_file(
+            &events.join(&pending.event_file),
+            &events.join(format!("{UNPUBLISHED_EVENT_PREFIX}{}", pending.event_file)),
+        )
+        .context("failed to set aside a completion event that disagrees with its journal")?;
+    }
+    remove_file_if_present(&completion_path)
 }
 
 fn validate_pending_completion(pending: &PendingTurnCompletion) -> Result<()> {
@@ -3926,15 +4060,16 @@ fn validate_pending_completion(pending: &PendingTurnCompletion) -> Result<()> {
 
 fn write_pending_completion_event(directory: &Path, pending: &PendingTurnCompletion) -> Result<()> {
     validate_pending_completion(pending)?;
-    let path = directory.join("events").join(&pending.event_file);
-    if path.exists() {
-        let stored: SessionEvent = read_json(&path)?;
-        if stored != pending.event {
+    match journaled_event_state(directory, pending)? {
+        JournaledEventState::Committed => Ok(()),
+        JournaledEventState::Mismatched => {
             bail!("pending native completion event file contains different data")
         }
-        return Ok(());
+        JournaledEventState::Absent => write_json_atomic(
+            &directory.join("events").join(&pending.event_file),
+            &pending.event,
+        ),
     }
-    write_json_atomic(&path, &pending.event)
 }
 
 fn mark_session_closed(directory: &Path, error: Option<String>) -> Result<()> {
@@ -3958,7 +4093,7 @@ fn mark_session_closed_locked(
     let status_result = update_status(directory, "closed", None, error);
     let (pending_result, running_result, claim_result) = if status_result.is_ok() {
         (
-            remove_file_if_present(&directory.join(TURN_COMPLETION_FILE))
+            settle_completion_journal_for_close(directory)
                 .and_then(|_| remove_file_if_present(&directory.join(LEGACY_RESUME_PENDING_FILE))),
             remove_file_if_present(&directory.join(LEGACY_RESUME_RUNNING_FILE)),
             remove_turn_claim_locked(claim_path),

@@ -180,7 +180,7 @@ Codex가 메인이든 Claude가 메인이든 같은 흐름을 사용합니다. �
 | --- | --- |
 | `completed` / `failed` | provider가 검증한 완료 결과 또는 실패 결과가 게시됨 |
 | `pending` | 해당 요청이 현재 claim을 보유하고 완료 결과를 기다리는 중 |
-| `recovery_required` | 완료 journal이 남아 있어 게시 완료를 확정하지 않음 |
+| `recovery_required` | completion journal이 남아 있고 그 journal의 event가 아직 기록되지 않아 게시를 확정하지 않은 상태입니다. journal의 event가 이미 journal과 같은 내용으로 기록돼 있으면 이 상태가 아니라 `completed`(또는 오류가 있으면 `failed`)로 보고됩니다. |
 | `unresolved` | 게시된 결과 없이 claim이 해제됐거나 owner가 종료됨. 재전송이 안전하다는 뜻이 아님 |
 | `unavailable` | 조회할 최근 결과가 없음 |
 | `busy` / `unknown` | 일관된 snapshot을 아직 얻지 못했거나 오류 응답 시 상태 확인 실패 |
@@ -395,11 +395,11 @@ JSON의 `ok: true`와 exit 0은 진단 보고서를 만들었다는 뜻입니다
 | `exited`, `failed` | `closed` |
 | `closed` | (없음) |
 
-`exited`와 `failed`는 `closed`로만 갈 수 있고, `closed`는 어디로도 가지 않습니다. close는 먼저 tombstone `closed.json`을 씁니다. tombstone이 있으면 이후 모든 상태 쓰기는 tombstone 사본으로 대체되므로 `closed`는 되돌아가지 않습니다.
+`exited`와 `failed`는 `closed`로만 갈 수 있고 `closed`는 어디로도 가지 않습니다. close는 먼저 tombstone `closed.json`을 씁니다. tombstone이 있으면 이후 모든 상태 쓰기(요청한 상태가 무엇이든, 같은 상태 쓰기 포함)는 전이 표를 검사하지 않고 `status.json`을 tombstone 사본으로 다시 씁니다. 이것이 `generation` 규칙의 유일한 예외로, 이 쓰기는 `generation`을 올리지 않고 tombstone의 `generation`·`updated_unix_ms`·`error`를 그대로 보존하며 표 위 문단의 "모든 상태 쓰기는 generation을 1 올린다"는 tombstone이 없는 동안의 규칙입니다. 따라서 `closed`는 되돌아가지 않습니다.
 
 특정 turn을 대신해 상태를 쓰는 writer — 전송이 일어났을 수 있는 terminal 전송 실패, cross-session 전송 불확실, 전송 시작 후의 initial prompt 실패 — 는 자기 claim token이 지금 설치된 `turn.claim`과 같을 때만 `working`과 오류 문구를 씁니다. 이 비교와 쓰기는 lifecycle lock 아래에서 이루어집니다. 이미 해제됐거나 다른 turn으로 교체된 claim의 지연 보고는 버려지고 `generation`도 바뀌지 않습니다. 세션 전체를 대상으로 하는 writer(프로세스 종료, 완료 monitor 실패, close)는 claim을 비교하지 않습니다.
 
-provider가 검증한 완료는 completion journal `turn.completion.json`에 먼저 기록한 뒤 event 게시 → 상태 갱신 → turn claim 해제 → journal 제거 순서로 lifecycle lock 아래에서 진행합니다. journal은 임시 파일을 쓰고 이름을 바꾸는 방식으로 만들므로 최종 경로에 불완전한 journal이 존재하지 않습니다. 중간에 멈춘 순서는 다음 lifecycle lock 보유자(`tell`, `sessions`, `ask`/`tell` 내부의 결과 대기, native-session 프로세스의 종료 처리)가 이어서 끝냅니다. 중단된 close도 같은 방식으로 수렴합니다. tombstone이 close의 확정 지점입니다. tombstone을 쓴 뒤 멈춘 프로세스가 있으면 다음 lifecycle lock 보유자가 `status.json`을 tombstone에서 다시 쓰고 completion journal, 구버전 resume 표시 파일, turn claim을 제거합니다. tombstone의 `generation`과 `error`는 그대로 유지됩니다. close 시점에 남아 있던 journal의 완료 결과는 게시되지 않습니다(중단 없는 close와 같습니다).
+provider가 검증한 완료는 completion journal `turn.completion.json`에 먼저 기록한 뒤 event 게시 → 상태 갱신 → turn claim 해제 → journal 제거 순서로 lifecycle lock 아래에서 진행합니다. journal은 임시 파일을 쓰고 이름을 바꾸는 방식으로 만들므로 최종 경로에 불완전한 journal이 존재하지 않습니다. 중간에 멈춘 순서는 다음 lifecycle lock 보유자(`tell`, `sessions`, `ask`/`tell` 내부의 결과 대기, native-session 프로세스의 종료 처리)가 이어서 끝냅니다. 중단된 close도 같은 방식으로 수렴합니다. tombstone이 close의 확정 지점입니다. tombstone을 쓴 뒤 멈춘 프로세스가 있으면 다음 lifecycle lock 보유자가 `status.json`을 tombstone에서 다시 쓰고 completion journal, 구버전 resume 표시 파일, turn claim을 제거합니다. tombstone의 `generation`과 `error`는 그대로 유지됩니다. close(중단 없는 close와 tombstone 뒤 중단된 close의 수렴 모두)가 journal을 발견하면 journal의 event 파일 상태에 따라 처리합니다. event가 아직 기록되지 않았으면 journal은 폐기되고 결과는 게시되지 않습니다(tombstone이 확정 지점). event가 이미 기록돼 있고 journal의 내용과 byte 단위로 같으면 provider가 검증한 결과이자 요청 영수증이 이미 그 event를 가리키므로 게시된 상태로 남으며, 이때 `result`는 close 전후로 같은 `request_state: completed`를 보고하고 `session_state`만 `closed`가 됩니다. event가 있지만 journal과 다르면 게시하지 않으며, 그 파일은 `events/` 안에서 `unpublished-` 접두사가 붙은 이름으로 옮겨져 보존되고 어떤 조회 명령도 읽지 않습니다. 세 경우 모두 journal은 제거되고, 중간에 멈춰도 다음 lifecycle lock 보유자가 같은 규칙으로 수렴합니다.
 
 `native-session.json`은 owner의 PID와 플랫폼별 process identity를 기록합니다. `tell`, `sessions`, `ask`/`tell` 내부의 결과 대기는 owner가 살아 있는지 확인하고, 종료됐으면 turn claim을 해제하고 세션을 `closed`로 바꾸며 `error`에 종료 사유를 남깁니다. 살아 있는 owner는 repair하지 않습니다. `inspect`와 `result`는 관측만 합니다. process identity가 없는 예전 Windows owner 기록(PID만 있음)은 identity를 알 수 없는 것이지 종료된 것이 아닙니다. PID가 살아 있으면 repair하지 않고 `inspect`의 `identity_matches`는 `null`로 남습니다. PID가 종료됐을 때만 repair합니다.
 
@@ -407,7 +407,7 @@ provider가 검증한 완료는 completion journal `turn.completion.json`에 먼
 
 세션 기록은 모두 공통 쓰기 helper를 거칩니다. 원자적 JSON 쓰기는 같은 디렉터리에 임시 파일을 만들어 내용을 쓰고 임시 파일을 동기화한 뒤 최종 이름으로 바꾸고, 최종 파일과 상위 디렉터리를 차례로 동기화합니다. 새로 만드는 private 파일(초기 prompt, turn claim)은 파일 동기화 뒤 상위 디렉터리를 동기화합니다. 삭제는 삭제 뒤 상위 디렉터리를, 이름 변경은 대상 디렉터리(원본 디렉터리가 다르면 그것도)를 동기화합니다.
 
-세션 디렉터리 자체도 기록입니다. 새 세션 디렉터리를 만든 직후 state root 디렉터리를 동기화해 디렉터리 항목이 남게 하고, `events/`를 만든 뒤 세션 디렉터리를 동기화합니다.
+세션 디렉터리 자체도 기록입니다. state root(또는 그 상위 디렉터리)가 없으면 만들며, 새로 만든 디렉터리마다 그 상위 디렉터리를 가장 깊은 것부터 차례로 동기화해 새 디렉터리 항목이 남게 합니다. 이미 있던 디렉터리 위로는 동기화하지 않습니다. 새 세션 디렉터리를 만든 직후 state root 디렉터리를 동기화하고, `events/`를 만든 뒤 세션 디렉터리를 동기화합니다.
 
 이 helper로 쓰는 내구 기록에는 `manifest.json`, `status.json`, `closed.json`, `events/event-*.json`, `turn.claim`, `turn.completion.json`, `requests/` 아래의 요청 영수증, `terminal.json`·`terminal.closing.json`·`terminal.closed.json`, `native-session.json`, `initial-prompt.txt`, 그리고 provider adapter가 세션 디렉터리에 두는 pending turn 기록과 Claude의 private 설정·hook 파일이 포함됩니다.
 
@@ -415,7 +415,7 @@ status lock과 lifecycle lock 파일, 전송 중에만 존재하는 임시 promp
 
 플랫폼 한계로, Unix(macOS 포함)는 파일과 디렉터리 handle에 fsync를 호출하며, fsync를 존중하는 파일 시스템에서 POSIX가 보증하는 범위만큼 내구성을 갖습니다. Windows는 파일 handle에 FlushFileBuffers를 호출하고, 디렉터리는 backup semantics로 handle을 열어 flush합니다. 이는 캐시된 메타데이터의 best-effort flush이며 NTFS가 디렉터리 항목을 자체 journal로 관리하므로 POSIX 디렉터리 fsync와 같은 보증은 아닙니다. 그 밖의 target에서는 디렉터리 동기화가 no-op이며 내구성을 주장하지 않습니다(해당 target은 지원 대상이 아닙니다).
 
-테스트가 증명하는 범위는 다음과 같습니다. 단위 테스트는 각 helper가 동기화를 위 순서대로 호출하는지와 세션 생성이 state root를 먼저 동기화하는지를 테스트 전용 hook으로 확인합니다. 완료 경로와 close 경로의 모든 파일 변경 직전에 실행을 멈추는 fault-injection 테스트는 그 상태에서 복구가 수렴함을 확인합니다. 전원 차단이나 커널 정지 후의 내구성은 테스트로 증명하지 않았으며 OS와 저장 장치가 flush를 존중하는지에 달려 있습니다.
+단위 테스트는 테스트 전용 hook으로 각 helper의 동기화 호출 순서를 확인합니다. 대상은 원자적 JSON 쓰기, private 파일 쓰기, turn claim 생성, 삭제, 이름 변경(같은 디렉터리·다른 디렉터리), 세션 디렉터리 생성(이미 있는 state root와 두 단계 위까지 없는 사용자 지정 state root 모두)입니다. fault-injection 테스트는 완료 경로와 close 경로에서 임시 파일 생성 직전, 권한·내용 쓰기 직전, 이름 변경 직전, 이름 변경 뒤 동기화 직전, 삭제 직전, 삭제 뒤 동기화 직전의 각 경계마다 실행을 멈추고 다음 lifecycle lock 보유자가 수렴함을 확인합니다. close 경로는 journal의 event가 없는 경우·journal과 같은 경우·journal과 다른 경우 각각에 대해 모든 경계를 반복합니다. 임시 파일이 만들어진 뒤의 경계에서 멈추면 그 임시 파일을 남겨 두며(갑작스러운 프로세스 종료와 같음), 조회 명령이 남은 임시 파일을 기록으로 읽지 않는 것도 같은 테스트가 확인합니다. 증명하지 않는 것은 전원 차단이나 커널 정지 후의 내구성으로, 이는 OS와 저장 장치가 flush를 존중하는지에 달려 있습니다.
 
 최소 지원 버전은 다음과 같습니다. 더 새로운 버전은 허용합니다.
 
