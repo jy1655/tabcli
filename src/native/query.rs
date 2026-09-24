@@ -594,6 +594,8 @@ const SEARCH_MAX_LIMIT: usize = 200;
 const SEARCH_EVENT_BUDGET: usize = 5_000;
 const SEARCH_BYTE_BUDGET: u64 = 64 * 1024 * 1024;
 const SEARCH_TIME_BUDGET: Duration = Duration::from_secs(10);
+/// Limit on the displayed excerpt: it is measured after control characters are escaped,
+/// so an excerpt never exceeds this many characters however it was sanitised.
 const SEARCH_EXCERPT_CHARS: usize = 200;
 
 #[derive(Debug)]
@@ -608,10 +610,35 @@ pub(crate) struct SearchRequest {
     scope: SearchScope,
     provider: Option<FirstPartyCli>,
     limit: usize,
+    /// Byte budget for event reads. Only the undocumented `--max-bytes` test hook lowers
+    /// it below [`SEARCH_BYTE_BUDGET`]; it can never raise it.
+    byte_budget: u64,
     json: bool,
 }
 
+/// Argument errors keep the documented `--json` contract: when the raw options carry
+/// `--json`, the structured failure is printed to stdout before the error propagates.
 pub(super) fn parse_search(args: &[String]) -> Result<NativeCommand> {
+    match parse_search_options(args) {
+        Ok(command) => Ok(command),
+        Err(error) => {
+            if args.iter().skip(1).any(|option| option == "--json") {
+                print_json(&search_error_value(
+                    args.first().filter(|query| !query.trim().is_empty()),
+                    &error,
+                ))?;
+            }
+            Err(error)
+        }
+    }
+}
+
+fn search_error_value(query: Option<&String>, error: &anyhow::Error) -> Value {
+    json!({"schema_version": 1, "ok": false, "query": query,
+        "error": format!("{error:#}"), "hits": []})
+}
+
+fn parse_search_options(args: &[String]) -> Result<NativeCommand> {
     let (query, options) = args.split_first().context("search requires a query")?;
     if query.trim().is_empty() {
         bail!("search requires a non-empty query");
@@ -620,6 +647,7 @@ pub(super) fn parse_search(args: &[String]) -> Result<NativeCommand> {
     let mut all_workspaces = false;
     let mut provider = None;
     let mut limit = None;
+    let mut byte_budget = None;
     let mut json = false;
     let mut index = 0;
     while index < options.len() {
@@ -645,6 +673,18 @@ pub(super) fn parse_search(args: &[String]) -> Result<NativeCommand> {
                     bail!("--limit must be between 1 and {SEARCH_MAX_LIMIT}");
                 }
                 set_once(&mut limit, parsed, "--limit")?;
+            }
+            // Test hook, deliberately absent from help: lowers the byte budget so an
+            // oversized event can be exercised without writing 64 MiB.
+            "--max-bytes" => {
+                let value = option_value(options, &mut index, "--max-bytes")?;
+                let parsed = value
+                    .parse::<u64>()
+                    .with_context(|| format!("invalid search byte budget: {value}"))?;
+                if !(1..=SEARCH_BYTE_BUDGET).contains(&parsed) {
+                    bail!("--max-bytes must be between 1 and {SEARCH_BYTE_BUDGET}");
+                }
+                set_once(&mut byte_budget, parsed, "--max-bytes")?;
             }
             "--json" => set_flag_once(&mut json, "--json")?,
             other => bail!("unknown search option: {other}"),
@@ -675,6 +715,7 @@ pub(super) fn parse_search(args: &[String]) -> Result<NativeCommand> {
         scope,
         provider,
         limit: limit.unwrap_or(SEARCH_DEFAULT_LIMIT),
+        byte_budget: byte_budget.unwrap_or(SEARCH_BYTE_BUDGET),
         json,
     }))
 }
@@ -699,7 +740,10 @@ struct IncompleteReason {
 }
 
 struct SearchScan {
-    started: Instant,
+    /// Wall-clock deadline fixed before the state root is enumerated, so enumeration,
+    /// snapshots, and event reads all draw on the same time budget.
+    deadline: Instant,
+    byte_budget: u64,
     events_read: usize,
     bytes_read: u64,
     sessions_scanned: usize,
@@ -708,19 +752,28 @@ struct SearchScan {
 }
 
 impl SearchScan {
-    /// Names the budget that is already exhausted. Checked before every read so a scan
-    /// never reads past its limits.
+    fn new(byte_budget: u64) -> Self {
+        Self {
+            deadline: Instant::now() + SEARCH_TIME_BUDGET,
+            byte_budget,
+            events_read: 0,
+            bytes_read: 0,
+            sessions_scanned: 0,
+            hits: Vec::new(),
+            reasons: Vec::new(),
+        }
+    }
+
+    /// Names the budget that is already exhausted. Checked before every session,
+    /// snapshot, and event read so a scan never works past its limits.
     fn exhausted_budget(&self) -> Option<String> {
         if self.events_read >= SEARCH_EVENT_BUDGET {
             Some(format!(
                 "event budget of {SEARCH_EVENT_BUDGET} reads exhausted"
             ))
-        } else if self.bytes_read >= SEARCH_BYTE_BUDGET {
-            Some(format!(
-                "byte budget of {} MiB exhausted",
-                SEARCH_BYTE_BUDGET / (1024 * 1024)
-            ))
-        } else if self.started.elapsed() >= SEARCH_TIME_BUDGET {
+        } else if self.bytes_read >= self.byte_budget {
+            Some(self.byte_budget_exhausted())
+        } else if Instant::now() >= self.deadline {
             Some(format!(
                 "time budget of {} s exhausted",
                 SEARCH_TIME_BUDGET.as_secs()
@@ -728,6 +781,10 @@ impl SearchScan {
         } else {
             None
         }
+    }
+
+    fn byte_budget_exhausted(&self) -> String {
+        format!("byte budget of {} bytes exhausted", self.byte_budget)
     }
 
     fn incomplete(&mut self, session: Option<&str>, reason: impl Into<String>) {
@@ -758,27 +815,105 @@ fn find_case_insensitive(message: &str, query_lower: &str) -> Option<usize> {
     Some(message.chars().count())
 }
 
+/// At most [`SEARCH_EXCERPT_CHARS`] displayed characters around the first match. The
+/// limit applies after sanitisation: the raw window is cut on a character boundary,
+/// sanitised whole, and shrunk again while escape expansion pushes it over the limit,
+/// so no escape sequence is ever split and the excerpt never exceeds the limit.
 fn excerpt(message: &str, match_start: usize, match_chars: usize) -> String {
+    let whole = terminal_safe_text(message, false);
+    if whole.chars().count() <= SEARCH_EXCERPT_CHARS {
+        return whole;
+    }
     let total = message.chars().count();
-    if total <= SEARCH_EXCERPT_CHARS {
-        return terminal_safe_text(message, false);
-    }
     // Both cut markers count toward the character limit.
-    let body = SEARCH_EXCERPT_CHARS - 2;
-    let start = match_start
-        .saturating_sub(body.saturating_sub(match_chars.min(body)) / 2)
-        .min(total - body);
-    let end = start + body;
-    let window = message.chars().skip(start).take(body).collect::<String>();
-    let mut text = String::new();
-    if start > 0 {
-        text.push('…');
+    let mut body = SEARCH_EXCERPT_CHARS - 2;
+    loop {
+        let start = match_start
+            .saturating_sub(body.saturating_sub(match_chars.min(body)) / 2)
+            .min(total.saturating_sub(body));
+        let end = (start + body).min(total);
+        let window = message.chars().skip(start).take(body).collect::<String>();
+        let safe = terminal_safe_text(&window, false);
+        let markers = usize::from(start > 0) + usize::from(end < total);
+        let shown = safe.chars().count() + markers;
+        if shown <= SEARCH_EXCERPT_CHARS || body == 0 {
+            let mut text = String::new();
+            if start > 0 {
+                text.push('…');
+            }
+            text.push_str(&safe);
+            if end < total {
+                text.push('…');
+            }
+            return text;
+        }
+        // Scale the raw window by the observed expansion ratio, always by at least one
+        // character, so the loop converges without ever cutting inside an escape.
+        let fits = SEARCH_EXCERPT_CHARS - markers;
+        body = (body * fits / safe.chars().count()).min(body - 1);
     }
-    text.push_str(&terminal_safe_text(&window, false));
-    if end < total {
-        text.push('…');
+}
+
+/// Reads one event without exceeding the remaining byte budget. `Ok(None)` means the
+/// file disappeared during the scan; `Err(Ok(bytes))` means the file is too large for the
+/// budget and was not consumed; `Err(Err(error))` is an I/O failure.
+fn read_event_within_budget(path: &Path, remaining: u64) -> Result<Option<String>, Result<u64>> {
+    use std::io::Read as _;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Err(
+                anyhow::Error::new(error).context(format!("failed to inspect {}", path.display()))
+            ));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(Err(anyhow::anyhow!(
+            "refusing non-regular session file: {}",
+            path.display()
+        )));
     }
-    text
+    if metadata.len() > remaining {
+        return Err(Ok(metadata.len()));
+    }
+    // The file may have grown since the metadata read: never read past the budget.
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Err(
+                anyhow::Error::new(error).context(format!("failed to read {}", path.display()))
+            ));
+        }
+    };
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    if let Err(error) = file.take(remaining + 1).read_to_end(&mut bytes) {
+        return Err(Err(
+            anyhow::Error::new(error).context(format!("failed to read {}", path.display()))
+        ));
+    }
+    if bytes.len() as u64 > remaining {
+        return Err(Ok(bytes.len() as u64));
+    }
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// The shared event listing turns a missing or non-directory `events` path into an
+/// empty list; a search must not present that damage as "no results".
+fn check_events_directory(directory: &Path) -> Result<(), String> {
+    let events = directory.join("events");
+    match fs::symlink_metadata(&events) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err("events directory is a symlink".to_owned())
+        }
+        Ok(metadata) if !metadata.is_dir() => Err("events is not a directory".to_owned()),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err("events directory is missing".to_owned())
+        }
+        Err(error) => Err(format!("events directory is unreadable: {error}")),
+    }
 }
 
 enum SessionScan {
@@ -806,8 +941,18 @@ fn search_session(
     {
         return Ok(SessionScan::Done);
     }
+    if let Some(budget) = scan.exhausted_budget() {
+        return Ok(SessionScan::Budget(budget));
+    }
     let snapshot = observe_snapshot(directory).map_err(|error| format!("{error:#}"))?;
     scan.sessions_scanned += 1;
+    check_events_directory(directory)?;
+    // A damaged request index loses event-to-request mappings. Events that still have a
+    // readable receipt are searched; the rest are skipped and counted, never reported
+    // as legacy `request_id: null` hits.
+    let index_incomplete =
+        snapshot.unreadable_requests > 0 || snapshot.request_index_error.is_some();
+    let mut without_receipt = 0usize;
     for path in &snapshot.paths {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
@@ -815,12 +960,18 @@ fn search_session(
         if !snapshot.published(name) {
             continue;
         }
+        let receipt = snapshot.receipt_for_event(name);
+        if index_incomplete && receipt.is_none() {
+            without_receipt += 1;
+            continue;
+        }
         if let Some(budget) = scan.exhausted_budget() {
             return Ok(SessionScan::Budget(budget));
         }
-        scan.events_read += 1;
-        let event: SessionEvent = match read_regular_text_if_present(path) {
+        let remaining = scan.byte_budget - scan.bytes_read;
+        let event: SessionEvent = match read_event_within_budget(path, remaining) {
             Ok(Some(text)) => {
+                scan.events_read += 1;
                 scan.bytes_read += text.len() as u64;
                 match serde_json::from_str(&text) {
                     Ok(event) => event,
@@ -834,7 +985,13 @@ fn search_session(
                 scan.incomplete(Some(id), format!("{name}: disappeared during the scan"));
                 continue;
             }
-            Err(error) => {
+            Err(Ok(size)) => {
+                return Ok(SessionScan::Budget(format!(
+                    "{}; {id}/{name} is {size} bytes with {remaining} bytes remaining",
+                    scan.byte_budget_exhausted()
+                )));
+            }
+            Err(Err(error)) => {
                 scan.incomplete(Some(id), format!("{name}: {error:#}"));
                 continue;
             }
@@ -845,9 +1002,7 @@ fn search_session(
         let Some(start) = find_case_insensitive(&event.message, query_lower) else {
             continue;
         };
-        let request_id = snapshot
-            .receipt_for_event(name)
-            .map(|receipt| receipt.request_id.clone());
+        let request_id = receipt.map(|receipt| receipt.request_id.clone());
         let result_command = match &request_id {
             Some(request_id) => format!("agent-bridge result {id} --request {request_id} --json"),
             None => format!("agent-bridge result {id} --event {name} --json"),
@@ -864,10 +1019,24 @@ fn search_session(
             result_command,
         });
     }
+    if index_incomplete {
+        let detail = match &snapshot.request_index_error {
+            Some(error) => error.clone(),
+            None => format!("{} unreadable receipt(s)", snapshot.unreadable_requests),
+        };
+        scan.incomplete(
+            Some(id),
+            format!(
+                "request index incomplete: {detail}; {without_receipt} event(s) without a readable receipt skipped"
+            ),
+        );
+    }
     Ok(SessionScan::Done)
 }
 
 fn search_value(request: &SearchRequest) -> Result<Value> {
+    // The clock starts before enumeration so slow roots count against the budget too.
+    let mut scan = SearchScan::new(request.byte_budget);
     let root = state_root()?;
     let mut ids = Vec::new();
     match fs::read_dir(&root) {
@@ -875,8 +1044,17 @@ fn search_value(request: &SearchRequest) -> Result<Value> {
             for entry in entries {
                 let entry = entry.context("failed to read the native state root")?;
                 let id = entry.file_name().to_string_lossy().into_owned();
-                if valid_session_id(&id) && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    ids.push(id);
+                if !valid_session_id(&id) {
+                    continue;
+                }
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => ids.push(id),
+                    Ok(_) => (),
+                    // An unreadable entry may be a session; it is never silently dropped.
+                    Err(error) => scan.incomplete(
+                        None,
+                        format!("session entry {id}: failed to read its file type: {error}"),
+                    ),
                 }
             }
         }
@@ -890,14 +1068,6 @@ fn search_value(request: &SearchRequest) -> Result<Value> {
     // Deterministic order keeps budget cut-offs and reasons reproducible.
     ids.sort();
     let query_lower = lowercase(&request.query);
-    let mut scan = SearchScan {
-        started: Instant::now(),
-        events_read: 0,
-        bytes_read: 0,
-        sessions_scanned: 0,
-        hits: Vec::new(),
-        reasons: Vec::new(),
-    };
     for id in &ids {
         let budget = match scan.exhausted_budget() {
             Some(budget) => Some(budget),
@@ -945,8 +1115,7 @@ pub(super) fn run_search(request: SearchRequest) -> Result<()> {
         Ok(value) => value,
         Err(error) => {
             if request.json {
-                print_json(&json!({"schema_version": 1, "ok": false,
-                    "query": request.query, "error": format!("{error:#}"), "hits": []}))?;
+                print_json(&search_error_value(Some(&request.query), &error))?;
             }
             return Err(error);
         }
@@ -1002,4 +1171,98 @@ pub(super) fn run_search(request: SearchRequest) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    #[test]
+    fn excerpt_limit_applies_to_the_sanitised_text_without_splitting_escapes() {
+        // Every raw character expands to six displayed characters, so a raw cut at
+        // 198 characters would display far more than the limit.
+        let message = "\x1b".repeat(400);
+        let text = excerpt(&message, 200, 1);
+        assert!(text.chars().count() <= SEARCH_EXCERPT_CHARS, "{text}");
+        assert!(text.starts_with('…') && text.ends_with('…'), "{text}");
+        let body = text.trim_matches('…');
+        assert!(!body.is_empty());
+        // The displayed body is whole `\u{1b}` escapes only: nothing was split.
+        let escaped = r"\u{1b}";
+        assert_eq!(
+            body.matches(escaped).count() * escaped.len(),
+            body.len(),
+            "{body}"
+        );
+        assert_eq!(text.chars().count(), SEARCH_EXCERPT_CHARS, "{text}");
+
+        // A short message whose escapes push it over the limit is cut, not returned whole.
+        let short = format!("{}needle", "\x07".repeat(60));
+        let text = excerpt(&short, 60, 6);
+        assert!(text.chars().count() <= SEARCH_EXCERPT_CHARS, "{text}");
+        assert!(text.contains("needle"), "{text}");
+
+        // Plain text keeps the previous behaviour: window plus both markers is exactly 200.
+        let plain = "a".repeat(1000);
+        let text = excerpt(&plain, 500, 1);
+        assert_eq!(text.chars().count(), SEARCH_EXCERPT_CHARS);
+        assert!(text.starts_with('…') && text.ends_with('…'));
+        assert_eq!(excerpt("short", 0, 5), "short");
+    }
+
+    #[test]
+    fn search_argument_errors_are_structured_only_when_json_was_requested() {
+        let value = search_error_value(Some(&"needle".to_owned()), &anyhow::anyhow!("boom"));
+        assert_eq!(
+            value,
+            json!({"schema_version": 1, "ok": false, "query": "needle", "error": "boom", "hits": []})
+        );
+        let value = search_error_value(None, &anyhow::anyhow!("boom"));
+        assert_eq!(value["query"], Value::Null);
+        let args = ["needle", "--max-bytes", "0", "--json"].map(str::to_owned);
+        let error = parse_search(&args).unwrap_err().to_string();
+        assert!(
+            error.contains("--max-bytes must be between 1 and"),
+            "{error}"
+        );
+        let args = ["needle", "--max-bytes", "1"].map(str::to_owned);
+        assert!(matches!(
+            parse_search(&args).unwrap(),
+            NativeCommand::Search(SearchRequest { byte_budget: 1, .. })
+        ));
+        let args = [
+            "needle",
+            "--max-bytes",
+            &(SEARCH_BYTE_BUDGET + 1).to_string(),
+        ]
+        .map(str::to_owned);
+        assert!(parse_search(&args).is_err());
+    }
+
+    #[test]
+    fn events_are_never_read_past_the_remaining_byte_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("event.json");
+        fs::write(&path, b"0123456789").unwrap();
+        assert_eq!(
+            read_event_within_budget(&path, 10).unwrap().unwrap(),
+            "0123456789"
+        );
+        assert_eq!(read_event_within_budget(&path, 9).unwrap_err().unwrap(), 10);
+        assert!(
+            read_event_within_budget(&directory.path().join("missing.json"), 10)
+                .unwrap()
+                .is_none()
+        );
+        let error = read_event_within_budget(directory.path(), 10)
+            .unwrap_err()
+            .unwrap_err();
+        assert!(error.to_string().contains("non-regular"), "{error}");
+        assert!(check_events_directory(directory.path()).is_err());
+        fs::write(directory.path().join("events"), "x").unwrap();
+        assert_eq!(
+            check_events_directory(directory.path()).unwrap_err(),
+            "events is not a directory"
+        );
+    }
 }
