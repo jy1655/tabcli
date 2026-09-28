@@ -94,8 +94,10 @@ launch, observe, continue, and close without replacing the capabilities those CL
   that unrelated provider adapters do not need modification.
 - For concurrency or lifecycle changes, reproduce the race or partial transition with a
   deterministic test before patching it.
-- Run `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt -- --check`,
-  and `git diff --check` before claiming completion.
+- Run `cargo test --all-targets --all-features -- --test-threads=1`,
+  `cargo clippy --all-targets -- -D warnings`, `cargo fmt -- --check`, and
+  `git diff --check` before claiming completion. Use serial test-harness execution for
+  local, CI, and release checks; retain concurrency created inside individual tests.
 - Tests requiring authenticated CLIs and visible terminal surfaces remain manual live
   tests; do not represent ignored live tests as runtime verification.
 - For Release workflow or release packaging changes, run the rehearsal

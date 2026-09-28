@@ -530,9 +530,11 @@ Release workflow의 immutable-release preflight는 Actions secret `IMMUTABLE_REL
 ```sh
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+cargo test --all-targets --all-features -- --test-threads=1
 cargo build --release
 ```
+
+로컬·CI·릴리스 검증은 `--test-threads=1`로 테스트 함수를 순차 실행합니다. 테스트끼리 CPU·파일시스템 자원을 경쟁하며 짧은 timeout 검사의 실행 시점에 영향을 주는 일을 줄이기 위한 실행 정책입니다. 개별 테스트 안에서 만드는 스레드·프로세스는 그대로 실행되므로 세션의 동시성·수명주기 검증도 유지됩니다. 옵션 없는 `cargo test`는 Rust 기본값인 병렬 실행을 사용하므로 공식 검증에는 위 명령을 사용합니다.
 
 `tests/native_live.rs`의 ignored 테스트는 감지되거나 `--terminal`로 지정한 실제 session surface와 로그인된 provider를 사용합니다. macOS에서는 지원 앱을, Windows에서는 `windows-console`을 지정합니다. 각 테스트는 `ask → result → tell → result → close-session --explicit → closed 상태 조회`를 한 번에 검증하고 정상 경로에서 생성한 surface를 닫습니다. 종료 단계 자체가 실패하면 진단을 위해 surface가 남을 수 있으므로 `sessions`로 확인합니다. Pi 0.84.1 이상은 Node.js 22.19.0 이상이 필요합니다.
 
