@@ -1,5 +1,6 @@
 //! Observations and advice only. No recovery, delivery, terminal control, or settings writes.
 use super::*;
+use anyhow::Context as _;
 use serde_json::{Value, json};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -202,6 +203,9 @@ pub(super) fn run(request: DoctorRequest) -> Result<()> {
         };
         owner_check(directory, request.session.as_deref().unwrap(), &mut checks);
         terminal_check(directory, request.session.as_deref().unwrap(), &mut checks);
+        if request.probe {
+            surface_check(directory, deadline, &mut checks);
+        }
         reopen_marker_check(directory, request.session.as_deref().unwrap(), &mut checks);
         manifest
     });
@@ -452,6 +456,16 @@ fn session_checks(
             "No active turn claim was observed.",
         ),
     };
+    let launch_failure = launch::diagnostic(
+        snapshot.launch.as_ref(),
+        &snapshot.status,
+        snapshot.claim.as_deref(),
+    );
+    let (availability, reason, detail) = if let Some((reason, detail)) = &launch_failure {
+        (Unavailable, *reason, detail.as_str())
+    } else {
+        (availability, reason, detail)
+    };
     checks.push(Check::new(
         "turn",
         availability,
@@ -492,6 +506,36 @@ fn session_checks(
         checks.push(Check::new("request_index", Unknown, "request_index_incomplete", "Some request references could not be read; absence is not proof that no request exists.", "Use an exact event id when known; preserve damaged request records.")
             .evidence(json!({"unreadable_requests": snapshot.unreadable_requests, "error": snapshot.request_index_error})));
     }
+}
+
+fn surface_check(directory: &Path, deadline: Instant, checks: &mut Vec<Check>) {
+    use Availability::*;
+    let result = (|| -> Result<bool> {
+        let session = query::optional_json::<terminal::TerminalSession>(
+            &directory.join(TERMINAL_HANDLE_FILE),
+        )?
+        .context("no active terminal handle is recorded")?;
+        session.verify_managed_session(
+            directory
+                .file_name()
+                .and_then(|s| s.to_str())
+                .context("invalid session path")?,
+        )?;
+        let budget = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(2));
+        if budget.is_zero() {
+            bail!("diagnostic probe deadline exhausted")
+        }
+        terminal::surface_present(&session, budget)
+    })();
+    let (availability, reason, detail) = match result {
+        Ok(true) => (Available, "terminal_surface_present", "Recorded terminal surface is present; this does not prove provider readiness or delivery.".to_owned()),
+        Ok(false) => (Unavailable, "terminal_surface_missing", "Recorded terminal surface is absent; a provider process may still survive it.".to_owned()),
+        Err(error) => (Unknown, "terminal_surface_unverified", format!("Surface presence could not be verified: {error:#}")),
+    };
+    checks.push(Check::new("terminal_surface", availability, reason, detail,
+        "Inspect the launch log and exact request; this read-only probe does not release a claim or resend input."));
 }
 
 fn owner_check(directory: &Path, id: &str, checks: &mut Vec<Check>) {

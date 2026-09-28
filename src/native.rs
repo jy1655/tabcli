@@ -3,6 +3,7 @@ mod tests;
 
 mod context;
 mod doctor;
+mod launch;
 mod provider;
 mod provider_process;
 mod query;
@@ -1104,6 +1105,7 @@ fn launch_created_session(
     let expected_claim_token = initial_claim.token.clone();
     let receipt = initial_claim.receipt.clone();
     *address = Some((created.id.clone(), receipt.request_id.clone()));
+    let launch_deadline = launch::begin(&created.directory, &expected_claim_token, deadline)?;
     let executable = std::env::current_exe().context("failed to locate agent-bridge executable")?;
     let bridge_command = bridge_shell_command(
         &created.manifest.workspace,
@@ -1114,11 +1116,13 @@ fn launch_created_session(
         &executable,
         &created.id,
     )?;
+    let bridge_command = launch::install_script(&created.directory, &bridge_command)?;
     let terminal_handle_path = created.directory.join(TERMINAL_HANDLE_FILE);
+    initial_claim.retain_in_place();
     let terminal_session = match terminal::open_bound_tab(
         terminal_kind,
         &bridge_command,
-        deadline,
+        launch_deadline,
         |session| {
             session.managed_session_id = Some(created.id.clone());
             write_json_atomic(&terminal_handle_path, session)
@@ -1127,12 +1131,9 @@ fn launch_created_session(
     ) {
         Ok(session) => session,
         Err(error) => {
-            let _ = fs::remove_file(created.directory.join("initial-prompt.txt"));
-            let _ = update_status(
+            let _ = launch::fail(
                 &created.directory,
-                "failed",
-                None,
-                Some(format!("{error:#}")),
+                &format!("terminal launch failed: {error:#}"),
             );
             return Err(error).with_context(|| {
                 format!(
@@ -1143,6 +1144,12 @@ fn launch_created_session(
             });
         }
     };
+    // Once the terminal accepted the wrapper command, only a fenced launch failure may
+    // release this claim. Detached callers also wait for provider startup, not its result.
+    initial_claim.retain_in_place();
+    launch::wait(&created.directory, &terminal_session, launch_deadline)?;
+    // The existing delivery paths own rollback/uncertainty after confirmed startup.
+    initial_claim.retained = false;
     let initial_prompt_transport = provider::initial_prompt_transport(provider);
     let mut expected_turn_id = None;
     if initial_prompt_transport == provider::InitialPromptTransport::TerminalPasteAfterLaunch {
@@ -3723,6 +3730,24 @@ fn verify_terminal_close_authority(
     #[cfg(any(target_os = "macos", windows))]
     {
         if read_regular_text_if_present(&directory.join(SESSION_OWNER_FILE))?.is_some() {
+            // An explicit close may reclaim the exact startup surface after its wrapper
+            // died, including an uncertain spawn. This is not automatic failure cleanup:
+            // neither a live/unknown owner nor an unbound/foreign handle gains authority.
+            if let Some(launch) = launch::read(directory)?
+                && launch.phase != launch::Phase::Spawned
+            {
+                let status: SessionStatus = read_json(&directory.join("status.json"))?;
+                let owner: NativeSessionOwner = read_json(&directory.join(SESSION_OWNER_FILE))?;
+                let observed = query::observe_owner_record(&owner);
+                if status.state == "failed"
+                    && owner.managed_session_id.as_deref() == Some(expected_session_id)
+                    && (observed.process_alive == Some(false)
+                        || observed.identity_matches == Some(false))
+                {
+                    session.verify_managed_session(expected_session_id)?;
+                    return Ok(false);
+                }
+            }
             verify_terminal_surface_ownership(directory, expected_session_id, session)?;
             return Ok(true);
         }
@@ -4000,13 +4025,37 @@ fn emit_session_result_with(
 }
 
 fn run_session(id: &str) -> Result<()> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        bail!("native-session must run in a visible interactive terminal");
-    }
     let directory = session_directory(id)?;
-    let owner = current_native_session_owner(id)?;
-    write_json_atomic(&directory.join(SESSION_OWNER_FILE), &owner)?;
-    let result = run_session_inner(&directory);
+    launch::log(&directory, "wrapper_started");
+    if let Some(record) = launch::read(&directory)? {
+        let status: SessionStatus = read_json(&directory.join("status.json"))?;
+        if record.phase != launch::Phase::Pending
+            || status.state != "launching"
+            || current_turn_claim_token(&directory)?.as_deref() != Some(&record.claim_token)
+        {
+            launch::log(
+                &directory,
+                "wrapper_exit_code=1; launch cancelled or already attempted",
+            );
+            bail!(
+                "provider launch cancelled or already attempted; the recorded session is unchanged"
+            );
+        }
+    }
+    let result = (|| {
+        launch::restore_stdout()?;
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            bail!("native-session must run in a visible interactive terminal");
+        }
+        let owner = current_native_session_owner(id)?;
+        write_json_atomic(&directory.join(SESSION_OWNER_FILE), &owner)?;
+        launch::log(&directory, "owner_recorded");
+        run_session_inner(&directory)
+    })();
+    match &result {
+        Ok(()) => launch::log(&directory, "wrapper_exit_code=0"),
+        Err(error) => launch::log(&directory, &format!("wrapper_exit_code=1; {error:#}")),
+    }
     if let Err(finalization_error) = finalize_native_session(&directory, &result) {
         return match result {
             Ok(()) => Err(finalization_error),
@@ -4021,15 +4070,31 @@ fn run_session(id: &str) -> Result<()> {
 fn finalize_native_session(directory: &Path, result: &Result<()>) -> Result<()> {
     let claim_path = directory.join(TURN_CLAIM_FILE);
     let _claim_lock = lock_turn_claim(&claim_path)?;
+    if let Some(record) = launch::read(directory)?
+        && record.phase != launch::Phase::Spawned
+        && current_turn_claim_token(directory)?.as_deref() != Some(&record.claim_token)
+    {
+        return Ok(());
+    }
     recover_pending_completion_locked(directory, &claim_path)?;
     let status: SessionStatus = read_json(&directory.join("status.json"))?;
     if !matches!(status.state.as_str(), "closed" | "exited" | "failed") {
         match result {
             Ok(()) => update_status(directory, "exited", Some(0), None)?,
             Err(error) => {
-                update_status(directory, "failed", None, Some(format!("{error:#}")))?;
+                let reason = if launch::uncertain(directory) {
+                    format!(
+                        "{error:#}; provider spawn is uncertain; the claim is retained, do not resend"
+                    )
+                } else {
+                    format!("{error:#}")
+                };
+                update_status(directory, "failed", Some(1), Some(reason))?;
             }
         }
+    }
+    if launch::uncertain(directory) && status.state != "closed" {
+        return Ok(());
     }
     remove_turn_claim_locked(&claim_path)
 }
@@ -4133,42 +4198,50 @@ fn run_session_inner(directory: &Path) -> Result<()> {
             format!("{error:#}"),
         ));
     }
-    let child = provider_command
+    provider_command
         .current_dir(&manifest.workspace)
         .env(SESSION_DIR_ENV, directory)
         .env("AGENT_BRIDGE_NATIVE_SESSION_ID", &manifest.id)
-        .env("AGENT_BRIDGE_EXECUTABLE", &executable)
-        .spawn();
-    let mut child = child.with_context(|| {
-        format!(
-            "failed to start {} at {}",
-            provider.as_str(),
-            manifest.provider_path.display()
-        )
-    })?;
-    // The process exists from here on. Its identity is recorded before the session leaves
-    // its launch state, so every later judgment about this launch (a reopen refusal, the
-    // source marker) can verify the process itself rather than the wrapper. A process whose
-    // record cannot be written is ended at once: nothing has been delivered to it, and an
-    // unrecorded provider could never be verified gone.
-    if let Err(error) = record_provider_process(directory, &manifest.id, &child) {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = completion_monitor.stop();
-        return Err(error);
-    }
-    match initial_prompt_transport {
-        provider::InitialPromptTransport::ProviderArgument => {
-            fs::remove_file(&prompt_path)
-                .context("failed to remove the accepted initial prompt")?;
-            update_status(directory, "running", None, None)?;
+        .env("AGENT_BRIDGE_EXECUTABLE", &executable);
+    launch::provider_stderr(&mut provider_command);
+    // Spawn and its durable identity are fenced against cancellation by the lifecycle
+    // lock. Failed identity recording ends the child but stays delivery-uncertain: an
+    // argument-delivered prompt could already have been consumed before cleanup.
+    let child = launch::spawn(directory, &mut provider_command, |child| {
+        record_provider_process(directory, &manifest.id, child)?;
+        match initial_prompt_transport {
+            provider::InitialPromptTransport::ProviderArgument => {
+                fs::remove_file(&prompt_path)
+                    .context("failed to remove the accepted initial prompt")?;
+                update_status(directory, "running", None, None)?;
+            }
+            provider::InitialPromptTransport::ProviderCrossSessionMessageAfterLaunch
+            | provider::InitialPromptTransport::TerminalPasteAfterLaunch => {
+                update_status(directory, "awaiting-initial-input", None, None)?;
+            }
         }
-        provider::InitialPromptTransport::ProviderCrossSessionMessageAfterLaunch
-        | provider::InitialPromptTransport::TerminalPasteAfterLaunch => {
-            update_status(directory, "awaiting-initial-input", None, None)?;
+        Ok(())
+    });
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = completion_monitor.stop();
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to start {} at {}",
+                    provider.as_str(),
+                    manifest.provider_path.display()
+                )
+            });
         }
-    }
+    };
     let status = child.wait();
+    if let Ok(status) = &status {
+        launch::log(
+            directory,
+            &format!("provider_exit_code={:?}", status.code()),
+        );
+    }
     completion_monitor.stop()?;
     let status = status.with_context(|| {
         format!(
@@ -6110,6 +6183,9 @@ where
         Some(error) => Err(error),
         None => Ok(false),
     };
+    if launch::repair(directory)? {
+        return untouched(recovery_damage);
+    }
     let status: SessionStatus = read_json(&directory.join("status.json"))?;
     if !matches!(
         status.state.as_str(),
@@ -6490,13 +6566,22 @@ fn bridge_shell_command(
     ] {
         validate_shell_command_component(value, field)?;
     }
-    Ok(format!(
-        "cd {} && {}={} {} native-session {}; bridge_status=$?; exit \"$bridge_status\"",
-        shell_quote(workspace.as_os_str()),
-        STATE_DIR_ENV,
+    let log = shell_quote(state_root.join(id).join(launch::LOG).as_os_str());
+    let location = format!("cd {} &&", shell_quote(workspace.as_os_str()));
+    let invocation = format!(
+        "{STATE_DIR_ENV}={} {} native-session {}",
         shell_quote(state_root.as_os_str()),
         shell_quote(executable.as_os_str()),
         shell_quote(OsString::from(id).as_os_str())
+    );
+    let start = format!("{location} {invocation}");
+    let logged_start = format!(
+        "{location} {}=3 {}=4 {invocation}",
+        launch::STDERR_ENV,
+        launch::STDOUT_ENV
+    );
+    Ok(format!(
+        "if (umask 077; : >> {log}) 2>/dev/null; then {{ {logged_start}; bridge_status=$?; printf 'wrapper_exit_code=%s\\n' \"$bridge_status\" >> {log}; }} 3>&2 4>&1 >> {log} 2>&1; else {start}; bridge_status=$?; fi; exit \"$bridge_status\""
     ))
 }
 
@@ -6520,8 +6605,9 @@ fn bridge_shell_command(
     ] {
         validate_shell_command_component(value, field)?;
     }
+    let log = powershell_quote(state_root.join(id).join(launch::LOG).as_os_str());
     Ok(format!(
-        "Set-Location -LiteralPath {} -ErrorAction Stop; $env:{} = {}; & {} native-session {}; exit $LASTEXITCODE",
+        "$bridgeStatus = 1; try {{ Set-Location -LiteralPath {} -ErrorAction Stop; $env:{} = {}; & {} native-session {}; $bridgeStatus = $LASTEXITCODE }} catch {{ try {{ Add-Content -LiteralPath {log} -Value $_ -ErrorAction Stop }} catch {{}} }}; try {{ Add-Content -LiteralPath {log} -Value (\"wrapper_exit_code=\" + $bridgeStatus) -ErrorAction Stop }} catch {{}}; exit $bridgeStatus",
         powershell_quote(workspace.as_os_str()),
         STATE_DIR_ENV,
         powershell_quote(state_root.as_os_str()),

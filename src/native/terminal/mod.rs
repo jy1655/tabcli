@@ -1,6 +1,6 @@
 use std::{path::Path, str::FromStr, time::Instant};
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(target_os = "macos"))]
 use anyhow::Context;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -343,6 +343,36 @@ pub(super) fn verify_macos_surface(
 
 pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
     platform::close_session(session)
+}
+
+/// Read-only presence check. Unlike control authorization, absence and an inspection
+/// error have different meanings. Never open a terminal app merely to diagnose it.
+pub(super) fn surface_present(
+    session: &TerminalSession,
+    timeout: std::time::Duration,
+) -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::surface_present(session, timeout)
+    }
+    #[cfg(windows)]
+    {
+        let _ = timeout;
+        let pid: u32 = session.id.parse().context("invalid Windows console pid")?;
+        if !agent_bridge::process_is_alive(pid) {
+            return Ok(false);
+        }
+        let identity = session
+            .windows_process_identity
+            .as_ref()
+            .context("console identity is missing")?;
+        Ok(windows_process_identity(pid)? == *identity)
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (session, timeout);
+        bail!("terminal surface probes are unsupported on this platform")
+    }
 }
 
 #[cfg(target_os = "windows")]
