@@ -25,6 +25,16 @@ pub(super) struct PiAdapter;
 
 const HOOK_FAILURE_FILE: &str = "pi-hook-failure.json";
 const PENDING_TURN_FILE: &str = "pi-pending-turn.json";
+#[cfg(any(windows, test))]
+const STARTUP_READY_FILE: &str = "pi-startup-ready.json";
+
+#[cfg(any(windows, test))]
+#[derive(Deserialize, Serialize)]
+struct StartupReady {
+    schema: u32,
+    claim_token: String,
+    session_id: String,
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct PendingPiTurn {
@@ -136,6 +146,19 @@ impl NativeProviderAdapter for PiAdapter {
         prompt_path: &Path,
         deadline: Instant,
     ) -> terminal::TerminalSendResult {
+        #[cfg(windows)]
+        {
+            let directory = session
+                .managed_session_id
+                .as_deref()
+                .context("Pi initial input has no managed session identity")
+                .and_then(super::super::session_directory)
+                .map_err(terminal::TerminalSendFailure::not_sent)?;
+            send_initial_prompt_after_startup(&directory, deadline, || {
+                terminal::send_file(session, prompt_path, deadline)
+            })
+        }
+        #[cfg(not(windows))]
         terminal::send_file(session, prompt_path, deadline)
     }
 
@@ -241,6 +264,52 @@ impl NativeProviderAdapter for PiAdapter {
     fn cancel_terminal_follow_up(&self, directory: &Path, claim_token: &str) -> Result<()> {
         cancel_pending_turn(directory, claim_token)
     }
+}
+
+#[cfg(any(windows, test))]
+fn send_initial_prompt_after_startup(
+    directory: &Path,
+    deadline: Instant,
+    send: impl FnOnce() -> terminal::TerminalSendResult,
+) -> terminal::TerminalSendResult {
+    // Pi's session_start(startup) follows resolution of project_trust. A fixed delay
+    // cannot prove that its trust dialog has gone away: Enter would choose a button.
+    // This is readiness, not consent; Pi can reach session_start after declining trust.
+    let wait = || -> Result<()> {
+        let pending = read_pending_turn(directory)?.context("Pi initial turn is missing")?;
+        loop {
+            if Instant::now() >= deadline {
+                bail!(
+                    "Pi startup has not confirmed that project trust was resolved; no initial console input was sent. Resolve the prompt in the managed terminal, then close and start a new Bridge session if this request timed out"
+                );
+            }
+            if super::super::current_turn_claim_token(directory)?.as_deref()
+                != Some(pending.claim_token.as_str())
+            {
+                bail!("Pi initial turn is no longer claimed; no initial console input was sent");
+            }
+            if let Some(text) =
+                super::super::read_regular_text_if_present(&directory.join(STARTUP_READY_FILE))?
+            {
+                let ready: StartupReady =
+                    serde_json::from_str(&text).context("invalid Pi startup receipt")?;
+                if ready.schema != 1
+                    || ready.claim_token != pending.claim_token
+                    || ready.session_id.trim().is_empty()
+                {
+                    bail!("Pi startup receipt does not identify this initial turn");
+                }
+                return Ok(());
+            }
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(100)),
+            );
+        }
+    };
+    wait().map_err(terminal::TerminalSendFailure::not_sent)?;
+    send()
 }
 
 fn validate_claim_token(claim_token: &str) -> Result<()> {
@@ -533,6 +602,29 @@ export default function (pi) {
     }
   }
 
+  // Official session_start follows project_trust resolution, including a user's decline.
+  // Never return a trust decision here or persist one in Pi's provider-owned store.
+  pi.on("session_start", (event, ctx) => {
+    if (event.reason !== "startup") return;
+    const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
+    const claimToken = readActiveClaimToken();
+    if (!directory || !claimToken) return;
+    const temporary = join(directory, `.pi-startup-${process.pid}-${Date.now()}.tmp`);
+    try {
+      writeFileSync(temporary, JSON.stringify({
+        schema: 1,
+        claim_token: claimToken,
+        session_id: ctx.sessionManager.getSessionId(),
+      }), { encoding: "utf8", flag: "wx", mode: 0o600 });
+      renameSync(temporary, join(directory, "pi-startup-ready.json"));
+    } catch {
+      try { unlinkSync(temporary); } catch {}
+      if (process.platform === "win32") {
+        ctx.ui.notify("Agent Bridge could not confirm Pi startup; the initial console input will remain withheld.", "warning");
+      }
+    }
+  });
+
   pi.on("before_agent_start", (event) => {
     activeClaimToken = readActiveClaimToken();
     activePromptCorrelated = Boolean(
@@ -624,6 +716,84 @@ mod tests {
 
     fn marked(message: &str, pending: &PendingPiTurn) -> String {
         format!("{message}\n{}", pending.marker)
+    }
+
+    #[test]
+    fn unresolved_project_trust_never_receives_the_initial_console_paste() {
+        let directory = tempfile::tempdir().unwrap();
+        claim_pending_turn(directory.path());
+        let sent = std::cell::Cell::new(false);
+        let result = send_initial_prompt_after_startup(directory.path(), Instant::now(), || {
+            sent.set(true);
+            Ok(())
+        });
+        assert!(
+            !sent.get(),
+            "initial input could press Enter on the unresolved trust dialog"
+        );
+        let failure = result.unwrap_err();
+        assert!(!failure.delivery_may_have_occurred());
+    }
+
+    #[test]
+    fn startup_receipt_allows_one_paste_and_preserves_the_transport_outcome() {
+        let directory = tempfile::tempdir().unwrap();
+        let pending = claim_pending_turn(directory.path());
+        write_json_atomic(
+            &directory.path().join(STARTUP_READY_FILE),
+            &StartupReady {
+                schema: 1,
+                claim_token: pending.claim_token,
+                session_id: "pi-native-session".to_owned(),
+            },
+        )
+        .unwrap();
+        let sends = std::cell::Cell::new(0);
+        let failure = send_initial_prompt_after_startup(
+            directory.path(),
+            Instant::now() + Duration::from_secs(1),
+            || {
+                sends.set(sends.get() + 1);
+                Err(terminal::TerminalSendFailure::delivery_uncertain(
+                    anyhow::anyhow!("transport uncertain"),
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(sends.get(), 1);
+        assert!(failure.delivery_may_have_occurred());
+        assert!(
+            failure
+                .into_error()
+                .to_string()
+                .contains("transport uncertain")
+        );
+    }
+
+    #[test]
+    fn stale_malformed_or_cancelled_startup_never_pastes() {
+        let directory = tempfile::tempdir().unwrap();
+        let pending = claim_pending_turn(directory.path());
+        let valid = serde_json::json!({"schema": 1, "claim_token": pending.claim_token, "session_id": "native"});
+        for receipt in [
+            "not-json".to_owned(),
+            serde_json::json!({"schema": 1, "claim_token": "1-2-3", "session_id": "native"}).to_string(),
+            serde_json::json!({"schema": 2, "claim_token": pending.claim_token, "session_id": "native"}).to_string(),
+            serde_json::json!({"schema": 1, "claim_token": pending.claim_token, "session_id": ""}).to_string(),
+        ] {
+            fs::write(directory.path().join(STARTUP_READY_FILE), receipt).unwrap();
+            let failure = send_initial_prompt_after_startup(directory.path(), Instant::now() + Duration::from_secs(1), || panic!("unexpected paste")).unwrap_err();
+            assert!(!failure.delivery_may_have_occurred());
+        }
+        fs::write(directory.path().join(STARTUP_READY_FILE), valid.to_string()).unwrap();
+        fs::remove_file(directory.path().join(TURN_CLAIM_FILE)).unwrap();
+        let failure = send_initial_prompt_after_startup(
+            directory.path(),
+            Instant::now() + Duration::from_secs(1),
+            || panic!("cancelled turn pasted"),
+        )
+        .unwrap_err();
+        assert!(!failure.delivery_may_have_occurred());
     }
 
     #[test]

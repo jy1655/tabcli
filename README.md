@@ -468,6 +468,14 @@ src/native/tests.rs            provider-neutral native orchestration 단위 테�
 
 기존 `{"iterm_session_id":"..."}` 형식의 `terminal.json`은 iTerm2 세션으로 계속 읽습니다. 새 세션은 terminal-neutral한 `terminal`, `session_id`, 선택적 `tab_id`·`window_id`와 내부 `managed_session_id` binding을 기록합니다. 가시적인 terminal title은 설정하거나 ownership record에 저장하지 않습니다. Terminal.app의 추가 owner attestation은 target `native-session`이 별도 private record에 기록합니다.
 
+## 0.0.8 개발: workspace trust 선행 보호
+
+[#28](https://github.com/jy1655/agent-bridge/issues/28)의 첫 변경으로, native Windows의 Pi 초기 입력은 공식 `session_start`의 `reason: "startup"` 영수증을 기다립니다. 이 이벤트는 Pi의 project trust 결정 뒤에 발생하므로, 신뢰 대화상자가 열린 동안 초기 프롬프트나 Enter를 보내지 않습니다. 현재 초기 turn의 claim과 일치하는 영수증만 인정하며, 전체 `ask --timeout-secs` 예산 안에서 기다립니다. 기한이 끝나면 입력을 보내지 않은 실패로 보고합니다. 사용자가 관리 터미널에서 신뢰 질문을 처리한 뒤 해당 Bridge 세션을 닫고 새 `ask`로 다시 시작할 수 있습니다.
+
+이 영수증은 trust **절차의 종료**만 뜻합니다. 사용자가 신뢰를 거절해도 Pi는 보호된 리소스를 제외하고 시작할 수 있으므로, 영수증을 다른 provider의 승인 근거로 쓰지 않습니다. Bridge는 `project_trust`의 결정을 반환하거나 Pi trust store를 수정하지 않습니다. 명시적 `--yolo`의 기존 Pi `--approve` 매핑은 그대로 적용됩니다.
+
+공용 consent 기록, provider 간 trust 공유, Codex·Agy의 Windows 초기 입력 보호는 #28의 후속 작업입니다. macOS는 기존 인자 전달 경로를 사용합니다. 이 변경은 게시된 0.0.7에 포함되지 않았으며 native Windows의 인증된 CLI·신뢰 대화상자 LIVE는 별도 검증 항목입니다.
+
 ## 0.0.7 업데이트
 
 `search <query>`는 workspace 범위에서 게시된 결과 본문을 검색해 정확한 session/request/event 주소를 돌려주고 읽기 전용이며 예산 초과·손상은 `incomplete`로 구분해 보고합니다. `ask`/`tell`의 `--context-result <session>/<request-id|event-id>`는 게시된 성공 결과를 전송 전에 검증·고정한 뒤 nonce 구분자로 감싼 데이터로 첨부하고 새 요청 영수증에 `context_sources` 출처를 남깁니다.
@@ -559,6 +567,10 @@ gh workflow run release.yml --ref <branch> -f tag=v0.0.5
 ```
 
 첫 명령은 `main`의 workflow로 리허설하며, 둘째 명령은 workflow를 고친 branch의 workflow로 리허설하여 merge 전에 변경을 검증할 때 씁니다. Release workflow나 release packaging을 바꿨을 때는 새 tag를 push하기 전에 리허설을 먼저 실행합니다. 리허설에서는 `IMMUTABLE_RELEASES_READ_TOKEN` secret이 없어도 경고만 남기고 계속하지만, 실제 tag push에서는 같은 secret이 없거나 저장소의 immutable releases 설정을 확인할 수 없으면 test와 build를 시작하기 전에 실패하고 게시 직전에 같은 확인을 다시 합니다. 게시 단계는 draft에 올라간 asset의 이름과 digest를 build 결과와 대조한 뒤 게시하고, 게시된 릴리스가 immutable인지 확인합니다.
+
+### 수동 릴리스 대안
+
+`IMMUTABLE_RELEASES_READ_TOKEN`을 Actions에 제공할 수 없으면, 릴리스 관리자는 [수동 릴리스 절차](docs/releasing.md)에 따라 같은 main commit의 성공한 CI artifact를 검증하고 draft로 올린 뒤 게시할 수 있습니다. 이는 공식 대안이며 tag workflow의 secret·immutable 검사를 완화하지 않습니다. 로컬 인증으로도 immutable 설정을 확인할 수 없으면 게시하지 않습니다. 원격 annotated tag object와 commit 고정, 네 파일의 checksum·구성·digest·다운로드 bytes 대조, 게시 후 immutable 및 release attestation 검증을 모두 수행합니다. 이미 게시된 릴리스의 파일을 바꾸지 않습니다.
 
 ## License
 
