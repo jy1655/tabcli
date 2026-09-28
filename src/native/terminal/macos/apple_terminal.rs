@@ -105,6 +105,7 @@ end run
 
 pub(in crate::native) const VERIFY_TAB_SCRIPT: &str = r#"
 on run argv
+    if application "Terminal" is not running then return "missing"
     set wantedTty to item 1 of argv
     set wantedWindowId to item 2 of argv as integer
     tell application "Terminal"

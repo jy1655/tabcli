@@ -168,7 +168,8 @@ agent-bridge result session-XXXXXXXX --event event-123-456.json --json
 `--event` 또는 `--request`로 읽습니다. event ID는 `.json`을 포함한 보존 파일명입니다.
 
 새 `ask/tell`은 provider에 보내기 전에 공개 `request_id`를 저장합니다. 이 ID는 provider의
-session/turn ID 또는 내부 claim token을 대체하지 않습니다. `--detach`는 접수 뒤 반환하며
+session/turn ID 또는 내부 claim token을 대체하지 않습니다. `ask --detach`도 provider 프로세스
+시작 확인까지 기다립니다(최대 30초, 전체 `--timeout-secs` 이내). 모델 결과는 기다리지 않고
 `request_state: accepted`, `result: null`입니다. 이미 완료됐을 수도 있으므로 실제 결과는
 요청 ID로 조회합니다. timeout이나 전송 오류가 발생해도 접수 기록이 생성됐다면 stdout JSON에
 session과 request ID를 반환하고 exit code는 0이 아닙니다. 접수 전 거부에는 요청 ID가 없습니다.
@@ -346,9 +347,13 @@ agent-bridge doctor --provider codex --probe --json
 ```
 
 현재 설치된 CLI 버전은 `--probe`가 있을 때만 `<provider> --version`으로 확인합니다.
-Codex는 추가로 `codex app-server daemon version`을 실행합니다. 두 조회는 총 5초 예산을 공유하고
+Codex는 추가로 `codex app-server daemon version`을 실행합니다. 세션을 지정하면 `--probe`는
+기록된 terminal surface의 존재도 조회합니다. macOS는 앱을 새로 열지 않고 iTerm session ID나
+Terminal.app window ID·TTY를 확인하며, Windows는 console process의 PID·identity를 확인합니다.
+표면 부재는 `terminal_surface_missing`, 조회 실패는 `terminal_surface_unverified`로 구분합니다.
+이 조회들은 총 5초 예산을 공유하고
 출력은 각 조회별 stdout·stderr 합산 64 KiB로 제한합니다. probe helper와 그 자식 process는 종료 시 회수하며 Windows batch shim의
-임시 파일은 세션 디렉터리 밖에 둡니다. 모델 호출, 메시지 전송, daemon 시작, terminal 앱 제어,
+임시 파일은 세션 디렉터리 밖에 둡니다. 모델 호출, 메시지 전송, daemon 시작, terminal 생성·입력·종료,
 설정 변경은 하지 않습니다. 외부 CLI를 실행하는 probe와 기본 로컬 관측은 출력의 `probe`로 구분합니다.
 
 JSON의 `ok: true`와 exit 0은 진단 보고서를 만들었다는 뜻입니다. 각 `checks` 항목의
@@ -416,6 +421,26 @@ provider가 검증한 완료는 completion journal `turn.completion.json`에 먼
 크기 정책은 completion journal(`turn.completion.json`)을 만드는 시점에 적용되므로, provider 결과의 event 기록(JSON 직렬화 결과)이 읽기 한도(64 MiB)를 넘으면 그 결과는 게시 가능한 완료로 completion journal에 기록되지 않습니다. 대신 실패 완료로 completion journal에 기록되어 event의 `message`는 빈 문자열이 되고 `error`에는 크기를 밝히는 문구 `provider result of <size> bytes exceeds the 67108864 byte event limit`가 들어가며(`<size>`는 실제 바이트 수), provider 식별 정보(`provider_session_id`, `turn_id`)는 유지됩니다. 이 완료는 다른 완료와 같은 순서(event 게시 → 상태 갱신 → turn claim 해제 → completion journal 제거)로 진행되어 세션 상태는 `failed`가 되고 `status.json`의 `error`에도 같은 문구가 들어갑니다. `failed`는 `closed`로만 갈 수 있는 종료 상태이므로 그 세션에 다음 turn을 보낼 수 없고, `result`는 이 요청을 `request_state: failed`로 보고하고 `error`에 같은 문구를 보여 줍니다. 이것은 크기 정책이 도입되기 전 버전이 남긴, event가 읽기 한도(64 MiB)를 넘는 completion journal을 다루는 방식과 다릅니다. 그런 completion journal은 게시하지 않으며 `result`는 `recovery_required`를 보고하고, 복구는 크기를 밝히는 오류와 함께 거부되어 completion journal이 남으며, close가 그 completion journal을 발견하면 위 문단의 규칙대로 처리합니다(event가 이미 `events/`에 있으면 `unpublished-` 접두사로 옮겨 보존, 없으면 completion journal 폐기).
 
 `native-session.json`은 owner의 PID와 플랫폼별 process identity를 기록합니다. `tell`, `sessions`, `ask`/`tell` 내부의 결과 대기는 owner가 살아 있는지 확인하고, 종료됐으면 turn claim을 해제하고 세션을 `closed`로 바꾸며 `error`에 종료 사유를 남깁니다. 살아 있는 owner는 repair하지 않습니다. `inspect`와 `result`는 관측만 합니다. process identity가 없는 예전 Windows owner 기록(PID만 있음)은 identity를 알 수 없는 것이지 종료된 것이 아닙니다. PID가 살아 있으면 repair하지 않고 `inspect`의 `identity_matches`는 `null`로 남습니다. PID가 종료됐을 때만 repair합니다.
+
+### 시작 확인과 런치 진단
+
+새 `ask`/`reopen`은 `launch.json`에 초기 claim과 시작 제한 시간을 저장합니다. terminal이
+명령을 받아도 provider가 스폰된 것이 확인되기 전에는 detached 성공을 반환하지 않습니다.
+시작 전 timeout, 표면 소멸, 초기 wrapper 오류는 `failed`와 원인을 기록하고 해당 claim을
+해제합니다. timeout과 spawn은 같은 lifecycle lock을 사용하며 늦은 wrapper는 취소된 요청을
+실행할 수 없습니다. spawn 도중 중단돼 실행 여부가 불확실하면 실패를 보고하되 claim을
+유지하고 자동 재전송하지 않습니다. 호출자가 종료됐어도 `sessions`가 만료된 새 launch를
+정리합니다. 과거 버전의 launch receipt 없는 세션에는 미전달을 추측한 자동 해제를 적용하지 않습니다.
+
+`doctor`와 `result --wait`는 읽기 전용으로 launch 실패·만료를 즉시 보고합니다. `doctor`의
+exit 0은 여전히 진단 보고서 생성 성공을 뜻하므로 각 check의 가용성과 사유를 읽습니다.
+`launch.log`는 wrapper 단계, 오류, provider/wrapper 종료 코드를 보존합니다. macOS shell의
+bootstrap stdout/stderr도 이 파일에 기록하고 provider의 stdout/stderr는 원래 터미널로
+연결해 TUI를 유지합니다. 긴 명령이 셸 초기 입력 버퍼에서 잘리지 않도록 private `launch.sh`를
+짧은 명령으로 source합니다. Windows의 console은 기존처럼 PowerShell `-Command`를 사용하고,
+wrapper 오류·종료 코드와 PowerShell 시작 오류를
+기록합니다. provider 대화 transcript를 복제하는 로그는 아니며, 부가 로그 기록 실패가
+정상 launch를 막지 않습니다.
 
 ### 내구 기록과 플랫폼 한계
 
