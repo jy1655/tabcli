@@ -2,13 +2,13 @@
 
 로컬에 설치되고 로그인된 `codex`, `claude`, `agy`, `pi` CLI를 사용자가 볼 수 있는 실제 터미널 세션에서 연결하는 브리지입니다. API 키나 로그인 토큰을 대신 소유하지 않고 각 CLI의 기존 인증·설정·대화형 UI를 그대로 사용합니다.
 
-첫 설치 가능 릴리스는 **v0.0.1**이며 최신 설치 가이드는 **v0.0.7** tag를 기준으로 합니다. macOS에서는 iTerm2와 내장 Terminal.app을 지원합니다. Agent Bridge는 자신을 실행한 터미널을 감지해 같은 앱의 새 surface에서 세션을 시작하고, 자신이 만든 surface만 제어합니다. Terminal.app에서는 기존 tab/window를 사용하지 않고 항상 전용 새 window를 엽니다. 감지할 수 없는 호스트에서는 Terminal.app으로 안전하게 fallback합니다. 이미 독립적으로 실행 중인 임의의 CLI에는 사후 attach하지 않습니다.
+첫 설치 가능 릴리스는 **v0.0.1**이며 최신 설치 가이드는 **v0.0.8** tag를 기준으로 합니다. macOS에서는 iTerm2와 내장 Terminal.app을 지원합니다. Agent Bridge는 자신을 실행한 터미널을 감지해 같은 앱의 새 surface에서 세션을 시작하고, 자신이 만든 surface만 제어합니다. Terminal.app에서는 기존 tab/window를 사용하지 않고 항상 전용 새 window를 엽니다. 감지할 수 없는 호스트에서는 Terminal.app으로 안전하게 fallback합니다. 이미 독립적으로 실행 중인 임의의 CLI에는 사후 attach하지 않습니다.
 
 ## 지원 범위
 
 | 환경 | 상태 | transport |
 | --- | --- | --- |
-| macOS + Ghostty | v0.0.7 미지원 | 현재 설치 가능한 1.3.1은 AppleScript surface 회귀가 있고 1.3.0은 이번 후보의 양성 runtime 근거가 없어 모든 버전을 surface 생성 전에 fail-closed |
+| macOS + Ghostty | v0.0.8 미지원 | 현재 설치 가능한 1.3.1은 AppleScript surface 회귀가 있고 1.3.0은 이번 후보의 양성 runtime 근거가 없어 모든 버전을 surface 생성 전에 fail-closed |
 | macOS + iTerm2 | 지원 | iTerm2 AppleScript 직접 제어 |
 | macOS + Terminal.app | 지원 | Terminal AppleScript 직접 제어 |
 | macOS의 다른 터미널 | fallback | 별도 adapter가 없으면 Terminal.app에서 시작 |
@@ -18,7 +18,7 @@
 
 macOS에서는 `TERM_PROGRAM`, `TERM`, `ITERM_SESSION_ID`, `TERM_SESSION_ID` 순으로 현재 호스트를 식별합니다. `--terminal ghostty|iterm2|terminal`로 명시 선택할 수 있고, 선택을 생략한 상태에서 호스트를 식별하지 못하면 내장 Terminal.app을 엽니다. Terminal.app은 복원되거나 기존에 열린 surface를 채택하지 않고 항상 전용 새 window를 만듭니다. 명시 선택한 adapter가 실패하면 다른 앱으로 조용히 우회하지 않고 오류를 반환합니다.
 
-Ghostty의 AppleScript는 1.3에서 추가된 preview API이며 macOS Automation 권한이 필요합니다. [Ghostty 1.3.1에는 AppleScript로 만든 tab의 terminal surface가 초기화되지 않는 회귀](https://github.com/ghostty-org/ghostty/issues/12730)가 있고, 1.3.0은 이번 릴리스 후보에서 다시 확인한 양성 runtime 근거가 없습니다. 따라서 Agent Bridge v0.0.7는 명시적인 `--terminal ghostty`를 AppleScript 실행 전에 거부하고, Ghostty 환경 자동 감지는 지원되는 Terminal.app으로 대체합니다. `--terminal iterm2` 또는 `--terminal terminal`을 사용하세요. Terminal.app은 기존 tab이나 UI scripting을 사용하지 않고 native AppleScript로 항상 전용 새 window를 만듭니다.
+Ghostty의 AppleScript는 1.3에서 추가된 preview API이며 macOS Automation 권한이 필요합니다. [Ghostty 1.3.1에는 AppleScript로 만든 tab의 terminal surface가 초기화되지 않는 회귀](https://github.com/ghostty-org/ghostty/issues/12730)가 있고, 1.3.0은 이번 릴리스 후보에서 다시 확인한 양성 runtime 근거가 없습니다. 따라서 Agent Bridge v0.0.8는 명시적인 `--terminal ghostty`를 AppleScript 실행 전에 거부하고, Ghostty 환경 자동 감지는 지원되는 Terminal.app으로 대체합니다. `--terminal iterm2` 또는 `--terminal terminal`을 사용하세요. Terminal.app은 기존 tab이나 UI scripting을 사용하지 않고 native AppleScript로 항상 전용 새 window를 만듭니다.
 
 Windows는 PowerShell 또는 cmd에서 호출할 수 있으며 PowerShell 7(`pwsh.exe`)이 설치되어 있어야 합니다. bridge는 absolute PATH entry에서 찾은 `pwsh.exe`의 절대 경로를 `CreateProcessW`에 전달하고, `CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED`로 전용 visible console을 만든 뒤 identity-bound handle을 기록한 후에만 실행을 재개합니다. 후속 입력과 explicit close는 managed session ID, PID 생성 시각, 실행 파일 identity가 모두 일치할 때만 전달합니다. npm provider shim은 `.exe`, `.ps1`, `.cmd`, `.bat` 순으로 찾고 PowerShell shim을 우선해 `%NAME%`의 `cmd.exe` 확장을 피합니다. Linux는 아직 미지원입니다. provider/session 계약은 공유하되 OS와 terminal transport는 각각 독립 모듈로 유지합니다. provider 간에도 transport 구현을 억지로 공통화하지 않습니다. 각 provider adapter가 공식 session messaging·follow-up·result identity를 우선 사용하고, upstream에서 제공하지 않는 플랫폼·버전에만 같은 의미론의 fallback을 소유합니다. upstream 지원이 추가되면 공통층을 늘리는 대신 해당 fallback을 삭제·교체합니다.
 
@@ -29,29 +29,29 @@ Windows는 PowerShell 또는 cmd에서 호출할 수 있으며 PowerShell 7(`pws
 - Agy: 세션 로그와 완료 transcript
 - Pi: 세션 전용 lifecycle 확장
 
-Windows와 macOS는 같은 세션 계약을 구현하지만 provider transport와 v0.0.7의 authenticated live 검증 범위는 다릅니다. 아래의 `구현·CI 검증`은 정적·단위·CI 근거를 뜻하며, 별도 표기 없는 Windows provider를 authenticated runtime 검증 완료로 해석하면 안 됩니다.
+Windows와 macOS는 같은 세션 계약을 구현하지만 provider transport와 authenticated live 검증 범위는 다릅니다. 아래 Windows 근거는 각 표기 버전의 이력이며 0.0.8의 새 Windows LIVE 검증을 뜻하지 않습니다. 아래의 `구현·CI 검증`은 정적·단위·CI 근거를 뜻하며, 별도 표기 없는 Windows provider를 authenticated runtime 검증 완료로 해석하면 안 됩니다.
 
 | Provider | macOS transport | native Windows transport | authenticated Windows live 근거 |
 | --- | --- | --- | --- |
 | Codex | 0.149+ native queue availability gate + provider session notify; 명확한 사전 부재만 terminal follow-up | 동일한 queue/notify adapter + 필요할 때만 Windows console follow-up | v0.0.3 terminal-follow-up 경로는 exact MSVC artifact로 검증; native queue 경로는 미검증 |
 | Claude Code | 지원 버전·backend·설정 gate를 모두 통과할 때 공식 cross-session `ListAgents`/`SendMessage` + `Stop` hook | Claude Code 2.1.234+의 공식 named-pipe cross-session `ListAgents`/`SendMessage` + `Stop` hook; 초기 prompt도 argv가 아닌 공식 메시지로 전달 | 구현·CI 검증, 이 후보의 authenticated Windows runtime은 미검증 |
-| Agy | transcript/result monitor + provider-owned terminal follow-up; 초기 prompt는 `--prompt-interactive` 인자, `tell`은 `agy.log`의 startup readiness 게이트(macOS는 redraw 줄이 없어 요구하지 않음, conversation 시작 직후 reload는 지연 reload로 치지 않음)를 통과한 뒤에만 paste; 모든 paste는 `HandleUserInput` input receipt(완전한 turn marker 포함)가 있어야 전달로 인정, 없으면 delivery-uncertain | transcript/result monitor + Windows console follow-up; 다중행 prompt는 한 줄 JSON 문자열로 framing; 초기 prompt는 `agy.log`의 startup readiness 게이트를 통과한 뒤에만 paste; 초기 prompt와 `tell` 모두 paste 직전 `agy.log` 길이 이후에 기록된 `HandleUserInput` input receipt(완전한 turn marker 포함)가 있어야 전달로 인정, 없으면 delivery-uncertain | macOS iTerm2 authenticated LIVE(2026-09-24, Agy 1.2.10)와 CI 검증; 이 후보의 authenticated Windows runtime은 2026-09-24 native Windows LIVE로 검증 |
+| Agy | transcript/result monitor + provider-owned terminal follow-up; 초기 prompt는 `--prompt-interactive` 인자, `tell`은 `agy.log`의 startup readiness 게이트(macOS는 redraw 줄이 없어 요구하지 않음, conversation 시작 직후 reload는 지연 reload로 치지 않음)를 통과한 뒤에만 paste; 모든 paste는 `HandleUserInput` input receipt(완전한 turn marker 포함)가 있어야 전달로 인정, 없으면 delivery-uncertain | transcript/result monitor + Windows console follow-up; 다중행 prompt는 한 줄 JSON 문자열로 framing; 초기 prompt는 `agy.log`의 startup readiness 게이트를 통과한 뒤에만 paste; 초기 prompt와 `tell` 모두 paste 직전 `agy.log` 길이 이후에 기록된 `HandleUserInput` input receipt(완전한 turn marker 포함)가 있어야 전달로 인정, 없으면 delivery-uncertain | macOS iTerm2 authenticated LIVE(2026-09-24, Agy 1.2.10)와 CI 검증; v0.0.7 native Windows LIVE(2026-09-24); 0.0.8 Windows LIVE는 미검증 |
 | Pi | session lifecycle extension + provider-owned terminal follow-up | lifecycle extension + Windows console follow-up; 다중행 prompt는 한 줄 JSON 문자열로 framing | 구현·CI 검증, 이 후보의 authenticated Windows runtime은 미검증 |
 
 provider별 console follow-up은 각 adapter 내부에 격리되어 있으며, bridge 공통층이 provider payload나 결과 identity를 추측하지 않습니다. Claude의 공식 cross-session 기능을 runtime gate 때문에 사용할 수 없으면 terminal injection으로 우회하지 않고 실패합니다. Codex만 구버전 또는 native queue가 메시지를 받지 않았다고 명확히 확인된 경우에 한해 같은 claim을 terminal follow-up으로 전달합니다.
 
 ## 설치
 
-소스에서 설치할 때는 Rust 1.97.1 이상이 필요합니다. macOS에서는 iTerm2 또는 Terminal.app이 필요하며 v0.0.7의 Ghostty adapter는 fail-closed입니다. Windows에서는 PowerShell 7이 필요합니다. 두 OS 모두 사용할 provider CLI를 먼저 직접 실행해 로그인과 초기 설정을 완료해야 합니다.
+소스에서 설치할 때는 Rust 1.97.1 이상이 필요합니다. macOS에서는 iTerm2 또는 Terminal.app이 필요하며 v0.0.8의 Ghostty adapter는 fail-closed입니다. Windows에서는 PowerShell 7이 필요합니다. 두 OS 모두 사용할 provider CLI를 먼저 직접 실행해 로그인과 초기 설정을 완료해야 합니다.
 
 ```sh
-git clone --branch v0.0.7 --depth 1 https://github.com/jy1655/agent-bridge.git
+git clone --branch v0.0.8 --depth 1 https://github.com/jy1655/agent-bridge.git
 cd agent-bridge
 cargo install --path . --locked
 agent-bridge --version
 ```
 
-마지막 명령은 `agent-bridge 0.0.7`를 출력해야 합니다. 개발 중인 `main`이 아니라 릴리스 tag에서 설치해야 설치본과 소스의 경계가 명확합니다.
+마지막 명령은 `agent-bridge 0.0.8`를 출력해야 합니다. 개발 중인 `main`이 아니라 릴리스 tag에서 설치해야 설치본과 소스의 경계가 명확합니다.
 
 Windows 명령줄 한도를 넘는 요청은 `--prompt-file`로 전달합니다. 파일은 UTF-8 텍스트로 읽고 CRLF는 LF로 정규화하며, Agent Bridge가 원본을 삭제하거나 수정하지 않습니다. 단독 CR과 그 밖의 제출·escape 제어문자는 거부합니다.
 
@@ -60,13 +60,13 @@ Windows 명령줄 한도를 넘는 요청은 `--prompt-file`로 전달합니다.
 GitHub Release에는 Apple Silicon macOS용 `agent-bridge-<version>-aarch64-apple-darwin.tar.gz`와 64비트 Windows용 `agent-bridge-<version>-x86_64-pc-windows-msvc.zip`을 게시하며, 각 archive와 같은 이름의 `.sha256` 파일을 함께 제공합니다. prebuilt archive 설치에는 Rust가 필요하지 않습니다. archive를 푼 뒤 macOS에서는 `agent-bridge`, Windows에서는 `agent-bridge.exe`를 `PATH`에 있는 디렉터리로 옮깁니다. 다운로드한 파일은 실행 전에 체크섬을 검증하세요.
 
 ```sh
-shasum -a 256 -c agent-bridge-0.0.7-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf agent-bridge-0.0.7-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c agent-bridge-0.0.8-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf agent-bridge-0.0.8-aarch64-apple-darwin.tar.gz
 ./agent-bridge --version
 ```
 
 ```powershell
-$archive = "agent-bridge-0.0.7-x86_64-pc-windows-msvc.zip"
+$archive = "agent-bridge-0.0.8-x86_64-pc-windows-msvc.zip"
 $expected = (Get-Content "$archive.sha256").Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "checksum mismatch" }
@@ -384,7 +384,7 @@ JSON의 `ok: true`와 exit 0은 진단 보고서를 만들었다는 뜻입니다
 
 ## 권한과 세션 경계
 
-- Agent Bridge는 같은 `ask` 작업에서 새로 만든 surface만 기록합니다. 새 handle은 managed session ID와 host가 제공하는 stable ID를 결합하며 `tell`과 `close-session` 직전에 다시 검증합니다. 지원되는 macOS iTerm2·Terminal.app 경로는 target `native-session` owner의 managed session ID·PID·controlling TTY device·process start fingerprint·foreground process group과 전용 login shell identity를 검증하고, surface가 보고하는 TTY도 owner와 일치해야 합니다. 시작 명령을 보내기 전에 handle을 내구성 있게 기록하고, 시작 실패 시 전체 timeout 안에 예약한 정리 구간에서 정확한 surface를 닫은 뒤 handle을 제거합니다. 정리가 실패한 경우에만 `launching`/`failed` 상태의 bound handle을 남겨 명시적 `close-session --explicit`이 stable ID로 회수할 수 있습니다. 비활성화된 Ghostty adapter 코드는 terminal·tab·window ID 복합체와 live owner 검증 경계를 유지하지만 v0.0.7에서는 선택될 수 없습니다. Windows 입력과 close는 console root와 `native-session` owner 각각의 PID 생성 시각·실행 파일 identity를 검증하고, console root의 검증된 process handle을 `AttachConsole`과 control이 끝날 때까지 유지해 PID 재사용을 fail-closed합니다. suspended console의 identity-bound handle은 private state에 내구성 있게 기록한 뒤에만 실행을 재개합니다. Windows Codex adapter는 정확한 canonical workspace를 provider process의 inherited current directory로 유지하고, verbatim 경로를 거부하는 Codex에는 의미가 달라질 수 있는 정규화 경로를 `-C`로 다시 전달하지 않습니다. 호출 당시 터미널을 재감지하거나 복원된 front/current/selected surface를 채택하지 않습니다.
+- Agent Bridge는 같은 `ask` 작업에서 새로 만든 surface만 기록합니다. 새 handle은 managed session ID와 host가 제공하는 stable ID를 결합하며 `tell`과 `close-session` 직전에 다시 검증합니다. 지원되는 macOS iTerm2·Terminal.app 경로는 target `native-session` owner의 managed session ID·PID·controlling TTY device·process start fingerprint·foreground process group과 전용 login shell identity를 검증하고, surface가 보고하는 TTY도 owner와 일치해야 합니다. 시작 명령을 보내기 전에 handle을 내구성 있게 기록하고, 시작 실패 시 전체 timeout 안에 예약한 정리 구간에서 정확한 surface를 닫은 뒤 handle을 제거합니다. 정리가 실패한 경우에만 `launching`/`failed` 상태의 bound handle을 남겨 명시적 `close-session --explicit`이 stable ID로 회수할 수 있습니다. 비활성화된 Ghostty adapter 코드는 terminal·tab·window ID 복합체와 live owner 검증 경계를 유지하지만 v0.0.8에서는 선택될 수 없습니다. Windows 입력과 close는 console root와 `native-session` owner 각각의 PID 생성 시각·실행 파일 identity를 검증하고, console root의 검증된 process handle을 `AttachConsole`과 control이 끝날 때까지 유지해 PID 재사용을 fail-closed합니다. suspended console의 identity-bound handle은 private state에 내구성 있게 기록한 뒤에만 실행을 재개합니다. Windows Codex adapter는 정확한 canonical workspace를 provider process의 inherited current directory로 유지하고, verbatim 경로를 거부하는 Codex에는 의미가 달라질 수 있는 정규화 경로를 `-C`로 다시 전달하지 않습니다. 호출 당시 터미널을 재감지하거나 복원된 front/current/selected surface를 채택하지 않습니다.
 - 새 세션의 `--model`, `--effort`, `--yolo`는 부모 CLI에서 추측하거나 상속하지 않습니다. 해당 `ask` 요청에 명시된 값만 사용합니다.
 - `reopen`은 원본 세션을 읽기 전용으로 검사하고, 원본의 turn-claim lock 아래에서 marker 하나만 기록해 동시 reopen 중 정확히 하나만 허용합니다. 원본의 tombstone·event·request는 바꾸지 않으며 원본 terminal handle을 재사용하지 않습니다. 새 세션의 launch 실패는 새 세션만 `failed`로 표시합니다. `reopen-conflict`와 `reopen-verification-failed`는 거기에 더해 새 surface만 `close-session`과 같은 경로로 닫고, 원본은 tombstone을 그대로 유지합니다. 새 세션이 만들어진 뒤 marker를 다시 풀어 주는 것은 launch 단계 gate 거부뿐이며, 그 세 지점은 spawn 직전 재검사, launch 뒤 등록 직후 검사, 첫 프롬프트 직전 검사이고 gate 이름은 `provider-unsupported`·`reopen-conflict`·`reopen-verification-failed`입니다. 대화에 아무것도 전달되지 않았기 때문입니다. 이후 `tell`의 거부와 일반적인 launch·전달 실패는 marker를 풀지 않습니다. 레지스트리 소유권 검사는 claim 전, spawn 직전, launch 뒤 등록 직후, 첫 프롬프트 직전, 매 `tell` 직전에 돌지만 provider가 대화의 배타적 점유를 제공하지 않으므로 동시 resume은 감지 대상이지 예방 대상이 아닙니다. 파싱되지 않거나 identity가 파일과 맞지 않는 레지스트리 기록은 파일 이름 PID가 죽어 있을 때만 무시합니다(fail-closed). 닫힌 원본 디렉터리로 늦게 도착한 hook은 아무것도 기록하지 않고, 이전 marker를 든 hook은 새 세션의 요청을 완료시키지 않습니다. `~/.claude/sessions` 옆의 `.key` 파일은 읽지 않습니다.
 - `--yolo`는 Codex의 `--dangerously-bypass-approvals-and-sandbox`, Claude와 Agy의 `--dangerously-skip-permissions`를 전달합니다. Pi에서는 해당 실행의 project-local files를 신뢰하는 `--approve`를 전달하며 Pi 자체 tool 정책은 유지합니다.
@@ -493,13 +493,19 @@ src/native/tests.rs            provider-neutral native orchestration 단위 테�
 
 기존 `{"iterm_session_id":"..."}` 형식의 `terminal.json`은 iTerm2 세션으로 계속 읽습니다. 새 세션은 terminal-neutral한 `terminal`, `session_id`, 선택적 `tab_id`·`window_id`와 내부 `managed_session_id` binding을 기록합니다. 가시적인 terminal title은 설정하거나 ownership record에 저장하지 않습니다. Terminal.app의 추가 owner attestation은 target `native-session`이 별도 private record에 기록합니다.
 
-## 0.0.8 개발: workspace trust 선행 보호
+## Workspace trust 초기 입력 보호
 
 [#28](https://github.com/jy1655/agent-bridge/issues/28)의 첫 변경으로, native Windows의 Pi 초기 입력은 공식 `session_start`의 `reason: "startup"` 영수증을 기다립니다. 이 이벤트는 Pi의 project trust 결정 뒤에 발생하므로, 신뢰 대화상자가 열린 동안 초기 프롬프트나 Enter를 보내지 않습니다. 현재 초기 turn의 claim과 일치하는 영수증만 인정하며, 전체 `ask --timeout-secs` 예산 안에서 기다립니다. 기한이 끝나면 입력을 보내지 않은 실패로 보고합니다. 사용자가 관리 터미널에서 신뢰 질문을 처리한 뒤 해당 Bridge 세션을 닫고 새 `ask`로 다시 시작할 수 있습니다.
 
 이 영수증은 trust **절차의 종료**만 뜻합니다. 사용자가 신뢰를 거절해도 Pi는 보호된 리소스를 제외하고 시작할 수 있으므로, 영수증을 다른 provider의 승인 근거로 쓰지 않습니다. Bridge는 `project_trust`의 결정을 반환하거나 Pi trust store를 수정하지 않습니다. 명시적 `--yolo`의 기존 Pi `--approve` 매핑은 그대로 적용됩니다.
 
-공용 consent 기록, provider 간 trust 공유, Codex·Agy의 Windows 초기 입력 보호는 #28의 후속 작업입니다. macOS는 기존 인자 전달 경로를 사용합니다. 이 변경은 게시된 0.0.7에 포함되지 않았으며 native Windows의 인증된 CLI·신뢰 대화상자 LIVE는 별도 검증 항목입니다.
+공용 consent 기록, provider 간 trust 공유, Codex·Agy의 Windows 초기 입력 보호는 #28의 후속 작업입니다. macOS는 기존 인자 전달 경로를 사용합니다. 이 초기 입력 보호는 0.0.8에 포함되며 native Windows의 인증된 CLI·신뢰 대화상자 LIVE는 별도 검증 항목입니다.
+
+## 0.0.8 업데이트
+
+0.0.8은 terminal이 명령을 받았지만 provider가 시작되지 않은 채 `launching`에 머무는 실패를 처리합니다. `ask --detach`도 최대 30초(전체 timeout 이내) 동안 스폰을 확인하고, 시작 전 실패는 `failed`와 원인을 남기며 해당 claim을 해제합니다. 늦은 wrapper 실행은 차단하고 이미 실행됐을 가능성이 있으면 claim을 유지합니다. `launch.log`와 읽기 전용 launch/surface 진단을 추가하고, 긴 bootstrap 명령은 private script에서 실행해 provider TTY를 유지합니다.
+
+Pi Windows의 초기 paste는 provider의 startup receipt 뒤에만 허용합니다. provider 간 workspace trust 공유 전체는 아직 구현 중입니다. 공식 테스트는 순차 실행하며, 검증된 main CI artifact를 사용하는 [수동 릴리스 절차](docs/releasing.md)를 공식 대안으로 제공합니다. Agy macOS follow-up receipt 문제 [#48](https://github.com/jy1655/agent-bridge/issues/48)은 별도 조사 중입니다. 변경과 검증 경계는 [0.0.8 릴리스 노트](docs/releases/0.0.8.md)에 있습니다.
 
 ## 0.0.7 업데이트
 
