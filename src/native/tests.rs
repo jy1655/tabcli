@@ -2038,15 +2038,9 @@ fn bridge_shell_command_quotes_the_workspace_and_executable() {
     )
     .unwrap();
     #[cfg(unix)]
-    assert_eq!(
-        command,
-        "cd '/tmp/project; touch nope' && AGENT_BRIDGE_NATIVE_STATE_DIR='/tmp/state root' '/tmp/Agent Bridge/bin' native-session 'session-safe123'; bridge_status=$?; exit \"$bridge_status\""
-    );
+    assert!(command.contains("cd '/tmp/project; touch nope' && AGENT_BRIDGE_LAUNCH_STDERR_FD=3 AGENT_BRIDGE_LAUNCH_STDOUT_FD=4 AGENT_BRIDGE_NATIVE_STATE_DIR='/tmp/state root' '/tmp/Agent Bridge/bin' native-session 'session-safe123'"));
     #[cfg(windows)]
-    assert_eq!(
-        command,
-        "Set-Location -LiteralPath '/tmp/project; touch nope' -ErrorAction Stop; $env:AGENT_BRIDGE_NATIVE_STATE_DIR = '/tmp/state root'; & '/tmp/Agent Bridge/bin' native-session 'session-safe123'; exit $LASTEXITCODE"
-    );
+    assert!(command.contains("Set-Location -LiteralPath '/tmp/project; touch nope' -ErrorAction Stop; $env:AGENT_BRIDGE_NATIVE_STATE_DIR = '/tmp/state root'; & '/tmp/Agent Bridge/bin' native-session 'session-safe123'"));
 }
 
 #[test]
@@ -2060,9 +2054,9 @@ fn managed_shell_exits_after_the_native_session_instead_of_accepting_late_input(
     .unwrap();
 
     #[cfg(unix)]
-    assert!(command.ends_with("bridge_status=$?; exit \"$bridge_status\""));
+    assert!(command.ends_with("exit \"$bridge_status\""));
     #[cfg(windows)]
-    assert!(command.ends_with("exit $LASTEXITCODE"));
+    assert!(command.ends_with("exit $bridgeStatus"));
 }
 
 #[cfg(windows)]
@@ -3156,6 +3150,7 @@ fn native_session_executes_the_provider_with_policy_and_provenance() {
     )
     .unwrap();
 
+    update_status(&directory, "launching", None, None).unwrap();
     let claim = acquire_turn_claim(&directory).unwrap();
     claim.retain();
     let result = run_session_inner(&directory);
@@ -3224,6 +3219,7 @@ fn claude_session_forwards_requested_model() {
     .unwrap();
     write_private(&directory.join("initial-prompt.txt"), b"claude prompt").unwrap();
 
+    update_status(&directory, "launching", None, None).unwrap();
     let claim = acquire_turn_claim(&directory).unwrap();
     claim.retain();
     let result = run_session_inner(&directory);
@@ -3276,6 +3272,7 @@ fn agy_session_uses_interactive_prompt_model_log_and_explicit_yolo() {
     .unwrap();
     write_private(&directory.join("initial-prompt.txt"), b"agy prompt").unwrap();
 
+    update_status(&directory, "launching", None, None).unwrap();
     let claim = acquire_turn_claim(&directory).unwrap();
     claim.retain();
     let result = run_session_inner(&directory);
@@ -3329,6 +3326,7 @@ fn pi_session_loads_the_result_extension_and_explicit_project_approval() {
     .unwrap();
     write_private(&directory.join("initial-prompt.txt"), b"pi prompt").unwrap();
 
+    update_status(&directory, "launching", None, None).unwrap();
     let claim = acquire_turn_claim(&directory).unwrap();
     claim.retain();
     let result = run_session_inner(&directory);

@@ -101,6 +101,31 @@ pub(super) fn verify_surface(
     }
 }
 
+pub(super) fn surface_present(session: &TerminalSession, timeout: Duration) -> Result<bool> {
+    let (label, script, args) = match session.kind {
+        TerminalKind::Iterm2 => ("iTerm2", iterm2::PRESENCE_SCRIPT, vec![session.id.as_str()]),
+        TerminalKind::AppleTerminal => (
+            "Terminal.app",
+            apple_terminal::VERIFY_TAB_SCRIPT,
+            vec![
+                session.id.as_str(),
+                session
+                    .window_id
+                    .as_deref()
+                    .context("Terminal.app window id is missing")?,
+            ],
+        ),
+        _ => bail!("terminal presence probe is unsupported for this host"),
+    };
+    let response = applescript::run_until(label, script, &args, timeout_deadline(timeout)?)?;
+    match response.as_str() {
+        "missing" => Ok(false),
+        "present" => Ok(true),
+        tty if session.kind == TerminalKind::AppleTerminal && tty == session.id => Ok(true),
+        _ => bail!("unexpected terminal presence response: {response:?}"),
+    }
+}
+
 pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
     match session.kind {
         TerminalKind::Iterm2 => iterm2::close_session(session),

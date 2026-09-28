@@ -115,6 +115,7 @@ pub(super) struct Snapshot {
     paths: Vec<PathBuf>,
     pub(super) claim: Option<String>,
     pub(super) pending: Option<PendingTurnCompletion>,
+    pub(super) launch: Option<launch::Record>,
     /// The publication predicate's bounded read of the journal's event file, when a journal
     /// exists and the snapshot performed the read (see `published` and
     /// [`PublicationRead`]); a search defers it to the event's scan position and keeps
@@ -212,7 +213,12 @@ impl Snapshot {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error).context("failed to observe native lifecycle lock"),
         };
-        let state_files = ["status.json", TURN_CLAIM_FILE, TURN_COMPLETION_FILE];
+        let state_files = [
+            "status.json",
+            TURN_CLAIM_FILE,
+            TURN_COMPLETION_FILE,
+            launch::FILE,
+        ];
         let before = state_files
             .map(|name| read_regular_text_if_present(&directory.join(name)))
             .into_iter()
@@ -255,6 +261,7 @@ impl Snapshot {
             paths: event_paths(directory)?,
             claim: before[1].as_deref().map(|text| text.trim().to_owned()),
             pending,
+            launch: launch::read(directory)?,
             pending_event,
             _lock: lock,
         };
@@ -345,6 +352,15 @@ impl Snapshot {
         {
             bail!("no such recorded event: {}", name.unwrap_or_default())
         }
+        let launch_failure = receipt
+            .filter(|r| {
+                self.launch
+                    .as_ref()
+                    .is_some_and(|l| l.claim_token == r.claim_token)
+            })
+            .and_then(|_| {
+                launch::diagnostic(self.launch.as_ref(), &self.status, self.claim.as_deref())
+            });
         let state = if let Some(event) = &event {
             if event.error.is_some() {
                 "failed"
@@ -355,6 +371,12 @@ impl Snapshot {
             .is_some_and(|name| self.pending.as_ref().is_some_and(|p| p.event_file == name))
         {
             "recovery_required"
+        } else if launch_failure.is_some() {
+            if self.status.state == "failed" {
+                "failed"
+            } else {
+                "unresolved"
+            }
         } else if receipt.is_some_and(|r| self.claim.as_deref() == Some(&r.claim_token)) {
             "pending"
         } else if receipt.is_some() {
@@ -369,7 +391,8 @@ impl Snapshot {
             "context_sources": receipt.map(|r| r.context_sources.as_slice()).unwrap_or_default(),
             "request_state": state, "session_state": self.status.state,
             "result": event.as_ref().map(|e| &e.message),
-            "error": event.as_ref().and_then(|e| e.error.as_ref()),
+            "error": event.as_ref().and_then(|e| e.error.as_ref()).or_else(||
+                if event.is_none() { launch_failure.as_ref().map(|(_, detail)| detail) } else { None }),
             "session_error": self.status.error,
             "provider_session_id": event.as_ref().and_then(|e| e.provider_session_id.as_ref()),
             "turn_id": event.as_ref().and_then(|e| e.turn_id.as_ref()),

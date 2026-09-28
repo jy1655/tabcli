@@ -100,6 +100,23 @@ on run argv
 end run
 "#;
 
+pub(in crate::native) const PRESENCE_SCRIPT: &str = r#"
+on run argv
+    if application "iTerm2" is not running then return "missing"
+    set wantedId to item 1 of argv
+    tell application "iTerm2"
+        repeat with targetWindow in windows
+            repeat with targetTab in tabs of targetWindow
+                repeat with targetSession in sessions of targetTab
+                    if unique ID of targetSession is wantedId then return "present"
+                end repeat
+            end repeat
+        end repeat
+    end tell
+    return "missing"
+end run
+"#;
+
 pub(in crate::native) const CLOSE_SESSION_SCRIPT: &str = r#"
 on run argv
     set wantedId to item 1 of argv
