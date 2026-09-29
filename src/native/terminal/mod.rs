@@ -322,6 +322,48 @@ pub(super) fn send_file(
     }
 }
 
+// Transport-neutral keys for an exact, unchanged managed dialog. Providers own
+// recognition and authorization; the terminal only compares the captured screen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub(super) enum DialogKey {
+    Enter,
+    DownEnter,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(super) struct GuardedDialogInput {
+    pub(super) screen: String,
+    pub(super) key: DialogKey,
+}
+
+pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Result<String> {
+    #[cfg(target_os = "macos")]
+    return macos::read_screen(session, deadline);
+    #[cfg(windows)]
+    return windows::read_screen(session, deadline);
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (session, deadline);
+        bail!("managed screen reads unsupported on this platform");
+    }
+}
+
+pub(super) fn guarded_dialog_input(
+    session: &TerminalSession,
+    input: &GuardedDialogInput,
+    deadline: Instant,
+) -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    return macos::guarded_dialog_input(session, input, deadline);
+    #[cfg(windows)]
+    return windows::guarded_dialog_input(session, input, deadline);
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (session, input, deadline);
+        bail!("managed dialog input unsupported on this platform");
+    }
+}
+
 #[cfg(any(windows, test))]
 pub(super) fn remaining_send_budget_at(
     deadline: Instant,

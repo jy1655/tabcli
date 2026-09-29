@@ -35,6 +35,7 @@ Usage:
       [--limit N] [--json]
   agent-bridge doctor <session> [--probe] [--json]
   agent-bridge doctor --provider <codex|claude|agy|pi> [--probe] [--json]
+  agent-bridge consent <inspect|revoke|reset> PATH [--json]
   agent-bridge prune-sessions --closed-before-days N --explicit [--json]
   agent-bridge close-session <session> --explicit [--json]
   agent-bridge --help | --version

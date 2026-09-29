@@ -80,6 +80,57 @@ impl PendingCodexTurn {
 const CODEX_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Codex reopen is not implemented in this slice; it requires the thread writer-lock and queued_items gates and a live check of resume-while-held behavior";
 
 impl NativeProviderAdapter for CodexAdapter {
+    fn workspace_trust_key(&self, _screen: &str, _workspace: &Path) -> Option<terminal::DialogKey> {
+        None
+    }
+    fn workspace_trust(
+        &self,
+        workspace: &Path,
+        homes: &super::super::consent::Homes,
+    ) -> Result<super::super::consent::Trust> {
+        use super::super::consent::{self, Evidence, Trust};
+        let Some(text) = consent::read_store(&homes.codex)? else {
+            return Ok(Trust::Absent);
+        };
+        let config: toml::Value = text.parse().context("invalid Codex trust config")?;
+        let mut key = consent::native_key(workspace)?;
+        if cfg!(windows) {
+            key = key.to_lowercase();
+        }
+        let Some(projects) = config.get("projects") else {
+            return Ok(Trust::Absent);
+        };
+        let projects = projects
+            .as_table()
+            .context("Codex projects is not a table")?;
+        let entry = projects.get(&key).or_else(|| {
+            if cfg!(windows) {
+                projects
+                    .iter()
+                    .find(|(k, _)| k.to_lowercase() == key)
+                    .map(|(_, v)| v)
+            } else {
+                None
+            }
+        });
+        let entry = entry
+            .map(|v| {
+                v.as_table()
+                    .context("Codex project trust entry is not a table")
+            })
+            .transpose()?;
+        match entry.and_then(|v| v.get("trust_level")) {
+            None => Ok(Trust::Absent),
+            Some(v) if v.as_str() == Some("trusted") => Ok(Trust::Trusted(Evidence {
+                provider: "codex".into(),
+                store: homes.codex.clone(),
+                key,
+            })),
+            Some(v) if v.as_str() == Some("untrusted") => Ok(Trust::Declined),
+            _ => bail!("unknown Codex trust level"),
+        }
+    }
+
     fn probe_environment_removals(&self) -> &'static [&'static str] {
         // Codex derives no session identity from the caller's environment.
         &[]
@@ -96,13 +147,25 @@ impl NativeProviderAdapter for CodexAdapter {
         let claim_token = super::super::current_turn_claim_token(context.directory)?
             .context("Codex launch has no native turn claim")?;
         let pending = install_pending_turn(context.directory, &claim_token)?;
-        let arguments = codex_launch_arguments(
+        let mut arguments = codex_launch_arguments(
             context.bridge_executable,
             context.workspace,
             context.prompt,
             &pending,
             cfg!(windows),
         )?;
+        if super::super::consent::authorized(context.directory, FirstPartyCli::Codex)? {
+            // Official process-local TOML override; never edits config.toml or any
+            // approval/sandbox setting. Insert before the positional prompt.
+            arguments.splice(
+                0..0,
+                [
+                    OsString::from("-c"),
+                    OsString::from(workspace_trust_override(context.workspace)?),
+                ],
+            );
+            super::super::consent::applied(context.directory, "codex-config-override")?;
+        }
         Ok(LaunchPlan {
             arguments,
             prompt_is_positional: false,
@@ -147,6 +210,20 @@ impl NativeProviderAdapter for CodexAdapter {
         prompt_path: &Path,
         deadline: Instant,
     ) -> terminal::TerminalSendResult {
+        if cfg!(windows) {
+            let directory = session
+                .managed_session_id
+                .as_deref()
+                .context("Codex terminal has no managed session binding")
+                .and_then(super::super::session_directory)
+                .map_err(terminal::TerminalSendFailure::not_sent)?;
+            super::super::consent::wait_for_native_trust(
+                &directory,
+                FirstPartyCli::Codex,
+                deadline,
+            )
+            .map_err(terminal::TerminalSendFailure::not_sent)?;
+        }
         terminal::send_file(session, prompt_path, deadline)
     }
 
@@ -237,6 +314,20 @@ impl NativeProviderAdapter for CodexAdapter {
     fn cancel_terminal_follow_up(&self, directory: &Path, claim_token: &str) -> Result<()> {
         cancel_pending_turn(directory, claim_token)
     }
+}
+
+fn workspace_trust_override(workspace: &Path) -> Result<String> {
+    let mut key = super::super::consent::native_key(workspace)?;
+    if cfg!(windows) {
+        key = key.to_lowercase();
+    }
+    // Codex config/src/overrides.rs splits the left side on every dot and does
+    // not parse quoted TOML keys. Put the path in the TOML VALUE instead: quoted
+    // dotted keys on the left create a different project and leave the dialog up.
+    Ok(format!(
+        "projects={{{}={{trust_level=\"trusted\"}}}}",
+        serde_json::to_string(&key)?
+    ))
 }
 
 fn codex_launch_arguments(
@@ -889,6 +980,68 @@ fn established_codex_thread(directory: &Path) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workspace_trust_override_uses_a_toml_value_for_paths_with_dots_and_quotes() {
+        for workspace in [
+            Path::new("/work/space.dir/a\"b"),
+            Path::new("C:\\Work\\한글.dir"),
+        ] {
+            let argument = workspace_trust_override(workspace).unwrap();
+            let (key, value) = argument.split_once('=').unwrap();
+            // The installed Codex splits this side with str::split('.'), without
+            // TOML quoted-key parsing. It must therefore contain only 'projects'.
+            assert_eq!(key, "projects");
+            let parsed: toml::Value = format!("value={value}").parse().unwrap();
+            let mut workspace_key = super::super::super::consent::native_key(workspace).unwrap();
+            if cfg!(windows) {
+                workspace_key = workspace_key.to_lowercase();
+            }
+            assert_eq!(
+                parsed["value"][&workspace_key]["trust_level"].as_str(),
+                Some("trusted")
+            );
+            assert_eq!(parsed["value"].as_table().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn workspace_trust_reads_exact_toml_key_and_no_permission_override() {
+        use super::super::super::consent::{self, Trust};
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().canonicalize().unwrap();
+        let homes = consent::fixture_homes(tmp.path());
+        let mut key = consent::native_key(&workspace).unwrap();
+        if cfg!(windows) {
+            key = key.to_lowercase();
+        }
+        let config = format!(
+            "[projects.{}]\ntrust_level = \"trusted\"\n",
+            serde_json::to_string(&key).unwrap()
+        );
+        std::fs::write(&homes.codex, config.as_bytes()).unwrap();
+        assert!(matches!(
+            ADAPTER.workspace_trust(&workspace, &homes).unwrap(),
+            Trust::Trusted(_)
+        ));
+        assert_eq!(
+            ADAPTER
+                .workspace_trust(&workspace.join("child"), &homes)
+                .unwrap(),
+            Trust::Absent
+        );
+        std::fs::write(
+            &homes.codex,
+            config.replace("trusted", "untrusted").as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            ADAPTER.workspace_trust(&workspace, &homes).unwrap(),
+            Trust::Declined
+        );
+        std::fs::write(&homes.codex, b"[bad").unwrap();
+        assert!(ADAPTER.workspace_trust(&workspace, &homes).is_err());
+    }
+
     #[test]
     fn diagnostics_keep_launch_version_and_unprobed_daemon_gates_explicit() {
         use super::super::super::doctor::{Availability, Context};

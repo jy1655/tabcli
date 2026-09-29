@@ -255,6 +255,59 @@ pub(super) fn send_file(
     run_console_send_helper(session, prompt_path, deadline)
 }
 
+pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Result<String> {
+    let mut command = console_helper_command("screen", session, None)?;
+    let output =
+        super::super::command_output_until(&mut command, deadline, "managed console screen")?;
+    if !output.status.success() {
+        bail!("{}", console_helper_failure_message(&output));
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+pub(super) fn guarded_dialog_input(
+    session: &TerminalSession,
+    input: &super::GuardedDialogInput,
+    deadline: Instant,
+) -> Result<bool> {
+    use std::io::Write;
+    let directory = super::super::session_directory(
+        session
+            .managed_session_id
+            .as_deref()
+            .context("missing managed session identity")?,
+    )?;
+    let mut file = tempfile::Builder::new()
+        .prefix("pending-prompt-")
+        .suffix(".txt")
+        .tempfile_in(directory)?;
+    super::super::set_private_file_permissions(file.as_file())?;
+    file.write_all(&serde_json::to_vec(input)?)?;
+    file.flush()?;
+    let mut command = console_helper_command(
+        "dialog",
+        session,
+        Some(file.path().to_str().context("dialog path is not UTF-8")?),
+    )?;
+    command.arg(
+        deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .max(1)
+            .to_string(),
+    );
+    let output =
+        super::super::command_output_until(&mut command, deadline, "managed console dialog input")?;
+    if !output.status.success() {
+        bail!("{}", console_helper_failure_message(&output));
+    }
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "sent" => Ok(true),
+        "changed" => Ok(false),
+        _ => bail!("unexpected managed console dialog result"),
+    }
+}
+
 pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
     match run_console_helper("close", session, None) {
         Ok(()) => Ok(CloseOutcome::Closed),
@@ -374,6 +427,21 @@ pub(super) fn console_control(
     let close_requested = action == "close";
     let mut console_processes = Vec::new();
     let result = match action {
+        "screen" => {
+            println!("{}", serde_json::to_string(&attached_screen()?)?);
+            Ok(())
+        }
+        "dialog" => {
+            let path = input_path.context("dialog requires an input record")?;
+            let input: super::GuardedDialogInput = serde_json::from_slice(&std::fs::read(path)?)?;
+            if input.screen != attached_screen()? {
+                println!("changed");
+            } else {
+                write_dialog_key(input.key)?;
+                println!("sent");
+            }
+            Ok(())
+        }
         "send" => {
             let timeout = timeout.context("send requires a console-control timeout")?;
             if !super::windows_console_submit_delays_fit(submit_count, timeout) {
@@ -413,6 +481,104 @@ pub(super) fn console_control(
     } else {
         Ok(())
     }
+}
+
+fn attached_screen() -> Result<String> {
+    use windows_sys::Win32::{
+        Foundation::GENERIC_READ,
+        System::Console::{
+            CONSOLE_SCREEN_BUFFER_INFO, COORD, GetConsoleScreenBufferInfo,
+            ReadConsoleOutputCharacterW,
+        },
+    };
+    let name: Vec<u16> = "CONOUT$".encode_utf16().chain(Some(0)).collect();
+    let raw = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
+    if unsafe { GetConsoleScreenBufferInfo(handle.as_raw_handle(), &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let width = i32::from(info.srWindow.Right) - i32::from(info.srWindow.Left) + 1;
+    let height = i32::from(info.srWindow.Bottom) - i32::from(info.srWindow.Top) + 1;
+    if width <= 0 || height <= 0 || width * height > 131072 {
+        bail!("invalid managed console screen dimensions");
+    }
+    let mut text = String::new();
+    for y in info.srWindow.Top..=info.srWindow.Bottom {
+        let mut line = vec![0u16; width as usize];
+        let mut read = 0;
+        if unsafe {
+            ReadConsoleOutputCharacterW(
+                handle.as_raw_handle(),
+                line.as_mut_ptr(),
+                width as u32,
+                COORD {
+                    X: info.srWindow.Left,
+                    Y: y,
+                },
+                &mut read,
+            )
+        } == 0
+            || read != width as u32
+        {
+            bail!("could not read the entire managed console screen");
+        }
+        text.push_str(&String::from_utf16(&line)?);
+        text.push('\n');
+    }
+    Ok(text)
+}
+
+fn write_dialog_key(key: super::DialogKey) -> Result<()> {
+    let name: Vec<u16> = "CONIN$".encode_utf16().chain(Some(0)).collect();
+    let raw = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut records = Vec::new();
+    if key == super::DialogKey::DownEnter {
+        for key_down in [1, 0] {
+            records.push(INPUT_RECORD {
+                EventType: KEY_EVENT as u16,
+                Event: windows_sys::Win32::System::Console::INPUT_RECORD_0 {
+                    KeyEvent: KEY_EVENT_RECORD {
+                        bKeyDown: key_down,
+                        wRepeatCount: 1,
+                        wVirtualKeyCode: 0x28,
+                        wVirtualScanCode: 0x50,
+                        uChar: KEY_EVENT_RECORD_0 { UnicodeChar: 0 },
+                        dwControlKeyState: 0,
+                    },
+                },
+            });
+        }
+    }
+    records.extend(build_console_input_records("", 1));
+    write_input_records(handle.as_raw_handle(), &records)
 }
 
 struct ConsoleProcess {

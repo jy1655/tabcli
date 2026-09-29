@@ -214,6 +214,53 @@ enum MessageGuardDecision {
 }
 
 impl NativeProviderAdapter for ClaudeAdapter {
+    fn workspace_trust_key(&self, screen: &str, workspace: &Path) -> Option<terminal::DialogKey> {
+        claude_trust_prompt_key(screen, workspace)
+    }
+    fn workspace_trust(
+        &self,
+        workspace: &Path,
+        homes: &super::super::consent::Homes,
+    ) -> Result<super::super::consent::Trust> {
+        use super::super::consent::{self, Evidence, Trust};
+        require_exact_claude_trust_scope(workspace)?;
+        let Some(text) = consent::read_store(&homes.claude)? else {
+            return Ok(Trust::Absent);
+        };
+        let config: serde_json::Value = serde_json::from_str(&text)?;
+        let config = config
+            .as_object()
+            .context("Claude config is not an object")?;
+        let Some(projects) = config.get("projects") else {
+            return Ok(Trust::Absent);
+        };
+        let projects = projects
+            .as_object()
+            .context("Claude projects is not an object")?;
+        let native = consent::native_key(workspace)?;
+        let key = if cfg!(windows) {
+            native.replace('\\', "/")
+        } else {
+            native.clone()
+        };
+        let entry = projects.get(&key).or_else(|| projects.get(&native));
+        let entry = entry
+            .map(|v| {
+                v.as_object()
+                    .context("Claude project trust entry is not an object")
+            })
+            .transpose()?;
+        match entry.and_then(|v| v.get("hasTrustDialogAccepted")) {
+            Some(serde_json::Value::Bool(true)) => Ok(Trust::Trusted(Evidence {
+                provider: "claude".into(),
+                store: homes.claude.clone(),
+                key,
+            })),
+            Some(serde_json::Value::Bool(false)) | None => Ok(Trust::Absent),
+            _ => bail!("unknown Claude workspace trust value"),
+        }
+    }
+
     fn probe_environment_removals(&self) -> &'static [&'static str] {
         // A `claude --version` or doctor probe is not an interactive session, but it is
         // still a `claude` started by the bridge: it drops the same markers so that no
@@ -427,6 +474,85 @@ impl NativeProviderAdapter for ClaudeAdapter {
     fn cancel_terminal_follow_up(&self, _directory: &Path, _claim_token: &str) -> Result<()> {
         bail!("Claude follow-up prompts use cross-session messaging")
     }
+}
+
+// Claude exposes no documented process-local trust switch. Use only its exact
+// startup workspace dialog; no config write, permission dialog, or generic Enter
+// fallback. Delete when Claude ships an official trust launch option.
+fn claude_trust_prompt_key(screen: &str, workspace: &Path) -> Option<terminal::DialogKey> {
+    require_exact_claude_trust_scope(workspace).ok()?;
+    let lines: Vec<_> = screen
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let start = lines.iter().rposition(|s| *s == "Accessing workspace:")?;
+    let lines = &lines[start..];
+    let key = super::super::consent::native_key(workspace).ok()?;
+    let key = if cfg!(windows) {
+        key.replace('\\', "/")
+    } else {
+        key
+    };
+    if lines.len() < 8 || lines[1] != key || *lines.last()? != "Enter to confirm · Esc to cancel" {
+        return None;
+    }
+    let guide = lines.iter().position(|s| *s == "Security guide")?;
+    if guide < 4
+        || guide + 4 != lines.len()
+        || lines[guide - 1] != "Claude Code'll be able to read, edit, and execute files here."
+    {
+        return None;
+    }
+    let safety = lines[2..guide - 1].join(" ");
+    if safety
+        != "Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this folder first."
+    {
+        return None;
+    }
+    match (lines[guide + 1], lines[guide + 2]) {
+        ("❯ No, exit", "Yes, I trust this folder") => Some(terminal::DialogKey::DownEnter),
+        ("No, exit", "❯ Yes, I trust this folder") => Some(terminal::DialogKey::Enter),
+        _ => None,
+    }
+}
+
+fn require_exact_claude_trust_scope(workspace: &Path) -> Result<()> {
+    // LIVE: Claude 2.1.284 displays a repository subdirectory but saves approval
+    // at the Git root. Do not expand an exact child consent to that ancestor.
+    // Git resolves nested repositories and worktree .git files itself. A failed
+    // lookup leaves Claude's own dialog untouched rather than guessing its scope.
+    let mut has_git_ancestor = false;
+    for parent in workspace.ancestors().skip(1) {
+        if parent.join(".git").try_exists()? {
+            has_git_ancestor = true;
+            break;
+        }
+    }
+    if !has_git_ancestor {
+        return Ok(());
+    }
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(super::super::consent::native_key(workspace)?)
+        .args(["rev-parse", "--show-toplevel"]);
+    let output = super::super::command_output_until(
+        &mut command,
+        Instant::now() + Duration::from_secs(2),
+        "Claude workspace trust scope",
+    )?;
+    if !output.status.success() {
+        bail!("cannot verify Claude's Git workspace trust scope; use its own trust dialog");
+    }
+    let root = PathBuf::from(std::str::from_utf8(&output.stdout)?.trim_end_matches(['\r', '\n']))
+        .canonicalize()?;
+    if root != workspace {
+        bail!(
+            "Claude would approve the parent Git repository, not this exact workspace; use its own trust dialog"
+        );
+    }
+    Ok(())
 }
 
 fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Result<LaunchPlan> {
@@ -1991,6 +2117,90 @@ pub(super) fn hook_settings(executable: &Path) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workspace_trust_and_dialog_require_the_exact_workspace() {
+        use super::super::super::consent::{self, Trust};
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().canonicalize().unwrap();
+        let homes = consent::fixture_homes(tmp.path());
+        let native = consent::native_key(&workspace).unwrap();
+        let key = if cfg!(windows) {
+            native.replace('\\', "/")
+        } else {
+            native
+        };
+        super::super::super::write_json_atomic(
+            &homes.claude,
+            &serde_json::json!({"projects":{key.clone():{"hasTrustDialogAccepted":true}}}),
+        )
+        .unwrap();
+        assert!(matches!(
+            ADAPTER.workspace_trust(&workspace, &homes).unwrap(),
+            Trust::Trusted(_)
+        ));
+        assert_eq!(
+            ADAPTER
+                .workspace_trust(&workspace.join("child"), &homes)
+                .unwrap(),
+            Trust::Absent
+        );
+        let screen = format!(
+            "Accessing workspace:\n{key}\nQuick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this folder first.\nClaude Code'll be able to read, edit, and execute files here.\nSecurity guide\n❯ No, exit\nYes, I trust this folder\nEnter to confirm · Esc to cancel"
+        );
+        assert_eq!(
+            claude_trust_prompt_key(&screen, &workspace),
+            Some(terminal::DialogKey::DownEnter)
+        );
+        assert_eq!(
+            claude_trust_prompt_key(&screen, &workspace.join("child")),
+            None
+        );
+        assert_eq!(
+            claude_trust_prompt_key(&(screen.clone() + "\nAllow Bash?"), &workspace),
+            None
+        );
+        // Claude 2.1.284 shows cwd but persists this dialog's decision at the
+        // Git root. An exact child consent must never approve the parent repo.
+        let child = workspace.join("child");
+        std::fs::create_dir(&child).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(&workspace)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let child_key = consent::native_key(&child).unwrap();
+        let child_key = if cfg!(windows) {
+            child_key.replace('\\', "/")
+        } else {
+            child_key
+        };
+        let child_screen = screen.replace(&key, &child_key);
+        assert_eq!(claude_trust_prompt_key(&child_screen, &child), None);
+        assert!(ADAPTER.workspace_trust(&child, &homes).is_err());
+        assert!(matches!(
+            ADAPTER.workspace_trust(&workspace, &homes).unwrap(),
+            Trust::Trusted(_)
+        ));
+        // A nested repository owns a distinct, exact approval scope.
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(&child)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(
+            claude_trust_prompt_key(&child_screen, &child),
+            Some(terminal::DialogKey::DownEnter)
+        );
+        std::fs::write(&homes.claude, b"{\"projects\":[]}").unwrap();
+        assert!(ADAPTER.workspace_trust(&workspace, &homes).is_err());
+    }
+
     use super::*;
 
     #[test]

@@ -499,7 +499,31 @@ src/native/tests.rs            provider-neutral native orchestration 단위 테�
 
 이 영수증은 trust **절차의 종료**만 뜻합니다. 사용자가 신뢰를 거절해도 Pi는 보호된 리소스를 제외하고 시작할 수 있으므로, 영수증을 다른 provider의 승인 근거로 쓰지 않습니다. Bridge는 `project_trust`의 결정을 반환하거나 Pi trust store를 수정하지 않습니다. 명시적 `--yolo`의 기존 Pi `--approve` 매핑은 그대로 적용됩니다.
 
-공용 consent 기록, provider 간 trust 공유, Codex·Agy의 Windows 초기 입력 보호는 #28의 후속 작업입니다. macOS는 기존 인자 전달 경로를 사용합니다. 이 초기 입력 보호는 0.0.8에 포함되며 native Windows의 인증된 CLI·신뢰 대화상자 LIVE는 별도 검증 항목입니다.
+0.0.8에는 Pi의 초기 입력 보호가 포함되며, 공용 consent 기록, provider 간 trust 공유, Codex·Agy의 Windows 초기 입력 보호는 0.0.9 개발 변경입니다. macOS는 기존 인자 전달 경로를 사용합니다. native Windows의 인증된 CLI·신뢰 대화상자 LIVE는 별도 검증 항목입니다.
+
+## 0.0.9 개발 변경 (미출시)
+
+현재 개발 버전은 0.0.9이며 설치 가능한 최신 릴리스는 위의 0.0.8입니다. 이번 작업은 commit·push까지이며 새 tag나 Release를 게시하지 않습니다.
+
+### 정확한 workspace의 신뢰 공유
+
+`ask`는 Codex·Claude·Agy·Pi가 저장한 **정확히 같은 workspace**의 승인을 읽고 canonical directory identity와 함께 private `workspace-consent` 기록에 연결합니다. 기본 위치는 `~/.agent-bridge/native-sessions/workspace-consent`이며 `AGENT_BRIDGE_NATIVE_STATE_DIR`로 격리할 수 있습니다. 처음 보는 workspace는 provider의 원래 확인 절차를 사용합니다. parent·child 경로, symlink alias, 교체된 디렉터리, 변경된 owner는 기존 Bridge 승인을 상속하지 않습니다.
+
+Codex는 공식 `-c`에 exact workspace를 키로 갖는 `projects` TOML 값을 전달하고, Pi는 공식 1회용 `--approve`를 사용합니다. Claude·Agy는 공식 세션별 trust 설정이 없어, Bridge가 만든 terminal의 정확한 workspace trust 화면과 선택지를 확인하고 화면이 그대로일 때 한 번만 응답합니다. Claude/Agy 전역 JSON은 Bridge가 직접 쓰지 않으며 provider가 자기 승인을 기록합니다. 알 수 없는 화면이나 변경된 선택지에는 응답하지 않습니다. 이 fallback은 provider가 공식 trust launch option을 제공하면 교체합니다.
+
+Claude는 Git 저장소의 하위 폴더에서 승인해도 Git root의 승인을 저장할 수 있습니다. Bridge는 이 경우 하위 폴더의 consent로 부모 저장소를 자동 승인하지 않으며 Claude의 수동 확인을 유지합니다. 독립 workspace와 정확한 Git root에서만 이 fallback을 적용합니다.
+
+`--yolo`, sandbox, 도구·네트워크·credential·MCP 승인 등은 공유하지 않습니다. `--yolo`의 기존 명시적 provider 매핑은 그대로입니다. `inspect <session> --json`의 `workspace_consent`와 `doctor`에서 승인 출처·적용 방법을 확인할 수 있습니다. Codex·Agy Windows 초기 paste도 workspace trust 근거 전에는 보내지 않습니다. Pi의 startup receipt는 여전히 readiness이며 consent가 아닙니다.
+
+```sh
+agent-bridge consent inspect /canonical/workspace --json
+agent-bridge consent revoke /canonical/workspace --json
+agent-bridge consent reset /canonical/workspace --json
+```
+
+`revoke`는 Bridge의 자동 공유를 중단하며 provider가 보유한 trust를 삭제하지 않습니다. 원래 승인 출처를 초기화하거나 읽을 수 없게 되면 다른 provider로 조용히 갈아타지 않습니다. 원래 provider에서 다시 승인하거나, `reset` 후 다음 `ask`에서 새 provider 근거를 확인할 수 있습니다. 교체된 디렉터리는 `reset` 전까지 공유를 재개하지 않습니다. 거부된 Codex/Pi trust나 읽을 수 없는 target store도 자동으로 덮어쓰지 않습니다.
+
+현재 검증 범위와 Agy #48 조사 결과는 [0.0.9 개발 노트](docs/releases/0.0.9.md)를 참조하세요. native Windows 인증 CLI LIVE는 macOS fixture·cross compile·CI와 별도입니다.
 
 ## 0.0.8 업데이트
 

@@ -29,6 +29,32 @@ pub(super) struct AgyAdapter;
 
 const PENDING_TURN_FILE: &str = "agy-pending-turn.json";
 
+// Agy 1.2.12 has no process-local workspace-trust flag. This adapter-only
+// fallback responds to its exact managed startup dialog, then verifies Agy's
+// own saved decision. Remove when Agy exposes an official trust input API.
+fn agy_trust_prompt_key(screen: &str, workspace: &Path) -> Option<terminal::DialogKey> {
+    let lines: Vec<_> = screen
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let start = lines.iter().rposition(|s| *s == "Accessing workspace:")?;
+    let lines = &lines[start..];
+    let key = super::super::consent::native_key(workspace).ok()?;
+    if lines.len() < 7
+        || lines[1] != key
+        || lines[2] != "Do you trust the contents of this project?"
+        || lines[3] != "Antigravity CLI requires permission to read, edit, and execute files here."
+        || lines[4] != "> Yes, I trust this folder"
+        || lines[5] != "No, exit"
+        || lines[6] != "↑/↓ Navigate · enter Confirm"
+        || lines[7..].iter().any(|s| !s.starts_with("Gemini "))
+    {
+        return None;
+    }
+    Some(terminal::DialogKey::Enter)
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct PendingAgyTurn {
     schema: u32,
@@ -54,6 +80,44 @@ impl PendingAgyTurn {
 const AGY_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Agy exposes no verifiable ownership evidence for a conversation (presence locks are not held by the running process) and its transcript monitor binds only to a newly created conversation";
 
 impl NativeProviderAdapter for AgyAdapter {
+    fn workspace_trust_key(&self, screen: &str, workspace: &Path) -> Option<terminal::DialogKey> {
+        agy_trust_prompt_key(screen, workspace)
+    }
+    fn workspace_trust(
+        &self,
+        workspace: &Path,
+        homes: &super::super::consent::Homes,
+    ) -> Result<super::super::consent::Trust> {
+        use super::super::consent::{self, Evidence, Trust};
+        let Some(text) = consent::read_store(&homes.agy)? else {
+            return Ok(Trust::Absent);
+        };
+        let config: serde_json::Value = serde_json::from_str(&text)?;
+        let config = config
+            .as_object()
+            .context("Agy settings is not an object")?;
+        let Some(entries) = config.get("trustedWorkspaces") else {
+            return Ok(Trust::Absent);
+        };
+        let entries = entries
+            .as_array()
+            .context("Agy trustedWorkspaces is not an array")?;
+        let key = consent::native_key(workspace)?;
+        let entries = entries
+            .iter()
+            .map(|v| v.as_str().context("unknown Agy trustedWorkspaces entry"))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(if entries.contains(&key.as_str()) {
+            Trust::Trusted(Evidence {
+                provider: "agy".into(),
+                store: homes.agy.clone(),
+                key,
+            })
+        } else {
+            Trust::Absent
+        })
+    }
+
     fn probe_environment_removals(&self) -> &'static [&'static str] {
         // Agy derives no session identity from the caller's environment.
         &[]
@@ -142,6 +206,10 @@ impl NativeProviderAdapter for AgyAdapter {
         deadline: Instant,
     ) -> terminal::TerminalSendResult {
         if cfg!(windows) {
+            let directory =
+                session_directory_of(session).map_err(terminal::TerminalSendFailure::not_sent)?;
+            super::super::consent::wait_for_native_trust(&directory, FirstPartyCli::Agy, deadline)
+                .map_err(terminal::TerminalSendFailure::not_sent)?;
             deliver_terminal_turn(
                 session,
                 prompt_path,
@@ -561,18 +629,66 @@ fn deliver_terminal_turn(
             .map_err(TerminalSendFailure::not_sent)?;
         follow_up_pre_paste_offset(log.as_deref()).map_err(TerminalSendFailure::not_sent)?
     };
-    terminal::send_file(session, prompt_path, deadline)?;
-    let pasted_at = Instant::now();
-    // The composer state after an unconfirmed paste is unknown; never paste again.
-    confirm_input_receipt_with(
-        &mut || read_log_bytes(&log_path),
+    trace_terminal_delivery(
+        &directory,
         &pending,
         pre_paste_len,
-        pasted_at,
-        deadline,
-        INPUT_RECEIPT_POLL_INTERVAL,
-        &mut SystemClock,
+        session.kind.as_str(),
+        || terminal::send_file(session, prompt_path, deadline),
+        || {
+            // The composer state after an unconfirmed paste is unknown; never paste again.
+            confirm_input_receipt_with(
+                &mut || read_log_bytes(&log_path),
+                &pending,
+                pre_paste_len,
+                Instant::now(),
+                deadline,
+                INPUT_RECEIPT_POLL_INTERVAL,
+                &mut SystemClock,
+            )
+        },
     )
+}
+
+// Request-scoped timing evidence for #48. A missing receipt alone cannot locate
+// the failure between terminal injection, a late reload, and Agy's input loop.
+// Record actual dispatch times and the offset used by the receipt check without
+// copying prompt text. Diagnostic write failures never cancel or retry delivery.
+fn trace_terminal_delivery<S, C>(
+    directory: &Path,
+    pending: &PendingAgyTurn,
+    pre_paste_len: usize,
+    terminal: &str,
+    send: S,
+    confirm: C,
+) -> terminal::TerminalSendResult
+where
+    S: FnOnce() -> terminal::TerminalSendResult,
+    C: FnOnce() -> terminal::TerminalSendResult,
+{
+    let path = directory.join(format!("agy-input-{}.json", pending.claim_token));
+    let mut trace = serde_json::json!({
+        "schema":1, "claim_token":pending.claim_token, "terminal":terminal,
+        "pre_paste_offset":pre_paste_len, "prepared_unix_ms":super::super::unix_ms(),
+        "outcome":"prepared", "paste_started_unix_ms":null,
+        "paste_returned_unix_ms":null, "receipt_finished_unix_ms":null, "error":null,
+    });
+    let _ = super::super::write_json_atomic(&path, &trace);
+    trace["paste_started_unix_ms"] = serde_json::json!(super::super::unix_ms());
+    let result = send();
+    trace["paste_returned_unix_ms"] = serde_json::json!(super::super::unix_ms());
+    let result = result.and_then(|()| confirm());
+    trace["receipt_finished_unix_ms"] = serde_json::json!(super::super::unix_ms());
+    trace["outcome"] = serde_json::json!(match &result {
+        Ok(()) => "confirmed",
+        Err(error) if error.delivery_may_have_occurred() => "delivery-uncertain",
+        Err(_) => "not-sent",
+    });
+    if let Err(error) = &result {
+        trace["error"] = serde_json::json!(error.error().to_string());
+    }
+    let _ = super::super::write_json_atomic(&path, &trace);
+    result
 }
 
 // A follow-up is pasted into a session whose Agy has been logging since launch, so
@@ -1758,6 +1874,123 @@ fn parse_transcript_line(line: &str) -> Option<(u64, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn missing_receipt_is_traced_once_and_trace_failure_does_not_cancel_delivery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pending = PendingAgyTurn::new("48-1-0").unwrap();
+        let sends = std::cell::Cell::new(0);
+        let result = trace_terminal_delivery(
+            tmp.path(),
+            &pending,
+            26060,
+            "apple-terminal",
+            || {
+                sends.set(sends.get() + 1);
+                Ok(())
+            },
+            || {
+                Err(terminal::TerminalSendFailure::delivery_uncertain(
+                    anyhow::anyhow!("no HandleUserInput receipt"),
+                ))
+            },
+        );
+        assert!(result.unwrap_err().delivery_may_have_occurred());
+        assert_eq!(sends.get(), 1);
+        let trace: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(tmp.path().join("agy-input-48-1-0.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(trace["pre_paste_offset"], 26060);
+        assert_eq!(trace["outcome"], "delivery-uncertain");
+        assert!(
+            trace["paste_started_unix_ms"].as_u64().unwrap()
+                <= trace["paste_returned_unix_ms"].as_u64().unwrap()
+        );
+        let blocked = tmp.path().join("not-a-directory");
+        std::fs::write(&blocked, b"preserve").unwrap();
+        trace_terminal_delivery(
+            &blocked,
+            &pending,
+            10,
+            "iterm2",
+            || {
+                sends.set(sends.get() + 1);
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(sends.get(), 2);
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"preserve");
+        let confirms = std::cell::Cell::new(0);
+        let failure = trace_terminal_delivery(
+            tmp.path(),
+            &pending,
+            10,
+            "iterm2",
+            || {
+                Err(terminal::TerminalSendFailure::not_sent(anyhow::anyhow!(
+                    "deadline"
+                )))
+            },
+            || {
+                confirms.set(confirms.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(!failure.delivery_may_have_occurred());
+        assert_eq!(confirms.get(), 0);
+    }
+
+    #[test]
+    fn workspace_trust_and_dialog_are_exact_and_do_not_accept_permission_prompts() {
+        use super::super::super::consent::{self, Trust};
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().canonicalize().unwrap();
+        let homes = consent::fixture_homes(tmp.path());
+        let key = consent::native_key(&workspace).unwrap();
+        super::super::super::write_json_atomic(
+            &homes.agy,
+            &serde_json::json!({"trustedWorkspaces":[key.clone()]}),
+        )
+        .unwrap();
+        assert!(matches!(
+            ADAPTER.workspace_trust(&workspace, &homes).unwrap(),
+            Trust::Trusted(_)
+        ));
+        assert_eq!(
+            ADAPTER
+                .workspace_trust(&workspace.join("child"), &homes)
+                .unwrap(),
+            Trust::Absent
+        );
+        let screen = format!(
+            "Accessing workspace:\n{key}\nDo you trust the contents of this project?\nAntigravity CLI requires permission to read, edit, and execute files here.\n> Yes, I trust this folder\nNo, exit\n↑/↓ Navigate · enter Confirm\nGemini 3.8 Flash · high"
+        );
+        assert_eq!(
+            agy_trust_prompt_key(&screen, &workspace),
+            Some(terminal::DialogKey::Enter)
+        );
+        assert_eq!(
+            agy_trust_prompt_key(&screen, &workspace.join("child")),
+            None
+        );
+        assert_eq!(
+            agy_trust_prompt_key(&(screen.clone() + "\nAllow terminal command?"), &workspace),
+            None
+        );
+        assert_eq!(
+            agy_trust_prompt_key(
+                &screen.replace("> Yes, I trust this folder", "Yes, I trust this folder"),
+                &workspace
+            ),
+            None
+        );
+        std::fs::write(&homes.agy, b"{\"trustedWorkspaces\":true}").unwrap();
+        assert!(ADAPTER.workspace_trust(&workspace, &homes).is_err());
+    }
+
     #[test]
     fn diagnostics_describe_agy_owned_fallback_without_claiming_live_delivery() {
         use super::super::super::doctor::{Availability, Context};

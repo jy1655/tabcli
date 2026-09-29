@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests;
 
+mod consent;
 mod context;
 mod doctor;
 mod launch;
@@ -80,6 +81,7 @@ static TURN_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 pub(crate) enum NativeCommand {
+    Consent(Vec<String>),
     Ask(AskRequest),
     Tell(TellRequest),
     Reopen(ReopenRequest),
@@ -394,6 +396,7 @@ pub(crate) fn is_command(value: &str) -> bool {
     matches!(
         value,
         "ask"
+            | "consent"
             | "tell"
             | "reopen"
             | "sessions"
@@ -423,6 +426,7 @@ where
     match command.as_str() {
         "ask" => parse_ask(rest),
         "tell" => parse_tell(rest),
+        "consent" => Ok(NativeCommand::Consent(rest.to_vec())),
         "reopen" => parse_reopen(rest),
         "inspect" => query::parse_inspect(rest),
         "result" => query::parse_result(rest),
@@ -452,11 +456,11 @@ where
                 bail!("native-console-control requires an action and managed session id");
             };
             require_valid_session_id(id)?;
-            if !matches!(action.as_str(), "send" | "close") {
+            if !matches!(action.as_str(), "send" | "close" | "screen" | "dialog") {
                 bail!("unsupported native console action: {action}");
             }
             let (input_name, timeout_ms) = match (action.as_str(), tail) {
-                ("send", [input, timeout_ms]) if valid_pending_prompt_name(input) => {
+                ("send" | "dialog", [input, timeout_ms]) if valid_pending_prompt_name(input) => {
                     let timeout_ms = timeout_ms
                         .parse::<u64>()
                         .context("invalid native console timeout")?;
@@ -466,6 +470,7 @@ where
                     (Some(input.clone()), Some(timeout_ms))
                 }
                 ("close", []) => (None, None),
+                ("screen", []) => (None, None),
                 _ => bail!("invalid native console control arguments"),
             };
             Ok(NativeCommand::ConsoleControl {
@@ -915,6 +920,7 @@ fn require_valid_session_id(value: &str) -> Result<()> {
 
 pub(crate) fn run(command: NativeCommand) -> Result<()> {
     match command {
+        NativeCommand::Consent(args) => consent::run(&args),
         NativeCommand::Ask(request) => run_ask(request),
         NativeCommand::Tell(request) => run_tell(request),
         NativeCommand::Reopen(request) => run_reopen(request),
@@ -961,7 +967,7 @@ fn run_windows_console_control(
     if session.kind != terminal::TerminalKind::WindowsConsole {
         bail!("managed session is not owned by the Windows console transport");
     }
-    if action == "send" {
+    if action != "close" {
         verify_terminal_surface_ownership(&directory, id, &session)?;
     } else {
         session.verify_managed_session(id)?;
@@ -1048,6 +1054,7 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
             &attached.prompt_with_attachments(&request.prompt),
         ),
     })?;
+    consent::prepare(&created.directory, &request.workspace)?;
     launch_created_session(
         SessionLaunch {
             created,
@@ -1148,6 +1155,9 @@ fn launch_created_session(
     // release this claim. Detached callers also wait for provider startup, not its result.
     initial_claim.retain_in_place();
     launch::wait(&created.directory, &terminal_session, launch_deadline)?;
+    // A trust response is separate from model input. Only verified consent and an
+    // adapter-recognized exact workspace dialog may produce one guarded response.
+    consent::complete_launch(&created.directory, provider, &terminal_session, deadline)?;
     // The existing delivery paths own rollback/uncertainty after confirmed startup.
     initial_claim.retained = false;
     let initial_prompt_transport = provider::initial_prompt_transport(provider);
