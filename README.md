@@ -566,7 +566,15 @@ Bridge가 띄운 Codex는 자체 in-process app-server로 실행되어 시작할
 
 Bridge는 credential을 읽거나 복사하거나 갱신하지 않습니다. MCP에 연결하지 않고, daemon을 재시작하지 않고, prompt를 다시 보내지 않습니다. 모델 응답 성공은 MCP 시작 성공의 근거가 아니므로 `doctor`의 `codex_mcp`는 계속 `unknown`입니다. 이 오류는 다시 로그인한 뒤에는 재현되지 않았고 오류를 본 세션은 특정하지 못해, 이슈는 열려 있습니다.
 
-검증 범위와 근거는 [0.0.9 개발 노트](docs/releases/0.0.9.md)와 [2026-10-01 검증 기록](docs/verification/2026-10-01-bug-triage.md)을 참조하세요. native Windows 인증 CLI LIVE는 macOS fixture·cross compile·CI와 별도입니다.
+### 새 세션과 키보드 포커스 (#58)
+
+지금까지 `ask`는 터미널 앱을 앞으로 가져오고 새 tab·window를 선택된 상태로 두었습니다. 그 순간 입력한 키는 관리 세션으로 들어갔습니다. 2026-10-01에는 그런 키가 Agy workspace 신뢰 대화상자를 두 번 승인했고 launch 명령을 한 번 깨뜨렸습니다([#58](https://github.com/jy1655/agent-bridge/issues/58)).
+
+이제 iTerm2와 Terminal.app은 관리 세션을 만들 때 앱을 앞으로 가져오지 않습니다. 키보드 포커스를 가지고 있던 tab(iTerm2) 또는 window(Terminal.app)를 새 것을 만든 직후 다시 선택합니다. 그 사이에 사용자가 다른 tab·window를 고르면 그 선택을 유지합니다. `ask`, 선택되지 않은 tab이나 뒤에 있는 window로의 `tell`, `close-session`은 이전과 같이 동작합니다.
+
+두 터미널 모두 선택하지 않고 tab·window를 만드는 방법이 없어, 새 것은 잠깐 키보드 포커스를 가집니다. 실측에서 iTerm2는 243~450 ms, Terminal.app은 397~519 ms였고 부하가 있으면 더 길어집니다. 그 사이에 입력한 키는 여전히 관리 세션으로 들어갑니다. 다른 앱이 앞에 있을 때 터미널 앱이 뒤에 머무는지는 화면이 잠긴 상태에서 측정해 NOT-VERIFIED입니다. Ghostty와 Windows console은 바뀌지 않았습니다.
+
+검증 범위와 근거는 [0.0.9 개발 노트](docs/releases/0.0.9.md), [2026-10-01 검증 기록](docs/verification/2026-10-01-bug-triage.md), [키보드 포커스 검증 기록](docs/verification/2026-10-01-focus.md)을 참조하세요. native Windows 인증 CLI LIVE는 macOS fixture·cross compile·CI와 별도입니다.
 
 ## 0.0.8 업데이트
 

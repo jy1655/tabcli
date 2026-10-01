@@ -10,11 +10,21 @@ use super::{
     applescript, close_response,
 };
 
+// A managed session must not take the keyboard from the user (issue #58): keys
+// typed into a tab that suddenly has the focus approved an Agy trust dialog and
+// broke a launch command on 2026-10-01. The script therefore never activates
+// iTerm2. iTerm2 3.7.3 selects every tab it creates and has no option to create
+// one unselected (`set current tab of <window>` fails), so the tab that was
+// selected is selected again right after; until then the new tab still has the
+// keyboard (`create tab` took 0.2 to 0.4 s on an idle machine and up to 1.9 s
+// under load). That tab is only given the keyboard back and is never the target,
+// and a failure to remember or reselect it never fails the launch. The selection
+// is taken back only from the new tab: a tab or window the user chose meanwhile
+// keeps the keyboard.
 pub(in crate::native) const OPEN_TAB_SCRIPT: &str = r#"
 on run
     set itermWasRunning to application "iTerm2" is running
     tell application "iTerm2"
-        activate
         if not itermWasRunning then
             set targetWindow to (create window with default profile)
             set targetSession to current session of targetWindow
@@ -23,10 +33,21 @@ on run
             set targetSession to current session of targetWindow
         else
             set targetWindow to current window
+            set keyboardTab to missing value
+            try
+                set keyboardTab to current tab of targetWindow
+            end try
             tell targetWindow
                 set targetTab to (create tab with default profile)
                 set targetSession to current session of targetTab
             end tell
+            if keyboardTab is not missing value then
+                try
+                    if (unique ID of current session of current tab of current window) is (unique ID of targetSession) then
+                        tell keyboardTab to select
+                    end if
+                end try
+            end if
         end if
         tell targetSession
             return unique ID

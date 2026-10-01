@@ -1537,6 +1537,116 @@ fn macos_cold_start_never_adopts_an_app_restored_surface() {
     );
 }
 
+// Issue #58: a new managed session must not take the keyboard. Neither host can
+// create a surface without selecting it, so each script gives the keyboard back to
+// the surface that had it, only while the new surface still holds it, and never
+// returns that surface. The scripts are pinned line by line where it matters: every
+// use of the remembered surface and every assignment of the owned one is listed, so
+// an added activation, a second use of the remembered surface, or another source
+// for the owned surface fails here.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_open_scripts_give_the_keyboard_back_and_never_activate_the_app() {
+    fn lines_with<'a>(script: &'a str, needle: &str) -> Vec<&'a str> {
+        script
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains(needle))
+            .collect()
+    }
+    let position = |script: &str, needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("open script lost {needle:?}"))
+    };
+
+    let iterm = terminal::macos::iterm2::OPEN_TAB_SCRIPT;
+    assert!(!iterm.contains("activate"));
+    assert_eq!(
+        lines_with(iterm, "keyboardTab"),
+        [
+            "set keyboardTab to missing value",
+            "set keyboardTab to current tab of targetWindow",
+            "if keyboardTab is not missing value then",
+            "tell keyboardTab to select",
+        ]
+    );
+    assert_eq!(
+        lines_with(iterm, "targetSession"),
+        [
+            "set targetSession to current session of targetWindow",
+            "set targetSession to current session of targetWindow",
+            "set targetSession to current session of targetTab",
+            "if (unique ID of current session of current tab of current window) is (unique ID of targetSession) then",
+            "tell targetSession",
+        ]
+    );
+    assert_eq!(
+        lines_with(iterm, "set targetTab to"),
+        ["set targetTab to (create tab with default profile)"]
+    );
+    assert_eq!(
+        lines_with(iterm, "set targetWindow to"),
+        [
+            "set targetWindow to (create window with default profile)",
+            "set targetWindow to (create window with default profile)",
+            "set targetWindow to current window",
+        ]
+    );
+    let remembered = position(
+        iterm,
+        "try\n                set keyboardTab to current tab of targetWindow\n            end try",
+    );
+    let created = position(iterm, "set targetTab to (create tab with default profile)");
+    let restored = position(
+        iterm,
+        "try\n                    if (unique ID of current session of current tab of current window) is (unique ID of targetSession) then\n                        tell keyboardTab to select\n                    end if\n                end try",
+    );
+    assert!(remembered < created && created < restored);
+    assert!(iterm.contains("tell targetSession\n            return unique ID"));
+
+    let terminal_app = terminal::macos::apple_terminal::OPEN_TAB_SCRIPT;
+    assert!(!terminal_app.contains("activate"));
+    assert_eq!(
+        lines_with(terminal_app, "keyboardWindowId"),
+        [
+            "set keyboardWindowId to missing value",
+            "if (count of windows) > 0 then set keyboardWindowId to id of window 1",
+            "if keyboardWindowId is not missing value and keyboardWindowId is not targetWindowId then",
+            "set frontmost of (first window whose id is keyboardWindowId) to true",
+        ]
+    );
+    assert_eq!(
+        lines_with(terminal_app, "set target"),
+        [
+            "set targetTab to do script \"\"",
+            "set targetTty to tty of targetTab",
+            "set targetWindowId to my windowIdForTty(targetTty)",
+            "set targetWindow to first window whose id is targetWindowId",
+        ]
+    );
+    assert_eq!(
+        lines_with(terminal_app, "window 1"),
+        [
+            "if (count of windows) > 0 then set keyboardWindowId to id of window 1",
+            "if (id of window 1) is targetWindowId then",
+        ]
+    );
+    let remembered = position(
+        terminal_app,
+        "try\n            if (count of windows) > 0 then set keyboardWindowId to id of window 1\n        end try",
+    );
+    let created = position(terminal_app, "set targetTab to do script \"\"");
+    let restored = position(
+        terminal_app,
+        "try\n                if (id of window 1) is targetWindowId then\n                    set frontmost of (first window whose id is keyboardWindowId) to true\n                end if\n            end try",
+    );
+    assert!(remembered < created && created < restored);
+    assert!(terminal_app.ends_with(
+        "return targetTty & linefeed & (targetWindowId as text)\n    end tell\nend run\n"
+    ));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn terminal_app_window_discovery_snapshots_and_skips_stale_window_references() {

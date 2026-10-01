@@ -34,6 +34,13 @@ end windowIdForTty
 
 on run argv
     tell application "Terminal"
+        -- The window that has the keyboard is remembered only to give it back
+        -- below (issue #58). It is never the target, and failing to remember or
+        -- restore it never fails the launch.
+        set keyboardWindowId to missing value
+        try
+            if (count of windows) > 0 then set keyboardWindowId to id of window 1
+        end try
         -- Untargeted do script creates a dedicated window and returns its new tab.
         -- Never derive ownership from a restored front/current/selected surface.
         set targetTab to do script ""
@@ -42,7 +49,16 @@ on run argv
         set targetWindow to first window whose id is targetWindowId
         if id of targetWindow is not targetWindowId then error "Agent Bridge lost its newly created Terminal.app window"
         if tty of targetTab is not targetTty then error "Agent Bridge lost its newly created Terminal.app tty"
-        activate
+        -- Terminal is not brought forward, and the new window does not keep the
+        -- keyboard. The front position is taken back only from the new window: a
+        -- window the user chose meanwhile stays in front.
+        if keyboardWindowId is not missing value and keyboardWindowId is not targetWindowId then
+            try
+                if (id of window 1) is targetWindowId then
+                    set frontmost of (first window whose id is keyboardWindowId) to true
+                end if
+            end try
+        end if
         return targetTty & linefeed & (targetWindowId as text)
     end tell
 end run

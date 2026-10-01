@@ -25,7 +25,7 @@ during the work. The table states the outcome for each.
 | #48 Agy follow-up receipt | Cause found and reproduced. Fixed in round 2 and verified on iTerm2 and Terminal.app. | Open until the owner closes it; native Windows is not re-verified. |
 | #56 `codex_apps` 401 `token_revoked` | Cause classified from provider logs as an invalidated ChatGPT sign-in. Not reproducible after the user signed in again. `doctor` guidance improved. | Open; the session in which the user saw the error was not identified. |
 | Agy quota failure (no issue; asked for during round 2) | A turn Agy gives up on is recorded as a failed request at once instead of waiting out the timeout. | Verified on macOS. |
-| #58 new managed sessions take the keyboard focus (opened during round 2) | Investigated only: the launch scripts call `activate`, and no supported terminal can create a surface without selecting it. No change here. | Open. |
+| #58 new managed sessions take the keyboard focus (opened during round 2) | Investigated only: the launch scripts call `activate`, and no supported terminal can create a surface without selecting it. No change here; the later change is recorded in [`2026-10-01-focus.md`](2026-10-01-focus.md). | Open. |
 | #6, #28, #53, #54, #55 | Feature work, outside this patch. | Unchanged. |
 
 ## #48 — the follow-up paste landed on Agy's workspace-trust dialog

@@ -20,6 +20,8 @@ on run
 end run
 "#;
 
+// This script still activates Ghostty and leaves the new tab selected (issue #58).
+// `create_tab` never runs it; remove both when the adapter is verified again.
 pub(in crate::native) const CREATE_SURFACE_SCRIPT: &str = r#"
 on run
     set ghosttyWasRunning to application "Ghostty" is running
