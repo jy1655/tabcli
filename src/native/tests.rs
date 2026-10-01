@@ -1533,8 +1533,118 @@ fn macos_cold_start_never_adopts_an_app_restored_surface() {
     }
     assert!(
         terminal::macos::apple_terminal::OPEN_TAB_SCRIPT
-            .contains("set targetWindowId to my windowIdForTty(targetTty)")
+            .contains("set targetWindowId to my windowIdForTty(targetTty, priorWindowIds)")
     );
+}
+
+// Issue #58: a new managed session must not take the keyboard. Neither host can
+// create a surface without selecting it, so each script gives the keyboard back to
+// the surface that had it, only while the new surface still holds it, and never
+// returns that surface. The scripts are pinned line by line where it matters: every
+// use of the remembered surface and every assignment of the owned one is listed, so
+// an added activation, a second use of the remembered surface, or another source
+// for the owned surface fails here.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_open_scripts_give_the_keyboard_back_and_never_activate_the_app() {
+    fn lines_with<'a>(script: &'a str, needle: &str) -> Vec<&'a str> {
+        script
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains(needle))
+            .collect()
+    }
+    let position = |script: &str, needle: &str| {
+        script
+            .find(needle)
+            .unwrap_or_else(|| panic!("open script lost {needle:?}"))
+    };
+
+    let iterm = terminal::macos::iterm2::OPEN_TAB_SCRIPT;
+    assert!(!iterm.contains("activate"));
+    assert_eq!(
+        lines_with(iterm, "keyboardTab"),
+        [
+            "set keyboardTab to missing value",
+            "set keyboardTab to current tab of targetWindow",
+            "if keyboardTab is not missing value then",
+            "tell keyboardTab to select",
+        ]
+    );
+    assert_eq!(
+        lines_with(iterm, "targetSession"),
+        [
+            "set targetSession to current session of targetWindow",
+            "set targetSession to current session of targetWindow",
+            "set targetSession to current session of targetTab",
+            "if (unique ID of current session of current tab of current window) is (unique ID of targetSession) then",
+            "tell targetSession",
+        ]
+    );
+    assert_eq!(
+        lines_with(iterm, "set targetTab to"),
+        ["set targetTab to (create tab with default profile)"]
+    );
+    assert_eq!(
+        lines_with(iterm, "set targetWindow to"),
+        [
+            "set targetWindow to (create window with default profile)",
+            "set targetWindow to (create window with default profile)",
+            "set targetWindow to current window",
+        ]
+    );
+    let remembered = position(
+        iterm,
+        "try\n                set keyboardTab to current tab of targetWindow\n            end try",
+    );
+    let created = position(iterm, "set targetTab to (create tab with default profile)");
+    let restored = position(
+        iterm,
+        "try\n                    if (unique ID of current session of current tab of current window) is (unique ID of targetSession) then\n                        tell keyboardTab to select\n                    end if\n                end try",
+    );
+    assert!(remembered < created && created < restored);
+    assert!(iterm.contains("tell targetSession\n            return unique ID"));
+
+    let terminal_app = terminal::macos::apple_terminal::OPEN_TAB_SCRIPT;
+    assert!(!terminal_app.contains("activate"));
+    assert_eq!(
+        lines_with(terminal_app, "keyboardWindowId"),
+        [
+            "set keyboardWindowId to missing value",
+            "if (count of windows) > 0 then set keyboardWindowId to id of window 1",
+            "if keyboardWindowId is not missing value and keyboardWindowId is not targetWindowId then",
+            "set frontmost of (first window whose id is keyboardWindowId) to true",
+        ]
+    );
+    assert_eq!(
+        lines_with(terminal_app, "set target"),
+        [
+            "set targetTab to do script \"\"",
+            "set targetTty to tty of targetTab",
+            "set targetWindowId to my windowIdForTty(targetTty, priorWindowIds)",
+            "set targetWindow to first window whose id is targetWindowId",
+        ]
+    );
+    assert_eq!(
+        lines_with(terminal_app, "window 1"),
+        [
+            "if (count of windows) > 0 then set keyboardWindowId to id of window 1",
+            "if (id of window 1) is targetWindowId then",
+        ]
+    );
+    let remembered = position(
+        terminal_app,
+        "try\n                if (count of windows) > 0 then set keyboardWindowId to id of window 1\n            end try",
+    );
+    let created = position(terminal_app, "set targetTab to do script \"\"");
+    let restored = position(
+        terminal_app,
+        "try\n                if (id of window 1) is targetWindowId then\n                    set frontmost of (first window whose id is keyboardWindowId) to true\n                end if\n            end try",
+    );
+    assert!(remembered < created && created < restored);
+    assert!(terminal_app.ends_with(
+        "return targetTty & linefeed & (targetWindowId as text)\n    end tell\nend run\n"
+    ));
 }
 
 #[cfg(target_os = "macos")]
@@ -1546,6 +1656,89 @@ fn terminal_app_window_discovery_snapshots_and_skips_stale_window_references() {
     assert!(script.contains("set candidateTabs to get tabs of candidateWindow"));
     assert!(script.contains("repeat with candidateTab in candidateTabs"));
     assert!(script.contains("try\n                set candidateTabs"));
+}
+
+// The Terminal.app ownership decision, executed rather than read: the handler is
+// plain AppleScript, so `osascript` runs it without talking to Terminal. The first
+// case is the launch that failed on 2026-10-01 (session-y5Wpkl): window 8332 had
+// lost its shell while a close confirmation was pending and still reported
+// `/dev/ttys003`, the name the new window 8335 received.
+#[cfg(target_os = "macos")]
+#[test]
+fn terminal_app_ownership_proof_ignores_windows_that_existed_before_the_launch() {
+    const UNPROVEN: &str = "Agent Bridge could not prove the newly created Terminal.app window";
+    const DRIVER: &str = r#"
+on run argv
+    set wantedTty to item 1 of argv
+    set priorWindowIds to missing value
+    if item 2 of argv is not "unknown" then
+        set priorWindowIds to {}
+        repeat with priorId in (words of (item 2 of argv))
+            set end of priorWindowIds to (priorId as integer)
+        end repeat
+    end if
+    set windowTtys to {}
+    repeat with argIndex from 3 to (count of argv) by 2
+        set end of windowTtys to {(item argIndex of argv) as integer, item (argIndex + 1) of argv}
+    end repeat
+    return my soleNewWindowWithTty(windowTtys, priorWindowIds, wantedTty)
+end run
+"#;
+    let script = terminal::macos::apple_terminal::OPEN_TAB_SCRIPT;
+    let start = script.find("on soleNewWindowWithTty(").unwrap();
+    let end = script.find("end soleNewWindowWithTty").unwrap() + "end soleNewWindowWithTty".len();
+    let handler = &script[start..end];
+    assert!(
+        !handler.contains("tell application"),
+        "the decision must not need Terminal"
+    );
+    let prove = |prior: &str, windows: &[(&str, &str)]| {
+        let output = std::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(format!("{handler}\n{DRIVER}"))
+            .arg("/dev/ttys003")
+            .arg(prior)
+            .args(windows.iter().flat_map(|(id, tty)| [*id, *tty]))
+            .output()
+            .unwrap();
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).into_owned())
+        }
+    };
+    let recorded = [("8335", "/dev/ttys003"), ("8332", "/dev/ttys003")];
+
+    // The stale window existed before the launch, so only the new one is a candidate.
+    assert_eq!(prove("8332 8316 8329", &recorded), Ok("8335".to_owned()));
+    // Without the list of earlier windows the former rule applies: the recorded failure.
+    assert!(prove("unknown", &recorded).unwrap_err().contains(UNPROVEN));
+    // A cold start has no earlier windows; a restored window with another tty is ignored.
+    assert_eq!(
+        prove("", &[("10", "/dev/ttys001"), ("11", "/dev/ttys003")]),
+        Ok("11".to_owned())
+    );
+    // The new window is not in the list, or two new windows report the tty: no proof.
+    assert!(
+        prove("8332", &[("8332", "/dev/ttys003")])
+            .unwrap_err()
+            .contains(UNPROVEN)
+    );
+    assert!(
+        prove(
+            "8332",
+            &[("8335", "/dev/ttys003"), ("8336", "/dev/ttys003")]
+        )
+        .unwrap_err()
+        .contains(UNPROVEN)
+    );
+    // A window that existed before is never returned, even as the only match.
+    assert!(
+        prove("8332 8335", &recorded)
+            .unwrap_err()
+            .contains(UNPROVEN),
+        "an earlier window must not be adopted"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -1994,6 +2187,25 @@ fn windows_console_helper_accepts_only_managed_session_identity() {
         ])
         .is_err()
     );
+    // The window lookup is bounded and takes nothing but its time.
+    assert!(matches!(
+        parse_args(["native-console-control", "window", "session-owner123", "600"]).unwrap(),
+        NativeCommand::ConsoleControl {
+            action,
+            id,
+            input_name: None,
+            timeout_ms: Some(600),
+        } if action == "window" && id == "session-owner123"
+    ));
+    for invalid in [
+        &["window", "session-owner123"][..],
+        &["window", "session-owner123", "0"],
+        &["window", "session-owner123", "pending-prompt-1.txt", "600"],
+    ] {
+        let mut arguments = vec!["native-console-control"];
+        arguments.extend_from_slice(invalid);
+        assert!(parse_args(arguments).is_err(), "{invalid:?}");
+    }
 }
 
 #[cfg(windows)]
@@ -2071,6 +2283,52 @@ fn powershell_launch_quoting_doubles_apostrophes() {
     .unwrap();
     assert!(command.contains("'C:\\work\\owner''s repo'"));
     assert!(!command.contains("owner's repo"));
+}
+
+// Windows refuses to replace a file while any other handle to it is open. A launcher
+// polls `status.json` and `launch.json` while the wrapper replaces them, so each
+// replacement can meet a reader that holds the record for a moment.
+#[cfg(windows)]
+#[test]
+fn a_record_is_replaced_although_a_reader_holds_it_open_for_a_moment() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("status.json");
+    write_json_atomic(&path, &serde_json::json!({ "state": "launching" })).unwrap();
+    let reader = File::open(&path).unwrap();
+    let release = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(150));
+        drop(reader);
+    });
+
+    write_json_atomic(&path, &serde_json::json!({ "state": "running" })).unwrap();
+
+    release.join().unwrap();
+    assert_eq!(
+        read_json::<serde_json::Value>(&path).unwrap()["state"],
+        "running"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_record_that_stays_open_fails_the_replacement_after_a_bounded_wait() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("status.json");
+    write_json_atomic(&path, &serde_json::json!({ "state": "launching" })).unwrap();
+    let reader = File::open(&path).unwrap();
+    let started = Instant::now();
+
+    let error = write_json_atomic(&path, &serde_json::json!({ "state": "running" })).unwrap_err();
+
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(format!("{error:#}").contains("failed to persist"));
+    drop(reader);
+    assert_eq!(
+        read_json::<serde_json::Value>(&path).unwrap()["state"],
+        "launching"
+    );
+    // The temporary record is removed, not left beside the one it could not replace.
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
 }
 
 #[test]

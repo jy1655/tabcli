@@ -748,6 +748,7 @@ pub(super) fn inspect_value(directory: &Path, id: &str) -> Result<Value> {
         "configured": {"model": snapshot.manifest.model, "effort": snapshot.manifest.effort,
             "yolo": snapshot.manifest.yolo, "provider_version_at_launch": snapshot.manifest.provider_version},
         "resumed_from": resumed_from,
+        "workspace_consent": consent::observe(directory),
         "owner_process_alive": owner.process_alive, "owner_identity_verified": owner.identity_matches == Some(true), "owner": owner,
         "recovery_required": snapshot.pending.is_some(), "turn_claimed": snapshot.claim.is_some(),
         "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error,

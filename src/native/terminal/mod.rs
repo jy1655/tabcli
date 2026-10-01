@@ -219,9 +219,13 @@ pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     platform::select(preferred)
 }
 
+// `directory` is the private directory of the managed session. Only Windows uses it: a
+// Windows Terminal tab creates its own process, which hands the console root over through
+// records kept there.
 pub(super) fn open_bound_tab<F, U>(
     kind: TerminalKind,
     command: &str,
+    directory: &Path,
     deadline: Instant,
     bind: F,
     unbind: U,
@@ -232,15 +236,16 @@ where
 {
     #[cfg(windows)]
     {
-        windows::open_bound_tab(kind, command, deadline, bind, unbind)
+        windows::open_bound_tab(kind, command, directory, deadline, bind, unbind)
     }
     #[cfg(target_os = "macos")]
     {
+        let _ = directory;
         macos::open_bound_tab(kind, command, deadline, bind, unbind)
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = deadline;
+        let _ = (directory, deadline);
         let mut session = platform::open_tab(kind, command)?;
         if let Err(error) = bind(&mut session) {
             let cleanup = platform::close_session(&session);
@@ -322,6 +327,48 @@ pub(super) fn send_file(
     }
 }
 
+// Transport-neutral keys for an exact, unchanged managed dialog. Providers own
+// recognition and authorization; the terminal only compares the captured screen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+pub(super) enum DialogKey {
+    Enter,
+    DownEnter,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(super) struct GuardedDialogInput {
+    pub(super) screen: String,
+    pub(super) key: DialogKey,
+}
+
+pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Result<String> {
+    #[cfg(target_os = "macos")]
+    return macos::read_screen(session, deadline);
+    #[cfg(windows)]
+    return windows::read_screen(session, deadline);
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (session, deadline);
+        bail!("managed screen reads unsupported on this platform");
+    }
+}
+
+pub(super) fn guarded_dialog_input(
+    session: &TerminalSession,
+    input: &GuardedDialogInput,
+    deadline: Instant,
+) -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    return macos::guarded_dialog_input(session, input, deadline);
+    #[cfg(windows)]
+    return windows::guarded_dialog_input(session, input, deadline);
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = (session, input, deadline);
+        bail!("managed dialog input unsupported on this platform");
+    }
+}
+
 #[cfg(any(windows, test))]
 pub(super) fn remaining_send_budget_at(
     deadline: Instant,
@@ -375,6 +422,14 @@ pub(super) fn surface_present(
     }
 }
 
+/// What the records of a session say that its console cannot: where the host of a tab
+/// recorded itself, and whether the wrapper that the console root starts ever ran.
+#[cfg(target_os = "windows")]
+pub(super) struct WindowsSessionRecords<'a> {
+    pub(super) directory: &'a Path,
+    pub(super) root_never_ran: bool,
+}
+
 #[cfg(target_os = "windows")]
 pub(super) fn windows_console_control(
     action: &str,
@@ -382,13 +437,27 @@ pub(super) fn windows_console_control(
     input_path: Option<&Path>,
     submit_count: usize,
     timeout: Option<std::time::Duration>,
+    records: &WindowsSessionRecords<'_>,
 ) -> Result<()> {
-    windows::console_control(action, session, input_path, submit_count, timeout)
+    windows::console_control(action, session, input_path, submit_count, timeout, records)
+}
+
+#[cfg(target_os = "windows")]
+pub(super) fn windows_console_host(directory: &Path) -> Result<()> {
+    windows::run_console_host(directory)
 }
 
 #[cfg(target_os = "windows")]
 pub(super) fn windows_powershell_executable() -> Result<std::path::PathBuf> {
     windows::powershell_executable()
+}
+
+#[cfg(all(target_os = "windows", test))]
+pub(super) fn windows_console_launch_command_line(
+    powershell: &Path,
+    command: &str,
+) -> Result<String> {
+    windows::console_launch_command_line(powershell, command)
 }
 
 #[cfg(windows)]
@@ -867,7 +936,10 @@ mod tests {
         assert!(!macos::apple_terminal::OPEN_TAB_SCRIPT.contains("front window"));
         assert!(!macos::apple_terminal::OPEN_TAB_SCRIPT.contains("selected tab"));
         assert!(macos::apple_terminal::OPEN_TAB_SCRIPT.contains("tty of targetTab"));
-        assert!(macos::apple_terminal::OPEN_TAB_SCRIPT.contains("windowIdForTty(targetTty)"));
+        assert!(
+            macos::apple_terminal::OPEN_TAB_SCRIPT
+                .contains("windowIdForTty(targetTty, priorWindowIds)")
+        );
         assert!(macos::apple_terminal::OPEN_TAB_SCRIPT.contains("id of targetWindow"));
         assert!(
             macos::apple_terminal::SEND_FILE_SCRIPT.contains("tty of candidateTab is wantedTty")

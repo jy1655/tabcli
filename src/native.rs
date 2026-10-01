@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests;
 
+mod consent;
 mod context;
 mod doctor;
 mod launch;
@@ -8,6 +9,7 @@ mod provider;
 mod provider_process;
 mod query;
 mod requests;
+mod settings;
 mod terminal;
 
 use provider_process::{
@@ -80,6 +82,8 @@ static TURN_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 pub(crate) enum NativeCommand {
+    Consent(Vec<String>),
+    Settings(Vec<String>),
     Ask(AskRequest),
     Tell(TellRequest),
     Reopen(ReopenRequest),
@@ -109,6 +113,9 @@ pub(crate) enum NativeCommand {
         id: String,
         input_name: Option<String>,
         timeout_ms: Option<u64>,
+    },
+    ConsoleHost {
+        directory: PathBuf,
     },
 }
 
@@ -394,6 +401,8 @@ pub(crate) fn is_command(value: &str) -> bool {
     matches!(
         value,
         "ask"
+            | "consent"
+            | "settings"
             | "tell"
             | "reopen"
             | "sessions"
@@ -407,6 +416,7 @@ pub(crate) fn is_command(value: &str) -> bool {
             | "native-hook"
             | "native-provider-control"
             | "native-console-control"
+            | "native-console-host"
     )
 }
 
@@ -423,6 +433,8 @@ where
     match command.as_str() {
         "ask" => parse_ask(rest),
         "tell" => parse_tell(rest),
+        "consent" => Ok(NativeCommand::Consent(rest.to_vec())),
+        "settings" => Ok(NativeCommand::Settings(rest.to_vec())),
         "reopen" => parse_reopen(rest),
         "inspect" => query::parse_inspect(rest),
         "result" => query::parse_result(rest),
@@ -452,20 +464,28 @@ where
                 bail!("native-console-control requires an action and managed session id");
             };
             require_valid_session_id(id)?;
-            if !matches!(action.as_str(), "send" | "close") {
+            if !matches!(
+                action.as_str(),
+                "send" | "close" | "screen" | "dialog" | "window"
+            ) {
                 bail!("unsupported native console action: {action}");
             }
-            let (input_name, timeout_ms) = match (action.as_str(), tail) {
-                ("send", [input, timeout_ms]) if valid_pending_prompt_name(input) => {
-                    let timeout_ms = timeout_ms
-                        .parse::<u64>()
-                        .context("invalid native console timeout")?;
-                    if timeout_ms == 0 {
-                        bail!("native console timeout must be positive");
-                    }
-                    (Some(input.clone()), Some(timeout_ms))
+            let timeout = |timeout_ms: &String| -> Result<u64> {
+                let timeout_ms = timeout_ms
+                    .parse::<u64>()
+                    .context("invalid native console timeout")?;
+                if timeout_ms == 0 {
+                    bail!("native console timeout must be positive");
                 }
+                Ok(timeout_ms)
+            };
+            let (input_name, timeout_ms) = match (action.as_str(), tail) {
+                ("send" | "dialog", [input, timeout_ms]) if valid_pending_prompt_name(input) => {
+                    (Some(input.clone()), Some(timeout(timeout_ms)?))
+                }
+                ("window", [timeout_ms]) => (None, Some(timeout(timeout_ms)?)),
                 ("close", []) => (None, None),
+                ("screen", []) => (None, None),
                 _ => bail!("invalid native console control arguments"),
             };
             Ok(NativeCommand::ConsoleControl {
@@ -474,6 +494,23 @@ where
                 input_name,
                 timeout_ms,
             })
+        }
+        "native-console-host" => {
+            // The tab's process does not necessarily inherit the state root, so it is
+            // given the session directory itself.
+            let directory = PathBuf::from(one_positional(
+                rest,
+                "native-console-host requires one session directory",
+            )?);
+            let id = directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("native-console-host requires a session directory")?;
+            require_valid_session_id(id)?;
+            if !directory.is_absolute() {
+                bail!("native-console-host requires an absolute session directory");
+            }
+            Ok(NativeCommand::ConsoleHost { directory })
         }
         _ => bail!("unknown native command: {command}"),
     }
@@ -915,6 +952,8 @@ fn require_valid_session_id(value: &str) -> Result<()> {
 
 pub(crate) fn run(command: NativeCommand) -> Result<()> {
     match command {
+        NativeCommand::Consent(args) => consent::run(&args),
+        NativeCommand::Settings(args) => settings::run(&args),
         NativeCommand::Ask(request) => run_ask(request),
         NativeCommand::Tell(request) => run_tell(request),
         NativeCommand::Reopen(request) => run_reopen(request),
@@ -937,7 +976,26 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
             input_name,
             timeout_ms,
         } => run_windows_console_control(&action, &id, input_name.as_deref(), timeout_ms),
+        NativeCommand::ConsoleHost { directory } => run_windows_console_host(&directory),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_console_host(directory: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(directory)
+        .with_context(|| format!("no such session directory: {}", directory.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!(
+            "refusing non-directory session directory: {}",
+            directory.display()
+        );
+    }
+    terminal::windows_console_host(directory)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_windows_console_host(_directory: &Path) -> Result<()> {
+    bail!("the native Windows console host is only available on Windows")
 }
 
 fn valid_pending_prompt_name(value: &str) -> bool {
@@ -961,21 +1019,42 @@ fn run_windows_console_control(
     if session.kind != terminal::TerminalKind::WindowsConsole {
         bail!("managed session is not owned by the Windows console transport");
     }
-    if action == "send" {
-        verify_terminal_surface_ownership(&directory, id, &session)?;
-    } else {
+    // A window is looked up right after the console root was started, before the wrapper
+    // has recorded itself as the owner. Like a close, it needs only the bound surface.
+    if matches!(action, "close" | "window") {
         session.verify_managed_session(id)?;
+    } else {
+        verify_terminal_surface_ownership(&directory, id, &session)?;
     }
     let input_path = input_name.map(|name| directory.join(name));
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
     let submit_count = provider::terminal_submit_count(provider);
+    let records = terminal::WindowsSessionRecords {
+        directory: &directory,
+        root_never_ran: windows_console_root_never_ran(&directory),
+    };
     terminal::windows_console_control(
         action,
         &session,
         input_path.as_deref(),
         submit_count,
         timeout_ms.map(Duration::from_millis),
+        &records,
     )
+}
+
+// The console root runs the wrapper, and the wrapper records itself as the owner before
+// it asks to spawn the provider. Without that record and without a spawn attempt in the
+// launch receipt, the root has not run its command. A receipt that cannot be read proves
+// nothing.
+#[cfg(windows)]
+fn windows_console_root_never_ran(directory: &Path) -> bool {
+    !directory.join(SESSION_OWNER_FILE).exists()
+        && match launch::read(directory) {
+            Ok(None) => true,
+            Ok(Some(record)) => record.phase == launch::Phase::Pending,
+            Err(_) => false,
+        }
 }
 
 #[cfg(windows)]
@@ -1048,6 +1127,7 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
             &attached.prompt_with_attachments(&request.prompt),
         ),
     })?;
+    consent::prepare(&created.directory, &request.workspace)?;
     launch_created_session(
         SessionLaunch {
             created,
@@ -1122,6 +1202,7 @@ fn launch_created_session(
     let terminal_session = match terminal::open_bound_tab(
         terminal_kind,
         &bridge_command,
+        &created.directory,
         launch_deadline,
         |session| {
             session.managed_session_id = Some(created.id.clone());
@@ -1148,6 +1229,9 @@ fn launch_created_session(
     // release this claim. Detached callers also wait for provider startup, not its result.
     initial_claim.retain_in_place();
     launch::wait(&created.directory, &terminal_session, launch_deadline)?;
+    // A trust response is separate from model input. Only verified consent and an
+    // adapter-recognized exact workspace dialog may produce one guarded response.
+    consent::complete_launch(&created.directory, provider, &terminal_session, deadline)?;
     // The existing delivery paths own rollback/uncertainty after confirmed startup.
     initial_claim.retained = false;
     let initial_prompt_transport = provider::initial_prompt_transport(provider);
@@ -5148,14 +5232,50 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         "renaming a temporary record over its final path",
         temporary,
     )?;
-    let persisted = temporary
-        .persist(path)
-        .map_err(|error| error.error)
+    let persisted = persist_record(temporary, path)
         .with_context(|| format!("failed to persist {}", path.display()))?;
     fault_point("syncing a renamed record")?;
     sync_file(&persisted, path)?;
     sync_parent_directory(path)?;
     Ok(())
+}
+
+// How long a record replacement waits for another handle to the record to close.
+#[cfg(windows)]
+const RECORD_REPLACE_WAIT: Duration = Duration::from_secs(1);
+
+/// Renames a temporary record over its final path. Windows refuses to replace a file
+/// while any other handle to it is open, whatever that handle shares, and a caller that
+/// polls a record holds one for a moment on every read (2026-10-01: a launcher's read of
+/// `launch.json` failed the wrapper's replacement of it with access denied). The rename
+/// is therefore repeated for a bounded time on those two errors; a record that stays
+/// open, or cannot be replaced for another reason, still fails.
+fn persist_record(temporary: tempfile::NamedTempFile, path: &Path) -> std::io::Result<File> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+        let deadline = Instant::now() + RECORD_REPLACE_WAIT;
+        let mut temporary = temporary;
+        loop {
+            match temporary.persist(path) {
+                Ok(file) => return Ok(file),
+                Err(error)
+                    if Instant::now() < deadline
+                        && error.error.raw_os_error().is_some_and(|code| {
+                            [ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION].contains(&(code as u32))
+                        }) =>
+                {
+                    temporary = error.file;
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => return Err(error.error),
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        temporary.persist(path).map_err(|error| error.error)
+    }
 }
 
 /// A fault at a boundary after the temporary file exists leaves that file behind, exactly
@@ -6606,8 +6726,11 @@ fn bridge_shell_command(
         validate_shell_command_component(value, field)?;
     }
     let log = powershell_quote(state_root.join(id).join(launch::LOG).as_os_str());
+    // The console launch passes this to PowerShell as one double-quoted `-Command`
+    // argument and refuses a command that holds a double quote, so every string here is
+    // single-quoted.
     Ok(format!(
-        "$bridgeStatus = 1; try {{ Set-Location -LiteralPath {} -ErrorAction Stop; $env:{} = {}; & {} native-session {}; $bridgeStatus = $LASTEXITCODE }} catch {{ try {{ Add-Content -LiteralPath {log} -Value $_ -ErrorAction Stop }} catch {{}} }}; try {{ Add-Content -LiteralPath {log} -Value (\"wrapper_exit_code=\" + $bridgeStatus) -ErrorAction Stop }} catch {{}}; exit $bridgeStatus",
+        "$bridgeStatus = 1; try {{ Set-Location -LiteralPath {} -ErrorAction Stop; $env:{} = {}; & {} native-session {}; $bridgeStatus = $LASTEXITCODE }} catch {{ try {{ Add-Content -LiteralPath {log} -Value $_ -ErrorAction Stop }} catch {{}} }}; try {{ Add-Content -LiteralPath {log} -Value ('wrapper_exit_code=' + $bridgeStatus) -ErrorAction Stop }} catch {{}}; exit $bridgeStatus",
         powershell_quote(workspace.as_os_str()),
         STATE_DIR_ENV,
         powershell_quote(state_root.as_os_str()),

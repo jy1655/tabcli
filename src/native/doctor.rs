@@ -308,6 +308,17 @@ pub(super) fn run(request: DoctorRequest) -> Result<()> {
             Err(_) => (Unknown, "workspace_unreadable"),
         };
         checks.push(Check::new("workspace", availability, reason, "Working directory observation; CLI version checks do not depend on this directory.", "Restore or inspect the recorded directory before workspace-relative operations.").evidence(json!({"path": workspace})));
+        if let Some(directory) = &directory {
+            let consent = consent::observe(directory);
+            let availability = if consent["state"] == "verified" {
+                Available
+            } else {
+                Unknown
+            };
+            checks.push(Check::new("workspace_consent", availability, "recorded_workspace_consent",
+                "Launch-time workspace consent and its provider-owned source. This is historical evidence, not a new trust grant.",
+                "Inspect workspace_consent; consent revoke disables sharing, and consent reset permits fresh provider evidence on a later ask.").evidence(consent));
+        }
         checks.extend(provider::diagnose(
             provider,
             Context {

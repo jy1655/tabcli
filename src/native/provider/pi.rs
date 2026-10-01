@@ -69,6 +69,47 @@ struct HookFailureSignal {
 const PI_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Pi exposes no verifiable ownership evidence for a session (no lock, pid, or registry under ~/.pi identifies a live writer)";
 
 impl NativeProviderAdapter for PiAdapter {
+    fn workspace_trust_key(&self, _screen: &str, _workspace: &Path) -> Option<terminal::DialogKey> {
+        None
+    }
+    fn workspace_trust(
+        &self,
+        workspace: &Path,
+        homes: &super::super::consent::Homes,
+    ) -> Result<super::super::consent::Trust> {
+        use super::super::consent::{self, Evidence, Trust};
+        let Some(text) = consent::read_store(&homes.pi)? else {
+            return Ok(Trust::Absent);
+        };
+        let config: serde_json::Value = serde_json::from_str(&text)?;
+        let entries = config
+            .as_object()
+            .context("Pi trust store is not an object")?;
+        let key = consent::native_key(workspace)?;
+        match entries.get(&key) {
+            Some(serde_json::Value::Bool(true)) => Ok(Trust::Trusted(Evidence {
+                provider: "pi".into(),
+                store: homes.pi.clone(),
+                key,
+            })),
+            Some(serde_json::Value::Bool(false)) => Ok(Trust::Declined),
+            None => {
+                // A parent's positive decision is not exact-workspace consent; a
+                // nearer negative decision still prevents overriding Pi's refusal.
+                for parent in workspace.ancestors().skip(1) {
+                    match entries.get(&consent::native_key(parent)?) {
+                        Some(serde_json::Value::Bool(false)) => return Ok(Trust::Declined),
+                        Some(serde_json::Value::Bool(true)) => break,
+                        Some(_) => bail!("unknown Pi ancestor trust value"),
+                        None => {}
+                    }
+                }
+                Ok(Trust::Absent)
+            }
+            _ => bail!("unknown Pi trust value"),
+        }
+    }
+
     fn probe_environment_removals(&self) -> &'static [&'static str] {
         // Pi derives no session identity from the caller's environment.
         &[]
@@ -100,6 +141,12 @@ impl NativeProviderAdapter for PiAdapter {
             OsString::from("--name"),
             OsString::from(context.title),
         ];
+        if super::super::consent::authorized(context.directory, FirstPartyCli::Pi)? {
+            // Pi documents --approve as a one-run project-trust override. It is
+            // not a tool permission flag and does not persist to trust.json.
+            arguments.push(OsString::from("--approve"));
+            super::super::consent::applied(context.directory, "pi-approve-once")?;
+        }
         if !cfg!(windows) {
             arguments.push(OsString::from(correlated_prompt(context.prompt, &pending)));
         }
@@ -682,6 +729,36 @@ export default function (pi) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workspace_trust_requires_exact_positive_but_respects_parent_decline() {
+        use super::super::super::consent::{self, Trust};
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().canonicalize().unwrap();
+        let homes = consent::fixture_homes(tmp.path());
+        let key = consent::native_key(&workspace).unwrap();
+        super::super::super::write_json_atomic(&homes.pi, &serde_json::json!({key.clone():true}))
+            .unwrap();
+        assert!(matches!(
+            ADAPTER.workspace_trust(&workspace, &homes).unwrap(),
+            Trust::Trusted(_)
+        ));
+        assert_eq!(
+            ADAPTER
+                .workspace_trust(&workspace.join("child"), &homes)
+                .unwrap(),
+            Trust::Absent
+        );
+        super::super::super::write_json_atomic(&homes.pi, &serde_json::json!({key:false})).unwrap();
+        assert_eq!(
+            ADAPTER
+                .workspace_trust(&workspace.join("child"), &homes)
+                .unwrap(),
+            Trust::Declined
+        );
+        std::fs::write(&homes.pi, b"[]").unwrap();
+        assert!(ADAPTER.workspace_trust(&workspace, &homes).is_err());
+    }
+
     #[test]
     fn diagnostics_describe_pi_owned_fallback_without_claiming_live_delivery() {
         use super::super::super::doctor::{Availability, Context};

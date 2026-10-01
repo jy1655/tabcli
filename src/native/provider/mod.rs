@@ -205,6 +205,12 @@ impl FollowUpTransport {
 }
 
 trait NativeProviderAdapter: Sync {
+    fn workspace_trust(
+        &self,
+        workspace: &Path,
+        homes: &super::consent::Homes,
+    ) -> Result<super::consent::Trust>;
+    fn workspace_trust_key(&self, screen: &str, workspace: &Path) -> Option<terminal::DialogKey>;
     fn diagnose(&self, context: super::doctor::Context<'_>) -> Vec<super::doctor::Check>;
     // Caller-environment variables removed from every short-lived provider query the
     // bridge runs (version preflight, doctor probes). Each adapter states its own list;
@@ -270,6 +276,22 @@ fn adapter(provider: FirstPartyCli) -> &'static dyn NativeProviderAdapter {
         FirstPartyCli::Agy => &agy::ADAPTER,
         FirstPartyCli::Pi => &pi::ADAPTER,
     }
+}
+
+pub(super) fn workspace_trust(
+    provider: FirstPartyCli,
+    workspace: &Path,
+    homes: &super::consent::Homes,
+) -> Result<super::consent::Trust> {
+    adapter(provider).workspace_trust(workspace, homes)
+}
+
+pub(super) fn workspace_trust_key(
+    provider: FirstPartyCli,
+    screen: &str,
+    workspace: &Path,
+) -> Option<terminal::DialogKey> {
+    adapter(provider).workspace_trust_key(screen, workspace)
 }
 
 pub(super) fn diagnose(

@@ -29,6 +29,45 @@ pub(super) struct AgyAdapter;
 
 const PENDING_TURN_FILE: &str = "agy-pending-turn.json";
 
+// The only line Agy draws under its trust dialog is the footer with the selected
+// model's label, and `agy models` (1.2.14) lists these families. The footer appears
+// about a second after the dialog and names the saved model, not always a Gemini
+// one: a `Gemini `-only rule left the dialog of a `Claude Opus 4.6 (Thinking)`
+// setup unanswered until the ask deadline (session-a1QguW, 2026-10-01). Any other
+// trailing line (a permission prompt, a custom status line, a new family) leaves
+// the dialog to the user.
+const AGY_MODEL_LABEL_PREFIXES: [&str; 3] = ["Gemini ", "Claude ", "GPT-"];
+
+// Agy 1.2.12 has no process-local workspace-trust flag. This adapter-only
+// fallback responds to its exact managed startup dialog, then verifies Agy's
+// own saved decision. Remove when Agy exposes an official trust input API.
+fn agy_trust_prompt_key(screen: &str, workspace: &Path) -> Option<terminal::DialogKey> {
+    let lines: Vec<_> = screen
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let start = lines.iter().rposition(|s| *s == "Accessing workspace:")?;
+    let lines = &lines[start..];
+    let key = super::super::consent::native_key(workspace).ok()?;
+    if lines.len() < 7
+        || lines[1] != key
+        || lines[2] != "Do you trust the contents of this project?"
+        || lines[3] != "Antigravity CLI requires permission to read, edit, and execute files here."
+        || lines[4] != "> Yes, I trust this folder"
+        || lines[5] != "No, exit"
+        || lines[6] != "↑/↓ Navigate · enter Confirm"
+        || lines[7..].iter().any(|line| {
+            !AGY_MODEL_LABEL_PREFIXES
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        })
+    {
+        return None;
+    }
+    Some(terminal::DialogKey::Enter)
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct PendingAgyTurn {
     schema: u32,
@@ -54,6 +93,44 @@ impl PendingAgyTurn {
 const AGY_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Agy exposes no verifiable ownership evidence for a conversation (presence locks are not held by the running process) and its transcript monitor binds only to a newly created conversation";
 
 impl NativeProviderAdapter for AgyAdapter {
+    fn workspace_trust_key(&self, screen: &str, workspace: &Path) -> Option<terminal::DialogKey> {
+        agy_trust_prompt_key(screen, workspace)
+    }
+    fn workspace_trust(
+        &self,
+        workspace: &Path,
+        homes: &super::super::consent::Homes,
+    ) -> Result<super::super::consent::Trust> {
+        use super::super::consent::{self, Evidence, Trust};
+        let Some(text) = consent::read_store(&homes.agy)? else {
+            return Ok(Trust::Absent);
+        };
+        let config: serde_json::Value = serde_json::from_str(&text)?;
+        let config = config
+            .as_object()
+            .context("Agy settings is not an object")?;
+        let Some(entries) = config.get("trustedWorkspaces") else {
+            return Ok(Trust::Absent);
+        };
+        let entries = entries
+            .as_array()
+            .context("Agy trustedWorkspaces is not an array")?;
+        let key = consent::native_key(workspace)?;
+        let entries = entries
+            .iter()
+            .map(|v| v.as_str().context("unknown Agy trustedWorkspaces entry"))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(if entries.contains(&key.as_str()) {
+            Trust::Trusted(Evidence {
+                provider: "agy".into(),
+                store: homes.agy.clone(),
+                key,
+            })
+        } else {
+            Trust::Absent
+        })
+    }
+
     fn probe_environment_removals(&self) -> &'static [&'static str] {
         // Agy derives no session identity from the caller's environment.
         &[]
@@ -64,16 +141,22 @@ impl NativeProviderAdapter for AgyAdapter {
         context: super::super::doctor::Context<'_>,
     ) -> Vec<super::super::doctor::Check> {
         use super::super::doctor::{Availability::Unknown, Check};
-        vec![
+        let mut checks = vec![
             Check::new(
                 "agy_follow_up",
                 Unknown,
                 "agy_terminal_fallback",
-                "Agy owns terminal-paste follow-up and transcript result monitoring. No verified first-party input path into a running interactive session is integrated. Every paste (the Windows initial prompt and every follow-up on Windows and macOS) waits for Agy's own log to show readiness and requires a HandleUserInput receipt; the macOS initial prompt is a launch argument and never waits.",
+                "Agy owns terminal-paste follow-up and transcript result monitoring. No verified first-party input path into a running interactive session is integrated. Every paste (the Windows initial prompt and every follow-up on Windows and macOS) waits for Agy's own log to show readiness and requires a HandleUserInput receipt; the Windows initial prompt and every macOS follow-up also wait until Agy's own trust store lists the exact workspace and the session's own log shows that it loaded the workspace customizations. The macOS initial prompt is a launch argument and never waits.",
                 "Inspect the managed owner and terminal; retain this fallback until Agy offers a verified native path.",
             ),
             input_receipt_check(context.directory),
-        ]
+        ];
+        // Session-scoped: only a launched session has a managed terminal that can
+        // still show the trust dialog.
+        if let Some(directory) = context.directory {
+            checks.push(workspace_trust_check(context.workspace, directory));
+        }
+        checks
     }
 
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
@@ -125,13 +208,13 @@ impl NativeProviderAdapter for AgyAdapter {
     }
 
     fn initial_prompt_ready_delay(&self) -> Duration {
-        // The Windows console paste waits on Agy's own startup log instead of a
-        // fixed delay (see `wait_for_startup_readiness_with`): the former 12 second
-        // delay was shorter than Agy's startup reload burst under CPU contention,
-        // and a paste that lands inside a reload is discarded (issue #43). A paste
-        // lost to a reload after the gate ends as delivery-uncertain, never as a
-        // second paste. Non-Windows delivers the initial prompt as an argument and
-        // never waits; its first paste is the first follow-up, which gates itself.
+        // The Windows console paste waits on Agy's trust evidence and startup log
+        // instead of a fixed delay (see `wait_for_startup_readiness_with`): the
+        // former 12 second delay pasted onto the workspace-trust dialog of an
+        // untrusted workspace, which discards the paste (issue #43). A paste that
+        // still gets no receipt ends as delivery-uncertain, never as a second
+        // paste. Non-Windows delivers the initial prompt as an argument and never
+        // waits; its first paste is the first follow-up, which gates itself.
         Duration::ZERO
     }
 
@@ -142,6 +225,10 @@ impl NativeProviderAdapter for AgyAdapter {
         deadline: Instant,
     ) -> terminal::TerminalSendResult {
         if cfg!(windows) {
+            let directory =
+                session_directory_of(session).map_err(terminal::TerminalSendFailure::not_sent)?;
+            wait_for_workspace_trust(&directory, deadline)
+                .map_err(terminal::TerminalSendFailure::not_sent)?;
             deliver_terminal_turn(
                 session,
                 prompt_path,
@@ -206,12 +293,16 @@ impl NativeProviderAdapter for AgyAdapter {
             deliver_terminal_turn(session, prompt_path, deadline, None)
         } else {
             // On macOS the initial prompt was a launch argument, so the first
-            // follow-up is the first paste and lands in the same startup burst that
-            // discards Windows initial pastes (issue #43): session-QMFk6F, 2026-09-24
-            // 21:32, lost its `tell` pasted 10.3 s after `CLI startup completed`, 0.85 s
-            // before the deferred skills reload. Every follow-up therefore waits for the
-            // macOS readiness rule and requires the receipt; a gate that has already
-            // settled passes after one quiet period.
+            // follow-up is the first paste. Agy runs that argument behind its
+            // workspace-trust dialog, which covers the composer until the workspace
+            // is approved, and a paste onto the dialog is lost while its Enter
+            // approves the folder (issue #48, see `wait_for_workspace_trust_with`).
+            // Every follow-up therefore waits for the trust evidence, then for the
+            // macOS readiness rule, and requires the receipt.
+            let directory =
+                session_directory_of(session).map_err(terminal::TerminalSendFailure::not_sent)?;
+            wait_for_workspace_trust(&directory, deadline)
+                .map_err(terminal::TerminalSendFailure::not_sent)?;
             deliver_terminal_turn(
                 session,
                 prompt_path,
@@ -313,57 +404,76 @@ fn correlated_response<'a>(message: &'a str, pending: &PendingAgyTurn) -> Result
     Ok(body)
 }
 
-// Windows console delivery verification (Agy adapter fallback, issue #43).
+// Terminal paste delivery verification (Agy adapter fallback, issues #43 and #48).
 //
-// Native Windows Agy has no first-party input API for a running interactive session
-// and no ready/accepted signal for a turn, so the adapter pastes the framed prompt
-// into the managed console. The TUI silently discards a paste that lands while it is
-// still reloading skills and hooks after `CLI startup completed`, and a discarded
-// paste leaves the session `working` at an empty composer. Until Agy exposes either a
-// first-party input path or a per-turn ready/accepted signal, this adapter reads
-// Agy's own `--log-file` output (glog lines) as the only available evidence:
+// Agy has no first-party input API for a running interactive session and no
+// ready/accepted signal for a turn, so the adapter pastes the framed prompt into the
+// managed terminal. Until Agy exposes either a first-party input path or a per-turn
+// ready/accepted signal, this adapter reads Agy's own trust store and `--log-file`
+// output (glog lines) as the only available evidence.
 //
-// - readiness gate: `CLI startup completed` (analytics.go), at least one
-//   `Full redraw completed` (manager.go) line after it, deferred-reload settlement,
-//   and a quiet period in which no `Reloading system slash commands` line (with
-//   or without "and skills"), no `Full redraw completed` line, and no
-//   `hooks_manager.go` line arrives, measured from the newest such line. The
-//   quiet period and the deferred-reload window run concurrently, not in
-//   sequence: both are timed on the gate's clock, the window from the first read
-//   that showed `CLI startup completed` and the quiet period from the first read
-//   that showed the newest activity line, and the gate is ready on the first read
-//   at which every condition holds. A healthy Agy that never logs the deferred
-//   reload and has been quiet since its startup burst is therefore ready at
-//   startup + 45 s exactly, not at startup + 45 s + 3.5 s; only an activity line
-//   inside the last 3.5 s of the window pushes readiness past its end.
-//   Deferred-reload settlement means either a `Reloading system slash commands and
-//   skills` line stamped at least 1 s after `CLI startup completed` (Agy 1.2.10
-//   defers its skills reload to roughly 10-37 s after startup, and that reload
-//   clears the composer: the session-IEKjtC paste at +9.5 s, 2026-09-24 17:47, the
-//   session-fMqSQc paste at +12 s, 2026-09-24 16:41, the session-ql5TVc paste at
-//   +20.1 s, 2026-09-24 18:48, and the session-uqraap paste at +35 s, 2026-09-24
-//   20:44, were all discarded by it; a skills reload stamped within 1 s of startup
-//   is the startup reload, which Agy logs on either side of `CLI startup
-//   completed`, and it never settles the condition: session-M8QFPp, 2026-09-24
-//   20:37, logged it 1.6 ms after startup) or 45 s since the gate first saw `CLI
-//   startup completed` (the deferred reload is not coming: a healthy
-//   session-IQHEwf, 2026-09-24 17:20, logged its startup reload before `CLI
-//   startup completed`, never logged the deferred reload, and went silent). The gate never
-//   waits for a hooks completion after a reload; the startup reload of session-IQHEwf
-//   had none. A reload that arrives after both windows is caught by the input
-//   receipt below, not by the gate. The gate also keeps the byte length and a
-//   digest of every byte of the newest read (`LogContinuity`): a log that
-//   disappears, shrinks, or no longer reproduces that digest over the observed
-//   length was replaced or rotated, so every settlement instant is discarded and
-//   the quiet period and the window are re-measured from the new content. Any
-//   number of such restarts is tolerated within the deadline: the gate fails the
-//   paste as `not_sent` only when the deadline passes, and the report then lists
-//   every discontinuity in order (review round 6, replacing round 5's leading-bytes
-//   check and its failure on the second discontinuity).
+// What loses a paste (root cause, 2026-10-01): Agy keeps its workspace-trust dialog
+// over the composer until the exact workspace is in its own trust store, and it runs
+// an argument-delivered initial prompt behind the dialog. A paste onto the dialog is
+// discarded and its Enter confirms the preselected "Yes, I trust this folder"; Agy
+// then logs `Reloading system slash commands and skills` with three companion lines
+// (356 bytes; `TrustWorkspace` -> `AddWorkspaceDir` -> `reloadWorkspaceCustomizations`
+// in the 1.2.14 binary) and no `HandleUserInput`, and the session is left `working`
+// at an empty composer. Reproduced on demand with Agy 1.2.14 on macOS (session-U2yPxX:
+// dialog on screen, paste, those 356 bytes 0.5 s later, the workspace added to
+// `trustedWorkspaces`, no receipt). In more than 100 Agy logs on that Mac
+// (2026-09-10 to 2026-10-01) the reload appears only in sessions whose workspace is
+// in the trust store, and in none of the sessions whose workspace never got there.
+// The "deferred skills reload" of the 2026-09-24 notes below is this reload: it
+// followed every lost paste by at most 1.4 s because the paste's own Enter caused
+// it, and it never came in a workspace that was already trusted. It is not a startup
+// timer, so no window can stand in for the trust evidence.
+//
+// - workspace trust: no paste before Agy's store lists the exact workspace and this
+//   session's own log shows the workspace customization load, the per-process
+//   evidence that its dialog is gone (`wait_for_workspace_trust_with`). The macOS
+//   follow-up and the native Windows initial paste both wait for it.
+// - readiness gate: `CLI startup completed` (analytics.go), on the Windows console
+//   at least one `Full redraw completed` (manager.go) line after it, and a quiet
+//   period in which no `Reloading system slash commands` line (with or without "and
+//   skills"), no `Full redraw completed` line, and no `hooks_manager.go` line
+//   arrives, measured on the gate's clock from the first read that showed the newest
+//   such line. The gate is ready on the first read at which every condition holds,
+//   and it never waits for a hooks completion after a reload; the startup reload of
+//   session-IQHEwf had none.
+//   No rule waits for the trust reload any more. The rules of 0.0.7 and 0.0.8 held
+//   the paste back for a "deferred reload window" (45 s on the Windows console after
+//   20 and 35 s had proved too short, 60 s on macOS) in which a `Reloading system
+//   slash commands and skills` line stamped at least 1 s after `CLI startup
+//   completed` ended the wait.
+//   That line is the trust reload, logged when a paste's Enter approved the dialog
+//   (the session-IEKjtC paste at +9.5 s, 2026-09-24 17:47, the session-fMqSQc paste
+//   at +12 s, 2026-09-24 16:41, the session-ql5TVc paste at +20.1 s, 2026-09-24
+//   18:48, and the session-uqraap paste at +35 s, 2026-09-24 20:44), so it never came
+//   before a paste and never comes in a workspace trusted before launch, where the
+//   window only delayed the paste (session-IQHEwf, 2026-09-24 17:20, logged its
+//   startup reload before `CLI startup completed`, never logged another, and went
+//   silent). The trust evidence is checked first instead. macOS dropped its window
+//   when the cause was found. The Windows console dropped it once native Windows was
+//   verified again (2026-10-01): session-jkxi48 (Agy 1.2.10, the 45 s rule) logged
+//   the customization load 58 ms after startup and no trust reload before its paste
+//   at +45 s, and session-C2fMs7 and session-uTpvwY (Agy 1.2.14, no window) pasted
+//   right after the quiet period, 8.8 and 7.9 s after startup, and logged their
+//   receipts 1.2 and 1.4 s later. `ReadinessTiming` still carries a window so that
+//   the tests can replay the recorded sessions against the former rules; no rule in
+//   this file sets one, and it can go together with those replays.
+//   The gate also keeps the byte length and a digest of every byte of the newest
+//   read (`LogContinuity`): a log that disappears, shrinks, or no longer reproduces
+//   that digest over the observed length was replaced or rotated, so every
+//   settlement instant is discarded and the quiet period is re-measured from the new
+//   content. Any number of such restarts is tolerated within the deadline: the gate
+//   fails the paste as `not_sent` only when the deadline passes, and the report then
+//   lists every discontinuity in order (review round 6, replacing round 5's
+//   leading-bytes check and its failure on the second discontinuity).
 // - input receipt: a complete `HandleUserInput called with text: "..."` line
 //   (input_loop.go) that starts after the byte length of agy.log observed
-//   immediately before the paste and whose text carries the Windows protocol prefix
-//   and the complete pending turn marker.
+//   immediately before the paste and whose text carries the adapter's framing and
+//   the complete pending turn marker.
 //
 // Delivery classification after a paste (issue #43 review):
 //
@@ -373,14 +483,14 @@ fn correlated_response<'a>(message: &'a str, pending: &PendingAgyTurn) -> Result
 //   conversation-start lines (`Starting new conversation`, `Created conversation`):
 //   session-udT6uY logged it 15 ms after the receipt (2026-09-24 16:42:50.228), and
 //   both delivered live asks of round 7 showed the same. That is the reload the new
-//   conversation triggers, not the deferred startup reload, so it is never evidence
-//   that the paste was cleared. `observe_input_receipt` looks only for the receipt,
-//   and `confirm_input_receipt_with` returns on the first read that yields
-//   `Delivered`, so a later reload cannot flip a delivered classification;
+//   conversation triggers, not the trust reload, so it is never evidence that the
+//   paste was lost. `observe_input_receipt` looks only for the receipt, and
+//   `confirm_input_receipt_with` returns on the first read that yields `Delivered`,
+//   so a later reload cannot flip a delivered classification;
 // - delivery-uncertain: everything else. Non-delivery would have to be proven by a
 //   line Agy logs after draining its console input without a receipt, and the real
 //   logs contain no such marker (session-fMqSQc, 2026-09-24: after the discarded
-//   paste Agy logged only its late reload and then nothing for a minute), so a
+//   paste Agy logged only the trust reload and then nothing for a minute), so a
 //   missing receipt at the end of the window, a deadline-capped window, an
 //   unreadable or missing log, a log shorter than the pre-paste offset (rotated or
 //   truncated), and a partial trailing line all stay uncertain and never `not_sent`.
@@ -392,32 +502,35 @@ fn correlated_response<'a>(message: &'a str, pending: &PendingAgyTurn) -> Result
 //   session with `close-session --explicit` or launch a new one; the bridge never
 //   re-pastes or cleans up on its own.
 //
-// macOS follow-up delivery (iTerm2/Terminal.app paste, 2026-09-24 21:32, Agy
-// 1.2.10): the initial prompt is a `--prompt-interactive` argument, so the first
-// paste is the first `tell`, and it meets the same startup burst. Two differences
-// from the Windows console:
+// macOS follow-up delivery (iTerm2/Terminal.app paste): the initial prompt is a
+// `--prompt-interactive` argument, so the first paste is the first `tell`. Three
+// differences from the Windows console:
 //
+// - The trust evidence is checked at the follow-up, not at launch: the argument
+//   prompt completes behind the dialog, so an `ask` in a workspace no provider has
+//   approved returns its result while the dialog is still up. Issue #48 was that
+//   state: the former 60 s window ended, the paste landed on the dialog, and the
+//   receipt check saw only the 356 bytes of the trust reload.
+// - There is no deferred-reload window (`MACOS_FOLLOW_UP_READINESS_TIMING`): once the
+//   trust evidence holds nothing is pending, and a follow-up in a workspace trusted
+//   before launch no longer waits 60 s for a reload that never comes.
 // - Agy on macOS logs no `Full redraw completed` line at all (session-QMFk6F and
-//   session-7IgCnx, this machine), so the macOS rule (`MACOS_FOLLOW_UP_READINESS_TIMING`)
-//   does not require the redraw marker; every other condition is the same.
-// - The argument-delivered initial prompt starts a conversation a few seconds after
-//   startup, and Agy logs a `Reloading system slash commands and skills` line a few
-//   milliseconds after `Starting new conversation` (7 ms in session-QMFk6F at +2.9 s,
-//   26 ms in session-7IgCnx at +2.7 s). That is the conversation reload, not the
-//   deferred startup reload, which still followed at +11.2 s in session-QMFk6F and
-//   cleared the composer under the smoke's `tell` (pasted at +10.3 s, no receipt,
-//   session left `working`). A skills reload stamped within
-//   `CONVERSATION_RELOAD_MAX_LATENCY` after the newest `Starting new conversation`
-//   line therefore never settles the deferred-reload condition, on either platform.
+//   session-7IgCnx, this machine), so the macOS rule does not require the redraw
+//   marker. The argument prompt starts a conversation a few seconds after startup,
+//   and the `Reloading system slash commands and skills` line a few milliseconds
+//   after `Starting new conversation` (7 ms in session-QMFk6F at +2.9 s, 26 ms in
+//   session-7IgCnx at +2.7 s) is the conversation reload: an activity line for the
+//   quiet period, and never the trust reload on either platform
+//   (`CONVERSATION_RELOAD_MAX_LATENCY`).
 //
 // The receipt is the same Go-quoted `HandleUserInput` line: a multi-line paste
 // through iTerm2 is logged as one record with `\n` escapes and the complete marker
 // (session-QMFk6F, 21:42:19). It carries the macOS framing header instead of the
 // Windows one, and `receipt_matches` accepts either adapter-owned framing.
 //
-// Delete this section, `initial_prompt_ready_delay`, and the receipt branches of
-// `send_initial_prompt`/`send_terminal_follow_up` when Agy provides such a signal
-// or an input API; the transcript result monitor is unaffected.
+// Delete this section, `initial_prompt_ready_delay`, and the trust and receipt
+// branches of `send_initial_prompt`/`send_terminal_follow_up` when Agy provides
+// such a signal or an input API; the transcript result monitor is unaffected.
 const AGY_LOG_FILE: &str = "agy.log";
 const STARTUP_COMPLETED_MARKER: &str = "CLI startup completed";
 const SLASH_RELOAD_MARKER: &str = "Reloading system slash commands";
@@ -436,12 +549,12 @@ const TURN_PROTOCOL_HEADER: &str = "[Agent Bridge Agy turn protocol]";
 // A skills reload stamped at most this long after the newest `Starting new
 // conversation` line is the reload the new conversation triggers (7 ms and 26 ms
 // after it on macOS; 15 ms after the receipt on Windows, session-udT6uY), never the
-// deferred startup reload, whose shortest observed latency after startup is 9.8 s.
+// trust reload, which follows the Enter that approves the workspace-trust dialog.
 const CONVERSATION_RELOAD_MAX_LATENCY: Duration = Duration::from_secs(1);
 // Observed post-login reload bursts arrive about 3.0 seconds apart; the quiet period
 // must outlast that cadence so the paste does not land between two of them.
 const STARTUP_QUIET_PERIOD: Duration = Duration::from_millis(3500);
-// Deferred skills reload latency after `CLI startup completed`, Agy 1.2.10 on this
+// Trust reload latency after `CLI startup completed`, Agy 1.2.10 on the Windows
 // machine, 2026-09-24 KST (the fixtures in the tests):
 //
 // | session        | latency | window at the time | paste                       |
@@ -453,44 +566,43 @@ const STARTUP_QUIET_PERIOD: Duration = Duration::from_millis(3500);
 // | session-uqraap | 36.4 s  | 35 s               | +35 s, lost (CPU idle)      |
 // | session-IQHEwf | never   | -                  | none (round-1 gate)         |
 //
-// Nine more logs put it at 12.9 to 13.2 s. The latencies form two clusters, one
-// near 10-21 s and a second near 36 s that arrived under heavy load and on an idle
-// CPU alike (two Agy launches overlapped in the idle case), so the second cluster
-// looks timer-driven rather than load-driven, and a 35 s window pasted right before
-// it twice. The window must outlast 36.4 s with margin. The trade-off is latency
-// for a healthy Agy that never logs the deferred reload: it now pastes at startup
-// + 45 s instead of + 35 s (the quiet period runs concurrently with the window and
-// has ended long before, unless an activity line lands inside the window's last
-// 3.5 s).
-const DEFERRED_RELOAD_WINDOW: Duration = Duration::from_secs(45);
+// Nine more logs put it at 12.9 to 13.2 s, about a second after the fixed 12 s
+// paste. The reload always trails the paste, whatever the window was: the paste's
+// Enter approved the workspace-trust dialog and Agy logged the trust reload, so each
+// longer window only moved the loss later, and session-IQHEwf, which pasted nothing,
+// never logged it. No window was ever a measured startup latency, and none is left
+// (see the note at the head of this section).
+//
 // A `Reloading system slash commands and skills` line stamped less than this long
-// after `CLI startup completed` is the startup reload, not the deferred one. Agy
+// after `CLI startup completed` is the startup reload, not the trust reload. Agy
 // logs its startup reload on either side of `CLI startup completed`: 3.5 ms before
 // it in session-fMqSQc, 0.5 ms after it in session-udT6uY and 1.6 ms after it in
-// session-M8QFPp (2026-09-24 20:37), where the former rule took it for the deferred
-// reload and settled the condition at once. The deferred reload has never arrived
-// earlier than 9.8 s after startup.
+// session-M8QFPp (2026-09-24 20:37), where the former rule took it for the later
+// reload and settled the condition at once. The trust reload follows an Enter on
+// the dialog; the earliest one recorded on the Windows console came 9.8 s after
+// startup.
 const DEFERRED_RELOAD_MIN_LATENCY: Duration = Duration::from_secs(1);
 // The Windows console rule: Agy redraws the console composer once the TUI is up, so
-// the redraw after startup is required.
+// the redraw after startup is required. The initial paste has already waited for the
+// trust evidence, so no trust reload is pending and there is no deferred-reload
+// window: the former 45 s one delayed every `ask` in a workspace trusted before
+// launch by that long (53 s for session-jkxi48 against 18 and 24 s without it,
+// 2026-10-01).
 const WINDOWS_STARTUP_READINESS_TIMING: ReadinessTiming = ReadinessTiming {
     quiet_period: STARTUP_QUIET_PERIOD,
-    deferred_reload_window: DEFERRED_RELOAD_WINDOW,
+    deferred_reload_window: Duration::ZERO,
     redraw_required: true,
 };
-// Deferred skills reload latency after `CLI startup completed` on macOS (iTerm2,
-// this Mac, 2026-09-24 KST, Agy 1.2.10): 11.2 s in session-QMFk6F and 55.4 s in
-// session-S7qq65, whose first `tell` the 45 s window pasted at +45 s and the reload
-// cleared 8 s later (reported delivery-uncertain, no receipt). The macOS window
-// therefore outlasts 55.4 s with margin; a healthy session that never logs the
-// deferred reload pastes its first follow-up at startup + 60 s, and every later
-// follow-up passes after one quiet period because the condition is already settled.
-const MACOS_DEFERRED_RELOAD_WINDOW: Duration = Duration::from_secs(60);
-// The macOS follow-up rule: the same quiet period, the longer window, and no redraw
-// marker, which Agy never logs on macOS.
+// The macOS follow-up rule: the same quiet period, no deferred-reload window, and no
+// redraw marker, which Agy never logs on macOS. The follow-up has already waited for
+// the trust evidence, so no trust reload is pending. The former 60 s window
+// (2026-09-24: 11.2 s in session-QMFk6F, 55.4 s in session-S7qq65, both the trust
+// reload that the `tell`'s own Enter caused) delayed every first follow-up in a
+// trusted workspace by a minute and still pasted onto the dialog of an untrusted one
+// (issue #48).
 const MACOS_FOLLOW_UP_READINESS_TIMING: ReadinessTiming = ReadinessTiming {
     quiet_period: STARTUP_QUIET_PERIOD,
-    deferred_reload_window: MACOS_DEFERRED_RELOAD_WINDOW,
+    deferred_reload_window: Duration::ZERO,
     redraw_required: false,
 };
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -525,10 +637,112 @@ fn read_log_bytes(log_path: &Path) -> Result<Option<Vec<u8>>> {
     super::super::read_regular_bytes_if_present(log_path)
 }
 
-// Pastes one framed turn into the managed terminal and confirms its receipt. With a
-// readiness rule the paste waits for Agy's startup burst to settle first (the Windows
-// initial prompt, every macOS follow-up); without one it pastes at once (a Windows
-// follow-up, whose initial paste already waited).
+// The trust evidence a paste needs (issue #48): Agy's trust store lists the exact
+// workspace, and this session's own log shows that this Agy process loaded the
+// workspace customizations. The store alone is shared by every Agy process: a
+// dialog approved in one session leaves the dialog of another session of the same
+// workspace open (session-UuYk87, 2026-10-01: store entry present, dialog still on
+// screen for five seconds until it was approved there too). Agy loads the
+// customizations only once it trusts the workspace, at startup when the store
+// already lists it or when the dialog is approved in that process (`AddWorkspaceDir`
+// -> `reloadWorkspaceCustomizations` -> `ReloadHooks`), and either way a goroutine
+// other than the main one logs a `hooks_manager.go` line; the main goroutine logs
+// the only other one while the store manager is built. In 112 logs of Agy 1.2.6 to
+// 1.2.14 on macOS and in the Windows fixtures of the tests, every delivered paste
+// follows such a line and no session with its dialog still open has one.
+//
+// A log without the line withholds the paste but does not prove an open dialog: the
+// log can be missing, or cut before the line, in a session that has none. The
+// reports therefore state what was read, and the recovery is conditional on what the
+// managed terminal shows.
+const TRUST_STORE_MISSING: &str = "Agy's trust store does not list the exact workspace, and Agy keeps its trust dialog over the composer until such a workspace is approved";
+const TRUST_SESSION_UNVERIFIED: &str = "Agy's trust store lists the workspace, but this session's agy.log does not show that this session loaded the workspace customizations (no `hooks_manager.go` line outside the main goroutine), so its own trust dialog may still be open";
+const TRUST_RECOVERY: &str = "If the managed terminal shows the trust dialog, approve it there and send the prompt again; if it shows the composer or the prompt is still withheld afterwards, close this session and start a new one";
+
+fn workspace_customizations_loaded(log: &[u8]) -> bool {
+    complete_log_lines(log).any(|line| {
+        glog_timestamp(&line).is_some()
+            && line
+                .get(21..)
+                .and_then(|rest| rest.trim_start().split_once(' '))
+                .is_some_and(|(goroutine, rest)| {
+                    goroutine != "1"
+                        && !goroutine.is_empty()
+                        && goroutine.bytes().all(|byte| byte.is_ascii_digit())
+                        && rest.starts_with(HOOKS_LOADED_SOURCE)
+                })
+    })
+}
+
+// Waits until `missing` reports nothing missing. An absent entry, a session whose
+// log lacks the load, an unreadable store or log, and a lookup error all keep
+// waiting, since none proves the dialog is gone: a human approves it in the managed
+// terminal, or shared consent answered it at launch. The deadline ends the wait as
+// `not_sent`, before any terminal input.
+fn wait_for_workspace_trust_with<T, C>(
+    missing: &mut T,
+    deadline: Instant,
+    poll_interval: Duration,
+    clock: &mut C,
+) -> Result<()>
+where
+    T: FnMut() -> Result<Option<&'static str>>,
+    C: Clock,
+{
+    loop {
+        let observed = missing();
+        if matches!(observed, Ok(None)) {
+            return Ok(());
+        }
+        let now = clock.now();
+        if now >= deadline {
+            let reason = match observed {
+                Err(error) => format!("Agy's trust evidence could not be read ({error:#})"),
+                Ok(missing) => missing.unwrap_or_default().to_owned(),
+            };
+            bail!(
+                "Agy workspace trust was not verified before the deadline, so the prompt was not pasted: {reason}. {TRUST_RECOVERY}"
+            );
+        }
+        clock.sleep(deadline.saturating_duration_since(now).min(poll_interval));
+    }
+}
+
+fn workspace_trust_missing(
+    workspace: &Path,
+    homes: &super::super::consent::Homes,
+    log_path: &Path,
+) -> Result<Option<&'static str>> {
+    use super::super::consent::Trust;
+    if !matches!(
+        ADAPTER.workspace_trust(workspace, homes)?,
+        Trust::Trusted(_)
+    ) {
+        return Ok(Some(TRUST_STORE_MISSING));
+    }
+    let loaded = read_log_bytes(log_path)?
+        .as_deref()
+        .is_some_and(workspace_customizations_loaded);
+    Ok((!loaded).then_some(TRUST_SESSION_UNVERIFIED))
+}
+
+fn wait_for_workspace_trust(directory: &Path, deadline: Instant) -> Result<()> {
+    let workspace = super::super::read_manifest(directory)?.workspace;
+    let homes = super::super::consent::Homes::current()?;
+    let log_path = directory.join(AGY_LOG_FILE);
+    wait_for_workspace_trust_with(
+        &mut || workspace_trust_missing(&workspace, &homes, &log_path),
+        deadline,
+        STARTUP_POLL_INTERVAL,
+        &mut SystemClock,
+    )
+}
+
+// Pastes one framed turn into the managed terminal and confirms its receipt. The
+// caller has already waited for workspace trust. With a readiness rule the paste
+// waits for Agy's startup burst to settle first (the Windows initial prompt, every
+// macOS follow-up); without one it pastes at once (a Windows follow-up, whose initial
+// paste already waited).
 fn deliver_terminal_turn(
     session: &terminal::TerminalSession,
     prompt_path: &Path,
@@ -561,18 +775,66 @@ fn deliver_terminal_turn(
             .map_err(TerminalSendFailure::not_sent)?;
         follow_up_pre_paste_offset(log.as_deref()).map_err(TerminalSendFailure::not_sent)?
     };
-    terminal::send_file(session, prompt_path, deadline)?;
-    let pasted_at = Instant::now();
-    // The composer state after an unconfirmed paste is unknown; never paste again.
-    confirm_input_receipt_with(
-        &mut || read_log_bytes(&log_path),
+    trace_terminal_delivery(
+        &directory,
         &pending,
         pre_paste_len,
-        pasted_at,
-        deadline,
-        INPUT_RECEIPT_POLL_INTERVAL,
-        &mut SystemClock,
+        session.kind.as_str(),
+        || terminal::send_file(session, prompt_path, deadline),
+        || {
+            // The composer state after an unconfirmed paste is unknown; never paste again.
+            confirm_input_receipt_with(
+                &mut || read_log_bytes(&log_path),
+                &pending,
+                pre_paste_len,
+                Instant::now(),
+                deadline,
+                INPUT_RECEIPT_POLL_INTERVAL,
+                &mut SystemClock,
+            )
+        },
     )
+}
+
+// Request-scoped timing evidence for #48. A missing receipt alone cannot locate
+// the failure between terminal injection, a late reload, and Agy's input loop.
+// Record actual dispatch times and the offset used by the receipt check without
+// copying prompt text. Diagnostic write failures never cancel or retry delivery.
+fn trace_terminal_delivery<S, C>(
+    directory: &Path,
+    pending: &PendingAgyTurn,
+    pre_paste_len: usize,
+    terminal: &str,
+    send: S,
+    confirm: C,
+) -> terminal::TerminalSendResult
+where
+    S: FnOnce() -> terminal::TerminalSendResult,
+    C: FnOnce() -> terminal::TerminalSendResult,
+{
+    let path = directory.join(format!("agy-input-{}.json", pending.claim_token));
+    let mut trace = serde_json::json!({
+        "schema":1, "claim_token":pending.claim_token, "terminal":terminal,
+        "pre_paste_offset":pre_paste_len, "prepared_unix_ms":super::super::unix_ms(),
+        "outcome":"prepared", "paste_started_unix_ms":null,
+        "paste_returned_unix_ms":null, "receipt_finished_unix_ms":null, "error":null,
+    });
+    let _ = super::super::write_json_atomic(&path, &trace);
+    trace["paste_started_unix_ms"] = serde_json::json!(super::super::unix_ms());
+    let result = send();
+    trace["paste_returned_unix_ms"] = serde_json::json!(super::super::unix_ms());
+    let result = result.and_then(|()| confirm());
+    trace["receipt_finished_unix_ms"] = serde_json::json!(super::super::unix_ms());
+    trace["outcome"] = serde_json::json!(match &result {
+        Ok(()) => "confirmed",
+        Err(error) if error.delivery_may_have_occurred() => "delivery-uncertain",
+        Err(_) => "not-sent",
+    });
+    if let Err(error) = &result {
+        trace["error"] = serde_json::json!(error.error().to_string());
+    }
+    let _ = super::super::write_json_atomic(&path, &trace);
+    result
 }
 
 // A follow-up is pasted into a session whose Agy has been logging since launch, so
@@ -704,7 +966,8 @@ struct StartupObservation {
     redraw_after_startup: Option<usize>,
     // Line index of the first `Reloading system slash commands and skills` line
     // after the startup line that is stamped at least `DEFERRED_RELOAD_MIN_LATENCY`
-    // after it: the deferred skills reload that clears the composer. The startup
+    // after it: the trust reload Agy logs when its workspace-trust dialog is
+    // approved (the "deferred" reload of the 2026-09-24 notes). The startup
     // reload, which Agy logs a few milliseconds before or after `CLI startup
     // completed`, does not count on either side of it.
     deferred_reload_after_startup: Option<usize>,
@@ -859,6 +1122,8 @@ impl ReadinessState {
 #[derive(Clone, Copy, Debug)]
 struct ReadinessTiming {
     quiet_period: Duration,
+    // How long the former rules waited for the trust reload after startup. Zero in
+    // every rule of this file; the tests set it to replay those rules.
     deferred_reload_window: Duration,
     // Whether a `Full redraw completed` line after startup is required. Agy logs it
     // on the Windows console and never on macOS.
@@ -1067,7 +1332,10 @@ impl ReadinessGate {
             Some(observation) => observation.missing_markers(self.timing.redraw_required),
             None => StartupObservation::default().missing_markers(self.timing.redraw_required),
         };
-        if !self.deferred_reload_settled {
+        // No rule of this file has a window; the report names one only for a rule
+        // that does.
+        let windowed = !self.timing.deferred_reload_window.is_zero();
+        if windowed && !self.deferred_reload_settled {
             missing.push(DEFERRED_RELOAD_DESCRIPTION);
         }
         if !self.quiet_reached {
@@ -1089,11 +1357,21 @@ impl ReadinessGate {
                 self.describe_discontinuities()
             ),
         };
+        let timed = if windowed {
+            format!(
+                "the quiet period is {} ms and the deferred reload window is {} ms, timed concurrently (the window from the first read with `CLI startup completed`, the quiet period from the newest reload, redraw, or hooks line; ready when both hold)",
+                self.timing.quiet_period.as_millis(),
+                self.timing.deferred_reload_window.as_millis()
+            )
+        } else {
+            format!(
+                "the quiet period is {} ms, timed from the newest reload, redraw, or hooks line",
+                self.timing.quiet_period.as_millis()
+            )
+        };
         format!(
-            "Agy did not report startup readiness before the deadline: {}; missing markers: {missing}; the quiet period is {} ms and the deferred reload window is {} ms, timed concurrently (the window from the first read with `CLI startup completed`, the quiet period from the newest reload, redraw, or hooks line; ready when both hold){restarted}; the prompt was not pasted",
+            "Agy did not report startup readiness before the deadline: {}; missing markers: {missing}; {timed}{restarted}; the prompt was not pasted",
             state.describe(),
-            self.timing.quiet_period.as_millis(),
-            self.timing.deferred_reload_window.as_millis()
         )
     }
 
@@ -1326,6 +1604,69 @@ where
     }
 }
 
+fn workspace_trust_check(workspace: &Path, directory: &Path) -> super::super::doctor::Check {
+    use super::super::doctor::{Availability::Unknown, Check};
+    match super::super::consent::Homes::current() {
+        Ok(homes) => workspace_trust_check_with(workspace, &homes, directory),
+        Err(error) => Check::new(
+            "agy_workspace_trust",
+            Unknown,
+            "agy_trust_store_unlocated",
+            format!("{error:#}"),
+            "Inspect the managed terminal; doctor never answers the dialog.",
+        ),
+    }
+}
+
+fn workspace_trust_check_with(
+    workspace: &Path,
+    homes: &super::super::consent::Homes,
+    directory: &Path,
+) -> super::super::doctor::Check {
+    use super::super::doctor::{Availability::*, Check};
+    const OBSERVATION: &str =
+        "Observation only: doctor never answers the dialog or edits Agy's settings.";
+    const WITHHELD: &str = "The Windows initial paste and every macOS follow-up are withheld meanwhile, because a paste onto the dialog is lost and its Enter would approve the folder; an argument-delivered initial prompt still runs behind the dialog.";
+    let log_path = directory.join(AGY_LOG_FILE);
+    let (availability, reason, detail) = match workspace_trust_missing(workspace, homes, &log_path) {
+        Ok(None) => (
+            Available,
+            "agy_workspace_trusted",
+            "Agy's own trust store lists this exact workspace and this session's agy.log shows that it loaded the workspace customizations, so no workspace-trust dialog covers the composer.".to_owned(),
+        ),
+        Ok(Some(TRUST_STORE_MISSING)) => (
+            Unavailable,
+            "agy_workspace_untrusted",
+            format!("Agy's own trust store does not list this exact workspace, and Agy keeps its workspace-trust dialog over the composer until such a workspace is approved. {WITHHELD}"),
+        ),
+        Ok(Some(_)) => (
+            Unknown,
+            "agy_session_trust_unverified",
+            format!("Agy's own trust store lists this exact workspace, but this session's agy.log does not show that this session loaded the workspace customizations. Either this session still shows its own workspace-trust dialog, as it does after the workspace was approved in another session, or the log is missing or no longer holds that line. {WITHHELD}"),
+        ),
+        Err(error) => (
+            Unknown,
+            "agy_trust_evidence_unreadable",
+            format!("Agy's trust store or this session's agy.log could not be read, so the dialog state is unobserved: {error:#}"),
+        ),
+    };
+    let next_action = if availability == Available {
+        OBSERVATION.to_owned()
+    } else {
+        format!(
+            "{OBSERVATION} {TRUST_RECOVERY}. A workspace another provider already trusts is answered from shared consent on a later ask."
+        )
+    };
+    Check::new(
+        "agy_workspace_trust",
+        availability,
+        reason,
+        detail,
+        next_action,
+    )
+    .evidence(serde_json::json!({ "workspace": workspace, "store": homes.agy, "log": log_path }))
+}
+
 fn input_receipt_check(directory: Option<&Path>) -> super::super::doctor::Check {
     input_receipt_check_for_platform(directory, cfg!(windows))
 }
@@ -1336,7 +1677,7 @@ fn input_receipt_check_for_platform(
 ) -> super::super::doctor::Check {
     use super::super::doctor::{Availability::Unknown, Check};
     const CHECK_ID: &str = "agy_input_receipt";
-    const NEXT_ACTION: &str = "Observation only. A gated paste (the Windows initial prompt, every macOS follow-up) waits for CLI startup completed (on the Windows console also a Full redraw completed after it), the deferred skills reload (Reloading system slash commands and skills stamped at least 1 s after startup and not within 1 s after a Starting new conversation line; an earlier one is the startup reload, a later one right after a conversation start is that conversation's reload) or the platform's deferred reload window since startup (45 s on the Windows console, 60 s on macOS), and a quiet period without reload, redraw, or hooks lines, re-measured from the new content whenever agy.log disappears, shrinks, or no longer holds the bytes observed earlier (any number of times within the timeout), pasted right after the read that passed the gate with that read's length as the receipt offset; every paste requires a HandleUserInput receipt carrying the complete pending turn marker within 60 s of the paste (Agy logs the receipt when it processes the paste, which took 18 s under load); a missing receipt leaves delivery uncertain with the session working and the reason in status.error, and the paste is never repeated. Inspect the session and close it explicitly or launch a new one.";
+    const NEXT_ACTION: &str = "Observation only. A gated paste (the Windows initial prompt, every macOS follow-up) first waits until Agy's own trust store lists the exact workspace and this session's agy.log shows the workspace customization load (agy_workspace_trust), then for CLI startup completed and a 3.5 s quiet period without reload, redraw, or hooks lines. The Windows console also requires a Full redraw completed after startup. Neither platform waits for the trust reload (Reloading system slash commands and skills stamped at least 1 s after startup and not within 1 s after a Starting new conversation line): Agy logs it only when a trust dialog is approved, so it never comes once the trust evidence holds. The log evidence is re-measured from the new content whenever agy.log disappears, shrinks, or no longer holds the bytes observed earlier (any number of times within the timeout), and the paste follows the read that passed the gate with that read's length as the receipt offset; every paste requires a HandleUserInput receipt carrying the complete pending turn marker within 60 s of the paste (Agy logs the receipt when it processes the paste, which took 18 s under load); a missing receipt leaves delivery uncertain with the session working and the reason in status.error, and the paste is never repeated. Inspect the session and close it explicitly or launch a new one.";
     let redraw_required = windows;
     let startup_markers = if windows {
         "CLI startup completed followed by a Full redraw completed"
@@ -1388,12 +1729,16 @@ fn input_receipt_check_for_platform(
             .any(|receipt| receipt_matches(receipt, pending))
     });
     // The doctor reads the log once, so it reports the two startup markers only; the
-    // deferred reload window and the quiet period are timed live and concurrently
-    // by the paste gate and cannot be judged here.
+    // quiet period is timed live by the paste gate and cannot be judged here.
+    let gate_rule = if windows {
+        "the paste gate also waits for a 3.5 s quiet period without reload, redraw, or hooks lines, after the workspace trust evidence (agy_workspace_trust)"
+    } else {
+        "the follow-up gate also waits for a 3.5 s quiet period without reload or hooks lines, after the workspace trust evidence (agy_workspace_trust)"
+    };
     let (reason, detail) = match (startup.markers_observed(redraw_required), last) {
         (false, _) => (
             "agy_startup_markers_missing",
-            format!("agy.log does not yet show the startup markers ({startup_markers}); the paste gate also waits for the deferred skills reload (stamped at least 1 s after startup and not right after a conversation start) or the platform's deferred reload window since startup (45 s on the Windows console, 60 s on macOS) and, concurrently, for a 3.5 s quiet period without reload, redraw, or hooks lines; it pastes on the first read at which both hold, so a quiet startup that never logs the deferred reload pastes when the window ends."),
+            format!("agy.log does not yet show the startup markers ({startup_markers}); {gate_rule}."),
         ),
         (true, None) => (
             "agy_no_input_receipt",
@@ -1627,16 +1972,88 @@ fn read_full_result(path: &Path, brain_root: &Path, step: u64) -> Result<Option<
     Ok(None)
 }
 
+// A turn Agy gives up on never reaches the transcript as a result: the conversation
+// keeps only its USER_INPUT step and agy.log gets one `agent executor error:` line
+// (2026-10-01, Agy 1.2.14: `generating and executing: RESOURCE_EXHAUSTED (code 429):
+// Individual quota reached. ... Resets in 2h22m28s.`; fifteen sessions, the only such
+// lines in more than 100 logs, each of which waited out its whole timeout). Turns are
+// sequential and each starts with a `Forwarding user message` line, so an error after
+// the newest such line ended the newest turn. That turn is the pending one when the
+// log itself says so: a pasted turn is preceded by the receipt that carries its
+// marker. The argument-delivered initial prompt has no receipt; it is the first turn
+// of the log, and Agy's full transcript must hold exactly one USER_INPUT step, the
+// one with the marker, so that a later turn whose log lines are not yet written
+// cannot inherit the first turn's error. Replace this when Agy exposes a per-turn
+// failure callback with turn identity.
+const TURN_START_MARKER: &str = "Forwarding user message to conversation ";
+const TURN_FAILURE_MARKER: &str = "agent executor error: ";
+
+// The terminal error of the newest turn when the log shows that turn to be the
+// pending one, and whether it was pasted (bound by its receipt) or is the first,
+// argument-delivered turn (still to be bound by the transcript).
+fn pending_turn_failure(log: &[u8], pending: &PendingAgyTurn) -> Option<(String, bool)> {
+    let mut turns = 0_usize;
+    let mut receipt = None;
+    let (mut ours, mut pasted) = (false, false);
+    let mut failure = None;
+    for line in complete_log_lines(log) {
+        if let Some(input) = parse_input_receipt(&line) {
+            receipt = Some(receipt_matches(&input, pending));
+        } else if line.contains(TURN_START_MARKER) {
+            (ours, pasted) = match receipt.take() {
+                Some(matches) => (matches, true),
+                None => (turns == 0, false),
+            };
+            turns += 1;
+            failure = None;
+        } else if ours
+            && failure.is_none()
+            && let Some((_, error)) = line.split_once(TURN_FAILURE_MARKER)
+        {
+            failure = Some(error.trim().to_owned());
+        }
+    }
+    failure.map(|error| (error, pasted))
+}
+
+fn only_user_input_carries(path: &Path, brain_root: &Path, marker: &str) -> Result<bool> {
+    if validated_file_metadata(path, brain_root)?.is_none() {
+        return Ok(false);
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .with_context(|| format!("failed to read full Agy transcript: {}", path.display()))?;
+    let (mut inputs, mut carries) = (0_usize, false);
+    for line in BufReader::new(file).lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line?) else {
+            continue;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("USER_INPUT") {
+            inputs += 1;
+            carries = value
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|content| content.contains(marker));
+        }
+    }
+    Ok(inputs == 1 && carries)
+}
+
 #[derive(Default)]
 struct MonitorState {
     conversation_id: Option<String>,
     transcript: Option<TranscriptCursor>,
+    // The claim whose turn failure has been recorded; its pending-turn file stays
+    // until the next turn replaces it.
+    failed_claim: Option<String>,
 }
 
 impl MonitorState {
     fn poll(&mut self, directory: &Path, log_path: &Path, brain_root: &Path) -> Result<()> {
-        if let Some(log) = super::super::read_regular_text_if_present(log_path)?
-            && let Some(newest_id) = parse_conversation_id(&log)
+        let log = super::super::read_regular_text_if_present(log_path)?;
+        if let Some(log) = &log
+            && let Some(newest_id) = parse_conversation_id(log)
             && self.conversation_id.as_deref() != Some(newest_id.as_str())
         {
             let path = brain_root
@@ -1650,7 +2067,28 @@ impl MonitorState {
         if let (Some(id), Some(cursor)) =
             (self.conversation_id.as_deref(), self.transcript.as_mut())
         {
+            // A result Agy has already written is recorded first, so a failure is
+            // only attributed to a turn that has none at this point. The failure
+            // releases the claim: a result written afterwards is not accepted.
             cursor.poll(directory, brain_root, id)?;
+            if let Some(log) = &log
+                && let Some(pending) = read_pending_turn(directory)?
+                && self.failed_claim.as_deref() != Some(pending.claim_token.as_str())
+                && let Some((error, pasted)) = pending_turn_failure(log.as_bytes(), &pending)
+                && (pasted
+                    || only_user_input_carries(&cursor.full_path, brain_root, &pending.marker)?)
+            {
+                super::super::record_provider_failure_for_claim(
+                    directory,
+                    FirstPartyCli::Agy,
+                    &format!("Agy turn failed: {error}"),
+                    Some(id.to_owned()),
+                    None,
+                    Some(&pending.claim_token),
+                )
+                .context("failed to record the Agy turn failure")?;
+                self.failed_claim = Some(pending.claim_token);
+            }
         }
         Ok(())
     }
@@ -1759,6 +2197,142 @@ fn parse_transcript_line(line: &str) -> Option<(u64, String)> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn missing_receipt_is_traced_once_and_trace_failure_does_not_cancel_delivery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pending = PendingAgyTurn::new("48-1-0").unwrap();
+        let sends = std::cell::Cell::new(0);
+        let result = trace_terminal_delivery(
+            tmp.path(),
+            &pending,
+            26060,
+            "apple-terminal",
+            || {
+                sends.set(sends.get() + 1);
+                Ok(())
+            },
+            || {
+                Err(terminal::TerminalSendFailure::delivery_uncertain(
+                    anyhow::anyhow!("no HandleUserInput receipt"),
+                ))
+            },
+        );
+        assert!(result.unwrap_err().delivery_may_have_occurred());
+        assert_eq!(sends.get(), 1);
+        let trace: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(tmp.path().join("agy-input-48-1-0.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(trace["pre_paste_offset"], 26060);
+        assert_eq!(trace["outcome"], "delivery-uncertain");
+        assert!(
+            trace["paste_started_unix_ms"].as_u64().unwrap()
+                <= trace["paste_returned_unix_ms"].as_u64().unwrap()
+        );
+        let blocked = tmp.path().join("not-a-directory");
+        std::fs::write(&blocked, b"preserve").unwrap();
+        trace_terminal_delivery(
+            &blocked,
+            &pending,
+            10,
+            "iterm2",
+            || {
+                sends.set(sends.get() + 1);
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(sends.get(), 2);
+        assert_eq!(std::fs::read(&blocked).unwrap(), b"preserve");
+        let confirms = std::cell::Cell::new(0);
+        let failure = trace_terminal_delivery(
+            tmp.path(),
+            &pending,
+            10,
+            "iterm2",
+            || {
+                Err(terminal::TerminalSendFailure::not_sent(anyhow::anyhow!(
+                    "deadline"
+                )))
+            },
+            || {
+                confirms.set(confirms.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(!failure.delivery_may_have_occurred());
+        assert_eq!(confirms.get(), 0);
+    }
+
+    #[test]
+    fn workspace_trust_and_dialog_are_exact_and_do_not_accept_permission_prompts() {
+        use super::super::super::consent::{self, Trust};
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().canonicalize().unwrap();
+        let homes = consent::fixture_homes(tmp.path());
+        let key = consent::native_key(&workspace).unwrap();
+        super::super::super::write_json_atomic(
+            &homes.agy,
+            &serde_json::json!({"trustedWorkspaces":[key.clone()]}),
+        )
+        .unwrap();
+        assert!(matches!(
+            ADAPTER.workspace_trust(&workspace, &homes).unwrap(),
+            Trust::Trusted(_)
+        ));
+        assert_eq!(
+            ADAPTER
+                .workspace_trust(&workspace.join("child"), &homes)
+                .unwrap(),
+            Trust::Absent
+        );
+        let screen = format!(
+            "Accessing workspace:\n{key}\nDo you trust the contents of this project?\nAntigravity CLI requires permission to read, edit, and execute files here.\n> Yes, I trust this folder\nNo, exit\n↑/↓ Navigate · enter Confirm\nGemini 3.8 Flash · high"
+        );
+        assert_eq!(
+            agy_trust_prompt_key(&screen, &workspace),
+            Some(terminal::DialogKey::Enter)
+        );
+        // The footer names the saved model, which need not be a Gemini one, and it
+        // is absent in the first second (session-a1QguW and session-n3tsmp).
+        for footer in ["Claude Opus 4.6 (Thinking)", "GPT-OSS 120B (Medium)"] {
+            assert_eq!(
+                agy_trust_prompt_key(
+                    &screen.replace("Gemini 3.8 Flash · high", footer),
+                    &workspace
+                ),
+                Some(terminal::DialogKey::Enter),
+                "{footer}"
+            );
+        }
+        assert_eq!(
+            agy_trust_prompt_key(
+                screen.trim_end_matches("\nGemini 3.8 Flash · high"),
+                &workspace
+            ),
+            Some(terminal::DialogKey::Enter)
+        );
+        assert_eq!(
+            agy_trust_prompt_key(&screen, &workspace.join("child")),
+            None
+        );
+        assert_eq!(
+            agy_trust_prompt_key(&(screen.clone() + "\nAllow terminal command?"), &workspace),
+            None
+        );
+        assert_eq!(
+            agy_trust_prompt_key(
+                &screen.replace("> Yes, I trust this folder", "Yes, I trust this folder"),
+                &workspace
+            ),
+            None
+        );
+        std::fs::write(&homes.agy, b"{\"trustedWorkspaces\":true}").unwrap();
+        assert!(ADAPTER.workspace_trust(&workspace, &homes).is_err());
+    }
+
+    #[test]
     fn diagnostics_describe_agy_owned_fallback_without_claiming_live_delivery() {
         use super::super::super::doctor::{Availability, Context};
         use super::NativeProviderAdapter;
@@ -1858,7 +2432,7 @@ mod tests {
     // and 153 are the startup. The main thread's hooks line (91) precedes the startup
     // reload (120), whose own hooks completion (122) follows at once. That startup
     // reload is stamped 0.5 ms after `CLI startup completed`, so it is the startup
-    // reload, not the deferred one, and the gate waits for the window on this log.
+    // reload, not the trust reload, which this trusted workspace never logs.
     const REAL_SUCCESS_STARTUP: &str = r"I0924 16:42:24.068931       1 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
 I0924 16:42:24.073126       1 common.go:438] Starting CLI program
 CLI ready for user input
@@ -1888,7 +2462,7 @@ I0924 16:42:50.228760     580 manager.go:1308] Reloading system slash commands
     // skipped its hooks pass, so the only hooks line before 16:41:20 is the main
     // thread's (95). The fixed 12 second delay pasted at about 16:41:19, and the
     // round-3 gate would have been ready at 16:41:17.24, 3.5 s after the 16:41:13
-    // reload; both precede the deferred reload below, which the gate now waits for.
+    // reload; both precede the trust reload below, which the paste itself caused.
     const REAL_FAILURE_STARTUP: &str = r"I0924 16:41:07.819578       1 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
 I0924 16:41:07.823186       1 common.go:438] Starting CLI program
 CLI ready for user input
@@ -1922,7 +2496,7 @@ I0924 16:41:20.816140     410 manager.go:1312] Slash commands unchanged, skippin
     // `... and skills` reload never came, and after three plain reloads within 6.4 s
     // the log was silent for five minutes. A healthy session, so the reload/hooks
     // pair cannot be the readiness discriminator, and the deferred reload cannot be
-    // required unconditionally: the gate pastes when its 45 s window ends.
+    // required at all: the gate pastes one quiet period after the last plain reload.
     const REAL_QUIET_STARTUP: &str = r#"E0924 17:20:28.610124     222 errorreport.go:224] error getting token source: You are not logged into Antigravity.
 W0924 17:20:28.610124     222 cache.go:135] Cache(userInfo): Singleflight refresh failed: failed to get load code assist response: error getting token source: You are not logged into Antigravity.
 E0924 17:20:28.610124     222 errorreport.go:224] failed to get load code assist response: error getting token source: You are not logged into Antigravity.
@@ -2214,8 +2788,9 @@ I0924 20:37:46.098266     482 http_helpers.go:305] URL: https://daily-cloudcode-
     // completed` line at all on macOS. The startup reload precedes `CLI startup
     // completed`; `Starting new conversation` (+2.9 s) is followed 7 ms later by the
     // conversation reload, which the former rule took for the deferred reload; the
-    // real deferred reload and its hooks line come at +11.2 s. The smoke pasted its
-    // follow-up at 21:32:18.79 (+10.3 s), 0.85 s before that reload, and no
+    // trust reload and its hooks line come at +11.2 s. The smoke pasted its
+    // follow-up at 21:32:18.79 (+10.3 s) onto the workspace-trust dialog; its Enter
+    // approved the folder, Agy logged that reload 0.85 s later, and no
     // `HandleUserInput` receipt followed.
     const REAL_MACOS_INITIAL_TURN: &str = r#"E0924 21:32:08.448630     204 errorreport.go:224] failed to get load code assist response: error getting token source: You are not logged into Antigravity.
 W0924 21:32:08.448718     204 cache.go:135] Cache(loadCodeAssistResponse): Singleflight refresh failed: error getting token source: You are not logged into Antigravity.
@@ -2298,10 +2873,12 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
     const REAL_MACOS_CONVERSATION_RELOAD_LINE: usize = 44;
     const REAL_MACOS_DEFERRED_RELOAD_LINE: usize = 72;
 
-    // Deferred skills reload latency (`Reloading system slash commands and skills`
+    // "Deferred" skills reload latency (`Reloading system slash commands and skills`
     // stamped at least 1 s after `CLI startup completed`, measured from the startup
-    // line) in the fixtures above, all Agy 1.2.10 on this machine, 2026-09-24 KST,
-    // for the next window adjustment:
+    // line) in the fixtures above, all Agy 1.2.10 on the Windows machine, 2026-09-24
+    // KST. Read with the 2026-10-01 finding: this is the trust reload, logged when the
+    // paste's Enter approved the workspace-trust dialog, so it trails every lost paste
+    // and is absent wherever the workspace was already trusted (the delivered rows).
     //
     // | fixture        | startup reload  | deferred reload      | latency  | paste                 |
     // |----------------|-----------------|----------------------|----------|-----------------------|
@@ -2360,6 +2937,17 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         deferred_reload_window: Duration::from_secs(35),
         redraw_required: true,
     };
+    // The Windows console rule of 0.0.7 and 0.0.8, for contrast: the same quiet period
+    // with the 45 s deferred-reload window, which no paste ever needed. A workspace
+    // trusted before launch never logs the trust reload, so its paste waited the
+    // whole window (session-jkxi48, 2026-10-01), and in an untrusted one the reload
+    // follows the paste, whatever the window is.
+    const DEFERRED_RELOAD_WINDOW: Duration = Duration::from_secs(45);
+    const ROUND_9_TIMING: ReadinessTiming = ReadinessTiming {
+        quiet_period: STARTUP_QUIET_PERIOD,
+        deferred_reload_window: DEFERRED_RELOAD_WINDOW,
+        redraw_required: true,
+    };
     // Round 8's receipt window, which session-M8QFPp's 18.0 s receipt outlasted.
     const ROUND_8_RECEIPT_WINDOW: Duration = Duration::from_secs(15);
     const REPLAY_POLL: Duration = Duration::from_millis(100);
@@ -2380,14 +2968,16 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
     struct LogReplay {
         start: Instant,
         first: Duration,
+        // The `mmdd` of the first timestamped line; a recorded log spans one day.
+        date: String,
         lines: Vec<(Instant, String)>,
     }
 
     impl LogReplay {
         fn new(text: &str, start: Instant) -> Self {
-            let first = text
+            let (first, date) = text
                 .lines()
-                .find_map(glog_time_of_day)
+                .find_map(|line| Some((glog_time_of_day(line)?, line[1..5].to_owned())))
                 .expect("a recorded log has a timestamped line");
             let mut previous = first;
             let mut lines = Vec::new();
@@ -2399,13 +2989,14 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
             Self {
                 start,
                 first,
+                date,
                 lines,
             }
         }
 
         // The replay instant of a recorded `HH:MM:SS.ffffff` time of day.
         fn recorded(&self, time: &str) -> Instant {
-            let stamp = glog_time_of_day(&format!("I0924 {time}")).expect("a glog time");
+            let stamp = glog_time_of_day(&format!("I{} {time}", self.date)).expect("a glog time");
             self.start + (stamp - self.first)
         }
 
@@ -2826,7 +3417,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
     }
 
     #[test]
-    fn readiness_gate_is_ready_when_the_concurrent_window_ends_on_the_quiet_healthy_startup() {
+    fn readiness_gate_is_ready_after_the_quiet_period_on_the_quiet_healthy_startup() {
         // session-IQHEwf: the round-1/2 rule required a hooks_manager.go line after
         // the latest `... and skills` reload. This log has none, so that rule would
         // have waited until the deadline; the receipt-less silence was a healthy
@@ -2843,36 +3434,66 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
             "the old readiness discriminator never appears in this healthy log"
         );
 
-        // The deferred skills reload never comes either, so the gate is ready 45 s
-        // after `CLI startup completed` (17:20:28.616574): 45.0 s of waiting, well
-        // inside any deadline. The quiet period runs concurrently with the window
-        // and had ended at 17:20:38.45, 3.5 s after the last plain reload, which is
-        // when the round-3 rule was ready; the window's end is the ready instant,
-        // not window + quiet period. The former 20 s window would have pasted at
-        // 17:20:48.62 and the former 35 s window at 17:21:03.62.
+        // The trust reload never comes either: the workspace was trusted before
+        // launch. The gate is ready at 17:20:38.45, 3.5 s after the last plain
+        // reload and 9.8 s after `CLI startup completed` (17:20:28.616574).
         let replay = LogReplay::new(REAL_QUIET_STARTUP, Instant::now());
         let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
-        assert_ready_at(&replay, ready, "17:21:13.616574", "session-IQHEwf");
+        assert_ready_at(&replay, ready, "17:20:38.450075", "session-IQHEwf");
+        assert_eq!(
+            replay.states(
+                WINDOWS_STARTUP_READINESS_TIMING,
+                &[
+                    "17:20:28.610124",
+                    "17:20:28.616574",
+                    "17:20:28.663151",
+                    "17:20:30.481001",
+                    "17:20:33.155749",
+                    "17:20:34.950075",
+                    "17:20:38.450074",
+                    "17:20:38.450075",
+                ]
+            ),
+            vec![
+                ReadinessState::AwaitingStartup,
+                ReadinessState::AwaitingRedraw,
+                ReadinessState::Settling,
+                ReadinessState::Settling,
+                ReadinessState::Settling,
+                ReadinessState::Settling,
+                ReadinessState::Settling,
+                ReadinessState::Ready,
+            ]
+        );
+
+        // The former rules waited for that reload all the same, each for its whole
+        // window, counted from when the gate first saw startup: the 45 s rule pasted
+        // at 17:21:13.62, the 35 s one at 17:21:03.62, and the quiet period that ran
+        // concurrently had long ended. The window's end was the ready instant, not
+        // window + quiet period.
+        assert_ready_at(
+            &replay,
+            replay_readiness(&replay, ROUND_9_TIMING),
+            "17:21:13.616574",
+            "session-IQHEwf, the 45 s rule",
+        );
         assert_ready_at(
             &replay,
             replay_readiness(&replay, ROUND_8_TIMING),
             "17:21:03.616574",
             "session-IQHEwf, round 8",
         );
-        let round_3 = replay_readiness(&replay, ROUND_3_TIMING);
-        assert_ready_at(
-            &replay,
-            round_3,
-            "17:20:38.450075",
-            "session-IQHEwf, round 3",
+        assert_eq!(
+            replay_readiness(&replay, ROUND_3_TIMING),
+            ready,
+            "round 3's rule is the rule again, now behind the trust evidence"
         );
 
-        // State by state at the recorded instants: every plain reload restarts the
-        // quiet period, the deferred-reload window is the last condition to hold,
-        // and the window counts from when the gate first saw startup.
+        // State by state under the 45 s rule: every plain reload restarts the quiet
+        // period, and the deferred-reload window is the last condition to hold.
         assert_eq!(
             replay.states(
-                WINDOWS_STARTUP_READINESS_TIMING,
+                ROUND_9_TIMING,
                 &[
                     "17:20:28.610124",
                     "17:20:28.616574",
@@ -2911,6 +3532,8 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
     #[test]
     fn readiness_gate_starts_the_quiet_period_at_the_newest_activity_line() {
         let start = Instant::now();
+        // A rule with the former 45 s window, so that the quiet period is exercised
+        // together with the condition it once ran concurrently with.
         let timing = ReadinessTiming {
             quiet_period: Duration::from_millis(3500),
             deferred_reload_window: Duration::from_secs(45),
@@ -3194,7 +3817,10 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
     fn readiness_gate_restarts_its_evidence_when_the_log_is_replaced() {
         let start = Instant::now();
         let at = |millis: u64| start + Duration::from_millis(millis);
-        let timing = WINDOWS_STARTUP_READINESS_TIMING;
+        // The 45 s rule, under which the window has to restart as well as the quiet
+        // period. The rule in force has no window; its quiet period restarts the
+        // same way (the last block of this test).
+        let timing = ROUND_9_TIMING;
         let startup_redraw = glog(
             "16:41:07.830345",
             1,
@@ -3375,6 +4001,33 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
             ReadinessState::AwaitingDeferredReload
         );
         assert!(gate.discontinuities.is_empty());
+
+        // The rule in force, on the review scenario: ready one quiet period after
+        // the redraw, and the replacement at t=20 owes a quiet period of its own.
+        let mut gate = ReadinessGate::new(start, WINDOWS_STARTUP_READINESS_TIMING);
+        assert_eq!(
+            gate.observe(Some(startup_redraw.as_bytes()), at(0)),
+            ReadinessState::Settling
+        );
+        assert_eq!(
+            gate.observe(Some(startup_redraw.as_bytes()), at(3_500)),
+            ReadinessState::Ready
+        );
+        assert_eq!(gate.observe(None, at(19_900)), ReadinessState::AwaitingLog);
+        assert_eq!(
+            gate.observe(Some(startup_redraw.as_bytes()), at(20_000)),
+            ReadinessState::Settling,
+            "a replacement with identical indices at t=20 is not ready"
+        );
+        assert_eq!(
+            gate.observe(Some(startup_redraw.as_bytes()), at(23_499)),
+            ReadinessState::Settling
+        );
+        assert_eq!(
+            gate.observe(Some(startup_redraw.as_bytes()), at(23_500)),
+            ReadinessState::Ready
+        );
+        assert_eq!(gate.discontinuities.len(), 1);
     }
 
     #[test]
@@ -3659,14 +4312,13 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         assert!(visible.contains("16:42:24.068931"));
         assert!(!visible.contains(STARTUP_COMPLETED_MARKER));
 
-        // session-udT6uY logs no deferred reload before its receipt, so the gate
-        // is ready when the 45 s window ends, counted from the first read at which
-        // startup was visible.
+        // session-udT6uY: the gate is ready 3.5 s after the last plain reload at
+        // 16:42:29.104592, whether or not the log starts with a header.
         let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
         assert_ready_at(
             &replay,
             ready,
-            "16:43:09.080467",
+            "16:42:32.604592",
             "session-udT6uY with a header",
         );
         let without_header = LogReplay::new(REAL_SUCCESS_STARTUP, start);
@@ -3676,32 +4328,46 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         );
     }
 
+    // The recorded lost pastes (2026-09-24, Agy 1.2.10, Windows console) under the
+    // rule in force and under the rules of their time. Each paste landed on the
+    // workspace-trust dialog, and the trust reload these logs show is what its Enter
+    // caused. The gate cannot see the dialog: it is ready one quiet period after the
+    // startup burst, before that reload in every one of them, and a window only moved
+    // the paste, and the loss, later. What withholds these pastes is the trust
+    // evidence, which none of these logs holds before its paste
+    // (`workspace_customization_load_is_read_from_the_sessions_own_log`).
     #[test]
-    fn readiness_gate_waits_past_the_lost_fixture_late_reload() {
-        // session-fMqSQc: the round-3 rule was ready at 16:41:17.24, 3.5 s after the
-        // 16:41:13 reload, and the fixed 12 s delay pasted at about 16:41:19; the
-        // deferred skills reload at 16:41:20.81 discarded that paste. It arrived
-        // 13.0 s after startup, inside the 45 s window, so the gate now waits for it
-        // and is ready 3.5 s after its hooks line.
+    fn readiness_gate_is_ready_before_the_trust_reload_of_the_lost_fixture() {
+        // session-fMqSQc: ready at 16:41:17.24, 3.5 s after the 16:41:13 reload; the
+        // fixed 12 s delay pasted at about 16:41:19, and the trust reload followed at
+        // 16:41:20.81, 13.0 s after startup.
         let log = late_reload_startup_log() + &late_reload_completion();
         let replay = LogReplay::new(&log, Instant::now());
-        let round_3 = replay_readiness(&replay, ROUND_3_TIMING);
-        assert_ready_at(
-            &replay,
-            round_3,
-            "16:41:17.237805",
-            "session-fMqSQc, round 3",
+        let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
+        assert_ready_at(&replay, ready, "16:41:17.237805", "session-fMqSQc");
+        assert!(
+            ready < replay.recorded("16:41:20.813553"),
+            "the gate is ready before the trust reload"
         );
         assert!(
-            round_3 < replay.recorded("16:41:20.813553"),
-            "the round-3 rule pasted before the deferred reload"
+            !workspace_customizations_loaded(late_reload_startup_log().as_bytes()),
+            "the trust evidence is missing before the paste"
         );
-        let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
-        assert_ready_at(&replay, ready, "16:41:24.314059", "session-fMqSQc");
-        assert!(ready > replay.recorded("16:41:20.816140"));
+
+        // The 45 s rule on the same recording: the reload falls inside its window, so
+        // it would have been ready 3.5 s after the reload's hooks line. The recording
+        // holds that reload only because an earlier rule had pasted.
+        let former = replay_readiness(&replay, ROUND_9_TIMING);
+        assert_ready_at(
+            &replay,
+            former,
+            "16:41:24.314059",
+            "session-fMqSQc, the 45 s rule",
+        );
+        assert!(former > replay.recorded("16:41:20.816140"));
         assert_eq!(
             replay.states(
-                WINDOWS_STARTUP_READINESS_TIMING,
+                ROUND_9_TIMING,
                 &[
                     "16:41:07.876154",
                     "16:41:17.237805",
@@ -3719,15 +4385,15 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
             ]
         );
 
-        // A skills reload during the quiet period restarts the period and settles the
-        // deferred-reload condition; a hooks line after it is never demanded.
+        // A skills reload during the quiet period restarts the period; a hooks line
+        // after it is never demanded.
         let start = Instant::now();
         let at = |millis: u64| start + Duration::from_millis(millis);
         let mut gate = ReadinessGate::new(start, WINDOWS_STARTUP_READINESS_TIMING);
         let late = late_reload_startup_log();
         assert_eq!(
             gate.observe(Some(late.as_bytes()), at(0)),
-            ReadinessState::AwaitingDeferredReload
+            ReadinessState::Settling
         );
         let reloading = late.clone()
             + &glog("16:41:15.000000", 410, "manager.go:1331", SKILLS_RELOAD)
@@ -3748,34 +4414,33 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
     }
 
     #[test]
-    fn readiness_gate_waits_past_the_deferred_reload_that_cleared_the_composer() {
-        // session-IEKjtC: the round-3 build was ready at 17:47:13.12, 3.5 s after the
-        // 17:47:09.62 plain reload, and pasted at about 17:47:13.1. The deferred
-        // skills reload at 17:47:13.468 then cleared the composer and no receipt
-        // followed. The new rule waits for that reload (9.8 s after startup) and is
-        // ready 3.5 s after its hooks line.
+    fn readiness_gate_is_ready_where_the_recorded_paste_met_the_trust_dialog() {
+        // session-IEKjtC: ready at 17:47:13.12, 3.5 s after the 17:47:09.62 plain
+        // reload, which is where the round-3 build pasted. The trust reload at
+        // 17:47:13.468 (9.8 s after startup) followed that paste by 0.35 s and no
+        // receipt came.
         let replay = LogReplay::new(REAL_DEFERRED_RELOAD_STARTUP, Instant::now());
-        let deferred_reload = replay.recorded("17:47:13.468286");
-        let round_3 = replay_readiness(&replay, ROUND_3_TIMING);
+        let trust_reload = replay.recorded("17:47:13.468286");
+        let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
+        assert_ready_at(&replay, ready, "17:47:13.116209", "session-IEKjtC");
+        assert!(
+            ready < trust_reload,
+            "the gate is ready before the trust reload"
+        );
+
+        // The 45 s rule on the same recording waits past the reload, its hooks line,
+        // and its completion.
+        let former = replay_readiness(&replay, ROUND_9_TIMING);
         assert_ready_at(
             &replay,
-            round_3,
-            "17:47:13.116209",
-            "session-IEKjtC, round 3",
+            former,
+            "17:47:16.968806",
+            "session-IEKjtC, the 45 s rule",
         );
-        assert!(
-            round_3 < deferred_reload,
-            "the round-3 rule pasted before the deferred reload"
-        );
-        let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
-        assert_ready_at(&replay, ready, "17:47:16.968806", "session-IEKjtC");
-        assert!(
-            ready > replay.recorded("17:47:13.470456"),
-            "the new rule waits past the deferred reload, its hooks line, and its completion"
-        );
+        assert!(former > replay.recorded("17:47:13.470456"));
         assert_eq!(
             replay.states(
-                WINDOWS_STARTUP_READINESS_TIMING,
+                ROUND_9_TIMING,
                 &[
                     "17:47:03.620082",
                     "17:47:03.666570",
@@ -3803,16 +4468,19 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
     }
 
     #[test]
-    fn readiness_gate_waits_past_the_deferred_reload_outside_the_former_window() {
+    fn a_20_s_window_only_moved_the_paste_onto_the_trust_dialog_later() {
         // session-ql5TVc: the quiet period ended at 18:48:12.15, 3.5 s after the
-        // 18:48:08.65 plain reload, and the round-6 rule's 20 s window ended at
-        // 18:48:24.12, when it pasted. The deferred skills reload at 18:48:25.481988
-        // (21.4 s after startup) then cleared the composer and no receipt followed.
-        // The 45 s window is still open at that reload, so the gate waits for it and
-        // is ready 3.5 s after its hooks line.
+        // 18:48:08.65 plain reload, which is when the rule in force is ready. The
+        // round-6 rule's 20 s window ended at 18:48:24.12, when it pasted, and the
+        // trust reload at 18:48:25.481988 (21.4 s after startup) followed that paste
+        // with no receipt. The 45 s rule on the recording is ready 3.5 s after the
+        // reload's hooks line.
         let replay = LogReplay::new(REAL_LATE_DEFERRED_RELOAD_STARTUP, Instant::now());
         let startup = replay.recorded("18:48:04.115440");
         let deferred_reload = replay.recorded("18:48:25.481988");
+        let in_force = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
+        assert_ready_at(&replay, in_force, "18:48:12.146591", "session-ql5TVc");
+        assert!(in_force < deferred_reload);
         assert!(
             deferred_reload - startup > Duration::from_secs(21)
                 && deferred_reload - startup < DEFERRED_RELOAD_WINDOW,
@@ -3829,15 +4497,20 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
             round_6 < deferred_reload,
             "the 20 s window pasted before the deferred reload"
         );
-        let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
-        assert_ready_at(&replay, ready, "18:48:28.982515", "session-ql5TVc");
+        let ready = replay_readiness(&replay, ROUND_9_TIMING);
+        assert_ready_at(
+            &replay,
+            ready,
+            "18:48:28.982515",
+            "session-ql5TVc, the 45 s rule",
+        );
         assert!(
             ready > replay.recorded("18:48:25.485154"),
             "the 45 s window waits past the deferred reload, its hooks line, and its completion"
         );
         assert_eq!(
             replay.states(
-                WINDOWS_STARTUP_READINESS_TIMING,
+                ROUND_9_TIMING,
                 &[
                     "18:48:04.115440",
                     "18:48:04.161713",
@@ -3888,26 +4561,34 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         );
     }
 
+    // The recorded delivered pastes of 2026-09-24 (Agy 1.2.10, Windows console): the
+    // workspace was trusted before launch, the customization load is logged at
+    // startup, and no trust reload ever follows. The rule in force is ready one quiet
+    // period after the last plain reload; the 45 s rule waited out its window for a
+    // reload that was not coming.
     #[test]
-    fn readiness_gate_waits_for_the_window_when_the_startup_reload_follows_startup() {
+    fn readiness_gate_is_ready_after_the_quiet_period_where_the_recorded_pastes_were_delivered() {
         // session-udT6uY: the skills reload 0.5 ms after `CLI startup completed` is
-        // the startup reload. The round-3 rule (and rounds 4-8, which took that
-        // reload for the deferred one) was ready 3.5 s after the last plain reload
-        // at 16:42:29.10; the gate now waits for the 45 s window, which ends at
-        // 16:43:09.08. The paste was delivered either way: the receipt came at
-        // 16:42:50.21 from the fixed 12 s delay, and no deferred reload preceded it.
+        // the startup reload, with the customization load right behind it. Ready
+        // 3.5 s after the last plain reload at 16:42:29.10; the paste of the fixed
+        // 12 s delay was received at 16:42:50.21. The 45 s window ended at
+        // 16:43:09.08.
+        assert!(workspace_customizations_loaded(
+            REAL_SUCCESS_STARTUP.as_bytes()
+        ));
         let replay = LogReplay::new(REAL_SUCCESS_STARTUP, Instant::now());
-        let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
-        assert_ready_at(&replay, ready, "16:43:09.080467", "session-udT6uY");
+        let in_force = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
+        assert_ready_at(&replay, in_force, "16:42:32.604592", "session-udT6uY");
+        let ready = replay_readiness(&replay, ROUND_9_TIMING);
         assert_ready_at(
             &replay,
-            replay_readiness(&replay, ROUND_3_TIMING),
-            "16:42:32.604592",
-            "session-udT6uY, round 3",
+            ready,
+            "16:43:09.080467",
+            "session-udT6uY, the 45 s rule",
         );
         assert_eq!(
             replay.states(
-                WINDOWS_STARTUP_READINESS_TIMING,
+                ROUND_9_TIMING,
                 &[
                     "16:42:24.080467",
                     "16:42:24.127839",
@@ -3931,22 +4612,31 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
             ]
         );
 
-        // session-M8QFPp: the same shape 1.6 ms after startup, with the hooks line.
-        // The round-8 rule pasted at 20:37:49.15, 3.5 s after the last plain reload
-        // (the round-3 rule's instant, since the startup reload settled its window);
-        // the gate now waits until the window ends at 20:38:25.65.
+        // session-M8QFPp: the same shape 1.6 ms after startup. The round-8 rule took
+        // the startup reload for the deferred one and pasted at 20:37:49.15, 3.5 s
+        // after the last plain reload; that paste was received. It is the instant of
+        // the rule in force. The 45 s window ended at 20:38:25.65.
+        assert!(workspace_customizations_loaded(
+            REAL_STARTUP_RELOAD_AFTER_STARTUP.as_bytes()
+        ));
         let replay = LogReplay::new(REAL_STARTUP_RELOAD_AFTER_STARTUP, Instant::now());
-        let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
-        assert_ready_at(&replay, ready, "20:38:25.653251", "session-M8QFPp");
+        let in_force = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
         assert_ready_at(
             &replay,
-            replay_readiness(&replay, ROUND_3_TIMING),
+            in_force,
             "20:37:49.146941",
-            "session-M8QFPp, round 3 (the round-8 paste instant)",
+            "session-M8QFPp (the instant of the recorded, delivered paste)",
+        );
+        let ready = replay_readiness(&replay, ROUND_9_TIMING);
+        assert_ready_at(
+            &replay,
+            ready,
+            "20:38:25.653251",
+            "session-M8QFPp, the 45 s rule",
         );
         assert_eq!(
             replay.states(
-                WINDOWS_STARTUP_READINESS_TIMING,
+                ROUND_9_TIMING,
                 &[
                     "20:37:40.653251",
                     "20:37:40.700886",
@@ -3968,16 +4658,19 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
     }
 
     #[test]
-    fn readiness_gate_waits_past_the_second_cluster_deferred_reload() {
+    fn a_35_s_window_only_moved_the_paste_onto_the_trust_dialog_later() {
         // session-uqraap: the quiet period ended at 20:44:09.93, 3.5 s after the
-        // 20:44:06.43 plain reload, and the round-8 rule's 35 s window ended at
-        // 20:44:36.44, when it pasted. The deferred skills reload at 20:44:37.855815
-        // (36.4 s after startup) then cleared the composer and no receipt followed.
-        // The 45 s window is still open at that reload, so the gate waits for it and
-        // is ready 3.5 s after its hooks line.
+        // 20:44:06.43 plain reload, which is when the rule in force is ready. The
+        // round-8 rule's 35 s window ended at 20:44:36.44, when it pasted, and the
+        // trust reload at 20:44:37.855815 (36.4 s after startup) followed that paste
+        // with no receipt. The 45 s rule on the recording is ready 3.5 s after the
+        // reload's hooks line.
         let replay = LogReplay::new(REAL_SECOND_CLUSTER_RELOAD_STARTUP, Instant::now());
         let startup = replay.recorded("20:44:01.443214");
         let deferred_reload = replay.recorded("20:44:37.855815");
+        let in_force = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
+        assert_ready_at(&replay, in_force, "20:44:09.927564", "session-uqraap");
+        assert!(in_force < deferred_reload);
         assert!(
             deferred_reload - startup > ROUND_8_TIMING.deferred_reload_window
                 && deferred_reload - startup < DEFERRED_RELOAD_WINDOW,
@@ -3994,15 +4687,20 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
             round_8 < deferred_reload,
             "the 35 s window pasted before the deferred reload"
         );
-        let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
-        assert_ready_at(&replay, ready, "20:44:41.356320", "session-uqraap");
+        let ready = replay_readiness(&replay, ROUND_9_TIMING);
+        assert_ready_at(
+            &replay,
+            ready,
+            "20:44:41.356320",
+            "session-uqraap, the 45 s rule",
+        );
         assert!(
             ready > replay.recorded("20:44:37.857983"),
             "the 45 s window waits past the deferred reload, its hooks line, and its completion"
         );
         assert_eq!(
             replay.states(
-                WINDOWS_STARTUP_READINESS_TIMING,
+                ROUND_9_TIMING,
                 &[
                     "20:44:01.443214",
                     "20:44:01.490907",
@@ -4119,6 +4817,27 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         assert!(message.contains("Agy did not report startup readiness before the deadline"));
         assert!(message.contains("agy.log has not been created"));
         assert!(message.contains(&format!(
+            "missing markers: `CLI startup completed`, {REDRAW_AFTER_STARTUP_DESCRIPTION}, {QUIET_PERIOD_DESCRIPTION}; the quiet period is 3500 ms, timed from the newest reload, redraw, or hooks line; the prompt was not pasted"
+        )));
+        assert!(
+            !message.contains("deferred reload"),
+            "the rule in force has no window to report"
+        );
+        assert!(!message.contains("hooks completion"));
+        assert_eq!(clock.slept, Duration::from_secs(1));
+
+        // A rule with a window names the window as well: the former 45 s rule.
+        let mut clock = FakeClock::new(start);
+        let error = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![Ok(None)]),
+            deadline,
+            ROUND_9_TIMING,
+            poll,
+            &mut clock,
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains(&format!(
             "missing markers: `CLI startup completed`, {REDRAW_AFTER_STARTUP_DESCRIPTION}, {DEFERRED_RELOAD_DESCRIPTION}, {QUIET_PERIOD_DESCRIPTION}"
         )));
         assert!(
@@ -4126,8 +4845,6 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
                 .contains("the quiet period is 3500 ms and the deferred reload window is 45000 ms, timed concurrently")
         );
         assert!(message.contains("the prompt was not pasted"));
-        assert!(!message.contains("hooks completion"));
-        assert_eq!(clock.slept, Duration::from_secs(1));
 
         let startup_only = glog(
             "16:41:07.830345",
@@ -4148,7 +4865,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         assert!(message.contains("no `Full redraw completed` line after `CLI startup completed`"));
         assert!(!message.contains("missing markers: `CLI startup completed`"));
         assert!(message.contains(&format!(
-            "missing markers: {REDRAW_AFTER_STARTUP_DESCRIPTION}, {DEFERRED_RELOAD_DESCRIPTION}; the quiet period"
+            "missing markers: {REDRAW_AFTER_STARTUP_DESCRIPTION}; the quiet period"
         )));
 
         let redraw_only = glog("16:41:07.876154", 269, "manager.go:934", FULL_REDRAW);
@@ -4164,17 +4881,18 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         let message = format!("{error:#}");
         assert!(message.contains("agy.log has no `CLI startup completed` line"));
         assert!(message.contains(&format!(
-            "missing markers: `CLI startup completed`, {REDRAW_AFTER_STARTUP_DESCRIPTION}, {DEFERRED_RELOAD_DESCRIPTION}; the quiet period"
+            "missing markers: `CLI startup completed`, {REDRAW_AFTER_STARTUP_DESCRIPTION}; the quiet period"
         )));
 
-        // Startup and redraw, no skills reload after them: the window and the quiet
-        // period are both missing at 1 s, only the window at 5 s.
+        // Startup and redraw, no skills reload after them, under the former 45 s
+        // rule: the window and the quiet period are both missing at 1 s, only the
+        // window at 5 s.
         let startup_redraw = startup_only.clone() + &redraw_only;
         let mut clock = FakeClock::new(start);
         let error = wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&startup_redraw)]),
             deadline,
-            WINDOWS_STARTUP_READINESS_TIMING,
+            ROUND_9_TIMING,
             poll,
             &mut clock,
         )
@@ -4190,7 +4908,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         let error = wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&startup_redraw)]),
             start + Duration::from_secs(5),
-            WINDOWS_STARTUP_READINESS_TIMING,
+            ROUND_9_TIMING,
             poll,
             &mut clock,
         )
@@ -4200,8 +4918,8 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
             "missing markers: {DEFERRED_RELOAD_DESCRIPTION}; the quiet period"
         )));
 
-        // session-fMqSQc with its deferred reload logged: the reload settles the
-        // condition, so only the quiet period is missing at 1 s.
+        // session-fMqSQc with its trust reload logged: only the quiet period is
+        // missing at 1 s.
         let mut clock = FakeClock::new(start);
         let error = wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&settled_startup_log())]),
@@ -4217,13 +4935,24 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
             "missing markers: {QUIET_PERIOD_DESCRIPTION}; the quiet period"
         )));
 
-        // Startup seen at once, the redraw a poll later, no skills reload: ready when
-        // the 45 s window ends, long after the concurrent quiet period at 3.6 s.
+        // Startup seen at once, the redraw a poll later, no skills reload: ready one
+        // quiet period after the redraw was first seen, at 3.6 s. The former 45 s
+        // rule was ready when its window ended, long after that.
         let mut clock = FakeClock::new(start);
         wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&startup_only), some_log(&startup_redraw)]),
             start + Duration::from_secs(60),
             WINDOWS_STARTUP_READINESS_TIMING,
+            poll,
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(clock.slept, poll + STARTUP_QUIET_PERIOD);
+        let mut clock = FakeClock::new(start);
+        wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(&startup_only), some_log(&startup_redraw)]),
+            start + Duration::from_secs(60),
+            ROUND_9_TIMING,
             poll,
             &mut clock,
         )
@@ -4243,13 +4972,61 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         assert!(format!("{error:#}").contains("startup readiness could not be observed"));
     }
 
-    // The concurrent rule, stated as deadlines: with startup and its redraw already
-    // logged and nothing after them, the quiet period ends at 3.5 s and the window
-    // at 45 s, so the gate is ready at exactly 45 s. A deadline one second past the
-    // window reaches the paste; a deadline one second short of it fails `not_sent`
-    // naming the window as the only missing condition.
+    // The rule, stated as deadlines: with startup and its redraw already logged and
+    // nothing after them, the quiet period ends at 3.5 s and the gate is ready then.
+    // A deadline past it reaches the paste; a shorter one fails `not_sent` naming the
+    // quiet period as the only missing condition.
     #[test]
-    fn readiness_wait_without_a_deferred_reload_pastes_at_the_window_end_and_not_before() {
+    fn readiness_wait_pastes_when_the_quiet_period_ends_and_not_before() {
+        let start = Instant::now();
+        let poll = Duration::from_millis(100);
+        let startup_redraw = glog(
+            "16:41:07.830345",
+            1,
+            "analytics.go:187",
+            "CLI startup completed (took 1ms)",
+        ) + &glog("16:41:07.876154", 269, "manager.go:934", FULL_REDRAW);
+
+        let mut clock = FakeClock::new(start);
+        let offset = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(&startup_redraw)]),
+            start + Duration::from_secs(4),
+            WINDOWS_STARTUP_READINESS_TIMING,
+            poll,
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(offset, startup_redraw.len());
+        assert_eq!(clock.slept, STARTUP_QUIET_PERIOD);
+
+        let mut clock = FakeClock::new(start);
+        let error = wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(&startup_redraw)]),
+            start + Duration::from_secs(3),
+            WINDOWS_STARTUP_READINESS_TIMING,
+            poll,
+            &mut clock,
+        )
+        .unwrap_err();
+        assert_eq!(clock.slept, Duration::from_secs(3));
+        let message = format!("{error:#}");
+        assert!(message.contains("logged a reload, redraw, or hooks line within the quiet period"));
+        assert!(message.contains(&format!(
+            "missing markers: {QUIET_PERIOD_DESCRIPTION}; the quiet period is 3500 ms, timed from the newest reload, redraw, or hooks line; the prompt was not pasted"
+        )));
+        let failure = terminal::TerminalSendFailure::not_sent(error);
+        assert!(
+            !failure.delivery_may_have_occurred(),
+            "a gate that never passed is not_sent, never uncertain"
+        );
+    }
+
+    // The former 45 s rule on the same log: the quiet period ended at 3.5 s and the
+    // window at 45 s, so that rule was ready at exactly 45 s. A deadline one second
+    // past the window reached the paste; a deadline one second short of it failed
+    // `not_sent` naming the window as the only missing condition.
+    #[test]
+    fn the_former_window_rule_pasted_at_the_window_end_and_not_before() {
         let start = Instant::now();
         let poll = Duration::from_millis(100);
         let startup_redraw = glog(
@@ -4263,7 +5040,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         let offset = wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&startup_redraw)]),
             start + Duration::from_secs(46),
-            WINDOWS_STARTUP_READINESS_TIMING,
+            ROUND_9_TIMING,
             poll,
             &mut clock,
         )
@@ -4278,7 +5055,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         let error = wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&startup_redraw)]),
             start + Duration::from_secs(44),
-            WINDOWS_STARTUP_READINESS_TIMING,
+            ROUND_9_TIMING,
             poll,
             &mut clock,
         )
@@ -4762,7 +5539,8 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         assert_eq!(evidence["redraw_required"], false);
         assert_eq!(evidence["redraw_after_startup_observed"], false);
         // The real macOS log: the conversation reload is reported as ignored, the
-        // deferred one as observed, and the smoke's lost paste left no receipt.
+        // trust reload as observed (the evidence keeps its "deferred" field name),
+        // and the smoke's lost paste left no receipt.
         fs::write(&log_path, REAL_MACOS_INITIAL_TURN).unwrap();
         let check = input_receipt_check_for_platform(Some(&directory), false);
         assert_eq!(check.reason_code, "agy_no_input_receipt");
@@ -4820,10 +5598,10 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
     }
 
     // The launcher path for a lost initial paste: the gate passes (here the startup
-    // log of session-fMqSQc stays static, so the 45 s window ends without its
-    // deferred reload), the paste lands in a reload that arrives after the gate, no
-    // receipt follows, and the launcher records the delivery-uncertain reason without
-    // touching the claim or the composer.
+    // log of session-fMqSQc stays static, so its quiet period ends), the paste is
+    // followed by the trust reload and no receipt, as it was when it met the trust
+    // dialog, and the launcher records the delivery-uncertain reason without touching
+    // the claim or the composer.
     #[test]
     fn lost_initial_paste_ends_delivery_uncertain_with_the_reason_in_status_json() {
         use super::super::super::{TURN_CLAIM_FILE, record_initial_prompt_delivery_failure};
@@ -4845,7 +5623,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
             &mut clock,
         )
         .unwrap();
-        assert_eq!(clock.slept, DEFERRED_RELOAD_WINDOW);
+        assert_eq!(clock.slept, STARTUP_QUIET_PERIOD);
         // The read that passed the gate is the pre-paste offset: the whole startup
         // log. The launcher marks the session working before the paste.
         assert_eq!(pre_paste_len, startup.len());
@@ -4891,13 +5669,14 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         assert!(read_pending_turn(&directory).unwrap().is_some());
     }
 
-    // The macOS follow-up rule on the real macOS log: the conversation reload never
-    // settles the deferred-reload condition, the redraw is not required, and the gate
-    // is ready one quiet period after the deferred reload's hooks line, past the
-    // instant at which the smoke lost its paste. The Windows rule never passes this
-    // log because no redraw line ever arrives.
+    // The macOS follow-up rule on the real macOS log: the redraw is not required and
+    // there is no window, so the log-only gate is ready one quiet period after the
+    // newest activity line. That is before the instant at which the smoke pasted onto
+    // the trust dialog: the log of an untrusted session shows nothing until the dialog
+    // is answered, which is why the paste waits for Agy's trust store first. The
+    // Windows rule never passes this log because no redraw line ever arrives.
     #[test]
-    fn macos_follow_up_gate_ignores_the_conversation_reload_and_waits_past_the_deferred_reload() {
+    fn macos_follow_up_gate_needs_only_startup_and_a_quiet_period() {
         let observation = observe_startup(REAL_MACOS_INITIAL_TURN.as_bytes());
         assert_eq!(observation.startup_line, Some(REAL_MACOS_STARTUP_LINE));
         assert_eq!(
@@ -4922,20 +5701,27 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         );
 
         let replay = LogReplay::new(REAL_MACOS_INITIAL_TURN, Instant::now());
-        // At the instant of the lost paste the deferred reload is still pending: the
-        // conversation reload at +2.9 s did not settle it.
+        // The newest activity line before the paste is the plain reload at
+        // 21:32:14.739; one quiet period later the log-only rule is ready, although
+        // the dialog was still up when the smoke pasted at 21:32:18.79.
         assert_eq!(
-            replay.states(MACOS_FOLLOW_UP_READINESS_TIMING, &["21:32:18.790000"]),
-            vec![ReadinessState::AwaitingDeferredReload]
+            replay.states(
+                MACOS_FOLLOW_UP_READINESS_TIMING,
+                &["21:32:14.800000", "21:32:18.790000"]
+            ),
+            vec![ReadinessState::Settling, ReadinessState::Ready]
         );
         let ready = replay_readiness(&replay, MACOS_FOLLOW_UP_READINESS_TIMING);
         assert_ready_at(
             &replay,
             ready,
-            "21:32:23.137963",
+            "21:32:18.239083",
             "session-QMFk6F, macOS rule",
         );
-        assert!(ready > replay.recorded("21:32:19.637013"));
+        assert!(
+            ready < replay.recorded("21:32:19.637013"),
+            "the trust reload is the paste's consequence, not something the gate waits for"
+        );
 
         let mut clock = FakeClock::new(replay.start);
         let error = wait_for_startup_readiness_with(
@@ -5034,10 +5820,10 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         );
     }
 
-    // The launcher path for the smoke's lost macOS follow-up: with the log as it stood
-    // before the deferred reload the gate waits the full window (the conversation reload
-    // does not settle it), the paste lands in the reload that arrives after the gate,
-    // no receipt follows, and the follow-up is recorded delivery-uncertain with the
+    // The launcher path for the smoke's lost macOS follow-up, which had no trust
+    // evidence: with the log as it stood before the paste the log-only gate is ready
+    // after one quiet period, the paste lands on the trust dialog, Agy logs the trust
+    // reload and no receipt, and the follow-up is recorded delivery-uncertain with the
     // claim retained.
     #[test]
     fn lost_macos_follow_up_paste_ends_delivery_uncertain_with_the_reason_in_status_json() {
@@ -5065,8 +5851,8 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         )
         .unwrap();
         assert_eq!(
-            clock.slept, MACOS_DEFERRED_RELOAD_WINDOW,
-            "a static macOS log without the deferred reload waits the 60 s window"
+            clock.slept, STARTUP_QUIET_PERIOD,
+            "a static macOS log waits one quiet period; it cannot show the trust dialog"
         );
         assert_eq!(pre_paste_len, before_reload.len());
         update_status(&directory, "working", None, None).unwrap();
@@ -5106,38 +5892,31 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         assert!(read_pending_turn(&directory).unwrap().is_some());
     }
 
-    // A follow-up minutes after startup on a session that never logged the deferred
-    // reload: Agy's own stamps prove a window's worth of runtime, so the gate settles
-    // the window from the log and pastes after one quiet period instead of waiting the
-    // whole window on its own clock (session-bbNK3d, macOS, 2026-09-24 22:03: two
-    // follow-ups each waited 60 s). A log whose newest stamp is inside the window still
-    // waits on the gate's clock.
+    // The former 45 s rule on a Windows session that never logged the trust reload
+    // (its workspace was trusted before launch): Agy's own stamps prove a window's
+    // worth of runtime, so that rule settled the window from the log and pasted after
+    // one quiet period instead of waiting the whole window on its own clock. A log
+    // whose newest stamp is inside the window still waited on the gate's clock. The
+    // rules in force have no window to settle.
     #[test]
-    fn follow_up_gate_settles_the_window_from_the_logged_runtime() {
-        let before_reload = &REAL_MACOS_INITIAL_TURN[..REAL_MACOS_INITIAL_TURN
-            .rfind("I0924 21:32:19.637013")
-            .unwrap()];
+    fn a_window_rule_settles_its_window_from_the_logged_runtime() {
         let quota_line = glog(
-            "21:33:20.001000",
-            214,
+            "17:21:20.000000",
+            248,
             "quota_manager.go:41",
             "doRefreshQuota: skipped (throttled)",
         );
-        let aged = before_reload.to_owned() + &quota_line;
+        let aged = REAL_QUIET_STARTUP.to_owned() + &quota_line;
         let observation = observe_startup(aged.as_bytes());
         assert_eq!(observation.deferred_reload_after_startup, None);
-        assert_eq!(
-            observation.newest_stamp,
-            glog_timestamp(&quota_line),
-            "the newest stamp is the quota line, 71.5 s after startup"
-        );
+        assert_eq!(observation.newest_stamp, glog_timestamp(&quota_line));
 
         let start = Instant::now();
         let mut clock = FakeClock::new(start);
         let pre_paste_len = wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(&aged)]),
             start + Duration::from_secs(300),
-            MACOS_FOLLOW_UP_READINESS_TIMING,
+            ROUND_9_TIMING,
             Duration::from_millis(100),
             &mut clock,
         )
@@ -5148,8 +5927,37 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
             "only the quiet period from the newest activity line, seen at the first read"
         );
 
-        // The same log without the aged line is still inside the window on Agy's clock
-        // (newest stamp 14.7 s after startup), so the gate waits on its own clock.
+        // The same log without the aged line is still inside the window on Agy's
+        // clock, so the 45 s rule waited on its own clock.
+        let mut clock = FakeClock::new(start);
+        wait_for_startup_readiness_with(
+            &mut log_sequence(vec![some_log(REAL_QUIET_STARTUP)]),
+            start + Duration::from_secs(300),
+            ROUND_9_TIMING,
+            Duration::from_millis(100),
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(clock.slept, DEFERRED_RELOAD_WINDOW);
+
+        // The rules in force pass both logs after one quiet period.
+        for log in [aged.as_str(), REAL_QUIET_STARTUP] {
+            let mut clock = FakeClock::new(start);
+            wait_for_startup_readiness_with(
+                &mut log_sequence(vec![some_log(log)]),
+                start + Duration::from_secs(300),
+                WINDOWS_STARTUP_READINESS_TIMING,
+                Duration::from_millis(100),
+                &mut clock,
+            )
+            .unwrap();
+            assert_eq!(clock.slept, STARTUP_QUIET_PERIOD);
+        }
+
+        // The macOS rule passes the un-aged macOS log after one quiet period.
+        let before_reload = &REAL_MACOS_INITIAL_TURN[..REAL_MACOS_INITIAL_TURN
+            .rfind("I0924 21:32:19.637013")
+            .unwrap()];
         let mut clock = FakeClock::new(start);
         wait_for_startup_readiness_with(
             &mut log_sequence(vec![some_log(before_reload)]),
@@ -5159,27 +5967,342 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
             &mut clock,
         )
         .unwrap();
-        assert_eq!(clock.slept, MACOS_DEFERRED_RELOAD_WINDOW);
+        assert_eq!(clock.slept, STARTUP_QUIET_PERIOD);
+    }
 
-        // The Windows rule shares the measurement: an aged Windows startup log with a
-        // redraw and no deferred reload settles from its stamps too.
-        let aged_windows = REAL_QUIET_STARTUP.to_owned()
-            + &glog(
-                "17:21:20.000000",
-                248,
-                "quota_manager.go:41",
-                "doRefreshQuota: skipped (throttled)",
+    // session-C2fMs7 and session-uTpvwY (the Windows machine, 2026-10-01 22:43 KST, Agy
+    // 1.2.14, native Windows console in a Windows Terminal tab, the rule without a
+    // window): the startup of two sessions in a workspace trusted before launch,
+    // verbatim. The omitted lines are HTTP, auth, model and quota chatter. Each logs
+    // the workspace customization load at startup (goroutines 327 and 311) and no
+    // trust reload afterwards. The pastes followed the quiet period, at 22:43:26.27
+    // and 22:43:48.67 (8.8 and 7.9 s after startup), and Agy logged their receipts
+    // at 22:43:27.485085 and 22:43:50.112237. This is the LIVE paste right after the
+    // quiet period that the 45 s window was kept waiting for; session-jkxi48 (22:38,
+    // Agy 1.2.10, the 45 s rule) had logged the same startup, no trust reload, and
+    // its receipt 2.1 s after the paste at +45 s.
+    const REAL_WINDOWS_TRUSTED_STARTUP: &str = r"I1001 22:43:17.413565       1 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
+I1001 22:43:17.418295       1 common.go:448] Starting CLI program
+CLI ready for user input
+I1001 22:43:17.423669     328 manager.go:1333] Reloading system slash commands and skills
+I1001 22:43:17.423669     328 manager.go:1310] Reloading system slash commands
+I1001 22:43:17.423669     328 manager.go:1314] Slash commands unchanged, skipping update
+I1001 22:43:17.426377     327 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
+I1001 22:43:17.426377       1 analytics.go:189] CLI startup completed (took 286.5143ms)
+I1001 22:43:17.472179     499 manager.go:935] Full redraw completed (rerenderAll) for conversation  (epoch 0, items 1)
+I1001 22:43:19.933070     614 manager.go:1310] Reloading system slash commands
+I1001 22:43:22.687836     654 manager.go:1310] Reloading system slash commands
+I1001 22:43:22.693045     654 manager.go:1314] Slash commands unchanged, skipping update
+";
+    const REAL_WINDOWS_TRUSTED_STARTUP_AGAIN: &str = r"I1001 22:43:40.797304       1 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
+I1001 22:43:40.802125       1 common.go:448] Starting CLI program
+CLI ready for user input
+I1001 22:43:40.808780     312 manager.go:1333] Reloading system slash commands and skills
+I1001 22:43:40.808780     312 manager.go:1310] Reloading system slash commands
+I1001 22:43:40.808780     312 manager.go:1314] Slash commands unchanged, skipping update
+I1001 22:43:40.808780       1 analytics.go:189] CLI startup completed (took 281.1586ms)
+I1001 22:43:40.808780     311 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)
+I1001 22:43:40.856868     247 manager.go:935] Full redraw completed (rerenderAll) for conversation  (epoch 0, items 1)
+I1001 22:43:42.633579      55 manager.go:1310] Reloading system slash commands
+I1001 22:43:44.991892     448 manager.go:1310] Reloading system slash commands
+I1001 22:43:44.994160     448 manager.go:1314] Slash commands unchanged, skipping update
+";
+
+    #[test]
+    fn a_windows_paste_right_after_the_quiet_period_needs_no_window_in_a_trusted_workspace() {
+        for (session, log, ready_at, window_end) in [
+            (
+                "session-C2fMs7",
+                REAL_WINDOWS_TRUSTED_STARTUP,
+                "22:43:26.187836",
+                "22:44:02.426377",
+            ),
+            (
+                "session-uTpvwY",
+                REAL_WINDOWS_TRUSTED_STARTUP_AGAIN,
+                "22:43:48.491892",
+                "22:44:25.808780",
+            ),
+        ] {
+            assert!(
+                workspace_customizations_loaded(log.as_bytes()),
+                "{session}: the customization load is logged at startup"
             );
+            let observation = observe_startup(log.as_bytes());
+            assert!(observation.markers_observed(true), "{session}");
+            assert_eq!(
+                observation.deferred_reload_after_startup, None,
+                "{session}: no trust reload follows the startup of a trusted workspace"
+            );
+            // Ready 3.5 s after the last plain reload, where the recorded paste was
+            // delivered; the former rule would have held it until the window ended.
+            let replay = LogReplay::new(log, Instant::now());
+            let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
+            assert_ready_at(&replay, ready, ready_at, session);
+            assert_ready_at(
+                &replay,
+                replay_readiness(&replay, ROUND_9_TIMING),
+                window_end,
+                &format!("{session}, the 45 s rule"),
+            );
+        }
+    }
+
+    // Issue #48, reproduced 2026-10-01 with Agy 1.2.14 (session-U2yPxX, macOS, iTerm2):
+    // the workspace was not in Agy's trust store, the dialog covered the composer, and
+    // the follow-up was pasted onto it. These four lines are everything Agy logged
+    // afterwards, verbatim: the trust reload, 356 bytes, and no receipt. That is the
+    // exact failure text of the issue, and it can only end delivery-uncertain.
+    const REAL_TRUST_RELOAD_AFTER_PASTE: &str = r"I1001 16:29:08.527232     958 manager.go:1333] Reloading system slash commands and skills
+I1001 16:29:08.527267     958 manager.go:1310] Reloading system slash commands
+I1001 16:29:08.528761     954 hooks_manager.go:53] loaded 1 named hooks from 1 hooks.json file(s)
+I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skipping update
+";
+
+    #[test]
+    fn a_paste_onto_the_trust_dialog_leaves_only_the_trust_reload_and_no_receipt() {
+        let pending = PendingAgyTurn::new("21521-1790839736415840000-1").unwrap();
+        let before = settled_startup_log();
+        let after = before.clone() + REAL_TRUST_RELOAD_AFTER_PASTE;
+        let evidence = observe_input_receipt(Some(after.as_bytes()), before.len(), &pending);
+        assert_eq!(
+            evidence,
+            ReceiptEvidence::NoReceipt {
+                appended: 356,
+                partial_tail: false
+            }
+        );
+        let message = unconfirmed_receipt_error(
+            &evidence,
+            &pending,
+            before.len(),
+            INPUT_RECEIPT_WINDOW,
+            true,
+        )
+        .to_string();
+        assert!(
+            message.contains("no HandleUserInput receipt in the 356 bytes appended"),
+            "{message}"
+        );
+    }
+
+    // What tells a trusted Agy process from one whose dialog is still open, in the
+    // recorded logs of both platforms: a `hooks_manager.go` line from a goroutine
+    // other than the main one. The two delivered Windows pastes (session-udT6uY,
+    // session-M8QFPp) had it at startup; every lost paste logged it only after the
+    // paste's own Enter approved the dialog; session-IQHEwf, which was never
+    // approved, never logged it.
+    #[test]
+    fn workspace_customization_load_is_read_from_the_sessions_own_log() {
+        let macos_before_approval = &REAL_MACOS_INITIAL_TURN[..REAL_MACOS_INITIAL_TURN
+            .rfind("I0924 21:32:19.637013")
+            .unwrap()];
+        for (log, loaded, what) in [
+            (
+                REAL_SUCCESS_STARTUP,
+                true,
+                "session-udT6uY, trusted at startup",
+            ),
+            (
+                REAL_STARTUP_RELOAD_AFTER_STARTUP,
+                true,
+                "session-M8QFPp, trusted at startup",
+            ),
+            (
+                REAL_FAILURE_STARTUP,
+                false,
+                "session-fMqSQc before its paste",
+            ),
+            (REAL_QUIET_STARTUP, false, "session-IQHEwf, never approved"),
+            (
+                macos_before_approval,
+                false,
+                "session-QMFk6F before its paste",
+            ),
+            (
+                REAL_MACOS_INITIAL_TURN,
+                true,
+                "session-QMFk6F after the paste approved the dialog",
+            ),
+            (
+                REAL_TRUST_RELOAD_AFTER_PASTE,
+                true,
+                "session-U2yPxX trust reload",
+            ),
+        ] {
+            assert_eq!(
+                workspace_customizations_loaded(log.as_bytes()),
+                loaded,
+                "{what}"
+            );
+        }
+        assert!(
+            workspace_customizations_loaded(settled_startup_log().as_bytes()),
+            "session-fMqSQc after the paste approved the dialog"
+        );
+        // The main goroutine's line while the store manager is built is not the load,
+        // and a line still being written is not evidence yet.
+        let main_only = glog("16:41:07.819578", 1, "hooks_manager.go:53", HOOKS_LOADED);
+        assert!(!workspace_customizations_loaded(main_only.as_bytes()));
+        let partial = glog("16:41:20.814059", 406, "hooks_manager.go:53", HOOKS_LOADED);
+        assert!(!workspace_customizations_loaded(
+            partial.trim_end().as_bytes()
+        ));
+        assert!(workspace_customizations_loaded(partial.as_bytes()));
+        // A field that is not a goroutine id is not evidence either.
+        let not_an_id = partial.replace("     406 ", "     4o6 ");
+        assert!(!workspace_customizations_loaded(not_an_id.as_bytes()));
+    }
+
+    // The fix for that state: no paste, before any terminal input, until Agy's own
+    // trust store lists the exact workspace and this session's own log shows the
+    // workspace customization load. A parent entry does not count, a dialog approved
+    // in another session leaves this session's dialog open, a log without the load
+    // line is reported as unverified rather than as an open dialog, an unreadable
+    // store proves nothing, and an approval during the wait releases the paste.
+    #[test]
+    fn a_paste_is_withheld_until_the_store_and_this_sessions_log_show_trust() {
+        use super::super::super::consent;
+        use super::super::super::doctor::Availability;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let directory = root.join("session-trust1");
+        fs::create_dir(&directory).unwrap();
+        let log_path = directory.join(AGY_LOG_FILE);
+        let homes = consent::fixture_homes(&root);
+        let trust_store = |entries: &[&Path]| {
+            let keys: Vec<String> = entries
+                .iter()
+                .map(|path| consent::native_key(path).unwrap())
+                .collect();
+            super::super::super::write_json_atomic(
+                &homes.agy,
+                &serde_json::json!({ "trustedWorkspaces": keys }),
+            )
+            .unwrap();
+        };
+        let start = Instant::now();
+        let wait = Duration::from_secs(30);
+        let refused = |expected: &str, availability: Availability, reason_code: &str| {
+            let mut clock = FakeClock::new(start);
+            let error = wait_for_workspace_trust_with(
+                &mut || workspace_trust_missing(&workspace, &homes, &log_path),
+                start + wait,
+                STARTUP_POLL_INTERVAL,
+                &mut clock,
+            )
+            .unwrap_err()
+            .to_string();
+            assert_eq!(clock.slept, wait, "the wait ends only at the deadline");
+            assert_eq!(
+                error,
+                format!(
+                    "Agy workspace trust was not verified before the deadline, so the prompt was not pasted: {expected}. {TRUST_RECOVERY}"
+                )
+            );
+            let check = workspace_trust_check_with(&workspace, &homes, &directory);
+            assert_eq!(check.availability, availability);
+            assert_eq!(check.reason_code, reason_code);
+            let next_action = serde_json::to_value(&check).unwrap()["next_action"].to_string();
+            assert!(next_action.contains(TRUST_RECOVERY), "{next_action}");
+        };
+        let untrusted = || {
+            refused(
+                TRUST_STORE_MISSING,
+                Availability::Unavailable,
+                "agy_workspace_untrusted",
+            )
+        };
+        let unverified = || {
+            refused(
+                TRUST_SESSION_UNVERIFIED,
+                Availability::Unknown,
+                "agy_session_trust_unverified",
+            )
+        };
+        let passes = |what: &str| {
+            let mut clock = FakeClock::new(start);
+            wait_for_workspace_trust_with(
+                &mut || workspace_trust_missing(&workspace, &homes, &log_path),
+                start + wait,
+                STARTUP_POLL_INTERVAL,
+                &mut clock,
+            )
+            .unwrap();
+            assert_eq!(clock.slept, Duration::ZERO, "{what}");
+            let check = workspace_trust_check_with(&workspace, &homes, &directory);
+            assert_eq!(check.availability, Availability::Available, "{what}");
+            assert_eq!(check.reason_code, "agy_workspace_trusted", "{what}");
+        };
+
+        // The workspace is not in the store: issue #48. Neither no store nor a
+        // parent entry is an approval, whatever the log says.
+        fs::write(&log_path, REAL_FAILURE_STARTUP).unwrap();
+        untrusted();
+        trust_store(&[&root]);
+        untrusted();
+        fs::write(&log_path, REAL_SUCCESS_STARTUP).unwrap();
+        untrusted();
+
+        // The store lists the workspace because another session approved it, and
+        // this session's log shows no load: its own dialog may still be open. The
+        // same holds for a log that is gone or was cut before the load line, in a
+        // session that has no dialog, so the report claims neither state.
+        trust_store(&[&root, &workspace]);
+        fs::write(&log_path, REAL_FAILURE_STARTUP).unwrap();
+        unverified();
+        fs::remove_file(&log_path).unwrap();
+        unverified();
+        let cut = REAL_SUCCESS_STARTUP
+            .find("I0924 16:42:24.081497")
+            .expect("the load line of session-udT6uY");
+        fs::write(&log_path, &REAL_SUCCESS_STARTUP[..cut]).unwrap();
+        assert!(REAL_SUCCESS_STARTUP[..cut].contains(STARTUP_COMPLETED_MARKER));
+        unverified();
+
+        // Approved in this session, or trusted before it started.
+        fs::write(&log_path, settled_startup_log()).unwrap();
+        passes("the dialog was approved in this session");
+        fs::write(&log_path, REAL_SUCCESS_STARTUP).unwrap();
+        passes("the workspace was trusted before launch");
+
+        // An approval during the wait releases the paste at the next poll.
+        let mut answers = [
+            Ok(Some(TRUST_STORE_MISSING)),
+            Err(anyhow::anyhow!("store busy")),
+            Ok(Some(TRUST_SESSION_UNVERIFIED)),
+            Ok(None),
+        ]
+        .into_iter();
         let mut clock = FakeClock::new(start);
-        wait_for_startup_readiness_with(
-            &mut log_sequence(vec![some_log(&aged_windows)]),
-            start + Duration::from_secs(300),
-            WINDOWS_STARTUP_READINESS_TIMING,
-            Duration::from_millis(100),
+        wait_for_workspace_trust_with(
+            &mut || answers.next().unwrap(),
+            start + wait,
+            STARTUP_POLL_INTERVAL,
             &mut clock,
         )
         .unwrap();
-        assert_eq!(clock.slept, STARTUP_QUIET_PERIOD);
+        assert_eq!(clock.slept, STARTUP_POLL_INTERVAL * 3);
+
+        // An unreadable store is not an approval, and the report says why.
+        fs::write(&homes.agy, b"{\"trustedWorkspaces\":true}").unwrap();
+        let mut clock = FakeClock::new(start);
+        let error = wait_for_workspace_trust_with(
+            &mut || workspace_trust_missing(&workspace, &homes, &log_path),
+            start + wait,
+            STARTUP_POLL_INTERVAL,
+            &mut clock,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("so the prompt was not pasted"), "{error}");
+        assert!(error.contains("could not be read"), "{error}");
+        assert_eq!(
+            workspace_trust_check_with(&workspace, &homes, &directory).availability,
+            Availability::Unknown
+        );
     }
 
     #[test]
@@ -5336,6 +6459,150 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         assert_eq!(second.message, "after clear");
         assert_eq!(second.provider_session_id.as_deref(), Some(second_id));
         assert_eq!(second.turn_id.as_deref(), Some("1"));
+    }
+
+    // A turn Agy gives up on is recorded as a failed request at once instead of
+    // waiting out the timeout: the quota error of 2026-10-01 (session-UuYk87), with
+    // its log lines verbatim. The failing turn must be the pending one by the log's
+    // own account: the first, argument-delivered turn whose only transcript input
+    // carries the marker, or a pasted turn behind its receipt. An error of a turn
+    // typed by hand, of an older turn, or of a first turn that a newer pending claim
+    // has not replaced in the log yet is ignored. A result written before the error
+    // is seen wins; one written after the failure was recorded is not accepted.
+    #[test]
+    fn monitor_records_a_turn_agy_gave_up_on_as_a_failed_request() {
+        use super::super::super::TURN_CLAIM_FILE;
+        const FORWARDED: &str = "I1001 17:23:48.670594     402 conversation_manager.go:699] Forwarding user message to conversation 97ad12fd-9e7a-4556-83a4-8f0147343657 (items=1, media=0)\n";
+        const QUOTA: &str = "E1001 17:23:49.333283     246 errorreport.go:224] agent executor error: generating and executing: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h22m28s.\nE1001 17:23:49.335578     246 errorreport.go:224] generating and executing: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h22m28s.\n";
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-quota1");
+        fs::create_dir(&directory).unwrap();
+        fs::create_dir(directory.join("events")).unwrap();
+        update_status(&directory, "working", None, None).unwrap();
+        let brain = root.path().join("brain");
+        let log = directory.join("agy.log");
+        let id = "97ad12fd-9e7a-4556-83a4-8f0147343657";
+        let logs = brain.join(id).join(".system_generated").join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("transcript.jsonl"), "").unwrap();
+        let full = logs.join("transcript_full.jsonl");
+        let user_input = |step: u64, text: &str| {
+            serde_json::json!({
+                "step_index": step,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "status": "DONE",
+                "content": format!("<USER_REQUEST>\n{text}\n</USER_REQUEST>"),
+            })
+            .to_string()
+                + "\n"
+        };
+        let pasted = |pending: &PendingAgyTurn| {
+            receipt_line(&go_quoted(
+                &terminal_correlated_prompt("again", pending, false).unwrap(),
+            ))
+        };
+        let created =
+            format!("I1001 17:23:46.491183     402 server.go:1248] Created conversation {id}\n");
+        let first = claim_pending_turn(&directory);
+        let mut monitor = MonitorState::default();
+        let quota_failure = |event: &SessionEvent| {
+            assert_eq!(event.message, "");
+            let error = event.error.clone().unwrap();
+            assert!(
+                error.starts_with("Agy turn failed: generating and executing: RESOURCE_EXHAUSTED (code 429): Individual quota reached."),
+                "{error}"
+            );
+            assert!(error.ends_with("Resets in 2h22m28s."), "{error}");
+            assert_eq!(event.provider_session_id.as_deref(), Some(id));
+            error
+        };
+
+        // The first turn failed, but Agy's record of its input does not carry this
+        // claim's marker: nothing is attributed.
+        fs::write(&full, user_input(0, "another request")).unwrap();
+        fs::write(&log, created.clone() + FORWARDED + QUOTA).unwrap();
+        monitor.poll(&directory, &log, &brain).unwrap();
+        assert!(event_paths(&directory).unwrap().is_empty());
+        assert!(directory.join(TURN_CLAIM_FILE).exists());
+
+        // The argument-delivered first turn is the pending one, and Agy gave up on it.
+        fs::write(&full, user_input(0, &marked("request", &first))).unwrap();
+        monitor.poll(&directory, &log, &brain).unwrap();
+        monitor.poll(&directory, &log, &brain).unwrap();
+        let paths = event_paths(&directory).unwrap();
+        assert_eq!(paths.len(), 1, "the failure is recorded once");
+        let error = quota_failure(&read_json(&paths[0]).unwrap());
+        assert!(
+            !directory.join(TURN_CLAIM_FILE).exists(),
+            "the failed turn releases its claim"
+        );
+        let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+        assert_eq!(status.state, "ready");
+        assert_eq!(status.error.as_deref(), Some(error.as_str()));
+
+        // A follow-up is claimed and its input already stands in the transcript, but
+        // the log still ends with the first turn's error: that error is not its own.
+        update_status(&directory, "claimed", None, None).unwrap();
+        update_status(&directory, "working", None, None).unwrap();
+        let second = claim_pending_turn(&directory);
+        fs::write(
+            &full,
+            user_input(0, &marked("request", &first)) + &user_input(1, &marked("again", &second)),
+        )
+        .unwrap();
+        monitor.poll(&directory, &log, &brain).unwrap();
+        assert_eq!(event_paths(&directory).unwrap().len(), 1);
+
+        // Its receipt and turn start arrive: still running, nothing to record.
+        let running = created + FORWARDED + QUOTA + &pasted(&second) + FORWARDED;
+        fs::write(&log, &running).unwrap();
+        monitor.poll(&directory, &log, &brain).unwrap();
+        assert_eq!(event_paths(&directory).unwrap().len(), 1);
+        assert!(directory.join(TURN_CLAIM_FILE).exists());
+
+        // A turn typed by hand after it fails: the newest turn is not the pending one.
+        let typed = receipt_line(&go_quoted("typed by hand"));
+        fs::write(&log, running.clone() + &typed + FORWARDED + QUOTA).unwrap();
+        monitor.poll(&directory, &log, &brain).unwrap();
+        assert_eq!(event_paths(&directory).unwrap().len(), 1);
+
+        // Agy gives up on the pasted follow-up itself: bound by its receipt.
+        let failed = running + QUOTA;
+        fs::write(&log, &failed).unwrap();
+        monitor.poll(&directory, &log, &brain).unwrap();
+        monitor.poll(&directory, &log, &brain).unwrap();
+        let paths = event_paths(&directory).unwrap();
+        assert_eq!(paths.len(), 2);
+        let error = quota_failure(&read_json(paths.last().unwrap()).unwrap());
+        assert!(!directory.join(TURN_CLAIM_FILE).exists());
+
+        // A result Agy writes after the failure was recorded is not accepted: the
+        // failed request released its claim.
+        let transcript = logs.join("transcript.jsonl");
+        fs::write(
+            &transcript,
+            planner_line(2, &marked("late", &second)) + "\n",
+        )
+        .unwrap();
+        monitor.poll(&directory, &log, &brain).unwrap();
+        assert_eq!(event_paths(&directory).unwrap().len(), 2);
+        let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+        assert_eq!(status.error.as_deref(), Some(error.as_str()));
+
+        // A result that is already written when the error is seen is recorded first.
+        update_status(&directory, "claimed", None, None).unwrap();
+        update_status(&directory, "working", None, None).unwrap();
+        let third = claim_pending_turn(&directory);
+        let mut appended = OpenOptions::new().append(true).open(&transcript).unwrap();
+        writeln!(appended, "{}", planner_line(3, &marked("done", &third))).unwrap();
+        fs::write(&log, failed + &pasted(&third) + FORWARDED + QUOTA).unwrap();
+        monitor.poll(&directory, &log, &brain).unwrap();
+        monitor.poll(&directory, &log, &brain).unwrap();
+        let paths = event_paths(&directory).unwrap();
+        assert_eq!(paths.len(), 3);
+        let latest: SessionEvent = read_json(paths.last().unwrap()).unwrap();
+        assert_eq!((latest.message.as_str(), latest.error), ("done", None));
     }
 
     #[cfg(windows)]

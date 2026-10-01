@@ -10,39 +10,85 @@ use super::{
     applescript, close_response,
 };
 
+// Ownership of the new window is proven by the tty of the tab that `do script`
+// returned: exactly one window must hold a tab with that tty. Only windows that did
+// not exist before the run are candidates, because a tty name alone is not unique
+// over time. A window whose shell ended while a close confirmation was pending keeps
+// reporting its old tty name after Terminal has released it, and the next tab
+// receives the same name (2026-10-01, session-y5Wpkl: the proof matched the new
+// window and that stale one, the launch failed, and the new window stayed open
+// without an owner). A window list that could not be read before the run excludes
+// nothing, which is the former rule.
 pub(in crate::native) const OPEN_TAB_SCRIPT: &str = r#"
-on windowIdForTty(wantedTty)
+on soleNewWindowWithTty(windowTtys, priorWindowIds, wantedTty)
+    set matchedWindowId to missing value
+    set matchCount to 0
+    repeat with windowTty in windowTtys
+        set candidateId to item 1 of windowTty
+        if priorWindowIds is missing value or priorWindowIds does not contain candidateId then
+            if item 2 of windowTty is wantedTty then
+                set matchedWindowId to candidateId
+                set matchCount to matchCount + 1
+            end if
+        end if
+    end repeat
+    if matchCount is not 1 then error "Agent Bridge could not prove the newly created Terminal.app window"
+    return matchedWindowId
+end soleNewWindowWithTty
+
+on windowIdForTty(wantedTty, priorWindowIds)
+    set windowTtys to {}
     tell application "Terminal"
-        set matchedWindowId to missing value
-        set matchCount to 0
         set candidateWindows to get windows
         repeat with candidateWindow in candidateWindows
             try
                 set candidateTabs to get tabs of candidateWindow
                 repeat with candidateTab in candidateTabs
-                    if tty of candidateTab is wantedTty then
-                        set matchedWindowId to id of candidateWindow
-                        set matchCount to matchCount + 1
-                    end if
+                    set end of windowTtys to {id of candidateWindow, tty of candidateTab}
                 end repeat
             end try
         end repeat
-        if matchCount is not 1 then error "Agent Bridge could not prove the newly created Terminal.app window"
-        return matchedWindowId
     end tell
+    return my soleNewWindowWithTty(windowTtys, priorWindowIds, wantedTty)
 end windowIdForTty
 
 on run argv
+    set terminalWasRunning to application "Terminal" is running
     tell application "Terminal"
+        -- A window that exists before this run can never be the one it creates.
+        -- The window that has the keyboard is remembered only to give it back
+        -- below (issue #58). It is never the target, and failing to remember or
+        -- restore it never fails the launch. Neither is asked of a Terminal that
+        -- is not running: the first event it receives stays the creation.
+        set priorWindowIds to {}
+        set keyboardWindowId to missing value
+        if terminalWasRunning then
+            set priorWindowIds to missing value
+            try
+                set priorWindowIds to id of every window
+            end try
+            try
+                if (count of windows) > 0 then set keyboardWindowId to id of window 1
+            end try
+        end if
         -- Untargeted do script creates a dedicated window and returns its new tab.
         -- Never derive ownership from a restored front/current/selected surface.
         set targetTab to do script ""
         set targetTty to tty of targetTab
-        set targetWindowId to my windowIdForTty(targetTty)
+        set targetWindowId to my windowIdForTty(targetTty, priorWindowIds)
         set targetWindow to first window whose id is targetWindowId
         if id of targetWindow is not targetWindowId then error "Agent Bridge lost its newly created Terminal.app window"
         if tty of targetTab is not targetTty then error "Agent Bridge lost its newly created Terminal.app tty"
-        activate
+        -- Terminal is not brought forward, and the new window does not keep the
+        -- keyboard. The front position is taken back only from the new window: a
+        -- window the user chose meanwhile stays in front.
+        if keyboardWindowId is not missing value and keyboardWindowId is not targetWindowId then
+            try
+                if (id of window 1) is targetWindowId then
+                    set frontmost of (first window whose id is keyboardWindowId) to true
+                end if
+            end try
+        end if
         return targetTty & linefeed & (targetWindowId as text)
     end tell
 end run
