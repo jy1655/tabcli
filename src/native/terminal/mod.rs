@@ -909,7 +909,10 @@ mod tests {
         assert!(!macos::apple_terminal::OPEN_TAB_SCRIPT.contains("front window"));
         assert!(!macos::apple_terminal::OPEN_TAB_SCRIPT.contains("selected tab"));
         assert!(macos::apple_terminal::OPEN_TAB_SCRIPT.contains("tty of targetTab"));
-        assert!(macos::apple_terminal::OPEN_TAB_SCRIPT.contains("windowIdForTty(targetTty)"));
+        assert!(
+            macos::apple_terminal::OPEN_TAB_SCRIPT
+                .contains("windowIdForTty(targetTty, priorWindowIds)")
+        );
         assert!(macos::apple_terminal::OPEN_TAB_SCRIPT.contains("id of targetWindow"));
         assert!(
             macos::apple_terminal::SEND_FILE_SCRIPT.contains("tty of candidateTab is wantedTty")

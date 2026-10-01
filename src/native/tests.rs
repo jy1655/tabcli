@@ -1533,7 +1533,7 @@ fn macos_cold_start_never_adopts_an_app_restored_surface() {
     }
     assert!(
         terminal::macos::apple_terminal::OPEN_TAB_SCRIPT
-            .contains("set targetWindowId to my windowIdForTty(targetTty)")
+            .contains("set targetWindowId to my windowIdForTty(targetTty, priorWindowIds)")
     );
 }
 
@@ -1621,7 +1621,7 @@ fn macos_open_scripts_give_the_keyboard_back_and_never_activate_the_app() {
         [
             "set targetTab to do script \"\"",
             "set targetTty to tty of targetTab",
-            "set targetWindowId to my windowIdForTty(targetTty)",
+            "set targetWindowId to my windowIdForTty(targetTty, priorWindowIds)",
             "set targetWindow to first window whose id is targetWindowId",
         ]
     );
@@ -1634,7 +1634,7 @@ fn macos_open_scripts_give_the_keyboard_back_and_never_activate_the_app() {
     );
     let remembered = position(
         terminal_app,
-        "try\n            if (count of windows) > 0 then set keyboardWindowId to id of window 1\n        end try",
+        "try\n                if (count of windows) > 0 then set keyboardWindowId to id of window 1\n            end try",
     );
     let created = position(terminal_app, "set targetTab to do script \"\"");
     let restored = position(
@@ -1656,6 +1656,89 @@ fn terminal_app_window_discovery_snapshots_and_skips_stale_window_references() {
     assert!(script.contains("set candidateTabs to get tabs of candidateWindow"));
     assert!(script.contains("repeat with candidateTab in candidateTabs"));
     assert!(script.contains("try\n                set candidateTabs"));
+}
+
+// The Terminal.app ownership decision, executed rather than read: the handler is
+// plain AppleScript, so `osascript` runs it without talking to Terminal. The first
+// case is the launch that failed on 2026-10-01 (session-y5Wpkl): window 8332 had
+// lost its shell while a close confirmation was pending and still reported
+// `/dev/ttys003`, the name the new window 8335 received.
+#[cfg(target_os = "macos")]
+#[test]
+fn terminal_app_ownership_proof_ignores_windows_that_existed_before_the_launch() {
+    const UNPROVEN: &str = "Agent Bridge could not prove the newly created Terminal.app window";
+    const DRIVER: &str = r#"
+on run argv
+    set wantedTty to item 1 of argv
+    set priorWindowIds to missing value
+    if item 2 of argv is not "unknown" then
+        set priorWindowIds to {}
+        repeat with priorId in (words of (item 2 of argv))
+            set end of priorWindowIds to (priorId as integer)
+        end repeat
+    end if
+    set windowTtys to {}
+    repeat with argIndex from 3 to (count of argv) by 2
+        set end of windowTtys to {(item argIndex of argv) as integer, item (argIndex + 1) of argv}
+    end repeat
+    return my soleNewWindowWithTty(windowTtys, priorWindowIds, wantedTty)
+end run
+"#;
+    let script = terminal::macos::apple_terminal::OPEN_TAB_SCRIPT;
+    let start = script.find("on soleNewWindowWithTty(").unwrap();
+    let end = script.find("end soleNewWindowWithTty").unwrap() + "end soleNewWindowWithTty".len();
+    let handler = &script[start..end];
+    assert!(
+        !handler.contains("tell application"),
+        "the decision must not need Terminal"
+    );
+    let prove = |prior: &str, windows: &[(&str, &str)]| {
+        let output = std::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(format!("{handler}\n{DRIVER}"))
+            .arg("/dev/ttys003")
+            .arg(prior)
+            .args(windows.iter().flat_map(|(id, tty)| [*id, *tty]))
+            .output()
+            .unwrap();
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).into_owned())
+        }
+    };
+    let recorded = [("8335", "/dev/ttys003"), ("8332", "/dev/ttys003")];
+
+    // The stale window existed before the launch, so only the new one is a candidate.
+    assert_eq!(prove("8332 8316 8329", &recorded), Ok("8335".to_owned()));
+    // Without the list of earlier windows the former rule applies: the recorded failure.
+    assert!(prove("unknown", &recorded).unwrap_err().contains(UNPROVEN));
+    // A cold start has no earlier windows; a restored window with another tty is ignored.
+    assert_eq!(
+        prove("", &[("10", "/dev/ttys001"), ("11", "/dev/ttys003")]),
+        Ok("11".to_owned())
+    );
+    // The new window is not in the list, or two new windows report the tty: no proof.
+    assert!(
+        prove("8332", &[("8332", "/dev/ttys003")])
+            .unwrap_err()
+            .contains(UNPROVEN)
+    );
+    assert!(
+        prove(
+            "8332",
+            &[("8335", "/dev/ttys003"), ("8336", "/dev/ttys003")]
+        )
+        .unwrap_err()
+        .contains(UNPROVEN)
+    );
+    // A window that existed before is never returned, even as the only match.
+    assert!(
+        prove("8332 8335", &recorded)
+            .unwrap_err()
+            .contains(UNPROVEN),
+        "an earlier window must not be adopted"
+    );
 }
 
 #[cfg(target_os = "macos")]

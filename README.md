@@ -574,7 +574,11 @@ Bridge는 credential을 읽거나 복사하거나 갱신하지 않습니다. MCP
 
 두 터미널 모두 선택하지 않고 tab·window를 만드는 방법이 없어, 새 것은 잠깐 키보드 포커스를 가집니다. 실측에서 iTerm2는 243~450 ms, Terminal.app은 397~519 ms였고 부하가 있으면 더 길어집니다. 그 사이에 입력한 키는 여전히 관리 세션으로 들어갑니다. 다른 앱이 앞에 있을 때 터미널 앱이 뒤에 머무는지는 화면이 잠긴 상태에서 측정해 NOT-VERIFIED입니다. Ghostty와 Windows console은 바뀌지 않았습니다.
 
-검증 범위와 근거는 [0.0.9 개발 노트](docs/releases/0.0.9.md), [2026-10-01 검증 기록](docs/verification/2026-10-01-bug-triage.md), [키보드 포커스 검증 기록](docs/verification/2026-10-01-focus.md)을 참조하세요. native Windows 인증 CLI LIVE는 macOS fixture·cross compile·CI와 별도입니다.
+### Terminal.app 새 window 확인
+
+Terminal.app에서 세션을 열 때 Agent Bridge는 새로 만든 tab의 tty로 자기 window를 확인합니다. shell이 끝난 채 닫기 확인을 기다리는 예전 window가 같은 tty 이름을 계속 보고하면 이 확인이 두 window에 걸려, `Agent Bridge could not prove the newly created Terminal.app window` 오류와 함께 launch가 실패하고 새 window가 남았습니다. 이제 launch 전에 이미 있던 window는 확인 대상에서 제외하므로 예전 window 때문에 실패하지 않습니다. 확인이 그래도 실패하는 경우(새 window가 목록에 없거나 새 window 둘이 같은 tty를 보고)에는 이전과 같이 새 window가 남습니다.
+
+검증 범위와 근거는 [0.0.9 개발 노트](docs/releases/0.0.9.md), [2026-10-01 검증 기록](docs/verification/2026-10-01-bug-triage.md), [키보드 포커스 검증 기록](docs/verification/2026-10-01-focus.md), [Terminal.app window 확인 검증 기록](docs/verification/2026-10-01-terminal-proof.md)을 참조하세요. native Windows 인증 CLI LIVE는 macOS fixture·cross compile·CI와 별도입니다.
 
 ## 0.0.8 업데이트
 
