@@ -69,7 +69,8 @@ pub(super) fn log(directory: &Path, message: &str) {
             return Ok(());
         }
         let mut file = OpenOptions::new().append(true).open(&path)?;
-        writeln!(file, "{} {message}", unix_ms())?;
+        // One write per line: the launcher and the wrapper append at the same time.
+        file.write_all(format!("{} {message}\n", unix_ms()).as_bytes())?;
         Ok(())
     })();
 }
@@ -598,6 +599,45 @@ mod tests {
         assert_eq!(output.status.code(), Some(7));
         assert!(String::from_utf8_lossy(&output.stdout).contains("wrapper stdout"));
         assert!(String::from_utf8_lossy(&output.stderr).contains("wrapper stderr"));
+    }
+
+    // Runs the bootstrap through the command line that the console launch itself builds.
+    // 0.0.8 put a double-quoted string into the bootstrap, which that command line cannot
+    // carry, so every launch on native Windows was refused before a console existed.
+    #[cfg(windows)]
+    #[test]
+    fn console_launch_carries_the_bootstrap_and_records_the_wrapper_exit_code() {
+        use std::os::windows::process::CommandExt;
+        // The stub is a batch file, and cmd.exe cannot start in a verbatim (`\\?\`) path, so
+        // the temporary directory is used as given.
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-shell");
+        fs::create_dir(&directory).unwrap();
+        let executable = root.path().join("bridge owner's stub.cmd");
+        fs::write(&executable, "@exit /b 7\r\n").unwrap();
+        let command =
+            bridge_shell_command(root.path(), root.path(), &executable, "session-shell").unwrap();
+        let powershell = terminal::windows_powershell_executable().unwrap();
+        let command_line =
+            terminal::windows_console_launch_command_line(&powershell, &command).unwrap();
+        let arguments = command_line
+            .strip_prefix(&format!("\"{}\" ", powershell.to_string_lossy()))
+            .unwrap();
+        let output = Command::new(&powershell)
+            .raw_arg(arguments)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            fs::read_to_string(directory.join(LOG))
+                .unwrap()
+                .contains("wrapper_exit_code=7")
+        );
     }
 
     #[cfg(unix)]

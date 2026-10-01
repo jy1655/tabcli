@@ -47,6 +47,29 @@ fn console_launch_is_suspended_until_process_identity_is_recorded() {
 }
 
 #[test]
+fn a_managed_surface_is_shown_without_being_activated() {
+    use windows_sys::Win32::System::Threading::{STARTF_USESHOWWINDOW, STARTUPINFOW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNOACTIVATE;
+
+    let startup = super::console_startup_info();
+    assert_eq!(startup.cb as usize, std::mem::size_of::<STARTUPINFOW>());
+    assert_eq!(startup.dwFlags, STARTF_USESHOWWINDOW);
+    assert_eq!(i32::from(startup.wShowWindow), SW_SHOWNOACTIVATE);
+}
+
+#[test]
+fn a_screen_row_holds_fewer_characters_than_cells_when_some_are_full_width() {
+    // "한글" fills four of six cells; the console returns it as two characters, followed
+    // by the two blank cells, and leaves the rest of the buffer untouched.
+    let mut cells = "한글  ".encode_utf16().collect::<Vec<_>>();
+    cells.resize(6, 0);
+
+    assert_eq!(super::screen_row(&cells, 4).unwrap(), "한글  ");
+    assert_eq!(super::screen_row(&cells, 0).unwrap(), "");
+    assert!(super::screen_row(&cells, 7).is_err());
+}
+
+#[test]
 fn startup_cleanup_rejects_unconfirmed_process_termination() {
     let handle = unsafe { OpenProcess(SYNCHRONIZE, 0, std::process::id()) };
     assert!(!handle.is_null());
@@ -77,6 +100,83 @@ fn startup_cleanup_waits_for_the_suspended_process_to_exit() {
     .unwrap();
 
     assert!(child.try_wait().unwrap().is_some());
+}
+
+// A suspended process with the handle that a close retains for every console process.
+fn console_process() -> (std::process::Child, super::ConsoleProcess) {
+    use windows_sys::Win32::System::Threading::{
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+    let child = std::process::Command::new(std::env::var_os("ComSpec").unwrap())
+        .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
+        .creation_flags(CREATE_SUSPENDED)
+        .spawn()
+        .unwrap();
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+            0,
+            child.id(),
+        )
+    };
+    assert!(!handle.is_null());
+    let process = super::ConsoleProcess {
+        pid: child.id(),
+        handle: unsafe { OwnedHandle::from_raw_handle(handle) },
+    };
+    (child, process)
+}
+
+#[test]
+fn a_close_ends_the_tab_host_last_and_without_a_failure_code() {
+    let (mut other, other_process) = console_process();
+    let (mut root, root_process) = console_process();
+    let (mut host, host_process) = console_process();
+    let (root_pid, host_pid) = (root.id(), host.id());
+    // In the order a console lists them: the host of a tab comes first.
+    let processes = [host_process, root_process, other_process];
+
+    super::terminate_console_processes(&processes, root_pid, Some(host_pid)).unwrap();
+
+    // Windows Terminal closes a tab whose own process ended without a failure code.
+    assert_eq!(host.wait().unwrap().code(), Some(0));
+    assert_eq!(root.wait().unwrap().code(), Some(1));
+    assert_eq!(other.wait().unwrap().code(), Some(1));
+
+    // A console window has no host: every process ends with the failure code.
+    let (mut root, root_process) = console_process();
+    let (mut other, other_process) = console_process();
+    let root_pid = root.id();
+    super::terminate_console_processes(&[root_process, other_process], root_pid, None).unwrap();
+    assert_eq!(root.wait().unwrap().code(), Some(1));
+    assert_eq!(other.wait().unwrap().code(), Some(1));
+}
+
+#[test]
+fn the_tab_host_is_the_console_process_that_recorded_itself() {
+    let (mut host, host_process) = console_process();
+    let (mut root, root_process) = console_process();
+    let recorded = (host.id(), query_process_identity(host.id()).unwrap());
+    let in_tab = [root_process, host_process];
+
+    assert_eq!(
+        super::tab_host_among(&in_tab, Some(&recorded)),
+        Some(host.id())
+    );
+    // A console window has no host, and neither has a session whose host did not
+    // record itself.
+    assert_eq!(super::tab_host_among(&in_tab, None), None);
+    // The host has left the console, as it does once the root has attached.
+    assert_eq!(super::tab_host_among(&in_tab[..1], Some(&recorded)), None);
+    // Another process has the pid that the host once had.
+    let mut reused = recorded.clone();
+    reused.1.creation_time = reused.1.creation_time.wrapping_add(1);
+    assert_eq!(super::tab_host_among(&in_tab, Some(&reused)), None);
+
+    for process in [&mut host, &mut root] {
+        process.kill().unwrap();
+        process.wait().unwrap();
+    }
 }
 
 #[test]

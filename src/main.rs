@@ -36,6 +36,7 @@ Usage:
   agent-bridge doctor <session> [--probe] [--json]
   agent-bridge doctor --provider <codex|claude|agy|pi> [--probe] [--json]
   agent-bridge consent <inspect|revoke|reset> PATH [--json]
+  agent-bridge settings [windows-tab-window <dedicated|current>] [--json]
   agent-bridge prune-sessions --closed-before-days N --explicit [--json]
   agent-bridge close-session <session> --explicit [--json]
   agent-bridge --help | --version
@@ -44,8 +45,13 @@ Runtime:
   macOS detects Ghostty, iTerm2, or Terminal.app from the invoking environment
   and opens a real surface for Codex, Claude, Agy, or Pi. Terminal.app always
   uses a dedicated new window. Use --terminal to override detection. An
-  unknown host falls back to Terminal.app. Windows opens a dedicated managed
-  PowerShell 7 console from either PowerShell or cmd. Linux is not yet supported.
+  unknown host falls back to Terminal.app. Windows opens a managed PowerShell 7
+  console from either PowerShell or cmd: a tab of the Agent Bridge window of
+  Windows Terminal or, when no tab can be created, a console window of its own.
+  settings windows-tab-window current opens the tab in the most recently used
+  Windows Terminal window instead, where the new tab takes the keyboard inside
+  that window; dedicated, the default, leaves the windows you work in alone.
+  Linux is not yet supported.
   Agent Bridge controls only sessions that it launched.
   Attaching to an arbitrary CLI is not supported.
 
@@ -301,8 +307,12 @@ mod tests {
             "Terminal.app always\n  uses a dedicated new window",
             "Use --terminal to override",
             "unknown host falls back to Terminal.app",
-            "Windows opens a dedicated managed",
-            "PowerShell 7 console from either PowerShell or cmd",
+            "Windows opens a managed PowerShell 7\n  console from either PowerShell or cmd",
+            "a tab of the Agent Bridge window of\n  Windows Terminal",
+            "when no tab can be created, a console window of its own",
+            "settings [windows-tab-window <dedicated|current>] [--json]",
+            "settings windows-tab-window current opens the tab in the most recently used",
+            "dedicated, the default, leaves the windows you work in alone",
             "Pi-qualified openai-codex/<model> value is passed as the native bare <model>",
             "Fable5 is passed to Claude Code as Fable",
             "Fable is passed to Pi as anthropic/claude-fable-5",

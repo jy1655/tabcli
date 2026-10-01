@@ -219,9 +219,13 @@ pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     platform::select(preferred)
 }
 
+// `directory` is the private directory of the managed session. Only Windows uses it: a
+// Windows Terminal tab creates its own process, which hands the console root over through
+// records kept there.
 pub(super) fn open_bound_tab<F, U>(
     kind: TerminalKind,
     command: &str,
+    directory: &Path,
     deadline: Instant,
     bind: F,
     unbind: U,
@@ -232,15 +236,16 @@ where
 {
     #[cfg(windows)]
     {
-        windows::open_bound_tab(kind, command, deadline, bind, unbind)
+        windows::open_bound_tab(kind, command, directory, deadline, bind, unbind)
     }
     #[cfg(target_os = "macos")]
     {
+        let _ = directory;
         macos::open_bound_tab(kind, command, deadline, bind, unbind)
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = deadline;
+        let _ = (directory, deadline);
         let mut session = platform::open_tab(kind, command)?;
         if let Err(error) = bind(&mut session) {
             let cleanup = platform::close_session(&session);
@@ -417,6 +422,14 @@ pub(super) fn surface_present(
     }
 }
 
+/// What the records of a session say that its console cannot: where the host of a tab
+/// recorded itself, and whether the wrapper that the console root starts ever ran.
+#[cfg(target_os = "windows")]
+pub(super) struct WindowsSessionRecords<'a> {
+    pub(super) directory: &'a Path,
+    pub(super) root_never_ran: bool,
+}
+
 #[cfg(target_os = "windows")]
 pub(super) fn windows_console_control(
     action: &str,
@@ -424,13 +437,27 @@ pub(super) fn windows_console_control(
     input_path: Option<&Path>,
     submit_count: usize,
     timeout: Option<std::time::Duration>,
+    records: &WindowsSessionRecords<'_>,
 ) -> Result<()> {
-    windows::console_control(action, session, input_path, submit_count, timeout)
+    windows::console_control(action, session, input_path, submit_count, timeout, records)
+}
+
+#[cfg(target_os = "windows")]
+pub(super) fn windows_console_host(directory: &Path) -> Result<()> {
+    windows::run_console_host(directory)
 }
 
 #[cfg(target_os = "windows")]
 pub(super) fn windows_powershell_executable() -> Result<std::path::PathBuf> {
     windows::powershell_executable()
+}
+
+#[cfg(all(target_os = "windows", test))]
+pub(super) fn windows_console_launch_command_line(
+    powershell: &Path,
+    command: &str,
+) -> Result<String> {
+    windows::console_launch_command_line(powershell, command)
 }
 
 #[cfg(windows)]

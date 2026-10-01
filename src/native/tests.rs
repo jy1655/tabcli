@@ -2187,6 +2187,25 @@ fn windows_console_helper_accepts_only_managed_session_identity() {
         ])
         .is_err()
     );
+    // The window lookup is bounded and takes nothing but its time.
+    assert!(matches!(
+        parse_args(["native-console-control", "window", "session-owner123", "600"]).unwrap(),
+        NativeCommand::ConsoleControl {
+            action,
+            id,
+            input_name: None,
+            timeout_ms: Some(600),
+        } if action == "window" && id == "session-owner123"
+    ));
+    for invalid in [
+        &["window", "session-owner123"][..],
+        &["window", "session-owner123", "0"],
+        &["window", "session-owner123", "pending-prompt-1.txt", "600"],
+    ] {
+        let mut arguments = vec!["native-console-control"];
+        arguments.extend_from_slice(invalid);
+        assert!(parse_args(arguments).is_err(), "{invalid:?}");
+    }
 }
 
 #[cfg(windows)]
@@ -2264,6 +2283,52 @@ fn powershell_launch_quoting_doubles_apostrophes() {
     .unwrap();
     assert!(command.contains("'C:\\work\\owner''s repo'"));
     assert!(!command.contains("owner's repo"));
+}
+
+// Windows refuses to replace a file while any other handle to it is open. A launcher
+// polls `status.json` and `launch.json` while the wrapper replaces them, so each
+// replacement can meet a reader that holds the record for a moment.
+#[cfg(windows)]
+#[test]
+fn a_record_is_replaced_although_a_reader_holds_it_open_for_a_moment() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("status.json");
+    write_json_atomic(&path, &serde_json::json!({ "state": "launching" })).unwrap();
+    let reader = File::open(&path).unwrap();
+    let release = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(150));
+        drop(reader);
+    });
+
+    write_json_atomic(&path, &serde_json::json!({ "state": "running" })).unwrap();
+
+    release.join().unwrap();
+    assert_eq!(
+        read_json::<serde_json::Value>(&path).unwrap()["state"],
+        "running"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_record_that_stays_open_fails_the_replacement_after_a_bounded_wait() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("status.json");
+    write_json_atomic(&path, &serde_json::json!({ "state": "launching" })).unwrap();
+    let reader = File::open(&path).unwrap();
+    let started = Instant::now();
+
+    let error = write_json_atomic(&path, &serde_json::json!({ "state": "running" })).unwrap_err();
+
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(format!("{error:#}").contains("failed to persist"));
+    drop(reader);
+    assert_eq!(
+        read_json::<serde_json::Value>(&path).unwrap()["state"],
+        "launching"
+    );
+    // The temporary record is removed, not left beside the one it could not replace.
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
 }
 
 #[test]
