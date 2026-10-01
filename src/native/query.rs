@@ -2,6 +2,10 @@
 use super::*;
 use serde_json::{Value, json};
 
+mod timeline;
+#[cfg(test)]
+pub(super) use timeline::timeline_value;
+
 #[derive(Debug)]
 pub(super) enum Selector {
     Latest,
@@ -24,14 +28,33 @@ pub(super) fn parse_inspect(args: &[String]) -> Result<NativeCommand> {
         .split_first()
         .context("inspect requires one session id")?;
     require_valid_session_id(id)?;
-    let json = match options {
-        [] => false,
-        [option] if option == "--json" => true,
-        _ => bail!("inspect accepts only --json"),
-    };
+    let mut json = false;
+    let mut timeline = false;
+    let mut request = None;
+    let mut index = 0;
+    while index < options.len() {
+        match options[index].as_str() {
+            "--json" => set_flag_once(&mut json, "--json")?,
+            "--timeline" => set_flag_once(&mut timeline, "--timeline")?,
+            "--request" => {
+                let id = option_value(options, &mut index, "--request")?;
+                if !requests::valid_id(id) {
+                    bail!("invalid Bridge request id")
+                }
+                set_once(&mut request, id.to_owned(), "--request")?;
+            }
+            other => bail!("unknown inspect option: {other}"),
+        }
+        index += 1;
+    }
+    if request.is_some() && !timeline {
+        bail!("--request requires --timeline")
+    }
     Ok(NativeCommand::Inspect {
         id: id.clone(),
         json,
+        timeline,
+        request,
     })
 }
 
@@ -679,8 +702,17 @@ pub(super) fn result_value_in(root: &Path, request: &ResultRequest) -> Result<Va
     }
 }
 
-pub(super) fn run_inspect(id: &str, json: bool) -> Result<()> {
-    let outcome = inspect_inner(id, json);
+pub(super) fn run_inspect(
+    id: &str,
+    json: bool,
+    timeline: bool,
+    request: Option<&str>,
+) -> Result<()> {
+    let outcome = if timeline {
+        timeline::run(id, json, request)
+    } else {
+        inspect_inner(id, json)
+    };
     if let Err(error) = &outcome
         && json
     {

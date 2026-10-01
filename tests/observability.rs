@@ -148,6 +148,242 @@ fn request(fixture: &Fixture, claim: &str, id: &str, event: &str) {
     );
 }
 
+fn timeline(fixture: &Fixture, request: Option<&str>) -> Value {
+    let mut args = vec!["inspect", "session-observe", "--timeline", "--json"];
+    if let Some(request) = request {
+        args.extend(["--request", request]);
+    }
+    success(fixture.run(&args))
+}
+
+#[test]
+fn timeline_preserves_identity_closed_results_and_every_session_byte() {
+    let fixture = Fixture::new();
+    request(&fixture, "123-456-0", "request-first", "event-1.json");
+    request(&fixture, "123-457-1", "request-second", "event-2.json");
+    fixture.event("event-1.json", "identical result");
+    fixture.event("event-2.json", "identical result");
+    fixture.event("event-0.json", "legacy result");
+    write(
+        &fixture.directory.join("launch.json"),
+        &json!({"schema": 1,
+        "claim_token": "123-456-0", "phase": "spawned", "deadline_unix_ms": 999}),
+    );
+    fs::write(
+        fixture.directory.join("launch.log"),
+        "5 arbitrary free text\nno timestamp\n1 failed sent ready\n",
+    )
+    .unwrap();
+    let status = json!({"state": "closed", "generation": 6, "updated_unix_ms": 6,
+        "exit_code": null, "error": "explicit close"});
+    write(&fixture.directory.join("status.json"), &status);
+    write(&fixture.directory.join("closed.json"), &status);
+    write(
+        &fixture.directory.join("terminal.closed.json"),
+        &json!({"consumed": true, "terminal": "windows-console"}),
+    );
+    fs::write(fixture.directory.join("turn.claim.lock"), "").unwrap();
+    let before = files(fixture.root.path());
+    let all = timeline(&fixture, None);
+    assert_eq!(all["requests"].as_array().unwrap().len(), 2);
+    for (index, id) in ["request-first", "request-second"].iter().enumerate() {
+        assert_eq!(all["requests"][index]["request_id"], *id);
+        assert_eq!(all["requests"][index]["request_state"], "completed");
+        assert_eq!(
+            all["requests"][index]["turn_id"],
+            format!("event-{}.json", index + 1)
+        );
+    }
+    let selected = timeline(&fixture, Some("request-first"));
+    assert_eq!(selected["requests"].as_array().unwrap().len(), 1);
+    let entries = selected["entries"].as_array().unwrap();
+    assert!(entries.iter().all(|e| e["request_id"] == "request-first"));
+    let phase = entries
+        .iter()
+        .find(|e| e["stage"] == "launch_phase")
+        .unwrap();
+    assert_eq!(phase["observed_unix_ms"], Value::Null);
+    assert_eq!(phase["detail"]["phase"], "spawned");
+    let session = selected["session_entries"].as_array().unwrap();
+    assert!(session.iter().all(|e| e["request_id"].is_null()));
+    assert!(session.iter().any(|e| e["event_id"] == "event-0.json"));
+    assert!(
+        session
+            .iter()
+            .any(|e| e["stage"] == "closed_status" && e["observed_unix_ms"] == 6)
+    );
+    assert!(
+        session
+            .iter()
+            .any(|e| e["stage"] == "terminal_closed" && e["observed_unix_ms"].is_null())
+    );
+    let logs = session
+        .iter()
+        .filter(|e| e["stage"] == "launch_log")
+        .collect::<Vec<_>>();
+    assert_eq!(logs.len(), 3);
+    assert_eq!(logs[0]["detail"]["text"], "1 failed sent ready");
+    assert_eq!(logs[0]["stage"], "launch_log");
+    assert_eq!(logs[2]["observed_unix_ms"], Value::Null);
+    assert_eq!(logs[2]["detail"]["line"], 2);
+    assert_eq!(
+        selected["doctor_command"],
+        "agent-bridge doctor session-observe --json"
+    );
+    let human = fixture.run(&[
+        "inspect",
+        "session-observe",
+        "--timeline",
+        "--request",
+        "request-first",
+    ]);
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("time=unknown"));
+    assert!(human.contains("source=\"launch.json\""));
+    assert!(human.contains("session_entries:"));
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[test]
+fn timeline_states_match_exact_result_and_never_confirm_uncertain_delivery() {
+    for state in [
+        "pending",
+        "failed",
+        "unresolved",
+        "recovery_required",
+        "completed",
+    ] {
+        let fixture = Fixture::new();
+        request(&fixture, "123-456-0", "request-turn", "event-1.json");
+        if state == "pending" || state == "recovery_required" {
+            fs::write(fixture.directory.join("turn.claim"), "123-456-0\n").unwrap();
+        }
+        if state == "failed" || state == "completed" {
+            let mut event = fixture.event("event-1.json", "result");
+            if state == "failed" {
+                event["error"] = json!("provider failed");
+            }
+            write(&fixture.directory.join("events/event-1.json"), &event);
+        }
+        if state == "recovery_required" {
+            let event = fixture.event("event-1.json", "unpublished bytes");
+            let mut proposed = event;
+            proposed["message"] = json!("different journal bytes");
+            write(
+                &fixture.directory.join("turn.completion.json"),
+                &json!({"schema": 1,
+                "claim_token": "123-456-0", "event_file": "event-1.json", "event": proposed,
+                "status_error": null, "status_state": "ready"}),
+            );
+        }
+        write(
+            &fixture.directory.join("status.json"),
+            &json!({"state": "working", "generation": 3,
+            "updated_unix_ms": 4, "exit_code": null, "error": "delivery could not be confirmed; do not resend"}),
+        );
+        let before = files(fixture.root.path());
+        let value = timeline(&fixture, Some("request-turn"));
+        let exact = success(fixture.run(&[
+            "result",
+            "session-observe",
+            "--request",
+            "request-turn",
+            "--json",
+        ]));
+        assert_eq!(
+            value["requests"][0]["request_state"],
+            exact["request_state"]
+        );
+        assert_eq!(value["requests"][0]["request_state"], state);
+        assert_eq!(value["session_error"], exact["session_error"]);
+        if state == "pending" || state == "unresolved" || state == "recovery_required" {
+            assert_eq!(value["requests"][0]["delivery"], "unknown");
+            assert!(
+                !value["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e["stage"] == "completion" && e["record_state"] == "observed")
+            );
+        }
+        assert_eq!(files(fixture.root.path()), before);
+    }
+}
+
+#[test]
+fn timeline_reports_missing_and_damaged_evidence_without_success() {
+    let fixture = Fixture::new();
+    request(&fixture, "123-456-0", "request-turn", "event-1.json");
+    let missing = timeline(&fixture, None);
+    assert!(
+        missing["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["source"] == "events/event-1.json" && e["record_state"] == "missing")
+    );
+    fs::write(fixture.directory.join("events/event-1.json"), "{broken").unwrap();
+    fs::write(fixture.directory.join("requests/123-457-1.json"), "{broken").unwrap();
+    fs::write(fixture.directory.join("closed.json"), "{broken").unwrap();
+    fs::write(fixture.directory.join("terminal.closing.json"), "{broken").unwrap();
+    let before = files(fixture.root.path());
+    let damaged = timeline(&fixture, None);
+    assert_eq!(damaged["incomplete"], true);
+    assert_eq!(damaged["unreadable_requests"], 1);
+    assert_eq!(damaged["requests"][0]["request_state"], "unknown");
+    assert_eq!(damaged["requests"][0]["delivery"], "unknown");
+    assert!(
+        damaged["session_entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["stage"] == "closed_status" && e["record_state"] == "unreadable")
+    );
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[test]
+fn timeline_rejects_unknown_requests_invalid_options_and_corrupt_core_records() {
+    let fixture = Fixture::new();
+    fixture.event("event-1.json", "unrelated result");
+    for args in [
+        vec!["inspect", "session-observe", "--request", "request-one"],
+        vec![
+            "inspect",
+            "session-observe",
+            "--timeline",
+            "--request",
+            "../outside",
+        ],
+        vec!["inspect", "session-observe", "--timeline", "--timeline"],
+        vec!["inspect", "session-observe", "--timeline", "--request"],
+        vec!["inspect", "session-observe", "--timeline", "--wait"],
+    ] {
+        assert!(!fixture.run(&args).status.success());
+    }
+    let output = fixture.run(&[
+        "inspect",
+        "session-observe",
+        "--timeline",
+        "--request",
+        "request-missing",
+        "--json",
+    ]);
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["ok"], false);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("unrelated result"));
+    fs::write(fixture.directory.join("launch.json"), "{broken").unwrap();
+    let before = files(fixture.root.path());
+    let output = fixture.run(&["inspect", "session-observe", "--timeline", "--json"]);
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["stored_state"], "unknown");
+    assert_eq!(files(fixture.root.path()), before);
+}
+
 #[test]
 fn exact_request_lookup_survives_a_later_turn_and_identical_result_text() {
     let fixture = Fixture::new();
