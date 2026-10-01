@@ -830,6 +830,17 @@ mod tests {
             refusal(format!("D:P(A;;FA;;;{user})(A;;WD;;;AU)")),
             "trust store can be changed by another account (S-1-5-11)"
         );
+        // Appending is enough to add a workspace, and a new owner can do everything. The
+        // account need not exist: the rule is what counts.
+        for rights in ["0x4", "WO"] {
+            assert_eq!(
+                refusal(format!(
+                    "D:P(A;;FA;;;{user})(A;;{rights};;;S-1-5-21-1-2-3-4444)"
+                )),
+                "trust store can be changed by another account (S-1-5-21-1-2-3-4444)",
+                "{rights}"
+            );
+        }
         assert_eq!(
             refusal("D:NO_ACCESS_CONTROL".to_owned()),
             "trust store has no access list, so every account can change it"
