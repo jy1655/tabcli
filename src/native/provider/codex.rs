@@ -596,7 +596,7 @@ fn diagnose_codex(context: super::super::doctor::Context<'_>) -> Vec<super::supe
         Unknown,
         "codex_mcp_not_observed",
         "MCP connection and authentication state have not been observed. Version, daemon availability and completed model turns do not prove MCP startup succeeded.",
-        "Inspect /mcp in this exact Codex session. For 401/token_revoked or reauthenticationRequired, use Codex's reconnect or sign-in flow. Optional MCP failure does not by itself mean the model turn failed; doctor does not change authentication or retry prompts.",
+        "Inspect /mcp in this exact Codex session. A codex_apps startup failure with 401/token_revoked (or reauthenticationRequired) means the provider rejected the stored ChatGPT sign-in: every newly launched Codex reads the same stored sign-in and fails the same way until `codex login`, and a long-lived Codex process that still fails afterwards needs a restart to load the new one. `codex doctor` checks that sign-in outside a session (auth.credentials and the authenticated network.websocket_reachability handshake). Optional MCP failure does not by itself mean the model turn failed; doctor does not change authentication or retry prompts.",
     ));
     checks
 }
