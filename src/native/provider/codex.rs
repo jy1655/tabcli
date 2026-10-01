@@ -1046,7 +1046,9 @@ mod tests {
             "[projects.{}]\ntrust_level = \"trusted\"\n",
             serde_json::to_string(&key).unwrap()
         );
-        std::fs::write(&homes.codex, config.as_bytes()).unwrap();
+        // Created as Codex creates it in a user profile: nobody else can change it. A
+        // plain file in the temporary directory inherits whatever that directory allows.
+        super::super::super::write_private(&homes.codex, config.as_bytes()).unwrap();
         assert!(matches!(
             ADAPTER.workspace_trust(&workspace, &homes).unwrap(),
             Trust::Trusted(_)
