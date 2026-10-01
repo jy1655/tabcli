@@ -20,7 +20,8 @@ pub(super) struct Receipt {
     pub(super) request_id: String,
     pub(super) claim_token: String,
     pub(super) event_file: String,
-    pub(super) created_unix_ms: u128,
+    #[serde(default)]
+    pub(super) created_unix_ms: Option<u128>,
     #[serde(default)]
     pub(super) source: Option<String>,
     // Receipts written before 0.0.7 have no provenance; they still deserialise as empty.
@@ -89,7 +90,7 @@ pub(super) fn create(
         ),
         claim_token: claim_token.to_owned(),
         event_file: new_event_file_name()?,
-        created_unix_ms: unix_ms(),
+        created_unix_ms: Some(unix_ms()),
         source: Some(delegation_source()),
         context_sources: context_sources.to_vec(),
     };
@@ -339,7 +340,7 @@ mod tests {
                 error: None,
                 provider_session_id: Some("thread".to_owned()),
                 turn_id: Some("turn".to_owned()),
-                created_unix_ms: 1,
+                created_unix_ms: Some(1),
             };
             let mut pending = PendingTurnCompletion::new(&token, event, None).unwrap();
             pending.event_file = receipt.event_file.clone();

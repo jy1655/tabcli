@@ -657,3 +657,37 @@ fn inspect_reports_unreadable_status_without_repairing_it() {
     assert_eq!(body["stored_state"], "unknown");
     assert_eq!(files(fixture.root.path()), before);
 }
+
+#[test]
+fn result_human_output_reports_bridge_elapsed_and_legacy_reason() {
+    let fixture = Fixture::new();
+    fixture.event("event-1.json", "old result");
+    let human = |args: &[&str]| {
+        let output = fixture.run(args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert!(
+        human(&["result", "session-observe", "--latest"])
+            .contains("Bridge observed elapsed: not computable (missing_receipt)")
+    );
+    fs::create_dir(fixture.directory.join("requests")).unwrap();
+    write(
+        &fixture.directory.join("requests/1-2-3.json"),
+        &json!({
+            "schema": 1, "request_id": "request-elapsed", "claim_token": "1-2-3",
+            "event_file": "event-1.json", "created_unix_ms": 1
+        }),
+    );
+    assert!(
+        human(&["result", "session-observe", "--request", "request-elapsed"])
+            .contains("Bridge observed elapsed: 2 ms")
+    );
+    assert!(
+        human(&["result", "session-observe", "--list"]).contains("Bridge observed elapsed: 2 ms")
+    );
+}

@@ -221,7 +221,8 @@ struct SessionEvent {
     error: Option<String>,
     provider_session_id: Option<String>,
     turn_id: Option<String>,
-    created_unix_ms: u128,
+    #[serde(default)]
+    created_unix_ms: Option<u128>,
 }
 
 // Where a reopened session's provider conversation came from: the closed Bridge session and
@@ -4077,6 +4078,7 @@ fn emit_session_result_with(
     extra: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<()> {
     let request_id = &receipt.request_id;
+    let (elapsed, elapsed_reason) = query::observed_elapsed(Some(receipt), event);
     if json {
         let mut value = serde_json::json!({
                 "ok": true,
@@ -4084,6 +4086,8 @@ fn emit_session_result_with(
                 "session": id,
                 "request_id": request_id,
                 "context_sources": receipt.context_sources,
+                "bridge_observed_elapsed_ms": elapsed,
+                "bridge_observed_elapsed_reason": elapsed_reason,
                 "request_state": if event.is_some() { "completed" } else { "accepted" },
                 "provider": provider.as_str(),
                 "terminal": terminal_session.kind.as_str(),
@@ -4466,7 +4470,7 @@ fn record_provider_result_for_claim_condition(
         error: None,
         provider_session_id,
         turn_id,
-        created_unix_ms: unix_ms(),
+        created_unix_ms: Some(unix_ms()),
     };
     commit_provider_completion_locked(
         directory,
@@ -4571,7 +4575,7 @@ fn record_provider_failure_for_claim_condition(
         error: Some(error.clone()),
         provider_session_id,
         turn_id,
-        created_unix_ms: unix_ms(),
+        created_unix_ms: Some(unix_ms()),
     };
     commit_provider_completion_locked(
         directory,
@@ -4609,7 +4613,7 @@ fn record_provider_monitor_failure(
         error: Some(error.clone()),
         provider_session_id: None,
         turn_id: None,
-        created_unix_ms: unix_ms(),
+        created_unix_ms: Some(unix_ms()),
     };
     commit_provider_completion_with_status_locked(
         directory,
