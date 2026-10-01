@@ -2,6 +2,10 @@
 use super::*;
 use serde_json::{Value, json};
 
+mod timeline;
+#[cfg(test)]
+pub(super) use timeline::timeline_value;
+
 #[derive(Debug)]
 pub(super) enum Selector {
     Latest,
@@ -24,14 +28,33 @@ pub(super) fn parse_inspect(args: &[String]) -> Result<NativeCommand> {
         .split_first()
         .context("inspect requires one session id")?;
     require_valid_session_id(id)?;
-    let json = match options {
-        [] => false,
-        [option] if option == "--json" => true,
-        _ => bail!("inspect accepts only --json"),
-    };
+    let mut json = false;
+    let mut timeline = false;
+    let mut request = None;
+    let mut index = 0;
+    while index < options.len() {
+        match options[index].as_str() {
+            "--json" => set_flag_once(&mut json, "--json")?,
+            "--timeline" => set_flag_once(&mut timeline, "--timeline")?,
+            "--request" => {
+                let id = option_value(options, &mut index, "--request")?;
+                if !requests::valid_id(id) {
+                    bail!("invalid Bridge request id")
+                }
+                set_once(&mut request, id.to_owned(), "--request")?;
+            }
+            other => bail!("unknown inspect option: {other}"),
+        }
+        index += 1;
+    }
+    if request.is_some() && !timeline {
+        bail!("--request requires --timeline")
+    }
     Ok(NativeCommand::Inspect {
         id: id.clone(),
         json,
+        timeline,
+        request,
     })
 }
 
@@ -185,6 +208,42 @@ pub(super) fn optional_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result
         .transpose()
 }
 
+// Bridge wall-clock time from receipt creation to the published completion event's
+// timestamp, including dispatch and delivery waits; never model or billing time.
+pub(super) fn observed_elapsed(
+    receipt: Option<&requests::Receipt>,
+    event: Option<&SessionEvent>,
+) -> (Option<u128>, Option<&'static str>) {
+    let Some(event) = event else {
+        return (None, Some("no_published_result"));
+    };
+    let Some(receipt) = receipt else {
+        return (None, Some("missing_receipt"));
+    };
+    let Some(start) = receipt.created_unix_ms else {
+        return (None, Some("missing_receipt_time"));
+    };
+    let Some(end) = event.created_unix_ms else {
+        return (None, Some("missing_result_time"));
+    };
+    match end.checked_sub(start) {
+        Some(elapsed) => (Some(elapsed), None),
+        None => (None, Some("inverted_time")),
+    }
+}
+
+fn elapsed_text(value: &Value) -> String {
+    match &value["bridge_observed_elapsed_ms"] {
+        Value::Number(ms) => format!("Bridge observed elapsed: {ms} ms"),
+        _ => format!(
+            "Bridge observed elapsed: not computable ({})",
+            value["bridge_observed_elapsed_reason"]
+                .as_str()
+                .unwrap_or("unknown")
+        ),
+    }
+}
+
 impl Snapshot {
     pub(super) fn read(directory: &Path) -> Result<Self> {
         Self::read_with(directory, PublicationRead::Within(EVENT_READ_LIMIT))
@@ -315,6 +374,15 @@ impl Snapshot {
     }
 
     pub(super) fn result(&self, directory: &Path, selector: &Selector) -> Result<Value> {
+        self.result_with(selector, |name| self.event(directory, name))
+    }
+
+    // Timeline uses cached strict bytes; ordinary queries keep their reader.
+    fn result_with(
+        &self,
+        selector: &Selector,
+        read_event: impl FnOnce(&str) -> Result<Option<SessionEvent>>,
+    ) -> Result<Value> {
         let receipt = match selector {
             Selector::Request(id) => Some(
                 self.receipts
@@ -342,10 +410,7 @@ impl Snapshot {
             Selector::List => bail!("list is not a single result selector"),
         };
         let receipt = receipt.or_else(|| name.and_then(|name| self.receipt_for_event(name)));
-        let event = name
-            .map(|name| self.event(directory, name))
-            .transpose()?
-            .flatten();
+        let event = name.map(read_event).transpose()?.flatten();
         if matches!(selector, Selector::Event(_))
             && event.is_none()
             && name.is_some_and(|name| self.published(name))
@@ -384,7 +449,9 @@ impl Snapshot {
         } else {
             "unavailable"
         };
+        let (elapsed, elapsed_reason) = observed_elapsed(receipt, event.as_ref());
         Ok(json!({
+            "bridge_observed_elapsed_ms": elapsed, "bridge_observed_elapsed_reason": elapsed_reason,
             "schema_version": 1, "ok": true, "session": self.manifest.id,
             "provider": self.manifest.provider, "workspace": self.manifest.workspace,
             "request_id": receipt.map(|r| &r.request_id), "event_id": name,
@@ -528,6 +595,7 @@ fn print_result(value: &Value, json: bool) -> Result<()> {
         "state: {}",
         value["request_state"].as_str().unwrap_or("unknown")
     );
+    println!("{}", elapsed_text(value));
     if let Some(message) = value["result"].as_str() {
         println!("\n{}", terminal_safe_text(message, true));
     }
@@ -564,10 +632,11 @@ pub(super) fn run_result(request: ResultRequest) -> Result<()> {
                 } else {
                     for event in value["events"].as_array().into_iter().flatten() {
                         println!(
-                            "{}\t{}\t{}",
+                            "{}\t{}\t{}\t{}",
                             event["event_id"].as_str().unwrap_or("?"),
                             event["request_state"].as_str().unwrap_or("?"),
-                            event["request_id"].as_str().unwrap_or("legacy")
+                            event["request_id"].as_str().unwrap_or("legacy"),
+                            elapsed_text(event)
                         );
                     }
                 }
@@ -605,7 +674,8 @@ pub(super) fn result_value_in(root: &Path, request: &ResultRequest) -> Result<Va
     let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
     let mut last = json!({"schema_version": 1, "ok": true, "session": request.id,
         "request_id": match &request.selector { Selector::Request(id) => Some(id), _ => None },
-        "request_state": "busy", "result": null});
+        "request_state": "busy", "result": null,
+        "bridge_observed_elapsed_ms": null, "bridge_observed_elapsed_reason": "no_published_result"});
     loop {
         let observed = if request.wait {
             Snapshot::read(&directory)
@@ -679,8 +749,17 @@ pub(super) fn result_value_in(root: &Path, request: &ResultRequest) -> Result<Va
     }
 }
 
-pub(super) fn run_inspect(id: &str, json: bool) -> Result<()> {
-    let outcome = inspect_inner(id, json);
+pub(super) fn run_inspect(
+    id: &str,
+    json: bool,
+    timeline: bool,
+    request: Option<&str>,
+) -> Result<()> {
+    let outcome = if timeline {
+        timeline::run(id, json, request)
+    } else {
+        inspect_inner(id, json)
+    };
     if let Err(error) = &outcome
         && json
     {
@@ -732,10 +811,16 @@ pub(super) fn inspect_value(directory: &Path, id: &str) -> Result<Value> {
         .receipts
         .iter()
         .map(|receipt| {
+            let (elapsed, elapsed_reason) = match snapshot.event(directory, &receipt.event_file) {
+                Ok(event) => observed_elapsed(Some(receipt), event.as_ref()),
+                Err(_) => (None, Some("unreadable_result")),
+            };
             json!({
                 "request_id": receipt.request_id, "created_unix_ms": receipt.created_unix_ms, "source": receipt.source,
                 "event_id": receipt.event_file, "context_sources": receipt.context_sources,
                 "active": snapshot.claim.as_deref() == Some(&receipt.claim_token),
+                "bridge_observed_elapsed_ms": elapsed,
+                "bridge_observed_elapsed_reason": elapsed_reason,
             })
         })
         .collect::<Vec<_>>();
@@ -913,7 +998,7 @@ struct SearchHit {
     title: String,
     request_id: Option<String>,
     event_id: String,
-    created_unix_ms: u128,
+    created_unix_ms: Option<u128>,
     excerpt: String,
     result_command: String,
 }
@@ -1483,6 +1568,25 @@ mod search_tests {
         assert_eq!(
             check_events_directory(directory.path()).unwrap_err(),
             "events is not a directory"
+        );
+    }
+}
+
+#[cfg(test)]
+mod elapsed_tests {
+    use super::*;
+
+    #[test]
+    fn human_elapsed_distinguishes_zero_from_uncomputable() {
+        assert_eq!(
+            elapsed_text(&json!({"bridge_observed_elapsed_ms": 0})),
+            "Bridge observed elapsed: 0 ms"
+        );
+        assert_eq!(
+            elapsed_text(
+                &json!({"bridge_observed_elapsed_ms": null, "bridge_observed_elapsed_reason": "missing_receipt"})
+            ),
+            "Bridge observed elapsed: not computable (missing_receipt)"
         );
     }
 }

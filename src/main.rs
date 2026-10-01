@@ -21,6 +21,9 @@ Usage:
   agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]
       [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|windows-console>]
       [--yolo] [--timeout-secs N] [--detach] [--json] [--context-result <session>/<request-id>]...
+  agent-bridge self-test <codex|claude|agy|pi> [--workspace PATH]
+      [--terminal <ghostty|iterm2|terminal|windows-console>] [--model MODEL] [--effort EFFORT]
+      [--yolo] [--timeout-secs N] [--isolated] [--json]
   agent-bridge tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
       [--context-result <session>/<request-id>]...
   agent-bridge reopen <closed-session> (--prompt TEXT | --prompt-file PATH) [--title NAME]
@@ -28,7 +31,7 @@ Usage:
       [--detach] [--json]
   agent-bridge sessions [--workspace PATH] [--provider <codex|claude|agy|pi>] [--state STATE]
       [--sort <id|updated>] [--json]
-  agent-bridge inspect <session> [--json]
+  agent-bridge inspect <session> [--timeline [--request REQUEST]] [--json]
   agent-bridge result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
       [--wait --timeout-secs N]
   agent-bridge search <query> [--workspace PATH | --all-workspaces] [--provider <codex|claude|agy|pi>]
@@ -55,6 +58,18 @@ Runtime:
   Agent Bridge controls only sessions that it launched.
   Attaching to an arbitrary CLI is not supported.
 
+Self-test:
+  self-test makes real model calls and opens a real terminal. It runs in the
+  ordinary state root, reports its path, and closes only the session it creates.
+  It never resends an uncertain prompt or automatically approves workspace trust.
+  --timeout-secs is a per-command budget (default 120); cleanup uses the normal
+  explicit-close contract. Closed records remain in the registry for inspection.
+  --isolated keeps the run apart from your sessions in a private directory of its
+  own; your state root's settings and consent records do not apply, and the
+  private directory stays until you remove it. Only a fully verified round trip
+  and cleanup exit successfully. Model, effort, and --yolo follow the new-session
+  policy below.
+
 Session policy:
   --model and --effort apply only to the new child session. For Codex, a non-empty
   Pi-qualified openai-codex/<model> value is passed as the native bare <model>.
@@ -62,7 +77,7 @@ Session policy:
   exact model value Fable is passed to Pi as anthropic/claude-fable-5. All other
   model values are forwarded unchanged.
 
-  --yolo is never inherited. It is forwarded only when the ask or reopen command
+  --yolo is never inherited. It is forwarded only when ask, reopen, or self-test
   includes it and the provider has a matching option. Codex, Claude, and Agy
   receive their native bypass flags. Pi receives --approve for project-local trust
   while its native tool policy remains in effect.
@@ -132,6 +147,11 @@ Session policy:
   admits one reopen. inspect and sessions --json report resumed_from for the new
   session.
 
+  result reports bridge_observed_elapsed_ms from Bridge receipt creation to the
+  published completion event, not model or billing time. Uncomputable values are
+  null with bridge_observed_elapsed_reason. inspect and finished ask/tell JSON
+  report the same per-request measurement; no token or cost usage is collected.
+
   --context-result attaches a previously recorded result, addressed exactly as
   <session>/<request-id> (or <session>/<event-id> for records without a receipt),
   after the prompt as clearly delimited reference material. Up to 8 values are
@@ -141,6 +161,9 @@ Session policy:
 
   Supported CLI minimums: Codex 0.147.0, Claude 2.1.234, Agy 1.1.12, Pi 0.84.1.
   Session state is stored privately under ~/.agent-bridge/native-sessions.
+  inspect --timeline reads preserved request, launch, completion and close evidence.
+  --request filters request entries; session diagnostics remain separate. Unknown
+  times are not inferred. This query never repairs, resends or closes a session.
   Closed records remain until prune-sessions explicitly removes quiescent records
   older than the requested retention window.
 
@@ -297,10 +320,18 @@ mod tests {
             "reopen <closed-session> (--prompt TEXT | --prompt-file PATH)",
             "supports only Claude Code on native Windows",
             "sessions [--workspace PATH]",
-            "inspect <session>",
+            "inspect <session> [--timeline [--request REQUEST]] [--json]",
             "result <session>",
             "search <query> [--workspace PATH | --all-workspaces]",
             "doctor <session> [--probe] [--json]",
+            "self-test <codex|claude|agy|pi>",
+            "self-test makes real model calls and opens a real terminal",
+            "ordinary state root, reports its path, and closes only the session it creates",
+            "Closed records remain in the registry for inspection",
+            "[--isolated]",
+            "--isolated keeps the run apart from your",
+            "settings and consent records do not apply",
+            "private directory stays until you remove it",
             "prune-sessions --closed-before-days N --explicit",
             "close-session <session> --explicit",
             "macOS detects Ghostty, iTerm2, or Terminal.app",
@@ -320,6 +351,10 @@ mod tests {
             "Attaching to an arbitrary CLI",
             "[--context-result <session>/<request-id>]...",
             "records the attached sources as context_sources",
+            "bridge_observed_elapsed_ms",
+            "bridge_observed_elapsed_reason",
+            "not model or billing time",
+            "no token or cost usage is collected",
         ] {
             assert!(help.contains(expected), "help is missing {expected:?}");
         }

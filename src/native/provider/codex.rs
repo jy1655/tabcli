@@ -222,10 +222,21 @@ impl NativeProviderAdapter for CodexAdapter {
                 .context("Codex terminal has no managed session binding")
                 .and_then(super::super::session_directory)
                 .map_err(terminal::TerminalSendFailure::not_sent)?;
+            // A screen read costs a helper process and the wait polls ten times a second,
+            // so the screen is read once per `COMPOSER_POLL`.
+            let mut last_read: Option<Instant> = None;
             super::super::consent::wait_for_native_trust(
                 &directory,
                 FirstPartyCli::Codex,
                 deadline,
+                &mut || {
+                    if last_read.is_some_and(|read| read.elapsed() < COMPOSER_POLL) {
+                        return false;
+                    }
+                    last_read = Some(Instant::now());
+                    terminal::read_screen(session, deadline)
+                        .is_ok_and(|screen| composer_is_ready(&screen))
+                },
             )
             .map_err(terminal::TerminalSendFailure::not_sent)?;
         }
@@ -328,6 +339,40 @@ impl NativeProviderAdapter for CodexAdapter {
     fn cancel_terminal_follow_up(&self, directory: &Path, claim_token: &str) -> Result<()> {
         cancel_pending_turn(directory, claim_token)
     }
+}
+
+// The empty composer of the chat view: the prompt glyph and Codex's placeholder
+// (`PLACEHOLDER` in codex-rs/tui/src/chatwidget.rs, rust-v0.159.3).
+const COMPOSER_ROW: &str = "› Ask Codex to do anything";
+const COMPOSER_POLL: Duration = Duration::from_secs(1);
+
+// Positive evidence that an initial paste lands in the composer and not on the trust
+// dialog. Codex draws the composer only when no onboarding screen and no view of the
+// bottom pane is active, so its empty row on the screen means that the trust dialog is
+// over. An exact project entry is not the only way there (issue #60): Codex takes the
+// trust of a workspace without one from its repository root, which covers a
+// subdirectory and a linked worktree, shows no dialog then and saves no exact entry;
+// and "Trust and continue", answered by the user in the managed terminal, saves the
+// repository root as well. Measured 2026-10-02 with Codex CLI 0.159.3 on native
+// Windows: no dialog in a linked worktree of a trusted repository; the dialog in a
+// directory that nothing trusts, with and without `--yolo`, and in a plain directory
+// below a trusted one.
+//
+// Nothing is inferred from Codex's configuration or from Git: an inference that is
+// wrong would paste onto the dialog. An empty screen, a screen that is still loading
+// and a layout this does not know are no evidence, and neither is a composer beside
+// the words of the dialog. This is not workspace consent, which stays exact and is the
+// only trust that is shared with another provider. Delete it when Codex has an input
+// path that needs no paste.
+fn composer_is_ready(screen: &str) -> bool {
+    let mut composer = false;
+    for line in screen.lines() {
+        if line.contains("Trust this folder?") || line.contains("Trust and continue") {
+            return false;
+        }
+        composer |= line.trim() == COMPOSER_ROW;
+    }
+    composer
 }
 
 fn workspace_trust_override(workspace: &Path) -> Result<String> {
@@ -983,6 +1028,39 @@ fn codex_owned_string(payload: &serde_json::Value, key: &str) -> Option<String> 
     codex_string(payload, key).map(str::to_owned)
 }
 
+// The first line and the request heading of the IDE context that the TUI puts in front
+// of the user's message while `/ide` is on (`render_prompt_context` and
+// `PROMPT_REQUEST_BEGIN` in codex-rs/tui/src/ide_context/prompt.rs, rust-v0.159.3).
+const IDE_CONTEXT_HEADING: &str = "# Context from my IDE setup:";
+const IDE_REQUEST_HEADING: &str = "## My request for Codex:";
+
+// Whether a message that Codex reports as the input of a turn is the prompt Bridge
+// sent: it begins with the delegation header, directly or behind Codex's IDE context.
+// The context can quote a file that holds the request heading, and so can the prompt,
+// so every heading is tried.
+fn begins_with_bridge_prompt(message: &str) -> bool {
+    let header = super::super::NATIVE_DELEGATION_HEADER;
+    let message = message.trim_start();
+    message.starts_with(header)
+        || (message.starts_with(IDE_CONTEXT_HEADING)
+            && message
+                .match_indices(IDE_REQUEST_HEADING)
+                .any(|(at, heading)| {
+                    message[at + heading.len()..]
+                        .trim_start()
+                        .starts_with(header)
+                }))
+}
+
+// The input of the turn that Bridge started is the prompt Bridge sent: it begins with the
+// delegation header and ends with the turn marker. The marker alone does not identify
+// it. Codex CLI 0.159.3 answers the first message of a TUI with a second turn, on a
+// thread of its own, that makes the task title; its input is Codex's instruction
+// followed by the user's whole message, marker included, and its notify can arrive
+// first (issue #61, 2026-10-02: `{"title":"READY"}` recorded as the result of two
+// initial requests out of six, with the title thread as the session's thread). This
+// tells Bridge's framing from that of a turn Codex starts; it is not an identity of
+// the turn, which Codex does not give before the first notify.
 fn codex_input_correlates(payload: &serde_json::Value, pending: &PendingCodexTurn) -> bool {
     if codex_string(payload, "type") != Some("agent-turn-complete") {
         return false;
@@ -991,7 +1069,9 @@ fn codex_input_correlates(payload: &serde_json::Value, pending: &PendingCodexTur
         .get("input-messages")
         .and_then(serde_json::Value::as_array)
         .and_then(|messages| messages.iter().rev().find_map(serde_json::Value::as_str))
-        .is_some_and(|message| message.trim_end().ends_with(&pending.marker))
+        .is_some_and(|message| {
+            begins_with_bridge_prompt(message) && message.trim_end().ends_with(&pending.marker)
+        })
 }
 
 fn established_codex_thread(directory: &Path) -> Result<Option<String>> {
@@ -1030,6 +1110,41 @@ mod tests {
             );
             assert_eq!(parsed["value"].as_table().unwrap().len(), 1);
         }
+    }
+
+    // The screens an initial paste can meet, as Codex CLI 0.159.3 drew them on
+    // 2026-10-02 (session-kkpVsB: the dialog; session-nXZtvt: the composer), in the
+    // order of a start in which the dialog opens and the user answers it.
+    #[test]
+    fn only_the_empty_composer_is_evidence_for_an_initial_paste() {
+        let dialog = "  Folder access\n  C:\\work\\project\n  Trust this folder? Codex can read, edit, and run files here, subject to your permission settings. Folder settings\n  can run code automatically, even without a model request. Continue only if you trust these files. Your trust\n  decision will be saved.\n› 1. Trust and continue\n  2. Quit\n  enter continue · esc quit";
+        let composer = "  >_ OpenAI Codex (v0.159.3)\n     D:\\Dev\\project\n  How deep does this codebase go?\n› Ask Codex to do anything                                   \n  GPT-6.1-Sol low · D:\\Dev\\project\n  ? for shortcuts";
+        let start = [
+            "",
+            "\n\n\n",
+            "  >_ OpenAI Codex (v0.159.3)\n",
+            dialog,
+            composer,
+        ];
+        assert_eq!(
+            start.map(composer_is_ready),
+            [false, false, false, false, true],
+            "the gate opens with the composer and not before"
+        );
+
+        // Another row that begins with the glyph is not the composer: a selected
+        // option, a draft, another placeholder.
+        for screen in [
+            "› 1. Trust and continue",
+            "› Ask Codex to do anything else",
+            "› Ask a follow-up question",
+            "Ask Codex to do anything",
+        ] {
+            assert!(!composer_is_ready(screen), "{screen}");
+        }
+        // A screen that shows both is not one this knows.
+        assert!(!composer_is_ready(&format!("{dialog}\n{composer}")));
+        assert!(!composer_is_ready(&format!("{composer}\n{dialog}")));
     }
 
     #[test]
@@ -1176,8 +1291,8 @@ mod tests {
     #[cfg(unix)]
     use super::super::super::{SESSION_SCHEMA, SessionManifest, write_json_atomic};
     use super::super::super::{
-        SessionEvent, SessionStatus, TURN_CLAIM_FILE, acquire_turn_claim, event_paths, read_json,
-        update_status,
+        SessionEvent, SessionStatus, TURN_CLAIM_FILE, acquire_turn_claim, event_paths,
+        native_delegation_prompt, read_json, update_status,
     };
     use super::*;
 
@@ -1251,7 +1366,7 @@ exit 91
                 error: None,
                 provider_session_id: Some(thread_id.to_owned()),
                 turn_id: Some("initial-turn".to_owned()),
-                created_unix_ms: 1,
+                created_unix_ms: Some(1),
             },
         )
         .unwrap();
@@ -1572,6 +1687,8 @@ exit 1
         let claim = acquire_turn_claim(&directory).unwrap();
         let claim_token = claim.token.clone();
         claim.retain();
+        // The prompt as `tell` hands it to the adapter: already framed.
+        let prompt = native_delegation_prompt("external", "follow up");
 
         ADAPTER
             .send_cross_session_message(CrossSessionMessageContext {
@@ -1579,7 +1696,7 @@ exit 1
                 directory: &directory,
                 provider_path: &provider,
                 request_id: &claim_token,
-                prompt: "follow up",
+                prompt: &prompt,
                 deadline: Instant::now() + Duration::from_secs(2),
             })
             .unwrap();
@@ -1597,7 +1714,7 @@ exit 1
         assert_eq!(
             arguments[4],
             format!(
-                "follow up\n\n[Agent Bridge Codex turn metadata; do not include this metadata in the response]\n<!-- agent-bridge-codex-turn:{claim_token} -->"
+                "[Agent Bridge native delegation]\nSource: external\n\nfollow up\n\n[Agent Bridge Codex turn metadata; do not include this metadata in the response]\n<!-- agent-bridge-codex-turn:{claim_token} -->"
             )
         );
         let daemon_arguments = std::fs::read(directory.join("daemon-argv.bin")).unwrap();
@@ -1611,12 +1728,12 @@ exit 1
         assert!(directory.join(TURN_CLAIM_FILE).is_file());
         assert_eq!(event_paths(&directory).unwrap().len(), 1);
 
-        let pending = read_pending_turn(&directory).unwrap().unwrap();
+        // Codex reports the message it was given: replay the argument that was queued.
         let completion = serde_json::json!({
             "type": "agent-turn-complete",
             "thread-id": thread_id,
             "turn-id": "queued-turn",
-            "input-messages": [correlated_prompt("follow up", &pending)],
+            "input-messages": [arguments[4]],
             "last-assistant-message": "queued result",
         });
         ADAPTER.handle_hook(&directory, &completion).unwrap();
@@ -1955,9 +2072,12 @@ exit 91
             "type": "agent-turn-complete",
             "thread-id": "codex-thread",
             "turn-id": "codex-turn",
-            "input-messages": [format!(
-                "Reply with exactly EXACT_OUTPUT and nothing else.\n{}",
-                pending.marker
+            "input-messages": [correlated_prompt(
+                &native_delegation_prompt(
+                    "external",
+                    "Reply with exactly EXACT_OUTPUT and nothing else.",
+                ),
+                &pending,
             )],
             "last-assistant-message": "EXACT_OUTPUT",
         });
@@ -1969,6 +2089,125 @@ exit 91
         assert_eq!(event.message, "EXACT_OUTPUT");
         assert_eq!(event.provider_session_id.as_deref(), Some("codex-thread"));
         assert_eq!(event.turn_id.as_deref(), Some("codex-turn"));
+    }
+
+    // Issue #61. The two notify payloads of one initial request, as Codex CLI 0.159.3
+    // sent them on 2026-10-02 (session-2qIKg5), in the order that recorded the title as
+    // the result. The Windows console paste joins the lines of the prompt, so the
+    // message that Codex reports has none.
+    #[test]
+    fn codex_hook_ignores_the_task_title_turn_that_quotes_the_prompt() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let pending = claim_pending_turn(directory.path());
+        let prompt = correlated_prompt(
+            &native_delegation_prompt(
+                "external",
+                "Reply with the single word READY and nothing else. Do not use any tools.",
+            ),
+            &pending,
+        )
+        .replace('\n', "");
+        let title_turn = serde_json::json!({
+            "type": "agent-turn-complete",
+            "client": "codex-tui",
+            "thread-id": "title-thread",
+            "turn-id": "title-turn",
+            "input-messages": [format!(
+                "Generate a concise, single-line task title of at most 36 characters and under five words where possible. Start with an imperative verb. Capitalize only the first word unless the user's language, proper nouns, acronyms, or code terms require otherwise. Preserve ticket references exactly. Write in the user's language. Do not use quotes, markdown, or trailing punctuation. Do not answer the request.\n\nUser prompt:\n{prompt}"
+            )],
+            "last-assistant-message": "{\"title\":\"READY\"}",
+        });
+
+        ADAPTER.handle_hook(directory.path(), &title_turn).unwrap();
+
+        assert!(event_paths(directory.path()).unwrap().is_empty());
+        assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+
+        ADAPTER
+            .handle_hook(
+                directory.path(),
+                &serde_json::json!({
+                    "type": "agent-turn-complete",
+                    "client": "codex-tui",
+                    "thread-id": "managed-thread",
+                    "turn-id": "managed-turn",
+                    "input-messages": [prompt],
+                    "last-assistant-message": "READY",
+                }),
+            )
+            .unwrap();
+
+        let paths = event_paths(directory.path()).unwrap();
+        assert_eq!(paths.len(), 1);
+        let event: SessionEvent = read_json(&paths[0]).unwrap();
+        assert_eq!(event.message, "READY");
+        assert_eq!(event.provider_session_id.as_deref(), Some("managed-thread"));
+        // The title turn that arrives late changes nothing either.
+        ADAPTER.handle_hook(directory.path(), &title_turn).unwrap();
+        assert_eq!(event_paths(directory.path()).unwrap().len(), 1);
+    }
+
+    // With `/ide` on, the TUI puts its IDE context in front of the message
+    // (codex-rs/tui/src/ide_context/prompt.rs, rust-v0.159.3). That turn is still the
+    // one Bridge started; the title turn that quotes it is not. Not observed live: the
+    // wrapper is taken from Codex's source.
+    #[test]
+    fn codex_hook_accepts_the_prompt_behind_the_ide_context() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let pending = claim_pending_turn(directory.path());
+        let prompt = correlated_prompt(
+            &native_delegation_prompt("external", "Reply READY."),
+            &pending,
+        );
+        // The active file quotes the request heading itself.
+        let with_context = format!(
+            "# Context from my IDE setup:\n\n## Active file: src/prompt.rs\n\n## Active selection of the file:\nconst PROMPT_REQUEST_BEGIN: &str = \"## My request for Codex:\";\n\n## My request for Codex:\n{prompt}"
+        );
+        let payload = |thread: &str, input: String, answer: &str| {
+            serde_json::json!({
+                "type": "agent-turn-complete",
+                "thread-id": thread,
+                "turn-id": format!("{thread}-turn"),
+                "input-messages": [input],
+                "last-assistant-message": answer,
+            })
+        };
+
+        for refused in [
+            // The title turn quotes the whole message, context included.
+            format!("Generate a concise, single-line task title.\n\nUser prompt:\n{with_context}"),
+            // A context without Bridge's prompt behind any request heading.
+            format!(
+                "# Context from my IDE setup:\n\n## My request for Codex:\nSummarise this.\n{}",
+                pending.marker
+            ),
+            // The headings alone, in a message that does not begin with the context.
+            format!("Note\n## My request for Codex:\n{prompt}"),
+        ] {
+            ADAPTER
+                .handle_hook(
+                    directory.path(),
+                    &payload("other-thread", refused, "{\"title\":\"READY\"}"),
+                )
+                .unwrap();
+            assert!(event_paths(directory.path()).unwrap().is_empty());
+        }
+
+        ADAPTER
+            .handle_hook(
+                directory.path(),
+                &payload("managed-thread", with_context, "READY"),
+            )
+            .unwrap();
+        let paths = event_paths(directory.path()).unwrap();
+        assert_eq!(paths.len(), 1);
+        let event: SessionEvent = read_json(&paths[0]).unwrap();
+        assert_eq!(event.message, "READY");
+        assert_eq!(event.provider_session_id.as_deref(), Some("managed-thread"));
     }
 
     #[test]
@@ -2116,7 +2355,10 @@ exit 91
                     "type": "agent-turn-complete",
                     "thread-id": "managed-thread",
                     "turn-id": "delayed-old-turn-with-a-new-id",
-                    "input-messages": [format!("old prompt\n{}", initial_pending.marker)],
+                    "input-messages": [correlated_prompt(
+                        &native_delegation_prompt("external", "old prompt"),
+                        &initial_pending,
+                    )],
                     "last-assistant-message": "delayed old result",
                 }),
             )

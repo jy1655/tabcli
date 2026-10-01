@@ -125,6 +125,35 @@ launch, observe, continue, and close without replacing the capabilities those CL
   the transcript before its log lines are written. Replace this with a per-turn failure
   signal when Agy provides one.
 
+## Current Codex Boundary
+
+- Codex gives no identity of a turn before its first `notify`. The adapter appends a turn
+  marker to the prompt and accepts an `agent-turn-complete` payload when the assistant
+  message ends with the marker, or when the last element of `input-messages` is the
+  prompt Bridge sent: it begins with Bridge's delegation header and ends with the marker.
+  The thread of the first accepted payload becomes the session's thread, which every
+  follow-up addresses, so a wrong first payload is a wrong result and a wrong thread.
+- The marker alone does not identify the turn. Codex CLI 0.159.3 answers the first message
+  of a TUI with a second turn, on a thread of its own, that makes the task title; its
+  input is Codex's instruction followed by the user's whole message, marker included, and
+  its `notify` can arrive first (issue #61, 2026-10-02: `{"title":"READY"}` recorded as
+  the result of two short initial requests out of six; a long prompt is cut in the title
+  input and loses the marker). Any turn that Codex starts itself can quote the prompt in
+  the same way. Do not weaken the header requirement to a substring match.
+- With `/ide` on, the TUI puts its IDE context in front of the user's message: a first
+  line `# Context from my IDE setup:`, the context, and a line `## My request for Codex:`
+  (codex-rs/tui/src/ide_context/prompt.rs, rust-v0.159.3; taken from the source, not
+  observed live). That input is still Bridge's turn. Recognise this wrapper exactly and
+  no other; a new wrapper needs its own evidence from Codex's source or from a recorded
+  payload.
+- The header is framing, not provenance: a turn that copies the framed prompt verbatim,
+  or an answer that ends with the marker, would still be accepted. Replace the
+  correlation when Codex reports the thread of the TUI before the first turn, or gives a
+  turn an identity that the launcher can choose.
+- When a correlation question comes up, record the raw `notify` payloads with a temporary
+  build and read them; do not reason from the result alone. The two payloads of #61
+  looked alike in everything but the thread, the input and the answer.
+
 ## Current Windows Surface Boundary
 
 - A managed console on native Windows is a tab of Windows Terminal, and a console window
@@ -219,11 +248,52 @@ launch, observe, continue, and close without replacing the capabilities those CL
   content earlier, and it does not exclude a writer that has the store open. Do not open
   a provider store without write sharing to change that: Bridge polls Agy's store every
   100 ms while Agy saves an approved decision, and a provider's own write would fail.
+- The gate that withholds an initial paste on native Windows asks another question than
+  workspace consent: not whether the user approved this exact workspace, but whether the
+  provider takes input now. For Codex an exact project entry is not the only way past
+  the trust dialog. Codex CLI 0.159.3 takes the trust of a workspace without an exact
+  entry from its repository root, found by reading `.git` itself and checking a linked
+  worktree's registration; it shows no dialog then and saves no exact entry, and "Trust
+  and continue" in a subdirectory saves the repository root (measured 2026-10-02;
+  `--yolo` does not suppress the dialog). A wait for the exact entry never ended there
+  (issue #60). The Codex adapter therefore also opens the gate on positive evidence from
+  the screen: the empty composer row, which Codex draws only when no onboarding screen
+  and no view of the bottom pane is active. Do not infer the absence of the dialog from
+  Codex's configuration, from Git, or from a screen that merely lacks the dialog's
+  words: an empty screen is not evidence, and a wrong inference pastes an Enter onto
+  "Trust and continue". Consent that is shared with another provider stays exact.
+- A wait for workspace trust ends when its session has ended, and looks at the session
+  before it looks at the evidence: the launcher of a closed session must not wait until
+  its deadline, and an ended session is never pasted into. This holds for the Codex wait
+  and for the Agy wait.
 - Create a store fixture in a test the way a private record is created
   (`write_private`, `write_json_atomic`). A plain write inherits what the temporary
   directory allows, and on a PC with the Codex sandbox that directory lets another
   account modify its files (observed 2026-10-02: `CodexSandboxUsers`), so the fixture is
   refused there and accepted on CI.
+
+## Observation and Self-Test Boundary
+
+- A query observes and nothing else: `inspect`, `inspect --timeline`, `result`, `search`
+  and the read-only form of the sessions query never repair, recover, resend, close or
+  write. A new query reuses the readers and the publication rules of the existing ones,
+  so that the same request has the same state everywhere.
+- The timeline shows what the records hold. It reads every record once for one answer,
+  strictly as UTF-8 and within a bound, reports a record it could not read as such, and
+  fails when a record changed while it read. What it derives is marked: the request
+  summaries are what `result` reports at the time of the query and carry `derived_from`.
+  Do not add an entry for something no record holds.
+- `created_unix_ms` of a receipt and of an event is optional only when a record is read,
+  so that a damaged record can be reported with a reason. Every writer writes it, and no
+  path may publish an event without it: the completion-journal validation rejects one.
+- The elapsed time is what Bridge observed between two records. Do not present it as
+  model time or billing time, and do not collect provider usage from a signal that the
+  provider does not document as usage.
+- The self-test runs in the ordinary state root by default and in a private directory
+  only with `--isolated` (owner's decision, 2026-10-02): its purpose is to check the
+  installed setup as it is. It closes only what it created, bounds every command it
+  runs, never resends after an uncertain delivery, never approves trust, and never
+  deletes a record. Nothing else may call it.
 
 ## Change and Verification Rules
 

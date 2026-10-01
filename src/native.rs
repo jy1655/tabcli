@@ -9,6 +9,7 @@ mod provider;
 mod provider_process;
 mod query;
 mod requests;
+mod self_test;
 mod settings;
 mod terminal;
 
@@ -85,11 +86,14 @@ pub(crate) enum NativeCommand {
     Consent(Vec<String>),
     Settings(Vec<String>),
     Ask(AskRequest),
+    SelfTest(self_test::Request),
     Tell(TellRequest),
     Reopen(ReopenRequest),
     Inspect {
         id: String,
         json: bool,
+        timeline: bool,
+        request: Option<String>,
     },
     Result(query::ResultRequest),
     Search(query::SearchRequest),
@@ -219,7 +223,8 @@ struct SessionEvent {
     error: Option<String>,
     provider_session_id: Option<String>,
     turn_id: Option<String>,
-    created_unix_ms: u128,
+    #[serde(default)]
+    created_unix_ms: Option<u128>,
 }
 
 // Where a reopened session's provider conversation came from: the closed Bridge session and
@@ -401,6 +406,7 @@ pub(crate) fn is_command(value: &str) -> bool {
     matches!(
         value,
         "ask"
+            | "self-test"
             | "consent"
             | "settings"
             | "tell"
@@ -432,6 +438,7 @@ where
     let (command, rest) = args.split_first().context("native command is required")?;
     match command.as_str() {
         "ask" => parse_ask(rest),
+        "self-test" => self_test::parse(rest),
         "tell" => parse_tell(rest),
         "consent" => Ok(NativeCommand::Consent(rest.to_vec())),
         "settings" => Ok(NativeCommand::Settings(rest.to_vec())),
@@ -955,9 +962,15 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
         NativeCommand::Consent(args) => consent::run(&args),
         NativeCommand::Settings(args) => settings::run(&args),
         NativeCommand::Ask(request) => run_ask(request),
+        NativeCommand::SelfTest(request) => self_test::run(request),
         NativeCommand::Tell(request) => run_tell(request),
         NativeCommand::Reopen(request) => run_reopen(request),
-        NativeCommand::Inspect { id, json } => query::run_inspect(&id, json),
+        NativeCommand::Inspect {
+            id,
+            json,
+            timeline,
+            request,
+        } => query::run_inspect(&id, json, timeline, request.as_deref()),
         NativeCommand::Result(request) => query::run_result(request),
         NativeCommand::Search(request) => query::run_search(request),
         NativeCommand::Doctor(request) => doctor::run(request),
@@ -3535,6 +3548,19 @@ fn run_sessions(request: SessionsRequest) -> Result<()> {
 /// The `sessions` listing over one state root. Listing is also a lifecycle-lock holder: it
 /// converges interrupted completions and closes and repairs dead owners before it reads.
 fn sessions_in(root: &Path, request: &SessionsRequest) -> Result<Vec<serde_json::Value>> {
+    sessions_query(root, request, true)
+}
+
+// Ownership discovery must not recover, repair, or otherwise change shared records.
+fn sessions_in_read_only(root: &Path, request: &SessionsRequest) -> Result<Vec<serde_json::Value>> {
+    sessions_query(root, request, false)
+}
+
+fn sessions_query(
+    root: &Path,
+    request: &SessionsRequest,
+    repair: bool,
+) -> Result<Vec<serde_json::Value>> {
     let mut sessions = Vec::new();
     if root.is_dir() {
         for entry in fs::read_dir(root)? {
@@ -3563,7 +3589,9 @@ fn sessions_in(root: &Path, request: &SessionsRequest) -> Result<Vec<serde_json:
             // Repair runs completion recovery first itself, unconditionally and under the
             // same lifecycle lock, so a listing publishes every finished turn before it
             // decides on the owner without a separate recovery pass.
-            let _ = repair_dead_native_owner(&directory);
+            if repair {
+                let _ = repair_dead_native_owner(&directory);
+            }
             let status = read_json::<SessionStatus>(&directory.join("status.json")).ok();
             let state = status
                 .as_ref()
@@ -4070,6 +4098,7 @@ fn emit_session_result_with(
     extra: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<()> {
     let request_id = &receipt.request_id;
+    let (elapsed, elapsed_reason) = query::observed_elapsed(Some(receipt), event);
     if json {
         let mut value = serde_json::json!({
                 "ok": true,
@@ -4077,6 +4106,8 @@ fn emit_session_result_with(
                 "session": id,
                 "request_id": request_id,
                 "context_sources": receipt.context_sources,
+                "bridge_observed_elapsed_ms": elapsed,
+                "bridge_observed_elapsed_reason": elapsed_reason,
                 "request_state": if event.is_some() { "completed" } else { "accepted" },
                 "provider": provider.as_str(),
                 "terminal": terminal_session.kind.as_str(),
@@ -4459,7 +4490,7 @@ fn record_provider_result_for_claim_condition(
         error: None,
         provider_session_id,
         turn_id,
-        created_unix_ms: unix_ms(),
+        created_unix_ms: Some(unix_ms()),
     };
     commit_provider_completion_locked(
         directory,
@@ -4564,7 +4595,7 @@ fn record_provider_failure_for_claim_condition(
         error: Some(error.clone()),
         provider_session_id,
         turn_id,
-        created_unix_ms: unix_ms(),
+        created_unix_ms: Some(unix_ms()),
     };
     commit_provider_completion_locked(
         directory,
@@ -4602,7 +4633,7 @@ fn record_provider_monitor_failure(
         error: Some(error.clone()),
         provider_session_id: None,
         turn_id: None,
-        created_unix_ms: unix_ms(),
+        created_unix_ms: Some(unix_ms()),
     };
     commit_provider_completion_with_status_locked(
         directory,
@@ -6183,6 +6214,9 @@ fn sync_committed_event_directory(directory: &Path) -> Result<()> {
 }
 
 fn validate_pending_completion(pending: &PendingTurnCompletion) -> Result<()> {
+    if pending.event.created_unix_ms.is_none() {
+        bail!("pending native completion event is missing created_unix_ms")
+    }
     if pending.schema != 1
         || !valid_turn_claim_token(&pending.claim_token)
         || !matches!(pending.status_state.as_str(), "ready" | "failed")
@@ -6761,6 +6795,11 @@ fn delegation_source() -> String {
     std::env::var("AGENT_BRIDGE_NATIVE_SESSION_ID").unwrap_or_else(|_| "external".to_owned())
 }
 
+// The first line of every prompt that Bridge sends to a provider. It is framing, not an
+// identity: an adapter can tell by it a prompt that Bridge sent from a text that a
+// provider put around the same prompt, and nothing more.
+const NATIVE_DELEGATION_HEADER: &str = "[Agent Bridge native delegation]";
+
 fn native_delegation_prompt(source: &str, prompt: &str) -> String {
     let source = source
         .chars()
@@ -6779,7 +6818,7 @@ fn native_delegation_prompt(source: &str, prompt: &str) -> String {
         source.trim()
     };
     format!(
-        "[Agent Bridge native delegation]\nSource: {}\n\n{}",
+        "{NATIVE_DELEGATION_HEADER}\nSource: {}\n\n{}",
         source,
         prompt.trim()
     )
