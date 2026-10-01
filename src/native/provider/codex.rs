@@ -983,6 +983,13 @@ fn codex_owned_string(payload: &serde_json::Value, key: &str) -> Option<String> 
     codex_string(payload, key).map(str::to_owned)
 }
 
+// The input of the turn that Bridge started is the prompt Bridge sent: it begins with the
+// delegation header and ends with the turn marker. The marker alone does not identify
+// it. Codex CLI 0.159.3 answers the first message of a TUI with a second turn, on a
+// thread of its own, that makes the task title; its input is Codex's instruction
+// followed by the user's whole message, marker included, and its notify can arrive
+// first (issue #61, 2026-10-02: `{"title":"READY"}` recorded as the result of two
+// initial requests out of six, with the title thread as the session's thread).
 fn codex_input_correlates(payload: &serde_json::Value, pending: &PendingCodexTurn) -> bool {
     if codex_string(payload, "type") != Some("agent-turn-complete") {
         return false;
@@ -991,7 +998,12 @@ fn codex_input_correlates(payload: &serde_json::Value, pending: &PendingCodexTur
         .get("input-messages")
         .and_then(serde_json::Value::as_array)
         .and_then(|messages| messages.iter().rev().find_map(serde_json::Value::as_str))
-        .is_some_and(|message| message.trim_end().ends_with(&pending.marker))
+        .is_some_and(|message| {
+            message
+                .trim_start()
+                .starts_with(super::super::NATIVE_DELEGATION_HEADER)
+                && message.trim_end().ends_with(&pending.marker)
+        })
 }
 
 fn established_codex_thread(directory: &Path) -> Result<Option<String>> {
@@ -1176,8 +1188,8 @@ mod tests {
     #[cfg(unix)]
     use super::super::super::{SESSION_SCHEMA, SessionManifest, write_json_atomic};
     use super::super::super::{
-        SessionEvent, SessionStatus, TURN_CLAIM_FILE, acquire_turn_claim, event_paths, read_json,
-        update_status,
+        SessionEvent, SessionStatus, TURN_CLAIM_FILE, acquire_turn_claim, event_paths,
+        native_delegation_prompt, read_json, update_status,
     };
     use super::*;
 
@@ -1616,7 +1628,10 @@ exit 1
             "type": "agent-turn-complete",
             "thread-id": thread_id,
             "turn-id": "queued-turn",
-            "input-messages": [correlated_prompt("follow up", &pending)],
+            "input-messages": [correlated_prompt(
+                &native_delegation_prompt("external", "follow up"),
+                &pending,
+            )],
             "last-assistant-message": "queued result",
         });
         ADAPTER.handle_hook(&directory, &completion).unwrap();
@@ -1955,9 +1970,12 @@ exit 91
             "type": "agent-turn-complete",
             "thread-id": "codex-thread",
             "turn-id": "codex-turn",
-            "input-messages": [format!(
-                "Reply with exactly EXACT_OUTPUT and nothing else.\n{}",
-                pending.marker
+            "input-messages": [correlated_prompt(
+                &native_delegation_prompt(
+                    "external",
+                    "Reply with exactly EXACT_OUTPUT and nothing else.",
+                ),
+                &pending,
             )],
             "last-assistant-message": "EXACT_OUTPUT",
         });
@@ -1969,6 +1987,64 @@ exit 91
         assert_eq!(event.message, "EXACT_OUTPUT");
         assert_eq!(event.provider_session_id.as_deref(), Some("codex-thread"));
         assert_eq!(event.turn_id.as_deref(), Some("codex-turn"));
+    }
+
+    // Issue #61. The two notify payloads of one initial request, as Codex CLI 0.159.3
+    // sent them on 2026-10-02 (session-2qIKg5), in the order that recorded the title as
+    // the result. The Windows console paste joins the lines of the prompt, so the
+    // message that Codex reports has none.
+    #[test]
+    fn codex_hook_ignores_the_task_title_turn_that_quotes_the_prompt() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let pending = claim_pending_turn(directory.path());
+        let prompt = correlated_prompt(
+            &native_delegation_prompt(
+                "external",
+                "Reply with the single word READY and nothing else. Do not use any tools.",
+            ),
+            &pending,
+        )
+        .replace('\n', "");
+        let title_turn = serde_json::json!({
+            "type": "agent-turn-complete",
+            "client": "codex-tui",
+            "thread-id": "title-thread",
+            "turn-id": "title-turn",
+            "input-messages": [format!(
+                "Generate a concise, single-line task title of at most 36 characters and under five words where possible. Start with an imperative verb. Capitalize only the first word unless the user's language, proper nouns, acronyms, or code terms require otherwise. Preserve ticket references exactly. Write in the user's language. Do not use quotes, markdown, or trailing punctuation. Do not answer the request.\n\nUser prompt:\n{prompt}"
+            )],
+            "last-assistant-message": "{\"title\":\"READY\"}",
+        });
+
+        ADAPTER.handle_hook(directory.path(), &title_turn).unwrap();
+
+        assert!(event_paths(directory.path()).unwrap().is_empty());
+        assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+
+        ADAPTER
+            .handle_hook(
+                directory.path(),
+                &serde_json::json!({
+                    "type": "agent-turn-complete",
+                    "client": "codex-tui",
+                    "thread-id": "managed-thread",
+                    "turn-id": "managed-turn",
+                    "input-messages": [prompt],
+                    "last-assistant-message": "READY",
+                }),
+            )
+            .unwrap();
+
+        let paths = event_paths(directory.path()).unwrap();
+        assert_eq!(paths.len(), 1);
+        let event: SessionEvent = read_json(&paths[0]).unwrap();
+        assert_eq!(event.message, "READY");
+        assert_eq!(event.provider_session_id.as_deref(), Some("managed-thread"));
+        // The title turn that arrives late changes nothing either.
+        ADAPTER.handle_hook(directory.path(), &title_turn).unwrap();
+        assert_eq!(event_paths(directory.path()).unwrap().len(), 1);
     }
 
     #[test]
@@ -2116,7 +2192,10 @@ exit 91
                     "type": "agent-turn-complete",
                     "thread-id": "managed-thread",
                     "turn-id": "delayed-old-turn-with-a-new-id",
-                    "input-messages": [format!("old prompt\n{}", initial_pending.marker)],
+                    "input-messages": [correlated_prompt(
+                        &native_delegation_prompt("external", "old prompt"),
+                        &initial_pending,
+                    )],
                     "last-assistant-message": "delayed old result",
                 }),
             )
