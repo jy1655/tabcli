@@ -5296,7 +5296,7 @@ fn timeline_uses_the_existing_publication_predicate_at_every_completion_boundary
             error: None,
             provider_session_id: Some("thread".to_owned()),
             turn_id: Some("turn".to_owned()),
-            created_unix_ms: 5,
+            created_unix_ms: Some(5),
         };
         let mut pending = PendingTurnCompletion::new(&token, event, None).unwrap();
         pending.event_file = event_path.file_name().unwrap().to_str().unwrap().to_owned();
