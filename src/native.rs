@@ -9,6 +9,7 @@ mod provider;
 mod provider_process;
 mod query;
 mod requests;
+mod self_test;
 mod settings;
 mod terminal;
 
@@ -85,6 +86,7 @@ pub(crate) enum NativeCommand {
     Consent(Vec<String>),
     Settings(Vec<String>),
     Ask(AskRequest),
+    SelfTest(self_test::Request),
     Tell(TellRequest),
     Reopen(ReopenRequest),
     Inspect {
@@ -401,6 +403,7 @@ pub(crate) fn is_command(value: &str) -> bool {
     matches!(
         value,
         "ask"
+            | "self-test"
             | "consent"
             | "settings"
             | "tell"
@@ -432,6 +435,7 @@ where
     let (command, rest) = args.split_first().context("native command is required")?;
     match command.as_str() {
         "ask" => parse_ask(rest),
+        "self-test" => self_test::parse(rest),
         "tell" => parse_tell(rest),
         "consent" => Ok(NativeCommand::Consent(rest.to_vec())),
         "settings" => Ok(NativeCommand::Settings(rest.to_vec())),
@@ -955,6 +959,7 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
         NativeCommand::Consent(args) => consent::run(&args),
         NativeCommand::Settings(args) => settings::run(&args),
         NativeCommand::Ask(request) => run_ask(request),
+        NativeCommand::SelfTest(request) => self_test::run(request),
         NativeCommand::Tell(request) => run_tell(request),
         NativeCommand::Reopen(request) => run_reopen(request),
         NativeCommand::Inspect { id, json } => query::run_inspect(&id, json),

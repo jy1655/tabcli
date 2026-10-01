@@ -21,6 +21,9 @@ Usage:
   agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]
       [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|windows-console>]
       [--yolo] [--timeout-secs N] [--detach] [--json] [--context-result <session>/<request-id>]...
+  agent-bridge self-test <codex|claude|agy|pi> [--workspace PATH]
+      [--terminal <ghostty|iterm2|terminal|windows-console>] [--model MODEL] [--effort EFFORT]
+      [--yolo] [--timeout-secs N] [--json]
   agent-bridge tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
       [--context-result <session>/<request-id>]...
   agent-bridge reopen <closed-session> (--prompt TEXT | --prompt-file PATH) [--title NAME]
@@ -55,6 +58,15 @@ Runtime:
   Agent Bridge controls only sessions that it launched.
   Attaching to an arbitrary CLI is not supported.
 
+Self-test:
+  self-test makes real model calls and opens a real terminal. It uses a private
+  state directory, reports its path, and closes only the session it creates.
+  It never resends an uncertain prompt or automatically approves workspace trust.
+  --timeout-secs is a per-command budget (default 120); cleanup uses the normal
+  explicit-close contract. Records remain for inspection with the reported
+  AGENT_BRIDGE_NATIVE_STATE_DIR. Only a fully verified round trip and cleanup
+  exit successfully. Model, effort, and --yolo follow the new-session policy below.
+
 Session policy:
   --model and --effort apply only to the new child session. For Codex, a non-empty
   Pi-qualified openai-codex/<model> value is passed as the native bare <model>.
@@ -62,7 +74,7 @@ Session policy:
   exact model value Fable is passed to Pi as anthropic/claude-fable-5. All other
   model values are forwarded unchanged.
 
-  --yolo is never inherited. It is forwarded only when the ask or reopen command
+  --yolo is never inherited. It is forwarded only when ask, reopen, or self-test
   includes it and the provider has a matching option. Codex, Claude, and Agy
   receive their native bypass flags. Pi receives --approve for project-local trust
   while its native tool policy remains in effect.
@@ -301,6 +313,8 @@ mod tests {
             "result <session>",
             "search <query> [--workspace PATH | --all-workspaces]",
             "doctor <session> [--probe] [--json]",
+            "self-test <codex|claude|agy|pi>",
+            "self-test makes real model calls and opens a real terminal",
             "prune-sessions --closed-before-days N --explicit",
             "close-session <session> --explicit",
             "macOS detects Ghostty, iTerm2, or Terminal.app",
