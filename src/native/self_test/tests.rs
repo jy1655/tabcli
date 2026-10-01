@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 struct Fake {
     replies: VecDeque<Reply>,
     calls: Vec<Vec<String>>,
-    owned: Option<String>,
+    sessions: Vec<Value>,
     ownership_error: bool,
 }
 
@@ -14,11 +14,11 @@ impl Operations for Fake {
         self.calls.push(args.to_vec());
         self.replies.pop_front().expect("unexpected operation")
     }
-    fn owned_session(&self) -> Result<Option<String>> {
+    fn owned_session(&self, _: &Path, title: &str) -> Result<Option<String>> {
         if self.ownership_error {
             bail!("unreadable manifest")
         }
-        Ok(self.owned.clone())
+        session_with_title(&self.sessions, title)
     }
     fn metadata(&self, _: &str) -> Result<(String, Option<String>)> {
         Ok((
@@ -60,7 +60,11 @@ fn fake(replies: impl IntoIterator<Item = Reply>) -> Fake {
     Fake {
         replies: replies.into_iter().collect(),
         calls: Vec::new(),
-        owned: Some("session-owned".to_owned()),
+        sessions: vec![
+            json!({"id":"session-foreign","title":"different title"}),
+            json!({"id":"session-similar","title":"Agent Bridge self-test AB_marker extra"}),
+            json!({"id":"session-owned","title":"Agent Bridge self-test AB_marker"}),
+        ],
         ownership_error: false,
     }
 }
@@ -76,7 +80,7 @@ fn run_fake(fake: &mut Fake) -> Report {
     let report = orchestrate(
         &request(&[]),
         fake,
-        PathBuf::from("private-root"),
+        PathBuf::from("ordinary-root"),
         "AB_marker".to_owned(),
     );
     assert!(fake.replies.is_empty());
@@ -138,11 +142,19 @@ fn identical_answers_require_distinct_requests_and_events() {
             .any(|args| args == ["--request", "request-2"])
     );
     assert_eq!(fake.calls[0][5], fake.calls[2][3]);
+    assert!(
+        fake.calls[0]
+            .windows(2)
+            .any(|args| args == ["--title", "Agent Bridge self-test AB_marker"])
+    );
 }
 
 #[test]
 fn failing_ask_still_closes_its_owned_session_without_retry() {
-    let mut fake = fake([error("launch failed")].into_iter().chain(cleanup()));
+    let mut reply = error("launch failed");
+    reply.value = json!({"session":"session-owned", "request_id":"request-1"});
+    let mut fake = fake([reply].into_iter().chain(cleanup()));
+    fake.ownership_error = true;
     let report = run_fake(&mut fake);
     assert_eq!(report.outcome, Outcome::Failed);
     assert_eq!(report.steps[4].outcome, Outcome::Passed);
@@ -152,11 +164,12 @@ fn failing_ask_still_closes_its_owned_session_without_retry() {
 #[test]
 fn prelaunch_failure_has_no_close_target() {
     let mut fake = fake([error("provider executable not found")]);
-    fake.owned = None;
+    fake.sessions.clear();
     let report = run_fake(&mut fake);
     assert_eq!(report.outcome, Outcome::Failed);
     assert!(report.session.is_none());
     assert_eq!(fake.calls.len(), 1);
+    assert_eq!(report.steps[4].outcome, Outcome::NotVerified);
 }
 
 #[test]
@@ -287,26 +300,33 @@ fn successful_close_without_closed_state_is_not_verified() {
 }
 
 #[test]
-fn foreign_ask_address_is_never_used_for_cleanup() {
-    let mut reply = accepted("request-1");
-    reply.value["session"] = json!("session-foreign");
-    let mut fake = fake([reply].into_iter().chain(cleanup()));
-    assert_eq!(run_fake(&mut fake).outcome, Outcome::NotVerified);
-    assert!(
-        fake.calls
-            .iter()
-            .skip(1)
-            .all(|args| args[1] == "session-owned")
+fn ask_id_is_authoritative_without_title_lookup() {
+    let mut fake = fake([error("ask failed")].into_iter().chain(cleanup()));
+    fake.replies[0].value = json!({"session":"session-owned"});
+    fake.ownership_error = true;
+    assert_eq!(run_fake(&mut fake).steps[4].outcome, Outcome::Passed);
+}
+
+#[test]
+fn ask_without_id_uses_title_lookup_for_cleanup_only() {
+    let mut fake = fake(
+        [ok(json!({"ok":true,"request_id":"request-1"}))]
+            .into_iter()
+            .chain(cleanup()),
     );
+    let report = run_fake(&mut fake);
+    assert_eq!(report.steps[0].outcome, Outcome::NotVerified);
+    assert_eq!(report.steps[4].outcome, Outcome::Passed);
+    assert_eq!(fake.calls.len(), 3);
 }
 
 #[test]
 fn unreadable_ownership_never_guesses_a_close_target() {
-    let mut fake = fake([accepted("request-1")]);
+    let mut fake = fake([error("ask failed")]);
     fake.ownership_error = true;
     let report = run_fake(&mut fake);
     assert_eq!(report.steps[4].outcome, Outcome::NotVerified);
-    assert_eq!(report.session.as_deref(), Some("session-owned"));
+    assert!(report.session.is_none());
     assert!(report.session_state.is_none());
     assert_eq!(fake.calls.len(), 1);
 }
@@ -353,7 +373,7 @@ fn self_test_options_follow_explicit_new_session_policy() {
 #[test]
 fn json_report_exposes_all_step_outcomes_and_addresses() {
     let mut fake = fake([error("unsupported terminal")]);
-    fake.owned = None;
+    fake.sessions.clear();
     let report = run_fake(&mut fake);
     let value = serde_json::to_value(report).unwrap();
     assert_eq!(value["schema_version"], 1);
@@ -361,7 +381,9 @@ fn json_report_exposes_all_step_outcomes_and_addresses() {
     assert_eq!(value["steps"][1]["outcome"], "not_verified");
     assert!(value["steps"][0]["request_address"].is_null());
     assert!(value["steps"][0]["event_address"].is_null());
-    assert_eq!(value["steps"][4]["outcome"], "passed");
+    assert_eq!(value["steps"][4]["outcome"], "not_verified");
+    assert_eq!(value["state_root"], "ordinary-root");
+    assert!(value.get("state_directory").is_none());
     for outcome in [
         Outcome::Passed,
         Outcome::Failed,
@@ -374,47 +396,79 @@ fn json_report_exposes_all_step_outcomes_and_addresses() {
 }
 
 #[test]
-fn installed_ownership_discovery_is_private_and_read_only() {
+fn exact_title_lookup_never_selects_other_sessions_and_is_read_only() {
     let root = tempfile::tempdir().unwrap();
-    let outside = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
     let installed = Installed {
         executable: PathBuf::from("unused"),
         root: root.path().to_owned(),
     };
-    assert!(installed.owned_session().unwrap().is_none());
-    let directory = root.path().join("session-owned");
-    fs::create_dir(&directory).unwrap();
-    let manifest = json!({"schema":1,"id":"session-owned","provider":"claude","provider_path":"unused","provider_version":"2.1.281","workspace":outside.path(),"title":"self-test fixture","model":null,"effort":null,"yolo":false,"created_unix_ms":1});
-    write_json_atomic(&directory.join("manifest.json"), &manifest).unwrap();
-    let before = fs::read(directory.join("manifest.json")).unwrap();
-    fs::create_dir(outside.path().join("session-foreign")).unwrap();
+    let title = "Agent Bridge self-test AB_marker";
+    assert!(installed.owned_session(workspace.path(), title).is_err());
+    let mut snapshots = Vec::new();
+    for (id, session_title) in [
+        ("session-foreign", "different title"),
+        ("session-similar", "Agent Bridge self-test AB_marker extra"),
+        ("session-owned", title),
+    ] {
+        let directory = root.path().join(id);
+        fs::create_dir(&directory).unwrap();
+        write_json_atomic(&directory.join("manifest.json"), &json!({"schema":1,"id":id,"provider":"claude","provider_path":"unused","provider_version":"2.1.281","workspace":workspace.path().canonicalize().unwrap(),"title":session_title,"model":null,"effort":null,"yolo":false,"created_unix_ms":1})).unwrap();
+        write_json_atomic(&directory.join("status.json"), &json!({"schema":1,"state":"working","pid":4294967295u32,"updated_unix_ms":1,"error":null})).unwrap();
+        snapshots.push((
+            directory.clone(),
+            fs::read(directory.join("status.json")).unwrap(),
+            fs::read(directory.join("manifest.json")).unwrap(),
+        ));
+        if id != "session-owned" {
+            assert!(installed.owned_session(workspace.path(), title).is_err());
+        }
+    }
     assert_eq!(
-        installed.owned_session().unwrap().as_deref(),
+        installed
+            .owned_session(workspace.path(), title)
+            .unwrap()
+            .as_deref(),
         Some("session-owned")
     );
     assert_eq!(
         installed.metadata("session-owned").unwrap(),
         ("2.1.281".to_owned(), None)
     );
-    assert_eq!(fs::read(directory.join("manifest.json")).unwrap(), before);
-    assert!(outside.path().join("session-foreign").is_dir());
+    for (directory, status, manifest) in snapshots {
+        assert_eq!(fs::read(directory.join("status.json")).unwrap(), status);
+        assert_eq!(fs::read(directory.join("manifest.json")).unwrap(), manifest);
+        assert_eq!(fs::read_dir(directory).unwrap().count(), 2);
+    }
     let second = root.path().join("session-second");
     fs::create_dir(&second).unwrap();
-    let mut manifest = manifest;
+    let mut manifest: Value = read_json(&root.path().join("session-owned/manifest.json")).unwrap();
     manifest["id"] = json!("session-second");
     write_json_atomic(&second.join("manifest.json"), &manifest).unwrap();
-    assert!(installed.owned_session().is_err());
+    assert!(installed.owned_session(workspace.path(), title).is_err());
 }
 
 #[test]
-fn installed_ownership_refuses_mismatched_manifest() {
-    let root = tempfile::tempdir().unwrap();
-    let directory = root.path().join("session-owned");
-    fs::create_dir(&directory).unwrap();
-    write_json_atomic(&directory.join("manifest.json"), &json!({"schema":1,"id":"session-foreign","provider":"claude","provider_path":"unused","provider_version":"2.1.281","workspace":root.path(),"title":"fixture","yolo":false,"created_unix_ms":1})).unwrap();
-    let installed = Installed {
-        executable: PathBuf::from("unused"),
-        root: root.path().to_owned(),
-    };
-    assert!(installed.owned_session().is_err());
+fn ambiguous_title_lookup_never_closes_anything() {
+    for sessions in [
+        vec![],
+        vec![
+            json!({"id":"session-owned","title":"Agent Bridge self-test AB_marker"}),
+            json!({"id":"session-second","title":"Agent Bridge self-test AB_marker"}),
+        ],
+    ] {
+        let count = sessions.len();
+        let mut fake = fake([error("ask failed without an id")]);
+        fake.sessions = sessions;
+        let report = run_fake(&mut fake);
+        assert_eq!(report.steps[4].outcome, Outcome::NotVerified);
+        assert!(
+            report.steps[4]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains(&format!("found {count} sessions"))
+        );
+        assert_eq!(fake.calls.len(), 1);
+    }
 }

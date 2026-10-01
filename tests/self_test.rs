@@ -12,6 +12,8 @@ fn self_test_help_explicitly_describes_real_calls_and_terminals() {
     let help = String::from_utf8(output.stdout).unwrap();
     assert!(help.contains("self-test <codex|claude|agy|pi>"));
     assert!(help.contains("makes real model calls and opens a real terminal"));
+    assert!(help.contains("ordinary state root"));
+    assert!(help.contains("closes only the session it creates"));
 }
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -30,11 +32,11 @@ fn unsupported_terminal_reports_failure_without_creating_a_session() {
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["outcome"], "unsupported");
     assert!(report["session"].is_null());
-    assert_eq!(report["steps"][4]["outcome"], "passed");
-    let state = std::path::Path::new(report["state_directory"].as_str().unwrap());
-    assert!(state.starts_with(root.path()));
-    assert_ne!(state, root.path());
-    assert_eq!(std::fs::read_dir(state).unwrap().count(), 0);
+    assert_eq!(report["steps"][4]["outcome"], "not_verified");
+    let state = std::path::Path::new(report["state_root"].as_str().unwrap());
+    assert_eq!(state, root.path());
+    assert!(report.get("state_directory").is_none());
+    assert_eq!(std::fs::read_dir(state).unwrap().count(), 1);
     assert_eq!(
         std::fs::read(foreign.join("preserve")).unwrap(),
         b"unchanged"
@@ -47,9 +49,9 @@ fn unsupported_terminal_reports_failure_without_creating_a_session() {
         .output()
         .unwrap();
     assert!(!human.status.success());
-    assert!(new_root.is_dir());
+    assert!(!new_root.exists());
     let human = String::from_utf8(human.stdout).unwrap();
     assert!(human.contains("ask: unsupported"));
-    assert!(human.contains("cleanup: passed"));
-    assert!(human.contains("state directory:"));
+    assert!(human.contains("cleanup: not_verified"));
+    assert!(human.contains("state root:"));
 }

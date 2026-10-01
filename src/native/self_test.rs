@@ -62,7 +62,7 @@ struct Report {
     provider: String,
     provider_version: Option<String>,
     terminal: Option<String>,
-    state_directory: PathBuf,
+    state_root: PathBuf,
     marker: String,
     session: Option<String>,
     session_state: Option<String>,
@@ -80,7 +80,7 @@ struct Reply {
 // Public command execution and ownership discovery are the only runtime-facing operations.
 trait Operations {
     fn call(&mut self, args: &[String]) -> Reply;
-    fn owned_session(&self) -> Result<Option<String>>;
+    fn owned_session(&self, workspace: &Path, title: &str) -> Result<Option<String>>;
     fn metadata(&self, session: &str) -> Result<(String, Option<String>)>;
 }
 
@@ -91,11 +91,7 @@ struct Installed {
 
 impl Operations for Installed {
     fn call(&mut self, args: &[String]) -> Reply {
-        match Command::new(&self.executable)
-            .args(args)
-            .env(STATE_DIR_ENV, &self.root)
-            .output()
-        {
+        match Command::new(&self.executable).args(args).output() {
             Ok(output) => {
                 let value: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
                 let error = value["error"].as_str().map(str::to_owned).or_else(|| {
@@ -116,28 +112,17 @@ impl Operations for Installed {
         }
     }
 
-    fn owned_session(&self) -> Result<Option<String>> {
-        let mut sessions = Vec::new();
-        for entry in fs::read_dir(&self.root)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if valid_session_id(&name) && entry.file_type()?.is_dir() {
-                let directory = session_directory_in(&self.root, &name)?;
-                if directory.join("manifest.json").exists() {
-                    let manifest = read_manifest(&directory)?;
-                    if manifest.id != name {
-                        bail!("self-test session manifest has a different id")
-                    }
-                    sessions.push(name);
-                }
-            }
-        }
-        if sessions.len() > 1 {
-            bail!(
-                "self-test state contains more than one session; cleanup ownership is not verified"
-            )
-        }
-        Ok(sessions.pop())
+    fn owned_session(&self, workspace: &Path, title: &str) -> Result<Option<String>> {
+        let NativeCommand::Sessions(request) = parse_sessions(&arguments(&[
+            "--workspace",
+            &workspace.to_string_lossy(),
+            "--json",
+        ]))?
+        else {
+            unreachable!()
+        };
+        let sessions = sessions_in_read_only(&self.root, &request)?;
+        session_with_title(&sessions, title)
     }
 
     fn metadata(&self, session: &str) -> Result<(String, Option<String>)> {
@@ -150,6 +135,24 @@ impl Operations for Installed {
                 .map(|terminal| terminal.kind.as_str().to_owned());
         Ok((manifest.provider_version, terminal))
     }
+}
+
+fn session_with_title(sessions: &[Value], title: &str) -> Result<Option<String>> {
+    let matches: Vec<_> = sessions
+        .iter()
+        .filter(|session| session["title"] == title)
+        .collect();
+    if matches.len() != 1 {
+        bail!(
+            "found {} sessions with the exact self-test title; cleanup ownership is not verified",
+            matches.len()
+        )
+    }
+    let id = matches[0]["id"]
+        .as_str()
+        .context("matching session has no id")?;
+    require_valid_session_id(id)?;
+    Ok(Some(id.to_owned()))
 }
 
 fn arguments(values: &[&str]) -> Vec<String> {
@@ -279,7 +282,7 @@ fn orchestrate(
         provider: ask.provider.as_str().to_owned(),
         provider_version: None,
         terminal: ask.terminal.map(|kind| kind.as_str().to_owned()),
-        state_directory: root,
+        state_root: root,
         marker,
         session: None,
         session_state: None,
@@ -287,6 +290,7 @@ fn orchestrate(
         elapsed_ms: 0,
         steps: Vec::new(),
     };
+    let title = format!("Agent Bridge self-test {}", report.marker);
     let mut args = arguments(&["ask", ask.provider.as_str(), "--workspace"]);
     args.push(ask.workspace.to_string_lossy().into_owned());
     args.extend(arguments(&[
@@ -296,6 +300,8 @@ fn orchestrate(
         &timeout,
         "--detach",
         "--json",
+        "--title",
+        &title,
     ]));
     for (option, value) in [
         ("--model", ask.model.as_deref()),
@@ -314,22 +320,19 @@ fn orchestrate(
     let start = Instant::now();
     let initial = operations.call(&args);
     let mut initial_step = step("ask", start, &initial);
-    let mut ownership_verified = true;
-    match operations.owned_session() {
-        Ok(session) => report.session = session,
-        Err(error) => {
-            ownership_verified = false;
-            report.session = initial.value["session"]
-                .as_str()
-                .filter(|id| valid_session_id(id))
-                .map(str::to_owned);
-            reject(
-                &mut initial_step,
-                Outcome::NotVerified,
-                &format!("cannot verify cleanup ownership: {error:#}"),
-            );
+    report.session = initial.value["session"].as_str().map(str::to_owned);
+    let ownership = match report.session.as_deref() {
+        Some(id) => require_valid_session_id(id).map(|()| Some(id.to_owned())),
+        None => operations.owned_session(&ask.workspace, &title),
+    };
+    let ownership_error = match ownership {
+        Ok(Some(session)) => {
+            report.session = Some(session);
+            None
         }
-    }
+        Ok(None) => Some("no session with the exact self-test title was found".to_owned()),
+        Err(error) => Some(format!("cannot verify cleanup ownership: {error:#}")),
+    };
     if initial_step.outcome == Outcome::Passed
         && (report.session.is_none()
             || initial.value["session"].as_str() != report.session.as_deref()
@@ -429,12 +432,8 @@ fn orchestrate(
         event_address: None,
         reason: Some("no session was created".to_owned()),
     };
-    if !ownership_verified {
-        reject(
-            &mut cleanup,
-            Outcome::NotVerified,
-            "cleanup ownership could not be verified; inspect the self-test state directory",
-        );
+    if let Some(reason) = ownership_error {
+        reject(&mut cleanup, Outcome::NotVerified, &reason);
     } else if let Some(session) = &report.session {
         let reply = operations.call(&arguments(&[
             "close-session",
@@ -454,7 +453,7 @@ fn orchestrate(
             reject(
                 &mut cleanup,
                 Outcome::NotVerified,
-                "close could not be confirmed; inspect the reported session in the self-test state directory",
+                "close could not be confirmed; inspect the reported session in the reported state root",
             );
         }
         cleanup.elapsed_ms = start.elapsed().as_millis();
@@ -471,17 +470,7 @@ fn orchestrate(
 }
 
 pub(super) fn run(request: Request) -> Result<()> {
-    let mut builder = tempfile::Builder::new();
-    builder.prefix("agent-bridge-self-test-");
-    let directory = match std::env::var_os(STATE_DIR_ENV) {
-        Some(root) => {
-            fs::create_dir_all(&root)?;
-            builder.tempdir_in(root)?
-        }
-        None => builder.tempdir()?,
-    };
-    let root = directory.keep();
-    set_private_directory_permissions(&root)?;
+    let root = state_root()?;
     let marker = format!("AB_{}", new_event_file_name()?.trim_end_matches(".json"));
     let mut installed = Installed {
         executable: std::env::current_exe()?,
@@ -496,13 +485,13 @@ pub(super) fn run(request: Request) -> Result<()> {
             report.bridge_version, report.provider
         );
         println!(
-            "CLI: {}\nterminal: {}\nstate directory: {}\nsession: {}\nstate: {}",
+            "CLI: {}\nterminal: {}\nstate root: {}\nsession: {}\nstate: {}",
             terminal_safe_text(
                 report.provider_version.as_deref().unwrap_or("not verified"),
                 false
             ),
             report.terminal.as_deref().unwrap_or("not verified"),
-            terminal_safe_text(&report.state_directory.display().to_string(), false),
+            terminal_safe_text(&report.state_root.display().to_string(), false),
             report.session.as_deref().unwrap_or("none"),
             report.session_state.as_deref().unwrap_or("not verified")
         );

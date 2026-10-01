@@ -3540,6 +3540,19 @@ fn run_sessions(request: SessionsRequest) -> Result<()> {
 /// The `sessions` listing over one state root. Listing is also a lifecycle-lock holder: it
 /// converges interrupted completions and closes and repairs dead owners before it reads.
 fn sessions_in(root: &Path, request: &SessionsRequest) -> Result<Vec<serde_json::Value>> {
+    sessions_query(root, request, true)
+}
+
+// Ownership discovery must not recover, repair, or otherwise change shared records.
+fn sessions_in_read_only(root: &Path, request: &SessionsRequest) -> Result<Vec<serde_json::Value>> {
+    sessions_query(root, request, false)
+}
+
+fn sessions_query(
+    root: &Path,
+    request: &SessionsRequest,
+    repair: bool,
+) -> Result<Vec<serde_json::Value>> {
     let mut sessions = Vec::new();
     if root.is_dir() {
         for entry in fs::read_dir(root)? {
@@ -3568,7 +3581,9 @@ fn sessions_in(root: &Path, request: &SessionsRequest) -> Result<Vec<serde_json:
             // Repair runs completion recovery first itself, unconditionally and under the
             // same lifecycle lock, so a listing publishes every finished turn before it
             // decides on the owner without a separate recovery pass.
-            let _ = repair_dead_native_owner(&directory);
+            if repair {
+                let _ = repair_dead_native_owner(&directory);
+            }
             let status = read_json::<SessionStatus>(&directory.join("status.json")).ok();
             let state = status
                 .as_ref()

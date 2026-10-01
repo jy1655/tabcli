@@ -59,13 +59,13 @@ Runtime:
   Attaching to an arbitrary CLI is not supported.
 
 Self-test:
-  self-test makes real model calls and opens a real terminal. It uses a private
-  state directory, reports its path, and closes only the session it creates.
+  self-test makes real model calls and opens a real terminal. It runs in the
+  ordinary state root, reports its path, and closes only the session it creates.
   It never resends an uncertain prompt or automatically approves workspace trust.
   --timeout-secs is a per-command budget (default 120); cleanup uses the normal
-  explicit-close contract. Records remain for inspection with the reported
-  AGENT_BRIDGE_NATIVE_STATE_DIR. Only a fully verified round trip and cleanup
-  exit successfully. Model, effort, and --yolo follow the new-session policy below.
+  explicit-close contract. Closed records remain in the registry for inspection. Set
+  AGENT_BRIDGE_NATIVE_STATE_DIR yourself when isolation is wanted. Only a fully
+  verified round trip and cleanup exit successfully. Model, effort, and --yolo follow the new-session policy below.
 
 Session policy:
   --model and --effort apply only to the new child session. For Codex, a non-empty
@@ -315,6 +315,8 @@ mod tests {
             "doctor <session> [--probe] [--json]",
             "self-test <codex|claude|agy|pi>",
             "self-test makes real model calls and opens a real terminal",
+            "ordinary state root, reports its path, and closes only the session it creates",
+            "Closed records remain in the registry for inspection",
             "prune-sessions --closed-before-days N --explicit",
             "close-session <session> --explicit",
             "macOS detects Ghostty, iTerm2, or Terminal.app",
