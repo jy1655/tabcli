@@ -1251,7 +1251,7 @@ exit 91
                 error: None,
                 provider_session_id: Some(thread_id.to_owned()),
                 turn_id: Some("initial-turn".to_owned()),
-                created_unix_ms: 1,
+                created_unix_ms: Some(1),
             },
         )
         .unwrap();

@@ -475,7 +475,7 @@ fn pending_completion_recovery_converges_after_every_partial_mutation() {
             error: None,
             provider_session_id: Some("provider-session".to_owned()),
             turn_id: Some("provider-turn".to_owned()),
-            created_unix_ms: 1,
+            created_unix_ms: Some(1),
         };
         let pending = PendingTurnCompletion::new(&claim_token, event, None).unwrap();
         write_json_atomic(&directory.path().join(TURN_COMPLETION_FILE), &pending).unwrap();
@@ -681,7 +681,7 @@ fn correlated_wait_ignores_other_completed_turns() {
                 error: None,
                 provider_session_id: Some("claude-session".to_owned()),
                 turn_id: Some(turn_id.to_owned()),
-                created_unix_ms: unix_ms(),
+                created_unix_ms: Some(unix_ms()),
             },
         )
         .unwrap();
@@ -722,7 +722,7 @@ fn completed_event_is_not_published_until_the_session_is_ready() {
             error: None,
             provider_session_id: Some("codex-session".to_owned()),
             turn_id: Some("codex-turn".to_owned()),
-            created_unix_ms: unix_ms(),
+            created_unix_ms: Some(unix_ms()),
         },
     )
     .unwrap();
@@ -747,7 +747,7 @@ fn completed_event_uses_its_own_released_claim_not_a_later_turns_claim() {
             error: None,
             provider_session_id: None,
             turn_id: None,
-            created_unix_ms: unix_ms(),
+            created_unix_ms: Some(unix_ms()),
         },
     )
     .unwrap();
@@ -786,7 +786,7 @@ fn completed_event_waits_for_its_own_claim_to_be_released() {
             error: None,
             provider_session_id: None,
             turn_id: None,
-            created_unix_ms: unix_ms(),
+            created_unix_ms: Some(unix_ms()),
         },
     )
     .unwrap();
@@ -817,7 +817,7 @@ fn uncorrelated_wait_returns_the_first_event_after_its_baseline() {
                 error: None,
                 provider_session_id: None,
                 turn_id: None,
-                created_unix_ms: unix_ms(),
+                created_unix_ms: Some(unix_ms()),
             },
         )
         .unwrap();
@@ -2807,7 +2807,7 @@ fn event_commit_does_not_create_a_racy_latest_cache() {
         error: None,
         provider_session_id: None,
         turn_id: None,
-        created_unix_ms: 1,
+        created_unix_ms: Some(1),
     };
 
     write_event(directory.path(), &event).unwrap();
@@ -3617,7 +3617,7 @@ fn sample_completion(claim_token: &str, message: &str) -> PendingTurnCompletion 
             error: None,
             provider_session_id: Some("provider-session".to_owned()),
             turn_id: Some("provider-turn".to_owned()),
-            created_unix_ms: 1,
+            created_unix_ms: Some(1),
         },
         None,
     )
@@ -5238,7 +5238,7 @@ fn oversized_sample_event(message: &str) -> SessionEvent {
         error: None,
         provider_session_id: Some("provider-session".to_owned()),
         turn_id: Some("provider-turn".to_owned()),
-        created_unix_ms: 1,
+        created_unix_ms: Some(1),
     }
 }
 
@@ -7536,7 +7536,7 @@ fn reopen_refuses_receipts_whose_recorded_result_is_empty_malformed_or_foreign()
             request_id: "request-older".to_owned(),
             claim_token: "1-1-1".to_owned(),
             event_file: older_event.to_owned(),
-            created_unix_ms: 1,
+            created_unix_ms: Some(1),
             source: None,
             context_sources: Vec::new(),
         },
@@ -9529,4 +9529,271 @@ fn uninspectable_provider_process_retains_the_marker() {
         "{refused:#}"
     );
     assert!(source.join(REOPEN_MARKER_FILE).is_file());
+}
+
+#[test]
+fn observed_elapsed_queries_preserve_existing_records_and_timestamp_boundaries() {
+    use serde_json::{Value, json};
+    for (label, receipt_time, result_time, has_receipt, has_event, failed, expected, reason) in [
+        (
+            "completed",
+            Some(100),
+            Some(145),
+            true,
+            true,
+            false,
+            Some(45),
+            None,
+        ),
+        (
+            "failed",
+            Some(100),
+            Some(145),
+            true,
+            true,
+            true,
+            Some(45),
+            None,
+        ),
+        (
+            "pending",
+            Some(100),
+            None,
+            true,
+            false,
+            false,
+            None,
+            Some("no_published_result"),
+        ),
+        (
+            "legacy",
+            Some(100),
+            Some(145),
+            false,
+            true,
+            false,
+            None,
+            Some("missing_receipt"),
+        ),
+        (
+            "missing receipt time",
+            None,
+            Some(145),
+            true,
+            true,
+            false,
+            None,
+            Some("missing_receipt_time"),
+        ),
+        (
+            "missing result time",
+            Some(100),
+            None,
+            true,
+            true,
+            false,
+            None,
+            Some("missing_result_time"),
+        ),
+        (
+            "inverted",
+            Some(145),
+            Some(100),
+            true,
+            true,
+            false,
+            None,
+            Some("inverted_time"),
+        ),
+        ("zero", Some(0), Some(0), true, true, false, Some(0), None),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-elapsed");
+        fs::create_dir_all(directory.join("events")).unwrap();
+        write_test_manifest(&directory);
+        update_status(&directory, "working", None, None).unwrap();
+        let event_path = directory.join("events/event-1.json");
+        let receipt_path = directory.join("requests/1-2-3.json");
+        if has_receipt {
+            let mut receipt = json!({"schema":1, "request_id":"request-elapsed",
+                "claim_token":"1-2-3", "event_file":"event-1.json"});
+            if let Some(time) = receipt_time {
+                receipt["created_unix_ms"] = json!(time);
+            }
+            fs::create_dir(directory.join("requests")).unwrap();
+            write_json_atomic(&receipt_path, &receipt).unwrap();
+        }
+        if has_event {
+            let mut event = json!({"provider":"codex", "message":"original result",
+                "provider_session_id":"thread", "turn_id":"turn"});
+            if failed {
+                event["error"] = json!("provider failed");
+            }
+            if let Some(time) = result_time {
+                event["created_unix_ms"] = json!(time);
+            }
+            write_json_atomic(&event_path, &event).unwrap();
+        } else {
+            write_private(&directory.join(TURN_CLAIM_FILE), b"1-2-3").unwrap();
+        }
+        let paths = [
+            directory.join("manifest.json"),
+            directory.join("status.json"),
+            receipt_path,
+            event_path,
+            directory.join(TURN_CLAIM_FILE),
+        ];
+        let before = paths.each_ref().map(|path| fs::read(path).ok());
+        let selector = if has_receipt { "--request" } else { "--event" };
+        let address = if has_receipt {
+            "request-elapsed"
+        } else {
+            "event-1.json"
+        };
+        let result = cli_result(
+            root.path(),
+            &["result", "session-elapsed", selector, address, "--json"],
+        );
+        assert_eq!(
+            result["bridge_observed_elapsed_ms"],
+            json!(expected),
+            "{label}"
+        );
+        assert_eq!(
+            result["bridge_observed_elapsed_reason"],
+            json!(reason),
+            "{label}"
+        );
+        assert_eq!(
+            result["request_state"],
+            if !has_event {
+                "pending"
+            } else if failed {
+                "failed"
+            } else {
+                "completed"
+            },
+            "{label}"
+        );
+        assert_eq!(
+            result["result"],
+            if has_event {
+                json!("original result")
+            } else {
+                Value::Null
+            }
+        );
+        assert_eq!(
+            result,
+            cli_result(
+                root.path(),
+                &["result", "session-elapsed", selector, address, "--json"]
+            ),
+            "repeat: {label}"
+        );
+        let list = cli_result(
+            root.path(),
+            &["result", "session-elapsed", "--list", "--json"],
+        );
+        for entry in list["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(list["requests"].as_array().unwrap())
+        {
+            assert_eq!(
+                entry["bridge_observed_elapsed_ms"],
+                json!(expected),
+                "list: {label}"
+            );
+            assert_eq!(
+                entry["bridge_observed_elapsed_reason"],
+                json!(reason),
+                "list: {label}"
+            );
+        }
+        let inspect = query::inspect_value(&directory, "session-elapsed").unwrap();
+        if has_event {
+            assert_eq!(
+                inspect["latest_result"]["bridge_observed_elapsed_ms"],
+                json!(expected),
+                "inspect latest: {label}"
+            );
+            assert_eq!(
+                inspect["latest_result"]["bridge_observed_elapsed_reason"],
+                json!(reason),
+                "inspect latest: {label}"
+            );
+        }
+        if has_receipt {
+            assert_eq!(
+                inspect["requests"][0]["bridge_observed_elapsed_ms"],
+                json!(expected),
+                "inspect request: {label}"
+            );
+            assert_eq!(
+                inspect["requests"][0]["bridge_observed_elapsed_reason"],
+                json!(reason),
+                "inspect request: {label}"
+            );
+        }
+        assert_eq!(
+            before,
+            paths.each_ref().map(|path| fs::read(path).ok()),
+            "query wrote records: {label}"
+        );
+    }
+}
+
+#[test]
+fn observed_elapsed_requires_a_published_result_and_keeps_inspect_available() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-elapsed-boundary");
+    fs::create_dir_all(directory.join("events")).unwrap();
+    write_test_manifest(&directory);
+    update_status(&directory, "working", None, None).unwrap();
+    let claim = acquire_turn_claim(&directory).unwrap();
+    let receipt = claim.receipt.clone();
+    let mut event = sample_completion(&claim.token, "not published").event;
+    event.created_unix_ms = receipt.created_unix_ms;
+    write_json_atomic(&directory.join("events").join(&receipt.event_file), &event).unwrap();
+    claim.retain();
+    let pending = query::request_result(&directory, &receipt.request_id).unwrap();
+    assert_eq!(pending["request_state"], "pending");
+    assert_eq!(
+        pending["bridge_observed_elapsed_ms"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        pending["bridge_observed_elapsed_reason"],
+        "no_published_result"
+    );
+    fs::remove_file(directory.join("events").join(&receipt.event_file)).unwrap();
+    release_turn_claim(&directory).unwrap();
+    let unresolved = query::request_result(&directory, &receipt.request_id).unwrap();
+    assert_eq!(unresolved["request_state"], "unresolved");
+    assert_eq!(
+        unresolved["bridge_observed_elapsed_reason"],
+        "no_published_result"
+    );
+    // A damaged older result does not prevent inspection of session records or its latest result.
+    fs::write(
+        directory.join("events").join(&receipt.event_file),
+        b"not JSON",
+    )
+    .unwrap();
+    write_json_atomic(
+        &directory.join("events/event-99999999999999999999.json"),
+        &event,
+    )
+    .unwrap();
+    let inspected = query::inspect_value(&directory, "session-elapsed-boundary").unwrap();
+    assert_eq!(
+        inspected["requests"][0]["bridge_observed_elapsed_ms"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        inspected["requests"][0]["bridge_observed_elapsed_reason"],
+        "unreadable_result"
+    );
 }

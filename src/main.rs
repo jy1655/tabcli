@@ -132,6 +132,11 @@ Session policy:
   admits one reopen. inspect and sessions --json report resumed_from for the new
   session.
 
+  result reports bridge_observed_elapsed_ms from Bridge receipt creation to the
+  published completion event, not model or billing time. Uncomputable values are
+  null with bridge_observed_elapsed_reason. inspect and finished ask/tell JSON
+  report the same per-request measurement; no token or cost usage is collected.
+
   --context-result attaches a previously recorded result, addressed exactly as
   <session>/<request-id> (or <session>/<event-id> for records without a receipt),
   after the prompt as clearly delimited reference material. Up to 8 values are
@@ -320,6 +325,10 @@ mod tests {
             "Attaching to an arbitrary CLI",
             "[--context-result <session>/<request-id>]...",
             "records the attached sources as context_sources",
+            "bridge_observed_elapsed_ms",
+            "bridge_observed_elapsed_reason",
+            "not model or billing time",
+            "no token or cost usage is collected",
         ] {
             assert!(help.contains(expected), "help is missing {expected:?}");
         }

@@ -279,7 +279,9 @@ pub(crate) fn resolve_in(root: &Path, references: &[ContextResultRef]) -> Result
                 .as_str()
                 .map(str::to_owned)
                 .ok_or_else(|| unreadable("no provider".to_owned()))?,
-            created_unix_ms: event.created_unix_ms,
+            created_unix_ms: event
+                .created_unix_ms
+                .ok_or_else(|| unreadable("no event creation time".to_owned()))?,
         };
         requests::validate_context_source(&source)
             .map_err(|error| unreadable(format!("invalid recorded provenance: {error:#}")))?;
