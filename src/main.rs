@@ -28,7 +28,7 @@ Usage:
       [--detach] [--json]
   agent-bridge sessions [--workspace PATH] [--provider <codex|claude|agy|pi>] [--state STATE]
       [--sort <id|updated>] [--json]
-  agent-bridge inspect <session> [--json]
+  agent-bridge inspect <session> [--timeline [--request REQUEST]] [--json]
   agent-bridge result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
       [--wait --timeout-secs N]
   agent-bridge search <query> [--workspace PATH | --all-workspaces] [--provider <codex|claude|agy|pi>]
@@ -141,6 +141,9 @@ Session policy:
 
   Supported CLI minimums: Codex 0.147.0, Claude 2.1.234, Agy 1.1.12, Pi 0.84.1.
   Session state is stored privately under ~/.agent-bridge/native-sessions.
+  inspect --timeline reads preserved request, launch, completion and close evidence.
+  --request filters request entries; session diagnostics remain separate. Unknown
+  times are not inferred. This query never repairs, resends or closes a session.
   Closed records remain until prune-sessions explicitly removes quiescent records
   older than the requested retention window.
 
@@ -297,7 +300,7 @@ mod tests {
             "reopen <closed-session> (--prompt TEXT | --prompt-file PATH)",
             "supports only Claude Code on native Windows",
             "sessions [--workspace PATH]",
-            "inspect <session>",
+            "inspect <session> [--timeline [--request REQUEST]] [--json]",
             "result <session>",
             "search <query> [--workspace PATH | --all-workspaces]",
             "doctor <session> [--probe] [--json]",

@@ -90,6 +90,8 @@ pub(crate) enum NativeCommand {
     Inspect {
         id: String,
         json: bool,
+        timeline: bool,
+        request: Option<String>,
     },
     Result(query::ResultRequest),
     Search(query::SearchRequest),
@@ -957,7 +959,12 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
         NativeCommand::Ask(request) => run_ask(request),
         NativeCommand::Tell(request) => run_tell(request),
         NativeCommand::Reopen(request) => run_reopen(request),
-        NativeCommand::Inspect { id, json } => query::run_inspect(&id, json),
+        NativeCommand::Inspect {
+            id,
+            json,
+            timeline,
+            request,
+        } => query::run_inspect(&id, json, timeline, request.as_deref()),
         NativeCommand::Result(request) => query::run_result(request),
         NativeCommand::Search(request) => query::run_search(request),
         NativeCommand::Doctor(request) => doctor::run(request),

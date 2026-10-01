@@ -5256,6 +5256,85 @@ fn seed_claimed_session(directory: &Path) -> (String, String, PathBuf) {
     (request_id, token, event_path)
 }
 
+#[test]
+fn timeline_rejects_a_log_change_during_a_consistent_lifecycle_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let (request, _, _) = seed_claimed_session(directory.path());
+    fs::write(directory.path().join(launch::LOG), "1 before\n").unwrap();
+    let error = query::with_snapshot_hook(
+        |directory| fs::write(directory.join(launch::LOG), "2 after\n").unwrap(),
+        || query::timeline_value(directory.path(), "session-query", Some(&request)),
+    )
+    .unwrap_err();
+    assert!(error.is::<query::SnapshotBusy>(), "{error:#}");
+}
+
+#[test]
+fn timeline_reports_busy_without_repair_when_status_keeps_changing() {
+    let directory = tempfile::tempdir().unwrap();
+    let (request, _, _) = seed_claimed_session(directory.path());
+    let error = query::with_snapshot_retry_window(Duration::ZERO, || {
+        query::with_snapshot_hook(
+            |directory| update_status(directory, "working", None, None).unwrap(),
+            || query::timeline_value(directory.path(), "session-query", Some(&request)),
+        )
+    })
+    .unwrap_err();
+    assert!(error.is::<query::SnapshotBusy>(), "{error:#}");
+    assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+    assert!(!directory.path().join(TURN_COMPLETION_FILE).exists());
+}
+
+#[test]
+fn timeline_uses_the_existing_publication_predicate_at_every_completion_boundary() {
+    for mutations in 0..=3 {
+        let directory = tempfile::tempdir().unwrap();
+        let (request, token, event_path) = seed_claimed_session(directory.path());
+        let event = SessionEvent {
+            provider: "codex".to_owned(),
+            message: "same result".to_owned(),
+            error: None,
+            provider_session_id: Some("thread".to_owned()),
+            turn_id: Some("turn".to_owned()),
+            created_unix_ms: 5,
+        };
+        let mut pending = PendingTurnCompletion::new(&token, event, None).unwrap();
+        pending.event_file = event_path.file_name().unwrap().to_str().unwrap().to_owned();
+        write_json_atomic(&directory.path().join(TURN_COMPLETION_FILE), &pending).unwrap();
+        if mutations >= 1 {
+            write_pending_completion_event(directory.path(), &pending).unwrap();
+        }
+        if mutations >= 2 {
+            update_status(directory.path(), "ready", None, None).unwrap();
+        }
+        if mutations >= 3 {
+            release_turn_claim_token(&directory.path().join(TURN_CLAIM_FILE), &token).unwrap();
+        }
+        let before = snapshot_directory(directory.path());
+        let value =
+            query::timeline_value(directory.path(), "session-query", Some(&request)).unwrap();
+        assert_eq!(
+            value["requests"][0]["request_state"],
+            if mutations == 0 {
+                "recovery_required"
+            } else {
+                "completed"
+            }
+        );
+        assert_eq!(value["recovery_required"], true);
+        assert_eq!(
+            value["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["stage"] == "completion" && e["record_state"] == "observed")
+                .count(),
+            usize::from(mutations >= 1)
+        );
+        assert_eq!(snapshot_directory(directory.path()), before);
+    }
+}
+
 /// Everything a query or a lifecycle step can observe of a settled completion.
 #[derive(Debug, PartialEq)]
 struct SettledCompletion {
