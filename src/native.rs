@@ -9,6 +9,7 @@ mod provider;
 mod provider_process;
 mod query;
 mod requests;
+mod self_test;
 mod settings;
 mod terminal;
 
@@ -85,6 +86,7 @@ pub(crate) enum NativeCommand {
     Consent(Vec<String>),
     Settings(Vec<String>),
     Ask(AskRequest),
+    SelfTest(self_test::Request),
     Tell(TellRequest),
     Reopen(ReopenRequest),
     Inspect {
@@ -404,6 +406,7 @@ pub(crate) fn is_command(value: &str) -> bool {
     matches!(
         value,
         "ask"
+            | "self-test"
             | "consent"
             | "settings"
             | "tell"
@@ -435,6 +438,7 @@ where
     let (command, rest) = args.split_first().context("native command is required")?;
     match command.as_str() {
         "ask" => parse_ask(rest),
+        "self-test" => self_test::parse(rest),
         "tell" => parse_tell(rest),
         "consent" => Ok(NativeCommand::Consent(rest.to_vec())),
         "settings" => Ok(NativeCommand::Settings(rest.to_vec())),
@@ -958,6 +962,7 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
         NativeCommand::Consent(args) => consent::run(&args),
         NativeCommand::Settings(args) => settings::run(&args),
         NativeCommand::Ask(request) => run_ask(request),
+        NativeCommand::SelfTest(request) => self_test::run(request),
         NativeCommand::Tell(request) => run_tell(request),
         NativeCommand::Reopen(request) => run_reopen(request),
         NativeCommand::Inspect {
@@ -3543,6 +3548,19 @@ fn run_sessions(request: SessionsRequest) -> Result<()> {
 /// The `sessions` listing over one state root. Listing is also a lifecycle-lock holder: it
 /// converges interrupted completions and closes and repairs dead owners before it reads.
 fn sessions_in(root: &Path, request: &SessionsRequest) -> Result<Vec<serde_json::Value>> {
+    sessions_query(root, request, true)
+}
+
+// Ownership discovery must not recover, repair, or otherwise change shared records.
+fn sessions_in_read_only(root: &Path, request: &SessionsRequest) -> Result<Vec<serde_json::Value>> {
+    sessions_query(root, request, false)
+}
+
+fn sessions_query(
+    root: &Path,
+    request: &SessionsRequest,
+    repair: bool,
+) -> Result<Vec<serde_json::Value>> {
     let mut sessions = Vec::new();
     if root.is_dir() {
         for entry in fs::read_dir(root)? {
@@ -3571,7 +3589,9 @@ fn sessions_in(root: &Path, request: &SessionsRequest) -> Result<Vec<serde_json:
             // Repair runs completion recovery first itself, unconditionally and under the
             // same lifecycle lock, so a listing publishes every finished turn before it
             // decides on the owner without a separate recovery pass.
-            let _ = repair_dead_native_owner(&directory);
+            if repair {
+                let _ = repair_dead_native_owner(&directory);
+            }
             let status = read_json::<SessionStatus>(&directory.join("status.json")).ok();
             let state = status
                 .as_ref()
