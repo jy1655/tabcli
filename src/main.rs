@@ -23,7 +23,7 @@ Usage:
       [--yolo] [--timeout-secs N] [--detach] [--json] [--context-result <session>/<request-id>]...
   agent-bridge self-test <codex|claude|agy|pi> [--workspace PATH]
       [--terminal <ghostty|iterm2|terminal|windows-console>] [--model MODEL] [--effort EFFORT]
-      [--yolo] [--timeout-secs N] [--json]
+      [--yolo] [--timeout-secs N] [--isolated] [--json]
   agent-bridge tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
       [--context-result <session>/<request-id>]...
   agent-bridge reopen <closed-session> (--prompt TEXT | --prompt-file PATH) [--title NAME]
@@ -63,9 +63,12 @@ Self-test:
   ordinary state root, reports its path, and closes only the session it creates.
   It never resends an uncertain prompt or automatically approves workspace trust.
   --timeout-secs is a per-command budget (default 120); cleanup uses the normal
-  explicit-close contract. Closed records remain in the registry for inspection. Set
-  AGENT_BRIDGE_NATIVE_STATE_DIR yourself when isolation is wanted. Only a fully
-  verified round trip and cleanup exit successfully. Model, effort, and --yolo follow the new-session policy below.
+  explicit-close contract. Closed records remain in the registry for inspection.
+  --isolated keeps the run apart from your sessions in a private directory of its
+  own; your state root's settings and consent records do not apply, and the
+  private directory stays until you remove it. Only a fully verified round trip
+  and cleanup exit successfully. Model, effort, and --yolo follow the new-session
+  policy below.
 
 Session policy:
   --model and --effort apply only to the new child session. For Codex, a non-empty
@@ -317,6 +320,10 @@ mod tests {
             "self-test makes real model calls and opens a real terminal",
             "ordinary state root, reports its path, and closes only the session it creates",
             "Closed records remain in the registry for inspection",
+            "[--isolated]",
+            "--isolated keeps the run apart from your",
+            "settings and consent records do not apply",
+            "private directory stays until you remove it",
             "prune-sessions --closed-before-days N --explicit",
             "close-session <session> --explicit",
             "macOS detects Ghostty, iTerm2, or Terminal.app",

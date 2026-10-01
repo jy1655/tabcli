@@ -7,6 +7,7 @@ struct Fake {
     calls: Vec<Vec<String>>,
     sessions: Vec<Value>,
     ownership_error: bool,
+    isolated: bool,
 }
 
 impl Operations for Fake {
@@ -18,7 +19,17 @@ impl Operations for Fake {
         if self.ownership_error {
             bail!("unreadable manifest")
         }
-        session_with_title(&self.sessions, title)
+        if self.isolated {
+            if self.sessions.len() > 1 {
+                bail!("self-test state contains more than one session")
+            }
+            Ok(self
+                .sessions
+                .first()
+                .and_then(|session| session["id"].as_str().map(str::to_owned)))
+        } else {
+            session_with_title(&self.sessions, title)
+        }
     }
     fn metadata(&self, _: &str) -> Result<(String, Option<String>)> {
         Ok((
@@ -66,6 +77,7 @@ fn fake(replies: impl IntoIterator<Item = Reply>) -> Fake {
             json!({"id":"session-owned","title":"Agent Bridge self-test AB_marker"}),
         ],
         ownership_error: false,
+        isolated: false,
     }
 }
 fn request(extra: &[&str]) -> Request {
@@ -78,7 +90,7 @@ fn request(extra: &[&str]) -> Request {
 }
 fn run_fake(fake: &mut Fake) -> Report {
     let report = orchestrate(
-        &request(&[]),
+        &request(if fake.isolated { &["--isolated"] } else { &[] }),
         fake,
         PathBuf::from("ordinary-root"),
         "AB_marker".to_owned(),
@@ -353,6 +365,7 @@ fn self_test_options_follow_explicit_new_session_policy() {
     assert_eq!(request.ask.timeout, Duration::from_secs(9));
     let default = self::request(&[]);
     assert!(!default.ask.yolo);
+    assert!(!default.isolated);
     assert!(default.ask.model.is_none() && default.ask.effort.is_none());
     assert_eq!(default.ask.timeout, Duration::from_secs(120));
     for options in [
@@ -363,6 +376,8 @@ fn self_test_options_follow_explicit_new_session_policy() {
         vec!["--timeout-secs", "0"],
         vec!["--yolo", "--yolo"],
         vec!["--model", ""],
+        vec!["--isolated", "--isolated"],
+        vec!["--isolated", "--unknown"],
     ] {
         let mut args = arguments(&["self-test", "claude"]);
         args.extend(arguments(&options));
@@ -383,6 +398,7 @@ fn json_report_exposes_all_step_outcomes_and_addresses() {
     assert!(value["steps"][0]["event_address"].is_null());
     assert_eq!(value["steps"][4]["outcome"], "not_verified");
     assert_eq!(value["state_root"], "ordinary-root");
+    assert_eq!(value["isolated"], false);
     assert!(value.get("state_directory").is_none());
     for outcome in [
         Outcome::Passed,
@@ -402,6 +418,7 @@ fn exact_title_lookup_never_selects_other_sessions_and_is_read_only() {
     let installed = Installed {
         executable: PathBuf::from("unused"),
         root: root.path().to_owned(),
+        isolated: false,
     };
     let title = "Agent Bridge self-test AB_marker";
     assert!(installed.owned_session(workspace.path(), title).is_err());
@@ -471,4 +488,147 @@ fn ambiguous_title_lookup_never_closes_anything() {
         );
         assert_eq!(fake.calls.len(), 1);
     }
+}
+
+#[test]
+fn isolated_option_is_accepted_in_every_option_position() {
+    let base = arguments(&["self-test", "claude", "--workspace", ".", "--json"]);
+    for position in [1, 2, 4, 5] {
+        let mut args = base.clone();
+        args.insert(position, "--isolated".to_owned());
+        let NativeCommand::SelfTest(request) = parse_args(args).unwrap() else {
+            panic!()
+        };
+        assert!(request.isolated && request.ask.json);
+    }
+    assert!(
+        parse_args(arguments(&[
+            "self-test",
+            "--isolated",
+            "claude",
+            "--isolated"
+        ]))
+        .is_err()
+    );
+}
+
+#[test]
+fn isolated_round_trip_reports_mode_and_uses_the_same_commands() {
+    let mut fake = fake(
+        [
+            accepted("request-1"),
+            result("request-1", "event-1.json"),
+            accepted("request-2"),
+            result("request-2", "event-2.json"),
+        ]
+        .into_iter()
+        .chain(cleanup()),
+    );
+    fake.isolated = true;
+    fake.sessions = vec![json!({"id":"session-owned","title":"irrelevant in private root"})];
+    let report = run_fake(&mut fake);
+    assert_eq!(report.outcome, Outcome::Passed);
+    assert!(report.isolated);
+    assert_eq!(fake.calls.len(), 6);
+}
+
+#[test]
+fn isolated_ownership_is_from_the_directory_even_without_an_ask_id() {
+    for ask in [
+        error("launch failed"),
+        ok(json!({"ok":true,"session":"session-foreign","request_id":"request-1"})),
+        ok(json!({"ok":true,"request_id":"request-1"})),
+    ] {
+        let mut fake = fake([ask].into_iter().chain(cleanup()));
+        fake.isolated = true;
+        fake.sessions = vec![json!({"id":"session-owned","title":"unrelated title"})];
+        let report = run_fake(&mut fake);
+        assert_eq!(report.session.as_deref(), Some("session-owned"));
+        assert_eq!(report.steps[4].outcome, Outcome::Passed);
+        assert_eq!(fake.calls.len(), 3);
+    }
+    let mut fake = fake([error("prelaunch failure")]);
+    fake.isolated = true;
+    fake.sessions.clear();
+    assert_eq!(run_fake(&mut fake).steps[4].outcome, Outcome::Passed);
+}
+
+#[test]
+fn isolated_unreadable_or_ambiguous_ownership_never_closes() {
+    for unreadable in [false, true] {
+        let mut fake = fake([accepted("request-1")]);
+        fake.isolated = true;
+        fake.ownership_error = unreadable;
+        let report = run_fake(&mut fake);
+        assert_eq!(report.steps[4].outcome, Outcome::NotVerified);
+        assert_eq!(fake.calls.len(), 1);
+    }
+}
+
+#[test]
+fn installed_commands_override_the_root_only_in_isolated_mode() {
+    let root = tempfile::tempdir().unwrap();
+    for isolated in [false, true] {
+        let installed = Installed {
+            executable: PathBuf::from("unused"),
+            root: root.path().join("not-created"),
+            isolated,
+        };
+        for command in ["ask", "result", "tell", "close-session", "inspect"] {
+            let command = installed.command(&arguments(&[command]));
+            let env: Vec<_> = command.get_envs().collect();
+            if isolated {
+                assert_eq!(
+                    env,
+                    [(
+                        std::ffi::OsStr::new(STATE_DIR_ENV),
+                        Some(installed.root.as_os_str())
+                    )]
+                );
+            } else {
+                assert!(env.is_empty());
+            }
+            assert!(!installed.root.exists());
+        }
+    }
+}
+
+#[test]
+fn installed_private_ownership_is_read_only_and_ignores_title_and_workspace() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let installed = Installed {
+        executable: PathBuf::from("unused"),
+        root: root.path().to_owned(),
+        isolated: true,
+    };
+    assert!(
+        installed
+            .owned_session(workspace.path(), "unused")
+            .unwrap()
+            .is_none()
+    );
+    let directory = root.path().join("session-owned");
+    fs::create_dir(&directory).unwrap();
+    let manifest = json!({"schema":1,"id":"session-owned","provider":"claude","provider_path":"unused","provider_version":"2.1.281","workspace":root.path(),"title":"unrelated","yolo":false,"created_unix_ms":1});
+    write_json_atomic(&directory.join("manifest.json"), &manifest).unwrap();
+    let before = fs::read(directory.join("manifest.json")).unwrap();
+    assert_eq!(
+        installed
+            .owned_session(workspace.path(), "unused")
+            .unwrap()
+            .as_deref(),
+        Some("session-owned")
+    );
+    assert_eq!(fs::read(directory.join("manifest.json")).unwrap(), before);
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+    let second = root.path().join("session-second");
+    fs::create_dir(&second).unwrap();
+    let mut manifest = manifest;
+    manifest["id"] = json!("session-second");
+    write_json_atomic(&second.join("manifest.json"), &manifest).unwrap();
+    assert!(installed.owned_session(workspace.path(), "unused").is_err());
+    manifest["id"] = json!("session-foreign");
+    write_json_atomic(&second.join("manifest.json"), &manifest).unwrap();
+    assert!(installed.owned_session(workspace.path(), "unused").is_err());
 }

@@ -4,9 +4,12 @@ use serde_json::Value;
 #[derive(Debug)]
 pub(crate) struct Request {
     ask: AskRequest,
+    isolated: bool,
 }
 
 pub(super) fn parse(args: &[String]) -> Result<NativeCommand> {
+    let mut isolated = args.first().is_some_and(|arg| arg == "--isolated");
+    let args = if isolated { &args[1..] } else { args };
     let (provider, options) = args
         .split_first()
         .context("self-test requires codex, claude, agy, or pi")?;
@@ -21,6 +24,7 @@ pub(super) fn parse(args: &[String]) -> Result<NativeCommand> {
                 ask_args.push(option_value(options, &mut index, option)?.to_owned());
             }
             "--yolo" | "--json" => ask_args.push(option.clone()),
+            "--isolated" => set_flag_once(&mut isolated, "--isolated")?,
             other => bail!("unknown self-test option: {other}"),
         }
         index += 1;
@@ -32,7 +36,7 @@ pub(super) fn parse(args: &[String]) -> Result<NativeCommand> {
     let NativeCommand::Ask(ask) = parse_ask(&ask_args)? else {
         unreachable!()
     };
-    Ok(NativeCommand::SelfTest(Request { ask }))
+    Ok(NativeCommand::SelfTest(Request { ask, isolated }))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -63,6 +67,7 @@ struct Report {
     provider_version: Option<String>,
     terminal: Option<String>,
     state_root: PathBuf,
+    isolated: bool,
     marker: String,
     session: Option<String>,
     session_state: Option<String>,
@@ -87,11 +92,47 @@ trait Operations {
 struct Installed {
     executable: PathBuf,
     root: PathBuf,
+    isolated: bool,
+}
+
+impl Installed {
+    fn private_session(&self) -> Result<Option<String>> {
+        let mut sessions = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if valid_session_id(&name) && entry.file_type()?.is_dir() {
+                let directory = session_directory_in(&self.root, &name)?;
+                if directory.join("manifest.json").exists() {
+                    let manifest = read_manifest(&directory)?;
+                    if manifest.id != name {
+                        bail!("self-test session manifest has a different id")
+                    }
+                    sessions.push(name);
+                }
+            }
+        }
+        if sessions.len() > 1 {
+            bail!(
+                "self-test state contains more than one session; cleanup ownership is not verified"
+            )
+        }
+        Ok(sessions.pop())
+    }
+
+    fn command(&self, args: &[String]) -> Command {
+        let mut command = Command::new(&self.executable);
+        command.args(args);
+        if self.isolated {
+            command.env(STATE_DIR_ENV, &self.root);
+        }
+        command
+    }
 }
 
 impl Operations for Installed {
     fn call(&mut self, args: &[String]) -> Reply {
-        match Command::new(&self.executable).args(args).output() {
+        match self.command(args).output() {
             Ok(output) => {
                 let value: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
                 let error = value["error"].as_str().map(str::to_owned).or_else(|| {
@@ -113,6 +154,9 @@ impl Operations for Installed {
     }
 
     fn owned_session(&self, workspace: &Path, title: &str) -> Result<Option<String>> {
+        if self.isolated {
+            return self.private_session();
+        }
         let NativeCommand::Sessions(request) = parse_sessions(&arguments(&[
             "--workspace",
             &workspace.to_string_lossy(),
@@ -283,6 +327,7 @@ fn orchestrate(
         provider_version: None,
         terminal: ask.terminal.map(|kind| kind.as_str().to_owned()),
         state_root: root,
+        isolated: request.isolated,
         marker,
         session: None,
         session_state: None,
@@ -322,17 +367,26 @@ fn orchestrate(
     let mut initial_step = step("ask", start, &initial);
     report.session = initial.value["session"].as_str().map(str::to_owned);
     let ownership = match report.session.as_deref() {
-        Some(id) => require_valid_session_id(id).map(|()| Some(id.to_owned())),
-        None => operations.owned_session(&ask.workspace, &title),
+        Some(id) if !request.isolated => require_valid_session_id(id).map(|()| Some(id.to_owned())),
+        _ => operations.owned_session(&ask.workspace, &title),
     };
     let ownership_error = match ownership {
         Ok(Some(session)) => {
             report.session = Some(session);
             None
         }
+        Ok(None) if request.isolated => {
+            report.session = None;
+            None
+        }
         Ok(None) => Some("no session with the exact self-test title was found".to_owned()),
         Err(error) => Some(format!("cannot verify cleanup ownership: {error:#}")),
     };
+    if request.isolated
+        && let Some(reason) = &ownership_error
+    {
+        reject(&mut initial_step, Outcome::NotVerified, reason);
+    }
     if initial_step.outcome == Outcome::Passed
         && (report.session.is_none()
             || initial.value["session"].as_str() != report.session.as_deref()
@@ -470,11 +524,27 @@ fn orchestrate(
 }
 
 pub(super) fn run(request: Request) -> Result<()> {
-    let root = state_root()?;
+    let root = if request.isolated {
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("agent-bridge-self-test-");
+        let directory = match std::env::var_os(STATE_DIR_ENV) {
+            Some(root) => {
+                fs::create_dir_all(&root)?;
+                builder.tempdir_in(root)?
+            }
+            None => builder.tempdir()?,
+        };
+        let root = directory.keep();
+        set_private_directory_permissions(&root)?;
+        root
+    } else {
+        state_root()?
+    };
     let marker = format!("AB_{}", new_event_file_name()?.trim_end_matches(".json"));
     let mut installed = Installed {
         executable: std::env::current_exe()?,
         root: root.clone(),
+        isolated: request.isolated,
     };
     let report = orchestrate(&request, &mut installed, root, marker);
     if request.ask.json {
@@ -485,7 +555,12 @@ pub(super) fn run(request: Request) -> Result<()> {
             report.bridge_version, report.provider
         );
         println!(
-            "CLI: {}\nterminal: {}\nstate root: {}\nsession: {}\nstate: {}",
+            "mode: {}\nCLI: {}\nterminal: {}\nstate root: {}\nsession: {}\nstate: {}",
+            if report.isolated {
+                "isolated"
+            } else {
+                "ordinary state root"
+            },
             terminal_safe_text(
                 report.provider_version.as_deref().unwrap_or("not verified"),
                 false
