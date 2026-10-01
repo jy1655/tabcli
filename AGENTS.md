@@ -219,6 +219,17 @@ launch, observe, continue, and close without replacing the capabilities those CL
   content earlier, and it does not exclude a writer that has the store open. Do not open
   a provider store without write sharing to change that: Bridge polls Agy's store every
   100 ms while Agy saves an approved decision, and a provider's own write would fail.
+- The gate that withholds an initial paste on native Windows asks another question than
+  workspace consent: not whether the user approved this exact workspace, but whether the
+  provider shows its trust dialog now. Codex takes the trust of a workspace without an
+  exact entry from its Git project (the parent of the Git common directory, so the main
+  repository for a linked worktree), shows no dialog there and saves no exact entry
+  (measured 2026-10-02 with Codex CLI 0.159.3; `--yolo` does not suppress the dialog). A
+  wait for the exact entry never ended there (issue #60). The Codex adapter therefore
+  opens the gate for such a workspace as well, and only while the screen does not show
+  the dialog. Consent that is shared with another provider stays exact.
+- A wait for workspace trust ends when its session has ended; a launcher must not outlive
+  a closed session until its deadline.
 - Create a store fixture in a test the way a private record is created
   (`write_private`, `write_json_atomic`). A plain write inherits what the temporary
   directory allows, and on a PC with the Codex sandbox that directory lets another

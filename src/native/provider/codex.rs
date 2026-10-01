@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsString,
     io::{Read, Seek, SeekFrom},
-    path::Path,
-    process::{ExitStatus, Stdio},
+    path::{Path, PathBuf},
+    process::{Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -222,10 +222,19 @@ impl NativeProviderAdapter for CodexAdapter {
                 .context("Codex terminal has no managed session binding")
                 .and_then(super::super::session_directory)
                 .map_err(terminal::TerminalSendFailure::not_sent)?;
+            // The Git project of a workspace does not change while its session starts,
+            // and finding it runs `git`: look it up once, when the store first has no
+            // exact entry.
+            let mut git_project = None;
             super::super::consent::wait_for_native_trust(
                 &directory,
                 FirstPartyCli::Codex,
                 deadline,
+                &mut |workspace, homes| {
+                    let project = git_project.get_or_insert_with(|| git_project_root(workspace));
+                    trusted_through_git_project(workspace, project.as_deref(), homes)
+                        && !trust_dialog_on_screen(session, deadline)
+                },
             )
             .map_err(terminal::TerminalSendFailure::not_sent)?;
         }
@@ -328,6 +337,73 @@ impl NativeProviderAdapter for CodexAdapter {
     fn cancel_terminal_follow_up(&self, directory: &Path, claim_token: &str) -> Result<()> {
         cancel_pending_turn(directory, claim_token)
     }
+}
+
+// Codex takes the trust of a workspace from the project entry of that exact directory
+// and, without one, from the entry of the Git project the workspace belongs to: the
+// parent of the Git common directory, which for a linked worktree is the main
+// repository. It shows no trust dialog then and saves no exact entry. Measured
+// 2026-10-02 with Codex CLI 0.159.3 on native Windows (issue #60): no dialog in a
+// linked worktree of a trusted repository; the dialog in a directory that nothing
+// trusts, with and without `--yolo`, and in a plain directory below a trusted one.
+//
+// This is the adapter's evidence that the initial paste cannot land on the dialog. It
+// is not workspace consent: `workspace_trust` stays exact, and nothing here is shared
+// with another provider. Delete it when Codex has an input path that needs no paste.
+fn git_project_root(workspace: &Path) -> Option<PathBuf> {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(super::super::consent::native_key(workspace).ok()?)
+        .args(["rev-parse", "--git-common-dir"]);
+    let output = super::super::command_output_until(
+        &mut command,
+        Instant::now() + Duration::from_secs(2),
+        "Codex workspace trust scope",
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // Git prints the directory relative to the workspace unless it lies elsewhere. The
+    // workspace is joined in its ordinary spelling: a verbatim Windows path would take
+    // `..` and `/` in Git's answer as names.
+    let common = PathBuf::from(super::super::consent::native_key(workspace).ok()?).join(
+        std::str::from_utf8(&output.stdout)
+            .ok()?
+            .trim_end_matches(['\r', '\n']),
+    );
+    Some(common.canonicalize().ok()?.parent()?.to_path_buf())
+}
+
+// An exact entry decides alone, as it does for Codex: this holds only for a workspace
+// without one whose Git project is another directory that Codex trusts.
+fn trusted_through_git_project(
+    workspace: &Path,
+    project: Option<&Path>,
+    homes: &super::super::consent::Homes,
+) -> bool {
+    use super::super::consent::Trust;
+    matches!(ADAPTER.workspace_trust(workspace, homes), Ok(Trust::Absent))
+        && project.is_some_and(|project| {
+            project != workspace
+                && matches!(
+                    ADAPTER.workspace_trust(project, homes),
+                    Ok(Trust::Trusted(_))
+                )
+        })
+}
+
+// The rule above is inferred from Codex's behaviour, so the paste also needs the screen
+// to be free of the dialog it must not answer. A screen that cannot be read counts as
+// showing it.
+fn trust_dialog_on_screen(session: &terminal::TerminalSession, deadline: Instant) -> bool {
+    terminal::read_screen(session, deadline).map_or(true, |screen| shows_trust_dialog(&screen))
+}
+
+// The dialog of Codex CLI 0.159.3: `Trust this folder?` above `1. Trust and continue`.
+fn shows_trust_dialog(screen: &str) -> bool {
+    screen.contains("Trust this folder?") || screen.contains("Trust and continue")
 }
 
 fn workspace_trust_override(workspace: &Path) -> Result<String> {
@@ -1030,6 +1106,113 @@ mod tests {
             );
             assert_eq!(parsed["value"].as_table().unwrap().len(), 1);
         }
+    }
+
+    // Runs Git on a fixture. The identity only satisfies `git commit`.
+    fn git(directory: &Path, arguments: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(arguments)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?}");
+    }
+
+    // Issue #60: Codex shows no trust dialog in a linked worktree of a trusted
+    // repository and saves no entry for it, so the paste gate waited for an exact entry
+    // that never came. The workspaces below are the ones measured with Codex CLI
+    // 0.159.3, and a directory inside the repository, which Git resolves the same way.
+    #[test]
+    fn a_workspace_without_an_entry_takes_the_trust_of_its_git_project() {
+        use super::super::super::consent;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (repository, worktree, plain) = (
+            root.join("repository"),
+            root.join("worktree"),
+            root.join("plain"),
+        );
+        let nested = repository.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(&plain).unwrap();
+        git(&repository, &["init", "--quiet"]);
+        git(
+            &repository,
+            &["commit", "--quiet", "--allow-empty", "-m", "initial"],
+        );
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                &consent::native_key(&worktree).unwrap(),
+            ],
+        );
+
+        assert_eq!(git_project_root(&worktree), Some(repository.clone()));
+        assert_eq!(git_project_root(&nested), Some(repository.clone()));
+        assert_eq!(git_project_root(&repository), Some(repository.clone()));
+        assert_eq!(git_project_root(&plain), None);
+
+        let homes = consent::fixture_homes(&root);
+        super::super::super::write_private(&homes.codex, b"").unwrap();
+        let entries = |entries: &[(&Path, &str)]| {
+            let config = entries
+                .iter()
+                .map(|(path, level)| {
+                    format!(
+                        "[projects.{}]\ntrust_level = \"{level}\"\n",
+                        serde_json::to_string(&consent::native_key(path).unwrap()).unwrap()
+                    )
+                })
+                .collect::<String>();
+            std::fs::write(&homes.codex, config).unwrap();
+        };
+        let through_project = |workspace: &Path| {
+            trusted_through_git_project(workspace, git_project_root(workspace).as_deref(), &homes)
+        };
+
+        // Only the main repository is trusted: Codex shows no dialog in its worktree.
+        entries(&[(&repository, "trusted")]);
+        assert!(through_project(&worktree));
+        assert!(through_project(&nested));
+        // The repository itself has its exact entry, which the shared rule reads.
+        assert!(!through_project(&repository));
+        // A trusted directory above is not the Git project: Codex shows its dialog.
+        entries(&[(&root, "trusted")]);
+        assert!(!through_project(&plain));
+        assert!(!through_project(&worktree));
+        // An exact entry decides alone, and a declined project is no trust.
+        entries(&[(&repository, "trusted"), (&worktree, "untrusted")]);
+        assert!(!through_project(&worktree));
+        entries(&[(&repository, "untrusted")]);
+        assert!(!through_project(&worktree));
+        entries(&[]);
+        assert!(!through_project(&worktree));
+    }
+
+    // The two screens of Codex CLI 0.159.3 that the initial paste can meet
+    // (session-kkpVsB and session-nXZtvt, 2026-10-02).
+    #[test]
+    fn the_trust_dialog_is_recognised_on_the_screen() {
+        assert!(shows_trust_dialog(
+            "  Folder access\n  C:\\work\\project\n  Trust this folder? Codex can read, edit, and run files here, subject to your permission settings. Folder settings\n  can run code automatically, even without a model request. Continue only if you trust these files. Your trust\n  decision will be saved.\n› 1. Trust and continue\n  2. Quit\n  enter continue · esc quit"
+        ));
+        assert!(!shows_trust_dialog(
+            "  >_ OpenAI Codex (v0.159.3)\n     D:\\Dev\\project\n  How deep does this codebase go?\n› Ask Codex to do anything\n  GPT-6.1-Sol low · D:\\Dev\\project\n  ? for shortcuts"
+        ));
     }
 
     #[test]

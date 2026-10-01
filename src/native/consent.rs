@@ -432,13 +432,29 @@ pub(super) fn complete_launch(
 
 // Native Windows paste must not select a workspace-trust button. A provider
 // adapter calls this only where its official input API/startup event is absent.
+//
+// The store's exact entry is not the only reason a provider shows no trust dialog:
+// Codex takes the trust of a linked worktree from its main repository, shows no dialog
+// there and saves no exact entry, so a wait for that entry never ended (issue #60).
+// `no_dialog` is the adapter's own evidence for such a workspace. It never widens
+// workspace consent, which stays exact.
 pub(super) fn wait_for_native_trust(
     directory: &Path,
     target: FirstPartyCli,
     deadline: Instant,
+    no_dialog: &mut dyn FnMut(&Path, &Homes) -> bool,
+) -> Result<()> {
+    wait_for_native_trust_with(directory, target, deadline, &Homes::current()?, no_dialog)
+}
+
+fn wait_for_native_trust_with(
+    directory: &Path,
+    target: FirstPartyCli,
+    deadline: Instant,
+    homes: &Homes,
+    no_dialog: &mut dyn FnMut(&Path, &Homes) -> bool,
 ) -> Result<()> {
     let manifest = read_manifest(directory)?;
-    let homes = Homes::current()?;
     loop {
         let assessment = observe(directory);
         let applied_here = matches!(
@@ -447,11 +463,23 @@ pub(super) fn wait_for_native_trust(
         );
         if (applied_here && authorized(directory, target)?)
             || matches!(
-                provider::workspace_trust(target, &manifest.workspace, &homes),
+                provider::workspace_trust(target, &manifest.workspace, homes),
                 Ok(Trust::Trusted(_))
             )
+            || no_dialog(&manifest.workspace, homes)
         {
             return Ok(());
+        }
+        // A session that has ended has no terminal left to send to, whatever becomes
+        // of its workspace's trust. Without this the launcher of a closed session went
+        // on waiting until its deadline.
+        if let Ok(status) = read_json::<SessionStatus>(&directory.join("status.json"))
+            && matches!(status.state.as_str(), "failed" | "exited" | "closed")
+        {
+            bail!(
+                "the session is {} and no longer waits for workspace trust; no initial console input was sent",
+                status.state
+            );
         }
         if Instant::now() >= deadline {
             bail!(
@@ -909,6 +937,88 @@ mod tests {
         assert_eq!(
             verdict(administrators, &["S-1-5-32-545"], &[user, administrators]),
             Err("trust store can be changed by another account (S-1-5-32-545)".to_owned())
+        );
+    }
+
+    // A session directory in a state root of its own; a manifest is read only from a
+    // directory that bears its id.
+    fn session(workspace: &Path, state: &str) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-trustwait");
+        fs::create_dir(&directory).unwrap();
+        write_json_atomic(
+            &directory.join("manifest.json"),
+            &SessionManifest {
+                schema: SESSION_SCHEMA,
+                id: "session-trustwait".to_owned(),
+                provider: "codex".to_owned(),
+                provider_path: PathBuf::from("codex"),
+                provider_version: "0.159.3".to_owned(),
+                workspace: workspace.to_owned(),
+                title: "trust wait".to_owned(),
+                model: None,
+                effort: None,
+                yolo: false,
+                created_unix_ms: 1,
+            },
+        )
+        .unwrap();
+        fs::write(
+            directory.join("status.json"),
+            format!(
+                r#"{{"state":"{state}","generation":1,"updated_unix_ms":1,"exit_code":null,"error":null}}"#
+            ),
+        )
+        .unwrap();
+        (root, directory)
+    }
+
+    // Issue #60. The store never lists a workspace whose trust the provider takes from
+    // elsewhere, and a launcher went on waiting for a session that had been closed.
+    #[test]
+    fn the_wait_for_native_trust_ends_with_the_adapters_evidence_or_with_the_session() {
+        let (_temp, workspace, homes) = setup();
+        let far = || Instant::now() + Duration::from_secs(600);
+        let wait = |directory: &Path,
+                    deadline: Instant,
+                    no_dialog: &mut dyn FnMut(&Path, &Homes) -> bool| {
+            wait_for_native_trust_with(directory, FirstPartyCli::Codex, deadline, &homes, no_dialog)
+                .map_err(|error| error.to_string())
+        };
+
+        let (_root, waiting) = session(&workspace, "awaiting-initial-input");
+        let mut asked = 0;
+        wait(&waiting, far(), &mut |path, _| {
+            asked += 1;
+            path == workspace && asked == 3
+        })
+        .unwrap();
+        assert_eq!(
+            asked, 3,
+            "asked again on every poll until the evidence holds"
+        );
+
+        for state in ["closed", "failed", "exited"] {
+            let (_root, ended) = session(&workspace, state);
+            let started = Instant::now();
+            assert_eq!(
+                wait(&ended, far(), &mut |_, _| false),
+                Err(format!(
+                    "the session is {state} and no longer waits for workspace trust; no initial console input was sent"
+                ))
+            );
+            assert!(started.elapsed() < Duration::from_secs(60), "{state}");
+        }
+
+        let error = wait(
+            &waiting,
+            Instant::now() + Duration::from_millis(250),
+            &mut |_, _| false,
+        )
+        .unwrap_err();
+        assert!(
+            error.starts_with("workspace trust is not verified; no initial console input was sent"),
+            "{error}"
         );
     }
 
