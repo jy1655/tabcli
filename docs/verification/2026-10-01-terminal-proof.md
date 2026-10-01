@@ -30,10 +30,17 @@ depends on how it got there.
 | --- | --- | --- |
 | Shell ended while a close confirmation was pending (ids 8332, 8338) | The old name, unchanged | Terminal had released the name. A later tab received it (`/dev/ttys003` went to window 8335, `/dev/ttys006` to an iTerm2 tab), so the proof matched two tabs |
 | Shell killed, no confirmation pending (ids 8341, 8345) | The old name followed by the character U+0001 | The name was handed out again (`/dev/ttys014` went to window 8342), but the extra character prevented a match |
-| Shell killed, no confirmation pending (id 8344) | The old name, unchanged | The name was not handed out again while the window existed: forty new ptys skipped it |
+| Shell killed, no confirmation pending (id 8344) | The old name, unchanged | The name was handed out again within two seconds (`/dev/ttys014` went to an iTerm2 session of another task), so this state can collide as well |
 
-Only the first state produced the failure. What decides between the second
-and the third state was not established.
+The first state produced the recorded failure. The third state has the same
+two ingredients, an unchanged name and a name that is handed out again, without
+any pending confirmation. What decides between the second and the third state
+was not established.
+
+An earlier version of this record said that the name of window 8344 was not
+handed out again while the window existed, because forty new ptys skipped it.
+That reading was wrong. The name was held by the iTerm2 session described under
+"A fault caused by this task" below.
 
 ## The change
 
@@ -108,11 +115,29 @@ seven entries.
   work. The claim about the first Apple Event rests on the script text.
 - Native Windows, Ghostty and iTerm2 are not affected by this change.
 
-## Observations outside this change
+## A fault caused by this task
 
 Two iTerm2 launches of this task (`session-TeRuNV`, `session-kz8Yb9`) failed
-after 30 seconds with `iTerm2 automation timed out`. `create tab` did not
-return at that time, while reading the tab list still worked. The window
-server listed a small iTerm2 window of dialog size (260 by 202 points) that
-had appeared a few minutes earlier, which suggests an open dialog. Its content
-could not be read and it could not be dismissed, because the screen was locked.
+after 30 seconds with `iTerm2 automation timed out`, and so did the launches
+of another task on the same Mac from 19:52 KST on. `create tab` did not return,
+while reading the tab list still worked. iTerm2 was waiting in its warning "A
+session ended very soon after starting", which it shows as a modal dialog when
+a session ends less than three seconds after it was created.
+
+This task caused that dialog. A cleanup command for two experiment windows
+ended processes by tty name in two passes, two seconds apart:
+
+| Time (KST) | Event |
+| --- | --- |
+| about 19:51:50.9 | First pass (SIGHUP) ended the shells on `ttys014` and `ttys015`; both names were released |
+| 19:51:52.869 | A new `login` process started on `ttys014`: an iTerm2 tab that the other task had just created (`session-q1eerT`) |
+| about 19:51:53.0 | Second pass read the processes on `ttys014` again and sent SIGKILL. The new `login` was gone 0.1 seconds after it had started; its login record has no logout |
+| 19:52:20.563 | `session-q1eerT` failed with `provider launch timed out before startup was confirmed` |
+
+The kill itself and the dialog were not observed directly. The attribution
+rests on the times above, the missing logout record, the launch log of
+`session-q1eerT`, and a sample of iTerm2's main thread taken later.
+
+It is the hazard this record describes, met from the other side: a tty name
+does not identify a session over time. Processes must be ended by the process
+ids that were read once, never by a name that is looked up again later.
