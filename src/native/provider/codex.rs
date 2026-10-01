@@ -24,6 +24,11 @@ pub(super) struct CodexAdapter;
 
 const PENDING_TURN_FILE: &str = "codex-pending-turn.json";
 const MAX_NATIVE_QUEUE_OUTPUT_BYTES: usize = 1024 * 1024;
+// A managed terminal can display a different thread or the /agent picker. Codex
+// has no integrated, atomic active-thread check plus addressed terminal input.
+// Replace this refusal only with a provider-owned input path that binds delivery
+// to the recorded thread; a title, old notify, or live process is not that proof.
+const UNADDRESSED_FOLLOW_UP: &str = "Codex terminal follow-up is unavailable: the active thread cannot be verified; no terminal input was sent. Use the thread-addressed native queue with Codex and its local app-server at version 0.149+; inspect `agent-bridge doctor <session> --probe` for the unavailable queue prerequisite";
 
 fn codex_version_supports_native_queue(output: &str) -> Result<bool> {
     let installed = output
@@ -239,9 +244,9 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 
     fn follow_up_transport(&self) -> FollowUpTransport {
-        // Remove the terminal fallback only when the minimum supported Codex has queue support,
-        // every supported platform has an official always-available local queue path, and the
-        // queue-to-notify flow has authenticated LIVE evidence for bridge-launched sessions.
+        // This shared branch uses claim-based queue correlation rather than the
+        // messenger's generated turn identity. The adapter refuses unaddressed
+        // terminal fallback until Codex can bind it to the managed thread.
         FollowUpTransport::ProviderCrossSessionMessageWithTerminalPasteFallback
     }
 
@@ -253,7 +258,15 @@ impl NativeProviderAdapter for CodexAdapter {
         &self,
         context: CrossSessionMessageContext<'_>,
     ) -> CrossSessionMessageResult {
-        send_native_queue_message(context)
+        send_native_queue_message(context).map_err(|failure| {
+            if failure.allows_terminal_fallback() {
+                CrossSessionMessageFailure::not_sent(
+                    failure.into_error().context(UNADDRESSED_FOLLOW_UP),
+                )
+            } else {
+                failure
+            }
+        })
     }
 
     fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()> {
@@ -294,21 +307,22 @@ impl NativeProviderAdapter for CodexAdapter {
 
     fn send_terminal_follow_up(
         &self,
-        session: &terminal::TerminalSession,
-        prompt_path: &Path,
-        deadline: Instant,
+        _session: &terminal::TerminalSession,
+        _prompt_path: &Path,
+        _deadline: Instant,
     ) -> terminal::TerminalSendResult {
-        terminal::send_file(session, prompt_path, deadline)
+        Err(terminal::TerminalSendFailure::not_sent(anyhow::anyhow!(
+            UNADDRESSED_FOLLOW_UP
+        )))
     }
 
     fn prepare_terminal_follow_up(
         &self,
-        directory: &Path,
-        prompt: &str,
-        claim_token: &str,
+        _directory: &Path,
+        _prompt: &str,
+        _claim_token: &str,
     ) -> Result<String> {
-        let pending = install_pending_turn(directory, claim_token)?;
-        Ok(correlated_prompt(prompt, &pending))
+        bail!(UNADDRESSED_FOLLOW_UP)
     }
 
     fn cancel_terminal_follow_up(&self, directory: &Path, claim_token: &str) -> Result<()> {
@@ -495,7 +509,7 @@ fn diagnose_codex(context: super::super::doctor::Context<'_>) -> Vec<super::supe
     };
     checks.push(Check::new("codex_queue_version", availability, reason,
         "Native queue requires Codex 0.149+. Existing sessions select transport using their launch-recorded version.",
-        "The adapter retains terminal fallback when native queue prerequisites are unavailable; do not resend an uncertain turn.")
+        "Unavailable queue prerequisites refuse tell before terminal input: the active TUI thread cannot be verified. Do not resend an uncertain turn.")
         .evidence(serde_json::json!({"version": version, "source": if context.manifest.is_some() { "launch_record" } else { "current_probe" }})));
     if let Some(current) = context.current_version {
         let (availability, reason) = match codex_version_supports_native_queue(current) {
@@ -570,6 +584,20 @@ fn diagnose_codex(context: super::super::doctor::Context<'_>) -> Vec<super::supe
         )
     };
     checks.push(daemon);
+    checks.push(Check::new(
+        "codex_terminal_follow_up",
+        Unavailable,
+        "codex_active_terminal_thread_unverified",
+        "A managed terminal and recorded result do not identify the thread currently selected in the Codex TUI. Unaddressed terminal follow-up is refused before input.",
+        "Use the thread-addressed native queue; inspect the queue version, thread and daemon checks. Agent Bridge does not start or restart the shared daemon.",
+    ));
+    checks.push(Check::new(
+        "codex_mcp",
+        Unknown,
+        "codex_mcp_not_observed",
+        "MCP connection and authentication state have not been observed. Version, daemon availability and completed model turns do not prove MCP startup succeeded.",
+        "Inspect /mcp in this exact Codex session. For 401/token_revoked or reauthenticationRequired, use Codex's reconnect or sign-in flow. Optional MCP failure does not by itself mean the model turn failed; doctor does not change authentication or retry prompts.",
+    ));
     checks
 }
 
@@ -1084,6 +1112,17 @@ mod tests {
                     .reason_code,
                 "session_required"
             );
+            let mcp = checks.iter().find(|c| c.id == "codex_mcp").unwrap();
+            assert_eq!(mcp.availability, Availability::Unknown);
+            assert_eq!(mcp.reason_code, "codex_mcp_not_observed");
+            assert_eq!(
+                checks
+                    .iter()
+                    .find(|c| c.id == "codex_terminal_follow_up")
+                    .unwrap()
+                    .availability,
+                Availability::Unavailable
+            );
         }
     }
 
@@ -1236,6 +1275,136 @@ exit 91
             assert!(codex_version_supports_native_queue(version).unwrap());
         }
         assert!(codex_version_supports_native_queue("codex unknown").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_queue_never_selects_unaddressed_terminal_input() {
+        use super::super::super::{
+            CrossSessionFailureAction, acquire_ready_turn_claim_with_context,
+            cross_session_failure_action,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session-codexqueue");
+        std::fs::create_dir(&path).unwrap();
+        let directory = path.as_path();
+        let provider = directory.join("fake-codex");
+        std::fs::write(
+            &provider,
+            r#"#!/bin/sh
+if [ "$1" = "app-server" ]; then
+  printf '%s\n' '{"status":"running","appServerVersion":"0.159.3"}'
+  exit 0
+fi
+printf '%s\n' 'Error: failed to queue session message: thread/queue/add failed: user message queue is unavailable (code -32600)' >&2
+exit 1
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_queue_manifest(directory, &provider, "codex-cli 0.159.3");
+        // The stored result belongs to A. It says nothing about whether the TUI
+        // still shows A, has switched to B, or is displaying the agent picker.
+        let managed_thread = "018f0000-0000-7000-8000-000000000001";
+        write_established_thread(directory, managed_thread);
+        update_status(directory, "ready", None, None).unwrap();
+        let (claim, _) =
+            acquire_ready_turn_claim_with_context(directory, "session-codexqueue", &[]).unwrap();
+        update_status(directory, "working", None, None).unwrap();
+        let failure = ADAPTER
+            .send_cross_session_message(CrossSessionMessageContext {
+                bridge_executable: Path::new("/unused/agent-bridge"),
+                directory,
+                provider_path: &provider,
+                request_id: &claim.token,
+                prompt: "request addressed only to A",
+                deadline: Instant::now() + Duration::from_secs(2),
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            cross_session_failure_action(ADAPTER.follow_up_transport(), &failure),
+            CrossSessionFailureAction::ReturnError,
+            "a queue rejection must not select a paste into an unverified active thread"
+        );
+        assert!(!failure.delivery_may_have_occurred());
+        assert!(!directory.join(PENDING_TURN_FILE).exists());
+        let reason = format!("{:#}", failure.into_error());
+        assert!(reason.contains("the active thread cannot be verified"));
+        assert!(reason.contains("user message queue is unavailable"));
+        let receipt = super::super::super::requests::for_claim(directory, &claim.token)
+            .unwrap()
+            .unwrap();
+        let token = claim.token.clone();
+        drop(claim);
+        assert!(!directory.join(TURN_CLAIM_FILE).exists());
+        let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+        assert_eq!(status.state, "ready");
+        assert_eq!(event_paths(directory).unwrap().len(), 1);
+        assert_eq!(
+            established_codex_thread(directory).unwrap().as_deref(),
+            Some(managed_thread)
+        );
+        assert_eq!(
+            super::super::super::requests::for_claim(directory, &token)
+                .unwrap()
+                .unwrap()
+                .request_id,
+            receipt.request_id
+        );
+        // A known pre-send refusal releases the claim and allows a later,
+        // independently requested addressed turn; it never retries this prompt.
+        let (next, _) =
+            acquire_ready_turn_claim_with_context(directory, "session-codexqueue", &[]).unwrap();
+        assert_ne!(next.token, token);
+    }
+
+    #[test]
+    fn terminal_follow_up_refuses_before_installing_pending_turn_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let result = ADAPTER.prepare_terminal_follow_up(directory.path(), "only for A", "1-2-0");
+        assert!(
+            result.is_err(),
+            "terminal ownership does not identify the active Codex thread"
+        );
+        assert!(!directory.path().join(PENDING_TURN_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_model_result_does_not_mark_mcp_connected() {
+        use super::super::super::doctor::{Availability, Context};
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-codexqueue");
+        std::fs::create_dir(&directory).unwrap();
+        write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
+        let checks = diagnose_codex(Context {
+            directory: Some(&directory),
+            manifest: None,
+            executable: None,
+            current_version: Some("0.159.3"),
+            workspace: root.path(),
+            probe: false,
+            deadline: Instant::now(),
+        });
+        assert_eq!(
+            checks
+                .iter()
+                .find(|c| c.id == "codex_thread")
+                .unwrap()
+                .availability,
+            Availability::Available
+        );
+        assert_eq!(
+            checks
+                .iter()
+                .find(|c| c.id == "codex_mcp")
+                .unwrap()
+                .availability,
+            Availability::Unknown
+        );
     }
 
     #[test]
@@ -1501,7 +1670,7 @@ exit 91
 
     #[cfg(unix)]
     #[test]
-    fn codex_queue_falls_back_before_start_for_old_versions_or_missing_threads() {
+    fn codex_queue_refuses_before_start_for_old_versions_or_missing_threads() {
         for (version, include_thread) in [("codex-cli 0.148.9", true), ("codex-cli 0.153.2", false)]
         {
             let root = tempfile::tempdir().unwrap();
@@ -1527,7 +1696,7 @@ exit 91
                 })
                 .unwrap_err();
 
-            assert!(failure.allows_terminal_fallback(), "{version}");
+            assert!(!failure.allows_terminal_fallback(), "{version}");
             assert!(!failure.delivery_may_have_occurred(), "{version}");
             assert!(!directory.join(PENDING_TURN_FILE).exists(), "{version}");
         }
@@ -1568,7 +1737,7 @@ exit 91
             })
             .unwrap_err();
 
-        assert!(failure.allows_terminal_fallback());
+        assert!(!failure.allows_terminal_fallback());
         assert!(!failure.delivery_may_have_occurred());
         assert!(
             !directory.join("provider-ran").exists(),
@@ -1618,7 +1787,7 @@ exit 91
             })
             .unwrap_err();
 
-        assert!(failure.allows_terminal_fallback());
+        assert!(!failure.allows_terminal_fallback());
         assert!(!failure.delivery_may_have_occurred());
         assert!(!directory.join("queue-ran").exists());
         assert!(!directory.join(PENDING_TURN_FILE).exists());
