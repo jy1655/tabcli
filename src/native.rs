@@ -6761,6 +6761,11 @@ fn delegation_source() -> String {
     std::env::var("AGENT_BRIDGE_NATIVE_SESSION_ID").unwrap_or_else(|_| "external".to_owned())
 }
 
+// The first line of every prompt that Bridge sends to a provider. It is framing, not an
+// identity: an adapter can tell by it a prompt that Bridge sent from a text that a
+// provider put around the same prompt, and nothing more.
+const NATIVE_DELEGATION_HEADER: &str = "[Agent Bridge native delegation]";
+
 fn native_delegation_prompt(source: &str, prompt: &str) -> String {
     let source = source
         .chars()
@@ -6779,7 +6784,7 @@ fn native_delegation_prompt(source: &str, prompt: &str) -> String {
         source.trim()
     };
     format!(
-        "[Agent Bridge native delegation]\nSource: {}\n\n{}",
+        "{NATIVE_DELEGATION_HEADER}\nSource: {}\n\n{}",
         source,
         prompt.trim()
     )
