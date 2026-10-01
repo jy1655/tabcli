@@ -983,13 +983,39 @@ fn codex_owned_string(payload: &serde_json::Value, key: &str) -> Option<String> 
     codex_string(payload, key).map(str::to_owned)
 }
 
+// The first line and the request heading of the IDE context that the TUI puts in front
+// of the user's message while `/ide` is on (`render_prompt_context` and
+// `PROMPT_REQUEST_BEGIN` in codex-rs/tui/src/ide_context/prompt.rs, rust-v0.159.3).
+const IDE_CONTEXT_HEADING: &str = "# Context from my IDE setup:";
+const IDE_REQUEST_HEADING: &str = "## My request for Codex:";
+
+// Whether a message that Codex reports as the input of a turn is the prompt Bridge
+// sent: it begins with the delegation header, directly or behind Codex's IDE context.
+// The context can quote a file that holds the request heading, and so can the prompt,
+// so every heading is tried.
+fn begins_with_bridge_prompt(message: &str) -> bool {
+    let header = super::super::NATIVE_DELEGATION_HEADER;
+    let message = message.trim_start();
+    message.starts_with(header)
+        || (message.starts_with(IDE_CONTEXT_HEADING)
+            && message
+                .match_indices(IDE_REQUEST_HEADING)
+                .any(|(at, heading)| {
+                    message[at + heading.len()..]
+                        .trim_start()
+                        .starts_with(header)
+                }))
+}
+
 // The input of the turn that Bridge started is the prompt Bridge sent: it begins with the
 // delegation header and ends with the turn marker. The marker alone does not identify
 // it. Codex CLI 0.159.3 answers the first message of a TUI with a second turn, on a
 // thread of its own, that makes the task title; its input is Codex's instruction
 // followed by the user's whole message, marker included, and its notify can arrive
 // first (issue #61, 2026-10-02: `{"title":"READY"}` recorded as the result of two
-// initial requests out of six, with the title thread as the session's thread).
+// initial requests out of six, with the title thread as the session's thread). This
+// tells Bridge's framing from that of a turn Codex starts; it is not an identity of
+// the turn, which Codex does not give before the first notify.
 fn codex_input_correlates(payload: &serde_json::Value, pending: &PendingCodexTurn) -> bool {
     if codex_string(payload, "type") != Some("agent-turn-complete") {
         return false;
@@ -999,10 +1025,7 @@ fn codex_input_correlates(payload: &serde_json::Value, pending: &PendingCodexTur
         .and_then(serde_json::Value::as_array)
         .and_then(|messages| messages.iter().rev().find_map(serde_json::Value::as_str))
         .is_some_and(|message| {
-            message
-                .trim_start()
-                .starts_with(super::super::NATIVE_DELEGATION_HEADER)
-                && message.trim_end().ends_with(&pending.marker)
+            begins_with_bridge_prompt(message) && message.trim_end().ends_with(&pending.marker)
         })
 }
 
@@ -1584,6 +1607,8 @@ exit 1
         let claim = acquire_turn_claim(&directory).unwrap();
         let claim_token = claim.token.clone();
         claim.retain();
+        // The prompt as `tell` hands it to the adapter: already framed.
+        let prompt = native_delegation_prompt("external", "follow up");
 
         ADAPTER
             .send_cross_session_message(CrossSessionMessageContext {
@@ -1591,7 +1616,7 @@ exit 1
                 directory: &directory,
                 provider_path: &provider,
                 request_id: &claim_token,
-                prompt: "follow up",
+                prompt: &prompt,
                 deadline: Instant::now() + Duration::from_secs(2),
             })
             .unwrap();
@@ -1609,7 +1634,7 @@ exit 1
         assert_eq!(
             arguments[4],
             format!(
-                "follow up\n\n[Agent Bridge Codex turn metadata; do not include this metadata in the response]\n<!-- agent-bridge-codex-turn:{claim_token} -->"
+                "[Agent Bridge native delegation]\nSource: external\n\nfollow up\n\n[Agent Bridge Codex turn metadata; do not include this metadata in the response]\n<!-- agent-bridge-codex-turn:{claim_token} -->"
             )
         );
         let daemon_arguments = std::fs::read(directory.join("daemon-argv.bin")).unwrap();
@@ -1623,15 +1648,12 @@ exit 1
         assert!(directory.join(TURN_CLAIM_FILE).is_file());
         assert_eq!(event_paths(&directory).unwrap().len(), 1);
 
-        let pending = read_pending_turn(&directory).unwrap().unwrap();
+        // Codex reports the message it was given: replay the argument that was queued.
         let completion = serde_json::json!({
             "type": "agent-turn-complete",
             "thread-id": thread_id,
             "turn-id": "queued-turn",
-            "input-messages": [correlated_prompt(
-                &native_delegation_prompt("external", "follow up"),
-                &pending,
-            )],
+            "input-messages": [arguments[4]],
             "last-assistant-message": "queued result",
         });
         ADAPTER.handle_hook(&directory, &completion).unwrap();
@@ -2045,6 +2067,67 @@ exit 91
         // The title turn that arrives late changes nothing either.
         ADAPTER.handle_hook(directory.path(), &title_turn).unwrap();
         assert_eq!(event_paths(directory.path()).unwrap().len(), 1);
+    }
+
+    // With `/ide` on, the TUI puts its IDE context in front of the message
+    // (codex-rs/tui/src/ide_context/prompt.rs, rust-v0.159.3). That turn is still the
+    // one Bridge started; the title turn that quotes it is not. Not observed live: the
+    // wrapper is taken from Codex's source.
+    #[test]
+    fn codex_hook_accepts_the_prompt_behind_the_ide_context() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "working", None, None).unwrap();
+        let pending = claim_pending_turn(directory.path());
+        let prompt = correlated_prompt(
+            &native_delegation_prompt("external", "Reply READY."),
+            &pending,
+        );
+        // The active file quotes the request heading itself.
+        let with_context = format!(
+            "# Context from my IDE setup:\n\n## Active file: src/prompt.rs\n\n## Active selection of the file:\nconst PROMPT_REQUEST_BEGIN: &str = \"## My request for Codex:\";\n\n## My request for Codex:\n{prompt}"
+        );
+        let payload = |thread: &str, input: String, answer: &str| {
+            serde_json::json!({
+                "type": "agent-turn-complete",
+                "thread-id": thread,
+                "turn-id": format!("{thread}-turn"),
+                "input-messages": [input],
+                "last-assistant-message": answer,
+            })
+        };
+
+        for refused in [
+            // The title turn quotes the whole message, context included.
+            format!("Generate a concise, single-line task title.\n\nUser prompt:\n{with_context}"),
+            // A context without Bridge's prompt behind any request heading.
+            format!(
+                "# Context from my IDE setup:\n\n## My request for Codex:\nSummarise this.\n{}",
+                pending.marker
+            ),
+            // The headings alone, in a message that does not begin with the context.
+            format!("Note\n## My request for Codex:\n{prompt}"),
+        ] {
+            ADAPTER
+                .handle_hook(
+                    directory.path(),
+                    &payload("other-thread", refused, "{\"title\":\"READY\"}"),
+                )
+                .unwrap();
+            assert!(event_paths(directory.path()).unwrap().is_empty());
+        }
+
+        ADAPTER
+            .handle_hook(
+                directory.path(),
+                &payload("managed-thread", with_context, "READY"),
+            )
+            .unwrap();
+        let paths = event_paths(directory.path()).unwrap();
+        assert_eq!(paths.len(), 1);
+        let event: SessionEvent = read_json(&paths[0]).unwrap();
+        assert_eq!(event.message, "READY");
+        assert_eq!(event.provider_session_id.as_deref(), Some("managed-thread"));
     }
 
     #[test]
