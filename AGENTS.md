@@ -75,18 +75,54 @@ launch, observe, continue, and close without replacing the capabilities those CL
   own `--log-file`: a readiness gate before the paste and a `HandleUserInput` receipt
   after it. This holds for the native Windows initial prompt and for every follow-up on
   native Windows and macOS; the macOS initial prompt is a launch argument and never waits.
-- Agy 1.2.10 discards a paste that lands in its deferred skills reload (10-37 s after
-  `CLI startup completed` on Windows, 11-55 s on macOS, sometimes never). The gate's
-  window is per platform (45 s Windows console, 60 s macOS); a reload outside it is
-  caught by the receipt, not the gate. On macOS the argument-delivered initial
-  prompt starts a conversation a few seconds after startup, and the reload logged right
-  after `Starting new conversation` is that conversation's reload, not the deferred one;
-  the gate must not settle on it (observed 2026-09-24 21:32, macOS smoke: `tell` pasted at
-  +10.3 s, lost to the reload at +11.2 s, reported as delivered). Agy logs `Full redraw
-  completed` on the Windows console only, so the macOS rule does not require it.
+- Agy keeps its workspace-trust dialog over the composer until the exact workspace is in
+  its own trust store (`trustedWorkspaces`), and it still runs an argument-delivered
+  initial prompt behind the dialog. A paste onto the dialog is discarded and its Enter
+  confirms the preselected "Yes, I trust this folder"; Agy then logs the trust reload
+  (`Reloading system slash commands and skills` and three companion lines, 356 bytes) and
+  no receipt. That is the "deferred skills reload" of issues #43 and #48: it trailed every
+  lost paste because the paste caused it, and it never comes in a workspace trusted before
+  launch (reproduced on demand 2026-10-01, Agy 1.2.14, macOS; more than 100 logs, no
+  counterexample).
+- Never paste without both trust facts: Agy's store lists the exact workspace, and this
+  session's own `agy.log` shows the workspace customization load, a `hooks_manager.go`
+  line from a goroutine other than the main one. The store is shared by every Agy
+  process, so a dialog approved in one session leaves another session's dialog open; the
+  log line is per process and appears at startup in a workspace trusted before launch or
+  when the dialog is approved in that session. The macOS follow-up and the native Windows
+  initial paste wait for both and fail `not_sent` at the deadline. Do not put a time
+  window in their place, and do not answer the dialog without verified consent.
+- A log without that line withholds the paste but does not prove an open dialog: the log
+  can be missing, or cut before the line, in a session that has none. Report what was
+  read (the session's trust is unverified) and keep the recovery conditional on what the
+  managed terminal shows: approve a dialog that is there, otherwise replace the session.
+- macOS has no reload window: trust, `CLI startup completed`, one quiet period, then the
+  receipt. The Windows console gate still waits 45 s for the trust reload in a workspace
+  trusted before launch, where it never comes; that wait is kept only because native
+  Windows has not been re-verified since the cause was found. The reload logged right
+  after `Starting new conversation` is that conversation's reload, never the trust reload.
+  Agy logs `Full redraw completed` on the Windows console only, so the macOS rule does
+  not require it.
+- The trust dialog matcher accepts only the exact dialog, alone or followed by a footer
+  that names an Agy model family (`Gemini `, `Claude `, `GPT-`): the footer shows the
+  saved model, which is not always a Gemini one, and appears about a second after the
+  dialog.
 - A missing receipt is delivery-uncertain, never a second paste; the claim is kept and the
   reason lands in `status.error`. Delete the gate and the receipt when Agy exposes an
   input API or an accepted-turn signal; the transcript result monitor is unaffected.
+- A turn Agy gives up on leaves no result in the transcript, only an `agent executor
+  error:` line in `agy.log` (2026-10-01: `RESOURCE_EXHAUSTED (code 429): Individual quota
+  reached`, which made every request wait out its timeout). The result monitor records it
+  as a failed request for the pending claim only when the log itself shows the newest turn
+  to be the pending one: a pasted turn behind the receipt that carries its marker, or the
+  first, argument-delivered turn when the only `USER_INPUT` step of Agy's full transcript
+  carries the marker. The error must follow that turn's `Forwarding user message` line.
+  A result Agy has already written is recorded first; once the failure is recorded the
+  claim is released and a later result of that turn is not accepted. Only the quota
+  error has been observed, so do not assume the same for an error Agy might recover
+  from. Do not bind a failure by the transcript alone: a newer claim's input can reach
+  the transcript before its log lines are written. Replace this with a per-turn failure
+  signal when Agy provides one.
 
 ## Change and Verification Rules
 
