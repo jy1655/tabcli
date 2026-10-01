@@ -29,14 +29,14 @@ Windows는 PowerShell 또는 cmd에서 호출할 수 있고 PowerShell 7(`pwsh.e
 - Agy: 세션 로그와 완료 transcript
 - Pi: 세션 전용 lifecycle 확장
 
-Windows와 macOS는 같은 세션 계약을 구현하지만 provider transport와 authenticated live 검증 범위는 다릅니다. 표의 마지막 열은 native Windows에서 실제 인증된 CLI로 확인한 근거이며, 0.0.9의 항목은 2026-10-01 native Windows LIVE 결과입니다. `구현·CI 검증`은 정적·단위·CI 근거를 뜻하고, 별도 표기가 없는 항목을 authenticated runtime 검증 완료로 해석하면 안 됩니다.
+Windows와 macOS는 같은 세션 계약을 구현하지만 provider transport와 authenticated live 검증 범위는 다릅니다. 표의 마지막 열은 native Windows에서 실제 인증된 CLI로 확인한 근거이며, 0.0.9의 항목은 2026-10-01, 0.0.10의 항목은 2026-10-02의 native Windows LIVE 결과입니다. `구현·CI 검증`은 정적·단위·CI 근거를 뜻하고, 별도 표기가 없는 항목을 authenticated runtime 검증 완료로 해석하면 안 됩니다.
 
 | Provider | macOS transport | native Windows transport | authenticated Windows live 근거 |
 | --- | --- | --- | --- |
-| Codex | 0.149+ native queue(thread UUID 주소 지정) + provider session notify; queue를 쓸 수 없으면 `tell`을 입력 전에 거부하며 terminal follow-up은 없음 | macOS와 같은 queue/notify adapter; 초기 prompt는 Windows console paste; `tell`에는 실행 중인 local daemon이 필요 | 0.0.9 LIVE(Codex CLI 0.159.3): daemon이 실행 중일 때 queue `tell` 완료, daemon이 없을 때 입력 전 거부, 공유 consent의 config override 적용 확인; `/agents` 화면과 두 번째 agent thread 전환은 미검증 |
-| Claude Code | 지원 버전·backend·설정 gate를 모두 통과할 때 공식 cross-session `ListAgents`/`SendMessage` + `Stop` hook | Claude Code 2.1.234+의 공식 named-pipe cross-session `ListAgents`/`SendMessage` + `Stop` hook; 초기 prompt도 argv가 아닌 공식 메시지로 전달 | 0.0.9 LIVE(Claude Code 2.1.286): tab과 console window 양쪽에서 `ask`/`tell`/close 확인; workspace consent는 미검증 |
-| Agy | transcript/result monitor + provider-owned terminal follow-up; 초기 prompt는 `--prompt-interactive` 인자, `tell`은 `agy.log`의 startup readiness 게이트(macOS는 redraw 줄이 없어 요구하지 않음, conversation 시작 직후 reload는 지연 reload로 치지 않음)를 통과한 뒤에만 paste; 모든 paste는 `HandleUserInput` input receipt(완전한 turn marker 포함)가 있어야 전달로 인정, 없으면 delivery-uncertain | transcript/result monitor + Windows console follow-up; 다중행 prompt는 한 줄 JSON 문자열로 framing; 초기 prompt는 `agy.log`의 startup readiness 게이트를 통과한 뒤에만 paste; 초기 prompt와 `tell` 모두 paste 직전 `agy.log` 길이 이후에 기록된 `HandleUserInput` input receipt(완전한 turn marker 포함)가 있어야 전달로 인정, 없으면 delivery-uncertain | 0.0.9 LIVE(Agy 1.2.10, 1.2.14): 신뢰된 workspace의 초기 paste와 receipt, `tell`, 신뢰되지 않은 workspace의 paste 보류, 공유 consent의 대화상자 응답 확인; turn 실패 보고는 미검증; 이전 근거는 v0.0.7 native Windows LIVE(2026-09-24) |
-| Pi | session lifecycle extension + provider-owned terminal follow-up | lifecycle extension + Windows console follow-up; 다중행 prompt는 한 줄 JSON 문자열로 framing | 구현·CI 검증; 0.0.9 LIVE에서는 저장된 Pi 로그인이 무효여서 첫 turn이 provider 오류로 끝났고 Bridge는 그 실패를 즉시 보고함; `tell`과 workspace consent는 미검증 |
+| Codex | 0.149+ native queue(thread UUID 주소 지정) + provider session notify; queue를 쓸 수 없으면 `tell`을 입력 전에 거부하며 terminal follow-up은 없음 | macOS와 같은 queue/notify adapter; 초기 prompt는 Windows console paste; `tell`에는 실행 중인 local daemon이 필요 | 0.0.9 LIVE(Codex CLI 0.159.3): daemon이 실행 중일 때 queue `tell` 완료, daemon이 없을 때 입력 전 거부, 공유 consent의 config override 적용 확인; 0.0.10 LIVE: linked worktree와 하위 디렉터리에서 초기 prompt 전달(#60), task title turn 구별(#61), daemon 실행 중 self-test 통과; `/agents` 화면과 두 번째 agent thread 전환은 미검증 |
+| Claude Code | 지원 버전·backend·설정 gate를 모두 통과할 때 공식 cross-session `ListAgents`/`SendMessage` + `Stop` hook | Claude Code 2.1.234+의 공식 named-pipe cross-session `ListAgents`/`SendMessage` + `Stop` hook; 초기 prompt도 argv가 아닌 공식 메시지로 전달 | 0.0.9 LIVE(Claude Code 2.1.286): tab과 console window 양쪽에서 `ask`/`tell`/close 확인; 0.0.10 LIVE(Claude Code 2.1.287): self-test 통과; workspace consent는 미검증 |
+| Agy | transcript/result monitor + provider-owned terminal follow-up; 초기 prompt는 `--prompt-interactive` 인자, `tell`은 `agy.log`의 startup readiness 게이트(macOS는 redraw 줄이 없어 요구하지 않음, conversation 시작 직후 reload는 지연 reload로 치지 않음)를 통과한 뒤에만 paste; 모든 paste는 `HandleUserInput` input receipt(완전한 turn marker 포함)가 있어야 전달로 인정, 없으면 delivery-uncertain | transcript/result monitor + Windows console follow-up; 다중행 prompt는 한 줄 JSON 문자열로 framing; 초기 prompt는 `agy.log`의 startup readiness 게이트를 통과한 뒤에만 paste; 초기 prompt와 `tell` 모두 paste 직전 `agy.log` 길이 이후에 기록된 `HandleUserInput` input receipt(완전한 turn marker 포함)가 있어야 전달로 인정, 없으면 delivery-uncertain | 0.0.9 LIVE(Agy 1.2.10, 1.2.14): 신뢰된 workspace의 초기 paste와 receipt, `tell`, 신뢰되지 않은 workspace의 paste 보류, 공유 consent의 대화상자 응답 확인; 0.0.10 LIVE(Agy 1.2.14): self-test 통과; turn 실패 보고는 미검증; 이전 근거는 v0.0.7 native Windows LIVE(2026-09-24) |
+| Pi | session lifecycle extension + provider-owned terminal follow-up | lifecycle extension + Windows console follow-up; 다중행 prompt는 한 줄 JSON 문자열로 framing | 0.0.10 LIVE(Pi 0.99.2): 초기 요청과 `tell` 완료, 공유 consent의 `pi-approve-once` 적용, 신뢰 대화상자가 열린 동안 초기 입력 보류, self-test 통과; 0.0.9 LIVE에서는 저장된 Pi 로그인이 무효여서 첫 turn이 provider 오류로 끝났고 Bridge는 그 실패를 즉시 보고함 |
 
 provider별 console follow-up은 각 adapter 내부에 격리되어 있으며, bridge 공통층이 provider payload나 결과 identity를 추측하지 않습니다. Claude의 공식 cross-session 기능을 runtime gate 때문에 사용할 수 없으면 terminal injection으로 우회하지 않고 실패합니다. Codex `tell`은 thread UUID로 주소를 지정하는 native queue로만 전달합니다. queue를 쓸 수 없으면 터미널에 입력하기 전에 거부하며 terminal follow-up으로 우회하지 않습니다.
 
@@ -518,7 +518,169 @@ src/native/tests.rs            provider-neutral native orchestration 단위 테�
 
 이 영수증은 trust **절차의 종료**만 뜻합니다. 사용자가 신뢰를 거절해도 Pi는 보호된 리소스를 제외하고 시작할 수 있으므로, 영수증을 다른 provider의 승인 근거로 쓰지 않습니다. Bridge는 `project_trust`의 결정을 반환하거나 Pi trust store를 수정하지 않습니다. 명시적 `--yolo`의 기존 Pi `--approve` 매핑은 그대로 적용됩니다.
 
-Pi의 초기 입력 보호는 0.0.8부터 포함됩니다. 공용 consent 기록, provider 간 trust 공유, Codex·Agy의 Windows 초기 입력 보호는 0.0.9에 포함됩니다. macOS는 기존 인자 전달 경로를 사용합니다. native Windows에서는 Agy와 Codex의 공유 consent를 LIVE로 확인했고, Claude와 Pi는 미검증입니다.
+Pi의 초기 입력 보호는 0.0.8부터 포함됩니다. 공용 consent 기록, provider 간 trust 공유, Codex·Agy의 Windows 초기 입력 보호는 0.0.9에 포함됩니다. macOS는 기존 인자 전달 경로를 사용합니다. native Windows에서는 Agy와 Codex의 공유 consent를 0.0.9에서, Pi의 공유 consent와 초기 입력 보호를 0.0.10에서 LIVE로 확인했습니다. Claude는 미검증입니다.
+
+## 0.0.10 업데이트
+
+0.0.10은 0.0.9 게시 직후 발견한 Codex 결함 두 건(#60, #61)을 고치고, workspace 신뢰 대기가 세션 종료와 함께 끝나게 하며, 요청 timeline(#53)·Bridge가 관측한 경과 시간(#55)·self-test(#54)를 추가합니다. Codex를 쓰면 0.0.9 대신 0.0.10을 씁니다. 0.0.9는 native Windows에서 Codex가 신뢰하는 repository의 linked worktree나 하위 디렉터리에 첫 prompt를 보내지 않고, 플랫폼과 무관하게 짧은 첫 요청의 결과로 Codex의 task title을 기록할 수 있습니다.
+
+### Codex 초기 prompt (native Windows, #60)
+
+native Windows에서 Codex의 첫 prompt는 관리 console에 붙여넣습니다. 신뢰 대화상자 위에 붙여넣으면 뒤따르는 Enter가 기본 버튼 "Trust and continue"를 누르므로, 신뢰 근거가 있을 때까지 붙여넣지 않습니다. 0.0.9의 근거는 Codex 설정의 정확한 workspace 항목 또는 Bridge가 그 세션에 적용한 consent override뿐이었습니다. Codex CLI 0.159.3은 정확한 항목이 없으면 repository root의 신뢰를 따릅니다(하위 디렉터리, linked worktree). 이때 신뢰 대화상자를 띄우지 않고 정확한 항목도 저장하지 않습니다. 그래서 0.0.9에서는 대기가 끝나지 않았고, 터미널에 composer가 보이는 채로 `ask`가 deadline에 아래 block의 오류로 실패했습니다.
+
+```text
+workspace trust is not verified; no initial console input was sent. Approve the exact workspace in the managed provider and start a new request after a timeout
+```
+
+테스트 PC에서 Codex CLI 0.159.3으로 측정한 결과입니다.
+
+| workspace | `--yolo` | Codex 화면 |
+| --- | --- | --- |
+| 어디에도 신뢰되지 않은 디렉터리 | 있음 | 신뢰 대화상자 |
+| 어디에도 신뢰되지 않은 디렉터리 | 없음 | 신뢰 대화상자 |
+| trusted 항목이 있는 디렉터리 아래의 일반 디렉터리 | 없음 | 신뢰 대화상자 |
+| 정확한 trusted 항목이 있는 repository의 linked worktree | 없음 | 대화상자 없음, composer |
+
+이제 관리 console 화면에 빈 composer 행(`› Ask Codex to do anything`)이 실제로 보이면 prompt를 붙여넣습니다. Codex는 온보딩 화면이나 선택 화면이 없을 때만 composer를 그리므로, 그 행은 신뢰 대화상자가 끝났다는 양성 근거입니다. Codex 설정이나 Git에서 추론하지 않습니다. 빈 화면, 로딩 중인 화면, Bridge가 모르는 배치는 근거가 아닙니다. 화면은 1초에 한 번 읽습니다. 정확한 항목이나 consent override가 있을 때의 경로는 그대로이며 화면을 읽지 않습니다. 사용자가 관리 터미널에서 신뢰 대화상자에 직접 답하면 composer가 나타나고 그때 prompt가 전송됩니다. 이 경우는 LIVE로 실행하지 않았고 화면 순서를 재생하는 테스트로 확인했습니다. 다른 provider와 공유하는 workspace consent는 여전히 정확한 경로만 인정합니다.
+
+workspace 신뢰 대기는 세션이 `failed`·`exited`·`closed`가 되면 끝납니다. 0.0.9에서는 닫힌 세션의 `ask`가 deadline까지 남아 있었습니다. Codex와 Agy의 대기 모두에 적용됩니다. 오류는 아래 block과 같습니다.
+
+```text
+the session is closed and no longer waits for workspace trust; no initial console input was sent
+```
+
+수정한 build로 linked worktree와 trusted repository의 하위 디렉터리에서 `ask`가 각각 약 20초에 완료됐습니다. 어디에도 신뢰되지 않은 디렉터리에서는 대화상자가 그대로였고 화면이 전후 byte 동일했으며 `ask`는 deadline에 `not_sent`로 실패했습니다. 대기 중인 세션을 닫으면 `ask`가 0.5초 안에 끝났습니다.
+
+### Codex task title turn (#61)
+
+Bridge는 Codex의 `notify` hook으로 turn 완료를 압니다. prompt 끝에 turn marker를 붙이고, 0.0.9는 입력이 marker로 끝나는 notify를 받아들였습니다. Codex CLI 0.159.3 TUI는 첫 메시지에 대해 별도 thread에서 task title turn을 실행하고 그 turn도 notify를 보냅니다. 그 입력은 Codex의 지시문 뒤에 사용자 메시지 전체를 인용하므로 marker로 끝납니다. 먼저 도착한 notify가 첫 요청의 결과가 됐습니다. 테스트 PC에서 같은 짧은 prompt 6회 중 2회의 결과가 `{"title":"READY"}`였고, 세션의 thread로 task title turn의 thread가 기록됐습니다. 이후 `tell`은 그 thread를 대상으로 합니다. 이번 작업에서 긴 prompt는 영향을 받지 않았습니다. title 입력이 메시지를 자르는 것으로 보이며 그 길이는 측정하지 않았습니다.
+
+notify의 입력이 Bridge가 모든 prompt 앞에 붙이는 header(`[Agent Bridge native delegation]`)로 시작하고 turn marker로 끝날 때만 받아들입니다. Codex가 스스로 시작한 turn은 메시지를 자기 지시문 뒤에 인용하므로 header로 시작하지 않습니다. `/ide`가 켜져 있으면 Codex TUI가 메시지 앞에 IDE context를 붙입니다(첫 줄 `# Context from my IDE setup:`, context, `## My request for Codex:` 줄). 그 입력도 받아들입니다. 이 형식은 Codex 소스(rust-v0.159.3)에서 확인했고 LIVE로 관측하지는 않았습니다. header는 framing을 구별할 뿐 turn의 identity가 아닙니다. Codex는 첫 notify 전에 identity를 주지 않습니다.
+
+수정한 build로 짧은 첫 요청 6회 중 6회가 정상 결과를 돌려줬습니다. 릴리스 후보로는 linked worktree에서 3회 중 3회가 정상이었고, local Codex daemon을 켠 상태에서 self-test가 Codex와 두 요청을 모두 완료했습니다. macOS와 `/ide`가 켜진 세션은 실행하지 않았습니다.
+
+### 요청 timeline (#53)
+
+`inspect`에 세션의 보존 기록을 각 기록이 가진 시각 순서로 보여 주는 조회가 추가됐습니다.
+
+```bash
+agent-bridge inspect <session> --timeline [--request REQUEST] [--json]
+```
+
+- 요청별로 request receipt, 게시된 completion event, 초기 요청의 launch phase를 보여 줍니다.
+- 요청에 귀속할 수 없는 세션 기록은 따로 보여 줍니다: `launch.log`의 줄, status와 close 기록, terminal close 기록, request·event 색인, legacy event.
+- 각 항목은 session, 해당하면 request와 event, 단계(`stage`), 관측 시각 또는 unknown, 출처 기록, 그 기록의 상태(`observed`, `missing`, `unreadable`, `unpublished`)를 담습니다.
+- 각 요청에는 조회 시점에 요청별 `result`가 보고하는 상태(`completed`, `failed`, `pending`, `unresolved`, `recovery_required`, `unknown`), completion 기록 여부, 아래 "경과 시간"의 값, 정확한 `result` 명령이 붙습니다.
+- 항목에서는 아무것도 추정하지 않습니다. launch deadline을 phase의 시각으로 쓰지 않고, receipt 시각은 receipt를 만든 시각이지 전달 시각이 아니며, `launch.log` 줄은 timestamp와 원문만 보여 줍니다.
+- 조회하는 동안 기록이 바뀌면 timeline이 아니라 실패한 조회로 보고합니다.
+- 조회는 복구·재전송·close·쓰기를 하지 않습니다. 기본 `inspect` 출력과 `result`는 그대로입니다.
+- `--request`는 `--timeline`과 함께만 씁니다. 요청 항목만 거르고 세션 항목은 유지합니다.
+- 한 timeline에서 각 기록은 한 번만 읽으며 유효한 UTF-8이어야 합니다. 그렇지 않은 기록은 사유와 함께 `unreadable`로 보고합니다.
+- `launch.log`는 1 MiB까지, 그 밖의 기록은 64 MiB까지 읽습니다. 더 큰 log는 크기와 한도를 담은 `unreadable` 항목으로 보고하고 timeline을 `incomplete`로 표시합니다.
+- 앞의 숫자를 시각으로 쓸 수 없는 `launch.log` 줄은 시각을 unknown으로 두고 원문을 보여 줍니다.
+- 요청 요약에는 `derived_from` 필드가 있고 값은 `result`입니다. 요약의 상태와 진단은 조회 시점에 요청별 `result`가 보고하는 것이며, 기록된 deadline이 지난 launch의 진단도 포함합니다. launch 항목은 `launch.json`에 있는 것만 보여 줍니다.
+
+JSON의 최상위 필드입니다.
+
+| 필드 | 의미 |
+| --- | --- |
+| `schema_version` | `1` |
+| `ok` | 조회 성공 여부. 요청의 성공이나 전달 확정을 뜻하지 않음 |
+| `session` | 조회한 session |
+| `request_id` | `--request`로 지정한 요청, 없으면 `null` |
+| `session_state`, `session_error` | 저장된 세션 상태와 오류 |
+| `recovery_required` | completion journal 존재 여부 |
+| `incomplete` | 색인·기록 손상, event directory 누락, 누락되거나 게시되지 않은 completion 등 확인된 공백 여부 |
+| `unreadable_requests`, `request_index_error` | 읽을 수 없는 receipt 수와 색인 오류 |
+| `requests` | 요청별 상태 요약 |
+| `entries` | 요청에 귀속된 항목 |
+| `session_entries` | 요청에 귀속할 수 없는 세션 항목 |
+| `doctor_command` | `agent-bridge doctor <session> --json` |
+
+각 항목의 필드입니다.
+
+| 필드 | 의미 |
+| --- | --- |
+| `session`, `request_id`, `event_id` | 주소. 귀속할 수 없으면 `null` |
+| `stage` | `request_receipt`, `completion`, `launch_phase`, `completion_journal`, `status`, `request_index`, `event_index`, `closed_status`, `terminal_closing`, `terminal_closed`, `launch_log` |
+| `observed_unix_ms` | 기록에 저장된 시각(Unix ms), 없으면 `null` |
+| `source` | 세션 디렉터리 기준 출처 파일 |
+| `record_state` | `observed`, `missing`, `unreadable`, `unpublished` |
+| `detail` | 단계별 근거 객체, 오류 문자열 또는 `null` |
+
+### Bridge가 관측한 경과 시간 (#55)
+
+- `bridge_observed_elapsed_ms`는 request receipt를 만든 시각부터 게시된 completion event의 생성 시각까지의 밀리초이거나 `null`입니다.
+- `bridge_observed_elapsed_reason`은 계산됐으면 `null`이고, 아니면 `no_published_result`, `missing_receipt`(receipt 없는 legacy event), `missing_receipt_time`, `missing_result_time`, `inverted_time` 중 하나입니다. `inspect`에서는 `unreadable_result`도 있습니다.
+- 두 필드는 요청별 `result`, `result --list`의 각 항목, `inspect`(최신 결과와 모든 요청), timeline, 완료된 `ask`·`tell` 응답에 들어갑니다.
+- `result`의 사람용 출력은 `Bridge observed elapsed: N ms` 또는 사유를 보여 줍니다.
+- 값은 Bridge가 관측한 wall-clock 시간이며 dispatch와 전달 대기를 포함합니다. 모델 처리 시간이나 과금 시간이 아닙니다. 결과 시각이 receipt 시각보다 이르면 0으로 고치지 않고 `inverted_time`으로 보고합니다. 두 시각이 같으면 `0`입니다.
+- 값은 조회할 때마다 계산하며 저장하지 않습니다.
+- 시각 없는 기록을 보고하려고 receipt와 event의 `created_unix_ms`를 읽을 때는 없어도 되게 했습니다. 쓰는 쪽은 항상 기록하고, 결과를 context로 첨부할 때는 여전히 필요하며, 시각 없는 completion은 게시하지 않습니다.
+- provider 사용량(tokens, cost)은 수집하지 않습니다. 현재 Bridge가 받는 신호(Codex notify payload, Claude `Stop` hook 입력, extension이 읽는 Pi lifecycle event, Agy transcript)에는 사용량이 없습니다. provider에 사용량 API가 없다는 뜻은 아닙니다.
+
+### self-test (#54)
+
+설치된 provider와의 실제 왕복을 확인하는 명령입니다.
+
+```bash
+agent-bridge self-test <codex|claude|agy|pi> [--workspace PATH]
+    [--terminal <ghostty|iterm2|terminal|windows-console>]
+    [--model MODEL] [--effort EFFORT] [--yolo]
+    [--timeout-secs N] [--isolated] [--json]
+```
+
+- 실제 모델 호출을 하고 실제 터미널을 엽니다. 다른 명령이 이 명령을 부르지 않습니다.
+- 공개 명령으로 다섯 단계(`ask`, `initial_result`, `tell`, `follow_up_result`, `cleanup`)를 실행합니다. 두 요청 모두 그 실행의 고유 marker를 각자의 request와 event로 돌려줘야 합니다.
+- 각 단계는 `passed`, `failed`, `timed_out`, `unsupported`, `not_verified` 중 하나로 끝납니다. 보고서는 단계별 경과 시간·request와 event 주소·사유, 그리고 Bridge 버전·provider 버전·터미널·state root·세션과 정리 후 상태를 담습니다.
+- 모든 단계와 정리가 통과했을 때만 종료 코드가 0입니다.
+- 기본으로 평소 state root에서 실행하며 그 설정과 consent 기록을 그대로 씁니다. 닫는 세션은 자신의 `ask`가 돌려준 id의 세션입니다. `ask`가 id를 돌려주지 않은 경우에만 그 실행 고유의 title로 세션을 찾고, 정확히 하나일 때만 인정합니다.
+- `--isolated`를 주면 그 실행만의 private state 디렉터리를 씁니다. `AGENT_BRIDGE_NATIVE_STATE_DIR`가 있으면 그 아래, 없으면 시스템 임시 디렉터리 아래에 만듭니다. 평소 state root의 설정과 consent 기록은 적용되지 않고, 디렉터리는 사용자가 지울 때까지 남습니다.
+- 전달이 불확실한 prompt를 다시 보내지 않고, workspace 신뢰를 승인하지 않으며, prune하지 않고, 자신이 만들지 않은 세션을 닫지 않습니다. 닫힌 세션은 다른 닫힌 세션처럼 state root에 남습니다.
+- `--timeout-secs`는 명령 하나의 예산(기본 120초)이며 전체 실행의 제한이 아닙니다.
+- 요청 명령에는 `--timeout-secs` 예산에 5초를 더한 한도가, close와 그 확인에는 각각 10초의 한도가 있습니다. 한도 안에 돌아오지 않는 명령은 끝내고 그 단계를 `timed_out`으로 보고합니다. 정리는 그래도 시도합니다.
+- `--isolated`에서는 private 디렉터리의 모든 세션을 닫습니다. `ask`가 돌려준 세션을 먼저 닫고, 보고서의 `cleanup_sessions`에 각 세션을 적습니다.
+
+JSON 보고서의 필드입니다.
+
+| 필드 | 의미 |
+| --- | --- |
+| `schema_version` | `1` |
+| `bridge_version`, `provider`, `provider_version`, `terminal` | 실행한 Bridge와 provider, 기록된 CLI 버전과 터미널. 알 수 없으면 `null` |
+| `state_root` | 실행이 쓴 state root |
+| `isolated` | `--isolated` 실행이면 `true` |
+| `marker` | 두 응답에 요구하는 고유 문자열 |
+| `session`, `session_state` | 만든 세션과 정리 후 관측한 상태, 없으면 `null` |
+| `outcome` | 통과하지 못한 첫 단계의 결과, 모두 통과하면 `passed` |
+| `elapsed_ms` | 전체 경과 시간(ms) |
+| `steps[]` | `name`, `outcome`, `elapsed_ms`, `request_address`, `event_address`, `reason` |
+| `cleanup_sessions[]` | 정리한 세션별 `session`, `session_state`, `outcome`, `reason` |
+
+테스트 PC(Windows Terminal 1.24)에서 릴리스 후보로 실행한 결과입니다.
+
+| provider | 방식 | 결과 |
+| --- | --- | --- |
+| Claude Code 2.1.287 | 기본 | 모든 단계 통과, 43.3 s (`session-5aU43A`) |
+| Claude Code 2.1.287 | `--isolated` | 모든 단계 통과, 37.7 s (`session-O71WMr`) |
+| Agy 1.2.14 | 기본 | 모든 단계 통과, 58.8 s (`session-xFslsi`) |
+| Pi 0.99.2 | 기본 | 모든 단계 통과, 11.0 s (`session-Zo5WLc`) |
+| Codex CLI 0.159.3, local daemon 실행 중 | 기본 | 모든 단계 통과, 25.7 s (`session-TXv9Kk`) |
+| Codex CLI 0.159.3, local daemon 없음 | 기본 | `tell`이 `unsupported`로 끝나고 21.4 s 뒤 종료 코드 1, 세션은 닫힘 (`session-VJ9pza`) |
+
+모든 실행은 `AGENT_BRIDGE_NATIVE_STATE_DIR`로 지정한 state root를 썼고, Codex의 `tell`에는 실행 중인 local Codex daemon이 필요하며 Bridge는 그 daemon을 시작하지 않습니다.
+
+### native Windows의 Pi 확인
+
+테스트 PC의 Pi 로그인을 갱신한 뒤, 0.0.9에서 미검증으로 남았던 Pi 항목을 Pi 0.99.2와 0.0.9 코드로 실행했습니다. `--yolo`는 쓰지 않았습니다.
+
+| 경우 | 근거 | 결과 |
+| --- | --- | --- |
+| Codex가 정확히 신뢰하는 workspace | `session-TUTYoG` | consent `verified`, `applied=pi-approve-once`; `ask` 8.8 s, `tell` 2.6 s |
+| Agy가 정확히 신뢰하고 `.pi` 아래에 project resource가 있는 workspace | `session-3W1uzJ` | consent `verified`, `applied=pi-approve-once`; 신뢰 대화상자 없음; `ask` 7.9 s, `tell` 1.9 s; Pi trust store는 만들어지지 않음 |
+| 어디에도 신뢰되지 않고 project resource가 없는 workspace | `session-aBKIBB` | Pi가 대화상자를 띄우지 않음; `ask` 완료; 적용된 것 없음 |
+| 어디에도 신뢰되지 않고 `.pi` 아래에 project resource가 있는 workspace | `session-bX0oI0` | Pi가 `Trust project folder?`를 띄움; 초기 입력 보류; `ask`가 45초 deadline에 실패; 화면 byte 동일; Pi trust store는 만들어지지 않음 |
+
+검증 범위와 근거는 [0.0.10 릴리스 노트](docs/releases/0.0.10.md)와 [2026-10-02 native Windows 검증 기록](docs/verification/2026-10-02-windows.md)에 있습니다. 이번 릴리스의 변경은 모두 native Windows에서만 실행했습니다. macOS와 Linux target은 compile과 lint만 했습니다. native Windows의 Claude workspace consent는 여전히 미검증입니다.
 
 ## 0.0.9 업데이트
 
