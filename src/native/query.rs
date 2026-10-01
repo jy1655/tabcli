@@ -374,6 +374,15 @@ impl Snapshot {
     }
 
     pub(super) fn result(&self, directory: &Path, selector: &Selector) -> Result<Value> {
+        self.result_with(selector, |name| self.event(directory, name))
+    }
+
+    // Timeline uses cached strict bytes; ordinary queries keep their reader.
+    fn result_with(
+        &self,
+        selector: &Selector,
+        read_event: impl FnOnce(&str) -> Result<Option<SessionEvent>>,
+    ) -> Result<Value> {
         let receipt = match selector {
             Selector::Request(id) => Some(
                 self.receipts
@@ -401,10 +410,7 @@ impl Snapshot {
             Selector::List => bail!("list is not a single result selector"),
         };
         let receipt = receipt.or_else(|| name.and_then(|name| self.receipt_for_event(name)));
-        let event = name
-            .map(|name| self.event(directory, name))
-            .transpose()?
-            .flatten();
+        let event = name.map(read_event).transpose()?.flatten();
         if matches!(selector, Selector::Event(_))
             && event.is_none()
             && name.is_some_and(|name| self.published(name))
