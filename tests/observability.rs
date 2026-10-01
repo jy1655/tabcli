@@ -691,3 +691,260 @@ fn result_human_output_reports_bridge_elapsed_and_legacy_reason() {
         human(&["result", "session-observe", "--list"]).contains("Bridge observed elapsed: 2 ms")
     );
 }
+
+#[test]
+fn timeline_invalid_utf8_is_unreadable() {
+    for source in [
+        "events/event-1.json",
+        "requests/123-456-0.json",
+        "closed.json",
+        "terminal.closed.json",
+    ] {
+        let fixture = Fixture::new();
+        request(&fixture, "123-456-0", "request-turn", "event-1.json");
+        fixture.event("event-1.json", "damage");
+        if source == "closed.json" {
+            fs::copy(
+                fixture.directory.join("status.json"),
+                fixture.directory.join(source),
+            )
+            .unwrap();
+        }
+        if source == "terminal.closed.json" {
+            write(
+                &fixture.directory.join(source),
+                &json!({"message": "damage"}),
+            );
+        }
+        let path = fixture.directory.join(source);
+        let mut bytes = fs::read(&path).unwrap();
+        let needle: &[u8] = if source.starts_with("requests/") {
+            b"request-turn"
+        } else if source == "closed.json" {
+            b"ready"
+        } else {
+            b"damage"
+        };
+        let at = bytes
+            .windows(needle.len())
+            .position(|b| b == needle)
+            .unwrap();
+        bytes[at] = 255;
+        fs::write(path, bytes).unwrap();
+        let value = timeline(&fixture, None);
+        assert!(
+            value["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .chain(value["session_entries"].as_array().unwrap())
+                .any(|e| e["source"] == source && e["record_state"] == "unreadable"),
+            "{source}: {value}"
+        );
+    }
+}
+
+#[test]
+fn timeline_oversized_records_are_unreadable() {
+    for (source, limit) in [
+        ("launch.log", 1024 * 1024),
+        ("events/event-1.json", 64 * 1024 * 1024),
+    ] {
+        let fixture = Fixture::new();
+        request(&fixture, "123-456-0", "request-turn", "event-1.json");
+        let file = fs::File::create(fixture.directory.join(source)).unwrap();
+        file.set_len(limit + 1).unwrap();
+        let value = timeline(&fixture, None);
+        let e = value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(value["session_entries"].as_array().unwrap())
+            .find(|e| e["source"] == source)
+            .unwrap();
+        assert_eq!(e["record_state"], "unreadable");
+        assert!(e["detail"].to_string().contains(&limit.to_string()));
+    }
+}
+
+#[test]
+fn timeline_log_timestamp_overflow_has_unknown_time() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.directory.join("launch.log"),
+        "18446744073709551616 message\n",
+    )
+    .unwrap();
+    let value = timeline(&fixture, None);
+    let e = value["session_entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["stage"] == "launch_log")
+        .unwrap();
+    assert!(e["observed_unix_ms"].is_null());
+    assert_eq!(e["detail"]["text"], "18446744073709551616 message");
+}
+
+#[test]
+fn timeline_completion_without_time_is_recorded_delivery() {
+    let fixture = Fixture::new();
+    request(&fixture, "123-456-0", "request-turn", "event-1.json");
+    let mut event = fixture.event("event-1.json", "done");
+    event["created_unix_ms"] = Value::Null;
+    write(&fixture.directory.join("events/event-1.json"), &event);
+    let value = timeline(&fixture, Some("request-turn"));
+    assert_eq!(value["requests"][0]["request_state"], "completed");
+    assert_eq!(value["requests"][0]["delivery"], "completion_recorded");
+    assert!(
+        value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["stage"] == "completion")
+            .unwrap()["observed_unix_ms"]
+            .is_null()
+    );
+}
+
+#[test]
+fn timeline_expired_launch_summary_is_derived_from_result() {
+    let fixture = Fixture::new();
+    request(&fixture, "123-456-0", "request-turn", "event-1.json");
+    fs::write(fixture.directory.join("turn.claim"), "123-456-0\n").unwrap();
+    write(
+        &fixture.directory.join("status.json"),
+        &json!({"state": "launching", "updated_unix_ms": 4}),
+    );
+    write(
+        &fixture.directory.join("launch.json"),
+        &json!({"schema":1,"claim_token":"123-456-0","phase":"pending","deadline_unix_ms":1}),
+    );
+    let value = timeline(&fixture, Some("request-turn"));
+    let exact = success(fixture.run(&[
+        "result",
+        "session-observe",
+        "--request",
+        "request-turn",
+        "--json",
+    ]));
+    assert_eq!(
+        value["requests"][0]["request_state"],
+        exact["request_state"]
+    );
+    assert_eq!(exact["request_state"], "unresolved");
+    assert_eq!(value["requests"][0]["error"], exact["error"]);
+    assert_eq!(value["requests"][0]["derived_from"], "result");
+    let diagnostic = exact["error"].as_str().unwrap();
+    assert!(!value["entries"].to_string().contains(diagnostic));
+    let launch = value["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["stage"] == "launch_phase")
+        .unwrap();
+    assert_eq!(
+        launch["detail"],
+        json!({"phase":"pending","deadline_unix_ms":1})
+    );
+    assert!(launch["observed_unix_ms"].is_null());
+}
+
+#[test]
+fn timeline_request_ignores_other_requests_event_bytes() {
+    let fixture = Fixture::new();
+    request(&fixture, "123-456-0", "request-first", "event-1.json");
+    request(&fixture, "123-457-1", "request-second", "event-2.json");
+    fixture.event("event-1.json", "done");
+    fs::write(fixture.directory.join("events/event-2.json"), [255]).unwrap();
+    let selected = timeline(&fixture, Some("request-first"));
+    assert_eq!(selected["incomplete"], false);
+    assert!(!selected.to_string().contains("events/event-2.json"));
+    assert_eq!(timeline(&fixture, None)["incomplete"], true);
+}
+
+#[test]
+fn timeline_recorded_timestamp_overflow_never_panics() {
+    for source in [
+        "events/event-1.json",
+        "requests/123-456-0.json",
+        "status.json",
+        "launch.json",
+        "closed.json",
+    ] {
+        let fixture = Fixture::new();
+        request(&fixture, "123-456-0", "request-turn", "event-1.json");
+        fixture.event("event-1.json", "done");
+        if source == "closed.json" {
+            fs::copy(
+                fixture.directory.join("status.json"),
+                fixture.directory.join(source),
+            )
+            .unwrap();
+        }
+        if source == "launch.json" {
+            fs::write(
+                fixture.directory.join(source),
+                r#"{"schema":1,"claim_token":"123-456-0","phase":"pending","deadline_unix_ms":3}"#,
+            )
+            .unwrap();
+        }
+        let path = fixture.directory.join(source);
+        let text = fs::read_to_string(&path).unwrap();
+        let field = if source == "launch.json" {
+            "deadline_unix_ms"
+        } else if source.ends_with("status.json") || source == "closed.json" {
+            "updated_unix_ms"
+        } else {
+            "created_unix_ms"
+        };
+        let mut value: Value = serde_json::from_str(&text).unwrap();
+        value[field] = json!("OVERFLOW");
+        let text = serde_json::to_string(&value)
+            .unwrap()
+            .replace("\"OVERFLOW\"", "18446744073709551616");
+        fs::write(path, text).unwrap();
+        let output = fixture.run(&["inspect", "session-observe", "--timeline", "--json"]);
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            value["ok"] == false || value["incomplete"] == true,
+            "{source}: {value}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
+    }
+}
+
+#[test]
+fn timeline_unpublished_invalid_utf8_is_still_unreadable() {
+    let fixture = Fixture::new();
+    request(&fixture, "123-456-0", "request-turn", "event-1.json");
+    fs::write(fixture.directory.join("turn.claim"), "123-456-0\n").unwrap();
+    fs::write(fixture.directory.join("events/event-1.json"), [255]).unwrap();
+    let value = timeline(&fixture, Some("request-turn"));
+    let e = value["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["stage"] == "completion")
+        .unwrap();
+    assert_eq!(e["record_state"], "unreadable");
+    assert!(e["detail"].as_str().unwrap().contains("invalid UTF-8"));
+    assert_eq!(value["requests"][0]["request_state"], "pending");
+}
+
+#[test]
+fn timeline_launch_failure_without_completion_keeps_delivery_unknown() {
+    let fixture = Fixture::new();
+    request(&fixture, "123-456-0", "request-turn", "event-1.json");
+    write(
+        &fixture.directory.join("status.json"),
+        &json!({"state":"failed","updated_unix_ms":4,"error":"launch failed"}),
+    );
+    write(
+        &fixture.directory.join("launch.json"),
+        &json!({"schema":1,"claim_token":"123-456-0","phase":"pending","deadline_unix_ms":1}),
+    );
+    let value = timeline(&fixture, Some("request-turn"));
+    assert_eq!(value["requests"][0]["request_state"], "failed");
+    assert_eq!(value["requests"][0]["delivery"], "unknown");
+}

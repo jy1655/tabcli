@@ -9876,3 +9876,35 @@ fn observed_elapsed_requires_a_published_result_and_keeps_inspect_available() {
         "unreadable_result"
     );
 }
+
+#[test]
+fn timeline_aba_replacement_keeps_summary_and_entry_together() {
+    let directory = tempfile::tempdir().unwrap();
+    let (request, token, path) = seed_claimed_session(directory.path());
+    release_turn_claim_token(&directory.path().join(TURN_CLAIM_FILE), &token).unwrap();
+    let a = oversized_sample_event("A");
+    write_json_atomic(&path, &a).unwrap();
+    let original = fs::read(&path).unwrap();
+    let mut calls = 0;
+    let value = query::with_snapshot_hook(
+        move |_| {
+            calls += 1;
+            if calls == 1 {
+                let mut b = oversized_sample_event("B");
+                b.error = Some("B failure".to_owned());
+                write_json_atomic(&path, &b).unwrap();
+            } else {
+                fs::write(&path, &original).unwrap();
+            }
+        },
+        || query::timeline_value(directory.path(), "session-query", Some(&request)),
+    )
+    .unwrap();
+    let completion = value["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["stage"] == "completion")
+        .unwrap();
+    assert_eq!(value["requests"][0]["error"], completion["detail"]["error"]);
+}
