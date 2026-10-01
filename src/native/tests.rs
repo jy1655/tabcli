@@ -9908,3 +9908,28 @@ fn timeline_aba_replacement_keeps_summary_and_entry_together() {
         .unwrap();
     assert_eq!(value["requests"][0]["error"], completion["detail"]["error"]);
 }
+
+#[test]
+fn completion_journal_without_result_time_cannot_publish_or_release_claim() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), "working", None, None).unwrap();
+    let claim = acquire_turn_claim(directory.path()).unwrap();
+    let mut pending = sample_completion(&claim.token, "untimed result");
+    pending.event.created_unix_ms = None;
+    claim.retain();
+    let mut journal = serde_json::to_value(&pending).unwrap();
+    journal["event"]
+        .as_object_mut()
+        .unwrap()
+        .remove("created_unix_ms");
+    assert!(serde_json::from_value::<PendingTurnCompletion>(journal.clone()).is_ok());
+    write_json_atomic(&directory.path().join(TURN_COMPLETION_FILE), &journal).unwrap();
+    let error = recover_pending_completion(directory.path()).unwrap_err();
+    assert!(format!("{error:#}").contains("missing created_unix_ms"));
+    assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+    assert!(directory.path().join(TURN_COMPLETION_FILE).exists());
+    assert!(event_paths(directory.path()).unwrap().is_empty());
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "working");
+}
