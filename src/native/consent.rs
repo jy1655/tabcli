@@ -182,7 +182,7 @@ pub(super) fn read_store(path: &Path) -> Result<Option<String>> {
         }
     }
     #[cfg(windows)]
-    if windows_owner(path)? != windows_current_user()? {
+    if !windows_current_owners()?.contains(&windows_owner(path)?) {
         bail!("trust store owner differs from current user");
     }
     if !opened_meta.is_file() || opened_meta.len() > 8 * 1024 * 1024 {
@@ -511,11 +511,16 @@ pub(super) fn run(args: &[String]) -> Result<()> {
     })
 }
 
+// The owners that a file written by this user's own processes can have: the user, and the
+// default owner of this process's token. For an elevated process that is the
+// Administrators group, and a provider that ran elevated left its trust store owned by
+// it (every file of a GitHub Windows runner is). A store with any other owner was
+// written by someone else.
 #[cfg(windows)]
-fn windows_current_user() -> Result<String> {
+fn windows_current_owners() -> Result<Vec<String>> {
     use std::os::windows::io::FromRawHandle;
     use windows_sys::Win32::{
-        Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser},
+        Security::{GetTokenInformation, PSID, TOKEN_QUERY, TokenOwner, TokenUser},
         System::Threading::{GetCurrentProcess, OpenProcessToken},
     };
     let mut raw = std::ptr::null_mut();
@@ -523,22 +528,24 @@ fn windows_current_user() -> Result<String> {
         return Err(std::io::Error::last_os_error().into());
     }
     let _handle = unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(raw) };
-    let mut needed = 0;
-    unsafe { GetTokenInformation(raw, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
-    let mut buffer = vec![0usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
-    if unsafe {
-        GetTokenInformation(
-            raw,
-            TokenUser,
-            buffer.as_mut_ptr().cast(),
-            needed,
-            &mut needed,
-        )
-    } == 0
-    {
-        return Err(std::io::Error::last_os_error().into());
+    let mut owners = Vec::new();
+    // `TOKEN_USER` and `TOKEN_OWNER` both begin with the pointer to their SID.
+    for class in [TokenUser, TokenOwner] {
+        let mut needed = 0;
+        unsafe { GetTokenInformation(raw, class, std::ptr::null_mut(), 0, &mut needed) };
+        let mut buffer = vec![0usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
+        if unsafe {
+            GetTokenInformation(raw, class, buffer.as_mut_ptr().cast(), needed, &mut needed)
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let sid = windows_sid(unsafe { *buffer.as_ptr().cast::<PSID>() })?;
+        if !owners.contains(&sid) {
+            owners.push(sid);
+        }
     }
-    windows_sid(unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid })
+    Ok(owners)
 }
 
 #[cfg(windows)]
@@ -626,6 +633,25 @@ mod tests {
                 .as_bytes(),
         )
         .unwrap();
+    }
+
+    // A provider that ran elevated leaves its store owned by the Administrators group,
+    // which is the default owner of an elevated token and of every file on a GitHub
+    // Windows runner. Whichever owner Windows gives a file that this process writes, it
+    // is one of this process's own.
+    #[cfg(windows)]
+    #[test]
+    fn a_store_written_by_this_user_is_read_whoever_windows_made_its_owner() {
+        let (_temp, workspace, homes) = setup();
+        trust_pi(&homes, &workspace);
+
+        let owners = windows_current_owners().unwrap();
+        assert!((1..=2).contains(&owners.len()), "{owners:?}");
+        assert!(
+            owners.contains(&windows_owner(&homes.pi).unwrap()),
+            "{owners:?}"
+        );
+        assert!(read_store(&homes.pi).unwrap().is_some());
     }
 
     #[test]
