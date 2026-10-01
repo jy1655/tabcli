@@ -1,6 +1,11 @@
 use super::*;
 use serde_json::Value;
 
+// Let each public command report its timeout before the outer deadline.
+const COMMAND_MARGIN: Duration = Duration::from_secs(5);
+// Each close and read-only confirmation gets its own fixed deadline.
+const CLEANUP_BUDGET: Duration = Duration::from_secs(10);
+
 #[derive(Debug)]
 pub(crate) struct Request {
     ask: AskRequest,
@@ -60,6 +65,14 @@ struct Step {
 }
 
 #[derive(Debug, Serialize)]
+struct CleanupSession {
+    session: String,
+    session_state: Option<String>,
+    outcome: Outcome,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct Report {
     schema_version: u32,
     bridge_version: &'static str,
@@ -74,6 +87,7 @@ struct Report {
     outcome: Outcome,
     elapsed_ms: u128,
     steps: Vec<Step>,
+    cleanup_sessions: Vec<CleanupSession>,
 }
 
 struct Reply {
@@ -84,7 +98,8 @@ struct Reply {
 
 // Public command execution and ownership discovery are the only runtime-facing operations.
 trait Operations {
-    fn call(&mut self, args: &[String]) -> Reply;
+    fn call(&mut self, args: &[String], budget: Duration) -> Reply;
+    fn private_sessions(&self) -> Result<Vec<String>>;
     fn owned_session(&self, workspace: &Path, title: &str) -> Result<Option<String>>;
     fn metadata(&self, session: &str) -> Result<(String, Option<String>)>;
 }
@@ -96,28 +111,17 @@ struct Installed {
 }
 
 impl Installed {
-    fn private_session(&self) -> Result<Option<String>> {
+    fn private_sessions(&self) -> Result<Vec<String>> {
         let mut sessions = Vec::new();
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
             if valid_session_id(&name) && entry.file_type()?.is_dir() {
-                let directory = session_directory_in(&self.root, &name)?;
-                if directory.join("manifest.json").exists() {
-                    let manifest = read_manifest(&directory)?;
-                    if manifest.id != name {
-                        bail!("self-test session manifest has a different id")
-                    }
-                    sessions.push(name);
-                }
+                sessions.push(name);
             }
         }
-        if sessions.len() > 1 {
-            bail!(
-                "self-test state contains more than one session; cleanup ownership is not verified"
-            )
-        }
-        Ok(sessions.pop())
+        sessions.sort();
+        Ok(sessions)
     }
 
     fn command(&self, args: &[String]) -> Command {
@@ -131,8 +135,11 @@ impl Installed {
 }
 
 impl Operations for Installed {
-    fn call(&mut self, args: &[String]) -> Reply {
-        match self.command(args).output() {
+    fn call(&mut self, args: &[String], budget: Duration) -> Reply {
+        let label = format!("self-test {} command did not return", args[0]);
+        let output = checked_deadline_from(Instant::now(), budget)
+            .and_then(|deadline| command_output_until(&mut self.command(args), deadline, &label));
+        match output {
             Ok(output) => {
                 let value: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);
                 let error = value["error"].as_str().map(str::to_owned).or_else(|| {
@@ -153,9 +160,13 @@ impl Operations for Installed {
         }
     }
 
+    fn private_sessions(&self) -> Result<Vec<String>> {
+        Installed::private_sessions(self)
+    }
+
     fn owned_session(&self, workspace: &Path, title: &str) -> Result<Option<String>> {
         if self.isolated {
-            return self.private_session();
+            return Ok(self.private_sessions()?.into_iter().next());
         }
         let NativeCommand::Sessions(request) = parse_sessions(&arguments(&[
             "--workspace",
@@ -334,6 +345,7 @@ fn orchestrate(
         outcome: Outcome::NotVerified,
         elapsed_ms: 0,
         steps: Vec::new(),
+        cleanup_sessions: Vec::new(),
     };
     let title = format!("Agent Bridge self-test {}", report.marker);
     let mut args = arguments(&["ask", ask.provider.as_str(), "--workspace"]);
@@ -363,11 +375,11 @@ fn orchestrate(
         args.push("--yolo".to_owned());
     }
     let start = Instant::now();
-    let initial = operations.call(&args);
+    let initial = operations.call(&args, ask.timeout.saturating_add(COMMAND_MARGIN));
     let mut initial_step = step("ask", start, &initial);
     report.session = initial.value["session"].as_str().map(str::to_owned);
     let ownership = match report.session.as_deref() {
-        Some(id) if !request.isolated => require_valid_session_id(id).map(|()| Some(id.to_owned())),
+        Some(id) => require_valid_session_id(id).map(|()| Some(id.to_owned())),
         _ => operations.owned_session(&ask.workspace, &title),
     };
     let ownership_error = match ownership {
@@ -382,11 +394,6 @@ fn orchestrate(
         Ok(None) => Some("no session with the exact self-test title was found".to_owned()),
         Err(error) => Some(format!("cannot verify cleanup ownership: {error:#}")),
     };
-    if request.isolated
-        && let Some(reason) = &ownership_error
-    {
-        reject(&mut initial_step, Outcome::NotVerified, reason);
-    }
     if initial_step.outcome == Outcome::Passed
         && (report.session.is_none()
             || initial.value["session"].as_str() != report.session.as_deref()
@@ -447,7 +454,7 @@ fn orchestrate(
             ])
         };
         let start = Instant::now();
-        let reply = operations.call(&args);
+        let reply = operations.call(&args, ask.timeout.saturating_add(COMMAND_MARGIN));
         let mut current = step(name, start, &reply);
         if name == "tell" {
             if current.outcome == Outcome::Passed
@@ -486,32 +493,72 @@ fn orchestrate(
         event_address: None,
         reason: Some("no session was created".to_owned()),
     };
-    if let Some(reason) = ownership_error {
-        reject(&mut cleanup, Outcome::NotVerified, &reason);
-    } else if let Some(session) = &report.session {
-        let reply = operations.call(&arguments(&[
-            "close-session",
-            session,
-            "--explicit",
-            "--json",
-        ]));
-        cleanup = step("cleanup", start, &reply);
-        let observed = operations.call(&arguments(&["inspect", session, "--json"]));
-        report.session_state = observed.value["stored_state"].as_str().map(str::to_owned);
-        if cleanup.outcome == Outcome::Passed
-            && (reply.value["session"] != *session
-                || reply.value["closed"] != true
-                || !observed.ok
-                || report.session_state.as_deref() != Some("closed"))
-        {
-            reject(
-                &mut cleanup,
-                Outcome::NotVerified,
-                "close could not be confirmed; inspect the reported session in the reported state root",
-            );
+    let mut targets: Vec<String> = report
+        .session
+        .iter()
+        .filter(|id| valid_session_id(id))
+        .cloned()
+        .collect();
+    let mut discovery_error = ownership_error;
+    if request.isolated {
+        match operations.private_sessions() {
+            Ok(sessions) => {
+                for session in sessions {
+                    if !targets.contains(&session) {
+                        targets.push(session);
+                    }
+                }
+            }
+            Err(error) => {
+                discovery_error = Some(format!("cannot discover all private sessions: {error:#}"))
+            }
         }
-        cleanup.elapsed_ms = start.elapsed().as_millis();
     }
+    for session in targets {
+        let close_start = Instant::now();
+        let reply = operations.call(
+            &arguments(&["close-session", &session, "--explicit", "--json"]),
+            CLEANUP_BUDGET,
+        );
+        let mut closed = step("cleanup", close_start, &reply);
+        let observed =
+            operations.call(&arguments(&["inspect", &session, "--json"]), CLEANUP_BUDGET);
+        let state = observed.value["stored_state"].as_str().map(str::to_owned);
+        if report.session.as_deref() == Some(&session) {
+            report.session_state = state.clone();
+        }
+        if closed.outcome == Outcome::Passed {
+            if !observed.ok {
+                let (outcome, reason) = failure(&observed);
+                reject(&mut closed, outcome, &reason);
+            } else if reply.value["session"] != session
+                || reply.value["closed"] != true
+                || state.as_deref() != Some("closed")
+            {
+                reject(
+                    &mut closed,
+                    Outcome::NotVerified,
+                    "close could not be confirmed; inspect the reported session in the reported state root",
+                );
+            }
+        }
+        if cleanup.outcome == Outcome::Passed {
+            cleanup.outcome = closed.outcome;
+            cleanup.reason = closed.reason.clone();
+        }
+        report.cleanup_sessions.push(CleanupSession {
+            session,
+            session_state: state,
+            outcome: closed.outcome,
+            reason: closed.reason,
+        });
+    }
+    if let Some(reason) = discovery_error
+        && cleanup.outcome == Outcome::Passed
+    {
+        reject(&mut cleanup, Outcome::NotVerified, &reason);
+    }
+    cleanup.elapsed_ms = start.elapsed().as_millis();
     report.steps.push(cleanup);
     report.outcome = report
         .steps
@@ -570,6 +617,19 @@ pub(super) fn run(request: Request) -> Result<()> {
             report.session.as_deref().unwrap_or("none"),
             report.session_state.as_deref().unwrap_or("not verified")
         );
+        for session in &report.cleanup_sessions {
+            println!(
+                "cleanup session {}: {} state={}{}",
+                session.session,
+                serde_json::to_value(session.outcome)?.as_str().unwrap(),
+                session.session_state.as_deref().unwrap_or("not verified"),
+                session
+                    .reason
+                    .as_ref()
+                    .map(|reason| format!("; {}", terminal_safe_text(reason, true)))
+                    .unwrap_or_default()
+            );
+        }
         for step in &report.steps {
             println!(
                 "{}: {} ({} ms) request={} event={}{}",

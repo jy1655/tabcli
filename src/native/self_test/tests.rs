@@ -11,18 +11,25 @@ struct Fake {
 }
 
 impl Operations for Fake {
-    fn call(&mut self, args: &[String]) -> Reply {
+    fn call(&mut self, args: &[String], _: Duration) -> Reply {
         self.calls.push(args.to_vec());
         self.replies.pop_front().expect("unexpected operation")
+    }
+    fn private_sessions(&self) -> Result<Vec<String>> {
+        if self.ownership_error {
+            bail!("unreadable manifest")
+        }
+        Ok(self
+            .sessions
+            .iter()
+            .map(|session| session["id"].as_str().unwrap().to_owned())
+            .collect())
     }
     fn owned_session(&self, _: &Path, title: &str) -> Result<Option<String>> {
         if self.ownership_error {
             bail!("unreadable manifest")
         }
         if self.isolated {
-            if self.sessions.len() > 1 {
-                bail!("self-test state contains more than one session")
-            }
             Ok(self
                 .sessions
                 .first()
@@ -536,7 +543,6 @@ fn isolated_round_trip_reports_mode_and_uses_the_same_commands() {
 fn isolated_ownership_is_from_the_directory_even_without_an_ask_id() {
     for ask in [
         error("launch failed"),
-        ok(json!({"ok":true,"session":"session-foreign","request_id":"request-1"})),
         ok(json!({"ok":true,"request_id":"request-1"})),
     ] {
         let mut fake = fake([ask].into_iter().chain(cleanup()));
@@ -554,15 +560,16 @@ fn isolated_ownership_is_from_the_directory_even_without_an_ask_id() {
 }
 
 #[test]
-fn isolated_unreadable_or_ambiguous_ownership_never_closes() {
-    for unreadable in [false, true] {
-        let mut fake = fake([accepted("request-1")]);
-        fake.isolated = true;
-        fake.ownership_error = unreadable;
-        let report = run_fake(&mut fake);
-        assert_eq!(report.steps[4].outcome, Outcome::NotVerified);
-        assert_eq!(fake.calls.len(), 1);
-    }
+fn isolated_unreadable_ownership_still_closes_the_reported_session() {
+    let mut ask = error("launch failed");
+    ask.value = json!({"session":"session-owned"});
+    let mut fake = fake([ask].into_iter().chain(cleanup()));
+    fake.isolated = true;
+    fake.ownership_error = true;
+    let report = run_fake(&mut fake);
+    assert_eq!(report.steps[4].outcome, Outcome::NotVerified);
+    assert_eq!(report.cleanup_sessions[0].outcome, Outcome::Passed);
+    assert_eq!(fake.calls.len(), 3);
 }
 
 #[test]
@@ -627,8 +634,172 @@ fn installed_private_ownership_is_read_only_and_ignores_title_and_workspace() {
     let mut manifest = manifest;
     manifest["id"] = json!("session-second");
     write_json_atomic(&second.join("manifest.json"), &manifest).unwrap();
-    assert!(installed.owned_session(workspace.path(), "unused").is_err());
+    assert_eq!(
+        installed.private_sessions().unwrap(),
+        ["session-owned", "session-second"]
+    );
     manifest["id"] = json!("session-foreign");
     write_json_atomic(&second.join("manifest.json"), &manifest).unwrap();
-    assert!(installed.owned_session(workspace.path(), "unused").is_err());
+    assert_eq!(
+        installed.private_sessions().unwrap(),
+        ["session-owned", "session-second"]
+    );
+}
+
+#[test]
+fn isolated_cleanup_closes_reported_session_then_every_other_session() {
+    let mut ask = error("launch failed");
+    ask.value = json!({"session":"session-owned"});
+    let mut fake = fake([ask].into_iter().chain(cleanup()).chain([
+        ok(json!({"ok":true,"session":"session-other","closed":true})),
+        ok(json!({"ok":true,"stored_state":"closed"})),
+    ]));
+    fake.isolated = true;
+    fake.sessions = vec![json!({"id":"session-other"}), json!({"id":"session-owned"})];
+    let report = orchestrate(
+        &request(&["--isolated"]),
+        &mut fake,
+        PathBuf::from("private-root"),
+        "AB_marker".to_owned(),
+    );
+    assert_eq!(report.steps[4].outcome, Outcome::Passed);
+    assert!(fake.replies.is_empty());
+    assert_eq!(
+        fake.calls
+            .iter()
+            .filter(|args| args[0] == "close-session")
+            .map(|args| args[1].as_str())
+            .collect::<Vec<_>>(),
+        ["session-owned", "session-other"]
+    );
+    let value = serde_json::to_value(report).unwrap();
+    assert_eq!(value["cleanup_sessions"][0]["session"], "session-owned");
+    assert_eq!(value["cleanup_sessions"][1]["session"], "session-other");
+    assert_eq!(value["cleanup_sessions"][1]["outcome"], "passed");
+}
+
+#[test]
+#[ignore = "subprocess fixture; invoked only by the deadline test"]
+fn nonreturning_command_fixture() {
+    thread::sleep(Duration::from_secs(1));
+}
+
+struct Hanging {
+    fake: Fake,
+    hang_at: usize,
+}
+impl Operations for Hanging {
+    fn call(&mut self, args: &[String], budget: Duration) -> Reply {
+        if self.fake.calls.len() == self.hang_at {
+            self.fake.calls.push(args.to_vec());
+            let mut installed = Installed {
+                executable: std::env::current_exe().unwrap(),
+                root: PathBuf::from("unused"),
+                isolated: false,
+            };
+            installed.call(
+                &arguments(&[
+                    "--exact",
+                    "native::self_test::tests::nonreturning_command_fixture",
+                    "--ignored",
+                ]),
+                Duration::from_millis(50),
+            )
+        } else {
+            self.fake.call(args, budget)
+        }
+    }
+    fn private_sessions(&self) -> Result<Vec<String>> {
+        self.fake.private_sessions()
+    }
+    fn owned_session(&self, workspace: &Path, title: &str) -> Result<Option<String>> {
+        self.fake.owned_session(workspace, title)
+    }
+    fn metadata(&self, session: &str) -> Result<(String, Option<String>)> {
+        self.fake.metadata(session)
+    }
+}
+#[test]
+fn command_deadlines_skip_later_requests_and_still_attempt_cleanup() {
+    for hang_at in 0..6 {
+        let mut replies = vec![
+            accepted("request-1"),
+            result("request-1", "event-1.json"),
+            accepted("request-2"),
+            result("request-2", "event-2.json"),
+        ];
+        replies.extend(cleanup());
+        if hang_at < 4 {
+            replies.drain(hang_at..4);
+        } else {
+            replies.remove(hang_at);
+        }
+        let mut operations = Hanging {
+            fake: fake(replies),
+            hang_at,
+        };
+        let report = orchestrate(
+            &request(&[]),
+            &mut operations,
+            PathBuf::from("unused"),
+            "AB_marker".to_owned(),
+        );
+        let step = &report.steps[hang_at.min(4)];
+        assert_eq!(step.outcome, Outcome::TimedOut, "command {hang_at}");
+        assert!(
+            step.reason
+                .as_deref()
+                .unwrap()
+                .contains("command did not return")
+        );
+        assert!(
+            operations
+                .fake
+                .calls
+                .iter()
+                .any(|args| args[0] == "close-session")
+        );
+        assert!(operations.fake.replies.is_empty());
+    }
+}
+
+#[test]
+fn isolated_cleanup_attempts_remaining_sessions_after_a_failed_close() {
+    let mut ask = error("launch failed");
+    ask.value = json!({"session":"session-owned"});
+    let mut fake = fake([
+        ask,
+        error("close timed out; command did not return"),
+        ok(json!({"stored_state":"working"})),
+        ok(json!({"ok":true,"session":"session-other","closed":true})),
+        ok(json!({"ok":true,"stored_state":"closed"})),
+    ]);
+    fake.isolated = true;
+    fake.sessions = vec![json!({"id":"session-owned"}), json!({"id":"session-other"})];
+    let report = orchestrate(
+        &request(&["--isolated"]),
+        &mut fake,
+        PathBuf::from("private-root"),
+        "AB_marker".to_owned(),
+    );
+    assert_eq!(report.steps[4].outcome, Outcome::TimedOut);
+    assert_eq!(report.cleanup_sessions.len(), 2);
+    assert_eq!(report.cleanup_sessions[1].outcome, Outcome::Passed);
+    assert!(fake.replies.is_empty());
+}
+
+#[test]
+fn invalid_reported_session_is_never_a_close_target() {
+    let mut ask = error("launch failed");
+    ask.value = json!({"session":"../foreign"});
+    let mut fake = fake([ask]);
+    let report = orchestrate(
+        &request(&[]),
+        &mut fake,
+        PathBuf::from("unused"),
+        "AB_marker".to_owned(),
+    );
+    assert_eq!(fake.calls.len(), 1);
+    assert_eq!(report.steps[4].outcome, Outcome::NotVerified);
+    assert!(report.cleanup_sessions.is_empty());
 }

@@ -6214,6 +6214,9 @@ fn sync_committed_event_directory(directory: &Path) -> Result<()> {
 }
 
 fn validate_pending_completion(pending: &PendingTurnCompletion) -> Result<()> {
+    if pending.event.created_unix_ms.is_none() {
+        bail!("pending native completion event is missing created_unix_ms")
+    }
     if pending.schema != 1
         || !valid_turn_claim_token(&pending.claim_token)
         || !matches!(pending.status_state.as_str(), "ready" | "failed")
