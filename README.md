@@ -606,6 +606,16 @@ agent-bridge settings windows-tab-window dedicated
 
 화면에 한글 같은 전각 문자가 있으면 managed console의 화면을 읽지 못하던 문제를 고쳤습니다. 공유 consent는 신뢰 대화상자에 응답하기 전에 화면을 읽으므로, 한글 경로가 표시된 대화상자에는 응답하지 못했습니다.
 
+관리자 권한으로 실행한 프로세스(elevated process)가 쓴 provider trust store를 거부하던 문제를 고쳤습니다. Bridge를 관리자 권한으로 실행해도 거부했습니다. Windows는 elevated process가 만든 파일의 owner를 Administrators group으로 두는데, Bridge는 owner가 사용자 계정일 때만 trust store를 받아들였습니다. 그래서 공유 consent가 신뢰를 찾지 못했고 Agy의 초기 paste가 보류되었습니다. 이제 owner가 사용자이거나 Bridge 프로세스의 기본 owner(elevated process에서는 Administrators group)이면 받아들입니다. elevated process가 쓴 trust store를 Bridge가 관리자 권한 없이 읽는 경우는 여전히 거부합니다.
+
+Windows에서 trust store의 owner만 확인하던 것도 고쳤습니다. 다른 계정이 바꿀 수 있는 trust store를 사용자의 것으로 읽었습니다. macOS와 Linux에서는 group이나 다른 사용자가 쓸 수 있는 trust store를 처음부터 거부했습니다. 이제 Windows에서도 access list를 읽습니다. access list가 없는 store, 사용자·Bridge 프로세스의 기본 owner·system·Administrators group이 아닌 계정에게 쓰기·덧붙이기·access list 변경·owner 변경을 허용하는 access rule이 있는 store, 단순한 allow·deny가 아닌 access rule(조건부 rule 등)이 있는 store를 거부합니다. 다른 계정의 읽기 권한은 상관없습니다. 거부할 때의 오류는 아래 block의 세 문장 중 하나입니다. `<SID>`는 그 계정의 security identifier입니다. 사용자 프로필 안의 trust store는 테스트 PC에서 이 확인을 통과합니다. 다른 계정이 파일을 수정할 수 있는 폴더의 파일은 통과하지 못합니다. 이 확인은 읽는 시점에 누가 store를 바꿀 수 있는지만 봅니다. 그 전에 누가 내용을 썼는지는 알 수 없습니다. 첫 문제는 consent 코드의 첫 Windows CI 실행에서, 둘째 문제는 그 수정의 리뷰에서 발견했습니다. elevated 터미널과 두 번째 계정을 쓴 LIVE 확인은 하지 않았습니다.
+
+```text
+trust store can be changed by another account (<SID>)
+trust store has no access list, so every account can change it
+trust store has an access rule that cannot be evaluated
+```
+
 ### Terminal.app 새 window 확인
 
 Terminal.app에서 세션을 열 때 Agent Bridge는 새로 만든 tab의 tty로 자기 window를 확인합니다. shell이 끝난 채 닫기 확인을 기다리는 예전 window가 같은 tty 이름을 계속 보고하면 이 확인이 두 window에 걸려, `Agent Bridge could not prove the newly created Terminal.app window` 오류와 함께 launch가 실패하고 새 window가 남았습니다. 이제 launch 전에 이미 있던 window는 확인 대상에서 제외하므로 예전 window 때문에 실패하지 않습니다. 확인이 그래도 실패하는 경우(새 window가 목록에 없거나 새 window 둘이 같은 tty를 보고)에는 이전과 같이 새 window가 남습니다.

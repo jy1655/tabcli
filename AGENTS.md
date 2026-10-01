@@ -205,6 +205,26 @@ launch, observe, continue, and close without replacing the capabilities those CL
 - A full-width character fills two console cells and is returned once, so a screen row
   can hold fewer characters than cells. Do not treat a short row as a failed read.
 
+## Trust Store Boundary
+
+- A provider trust store, and a Bridge consent record, is evidence only when nobody but
+  the user can change it. On Unix that is the owner and the mode. On Windows it is the
+  owner and the access list, both read from the handle that the content is read from: the
+  owner must be the token's user or the token's default owner (the Administrators group
+  for an elevated process, which is what a GitHub Windows runner is), and no access rule
+  may let another account write, append, or change the access list or the owner. The
+  system, the Administrators group and `OWNER RIGHTS` may. A missing access list and a
+  rule that is neither a plain allow nor a plain deny are refused.
+- The check describes the store at the time of the read. It cannot tell who wrote the
+  content earlier, and it does not exclude a writer that has the store open. Do not open
+  a provider store without write sharing to change that: Bridge polls Agy's store every
+  100 ms while Agy saves an approved decision, and a provider's own write would fail.
+- Create a store fixture in a test the way a private record is created
+  (`write_private`, `write_json_atomic`). A plain write inherits what the temporary
+  directory allows, and on a PC with the Codex sandbox that directory lets another
+  account modify its files (observed 2026-10-02: `CodexSandboxUsers`), so the fixture is
+  refused there and accepted on CI.
+
 ## Change and Verification Rules
 
 - For provider behavior changes, add or update tests in that provider's adapter and prove
