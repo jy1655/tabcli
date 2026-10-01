@@ -288,7 +288,7 @@ enum QueueOutcome {
 
 pub(super) fn create_tab(_deadline: Instant) -> Result<TerminalSession> {
     bail!(
-        "unsupported Ghostty terminal; Agent Bridge v0.0.9 has no currently verified Ghostty release because the available 1.3.1 build cannot initialize an AppleScript-created terminal surface and 1.3.0 has no current positive runtime evidence; use --terminal iterm2 or --terminal terminal"
+        "unsupported Ghostty terminal; Agent Bridge v0.0.10 has no currently verified Ghostty release because the available 1.3.1 build cannot initialize an AppleScript-created terminal surface and 1.3.0 has no current positive runtime evidence; use --terminal iterm2 or --terminal terminal"
     )
 }
 
@@ -363,7 +363,7 @@ fn validate_ghostty_version(raw_version: &str) -> Result<()> {
     let version = Version::parse(raw_version)
         .with_context(|| format!("Ghostty returned an invalid version {raw_version:?}"))?;
     bail!(
-        "unsupported Ghostty version {version}; Agent Bridge v0.0.9 has no currently verified Ghostty release because the available 1.3.1 build cannot initialize an AppleScript-created terminal surface and 1.3.0 has no current positive runtime evidence; use --terminal iterm2 or --terminal terminal"
+        "unsupported Ghostty version {version}; Agent Bridge v0.0.10 has no currently verified Ghostty release because the available 1.3.1 build cannot initialize an AppleScript-created terminal surface and 1.3.0 has no current positive runtime evidence; use --terminal iterm2 or --terminal terminal"
     )
 }
 
