@@ -219,6 +219,24 @@ launch, observe, continue, and close without replacing the capabilities those CL
   content earlier, and it does not exclude a writer that has the store open. Do not open
   a provider store without write sharing to change that: Bridge polls Agy's store every
   100 ms while Agy saves an approved decision, and a provider's own write would fail.
+- The gate that withholds an initial paste on native Windows asks another question than
+  workspace consent: not whether the user approved this exact workspace, but whether the
+  provider takes input now. For Codex an exact project entry is not the only way past
+  the trust dialog. Codex CLI 0.159.3 takes the trust of a workspace without an exact
+  entry from its repository root, found by reading `.git` itself and checking a linked
+  worktree's registration; it shows no dialog then and saves no exact entry, and "Trust
+  and continue" in a subdirectory saves the repository root (measured 2026-10-02;
+  `--yolo` does not suppress the dialog). A wait for the exact entry never ended there
+  (issue #60). The Codex adapter therefore also opens the gate on positive evidence from
+  the screen: the empty composer row, which Codex draws only when no onboarding screen
+  and no view of the bottom pane is active. Do not infer the absence of the dialog from
+  Codex's configuration, from Git, or from a screen that merely lacks the dialog's
+  words: an empty screen is not evidence, and a wrong inference pastes an Enter onto
+  "Trust and continue". Consent that is shared with another provider stays exact.
+- A wait for workspace trust ends when its session has ended, and looks at the session
+  before it looks at the evidence: the launcher of a closed session must not wait until
+  its deadline, and an ended session is never pasted into. This holds for the Codex wait
+  and for the Agy wait.
 - Create a store fixture in a test the way a private record is created
   (`write_private`, `write_json_atomic`). A plain write inherits what the temporary
   directory allows, and on a PC with the Codex sandbox that directory lets another

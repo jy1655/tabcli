@@ -222,10 +222,21 @@ impl NativeProviderAdapter for CodexAdapter {
                 .context("Codex terminal has no managed session binding")
                 .and_then(super::super::session_directory)
                 .map_err(terminal::TerminalSendFailure::not_sent)?;
+            // A screen read costs a helper process and the wait polls ten times a second,
+            // so the screen is read once per `COMPOSER_POLL`.
+            let mut last_read: Option<Instant> = None;
             super::super::consent::wait_for_native_trust(
                 &directory,
                 FirstPartyCli::Codex,
                 deadline,
+                &mut || {
+                    if last_read.is_some_and(|read| read.elapsed() < COMPOSER_POLL) {
+                        return false;
+                    }
+                    last_read = Some(Instant::now());
+                    terminal::read_screen(session, deadline)
+                        .is_ok_and(|screen| composer_is_ready(&screen))
+                },
             )
             .map_err(terminal::TerminalSendFailure::not_sent)?;
         }
@@ -328,6 +339,40 @@ impl NativeProviderAdapter for CodexAdapter {
     fn cancel_terminal_follow_up(&self, directory: &Path, claim_token: &str) -> Result<()> {
         cancel_pending_turn(directory, claim_token)
     }
+}
+
+// The empty composer of the chat view: the prompt glyph and Codex's placeholder
+// (`PLACEHOLDER` in codex-rs/tui/src/chatwidget.rs, rust-v0.159.3).
+const COMPOSER_ROW: &str = "› Ask Codex to do anything";
+const COMPOSER_POLL: Duration = Duration::from_secs(1);
+
+// Positive evidence that an initial paste lands in the composer and not on the trust
+// dialog. Codex draws the composer only when no onboarding screen and no view of the
+// bottom pane is active, so its empty row on the screen means that the trust dialog is
+// over. An exact project entry is not the only way there (issue #60): Codex takes the
+// trust of a workspace without one from its repository root, which covers a
+// subdirectory and a linked worktree, shows no dialog then and saves no exact entry;
+// and "Trust and continue", answered by the user in the managed terminal, saves the
+// repository root as well. Measured 2026-10-02 with Codex CLI 0.159.3 on native
+// Windows: no dialog in a linked worktree of a trusted repository; the dialog in a
+// directory that nothing trusts, with and without `--yolo`, and in a plain directory
+// below a trusted one.
+//
+// Nothing is inferred from Codex's configuration or from Git: an inference that is
+// wrong would paste onto the dialog. An empty screen, a screen that is still loading
+// and a layout this does not know are no evidence, and neither is a composer beside
+// the words of the dialog. This is not workspace consent, which stays exact and is the
+// only trust that is shared with another provider. Delete it when Codex has an input
+// path that needs no paste.
+fn composer_is_ready(screen: &str) -> bool {
+    let mut composer = false;
+    for line in screen.lines() {
+        if line.contains("Trust this folder?") || line.contains("Trust and continue") {
+            return false;
+        }
+        composer |= line.trim() == COMPOSER_ROW;
+    }
+    composer
 }
 
 fn workspace_trust_override(workspace: &Path) -> Result<String> {
@@ -1065,6 +1110,41 @@ mod tests {
             );
             assert_eq!(parsed["value"].as_table().unwrap().len(), 1);
         }
+    }
+
+    // The screens an initial paste can meet, as Codex CLI 0.159.3 drew them on
+    // 2026-10-02 (session-kkpVsB: the dialog; session-nXZtvt: the composer), in the
+    // order of a start in which the dialog opens and the user answers it.
+    #[test]
+    fn only_the_empty_composer_is_evidence_for_an_initial_paste() {
+        let dialog = "  Folder access\n  C:\\work\\project\n  Trust this folder? Codex can read, edit, and run files here, subject to your permission settings. Folder settings\n  can run code automatically, even without a model request. Continue only if you trust these files. Your trust\n  decision will be saved.\n› 1. Trust and continue\n  2. Quit\n  enter continue · esc quit";
+        let composer = "  >_ OpenAI Codex (v0.159.3)\n     D:\\Dev\\project\n  How deep does this codebase go?\n› Ask Codex to do anything                                   \n  GPT-6.1-Sol low · D:\\Dev\\project\n  ? for shortcuts";
+        let start = [
+            "",
+            "\n\n\n",
+            "  >_ OpenAI Codex (v0.159.3)\n",
+            dialog,
+            composer,
+        ];
+        assert_eq!(
+            start.map(composer_is_ready),
+            [false, false, false, false, true],
+            "the gate opens with the composer and not before"
+        );
+
+        // Another row that begins with the glyph is not the composer: a selected
+        // option, a draft, another placeholder.
+        for screen in [
+            "› 1. Trust and continue",
+            "› Ask Codex to do anything else",
+            "› Ask a follow-up question",
+            "Ask Codex to do anything",
+        ] {
+            assert!(!composer_is_ready(screen), "{screen}");
+        }
+        // A screen that shows both is not one this knows.
+        assert!(!composer_is_ready(&format!("{dialog}\n{composer}")));
+        assert!(!composer_is_ready(&format!("{composer}\n{dialog}")));
     }
 
     #[test]

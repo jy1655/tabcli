@@ -678,9 +678,12 @@ fn workspace_customizations_loaded(log: &[u8]) -> bool {
 // log lacks the load, an unreadable store or log, and a lookup error all keep
 // waiting, since none proves the dialog is gone: a human approves it in the managed
 // terminal, or shared consent answered it at launch. The deadline ends the wait as
-// `not_sent`, before any terminal input.
+// `not_sent`, before any terminal input, and so does a session that has ended
+// (`ended` names its state): it has no terminal left to paste into, and the launcher
+// of a closed session went on waiting until its deadline (issue #60).
 fn wait_for_workspace_trust_with<T, C>(
     missing: &mut T,
+    ended: &mut dyn FnMut() -> Option<String>,
     deadline: Instant,
     poll_interval: Duration,
     clock: &mut C,
@@ -690,6 +693,11 @@ where
     C: Clock,
 {
     loop {
+        if let Some(state) = ended() {
+            bail!(
+                "the session is {state} and no longer waits for Agy workspace trust, so the prompt was not pasted"
+            );
+        }
         let observed = missing();
         if matches!(observed, Ok(None)) {
             return Ok(());
@@ -732,6 +740,12 @@ fn wait_for_workspace_trust(directory: &Path, deadline: Instant) -> Result<()> {
     let log_path = directory.join(AGY_LOG_FILE);
     wait_for_workspace_trust_with(
         &mut || workspace_trust_missing(&workspace, &homes, &log_path),
+        &mut || {
+            super::super::read_json::<super::super::SessionStatus>(&directory.join("status.json"))
+                .ok()
+                .map(|status| status.state)
+                .filter(|state| matches!(state.as_str(), "failed" | "exited" | "closed"))
+        },
         deadline,
         STARTUP_POLL_INTERVAL,
         &mut SystemClock,
@@ -6161,6 +6175,53 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
     // line is reported as unverified rather than as an open dialog, an unreadable
     // store proves nothing, and an approval during the wait releases the paste.
     #[test]
+    fn the_trust_wait_ends_when_the_session_has_ended() {
+        let start = Instant::now();
+        let wait = Duration::from_secs(60);
+
+        // Issue #60: the launcher of a closed session went on waiting until its
+        // deadline. The session is looked at before every look at the trust evidence.
+        let mut clock = FakeClock::new(start);
+        let mut polls = 0;
+        let error = wait_for_workspace_trust_with(
+            &mut || Ok(Some(TRUST_STORE_MISSING)),
+            &mut || {
+                polls += 1;
+                (polls == 3).then(|| "closed".to_owned())
+            },
+            start + wait,
+            STARTUP_POLL_INTERVAL,
+            &mut clock,
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            error,
+            "the session is closed and no longer waits for Agy workspace trust, so the prompt was not pasted"
+        );
+        assert_eq!(clock.slept, STARTUP_POLL_INTERVAL * 2);
+
+        // An ended session is not pasted into even when its trust is evident.
+        let mut clock = FakeClock::new(start);
+        let mut looked = false;
+        assert!(
+            wait_for_workspace_trust_with(
+                &mut || {
+                    looked = true;
+                    Ok(None)
+                },
+                &mut || Some("failed".to_owned()),
+                start + wait,
+                STARTUP_POLL_INTERVAL,
+                &mut clock,
+            )
+            .is_err()
+        );
+        assert!(!looked);
+        assert_eq!(clock.slept, Duration::ZERO);
+    }
+
+    #[test]
     fn a_paste_is_withheld_until_the_store_and_this_sessions_log_show_trust() {
         use super::super::super::consent;
         use super::super::super::doctor::Availability;
@@ -6189,6 +6250,7 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
             let mut clock = FakeClock::new(start);
             let error = wait_for_workspace_trust_with(
                 &mut || workspace_trust_missing(&workspace, &homes, &log_path),
+                &mut || None,
                 start + wait,
                 STARTUP_POLL_INTERVAL,
                 &mut clock,
@@ -6226,6 +6288,7 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
             let mut clock = FakeClock::new(start);
             wait_for_workspace_trust_with(
                 &mut || workspace_trust_missing(&workspace, &homes, &log_path),
+                &mut || None,
                 start + wait,
                 STARTUP_POLL_INTERVAL,
                 &mut clock,
@@ -6279,6 +6342,7 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         let mut clock = FakeClock::new(start);
         wait_for_workspace_trust_with(
             &mut || answers.next().unwrap(),
+            &mut || None,
             start + wait,
             STARTUP_POLL_INTERVAL,
             &mut clock,
@@ -6291,6 +6355,7 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         let mut clock = FakeClock::new(start);
         let error = wait_for_workspace_trust_with(
             &mut || workspace_trust_missing(&workspace, &homes, &log_path),
+            &mut || None,
             start + wait,
             STARTUP_POLL_INTERVAL,
             &mut clock,
