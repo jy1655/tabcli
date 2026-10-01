@@ -433,18 +433,18 @@ pub(super) fn complete_launch(
 // Native Windows paste must not select a workspace-trust button. A provider
 // adapter calls this only where its official input API/startup event is absent.
 //
-// The store's exact entry is not the only reason a provider shows no trust dialog:
-// Codex takes the trust of a linked worktree from its main repository, shows no dialog
-// there and saves no exact entry, so a wait for that entry never ended (issue #60).
-// `no_dialog` is the adapter's own evidence for such a workspace. It never widens
-// workspace consent, which stays exact.
+// The store's exact entry is not the only way a provider gets past its trust dialog:
+// Codex takes the trust of a subdirectory or a linked worktree from the repository
+// root, shows no dialog there and saves no exact entry, so a wait for that entry never
+// ended (issue #60). `ready` is the adapter's own evidence that the provider now takes
+// input. It never widens workspace consent, which stays exact.
 pub(super) fn wait_for_native_trust(
     directory: &Path,
     target: FirstPartyCli,
     deadline: Instant,
-    no_dialog: &mut dyn FnMut(&Path, &Homes) -> bool,
+    ready: &mut dyn FnMut() -> bool,
 ) -> Result<()> {
-    wait_for_native_trust_with(directory, target, deadline, &Homes::current()?, no_dialog)
+    wait_for_native_trust_with(directory, target, deadline, &Homes::current()?, ready)
 }
 
 fn wait_for_native_trust_with(
@@ -452,10 +452,21 @@ fn wait_for_native_trust_with(
     target: FirstPartyCli,
     deadline: Instant,
     homes: &Homes,
-    no_dialog: &mut dyn FnMut(&Path, &Homes) -> bool,
+    ready: &mut dyn FnMut() -> bool,
 ) -> Result<()> {
     let manifest = read_manifest(directory)?;
     loop {
+        // A session that has ended has no terminal left to send to, whatever becomes
+        // of its workspace's trust, so this comes before the evidence. Without it the
+        // launcher of a closed session went on waiting until its deadline.
+        if let Ok(status) = read_json::<SessionStatus>(&directory.join("status.json"))
+            && matches!(status.state.as_str(), "failed" | "exited" | "closed")
+        {
+            bail!(
+                "the session is {} and no longer waits for workspace trust; no initial console input was sent",
+                status.state
+            );
+        }
         let assessment = observe(directory);
         let applied_here = matches!(
             assessment.get("applied").and_then(|s| s.as_str()),
@@ -466,20 +477,9 @@ fn wait_for_native_trust_with(
                 provider::workspace_trust(target, &manifest.workspace, homes),
                 Ok(Trust::Trusted(_))
             )
-            || no_dialog(&manifest.workspace, homes)
+            || ready()
         {
             return Ok(());
-        }
-        // A session that has ended has no terminal left to send to, whatever becomes
-        // of its workspace's trust. Without this the launcher of a closed session went
-        // on waiting until its deadline.
-        if let Ok(status) = read_json::<SessionStatus>(&directory.join("status.json"))
-            && matches!(status.state.as_str(), "failed" | "exited" | "closed")
-        {
-            bail!(
-                "the session is {} and no longer waits for workspace trust; no initial console input was sent",
-                status.state
-            );
         }
         if Instant::now() >= deadline {
             bail!(
@@ -979,41 +979,64 @@ mod tests {
     fn the_wait_for_native_trust_ends_with_the_adapters_evidence_or_with_the_session() {
         let (_temp, workspace, homes) = setup();
         let far = || Instant::now() + Duration::from_secs(600);
-        let wait = |directory: &Path,
-                    deadline: Instant,
-                    no_dialog: &mut dyn FnMut(&Path, &Homes) -> bool| {
-            wait_for_native_trust_with(directory, FirstPartyCli::Codex, deadline, &homes, no_dialog)
+        let wait = |directory: &Path, deadline: Instant, ready: &mut dyn FnMut() -> bool| {
+            wait_for_native_trust_with(directory, FirstPartyCli::Codex, deadline, &homes, ready)
                 .map_err(|error| error.to_string())
         };
 
+        // The adapter is asked on every poll, and the wait ends with its first yes.
         let (_root, waiting) = session(&workspace, "awaiting-initial-input");
         let mut asked = 0;
-        wait(&waiting, far(), &mut |path, _| {
+        wait(&waiting, far(), &mut || {
             asked += 1;
-            path == workspace && asked == 3
+            asked == 3
         })
         .unwrap();
-        assert_eq!(
-            asked, 3,
-            "asked again on every poll until the evidence holds"
-        );
+        assert_eq!(asked, 3);
 
+        // A session that has ended is not sent to, even when the evidence holds in the
+        // same poll: the adapter is not even asked.
         for state in ["closed", "failed", "exited"] {
             let (_root, ended) = session(&workspace, state);
-            let started = Instant::now();
+            let mut asked = false;
             assert_eq!(
-                wait(&ended, far(), &mut |_, _| false),
+                wait(&ended, far(), &mut || {
+                    asked = true;
+                    true
+                }),
                 Err(format!(
                     "the session is {state} and no longer waits for workspace trust; no initial console input was sent"
                 ))
             );
-            assert!(started.elapsed() < Duration::from_secs(60), "{state}");
+            assert!(!asked, "{state}");
         }
+
+        // A session that ends while its input waits ends the wait at the next poll.
+        let (_root, closing) = session(&workspace, "awaiting-initial-input");
+        let mut polls = 0;
+        assert_eq!(
+            wait(&closing, far(), &mut || {
+                polls += 1;
+                if polls == 2 {
+                    fs::write(
+                        closing.join("status.json"),
+                        r#"{"state":"closed","generation":2,"updated_unix_ms":2,"exit_code":null,"error":null}"#,
+                    )
+                    .unwrap();
+                }
+                false
+            }),
+            Err(
+                "the session is closed and no longer waits for workspace trust; no initial console input was sent"
+                    .to_owned()
+            )
+        );
+        assert_eq!(polls, 2);
 
         let error = wait(
             &waiting,
             Instant::now() + Duration::from_millis(250),
-            &mut |_, _| false,
+            &mut || false,
         )
         .unwrap_err();
         assert!(
