@@ -72,6 +72,9 @@ fn script_args(session: &TerminalSession) -> Result<(&'static str, Vec<&str>)> {
                     .context("Terminal window identity missing")?,
             ],
         )),
+        TerminalKind::Warp => bail!(
+            "managed Warp screen reads and guarded input are unsupported; Warp Control input.insert/input.replace do not submit"
+        ),
         _ => bail!("managed dialog input unsupported for this terminal"),
     }
 }

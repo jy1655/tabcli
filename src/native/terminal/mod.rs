@@ -29,13 +29,14 @@ pub(crate) enum TerminalKind {
     Iterm2,
     AppleTerminal,
     Ghostty,
+    Warp,
     WindowsConsole,
 }
 
 impl TerminalKind {
     pub(super) const fn supported_on_this_platform(self) -> bool {
         match self {
-            Self::Iterm2 | Self::AppleTerminal => cfg!(target_os = "macos"),
+            Self::Iterm2 | Self::AppleTerminal | Self::Warp => cfg!(target_os = "macos"),
             Self::WindowsConsole => cfg!(windows),
             // Ghostty cannot establish creation-time surface ownership in this build.
             Self::Ghostty => false,
@@ -47,6 +48,7 @@ impl TerminalKind {
             Self::Iterm2 => "iterm2",
             Self::AppleTerminal => "apple-terminal",
             Self::Ghostty => "ghostty",
+            Self::Warp => "warp",
             Self::WindowsConsole => "windows-console",
         }
     }
@@ -56,6 +58,7 @@ impl TerminalKind {
             Self::Iterm2 => "iTerm2",
             Self::AppleTerminal => "Terminal.app",
             Self::Ghostty => "Ghostty",
+            Self::Warp => "Warp",
             Self::WindowsConsole => "Windows Console",
         }
     }
@@ -67,13 +70,14 @@ impl FromStr for TerminalKind {
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         match value.to_ascii_lowercase().as_str() {
             "ghostty" => Ok(Self::Ghostty),
+            "warp" | "warpterminal" => Ok(Self::Warp),
             "windows-console" | "windows" | "console" => Ok(Self::WindowsConsole),
             "iterm" | "iterm.app" | "iterm2" => Ok(Self::Iterm2),
             "apple-terminal" | "apple_terminal" | "default" | "terminal" | "terminal.app" => {
                 Ok(Self::AppleTerminal)
             }
             _ => Err(format!(
-                "unsupported terminal {value:?}; expected ghostty, iterm2, terminal, or windows-console"
+                "unsupported terminal {value:?}; expected ghostty, iterm2, terminal, warp, or windows-console"
             )),
         }
     }
@@ -219,9 +223,8 @@ pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     platform::select(preferred)
 }
 
-// `directory` is the private directory of the managed session. Only Windows uses it: a
-// Windows Terminal tab creates its own process, which hands the console root over through
-// records kept there.
+// `directory` is the private directory of the managed session. Windows and Warp use it
+// for a one-writer host offer/start decision before the provider process can run.
 pub(super) fn open_bound_tab<F, U>(
     kind: TerminalKind,
     command: &str,
@@ -240,8 +243,7 @@ where
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = directory;
-        macos::open_bound_tab(kind, command, deadline, bind, unbind)
+        macos::open_bound_tab(kind, command, directory, deadline, bind, unbind)
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
@@ -447,6 +449,18 @@ pub(super) fn windows_console_host(directory: &Path) -> Result<()> {
     windows::run_console_host(directory)
 }
 
+pub(super) fn warp_host(directory: &Path, attempt: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::warp::run_host(directory, attempt)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (directory, attempt);
+        bail!("the native Warp host is only available on macOS")
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub(super) fn windows_powershell_executable() -> Result<std::path::PathBuf> {
     windows::powershell_executable()
@@ -498,6 +512,7 @@ pub(super) fn classify_macos_terminal(
     if let Some(value) = term_program {
         return match value.to_ascii_lowercase().as_str() {
             "ghostty" => Some(TerminalKind::Ghostty),
+            "warpterminal" | "warp" => Some(TerminalKind::Warp),
             "iterm" | "iterm.app" | "iterm2" => Some(TerminalKind::Iterm2),
             "apple_terminal" | "terminal" | "terminal.app" => Some(TerminalKind::AppleTerminal),
             _ => None,
@@ -629,6 +644,10 @@ mod tests {
             Some(TerminalKind::AppleTerminal)
         );
         assert_eq!(
+            classify_macos_terminal(Some("WarpTerminal"), Some("xterm-256color"), false, true),
+            Some(TerminalKind::Warp)
+        );
+        assert_eq!(
             classify_macos_terminal(Some("vscode"), Some("xterm-256color"), false, false),
             None
         );
@@ -662,6 +681,64 @@ mod tests {
             select_macos_terminal(None, Some("ghostty"), Some("xterm-ghostty"), false, false,),
             TerminalKind::AppleTerminal
         );
+        assert_eq!(
+            select_macos_terminal(
+                None,
+                Some("WarpTerminal"),
+                Some("xterm-256color"),
+                false,
+                false,
+            ),
+            TerminalKind::Warp
+        );
+    }
+
+    #[test]
+    fn explicit_warp_target_is_independent_of_the_invoking_host() {
+        for (host, program, term, iterm, terminal) in [
+            (
+                "Warp",
+                Some("WarpTerminal"),
+                Some("xterm-256color"),
+                false,
+                false,
+            ),
+            (
+                "iTerm2",
+                Some("iTerm.app"),
+                Some("xterm-256color"),
+                true,
+                true,
+            ),
+            (
+                "Terminal.app",
+                Some("Apple_Terminal"),
+                Some("xterm-256color"),
+                false,
+                true,
+            ),
+            (
+                "WezTerm",
+                Some("WezTerm"),
+                Some("xterm-256color"),
+                false,
+                false,
+            ),
+            ("empty", None, None, false, false),
+            (
+                "conflicting",
+                Some("Apple_Terminal"),
+                Some("xterm-ghostty"),
+                true,
+                true,
+            ),
+        ] {
+            assert_eq!(
+                select_macos_terminal(Some(TerminalKind::Warp), program, term, iterm, terminal),
+                TerminalKind::Warp,
+                "explicit Warp target was changed by the {host} invoking environment"
+            );
+        }
     }
 
     #[test]
@@ -676,6 +753,11 @@ mod tests {
             );
         }
         assert_eq!(TerminalKind::from_str("Ghostty"), Ok(TerminalKind::Ghostty));
+        assert_eq!(TerminalKind::from_str("Warp"), Ok(TerminalKind::Warp));
+        assert_eq!(
+            TerminalKind::from_str("WarpTerminal"),
+            Ok(TerminalKind::Warp)
+        );
         assert_eq!(
             TerminalKind::from_str("windows-console"),
             Ok(TerminalKind::WindowsConsole)
@@ -966,10 +1048,10 @@ mod tests {
             .find("if busy of targetTab then error")
             .expect("busy-process finality check");
         let final_window = close_script
-            .rfind("if id of targetWindow is not wantedWindowId then return \"missing\"")
+            .rfind("if id of targetWindow is not wantedWindowId then error")
             .expect("final window identity check");
         let final_tty = close_script
-            .rfind("if tty of targetTab is not wantedTty then return \"missing\"")
+            .rfind("if not my isOwnedTty(tty of targetTab, wantedTty) then error")
             .expect("final tty identity check");
         let final_tab_count = close_script
             .rfind("if (count of tabs of targetWindow) is not 1 then error")

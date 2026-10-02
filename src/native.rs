@@ -50,6 +50,10 @@ const CLOSED_STATUS_FILE: &str = "closed.json";
 const TERMINAL_HANDLE_FILE: &str = "terminal.json";
 const TERMINAL_CLOSING_FILE: &str = "terminal.closing.json";
 const TERMINAL_TOMBSTONE_FILE: &str = "terminal.closed.json";
+// An explicit Terminal.app or Warp close writes it after verifying the live owner
+// and surface, before teardown/close; see `terminal_close_intent_owner`.
+#[cfg(target_os = "macos")]
+const TERMINAL_CLOSE_INTENT_FILE: &str = "terminal.close-intent.json";
 // v0.0.2 native-Windows Claude sessions may still carry these files. New sessions never
 // create them; explicit close and prune consume them so an upgrade cannot strand state.
 const LEGACY_RESUME_PENDING_FILE: &str = "resume.pending.json";
@@ -120,6 +124,10 @@ pub(crate) enum NativeCommand {
     },
     ConsoleHost {
         directory: PathBuf,
+    },
+    WarpHost {
+        directory: PathBuf,
+        attempt: String,
     },
 }
 
@@ -333,6 +341,14 @@ struct MacTerminalShellIdentity {
     process_start_microseconds: u64,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Deserialize, Serialize)]
+struct TerminalCloseIntent {
+    managed_session_id: String,
+    terminal: terminal::TerminalSession,
+    owner: NativeSessionOwner,
+}
+
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeProcessIdentity {
@@ -423,6 +439,7 @@ pub(crate) fn is_command(value: &str) -> bool {
             | "native-provider-control"
             | "native-console-control"
             | "native-console-host"
+            | "native-warp-host"
     )
 }
 
@@ -518,6 +535,27 @@ where
                 bail!("native-console-host requires an absolute session directory");
             }
             Ok(NativeCommand::ConsoleHost { directory })
+        }
+        "native-warp-host" => {
+            let [directory, attempt] = rest else {
+                bail!("native-warp-host requires a session directory and attempt token");
+            };
+            let directory = PathBuf::from(directory);
+            let id = directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("native-warp-host requires a session directory")?;
+            require_valid_session_id(id)?;
+            if !directory.is_absolute() {
+                bail!("native-warp-host requires an absolute session directory");
+            }
+            if attempt.len() != 32 || !attempt.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                bail!("native-warp-host requires a valid attempt token");
+            }
+            Ok(NativeCommand::WarpHost {
+                directory,
+                attempt: attempt.clone(),
+            })
         }
         _ => bail!("unknown native command: {command}"),
     }
@@ -990,6 +1028,7 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
             timeout_ms,
         } => run_windows_console_control(&action, &id, input_name.as_deref(), timeout_ms),
         NativeCommand::ConsoleHost { directory } => run_windows_console_host(&directory),
+        NativeCommand::WarpHost { directory, attempt } => terminal::warp_host(&directory, &attempt),
     }
 }
 
@@ -1983,6 +2022,13 @@ fn close_session_surface(directory: &Path, id: &str, reason: Option<String>) -> 
         if has_native_owner && session.kind == terminal::TerminalKind::AppleTerminal {
             terminate_apple_terminal_owner(directory, id, session)?;
         }
+        #[cfg(target_os = "macos")]
+        if has_native_owner && session.kind == terminal::TerminalKind::Warp {
+            // tab.close can end the owner while window disappearance still fails.
+            // Preserve this exact requested close before its first external mutation.
+            let (owner, _) = verified_macos_terminal_owner(directory, id, session, None)?;
+            record_terminal_close_intent(directory, id, session, &owner)?;
+        }
         #[cfg(not(target_os = "macos"))]
         let _ = has_native_owner;
         terminal::close_session(session)
@@ -2716,7 +2762,77 @@ fn terminate_apple_terminal_owner(
     let process_group = verified_terminal_owner_process_group(&owner, &live)?;
     let live_shell = live_native_process_identity(live.parent_pid)?;
     let shell_process_group = verified_terminal_shell_process_group(&owner, &live, &live_shell)?;
+    record_terminal_close_intent(directory, expected_session_id, session, &owner)?;
     terminal::macos::apple_terminal::terminate_process_groups(process_group, shell_process_group)
+}
+
+#[cfg(target_os = "macos")]
+fn record_terminal_close_intent(
+    directory: &Path,
+    expected_session_id: &str,
+    session: &terminal::TerminalSession,
+    owner: &NativeSessionOwner,
+) -> Result<()> {
+    write_json_atomic(
+        &directory.join(TERMINAL_CLOSE_INTENT_FILE),
+        &TerminalCloseIntent {
+            managed_session_id: expected_session_id.to_owned(),
+            terminal: session.clone(),
+            owner: owner.clone(),
+        },
+    )
+}
+
+// An explicit close can end the owner before the window is gone, so a
+// close that fails after it can never verify that owner again, and the owner's death
+// says nothing about the window. The intent that the close recorded first lets only
+// that close finish: it names this managed session, this exact handle and this exact
+// owner record, with the owner's whole identity. Anything else, unreadable or not,
+// grants nothing.
+#[cfg(target_os = "macos")]
+fn terminal_close_intent_owner(
+    directory: &Path,
+    session: &terminal::TerminalSession,
+) -> Result<Option<NativeSessionOwner>> {
+    if !matches!(
+        session.kind,
+        terminal::TerminalKind::AppleTerminal | terminal::TerminalKind::Warp
+    ) {
+        return Ok(None);
+    }
+    let (Some(intent), Some(owner)) = (
+        read_regular_text_if_present(&directory.join(TERMINAL_CLOSE_INTENT_FILE))?,
+        read_regular_text_if_present(&directory.join(SESSION_OWNER_FILE))?,
+    ) else {
+        return Ok(None);
+    };
+    let (Ok(intent), Ok(owner)) = (
+        serde_json::from_str::<TerminalCloseIntent>(&intent),
+        serde_json::from_str::<NativeSessionOwner>(&owner),
+    ) else {
+        return Ok(None);
+    };
+    let attested = matches!(
+        (
+            owner.terminal_tty_device,
+            owner.process_start_seconds,
+            owner.process_start_microseconds,
+            owner.process_group,
+            owner.terminal_process_group,
+        ),
+        (Some(_), Some(_), Some(_), Some(_), Some(_))
+    );
+    let bound = session.managed_session_id.as_deref() == Some(intent.managed_session_id.as_str())
+        && owner.managed_session_id.as_deref() == Some(intent.managed_session_id.as_str());
+    let exact = intent.terminal == *session
+        && serde_json::to_value(&intent.owner)? == serde_json::to_value(&owner)?;
+    Ok((attested && bound && exact).then_some(owner))
+}
+
+#[cfg(target_os = "macos")]
+fn terminal_close_resumable(directory: &Path, session: &terminal::TerminalSession) -> Result<bool> {
+    Ok(terminal_close_intent_owner(directory, session)?
+        .is_some_and(|owner| !process_is_alive(owner.pid)))
 }
 
 #[cfg(test)]
@@ -3860,6 +3976,14 @@ fn verify_terminal_close_authority(
                     return Ok(false);
                 }
             }
+            // The close that recorded the intent may finish without signalling anything
+            // again, and only once the owner it verified no longer exists. A live owner,
+            // or a PID that is alive again, keeps the rules below.
+            #[cfg(target_os = "macos")]
+            if terminal_close_resumable(directory, session)? {
+                session.verify_managed_session(expected_session_id)?;
+                return Ok(false);
+            }
             verify_terminal_surface_ownership(directory, expected_session_id, session)?;
             return Ok(true);
         }
@@ -4005,9 +4129,14 @@ fn consume_terminal_handle(
     );
     let active_result = remove_file_if_present(&directory.join(TERMINAL_HANDLE_FILE));
     let closing_result = remove_file_if_present(&directory.join(TERMINAL_CLOSING_FILE));
+    #[cfg(target_os = "macos")]
+    let intent_result = remove_file_if_present(&directory.join(TERMINAL_CLOSE_INTENT_FILE));
+    #[cfg(not(target_os = "macos"))]
+    let intent_result = Ok(());
     tombstone_result?;
     active_result?;
-    closing_result
+    closing_result?;
+    intent_result
 }
 
 fn remove_file_if_present(path: &Path) -> Result<()> {
@@ -6418,6 +6547,14 @@ where
     }
     #[cfg(not(windows))]
     {
+        // An explicit close that began its teardown still has to close the surface or
+        // prove it absent. Even a damaged/mismatched intent must preserve that pending
+        // cleanup: it grants no authority, but is not evidence of a vanished surface.
+        // The explicit close validates the full intent before using it as authority.
+        #[cfg(target_os = "macos")]
+        if read_regular_bytes_if_present(&directory.join(TERMINAL_CLOSE_INTENT_FILE))?.is_some() {
+            return untouched(recovery_damage);
+        }
         mark_session_closed(directory, repair_error)?;
         Ok(true)
     }

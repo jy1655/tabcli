@@ -1748,11 +1748,13 @@ fn terminal_app_actions_require_the_recorded_window_and_tty() {
         terminal::macos::apple_terminal::START_SESSION_SCRIPT,
         terminal::macos::apple_terminal::SEND_FILE_SCRIPT,
         terminal::macos::apple_terminal::CLOSE_TAB_SCRIPT,
-        terminal::macos::apple_terminal::WAIT_FOR_CLOSE_SCRIPT,
     ] {
         assert!(script.contains("wantedWindowId"));
         assert!(script.contains("wantedTty"));
     }
+    let wait = terminal::macos::apple_terminal::WAIT_FOR_CLOSE_SCRIPT;
+    assert!(wait.contains("wantedWindowId"));
+    assert!(!wait.contains("wantedTty"));
     assert!(terminal::macos::apple_terminal::OPEN_TAB_SCRIPT.contains("do script \"\""));
     assert!(!terminal::macos::apple_terminal::OPEN_TAB_SCRIPT.contains("bridgeCommand"));
 }
@@ -2914,6 +2916,278 @@ fn exited_dead_native_owner_consumes_terminal_without_adapter_calls() {
 #[test]
 fn failed_dead_native_owner_consumes_terminal_without_adapter_calls() {
     assert_dead_terminal_owner_close_converges("failed");
+}
+
+// An owner that passed the live Terminal.app verification has its whole identity recorded.
+#[cfg(target_os = "macos")]
+fn write_attested_apple_terminal_state(
+    directory: &Path,
+    state: &str,
+    owner_pid: u32,
+) -> NativeSessionOwner {
+    write_owned_terminal_state(directory, state, owner_pid);
+    let owner = NativeSessionOwner {
+        pid: owner_pid,
+        managed_session_id: Some("session-owner123".to_owned()),
+        terminal_tty: Some("/dev/ttys999".to_owned()),
+        terminal_tty_device: Some(7),
+        process_start_seconds: Some(1_790_000_000),
+        process_start_microseconds: Some(42),
+        process_group: Some(owner_pid),
+        terminal_process_group: Some(owner_pid),
+        ..NativeSessionOwner::default()
+    };
+    write_json_atomic(&directory.join(SESSION_OWNER_FILE), &owner).unwrap();
+    owner
+}
+
+// The first attempt of an explicit Terminal.app close, up to its failure: the owner and the
+// surface were verified, the intent was recorded as the teardown records it, the teardown
+// ended the owner (it is already gone here), and the adapter close failed.
+#[cfg(target_os = "macos")]
+fn fail_apple_terminal_close_after_teardown(directory: &Path, owner: &NativeSessionOwner) {
+    let failure = close_session_state_with_error(directory, None, |session| {
+        record_terminal_close_intent(directory, "session-owner123", session, owner)?;
+        Err(anyhow::anyhow!(
+            "Terminal.app automation failed: AppleEvent timed out."
+        ))
+    })
+    .unwrap_err();
+    assert!(failure.to_string().contains("timed out"));
+}
+
+#[cfg(target_os = "macos")]
+fn assert_closed_without_terminal_records(directory: &Path) {
+    for record in [
+        TERMINAL_HANDLE_FILE,
+        TERMINAL_CLOSING_FILE,
+        TERMINAL_CLOSE_INTENT_FILE,
+    ] {
+        assert!(!directory.join(record).exists(), "{record} was kept");
+    }
+    assert!(directory.join(TERMINAL_TOMBSTONE_FILE).exists());
+    let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+    assert_eq!(status.state, "closed");
+}
+
+// The partial transition of an explicit Terminal.app close: the teardown ended the owner and
+// the adapter close failed. The retry must reach the adapter instead of reporting the
+// surface closed because the owner is gone.
+#[cfg(target_os = "macos")]
+#[test]
+fn apple_terminal_close_retry_after_teardown_reaches_the_adapter() {
+    for outcome in [
+        terminal::CloseOutcome::Closed,
+        terminal::CloseOutcome::Missing,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let owner =
+            write_attested_apple_terminal_state(directory.path(), "ready", reaped_child_pid());
+        fail_apple_terminal_close_after_teardown(directory.path(), &owner);
+        let handle: terminal::TerminalSession =
+            read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
+        assert!(directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
+
+        // A later command's repair does not report the surface closed.
+        assert!(!repair_dead_native_owner(directory.path()).unwrap());
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state, "ready");
+        // The close that recorded the intent may finish without signalling anything. The
+        // first assertion keeps a regression from reaching the Terminal.app probe.
+        assert!(terminal_close_resumable(directory.path(), &handle).unwrap());
+        assert!(
+            !verify_terminal_close_authority(directory.path(), "session-owner123", &handle)
+                .unwrap()
+        );
+
+        let mut adapter_calls = 0;
+        close_repaired_session_state(directory.path(), |session| {
+            adapter_calls += 1;
+            assert_eq!(session, &handle);
+            Ok(outcome)
+        })
+        .unwrap();
+        assert_eq!(adapter_calls, 1, "the retried close must reach the adapter");
+        assert_closed_without_terminal_records(directory.path());
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn apple_terminal_close_retry_failure_or_interruption_keeps_the_intent_and_the_handle() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = write_attested_apple_terminal_state(directory.path(), "ready", reaped_child_pid());
+    fail_apple_terminal_close_after_teardown(directory.path(), &owner);
+
+    close_repaired_session_state(directory.path(), |_| {
+        Err(anyhow::anyhow!(
+            "Agent Bridge Terminal.app window no longer holds its tab"
+        ))
+    })
+    .unwrap_err();
+    assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
+    assert!(directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state, "ready");
+
+    // A closer that stopped after claiming the handle leaves it claimed; repair leaves it
+    // and the next close resumes the claim.
+    fs::rename(
+        directory.path().join(TERMINAL_HANDLE_FILE),
+        directory.path().join(TERMINAL_CLOSING_FILE),
+    )
+    .unwrap();
+    assert!(!repair_dead_native_owner(directory.path()).unwrap());
+    assert!(directory.path().join(TERMINAL_CLOSING_FILE).exists());
+    let mut adapter_calls = 0;
+    close_repaired_session_state(directory.path(), |_| {
+        adapter_calls += 1;
+        Ok(terminal::CloseOutcome::Closed)
+    })
+    .unwrap();
+    assert_eq!(adapter_calls, 1);
+    assert_closed_without_terminal_records(directory.path());
+}
+
+// A close interrupted after its intent but before its teardown left the owner alive: the
+// intent grants nothing, and the original live-owner rules apply.
+#[cfg(target_os = "macos")]
+#[test]
+fn apple_terminal_close_intent_grants_nothing_while_the_owner_pid_is_alive() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = write_attested_apple_terminal_state(directory.path(), "ready", std::process::id());
+    let handle: terminal::TerminalSession =
+        read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
+    record_terminal_close_intent(directory.path(), "session-owner123", &handle, &owner).unwrap();
+    assert!(
+        terminal_close_intent_owner(directory.path(), &handle)
+            .unwrap()
+            .is_some()
+    );
+    assert!(!terminal_close_resumable(directory.path(), &handle).unwrap());
+}
+
+// Warp can close the owned tab (ending its owner) while its dedicated window remains.
+// A second close must retain authority to verify the window, not consume the handle
+// merely because the owner died during the first requested close.
+#[cfg(target_os = "macos")]
+#[test]
+fn warp_close_retry_preserves_authority_after_partial_surface_cleanup() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = write_attested_apple_terminal_state(directory.path(), "ready", reaped_child_pid());
+    let mut handle: terminal::TerminalSession =
+        read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
+    handle.kind = terminal::TerminalKind::Warp;
+    handle.id = "instance-test".into();
+    handle.tab_id = Some("tab-test".into());
+    handle.window_id = Some("window-test".into());
+    write_json_atomic(&directory.path().join(TERMINAL_HANDLE_FILE), &handle).unwrap();
+    close_session_state_with_error(directory.path(), None, |session| {
+        record_terminal_close_intent(directory.path(), "session-owner123", session, &owner)?;
+        bail!("managed Warp tab is closed but its dedicated empty window remains")
+    })
+    .unwrap_err();
+
+    assert!(!repair_dead_native_owner(directory.path()).unwrap());
+    // Guard the production authority call so a regression never probes a real app.
+    assert!(terminal_close_resumable(directory.path(), &handle).unwrap());
+    assert!(
+        !verify_terminal_close_authority(directory.path(), "session-owner123", &handle).unwrap()
+    );
+    let mut calls = 0;
+    close_repaired_session_state(directory.path(), |session| {
+        assert_eq!(session, &handle);
+        calls += 1;
+        Ok(terminal::CloseOutcome::Missing)
+    })
+    .unwrap();
+    assert_eq!(calls, 1);
+    assert_closed_without_terminal_records(directory.path());
+}
+
+#[cfg(target_os = "macos")]
+type CloseIntentMutation = fn(&Path, &terminal::TerminalSession, &NativeSessionOwner);
+
+// An invalid intent grants no close authority, but is not evidence that the surface
+// disappeared. Only an owner that died without any explicit close keeps the old repair.
+#[cfg(target_os = "macos")]
+#[test]
+fn apple_terminal_close_intent_grants_nothing_unless_it_names_this_handle_and_owner() {
+    let record = |directory: &Path, id: &str, handle, owner| {
+        record_terminal_close_intent(directory, id, handle, owner).unwrap()
+    };
+    let cases: [(&str, CloseIntentMutation); 6] = [
+        ("no intent", |_, _, _| {}),
+        ("corrupt intent", |directory, _, _| {
+            fs::write(directory.join(TERMINAL_CLOSE_INTENT_FILE), "{").unwrap()
+        }),
+        ("another session", |directory, handle, owner| {
+            let mut handle = handle.clone();
+            handle.managed_session_id = Some("session-other456".to_owned());
+            record_terminal_close_intent(directory, "session-other456", &handle, owner).unwrap()
+        }),
+        ("another handle", |directory, handle, owner| {
+            let mut handle = handle.clone();
+            handle.window_id = Some("1002".to_owned());
+            record_terminal_close_intent(directory, "session-owner123", &handle, owner).unwrap()
+        }),
+        ("another owner", |directory, handle, owner| {
+            let mut owner = owner.clone();
+            owner.process_start_microseconds = Some(43);
+            record_terminal_close_intent(directory, "session-owner123", handle, &owner).unwrap()
+        }),
+        ("owner without its identity", |directory, handle, owner| {
+            let owner = NativeSessionOwner {
+                pid: owner.pid,
+                managed_session_id: owner.managed_session_id.clone(),
+                terminal_tty: owner.terminal_tty.clone(),
+                ..NativeSessionOwner::default()
+            };
+            write_json_atomic(&directory.join(SESSION_OWNER_FILE), &owner).unwrap();
+            record_terminal_close_intent(directory, "session-owner123", handle, &owner).unwrap()
+        }),
+    ];
+    for (case, mutate) in cases {
+        let directory = tempfile::tempdir().unwrap();
+        let owner =
+            write_attested_apple_terminal_state(directory.path(), "ready", reaped_child_pid());
+        let handle: terminal::TerminalSession =
+            read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
+        mutate(directory.path(), &handle, &owner);
+        assert!(
+            !terminal_close_resumable(directory.path(), &handle).unwrap(),
+            "{case}"
+        );
+        if case == "no intent" {
+            close_repaired_session_state(directory.path(), |_| {
+                panic!("{case}: no authority, so no adapter call")
+            })
+            .unwrap();
+            assert_closed_without_terminal_records(directory.path());
+        } else {
+            assert!(
+                !repair_dead_native_owner_with_terminal_close(directory.path(), |_| {
+                    panic!("{case}: invalid intent grants no adapter authority")
+                })
+                .unwrap(),
+                "{case}: invalid close evidence must not become cleanup success"
+            );
+            assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
+            assert!(directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
+            assert!(!directory.path().join(TERMINAL_TOMBSTONE_FILE).exists());
+            let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+            assert_eq!(status.state, "ready", "{case}");
+        }
+    }
+
+    // Only a Terminal.app handle can carry the intent.
+    let directory = tempfile::tempdir().unwrap();
+    let owner = write_attested_apple_terminal_state(directory.path(), "ready", reaped_child_pid());
+    let mut handle: terminal::TerminalSession =
+        read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
+    handle.kind = terminal::TerminalKind::Iterm2;
+    record(directory.path(), "session-owner123", &handle, &owner);
+    assert!(!terminal_close_resumable(directory.path(), &handle).unwrap());
 }
 
 #[test]

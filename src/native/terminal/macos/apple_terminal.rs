@@ -155,11 +155,9 @@ on run argv
     set wantedTty to item 1 of argv
     set wantedWindowId to item 2 of argv as integer
     tell application "Terminal"
-        try
-            set targetWindow to first window whose id is wantedWindowId
-        on error
-            return "missing"
-        end try
+        -- Only Terminal's own window list proves absence; a failed read is an error.
+        if (id of every window) does not contain wantedWindowId then return "missing"
+        set targetWindow to first window whose id is wantedWindowId
         set matchCount to 0
         repeat with candidateTab in tabs of targetWindow
             if tty of candidateTab is wantedTty then set matchCount to matchCount + 1
@@ -171,26 +169,35 @@ on run argv
 end run
 "#;
 
+// Bridge kills the shell before it closes the window, and a tab whose shell was killed
+// can report its tty followed by U+0001 (2026-10-01, Terminal.app 2.15, windows 8341
+// and 8345 in docs/verification/2026-10-01-terminal-proof.md). An exact comparison
+// takes that tab for a missing one and reports the close as done without closing it.
+// The window is missing only when Terminal is not running or its own window list, read
+// without error, lacks it; a window that holds no tab of this tty has changed, it is not
+// absent. The running check launches nothing, unlike an event sent to a stopped Terminal.
 pub(in crate::native) const CLOSE_TAB_SCRIPT: &str = r#"
+on isOwnedTty(reportedTty, wantedTty)
+    return reportedTty is wantedTty or reportedTty is (wantedTty & (character id 1))
+end isOwnedTty
+
 on run argv
+    if application "Terminal" is not running then return "missing"
     set wantedTty to item 1 of argv
     set wantedWindowId to item 2 of argv as integer
     tell application "Terminal"
-        try
-            set targetWindow to first window whose id is wantedWindowId
-        on error
-            return "missing"
-        end try
+        if (id of every window) does not contain wantedWindowId then return "missing"
+        set targetWindow to first window whose id is wantedWindowId
 
         set targetTab to missing value
         set matchCount to 0
         repeat with candidateTab in tabs of targetWindow
-            if tty of candidateTab is wantedTty then
+            if my isOwnedTty(tty of candidateTab, wantedTty) then
                 set targetTab to candidateTab
                 set matchCount to matchCount + 1
             end if
         end repeat
-        if matchCount is 0 then return "missing"
+        if matchCount is 0 then error "Agent Bridge Terminal.app window no longer holds its tab"
         if matchCount is not 1 then error "Agent Bridge Terminal.app ownership proof matched multiple tabs"
         if (count of tabs of targetWindow) is not 1 then error "Agent Bridge refuses to close a Terminal.app window containing another tab"
 
@@ -203,8 +210,8 @@ on run argv
         end repeat
         if busy of targetTab then error "Agent Bridge could not stop the foreground process in its Terminal.app tab"
 
-        if id of targetWindow is not wantedWindowId then return "missing"
-        if tty of targetTab is not wantedTty then return "missing"
+        if id of targetWindow is not wantedWindowId then error "Agent Bridge Terminal.app window identity changed before close"
+        if not my isOwnedTty(tty of targetTab, wantedTty) then error "Agent Bridge Terminal.app tab changed before close"
         if (count of tabs of targetWindow) is not 1 then error "Agent Bridge refuses to close a Terminal.app window containing another tab"
         close targetWindow
         return "closed"
@@ -212,25 +219,16 @@ on run argv
 end run
 "#;
 
+// A closed window is one that Terminal's window list lacks. The tty proves nothing
+// here: it changes when the shell ends, and the window stays on the screen.
 pub(in crate::native) const WAIT_FOR_CLOSE_SCRIPT: &str = r#"
 on run argv
-    set wantedTty to item 1 of argv
-    set wantedWindowId to item 2 of argv as integer
-    set attemptCount to item 3 of argv as integer
+    set wantedWindowId to item 1 of argv as integer
+    set attemptCount to item 2 of argv as integer
     if not application "Terminal" is running then return "missing"
     tell application "Terminal"
         repeat attemptCount times
-            set targetExists to false
-            try
-                set targetWindow to first window whose id is wantedWindowId
-                repeat with candidateTab in tabs of targetWindow
-                    if tty of candidateTab is wantedTty then
-                        set targetExists to true
-                        exit repeat
-                    end if
-                end repeat
-            end try
-            if not targetExists then return "missing"
+            if (id of every window) does not contain wantedWindowId then return "missing"
             delay 0.05
         end repeat
     end tell
@@ -386,11 +384,8 @@ fn close_session_with_deadline(
         return Ok(outcome);
     }
 
-    let verification = run_terminal_automation(
-        WAIT_FOR_CLOSE_SCRIPT,
-        &[&session.id, window_id, "20"],
-        deadline,
-    )?;
+    let verification =
+        run_terminal_automation(WAIT_FOR_CLOSE_SCRIPT, &[window_id, "20"], deadline)?;
     if verification == "missing" {
         return Ok(CloseOutcome::Closed);
     }
@@ -402,16 +397,10 @@ fn close_session_with_deadline(
     if close_response(TerminalKind::AppleTerminal, &retry)? == CloseOutcome::Missing {
         return Ok(CloseOutcome::Closed);
     }
-    let verification = run_terminal_automation(
-        WAIT_FOR_CLOSE_SCRIPT,
-        &[&session.id, window_id, "100"],
-        deadline,
-    )?;
+    let verification =
+        run_terminal_automation(WAIT_FOR_CLOSE_SCRIPT, &[window_id, "100"], deadline)?;
     if verification != "missing" {
-        bail!(
-            "Terminal.app reported a closed tab twice but tty {:?} is still present",
-            session.id
-        );
+        bail!("Terminal.app reported a closed tab twice but window {window_id} is still present");
     }
     Ok(CloseOutcome::Closed)
 }
@@ -432,4 +421,267 @@ fn ownership_proof(session: &TerminalSession) -> Result<&str> {
         .window_id
         .as_deref()
         .context("Terminal.app session record is missing its window id")
+}
+
+// The shipped scripts, executed with Terminal replaced by records: only the reads and
+// the close are swapped for mock handlers, the scripts' own decisions run in
+// `osascript`, and nothing talks to Terminal.
+#[cfg(test)]
+mod tests {
+    use super::{CLOSE_TAB_SCRIPT, VERIFY_TAB_SCRIPT, WAIT_FOR_CLOSE_SCRIPT};
+
+    const WINDOW: &str = "8341";
+    const TTY: &str = "/dev/ttys014";
+    const LIVE: &str = r#"{id:8341, tabs:{{tty:"/dev/ttys014", busy:false}}}"#;
+    // The form that windows 8341 and 8345 reported after their shells were killed
+    // with no confirmation pending: the old name followed by U+0001
+    // (docs/verification/2026-10-01-terminal-proof.md). Bridge kills the shell
+    // before it closes the window.
+    const KILLED: &str = r#"{id:8341, tabs:{{tty:"/dev/ttys014" & (character id 1), busy:false}}}"#;
+    const CHANGED: &str = r#"{id:8341, tabs:{{tty:"/dev/ttys020", busy:false}}}"#;
+    const SHARED: &str =
+        r#"{id:8341, tabs:{{tty:"/dev/ttys014", busy:false}, {tty:"/dev/ttys020", busy:false}}}"#;
+    const UNRELATED: &str = r#"{id:8000, tabs:{{tty:"/dev/ttys014", busy:false}}}"#;
+    const EMPTY: &str = r#"{id:8341, tabs:{}}"#;
+    // Listed as 8341, but its id reads 8342 at the final check before the close.
+    const RENUMBERED: &str = r#"{listedId:8341, id:8342, tabs:{{tty:"/dev/ttys014", busy:false}}}"#;
+    const DENIED: &str = r#"{-1743, "Not authorized to send Apple events to Terminal."}"#;
+    const TIMED_OUT: &str = r#"{-1712, "AppleEvent timed out."}"#;
+
+    // An Apple Event to a Terminal that is not running launches it, without the
+    // windows Bridge created.
+    const MOCK: &str = r#"
+on mockEvent()
+    if not mockRunning then
+        log "launched Terminal"
+        set mockRunning to true
+        set mockWindows to {}
+    end if
+    if mockError is not missing value then error (item 2 of mockError) number (item 1 of mockError)
+end mockEvent
+
+on mockWindowIds()
+    mockEvent()
+    set windowIds to {}
+    repeat with mockWindow in mockWindows
+        try
+            set end of windowIds to listedId of mockWindow
+        on error
+            set end of windowIds to id of mockWindow
+        end try
+    end repeat
+    return windowIds
+end mockWindowIds
+
+on mockWindowWithId(wantedId)
+    set windowIds to mockWindowIds()
+    repeat with windowIndex from 1 to count of windowIds
+        if item windowIndex of windowIds is wantedId then return item windowIndex of mockWindows
+    end repeat
+    error "Can't get window 1 whose id = " & wantedId & "." number -1728
+end mockWindowWithId
+
+on mockClose(targetWindow)
+    mockEvent()
+    log "closed " & (id of targetWindow)
+end mockClose
+"#;
+
+    struct Terminal<'a> {
+        running: bool,
+        windows: &'a [&'a str],
+        error: Option<&'a str>,
+    }
+
+    const fn running<'a>(windows: &'a [&'a str]) -> Terminal<'a> {
+        Terminal {
+            running: true,
+            windows,
+            error: None,
+        }
+    }
+
+    const STOPPED: Terminal = Terminal {
+        running: false,
+        windows: &[LIVE],
+        error: None,
+    };
+
+    const fn failing(error: &str) -> Terminal<'_> {
+        Terminal {
+            running: true,
+            windows: &[LIVE],
+            error: Some(error),
+        }
+    }
+
+    // The script's response or error, and the windows it closed or the launch it caused.
+    fn replay(
+        script: &str,
+        terminal: &Terminal,
+        arguments: &[&str],
+    ) -> (Result<String, String>, Vec<String>) {
+        let script = [
+            ("tell application \"Terminal\"", "tell me"),
+            ("application \"Terminal\" is not running", "not mockRunning"),
+            ("application \"Terminal\" is running", "mockRunning"),
+            (
+                "first window whose id is wantedWindowId",
+                "my mockWindowWithId(wantedWindowId)",
+            ),
+            ("id of every window", "my mockWindowIds()"),
+            ("close targetWindow", "my mockClose(targetWindow)"),
+        ]
+        .iter()
+        .fold(script.to_owned(), |script, (term, mock)| {
+            script.replace(term, mock)
+        });
+        for term in ["application \"Terminal\"", " window whose ", "every window"] {
+            assert!(!script.contains(term), "unmocked Terminal term {term:?}");
+        }
+        let state = format!(
+            "property mockRunning : {}\nproperty mockError : {}\nproperty mockWindows : {{{}}}\n",
+            terminal.running,
+            terminal.error.unwrap_or("missing value"),
+            terminal.windows.join(", ")
+        );
+        let output = std::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(format!("{state}{MOCK}{script}"))
+            .args(arguments)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let events = stderr
+            .lines()
+            .filter(|line| line.starts_with("closed ") || *line == "launched Terminal")
+            .map(str::to_owned)
+            .collect();
+        let response = if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        } else {
+            Err(stderr)
+        };
+        (response, events)
+    }
+
+    fn check(
+        failures: &mut Vec<String>,
+        case: &str,
+        actual: (Result<String, String>, Vec<String>),
+        expected: Result<&str, &str>,
+        closes_owned_window: bool,
+    ) {
+        let events: &[&str] = if closes_owned_window {
+            &["closed 8341"]
+        } else {
+            &[]
+        };
+        let response_matches = match (&actual.0, expected) {
+            (Ok(response), Ok(wanted)) => response == wanted,
+            (Err(error), Err(wanted)) => error.contains(wanted),
+            _ => false,
+        };
+        if !response_matches || actual.1 != events {
+            failures.push(format!(
+                "{case}: expected {expected:?} with {events:?}, got {:?} with {:?}",
+                actual.0, actual.1
+            ));
+        }
+    }
+
+    #[test]
+    fn terminal_app_close_closes_its_killed_shell_tab_and_reports_only_proven_absence() {
+        let close = |terminal: &Terminal| replay(CLOSE_TAB_SCRIPT, terminal, &[TTY, WINDOW]);
+        let mut failures = Vec::new();
+        let cases = [
+            ("Terminal not running", STOPPED, Ok("missing"), false),
+            ("live owned tab", running(&[LIVE]), Ok("closed"), true),
+            ("no windows", running(&[]), Ok("missing"), false),
+            (
+                "only another window",
+                running(&[UNRELATED]),
+                Ok("missing"),
+                false,
+            ),
+            ("killed shell", running(&[KILLED]), Ok("closed"), true),
+            (
+                "window list denied",
+                failing(DENIED),
+                Err("Not authorized"),
+                false,
+            ),
+            (
+                "tab replaced in the owned window",
+                running(&[CHANGED]),
+                Err("no longer holds its tab"),
+                false,
+            ),
+            (
+                "window shared with another tab",
+                running(&[SHARED]),
+                Err("refuses to close a Terminal.app window containing another tab"),
+                false,
+            ),
+            (
+                "owned window without tabs",
+                running(&[EMPTY]),
+                Err("no longer holds its tab"),
+                false,
+            ),
+            (
+                "window identity changed before close",
+                running(&[RENUMBERED]),
+                Err("window identity changed"),
+                false,
+            ),
+        ];
+        for (case, terminal, expected, closed) in cases {
+            check(&mut failures, case, close(&terminal), expected, closed);
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    fn terminal_app_close_wait_reports_absence_only_from_the_window_list() {
+        let wait = |terminal: &Terminal| replay(WAIT_FOR_CLOSE_SCRIPT, terminal, &[WINDOW, "2"]);
+        let mut failures = Vec::new();
+        let cases = [
+            ("Terminal not running", STOPPED, Ok("missing")),
+            ("window closed", running(&[UNRELATED]), Ok("missing")),
+            ("live owned tab", running(&[LIVE]), Ok("present")),
+            ("killed shell", running(&[KILLED]), Ok("present")),
+            ("tab replaced", running(&[CHANGED]), Ok("present")),
+            (
+                "owned window without tabs",
+                running(&[EMPTY]),
+                Ok("present"),
+            ),
+            (
+                "window list timed out",
+                failing(TIMED_OUT),
+                Err("timed out"),
+            ),
+        ];
+        for (case, terminal, expected) in cases {
+            check(&mut failures, case, wait(&terminal), expected, false);
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    fn terminal_app_verify_reports_a_read_error_not_absence() {
+        let verify = |terminal: &Terminal| replay(VERIFY_TAB_SCRIPT, terminal, &[TTY, WINDOW]);
+        let mut failures = Vec::new();
+        let cases = [
+            ("Terminal not running", STOPPED, Ok("missing")),
+            ("window closed", running(&[UNRELATED]), Ok("missing")),
+            ("live owned tab", running(&[LIVE]), Ok(TTY)),
+            ("window list denied", failing(DENIED), Err("Not authorized")),
+        ];
+        for (case, terminal, expected) in cases {
+            check(&mut failures, case, verify(&terminal), expected, false);
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
 }

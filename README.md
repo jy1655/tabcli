@@ -11,12 +11,15 @@
 | macOS + Ghostty | v0.0.10 미지원 | 현재 설치 가능한 1.3.1은 AppleScript surface 회귀가 있고 1.3.0은 이번 후보의 양성 runtime 근거가 없어 모든 버전을 surface 생성 전에 fail-closed |
 | macOS + iTerm2 | 지원 | iTerm2 AppleScript 직접 제어 |
 | macOS + Terminal.app | 지원 | Terminal AppleScript 직접 제어 |
+| macOS + Warp | 현재 소스 구현, 실제 호스트 검증 전 | 공식 Warp Control endpoint와 Launch Configuration 사용; v0.0.10 설치 바이너리에는 미포함 |
 | macOS의 다른 터미널 | fallback | 별도 adapter가 없으면 Terminal.app에서 시작 |
 | Windows PowerShell / cmd | 지원 | PowerShell 7(`pwsh.exe`) 기반 managed console; Windows Terminal의 tab으로 열고 tab을 만들 수 없을 때만 전용 console window; `ask`/`tell`/`sessions`/explicit prune·close |
 | Linux 터미널 | 미지원 | [Issue #6](https://github.com/jy1655/agent-bridge/issues/6)에서 별도 구현 |
 | VS Code 통합 터미널 | 현재 비범위 | 전용 adapter가 필요하면 별도로 판단 |
 
-macOS에서는 `TERM_PROGRAM`, `TERM`, `ITERM_SESSION_ID`, `TERM_SESSION_ID` 순으로 현재 호스트를 식별합니다. `--terminal ghostty|iterm2|terminal`로 명시 선택할 수 있고, 선택을 생략한 상태에서 호스트를 식별하지 못하면 내장 Terminal.app을 엽니다. Terminal.app은 복원되거나 기존에 열린 surface를 채택하지 않고 항상 전용 새 window를 만듭니다. 명시 선택한 adapter가 실패하면 다른 앱으로 조용히 우회하지 않고 오류를 반환합니다.
+macOS에서는 `TERM_PROGRAM`, `TERM`, `ITERM_SESSION_ID`, `TERM_SESSION_ID` 순으로 현재 호스트를 식별합니다. 현재 소스는 `--terminal ghostty|iterm2|terminal|warp`를 받으며 `TERM_PROGRAM=WarpTerminal`을 Warp로 식별합니다. 선택을 생략한 상태에서 호스트를 식별하지 못하면 내장 Terminal.app을 엽니다. Terminal.app은 복원되거나 기존에 열린 surface를 채택하지 않고 항상 전용 새 window를 만듭니다. 명시한 `--terminal` 대상은 호출한 터미널의 환경보다 우선합니다. 다른 터미널에서 `--terminal warp`로 호출해도 설치된 Warp 번들과 공식 endpoint를 사용합니다. 선택된 adapter가 실패하면 다른 앱으로 조용히 우회하지 않고 오류를 반환합니다.
+
+Warp는 필요한 동작을 제공하는, 접근 권한이 있는 공식 Warp Control endpoint가 있어야 합니다. 공개 채널의 Scripting 동의는 사용자가 설정하며 Bridge가 이를 변경하지 않습니다. 번들의 공식 wrapper 또는 해당 채널 실행 파일의 `--warpctrl` 경로를 사용하고, 버전 문자열이나 wrapper 존재만으로 지원을 판정하지 않습니다. 전용 Launch Configuration에서 대기 호스트를 시작한 뒤 생성한 window와 tab의 정확한 ID를 기록해야만 provider를 실행합니다. Codex와 Claude의 후속 요청은 기존 provider-native 경로를 사용합니다. Warp의 `input.insert`와 `input.replace`는 텍스트를 준비할 뿐 제출하지 않으므로 Agy·Pi의 terminal 기반 `tell`과 화면을 읽어 동의 대화상자에 응답하는 기능은 지원하지 않습니다. 설치된 Stable `0.2026.09.30.08.29.01`의 실제 endpoint 접근과 provider 왕복·화면 정리는 아직 검증하지 않았습니다.
 
 Ghostty의 AppleScript는 1.3에서 추가된 preview API이며 macOS Automation 권한이 필요합니다. [Ghostty 1.3.1에는 AppleScript로 만든 tab의 terminal surface가 초기화되지 않는 회귀](https://github.com/ghostty-org/ghostty/issues/12730)가 있고, 1.3.0은 이번 릴리스 후보에서 다시 확인한 양성 runtime 근거가 없습니다. 따라서 Agent Bridge v0.0.10은 명시적인 `--terminal ghostty`를 AppleScript 실행 전에 거부하고, Ghostty 환경 자동 감지는 지원되는 Terminal.app으로 대체합니다. `--terminal iterm2` 또는 `--terminal terminal`을 사용하세요. Terminal.app은 기존 tab이나 UI scripting을 사용하지 않고 native AppleScript로 항상 전용 새 window를 만듭니다.
 
@@ -126,7 +129,7 @@ agent-bridge reopen session-XXXXXXXX \
 
 ```text
 agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]
-    [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|windows-console>]
+    [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|warp|windows-console>]
     [--yolo] [--timeout-secs N] [--detach] [--json] [--context-result <session>/<request-id>]...
 agent-bridge tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
     [--context-result <session>/<request-id>]...

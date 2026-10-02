@@ -19,10 +19,10 @@ fn help_text() -> String {
 
 Usage:
   agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]
-      [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|windows-console>]
+      [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|warp|windows-console>]
       [--yolo] [--timeout-secs N] [--detach] [--json] [--context-result <session>/<request-id>]...
   agent-bridge self-test <codex|claude|agy|pi> [--workspace PATH]
-      [--terminal <ghostty|iterm2|terminal|windows-console>] [--model MODEL] [--effort EFFORT]
+      [--terminal <ghostty|iterm2|terminal|warp|windows-console>] [--model MODEL] [--effort EFFORT]
       [--yolo] [--timeout-secs N] [--isolated] [--json]
   agent-bridge tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
       [--context-result <session>/<request-id>]...
@@ -45,10 +45,13 @@ Usage:
   agent-bridge --help | --version
 
 Runtime:
-  macOS detects Ghostty, iTerm2, or Terminal.app from the invoking environment
+  macOS detects Ghostty, iTerm2, Terminal.app, or Warp from the invoking environment
   and opens a real surface for Codex, Claude, Agy, or Pi. Terminal.app always
   uses a dedicated new window. Use --terminal to override detection. An
-  unknown host falls back to Terminal.app. Windows opens a managed PowerShell 7
+  unknown host falls back to Terminal.app. Warp requires its Scripting opt-in and a
+  reachable authorized official Warp Control endpoint; its control API cannot submit
+  terminal input, so follow-ups without a provider-native input path are unsupported.
+  Windows opens a managed PowerShell 7
   console from either PowerShell or cmd: a tab of the Agent Bridge window of
   Windows Terminal or, when no tab can be created, a console window of its own.
   settings windows-tab-window current opens the tab in the most recently used
@@ -334,7 +337,7 @@ mod tests {
             "private directory stays until you remove it",
             "prune-sessions --closed-before-days N --explicit",
             "close-session <session> --explicit",
-            "macOS detects Ghostty, iTerm2, or Terminal.app",
+            "macOS detects Ghostty, iTerm2, Terminal.app, or Warp",
             "Terminal.app always\n  uses a dedicated new window",
             "Use --terminal to override",
             "unknown host falls back to Terminal.app",
