@@ -3,7 +3,7 @@ use std::{
     ffi::OsStr,
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::{fs::PermissionsExt, process::CommandExt},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
@@ -28,6 +28,7 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_CLEANUP_RESERVE: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_CONTROL_OUTPUT: usize = 1024 * 1024;
+const TITLE_PROOF_ATTEMPTS: u32 = 3;
 
 const REQUIRED_ACTIONS: &[&str] = &[
     "instance.inspect",
@@ -122,6 +123,8 @@ struct ControlBinding {
     instance_id: String,
     pid: u32,
     protocol_version: u32,
+    #[serde(default)]
+    process_birth: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -228,6 +231,7 @@ struct TabInspectResponse {
     tab: TabDescription,
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct WindowInspectResponse {
     action: String,
@@ -285,6 +289,8 @@ trait WarpRunner {
         deadline: Instant,
     ) -> Result<()>;
 
+    fn process_birth(&mut self, pid: u32) -> Result<Option<(u64, u64)>>;
+
     fn pause(&mut self, duration: Duration) {
         thread::sleep(duration);
     }
@@ -293,6 +299,10 @@ trait WarpRunner {
 struct ProcessRunner;
 
 impl WarpRunner for ProcessRunner {
+    fn process_birth(&mut self, pid: u32) -> Result<Option<(u64, u64)>> {
+        crate::native::macos_process_start(pid)
+    }
+
     fn control(
         &mut self,
         client: &ControlClient,
@@ -353,12 +363,44 @@ struct OpenRequest<'a> {
     deadline: Instant,
     cleanup_deadline: Instant,
     attempt: &'a str,
+    force_new_window: bool,
 }
 
+// Chosen once, from what is known before the creation, and never changed after it.
+// Interfaces at pinned d5d23e6119b39edb8c95580a60b68fcd4a2d5a1b.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CreationRoute {
+    // `tab_config` URI: a new tab in the active window. uri/mod.rs:153 takes this host
+    // only with TabConfigs, which is enabled per build (features.rs:454-455) and which
+    // Warp Control does not report, so the route is proven only by the host offer it
+    // produces.
+    Tab,
+    // `launch` URI: uri/mod.rs:142 takes this host without a feature gate, and
+    // 227-241 with root_view.rs:589-622 always builds a new window from the template.
+    Window,
+}
+
+// Compatibility entry point; routing can pass its one creation-time choice below.
+#[allow(dead_code)]
 pub(super) fn open_bound_tab<F, U>(
     command: &str,
     directory: &Path,
     deadline: Instant,
+    bind: F,
+    unbind: U,
+) -> Result<TerminalSession>
+where
+    F: FnOnce(&mut TerminalSession) -> Result<()>,
+    U: FnOnce() -> Result<()>,
+{
+    open_bound_tab_with_mode(command, directory, deadline, false, bind, unbind)
+}
+
+pub(super) fn open_bound_tab_with_mode<F, U>(
+    command: &str,
+    directory: &Path,
+    deadline: Instant,
+    force_new_window: bool,
     bind: F,
     unbind: U,
 ) -> Result<TerminalSession>
@@ -375,6 +417,7 @@ where
     open_bound_tab_with(
         &mut ProcessRunner,
         OpenRequest {
+            force_new_window,
             clients: &clients,
             command,
             directory,
@@ -399,6 +442,7 @@ where
     U: FnOnce() -> Result<()>,
 {
     let OpenRequest {
+        force_new_window,
         clients,
         command,
         directory,
@@ -421,6 +465,20 @@ where
 
     let (client, before_instances) = discover_control_client(runner, clients, deadline)?;
     let before = snapshot_instances(runner, &client, &before_instances, deadline)?;
+    // A window is the route when it is asked for, or when no window exists that could
+    // take a tab. A Tab Config URI is not a window route: the window it opens is an
+    // empty workspace with a tab of its own (uri/mod.rs:838-849, root_view.rs:1231-1243,
+    // workspace/view.rs:4430-4461), so the launch tab would not be the only new one.
+    let route = if force_new_window
+        || before
+            .instances
+            .values()
+            .all(|instance| instance.windows.is_empty())
+    {
+        CreationRoute::Window
+    } else {
+        CreationRoute::Tab
+    };
 
     let (deadline_unix_ms, decision_timeout_ms) = host_deadlines(deadline)?;
     let plan = HostPlan {
@@ -436,69 +494,94 @@ where
     let config_name = format!("agent-bridge-{attempt}");
     let offer_title = format!("agent-bridge-offer-{attempt}");
     let bound_title = format!("agent-bridge-{attempt}");
-    let config_path = write_launch_config(&client, &config_name, &offer_title, directory, attempt)?;
-    let _config_guard = LaunchConfigGuard(config_path);
-    let uri = format!("{}://launch/{config_name}", client.scheme);
-    runner.dispatch_uri(&client, &uri, directory, attempt, deadline)?;
+    let (config_path, uri_host, offer_missing) = match route {
+        CreationRoute::Tab => (
+            write_tab_config(
+                &client,
+                &config_name,
+                &offer_title,
+                directory,
+                attempt,
+                command,
+            )?,
+            "tab_config",
+            "Warp Tab Config host offer was not verified; TabConfigs URI support/feature enablement is unverified on this app, or host startup did not complete; a residual launch tab may remain and was not closed; no creation retry or new-window fallback was dispatched",
+        ),
+        CreationRoute::Window => (
+            write_launch_config(
+                &client,
+                &config_name,
+                &offer_title,
+                directory,
+                attempt,
+                command,
+            )?,
+            "launch",
+            "Warp Launch Configuration host offer was not verified; the launch URI was not handled or host startup did not complete; a residual launch window may remain and was not closed; no creation retry was dispatched",
+        ),
+    };
+    let _config_guard = ConfigFileGuard(config_path);
+    // One URI is one creation request. A missing, late or lost reply is never read as a
+    // missing capability: no retry and no other route is dispatched after this.
+    let uri = format!("{}://{uri_host}/{config_name}", client.scheme);
+    if let Err(error) = runner.dispatch_uri(&client, &uri, directory, attempt, deadline) {
+        decision.abort_before_cleanup().context("Warp dispatch failed and Abort could not be established; unproven residual surface was preserved")?;
+        return Err(error).context("Warp dispatch failed; ownership is unproven and a residual launch tab may remain; no surface was closed");
+    }
 
-    let offer = wait_for_offer(runner, directory, attempt, deadline)?;
-    let after_instances = list_matching_instances(runner, &client, deadline)?;
+    wait_for_offer(runner, directory, attempt, deadline).context(offer_missing)?;
+    let after_instances = list_matching_instances(runner, &client, deadline).context(
+        "Warp instance ownership is unproven; a residual launch tab may remain and was preserved",
+    )?;
     if instance_map(&after_instances)? != instance_map(&before_instances)? {
         decision.publish(HostAction::Abort)?;
-        bail!("Warp instance identity changed during launch; no surface was mutated");
+        bail!(
+            "Warp instance identity changed during launch; unproven residual launch tab may remain; no surface was mutated"
+        );
     }
-    let after = snapshot_instances(runner, &client, &after_instances, deadline)?;
-    let mut new_windows = Vec::new();
+    let after = snapshot_instances(runner, &client, &after_instances, deadline).context(
+        "Warp surface ownership is unproven; a residual launch tab may remain and was preserved",
+    )?;
+    let mut new_tabs = Vec::new();
     for (instance_id, snapshot) in &after.instances {
         let prior = before
             .instances
             .get(instance_id)
             .context("Warp instance appeared during launch")?;
         for (window_id, tabs) in &snapshot.windows {
-            if !prior.windows.contains_key(window_id) {
-                new_windows.push((instance_id.clone(), window_id.clone(), tabs.clone()));
+            for tab_id in tabs {
+                if !prior
+                    .windows
+                    .get(window_id)
+                    .is_some_and(|old| old.contains(tab_id))
+                {
+                    new_tabs.push((instance_id.clone(), window_id.clone(), tab_id.clone()));
+                }
             }
         }
     }
-    if new_windows.len() != 1 || new_windows[0].2.len() != 1 {
+    if new_tabs.len() != 1 {
         decision.publish(HostAction::Abort)?;
         bail!(
-            "Warp launch did not produce exactly one new window with one tab; no surface was mutated"
+            "Warp launch did not produce exactly one new tab; unproven residual launch tab may remain; no surface was mutated"
         );
     }
-    let (instance_id, window_id, tabs) = new_windows.pop().expect("one new window");
-    let tab_id = tabs.into_iter().next().expect("one tab");
+    let (instance_id, window_id, tab_id) = new_tabs.pop().expect("one new tab");
+    if route == CreationRoute::Window
+        && before.instances[&instance_id]
+            .windows
+            .contains_key(&window_id)
+    {
+        decision.publish(HostAction::Abort)?;
+        bail!("Warp did not honor the explicit new-window request; unproven tab was preserved");
+    }
     let instance = after_instances
         .iter()
         .find(|instance| instance.instance_id == instance_id)
-        .context("new Warp window has no matching instance identity")?;
+        .context("new Warp tab has no matching instance identity")?;
 
-    let renamed: RenameResponse = control_json(
-        runner,
-        &client,
-        &[
-            "tab".into(),
-            "rename".into(),
-            "--instance".into(),
-            instance_id.clone(),
-            "--window".into(),
-            window_id.clone(),
-            "--tab-title".into(),
-            offer_title,
-            bound_title,
-        ],
-        deadline,
-    )
-    .map_err(anyhow::Error::new)?;
-    if !renamed.ok
-        || renamed.action != "tab.rename"
-        || renamed.instance_id != instance_id
-        || renamed.window_id != window_id
-        || renamed.tab_id != tab_id
-    {
-        decision.publish(HostAction::Abort)?;
-        bail!("Warp returned the wrong identity for the one scoped title claim");
-    }
+    let process_birth = runner.process_birth(instance.pid)?
+        .context("Warp instance process ended before its launch binding; unproven residual surface preserved")?;
 
     let mut session = TerminalSession {
         kind: TerminalKind::Warp,
@@ -507,6 +590,7 @@ where
         window_id: Some(window_id),
         managed_session_id: None,
         windows_process_identity: None,
+        wezterm_mux: None,
     };
 
     let control = ControlBinding {
@@ -521,10 +605,23 @@ where
         instance_id: instance_id.clone(),
         pid: instance.pid,
         protocol_version: instance.protocol_version,
+        process_birth: Some(process_birth),
     };
+    if let Err(error) = prove_offer_title(
+        runner,
+        &client,
+        instance,
+        &session,
+        &offer_title,
+        process_birth,
+        deadline,
+    ) {
+        decision.abort_before_cleanup().context("Warp title proof failed and Abort could not be established; unproven residual surface preserved")?;
+        return Err(error).context("Warp random title ownership remains unproven; a residual launch tab may remain; no final rename or close was attempted");
+    }
     if let Err(binding_error) = write_new_json(&directory.join(CONTROL_FILE), &control) {
         decision.publish(HostAction::Abort)?;
-        return match close_exact(runner, &client, &session, cleanup_deadline) {
+        return match close_bound_exact(runner, &client, &session, &control, cleanup_deadline) {
             Ok(_) => Err(binding_error).context("failed to persist the Warp control binding"),
             Err(cleanup_error) => Err(anyhow!(
                 "failed to persist the Warp control binding: {binding_error:#}; exact surface cleanup also failed: {cleanup_error:#}"
@@ -533,17 +630,42 @@ where
     }
     if let Err(bind_error) = bind(&mut session) {
         decision.publish(HostAction::Abort)?;
-        let cleanup = close_exact(runner, &client, &session, cleanup_deadline);
+        let cleanup = close_bound_exact(runner, &client, &session, &control, cleanup_deadline);
         return finish_failed_bind(bind_error, cleanup, unbind);
     }
     if Instant::now() >= deadline {
         decision.publish(HostAction::Abort)?;
-        let cleanup = close_exact(runner, &client, &session, cleanup_deadline);
+        let cleanup = close_bound_exact(runner, &client, &session, &control, cleanup_deadline);
         return finish_failed_bind(
             anyhow!("Warp launch deadline expired after binding and before provider start"),
             cleanup,
             unbind,
         );
+    }
+    let rename_result = (|| -> Result<()> {
+        if !bound_instance_present(runner, &client, &control, deadline)? {
+            bail!("Warp instance ended before rename");
+        }
+        let mut args = tab_args("rename", &session)?;
+        args.push(bound_title);
+        let renamed: RenameResponse =
+            control_json(runner, &client, &args, deadline).map_err(anyhow::Error::new)?;
+        if !renamed.ok
+            || renamed.action != "tab.rename"
+            || renamed.instance_id != instance_id
+            || renamed.window_id != session.window_id.as_deref().expect("checked")
+            || renamed.tab_id != session.tab_id.as_deref().expect("checked")
+        {
+            bail!("Warp returned the wrong identity for the one scoped title claim");
+        }
+        Ok(())
+    })();
+    if let Err(error) = rename_result {
+        decision.abort_before_cleanup().context(
+            "Warp rename failed and Abort could not be established; exact binding retained",
+        )?;
+        let cleanup = close_bound_exact(runner, &client, &session, &control, cleanup_deadline);
+        return finish_failed_bind(error.context("Warp scoped rename failed"), cleanup, unbind);
     }
     if let Err(start_error) = decision.publish(HostAction::Start) {
         let start_error = start_error.context("failed to release the bound Warp host");
@@ -552,13 +674,82 @@ where
                 "{start_error:#}; abort could not be established: {abort_error:#}; durable exact binding retained"
             ));
         }
-        let cleanup = close_exact(runner, &client, &session, cleanup_deadline);
+        let cleanup = close_bound_exact(runner, &client, &session, &control, cleanup_deadline);
         return finish_failed_bind(start_error, cleanup, unbind);
     }
-    if offer.tty.is_empty() || offer.pid == 0 {
-        bail!("invalid Warp host offer");
-    }
     Ok(session)
+}
+
+// Pinned d5d23e metadata tab.inspect rejects title selectors. Official tab.rename
+// selects one exact display title and returns its actual instance/window/tab IDs.
+// Setting the same unpredictable offer title is still a mutation. A lost reply may
+// be reacquired by repeating this same-title claim; it never advances the title or
+// releases the host. Replace this proof when Warp exposes read-only title/creation
+// identity. No tab delta, error, or unvalidated reply grants close authority.
+fn prove_offer_title<R: WarpRunner>(
+    runner: &mut R,
+    client: &ControlClient,
+    instance: &InstanceSummary,
+    session: &TerminalSession,
+    offer_title: &str,
+    process_birth: (u64, u64),
+    deadline: Instant,
+) -> Result<()> {
+    require_exact_ids(session)?;
+    let args = vec![
+        "tab".into(),
+        "rename".into(),
+        "--instance".into(),
+        session.id.clone(),
+        "--window".into(),
+        session.window_id.clone().expect("checked"),
+        "--tab-title".into(),
+        offer_title.to_owned(),
+        offer_title.to_owned(),
+    ];
+    let mut last_error = None;
+    for attempt in 0..TITLE_PROOF_ATTEMPTS {
+        ensure_time(deadline, "Warp same-title proof")?;
+        if runner.process_birth(instance.pid)? != Some(process_birth) {
+            bail!("Warp app process changed or ended before title proof; no control authority");
+        }
+        // Reserve time for reacquisition after a hung/lost first reply.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let call_budget = (remaining / (TITLE_PROOF_ATTEMPTS - attempt)).min(CONTROL_TIMEOUT);
+        let call_deadline = Instant::now()
+            .checked_add(call_budget)
+            .context("Warp title proof deadline overflow")?
+            .min(deadline);
+        match control_json::<RenameResponse, _>(runner, client, &args, call_deadline) {
+            Ok(proof) => {
+                if !proof.ok
+                    || proof.action != "tab.rename"
+                    || proof.instance_id != session.id
+                    || proof.window_id != session.window_id.as_deref().expect("checked")
+                    || proof.tab_id != session.tab_id.as_deref().expect("checked")
+                {
+                    bail!(
+                        "Warp same-title proof returned the wrong exact target identity or acknowledgement"
+                    );
+                }
+                if runner.process_birth(instance.pid)? != Some(process_birth) {
+                    bail!(
+                        "Warp app process changed or ended during title proof; no control authority"
+                    );
+                }
+                return Ok(());
+            }
+            Err(error) if error.code.is_some() => {
+                return Err(anyhow::Error::new(error))
+                    .context("Warp rejected the unique exact random-title proof");
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(anyhow::Error::new(
+        last_error.context("Warp title proof returned no response")?,
+    ))
+    .context("Warp same-title proof reply could not be reacquired within three attempts")
 }
 
 fn finish_failed_bind<U>(
@@ -602,10 +793,10 @@ pub(super) fn verify_surface(
     validate_offer(&offer, &binding.attempt, &directory)?;
     let deadline = deadline_from_timeout(timeout.unwrap_or(CONTROL_TIMEOUT))?;
     let mut runner = ProcessRunner;
-    let client = binding.client()?;
-    if !bound_instance_present(&mut runner, &client, &binding, deadline)?
-        || !tab_present_with(&mut runner, &client, session, deadline)?
-    {
+    let Some(client) = binding_client_if_present(&mut runner, &binding, deadline)? else {
+        bail!("managed Warp tab is missing");
+    };
+    if !tab_present_with(&mut runner, &client, session, deadline)? {
         bail!("managed Warp tab is missing");
     }
     Ok(offer.tty)
@@ -615,11 +806,10 @@ pub(super) fn surface_present(session: &TerminalSession, timeout: Duration) -> R
     let directory = session_directory(session)?;
     let binding = load_binding(&directory, session)?;
     let mut runner = ProcessRunner;
-    let client = binding.client()?;
     let deadline = deadline_from_timeout(timeout)?;
-    if !bound_instance_present(&mut runner, &client, &binding, deadline)? {
+    let Some(client) = binding_client_if_present(&mut runner, &binding, deadline)? else {
         return Ok(false);
-    }
+    };
     tab_present_with(&mut runner, &client, session, deadline)
 }
 
@@ -634,11 +824,34 @@ pub(super) fn close_session_until(
     let directory = session_directory(session)?;
     let binding = load_binding(&directory, session)?;
     let mut runner = ProcessRunner;
-    let client = binding.client()?;
-    if !bound_instance_present(&mut runner, &client, &binding, deadline)? {
+    let Some(client) = binding_client_if_present(&mut runner, &binding, deadline)? else {
         return Ok(CloseOutcome::Missing);
-    }
+    };
     close_exact(&mut runner, &client, session, deadline)
+}
+
+fn recorded_process_present<R: WarpRunner>(
+    runner: &mut R,
+    binding: &ControlBinding,
+) -> Result<bool> {
+    let birth = binding.process_birth.context("Warp control binding is missing the app process birth; absence and control authority are unverified")?;
+    match runner.process_birth(binding.pid)? {
+        None => Ok(false),
+        Some(live) if live == birth => Ok(true),
+        Some(_) => bail!("recorded Warp app PID was reused; control and absence are unverified"),
+    }
+}
+
+fn binding_client_if_present<R: WarpRunner>(
+    runner: &mut R,
+    binding: &ControlBinding,
+    deadline: Instant,
+) -> Result<Option<ControlClient>> {
+    if !recorded_process_present(runner, binding)? {
+        return Ok(None);
+    }
+    let client = binding.client()?;
+    Ok(bound_instance_present(runner, &client, binding, deadline)?.then_some(client))
 }
 
 fn bound_instance_present<R: WarpRunner>(
@@ -647,7 +860,10 @@ fn bound_instance_present<R: WarpRunner>(
     binding: &ControlBinding,
     deadline: Instant,
 ) -> Result<bool> {
-    let Some(inspect) = optional_control_json::<InstanceInspect, _>(
+    if !recorded_process_present(runner, binding)? {
+        return Ok(false);
+    }
+    let inspect: InstanceInspect = match control_json(
         runner,
         client,
         &[
@@ -657,10 +873,12 @@ fn bound_instance_present<R: WarpRunner>(
             binding.instance_id.clone(),
         ],
         deadline,
-    )
-    .map_err(anyhow::Error::new)?
-    else {
-        return Ok(false);
+    ) {
+        Ok(inspect) => inspect,
+        Err(error) => {
+            return Err(anyhow::Error::new(error))
+                .context("Warp instance absence is unverified; exact binding retained");
+        }
     };
     if inspect.instance_id != binding.instance_id
         || inspect.pid != binding.pid
@@ -673,6 +891,19 @@ fn bound_instance_present<R: WarpRunner>(
     Ok(true)
 }
 
+fn close_bound_exact<R: WarpRunner>(
+    runner: &mut R,
+    client: &ControlClient,
+    session: &TerminalSession,
+    binding: &ControlBinding,
+    deadline: Instant,
+) -> Result<CloseOutcome> {
+    if !bound_instance_present(runner, client, binding, deadline)? {
+        return Ok(CloseOutcome::Missing);
+    }
+    close_exact(runner, client, session, deadline)
+}
+
 fn close_exact<R: WarpRunner>(
     runner: &mut R,
     client: &ControlClient,
@@ -682,42 +913,35 @@ fn close_exact<R: WarpRunner>(
     require_exact_ids(session)?;
     let was_present = tab_present_with(runner, client, session, deadline)?;
     if was_present {
-        let response: OkResponse =
-            control_json(runner, client, &tab_args("close", session)?, deadline)
-                .map_err(anyhow::Error::new)?;
-        if !response.ok || response.action != "tab.close" || response.instance_id != session.id {
-            bail!("Warp did not acknowledge the exact tab.close request");
+        match control_json::<OkResponse, _>(runner, client, &tab_args("close", session)?, deadline)
+        {
+            Ok(response) => {
+                if !response.ok
+                    || response.action != "tab.close"
+                    || response.instance_id != session.id
+                {
+                    bail!("Warp did not acknowledge the exact tab.close request");
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.code.as_deref(),
+                    Some("stale_target" | "missing_target")
+                ) => {}
+            Err(error) => return Err(anyhow::Error::new(error)),
         }
     }
-
-    let mut last_tab_present = was_present;
     loop {
-        if Instant::now() >= deadline {
-            if last_tab_present {
-                bail!("Warp acknowledged tab.close but the exact tab remains present");
-            }
-            bail!(
-                "managed Warp tab is absent but dedicated-window disappearance was not proven before the deadline"
-            );
-        }
-        if tab_present_with(runner, client, session, deadline)? {
-            last_tab_present = true;
-            runner.pause(POLL_INTERVAL);
-            continue;
-        }
-        last_tab_present = false;
-        if !window_present_with(runner, client, session, deadline)? {
+        ensure_time(
+            deadline,
+            "Warp exact tab disappearance; tab remains present or absence is unverified",
+        )?;
+        if !tab_present_with(runner, client, session, deadline)? {
             return Ok(if was_present {
                 CloseOutcome::Closed
             } else {
                 CloseOutcome::Missing
             });
-        }
-        let siblings = list_tabs(runner, client, session, deadline)?;
-        if !siblings.is_empty() {
-            bail!(
-                "managed Warp tab is closed but its dedicated window contains another tab; it may be user-owned and was preserved"
-            );
         }
         runner.pause(POLL_INTERVAL);
     }
@@ -748,6 +972,7 @@ fn tab_present_with<R: WarpRunner>(
     Ok(true)
 }
 
+#[cfg(test)]
 fn window_present_with<R: WarpRunner>(
     runner: &mut R,
     client: &ControlClient,
@@ -780,32 +1005,6 @@ fn window_present_with<R: WarpRunner>(
         bail!("Warp window.inspect returned the wrong exact target identity");
     }
     Ok(true)
-}
-
-fn list_tabs<R: WarpRunner>(
-    runner: &mut R,
-    client: &ControlClient,
-    session: &TerminalSession,
-    deadline: Instant,
-) -> Result<Vec<TabDescription>> {
-    let response = optional_control_json::<TabList, _>(
-        runner,
-        client,
-        &[
-            "tab".into(),
-            "list".into(),
-            "--instance".into(),
-            session.id.clone(),
-            "--window".into(),
-            session
-                .window_id
-                .clone()
-                .context("Warp window id is missing")?,
-        ],
-        deadline,
-    )
-    .map_err(anyhow::Error::new)?;
-    Ok(response.map_or_else(Vec::new, |value| value.tabs))
 }
 
 fn tab_args(action: &str, session: &TerminalSession) -> Result<Vec<String>> {
@@ -855,6 +1054,11 @@ fn discover_control_client<R: WarpRunner>(
         bail!(
             "Warp Control endpoint discovery failed closed: {}",
             errors.join("; ")
+        );
+    }
+    if active_clients.is_empty() {
+        bail!(
+            "no reachable authorized Warp Control endpoint was found; the target app must expose an official endpoint and authorize Scripting and required actions. Bundle or CLI version alone does not establish availability"
         );
     }
     if active_clients.len() != 1 {
@@ -1079,14 +1283,78 @@ fn optional_control_json<T: DeserializeOwned, R: WarpRunner>(
     }
 }
 
+fn write_tab_config(
+    client: &ControlClient,
+    name: &str,
+    title: &str,
+    directory: &Path,
+    attempt: &str,
+    command: &str,
+) -> Result<PathBuf> {
+    let config_dir = ensure_private_config_directory(&client.config_dir)?;
+    let (directory_text, host_command) = host_launch_command(directory, attempt, command)?;
+    // Interface only: upstream tab_config.rs:144-164 and workspace/view.rs:7312-7326
+    // pass the rendered title to add_tab_with_pane_layout, which sets custom_title
+    // (13061-13063). metadata_config.rs:393-399 selects that exact display title.
+    // JSON string escaping is TOML basic-string escaping except for DEL.
+    let configuration = format!(
+        "name = {}\ntitle = {}\n\n[[panes]]\nid = \"main\"\ntype = \"terminal\"\ndirectory = {}\ncommands = [{}]\n",
+        serde_json::to_string(name)?,
+        serde_json::to_string(title)?,
+        serde_json::to_string(directory_text)?,
+        serde_json::to_string(&host_command)?,
+    );
+    let path = config_dir.join(format!("{name}.toml"));
+    write_new_bytes(&path, escape_unportable(&configuration).as_bytes())?;
+    Ok(path)
+}
+
+// The window route that R2 used, restored: it needs no TabConfigs. Replace both
+// routes when Warp Control can create a surface that runs a given command; at the
+// pinned commit tab.create and window.create take only a tab type
+// (crates/local_control/src/protocol.rs:170-173).
 fn write_launch_config(
     client: &ControlClient,
     name: &str,
     title: &str,
     directory: &Path,
     attempt: &str,
+    command: &str,
 ) -> Result<PathBuf> {
-    let config_dir = ensure_private_config_directory(&client.config_dir)?;
+    // user_config/mod.rs:210-216 keeps launch_configurations beside tab_configs.
+    let config_dir = ensure_private_config_directory(
+        &client.config_dir.with_file_name("launch_configurations"),
+    )?;
+    let (directory_text, host_command) = host_launch_command(directory, attempt, command)?;
+    // Interface only: launch_config.rs:15-21, 37-47, 190-206, 278-290, 364-367. The
+    // URI finds the document by its `name` (uri/mod.rs:787-811) among the .yaml files
+    // that serde_yaml reads (user_config/util.rs:20, 74-84); JSON is YAML flow style.
+    // workspace/view.rs:4018-4023 passes the tab title to add_tab_with_pane_layout, so
+    // the same-title proof holds as on the Tab Config route.
+    let configuration = serde_json::to_string_pretty(&json!({
+        "name": name,
+        "windows": [{
+            "active_tab_index": 0,
+            "tabs": [{
+                "title": title,
+                "layout": { "cwd": directory_text },
+                "commands": [{ "exec": host_command }]
+            }]
+        }],
+        "active_window_index": 0
+    }))?;
+    let path = config_dir.join(format!("{name}.yaml"));
+    write_new_bytes(&path, escape_unportable(&configuration).as_bytes())?;
+    Ok(path)
+}
+
+// The session directory as text and the one command of the launch tab; both creation
+// routes carry the same pair.
+fn host_launch_command<'a>(
+    directory: &'a Path,
+    attempt: &str,
+    command: &str,
+) -> Result<(&'a str, String)> {
     let executable =
         std::env::current_exe().context("failed to resolve Agent Bridge executable")?;
     let executable = executable
@@ -1101,26 +1369,39 @@ fn write_launch_config(
         shell_quote(directory.as_os_str()),
         shell_quote(OsStr::new(attempt))
     );
-    let configuration = json!({
-        "name": name,
-        "windows": [{
-            "active_tab_index": 0,
-            "tabs": [{
-                "title": title,
-                "layout": { "cwd": directory_text },
-                "commands": [{ "exec": host_command }]
-            }]
-        }],
-        "active_window_index": 0
-    });
-    let path = config_dir.join(format!("{name}.yaml"));
-    write_new_json(&path, &configuration)?;
-    Ok(path)
+    // These are distinct interactive-shell jobs; sourcing the launch command here
+    // preserves the existing owner/shell foreground-group attestation.
+    Ok((directory_text, gated_launch_command(&host_command, command)))
 }
 
-struct LaunchConfigGuard(PathBuf);
+// serde_json writes these characters raw, and a reader of the two documents may not
+// take them raw: TOML refuses DEL in a basic string, and YAML 1.1 treats NEL, LS and
+// PS as line breaks and excludes DEL, the C1 controls, a byte order mark and the
+// noncharacters. `\uXXXX` is the same character to a JSON, TOML or YAML reader, and
+// both documents hold such a character only inside a quoted string.
+fn escape_unportable(document: &str) -> String {
+    let mut escaped = String::with_capacity(document.len());
+    for character in document.chars() {
+        match character {
+            '\u{7f}'..='\u{9f}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{feff}'
+            | '\u{fffe}'
+            | '\u{ffff}' => escaped.push_str(&format!("\\u{:04x}", u32::from(character))),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
 
-impl Drop for LaunchConfigGuard {
+fn gated_launch_command(host_command: &str, command: &str) -> String {
+    format!("{host_command} || exit; {command}")
+}
+
+struct ConfigFileGuard(PathBuf);
+
+impl Drop for ConfigFileGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
     }
@@ -1252,6 +1533,10 @@ fn write_decision(directory: &Path, attempt: &str, action: HostAction) -> Result
 }
 
 fn write_new_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write_new_bytes(path, &serde_json::to_vec_pretty(value)?)
+}
+
+fn write_new_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("Warp record path has no parent")?;
     let mut temporary = tempfile::Builder::new()
         .prefix(".agent-bridge-warp-")
@@ -1260,9 +1545,7 @@ fn write_new_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     temporary
         .as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))?;
-    temporary
-        .as_file_mut()
-        .write_all(&serde_json::to_vec_pretty(value)?)?;
+    temporary.as_file_mut().write_all(bytes)?;
     temporary.as_file_mut().flush()?;
     temporary.as_file().sync_all()?;
     fs::hard_link(temporary.path(), path)
@@ -1395,7 +1678,7 @@ fn client_for_bundle(
         app_id: spec.app_id.into(),
         channel: spec.channel.into(),
         scheme: spec.scheme.into(),
-        config_dir: home.join(spec.config_home).join("launch_configurations"),
+        config_dir: home.join(spec.config_home).join("tab_configs"),
     }))
 }
 
@@ -1505,14 +1788,8 @@ pub(in crate::native) fn run_host(directory: &Path, attempt: &str) -> Result<()>
                 bail!("Warp host decision does not match this launch attempt");
             }
             return match decision.action {
-                HostAction::Abort => Ok(()),
-                HostAction::Start => {
-                    let error = Command::new("/bin/zsh")
-                        .arg("-lc")
-                        .arg(&plan.command)
-                        .exec();
-                    Err(error).context("failed to replace Warp host with launch command")
-                }
+                HostAction::Abort => bail!("Warp host launch was aborted"),
+                HostAction::Start => Ok(()),
             };
         }
         thread::sleep(POLL_INTERVAL);
@@ -1599,7 +1876,7 @@ fn shell_quote(value: &OsStr) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::{cell::Cell, os::unix::process::CommandExt};
 
     use super::*;
 
@@ -1622,6 +1899,28 @@ mod tests {
         missing_action: bool,
         block_control_binding: bool,
         calls: Vec<Vec<String>>,
+        process_birth: Option<(u64, u64)>,
+        birth_unreadable: bool,
+        proof_failures: usize,
+        proof_reply: Option<&'static str>,
+        proof_selector_error: Option<&'static str>,
+        proof_calls: usize,
+        require_session_binding: bool,
+        proof_executed: usize,
+        offered_title: String,
+        rename_error: Option<&'static str>,
+        close_error: Option<&'static str>,
+        reuse_window: bool,
+        no_window: bool,
+        uri_new_window: bool,
+        dispatch_uncertain: bool,
+        // The fake follows pinned d5d23e: `launch` is always handled, `tab_config`
+        // only with TabConfigs (uri/mod.rs:142, 153).
+        tab_configs_enabled: bool,
+        launch_uri: bool,
+        created: bool,
+        home_tab: bool,
+        launch_into_existing: bool,
     }
 
     impl FakeRunner {
@@ -1645,6 +1944,34 @@ mod tests {
                 missing_action: false,
                 block_control_binding: false,
                 calls: Vec::new(),
+                process_birth: Some((100, 123)),
+                birth_unreadable: false,
+                proof_failures: 0,
+                proof_reply: None,
+                proof_selector_error: None,
+                proof_calls: 0,
+                require_session_binding: false,
+                proof_executed: 0,
+                offered_title: format!("agent-bridge-offer-{attempt}"),
+                rename_error: None,
+                close_error: None,
+                reuse_window: false,
+                no_window: false,
+                uri_new_window: false,
+                dispatch_uncertain: false,
+                tab_configs_enabled: true,
+                launch_uri: false,
+                created: false,
+                home_tab: false,
+                launch_into_existing: false,
+            }
+        }
+
+        fn owned_window(&self) -> &'static str {
+            if self.reuse_window && !self.no_window && !self.uri_new_window {
+                "old-window"
+            } else {
+                "new-window"
             }
         }
 
@@ -1670,11 +1997,18 @@ mod tests {
     }
 
     impl WarpRunner for FakeRunner {
+        fn process_birth(&mut self, _pid: u32) -> Result<Option<(u64, u64)>> {
+            if self.birth_unreadable {
+                bail!("injected app birth unreadable");
+            }
+            Ok(self.process_birth)
+        }
+
         fn control(
             &mut self,
             client: &ControlClient,
             args: &[String],
-            _deadline: Instant,
+            deadline: Instant,
         ) -> Result<CommandOutput> {
             let command = control_command(client, args);
             assert_eq!(command.get_program(), client.executable.as_os_str());
@@ -1729,12 +2063,16 @@ mod tests {
                             json!({"windows": [{"window_id": "second-window"}]}),
                         ));
                     }
-                    let mut windows = vec![json!({"window_id": "old-window"})];
-                    if self.dispatched {
+                    let mut windows = if self.no_window {
+                        Vec::new()
+                    } else {
+                        vec![json!({"window_id": "old-window"})]
+                    };
+                    if self.created && self.owned_window() == "new-window" {
                         windows.push(json!({"window_id": "new-window"}));
-                        if self.ambiguous {
-                            windows.push(json!({"window_id": "other-window"}));
-                        }
+                    }
+                    if self.dispatched && self.ambiguous {
+                        windows.push(json!({"window_id": "other-window"}));
                     }
                     Self::json(json!({"windows": windows}))
                 }
@@ -1742,7 +2080,15 @@ mod tests {
                     let window = args.last().unwrap();
                     let tabs = match window.as_str() {
                         "old-window" => {
-                            vec![json!({"tab_id": "old-tab", "window_id": "old-window"})]
+                            let mut tabs =
+                                vec![json!({"tab_id": "old-tab", "window_id": "old-window"})];
+                            if self.created
+                                && self.owned_window() == "old-window"
+                                && self.tab_present
+                            {
+                                tabs.push(json!({"tab_id": "new-tab", "window_id": "old-window"}));
+                            }
+                            tabs
                         }
                         "new-window" if !self.window_present => Vec::new(),
                         "new-window" => {
@@ -1751,6 +2097,9 @@ mod tests {
                                 .iter()
                                 .map(|id| json!({"tab_id": id, "window_id": "new-window"}))
                                 .collect::<Vec<_>>();
+                            if self.home_tab {
+                                tabs.push(json!({"tab_id": "home-tab", "window_id": "new-window"}));
+                            }
                             if self.tab_present {
                                 tabs.insert(
                                     0,
@@ -1770,19 +2119,98 @@ mod tests {
                     Self::json(json!({"tabs": tabs}))
                 }
                 ["tab", "rename"] => {
-                    if self.block_control_binding {
-                        write_new_json(
-                            &self.directory.join(CONTROL_FILE),
-                            &json!({"occupied": true}),
+                    if args.iter().any(|arg| arg == "--tab-title") {
+                        self.proof_calls += 1;
+                        assert!(
+                            !self.directory.join(CONTROL_FILE).exists(),
+                            "proof precedes binding"
+                        );
+                        assert_eq!(args[3], "instance-1");
+                        assert_eq!(args[5], self.owned_window());
+                        let title = &args[7];
+                        assert_eq!(title, &format!("agent-bridge-offer-{}", self.attempt));
+                        assert_eq!(
+                            args.last().unwrap(),
+                            title,
+                            "same-title proof cannot change the offer title"
+                        );
+                        if let Some(code) = self.proof_selector_error {
+                            return Ok(Self::error(code));
+                        }
+                        if self.offered_title != *title {
+                            return Ok(Self::error("missing_target"));
+                        }
+                        // Upstream selects a unique exact display title, then sets that same title.
+                        self.proof_executed += 1;
+                        if self.proof_failures > 0 {
+                            self.proof_failures -= 1;
+                            return match self.proof_reply {
+                                Some("malformed") => Ok(CommandOutput {
+                                    success: true,
+                                    stdout: b"{".to_vec(),
+                                    stderr: Vec::new(),
+                                }),
+                                Some("timeout") => {
+                                    thread::sleep(
+                                        deadline.saturating_duration_since(Instant::now()),
+                                    );
+                                    bail!("executed same-title proof, lost reply at timeout");
+                                }
+                                _ => bail!("executed same-title proof, reply lost"),
+                            };
+                        }
+                        if self.block_control_binding {
+                            write_new_json(
+                                &self.directory.join(CONTROL_FILE),
+                                &json!({"occupied": true}),
+                            )?;
+                        }
+                        return Ok(Self::json(json!({
+                            "action": if self.proof_reply == Some("wrong_action") { "tab.close" } else { "tab.rename" },
+                            "ok": self.proof_reply != Some("not_ok"),
+                            "instance_id": if self.proof_reply == Some("wrong_instance") { "wrong-instance" } else { "instance-1" },
+                            "window_id": if self.proof_reply == Some("wrong_window") { "wrong-window" } else { self.owned_window() },
+                            "tab_id": if self.proof_reply == Some("wrong_tab") { "wrong-tab" } else { "new-tab" },
+                        })));
+                    }
+                    assert!(
+                        self.directory.join(CONTROL_FILE).exists(),
+                        "binding precedes mutation"
+                    );
+                    if self.require_session_binding {
+                        let binding: TerminalSession = read_record(
+                            &self.directory.join("proof-session-binding.json"),
+                            "test session binding",
                         )?;
+                        assert_eq!(
+                            binding,
+                            session(),
+                            "exact session binding precedes final rename"
+                        );
+                    }
+                    if let Some(code) = self.rename_error {
+                        if code == "timeout" {
+                            bail!("injected rename timeout");
+                        }
+                        if code == "malformed" {
+                            return Ok(CommandOutput {
+                                success: true,
+                                stdout: b"{".to_vec(),
+                                stderr: Vec::new(),
+                            });
+                        }
+                        return Ok(Self::error(code));
                     }
                     Self::json(json!({
                         "action": "tab.rename", "ok": true, "instance_id": "instance-1",
-                        "window_id": "new-window",
+                        "window_id": self.owned_window(),
                         "tab_id": if self.wrong_rename_identity { "wrong-tab" } else { "new-tab" }
                     }))
                 }
                 ["tab", "inspect"] => {
+                    if args.iter().any(|arg| arg == "--tab-title") {
+                        return Ok(Self::error("invalid_selector"));
+                    }
                     if let Some(code) = self.inspect_error {
                         Self::error(code)
                     } else if self.tab_present {
@@ -1790,7 +2218,7 @@ mod tests {
                             "action": "tab.inspect",
                             "tab": {
                                 "tab_id": if self.wrong_inspect_identity { "wrong-tab" } else { "new-tab" },
-                                "window_id": "new-window"
+                                "window_id": self.owned_window()
                             }
                         }))
                     } else {
@@ -1810,12 +2238,18 @@ mod tests {
                     }
                 }
                 ["tab", "close"] => {
+                    if let Some(code) = self.close_error {
+                        if self.close_removes_tab {
+                            self.tab_present = false;
+                        }
+                        return Ok(Self::error(code));
+                    }
                     if self.cancel_close {
                         Self::error("target_state_conflict")
                     } else {
                         if self.close_removes_tab {
                             self.tab_present = false;
-                            if self.siblings.is_empty() {
+                            if self.siblings.is_empty() && self.owned_window() != "old-window" {
                                 self.window_present = false;
                             }
                         }
@@ -1844,37 +2278,120 @@ mod tests {
             );
             assert_eq!(directory, self.directory);
             assert_eq!(attempt, self.attempt);
-            assert_eq!(uri, format!("warp://launch/agent-bridge-{attempt}"));
-            let config = client
-                .config_dir
-                .join(format!("agent-bridge-{attempt}.yaml"));
-            let parsed: Value = serde_json::from_slice(&fs::read(config).unwrap()).unwrap();
-            assert_eq!(parsed["windows"].as_array().unwrap().len(), 1);
-            assert_eq!(parsed["windows"][0]["tabs"].as_array().unwrap().len(), 1);
-            assert_eq!(
-                parsed["windows"][0]["tabs"][0]["commands"]
-                    .as_array()
-                    .unwrap()
-                    .len(),
-                1
-            );
-            let command = parsed["windows"][0]["tabs"][0]["commands"][0]["exec"]
-                .as_str()
-                .unwrap();
-            assert!(command.contains("native-warp-host"));
-            assert!(command.contains(attempt));
+            assert!(!self.dispatched, "one URI creation only");
             self.dispatched = true;
-            if self.write_offer {
-                write_new_json(
-                    &directory.join(HOST_OFFER_FILE),
-                    &HostOffer {
-                        schema: RECORD_SCHEMA,
-                        attempt: attempt.into(),
-                        directory: directory.to_owned(),
-                        pid: 77,
-                        tty: "/dev/ttys777".into(),
-                    },
-                )?;
+            let name = format!("agent-bridge-{attempt}");
+            let tab_config = client.config_dir.join(format!("{name}.toml"));
+            let launch_config = client
+                .config_dir
+                .with_file_name("launch_configurations")
+                .join(format!("{name}.yaml"));
+            // Both routes must carry the same gate in front of the same launch command.
+            let plan: HostPlan = read_record(&directory.join(HOST_PLAN_FILE), "plan").unwrap();
+            let gated = gated_launch_command(
+                &format!(
+                    "{} native-warp-host {} {}",
+                    shell_quote(std::env::current_exe().unwrap().as_os_str()),
+                    shell_quote(directory.as_os_str()),
+                    shell_quote(OsStr::new(attempt))
+                ),
+                &plan.command,
+            );
+            self.launch_uri = uri == format!("warp://launch/{name}");
+            let new_window = if self.launch_uri {
+                assert!(!tab_config.exists(), "one creation config only");
+                let text = fs::read_to_string(&launch_config).unwrap();
+                // Raw, a YAML 1.1 reader folds these as line breaks or refuses them.
+                assert!(!text.chars().any(|character| {
+                    ('\u{7f}'..='\u{9f}').contains(&character)
+                        || "\u{2028}\u{2029}\u{feff}\u{fffe}\u{ffff}".contains(character)
+                }));
+                // Pinned launch_config.rs:15-21, 37-47, 190-206, 278-290, 364-367.
+                assert_eq!(
+                    serde_json::from_str::<Value>(&text).unwrap(),
+                    json!({
+                        "name": name,
+                        "active_window_index": 0,
+                        "windows": [{
+                            "active_tab_index": 0,
+                            "tabs": [{
+                                "title": format!("agent-bridge-offer-{attempt}"),
+                                "layout": {"cwd": directory.to_str().unwrap()},
+                                "commands": [{"exec": gated}]
+                            }]
+                        }]
+                    })
+                );
+                assert_eq!(
+                    fs::metadata(&launch_config).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+                true
+            } else {
+                let new_window = uri == format!("warp://tab_config/{name}?new_window=true");
+                assert!(new_window || uri == format!("warp://tab_config/{name}"));
+                assert!(!launch_config.exists(), "one creation config only");
+                let parsed: toml::Value = fs::read_to_string(&tab_config).unwrap().parse().unwrap();
+                assert_eq!(
+                    parsed
+                        .as_table()
+                        .unwrap()
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    ["name", "panes", "title"]
+                );
+                assert_eq!(
+                    parsed["panes"][0]
+                        .as_table()
+                        .unwrap()
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    ["commands", "directory", "id", "type"]
+                );
+                assert_eq!(
+                    parsed["title"].as_str().unwrap(),
+                    format!("agent-bridge-offer-{attempt}")
+                );
+                assert_eq!(parsed["panes"].as_array().unwrap().len(), 1);
+                assert_eq!(parsed["panes"][0]["id"].as_str(), Some("main"));
+                assert_eq!(parsed["panes"][0]["type"].as_str(), Some("terminal"));
+                assert_eq!(parsed["panes"][0]["directory"].as_str(), directory.to_str());
+                assert_eq!(parsed["panes"][0]["commands"].as_array().unwrap().len(), 1);
+                assert_eq!(
+                    parsed["panes"][0]["commands"][0].as_str(),
+                    Some(gated.as_str())
+                );
+                assert_eq!(
+                    fs::metadata(&tab_config).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+                new_window
+            };
+            if self.launch_uri || self.tab_configs_enabled {
+                self.created = true;
+                self.uri_new_window = new_window && !self.launch_into_existing;
+                // A window opened for a Tab Config is an empty workspace, which has a
+                // tab of its own beside the configured one (uri/mod.rs:838-849,
+                // root_view.rs:1231-1243, workspace/view.rs:4430-4461). A Launch
+                // Configuration window holds its template's tabs only (3939-4034).
+                self.home_tab = !self.launch_uri && (new_window || self.no_window);
+                if self.write_offer {
+                    write_new_json(
+                        &directory.join(HOST_OFFER_FILE),
+                        &HostOffer {
+                            schema: RECORD_SCHEMA,
+                            attempt: attempt.into(),
+                            directory: directory.to_owned(),
+                            pid: 77,
+                            tty: "/dev/ttys777".into(),
+                        },
+                    )?;
+                }
+            }
+            if self.dispatch_uncertain {
+                bail!("injected lost URI dispatch reply");
             }
             Ok(())
         }
@@ -1898,7 +2415,7 @@ mod tests {
             app_id: "dev.warp.Warp-Stable".into(),
             channel: "stable".into(),
             scheme: "warp".into(),
-            config_dir: temp.path().join("launch_configurations"),
+            config_dir: temp.path().join("tab_configs"),
         };
         (temp, client, "0123456789abcdef0123456789abcdef".into())
     }
@@ -1911,6 +2428,7 @@ mod tests {
             window_id: Some("new-window".into()),
             managed_session_id: Some("session-test".into()),
             windows_process_identity: None,
+            wezterm_mux: None,
         }
     }
 
@@ -1925,6 +2443,7 @@ mod tests {
         let result = open_bound_tab_with(
             &mut runner,
             OpenRequest {
+                force_new_window: false,
                 clients: &[client],
                 command: ". launch.sh",
                 directory: &directory,
@@ -1958,6 +2477,7 @@ mod tests {
         let result = open_bound_tab_with(
             &mut runner,
             OpenRequest {
+                force_new_window: false,
                 clients: &[client],
                 command: "ignored",
                 directory: &directory,
@@ -1987,6 +2507,7 @@ mod tests {
         let error = open_bound_tab_with(
             &mut runner,
             OpenRequest {
+                force_new_window: false,
                 clients: &[client],
                 command: "ignored",
                 directory: &directory,
@@ -2001,7 +2522,7 @@ mod tests {
             || Ok(()),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("deadline"));
+        assert!(format!("{error:#}").contains("deadline"));
         assert!(!bound.get());
         let decision: HostDecision =
             read_record(&directory.join(HOST_DECISION_FILE), "decision").unwrap();
@@ -2018,6 +2539,7 @@ mod tests {
         let error = open_bound_tab_with(
             &mut runner,
             OpenRequest {
+                force_new_window: false,
                 clients: &[client],
                 command: "ignored",
                 directory: &directory,
@@ -2046,6 +2568,7 @@ mod tests {
         let error = open_bound_tab_with(
             &mut runner,
             OpenRequest {
+                force_new_window: false,
                 clients: &[client],
                 command: "ignored",
                 directory: &directory,
@@ -2060,7 +2583,7 @@ mod tests {
             || Ok(()),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("exactly one new window"));
+        assert!(error.to_string().contains("exactly one new tab"));
         assert!(!bound.get());
         assert!(
             !runner
@@ -2074,7 +2597,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_claim_identity_is_rejected_before_bind_or_close() {
+    fn wrong_claim_identity_is_rejected_after_proven_binding() {
         let (temp, client, attempt) = fixture();
         let directory = temp.path().join("session");
         fs::create_dir(&directory).unwrap();
@@ -2083,6 +2606,7 @@ mod tests {
         let error = open_bound_tab_with(
             &mut runner,
             OpenRequest {
+                force_new_window: false,
                 clients: &[client],
                 command: "ignored",
                 directory: &directory,
@@ -2090,13 +2614,13 @@ mod tests {
                 cleanup_deadline: Instant::now() + Duration::from_secs(3),
                 attempt: &attempt,
             },
-            |_| bail!("must not bind"),
+            |_| Ok(()),
             || Ok(()),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("wrong identity"));
+        assert!(format!("{error:#}").contains("wrong identity"));
         assert!(
-            !runner
+            runner
                 .calls
                 .iter()
                 .any(|call| call.get(1).is_some_and(|value| value == "close"))
@@ -2113,6 +2637,7 @@ mod tests {
         let error = open_bound_tab_with(
             &mut runner,
             OpenRequest {
+                force_new_window: false,
                 clients: &[client],
                 command: "ignored",
                 directory: &directory,
@@ -2146,6 +2671,7 @@ mod tests {
         let error = open_bound_tab_with(
             &mut runner,
             OpenRequest {
+                force_new_window: false,
                 clients: &[client],
                 command: "ignored",
                 directory: &directory,
@@ -2184,6 +2710,7 @@ mod tests {
         let error = open_bound_tab_with(
             &mut runner,
             OpenRequest {
+                force_new_window: false,
                 clients: &[client],
                 command: "ignored",
                 directory: &directory,
@@ -2222,10 +2749,10 @@ mod tests {
             let binding = load_binding(&directory, &retained).unwrap();
             assert_eq!(binding.attempt, attempt);
         }
-        let cleanup_attempted = runner
-            .calls
-            .iter()
-            .any(|call| call.starts_with(&["tab".into(), "inspect".into()]));
+        let cleanup_attempted = runner.calls.iter().any(|call| {
+            call.starts_with(&["tab".into(), "inspect".into()])
+                && call.iter().any(|arg| arg == "--tab")
+        });
         let outcome = (unbound.get(), durable_binding.exists(), cleanup_attempted);
         if cancel_close && durable_binding.exists() {
             runner.cancel_close = false;
@@ -2298,6 +2825,7 @@ mod tests {
         let error = open_bound_tab_with(
             &mut runner,
             OpenRequest {
+                force_new_window: false,
                 clients: &[client],
                 command: "ignored",
                 directory: &directory,
@@ -2353,6 +2881,267 @@ mod tests {
     }
 
     #[test]
+    fn tab_first_regression_close_race_requires_exact_disappearance() {
+        for code in ["stale_target", "missing_target"] {
+            let (temp, client, attempt) = fixture();
+            let mut runner = FakeRunner::new(temp.path(), &attempt);
+            runner.close_error = Some(code);
+            let outcome = close_exact(
+                &mut runner,
+                &client,
+                &session(),
+                Instant::now() + Duration::from_millis(100),
+            );
+            eprintln!("tab.close race {code}: {outcome:?}");
+            assert_eq!(outcome.unwrap(), CloseOutcome::Closed);
+            assert_eq!(runner.calls.last().unwrap()[..2], ["tab", "inspect"]);
+        }
+    }
+
+    #[test]
+    fn tab_first_regression_verified_death_needs_no_control_call() {
+        let (temp, client, attempt) = fixture();
+        let binding: ControlBinding = serde_json::from_value(json!({
+            "schema": RECORD_SCHEMA, "attempt": attempt, "bundle": client.bundle,
+            "executable": client.executable, "inject_warpctrl": false,
+            "app_id": client.app_id, "channel": client.channel, "scheme": client.scheme,
+            "instance_id": "instance-1", "pid": 42, "protocol_version": 1,
+            "process_birth": [100, 123],
+        }))
+        .unwrap();
+        let mut runner = FakeRunner::new(temp.path(), &attempt);
+        runner.process_birth = None;
+        let outcome = bound_instance_present(
+            &mut runner,
+            &client,
+            &binding,
+            Instant::now() + Duration::from_secs(1),
+        );
+        eprintln!(
+            "verified process death: {outcome:?}; CLI calls={:?}",
+            runner.calls
+        );
+        assert!(!outcome.unwrap());
+        assert!(runner.calls.is_empty());
+    }
+
+    #[test]
+    fn tab_first_verified_death_precedes_missing_bundle_resolution() {
+        let (temp, client, attempt) = fixture();
+        let binding: ControlBinding = serde_json::from_value(json!({
+            "schema": RECORD_SCHEMA, "attempt": attempt, "bundle": client.bundle,
+            "executable": client.executable, "inject_warpctrl": false,
+            "app_id": client.app_id, "channel": client.channel, "scheme": client.scheme,
+            "instance_id": "instance-1", "pid": 42, "protocol_version": 1,
+            "process_birth": [100, 123],
+        }))
+        .unwrap();
+        fs::remove_dir_all(&client.bundle).unwrap();
+        let mut runner = FakeRunner::new(temp.path(), &attempt);
+        runner.process_birth = None;
+        assert!(
+            binding_client_if_present(
+                &mut runner,
+                &binding,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(runner.calls.is_empty());
+        runner.process_birth = Some((100, 123));
+        assert!(
+            binding_client_if_present(
+                &mut runner,
+                &binding,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn tab_first_config_schema_round_trips_quoted_paths_and_commands() {
+        let (temp, client, attempt) = fixture();
+        let directory = temp.path().join("한글 'quoted' \"path\"\nline");
+        fs::create_dir(&directory).unwrap();
+        let command = "source '/a quoted/path'; printf '%s' \"line\\n\"";
+        let path = write_tab_config(
+            &client,
+            "private-name",
+            "private-title",
+            &directory,
+            &attempt,
+            command,
+        )
+        .unwrap();
+        let config: toml::Value = fs::read_to_string(&path).unwrap().parse().unwrap();
+        assert_eq!(config["name"].as_str(), Some("private-name"));
+        assert_eq!(config["title"].as_str(), Some("private-title"));
+        assert_eq!(config["panes"][0]["directory"].as_str(), directory.to_str());
+        assert!(
+            config["panes"][0]["commands"][0]
+                .as_str()
+                .unwrap()
+                .ends_with(command)
+        );
+        assert_eq!(config["panes"][0]["type"].as_str(), Some("terminal"));
+        assert_eq!(path.extension().unwrap(), "toml");
+    }
+
+    #[test]
+    fn tab_first_close_race_error_does_not_itself_prove_absence() {
+        for code in ["stale_target", "missing_target", "unauthorized"] {
+            let (temp, client, attempt) = fixture();
+            let mut runner = FakeRunner::new(temp.path(), &attempt);
+            runner.close_error = Some(code);
+            runner.close_removes_tab = false;
+            let error = close_exact(
+                &mut runner,
+                &client,
+                &session(),
+                Instant::now() + Duration::from_millis(15),
+            )
+            .unwrap_err();
+            if code == "unauthorized" {
+                assert!(error.to_string().contains("unauthorized"));
+                assert_eq!(runner.calls.len(), 2);
+            } else {
+                // Either the loop or its inner Control call can observe the deadline.
+                let message = error.to_string();
+                assert!(
+                    message.contains("remains present")
+                        || message.contains("deadline is exhausted"),
+                    "{message}"
+                );
+                assert!(runner.calls.len() > 2);
+            }
+        }
+    }
+
+    #[test]
+    fn tab_first_existing_window_and_explicit_new_window_and_no_workspace() {
+        for (no_window, force_new_window) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let (temp, client, attempt) = fixture();
+            let directory = temp.path().join("session");
+            fs::create_dir(&directory).unwrap();
+            let mut runner = FakeRunner::new(&directory, &attempt);
+            runner.reuse_window = true;
+            runner.no_window = no_window;
+            let bound = Cell::new(false);
+            let result = open_bound_tab_with(
+                &mut runner,
+                OpenRequest {
+                    clients: std::slice::from_ref(&client),
+                    command: "ignored",
+                    directory: &directory,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    cleanup_deadline: Instant::now() + Duration::from_secs(2),
+                    attempt: &attempt,
+                    force_new_window,
+                },
+                |session| {
+                    assert!(directory.join(CONTROL_FILE).exists());
+                    assert_eq!(
+                        session.window_id.as_deref(),
+                        Some(if no_window || force_new_window {
+                            "new-window"
+                        } else {
+                            "old-window"
+                        })
+                    );
+                    bound.set(true);
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .unwrap();
+            assert!(bound.get());
+            assert_eq!(runner.proof_calls, 1);
+            // A window is a Launch Configuration; only a tab is a Tab Config.
+            assert_eq!(runner.launch_uri, no_window || force_new_window);
+            assert!(!creation_config_remains(&client, &attempt));
+            close_exact(
+                &mut runner,
+                &client,
+                &result,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+            if !no_window && !force_new_window {
+                assert!(
+                    runner.window_present,
+                    "existing workspace and sibling tab remain"
+                );
+            }
+            assert!(
+                !runner
+                    .calls
+                    .iter()
+                    .any(|call| call.first().is_some_and(|s| s == "window")
+                        && call.get(1).is_some_and(|s| s == "close"))
+            );
+            assert!(
+                runner
+                    .calls
+                    .iter()
+                    .filter(|call| call.get(1).is_some_and(|s| s == "close"))
+                    .all(|call| call.last().is_some_and(|s| s == "new-tab"))
+            );
+        }
+    }
+
+    #[test]
+    fn tab_first_concurrent_delta_in_existing_window_never_grants_authority() {
+        let (temp, client, attempt) = fixture();
+        let directory = temp.path().join("session");
+        fs::create_dir(&directory).unwrap();
+        let mut runner = FakeRunner::new(&directory, &attempt);
+        runner.reuse_window = true;
+        runner.ambiguous = true;
+        let bound = Cell::new(false);
+        assert!(proof_open_fixture(&mut runner, &client, &directory, &attempt, &bound).is_err());
+        assert!(!bound.get());
+        assert_eq!(runner.proof_calls, 0);
+        assert!(
+            !runner
+                .calls
+                .iter()
+                .any(|call| call.get(1).is_some_and(|s| s == "rename" || s == "close"))
+        );
+    }
+
+    #[test]
+    fn tab_first_uncertain_dispatch_and_unknown_capability_never_retry_creation() {
+        for uncertain in [false, true] {
+            let (temp, client, attempt) = fixture();
+            let directory = temp.path().join("session");
+            fs::create_dir(&directory).unwrap();
+            let mut runner = FakeRunner::new(&directory, &attempt);
+            runner.dispatch_uncertain = uncertain;
+            runner.write_offer = false;
+            let bound = Cell::new(false);
+            let error =
+                proof_open_fixture(&mut runner, &client, &directory, &attempt, &bound).unwrap_err();
+            assert!(runner.dispatched && !runner.launch_uri && !bound.get());
+            assert!(
+                runner
+                    .calls
+                    .iter()
+                    .all(|call| call.get(1).is_none_or(|s| s != "rename" && s != "close"))
+            );
+            if !uncertain {
+                assert!(format!("{error:#}").contains("feature enablement is unverified"));
+            }
+            let decision: HostDecision =
+                read_record(&directory.join(HOST_DECISION_FILE), "decision").unwrap();
+            assert_eq!(decision.action, HostAction::Abort);
+        }
+    }
+
+    #[test]
     fn inspect_responses_must_name_the_exact_recorded_targets() {
         let (temp, client, attempt) = fixture();
         let directory = temp.path().join("session");
@@ -2402,6 +3191,7 @@ mod tests {
             instance_id: "instance-1".into(),
             pid: 99,
             protocol_version: 1,
+            process_birth: Some((100, 123)),
         };
         let error = bound_instance_present(
             &mut runner,
@@ -2413,7 +3203,8 @@ mod tests {
         assert!(error.to_string().contains("identity no longer matches"));
 
         binding.pid = 42;
-        runner.instance_inspect_error = Some("stale_target");
+        runner.instance_inspect_error = Some("no_instance");
+        runner.process_birth = None;
         assert!(
             !bound_instance_present(
                 &mut runner,
@@ -2426,20 +3217,22 @@ mod tests {
     }
 
     #[test]
-    fn close_preserves_user_siblings_and_reports_residual_window() {
+    fn close_preserves_user_siblings_without_requiring_window_disappearance() {
         let (temp, client, attempt) = fixture();
         let directory = temp.path().join("session");
         fs::create_dir(&directory).unwrap();
         let mut runner = FakeRunner::new(&directory, &attempt);
         runner.siblings.push("user-tab".into());
-        let error = close_exact(
+        let outcome = close_exact(
             &mut runner,
             &client,
             &session(),
             Instant::now() + Duration::from_secs(1),
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("may be user-owned"));
+        .unwrap();
+        assert_eq!(outcome, CloseOutcome::Closed);
+        assert!(runner.window_present);
+        assert_eq!(runner.siblings, ["user-tab"]);
         assert!(
             !runner
                 .calls
@@ -2473,7 +3266,7 @@ mod tests {
     }
 
     #[test]
-    fn close_ack_is_not_closure_until_exact_tab_and_window_disappear() {
+    fn close_ack_is_not_closure_until_exact_tab_disappears() {
         let (temp, client, attempt) = fixture();
         let directory = temp.path().join("session");
         fs::create_dir(&directory).unwrap();
@@ -2486,7 +3279,12 @@ mod tests {
             Instant::now() + Duration::from_millis(100),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("remains present"));
+        // Both deadline observations retain the surface; an acknowledgement is not absence.
+        let message = error.to_string();
+        assert!(
+            message.contains("remains present") || message.contains("deadline is exhausted"),
+            "{message}"
+        );
 
         runner.close_removes_tab = true;
         let outcome = close_exact(
@@ -2598,6 +3396,7 @@ mod tests {
             let result = open_bound_tab_with(
                 &mut runner,
                 OpenRequest {
+                    force_new_window: false,
                     clients: &clients,
                     command: "ignored",
                     directory: &directory,
@@ -2662,5 +3461,776 @@ mod tests {
         let failure = send_file(&session(), Path::new("ignored"), Instant::now()).unwrap_err();
         assert!(!failure.delivery_may_have_occurred());
         assert!(failure.error().to_string().contains("cannot submit"));
+    }
+
+    // This child executes the real host/attestation functions in its own PTY process.
+    #[test]
+    fn warp_r2_owned_process_probe() {
+        let Ok(mode) = std::env::var("WARP_R2_PROBE_MODE") else {
+            return;
+        };
+        let directory = PathBuf::from(std::env::var_os("WARP_R2_PROBE_DIR").unwrap());
+        let attempt = "0123456789abcdef0123456789abcdef";
+        if mode == "host" {
+            if let Err(error) = run_host(&directory, attempt) {
+                eprintln!("{error:#}");
+                std::process::exit(7);
+            }
+        } else {
+            let result = crate::native::current_native_session_owner("session-warp-r2-probe");
+            let value = match result {
+                Ok(owner) => json!({"ok": true, "pid": owner.pid, "group": owner.process_group}),
+                Err(error) => json!({"ok": false, "error": format!("{error:#}")}),
+            };
+            write_new_json(&directory.join("owner-probe.json"), &value).unwrap();
+        }
+    }
+
+    #[test]
+    fn warp_r2_real_host_and_owner_attestation_through_private_pty() {
+        real_host_fixture(Some(HostAction::Start), false);
+        real_host_fixture(Some(HostAction::Abort), false);
+        real_host_fixture(None, false);
+        real_host_fixture(Some(HostAction::Start), true);
+    }
+
+    fn real_host_fixture(action: Option<HostAction>, invalid_plan: bool) {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("session-warp-r2-probe");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let probe = format!(
+            "{} --exact native::terminal::macos::warp::tests::warp_r2_owned_process_probe --nocapture --test-threads=1",
+            shell_quote(executable.as_os_str())
+        );
+        let owner_command = format!("WARP_R2_PROBE_MODE=owner {probe}");
+        write_new_json(
+            &directory.join(HOST_PLAN_FILE),
+            &HostPlan {
+                schema: RECORD_SCHEMA,
+                attempt: "0123456789abcdef0123456789abcdef".into(),
+                command: format!("{owner_command}; :"),
+                deadline_unix_ms: wall_ms().unwrap() + 2000,
+                decision_timeout_ms: 200,
+            },
+        )
+        .unwrap();
+        if invalid_plan {
+            fs::write(directory.join(HOST_PLAN_FILE), b"{").unwrap();
+        }
+        if let Some(action) = action {
+            write_decision(&directory, "0123456789abcdef0123456789abcdef", action).unwrap();
+        }
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { File::from_raw_fd(slave) };
+        let shell_command = format!(
+            "{}; exit",
+            gated_launch_command(&format!("WARP_R2_PROBE_MODE=host {probe}"), &owner_command)
+        );
+        let mut command = Command::new("/bin/zsh");
+        command
+            .args(["-f", "-i", "-c", &shell_command])
+            .env("WARP_R2_PROBE_DIR", &directory)
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave.try_clone().unwrap());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        // Drain concurrently so a full PTY never blocks the owned child.
+        let fd = master.as_raw_fd();
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+        }
+        let mut master = master;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut output = Vec::new();
+        loop {
+            let mut bytes = [0u8; 4096];
+            if let Ok(n) = master.read(&mut bytes) {
+                output.extend_from_slice(&bytes[..n]);
+            }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!(
+                    "owned host fixture timed out: {}",
+                    String::from_utf8_lossy(&output)
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if action != Some(HostAction::Start) || invalid_plan {
+            assert!(
+                !directory.join("owner-probe.json").exists(),
+                "aborted or timed-out gate must exit its launch shell"
+            );
+            assert!(!child.wait().unwrap().success());
+            return;
+        }
+        let value: Value =
+            serde_json::from_slice(&fs::read(directory.join("owner-probe.json")).unwrap()).unwrap();
+        eprintln!(
+            "actual host/current_native_session_owner: {value}; PTY: {}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(
+            value["ok"], true,
+            "real host must preserve a separate foreground native-session job: {value}"
+        );
+    }
+
+    #[test]
+    fn warp_r2_rename_failure_retains_proven_binding_and_aborts() {
+        let (temp, client, attempt) = fixture();
+        let directory = temp.path().join("session");
+        fs::create_dir(&directory).unwrap();
+        let mut runner = FakeRunner::new(&directory, &attempt);
+        runner.wrong_rename_identity = true;
+        runner.cancel_close = true;
+        let bound = Cell::new(false);
+        let error = open_bound_tab_with(
+            &mut runner,
+            OpenRequest {
+                force_new_window: false,
+                clients: &[client],
+                command: "ignored",
+                directory: &directory,
+                deadline: Instant::now() + Duration::from_secs(1),
+                cleanup_deadline: Instant::now() + Duration::from_secs(2),
+                attempt: &attempt,
+            },
+            |_| {
+                bound.set(true);
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            bound.get(),
+            "title proof must be durably bound before rename: {error:#}"
+        );
+        assert!(directory.join(CONTROL_FILE).exists());
+        let decision: HostDecision =
+            read_record(&directory.join(HOST_DECISION_FILE), "decision").unwrap();
+        assert_eq!(decision.action, HostAction::Abort);
+    }
+
+    #[test]
+    fn warp_r2_proof_official_route_binds_before_final_rename() {
+        let (temp, client, attempt) = fixture();
+        let directory = temp.path().join("session");
+        fs::create_dir(&directory).unwrap();
+        let mut runner = FakeRunner::new(&directory, &attempt);
+        runner.require_session_binding = true;
+        let result = open_bound_tab_with(
+            &mut runner,
+            OpenRequest {
+                force_new_window: false,
+                clients: &[client],
+                command: "ignored",
+                directory: &directory,
+                deadline: Instant::now() + Duration::from_secs(1),
+                cleanup_deadline: Instant::now() + Duration::from_secs(2),
+                attempt: &attempt,
+            },
+            |record| {
+                assert!(directory.join(CONTROL_FILE).exists());
+                assert!(!directory.join(HOST_DECISION_FILE).exists());
+                record.managed_session_id = Some("session-test".into());
+                write_new_json(&directory.join("proof-session-binding.json"), record)?;
+                Ok(())
+            },
+            || Ok(()),
+        );
+        assert!(
+            result.is_ok(),
+            "pinned official same-title rename must provide proof instead of unsupported title inspect: {result:?}"
+        );
+        assert_eq!(runner.proof_executed, 1);
+        let mutations = runner
+            .calls
+            .iter()
+            .filter(|args| args.get(1).is_some_and(|arg| arg == "rename"))
+            .collect::<Vec<_>>();
+        assert_eq!(mutations.len(), 2);
+        assert!(mutations[0].iter().any(|arg| arg == "--tab-title"));
+        assert!(mutations[1].iter().any(|arg| arg == "--tab"));
+    }
+
+    #[test]
+    fn warp_r2_rename_errors_fence_and_retain_exact_retry() {
+        for code in ["target_state_conflict", "malformed", "timeout"] {
+            let (temp, client, attempt) = fixture();
+            let directory = temp.path().join("session");
+            fs::create_dir(&directory).unwrap();
+            let mut runner = FakeRunner::new(&directory, &attempt);
+            runner.rename_error = Some(code);
+            runner.cancel_close = true;
+            let bound = Cell::new(false);
+            let unbound = Cell::new(false);
+            let error = open_bound_tab_with(
+                &mut runner,
+                OpenRequest {
+                    force_new_window: false,
+                    clients: std::slice::from_ref(&client),
+                    command: "ignored",
+                    directory: &directory,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    cleanup_deadline: Instant::now() + Duration::from_secs(2),
+                    attempt: &attempt,
+                },
+                |_| {
+                    bound.set(true);
+                    Ok(())
+                },
+                || {
+                    unbound.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(bound.get() && !unbound.get(), "{code}: {error:#}");
+            let binding: ControlBinding =
+                read_record(&directory.join(CONTROL_FILE), "binding").unwrap();
+            let decision: HostDecision =
+                read_record(&directory.join(HOST_DECISION_FILE), "decision").unwrap();
+            assert_eq!(decision.action, HostAction::Abort);
+            runner.cancel_close = false;
+            assert_eq!(
+                close_bound_exact(
+                    &mut runner,
+                    &client,
+                    &session(),
+                    &binding,
+                    Instant::now() + Duration::from_secs(1)
+                )
+                .unwrap(),
+                CloseOutcome::Closed
+            );
+        }
+    }
+
+    #[test]
+    fn warp_r2_app_birth_and_official_no_instance_semantics() {
+        let (temp, client, attempt) = fixture();
+        let mut runner = FakeRunner::new(temp.path(), &attempt);
+        let mut binding = ControlBinding {
+            schema: RECORD_SCHEMA,
+            attempt,
+            bundle: client.bundle.clone(),
+            executable: client.executable.clone(),
+            inject_warpctrl: false,
+            app_id: client.app_id.clone(),
+            channel: client.channel.clone(),
+            scheme: client.scheme.clone(),
+            instance_id: "instance-1".into(),
+            pid: 42,
+            protocol_version: 1,
+            process_birth: Some((100, 123)),
+        };
+        runner.instance_inspect_error = Some("no_instance");
+        assert!(
+            bound_instance_present(
+                &mut runner,
+                &client,
+                &binding,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .is_err()
+        );
+        runner.process_birth = None;
+        assert!(
+            !bound_instance_present(
+                &mut runner,
+                &client,
+                &binding,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .unwrap()
+        );
+        runner.process_birth = Some((101, 0));
+        let calls = runner.calls.len();
+        assert!(
+            bound_instance_present(
+                &mut runner,
+                &client,
+                &binding,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .is_err()
+        );
+        assert_eq!(
+            runner.calls.len(),
+            calls,
+            "reused app must never be controlled"
+        );
+        runner.birth_unreadable = true;
+        assert!(
+            bound_instance_present(
+                &mut runner,
+                &client,
+                &binding,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .is_err()
+        );
+        runner.birth_unreadable = false;
+        binding.process_birth = None;
+        assert!(
+            bound_instance_present(
+                &mut runner,
+                &client,
+                &binding,
+                Instant::now() + Duration::from_secs(1)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn warp_r2_oss_channel_matches_pinned_upstream_display() {
+        let spec = BUNDLE_SPECS
+            .iter()
+            .find(|spec| spec.bundle_name == "WarpOss.app")
+            .unwrap();
+        // crates/warp_core/src/channel/mod.rs:75-83 at d5d23e6119b39edb8c95580a60b68fcd4a2d5a1b.
+        assert_eq!(spec.channel, "warp-oss");
+    }
+
+    struct ProofBirthRunner {
+        fake: FakeRunner,
+        injected_birth: Option<Option<(u64, u64)>>,
+    }
+
+    impl WarpRunner for ProofBirthRunner {
+        fn process_birth(&mut self, pid: u32) -> Result<Option<(u64, u64)>> {
+            match self.injected_birth {
+                Some(birth) => Ok(birth),
+                None => crate::native::macos_process_start(pid),
+            }
+        }
+        fn control(
+            &mut self,
+            client: &ControlClient,
+            args: &[String],
+            deadline: Instant,
+        ) -> Result<CommandOutput> {
+            self.fake.control(client, args, deadline)
+        }
+        fn dispatch_uri(
+            &mut self,
+            client: &ControlClient,
+            uri: &str,
+            directory: &Path,
+            attempt: &str,
+            deadline: Instant,
+        ) -> Result<()> {
+            self.fake
+                .dispatch_uri(client, uri, directory, attempt, deadline)
+        }
+    }
+
+    #[test]
+    fn warp_r2_proof_regression_official_no_instance_after_verified_death() {
+        let (temp, client, attempt) = fixture();
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let birth_result = crate::native::macos_process_start(pid);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let birth = birth_result.unwrap().expect("owned probe alive");
+        assert_eq!(
+            crate::native::macos_process_start(pid).unwrap(),
+            None,
+            "owned probe death must be verified independently"
+        );
+        let binding: ControlBinding = serde_json::from_value(json!({
+            "schema": RECORD_SCHEMA, "attempt": attempt, "bundle": client.bundle, "executable": client.executable,
+            "inject_warpctrl": false, "app_id": client.app_id, "channel": client.channel, "scheme": client.scheme,
+            "instance_id": "instance-1", "pid": pid, "protocol_version": 1, "process_birth": birth,
+        })).unwrap();
+        let mut runner = ProofBirthRunner {
+            fake: FakeRunner::new(temp.path(), &attempt),
+            injected_birth: None,
+        };
+        runner.fake.instance_inspect_error = Some("no_instance");
+        let observed = bound_instance_present(
+            &mut runner,
+            &client,
+            &binding,
+            Instant::now() + Duration::from_secs(1),
+        );
+        eprintln!(
+            "verified owned process death pid={pid} birth={birth:?}; official no_instance result={observed:?}"
+        );
+        assert!(
+            !observed.unwrap(),
+            "verified dead recorded process must establish absence without any CLI"
+        );
+        assert!(runner.fake.calls.is_empty());
+    }
+
+    #[test]
+    fn warp_r2_proof_regression_reused_app_pid_never_controls() {
+        let (temp, client, attempt) = fixture();
+        let binding: ControlBinding = serde_json::from_value(json!({
+            "schema": RECORD_SCHEMA, "attempt": attempt, "bundle": client.bundle, "executable": client.executable,
+            "inject_warpctrl": false, "app_id": client.app_id, "channel": client.channel, "scheme": client.scheme,
+            "instance_id": "instance-1", "pid": 42, "protocol_version": 1, "process_birth": [100, 123],
+        })).unwrap();
+        let mut runner = ProofBirthRunner {
+            fake: FakeRunner::new(temp.path(), &attempt),
+            injected_birth: Some(Some((101, 0))),
+        };
+        let observed = bound_instance_present(
+            &mut runner,
+            &client,
+            &binding,
+            Instant::now() + Duration::from_secs(1),
+        );
+        eprintln!(
+            "reused PID fixture old=(100,123) current=(101,0); result={observed:?}; control calls={:?}",
+            runner.fake.calls
+        );
+        assert!(
+            observed.is_err(),
+            "reused PID must never be accepted by matching endpoint metadata"
+        );
+        assert!(
+            runner.fake.calls.is_empty(),
+            "reused PID must fail before any app control"
+        );
+    }
+
+    fn proof_open_fixture(
+        runner: &mut FakeRunner,
+        client: &ControlClient,
+        directory: &Path,
+        attempt: &str,
+        bound: &Cell<bool>,
+    ) -> Result<TerminalSession> {
+        mode_open_fixture(runner, client, directory, attempt, bound, false)
+    }
+
+    fn mode_open_fixture(
+        runner: &mut FakeRunner,
+        client: &ControlClient,
+        directory: &Path,
+        attempt: &str,
+        bound: &Cell<bool>,
+        force_new_window: bool,
+    ) -> Result<TerminalSession> {
+        open_bound_tab_with(
+            runner,
+            OpenRequest {
+                force_new_window,
+                clients: std::slice::from_ref(client),
+                command: "ignored",
+                directory,
+                deadline: Instant::now() + Duration::from_millis(450),
+                cleanup_deadline: Instant::now() + Duration::from_secs(1),
+                attempt,
+            },
+            |_| {
+                assert!(directory.join(CONTROL_FILE).exists());
+                assert!(!directory.join(HOST_DECISION_FILE).exists());
+                bound.set(true);
+                Ok(())
+            },
+            || Ok(()),
+        )
+    }
+
+    #[test]
+    fn warp_r2_proof_uncertain_executed_reply_reacquires_same_title() {
+        for code in ["lost", "malformed", "timeout"] {
+            let (temp, client, attempt) = fixture();
+            let directory = temp.path().join("session");
+            fs::create_dir(&directory).unwrap();
+            let mut runner = FakeRunner::new(&directory, &attempt);
+            runner.proof_failures = 1;
+            runner.proof_reply = Some(code);
+            let bound = Cell::new(false);
+            proof_open_fixture(&mut runner, &client, &directory, &attempt, &bound).unwrap();
+            assert!(bound.get());
+            assert_eq!(runner.proof_calls, 2);
+            assert_eq!(runner.proof_executed, 2);
+            assert_eq!(
+                runner.offered_title,
+                format!("agent-bridge-offer-{attempt}")
+            );
+            assert!(
+                !runner
+                    .calls
+                    .iter()
+                    .any(|args| args.get(1).is_some_and(|arg| arg == "close"))
+            );
+        }
+    }
+
+    #[test]
+    fn warp_r2_proof_wrong_identity_or_ack_never_binds_or_closes() {
+        for code in [
+            "wrong_instance",
+            "wrong_window",
+            "wrong_tab",
+            "wrong_action",
+            "not_ok",
+        ] {
+            let (temp, client, attempt) = fixture();
+            let directory = temp.path().join("session");
+            fs::create_dir(&directory).unwrap();
+            let mut runner = FakeRunner::new(&directory, &attempt);
+            runner.proof_reply = Some(code);
+            let bound = Cell::new(false);
+            let error =
+                proof_open_fixture(&mut runner, &client, &directory, &attempt, &bound).unwrap_err();
+            assert!(format!("{error:#}").contains("wrong exact target"));
+            assert!(!bound.get() && !directory.join(CONTROL_FILE).exists());
+            assert_eq!(runner.proof_calls, 1);
+            assert!(
+                !runner
+                    .calls
+                    .iter()
+                    .any(|args| args.get(1).is_some_and(|arg| arg == "close")
+                        || args.iter().any(|arg| arg == "--tab")
+                            && args.get(1).is_some_and(|arg| arg == "rename"))
+            );
+            let decision: HostDecision =
+                read_record(&directory.join(HOST_DECISION_FILE), "decision").unwrap();
+            assert_eq!(decision.action, HostAction::Abort);
+        }
+    }
+
+    #[test]
+    fn warp_r2_proof_ambiguous_removed_title_and_exhausted_reply_preserve_unproven_surface() {
+        for code in [
+            "ambiguous_target",
+            "missing_target",
+            "removed",
+            "lost",
+            "timeout",
+        ] {
+            let (temp, client, attempt) = fixture();
+            let directory = temp.path().join("session");
+            fs::create_dir(&directory).unwrap();
+            let mut runner = FakeRunner::new(&directory, &attempt);
+            match code {
+                "removed" => runner.offered_title = "user-changed-title".into(),
+                "lost" | "timeout" => {
+                    runner.proof_failures = 99;
+                    runner.proof_reply = Some(code);
+                }
+                _ => runner.proof_selector_error = Some(code),
+            }
+            let bound = Cell::new(false);
+            let error =
+                proof_open_fixture(&mut runner, &client, &directory, &attempt, &bound).unwrap_err();
+            assert!(error.to_string().contains("residual launch tab"));
+            assert!(!bound.get() && !directory.join(CONTROL_FILE).exists());
+            assert!(runner.proof_calls <= 3);
+            if code == "lost" {
+                assert_eq!(runner.proof_calls, 3);
+            }
+            assert!(
+                !runner
+                    .calls
+                    .iter()
+                    .any(|args| args.get(1).is_some_and(|arg| arg == "close"))
+            );
+            let decision: HostDecision =
+                read_record(&directory.join(HOST_DECISION_FILE), "decision").unwrap();
+            assert_eq!(decision.action, HostAction::Abort);
+        }
+    }
+
+    fn creation_config_remains(client: &ControlClient, attempt: &str) -> bool {
+        client
+            .config_dir
+            .join(format!("agent-bridge-{attempt}.toml"))
+            .exists()
+            || client
+                .config_dir
+                .with_file_name("launch_configurations")
+                .join(format!("agent-bridge-{attempt}.yaml"))
+                .exists()
+    }
+
+    fn assert_unproven_surface_untouched(runner: &FakeRunner, directory: &Path, case: &str) {
+        assert!(
+            runner.calls.iter().all(|call| call
+                .get(1)
+                .is_none_or(|action| action != "rename" && action != "close")),
+            "{case}: an unproven surface was mutated"
+        );
+        assert!(!directory.join(CONTROL_FILE).exists(), "{case}");
+        let decision: HostDecision =
+            read_record(&directory.join(HOST_DECISION_FILE), "decision").unwrap();
+        assert_eq!(decision.action, HostAction::Abort, "{case}");
+    }
+
+    // R3 finding 7. A window asked for, or needed because no window can take a tab,
+    // must not depend on TabConfigs, and must hold the launch tab alone.
+    #[test]
+    fn g4_r20_window_route_is_the_ungated_launch_configuration() {
+        let mut failures = Vec::new();
+        for (no_window, force_new_window) in [(false, true), (true, true), (true, false)] {
+            for tab_configs_enabled in [false, true] {
+                let case = format!(
+                    "no_window={no_window} force_new_window={force_new_window} tab_configs_enabled={tab_configs_enabled}"
+                );
+                let (temp, client, attempt) = fixture();
+                let directory = temp.path().join("session");
+                fs::create_dir(&directory).unwrap();
+                let mut runner = FakeRunner::new(&directory, &attempt);
+                runner.reuse_window = true;
+                runner.no_window = no_window;
+                runner.tab_configs_enabled = tab_configs_enabled;
+                let bound = Cell::new(false);
+                match mode_open_fixture(
+                    &mut runner,
+                    &client,
+                    &directory,
+                    &attempt,
+                    &bound,
+                    force_new_window,
+                ) {
+                    Ok(session) => {
+                        assert!(bound.get() && runner.launch_uri, "{case}");
+                        assert_eq!(session.window_id.as_deref(), Some("new-window"), "{case}");
+                        assert_eq!(session.tab_id.as_deref(), Some("new-tab"), "{case}");
+                        let decision: HostDecision =
+                            read_record(&directory.join(HOST_DECISION_FILE), "decision").unwrap();
+                        assert_eq!(decision.action, HostAction::Start, "{case}");
+                    }
+                    Err(error) => failures.push(format!("{case}: {error:#}")),
+                }
+                assert!(!creation_config_remains(&client, &attempt), "{case}");
+            }
+        }
+        eprintln!("window route failures: {failures:#?}");
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    // The tab route stays the first choice while a window exists. Its uncertainty is
+    // never read as "no tab capability": one dispatch, no window, no mutation.
+    #[test]
+    fn g4_r20_uncertain_tab_request_never_becomes_a_window() {
+        for case in ["tab_configs_off", "no_offer", "lost_reply", "ambiguous"] {
+            let (temp, client, attempt) = fixture();
+            let directory = temp.path().join("session");
+            fs::create_dir(&directory).unwrap();
+            let mut runner = FakeRunner::new(&directory, &attempt);
+            runner.reuse_window = true;
+            match case {
+                "tab_configs_off" => runner.tab_configs_enabled = false,
+                "no_offer" => runner.write_offer = false,
+                "lost_reply" => runner.dispatch_uncertain = true,
+                _ => runner.ambiguous = true,
+            }
+            let bound = Cell::new(false);
+            let error =
+                mode_open_fixture(&mut runner, &client, &directory, &attempt, &bound, false)
+                    .unwrap_err();
+            // The fake refuses a second dispatch, so this is the only creation request.
+            assert!(
+                runner.dispatched && !runner.launch_uri && !bound.get(),
+                "{case}: {error:#}"
+            );
+            assert_unproven_surface_untouched(&runner, &directory, case);
+            assert!(!creation_config_remains(&client, &attempt), "{case}");
+            if case == "tab_configs_off" {
+                assert!(format!("{error:#}").contains("feature enablement is unverified"));
+            }
+        }
+    }
+
+    #[test]
+    fn g4_r20_window_route_partial_transitions_preserve_the_unproven_surface() {
+        for case in ["no_offer", "lost_reply", "existing_window", "ambiguous"] {
+            let (temp, client, attempt) = fixture();
+            let directory = temp.path().join("session");
+            fs::create_dir(&directory).unwrap();
+            let mut runner = FakeRunner::new(&directory, &attempt);
+            runner.reuse_window = true;
+            match case {
+                "no_offer" => runner.write_offer = false,
+                "lost_reply" => runner.dispatch_uncertain = true,
+                "existing_window" => runner.launch_into_existing = true,
+                _ => runner.ambiguous = true,
+            }
+            let bound = Cell::new(false);
+            let error = mode_open_fixture(&mut runner, &client, &directory, &attempt, &bound, true)
+                .unwrap_err();
+            assert!(
+                runner.launch_uri,
+                "{case}: a window must be requested through the Launch Configuration: {error:#}"
+            );
+            assert!(runner.dispatched && !bound.get(), "{case}: {error:#}");
+            assert_unproven_surface_untouched(&runner, &directory, case);
+            assert!(!creation_config_remains(&client, &attempt), "{case}");
+            if case == "existing_window" {
+                assert!(format!("{error:#}").contains("new-window request"));
+            }
+        }
+    }
+
+    #[test]
+    fn g4_r20_creation_configs_carry_quoted_and_unicode_text_exactly() {
+        for force_new_window in [false, true] {
+            let (temp, client, attempt) = fixture();
+            // NEL, LS and DEL are what a YAML 1.1 or TOML reader treats unlike JSON.
+            let directory = temp
+                .path()
+                .join("한글 'quoted' \"path\"\nline \u{85}\u{2028}\u{7f} end");
+            fs::create_dir(&directory).unwrap();
+            let mut runner = FakeRunner::new(&directory, &attempt);
+            runner.reuse_window = true;
+            // The fake compares the parsed document with this directory and command.
+            let result = open_bound_tab_with(
+                &mut runner,
+                OpenRequest {
+                    force_new_window,
+                    clients: std::slice::from_ref(&client),
+                    command: "source '/a quoted/path'; printf '%s' \"line\\n\"",
+                    directory: &directory,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    cleanup_deadline: Instant::now() + Duration::from_secs(2),
+                    attempt: &attempt,
+                },
+                |_| Ok(()),
+                || Ok(()),
+            );
+            assert_eq!(runner.launch_uri, force_new_window, "{result:?}");
+            result.unwrap();
+        }
     }
 }

@@ -149,6 +149,7 @@ where
         tab_id: None,
         window_id: None,
         managed_session_id: None,
+        wezterm_mux: None,
         windows_process_identity: Some(surface.identity().clone()),
     };
     let launch = super::bind_surface_before_start(

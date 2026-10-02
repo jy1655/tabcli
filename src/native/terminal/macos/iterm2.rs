@@ -22,10 +22,11 @@ use super::{
 // is taken back only from the new tab: a tab or window the user chose meanwhile
 // keeps the keyboard.
 pub(in crate::native) const OPEN_TAB_SCRIPT: &str = r#"
-on run
+on run argv
+    set forceNewWindow to (item 1 of argv) is "new-window"
     set itermWasRunning to application "iTerm2" is running
     tell application "iTerm2"
-        if not itermWasRunning then
+        if forceNewWindow or not itermWasRunning then
             set targetWindow to (create window with default profile)
             set targetSession to current session of targetWindow
         else if (count of windows) is 0 then
@@ -157,8 +158,11 @@ on run argv
 end run
 "#;
 
-pub(super) fn create_tab(deadline: Instant) -> Result<TerminalSession> {
-    let id = applescript::run_until("iTerm2", OPEN_TAB_SCRIPT, &[], deadline)?;
+pub(super) fn create_tab(
+    mode: crate::native::settings::MacosOpenMode,
+    deadline: Instant,
+) -> Result<TerminalSession> {
+    let id = applescript::run_until("iTerm2", OPEN_TAB_SCRIPT, &[mode.as_str()], deadline)?;
     if id.is_empty() {
         bail!("iTerm2 did not return a session id");
     }
@@ -168,6 +172,7 @@ pub(super) fn create_tab(deadline: Instant) -> Result<TerminalSession> {
         tab_id: None,
         window_id: None,
         managed_session_id: None,
+        wezterm_mux: None,
         windows_process_identity: None,
     })
 }

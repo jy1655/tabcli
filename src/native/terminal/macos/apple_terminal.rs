@@ -163,7 +163,7 @@ on run argv
             if tty of candidateTab is wantedTty then set matchCount to matchCount + 1
         end repeat
         if matchCount is 1 then return wantedTty
-        if matchCount is 0 then return "missing"
+        if matchCount is 0 then error "Agent Bridge Terminal.app window no longer matches a tab of the recorded tty"
         error "Agent Bridge Terminal.app ownership proof matched multiple tabs"
     end tell
 end run
@@ -250,6 +250,7 @@ pub(super) fn create_tab(deadline: Instant) -> Result<TerminalSession> {
         tab_id: None,
         window_id: Some(window_id.unwrap().to_owned()),
         managed_session_id: None,
+        wezterm_mux: None,
         windows_process_identity: None,
     })
 }
@@ -377,15 +378,59 @@ fn close_session_with_deadline(
     session: &TerminalSession,
     deadline: Option<Instant>,
 ) -> Result<CloseOutcome> {
+    close_session_with(session, |script, arguments| {
+        run_terminal_automation(script, arguments, deadline)
+    })
+}
+
+pub(in crate::native) fn close_attested_session(
+    session: &TerminalSession,
+    app: &crate::native::MacTerminalAppIdentity,
+) -> Result<CloseOutcome> {
+    close_attested_session_with(
+        session,
+        app,
+        crate::native::macos_process_start,
+        crate::native::terminal_app_instances,
+        |script, arguments| run_terminal_automation(script, arguments, None),
+    )
+}
+
+fn close_attested_session_with(
+    session: &TerminalSession,
+    app: &crate::native::MacTerminalAppIdentity,
+    mut process_birth: impl FnMut(u32) -> Result<Option<(u64, u64)>>,
+    mut instances: impl FnMut() -> Result<Vec<crate::native::MacTerminalAppIdentity>>,
+    mut run: impl FnMut(&str, &[&str]) -> Result<String>,
+) -> Result<CloseOutcome> {
+    // Recheck before every transaction, including retries; a restarted app must
+    // never inherit the old window/tty's close authority.
+    close_session_with(session, |script, arguments| {
+        if !crate::native::terminal_app_alive_with(app, &mut process_birth)? {
+            return Ok("missing".into());
+        }
+        crate::native::require_unique_terminal_app(app, &instances()?)?;
+        let reply = run(script, arguments)?;
+        if !crate::native::terminal_app_alive_with(app, &mut process_birth)? {
+            return Ok("missing".into());
+        }
+        crate::native::require_unique_terminal_app(app, &instances()?)?;
+        Ok(reply)
+    })
+}
+
+fn close_session_with(
+    session: &TerminalSession,
+    mut run: impl FnMut(&str, &[&str]) -> Result<String>,
+) -> Result<CloseOutcome> {
     let window_id = ownership_proof(session)?;
-    let response = run_terminal_automation(CLOSE_TAB_SCRIPT, &[&session.id, window_id], deadline)?;
+    let response = run(CLOSE_TAB_SCRIPT, &[&session.id, window_id])?;
     let outcome = close_response(TerminalKind::AppleTerminal, &response)?;
     if outcome == CloseOutcome::Missing {
         return Ok(outcome);
     }
 
-    let verification =
-        run_terminal_automation(WAIT_FOR_CLOSE_SCRIPT, &[window_id, "20"], deadline)?;
+    let verification = run(WAIT_FOR_CLOSE_SCRIPT, &[window_id, "20"])?;
     if verification == "missing" {
         return Ok(CloseOutcome::Closed);
     }
@@ -393,12 +438,11 @@ fn close_session_with_deadline(
     // Terminal may consume the first close request by terminating the foreground
     // process while leaving its shell surface alive. Retry only the same owned
     // window/TTY proof, then verify from a separate AppleScript transaction.
-    let retry = run_terminal_automation(CLOSE_TAB_SCRIPT, &[&session.id, window_id], deadline)?;
+    let retry = run(CLOSE_TAB_SCRIPT, &[&session.id, window_id])?;
     if close_response(TerminalKind::AppleTerminal, &retry)? == CloseOutcome::Missing {
         return Ok(CloseOutcome::Closed);
     }
-    let verification =
-        run_terminal_automation(WAIT_FOR_CLOSE_SCRIPT, &[window_id, "100"], deadline)?;
+    let verification = run(WAIT_FOR_CLOSE_SCRIPT, &[window_id, "100"])?;
     if verification != "missing" {
         bail!("Terminal.app reported a closed tab twice but window {window_id} is still present");
     }
@@ -447,6 +491,83 @@ mod tests {
     const RENUMBERED: &str = r#"{listedId:8341, id:8342, tabs:{{tty:"/dev/ttys014", busy:false}}}"#;
     const DENIED: &str = r#"{-1743, "Not authorized to send Apple events to Terminal."}"#;
     const TIMED_OUT: &str = r#"{-1712, "AppleEvent timed out."}"#;
+
+    #[test]
+    fn attested_close_rechecks_app_before_every_transaction() {
+        let session: super::TerminalSession = serde_json::from_value(serde_json::json!({
+            "terminal": "apple-terminal", "session_id": TTY, "window_id": WINDOW,
+            "managed_session_id": "session-test"
+        }))
+        .unwrap();
+        let app = crate::native::MacTerminalAppIdentity {
+            pid: 1234,
+            start_seconds: 100,
+            start_microseconds: 42,
+        };
+        for mode in [
+            "same",
+            "dead",
+            "reused",
+            "unreadable",
+            "restart-after-close",
+            "multiple-instances",
+            "instance-added-after-close",
+        ] {
+            let mut observations = 0;
+            let mut instance_reads = 0;
+            let mut calls = 0;
+            let result = super::close_attested_session_with(
+                &session,
+                &app,
+                |pid| {
+                    assert_eq!(pid, app.pid);
+                    observations += 1;
+                    match mode {
+                        "dead" => Ok(None),
+                        "unreadable" => anyhow::bail!("injected OS error"),
+                        "reused" => Ok(Some((101, 42))),
+                        "restart-after-close" if observations > 1 => Ok(Some((101, 42))),
+                        _ => Ok(Some((100, 42))),
+                    }
+                },
+                || {
+                    instance_reads += 1;
+                    let mut found = vec![app.clone()];
+                    if mode == "multiple-instances"
+                        || (mode == "instance-added-after-close" && instance_reads > 1)
+                    {
+                        let mut other = app.clone();
+                        other.pid += 1;
+                        found.push(other);
+                    }
+                    Ok(found)
+                },
+                |_, _| {
+                    calls += 1;
+                    Ok(match calls {
+                        1 | 3 => "closed",
+                        2 => "present",
+                        _ => "missing",
+                    }
+                    .into())
+                },
+            );
+            assert_eq!(
+                result.is_ok(),
+                matches!(mode, "same" | "dead"),
+                "{mode}: {result:?}"
+            );
+            assert_eq!(
+                calls,
+                match mode {
+                    "same" => 4,
+                    "restart-after-close" | "instance-added-after-close" => 1,
+                    _ => 0,
+                },
+                "{mode}"
+            );
+        }
+    }
 
     // An Apple Event to a Terminal that is not running launches it, without the
     // windows Bridge created.
@@ -678,6 +799,21 @@ end mockClose
             ("window closed", running(&[UNRELATED]), Ok("missing")),
             ("live owned tab", running(&[LIVE]), Ok(TTY)),
             ("window list denied", failing(DENIED), Err("Not authorized")),
+            (
+                "killed shell",
+                running(&[KILLED]),
+                Err("no longer matches a tab"),
+            ),
+            (
+                "changed tty",
+                running(&[CHANGED]),
+                Err("no longer matches a tab"),
+            ),
+            (
+                "empty window",
+                running(&[EMPTY]),
+                Err("no longer matches a tab"),
+            ),
         ];
         for (case, terminal, expected) in cases {
             check(&mut failures, case, verify(&terminal), expected, false);
