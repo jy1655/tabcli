@@ -487,6 +487,11 @@ mod tests {
         r#"{id:8341, tabs:{{tty:"/dev/ttys014", busy:false}, {tty:"/dev/ttys020", busy:false}}}"#;
     const UNRELATED: &str = r#"{id:8000, tabs:{{tty:"/dev/ttys014", busy:false}}}"#;
     const EMPTY: &str = r#"{id:8341, tabs:{}}"#;
+    // Window 12064 changed from invisible to visible with no tabs after close
+    // (2026-10-03, user-confirmed residual session-mpL0WX). Neither state is
+    // evidence of absence, even after a close command reported success.
+    const HIDDEN_EMPTY: &str = r#"{id:8341, tabs:{}, visible:false}"#;
+    const VISIBLE_EMPTY: &str = r#"{id:8341, tabs:{}, visible:true}"#;
     // Listed as 8341, but its id reads 8342 at the final check before the close.
     const RENUMBERED: &str = r#"{listedId:8341, id:8342, tabs:{{tty:"/dev/ttys014", busy:false}}}"#;
     const DENIED: &str = r#"{-1743, "Not authorized to send Apple events to Terminal."}"#;
@@ -727,6 +732,18 @@ end mockClose
             ),
             ("killed shell", running(&[KILLED]), Ok("closed"), true),
             (
+                "hidden empty window is not closed",
+                running(&[HIDDEN_EMPTY]),
+                Err("no longer holds its tab"),
+                false,
+            ),
+            (
+                "visible empty window is not closed",
+                running(&[VISIBLE_EMPTY]),
+                Err("no longer holds its tab"),
+                false,
+            ),
+            (
                 "window list denied",
                 failing(DENIED),
                 Err("Not authorized"),
@@ -770,6 +787,16 @@ end mockClose
         let cases = [
             ("Terminal not running", STOPPED, Ok("missing")),
             ("window closed", running(&[UNRELATED]), Ok("missing")),
+            (
+                "hidden empty window remains",
+                running(&[HIDDEN_EMPTY]),
+                Ok("present"),
+            ),
+            (
+                "visible empty window remains",
+                running(&[VISIBLE_EMPTY]),
+                Ok("present"),
+            ),
             ("live owned tab", running(&[LIVE]), Ok("present")),
             ("killed shell", running(&[KILLED]), Ok("present")),
             ("tab replaced", running(&[CHANGED]), Ok("present")),
@@ -797,6 +824,16 @@ end mockClose
         let cases = [
             ("Terminal not running", STOPPED, Ok("missing")),
             ("window closed", running(&[UNRELATED]), Ok("missing")),
+            (
+                "hidden empty window is not absence",
+                running(&[HIDDEN_EMPTY]),
+                Err("no longer matches a tab"),
+            ),
+            (
+                "visible empty window is not absence",
+                running(&[VISIBLE_EMPTY]),
+                Err("no longer matches a tab"),
+            ),
             ("live owned tab", running(&[LIVE]), Ok(TTY)),
             ("window list denied", failing(DENIED), Err("Not authorized")),
             (
