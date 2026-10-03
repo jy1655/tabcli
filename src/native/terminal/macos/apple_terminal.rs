@@ -46,10 +46,11 @@ use super::{
 // session's bootstrap, with the tty's line kill (U+0015) in front. The PTY of a new
 // tab is canonical with the kernel's control characters (lflag 0x5cb, kill ^U) until
 // a shell changes that, so the kernel discards a key that Terminal wrote in front,
-// and the line editors of zsh and bash discard it by default. A key that was written
-// in front and followed by Enter is a command line of its own; nothing typed can
-// take it back. Replace the typed start when Terminal can create a tab that runs a
-// command.
+// and the default line editors of zsh and bash discard ordinary text in insertion
+// mode. A prefix or quote key just before it (Escape or Ctrl-V), or a remapped line
+// kill, can defeat this and leave the start unexecuted. Text already followed by
+// Enter is a command line of its own; nothing typed can take it back. Replace the
+// typed start when Terminal can create a tab that runs a command.
 pub(in crate::native) const OPEN_TAB_SCRIPT: &str = r#"
 on soleNewWindowWithTty(windowTtys, priorWindowIds, wantedTty)
     set matchedWindowId to missing value
@@ -301,8 +302,9 @@ pub(super) fn create_tab(
 
 // The typed line stays short (#50) and names a private file. The tab's own shell
 // sources it, so the gate and the wrapper are two jobs of that shell and the wrapper
-// keeps the shell as its parent and a foreground group of its own. A gate that
-// refuses ends the shell: nothing is left that could start the wrapper later.
+// keeps the shell as its parent and a foreground group of its own. A refused gate
+// stops the bootstrap before the wrapper. A zsh with running or suspended jobs can
+// refuse exit and return to its prompt; the failed launch keeps its close proof.
 fn install_bootstrap(directory: &Path, host: &str, command: &str) -> Result<String> {
     let path = directory.join(BOOTSTRAP_FILE);
     crate::native::write_private(&path, format!("{host} || exit\n{command}\n").as_bytes())?;

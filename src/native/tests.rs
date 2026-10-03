@@ -1528,12 +1528,34 @@ fn iterm_new_window_returns_selection_before_starting_the_provider() {
     let script = terminal::macos::iterm2::OPEN_TAB_SCRIPT;
     // The new-window path previously remembered nothing: a real self-test
     // selected its window for all 28 seconds and brought iTerm2 to the front.
-    assert!(script.contains("set keyboardWindow to current window"));
-    assert!(script.contains("tell keyboardWindow to select"));
-    assert!(script.contains("my restoreApplication(earlierApplication, keyboardSessionId)"));
+    assert!(script.contains("set keyboardWindow to my itermCurrentWindow()"));
     assert!(script.contains(
-        "if (unique ID of current session of current window) is (unique ID of targetSession) then"
+        "set newSessionId to my itermCreateWindow(bridgeCommand)\n        try\n            my returnFromNewWindow(earlierApplication, keyboardWindow, newSessionId)\n        end try"
     ));
+    // iTerm2 activates itself after the creation and then makes the new window
+    // key again. The return waits for iTerm2's own word that this has happened,
+    // selects the earlier window only while the new session is the selected one,
+    // and looks at both again before it gives the foreground back.
+    let (_, handler) = script
+        .split_once("on returnFromNewWindow(earlierApplication, keyboardWindow, newSessionId)")
+        .unwrap();
+    let (handler, _) = handler.split_once("end returnFromNewWindow").unwrap();
+    let mut rest = handler;
+    for step in [
+        "repeat until my itermIsActive()",
+        "if looks > activationLooks then return",
+        "end repeat\n    if (my itermSelectedSessionId()) is not newSessionId then return",
+        "my itermSelectWindow(keyboardWindow)",
+        "if not (my isEarlierOrITerm(my foregroundApplication(), earlierApplication)) then return",
+        "if earlierApplication's isTerminated() as boolean then return",
+        "if not (my itermIsActive()) then return\n    if (my itermSelectedSessionId()) is not expectedSessionId then return\n    earlierApplication's activateWithOptions:2\n",
+    ] {
+        let (_, after) = rest
+            .split_once(step)
+            .unwrap_or_else(|| panic!("the return from a new window lost or moved {step:?}"));
+        rest = after;
+    }
+    assert!(rest.trim().is_empty(), "{rest}");
 }
 
 #[cfg(target_os = "macos")]
@@ -1541,14 +1563,13 @@ fn iterm_new_window_returns_selection_before_starting_the_provider() {
 fn macos_cold_start_never_adopts_an_app_restored_surface() {
     // Closing the key window while iTerm2 is in the background can leave other
     // windows but no current window. That is not authority to adopt any of them.
+    // The current window is read once, and only from an iTerm2 that was running.
     assert!(terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains(
-        "else if (count of windows) is 0 or current window is missing value then\n            set targetWindow to (create window with default profile command bridgeCommand)"
+        "if my itermIsRunning() then\n        try\n            set keyboardWindow to my itermCurrentWindow()"
     ));
-    assert!(
-            terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains(
-                "if forceNewWindow or not itermWasRunning then\n            set targetWindow to (create window with default profile command bridgeCommand)"
-            )
-        );
+    assert!(terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains(
+        "if forceNewWindow or keyboardWindow is missing value then\n        set newSessionId to my itermCreateWindow(bridgeCommand)"
+    ));
     assert!(terminal::macos::ghostty::CREATE_SURFACE_SCRIPT.contains(
         "if wantedWindowId is \"-\" then\n   set targetWindow to new window with configuration cfg"
     ));
@@ -1591,46 +1612,115 @@ fn macos_open_scripts_give_the_keyboard_back_and_never_activate_the_app() {
     };
 
     let iterm = terminal::macos::iterm2::OPEN_TAB_SCRIPT;
-    assert!(!iterm.lines().any(|line| line.trim() == "activate"));
+    // The comments of the script speak of activation; its statements are listed.
+    let iterm_statements = |needle: &str| -> Vec<&str> {
+        lines_with(iterm, needle)
+            .into_iter()
+            .filter(|line| !line.starts_with("--"))
+            .collect()
+    };
+    // iTerm2 is never told to activate. The one activation in the script gives
+    // the foreground back to another application, and only the creation of a
+    // window leads to it.
     assert_eq!(
-        lines_with(iterm, "set targetWindow to"),
+        iterm_statements("activate"),
+        ["earlierApplication's activateWithOptions:2"]
+    );
+    assert_eq!(
+        iterm_statements("returnFromNewWindow"),
         [
-            "set targetWindow to (create window with default profile command bridgeCommand)",
-            "set targetWindow to (create window with default profile command bridgeCommand)",
-            "set targetWindow to current window",
+            "on returnFromNewWindow(earlierApplication, keyboardWindow, newSessionId)",
+            "end returnFromNewWindow",
+            "my returnFromNewWindow(earlierApplication, keyboardWindow, newSessionId)",
+        ]
+    );
+    let window_return = position(
+        iterm,
+        "on returnFromNewWindow(earlierApplication, keyboardWindow, newSessionId)",
+    );
+    let activation = position(iterm, "earlierApplication's activateWithOptions:2");
+    assert!(window_return < activation && activation < position(iterm, "end returnFromNewWindow"));
+    assert_eq!(
+        iterm_statements("returnFromNewTab"),
+        [
+            "on returnFromNewTab(keyboardWindow, keyboardTab, newSessionId)",
+            "end returnFromNewTab",
+            "my returnFromNewTab(keyboardWindow, keyboardTab, newSessionId)",
+        ]
+    );
+    // A tab is left only while its window still shows it, a window only while
+    // its session is the selected one.
+    assert_eq!(
+        iterm_statements("my itermSelectTab("),
+        [
+            "if (my itermSessionIdOfWindow(keyboardWindow)) is newSessionId then my itermSelectTab(keyboardTab)"
         ]
     );
     assert_eq!(
-        lines_with(iterm, "set targetTab to"),
-        ["set targetTab to (create tab with default profile command bridgeCommand)"]
+        iterm_statements("my itermSelectWindow("),
+        ["my itermSelectWindow(keyboardWindow)"]
+    );
+    // The owned session comes from a creation, its id is read once there, and
+    // a tab is created in the window that was remembered.
+    assert_eq!(
+        iterm_statements("create "),
+        [
+            "set newWindow to (create window with default profile command bridgeCommand)",
+            "set newTab to (create tab with default profile command bridgeCommand)",
+        ]
     );
     assert_eq!(
-        lines_with(iterm, "set keyboardWindow to"),
+        iterm_statements("unique ID of current session of new"),
+        [
+            "return unique ID of current session of newWindow",
+            "return unique ID of current session of newTab",
+        ]
+    );
+    assert_eq!(
+        iterm_statements("set newSessionId to"),
+        [
+            "set newSessionId to my itermCreateWindow(bridgeCommand)",
+            "set newSessionId to my itermCreateTab(keyboardWindow, bridgeCommand)",
+        ]
+    );
+    assert_eq!(
+        iterm_statements("set keyboardWindow to"),
         [
             "set keyboardWindow to missing value",
-            "set keyboardWindow to current window"
+            "set keyboardWindow to my itermCurrentWindow()"
         ]
     );
     assert_eq!(
-        lines_with(iterm, "set keyboardTab to"),
+        iterm_statements("set keyboardTab to"),
         [
             "set keyboardTab to missing value",
-            "set keyboardTab to current tab of keyboardWindow"
+            "if keyboardWindow is not missing value then set keyboardTab to my itermCurrentTabOf(keyboardWindow)"
         ]
     );
-    let remembered = position(iterm, "set keyboardWindow to current window");
-    let created = position(iterm, "set targetWindow to (create window");
-    let guard = position(
+    let remembered = position(iterm, "set keyboardWindow to my itermCurrentWindow()");
+    let created = position(
         iterm,
-        "if (unique ID of current session of current window) is (unique ID of targetSession) then",
+        "set newSessionId to my itermCreateWindow(bridgeCommand)",
     );
-    let restored = position(iterm, "tell keyboardTab to select");
-    let app_restored = position(
+    let window_returned = position(
         iterm,
-        "my restoreApplication(earlierApplication, keyboardSessionId)",
+        "my returnFromNewWindow(earlierApplication, keyboardWindow, newSessionId)",
     );
-    assert!(remembered < created && created < guard && guard < restored && restored < app_restored);
-    assert!(iterm.contains("tell targetSession\n            return unique ID"));
+    let tab_created = position(
+        iterm,
+        "set newSessionId to my itermCreateTab(keyboardWindow, bridgeCommand)",
+    );
+    let tab_returned = position(
+        iterm,
+        "my returnFromNewTab(keyboardWindow, keyboardTab, newSessionId)",
+    );
+    assert!(
+        remembered < created
+            && created < window_returned
+            && window_returned < tab_created
+            && tab_created < tab_returned
+    );
+    assert!(iterm.ends_with("    return newSessionId\nend run\n"));
 
     let terminal_app = terminal::macos::apple_terminal::OPEN_TAB_SCRIPT;
     assert!(!terminal_app.contains("activate"));
@@ -2067,6 +2157,12 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
         (
             "Ghostty create surface",
             terminal::macos::ghostty::CREATE_SURFACE_SCRIPT,
+            "Ghostty",
+            "/Applications/Ghostty.app",
+        ),
+        (
+            "Ghostty foreground",
+            terminal::macos::ghostty::FOREGROUND_SCRIPT,
             "Ghostty",
             "/Applications/Ghostty.app",
         ),

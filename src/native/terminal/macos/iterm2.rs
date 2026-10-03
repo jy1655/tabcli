@@ -11,101 +11,209 @@ use super::{
     applescript, close_response,
 };
 
-// iTerm2 3.7.3 selects every surface it creates; a new window also activates the
-// application. Return selection only from the exact new session, then give the
-// foreground back to the retained earlier application. A different application,
-// tab or window the user chose keeps it. Native `command` creation plus the bound
-// launch host below prevent keys in this brief exposure from editing the launch
-// line or answering the provider's first dialog. Restore is best effort, never
-// ownership authority; remove it when iTerm offers creation without selection.
+// iTerm2 3.7.3 selects every surface it creates, and a new window also makes
+// iTerm2 activate itself (issue #58). The script gives back what its creation
+// took and nothing else:
+// - a new tab: the tab that was selected in that window, while the window still
+//   shows the new session. `create tab` never activates iTerm2, so no
+//   application is touched.
+// - a new window: the earlier window, then the application that had the
+//   foreground, once iTerm2 itself says that it is active. iTerm2 activates
+//   itself asynchronously and makes the new window key again when it is active,
+//   so anything given back earlier is taken again.
+// An application, window or tab that the user chose meanwhile keeps the keyboard.
+// None of this is authority over the surface or a reason to fail the launch. An
+// application is kept as its NSRunningApplication object, never as a pid to look
+// up. Native `command` creation and the bound launch host below keep the keys of
+// this exposure from editing the launch line or answering the provider's first
+// dialog. Remove the return when iTerm2 can create without selecting.
 pub(in crate::native) const OPEN_TAB_SCRIPT: &str = r#"
 use framework "AppKit"
 
--- Keep the actual NSRunningApplication object in this script, not a PID to
--- resolve later. AppKit keeps it tied to that application even after it exits.
-on currentForegroundApplication()
-    -- NSWorkspace updates this property on the main run loop. Creation and
-    -- selection are synchronous Apple Events; refresh pending workspace events
-    -- before observing the foreground again (not a delay to guess readiness).
-    current application's NSRunLoop's currentRunLoop()'s runUntilDate:(current application's NSDate's dateWithTimeIntervalSinceNow:0.001)
+-- The machine. Everything this script knows about AppKit and iTerm2 comes
+-- through these handlers.
+
+-- NSWorkspace learns of a new foreground on the main run loop, which a script
+-- reaches only here. An application object learns in the same way that its
+-- application has ended.
+on foregroundApplication()
+    current application's NSRunLoop's currentRunLoop()'s runUntilDate:(current application's NSDate's dateWithTimeIntervalSinceNow:0.01)
     return current application's NSWorkspace's sharedWorkspace()'s frontmostApplication()
-end currentForegroundApplication
+end foregroundApplication
 
-on mayRestoreSelection(earlierApplication)
-    if earlierApplication is missing value then return false
-    set frontApplication to my currentForegroundApplication()
-    if frontApplication is missing value then return false
-    if (frontApplication's bundleIdentifier() as text) is "com.googlecode.iterm2" then return true
-    return (frontApplication's isEqual:earlierApplication) as boolean
-end mayRestoreSelection
+on itermIsRunning()
+    return application "iTerm2" is running
+end itermIsRunning
 
-on restoreApplication(earlierApplication, expectedSessionId)
-    if earlierApplication is missing value then return
-    set frontApplication to my currentForegroundApplication()
-    if earlierApplication's isTerminated() as boolean then return
-    set earlierBundle to earlierApplication's bundleIdentifier()
-    if earlierBundle is missing value then return
-    if (earlierBundle as text) is "com.googlecode.iterm2" then return
-    if frontApplication is missing value then return
-    if (frontApplication's bundleIdentifier() as text) is not "com.googlecode.iterm2" then return
+-- AppleScript answers `frontmost of application` itself, from what the system
+-- lists, and sends no event (AppleScript Language Guide, application class). The
+-- system lists iTerm2 in front before iTerm2 has handled its own activation.
+-- The record of its properties is iTerm2's own answer, and `frontmost` in it is
+-- iTerm2's `isActive` (iTerm2.sdef): true once iTerm2 has become active and has
+-- done what it had put off until then. The two terms are written as their
+-- codes, `properties` and `frontmost`. In iTerm2's dictionary they compile to
+-- the same script; without a dictionary, as in the replay of this handler,
+-- `properties` would read as `every property`.
+on itermIsActive()
     tell application "iTerm2"
-        if current window is missing value then return
-        if (unique ID of current session of current window) is not expectedSessionId then return
+        set applicationProperties to «property pALL»
+        return «property pisf» of applicationProperties
     end tell
+end itermIsActive
+
+on itermCurrentWindow()
+    tell application "iTerm2" to return current window
+end itermCurrentWindow
+
+on itermCurrentTabOf(aWindow)
+    tell application "iTerm2" to return current tab of aWindow
+end itermCurrentTabOf
+
+on itermSessionIdOfWindow(aWindow)
+    tell application "iTerm2" to return unique ID of current session of aWindow
+end itermSessionIdOfWindow
+
+on itermSelectedSessionId()
+    tell application "iTerm2"
+        if current window is missing value then return missing value
+        return unique ID of current session of current window
+    end tell
+end itermSelectedSessionId
+
+on itermWindowIsVisible(aWindow)
+    tell application "iTerm2" to return visible of aWindow
+end itermWindowIsVisible
+
+on itermSelectTab(aTab)
+    tell application "iTerm2"
+        tell aTab to select
+    end tell
+end itermSelectTab
+
+on itermSelectWindow(aWindow)
+    tell application "iTerm2"
+        tell aWindow to select
+    end tell
+end itermSelectWindow
+
+-- Both creations return the unique ID of the session they created, read once.
+on itermCreateWindow(bridgeCommand)
+    tell application "iTerm2"
+        set newWindow to (create window with default profile command bridgeCommand)
+        return unique ID of current session of newWindow
+    end tell
+end itermCreateWindow
+
+on itermCreateTab(aWindow, bridgeCommand)
+    tell application "iTerm2"
+        tell aWindow
+            set newTab to (create tab with default profile command bridgeCommand)
+        end tell
+        return unique ID of current session of newTab
+    end tell
+end itermCreateTab
+
+-- The flow. Nothing below names iTerm2 or an AppKit class, so the replay test
+-- runs these handlers unchanged on a model of both.
+
+-- How often iTerm2 is asked whether it has become active: about two seconds,
+-- the time for which iTerm2 itself retries its activation on every turn of its
+-- run loop.
+property activationLooks : 200
+
+-- An application without a bundle identifier is not iTerm2.
+on isITerm(anApplication)
+    set bundle to anApplication's bundleIdentifier()
+    if bundle is missing value then return false
+    return (bundle as text) is "com.googlecode.iterm2"
+end isITerm
+
+on isAnotherApplication(anApplication)
+    if anApplication is missing value then return false
+    return not (my isITerm(anApplication))
+end isAnotherApplication
+
+on isEarlierOrITerm(anApplication, earlierApplication)
+    if anApplication is missing value then return false
+    if my isITerm(anApplication) then return true
+    return (anApplication's isEqual:earlierApplication) as boolean
+end isEarlierOrITerm
+
+-- A new tab is the selected tab of its window, and creating one never activates
+-- iTerm2. The tab that was selected there is selected again while that window
+-- still shows the new session. No application is touched: if iTerm2 is in front
+-- now, the user put it there.
+on returnFromNewTab(keyboardWindow, keyboardTab, newSessionId)
+    if keyboardTab is missing value then return
+    if (my itermSessionIdOfWindow(keyboardWindow)) is newSessionId then my itermSelectTab(keyboardTab)
+end returnFromNewTab
+
+-- A new window makes iTerm2 activate itself. It does so asynchronously, retries
+-- for seconds, and makes the new window key again once it is active, so whatever
+-- is given back before that is taken again. This waits, within a bound, until
+-- iTerm2 itself says that it is active. Then it selects the earlier window and
+-- gives the foreground to the application that iTerm2 took it from: the last one
+-- seen in front, unless iTerm2 was in front at the start. Each step is taken
+-- only while iTerm2 still selects what this script selected; everything else
+-- returns without a change.
+on returnFromNewWindow(earlierApplication, keyboardWindow, newSessionId)
+    set looks to 0
+    repeat until my itermIsActive()
+        set looks to looks + 1
+        if looks > activationLooks then return
+        set seenApplication to my foregroundApplication()
+        if my isAnotherApplication(earlierApplication) and my isAnotherApplication(seenApplication) then set earlierApplication to seenApplication
+    end repeat
+    if (my itermSelectedSessionId()) is not newSessionId then return
+    set expectedSessionId to newSessionId
+    if keyboardWindow is not missing value then
+        if my itermWindowIsVisible(keyboardWindow) then
+            my itermSelectWindow(keyboardWindow)
+            -- Only a selection that took effect is expected to last.
+            set earlierSessionId to my itermSessionIdOfWindow(keyboardWindow)
+            if (my itermSelectedSessionId()) is earlierSessionId then set expectedSessionId to earlierSessionId
+        end if
+    end if
+    if not (my isAnotherApplication(earlierApplication)) then return
+    if earlierApplication's bundleIdentifier() is missing value then return
+    if not (my isEarlierOrITerm(my foregroundApplication(), earlierApplication)) then return
+    if earlierApplication's isTerminated() as boolean then return
+    if not (my itermIsActive()) then return
+    if (my itermSelectedSessionId()) is not expectedSessionId then return
     earlierApplication's activateWithOptions:2
-end restoreApplication
+end returnFromNewWindow
 
 on run argv
     set forceNewWindow to (item 1 of argv) is "new-window"
     set bridgeCommand to item 2 of argv
+    -- The application object itself is kept. No pid is looked up later.
     set earlierApplication to missing value
     try
-        set earlierApplication to my currentForegroundApplication()
+        set earlierApplication to my foregroundApplication()
     end try
-    set itermWasRunning to application "iTerm2" is running
-    tell application "iTerm2"
-        set keyboardWindow to missing value
-        set keyboardTab to missing value
-        if itermWasRunning then
-            try
-                set keyboardWindow to current window
-                set keyboardTab to current tab of keyboardWindow
-            end try
-        end if
-        if forceNewWindow or not itermWasRunning then
-            set targetWindow to (create window with default profile command bridgeCommand)
-            set targetSession to current session of targetWindow
-        else if (count of windows) is 0 or current window is missing value then
-            set targetWindow to (create window with default profile command bridgeCommand)
-            set targetSession to current session of targetWindow
-        else
-            set targetWindow to current window
-            tell targetWindow
-                set targetTab to (create tab with default profile command bridgeCommand)
-                set targetSession to current session of targetTab
-            end tell
-        end if
-        set keyboardSessionId to unique ID of targetSession
+    -- The selected window is read once. A tab is created in that window, and it
+    -- is the one that gets the keyboard back. Without one, no window of iTerm2
+    -- is adopted.
+    set keyboardWindow to missing value
+    set keyboardTab to missing value
+    if my itermIsRunning() then
         try
-            if my mayRestoreSelection(earlierApplication) then
-                if (unique ID of current session of current window) is (unique ID of targetSession) then
-                    if keyboardWindow is not missing value and keyboardTab is not missing value then
-                        if visible of keyboardWindow then
-                            tell keyboardTab to select
-                            if (id of keyboardWindow) is not (id of targetWindow) then
-                                if (unique ID of current session of current window) is (unique ID of targetSession) then tell keyboardWindow to select
-                            end if
-                            set keyboardSessionId to unique ID of current session of keyboardTab
-                        end if
-                    end if
-                    my restoreApplication(earlierApplication, keyboardSessionId)
-                end if
-            end if
+            set keyboardWindow to my itermCurrentWindow()
+            if keyboardWindow is not missing value then set keyboardTab to my itermCurrentTabOf(keyboardWindow)
         end try
-        tell targetSession
-            return unique ID
-        end tell
-    end tell
+    end if
+    if forceNewWindow or keyboardWindow is missing value then
+        set newSessionId to my itermCreateWindow(bridgeCommand)
+        try
+            my returnFromNewWindow(earlierApplication, keyboardWindow, newSessionId)
+        end try
+    else
+        set newSessionId to my itermCreateTab(keyboardWindow, bridgeCommand)
+        try
+            my returnFromNewTab(keyboardWindow, keyboardTab, newSessionId)
+        end try
+    end if
+    return newSessionId
 end run
 "#;
 
@@ -231,7 +339,25 @@ pub(super) fn create_tab(
 fn shell_command(host: &str, command: &str) -> String {
     format!(
         "/bin/zsh -l -i -c {}",
-        crate::native::shell_quote(std::ffi::OsStr::new(&format!("{host} || exit; {command}")))
+        iterm_argument(&format!("{host} || exit; {command}"))
+    )
+}
+
+// One argument of an iTerm2 `command`. iTerm2 3.7.3 hands that string to no
+// shell. It replaces `$$…$$` variables, asking the user for one that it does not
+// know (`$$$$` is a literal `$$`), and splits the rest with a parser of its own,
+// in which a backslash escapes even inside single quotes (PTYSession.m
+// `computeArgvForCommand:`; NSStringITerm.m `doubleDollarVariables`,
+// `componentsInShellCommand`). Double quotes with `\\` and `\"` are what
+// iTerm2 itself writes for that parser (ITAddressBookMgr.m
+// `standardLoginCommand`).
+fn iterm_argument(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace("$$", "$$$$")
     )
 }
 
@@ -366,139 +492,861 @@ pub(super) fn close_session_until(
 mod tests {
     use super::*;
 
-    // The live #58 failure was `a. '/.../launch.sh'`: the native write-text path
-    // appends to an editable shell line. Replay that input on a private PTY; no
-    // terminal app or global keyboard is used here.
-    // Execute the shipped restoration handlers with only OS observations replaced.
-    // No native app is addressed and no window or keyboard is touched by this replay.
-    #[test]
-    fn retained_application_and_exact_selection_bound_iterm_focus_restoration() {
-        let handlers = OPEN_TAB_SCRIPT
-            .split("on run argv")
-            .next()
-            .unwrap()
-            .replace("use framework \"AppKit\"", "")
-            .replace("current application's NSRunLoop's currentRunLoop()'s runUntilDate:(current application's NSDate's dateWithTimeIntervalSinceNow:0.001)", "")
-            .replace(
-                "current application's NSWorkspace's sharedWorkspace()'s frontmostApplication()",
-                "my mockApplication(mockFront)",
-            )
-            .replace("tell application \"iTerm2\"", "tell me")
-            .replace("current window is missing value", "mockMissingWindow")
-            .replace(
-                "(unique ID of current session of current window)",
-                "mockSelectedSession",
-            );
-        assert!(!handlers.contains("current application's NSWorkspace"));
-        assert!(!handlers.contains("application \"iTerm2\""));
-        const MOCK: &str = r#"
-on mockApplication(info)
- if info is missing value then return missing value
- script appObject
-  property appInfo : info
-  on bundleIdentifier()
-   return bundle of appInfo
-  end bundleIdentifier
-  on isTerminated()
-   return ended of appInfo
-  end isTerminated
-  on isEqual:other
-   return (instanceId of appInfo) is (instanceId of appInfo of other)
-  end isEqual:
-  on activateWithOptions:options
-   log "activated " & (instanceId of appInfo)
-   return true
-  end activateWithOptions:
- end script
- return appObject
-end mockApplication
+    fn osascript(script: &str) -> String {
+        let output = std::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    // A model of iTerm2 3.7.3 and of the foreground for the replay below. It
+    // addresses nothing of the machine.
+    const MODEL: &str = r#"
+-- A model of iTerm2 3.7.3 and of the foreground, for the replay of the open script.
+-- What it encodes, from iTerm2's source at tag v3.7.3:
+--   * the window of a first or new tab is the current terminal at once
+--     (PseudoTerminal.m:13266-13278);
+--   * `create window` lets iTerm2 activate itself: asynchronously, and when it has become
+--     active it makes the new window key again (iTermSessionLauncher.m:237-271,
+--     iTermApplication.m:1015-1088). `create tab` never activates
+--     (iTermWindowScriptingImpl.m:37-60);
+--   * selecting a tab changes no window (PTYTab+Scripting.m:78-80); selecting a window makes
+--     it the current terminal and activates nothing (iTermController.m:2219-2241).
+-- The application in front (`mFront`) is what the system lists. Whether iTerm2 is active
+-- (`mItermActive`) is what iTerm2 itself has handled; the two differ for a moment.
+-- Time is counted in calls to the model: one call stands for one Apple Event or one look
+-- at the workspace.
+property mWindows : {}
+property mKey : missing value
+property mRunning : true
+property mItermActive : false
+property mFront : "earlier"
+property mEarlierEnded : false
+property mEndedSeen : false
+property mPending : missing value
+property mCalls : 0
+property mNames : {}
+property mLast : ""
+property mCreatedAt : missing value
+property mNextWid : 100
+property mActivated : {}
+property mSelects : {}
+
+on mFind(wantedWid)
+	repeat with candidate in mWindows
+		if (wid of candidate) is wantedWid then return contents of candidate
+	end repeat
+	error "model: no window " & wantedWid
+end mFind
+
+on mShownSession(wantedWid)
+	set found to my mFind(wantedWid)
+	return item (sel of found) of (sids of found)
+end mShownSession
+
+on mAct(act)
+	if act is "activation-completes" then
+		if mPending is not missing value then
+			set mItermActive to true
+			set mFront to "iterm"
+			set mKey to mPending
+			set mPending to missing value
+		end if
+	else if act begins with "listed-in-front " then
+		-- What the system lists changes; iTerm2 has not handled the change yet.
+		set mFront to text 17 thru -1 of act
+	else if act is "user-to-iterm" then
+		set mFront to "iterm"
+		set mItermActive to true
+		if mPending is not missing value then
+			set mKey to mPending
+			set mPending to missing value
+		end if
+	else if act is "user-to-other" then
+		set mFront to "other"
+		set mItermActive to false
+	else if act is "user-to-earlier" then
+		set mFront to "earlier"
+		set mItermActive to false
+	else if act begins with "user-selects-window " then
+		set mKey to (text 21 thru -1 of act) as integer
+	else if act begins with "user-selects-tab " then
+		set spec to text 18 thru -1 of act
+		set cut to offset of ":" in spec
+		set found to my mFind((text 1 thru (cut - 1) of spec) as integer)
+		set sel of found to (text (cut + 1) thru -1 of spec) as integer
+	else if act is "user-closes-current-window" then
+		set mKey to missing value
+	else if act is "earlier-ends" then
+		set mEarlierEnded to true
+	else
+		error "model: unknown act " & act
+	end if
+end mAct
+
+on mRun(acts)
+	repeat with act in acts
+		my mAct(contents of act)
+	end repeat
+end mRun
+
+-- Every access of the script to the machine is one call. What the user does is tied to a
+-- call: to the nth call of a handler, or to the time right after it (`sAtCall`), or to
+-- the number of calls since the creation (`sAfterCreation`).
+on mCall(handlerName)
+	set mCalls to mCalls + 1
+	if sAtCall is not {} then
+		set end of mNames to handlerName
+		set nth to 0
+		repeat with earlierName in mNames
+			if (contents of earlierName) is handlerName then set nth to nth + 1
+		end repeat
+		set this to handlerName & " " & nth
+		repeat with entry in sAtCall
+			if (done of entry) is false and ((onCall of entry) is this or (onCall of entry) is ("after " & mLast)) then
+				set done of entry to true
+				my mAct(act of entry)
+			end if
+		end repeat
+		set mLast to this
+	end if
+	if mCreatedAt is not missing value then
+		set sinceCreation to mCalls - mCreatedAt
+		repeat with entry in sAfterCreation
+			if (done of entry) is false and (calls of entry) ≤ sinceCreation then
+				set done of entry to true
+				my mAct(act of entry)
+			end if
+		end repeat
+		if mPending is not missing value and sinceCreation > sActivationLatency then my mAct("activation-completes")
+	end if
+end mCall
+
+on mApp(which)
+	script anApplication
+		property who : which
+		on bundleIdentifier()
+			if who is "iterm" then return "com.googlecode.iterm2"
+			if who is "nobundle" then return missing value
+			-- Another instance of the earlier application.
+			if who is "twin" then return "com.example.earlier"
+			return "com.example." & who
+		end bundleIdentifier
+		on isTerminated()
+			-- An application object learns that its application has ended on the run loop.
+			if who is "earlier" then return mEndedSeen
+			return false
+		end isTerminated
+		on isEqual:another
+			return who is (who of another)
+		end isEqual:
+		on activateWithOptions:options
+			set end of mActivated to who
+			set mFront to who
+			set mItermActive to false
+			return true
+		end activateWithOptions:
+	end script
+	return anApplication
+end mApp
+
+on mJoin(values)
+	set joined to ""
+	repeat with value in values
+		if joined is not "" then set joined to joined & ","
+		set joined to joined & (contents of value)
+	end repeat
+	return joined
+end mJoin
+
+-- The machine, as the open script reaches it.
+on foregroundApplication()
+	my mCall("foregroundApplication")
+	set mEndedSeen to mEarlierEnded
+	if mFront is "unreadable" then return missing value
+	return my mApp(mFront)
+end foregroundApplication
+
+on itermIsRunning()
+	my mCall("itermIsRunning")
+	return mRunning
+end itermIsRunning
+
+on itermIsActive()
+	my mCall("itermIsActive")
+	return mItermActive
+end itermIsActive
+
+on itermCurrentWindow()
+	my mCall("itermCurrentWindow")
+	return mKey
+end itermCurrentWindow
+
+on itermCurrentTabOf(aWindow)
+	my mCall("itermCurrentTabOf")
+	return {tabWid:aWindow, tabNo:(sel of (my mFind(aWindow)))}
+end itermCurrentTabOf
+
+on itermSessionIdOfWindow(aWindow)
+	my mCall("itermSessionIdOfWindow")
+	return my mShownSession(aWindow)
+end itermSessionIdOfWindow
+
+on itermSelectedSessionId()
+	my mCall("itermSelectedSessionId")
+	if mKey is missing value then return missing value
+	return my mShownSession(mKey)
+end itermSelectedSessionId
+
+on itermWindowIsVisible(aWindow)
+	my mCall("itermWindowIsVisible")
+	return vis of (my mFind(aWindow))
+end itermWindowIsVisible
+
+on itermSelectTab(aTab)
+	my mCall("itermSelectTab")
+	set end of mSelects to "tab " & (tabWid of aTab) & ":" & (tabNo of aTab)
+	set sel of (my mFind(tabWid of aTab)) to tabNo of aTab
+end itermSelectTab
+
+on itermSelectWindow(aWindow)
+	my mCall("itermSelectWindow")
+	set end of mSelects to "window " & aWindow
+	if not sSelectWindowHasNoEffect then set mKey to aWindow
+end itermSelectWindow
+
+on mNewWindow()
+	set newWid to mNextWid
+	set mNextWid to mNextWid + 1
+	set end of mWindows to {wid:newWid, sids:{"new"}, sel:1, vis:true}
+	set mRunning to true
+	set mKey to newWid
+	if not mItermActive then set mPending to newWid
+	set mCreatedAt to mCalls
+	my mRun(sDuringCreation)
+	return newWid
+end mNewWindow
+
+on mNewTab(aWindow)
+	set found to my mFind(aWindow)
+	set end of (sids of found) to "new"
+	set sel of found to (count of (sids of found))
+	set mKey to aWindow
+	set mCreatedAt to mCalls
+	my mRun(sDuringCreation)
+	return {tabWid:aWindow, tabNo:(sel of found)}
+end mNewTab
+
+on itermCreateWindow(bridgeCommand)
+	my mCall("itermCreateWindow")
+	my mNewWindow()
+	return "new"
+end itermCreateWindow
+
+on itermCreateTab(aWindow, bridgeCommand)
+	my mCall("itermCreateTab")
+	my mNewTab(aWindow)
+	return "new"
+end itermCreateTab
+
 on run
- set earlier to my mockApplication(mockEarlier)
- set allowed to my mayRestoreSelection(earlier)
- my restoreApplication(earlier, "owned-or-restored")
- return allowed
+	set mWindows to sWindows
+	set mKey to sKey
+	set mRunning to sRunning
+	set mFront to sFront
+	set mItermActive to (sFront is "iterm")
+	set returned to my bridgeRun({sMode, "COMMAND"})
+	-- An activation that is still pending completes after the script has returned.
+	my mAct("activation-completes")
+	set selected to "none"
+	if mKey is not missing value then set selected to my mShownSession(mKey)
+	-- Every window with its sessions; the one it shows is marked.
+	set shown to {}
+	repeat with candidate in mWindows
+		set listed to ""
+		repeat with position from 1 to count of (sids of candidate)
+			if listed is not "" then set listed to listed & "/"
+			set listed to listed & (item position of (sids of candidate))
+			if position is (sel of candidate) then set listed to listed & "*"
+		end repeat
+		set end of shown to ((wid of candidate) as text) & ":" & listed
+	end repeat
+	return "returned=" & returned & " front=" & mFront & " selected=" & selected & " activated=" & (my mJoin(mActivated)) & " selects=" & (my mJoin(mSelects)) & " windows=" & (my mJoin(shown))
 end run
 "#;
-        const EDITOR: &str =
-            r#"{bundle:"com.example.editor", ended:false, instanceId:"editor-original"}"#;
-        const ITERM: &str = r#"{bundle:"com.googlecode.iterm2", ended:false, instanceId:"iterm"}"#;
-        let replay = |earlier: &str, front: &str, selected: &str, missing: bool| {
-            let script = format!(
-                "property mockEarlier : {earlier}\nproperty mockFront : {front}\nproperty mockSelectedSession : \"{selected}\"\nproperty mockMissingWindow : {missing}\n{handlers}\n{MOCK}"
+
+    // The flow of the open script as shipped, on the model instead of the machine.
+    fn flow() -> String {
+        let (_, flow) = OPEN_TAB_SCRIPT.split_once("-- The flow.").unwrap();
+        // Only the machine part may address iTerm2 or AppKit.
+        assert!(!flow.contains("application \"iTerm2\""));
+        assert!(!flow.contains("current application"));
+        assert_eq!(flow.matches("on run argv").count(), 1);
+        assert_eq!(flow.matches("end run").count(), 1);
+        format!(
+            "--{}\n{MODEL}",
+            flow.replace("on run argv", "on bridgeRun(argv)")
+                .replace("end run", "end bridgeRun")
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    struct Scene {
+        mode: &'static str,
+        // iTerm2's windows as the model keeps them, and its current window.
+        windows: &'static str,
+        current_window: &'static str,
+        running: bool,
+        // The application in front when the script starts.
+        front: &'static str,
+        // Calls of the model between a window creation and iTerm2 being active.
+        activation_latency: usize,
+        // What the user or the system does: while the creation runs, a number of
+        // calls after it, and at the nth call of a handler of the machine.
+        during_creation: &'static str,
+        after_creation: &'static str,
+        at_call: &'static str,
+        select_window_has_no_effect: bool,
+    }
+
+    const ONE_WINDOW: &str = r#"{{wid:1, sids:{"old"}, sel:1, vis:true}}"#;
+    const TWO_WINDOWS: &str =
+        r#"{{wid:1, sids:{"old"}, sel:1, vis:true}, {wid:2, sids:{"other"}, sel:1, vis:true}}"#;
+    // Another application is in front and iTerm2 has one window with one tab.
+    const WINDOW: Scene = Scene {
+        mode: "new-window",
+        windows: ONE_WINDOW,
+        current_window: "1",
+        running: true,
+        front: "earlier",
+        activation_latency: 0,
+        during_creation: "{}",
+        after_creation: "{}",
+        at_call: "{}",
+        select_window_has_no_effect: false,
+    };
+    const TAB: Scene = Scene {
+        mode: "tab-first",
+        ..WINDOW
+    };
+
+    // Runs the flow on the model and tells where the keyboard is afterwards and
+    // what the script did: the application in front, the session that iTerm2 has
+    // selected, the applications that the script activated, what it selected in
+    // iTerm2, and every window with its sessions (`*` marks the one it shows).
+    fn replay(scene: Scene) -> String {
+        let state = osascript(&format!(
+            "property sMode : \"{}\"\nproperty sRunning : {}\nproperty sWindows : {}\nproperty sKey : {}\nproperty sFront : \"{}\"\nproperty sActivationLatency : {}\nproperty sDuringCreation : {}\nproperty sAfterCreation : {}\nproperty sAtCall : {}\nproperty sSelectWindowHasNoEffect : {}\n{}",
+            scene.mode,
+            scene.running,
+            scene.windows,
+            scene.current_window,
+            scene.front,
+            scene.activation_latency,
+            scene.during_creation,
+            scene.after_creation,
+            scene.at_call,
+            scene.select_window_has_no_effect,
+            flow()
+        ));
+        // The script returns the id of the session that it created.
+        state
+            .strip_prefix("returned=new ")
+            .unwrap_or_else(|| panic!("the script did not return its session: {state}"))
+            .to_owned()
+    }
+
+    // Review finding 1 of 2026-10-03, on the script's own flow. iTerm2 activates
+    // itself asynchronously after `create window` and makes the new window key
+    // again when it is active. Whenever that happens, the earlier window and the
+    // earlier application must have the keyboard in the end. 0: active before the
+    // script looks, the order of the live runs. Later: active only after a script
+    // that does not wait has selected the earlier window, or has returned.
+    #[test]
+    fn a_new_window_returns_the_keyboard_whenever_iterm2_becomes_active() {
+        const RETURNED: &str =
+            "front=earlier selected=old activated=earlier selects=window 1 windows=1:old*,100:new*";
+        for activation_latency in [0, 1, 14, 40, 300] {
+            assert_eq!(
+                replay(Scene {
+                    activation_latency,
+                    ..WINDOW
+                }),
+                RETURNED,
+                "iTerm2 active {activation_latency} calls after the creation"
             );
-            let output = std::process::Command::new("/usr/bin/osascript")
-                .arg("-e")
-                .arg(script)
-                .output()
-                .unwrap();
-            let err = String::from_utf8_lossy(&output.stderr);
-            assert!(output.status.success(), "{err}");
-            (
-                String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-                err.contains("activated "),
-            )
-        };
+        }
+        // The system lists iTerm2 in front before iTerm2 has handled its
+        // activation. Only iTerm2's own answer ends the wait.
         assert_eq!(
-            replay(EDITOR, ITERM, "owned-or-restored", false),
-            ("true".into(), true)
+            replay(Scene {
+                activation_latency: 14,
+                after_creation: r#"{{calls:2, act:"listed-in-front iterm", done:false}}"#,
+                ..WINDOW
+            }),
+            RETURNED
         );
+    }
+
+    // Review finding 2. A tab creation never activates iTerm2: if iTerm2 is in
+    // front afterwards, the user chose it, and it keeps the foreground.
+    #[test]
+    fn a_new_tab_never_takes_the_foreground_from_iterm2() {
         assert_eq!(
-            replay(EDITOR, EDITOR, "owned-or-restored", false),
-            ("true".into(), false)
+            replay(TAB),
+            "front=earlier selected=old activated= selects=tab 1:1 windows=1:old*/new"
         );
-        assert_eq!(
-            replay(
-                EDITOR,
-                &EDITOR.replace("editor-original", "another-instance"),
-                "owned-or-restored",
-                false
-            ),
-            ("false".into(), false)
-        );
-        for (earlier, front, selected, missing) in [
-            (EDITOR.to_owned(), ITERM.to_owned(), "user-selected", false),
-            (
-                EDITOR.to_owned(),
-                ITERM.to_owned(),
-                "owned-or-restored",
-                true,
-            ),
-            (
-                EDITOR.replace("ended:false", "ended:true"),
-                ITERM.to_owned(),
-                "owned-or-restored",
-                false,
-            ),
-            (
-                EDITOR.replace("\"com.example.editor\"", "missing value"),
-                ITERM.to_owned(),
-                "owned-or-restored",
-                false,
-            ),
-            (
-                ITERM.to_owned(),
-                ITERM.to_owned(),
-                "owned-or-restored",
-                false,
-            ),
-            (
-                EDITOR.to_owned(),
-                "missing value".to_owned(),
-                "owned-or-restored",
-                false,
-            ),
-            (
-                "missing value".to_owned(),
-                ITERM.to_owned(),
-                "owned-or-restored",
-                false,
-            ),
+        for scene in [
+            Scene {
+                during_creation: r#"{"user-to-iterm"}"#,
+                ..TAB
+            },
+            Scene {
+                front: "iterm",
+                ..TAB
+            },
         ] {
-            assert!(!replay(&earlier, &front, selected, missing).1);
+            assert_eq!(
+                replay(scene),
+                "front=iterm selected=old activated= selects=tab 1:1 windows=1:old*/new"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_window_gives_back_only_what_its_creation_took() {
+        let cases = [
+            (
+                "iTerm2 was in front: its earlier window, and no application",
+                Scene {
+                    front: "iterm",
+                    ..WINDOW
+                },
+                "front=iterm selected=old activated= selects=window 1 windows=1:old*,100:new*",
+            ),
+            (
+                // iTerm2 was active when it created the window, so it did not
+                // activate itself: the user brought it back to the front.
+                "iTerm2 was in front, the user left it and came back",
+                Scene {
+                    front: "iterm",
+                    during_creation: r#"{"user-to-other"}"#,
+                    after_creation: r#"{{calls:4, act:"user-to-iterm", done:false}}"#,
+                    ..WINDOW
+                },
+                "front=iterm selected=old activated= selects=window 1 windows=1:old*,100:new*",
+            ),
+            (
+                "the user went to another application, which iTerm2 then took the foreground from",
+                Scene {
+                    activation_latency: 8,
+                    after_creation: r#"{{calls:3, act:"user-to-other", done:false}}"#,
+                    ..WINDOW
+                },
+                "front=other selected=old activated=other selects=window 1 windows=1:old*,100:new*",
+            ),
+            (
+                "the user went to another application and back",
+                Scene {
+                    activation_latency: 12,
+                    after_creation: r#"{{calls:3, act:"user-to-other", done:false}, {calls:7, act:"user-to-earlier", done:false}}"#,
+                    ..WINDOW
+                },
+                "front=earlier selected=old activated=earlier selects=window 1 windows=1:old*,100:new*",
+            ),
+            (
+                // The object that was seen gets the foreground, not its bundle.
+                "another instance of the earlier application came to the front",
+                Scene {
+                    activation_latency: 8,
+                    after_creation: r#"{{calls:3, act:"listed-in-front twin", done:false}}"#,
+                    ..WINDOW
+                },
+                "front=twin selected=old activated=twin selects=window 1 windows=1:old*,100:new*",
+            ),
+            (
+                "the earlier window is not on the screen: it is not selected",
+                Scene {
+                    windows: r#"{{wid:1, sids:{"old"}, sel:1, vis:false}}"#,
+                    ..WINDOW
+                },
+                "front=earlier selected=new activated=earlier selects= windows=1:old*,100:new*",
+            ),
+            (
+                "iTerm2 had windows but no current window: none is adopted",
+                Scene {
+                    current_window: "missing value",
+                    ..TAB
+                },
+                "front=earlier selected=new activated=earlier selects= windows=1:old*,100:new*",
+            ),
+            (
+                "iTerm2 was not running",
+                Scene {
+                    running: false,
+                    windows: "{}",
+                    current_window: "missing value",
+                    ..TAB
+                },
+                "front=earlier selected=new activated=earlier selects= windows=100:new*",
+            ),
+            (
+                // The foreground still goes back; the window is not said to be
+                // selected.
+                "selecting the earlier window had no effect",
+                Scene {
+                    select_window_has_no_effect: true,
+                    ..WINDOW
+                },
+                "front=earlier selected=new activated=earlier selects=window 1 windows=1:old*,100:new*",
+            ),
+            (
+                // The script did nothing. The state is what iTerm2 makes of it later.
+                "iTerm2 did not become active within the bound",
+                Scene {
+                    activation_latency: 1000,
+                    ..WINDOW
+                },
+                "front=iterm selected=new activated= selects= windows=1:old*,100:new*",
+            ),
+        ];
+        for (name, scene, expected) in cases {
+            assert_eq!(replay(scene), expected, "{name}");
+        }
+    }
+
+    // Every condition of the return of the foreground, one case each. The cases
+    // with `at_call` change the state at the very call that looks at it: the
+    // second look at the foreground is the one before the application's end is
+    // read, the second `itermIsActive` and the third `itermSelectedSessionId`
+    // are the last looks before the foreground is given back.
+    #[test]
+    fn a_new_window_keeps_iterm2_in_front_when_the_return_is_not_certain() {
+        const KEPT: &str =
+            "front=iterm selected=old activated= selects=window 1 windows=1:old*,100:new*";
+        let cases = [
+            (
+                "the user selected another window of iTerm2",
+                Scene {
+                    windows: TWO_WINDOWS,
+                    activation_latency: 4,
+                    at_call: r#"{{onCall:"itermSelectedSessionId 1", act:"user-selects-window 2", done:false}}"#,
+                    ..WINDOW
+                },
+                "front=iterm selected=other activated= selects= windows=1:old*,2:other*,100:new*",
+            ),
+            (
+                "the foreground could not be read at the start",
+                Scene {
+                    front: "unreadable",
+                    ..WINDOW
+                },
+                KEPT,
+            ),
+            (
+                "the earlier application has no bundle identifier",
+                Scene {
+                    front: "nobundle",
+                    ..WINDOW
+                },
+                KEPT,
+            ),
+            (
+                "the earlier application ended during the wait",
+                Scene {
+                    activation_latency: 6,
+                    after_creation: r#"{{calls:2, act:"earlier-ends", done:false}}"#,
+                    ..WINDOW
+                },
+                KEPT,
+            ),
+            (
+                // Its end is known only after another turn of the run loop.
+                "the earlier application ended while the window was selected",
+                Scene {
+                    at_call: r#"{{onCall:"itermSelectWindow 1", act:"earlier-ends", done:false}}"#,
+                    ..WINDOW
+                },
+                KEPT,
+            ),
+            (
+                "another application is listed in front, iTerm2 has not noticed",
+                Scene {
+                    at_call: r#"{{onCall:"foregroundApplication 2", act:"listed-in-front other", done:false}}"#,
+                    ..WINDOW
+                },
+                "front=other selected=old activated= selects=window 1 windows=1:old*,100:new*",
+            ),
+            (
+                "another instance of the earlier application is listed in front",
+                Scene {
+                    at_call: r#"{{onCall:"foregroundApplication 2", act:"listed-in-front twin", done:false}}"#,
+                    ..WINDOW
+                },
+                "front=twin selected=old activated= selects=window 1 windows=1:old*,100:new*",
+            ),
+            (
+                "the foreground cannot be read",
+                Scene {
+                    at_call: r#"{{onCall:"foregroundApplication 2", act:"listed-in-front unreadable", done:false}}"#,
+                    ..WINDOW
+                },
+                "front=unreadable selected=old activated= selects=window 1 windows=1:old*,100:new*",
+            ),
+            (
+                "the user left iTerm2 at the last look",
+                Scene {
+                    at_call: r#"{{onCall:"itermIsActive 2", act:"user-to-other", done:false}}"#,
+                    ..WINDOW
+                },
+                "front=other selected=old activated= selects=window 1 windows=1:old*,100:new*",
+            ),
+            (
+                "the user selected another window at the last look",
+                Scene {
+                    windows: TWO_WINDOWS,
+                    at_call: r#"{{onCall:"itermSelectedSessionId 3", act:"user-selects-window 2", done:false}}"#,
+                    ..WINDOW
+                },
+                "front=iterm selected=other activated= selects=window 1 windows=1:old*,2:other*,100:new*",
+            ),
+            (
+                "iTerm2 has no current window at the last look",
+                Scene {
+                    at_call: r#"{{onCall:"itermSelectedSessionId 3", act:"user-closes-current-window", done:false}}"#,
+                    ..WINDOW
+                },
+                "front=iterm selected=none activated= selects=window 1 windows=1:old*,100:new*",
+            ),
+        ];
+        for (name, scene, expected) in cases {
+            assert_eq!(replay(scene), expected, "{name}");
         }
         assert!(!OPEN_TAB_SCRIPT.contains("runningApplicationWithProcessIdentifier"));
     }
 
+    // Review findings 3 and 4. The earlier tab is selected again whenever its
+    // window still shows the new session; neither the foreground nor the
+    // visibility of the window decides that.
+    #[test]
+    fn a_new_tab_is_left_whenever_its_window_still_shows_it() {
+        const LEFT: &str =
+            "front=earlier selected=old activated= selects=tab 1:1 windows=1:old*/new";
+        let cases = [
+            (
+                "another application came to the front",
+                Scene {
+                    during_creation: r#"{"user-to-other"}"#,
+                    ..TAB
+                },
+                "front=other selected=old activated= selects=tab 1:1 windows=1:old*/new",
+            ),
+            (
+                "the foreground cannot be read",
+                Scene {
+                    front: "unreadable",
+                    ..TAB
+                },
+                "front=unreadable selected=old activated= selects=tab 1:1 windows=1:old*/new",
+            ),
+            (
+                "the application in front has no bundle identifier",
+                Scene {
+                    front: "nobundle",
+                    ..TAB
+                },
+                "front=nobundle selected=old activated= selects=tab 1:1 windows=1:old*/new",
+            ),
+            (
+                "the window is not on the screen",
+                Scene {
+                    windows: r#"{{wid:1, sids:{"old"}, sel:1, vis:false}}"#,
+                    ..TAB
+                },
+                LEFT,
+            ),
+            (
+                "the user selected another tab of that window: it stays",
+                Scene {
+                    windows: r#"{{wid:1, sids:{"old", "second"}, sel:1, vis:true}}"#,
+                    during_creation: r#"{"user-selects-tab 1:2"}"#,
+                    ..TAB
+                },
+                "front=earlier selected=second activated= selects= windows=1:old/second*/new",
+            ),
+            (
+                // The tab goes into the window whose tab was remembered.
+                "the user selected another window between the read and the creation",
+                Scene {
+                    windows: TWO_WINDOWS,
+                    at_call: r#"{{onCall:"after itermCurrentTabOf 1", act:"user-selects-window 2", done:false}}"#,
+                    ..TAB
+                },
+                "front=earlier selected=old activated= selects=tab 1:1 windows=1:old*/new,2:other*",
+            ),
+        ];
+        for (name, scene, expected) in cases {
+            assert_eq!(replay(scene), expected, "{name}");
+        }
+    }
+
+    // AppleScript answers `frontmost of application "iTerm2"` itself, from what the
+    // system lists. The handler must read `frontmost` in the record that iTerm2
+    // returns for its properties: here the target says the opposite of its record.
+    #[test]
+    fn the_activity_is_read_from_iterm2_s_own_properties() {
+        let start = OPEN_TAB_SCRIPT.find("on itermIsActive()").unwrap();
+        let end = OPEN_TAB_SCRIPT.find("end itermIsActive").unwrap();
+        let handler = &OPEN_TAB_SCRIPT[start..end];
+        assert_eq!(handler.matches("tell application \"iTerm2\"").count(), 1);
+        let handler = handler.replace("tell application \"iTerm2\"", "tell applicationModel");
+        for active in [true, false] {
+            assert_eq!(
+                osascript(&format!(
+                    "property applicationModel : {{«property pALL»:{{«property pisf»:{active}}}, «property pisf»:{}}}\n{handler}end itermIsActive\non run\n    return my itermIsActive()\nend run",
+                    !active
+                )),
+                active.to_string()
+            );
+        }
+    }
+
+    // A directory name with everything that iTerm2's parser or a shell could take
+    // for syntax.
+    const ODD_NAME: &str = "it's a \"state\" \\new \\a\\t\\r\\ $$ $$$ ~ ; 한글 🙂";
+
+    // What iTerm2 3.7.3 makes of a `command` before it executes it. It replaces
+    // `$$…$$` variables, and asks the user for one other than `$$$$`; then it
+    // splits with its own parser (PTYSession.m `computeArgvForCommand:`;
+    // NSStringITerm.m `doubleDollarVariables`,
+    // `componentsBySplittingStringWithQuotesAndBackslashEscaping:`).
+    fn iterm2_arguments(command: &str) -> Vec<String> {
+        let (mut from, mut open) = (0, None);
+        while let Some(found) = command[from..].find("$$").map(|at| at + from) {
+            match open.take() {
+                None => open = Some(found),
+                Some(start) => assert_eq!(
+                    &command[start..found + 2],
+                    "$$$$",
+                    "iTerm2 would ask the user for a variable"
+                ),
+            }
+            from = found + 2;
+        }
+        let program = command.replace("$$$$", "$$");
+        let (mut single, mut double, mut escape) = (false, false, false);
+        let (mut first, mut first_was_quoted) = (true, true);
+        let mut current = String::new();
+        let mut arguments = Vec::new();
+        for character in program.chars().map(Some).chain([None]) {
+            let c = match character {
+                Some('\0') => ' ',
+                Some(c) => c,
+                None => {
+                    escape = false;
+                    '\0'
+                }
+            };
+            if c == '\\' && !escape {
+                escape = true;
+                continue;
+            }
+            if escape {
+                first = false;
+                escape = false;
+                match c {
+                    'n' => current.push('\n'),
+                    'a' => current.push('\u{7}'),
+                    't' => current.push('\t'),
+                    'r' => current.push('\r'),
+                    '"' | '\\' if double => current.push(c),
+                    '\'' if single && !double => current.push('\\'),
+                    _ if double || single => current.extend(['\\', c]),
+                    _ => current.push(c),
+                }
+                continue;
+            }
+            if c == '"' && !single {
+                double = !double;
+                first = false;
+                continue;
+            }
+            if c == '\'' && !double {
+                single = !single;
+                first = false;
+                continue;
+            }
+            if c == '\0' {
+                single = false;
+                double = false;
+            }
+            if !single && !double && (c == '\0' || c.is_whitespace()) {
+                if !first {
+                    // iTerm2 expands a tilde in a word that began unquoted.
+                    assert!(first_was_quoted || !current.starts_with('~'), "{current}");
+                    arguments.push(std::mem::take(&mut current));
+                    first_was_quoted = true;
+                    first = true;
+                }
+                continue;
+            }
+            if first {
+                first_was_quoted = single || double;
+                first = false;
+            }
+            current.push(c);
+        }
+        arguments
+    }
+
+    // Review finding 6. iTerm2 turns the bootstrap into arguments itself, and
+    // not as a shell does: the script must reach zsh as it was written.
+    #[test]
+    fn the_bootstrap_reaches_zsh_as_written_through_iterm2_s_own_parser() {
+        let quote = |value: &str| crate::native::shell_quote(std::ffi::OsStr::new(value));
+        for root in [
+            "/Users/tester/.agent-bridge/native-sessions".to_owned(),
+            format!("/Users/tester/{ODD_NAME}"),
+        ] {
+            let host = format!(
+                "{} native-iterm2-host {}",
+                quote(&format!("{root}/bin/agent-bridge")),
+                quote(&format!("{root}/session-a1"))
+            );
+            let command = format!(". {}", quote(&format!("{root}/session-a1/launch.sh")));
+            assert_eq!(
+                iterm2_arguments(&shell_command(&host, &command)),
+                [
+                    "/bin/zsh",
+                    "-l",
+                    "-i",
+                    "-c",
+                    &format!("{host} || exit; {command}")
+                ],
+                "{root}"
+            );
+        }
+        // The quoting of a shell is not what that parser reads. This is what
+        // was sent before: a backslash in front of `n` became a line feed.
+        assert_eq!(
+            iterm2_arguments(&format!(
+                "/bin/zsh -c {}",
+                quote("'/state\\new/session-a1'")
+            )),
+            ["/bin/zsh", "-c", "'/state\new/session-a1'"]
+        );
+    }
+
+    // The live #58 failure was `a. '/.../launch.sh'`: the native write-text path
+    // appends to an editable shell line. Replay that input on a private PTY; no
+    // terminal app or global keyboard is used here.
     #[test]
     fn startup_keys_cannot_change_the_launch_command() {
         use std::{
@@ -599,10 +1447,14 @@ end run
     }
 
     fn launch_fixture() -> tempfile::TempDir {
+        launch_fixture_in(&std::env::temp_dir())
+    }
+
+    fn launch_fixture_in(parent: &Path) -> tempfile::TempDir {
         use crate::native::*;
         let directory = tempfile::Builder::new()
             .prefix("session-iterm-")
-            .tempdir()
+            .tempdir_in(parent)
             .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -711,16 +1563,24 @@ end run
             process::Command,
             thread,
         };
-        let directory = launch_fixture();
+        // The session directory lies under a name with everything that iTerm2's parser or
+        // a shell could take for syntax, and the bootstrap names it.
+        let parent = tempfile::tempdir().unwrap();
+        let odd = parent.path().join(ODD_NAME);
+        std::fs::create_dir(&odd).unwrap();
+        let directory = launch_fixture_in(&odd);
         let executable = std::env::current_exe().unwrap();
         let probe = format!(
-            "{} --exact native::terminal::macos::iterm2::tests::iterm_owned_process_probe --nocapture --test-threads=1",
+            "AB_ITERM_PROBE_DIR={} {} --exact native::terminal::macos::iterm2::tests::iterm_owned_process_probe --nocapture --test-threads=1",
+            crate::native::shell_quote(directory.path().as_os_str()),
             crate::native::shell_quote(executable.as_os_str())
         );
         let bootstrap = shell_command(
             &format!("AB_ITERM_PROBE_MODE=host {probe}"),
             &format!("AB_ITERM_PROBE_MODE=owner {probe}; exit $?"),
         );
+        // iTerm2 executes the arguments that its own parser makes of the command.
+        let arguments = iterm2_arguments(&bootstrap);
         let mut master = -1;
         let mut slave = -1;
         assert_eq!(
@@ -742,10 +1602,9 @@ end run
             libc::fcntl(slave.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
             libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
         }
-        let mut command = Command::new("/bin/zsh");
+        let mut command = Command::new(&arguments[0]);
         command
-            .args(["-f", "-c", &bootstrap])
-            .env("AB_ITERM_PROBE_DIR", directory.path())
+            .args(&arguments[1..])
             .env("ZDOTDIR", directory.path())
             .env("ITERM_SESSION_ID", "w0t0p0:owned-id")
             .stdin(slave.try_clone().unwrap())

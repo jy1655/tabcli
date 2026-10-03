@@ -2,7 +2,7 @@
 
 로컬에 설치되고 로그인된 `codex`, `claude`, `agy`, `pi` CLI를 사용자가 볼 수 있는 실제 터미널 세션에서 연결하는 브리지입니다. API 키나 로그인 토큰을 대신 소유하지 않고 각 CLI의 기존 인증·설정·대화형 UI를 그대로 사용합니다.
 
-0.1.0은 준비 중입니다. 변경한 이슈와 검증·미완료 조건은 [0.1.0 이슈 작업 기록](docs/verification/2026-10-03-v0.1.0-issues.md)을 참고하세요. 남은 수락 검사에서 확인한 포커스·타이핑 실패와 수정 진행은 [포커스 검사 기록](docs/verification/2026-10-03-v0.1.0-focus.md)에 있습니다.
+0.1.0의 변경 내용은 [릴리스 노트](docs/releases/0.1.0.md)에 있습니다. iTerm2·Terminal.app·Ghostty·WezTerm의 실제 입력, 포커스 복원과 세션 왕복·종료를 확인했습니다. 후보별 실패와 수정, 검증 범위는 [포커스 검사 기록](docs/verification/2026-10-03-v0.1.0-focus.md)과 [이슈 작업 기록](docs/verification/2026-10-03-v0.1.0-issues.md)을 참고하세요.
 
 이 문서와 설치 예시는 **v0.1.0**을 기준으로 합니다. macOS에서는 iTerm2·Terminal.app·Ghostty·WezTerm을 지원합니다. Agent Bridge는 자신을 실행한 터미널을 감지해 같은 앱의 새 surface에서 세션을 시작하고, 자신이 만든 surface만 제어합니다. Terminal.app에서는 기존 tab/window를 사용하지 않고 항상 전용 새 window를 엽니다. 감지할 수 없는 호스트에서는 Terminal.app으로 안전하게 fallback합니다. 이미 독립적으로 실행 중인 임의의 CLI에는 사후 attach하지 않습니다.
 
