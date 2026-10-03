@@ -36,7 +36,7 @@ Automation 권한은 Claude 안의 도구 승인과 다릅니다. 실제 제어�
 
 아래 `self-test`는 Computer Use를 호출하지 않고 Agent Bridge의 실제 `ask`·`result`·`tell`·`close-session` 경로를 검사합니다. 허용된 shell 실행 환경에서는 에이전트도 수행할 수 있습니다. 실제 모델 호출과 새 터미널 surface 생성·종료가 발생하며, 화면 없는 provider 검사와는 다릅니다. 승인 대화상자가 나타나면 사용자가 내용을 확인하고 처리합니다.
 
-먼저 검증할 소스의 commit과 바이너리를 고정합니다. Warp·WezTerm·`macos-open-mode`가 추가된 `3648cc65abf1d2a76f28ba6e17d78fbabafe25ff`의 개발 빌드는 버전 문자열도 `0.0.10`이므로, `--version`만으로 정식 v0.0.10 설치본과 구별할 수 없습니다. 설치본을 교체하지 않고 빌드 결과의 절대 경로를 사용합니다.
+먼저 검증할 소스의 commit과 바이너리 SHA-256을 고정합니다. 초기 후보 `3648cc65abf1d2a76f28ba6e17d78fbabafe25ff`는 Warp·WezTerm·`macos-open-mode`를 포함하면서도 `0.0.10`을 출력했습니다. 이는 과거 후보이며, 버전 문자열만으로 같은 소스라고 판단하지 않습니다. 0.1.0 검사는 [포커스·시작 입력 검증 기록](verification/2026-10-03-v0.1.0-focus.md)의 후보별 해시를 따릅니다. 설치본을 교체하지 않고 검증할 바이너리의 절대 경로를 사용합니다.
 
 ```sh
 git rev-parse HEAD
@@ -108,3 +108,7 @@ Warp에서 Agy·Pi의 terminal 기반 후속 제출은 이 후보가 지원하�
 이미 handle을 소비한 실험 세션은 `close-session`이 성공을 반환해도 그 창을 다시 제어하지 않을 수 있습니다. 새 검사를 반복하지 말고 정확한 창 ID·원래 요청 기록을 보존합니다. native API로 정리가 증명되지 않는 잔여 창은 사용자가 해당 창의 닫기 버튼으로 확인해야 합니다. 앱 전체 종료·추측한 TTY 종료로 다른 사용자 세션을 정리하지 않습니다.
 
 실패한 실행의 정확한 window·tab ID까지 보존해야 한다면 `self-test` 대신 `ask --detach --json`부터 `result`·`tell`·`close-session`까지 각각 실행하고 `ask` 응답을 보존합니다. 현재 self-test report에는 surface ID가 없고, 닫힌 세션의 terminal handle은 소비되므로 사후 복원에 의존하지 않습니다. 화면 관찰이 JSON과 다르면 PASS를 철회하고 사람이 본 사실을 먼저 기록합니다.
+
+## 시작 중 키 입력과 포커스 확인
+
+`self-test`의 provider 왕복·cleanup 성공은 물리 키보드 검증을 대신하지 않습니다. 화면 잠금이 해제된 상태에서 다른 앱이 전경인 조건과 같은 터미널의 입력창에서 타이핑하는 조건을 나눠 확인합니다. 새 surface가 잠시 선택되는 동안 받은 키는 시작 gate에서 버리며 원래 입력창에 재전송하지 않습니다. 사용자가 다른 창·탭·앱을 선택한 경우에는 복원을 강제하지 않습니다. 터미널별 동작·실패 원본·수정본 결과는 [0.1.0 포커스 검증 기록](verification/2026-10-03-v0.1.0-focus.md)에 구분해 남깁니다.

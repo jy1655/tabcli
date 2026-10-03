@@ -1504,10 +1504,14 @@ fn internal_session_ids_cannot_escape_the_state_root() {
 #[test]
 fn iterm_script_keeps_dynamic_values_in_argv() {
     assert!(!terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains("review this"));
-    assert!(!terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains("bridgeCommand"));
+    assert!(
+        terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains("set bridgeCommand to item 2 of argv")
+    );
     assert!(!terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains("write text"));
-    assert!(terminal::macos::iterm2::START_SESSION_SCRIPT.contains("item 2 of argv"));
-    assert!(terminal::macos::iterm2::START_SESSION_SCRIPT.contains("write text bridgeCommand"));
+    assert!(
+        terminal::macos::iterm2::OPEN_TAB_SCRIPT
+            .contains("with default profile command bridgeCommand")
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -1520,10 +1524,29 @@ fn iterm_follow_up_sends_an_explicit_carriage_return() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn iterm_new_window_returns_selection_before_starting_the_provider() {
+    let script = terminal::macos::iterm2::OPEN_TAB_SCRIPT;
+    // The new-window path previously remembered nothing: a real self-test
+    // selected its window for all 28 seconds and brought iTerm2 to the front.
+    assert!(script.contains("set keyboardWindow to current window"));
+    assert!(script.contains("tell keyboardWindow to select"));
+    assert!(script.contains("my restoreApplication(earlierApplication, keyboardSessionId)"));
+    assert!(script.contains(
+        "if (unique ID of current session of current window) is (unique ID of targetSession) then"
+    ));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn macos_cold_start_never_adopts_an_app_restored_surface() {
+    // Closing the key window while iTerm2 is in the background can leave other
+    // windows but no current window. That is not authority to adopt any of them.
+    assert!(terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains(
+        "else if (count of windows) is 0 or current window is missing value then\n            set targetWindow to (create window with default profile command bridgeCommand)"
+    ));
     assert!(
             terminal::macos::iterm2::OPEN_TAB_SCRIPT.contains(
-                "if forceNewWindow or not itermWasRunning then\n            set targetWindow to (create window with default profile)"
+                "if forceNewWindow or not itermWasRunning then\n            set targetWindow to (create window with default profile command bridgeCommand)"
             )
         );
     assert!(terminal::macos::ghostty::CREATE_SURFACE_SCRIPT.contains(
@@ -1568,48 +1591,45 @@ fn macos_open_scripts_give_the_keyboard_back_and_never_activate_the_app() {
     };
 
     let iterm = terminal::macos::iterm2::OPEN_TAB_SCRIPT;
-    assert!(!iterm.contains("activate"));
+    assert!(!iterm.lines().any(|line| line.trim() == "activate"));
     assert_eq!(
-        lines_with(iterm, "keyboardTab"),
+        lines_with(iterm, "set targetWindow to"),
         [
-            "set keyboardTab to missing value",
-            "set keyboardTab to current tab of targetWindow",
-            "if keyboardTab is not missing value then",
-            "tell keyboardTab to select",
-        ]
-    );
-    assert_eq!(
-        lines_with(iterm, "targetSession"),
-        [
-            "set targetSession to current session of targetWindow",
-            "set targetSession to current session of targetWindow",
-            "set targetSession to current session of targetTab",
-            "if (unique ID of current session of current tab of current window) is (unique ID of targetSession) then",
-            "tell targetSession",
+            "set targetWindow to (create window with default profile command bridgeCommand)",
+            "set targetWindow to (create window with default profile command bridgeCommand)",
+            "set targetWindow to current window",
         ]
     );
     assert_eq!(
         lines_with(iterm, "set targetTab to"),
-        ["set targetTab to (create tab with default profile)"]
+        ["set targetTab to (create tab with default profile command bridgeCommand)"]
     );
     assert_eq!(
-        lines_with(iterm, "set targetWindow to"),
+        lines_with(iterm, "set keyboardWindow to"),
         [
-            "set targetWindow to (create window with default profile)",
-            "set targetWindow to (create window with default profile)",
-            "set targetWindow to current window",
+            "set keyboardWindow to missing value",
+            "set keyboardWindow to current window"
         ]
     );
-    let remembered = position(
-        iterm,
-        "try\n                set keyboardTab to current tab of targetWindow\n            end try",
+    assert_eq!(
+        lines_with(iterm, "set keyboardTab to"),
+        [
+            "set keyboardTab to missing value",
+            "set keyboardTab to current tab of keyboardWindow"
+        ]
     );
-    let created = position(iterm, "set targetTab to (create tab with default profile)");
-    let restored = position(
+    let remembered = position(iterm, "set keyboardWindow to current window");
+    let created = position(iterm, "set targetWindow to (create window");
+    let guard = position(
         iterm,
-        "try\n                    if (unique ID of current session of current tab of current window) is (unique ID of targetSession) then\n                        tell keyboardTab to select\n                    end if\n                end try",
+        "if (unique ID of current session of current window) is (unique ID of targetSession) then",
     );
-    assert!(remembered < created && created < restored);
+    let restored = position(iterm, "tell keyboardTab to select");
+    let app_restored = position(
+        iterm,
+        "my restoreApplication(earlierApplication, keyboardSessionId)",
+    );
+    assert!(remembered < created && created < guard && guard < restored && restored < app_restored);
     assert!(iterm.contains("tell targetSession\n            return unique ID"));
 
     let terminal_app = terminal::macos::apple_terminal::OPEN_TAB_SCRIPT;
@@ -1626,7 +1646,7 @@ fn macos_open_scripts_give_the_keyboard_back_and_never_activate_the_app() {
     assert_eq!(
         lines_with(terminal_app, "set target"),
         [
-            "set targetTab to do script \"\"",
+            "set targetTab to do script ((character id 21) & bridgeCommand)",
             "set targetTty to tty of targetTab",
             "set targetWindowId to my windowIdForTty(targetTty, priorWindowIds)",
             "set targetWindow to first window whose id is targetWindowId",
@@ -1643,7 +1663,10 @@ fn macos_open_scripts_give_the_keyboard_back_and_never_activate_the_app() {
         terminal_app,
         "try\n                if (count of windows) > 0 then set keyboardWindowId to id of window 1\n            end try",
     );
-    let created = position(terminal_app, "set targetTab to do script \"\"");
+    let created = position(
+        terminal_app,
+        "set targetTab to do script ((character id 21) & bridgeCommand)",
+    );
     let restored = position(
         terminal_app,
         "try\n                if (id of window 1) is targetWindowId then\n                    set frontmost of (first window whose id is keyboardWindowId and visible is true) to true\n                end if\n            end try",
@@ -1752,7 +1775,6 @@ end run
 #[test]
 fn terminal_app_actions_require_the_recorded_window_and_tty() {
     for script in [
-        terminal::macos::apple_terminal::START_SESSION_SCRIPT,
         terminal::macos::apple_terminal::SEND_FILE_SCRIPT,
         terminal::macos::apple_terminal::CLOSE_TAB_SCRIPT,
     ] {
@@ -1762,8 +1784,48 @@ fn terminal_app_actions_require_the_recorded_window_and_tty() {
     let wait = terminal::macos::apple_terminal::WAIT_FOR_CLOSE_SCRIPT;
     assert!(wait.contains("wantedWindowId"));
     assert!(!wait.contains("wantedTty"));
-    assert!(terminal::macos::apple_terminal::OPEN_TAB_SCRIPT.contains("do script \"\""));
-    assert!(!terminal::macos::apple_terminal::OPEN_TAB_SCRIPT.contains("bridgeCommand"));
+    // The start is not an action on a recorded tab: Terminal types it into the tab
+    // that the same `do script` creates, and no script types a start afterwards.
+    let open = terminal::macos::apple_terminal::OPEN_TAB_SCRIPT;
+    assert!(open.contains("set targetTab to do script ((character id 21) & bridgeCommand)"));
+    assert!(!open.contains("do script \"\""));
+    assert!(!open.contains(" in targetTab"));
+}
+
+// The tab's shell reaches the gate only through this command: an unrouted name would
+// end every Terminal.app launch at its first line.
+#[test]
+fn terminal_host_command_takes_one_absolute_session_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let valid_path = root.path().join("session-abc");
+    let invalid_path = root.path().join("not-a-session");
+    let valid = valid_path.to_str().unwrap();
+    let invalid = invalid_path.to_str().unwrap();
+    assert!(is_command("native-terminal-host"));
+    assert!(matches!(
+        parse_args(["native-terminal-host", valid]).unwrap(),
+        NativeCommand::AppleTerminalHost { directory } if directory == valid_path
+    ));
+    for arguments in [
+        vec!["native-terminal-host"],
+        vec!["native-terminal-host", "state/session-abc"],
+        vec!["native-terminal-host", invalid],
+        vec!["native-terminal-host", valid, "extra"],
+    ] {
+        assert!(parse_args(&arguments).is_err(), "{arguments:?}");
+    }
+}
+
+// The surface's shell reaches the host only through this command. It takes nothing:
+// the surface exists before a session is bound to it.
+#[test]
+fn ghostty_host_command_takes_no_argument() {
+    assert!(is_command("native-ghostty-host"));
+    assert!(matches!(
+        parse_args(["native-ghostty-host"]).unwrap(),
+        NativeCommand::GhosttyHost
+    ));
+    assert!(parse_args(["native-ghostty-host", "/state/session-abc"]).is_err());
 }
 
 #[cfg(target_os = "macos")]
@@ -1896,10 +1958,6 @@ fn macos_terminal_adapters_never_set_or_verify_display_titles() {
             terminal::macos::ghostty::QUEUE_COMMAND_SCRIPT,
         ),
         (
-            "Ghostty press Enter",
-            terminal::macos::ghostty::PRESS_ENTER_SCRIPT,
-        ),
-        (
             "Ghostty verify",
             terminal::macos::ghostty::VERIFY_SURFACE_SCRIPT,
         ),
@@ -1953,12 +2011,6 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
             "/Applications/iTerm.app",
         ),
         (
-            "iTerm2 start session",
-            terminal::macos::iterm2::START_SESSION_SCRIPT,
-            "iTerm2",
-            "/Applications/iTerm.app",
-        ),
-        (
             "iTerm2 send file",
             terminal::macos::iterm2::SEND_FILE_SCRIPT,
             "iTerm2",
@@ -1979,12 +2031,6 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
         (
             "Terminal.app open tab",
             terminal::macos::apple_terminal::OPEN_TAB_SCRIPT,
-            "Terminal",
-            "/System/Applications/Utilities/Terminal.app",
-        ),
-        (
-            "Terminal.app start session",
-            terminal::macos::apple_terminal::START_SESSION_SCRIPT,
             "Terminal",
             "/System/Applications/Utilities/Terminal.app",
         ),
@@ -2033,12 +2079,6 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
         (
             "Ghostty queue command",
             terminal::macos::ghostty::QUEUE_COMMAND_SCRIPT,
-            "Ghostty",
-            "/Applications/Ghostty.app",
-        ),
-        (
-            "Ghostty press Enter",
-            terminal::macos::ghostty::PRESS_ENTER_SCRIPT,
             "Ghostty",
             "/Applications/Ghostty.app",
         ),

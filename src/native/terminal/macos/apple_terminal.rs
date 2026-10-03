@@ -1,4 +1,5 @@
 use std::{
+    os::unix::fs::MetadataExt,
     path::Path,
     time::{Duration, Instant},
 };
@@ -28,6 +29,27 @@ use super::{
 // not visible before this script ran and visible after it; the user had seen window
 // 12064 return that day after each of the next two launches, issue #64). The keyboard
 // therefore goes back only to a window that is visible.
+//
+// Terminal starts a command in a tab only by typing it (Terminal 2.15, read from the
+// binary on 2026-10-03). `do script X in tab` writes X and a carriage return to the
+// tab's PTY. `do script X` without a target puts X and a line feed into the write
+// buffer of the tab it creates, before the window is shown. A key typed into the new
+// window is queued behind that text until Terminal knows the shell's process, and is
+// written in front of it from then until Terminal writes the buffer, on the first
+// output it decodes while the shell is in the foreground. An empty creation and a
+// start command typed after the binding left an editable line in between: a key that
+// reached the new window while it had the keyboard became the start of the command
+// (2026-10-03, session-t9E3YV: `a. '<...>/launch.sh'`, `zsh: command not found: a.`,
+// issue #58).
+//
+// The creation text is therefore the whole start: one short line that sources the
+// session's bootstrap, with the tty's line kill (U+0015) in front. The PTY of a new
+// tab is canonical with the kernel's control characters (lflag 0x5cb, kill ^U) until
+// a shell changes that, so the kernel discards a key that Terminal wrote in front,
+// and the line editors of zsh and bash discard it by default. A key that was written
+// in front and followed by Enter is a command line of its own; nothing typed can
+// take it back. Replace the typed start when Terminal can create a tab that runs a
+// command.
 pub(in crate::native) const OPEN_TAB_SCRIPT: &str = r#"
 on soleNewWindowWithTty(windowTtys, priorWindowIds, wantedTty)
     set matchedWindowId to missing value
@@ -62,6 +84,7 @@ on windowIdForTty(wantedTty, priorWindowIds)
 end windowIdForTty
 
 on run argv
+    set bridgeCommand to item 1 of argv
     set terminalWasRunning to application "Terminal" is running
     tell application "Terminal"
         -- A window that exists before this run can never be the one it creates.
@@ -82,7 +105,8 @@ on run argv
         end if
         -- Untargeted do script creates a dedicated window and returns its new tab.
         -- Never derive ownership from a restored front/current/selected surface.
-        set targetTab to do script ""
+        -- The start is typed here and nowhere else, behind the tty's line kill.
+        set targetTab to do script ((character id 21) & bridgeCommand)
         set targetTty to tty of targetTab
         set targetWindowId to my windowIdForTty(targetTty, priorWindowIds)
         set targetWindow to first window whose id is targetWindowId
@@ -100,32 +124,6 @@ on run argv
             end try
         end if
         return targetTty & linefeed & (targetWindowId as text)
-    end tell
-end run
-"#;
-
-pub(in crate::native) const START_SESSION_SCRIPT: &str = r#"
-on run argv
-    set wantedTty to item 1 of argv
-    set wantedWindowId to item 2 of argv as integer
-    set bridgeCommand to item 3 of argv
-    tell application "Terminal"
-        try
-            set targetWindow to first window whose id is wantedWindowId
-        on error
-            error "Agent Bridge Terminal.app window not found before startup"
-        end try
-        set targetTab to missing value
-        set matchCount to 0
-        repeat with candidateTab in tabs of targetWindow
-            if tty of candidateTab is wantedTty then
-                set targetTab to candidateTab
-                set matchCount to matchCount + 1
-            end if
-        end repeat
-        if matchCount is not 1 then error "Agent Bridge Terminal.app startup proof did not match exactly one tab"
-        do script bridgeCommand in targetTab
-        return "started"
     end tell
 end run
 "#;
@@ -268,8 +266,22 @@ on run argv
 end run
 "#;
 
-pub(super) fn create_tab(deadline: Instant) -> Result<TerminalSession> {
-    let response = applescript::run_until("Terminal.app", OPEN_TAB_SCRIPT, &[], deadline)?;
+const BOOTSTRAP_FILE: &str = "terminal-start.sh";
+
+pub(super) fn create_tab(
+    command: &str,
+    directory: &Path,
+    deadline: Instant,
+) -> Result<TerminalSession> {
+    let executable =
+        std::env::current_exe().context("failed to resolve Agent Bridge executable")?;
+    let host = format!(
+        "{} native-terminal-host {}",
+        crate::native::shell_quote(executable.as_os_str()),
+        crate::native::shell_quote(directory.as_os_str())
+    );
+    let start = install_bootstrap(directory, &host, command)?;
+    let response = applescript::run_until("Terminal.app", OPEN_TAB_SCRIPT, &[&start], deadline)?;
     let mut ids = response.lines();
     let id = ids.next().filter(|value| !value.is_empty());
     let window_id = ids.next().filter(|value| !value.is_empty());
@@ -287,22 +299,102 @@ pub(super) fn create_tab(deadline: Instant) -> Result<TerminalSession> {
     })
 }
 
-pub(super) fn start_session(
-    session: &TerminalSession,
-    command: &str,
-    deadline: Instant,
-) -> Result<()> {
-    let window_id = ownership_proof(session)?;
-    let response = applescript::run_until(
-        "Terminal.app",
-        START_SESSION_SCRIPT,
-        &[&session.id, window_id, command],
-        deadline,
-    )?;
-    if response != "started" {
-        bail!("unexpected Terminal.app start response: {response:?}");
+// The typed line stays short (#50) and names a private file. The tab's own shell
+// sources it, so the gate and the wrapper are two jobs of that shell and the wrapper
+// keeps the shell as its parent and a foreground group of its own. A gate that
+// refuses ends the shell: nothing is left that could start the wrapper later.
+fn install_bootstrap(directory: &Path, host: &str, command: &str) -> Result<String> {
+    let path = directory.join(BOOTSTRAP_FILE);
+    crate::native::write_private(&path, format!("{host} || exit\n{command}\n").as_bytes())?;
+    Ok(format!(
+        ". {}",
+        crate::native::shell_quote(path.as_os_str())
+    ))
+}
+
+// The start is typed when the tab is created, before the launcher knows the tty that
+// Terminal gave it. The launch receipt and the atomic surface binding that already
+// exist are the gate: the wrapper starts only after the launcher has given the
+// keyboard back and bound this exact tty, and a launch that failed, was closed or
+// timed out starts nothing.
+pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(directory)
+        .with_context(|| format!("failed to inspect {}", directory.display()))?;
+    if !directory.is_absolute()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        bail!("Terminal.app launch directory is not private to the current user");
     }
-    Ok(())
+    let id = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("invalid Terminal.app launch directory")?;
+    crate::native::require_valid_session_id(id)?;
+    let released = release_start(directory, id);
+    crate::native::launch::log(
+        directory,
+        &match &released {
+            Ok(tty) => format!("terminal_host_released tty={tty}"),
+            Err(error) => format!("terminal_host_refused: {error:#}"),
+        },
+    );
+    released.map(|_| ())
+}
+
+fn release_start(directory: &Path, id: &str) -> Result<String> {
+    // The binding names the tab by its tty, and the flush below must be this tab's:
+    // standard input has to be the controlling terminal of this process.
+    let tty = crate::native::current_terminal_tty()?;
+    let live = crate::native::live_native_process_identity(std::process::id())?;
+    if live.terminal_tty_device != crate::native::terminal_tty_device(Path::new(&tty))? {
+        bail!("Terminal.app launch host is not attached to the tty of its standard input");
+    }
+    wait_for_binding(directory, id, &tty)?;
+    // Keys typed while the creation gave the new window the keyboard must not answer
+    // the provider's first dialog. Only the input queue of this tty is discarded.
+    if unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("cannot discard Terminal.app startup input");
+    }
+    Ok(tty)
+}
+
+fn wait_for_binding(directory: &Path, id: &str, tty: &str) -> Result<()> {
+    use crate::native::{
+        SessionStatus, TERMINAL_HANDLE_FILE, current_turn_claim_token, launch, read_json,
+        read_regular_text_if_present, unix_ms,
+    };
+    let initial = launch::read(directory)?.context("missing Terminal.app launch receipt")?;
+    // The receipt's deadline is wall-clock time; the launch itself never waits longer.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let record = launch::read(directory)?.context("missing Terminal.app launch receipt")?;
+        let status: SessionStatus = read_json(&directory.join("status.json"))?;
+        if Instant::now() >= deadline
+            || unix_ms() >= record.deadline_unix_ms
+            || record.phase != launch::Phase::Pending
+            || record.claim_token != initial.claim_token
+            || status.state != "launching"
+            || current_turn_claim_token(directory)?.as_deref() != Some(initial.claim_token.as_str())
+        {
+            bail!("Terminal.app launch was cancelled or timed out before its surface was bound");
+        }
+        if let Some(text) = read_regular_text_if_present(&directory.join(TERMINAL_HANDLE_FILE))? {
+            let surface: TerminalSession =
+                serde_json::from_str(&text).context("invalid Terminal.app surface binding")?;
+            surface.verify_managed_session(id)?;
+            if surface.kind != TerminalKind::AppleTerminal
+                || surface.id != tty
+                || surface.window_id.as_deref().is_none_or(str::is_empty)
+            {
+                bail!("Terminal.app surface binding does not name the tty of this launch host");
+            }
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 pub(super) fn send_file(
@@ -1076,17 +1168,21 @@ end mockClose
         r#"{id:8100, tabs:{{tty:"/dev/ttys001", busy:false}}, visible:true, frontmost:false}"#;
     const CLOSED_MEANWHILE: &str = r#"{id:8100, tabs:{{tty:"/dev/ttys001", busy:false}}, visible:true, frontmost:false, closesDuringOpen:true}"#;
 
-    // `do script ""` opens a window in front of the others. Setting `frontmost` is
-    // `makeKeyAndOrderFront:` in Terminal 2.15, which shows a window that is not on
-    // the screen; the windows that were made frontmost are reported after the run.
+    // An untargeted `do script` opens a window in front of the others and types its
+    // text there: the mock accepts only the line kill followed by the start line.
+    // Setting `frontmost` is `makeKeyAndOrderFront:` in Terminal 2.15, which shows a
+    // window that is not on the screen; the windows that were made frontmost are
+    // reported after the run.
+    const START_LINE: &str = ". '/state/session-test/terminal-start.sh'";
     const OPEN_MOCK: &str = r#"
 on mockWindowList()
     mockEvent()
     return mockWindows
 end mockWindowList
 
-on mockDoScript()
+on mockDoScript(creationText)
     mockEvent()
+    if creationText is not ((character id 21) & ". '/state/session-test/terminal-start.sh'") then error "unexpected creation text"
     repeat with mockWindow in mockWindows
         try
             if closesDuringOpen of mockWindow then
@@ -1127,7 +1223,10 @@ end run
             ("get windows", "my mockWindowList()"),
             ("(count of windows)", "(count of mockWindows)"),
             ("window 1", "(item 1 of mockWindows)"),
-            ("do script \"\"", "my mockDoScript()"),
+            (
+                "do script ((character id 21) & bridgeCommand)",
+                "my mockDoScript((character id 21) & bridgeCommand)",
+            ),
             (
                 "first window whose id is targetWindowId",
                 "my mockWindowWithId(targetWindowId)",
@@ -1145,7 +1244,8 @@ end run
         .fold(super::OPEN_TAB_SCRIPT.to_owned(), |script, (term, mock)| {
             script.replace(term, mock)
         }) + OPEN_MOCK;
-        let open = |windows: &[&str]| replay(&script, &running(windows), &[]);
+        assert!(!script.contains("do script ("), "unmocked typed start");
+        let open = |windows: &[&str]| replay(&script, &running(windows), &[START_LINE]);
         let opened = Ok("/dev/ttys030\n9000".to_owned());
         let fronted = |windows: &[&str]| -> Vec<String> {
             windows.iter().map(|id| format!("fronted {id}")).collect()
@@ -1154,5 +1254,550 @@ end run
         assert_eq!(open(&[ON_SCREEN]), (opened.clone(), fronted(&["8100"])));
         assert_eq!(open(&[CLOSED_LISTED]), (opened.clone(), fronted(&[])));
         assert_eq!(open(&[CLOSED_MEANWHILE]), (opened, fronted(&[])));
+        // Any other text than the start line behind the line kill is not typed.
+        let (reply, events) = replay(&script, &running(&[ON_SCREEN]), &["exit"]);
+        assert!(reply.unwrap_err().contains("unexpected creation text"));
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    // A private PTY in the state that Terminal 2.15 gives a new tab: canonical input
+    // with echo and the kernel's control characters (Terminal sets lflag 0x5cb, which is
+    // TTYDEF_LFLAG, and leaves c_cc alone). Nothing below talks to a terminal
+    // application or to the keyboard.
+    fn open_tab_pty() -> (std::fs::File, std::fs::File) {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let (mut master, mut slave) = (-1, -1);
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let (master, slave) = unsafe {
+            (
+                std::fs::File::from_raw_fd(master),
+                std::fs::File::from_raw_fd(slave),
+            )
+        };
+        let mut modes = std::mem::MaybeUninit::<libc::termios>::uninit();
+        unsafe {
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(slave.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+            assert_eq!(libc::tcgetattr(slave.as_raw_fd(), modes.as_mut_ptr()), 0);
+        }
+        let modes = unsafe { modes.assume_init() };
+        assert_eq!(
+            modes.c_lflag & (libc::ICANON | libc::ECHO),
+            libc::ICANON | libc::ECHO
+        );
+        assert_eq!(modes.c_cc[libc::VKILL], 0x15);
+        (master, slave)
+    }
+
+    // The shell of the tab: the session leader of the PTY, as `login` starts it.
+    fn spawn_tab_shell(
+        slave: &std::fs::File,
+        command: &mut std::process::Command,
+    ) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        command
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave.try_clone().unwrap());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().unwrap()
+    }
+
+    // Collects what the tab shows until `done` holds. False at the deadline.
+    fn read_tab_until(
+        master: &mut std::fs::File,
+        screen: &mut Vec<u8>,
+        deadline: std::time::Instant,
+        mut done: impl FnMut(&[u8]) -> bool,
+    ) -> bool {
+        use std::io::Read;
+        loop {
+            let mut bytes = [0; 4096];
+            if let Ok(count) = master.read(&mut bytes) {
+                screen.extend_from_slice(&bytes[..count]);
+            }
+            if done(screen) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    const PROMPT: &str = "AB_READY> ";
+
+    // The start of session-t9E3YV failed on 2026-10-03: the user was typing `a` into
+    // another Terminal window, one `a` reached the new window while it had the
+    // keyboard, the start command was typed behind it, and the shell ran
+    // `a. '<...>/launch.sh'` (`zsh: command not found: a.`). Terminal 2.15 types every
+    // command that a script gives it, so a key can be in the tab's input in front of
+    // the command, with the shell still starting (the recorded case) or already in its
+    // line editor. Replayed here with the bytes that the shipped script makes Terminal
+    // write, in that order.
+    #[test]
+    fn terminal_app_startup_keys_cannot_change_the_launch_command() {
+        use std::io::Write;
+        // An empty creation leaves the command to a later `do script ... in tab`,
+        // which ends it with a carriage return; a creation text ends with a line feed.
+        let script = super::OPEN_TAB_SCRIPT;
+        let typed_after_creation = script.contains("do script \"\"");
+        let line_kill = script.contains("do script ((character id 21) & bridgeCommand)");
+        let mut failures = Vec::new();
+        for (shell, arguments, editor) in [
+            ("/bin/zsh", ["-f", "-i"].as_slice(), "ed"),
+            ("/bin/zsh", ["-f", "-i"].as_slice(), "vi"),
+            (
+                "/bin/bash",
+                ["--noprofile", "--norc", "-i"].as_slice(),
+                "ed",
+            ),
+        ] {
+            for line_editor_active in [false, true] {
+                let case = format!(
+                    "{shell} EDITOR={editor}, {}",
+                    if line_editor_active {
+                        "key typed into the line editor"
+                    } else {
+                        "key typed while the shell starts"
+                    }
+                );
+                let directory = tempfile::tempdir().unwrap();
+                let marker = directory.path().join("started");
+                let script = directory.path().join("launch.sh");
+                std::fs::write(
+                    &script,
+                    format!(
+                        "printf started > {}; exit\n",
+                        crate::native::shell_quote(marker.as_os_str())
+                    ),
+                )
+                .unwrap();
+                let bridge_command =
+                    format!(". {}", crate::native::shell_quote(script.as_os_str()));
+                let end = if typed_after_creation { "\r" } else { "\n" };
+                let typed = format!(
+                    "{}{bridge_command}{end}exit{end}",
+                    if line_kill { "\u{15}" } else { "" }
+                );
+
+                let (mut master, slave) = open_tab_pty();
+                let mut command = std::process::Command::new(shell);
+                command
+                    .args(arguments)
+                    .env("PS1", PROMPT)
+                    .env("EDITOR", editor)
+                    .env_remove("VISUAL")
+                    .env("ZDOTDIR", directory.path())
+                    .current_dir(directory.path());
+                let mut screen = Vec::new();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut child = if line_editor_active {
+                    let child = spawn_tab_shell(&slave, &mut command);
+                    assert!(
+                        read_tab_until(&mut master, &mut screen, deadline, |screen| {
+                            String::from_utf8_lossy(screen).contains(PROMPT)
+                        }),
+                        "{case}: no prompt: {}",
+                        String::from_utf8_lossy(&screen)
+                    );
+                    master.write_all(b"a").unwrap();
+                    assert!(
+                        read_tab_until(&mut master, &mut screen, deadline, |screen| {
+                            String::from_utf8_lossy(screen)
+                                .rsplit(PROMPT)
+                                .next()
+                                .is_some_and(|line| line.contains('a'))
+                        }),
+                        "{case}: the line editor did not take the key: {}",
+                        String::from_utf8_lossy(&screen)
+                    );
+                    master.write_all(typed.as_bytes()).unwrap();
+                    child
+                } else {
+                    master.write_all(b"a").unwrap();
+                    master.write_all(typed.as_bytes()).unwrap();
+                    spawn_tab_shell(&slave, &mut command)
+                };
+                let ended = read_tab_until(&mut master, &mut screen, deadline, |_| {
+                    child.try_wait().unwrap().is_some()
+                });
+                if !ended {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                }
+                if !ended || !marker.exists() {
+                    failures.push(format!(
+                        "{case}: the typed key changed the launch command: {:?}",
+                        String::from_utf8_lossy(&screen)
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    // A launch as it stands when the surface is opened: a private session directory,
+    // the status `launching`, the retained initial claim and its pending receipt.
+    fn launch_fixture() -> tempfile::TempDir {
+        use crate::native::{
+            acquire_turn_claim, launch, set_private_directory_permissions, update_status,
+        };
+        let directory = tempfile::Builder::new()
+            .prefix("session-terminal-")
+            .tempdir()
+            .unwrap();
+        set_private_directory_permissions(directory.path()).unwrap();
+        std::fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "launching", None, None).unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        let token = claim.token.clone();
+        claim.retain();
+        launch::begin(
+            directory.path(),
+            &token,
+            std::time::Instant::now() + std::time::Duration::from_secs(20),
+        )
+        .unwrap();
+        directory
+    }
+
+    fn binding(directory: &std::path::Path, tty: &str) -> serde_json::Value {
+        serde_json::json!({
+            "terminal": "apple-terminal", "session_id": tty, "window_id": WINDOW,
+            "managed_session_id": directory.file_name().unwrap().to_str().unwrap()
+        })
+    }
+
+    fn bind(directory: &std::path::Path, binding: &serde_json::Value) {
+        crate::native::write_json_atomic(
+            &directory.join(crate::native::TERMINAL_HANDLE_FILE),
+            binding,
+        )
+        .unwrap();
+    }
+
+    // The gate opens for the launcher's binding of this tty in a pending launch, and
+    // for nothing else.
+    #[test]
+    fn terminal_app_host_starts_only_for_its_bound_tty_in_a_pending_launch() {
+        use crate::native::{
+            TERMINAL_HANDLE_FILE, TURN_CLAIM_FILE, launch, update_status, write_json_atomic,
+        };
+        for case in [
+            "bound",
+            "another tty",
+            "another session",
+            "another terminal",
+            "no window",
+            "unreadable binding",
+            "closed",
+            "failed",
+            "expired",
+            "another claim",
+            "released claim",
+            "spawn attempted",
+        ] {
+            let directory = launch_fixture();
+            let directory = directory.path();
+            let id = directory.file_name().unwrap().to_str().unwrap();
+            let mut handle = binding(directory, TTY);
+            match case {
+                "another tty" => handle["session_id"] = "/dev/ttys020".into(),
+                "another session" => handle["managed_session_id"] = "session-other".into(),
+                "another terminal" => handle["terminal"] = "iterm2".into(),
+                "no window" => {
+                    handle.as_object_mut().unwrap().remove("window_id");
+                }
+                _ => {}
+            }
+            if case == "unreadable binding" {
+                std::fs::write(directory.join(TERMINAL_HANDLE_FILE), b"{").unwrap();
+            } else {
+                bind(directory, &handle);
+            }
+            match case {
+                "closed" | "failed" => update_status(directory, case, None, None).unwrap(),
+                "expired" | "another claim" | "spawn attempted" => {
+                    let mut receipt = launch::read(directory).unwrap().unwrap();
+                    match case {
+                        "expired" => receipt.deadline_unix_ms = 0,
+                        "another claim" => receipt.claim_token = "unrelated".into(),
+                        _ => receipt.phase = launch::Phase::Spawning,
+                    }
+                    write_json_atomic(&directory.join(launch::FILE), &receipt).unwrap();
+                }
+                "released claim" => std::fs::remove_file(directory.join(TURN_CLAIM_FILE)).unwrap(),
+                _ => {}
+            }
+            assert_eq!(
+                super::wait_for_binding(directory, id, TTY).is_ok(),
+                case == "bound",
+                "{case}"
+            );
+        }
+    }
+
+    // The gate reads no record in a directory that another account could have prepared,
+    // and writes nothing there.
+    #[test]
+    fn terminal_app_host_refuses_a_directory_that_is_not_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let refused = |directory: &std::path::Path, reason: &str| {
+            let error = format!("{:#}", super::run_host(directory).unwrap_err());
+            assert!(error.contains(reason), "{}: {error}", directory.display());
+        };
+
+        let shared = launch_fixture();
+        bind(shared.path(), &binding(shared.path(), TTY));
+        let log = std::fs::read(shared.path().join(crate::native::launch::LOG)).unwrap();
+        std::fs::set_permissions(shared.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        refused(shared.path(), "not private");
+
+        let private = launch_fixture();
+        let link = root.path().join("session-link");
+        std::os::unix::fs::symlink(private.path(), &link).unwrap();
+        refused(&link, "not private");
+
+        let unnamed = root.path().join("not-a-session");
+        std::fs::create_dir(&unnamed).unwrap();
+        crate::native::set_private_directory_permissions(&unnamed).unwrap();
+        refused(&unnamed, "invalid Agent Bridge session id");
+
+        refused(&root.path().join("session-missing"), "failed to inspect");
+        assert_eq!(
+            std::fs::read(shared.path().join(crate::native::launch::LOG)).unwrap(),
+            log
+        );
+    }
+
+    #[test]
+    fn terminal_app_bootstrap_is_a_private_file_behind_a_short_line() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let start = super::install_bootstrap(
+            directory.path(),
+            "'/bin/agent bridge' native-terminal-host '/state/session-test'",
+            ". '/state/session-test/launch.sh'",
+        )
+        .unwrap();
+        let path = directory.path().join("terminal-start.sh");
+        assert_eq!(
+            start,
+            format!(". {}", crate::native::shell_quote(path.as_os_str()))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "'/bin/agent bridge' native-terminal-host '/state/session-test' || exit\n. '/state/session-test/launch.sh'\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    // Every byte that is queued for a reader of standard input, whatever the line
+    // discipline holds back in canonical mode: a provider's TUI reads without it.
+    fn queued_input_bytes() -> libc::c_int {
+        let mut modes = std::mem::MaybeUninit::<libc::termios>::uninit();
+        let mut queued: libc::c_int = -1;
+        unsafe {
+            assert_eq!(libc::tcgetattr(0, modes.as_mut_ptr()), 0);
+            let saved = modes.assume_init();
+            let mut raw = saved;
+            raw.c_lflag &= !libc::ICANON;
+            assert_eq!(libc::tcsetattr(0, libc::TCSANOW, &raw), 0);
+            assert_eq!(libc::ioctl(0, libc::FIONREAD, &mut queued), 0);
+            assert_eq!(libc::tcsetattr(0, libc::TCSANOW, &saved), 0);
+        }
+        queued
+    }
+
+    // Runs only as the gate or as the wrapper of the private PTY test below.
+    #[test]
+    fn terminal_app_start_probe() {
+        let Ok(mode) = std::env::var("AB_TERMINAL_PROBE_MODE") else {
+            return;
+        };
+        let directory =
+            std::path::PathBuf::from(std::env::var_os("AB_TERMINAL_PROBE_DIR").unwrap());
+        if mode == "host" {
+            std::fs::write(directory.join("host-entered"), b"").unwrap();
+            if let Err(error) = super::run_host(&directory) {
+                eprintln!("{error:#}");
+                std::process::exit(7);
+            }
+            return;
+        }
+        // The wrapper: what `native-session` records about itself in a Terminal.app
+        // tab, which fails unless the tab's shell is its parent and it leads a
+        // foreground group of its own.
+        let id = directory.file_name().unwrap().to_str().unwrap();
+        let owner = crate::native::current_native_session_owner(id).unwrap();
+        let shell = owner.terminal_shell.unwrap();
+        crate::native::write_json_atomic(
+            &directory.join("owner-probe.json"),
+            &serde_json::json!({
+                "group": owner.process_group, "shell": shell.pid,
+                "shell_group": shell.process_group, "queued_input": queued_input_bytes()
+            }),
+        )
+        .unwrap();
+    }
+
+    // The whole typed start on a private PTY: the bytes that Terminal writes for the
+    // creation text, a key in front of it and lines behind it, the tab's shell, and
+    // the gate and the wrapper as two jobs of that shell.
+    #[test]
+    fn terminal_app_start_waits_for_the_binding_and_discards_startup_keys() {
+        for outcome in ["bound", "closed", "another tty", "another standard input"] {
+            start_on_private_pty(outcome);
+        }
+    }
+
+    fn tty_name(tty: &std::fs::File) -> String {
+        use std::os::fd::AsRawFd;
+        let mut name = [0 as libc::c_char; 128];
+        assert_eq!(
+            unsafe { libc::ttyname_r(tty.as_raw_fd(), name.as_mut_ptr(), name.len()) },
+            0
+        );
+        unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn start_on_private_pty(outcome: &str) {
+        use std::io::Write;
+        let fixture = launch_fixture();
+        let directory = fixture.path();
+        let (mut master, slave) = open_tab_pty();
+        let tty = tty_name(&slave);
+        // A gate whose standard input is another tty than its controlling terminal:
+        // the binding of that other tty must not start the wrapper in this tab.
+        let (_other_master, other) = open_tab_pty();
+        let other = tty_name(&other);
+        let foreign_input = outcome == "another standard input";
+        let probe = format!(
+            "{} --exact native::terminal::macos::apple_terminal::tests::terminal_app_start_probe --nocapture --test-threads=1",
+            crate::native::shell_quote(std::env::current_exe().unwrap().as_os_str())
+        );
+        let start = super::install_bootstrap(
+            directory,
+            &if foreign_input {
+                format!("AB_TERMINAL_PROBE_MODE=host {probe} < {other}")
+            } else {
+                format!("AB_TERMINAL_PROBE_MODE=host {probe}")
+            },
+            &format!("AB_TERMINAL_PROBE_MODE=owner {probe}; exit $?"),
+        )
+        .unwrap();
+        if foreign_input {
+            bind(directory, &binding(directory, &other));
+        }
+        // The script hands Terminal the line kill and the start line, and Terminal
+        // ends the creation text with a line feed.
+        assert!(
+            super::OPEN_TAB_SCRIPT
+                .contains("set targetTab to do script ((character id 21) & bridgeCommand)")
+        );
+        // A key that Terminal wrote in front of the creation text, the text, and a
+        // line that was typed behind it while the new window had the keyboard.
+        master
+            .write_all(format!("a\u{15}{start}\naaaa\n").as_bytes())
+            .unwrap();
+        let mut command = std::process::Command::new("/bin/zsh");
+        command
+            .args(["-f", "-i"])
+            .env("PS1", PROMPT)
+            .env("EDITOR", "ed")
+            .env_remove("VISUAL")
+            .env("ZDOTDIR", directory)
+            .env("AB_TERMINAL_PROBE_DIR", directory)
+            .current_dir(directory);
+        let mut child = spawn_tab_shell(&slave, &mut command);
+        let mut screen = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let shown = |screen: &[u8]| String::from_utf8_lossy(screen).into_owned();
+        assert!(
+            read_tab_until(&mut master, &mut screen, deadline, |_| {
+                directory.join("host-entered").exists()
+            }),
+            "{outcome}: the gate never ran: {}",
+            shown(&screen)
+        );
+        let wrapper = directory.join("owner-probe.json");
+        if !foreign_input {
+            // The launcher is still proving the window. Whatever is typed, nothing
+            // starts.
+            master.write_all(b"more keys\n").unwrap();
+            assert!(
+                !read_tab_until(
+                    &mut master,
+                    &mut screen,
+                    std::time::Instant::now() + std::time::Duration::from_millis(300),
+                    |_| wrapper.exists() || child.try_wait().unwrap().is_some()
+                ),
+                "{outcome}: the start did not wait for the binding: {}",
+                shown(&screen)
+            );
+            match outcome {
+                "bound" => bind(directory, &binding(directory, &tty)),
+                "another tty" => bind(directory, &binding(directory, "/dev/ttys999")),
+                _ => crate::native::update_status(directory, "closed", None, None).unwrap(),
+            }
+        }
+        if !read_tab_until(&mut master, &mut screen, deadline, |_| {
+            child.try_wait().unwrap().is_some()
+        }) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("{outcome}: the tab's shell did not end: {}", shown(&screen));
+        }
+        let status = child.wait().unwrap();
+        let log = std::fs::read_to_string(directory.join(crate::native::launch::LOG)).unwrap();
+        if outcome == "bound" {
+            assert!(status.success(), "{}", shown(&screen));
+            let probe: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&wrapper).unwrap()).unwrap();
+            assert_eq!(
+                probe["queued_input"], 0,
+                "startup keys reached the wrapper: {probe}"
+            );
+            assert_eq!(probe["shell"], child.id(), "{probe}");
+            assert_eq!(probe["shell_group"], child.id(), "{probe}");
+            assert_ne!(probe["group"], probe["shell_group"], "{probe}");
+            assert!(
+                log.contains(&format!("terminal_host_released tty={tty}\n")),
+                "{log}"
+            );
+        } else {
+            assert!(!wrapper.exists(), "{outcome}: the wrapper started");
+            assert_eq!(status.code(), Some(7), "{outcome}: {}", shown(&screen));
+            assert!(log.contains("terminal_host_refused: "), "{outcome}: {log}");
+        }
     }
 }

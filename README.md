@@ -2,27 +2,27 @@
 
 로컬에 설치되고 로그인된 `codex`, `claude`, `agy`, `pi` CLI를 사용자가 볼 수 있는 실제 터미널 세션에서 연결하는 브리지입니다. API 키나 로그인 토큰을 대신 소유하지 않고 각 CLI의 기존 인증·설정·대화형 UI를 그대로 사용합니다.
 
-0.1.0은 준비 중입니다. 변경한 이슈와 검증·미완료 조건은 [0.1.0 이슈 작업 기록](docs/verification/2026-10-03-v0.1.0-issues.md)을 참고하세요.
+0.1.0은 준비 중입니다. 변경한 이슈와 검증·미완료 조건은 [0.1.0 이슈 작업 기록](docs/verification/2026-10-03-v0.1.0-issues.md)을 참고하세요. 남은 수락 검사에서 확인한 포커스·타이핑 실패와 수정 진행은 [포커스 검사 기록](docs/verification/2026-10-03-v0.1.0-focus.md)에 있습니다.
 
-첫 설치 가능 릴리스는 **v0.0.1**이며 최신 설치 가이드는 **v0.0.10** tag를 기준으로 합니다. macOS에서는 iTerm2와 내장 Terminal.app을 지원합니다. Agent Bridge는 자신을 실행한 터미널을 감지해 같은 앱의 새 surface에서 세션을 시작하고, 자신이 만든 surface만 제어합니다. Terminal.app에서는 기존 tab/window를 사용하지 않고 항상 전용 새 window를 엽니다. 감지할 수 없는 호스트에서는 Terminal.app으로 안전하게 fallback합니다. 이미 독립적으로 실행 중인 임의의 CLI에는 사후 attach하지 않습니다.
+이 문서와 설치 예시는 **v0.1.0**을 기준으로 합니다. macOS에서는 iTerm2·Terminal.app·Ghostty·WezTerm을 지원합니다. Agent Bridge는 자신을 실행한 터미널을 감지해 같은 앱의 새 surface에서 세션을 시작하고, 자신이 만든 surface만 제어합니다. Terminal.app에서는 기존 tab/window를 사용하지 않고 항상 전용 새 window를 엽니다. 감지할 수 없는 호스트에서는 Terminal.app으로 안전하게 fallback합니다. 이미 독립적으로 실행 중인 임의의 CLI에는 사후 attach하지 않습니다.
 
 ## 지원 범위
 
 | 환경 | 상태 | transport |
 | --- | --- | --- |
-| macOS + Ghostty | 현재 소스 구현, v0.0.10 미지원 | native scripting으로 새 tab/window 생성 후 실제 surface 입력 준비와 정확한 identity 확인; 최종 runtime 근거는 별도 |
+| macOS + Ghostty | 0.1.0 | native scripting으로 새 tab/window 생성; 실제 surface 준비와 composite identity 확인 |
 | macOS + iTerm2 | 지원 | iTerm2 AppleScript 직접 제어 |
 | macOS + Terminal.app | 지원 | Terminal AppleScript 직접 제어 |
-| macOS + Warp | 현재 소스 구현, 실제 호스트 검증 전 | 공식 Warp Control endpoint, Tab Config·Launch Configuration URI 사용; v0.0.10 설치 바이너리에는 미포함 |
-| macOS + WezTerm | 현재 소스 구현, 설치 바이너리 미포함 | 공식 CLI로 검증된 local window에 새 tab을 생성; 새 창 모드·대상 부재 시 전용 GUI 사용; v0.0.10 설치 바이너리에는 미포함 |
+| macOS + Warp | 실험적 구현, 실앱 수락 보류 | 공식 Warp Control endpoint, Tab Config·Launch Configuration URI 사용; #63 실제 호스트 검증은 NOT-VERIFIED |
+| macOS + WezTerm | 0.1.0 | 공식 CLI로 검증된 local window에 새 tab 생성; 새 창 모드·대상 부재 시 전용 GUI 사용 |
 | macOS의 다른 터미널 | fallback | 별도 adapter가 없으면 Terminal.app에서 시작 |
 | Windows PowerShell / cmd | 지원 | PowerShell 7(`pwsh.exe`) 기반 managed console; Windows Terminal의 tab으로 열고 tab을 만들 수 없을 때만 전용 console window; `ask`/`tell`/`sessions`/explicit prune·close |
 | Linux 터미널 | 미지원 | [Issue #6](https://github.com/jy1655/agent-bridge/issues/6)에서 별도 구현 |
 | VS Code 통합 터미널 | 현재 비범위 | 전용 adapter가 필요하면 별도로 판단 |
 
-macOS에서는 `TERM_PROGRAM`, `TERM`, `ITERM_SESSION_ID`, `TERM_SESSION_ID` 순으로 현재 호스트를 식별합니다. 현재 소스는 `--terminal ghostty|iterm2|terminal|warp|wezterm`를 받으며 `TERM_PROGRAM=WarpTerminal`을 Warp, `TERM_PROGRAM=WezTerm`을 WezTerm으로 식별합니다. 선택을 생략한 상태에서 호스트를 식별하지 못하면 내장 Terminal.app을 엽니다. Terminal.app은 복원되거나 기존에 열린 surface를 채택하지 않고 항상 전용 새 window를 만듭니다. 명시한 `--terminal` 대상은 호출한 터미널의 환경보다 우선합니다. 다른 터미널에서 `--terminal warp`로 호출해도 설치된 Warp 번들과 공식 endpoint를 사용합니다. 선택된 adapter가 실패하면 다른 앱으로 조용히 우회하지 않고 오류를 반환합니다.
+macOS에서는 `TERM_PROGRAM`, `TERM`, `ITERM_SESSION_ID`, `TERM_SESSION_ID` 순으로 현재 호스트를 식별합니다. `--terminal ghostty|iterm2|terminal|warp|wezterm`를 받으며 `TERM_PROGRAM=WarpTerminal`을 Warp, `TERM_PROGRAM=WezTerm`을 WezTerm으로 식별합니다. 선택을 생략한 상태에서 호스트를 식별하지 못하면 내장 Terminal.app을 엽니다. Terminal.app은 복원되거나 기존에 열린 surface를 채택하지 않고 항상 전용 새 window를 만듭니다. 명시한 `--terminal` 대상은 호출한 터미널의 환경보다 우선합니다. 다른 터미널에서 `--terminal warp`로 호출해도 설치된 Warp 번들과 공식 endpoint를 사용합니다. 선택된 adapter가 실패하면 다른 앱으로 조용히 우회하지 않고 오류를 반환합니다.
 
-개발 소스의 macOS 열기 기본값은 **tab-first**입니다. 기존 앱에서 새 tab을 만들 수 있으면 tab을 만들고, 지원되는 tab API나 안전하게 정할 수 있는 대상이 없을 때만 이유를 알리고 새 window를 엽니다. Terminal.app의 native AppleScript는 기존 tab에 명령을 보낼 수 있지만 새 tab 생성 명령은 제공하지 않아 새 window를 사용합니다. 키 입력으로 사용자 tab을 재사용하지 않습니다. 다음 설정은 기존 영구 설정 파일에 저장되며 Windows의 `windows-tab-window` 설정과 독립적입니다. 설정이 없으면 `tab-first`이고 잘못된 값은 terminal 생성 전에 오류가 됩니다. 이 명령은 아직 v0.0.10 설치 바이너리에 포함되지 않았습니다.
+macOS 열기 기본값은 **tab-first**입니다. 기존 앱에서 새 tab을 만들 수 있으면 tab을 만들고, 지원되는 tab API나 안전하게 정할 수 있는 대상이 없을 때만 이유를 알리고 새 window를 엽니다. Terminal.app의 native AppleScript는 기존 tab에 명령을 보낼 수 있지만 새 tab 생성 명령은 제공하지 않아 새 window를 사용합니다. 키 입력으로 사용자 tab을 재사용하지 않습니다. 다음 설정은 기존 영구 설정 파일에 저장되며 Windows의 `windows-tab-window` 설정과 독립적입니다. 설정이 없으면 `tab-first`이고 잘못된 값은 terminal 생성 전에 오류가 됩니다.
 
 ```sh
 agent-bridge settings macos-open-mode tab-first
@@ -34,15 +34,17 @@ agent-bridge settings --json
 
 Warp는 필요한 동작을 제공하는, 접근 권한이 있는 공식 Warp Control endpoint가 있어야 합니다. 공개 채널의 Scripting 동의는 사용자가 설정하며 Bridge가 이를 변경하지 않습니다. 번들의 공식 wrapper 또는 해당 채널 실행 파일의 `--warpctrl` 경로를 사용하고, 버전 문자열이나 wrapper 존재만으로 지원을 판정하지 않습니다. 기존 window의 새 tab에는 공식 Tab Config URI를 사용하며, 설치된 채널에서 TabConfigs 기능이 활성화되어 있어야 합니다. `new-window` 모드이거나 endpoint의 스냅샷에 열린 window가 없으면 별도 Launch Configuration URI로 새 window를 요청합니다. 고정한 upstream 소스에서 이 window 경로는 TabConfigs에 의존하지 않습니다. Control endpoint가 있다는 사실만으로 TabConfigs 활성화를 판정하지 않으며, 이 adapter의 생성 전 조회는 이 기능의 활성화를 증명하지 않습니다. tab 생성 결과가 불확실하면 지원 부재로 추정해 window를 추가 생성하지 않고 오류와 근거를 남깁니다. 생성 시 부여한 임의 제목을 공식 `tab.rename`으로 같은 제목으로 설정하고 정확한 instance/window/tab 응답과 앱 PID·시작 시각을 검증한 뒤에만 소유권을 기록합니다. 이 제목 설정은 mutation이며, 응답을 잃으면 같은 제목 증명을 제한적으로 재시도합니다. 소유권 기록과 최종 제목 설정이 끝난 뒤에만 provider를 실행합니다. 증명하지 못한 잔여 창을 추측해 닫지 않습니다. Codex와 Claude의 후속 요청은 기존 provider-native 경로를 사용합니다. Warp의 `input.insert`와 `input.replace`는 텍스트를 준비할 뿐 제출하지 않으므로 Agy·Pi의 terminal 기반 `tell`과 화면을 읽어 동의 대화상자에 응답하는 기능은 지원하지 않습니다. 설치된 Stable `0.2026.09.30.08.29.01`의 실제 endpoint 접근과 provider 왕복·화면 정리는 아직 검증하지 않았습니다.
 
-Terminal.app 종료 재시도는 기록된 앱 PID·시작 시각과 scripting 대상의 유일성을 확인합니다. 시작 명령이 앱 소유권 기록 전에 실패하면, 증명되지 않은 창을 닫거나 정리 완료로 표시하지 않고 오류와 기존 handle을 보존합니다. 기록된 앱의 종료 또는 정확한 창의 부재가 증명되면 읽기 전용으로 handle을 정리할 수 있습니다. 앱 identity가 없는 failed-start·legacy 기록은 전후로 변하지 않은 단일 Terminal 인스턴스(또는 실행 중인 인스턴스 없음)와 성공한 부재 조회가 필요합니다. 오류·모호한 인스턴스·재사용된 PID는 부재가 아닙니다. 살아 있는 legacy owner는 검증된 조상 관계에서 앱 identity를 얻어 종료 의도보다 먼저 기록합니다. 이 복구 조건은 정상 시작 경로와 구분되며, 변경된 Terminal 동작은 실제 GUI에서 검증하지 않았습니다.
+Terminal.app 종료 재시도는 기록된 앱 PID·시작 시각과 scripting 대상의 유일성을 확인합니다. 시작 명령이 앱 소유권 기록 전에 실패하면, 증명되지 않은 창을 닫거나 정리 완료로 표시하지 않고 오류와 기존 handle을 보존합니다. 기록된 앱의 종료 또는 정확한 창의 부재가 증명되면 읽기 전용으로 handle을 정리할 수 있습니다. 앱 identity가 없는 failed-start·legacy 기록은 전후로 변하지 않은 단일 Terminal 인스턴스(또는 실행 중인 인스턴스 없음)와 성공한 부재 조회가 필요합니다. 오류·모호한 인스턴스·재사용된 PID는 부재가 아닙니다. 살아 있는 legacy owner는 검증된 조상 관계에서 앱 identity를 얻어 종료 의도보다 먼저 기록합니다. 이 복구 조건은 정상 시작 경로와 구분됩니다. 실제 왕복·종료와 사용자의 빈 창 재등장 확인은 [0.1.0 검증 기록](docs/verification/2026-10-03-v0.1.0-issues.md)에 있습니다.
 
-WezTerm은 호출한 터미널이나 상속한 `WEZTERM_*` 값과 관계없이 local GUI socket의 소유자·서버 PID·실행 파일·생성 시각을 검증합니다. 기본값에서는 유일하게 정할 수 있는 기존 local window에 공식 `cli spawn --window-id ... --domain-name local`로 새 tab을 만듭니다. 반환된 새 pane ID와 tab·window·GUI identity가 모두 일치해야 연결하며 기존 pane은 채택하지 않습니다. 열린 안전한 대상이 없거나 대상 window가 여러 개여서 모호한 경우, 필요한 CLI 기능을 사용할 수 없는 경우에는 이유를 알리고 전용 새 GUI window로 fallback합니다. `new-window` 모드는 처음부터 `start --always-new-process --no-auto-connect`를 사용합니다. 생성 요청 이후 응답이 불확실하면 재시도·다른 window 생성·pane 차이만으로 추측한 정리를 하지 않습니다. 실행 파일은 `/Applications/WezTerm.app/Contents/MacOS/wezterm` 또는 `PATH`의 `wezterm`을 사용합니다. 새 전용 GUI의 시작 설정이 여러 pane이나 local tty가 없는 pane을 만들면 소유 대상을 정하지 못했다는 오류를 반환합니다.
+WezTerm은 호출한 터미널이나 상속한 `WEZTERM_*` 값과 관계없이 local GUI socket의 소유자·서버 PID·실행 파일·생성 시각을 검증합니다. 기본값에서는 유일하게 정할 수 있는 기존 local window에 공식 `cli spawn --window-id ... --domain-name local -- <program>`으로 새 tab을 만듭니다. 반환된 새 pane ID와 tab·window·GUI identity가 모두 일치해야 연결하며 기존 pane은 채택하지 않습니다. 열린 안전한 대상이 없거나 대상 window가 여러 개여서 모호한 경우, 필요한 CLI 기능을 사용할 수 없는 경우에는 이유를 알리고 전용 새 GUI window로 fallback합니다. `new-window` 모드는 처음부터 `start --always-new-process --no-auto-connect`를 사용합니다. 생성 요청 이후 응답이 불확실하면 재시도·다른 window 생성·pane 차이만으로 추측한 정리를 하지 않습니다. 실행 파일은 `/Applications/WezTerm.app/Contents/MacOS/wezterm` 또는 `PATH`의 `wezterm`을 사용합니다. 새 전용 GUI의 시작 설정이 여러 pane이나 local tty가 없는 pane을 만들면 소유 대상을 정하지 못했다는 오류를 반환합니다. 시작 명령은 `spawn`·`start`의 program 인자로 전달하고, 해당 pane이 연결된 뒤에만 provider를 시작합니다. 전경 GUI가 새 pane을 focused pane으로 보고한 동안만 이전 pane을 다시 선택합니다. 배경 GUI의 오래된 focus 값으로 선택을 바꾸지 않으므로, 배경 창에서는 새 tab이 선택된 채 남을 수 있습니다.
 
 WezTerm handle에는 실제로 만든 pane·tab·window, GUI PID·생성 시각·socket과 GUI 자체의 소유 여부를 기록합니다. 기존 GUI에 만든 tab은 정확한 pane만 제거하고 공유 GUI나 socket을 종료·삭제하지 않습니다. 전용 GUI에서도 사용자가 추가한 sibling pane이 있으면 GUI를 남깁니다. 전용 GUI의 최초 세션이 먼저 끝나고 그 GUI에 tab을 추가한 공유 세션이 마지막으로 끝나는 경우, `quit_when_all_windows_are_closed = false` 설정에서는 pane이 없는 GUI 프로세스가 남을 수 있습니다. 마지막 공유 세션도 GUI 종료 권한을 얻지 않습니다. 같은 WezTerm 설정에서 전용 GUI를 소유한 세션(`owns_gui: true`)의 pane이 Bridge 밖에서 끝나고(사용자가 닫거나 provider와 shell이 종료) owner도 사라진 경우에도 pane이 없는 GUI 프로세스가 남을 수 있습니다. 이때 `close-session`은 정확한 pane의 부재를 읽기 전용으로 확인해 handle을 정리할 뿐 GUI를 종료하지 않습니다. 생성 후 설정을 바꾸어도 기존 세션의 정리 범위는 달라지지 않습니다.
 
 WezTerm의 Codex·Claude 후속 요청은 기존 공식 provider 경로를 유지하고, Agy·Pi는 해당 provider의 입력 검증과 결과 상관관계를 유지한 채 `send-text --no-paste`를 사용합니다. WezTerm에는 화면 비교와 키 입력을 원자적으로 처리하는 API가 없으므로 workspace 동의 대화상자의 자동 응답은 제공하지 않습니다. 이 경우 키를 보내거나 응답 의도를 기록하지 않고 명시적인 오류를 반환합니다. provider 자체의 신뢰 절차를 완료한 후 다시 실행할 수 있습니다. adapter marker 검증과 provider 왕복·실제 화면 관찰은 별도 근거이며, 현재 소스의 상세 검증은 개발 기록을 따릅니다.
 
-Ghostty의 native AppleScript에는 Automation 권한과 해당 앱의 scripting 기능이 필요합니다. Bridge는 이 설정을 바꾸지 않습니다. v0.0.10은 [surface 초기화 문제](https://github.com/ghostty-org/ghostty/issues/12730) 때문에 명시한 Ghostty를 실행 전에 거부하고 자동 감지를 Terminal.app으로 대체합니다. 현재 개발 소스는 새 tab/window의 공식 반환 ID와 전후 topology를 검증하고, 정확한 새 terminal에 대한 빈 입력이 실제 model에 도달한 뒤에만 세션을 연결합니다. 새 surface에는 먼저 shell만 실행하며 provider 명령은 binding 뒤에 전달합니다. 기존 tab이나 내용을 입력 대상으로 채택하지 않습니다. 기본값은 유일하게 정할 수 있는 기존 window의 새 tab이며, 대상 부재·모호함 또는 `new-window` 설정에서는 새 window를 만듭니다. 초기화가 불확실하면 생성·명령 입력을 반복하거나 다른 창으로 재시도하지 않습니다. 새 target이 계속 선택되어 있을 때만 이전 선택을 복원하며, 이후 사용자가 만든 split은 종료하지 않습니다. 기존 tab 선택을 되돌리는 것은 앱 전경을 돌려주는 동작이 아니며, Bridge는 다른 앱으로 전경을 복원하지 않습니다. 전경 앱의 native metadata 기록(시작 전 → 세션 중 → 닫은 뒤)은 후보 바이너리별로 다릅니다. 이전 후보(SHA-256 `b6bf14c1…`)에서는 Chrome → Ghostty → Chrome이었고, Ghostty가 전경에 머문 시간과 Chrome으로 돌아온 원인은 확인하지 않았습니다. 이후 후보(SHA-256 `bb2b95dc…`)에서는 iTerm2 → Ghostty → Ghostty로, 세션을 닫은 뒤에도 Ghostty가 전경 앱이었습니다. 따라서 Ghostty는 세션을 닫은 뒤에도 전경에 남을 수 있습니다. 사용자가 다른 앱으로 전환할 때까지 키 입력은 세션이 열려 있는 동안에는 새 관리 shell이나 복원된 사용자 tab에, 닫은 뒤에는 복원된 사용자 tab에 들어갈 수 있습니다. 실제 화면·키보드 포커스는 NOT VERIFIED입니다. 버전 문자열·surface UUID 반환만으로 정상 동작을 인정하지 않으며, 초기화·provider 왕복 근거는 검증한 바이너리별로 구분합니다.
+Ghostty의 native AppleScript에는 Automation 권한과 해당 앱의 scripting 기능이 필요합니다. Bridge는 이 설정을 바꾸지 않습니다. 새 tab/window의 공식 반환 ID와 전후 topology를 검증하고, 정확한 새 terminal에 대한 빈 입력이 실제 model에 도달한 뒤에만 세션을 연결합니다. 기본값은 유일하게 정할 수 있는 기존 window의 새 tab이며, 대상 부재·모호함 또는 `new-window` 설정에서는 새 window를 만듭니다. 초기화가 불확실하면 생성·입력을 반복하거나 다른 창으로 재시도하지 않습니다. 기존 tab이나 내용을 입력 대상으로 채택하지 않으며, 이후 사용자가 만든 split은 종료하지 않습니다.
+
+Ghostty surface의 생성 command는 시작 host를 직접 실행합니다. host는 연결된 terminal에만 전달한 시작 신호와 기존 launch 기록을 확인하고 초기 입력을 버린 뒤 provider를 시작합니다. shell 명령을 입력 줄에 붙이거나 시작용 Enter를 보내지 않습니다. 새 target이 계속 선택돼 있을 때만 이전 tab/window를 복원하고, Ghostty가 전경을 가져갔다면 앞서 사용하던 앱으로 돌려주도록 요청합니다. 다른 앱·선택으로 바뀌었으면 복원하지 않습니다. macOS의 복원 수락과 실제 키 입력은 별도 확인이 필요하며, 실패한 이전 후보와 수정본의 검증은 [포커스 검사 기록](docs/verification/2026-10-03-v0.1.0-focus.md)에 구분합니다.
 
 Windows는 PowerShell 또는 cmd에서 호출할 수 있고 PowerShell 7(`pwsh.exe`)이 설치되어 있어야 합니다. managed console은 Windows Terminal의 tab으로 열며, 이름이 `agent-bridge`인 전용 window가 없으면 Windows Terminal이 만들고 있으면 그 window에 tab을 추가합니다. tab의 프로세스는 Windows Terminal이 직접 만들기 때문에, tab 안에서 Bridge의 내부 명령 `native-console-host`가 실행됩니다. 이 프로세스가 absolute PATH entry에서 찾은 `pwsh.exe`를 `CREATE_SUSPENDED`로 만들고, launcher가 그 프로세스의 identity를 기록한 뒤에만 실행을 재개합니다. tab을 만들 수 없으면(`wt.exe`가 `PATH`에 없음, Windows Terminal이 바꿔 읽는 문자가 경로에 있음, tab이 8초 안에 응답하지 않음) 이전과 같이 `CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED`로 전용 console window를 만듭니다. 어느 쪽이든 후속 입력과 explicit close는 managed session ID, PID 생성 시각, 실행 파일 identity가 모두 일치할 때만 전달합니다. npm provider shim은 `.exe`, `.ps1`, `.cmd`, `.bat` 순으로 찾고 PowerShell shim을 우선해 `%NAME%`의 `cmd.exe` 확장을 피합니다. Linux는 아직 미지원입니다. provider/session 계약은 공유하되 OS와 terminal transport는 각각 독립 모듈로 유지합니다. provider 간에도 transport 구현을 억지로 공통화하지 않습니다. 각 provider adapter가 공식 session messaging·follow-up·result identity를 우선 사용하고, upstream에서 제공하지 않는 플랫폼·버전에만 같은 의미론의 fallback을 소유합니다. upstream 지원이 추가되면 공통층을 늘리는 대신 해당 fallback을 삭제·교체합니다.
 
@@ -66,18 +68,18 @@ provider별 console follow-up은 각 adapter 내부에 격리되어 있으며, b
 
 ## 설치
 
-소스에서 설치할 때는 Rust 1.97.1 이상이 필요합니다. macOS에서는 iTerm2 또는 Terminal.app이 필요하며 v0.0.10의 Ghostty adapter는 fail-closed입니다. Windows에서는 PowerShell 7이 필요합니다. 두 OS 모두 사용할 provider CLI를 먼저 직접 실행해 로그인과 초기 설정을 완료해야 합니다.
+소스에서 설치할 때는 Rust 1.97.1 이상이 필요합니다. macOS에서는 iTerm2·Terminal.app·Ghostty·WezTerm 중 하나가 필요합니다. Windows에서는 PowerShell 7이 필요합니다. 두 OS 모두 사용할 provider CLI를 먼저 직접 실행해 로그인과 초기 설정을 완료해야 합니다.
 
 macOS에서 Claude의 폴더 신뢰·도구 권한을 승인했어도 터미널 제어 권한이나 Computer Use 접근이 승인된 것은 아닙니다. 처음 사용할 때와 권한 오류가 날 때는 [macOS 초기 승인과 실앱 검증](docs/macos-permissions.md)의 오류별 구분과 Computer Use 없이 실행하는 CLI `self-test` 절차를 확인하세요.
 
 ```sh
-git clone --branch v0.0.10 --depth 1 https://github.com/jy1655/agent-bridge.git
+git clone --branch v0.1.0 --depth 1 https://github.com/jy1655/agent-bridge.git
 cd agent-bridge
 cargo install --path . --locked
 agent-bridge --version
 ```
 
-마지막 명령은 `agent-bridge 0.0.10`을 출력해야 합니다. 개발 중인 `main`이 아니라 릴리스 tag에서 설치해야 설치본과 소스의 경계가 명확합니다.
+마지막 명령은 `agent-bridge 0.1.0`을 출력해야 합니다. 개발 중인 `main`이 아니라 릴리스 tag에서 설치해야 설치본과 소스의 경계가 명확합니다.
 
 Windows 명령줄 한도를 넘는 요청은 `--prompt-file`로 전달합니다. 파일은 UTF-8 텍스트로 읽고 CRLF는 LF로 정규화하며, Agent Bridge가 원본을 삭제하거나 수정하지 않습니다. 단독 CR과 그 밖의 제출·escape 제어문자는 거부합니다.
 
@@ -86,13 +88,13 @@ Windows 명령줄 한도를 넘는 요청은 `--prompt-file`로 전달합니다.
 GitHub Release에는 Apple Silicon macOS용 `agent-bridge-<version>-aarch64-apple-darwin.tar.gz`와 64비트 Windows용 `agent-bridge-<version>-x86_64-pc-windows-msvc.zip`을 게시하며, 각 archive와 같은 이름의 `.sha256` 파일을 함께 제공합니다. prebuilt archive 설치에는 Rust가 필요하지 않습니다. archive를 푼 뒤 macOS에서는 `agent-bridge`, Windows에서는 `agent-bridge.exe`를 `PATH`에 있는 디렉터리로 옮깁니다. 다운로드한 파일은 실행 전에 체크섬을 검증하세요.
 
 ```sh
-shasum -a 256 -c agent-bridge-0.0.10-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf agent-bridge-0.0.10-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c agent-bridge-0.1.0-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf agent-bridge-0.1.0-aarch64-apple-darwin.tar.gz
 ./agent-bridge --version
 ```
 
 ```powershell
-$archive = "agent-bridge-0.0.10-x86_64-pc-windows-msvc.zip"
+$archive = "agent-bridge-0.1.0-x86_64-pc-windows-msvc.zip"
 $expected = (Get-Content "$archive.sha256").Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "checksum mismatch" }
@@ -425,7 +427,7 @@ JSON의 `ok: true`와 exit 0은 진단 보고서를 만들었다는 뜻입니다
 
 ## 권한과 세션 경계
 
-- Agent Bridge는 같은 `ask` 작업에서 새로 만든 surface만 기록합니다. 새 handle은 managed session ID와 host가 제공하는 stable ID를 결합하며 `tell`과 `close-session` 직전에 다시 검증합니다. 지원되는 macOS iTerm2·Terminal.app 경로는 target `native-session` owner의 managed session ID·PID·controlling TTY device·process start fingerprint·foreground process group과 전용 login shell identity를 검증하고, surface가 보고하는 TTY도 owner와 일치해야 합니다. 시작 명령을 보내기 전에 handle을 내구성 있게 기록하고, 시작 실패 시 전체 timeout 안에 예약한 정리 구간에서 소유권과 정리 가능 여부를 검증합니다. 정확한 surface의 종료 또는 부재가 증명된 경우에만 handle을 제거합니다. 소유권을 기록하기 전의 실패나 정리를 증명하지 못한 경우에는 `launching`/`failed` 상태의 bound handle을 보존하며, 명시적 `close-session --explicit`도 해당 adapter의 소유권·부재 검증을 통과해야 합니다. 비활성화된 Ghostty adapter 코드는 terminal·tab·window ID 복합체와 live owner 검증 경계를 유지하지만 v0.0.8에서는 선택될 수 없습니다. Windows 입력과 close는 console root와 `native-session` owner 각각의 PID 생성 시각·실행 파일 identity를 검증하고, console root의 검증된 process handle을 `AttachConsole`과 control이 끝날 때까지 유지해 PID 재사용을 fail-closed합니다. suspended console의 identity-bound handle은 private state에 내구성 있게 기록한 뒤에만 실행을 재개합니다. Windows Codex adapter는 정확한 canonical workspace를 provider process의 inherited current directory로 유지하고, verbatim 경로를 거부하는 Codex에는 의미가 달라질 수 있는 정규화 경로를 `-C`로 다시 전달하지 않습니다. 호출 당시 터미널을 재감지하거나 복원된 front/current/selected surface를 채택하지 않습니다.
+- Agent Bridge는 같은 `ask` 작업에서 새로 만든 surface만 기록합니다. 새 handle은 managed session ID와 host가 제공하는 stable ID를 결합하며 `tell`과 `close-session` 직전에 다시 검증합니다. 지원되는 macOS iTerm2·Terminal.app 경로는 target `native-session` owner의 managed session ID·PID·controlling TTY device·process start fingerprint·foreground process group과 전용 login shell identity를 검증하고, surface가 보고하는 TTY도 owner와 일치해야 합니다. 시작 명령을 보내기 전에 handle을 내구성 있게 기록하고, 시작 실패 시 전체 timeout 안에 예약한 정리 구간에서 소유권과 정리 가능 여부를 검증합니다. 정확한 surface의 종료 또는 부재가 증명된 경우에만 handle을 제거합니다. 소유권을 기록하기 전의 실패나 정리를 증명하지 못한 경우에는 `launching`/`failed` 상태의 bound handle을 보존하며, 명시적 `close-session --explicit`도 해당 adapter의 소유권·부재 검증을 통과해야 합니다. Ghostty는 terminal·tab·window ID 복합체, 실제 surface 준비 상태와 live owner를 확인합니다. Windows 입력과 close는 console root와 `native-session` owner 각각의 PID 생성 시각·실행 파일 identity를 검증하고, console root의 검증된 process handle을 `AttachConsole`과 control이 끝날 때까지 유지해 PID 재사용을 fail-closed합니다. suspended console의 identity-bound handle은 private state에 내구성 있게 기록한 뒤에만 실행을 재개합니다. Windows Codex adapter는 정확한 canonical workspace를 provider process의 inherited current directory로 유지하고, verbatim 경로를 거부하는 Codex에는 의미가 달라질 수 있는 정규화 경로를 `-C`로 다시 전달하지 않습니다. 호출 당시 터미널을 재감지하거나 복원된 front/current/selected surface를 채택하지 않습니다.
 - 새 세션의 `--model`, `--effort`, `--yolo`는 부모 CLI에서 추측하거나 상속하지 않습니다. 해당 `ask` 요청에 명시된 값만 사용합니다.
 - `reopen`은 원본 세션을 읽기 전용으로 검사하고, 원본의 turn-claim lock 아래에서 marker 하나만 기록해 동시 reopen 중 정확히 하나만 허용합니다. 원본의 tombstone·event·request는 바꾸지 않으며 원본 terminal handle을 재사용하지 않습니다. 새 세션의 launch 실패는 새 세션만 `failed`로 표시합니다. `reopen-conflict`와 `reopen-verification-failed`는 거기에 더해 새 surface만 `close-session`과 같은 경로로 닫고, 원본은 tombstone을 그대로 유지합니다. 새 세션이 만들어진 뒤 marker를 다시 풀어 주는 것은 launch 단계 gate 거부뿐이며, 그 세 지점은 spawn 직전 재검사, launch 뒤 등록 직후 검사, 첫 프롬프트 직전 검사이고 gate 이름은 `provider-unsupported`·`reopen-conflict`·`reopen-verification-failed`입니다. 대화에 아무것도 전달되지 않았기 때문입니다. 이후 `tell`의 거부와 일반적인 launch·전달 실패는 marker를 풀지 않습니다. 레지스트리 소유권 검사는 claim 전, spawn 직전, launch 뒤 등록 직후, 첫 프롬프트 직전, 매 `tell` 직전에 돌지만 provider가 대화의 배타적 점유를 제공하지 않으므로 동시 resume은 감지 대상이지 예방 대상이 아닙니다. 파싱되지 않거나 identity가 파일과 맞지 않는 레지스트리 기록은 파일 이름 PID가 죽어 있을 때만 무시합니다(fail-closed). 닫힌 원본 디렉터리로 늦게 도착한 hook은 아무것도 기록하지 않고, 이전 marker를 든 hook은 새 세션의 요청을 완료시키지 않습니다. `~/.claude/sessions` 옆의 `.key` 파일은 읽지 않습니다.
 - `--yolo`는 Codex의 `--dangerously-bypass-approvals-and-sandbox`, Claude와 Agy의 `--dangerously-skip-permissions`를 전달합니다. Pi에서는 해당 실행의 project-local files를 신뢰하는 `--approve`를 전달하며 Pi 자체 tool 정책은 유지합니다.
@@ -527,7 +529,7 @@ src/providers/                 공통 provider 정책: 명령, 버전, model/eff
 src/native/provider/          provider별 실행, follow-up transport, 완료 monitor 선택
 src/native/provider_process.rs provider process 실행과 Windows shim 경계
 src/native/terminal/mod.rs     공통 terminal kind, session record, OS dispatch
-src/native/terminal/macos/     iTerm2, Terminal.app, Ghostty adapter
+src/native/terminal/macos/     iTerm2, Terminal.app, Ghostty, WezTerm, Warp adapter
 src/native/terminal/linux/     Linux transport 경계(현재 미지원)
 src/native/terminal/windows/   Windows console transport, process identity, ACL/security
 src/native.rs                  세션 상태, lifecycle, 명령 및 provider-neutral orchestration
@@ -545,6 +547,10 @@ src/native/tests.rs            provider-neutral native orchestration 단위 테�
 이 영수증은 trust **절차의 종료**만 뜻합니다. 사용자가 신뢰를 거절해도 Pi는 보호된 리소스를 제외하고 시작할 수 있으므로, 영수증을 다른 provider의 승인 근거로 쓰지 않습니다. Bridge는 `project_trust`의 결정을 반환하거나 Pi trust store를 수정하지 않습니다. 명시적 `--yolo`의 기존 Pi `--approve` 매핑은 그대로 적용됩니다.
 
 Pi의 초기 입력 보호는 0.0.8부터 포함됩니다. 공용 consent 기록, provider 간 trust 공유, Codex·Agy의 Windows 초기 입력 보호는 0.0.9에 포함됩니다. macOS는 기존 인자 전달 경로를 사용합니다. native Windows에서는 Agy와 Codex의 공유 consent를 0.0.9에서, Pi의 공유 consent와 초기 입력 보호를 0.0.10에서 LIVE로 확인했습니다. Claude는 미검증입니다.
+
+## 0.1.0 업데이트
+
+macOS의 `--terminal` 선택과 `macos-open-mode` 설정, WezTerm 지원과 Ghostty 복구를 추가합니다. 시작 중 입력이 launch 명령에 붙던 문제(#58), Terminal.app 빈 창 재등장(#64), owner 종료 후 내부 대기 지연(#69)을 수정했습니다. 변경 내용과 남은 검증 범위는 [0.1.0 릴리스 노트](docs/releases/0.1.0.md)를 참고하세요.
 
 ## 0.0.10 업데이트
 
@@ -768,7 +774,7 @@ Bridge는 credential을 읽거나 복사하거나 갱신하지 않습니다. MCP
 
 이제 iTerm2와 Terminal.app은 관리 세션을 만들 때 앱을 앞으로 가져오지 않습니다. 키보드 포커스를 가지고 있던 tab(iTerm2) 또는 window(Terminal.app)를 새 것을 만든 직후 다시 선택합니다. 그 사이에 사용자가 다른 tab·window를 고르면 그 선택을 유지합니다. `ask`, 선택되지 않은 tab이나 뒤에 있는 window로의 `tell`, `close-session`은 이전과 같이 동작합니다.
 
-두 터미널 모두 선택하지 않고 tab·window를 만드는 방법이 없어, 새 것은 잠깐 키보드 포커스를 가집니다. 실측에서 iTerm2는 243~450 ms, Terminal.app은 397~519 ms였고 부하가 있으면 더 길어집니다. 그 사이에 입력한 키는 여전히 관리 세션으로 들어갑니다. 다른 앱이 앞에 있을 때 터미널 앱이 뒤에 머무는지는 화면이 잠긴 상태에서 측정해 NOT-VERIFIED입니다. 현재 개발 소스의 Ghostty는 새 surface를 만드는 동안 앱이 전경으로 이동할 수 있으며 이전 tab 선택만 복원합니다. 다른 앱으로 전경을 복원하지 않는 제한과 관찰 범위는 위 Ghostty 지원 설명을 따릅니다. Windows의 동작은 다음 절에서 설명합니다.
+두 터미널 모두 선택하지 않고 tab·window를 만드는 방법이 없어, 새 것은 잠깐 키보드 포커스를 가집니다. 실측에서 iTerm2는 243~450 ms, Terminal.app은 397~519 ms였고 부하가 있으면 더 길어집니다. 그 사이에 입력한 키는 여전히 관리 세션으로 들어갑니다. 다른 앱이 앞에 있을 때 터미널 앱이 뒤에 머무는지는 화면이 잠긴 상태에서 측정해 NOT-VERIFIED입니다. 이 절은 0.0.9 당시의 기록입니다. 0.1.0에서 추가한 시작 입력 보호와 앱·tab 복원은 [최신 포커스 검사 기록](docs/verification/2026-10-03-v0.1.0-focus.md)을 따릅니다. Windows의 동작은 다음 절에서 설명합니다.
 
 ### Windows Terminal tab과 Windows의 키보드 포커스 (#58)
 

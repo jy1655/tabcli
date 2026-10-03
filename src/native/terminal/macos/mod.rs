@@ -20,7 +20,7 @@ pub(super) use screen::{guarded_dialog_input, read_screen};
 pub(in crate::native) mod ghostty;
 pub(in crate::native) mod iterm2;
 pub(in crate::native) mod warp;
-mod wezterm;
+pub(in crate::native) mod wezterm;
 
 pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     let term_program = env::var("TERM_PROGRAM").ok();
@@ -69,7 +69,7 @@ where
         .filter(|candidate| *candidate > Instant::now())
         .context("terminal startup timeout leaves no room for exact surface cleanup")?;
     let mut session = match kind {
-        TerminalKind::Iterm2 => iterm2::create_tab(mode, startup_deadline),
+        TerminalKind::Iterm2 => iterm2::create_tab(mode, command, directory, startup_deadline),
         TerminalKind::AppleTerminal => {
             if !force_new_window {
                 // Terminal.sdef exposes the tabs collection read-only. `do script in`
@@ -79,13 +79,17 @@ where
                     "Terminal.app tab-first: its native scripting interface has no new-tab creation command; opening a new owned window"
                 );
             }
-            apple_terminal::create_tab(startup_deadline)
+            apple_terminal::create_tab(command, directory, startup_deadline)
         }
         TerminalKind::Ghostty => ghostty::create_tab_with_mode(force_new_window, startup_deadline),
         TerminalKind::Warp => unreachable!(),
-        TerminalKind::WezTerm => {
-            wezterm::create_tab_with_mode(&wezterm::Installed, force_new_window, startup_deadline)
-        }
+        TerminalKind::WezTerm => wezterm::create_surface(
+            &wezterm::Installed,
+            force_new_window,
+            command,
+            directory,
+            startup_deadline,
+        ),
         TerminalKind::WindowsConsole => bail!("Windows Console is only available on Windows"),
     }?;
     let start_session = session.clone();
@@ -94,22 +98,18 @@ where
         &mut session,
         bind,
         || match start_session.kind {
-            TerminalKind::Iterm2 => {
-                iterm2::start_session(&start_session, command, startup_deadline)
-            }
-            TerminalKind::AppleTerminal => {
-                apple_terminal::start_session(&start_session, command, startup_deadline)
-            }
+            // The creation command waits for the atomic binding above before it
+            // starts the wrapper. No shell command is typed into the new tab.
+            TerminalKind::Iterm2 => Ok(()),
+            // Terminal.app typed its start when it created the tab, and the start
+            // waits for the same binding. Nothing is typed after the creation.
+            TerminalKind::AppleTerminal => Ok(()),
             TerminalKind::Ghostty => {
                 ghostty::start_session(&start_session, command, directory, startup_deadline)
             }
             TerminalKind::Warp => unreachable!(),
-            TerminalKind::WezTerm => wezterm::start_session(
-                &wezterm::Installed,
-                &start_session,
-                command,
-                startup_deadline,
-            ),
+            // The program of the pane waits for the binding above; nothing is typed.
+            TerminalKind::WezTerm => Ok(()),
             TerminalKind::WindowsConsole => unreachable!(),
         },
         || {

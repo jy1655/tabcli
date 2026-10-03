@@ -1,9 +1,9 @@
 // WezTerm through its official CLI (pinned source: 20240203-110809-5046fc22).
 // Default: discover protected gui-sock-<pid> sockets in the macOS runtime directory,
 // verify the socket peer, installed GUI executable and process birth, then use a
-// unique existing window. `cli spawn --window-id ID --domain-name local` returns the
-// new pane ID; that response, a pre-spawn snapshot and a post-spawn identity check
-// prove the new tab. Neither inherited WEZTERM_* nor the invoking terminal selects it.
+// unique existing window. `cli spawn --window-id ID --domain-name local -- PROGRAM`
+// returns the new pane ID; that response, a pre-spawn snapshot and a post-spawn identity
+// check prove the new tab. Neither inherited WEZTERM_* nor the invoking terminal selects it.
 // The built-in local domain is installed before configured domains, which skip an
 // existing name (wezterm-gui/src/main.rs; wezterm-mux-server-impl/src/lib.rs).
 // No safe unique window/capability: open a private `start --always-new-process` GUI
@@ -13,9 +13,14 @@
 // Shared GUIs are only addressed with kill-pane; their process and socket are never
 // removed, even after their last pane disappears. A private GUI can end only when
 // no sibling panes remain. Settings are not consulted during cleanup.
-// CLI send-text --no-paste writes to the exact pane's pty. Completion of kill-pane
+// The launch command is the program of the pane and never typed input: WezTerm executes
+// the arguments itself, and their first command (`run_host`) holds the wrapper back until
+// the launcher has bound exactly this pane.
+// CLI send-text --no-paste writes a prompt to the exact pane's pty. Completion of kill-pane
 // is checked by listing; failed reads are not absence. CLI has no atomic screen/key
-// operation or documented create-without-focus operation; neither is claimed here.
+// operation and no create-without-focus operation: a new tab is the active tab of its
+// window, and the pane that had the keyboard is selected again only on the GUI's own
+// evidence (`give_keyboard_back`). A private GUI holds nothing of the user to select.
 
 use std::{
     collections::BTreeSet,
@@ -42,11 +47,15 @@ use serde::Deserialize;
 
 use super::super::WezTermMux;
 use super::{CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession};
-use crate::native::CommandOutputFailure;
+use crate::native::{CommandOutputFailure, shell_quote};
 
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(100);
+// How long the GUI may take to paint a new tab and record its pane as focused. A window in
+// the background never does, so a tab opened there waits this long. Not measured live: one
+// frame is 16 ms at the default `max_fps`.
+const KEYBOARD_SETTLE: Duration = Duration::from_millis(300);
 // How long a process without panes may take to end by itself.
 const EXIT_GRACE: Duration = if cfg!(test) {
     Duration::from_millis(200)
@@ -60,8 +69,8 @@ pub(super) trait Host {
     fn discover_guis(&self) -> Result<Vec<WezTermMux>> {
         Ok(Vec::new())
     }
-    // Starts a WezTerm GUI process for one session.
-    fn start_gui(&self) -> Result<WezTermMux>;
+    // Starts a WezTerm GUI process for one session; its only pane runs `program`.
+    fn start_gui(&self, program: &[String]) -> Result<WezTermMux>;
     // The process that serves a socket, `None` when nothing listens there.
     fn socket_server(&self, socket: &str) -> Result<Option<u32>>;
     // The birth of a process, `None` when there is no such process.
@@ -100,10 +109,12 @@ fn wezterm_command(inherited: impl Iterator<Item = OsString>) -> Command {
 }
 
 // `--no-auto-connect`: the process attaches to no mux domain of the user's configuration,
-// so it holds no pane but the one it opens.
-fn gui_command(inherited: impl Iterator<Item = OsString>) -> Command {
+// so it holds no pane but the one it opens, which runs `program`.
+fn gui_command(inherited: impl Iterator<Item = OsString>, program: &[String]) -> Command {
     let mut command = wezterm_command(inherited);
-    command.args(["start", "--always-new-process", "--no-auto-connect"]);
+    command
+        .args(["start", "--always-new-process", "--no-auto-connect", "--"])
+        .args(program);
     command
 }
 
@@ -157,9 +168,9 @@ impl Host for Installed {
         Ok(guis)
     }
 
-    fn start_gui(&self) -> Result<WezTermMux> {
+    fn start_gui(&self, program: &[String]) -> Result<WezTermMux> {
         let home = env::var("HOME").context("HOME is not set to a UTF-8 path")?;
-        let mut command = gui_command(env::vars_os().map(|(name, _)| name));
+        let mut command = gui_command(env::vars_os().map(|(name, _)| name), program);
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -472,6 +483,82 @@ fn forget_socket(host: &dyn Host, mux: &WezTermMux) {
     }
 }
 
+// The fields of `CliListClientsResultItem` (wezterm/src/cli/list_clients.rs) that say which
+// pane a client has focused. The source declares that struct a stable output format too.
+#[derive(Deserialize)]
+struct Client {
+    pid: u32,
+    focused_pane_id: Option<u64>,
+}
+
+// The pane that the GUI reports as focused, `None` unless exactly its own client says so.
+// The GUI records a pane when it paints it while its window has the keyboard
+// (wezterm-gui/src/termwindow/render/paint.rs). The record of a window in the background
+// is old: it follows neither a new tab nor a tab that another CLI call selected.
+fn keyboard_pane(host: &dyn Host, mux: &WezTermMux, deadline: Instant) -> Option<u64> {
+    let clients = call(
+        host,
+        mux,
+        &["list-clients", "--format", "json"],
+        None,
+        deadline,
+    )
+    .ok()?;
+    let clients: Vec<Client> = serde_json::from_str(&clients).ok()?;
+    let mut gui = clients.iter().filter(|client| client.pid == mux.pid);
+    match (gui.next(), gui.next()) {
+        (Some(client), None) => client.focused_pane_id,
+        _ => None,
+    }
+}
+
+// A new tab is the active tab of its window (mux/src/lib.rs, `spawn_tab_or_window`), and
+// the CLI cannot create one unselected, so in a focused window the keys of the user go to
+// the session's pane (issue #58). The pane that had the keyboard right before the spawn is
+// selected again, on the GUI's own word only: it must report the new pane as focused, which
+// it does only for a window that has the keyboard. Everything else is no authority: a
+// record that stayed (a window in the background, whose selected tab the CLI cannot
+// tell), a pane the user chose meanwhile, a pane that the listing after the spawn no
+// longer shows in its tab and window, a failed read. The selection follows the GUI's
+// answer with no call in between, and nothing here fails the launch.
+fn give_keyboard_back(
+    host: &dyn Host,
+    mux: &WezTermMux,
+    previous: Option<&Pane>,
+    created: &Pane,
+    after: &[Pane],
+    deadline: Instant,
+) {
+    let Some(previous) = previous else {
+        return;
+    };
+    let mut same = after.iter().filter(|pane| pane.pane_id == previous.pane_id);
+    if !matches!(
+        (same.next(), same.next()),
+        (Some(pane), None)
+            if pane.tab_id == previous.tab_id && pane.window_id == previous.window_id
+    ) {
+        return;
+    }
+    let settled = Instant::now() + KEYBOARD_SETTLE;
+    loop {
+        match keyboard_pane(host, mux, deadline) {
+            Some(pane) if pane == created.pane_id => break,
+            Some(pane) if pane == previous.pane_id && Instant::now() < settled => {
+                thread::sleep(POLL)
+            }
+            _ => return,
+        }
+    }
+    let _ = call(
+        host,
+        mux,
+        &["activate-pane", "--pane-id", &previous.pane_id.to_string()],
+        None,
+        deadline,
+    );
+}
+
 // Writes bytes to the pane's pty, as typed input.
 fn write(
     host: &dyn Host,
@@ -559,8 +646,12 @@ fn end_unbound_process(host: &dyn Host, mux: &WezTermMux) -> Result<()> {
     }
 }
 
-fn create_private_gui(host: &dyn Host, deadline: Instant) -> Result<TerminalSession> {
-    let mux = host.start_gui()?;
+fn create_private_gui(
+    host: &dyn Host,
+    program: &[String],
+    deadline: Instant,
+) -> Result<TerminalSession> {
+    let mux = host.start_gui(program)?;
     match startup_pane(host, &mux, deadline) {
         Ok(pane) => Ok(TerminalSession {
             kind: TerminalKind::WezTerm,
@@ -616,42 +707,81 @@ fn existing_window(host: &dyn Host, deadline: Instant) -> Result<(WezTermMux, Ve
     Ok(target)
 }
 
-#[cfg(test)]
-pub(super) fn create_tab(host: &dyn Host, deadline: Instant) -> Result<TerminalSession> {
-    create_tab_with_mode(host, false, deadline)
+// The program of the session's pane. WezTerm executes these arguments itself (`cli spawn
+// -- PROG`, `start -- PROG`), so no line that the user can type into carries the launch
+// command: a key typed in front of the typed command made it `a. '/…/launch.sh'`, and the
+// provider never started (issue #58, human test of 2026-10-03). A login, interactive zsh
+// keeps the user's PATH and runs the gate and the wrapper as foreground jobs of the shell
+// that sources the launch script, which the owner record of the wrapper requires.
+fn pane_program(gate: &str, command: &str) -> [String; 5] {
+    [
+        "/bin/zsh",
+        "-l",
+        "-i",
+        "-c",
+        &format!("{gate} || exit; {command}"),
+    ]
+    .map(str::to_owned)
 }
 
-pub(super) fn create_tab_with_mode(
+pub(super) fn create_surface(
     host: &dyn Host,
     force_new_window: bool,
+    command: &str,
+    directory: &Path,
+    deadline: Instant,
+) -> Result<TerminalSession> {
+    let executable = env::current_exe().context("failed to resolve Agent Bridge executable")?;
+    let gate = format!(
+        "{} native-wezterm-host {}",
+        shell_quote(executable.as_os_str()),
+        shell_quote(directory.as_os_str())
+    );
+    create(
+        host,
+        force_new_window,
+        &pane_program(&gate, command),
+        deadline,
+    )
+}
+
+fn create(
+    host: &dyn Host,
+    force_new_window: bool,
+    program: &[String],
     deadline: Instant,
 ) -> Result<TerminalSession> {
     if force_new_window {
-        return create_private_gui(host, deadline);
+        return create_private_gui(host, program, deadline);
     }
     let (mux, snapshot, window) = match existing_window(host, deadline) {
         Ok(target) => target,
         Err(reason) => {
             eprintln!("WezTerm tab-first: {reason:#}; opening a new private GUI window");
-            return create_private_gui(host, deadline)
+            return create_private_gui(host, program, deadline)
                 .with_context(|| format!("WezTerm new-window fallback after: {reason:#}"));
         }
     };
+    // Read last: the user can select another tab until the spawn.
+    let keyboard = keyboard_pane(host, &mux, deadline).and_then(|id| {
+        snapshot
+            .iter()
+            .find(|pane| pane.pane_id == id && pane.window_id == window)
+            .cloned()
+    });
     // The CLI's exact SpawnResponse pane id is mandatory; a list delta alone is
     // never ownership. Its --domain-name overrides the user's default domain.
-    let returned = call(
-        host,
-        &mux,
-        &[
-            "spawn",
-            "--window-id",
-            &window.to_string(),
-            "--domain-name",
-            "local",
-        ],
-        None,
-        deadline,
-    );
+    let window_id = window.to_string();
+    let mut arguments = vec![
+        "spawn",
+        "--window-id",
+        &window_id,
+        "--domain-name",
+        "local",
+        "--",
+    ];
+    arguments.extend(program.iter().map(String::as_str));
+    let returned = call(host, &mux, &arguments, None, deadline);
     let evidence = || {
         serde_json::json!({
             "gui": mux, "requested_window_id": window,
@@ -677,7 +807,7 @@ pub(super) fn create_tab_with_mode(
             );
         }
     };
-    let validated = (|| -> Result<Pane> {
+    let validated = (|| -> Result<(Pane, Vec<Pane>)> {
         let id = reply.trim();
         if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
             bail!("spawn response is not exactly one pane id");
@@ -698,11 +828,12 @@ pub(super) fn create_tab_with_mode(
             bail!("spawn pane has no safe local tty");
         }
         require_serving(host, &mux)?;
-        Ok((*pane).clone())
+        Ok(((*pane).clone(), after))
     })();
-    let pane = validated.with_context(|| format!(
+    let (pane, after) = validated.with_context(|| format!(
         "WezTerm tab creation is uncertain; spawn reply={reply:?}; creation evidence={}; no retry, fallback or pane cleanup was attempted", evidence()
     ))?;
+    give_keyboard_back(host, &mux, keyboard.as_ref(), &pane, &after, deadline);
     Ok(TerminalSession {
         kind: TerminalKind::WezTerm,
         id: pane.pane_id.to_string(),
@@ -749,17 +880,88 @@ fn require_shared_pane(
     Ok(())
 }
 
-pub(super) fn start_session(
-    host: &dyn Host,
-    session: &TerminalSession,
-    command: &str,
-    deadline: Instant,
-) -> Result<()> {
-    let (mux, pane) = target(session)?;
-    require_serving(host, mux)?;
-    require_shared_pane(host, session, deadline)?;
-    write(host, mux, pane, format!("{command}\r").as_bytes(), deadline)
-        .map_err(CommandOutputFailure::into_error)
+// The first command of the session's pane (`pane_program`). The pane exists before the
+// launcher knows its id, so the wrapper may start only once the launcher has bound exactly
+// this pane: the handle must name the pane and the GUI socket that the mux itself gave this
+// process (`WEZTERM_PANE`, `WEZTERM_UNIX_SOCKET`; mux/src/domain.rs, `build_command`, set
+// after the user's configured environment). It waits on the receipt, the claim and the
+// status that every launch has and keeps no record of its own. A launch that failed or
+// timed out never falls back to typed input.
+pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(directory)
+        .with_context(|| format!("no WezTerm launch directory {}", directory.display()))?;
+    if !directory.is_absolute()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        bail!("WezTerm launch directory is not private to the current user");
+    }
+    let id = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("invalid WezTerm launch directory")?;
+    crate::native::require_valid_session_id(id)?;
+    let started = (|| -> Result<()> {
+        let pane =
+            env::var("WEZTERM_PANE").context("WezTerm did not name the pane of this host")?;
+        let socket = env::var_os("WEZTERM_UNIX_SOCKET")
+            .context("WezTerm did not name the GUI of this host")?;
+        wait_for_binding(directory, id, &pane, Path::new(&socket))?;
+        // Keys that arrived while the creation had selected this pane must not answer the
+        // provider's first dialog. This discards the input of this process's own pty only.
+        if unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("cannot discard WezTerm startup input");
+        }
+        Ok(())
+    })();
+    // The pane ends with this process and takes the message with it.
+    if let Err(error) = &started {
+        crate::native::launch::log(directory, &format!("wezterm_host_refused: {error:#}"));
+    }
+    started
+}
+
+fn wait_for_binding(directory: &Path, id: &str, pane: &str, socket: &Path) -> Result<()> {
+    use crate::native::{
+        SessionStatus, TERMINAL_HANDLE_FILE, current_turn_claim_token, launch, read_json,
+        read_regular_text_if_present, unix_ms,
+    };
+    let initial = launch::read(directory)?.context("missing WezTerm launch receipt")?;
+    let remaining = initial
+        .deadline_unix_ms
+        .saturating_sub(unix_ms())
+        .min(30_000);
+    let deadline = Instant::now() + Duration::from_millis(remaining as u64);
+    loop {
+        let record = launch::read(directory)?.context("missing WezTerm launch receipt")?;
+        let status: SessionStatus = read_json(&directory.join("status.json"))?;
+        if Instant::now() >= deadline
+            || unix_ms() >= record.deadline_unix_ms
+            || record.phase != launch::Phase::Pending
+            || record.claim_token != initial.claim_token
+            || status.state != "launching"
+            || current_turn_claim_token(directory)?.as_deref() != Some(initial.claim_token.as_str())
+        {
+            bail!("WezTerm launch was cancelled or timed out before surface binding");
+        }
+        if let Some(text) = read_regular_text_if_present(&directory.join(TERMINAL_HANDLE_FILE))? {
+            let surface: TerminalSession =
+                serde_json::from_str(&text).context("invalid WezTerm surface binding")?;
+            surface.verify_managed_session(id)?;
+            if surface.kind != TerminalKind::WezTerm
+                || surface.id != pane
+                || surface
+                    .wezterm_mux
+                    .is_none_or(|mux| Path::new(&mux.socket) != socket)
+            {
+                bail!("WezTerm surface binding does not name the pane of this launch host");
+            }
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 // The prompt and its Enter are one write to the pty. Only a call that never started is
@@ -933,13 +1135,38 @@ pub(super) fn close_session_until(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, os::unix::process::ExitStatusExt, process::ExitStatus};
+    use std::{
+        cell::RefCell, os::unix::process::ExitStatusExt, path::PathBuf, process::ExitStatus,
+    };
 
     use super::*;
 
     const SOCKET: &str = "/Users/tester/.local/share/wezterm/gui-sock-4242";
     const PID: u32 = 4242;
     const BIRTH: (u64, u64) = (1_790_000_000, 123_456);
+
+    // The program of a pane in these tests: a gate and a launch command, as in a launch.
+    fn program() -> [String; 5] {
+        pane_program("gate", ". '/tmp/s/launch.sh'")
+    }
+
+    fn create_tab(host: &Fake, deadline: Instant) -> Result<TerminalSession> {
+        create(host, false, &program(), deadline)
+    }
+
+    // One element of `wezterm cli list-clients --format json`: every field of
+    // `CliListClientsResultItem`.
+    fn client(pid: u32, focused: Option<u64>) -> serde_json::Value {
+        serde_json::json!({
+            "username": "tester",
+            "hostname": "host",
+            "pid": pid,
+            "connection_elapsed": {"secs": 9, "nanos": 0},
+            "idle_time": {"secs": 1, "nanos": 0},
+            "workspace": "default",
+            "focused_pane_id": focused,
+        })
+    }
 
     // One element of `wezterm cli list --format json`: every field of `CliListResultItem`.
     fn item(pane: u64, tty: bool) -> serde_json::Value {
@@ -1008,6 +1235,24 @@ mod tests {
         refused: Vec<&'static str>,
         answer_lost: Vec<&'static str>,
         calls: Vec<(String, Vec<String>, Option<Vec<u8>>)>,
+        // The program that the process was started with, and the one of the spawned tab.
+        gui_program: Option<Vec<String>>,
+        spawn_program: Option<Vec<String>>,
+        // The pane that the window presents: a spawn and `activate-pane` select it in any
+        // window (mux/src/lib.rs, `spawn_tab_or_window`; `SetFocusedPane`).
+        active: Option<u64>,
+        // Whether the window of the GUI has the keyboard, and the pane that the GUI's own
+        // client reports as focused: the one it painted last while its window had the
+        // keyboard (wezterm-gui/src/termwindow/render/paint.rs). The record follows the
+        // presented pane only in a focused window.
+        window_focused: bool,
+        focused: Option<u64>,
+        // How many `list-clients` answers after a spawn still show the old record, because
+        // the GUI has not painted the new tab yet.
+        paints_after: usize,
+        painting: Option<(u64, usize)>,
+        // What `list-clients` answers after a spawn, instead of the record.
+        after_spawn_clients: Option<String>,
     }
 
     struct Fake(RefCell<Mux>);
@@ -1059,12 +1304,13 @@ mod tests {
             }
             Ok(found)
         }
-        fn start_gui(&self) -> Result<WezTermMux> {
+        fn start_gui(&self, program: &[String]) -> Result<WezTermMux> {
             let mut mux = self.0.borrow_mut();
             if mux.start_fails {
                 bail!("failed to start WezTerm");
             }
             mux.started += 1;
+            mux.gui_program = Some(program.to_vec());
             mux.birth = Some(BIRTH);
             mux.panes = mux.startup_panes.clone();
             Ok(WezTermMux {
@@ -1154,12 +1400,22 @@ mod tests {
                 ),
                 "spawn" => {
                     assert_eq!(arguments[1], "--window-id");
-                    assert_eq!(&arguments[3..], ["--domain-name", "local"]);
+                    assert_eq!(&arguments[3..6], ["--domain-name", "local", "--"]);
+                    mux.spawn_program =
+                        Some(arguments[6..].iter().map(|a| (*a).to_owned()).collect());
                     let window = arguments[2].parse::<u64>().unwrap();
                     let id = mux.panes.iter().max().copied().unwrap_or(0) + 1;
                     mux.panes.push(id);
                     mux.pane_windows.insert(id, window);
                     mux.spawn_count += 1;
+                    mux.active = Some(id);
+                    if mux.window_focused {
+                        if mux.paints_after == 0 {
+                            mux.focused = Some(id);
+                        } else {
+                            mux.painting = Some((id, mux.paints_after));
+                        }
+                    }
                     if mux.reuse_after_spawn {
                         mux.birth = Some((BIRTH.0 + 1, 0));
                     }
@@ -1205,6 +1461,35 @@ mod tests {
                             })
                             .collect();
                         output(0, &serde_json::to_string_pretty(&listing).unwrap(), "")
+                    }
+                }
+                "list-clients" => {
+                    assert_eq!(arguments, ["list-clients", "--format", "json"]);
+                    if mux.spawn_count > 0 && mux.after_spawn_clients.is_some() {
+                        return Ok(output(0, mux.after_spawn_clients.as_deref().unwrap(), ""));
+                    }
+                    match mux.painting.take() {
+                        Some((pane, 0)) => mux.focused = Some(pane),
+                        Some((pane, answers)) => mux.painting = Some((pane, answers - 1)),
+                        None => {}
+                    }
+                    // The GUI, and another client of its mux that is not the GUI.
+                    let clients =
+                        serde_json::json!([client(PID, mux.focused), client(99_999, None)]);
+                    output(0, &serde_json::to_string_pretty(&clients).unwrap(), "")
+                }
+                "activate-pane" => {
+                    assert_eq!(arguments.len(), 3);
+                    let id = pane.expect("a call for one pane names it");
+                    if !mux.panes.contains(&id) {
+                        output(1, "", &format!("pane {id} not found"))
+                    } else {
+                        mux.active = Some(id);
+                        if mux.window_focused {
+                            mux.painting = None;
+                            mux.focused = Some(id);
+                        }
+                        output(0, "", "")
                     }
                 }
                 "kill-pane" | "send-text" | "get-text" => {
@@ -1456,7 +1741,7 @@ mod tests {
     #[test]
     fn explicit_opening_mode_records_scope_without_a_later_policy_read() {
         let host = existing();
-        let shared = create_tab_with_mode(&host, false, soon()).unwrap();
+        let shared = create(&host, false, &program(), soon()).unwrap();
         let persisted = serde_json::to_string(&shared).unwrap();
         let shared: TerminalSession = serde_json::from_str(&persisted).unwrap();
         // No current settings field is passed to close: the saved creation scope wins.
@@ -1466,7 +1751,7 @@ mod tests {
         assert_eq!(host.0.borrow().birth, Some(BIRTH));
         assert!(host.0.borrow().terminated.is_empty());
         let host = existing();
-        let private = create_tab_with_mode(&host, true, soon()).unwrap();
+        let private = create(&host, true, &program(), soon()).unwrap();
         assert!(private.wezterm_mux.as_ref().unwrap().owns_gui);
         assert_eq!(host.0.borrow().started, 1);
         assert_eq!(host.0.borrow().spawn_count, 0);
@@ -1495,8 +1780,13 @@ mod tests {
             assert_eq!(selected, initial);
             let host = existing();
             host.0.borrow_mut().stays_without_panes = true;
-            let handle =
-                create_tab_with_mode(&host, selected == MacosOpenMode::NewWindow, soon()).unwrap();
+            let handle = create(
+                &host,
+                selected == MacosOpenMode::NewWindow,
+                &program(),
+                soon(),
+            )
+            .unwrap();
             let saved_handle = root.path().join("terminal.json");
             crate::native::write_json_atomic(&saved_handle, &handle).unwrap();
 
@@ -1531,7 +1821,7 @@ mod tests {
     fn reused_gui_birth_never_reports_a_successful_close() {
         for force_new_window in [false, true] {
             let host = existing();
-            let handle = create_tab_with_mode(&host, force_new_window, soon()).unwrap();
+            let handle = create(&host, force_new_window, &program(), soon()).unwrap();
             {
                 let mut mux = host.0.borrow_mut();
                 mux.birth = Some((BIRTH.0 + 60, 0));
@@ -1551,17 +1841,21 @@ mod tests {
 
     #[test]
     fn shared_handles_never_address_a_wrong_tab_window_or_unreadable_process() {
+        let prompt = tempfile::NamedTempFile::new().unwrap();
+        fs::write(prompt.path(), "prompt").unwrap();
         let host = existing();
         let mut handle = create_tab(&host, soon()).unwrap();
         host.0.borrow_mut().calls.clear();
         handle.window_id = Some("99".into());
-        assert!(start_session(&host, &handle, "command", shortly()).is_err());
+        let failure = send_file(&host, &handle, prompt.path(), shortly()).unwrap_err();
+        assert!(!failure.delivery_may_have_occurred());
+        assert!(read_screen(&host, &handle, shortly()).is_err());
         assert!(close_session_until(&host, &handle, shortly()).is_err());
         assert!(verify_session(&host, &handle, None).is_err());
         assert!(
             !commands(&host)
                 .iter()
-                .any(|c| c == "kill-pane" || c == "send-text")
+                .any(|c| c == "kill-pane" || c == "send-text" || c == "get-text")
         );
         host.0.borrow_mut().unreadable_process = true;
         assert!(close_session_until(&host, &handle, shortly()).is_err());
@@ -1619,7 +1913,9 @@ mod tests {
         let mux = host.0.borrow();
         assert_eq!(mux.started, 1);
         assert!(mux.terminated.is_empty());
-        // Nothing is created in the process afterwards: its own pane is the surface.
+        assert_eq!(mux.gui_program.as_deref(), Some(&program()[..]));
+        // Nothing is created or selected in the process afterwards: its own pane is the
+        // surface, and it holds no pane of the user.
         assert_eq!(commands(&host), ["list", "list", "list"]);
     }
 
@@ -1635,7 +1931,7 @@ mod tests {
             "TERM_PROGRAM",
         ];
         for command in [
-            gui_command(inherited.iter().map(OsString::from)),
+            gui_command(inherited.iter().map(OsString::from), &program()),
             wezterm_command(inherited.iter().map(OsString::from)),
         ] {
             let removed: Vec<_> = command
@@ -1655,12 +1951,23 @@ mod tests {
                 ]
             );
         }
-        // Never the request to an existing process, never a mux domain of the user.
-        let command = gui_command(std::iter::empty());
+        // Never the request to an existing process, never a mux domain of the user, and
+        // the program of the pane as arguments of its own.
+        let command = gui_command(std::iter::empty(), &program());
         let arguments: Vec<_> = command.get_args().collect();
         assert_eq!(
             arguments,
-            ["start", "--always-new-process", "--no-auto-connect"]
+            [
+                "start",
+                "--always-new-process",
+                "--no-auto-connect",
+                "--",
+                "/bin/zsh",
+                "-l",
+                "-i",
+                "-c",
+                "gate || exit; . '/tmp/s/launch.sh'"
+            ]
         );
         assert_eq!(
             gui_socket("/Users/tester", 4242),
@@ -1725,14 +2032,14 @@ mod tests {
             TerminalKind::WezTerm => create_tab(&host, soon()).unwrap(),
             other => panic!("explicit target dispatched to {other:?}"),
         };
-        let command = gui_command(env::vars_os().map(|(key, _)| key));
+        let command = gui_command(env::vars_os().map(|(key, _)| key), &program());
         assert!(matches!(
             command.get_program().to_str().unwrap(),
             "/Applications/WezTerm.app/Contents/MacOS/wezterm" | "wezterm"
         ));
         assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            ["start", "--always-new-process", "--no-auto-connect"]
+            command.get_args().take(4).collect::<Vec<_>>(),
+            ["start", "--always-new-process", "--no-auto-connect", "--"]
         );
         for (key, _) in
             env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("WEZTERM_"))
@@ -1746,7 +2053,6 @@ mod tests {
         let mux = handle.wezterm_mux.as_ref().unwrap();
         assert_eq!(mux.socket, SOCKET);
         assert_eq!(mux.pid, PID);
-        start_session(&host, &handle, ". '/owned/launch.sh'", soon()).unwrap();
         assert_eq!(
             close_session_until(&host, &handle, soon()).unwrap(),
             CloseOutcome::Closed
@@ -1757,7 +2063,6 @@ mod tests {
         let host = existing();
         let handle = create_tab(&host, soon()).unwrap();
         assert!(!handle.wezterm_mux.as_ref().unwrap().owns_gui);
-        start_session(&host, &handle, "owned command", soon()).unwrap();
         close_session_until(&host, &handle, soon()).unwrap();
         assert_eq!(host.0.borrow().panes, [7]);
         assert_eq!(host.0.borrow().birth, Some(BIRTH));
@@ -1824,19 +2129,504 @@ mod tests {
         );
     }
 
+    // Issue #58 with WezTerm in front. `cli spawn` makes the new tab the active one of its
+    // window (mux/src/lib.rs, `spawn_tab_or_window`), so in a focused window the keys go to
+    // the new pane until the pane that had the keyboard is selected again.
     #[test]
-    fn the_launch_command_is_typed_into_the_pane_of_the_session() {
-        let host = fake();
-        let session = session(&host);
+    fn a_new_tab_gives_the_keyboard_back_to_the_pane_that_had_it() {
+        // In the second run the GUI paints the new tab two answers later.
+        for paints_after in [0, 2] {
+            let host = existing();
+            {
+                let mut mux = host.0.borrow_mut();
+                mux.window_focused = true;
+                mux.focused = Some(7);
+                mux.paints_after = paints_after;
+            }
+            let handle = create_tab(&host, soon()).unwrap();
+            assert_eq!(handle.id, "8");
+            assert_eq!(
+                host.0.borrow().focused,
+                Some(7),
+                "the new tab kept the keyboard"
+            );
+            let mux = host.0.borrow();
+            assert_eq!(mux.active, Some(7));
+            // The focus is read right before the spawn, and the pane is selected once.
+            let calls = commands(&host);
+            let spawn = calls.iter().rposition(|call| call == "spawn").unwrap();
+            assert_eq!(calls[spawn - 1], "list-clients");
+            assert_eq!(
+                mux.calls.last().unwrap().1,
+                ["activate-pane", "--pane-id", "7"]
+            );
+            assert_eq!(
+                calls.iter().filter(|call| *call == "activate-pane").count(),
+                1
+            );
+        }
+    }
 
-        start_session(&host, &session, ". '/tmp/s/launch.sh'", soon()).unwrap();
+    #[test]
+    fn the_keyboard_is_given_back_on_the_gui_s_own_evidence_only() {
+        type Arrange = fn(&mut Mux);
+        // What the GUI answers after the spawn when the fake's record is not used.
+        fn gui(focused: Option<u64>) -> Option<String> {
+            Some(serde_json::json!([client(PID, focused)]).to_string())
+        }
+        fn created() -> serde_json::Value {
+            let mut created = item(8, true);
+            created["window_id"] = serde_json::json!(7);
+            created
+        }
+        let cases: [(&str, Arrange); 10] = [
+            // Its record does not follow the new tab, and its selected tab is unknown.
+            ("a window in the background", |m| m.window_focused = false),
+            ("no pane was focused", |m| m.focused = None),
+            ("the focus was outside the window", |m| m.focused = Some(99)),
+            ("unreadable before the spawn", |m| {
+                m.refused.push("list-clients")
+            }),
+            ("unreadable after the spawn", |m| {
+                m.after_spawn_clients = Some("malformed".into())
+            }),
+            ("the user chose another pane", |m| {
+                m.panes.push(9);
+                m.pane_windows.insert(9, 7);
+                m.after_spawn_clients = gui(Some(9));
+            }),
+            ("no focus after the spawn", |m| {
+                m.after_spawn_clients = gui(None)
+            }),
+            ("two clients with the pid of the GUI", |m| {
+                m.after_spawn_clients = Some(
+                    serde_json::json!([client(PID, Some(8)), client(PID, Some(8))]).to_string(),
+                )
+            }),
+            ("the pane is gone", |m| {
+                m.after_spawn_listing = Some(serde_json::json!([created()]).to_string())
+            }),
+            ("the pane was moved to another window", |m| {
+                let mut moved = item(7, true);
+                moved["window_id"] = serde_json::json!(9);
+                m.after_spawn_listing = Some(serde_json::json!([moved, created()]).to_string())
+            }),
+        ];
+        for (name, arrange) in cases {
+            let host = existing();
+            {
+                let mut mux = host.0.borrow_mut();
+                mux.window_focused = true;
+                mux.focused = Some(7);
+                arrange(&mut mux);
+            }
+            let handle = create_tab(&host, soon()).expect(name);
+            assert!(!handle.wezterm_mux.unwrap().owns_gui, "{name}");
+            let calls = commands(&host);
+            assert!(!calls.contains(&"activate-pane".to_owned()), "{name}");
+            let mux = host.0.borrow();
+            assert_eq!(mux.spawn_count, 1, "{name}");
+            assert_eq!(mux.started, 0, "{name}");
+            if name == "a window in the background" {
+                // The window still presents the new tab; the launch waited for a record
+                // that never came and selected nothing.
+                assert_eq!((mux.active, mux.focused), (Some(8), Some(7)));
+                let asked = calls.iter().filter(|call| *call == "list-clients");
+                assert!(asked.count() >= 3, "{calls:?}");
+            }
+        }
+    }
 
+    #[test]
+    fn a_pane_that_cannot_be_selected_again_does_not_fail_the_launch() {
+        let host = existing();
+        {
+            let mut mux = host.0.borrow_mut();
+            mux.window_focused = true;
+            mux.focused = Some(7);
+            mux.refused.push("activate-pane");
+        }
+        let handle = create_tab(&host, soon()).unwrap();
+        assert_eq!(handle.id, "8");
+        assert_eq!(commands(&host).last().unwrap(), "activate-pane");
+        assert_eq!(host.0.borrow().active, Some(8));
+    }
+
+    // What `open_bound_tab` (macos/mod.rs) does with a WezTerm session.
+    fn launch(
+        host: &Fake,
+        force_new_window: bool,
+        command: &str,
+        directory: &Path,
+    ) -> TerminalSession {
+        create_surface(host, force_new_window, command, directory, soon()).unwrap()
+    }
+
+    // The launch command typed into the pane of the session, if it was typed.
+    fn typed(host: &Fake) -> Option<Vec<u8>> {
+        host.0
+            .borrow()
+            .calls
+            .iter()
+            .find(|(_, arguments, _)| arguments[0] == "send-text")
+            .map(|(_, _, input)| input.clone().unwrap())
+    }
+
+    // The program of the session's pane: of the spawned tab, or of the started process.
+    fn started(host: &Fake) -> Vec<String> {
         let mux = host.0.borrow();
-        let (socket, arguments, input) = mux.calls.last().unwrap();
-        assert_eq!(socket, SOCKET);
-        assert_eq!(arguments, &["send-text", "--pane-id", "0", "--no-paste"]);
-        assert_eq!(input.as_deref(), Some(&b". '/tmp/s/launch.sh'\r"[..]));
-        assert_eq!(mux.calls.len(), 1);
+        mux.spawn_program
+            .clone()
+            .or_else(|| mux.gui_program.clone())
+            .unwrap()
+    }
+
+    // The gate as the launch writes it: the installed executable and the session directory.
+    fn gate(directory: &Path) -> String {
+        format!(
+            "{} native-wezterm-host {}",
+            shell_quote(env::current_exe().unwrap().as_os_str()),
+            shell_quote(directory.as_os_str())
+        )
+    }
+
+    #[test]
+    fn the_launch_command_is_never_typed_into_the_pane() {
+        for force_new_window in [false, true] {
+            let host = existing();
+            launch(
+                &host,
+                force_new_window,
+                ". '/tmp/s/launch.sh'",
+                Path::new("/tmp/s"),
+            );
+            assert_eq!(
+                typed(&host).map(|input| String::from_utf8_lossy(&input).into_owned()),
+                None,
+                "the launch command went through the input of the pane"
+            );
+            // It is the program of the pane, behind the gate of exactly this session.
+            assert_eq!(
+                started(&host),
+                [
+                    "/bin/zsh",
+                    "-l",
+                    "-i",
+                    "-c",
+                    &format!(
+                        "{} || exit; . '/tmp/s/launch.sh'",
+                        gate(Path::new("/tmp/s"))
+                    )
+                ]
+            );
+            let mux = host.0.borrow();
+            assert_eq!(mux.started, usize::from(force_new_window));
+            assert_eq!(mux.spawn_count, usize::from(!force_new_window));
+        }
+    }
+
+    // The gate is a command of the installed executable. Without its route every launch
+    // would end in the pane with an unknown command.
+    #[test]
+    fn the_gate_of_the_pane_is_a_command_that_the_executable_routes_here() {
+        use crate::native::{NativeCommand, is_command, parse_args};
+        let gate = gate(Path::new("/s/session-a1"));
+        assert!(gate.ends_with(" native-wezterm-host '/s/session-a1'"));
+        assert!(is_command("native-wezterm-host"));
+        assert!(matches!(
+            parse_args(["native-wezterm-host", "/s/session-a1"]).unwrap(),
+            NativeCommand::WezTermHost { directory } if directory == Path::new("/s/session-a1")
+        ));
+        assert!(parse_args(["native-wezterm-host", "s/session-a1"]).is_err());
+        assert!(parse_args(["native-wezterm-host", "/s/not-a-session"]).is_err());
+    }
+
+    // A session directory as a launch leaves it while it waits for its terminal: private,
+    // status `launching`, the claim and the pending receipt.
+    fn launch_fixture() -> tempfile::TempDir {
+        use crate::native::{acquire_turn_claim, launch, update_status};
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::Builder::new()
+            .prefix("session-wezterm-")
+            .tempdir()
+            .unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), "launching", None, None).unwrap();
+        let claim = acquire_turn_claim(directory.path()).unwrap();
+        let token = claim.token.clone();
+        claim.retain();
+        launch::begin(
+            directory.path(),
+            &token,
+            Instant::now() + Duration::from_secs(20),
+        )
+        .unwrap();
+        directory
+    }
+
+    // What the launcher's bind does with the created surface.
+    fn bind(directory: &Path, session: &TerminalSession) {
+        let mut session = session.clone();
+        session.managed_session_id = directory.file_name().unwrap().to_str().map(str::to_owned);
+        crate::native::write_json_atomic(
+            &directory.join(crate::native::TERMINAL_HANDLE_FILE),
+            &session,
+        )
+        .unwrap();
+    }
+
+    // This test binary in place of the installed executable: the same `run_host`, reached
+    // through `pane_probe` instead of `native-wezterm-host`, and the wrapper's own proof.
+    fn probe(mode: &str, directory: &Path) -> String {
+        format!(
+            "AB_WEZTERM_PROBE={mode} AB_WEZTERM_PROBE_DIR={} {} --exact native::terminal::macos::wezterm::tests::pane_probe --nocapture --test-threads=1",
+            shell_quote(directory.as_os_str()),
+            shell_quote(env::current_exe().unwrap().as_os_str())
+        )
+    }
+
+    // Runs only as a program of the pane of the tests below.
+    #[test]
+    fn pane_probe() {
+        let Ok(mode) = env::var("AB_WEZTERM_PROBE") else {
+            return;
+        };
+        let directory = PathBuf::from(env::var_os("AB_WEZTERM_PROBE_DIR").unwrap());
+        if mode == "host" {
+            fs::write(directory.join("host-entered"), b"").unwrap();
+            if let Err(error) = run_host(&directory) {
+                eprintln!("{error:#}");
+                std::process::exit(7);
+            }
+        } else {
+            // The wrapper records itself as the leader of the foreground job of its shell;
+            // this fails in a shell that does not run it as a job of its own.
+            let id = directory.file_name().unwrap().to_str().unwrap();
+            let owner = crate::native::current_native_session_owner(id).unwrap();
+            let mut queued: libc::c_int = -1;
+            assert_eq!(unsafe { libc::ioctl(0, libc::FIONREAD, &mut queued) }, 0);
+            crate::native::write_json_atomic(
+                &directory.join("owner-probe.json"),
+                &serde_json::json!({"pid": owner.pid, "queued_input": queued}),
+            )
+            .unwrap();
+        }
+    }
+
+    // The human test of 2026-10-03 (iTerm2, same transport): a key typed while the new tab
+    // had the keyboard was read in front of the typed launch command, `a. '/…/launch.sh'`,
+    // and the provider never started. Replayed on a private pty with what the adapter sent;
+    // no terminal application and no key of the machine is involved.
+    #[test]
+    fn keys_typed_while_the_pane_starts_cannot_change_the_launch_command() {
+        for cancelled in [false, true] {
+            replay_on_a_private_pty(cancelled);
+        }
+    }
+
+    fn replay_on_a_private_pty(cancelled: bool) {
+        use std::{fs::File, io::Read, os::fd::FromRawFd};
+        let fixture = launch_fixture();
+        let directory = fixture.path();
+        // launch.sh as `launch::install_script` leaves it: sourced, and it ends the shell.
+        let script = directory.join("launch.sh");
+        fs::write(&script, format!("{}; exit $?\n", probe("owner", directory))).unwrap();
+        let command = format!(". {}", shell_quote(script.as_os_str()));
+        let host = existing();
+        let session = launch(&host, false, &command, directory);
+        assert_eq!(
+            typed(&host).map(|input| String::from_utf8_lossy(&input).into_owned()),
+            None,
+            "the launch command went through the input of the pane"
+        );
+        let mut program = started(&host);
+        assert!(program[4].starts_with(&gate(directory)), "{program:?}");
+        program[4] = program[4].replacen(&gate(directory), &probe("host", directory), 1);
+
+        let (mut master, mut slave) = (-1, -1);
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { File::from_raw_fd(slave) };
+        unsafe {
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(slave.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+        }
+        let mut pane = Command::new(&program[0]);
+        pane.args(&program[1..])
+            // What the mux gives every pane (mux/src/domain.rs, `build_command`).
+            .env("WEZTERM_PANE", &session.id)
+            .env("WEZTERM_UNIX_SOCKET", SOCKET)
+            // No startup file of the user.
+            .env("ZDOTDIR", directory)
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave.try_clone().unwrap());
+        // pty/src/unix.rs, `spawn_command`: a session of its own on the pty.
+        unsafe {
+            pane.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        // Keys typed before the program of the pane reads anything, an Enter among them.
+        master.write_all(b"aaaa\n").unwrap();
+        let mut child = pane.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let owner = directory.join("owner-probe.json");
+        let mut released = false;
+        let mut screen = Vec::new();
+        let status = loop {
+            let mut bytes = [0; 4096];
+            if let Ok(count) = master.read(&mut bytes) {
+                screen.extend_from_slice(&bytes[..count]);
+            }
+            if !released && directory.join("host-entered").exists() {
+                // The gate holds for as long as the pane is unbound.
+                thread::sleep(Duration::from_millis(300));
+                assert!(!owner.exists(), "the wrapper ran before its pane was bound");
+                // More keys while the gate waits: none may reach the wrapper either.
+                master.write_all(b"more keys\n").unwrap_or_else(|error| {
+                    panic!(
+                        "the pane ended before it was bound: {error}; {}",
+                        String::from_utf8_lossy(&screen)
+                    )
+                });
+                if cancelled {
+                    crate::native::update_status(directory, "closed", None, None).unwrap();
+                } else {
+                    bind(directory, &session);
+                }
+                released = true;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("the pane did not end: {}", String::from_utf8_lossy(&screen));
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let screen = String::from_utf8_lossy(&screen);
+        assert!(released, "the gate never ran: {screen}");
+        if cancelled {
+            assert!(!owner.exists(), "a cancelled launch started its wrapper");
+            assert!(!status.success());
+            let log = fs::read_to_string(directory.join(crate::native::launch::LOG)).unwrap();
+            assert!(
+                log.contains("wezterm_host_refused: WezTerm launch was cancelled"),
+                "{log}"
+            );
+        } else {
+            assert!(status.success(), "a typed key changed the launch: {screen}");
+            let proof: serde_json::Value =
+                serde_json::from_slice(&fs::read(owner).unwrap()).unwrap();
+            assert_eq!(
+                proof["queued_input"], 0,
+                "typed keys reached the wrapper: {proof}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_launch_host_starts_only_for_the_bound_pane_of_a_pending_launch() {
+        use crate::native::{TERMINAL_HANDLE_FILE, launch, write_json_atomic};
+        let binding = |directory: &Path| {
+            serde_json::json!({
+                "terminal": "wezterm", "session_id": "8", "tab_id": "8", "window_id": "7",
+                "managed_session_id": directory.file_name().unwrap().to_str().unwrap(),
+                "wezterm_mux": {
+                    "socket": SOCKET, "pid": PID, "start_seconds": BIRTH.0,
+                    "start_microseconds": BIRTH.1, "owns_gui": false
+                },
+            })
+        };
+        // The same socket in another spelling is the same socket.
+        for socket in [SOCKET, "/Users/tester//.local/share/wezterm/gui-sock-4242"] {
+            let fixture = launch_fixture();
+            let directory = fixture.path();
+            let id = directory.file_name().unwrap().to_str().unwrap();
+            write_json_atomic(&directory.join(TERMINAL_HANDLE_FILE), &binding(directory)).unwrap();
+            wait_for_binding(directory, id, "8", Path::new(socket)).unwrap();
+        }
+        for case in [
+            "another pane",
+            "another GUI",
+            "no GUI",
+            "another terminal",
+            "another session",
+            "unreadable binding",
+            "cancelled",
+            "expired",
+            "another claim",
+        ] {
+            let fixture = launch_fixture();
+            let directory = fixture.path();
+            let id = directory.file_name().unwrap().to_str().unwrap();
+            let mut bound = binding(directory);
+            match case {
+                "another pane" => bound["session_id"] = "9".into(),
+                "another GUI" => {
+                    bound["wezterm_mux"]["socket"] =
+                        "/Users/tester/.local/share/wezterm/gui-sock-4243".into()
+                }
+                "no GUI" => {
+                    bound.as_object_mut().unwrap().remove("wezterm_mux");
+                }
+                "another terminal" => bound["terminal"] = "ghostty".into(),
+                "another session" => bound["managed_session_id"] = "session-other".into(),
+                _ => {}
+            }
+            let handle = directory.join(TERMINAL_HANDLE_FILE);
+            if case == "unreadable binding" {
+                fs::write(&handle, b"{").unwrap();
+            } else {
+                write_json_atomic(&handle, &bound).unwrap();
+            }
+            match case {
+                "cancelled" => {
+                    crate::native::update_status(directory, "closed", None, None).unwrap()
+                }
+                "expired" | "another claim" => {
+                    let mut receipt = launch::read(directory).unwrap().unwrap();
+                    if case == "expired" {
+                        receipt.deadline_unix_ms = 0;
+                    } else {
+                        receipt.claim_token = "unrelated".into();
+                    }
+                    write_json_atomic(&directory.join(launch::FILE), &receipt).unwrap();
+                }
+                _ => {}
+            }
+            assert!(
+                wait_for_binding(directory, id, "8", Path::new(SOCKET)).is_err(),
+                "{case}"
+            );
+        }
+
+        // A directory that another account can enter is not a launch of this user.
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = launch_fixture();
+        fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let error = run_host(fixture.path()).unwrap_err();
+        assert!(format!("{error:#}").contains("not private"), "{error:#}");
     }
 
     #[test]
@@ -1861,7 +2651,6 @@ mod tests {
                 assert!(!surface_present(&host, &session, Duration::from_secs(1)).unwrap());
             }
             assert!(verify_session(&host, &session, None).is_err());
-            assert!(start_session(&host, &session, "command", soon()).is_err());
             assert!(read_screen(&host, &session, soon()).is_err());
             let failure = send_file(&host, &session, prompt.path(), soon()).unwrap_err();
             assert!(!failure.delivery_may_have_occurred());
@@ -1905,7 +2694,6 @@ mod tests {
         assert!(close_session_until(&host, &session, shortly()).is_err());
         assert!(surface_present(&host, &session, Duration::from_secs(1)).is_err());
         assert!(verify_session(&host, &session, None).is_err());
-        assert!(start_session(&host, &session, "command", soon()).is_err());
         let failure = send_file(&host, &session, prompt.path(), soon()).unwrap_err();
         assert!(!failure.delivery_may_have_occurred());
 
@@ -2148,15 +2936,29 @@ mod tests {
         assert!(mux.terminated.is_empty());
     }
 
-    // LIVE. Starts a real WezTerm process of its own, runs one harmless command in its
-    // pane and ends it. It reads and changes nothing of a WezTerm that is already running.
+    // LIVE. Starts a real WezTerm process of its own whose pane runs one harmless command
+    // behind the gate, binds the pane as the launcher does and ends it. It reads and
+    // changes nothing of a WezTerm that is already running.
     #[test]
     #[ignore = "starts a real WezTerm window"]
-    fn live_a_session_process_is_started_typed_into_and_ended() {
-        let marker = tempfile::NamedTempFile::new().unwrap();
+    fn live_a_session_process_is_started_bound_and_ended() {
+        let fixture = launch_fixture();
+        let directory = fixture.path();
+        let marker = directory.join("marker");
         let host = Installed;
-        let session =
-            create_tab_with_mode(&host, true, Instant::now() + Duration::from_secs(20)).unwrap();
+        let session = create(
+            &host,
+            true,
+            &pane_program(
+                &probe("host", directory),
+                &format!(
+                    "echo agent-bridge-wezterm-smoke | tee {}; sleep 600",
+                    shell_quote(marker.as_os_str())
+                ),
+            ),
+            Instant::now() + Duration::from_secs(20),
+        )
+        .unwrap();
         let mux = session.wezterm_mux.clone().unwrap();
         eprintln!(
             "LIVE created: pid={} birth={}.{:06} socket={} pane={}",
@@ -2170,17 +2972,15 @@ mod tests {
             let tty = verify_session(&host, &session, None)?;
             eprintln!("LIVE pane tty: {tty}");
             anyhow::ensure!(surface_present(&host, &session, Duration::from_secs(5))?);
-            start_session(
-                &host,
-                &session,
-                &format!(
-                    "echo agent-bridge-wezterm-smoke > '{}'",
-                    marker.path().display()
-                ),
-                soon(),
-            )?;
+            anyhow::ensure!(
+                !marker.exists(),
+                "the command ran before its pane was bound"
+            );
+            bind(directory, &session);
             let until = Instant::now() + Duration::from_secs(15);
-            while fs::read_to_string(marker.path())?.trim() != "agent-bridge-wezterm-smoke" {
+            while fs::read_to_string(&marker).unwrap_or_default().trim()
+                != "agent-bridge-wezterm-smoke"
+            {
                 anyhow::ensure!(
                     Instant::now() < until,
                     "the command did not run in the pane"

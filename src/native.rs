@@ -125,6 +125,16 @@ pub(crate) enum NativeCommand {
     ConsoleHost {
         directory: PathBuf,
     },
+    Iterm2Host {
+        directory: PathBuf,
+    },
+    AppleTerminalHost {
+        directory: PathBuf,
+    },
+    WezTermHost {
+        directory: PathBuf,
+    },
+    GhosttyHost,
     WarpHost {
         directory: PathBuf,
         attempt: String,
@@ -483,6 +493,10 @@ pub(crate) fn is_command(value: &str) -> bool {
             | "native-provider-control"
             | "native-console-control"
             | "native-console-host"
+            | "native-iterm2-host"
+            | "native-terminal-host"
+            | "native-wezterm-host"
+            | "native-ghostty-host"
             | "native-warp-host"
     )
 }
@@ -563,22 +577,38 @@ where
                 timeout_ms,
             })
         }
-        "native-console-host" => {
+        "native-console-host"
+        | "native-iterm2-host"
+        | "native-wezterm-host"
+        | "native-terminal-host" => {
             // The tab's process does not necessarily inherit the state root, so it is
             // given the session directory itself.
             let directory = PathBuf::from(one_positional(
                 rest,
-                "native-console-host requires one session directory",
+                &format!("{command} requires one session directory"),
             )?);
             let id = directory
                 .file_name()
                 .and_then(|name| name.to_str())
-                .context("native-console-host requires a session directory")?;
+                .with_context(|| format!("{command} requires a session directory"))?;
             require_valid_session_id(id)?;
             if !directory.is_absolute() {
-                bail!("native-console-host requires an absolute session directory");
+                bail!("{command} requires an absolute session directory");
             }
-            Ok(NativeCommand::ConsoleHost { directory })
+            match command.as_str() {
+                "native-iterm2-host" => Ok(NativeCommand::Iterm2Host { directory }),
+                "native-terminal-host" => Ok(NativeCommand::AppleTerminalHost { directory }),
+                "native-wezterm-host" => Ok(NativeCommand::WezTermHost { directory }),
+                _ => Ok(NativeCommand::ConsoleHost { directory }),
+            }
+        }
+        "native-ghostty-host" => {
+            // The surface is created before its session is bound to it, so this host
+            // is given nothing: its launch reaches it through its own terminal.
+            if !rest.is_empty() {
+                bail!("native-ghostty-host takes no argument");
+            }
+            Ok(NativeCommand::GhosttyHost)
         }
         "native-warp-host" => {
             let [directory, attempt] = rest else {
@@ -1072,6 +1102,10 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
             timeout_ms,
         } => run_windows_console_control(&action, &id, input_name.as_deref(), timeout_ms),
         NativeCommand::ConsoleHost { directory } => run_windows_console_host(&directory),
+        NativeCommand::Iterm2Host { directory } => terminal::iterm2_host(&directory),
+        NativeCommand::AppleTerminalHost { directory } => terminal::apple_terminal_host(&directory),
+        NativeCommand::WezTermHost { directory } => terminal::wezterm_host(&directory),
+        NativeCommand::GhosttyHost => terminal::ghostty_host(),
         NativeCommand::WarpHost { directory, attempt } => terminal::warp_host(&directory, &attempt),
     }
 }

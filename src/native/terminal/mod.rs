@@ -482,6 +482,53 @@ pub(super) fn windows_console_host(directory: &Path) -> Result<()> {
     windows::run_console_host(directory)
 }
 
+pub(super) fn iterm2_host(directory: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::iterm2::run_host(directory)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = directory;
+        bail!("the native iTerm2 host is only available on macOS")
+    }
+}
+
+pub(super) fn wezterm_host(directory: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::wezterm::run_host(directory)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = directory;
+        bail!("the native WezTerm host is only available on macOS")
+    }
+}
+
+pub(super) fn apple_terminal_host(directory: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::apple_terminal::run_host(directory)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = directory;
+        bail!("the native Terminal.app host is only available on macOS")
+    }
+}
+
+pub(super) fn ghostty_host() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::ghostty::run_host()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        bail!("the native Ghostty host is only available on macOS")
+    }
+}
+
 pub(super) fn warp_host(directory: &Path, attempt: &str) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -1042,7 +1089,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn ghostty_open_uses_separate_create_discover_queue_and_enter_transactions() {
+    fn ghostty_open_uses_separate_create_discover_and_frame_transactions() {
         fn assert_ordered(script: &str, statements: &[&str]) {
             let mut remaining = script;
             for statement in statements {
@@ -1110,62 +1157,33 @@ mod tests {
         assert!(!discover.contains("bridgeCommand"));
         assert!(!discover.contains("send key"));
 
+        // The start writes one frame for the launch host to the exact terminal and
+        // sends no Enter: nothing that reaches the terminal is a shell line.
         let queue = macos::ghostty::QUEUE_COMMAND_SCRIPT;
-        let press_enter = macos::ghostty::PRESS_ENTER_SCRIPT;
-        for script in [queue, press_enter] {
-            assert_ordered(
-                script,
-                &[
-                    "set wantedTerminalId to item 1 of argv",
-                    "set wantedTabId to item 2 of argv",
-                    "set wantedWindowId to item 3 of argv",
-                    "set targetWindow to first window whose id is wantedWindowId",
-                    "repeat with candidateTab in tabs of targetWindow",
-                    "if id of candidateTab is wantedTabId then",
-                    "if targetTab is missing value then return \"missing\"",
-                    "repeat with candidateTerminal in terminals of targetTab",
-                    "if id of candidateTerminal is wantedTerminalId then",
-                    "if targetTerminal is missing value then return \"missing\"",
-                ],
-            );
-            assert!(!script.contains("new tab"));
-            assert!(!script.contains("new window"));
-            assert!(!script.contains("focused terminal"));
-        }
-        assert!(queue.contains("set bridgeCommand to item 4 of argv"));
         assert_ordered(
             queue,
             &[
+                "set wantedTerminalId to item 1 of argv",
+                "set wantedTabId to item 2 of argv",
+                "set wantedWindowId to item 3 of argv",
+                "set targetWindow to first window whose id is wantedWindowId",
+                "repeat with candidateTab in tabs of targetWindow",
+                "if id of candidateTab is wantedTabId then",
+                "if targetTab is missing value then return \"missing\"",
+                "repeat with candidateTerminal in terminals of targetTab",
+                "if id of candidateTerminal is wantedTerminalId then",
                 "if targetTerminal is missing value then return \"missing\"",
                 "input text bridgeCommand to targetTerminal",
                 "return \"queued\"",
             ],
         );
+        assert!(!queue.contains("new tab"));
+        assert!(!queue.contains("new window"));
+        assert!(!queue.contains("focused terminal"));
+        assert!(queue.contains("set bridgeCommand to item 4 of argv"));
         assert!(queue.contains("if errorNumber is -10000 then return \"not-ready\""));
-        assert_eq!(
-            queue
-                .matches("input text bridgeCommand to targetTerminal")
-                .count(),
-            1
-        );
         assert_eq!(queue.matches("input text ").count(), 1);
         assert!(!queue.contains("send key"));
-        assert_ordered(
-            press_enter,
-            &[
-                "if targetTerminal is missing value then return \"missing\"",
-                "send key \"enter\" to targetTerminal",
-                "return \"pressed\"",
-            ],
-        );
-        assert!(!press_enter.contains("input text"));
-        assert_eq!(
-            press_enter
-                .matches("send key \"enter\" to targetTerminal")
-                .count(),
-            1
-        );
-        assert_eq!(press_enter.matches("send key ").count(), 1);
     }
 
     #[cfg(target_os = "macos")]
@@ -1177,7 +1195,6 @@ mod tests {
         assert!(macos::ghostty::DISCOVER_TERMINAL_SCRIPT.contains("item 1 of argv"));
         assert!(macos::ghostty::DISCOVER_TERMINAL_SCRIPT.contains("id of targetTerminal"));
         assert!(macos::ghostty::QUEUE_COMMAND_SCRIPT.contains("item 4 of argv"));
-        assert!(macos::ghostty::PRESS_ENTER_SCRIPT.contains("item 3 of argv"));
         assert!(macos::ghostty::SEND_FILE_SCRIPT.contains("input text promptText"));
         assert!(macos::ghostty::SEND_FILE_SCRIPT.contains("send key \"enter\""));
         assert!(macos::ghostty::CLOSE_TAB_SCRIPT.contains("close tab targetTab"));
@@ -1193,12 +1210,14 @@ mod tests {
             .map(str::trim)
             .filter(|line| line.starts_with("set ") && line.contains(" of cfg to "))
             .collect();
+        // The command is the launch host, given as an argument; the creation knows
+        // neither the session nor its launch command.
         assert_eq!(
             configured_properties,
-            ["set command of cfg to \"/bin/zsh -f\""]
+            ["set command of cfg to item 2 of argv"]
         );
         assert_eq!(create.matches("with configuration cfg").count(), 2);
-        assert!(!create.contains("item 2 of argv"));
+        assert!(!create.contains("item 3 of argv"));
         assert!(!create.contains("bridgeCommand"));
         assert!(!create.contains("input text"));
         assert!(!create.contains("send key"));
@@ -1206,7 +1225,6 @@ mod tests {
             create,
             macos::ghostty::DISCOVER_TERMINAL_SCRIPT,
             macos::ghostty::QUEUE_COMMAND_SCRIPT,
-            macos::ghostty::PRESS_ENTER_SCRIPT,
         ] {
             assert!(!script.contains("initial input"));
             assert!(!script.contains("bridgeConfiguration"));
@@ -1214,7 +1232,6 @@ mod tests {
         for script in [
             macos::ghostty::DISCOVER_TERMINAL_SCRIPT,
             macos::ghostty::QUEUE_COMMAND_SCRIPT,
-            macos::ghostty::PRESS_ENTER_SCRIPT,
         ] {
             assert!(!script.contains("new surface configuration"));
             assert!(!script.contains("with configuration"));
@@ -1224,17 +1241,18 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn apple_terminal_adapter_targets_only_its_created_tty() {
-        assert!(macos::apple_terminal::OPEN_TAB_SCRIPT.contains("set targetTab to do script \"\""));
-        assert!(!macos::apple_terminal::OPEN_TAB_SCRIPT.contains("bridgeCommand"));
-        assert!(macos::apple_terminal::START_SESSION_SCRIPT.contains("item 1 of argv"));
-        assert!(macos::apple_terminal::START_SESSION_SCRIPT.contains("item 3 of argv"));
+        // The start is typed once, by the creation, into the tab that the creation
+        // returns: no script addresses a tab with the start command afterwards.
         assert!(
-            macos::apple_terminal::START_SESSION_SCRIPT
-                .contains("do script bridgeCommand in targetTab")
+            macos::apple_terminal::OPEN_TAB_SCRIPT.contains("set bridgeCommand to item 1 of argv")
         );
-        assert!(
-            !macos::apple_terminal::START_SESSION_SCRIPT
-                .contains("do script bridgeCommand in front window")
+        assert_eq!(
+            macos::apple_terminal::OPEN_TAB_SCRIPT
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.starts_with("--") && line.contains("do script"))
+                .collect::<Vec<_>>(),
+            ["set targetTab to do script ((character id 21) & bridgeCommand)"]
         );
         assert!(!macos::apple_terminal::OPEN_TAB_SCRIPT.contains("System Events"));
         assert!(!macos::apple_terminal::OPEN_TAB_SCRIPT.contains("front window"));
