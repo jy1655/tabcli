@@ -231,14 +231,34 @@ end run
 
 // A closed window is one that Terminal's window list lacks. The tty proves nothing
 // here: it changes when the shell ends, and the window stays on the screen.
+//
+// Terminal can keep listing a window that it has closed: closing removes the window's
+// tabs and takes it off the screen, and the object stays in the list until Terminal
+// releases it (2026-10-03: windows 12064, 12674, 12678 and 12679 read listed, without
+// tabs and not visible after their close, 12064 for minutes; the second close then
+// failed with `no longer holds its tab`). The close that has just closed the recorded
+// window passes the close script's reply as the third argument, and only then is such
+// a window answered as `closed`. A window on the screen or with a tab is present, and
+// so is every window that this transaction did not close.
 pub(in crate::native) const WAIT_FOR_CLOSE_SCRIPT: &str = r#"
 on run argv
     set wantedWindowId to item 1 of argv as integer
     set attemptCount to item 2 of argv as integer
+    set closeWasSent to (count of argv) > 2 and item 3 of argv is "closed"
     if not application "Terminal" is running then return "missing"
     tell application "Terminal"
         repeat attemptCount times
             if (id of every window) does not contain wantedWindowId then return "missing"
+            if closeWasSent then
+                try
+                    set listedWindow to first window whose id is wantedWindowId
+                    if (count of tabs of listedWindow) is 0 and not (visible of listedWindow) then return "closed"
+                on error errorText number errorNumber
+                    -- The window can leave the list between the two reads: the next
+                    -- list read decides. Every other failed read is an error.
+                    if errorNumber is not -1728 then error errorText number errorNumber
+                end try
+            end if
             delay 0.05
         end repeat
     end tell
@@ -440,8 +460,10 @@ fn close_session_with(
         return Ok(outcome);
     }
 
-    let verification = run(WAIT_FOR_CLOSE_SCRIPT, &[window_id, "20"])?;
-    if verification == "missing" {
+    // The wait receives the close script's reply: only the close that was just sent to
+    // the proven window may take the window that Terminal still lists for closed.
+    let verification = run(WAIT_FOR_CLOSE_SCRIPT, &[window_id, "20", &response])?;
+    if matches!(verification.as_str(), "missing" | "closed") {
         return Ok(CloseOutcome::Closed);
     }
 
@@ -452,8 +474,8 @@ fn close_session_with(
     if close_response(TerminalKind::AppleTerminal, &retry)? == CloseOutcome::Missing {
         return Ok(CloseOutcome::Closed);
     }
-    let verification = run(WAIT_FOR_CLOSE_SCRIPT, &[window_id, "100"])?;
-    if verification != "missing" {
+    let verification = run(WAIT_FOR_CLOSE_SCRIPT, &[window_id, "100", &retry])?;
+    if !matches!(verification.as_str(), "missing" | "closed") {
         bail!("Terminal.app reported a closed tab twice but window {window_id} is still present");
     }
     Ok(CloseOutcome::Closed)
@@ -499,21 +521,29 @@ mod tests {
     const EMPTY: &str = r#"{id:8341, tabs:{}}"#;
     // Window 12064 changed from invisible to visible with no tabs after close
     // (2026-10-03, user-confirmed residual session-mpL0WX). Neither state is
-    // evidence of absence, even after a close command reported success.
+    // evidence of absence. Only the close that was just sent takes the invisible
+    // one for the window it closed; no later transaction does.
     const HIDDEN_EMPTY: &str = r#"{id:8341, tabs:{}, visible:false}"#;
     const VISIBLE_EMPTY: &str = r#"{id:8341, tabs:{}, visible:true}"#;
+    // Not visible, and its tab is still there.
+    const HIDDEN_LIVE: &str =
+        r#"{id:8341, tabs:{{tty:"/dev/ttys014", busy:false}}, visible:false}"#;
     // Listed as 8341, but its id reads 8342 at the final check before the close.
     const RENUMBERED: &str = r#"{listedId:8341, id:8342, tabs:{{tty:"/dev/ttys014", busy:false}}}"#;
     const DENIED: &str = r#"{-1743, "Not authorized to send Apple events to Terminal."}"#;
     const TIMED_OUT: &str = r#"{-1712, "AppleEvent timed out."}"#;
 
-    #[test]
-    fn attested_close_rechecks_app_before_every_transaction() {
-        let session: super::TerminalSession = serde_json::from_value(serde_json::json!({
+    fn session() -> super::TerminalSession {
+        serde_json::from_value(serde_json::json!({
             "terminal": "apple-terminal", "session_id": TTY, "window_id": WINDOW,
             "managed_session_id": "session-test"
         }))
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn attested_close_rechecks_app_before_every_transaction() {
+        let session = session();
         let app = crate::native::MacTerminalAppIdentity {
             pid: 1234,
             start_seconds: 100,
@@ -623,6 +653,7 @@ on mockClose(targetWindow)
 end mockClose
 "#;
 
+    #[derive(Clone, Copy)]
     struct Terminal<'a> {
         running: bool,
         windows: &'a [&'a str],
@@ -830,6 +861,164 @@ end mockClose
             check(&mut failures, case, wait(&terminal), expected, false);
         }
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    // Told that the close script answered `closed`, the wait also knows the window that
+    // Terminal has closed and still lists: no tabs, and not on the screen.
+    #[test]
+    fn terminal_app_close_wait_knows_the_listed_window_that_terminal_closed() {
+        let wait = |terminal: &Terminal, close_reply: &str| {
+            replay(WAIT_FOR_CLOSE_SCRIPT, terminal, &[WINDOW, "2", close_reply])
+        };
+        let mut failures = Vec::new();
+        let cases = [
+            ("Terminal not running", STOPPED, "closed", Ok("missing")),
+            (
+                "window left the list",
+                running(&[UNRELATED]),
+                "closed",
+                Ok("missing"),
+            ),
+            (
+                "closed window still listed",
+                running(&[HIDDEN_EMPTY]),
+                "closed",
+                Ok("closed"),
+            ),
+            (
+                "no close was sent",
+                running(&[HIDDEN_EMPTY]),
+                "missing",
+                Ok("present"),
+            ),
+            (
+                "empty window on the screen",
+                running(&[VISIBLE_EMPTY]),
+                "closed",
+                Ok("present"),
+            ),
+            (
+                "hidden window that holds its tab",
+                running(&[HIDDEN_LIVE]),
+                "closed",
+                Ok("present"),
+            ),
+            ("live owned tab", running(&[LIVE]), "closed", Ok("present")),
+            ("killed shell", running(&[KILLED]), "closed", Ok("present")),
+            (
+                "window list timed out",
+                failing(TIMED_OUT),
+                "closed",
+                Err("timed out"),
+            ),
+        ];
+        for (case, terminal, close_reply, expected) in cases {
+            check(
+                &mut failures,
+                case,
+                wait(&terminal, close_reply),
+                expected,
+                false,
+            );
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    // The window can leave the list between the list read and its own read: only the
+    // next list read is absence. Any other failed read stays an error.
+    #[test]
+    fn terminal_app_close_wait_takes_no_failed_read_for_a_closed_window() {
+        const LOOKUP: &str = "set listedWindow to first window whose id is wantedWindowId";
+        assert!(WAIT_FOR_CLOSE_SCRIPT.contains(LOOKUP));
+        for (lookup, expected) in [
+            (
+                "set mockWindows to {}\nerror \"Can't get window.\" number -1728",
+                Ok("missing"),
+            ),
+            ("error \"Can't get window.\" number -1728", Ok("present")),
+            (
+                "error \"Not authorized to send Apple events to Terminal.\" number -1743",
+                Err("Not authorized"),
+            ),
+        ] {
+            let script = WAIT_FOR_CLOSE_SCRIPT.replace(LOOKUP, lookup);
+            let (reply, events) =
+                replay(&script, &running(&[HIDDEN_EMPTY]), &[WINDOW, "2", "closed"]);
+            match expected {
+                Ok(wanted) => assert_eq!(reply.as_deref(), Ok(wanted), "{lookup}"),
+                Err(wanted) => assert!(reply.unwrap_err().contains(wanted), "{lookup}"),
+            }
+            assert!(events.is_empty(), "{lookup}: {events:?}");
+        }
+    }
+
+    // The whole close as `close_session_with` runs it, with the shipped scripts, against
+    // a Terminal that holds the killed shell's tab until it is told to close the window
+    // and `after_close` from then on. Returns the outcome and the closes that were sent.
+    fn close_lifecycle(
+        after_close: Terminal,
+    ) -> (anyhow::Result<super::CloseOutcome>, Vec<String>) {
+        let mut terminal = running(&[KILLED]);
+        let mut closes = Vec::new();
+        let outcome = super::close_session_with(&session(), |script, arguments| {
+            let mut arguments = arguments.to_vec();
+            if script == WAIT_FOR_CLOSE_SCRIPT {
+                arguments[1] = "2";
+            }
+            let (reply, events) = replay(script, &terminal, &arguments);
+            if !events.is_empty() {
+                terminal = after_close;
+                closes.extend(events);
+            }
+            reply.map_err(anyhow::Error::msg)
+        });
+        (outcome, closes)
+    }
+
+    // The cleanup of session-mpL0WX failed on 2026-10-03 with `window no longer holds
+    // its tab`: the close had closed window 12064, Terminal still listed it without
+    // tabs and not visible, and the second close found no tab in it.
+    #[test]
+    fn terminal_app_close_finishes_when_terminal_still_lists_the_window_it_closed() {
+        for (case, after_close) in [
+            ("closed window still listed", running(&[HIDDEN_EMPTY])),
+            ("window left the list", running(&[])),
+        ] {
+            let (outcome, closes) = close_lifecycle(after_close);
+            assert_eq!(
+                outcome.map_err(|error| format!("{error:#}")),
+                Ok(super::CloseOutcome::Closed),
+                "{case}"
+            );
+            assert_eq!(closes, ["closed 8341"], "{case}");
+        }
+    }
+
+    // What is not a closed window after the close keeps the close failing, and with it
+    // the handle: an empty window on the screen, a tab that both closes left in place,
+    // and a window list that can no longer be read.
+    #[test]
+    fn terminal_app_close_fails_while_its_window_is_on_the_screen_or_unread() {
+        for (case, after_close, error, closes_sent) in [
+            (
+                "empty window on the screen",
+                running(&[VISIBLE_EMPTY]),
+                "no longer holds its tab",
+                1,
+            ),
+            (
+                "tab still there",
+                running(&[KILLED]),
+                "window 8341 is still present",
+                2,
+            ),
+            ("window list denied", failing(DENIED), "Not authorized", 1),
+        ] {
+            let (outcome, closes) = close_lifecycle(after_close);
+            let failure = format!("{:#}", outcome.expect_err(case));
+            assert!(failure.contains(error), "{case}: {failure}");
+            assert_eq!(closes, vec!["closed 8341"; closes_sent], "{case}");
+        }
     }
 
     #[test]
