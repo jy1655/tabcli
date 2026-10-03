@@ -4859,7 +4859,8 @@ fn internal_event_wait_reports_dead_owner_without_consuming_surface() {
 #[test]
 fn internal_status_wait_reports_dead_owner_without_consuming_surface() {
     assert_internal_wait_reports_dead_owner(true);
-    // A retained, stale ready status must not authorize another delivery.
+    // Also cover a retained, stale ready status in this internal helper. Current
+    // macOS launches pass input as a provider argument and do not call this wait.
     let directory = tempfile::tempdir().unwrap();
     write_attested_apple_terminal_state(directory.path(), "ready", reaped_child_pid());
     let error =
@@ -4883,6 +4884,10 @@ fn internal_wait_does_not_call_live_or_unverified_owner_dead() {
         if mode == "missing" {
             fs::remove_file(directory.path().join(SESSION_OWNER_FILE)).unwrap();
         }
+        // Headless repair may stop at identity lookup before reaching the new
+        // guard. Check directly that a live PID with a different identity is not
+        // diagnosed as dead by that guard either.
+        require_running_wait_owner(directory.path()).unwrap();
         for status_wait in [false, true] {
             let error = if status_wait {
                 wait_for_status(directory.path(), "ready", Instant::now(), Duration::ZERO)

@@ -1969,12 +1969,25 @@ exit 91
     }
 
     #[cfg(unix)]
-    struct QueueTimeoutSync;
+    struct QueueTimeoutFixture {
+        pipe: std::path::PathBuf,
+    }
 
     #[cfg(unix)]
-    impl Drop for QueueTimeoutSync {
+    impl Drop for QueueTimeoutFixture {
         fn drop(&mut self) {
+            use std::{io::Write, os::unix::fs::OpenOptionsExt};
+
             QUEUE_TIMEOUT_READY.with(|path| path.borrow_mut().take());
+            // A broken containment path must fail the test without leaving the
+            // fake descendant blocked forever, including on an earlier assertion.
+            if let Ok(mut writer) = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.pipe)
+            {
+                let _ = writer.write_all(b"stop\n");
+            }
         }
     }
 
@@ -2050,7 +2063,7 @@ exit 91
                     .is_none()
             );
         });
-        let _sync = QueueTimeoutSync;
+        let _fixture = QueueTimeoutFixture { pipe: pipe.clone() };
         let failure = ADAPTER
             .send_cross_session_message(CrossSessionMessageContext {
                 bridge_executable: Path::new("/unused/agent-bridge"),
@@ -2062,8 +2075,18 @@ exit 91
             })
             .unwrap_err();
 
-        assert!(failure.delivery_may_have_occurred());
-        assert!(!failure.allows_terminal_fallback());
+        let delivery_uncertain = failure.delivery_may_have_occurred();
+        let allows_fallback = failure.allows_terminal_fallback();
+        let reason = format!("{:#}", failure.into_error());
+        assert!(reason.contains("Codex queue timed out"), "{reason}");
+        QUEUE_TIMEOUT_READY.with(|path| {
+            assert!(
+                path.borrow().is_none(),
+                "queue timeout hook was not consumed"
+            );
+        });
+        assert!(delivery_uncertain, "{reason}");
+        assert!(!allows_fallback, "{reason}");
         assert!(directory.join(PENDING_TURN_FILE).is_file());
         assert!(directory.join("queue-started").is_file());
         assert_eq!(
@@ -2072,7 +2095,6 @@ exit 91
                 .trim(),
             claim_token,
         );
-        assert!(format!("{:#}", failure.into_error()).contains("Codex queue timed out"));
         // A killed descendant closes the FIFO even if it remains a zombie. This
         // observes teardown directly instead of guessing from a delayed file write.
         let stopped = Instant::now() + Duration::from_secs(2);

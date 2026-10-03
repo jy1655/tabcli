@@ -1552,7 +1552,7 @@ fn launch_created_session(
     )
     .with_context(|| {
         format!(
-            "session {} did not report completion in {}; use `agent-bridge inspect {}` to inspect its recorded state",
+            "session {} in {} did not return a successful result; use `agent-bridge inspect {}` to inspect its recorded state",
             created.id,
             terminal_session.kind.display_name(),
             created.id
@@ -3844,7 +3844,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
     )
     .with_context(|| {
         format!(
-            "session {} did not report completion in {}; use `agent-bridge inspect {}` to inspect its recorded state",
+            "session {} in {} did not return a successful result; use `agent-bridge inspect {}` to inspect its recorded state",
             request.id,
             terminal_session.kind.display_name(),
             request.id
