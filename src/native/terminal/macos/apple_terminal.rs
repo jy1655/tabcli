@@ -229,8 +229,9 @@ on run argv
 end run
 "#;
 
-// A closed window is one that Terminal's window list lacks. The tty proves nothing
-// here: it changes when the shell ends, and the window stays on the screen.
+// Without a successful close in this transaction, only Terminal's window list can
+// prove the window missing. The tty changes when the shell ends even if the window
+// stays on the screen, so it cannot prove absence.
 //
 // Terminal can keep listing a window that it has closed: closing removes the window's
 // tabs and takes it off the screen, and the object stays in the list until Terminal
@@ -255,8 +256,9 @@ on run argv
                     if (count of tabs of listedWindow) is 0 and not (visible of listedWindow) then return "closed"
                 on error errorText number errorNumber
                     -- The window can leave the list between the two reads: the next
-                    -- list read decides. Every other failed read is an error.
-                    if errorNumber is not -1728 then error errorText number errorNumber
+                    -- list read decides. Terminal 2.15 returns -1719 for a missing
+                    -- whose match; -1728 also means a missing object. Other reads fail.
+                    if errorNumber is not -1728 and errorNumber is not -1719 then error errorText number errorNumber
                 end try
             end if
             delay 0.05
@@ -931,6 +933,11 @@ end mockClose
         const LOOKUP: &str = "set listedWindow to first window whose id is wantedWindowId";
         assert!(WAIT_FOR_CLOSE_SCRIPT.contains(LOOKUP));
         for (lookup, expected) in [
+            (
+                "set mockWindows to {}\nerror \"Invalid index.\" number -1719",
+                Ok("missing"),
+            ),
+            ("error \"Invalid index.\" number -1719", Ok("present")),
             (
                 "set mockWindows to {}\nerror \"Can't get window.\" number -1728",
                 Ok("missing"),
