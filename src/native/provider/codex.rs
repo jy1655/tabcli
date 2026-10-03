@@ -815,6 +815,16 @@ fn run_bounded_command_until(
             error.context(format!("failed to resume {label}")),
         ));
     }
+    // The timeout fixture must observe its descendant before expiring the budget.
+    // Release builds always keep the caller's original, shared deadline.
+    #[cfg(all(test, unix))]
+    let deadline = match tests::synchronized_queue_deadline(label, deadline) {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            terminate_bounded_process(&mut child, &process_tree);
+            return Err(CodexCommandFailure::started(error));
+        }
+    };
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -1953,13 +1963,53 @@ exit 91
     }
 
     #[cfg(unix)]
+    thread_local! {
+        static QUEUE_TIMEOUT_READY: std::cell::RefCell<Option<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(unix)]
+    struct QueueTimeoutSync;
+
+    #[cfg(unix)]
+    impl Drop for QueueTimeoutSync {
+        fn drop(&mut self) {
+            QUEUE_TIMEOUT_READY.with(|path| path.borrow_mut().take());
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn synchronized_queue_deadline(label: &str, deadline: Instant) -> Result<Instant> {
+        if label != "Codex queue" {
+            return Ok(deadline);
+        }
+        let Some(ready) = QUEUE_TIMEOUT_READY.with(|path| path.borrow_mut().take()) else {
+            return Ok(deadline);
+        };
+        while !ready.is_file() {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "queue fixture did not finish startup"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        Ok(Instant::now())
+    }
+
+    #[cfg(unix)]
     #[test]
     fn codex_queue_timeout_terminates_wrapper_descendants_and_retains_the_claim() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::{
+            ffi::OsStrExt,
+            fs::{OpenOptionsExt, PermissionsExt},
+        };
 
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("session-codexqueue");
         std::fs::create_dir(&directory).unwrap();
+        let pipe = directory.join("descendant-pipe");
+        let pipe_name = std::ffi::CString::new(pipe.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(pipe_name.as_ptr(), 0o600) }, 0);
         let provider = directory.join("fake-codex");
         std::fs::write(
             &provider,
@@ -1969,9 +2019,12 @@ if [ "$1" = "app-server" ]; then
   exit 0
 fi
 if [ "$1" = "queue" ]; then
-  : > "$AGENT_BRIDGE_NATIVE_SESSION_DIR/queue-started"
+  # Deliberately exceed the old shared 500 ms startup budget.
+  sleep 0.65
   (
-    sleep 0.80
+    exec 3<>"$AGENT_BRIDGE_NATIVE_SESSION_DIR/descendant-pipe"
+    : > "$AGENT_BRIDGE_NATIVE_SESSION_DIR/queue-started"
+    read -r finish <&3
     : > "$AGENT_BRIDGE_NATIVE_SESSION_DIR/descendant-survived"
   ) &
   wait
@@ -1987,6 +2040,17 @@ exit 91
         let claim_token = claim.token.clone();
         claim.retain();
 
+        // Give setup a separate bounded budget, then trigger the real timeout path
+        // only after the descendant holds the FIFO. The thread-local hook cannot
+        // affect another test, the daemon probe, or a release build.
+        QUEUE_TIMEOUT_READY.with(|path| {
+            assert!(
+                path.borrow_mut()
+                    .replace(directory.join("queue-started"))
+                    .is_none()
+            );
+        });
+        let _sync = QueueTimeoutSync;
         let failure = ADAPTER
             .send_cross_session_message(CrossSessionMessageContext {
                 bridge_executable: Path::new("/unused/agent-bridge"),
@@ -1994,7 +2058,7 @@ exit 91
                 provider_path: &provider,
                 request_id: &claim_token,
                 prompt: "follow up",
-                deadline: Instant::now() + Duration::from_millis(500),
+                deadline: Instant::now() + Duration::from_secs(5),
             })
             .unwrap_err();
 
@@ -2002,7 +2066,32 @@ exit 91
         assert!(!failure.allows_terminal_fallback());
         assert!(directory.join(PENDING_TURN_FILE).is_file());
         assert!(directory.join("queue-started").is_file());
-        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            std::fs::read_to_string(directory.join(super::super::super::TURN_CLAIM_FILE))
+                .unwrap()
+                .trim(),
+            claim_token,
+        );
+        assert!(format!("{:#}", failure.into_error()).contains("Codex queue timed out"));
+        // A killed descendant closes the FIFO even if it remains a zombie. This
+        // observes teardown directly instead of guessing from a delayed file write.
+        let stopped = Instant::now() + Duration::from_secs(2);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&pipe)
+            {
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => break,
+                Ok(writer) => drop(writer),
+                Err(error) => panic!("failed to inspect descendant FIFO: {error}"),
+            }
+            assert!(
+                Instant::now() < stopped,
+                "timed-out descendant still holds its FIFO"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
         assert!(
             !directory.join("descendant-survived").exists(),
             "a timed-out provider wrapper left a message-delivery descendant running"
