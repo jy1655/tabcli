@@ -1552,9 +1552,10 @@ fn launch_created_session(
     )
     .with_context(|| {
         format!(
-            "session {} remains open in {}; use `agent-bridge sessions` to inspect it",
+            "session {} did not report completion in {}; use `agent-bridge inspect {}` to inspect its recorded state",
             created.id,
-            terminal_session.kind.display_name()
+            terminal_session.kind.display_name(),
+            created.id
         )
     })?;
     emit_session_result_with(
@@ -3843,9 +3844,10 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
     )
     .with_context(|| {
         format!(
-            "session {} remains open in {}; the requested turn did not report completion",
+            "session {} did not report completion in {}; use `agent-bridge inspect {}` to inspect its recorded state",
             request.id,
-            terminal_session.kind.display_name()
+            terminal_session.kind.display_name(),
+            request.id
         )
     })?;
     emit_session_result(
@@ -7334,6 +7336,25 @@ fn event_paths(directory: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+// macOS repair deliberately retains a surface that may outlive its owner. That
+// cleanup obligation must not turn a known process exit into a request timeout.
+// This only diagnoses a dead PID: a reused/live PID or an unknown identity is not
+// proof of death, and nothing here consumes the surface or the pending claim.
+#[cfg(target_os = "macos")]
+fn require_running_wait_owner(directory: &Path) -> Result<()> {
+    if let Some(text) = read_regular_text_if_present(&directory.join(SESSION_OWNER_FILE))? {
+        let owner: NativeSessionOwner =
+            serde_json::from_str(&text).context("invalid native-session owner record")?;
+        if !process_is_alive(owner.pid) {
+            bail!(
+                "native session process {} is no longer running; terminal cleanup remains unverified",
+                owner.pid
+            );
+        }
+    }
+    Ok(())
+}
+
 fn wait_for_status(
     directory: &Path,
     expected_state: &str,
@@ -7344,14 +7365,16 @@ fn wait_for_status(
         recover_pending_completion(directory)?;
         repair_dead_native_owner(directory)?;
         if let Ok(status) = read_json::<SessionStatus>(&directory.join("status.json")) {
-            if status.state == expected_state {
-                return Ok(status);
-            }
             if matches!(status.state.as_str(), "failed" | "exited" | "closed") {
                 let reason = status
                     .error
                     .unwrap_or_else(|| format!("session entered state {}", status.state));
                 bail!("{reason}");
+            }
+            #[cfg(target_os = "macos")]
+            require_running_wait_owner(directory)?;
+            if status.state == expected_state {
+                return Ok(status);
             }
         }
         let remaining = deadline
@@ -7437,6 +7460,8 @@ fn wait_for_event_for_turn_until(
                 .unwrap_or_else(|| format!("session entered state {}", status.state));
             bail!("{reason}");
         }
+        #[cfg(target_os = "macos")]
+        require_running_wait_owner(directory)?;
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())

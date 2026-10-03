@@ -4793,6 +4793,145 @@ fn result_wait_repairs_a_dead_owner_and_ends_the_wait() {
     assert_eq!(status.state, "closed");
 }
 
+#[cfg(target_os = "macos")]
+fn assert_internal_wait_reports_dead_owner(status_wait: bool) {
+    let dead_pid = reaped_child_pid();
+    for kind in [
+        terminal::TerminalKind::AppleTerminal,
+        terminal::TerminalKind::Ghostty,
+        terminal::TerminalKind::WezTerm,
+        terminal::TerminalKind::Warp,
+    ] {
+        for retained in [
+            TERMINAL_HANDLE_FILE,
+            TERMINAL_CLOSING_FILE,
+            TERMINAL_CLOSE_INTENT_FILE,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let owner = write_attested_apple_terminal_state(directory.path(), "working", dead_pid);
+            let handle_path = directory.path().join(TERMINAL_HANDLE_FILE);
+            let mut handle: terminal::TerminalSession = read_json(&handle_path).unwrap();
+            handle.kind = kind;
+            write_json_atomic(&handle_path, &handle).unwrap();
+            if retained == TERMINAL_CLOSING_FILE {
+                fs::rename(&handle_path, directory.path().join(retained)).unwrap();
+            } else if retained == TERMINAL_CLOSE_INTENT_FILE {
+                record_terminal_close_intent(directory.path(), "session-owner123", &handle, &owner)
+                    .unwrap();
+            }
+            let records = ["status.json", SESSION_OWNER_FILE, TURN_CLAIM_FILE, retained];
+            let before: Vec<_> = records
+                .iter()
+                .map(|name| fs::read(directory.path().join(name)).unwrap())
+                .collect();
+            // An expired deadline makes the priority deterministic, without timing a live app.
+            let error = if status_wait {
+                wait_for_status(directory.path(), "ready", Instant::now(), Duration::ZERO)
+                    .unwrap_err()
+            } else {
+                wait_for_event_for_turn(directory.path(), 0, None, None, Duration::ZERO)
+                    .unwrap_err()
+            };
+            for (name, bytes) in records.iter().zip(before) {
+                assert_eq!(
+                    fs::read(directory.path().join(name)).unwrap(),
+                    bytes,
+                    "{kind:?}/{retained}/{name}"
+                );
+            }
+            assert!(!directory.path().join(CLOSED_STATUS_FILE).exists());
+            assert!(!directory.path().join(TERMINAL_TOMBSTONE_FILE).exists());
+            assert!(
+                format!("{error:#}").contains("no longer running"),
+                "{kind:?}/{retained}: {error:#}"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn internal_event_wait_reports_dead_owner_without_consuming_surface() {
+    assert_internal_wait_reports_dead_owner(false);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn internal_status_wait_reports_dead_owner_without_consuming_surface() {
+    assert_internal_wait_reports_dead_owner(true);
+    // A retained, stale ready status must not authorize another delivery.
+    let directory = tempfile::tempdir().unwrap();
+    write_attested_apple_terminal_state(directory.path(), "ready", reaped_child_pid());
+    let error =
+        wait_for_status(directory.path(), "ready", Instant::now(), Duration::ZERO).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("no longer running"),
+        "{error:#}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn internal_wait_does_not_call_live_or_unverified_owner_dead() {
+    for mode in ["live", "mismatched", "missing"] {
+        let directory = tempfile::tempdir().unwrap();
+        if mode == "mismatched" {
+            write_attested_apple_terminal_state(directory.path(), "working", std::process::id());
+        } else {
+            write_owned_terminal_state(directory.path(), "working", std::process::id());
+        }
+        if mode == "missing" {
+            fs::remove_file(directory.path().join(SESSION_OWNER_FILE)).unwrap();
+        }
+        for status_wait in [false, true] {
+            let error = if status_wait {
+                wait_for_status(directory.path(), "ready", Instant::now(), Duration::ZERO)
+                    .unwrap_err()
+            } else {
+                wait_for_event_for_turn(directory.path(), 0, None, None, Duration::ZERO)
+                    .unwrap_err()
+            };
+            assert!(
+                !format!("{error:#}").contains("no longer running"),
+                "{mode}: {error:#}"
+            );
+            assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+            assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn internal_event_wait_recovers_completion_before_reporting_dead_owner() {
+    for published in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        write_attested_apple_terminal_state(directory.path(), "working", reaped_child_pid());
+        let handle = fs::read(directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
+        let token = fs::read_to_string(directory.path().join(TURN_CLAIM_FILE)).unwrap();
+        let pending = sample_completion(token.trim(), "completed before owner exit");
+        write_json_atomic(&directory.path().join(TURN_COMPLETION_FILE), &pending).unwrap();
+        if published {
+            recover_pending_completion(directory.path()).unwrap();
+        }
+        let event = wait_for_event_for_turn(
+            directory.path(),
+            0,
+            Some("provider-turn"),
+            Some(token.trim()),
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(event.message, "completed before owner exit");
+        assert_eq!(
+            fs::read(directory.path().join(TERMINAL_HANDLE_FILE)).unwrap(),
+            handle
+        );
+        assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+        assert!(!directory.path().join(CLOSED_STATUS_FILE).exists());
+    }
+}
+
 #[test]
 fn atomic_json_write_syncs_temporary_then_persisted_file_then_parent() {
     let directory = tempfile::tempdir().unwrap();
