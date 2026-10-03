@@ -365,6 +365,22 @@ pub(super) fn applied(directory: &Path, method: &str) -> Result<()> {
     write_json_atomic(&path, &assessment)
 }
 
+fn respond_to_workspace_dialog(
+    directory: &Path,
+    session: &terminal::TerminalSession,
+    input: &terminal::GuardedDialogInput,
+    deadline: Instant,
+) -> Result<bool> {
+    if !terminal::guards_dialog_input(session.kind) {
+        bail!(
+            "the workspace trust dialog cannot be answered with a guarded key in {}; no key was sent; use the provider's own workspace trust prompt, then launch again",
+            session.kind.display_name()
+        );
+    }
+    applied(directory, "workspace-dialog-response-pending")?;
+    terminal::guarded_dialog_input(session, input, deadline)
+}
+
 pub(super) fn complete_launch(
     directory: &Path,
     target: FirstPartyCli,
@@ -413,8 +429,8 @@ pub(super) fn complete_launch(
             if let Some(key) = provider::workspace_trust_key(target, &screen, &manifest.workspace) {
                 // Persist intent before the one response. Never retry an input call
                 // that errors: it may already have reached the target dialog.
-                applied(directory, "workspace-dialog-response-pending")?;
-                responded = terminal::guarded_dialog_input(
+                responded = respond_to_workspace_dialog(
+                    directory,
                     session,
                     &terminal::GuardedDialogInput { screen, key },
                     deadline,
@@ -756,6 +772,42 @@ mod tests {
         fs::create_dir(&workspace).unwrap();
         let homes = fixture_homes(&root);
         (temp, workspace, homes)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unsupported_dialog_response_preserves_consent_without_pending_input() {
+        let (temp, workspace, homes) = setup();
+        let assessment = assess_with(temp.path(), &workspace, &homes).unwrap();
+        let path = temp.path().join(SESSION_FILE);
+        write_json_atomic(&path, &assessment).unwrap();
+        let before = fs::read(&path).unwrap();
+        for kind in [
+            terminal::TerminalKind::WezTerm,
+            terminal::TerminalKind::Warp,
+            terminal::TerminalKind::Ghostty,
+        ] {
+            let session = terminal::TerminalSession {
+                kind,
+                id: "unused".into(),
+                tab_id: None,
+                window_id: None,
+                managed_session_id: None,
+                windows_process_identity: None,
+                wezterm_mux: None,
+            };
+            let error = respond_to_workspace_dialog(
+                temp.path(),
+                &session,
+                &terminal::GuardedDialogInput {
+                    screen: "verified dialog".into(),
+                    key: terminal::DialogKey::Enter,
+                },
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap_err();
+            assert_eq!(fs::read(&path).unwrap(), before, "{kind:?}: {error:#}");
+        }
     }
 
     fn trust_pi(homes: &Homes, workspace: &Path) {

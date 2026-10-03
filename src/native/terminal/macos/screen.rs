@@ -72,6 +72,14 @@ fn script_args(session: &TerminalSession) -> Result<(&'static str, Vec<&str>)> {
                     .context("Terminal window identity missing")?,
             ],
         )),
+        TerminalKind::Warp => bail!(
+            "managed Warp screen reads and guarded input are unsupported; Warp Control input.insert/input.replace do not submit"
+        ),
+        // `get-text` and `send-text` are two calls, and the screen can change between
+        // them. A key is sent only by a call that compared the screen itself.
+        TerminalKind::WezTerm => bail!(
+            "WezTerm cannot compare the screen and send a key in one call; answer the dialog in its pane"
+        ),
         _ => bail!("managed dialog input unsupported for this terminal"),
     }
 }
@@ -80,6 +88,9 @@ pub(in crate::native::terminal) fn read_screen(
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<String> {
+    if session.kind == TerminalKind::WezTerm {
+        return wezterm::read_screen(&wezterm::Installed, session, deadline);
+    }
     let (script, args) = script_args(session)?;
     let text = applescript::run_until(session.kind.display_name(), script, &args, deadline)?;
     Ok(text

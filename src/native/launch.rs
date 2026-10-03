@@ -525,9 +525,14 @@ mod tests {
         assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
     }
 
+    // An explicit close after a failed startup whose wrapper recorded itself and ended.
+    // A surface with an app-unique native id (an iTerm2 session, a Windows console) is
+    // still closed by that id. A macOS surface that can outlive its owner is not: a
+    // failed launch is no close intent, and an owner record without the whole identity
+    // does not even allow the observation that could prove the surface gone.
     #[cfg(any(target_os = "macos", windows))]
     #[test]
-    fn explicit_close_can_recover_a_failed_startup_with_a_dead_recorded_owner() {
+    fn explicit_close_recovers_a_failed_startup_only_through_a_stable_native_id() {
         let (directory, _) = fixture();
         let id = directory.path().file_name().unwrap().to_str().unwrap();
         let mut record = read(directory.path()).unwrap().unwrap();
@@ -549,17 +554,43 @@ mod tests {
             },
         )
         .unwrap();
-        let mut surface = terminal::TerminalSession {
-            kind: terminal::TerminalKind::Iterm2,
-            id: "missing-owned-surface".to_owned(),
-            managed_session_id: Some(id.to_owned()),
-            tab_id: None,
-            window_id: None,
-            windows_process_identity: None,
+        let authority = |kind, managed_session_id: &str| {
+            verify_terminal_close_authority_with_observations(
+                directory.path(),
+                id,
+                &terminal::TerminalSession {
+                    kind,
+                    id: "missing-owned-surface".to_owned(),
+                    managed_session_id: Some(managed_session_id.to_owned()),
+                    tab_id: None,
+                    window_id: None,
+                    wezterm_mux: None,
+                    windows_process_identity: None,
+                },
+                || panic!("an unproven owner allows no surface observation"),
+                |_| panic!("no app incarnation is recorded"),
+                || panic!("no app incarnation is recorded"),
+            )
         };
-        assert!(!verify_terminal_close_authority(directory.path(), id, &surface).unwrap());
-        surface.managed_session_id = Some("session-foreign".to_owned());
-        assert!(verify_terminal_close_authority(directory.path(), id, &surface).is_err());
+        assert_eq!(
+            authority(terminal::TerminalKind::Iterm2, id).unwrap(),
+            TerminalCloseAuthority::SurfaceOnly
+        );
+        assert!(authority(terminal::TerminalKind::Iterm2, "session-foreign").is_err());
+        #[cfg(target_os = "macos")]
+        for kind in [
+            terminal::TerminalKind::AppleTerminal,
+            terminal::TerminalKind::Warp,
+            terminal::TerminalKind::WezTerm,
+        ] {
+            let error = authority(kind, id).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("no terminal observation or close was sent"),
+                "{kind:?}: {error:#}"
+            );
+        }
         assert!(directory.path().join(TURN_CLAIM_FILE).exists());
     }
 

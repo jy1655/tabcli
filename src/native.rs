@@ -50,6 +50,10 @@ const CLOSED_STATUS_FILE: &str = "closed.json";
 const TERMINAL_HANDLE_FILE: &str = "terminal.json";
 const TERMINAL_CLOSING_FILE: &str = "terminal.closing.json";
 const TERMINAL_TOMBSTONE_FILE: &str = "terminal.closed.json";
+// An explicit Terminal.app or Warp close writes it after verifying the live owner
+// and surface, before teardown/close; see `terminal_close_intent_owner`.
+#[cfg(target_os = "macos")]
+const TERMINAL_CLOSE_INTENT_FILE: &str = "terminal.close-intent.json";
 // v0.0.2 native-Windows Claude sessions may still carry these files. New sessions never
 // create them; explicit close and prune consume them so an upgrade cannot strand state.
 const LEGACY_RESUME_PENDING_FILE: &str = "resume.pending.json";
@@ -120,6 +124,20 @@ pub(crate) enum NativeCommand {
     },
     ConsoleHost {
         directory: PathBuf,
+    },
+    Iterm2Host {
+        directory: PathBuf,
+    },
+    AppleTerminalHost {
+        directory: PathBuf,
+    },
+    WezTermHost {
+        directory: PathBuf,
+    },
+    GhosttyHost,
+    WarpHost {
+        directory: PathBuf,
+        attempt: String,
     },
 }
 
@@ -321,6 +339,8 @@ struct NativeSessionOwner {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     terminal_shell: Option<MacTerminalShellIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_app: Option<MacTerminalAppIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     windows_process_identity: Option<terminal::WindowsProcessIdentity>,
 }
 
@@ -331,6 +351,23 @@ struct MacTerminalShellIdentity {
     terminal_tty_device: u64,
     process_start_seconds: u64,
     process_start_microseconds: u64,
+}
+
+// Captured from the verified native owner's ancestor chain before provider start.
+// A Terminal window id and tty are identities only inside this app incarnation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct MacTerminalAppIdentity {
+    pid: u32,
+    start_seconds: u64,
+    start_microseconds: u64,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Deserialize, Serialize)]
+struct TerminalCloseIntent {
+    managed_session_id: String,
+    terminal: terminal::TerminalSession,
+    owner: NativeSessionOwner,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -372,6 +409,38 @@ struct MacProcBsdInfo {
     process_start_microseconds: u64,
 }
 
+// `struct kinfo_proc` of <sys/sysctl.h> on 64-bit macOS, which libc does not define: the
+// start time, the PID, the command name and the parent PID at their offsets (0, 8, 40, 243
+// and 560 of 648 bytes), the rest as padding.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct MacKinfoProc {
+    start_seconds: i64,
+    start_microseconds: i32,
+    _to_pid: [u8; 28],
+    pid: i32,
+    _to_command: [u8; 199],
+    command: [u8; 17],
+    _to_parent: [u8; 300],
+    parent_pid: i32,
+    _rest: [u8; 84],
+}
+
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::size_of::<MacKinfoProc>() == 648);
+
+#[cfg(target_os = "macos")]
+impl MacKinfoProc {
+    fn identity(&self) -> Result<MacTerminalAppIdentity> {
+        Ok(MacTerminalAppIdentity {
+            pid: u32::try_from(self.pid)?,
+            start_seconds: u64::try_from(self.start_seconds)?,
+            start_microseconds: u64::try_from(self.start_microseconds)?,
+        })
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[link(name = "proc")]
 unsafe extern "C" {
@@ -382,6 +451,7 @@ unsafe extern "C" {
         buffer: *mut libc::c_void,
         buffer_size: libc::c_int,
     ) -> libc::c_int;
+    fn proc_pidpath(pid: libc::c_int, buffer: *mut libc::c_void, buffer_size: u32) -> libc::c_int;
 }
 
 struct CreatedSession {
@@ -423,6 +493,11 @@ pub(crate) fn is_command(value: &str) -> bool {
             | "native-provider-control"
             | "native-console-control"
             | "native-console-host"
+            | "native-iterm2-host"
+            | "native-terminal-host"
+            | "native-wezterm-host"
+            | "native-ghostty-host"
+            | "native-warp-host"
     )
 }
 
@@ -502,22 +577,59 @@ where
                 timeout_ms,
             })
         }
-        "native-console-host" => {
+        "native-console-host"
+        | "native-iterm2-host"
+        | "native-wezterm-host"
+        | "native-terminal-host" => {
             // The tab's process does not necessarily inherit the state root, so it is
             // given the session directory itself.
             let directory = PathBuf::from(one_positional(
                 rest,
-                "native-console-host requires one session directory",
+                &format!("{command} requires one session directory"),
             )?);
             let id = directory
                 .file_name()
                 .and_then(|name| name.to_str())
-                .context("native-console-host requires a session directory")?;
+                .with_context(|| format!("{command} requires a session directory"))?;
             require_valid_session_id(id)?;
             if !directory.is_absolute() {
-                bail!("native-console-host requires an absolute session directory");
+                bail!("{command} requires an absolute session directory");
             }
-            Ok(NativeCommand::ConsoleHost { directory })
+            match command.as_str() {
+                "native-iterm2-host" => Ok(NativeCommand::Iterm2Host { directory }),
+                "native-terminal-host" => Ok(NativeCommand::AppleTerminalHost { directory }),
+                "native-wezterm-host" => Ok(NativeCommand::WezTermHost { directory }),
+                _ => Ok(NativeCommand::ConsoleHost { directory }),
+            }
+        }
+        "native-ghostty-host" => {
+            // The surface is created before its session is bound to it, so this host
+            // is given nothing: its launch reaches it through its own terminal.
+            if !rest.is_empty() {
+                bail!("native-ghostty-host takes no argument");
+            }
+            Ok(NativeCommand::GhosttyHost)
+        }
+        "native-warp-host" => {
+            let [directory, attempt] = rest else {
+                bail!("native-warp-host requires a session directory and attempt token");
+            };
+            let directory = PathBuf::from(directory);
+            let id = directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("native-warp-host requires a session directory")?;
+            require_valid_session_id(id)?;
+            if !directory.is_absolute() {
+                bail!("native-warp-host requires an absolute session directory");
+            }
+            if attempt.len() != 32 || !attempt.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                bail!("native-warp-host requires a valid attempt token");
+            }
+            Ok(NativeCommand::WarpHost {
+                directory,
+                attempt: attempt.clone(),
+            })
         }
         _ => bail!("unknown native command: {command}"),
     }
@@ -990,6 +1102,11 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
             timeout_ms,
         } => run_windows_console_control(&action, &id, input_name.as_deref(), timeout_ms),
         NativeCommand::ConsoleHost { directory } => run_windows_console_host(&directory),
+        NativeCommand::Iterm2Host { directory } => terminal::iterm2_host(&directory),
+        NativeCommand::AppleTerminalHost { directory } => terminal::apple_terminal_host(&directory),
+        NativeCommand::WezTermHost { directory } => terminal::wezterm_host(&directory),
+        NativeCommand::GhosttyHost => terminal::ghostty_host(),
+        NativeCommand::WarpHost { directory, attempt } => terminal::warp_host(&directory, &attempt),
     }
 }
 
@@ -1469,9 +1586,10 @@ fn launch_created_session(
     )
     .with_context(|| {
         format!(
-            "session {} remains open in {}; use `agent-bridge sessions` to inspect it",
+            "session {} in {} did not return a successful result; use `agent-bridge inspect {}` to inspect its recorded state",
             created.id,
-            terminal_session.kind.display_name()
+            terminal_session.kind.display_name(),
+            created.id
         )
     })?;
     emit_session_result_with(
@@ -1978,13 +2096,49 @@ fn close_surface_after_reopen_verification_failure_with(
 // conflict still says why.
 fn close_session_surface(directory: &Path, id: &str, reason: Option<String>) -> Result<()> {
     close_repaired_session_state_with_reason(directory, reason, |session| {
-        let has_native_owner = verify_terminal_close_authority(directory, id, session)?;
+        let authority = verify_terminal_close_authority(directory, id, session)?;
+        if authority == TerminalCloseAuthority::Absent {
+            return Ok(terminal::CloseOutcome::Missing);
+        }
+        let has_native_owner = authority == TerminalCloseAuthority::LiveOwner;
         #[cfg(target_os = "macos")]
         if has_native_owner && session.kind == terminal::TerminalKind::AppleTerminal {
             terminate_apple_terminal_owner(directory, id, session)?;
         }
+        #[cfg(target_os = "macos")]
+        if has_native_owner && session.kind == terminal::TerminalKind::Warp {
+            let (owner, live) = verified_macos_terminal_owner(directory, id, session, None)?;
+            let shell = live_native_process_identity(live.parent_pid)?;
+            prepare_warp_close(
+                directory,
+                id,
+                session,
+                &owner,
+                &live,
+                &shell,
+                terminate_owned_foreground_group,
+            )?;
+        }
+        #[cfg(target_os = "macos")]
+        if has_native_owner && session.kind == terminal::TerminalKind::WezTerm {
+            // tab.close/kill-pane can end the owner while surface cleanup still fails.
+            // Preserve this exact requested close before its first external mutation.
+            let (owner, _) = verified_macos_terminal_owner(directory, id, session, None)?;
+            record_terminal_close_intent(directory, id, session, &owner)?;
+        }
         #[cfg(not(target_os = "macos"))]
         let _ = has_native_owner;
+        #[cfg(target_os = "macos")]
+        if session.kind == terminal::TerminalKind::AppleTerminal {
+            let owner: NativeSessionOwner = read_json(&directory.join(SESSION_OWNER_FILE))?;
+            return terminal::macos::apple_terminal::close_attested_session(
+                session,
+                owner
+                    .terminal_app
+                    .as_ref()
+                    .context("Terminal.app close has no app incarnation")?,
+            );
+        }
         terminal::close_session(session)
     })
 }
@@ -2712,11 +2866,179 @@ fn terminate_apple_terminal_owner(
     expected_session_id: &str,
     session: &terminal::TerminalSession,
 ) -> Result<()> {
-    let (owner, live) = verified_apple_terminal_owner(directory, expected_session_id, session)?;
+    let (mut owner, live) = verified_apple_terminal_owner(directory, expected_session_id, session)?;
     let process_group = verified_terminal_owner_process_group(&owner, &live)?;
     let live_shell = live_native_process_identity(live.parent_pid)?;
     let shell_process_group = verified_terminal_shell_process_group(&owner, &live, &live_shell)?;
+    record_legacy_terminal_app(directory, &mut owner, terminal_app_process)?;
+    require_unique_terminal_app(
+        owner
+            .terminal_app
+            .as_ref()
+            .context("Terminal.app identity was not recorded")?,
+        &terminal_app_instances()?,
+    )?;
+    record_terminal_close_intent(directory, expected_session_id, session, &owner)?;
     terminal::macos::apple_terminal::terminate_process_groups(process_group, shell_process_group)
+}
+
+// Warp preserves normal close warnings. Stop only the fully attested foreground
+// job before requesting tab.close; never suppress warnings or signal by tty name.
+#[cfg(target_os = "macos")]
+fn prepare_warp_close(
+    directory: &Path,
+    id: &str,
+    session: &terminal::TerminalSession,
+    owner: &NativeSessionOwner,
+    live: &NativeProcessIdentity,
+    shell: &NativeProcessIdentity,
+    stop: impl FnOnce(u32) -> Result<()>,
+) -> Result<()> {
+    session.verify_managed_session(id)?;
+    if session.kind != terminal::TerminalKind::Warp
+        || owner.managed_session_id.as_deref() != Some(id)
+        || !native_owner_identity_matches(owner, live)
+    {
+        bail!("Warp close owner identity changed");
+    }
+    let group = verified_terminal_owner_process_group(owner, live)?;
+    verified_terminal_shell_process_group(owner, live, shell)?;
+    record_terminal_close_intent(directory, id, session, owner)?;
+    stop(group)
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_owned_foreground_group(group: u32) -> Result<()> {
+    let target = terminal::macos::apple_terminal::process_group_signal_target(group)?;
+    if unsafe { libc::kill(target, libc::SIGTERM) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(error).context("could not stop the attested Warp foreground group");
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if unsafe { libc::kill(target, 0) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(error).context("could not observe the stopped Warp foreground group");
+        }
+        if Instant::now() >= deadline {
+            bail!("the attested Warp foreground group has not stopped; no tab close was sent");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+// The macOS surfaces that can outlive their native owner: Terminal.app keeps the window
+// of an ended shell, and Warp, WezTerm and Ghostty surfaces can remain. Outside the
+// native-ID failed-start recovery below, only the close that recorded its intent first
+// may reach a surface after its owner ended. Otherwise only proven absence consumes the
+// handle; repair itself never closes it.
+#[cfg(target_os = "macos")]
+fn surface_outlives_owner(kind: terminal::TerminalKind) -> bool {
+    matches!(
+        kind,
+        terminal::TerminalKind::AppleTerminal
+            | terminal::TerminalKind::Warp
+            | terminal::TerminalKind::WezTerm
+            | terminal::TerminalKind::Ghostty
+    )
+}
+
+#[cfg(any(target_os = "macos", windows))]
+fn failed_start_has_native_close_identity(kind: terminal::TerminalKind) -> bool {
+    matches!(
+        kind,
+        terminal::TerminalKind::Iterm2
+            | terminal::TerminalKind::Ghostty
+            | terminal::TerminalKind::WindowsConsole
+    )
+}
+
+// A record of 0.0.10 or earlier names no app incarnation. While its owner is live and
+// verified, the incarnation is the one that owner runs in. It is recorded before the
+// close intent, so that the intent and every retry carry it.
+#[cfg(target_os = "macos")]
+fn record_legacy_terminal_app(
+    directory: &Path,
+    owner: &mut NativeSessionOwner,
+    derive: impl FnOnce(&NativeSessionOwner) -> Result<MacTerminalAppIdentity>,
+) -> Result<()> {
+    if owner.terminal_app.is_none() {
+        owner.terminal_app = Some(derive(owner)?);
+        write_json_atomic(&directory.join(SESSION_OWNER_FILE), owner)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn record_terminal_close_intent(
+    directory: &Path,
+    expected_session_id: &str,
+    session: &terminal::TerminalSession,
+    owner: &NativeSessionOwner,
+) -> Result<()> {
+    write_json_atomic(
+        &directory.join(TERMINAL_CLOSE_INTENT_FILE),
+        &TerminalCloseIntent {
+            managed_session_id: expected_session_id.to_owned(),
+            terminal: session.clone(),
+            owner: owner.clone(),
+        },
+    )
+}
+
+// An explicit close can end the owner before the window is gone, so a
+// close that fails after it can never verify that owner again, and the owner's death
+// says nothing about the window. The intent that the close recorded first lets only
+// that close finish: it names this managed session, this exact handle and this exact
+// owner record, with the owner's whole identity. Anything else, unreadable or not,
+// grants nothing.
+#[cfg(target_os = "macos")]
+fn terminal_close_intent_owner(
+    directory: &Path,
+    session: &terminal::TerminalSession,
+) -> Result<Option<NativeSessionOwner>> {
+    if !surface_outlives_owner(session.kind) {
+        return Ok(None);
+    }
+    let (Some(intent), Some(owner)) = (
+        read_regular_text_if_present(&directory.join(TERMINAL_CLOSE_INTENT_FILE))?,
+        read_regular_text_if_present(&directory.join(SESSION_OWNER_FILE))?,
+    ) else {
+        return Ok(None);
+    };
+    let (Ok(intent), Ok(owner)) = (
+        serde_json::from_str::<TerminalCloseIntent>(&intent),
+        serde_json::from_str::<NativeSessionOwner>(&owner),
+    ) else {
+        return Ok(None);
+    };
+    let attested = matches!(
+        (
+            owner.terminal_tty_device,
+            owner.process_start_seconds,
+            owner.process_start_microseconds,
+            owner.process_group,
+            owner.terminal_process_group,
+        ),
+        (Some(_), Some(_), Some(_), Some(_), Some(_))
+    );
+    let bound = session.managed_session_id.as_deref() == Some(intent.managed_session_id.as_str())
+        && owner.managed_session_id.as_deref() == Some(intent.managed_session_id.as_str());
+    let exact = intent.terminal == *session
+        && serde_json::to_value(&intent.owner)? == serde_json::to_value(&owner)?;
+    Ok((attested && bound && exact).then_some(owner))
+}
+
+#[cfg(target_os = "macos")]
+fn terminal_close_resumable(directory: &Path, session: &terminal::TerminalSession) -> Result<bool> {
+    Ok(terminal_close_intent_owner(directory, session)?
+        .is_some_and(|owner| !process_is_alive(owner.pid)))
 }
 
 #[cfg(test)]
@@ -2790,6 +3112,7 @@ fn current_native_session_owner(session_id: &str) -> Result<NativeSessionOwner> 
         process_group: Some(live.process_group),
         terminal_process_group: Some(live.terminal_process_group),
         terminal_shell: Some(terminal_shell),
+        terminal_app: None,
         windows_process_identity: None,
     };
     verified_terminal_owner_process_group(&owner, &live)?;
@@ -2883,6 +3206,359 @@ fn live_native_process_identity(pid: u32) -> Result<NativeProcessIdentity> {
         process_start_seconds: info.process_start_seconds,
         process_start_microseconds: info.process_start_microseconds,
     })
+}
+
+// The birth of any process, with or without a controlling TTY. `None`: no such process.
+#[cfg(target_os = "macos")]
+fn macos_process_start(pid: u32) -> Result<Option<(u64, u64)>> {
+    Ok(macos_process_info(pid)?
+        .map(|info| (info.process_start_seconds, info.process_start_microseconds)))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_info(pid: u32) -> Result<Option<MacProcBsdInfo>> {
+    const PROC_PIDTBSDINFO: libc::c_int = 3;
+
+    let pid_value = libc::c_int::try_from(pid).context("PID is out of range")?;
+    let buffer_size = libc::c_int::try_from(std::mem::size_of::<MacProcBsdInfo>())
+        .context("macOS process-info structure is too large")?;
+    let mut info = std::mem::MaybeUninit::<MacProcBsdInfo>::zeroed();
+    let returned = unsafe {
+        proc_pidinfo(
+            pid_value,
+            PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            buffer_size,
+        )
+    };
+    if returned != buffer_size {
+        let error = std::io::Error::last_os_error();
+        if returned <= 0 && error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        return Err(error).with_context(|| format!("failed to inspect process {pid}"));
+    }
+    let info = unsafe { info.assume_init() };
+    if info.pid != pid {
+        bail!("macOS returned the identity of another process for {pid}")
+    }
+    Ok(Some(info))
+}
+
+// The kernel's process records for one sysctl name, as `ps` reads them. They answer for
+// the processes of every user. PROC_PIDTBSDINFO answers only for the caller's own, and
+// the shell of a terminal tab is a child of the root-owned /usr/bin/login.
+#[cfg(target_os = "macos")]
+fn macos_process_records(name: &mut [libc::c_int]) -> Result<Vec<MacKinfoProc>> {
+    let record = std::mem::size_of::<MacKinfoProc>();
+    let length = libc::c_uint::try_from(name.len())?;
+    let mut size = 0;
+    let sized = unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            length,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if sized != 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to size the process table");
+    }
+    // Room for processes that start between the two calls. A table that grew past it is
+    // an error of the second call, never a short list.
+    let mut records = vec![unsafe { std::mem::zeroed::<MacKinfoProc>() }; size / record + 64];
+    let mut size = records.len() * record;
+    let read = unsafe {
+        libc::sysctl(
+            name.as_mut_ptr(),
+            length,
+            records.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to read the process table");
+    }
+    if !size.is_multiple_of(record) {
+        bail!("macOS returned an incomplete process record")
+    }
+    records.truncate(size / record);
+    Ok(records)
+}
+
+// The executable of a process of any user. `None`: no such process.
+#[cfg(target_os = "macos")]
+fn macos_process_path(pid: u32) -> Result<Option<String>> {
+    let mut path = [0u8; 4096];
+    let count =
+        unsafe { proc_pidpath(pid.try_into()?, path.as_mut_ptr().cast(), path.len() as u32) };
+    if count <= 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        return Err(error).with_context(|| format!("could not read the executable of {pid}"));
+    }
+    let bytes = path
+        .get(..usize::try_from(count)?)
+        .context("incomplete executable path")?;
+    Ok(Some(
+        std::str::from_utf8(bytes)?
+            .trim_end_matches('\0')
+            .to_owned(),
+    ))
+}
+
+// One ancestor of the terminal shell: its incarnation, its parent and its executable.
+#[cfg(target_os = "macos")]
+fn terminal_app_ancestor(pid: u32) -> Result<(MacTerminalAppIdentity, u32, String)> {
+    let mut name = [
+        libc::CTL_KERN,
+        libc::KERN_PROC,
+        libc::KERN_PROC_PID,
+        libc::c_int::try_from(pid).context("PID is out of range")?,
+    ];
+    let records = macos_process_records(&mut name)
+        .with_context(|| format!("failed to inspect process {pid}"))?;
+    let [record] = records.as_slice() else {
+        bail!("Terminal.app ancestor {pid} ended during attestation")
+    };
+    let identity = record.identity()?;
+    if identity.pid != pid {
+        bail!("macOS returned the identity of another process for {pid}")
+    }
+    let path = macos_process_path(pid)?
+        .with_context(|| format!("Terminal.app ancestor {pid} ended during attestation"))?;
+    Ok((identity, u32::try_from(record.parent_pid)?, path))
+}
+
+// Every running process with this command name, in PID order, each with its birth. The
+// command name is the executable's, whichever bundle it runs from and whoever owns it.
+#[cfg(target_os = "macos")]
+fn macos_processes_named(command: &[u8]) -> Result<Vec<MacTerminalAppIdentity>> {
+    let mut name = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
+    let mut processes = macos_process_records(&mut name)?
+        .iter()
+        .filter(|record| record.command.split(|byte| *byte == 0).next() == Some(command))
+        .map(MacKinfoProc::identity)
+        .collect::<Result<Vec<_>>>()?;
+    processes.sort_by_key(|process| process.pid);
+    Ok(processes)
+}
+
+// Every running process that `application "Terminal"` can be.
+#[cfg(target_os = "macos")]
+fn terminal_app_instances() -> Result<Vec<MacTerminalAppIdentity>> {
+    macos_processes_named(b"Terminal")
+}
+
+#[cfg(target_os = "macos")]
+fn require_unique_terminal_app(
+    app: &MacTerminalAppIdentity,
+    instances: &[MacTerminalAppIdentity],
+) -> Result<()> {
+    if instances != std::slice::from_ref(app) {
+        bail!(
+            "Terminal.app scripting target is ambiguous or changed; the recorded app must be the only running instance and the exact surface handle is retained"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn terminal_app_process(owner: &NativeSessionOwner) -> Result<MacTerminalAppIdentity> {
+    let shell = owner
+        .terminal_shell
+        .as_ref()
+        .context("Terminal.app owner has no shell identity")?;
+    terminal_app_process_with(shell, terminal_app_ancestor)
+}
+
+#[cfg(target_os = "macos")]
+fn terminal_app_process_with(
+    shell: &MacTerminalShellIdentity,
+    mut observe: impl FnMut(u32) -> Result<(MacTerminalAppIdentity, u32, String)>,
+) -> Result<MacTerminalAppIdentity> {
+    let mut pid = shell.pid;
+    let mut lineage = Vec::new();
+    while pid > 1
+        && !lineage
+            .iter()
+            .any(|(app, _, _): &(MacTerminalAppIdentity, u32, String)| app.pid == pid)
+    {
+        let (app, parent, path) = observe(pid)?;
+        if app.pid != pid
+            || (pid == shell.pid
+                && (app.start_seconds, app.start_microseconds)
+                    != (
+                        shell.process_start_seconds,
+                        shell.process_start_microseconds,
+                    ))
+        {
+            bail!("Terminal.app ancestor incarnation changed during app attestation");
+        }
+        let is_terminal = matches!(
+            path.as_str(),
+            "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+                | "/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+        );
+        lineage.push((app.clone(), parent, path));
+        if is_terminal {
+            for recorded in &lineage {
+                if observe(recorded.0.pid)? != *recorded {
+                    bail!("Terminal.app ancestor identity changed during attestation");
+                }
+            }
+            return Ok(app);
+        }
+        pid = parent;
+    }
+    bail!("the verified terminal shell has no system Terminal.app ancestor")
+}
+
+#[cfg(target_os = "macos")]
+fn terminal_app_alive_with(
+    app: &MacTerminalAppIdentity,
+    process_birth: impl FnOnce(u32) -> Result<Option<(u64, u64)>>,
+) -> Result<bool> {
+    if app.pid == 0 || app.start_seconds == 0 || app.start_microseconds >= 1_000_000 {
+        bail!(
+            "Terminal.app process incarnation is incomplete; the exact surface handle is retained"
+        );
+    }
+    match process_birth(app.pid)? {
+        None => Ok(false),
+        Some(birth) if birth == (app.start_seconds, app.start_microseconds) => Ok(true),
+        Some(_) => bail!("Terminal.app PID was reused; no close or absence authority was granted"),
+    }
+}
+
+// Whether the recorded Terminal.app window is proven gone, by reading only. With the app
+// incarnation that created it: that process ended, or its window list lacks the window.
+// A record without one (a start that failed before the wrapper recorded it, or an owner
+// record of 0.0.10 and earlier) cannot tie a reply to an incarnation, so the reply
+// counts only when no second instance can have given it: at most one Terminal process
+// runs, the same before and after. A window list that lacks the id then proves the
+// window gone whichever incarnation created it. A listed id proves nothing: a restarted
+// Terminal can reuse it. Nothing here closes or signals.
+#[cfg(target_os = "macos")]
+fn terminal_surface_absent(
+    app: Option<&MacTerminalAppIdentity>,
+    process_birth: impl Fn(u32) -> Result<Option<(u64, u64)>>,
+    terminal_instances: impl Fn() -> Result<Vec<MacTerminalAppIdentity>>,
+    surface_present: impl FnOnce() -> Result<bool>,
+) -> Result<bool> {
+    let Some(app) = app else {
+        let before = terminal_instances()?;
+        if before.len() > 1 {
+            bail!(
+                "more than one Terminal.app process is running and the record names none; absence is unproven and the surface handle is retained"
+            );
+        }
+        let present = surface_present()?;
+        if terminal_instances()? != before {
+            bail!(
+                "Terminal.app started or ended during the observation; absence is unproven and the surface handle is retained"
+            );
+        }
+        return Ok(!present);
+    };
+    if !terminal_app_alive_with(app, &process_birth)? {
+        return Ok(true);
+    }
+    require_unique_terminal_app(app, &terminal_instances()?)?;
+    let present = surface_present()?;
+    if !terminal_app_alive_with(app, &process_birth)? {
+        return Ok(true);
+    }
+    require_unique_terminal_app(app, &terminal_instances()?)?;
+    Ok(!present)
+}
+
+// Startup command failure can precede the wrapper's owner and app identity record. The
+// window and tty alone do not authorize a close after an app restart. Only the proven
+// absence of the exact surface can unbind here; never close/signal.
+#[cfg(target_os = "macos")]
+fn apple_terminal_startup_absent(
+    directory: &Path,
+    surface: &terminal::TerminalSession,
+    deadline: Instant,
+) -> Result<bool> {
+    apple_terminal_startup_absent_with(
+        directory,
+        surface,
+        process_is_alive,
+        macos_process_start,
+        terminal_app_instances,
+        || terminal::surface_present(surface, deadline.saturating_duration_since(Instant::now())),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn apple_terminal_startup_absent_with(
+    directory: &Path,
+    surface: &terminal::TerminalSession,
+    owner_alive: impl FnOnce(u32) -> bool,
+    process_birth: impl Fn(u32) -> Result<Option<(u64, u64)>>,
+    terminal_instances: impl Fn() -> Result<Vec<MacTerminalAppIdentity>>,
+    surface_present: impl FnOnce() -> Result<bool>,
+) -> Result<bool> {
+    let bound: terminal::TerminalSession = read_json(&directory.join(TERMINAL_HANDLE_FILE))
+        .context("Terminal.app startup has no durable surface binding; cleanup is unverified")?;
+    if surface.kind != terminal::TerminalKind::AppleTerminal
+        || bound.kind != surface.kind
+        || bound.id != surface.id
+        || surface.id.is_empty()
+        || surface.window_id.as_deref().is_none_or(str::is_empty)
+        || bound.window_id != surface.window_id
+        || bound.tab_id != surface.tab_id
+        || bound.managed_session_id.is_none()
+    {
+        bail!(
+            "Terminal.app startup surface identity is incomplete or changed; the binding is retained"
+        );
+    }
+    // The wrapper records itself only once it runs: a start command that was never
+    // typed, or a wrapper that failed first, leaves no owner and no app incarnation.
+    let owner = read_regular_text_if_present(&directory.join(SESSION_OWNER_FILE))?
+        .map(|text| serde_json::from_str::<NativeSessionOwner>(&text))
+        .transpose()
+        .context("invalid Terminal.app startup owner record; the binding is retained")?;
+    if let Some(owner) = &owner {
+        if bound.managed_session_id != owner.managed_session_id
+            || owner.terminal_tty.as_deref() != Some(surface.id.as_str())
+            || !matches!(
+                (
+                    owner.terminal_tty_device,
+                    owner.process_start_seconds,
+                    owner.process_start_microseconds,
+                    owner.process_group,
+                    owner.terminal_process_group
+                ),
+                (Some(_), Some(_), Some(_), Some(_), Some(_))
+            )
+        {
+            bail!(
+                "Terminal.app startup owner/surface identity is incomplete or changed; the binding is retained"
+            );
+        }
+        if owner_alive(owner.pid) {
+            bail!(
+                "Terminal.app startup owner is still live; cleanup is unverified and the binding is retained"
+            );
+        }
+    }
+    terminal_surface_absent(
+        owner.as_ref().and_then(|owner| owner.terminal_app.as_ref()),
+        process_birth,
+        terminal_instances,
+        surface_present,
+    )
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -3202,9 +3878,10 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
     )
     .with_context(|| {
         format!(
-            "session {} remains open in {}; the requested turn did not report completion",
+            "session {} in {} did not return a successful result; use `agent-bridge inspect {}` to inspect its recorded state",
             request.id,
-            terminal_session.kind.display_name()
+            terminal_session.kind.display_name(),
+            request.id
         )
     })?;
     emit_session_result(
@@ -3426,6 +4103,15 @@ fn command_output_until_classified(
     deadline: Instant,
     label: &str,
 ) -> std::result::Result<Output, CommandOutputFailure> {
+    command_output_with_stdin_until_classified(command, Stdio::null(), deadline, label)
+}
+
+fn command_output_with_stdin_until_classified(
+    command: &mut Command,
+    stdin: Stdio,
+    deadline: Instant,
+    label: &str,
+) -> std::result::Result<Output, CommandOutputFailure> {
     if Instant::now() >= deadline {
         return Err(CommandOutputFailure::not_started(anyhow::anyhow!(
             "{label} timed out before it started"
@@ -3451,7 +4137,7 @@ fn command_output_until_classified(
         )));
     }
     let mut child = command
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::from(child_stdout))
         .stderr(Stdio::from(child_stderr))
         .spawn()
@@ -3838,15 +4524,75 @@ fn verify_terminal_close_authority(
     directory: &Path,
     expected_session_id: &str,
     session: &terminal::TerminalSession,
-) -> Result<bool> {
+) -> Result<TerminalCloseAuthority> {
+    verify_terminal_close_authority_with_presence(directory, expected_session_id, session, || {
+        terminal::surface_present(session, Duration::from_secs(3))
+    })
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum TerminalCloseAuthority {
+    LiveOwner,
+    #[cfg(any(target_os = "macos", windows))]
+    SurfaceOnly,
+    Absent,
+}
+
+fn verify_terminal_close_authority_with_presence(
+    directory: &Path,
+    expected_session_id: &str,
+    session: &terminal::TerminalSession,
+    surface_present: impl FnOnce() -> Result<bool>,
+) -> Result<TerminalCloseAuthority> {
+    verify_terminal_close_authority_with_observations(
+        directory,
+        expected_session_id,
+        session,
+        surface_present,
+        |pid| {
+            #[cfg(target_os = "macos")]
+            {
+                macos_process_start(pid)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = pid;
+                bail!("macOS app observation is unavailable on this platform")
+            }
+        },
+        || {
+            #[cfg(target_os = "macos")]
+            {
+                terminal_app_instances()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                bail!("macOS app observation is unavailable on this platform")
+            }
+        },
+    )
+}
+
+fn verify_terminal_close_authority_with_observations(
+    directory: &Path,
+    expected_session_id: &str,
+    session: &terminal::TerminalSession,
+    surface_present: impl FnOnce() -> Result<bool>,
+    process_birth: impl Fn(u32) -> Result<Option<(u64, u64)>>,
+    terminal_instances: impl Fn() -> Result<Vec<MacTerminalAppIdentity>>,
+) -> Result<TerminalCloseAuthority> {
+    let _ = (&surface_present, &process_birth, &terminal_instances);
     #[cfg(any(target_os = "macos", windows))]
     {
         if read_regular_text_if_present(&directory.join(SESSION_OWNER_FILE))?.is_some() {
             // An explicit close may reclaim the exact startup surface after its wrapper
             // died, including an uncertain spawn. This is not automatic failure cleanup:
             // neither a live/unknown owner nor an unbound/foreign handle gains authority.
+            // Terminal.app, Warp and WezTerm gain none here: a failed launch is no close
+            // intent, and the dead-owner rules below apply to them.
             if let Some(launch) = launch::read(directory)?
                 && launch.phase != launch::Phase::Spawned
+                && failed_start_has_native_close_identity(session.kind)
             {
                 let status: SessionStatus = read_json(&directory.join("status.json"))?;
                 let owner: NativeSessionOwner = read_json(&directory.join(SESSION_OWNER_FILE))?;
@@ -3857,11 +4603,97 @@ fn verify_terminal_close_authority(
                         || observed.identity_matches == Some(false))
                 {
                     session.verify_managed_session(expected_session_id)?;
-                    return Ok(false);
+                    return Ok(TerminalCloseAuthority::SurfaceOnly);
+                }
+            }
+            // The close that recorded the intent may finish without signalling anything
+            // again, and only once the owner it verified no longer exists. A live owner,
+            // or a PID that is alive again, keeps the rules below.
+            #[cfg(target_os = "macos")]
+            if terminal_close_resumable(directory, session)? {
+                session.verify_managed_session(expected_session_id)?;
+                if session.kind == terminal::TerminalKind::AppleTerminal {
+                    let owner: NativeSessionOwner = read_json(&directory.join(SESSION_OWNER_FILE))?;
+                    let Some(app) = &owner.terminal_app else {
+                        // An intent of 0.0.10 or earlier names no app incarnation, and
+                        // its owner is gone: nothing can tie the window to an app now.
+                        if terminal_surface_absent(
+                            None,
+                            &process_birth,
+                            &terminal_instances,
+                            surface_present,
+                        )? {
+                            return Ok(TerminalCloseAuthority::Absent);
+                        }
+                        bail!(
+                            "Terminal.app process incarnation was not recorded and its window is not proven gone; no close was sent and the exact surface handle is retained"
+                        );
+                    };
+                    if !terminal_app_alive_with(app, &process_birth)? {
+                        return Ok(TerminalCloseAuthority::Absent);
+                    }
+                    require_unique_terminal_app(app, &terminal_instances()?)?;
+                }
+                return Ok(TerminalCloseAuthority::SurfaceOnly);
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let owner: NativeSessionOwner = read_json(&directory.join(SESSION_OWNER_FILE))?;
+                if !mac_native_owner_is_live(&owner)? {
+                    session.verify_managed_session(expected_session_id)?;
+                    // A reused PID grants neither mutation nor absence authority. The
+                    // original owner's complete binding is required even for a query.
+                    if process_is_alive(owner.pid)
+                        || owner.managed_session_id.as_deref() != Some(expected_session_id)
+                        || !matches!(
+                            (
+                                owner.terminal_tty_device,
+                                owner.process_start_seconds,
+                                owner.process_start_microseconds,
+                                owner.process_group,
+                                owner.terminal_process_group
+                            ),
+                            (Some(_), Some(_), Some(_), Some(_), Some(_))
+                        )
+                        || owner.terminal_tty.as_deref().is_none_or(str::is_empty)
+                    {
+                        bail!(
+                            "dead native-session owner identity is incomplete, foreign, or its PID is reused; no terminal observation or close was sent"
+                        );
+                    }
+                    let absent = if session.kind == terminal::TerminalKind::AppleTerminal {
+                        terminal_surface_absent(
+                            owner.terminal_app.as_ref(),
+                            &process_birth,
+                            &terminal_instances,
+                            surface_present,
+                        )
+                    } else {
+                        surface_present().map(|present| !present)
+                    }
+                    .context("could not prove absence of the dead owner's exact terminal surface; no close was sent")?;
+                    if absent {
+                        return Ok(TerminalCloseAuthority::Absent);
+                    }
+                    bail!(
+                        "the recorded native-session owner is no longer live; visible terminal cleanup is unverified and no close was sent"
+                    );
+                }
+                // A live owner of 0.0.10 or earlier names no app incarnation: the close
+                // derives it from that owner's own ancestry before it records its intent.
+                if session.kind == terminal::TerminalKind::AppleTerminal
+                    && let Some(app) = &owner.terminal_app
+                {
+                    if !terminal_app_alive_with(app, &process_birth)? {
+                        bail!(
+                            "Terminal.app ended while its native owner remained; no close was sent"
+                        );
+                    }
+                    require_unique_terminal_app(app, &terminal_instances()?)?;
                 }
             }
             verify_terminal_surface_ownership(directory, expected_session_id, session)?;
-            return Ok(true);
+            return Ok(TerminalCloseAuthority::LiveOwner);
         }
         let status: SessionStatus = read_json(&directory.join("status.json"))?;
         if !matches!(status.state.as_str(), "launching" | "failed") {
@@ -3874,12 +4706,42 @@ fn verify_terminal_close_authority(
         // provider wrapper writes native-session.json. Explicit close may recover only that
         // bound launch surface; the adapter still targets its stable native identifiers.
         session.verify_managed_session(expected_session_id)?;
-        Ok(false)
+        // A Terminal.app window and tty are identities only inside the app incarnation
+        // that no wrapper recorded here, so nothing is closed: the handle is consumed
+        // once the window is proven gone.
+        #[cfg(target_os = "macos")]
+        if session.kind == terminal::TerminalKind::AppleTerminal {
+            if terminal_surface_absent(None, &process_birth, &terminal_instances, surface_present)?
+            {
+                return Ok(TerminalCloseAuthority::Absent);
+            }
+            bail!(
+                "Terminal.app startup has no native owner/app incarnation and its window is not proven gone; no close was sent and the surface handle is retained"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        if matches!(
+            session.kind,
+            terminal::TerminalKind::Warp | terminal::TerminalKind::WezTerm
+        ) {
+            if !surface_present().context(
+                "could not prove absence of the ownerless startup surface; no close was sent",
+            )? {
+                return Ok(TerminalCloseAuthority::Absent);
+            }
+            bail!(
+                "startup has no native owner or close intent and its surface is not proven gone; no close was sent and the surface handle is retained"
+            );
+        }
+        if !failed_start_has_native_close_identity(session.kind) {
+            bail!("startup surface has no supported native close identity; its handle is retained");
+        }
+        Ok(TerminalCloseAuthority::SurfaceOnly)
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
         verify_terminal_surface_ownership(directory, expected_session_id, session)?;
-        Ok(true)
+        Ok(TerminalCloseAuthority::LiveOwner)
     }
 }
 
@@ -4005,9 +4867,14 @@ fn consume_terminal_handle(
     );
     let active_result = remove_file_if_present(&directory.join(TERMINAL_HANDLE_FILE));
     let closing_result = remove_file_if_present(&directory.join(TERMINAL_CLOSING_FILE));
+    #[cfg(target_os = "macos")]
+    let intent_result = remove_file_if_present(&directory.join(TERMINAL_CLOSE_INTENT_FILE));
+    #[cfg(not(target_os = "macos"))]
+    let intent_result = Ok(());
     tombstone_result?;
     active_result?;
-    closing_result
+    closing_result?;
+    intent_result
 }
 
 fn remove_file_if_present(path: &Path) -> Result<()> {
@@ -4163,6 +5030,17 @@ fn run_session(id: &str) -> Result<()> {
             bail!("native-session must run in a visible interactive terminal");
         }
         let owner = current_native_session_owner(id)?;
+        #[cfg(target_os = "macos")]
+        let owner = {
+            let mut owner = owner;
+            let surface: terminal::TerminalSession =
+                read_json(&directory.join(TERMINAL_HANDLE_FILE))?;
+            surface.verify_managed_session(id)?;
+            if surface.kind == terminal::TerminalKind::AppleTerminal {
+                owner.terminal_app = Some(terminal_app_process(&owner)?);
+            }
+            owner
+        };
         write_json_atomic(&directory.join(SESSION_OWNER_FILE), &owner)?;
         launch::log(&directory, "owner_recorded");
         run_session_inner(&directory)
@@ -6418,6 +7296,28 @@ where
     }
     #[cfg(not(windows))]
     {
+        // An explicit close that began its teardown still has to close the surface or
+        // prove it absent. Even a damaged/mismatched intent must preserve that pending
+        // cleanup: it grants no authority, but is not evidence of a vanished surface.
+        // The explicit close validates the full intent before using it as authority.
+        #[cfg(target_os = "macos")]
+        if read_regular_bytes_if_present(&directory.join(TERMINAL_CLOSE_INTENT_FILE))?.is_some() {
+            return untouched(recovery_damage);
+        }
+        // A native owner ending on its own does not prove that a terminal window
+        // disappeared. Keep the exact handle for the affected macOS adapters even
+        // before a first explicit close. This gives no authority to send a close:
+        // the normal live-owner/previous-intent checks must still pass.
+        #[cfg(target_os = "macos")]
+        for name in [TERMINAL_HANDLE_FILE, TERMINAL_CLOSING_FILE] {
+            if let Some(bytes) = read_regular_bytes_if_present(&directory.join(name))? {
+                let surface: terminal::TerminalSession = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("invalid retained terminal handle {name}"))?;
+                if surface_outlives_owner(surface.kind) {
+                    return untouched(recovery_damage);
+                }
+            }
+        }
         mark_session_closed(directory, repair_error)?;
         Ok(true)
     }
@@ -6470,6 +7370,25 @@ fn event_paths(directory: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+// macOS repair deliberately retains a surface that may outlive its owner. That
+// cleanup obligation must not turn a known process exit into a request timeout.
+// This only diagnoses a dead PID: a reused/live PID or an unknown identity is not
+// proof of death, and nothing here consumes the surface or the pending claim.
+#[cfg(target_os = "macos")]
+fn require_running_wait_owner(directory: &Path) -> Result<()> {
+    if let Some(text) = read_regular_text_if_present(&directory.join(SESSION_OWNER_FILE))? {
+        let owner: NativeSessionOwner =
+            serde_json::from_str(&text).context("invalid native-session owner record")?;
+        if !process_is_alive(owner.pid) {
+            bail!(
+                "native session process {} is no longer running; terminal cleanup remains unverified",
+                owner.pid
+            );
+        }
+    }
+    Ok(())
+}
+
 fn wait_for_status(
     directory: &Path,
     expected_state: &str,
@@ -6480,14 +7399,16 @@ fn wait_for_status(
         recover_pending_completion(directory)?;
         repair_dead_native_owner(directory)?;
         if let Ok(status) = read_json::<SessionStatus>(&directory.join("status.json")) {
-            if status.state == expected_state {
-                return Ok(status);
-            }
             if matches!(status.state.as_str(), "failed" | "exited" | "closed") {
                 let reason = status
                     .error
                     .unwrap_or_else(|| format!("session entered state {}", status.state));
                 bail!("{reason}");
+            }
+            #[cfg(target_os = "macos")]
+            require_running_wait_owner(directory)?;
+            if status.state == expected_state {
+                return Ok(status);
             }
         }
         let remaining = deadline
@@ -6573,6 +7494,8 @@ fn wait_for_event_for_turn_until(
                 .unwrap_or_else(|| format!("session entered state {}", status.state));
             bail!("{reason}");
         }
+        #[cfg(target_os = "macos")]
+        require_running_wait_owner(directory)?;
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .filter(|remaining| !remaining.is_zero())

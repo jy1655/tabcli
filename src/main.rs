@@ -19,10 +19,10 @@ fn help_text() -> String {
 
 Usage:
   agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]
-      [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|windows-console>]
+      [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|warp|wezterm|windows-console>]
       [--yolo] [--timeout-secs N] [--detach] [--json] [--context-result <session>/<request-id>]...
   agent-bridge self-test <codex|claude|agy|pi> [--workspace PATH]
-      [--terminal <ghostty|iterm2|terminal|windows-console>] [--model MODEL] [--effort EFFORT]
+      [--terminal <ghostty|iterm2|terminal|warp|wezterm|windows-console>] [--model MODEL] [--effort EFFORT]
       [--yolo] [--timeout-secs N] [--isolated] [--json]
   agent-bridge tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
       [--context-result <session>/<request-id>]...
@@ -40,15 +40,27 @@ Usage:
   agent-bridge doctor --provider <codex|claude|agy|pi> [--probe] [--json]
   agent-bridge consent <inspect|revoke|reset> PATH [--json]
   agent-bridge settings [windows-tab-window <dedicated|current>] [--json]
+  agent-bridge settings macos-open-mode <tab-first|new-window> [--json]
   agent-bridge prune-sessions --closed-before-days N --explicit [--json]
   agent-bridge close-session <session> --explicit [--json]
   agent-bridge --help | --version
 
 Runtime:
-  macOS detects Ghostty, iTerm2, or Terminal.app from the invoking environment
-  and opens a real surface for Codex, Claude, Agy, or Pi. Terminal.app always
-  uses a dedicated new window. Use --terminal to override detection. An
-  unknown host falls back to Terminal.app. Windows opens a managed PowerShell 7
+  macOS detects Ghostty, iTerm2, Terminal.app, Warp, or WezTerm from the invoking environment
+  and opens a real surface for Codex, Claude, Agy, or Pi. The macOS default is
+  tab-first: create a new tab in a supported existing local window, with a new
+  window only when a safe tab target or creation API is unavailable.
+  settings macos-open-mode new-window always requests a new window;
+  settings macos-open-mode tab-first restores the default. Terminal.app uses
+  a new window because its native scripting API cannot create a new tab.
+  Existing tabs are never adopted; close uses the recorded target and scope,
+  independent of later settings changes. Use --terminal to override detection. An
+  unknown host falls back to Terminal.app. Warp requires its Scripting opt-in and a
+  reachable authorized official Warp Control endpoint. Its tab route also needs
+  enabled TabConfigs; new-window mode uses the separate Launch Configuration URI.
+  Its control API cannot submit terminal input, so follow-ups without a
+  provider-native input path are unsupported.
+  Windows opens a managed PowerShell 7
   console from either PowerShell or cmd: a tab of the Agent Bridge window of
   Windows Terminal or, when no tab can be created, a console window of its own.
   settings windows-tab-window current opens the tab in the most recently used
@@ -334,14 +346,18 @@ mod tests {
             "private directory stays until you remove it",
             "prune-sessions --closed-before-days N --explicit",
             "close-session <session> --explicit",
-            "macOS detects Ghostty, iTerm2, or Terminal.app",
-            "Terminal.app always\n  uses a dedicated new window",
+            "macOS detects Ghostty, iTerm2, Terminal.app, Warp, or WezTerm",
+            "tab-first: create a new tab in a supported existing local window",
+            "settings macos-open-mode new-window always requests a new window",
+            "settings macos-open-mode tab-first restores the default",
+            "its native scripting API cannot create a new tab",
             "Use --terminal to override",
             "unknown host falls back to Terminal.app",
             "Windows opens a managed PowerShell 7\n  console from either PowerShell or cmd",
             "a tab of the Agent Bridge window of\n  Windows Terminal",
             "when no tab can be created, a console window of its own",
             "settings [windows-tab-window <dedicated|current>] [--json]",
+            "settings macos-open-mode <tab-first|new-window> [--json]",
             "settings windows-tab-window current opens the tab in the most recently used",
             "dedicated, the default, leaves the windows you work in alone",
             "Pi-qualified openai-codex/<model> value is passed as the native bare <model>",

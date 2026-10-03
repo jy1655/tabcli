@@ -3,7 +3,38 @@
 use super::*;
 
 const FILE: &str = "settings.json";
-const USAGE: &str = "settings takes no argument to show the settings, or windows-tab-window <dedicated|current> to change one; --json is accepted";
+const USAGE: &str = "settings takes no argument to show the settings, or macos-open-mode <tab-first|new-window> or windows-tab-window <dedicated|current> to change one; --json is accepted";
+
+/// A creation preference, never cleanup authority. Each terminal handle records
+/// the surface that was actually created, even if this setting changes later.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum MacosOpenMode {
+    #[default]
+    TabFirst,
+    NewWindow,
+}
+
+impl MacosOpenMode {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::TabFirst => "tab-first",
+            Self::NewWindow => "new-window",
+        }
+    }
+}
+
+impl FromStr for MacosOpenMode {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "tab-first" => Ok(Self::TabFirst),
+            "new-window" => Ok(Self::NewWindow),
+            _ => bail!("macos-open-mode is tab-first or new-window, not {value:?}"),
+        }
+    }
+}
 
 /// The Windows Terminal window in which a managed console opens its tab on native
 /// Windows. It has no effect on another platform.
@@ -46,6 +77,8 @@ struct Record {
     schema: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     windows_tab_window: Option<WindowsTabWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    macos_open_mode: Option<MacosOpenMode>,
 }
 
 fn read(root: &Path) -> Result<Record> {
@@ -54,6 +87,7 @@ fn read(root: &Path) -> Result<Record> {
         return Ok(Record {
             schema: 1,
             windows_tab_window: None,
+            macos_open_mode: None,
         });
     };
     let record: Record = serde_json::from_str(&text)
@@ -70,6 +104,10 @@ fn read(root: &Path) -> Result<Record> {
 
 pub(super) fn windows_tab_window(root: &Path) -> Result<WindowsTabWindow> {
     Ok(read(root)?.windows_tab_window.unwrap_or_default())
+}
+
+pub(super) fn macos_open_mode(root: &Path) -> Result<MacosOpenMode> {
+    Ok(read(root)?.macos_open_mode.unwrap_or_default())
 }
 
 pub(super) fn run(args: &[String]) -> Result<()> {
@@ -90,6 +128,13 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
     }
     match named.as_slice() {
         [] => {}
+        ["macos-open-mode", value] => {
+            let value = value.parse::<MacosOpenMode>()?;
+            create_state_root(root, &home_directories())?;
+            let mut record = read(root)?;
+            record.macos_open_mode = Some(value);
+            write_json_atomic(&root.join(FILE), &record)?;
+        }
         ["windows-tab-window", value] => {
             let value = value.parse::<WindowsTabWindow>()?;
             create_state_root(root, &home_directories())?;
@@ -102,6 +147,7 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
     Ok(serde_json::json!({
         "settings_file": root.join(FILE),
         "windows_tab_window": windows_tab_window(root)?.as_str(),
+        "macos_open_mode": macos_open_mode(root)?.as_str(),
     }))
 }
 
@@ -155,6 +201,9 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("native-sessions");
         for invalid in [
+            &["macos-open-mode"][..],
+            &["macos-open-mode", "current"],
+            &["macos-open-mode", "tab-first", "extra"],
             &["windows-tab-window"][..],
             &["windows-tab-window", "new"],
             &["windows-tab-window", "current", "extra"],
@@ -172,11 +221,37 @@ mod tests {
         for record in [
             r#"{"schema":2,"windows_tab_window":"current"}"#,
             r#"{"schema":1,"windows_tab_window":"somewhere"}"#,
+            r#"{"schema":1,"macos_open_mode":"somewhere"}"#,
             "{",
         ] {
             fs::write(directory.path().join(FILE), record).unwrap();
             assert!(windows_tab_window(directory.path()).is_err(), "{record}");
+            assert!(macos_open_mode(directory.path()).is_err(), "{record}");
             assert!(apply(directory.path(), &[]).is_err(), "{record}");
         }
+    }
+
+    #[test]
+    fn macos_defaults_to_tabs_and_both_settings_survive_independent_updates() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("native-sessions");
+        assert_eq!(macos_open_mode(&root).unwrap(), MacosOpenMode::TabFirst);
+        assert_eq!(apply(&root, &[]).unwrap()["macos_open_mode"], "tab-first");
+        assert!(!root.exists(), "reading defaults must not write settings");
+
+        apply(&root, &arguments(&["windows-tab-window", "current"])).unwrap();
+        assert_eq!(macos_open_mode(&root).unwrap(), MacosOpenMode::TabFirst);
+        apply(&root, &arguments(&["macos-open-mode", "new-window"])).unwrap();
+        assert_eq!(macos_open_mode(&root).unwrap(), MacosOpenMode::NewWindow);
+        assert_eq!(
+            windows_tab_window(&root).unwrap(),
+            WindowsTabWindow::Current
+        );
+        apply(&root, &arguments(&["windows-tab-window", "dedicated"])).unwrap();
+        assert_eq!(macos_open_mode(&root).unwrap(), MacosOpenMode::NewWindow);
+        apply(&root, &arguments(&["macos-open-mode", "tab-first"])).unwrap();
+        let reloaded = apply(&root, &[]).unwrap();
+        assert_eq!(reloaded["macos_open_mode"], "tab-first");
+        assert_eq!(reloaded["windows_tab_window"], "dedicated");
     }
 }
