@@ -1620,7 +1620,7 @@ fn macos_open_scripts_give_the_keyboard_back_and_never_activate_the_app() {
             "set keyboardWindowId to missing value",
             "if (count of windows) > 0 then set keyboardWindowId to id of window 1",
             "if keyboardWindowId is not missing value and keyboardWindowId is not targetWindowId then",
-            "set frontmost of (first window whose id is keyboardWindowId) to true",
+            "set frontmost of (first window whose id is keyboardWindowId and visible is true) to true",
         ]
     );
     assert_eq!(
@@ -1646,7 +1646,7 @@ fn macos_open_scripts_give_the_keyboard_back_and_never_activate_the_app() {
     let created = position(terminal_app, "set targetTab to do script \"\"");
     let restored = position(
         terminal_app,
-        "try\n                if (id of window 1) is targetWindowId then\n                    set frontmost of (first window whose id is keyboardWindowId) to true\n                end if\n            end try",
+        "try\n                if (id of window 1) is targetWindowId then\n                    set frontmost of (first window whose id is keyboardWindowId and visible is true) to true\n                end if\n            end try",
     );
     assert!(remembered < created && created < restored);
     assert!(terminal_app.ends_with(

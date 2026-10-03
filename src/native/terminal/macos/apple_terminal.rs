@@ -19,6 +19,15 @@ use super::{
 // window and that stale one, the launch failed, and the new window stayed open
 // without an owner). A window list that could not be read before the run excludes
 // nothing, which is the former rule.
+//
+// Terminal keeps a window that it has closed in its window list, without tabs and off
+// the screen, until it releases the object, and making a window frontmost shows it
+// (Terminal 2.15: `setScriptFrontmost:` sends `makeKeyAndOrderFront:`). With no other
+// window, the window of the session closed before is `window 1`, and giving the
+// keyboard back to it put it on the screen again, empty (2026-10-03: window 12678 read
+// not visible before this script ran and visible after it; the user had seen window
+// 12064 return that day after each of the next two launches, issue #64). The keyboard
+// therefore goes back only to a window that is visible.
 pub(in crate::native) const OPEN_TAB_SCRIPT: &str = r#"
 on soleNewWindowWithTty(windowTtys, priorWindowIds, wantedTty)
     set matchedWindowId to missing value
@@ -81,11 +90,12 @@ on run argv
         if tty of targetTab is not targetTty then error "Agent Bridge lost its newly created Terminal.app tty"
         -- Terminal is not brought forward, and the new window does not keep the
         -- keyboard. The front position is taken back only from the new window: a
-        -- window the user chose meanwhile stays in front.
+        -- window the user chose meanwhile stays in front. It is given only to a
+        -- window that is on the screen, tested in the event that moves it.
         if keyboardWindowId is not missing value and keyboardWindowId is not targetWindowId then
             try
                 if (id of window 1) is targetWindowId then
-                    set frontmost of (first window whose id is keyboardWindowId) to true
+                    set frontmost of (first window whose id is keyboardWindowId and visible is true) to true
                 end if
             end try
         end if
@@ -641,7 +651,8 @@ end mockClose
         }
     }
 
-    // The script's response or error, and the windows it closed or the launch it caused.
+    // The script's response or error, and the windows it closed or brought to the front,
+    // or the launch it caused.
     fn replay(
         script: &str,
         terminal: &Terminal,
@@ -680,7 +691,11 @@ end mockClose
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let events = stderr
             .lines()
-            .filter(|line| line.starts_with("closed ") || *line == "launched Terminal")
+            .filter(|line| {
+                line.starts_with("closed ")
+                    || line.starts_with("fronted ")
+                    || *line == "launched Terminal"
+            })
             .map(str::to_owned)
             .collect();
         let response = if output.status.success() {
@@ -856,5 +871,92 @@ end mockClose
             check(&mut failures, case, verify(&terminal), expected, false);
         }
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    // The window of an earlier session, closed and still listed, and a window on the
+    // screen. The last one is closed by its own session while the new window opens.
+    const CLOSED_LISTED: &str = r#"{id:8341, tabs:{}, visible:false, frontmost:false}"#;
+    const ON_SCREEN: &str =
+        r#"{id:8100, tabs:{{tty:"/dev/ttys001", busy:false}}, visible:true, frontmost:false}"#;
+    const CLOSED_MEANWHILE: &str = r#"{id:8100, tabs:{{tty:"/dev/ttys001", busy:false}}, visible:true, frontmost:false, closesDuringOpen:true}"#;
+
+    // `do script ""` opens a window in front of the others. Setting `frontmost` is
+    // `makeKeyAndOrderFront:` in Terminal 2.15, which shows a window that is not on
+    // the screen; the windows that were made frontmost are reported after the run.
+    const OPEN_MOCK: &str = r#"
+on mockWindowList()
+    mockEvent()
+    return mockWindows
+end mockWindowList
+
+on mockDoScript()
+    mockEvent()
+    repeat with mockWindow in mockWindows
+        try
+            if closesDuringOpen of mockWindow then
+                set tabs of mockWindow to {}
+                set visible of mockWindow to false
+            end if
+        end try
+    end repeat
+    set newTab to {tty:"/dev/ttys030", busy:false}
+    set mockWindows to {{id:9000, tabs:{newTab}, visible:true, frontmost:false}} & mockWindows
+    return newTab
+end mockDoScript
+
+on mockVisibleWindowWithId(wantedId)
+    set foundWindow to mockWindowWithId(wantedId)
+    if visible of foundWindow then return foundWindow
+    error "Can't get window 1 whose id = " & wantedId & " and visible = true." number -1728
+end mockVisibleWindowWithId
+
+on run argv
+    set reply to openRun(argv)
+    repeat with mockWindow in mockWindows
+        if frontmost of mockWindow then log "fronted " & (id of mockWindow)
+    end repeat
+    return reply
+end run
+"#;
+
+    // A window that Terminal had closed and still listed came back, empty, when the next
+    // session was opened: it was `window 1`, and the keyboard was given back to it
+    // (2026-10-03: window 12678, read before and after the script; the user saw window
+    // 12064 return twice).
+    #[test]
+    fn terminal_app_open_gives_the_keyboard_back_only_to_a_window_on_the_screen() {
+        let script = [
+            ("on run argv", "on openRun(argv)"),
+            ("end run", "end openRun"),
+            ("get windows", "my mockWindowList()"),
+            ("(count of windows)", "(count of mockWindows)"),
+            ("window 1", "(item 1 of mockWindows)"),
+            ("do script \"\"", "my mockDoScript()"),
+            (
+                "first window whose id is targetWindowId",
+                "my mockWindowWithId(targetWindowId)",
+            ),
+            (
+                "first window whose id is keyboardWindowId and visible is true",
+                "my mockVisibleWindowWithId(keyboardWindowId)",
+            ),
+            (
+                "first window whose id is keyboardWindowId",
+                "my mockWindowWithId(keyboardWindowId)",
+            ),
+        ]
+        .iter()
+        .fold(super::OPEN_TAB_SCRIPT.to_owned(), |script, (term, mock)| {
+            script.replace(term, mock)
+        }) + OPEN_MOCK;
+        let open = |windows: &[&str]| replay(&script, &running(windows), &[]);
+        let opened = Ok("/dev/ttys030\n9000".to_owned());
+        let fronted = |windows: &[&str]| -> Vec<String> {
+            windows.iter().map(|id| format!("fronted {id}")).collect()
+        };
+
+        assert_eq!(open(&[ON_SCREEN]), (opened.clone(), fronted(&["8100"])));
+        assert_eq!(open(&[CLOSED_LISTED]), (opened.clone(), fronted(&[])));
+        assert_eq!(open(&[CLOSED_MEANWHILE]), (opened, fronted(&[])));
     }
 }
