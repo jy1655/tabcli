@@ -4,6 +4,8 @@
 
 0.1.1은 Codex `tell`의 shared daemon 사전 조건을 제거합니다. 공식 `queue`가 사용 가능한 서버를 선택하며, 대상 대화와 완료 알림 검증은 유지합니다. 변경 내용은 [릴리스 노트](docs/releases/0.1.1.md), 근거와 검증 범위는 [Codex queue 검증 기록](docs/verification/2026-10-04-codex-queue.md)에 있습니다.
 
+macOS에서는 Codex의 WezTerm·Ghostty·Terminal.app 왕복과 Claude·Agy의 WezTerm 왕복을 확인했습니다. Terminal.app은 자동화 승인 후 통과했습니다. iTerm2의 자동화 시간 초과, Pi의 무효 OAuth 로그인, Warp의 Control endpoint 부재는 성공으로 처리하지 않았습니다. 환경·테스트 결과와 검증 범위는 [macOS 0.1.1 검증 기록](docs/verification/2026-10-04-macos-0.1.1.md)에 있습니다.
+
 이 문서와 설치 예시는 **v0.1.1**을 기준으로 합니다. macOS에서는 iTerm2·Terminal.app·Ghostty·WezTerm을 지원합니다. Agent Bridge는 자신을 실행한 터미널을 감지해 같은 앱의 새 surface에서 세션을 시작하고, 자신이 만든 surface만 제어합니다. Terminal.app에서는 기존 tab/window를 사용하지 않고 항상 전용 새 window를 엽니다. 감지할 수 없는 호스트에서는 Terminal.app으로 안전하게 fallback합니다. 이미 독립적으로 실행 중인 임의의 CLI에는 사후 attach하지 않습니다.
 
 ## 지원 범위
@@ -392,11 +394,13 @@ JSON의 `ok: true`와 exit 0은 진단 보고서를 만들었다는 뜻입니다
 모든 관측이 성공해도 메시지 전달·모델 실행·완료까지 보증하지 않습니다. 잘못된 인자는 nonzero입니다.
 손상·경합 중인 저장 기록은 가능한 나머지 진단과 함께 미확인으로 보고하며 자동 복구하지 않습니다.
 
-- Codex는 실제 sender와 같은 launch-version·thread identity·daemon 판정을 재사용합니다.
-  시작 때 기록한 버전과 probe로 읽은 현재 버전은 별도로 표시하며, daemon 통과가 TUI의 thread
-  표시나 queue 소비를 증명하지는 않습니다. 읽기 실패와 daemon 부재를 같은 사실로 취급하지 않습니다.
-  probe 실행·해석 실패는 `unknown`, CLI가 nonzero로 응답해 native queue gate를 통과하지 못한
-  경우는 `unavailable`입니다. 이 응답만으로 daemon process 자체의 부재를 단정하지 않습니다.
+- Codex는 실제 sender와 같은 launch-version·thread identity 판정을 재사용합니다.
+  시작 때 기록한 버전과 probe로 읽은 현재 버전은 별도로 표시합니다. daemon 항목은 선택적인
+  공유 서버 관측이며 전송 조건이 아닙니다. 공식 `queue`가 사용할 서버를 선택하고, 실제 수락
+  응답과 해당 요청의 완료 notify로 전달·완료를 구분합니다.
+  daemon probe 실행·해석 실패는 `unknown`, CLI의 nonzero 응답이나 확인된 비호환 상태는
+  해당 daemon 항목의 `unavailable`입니다. 어느 쪽도 queue 사용 불가나 daemon process 자체의
+  부재를 증명하지 않으며, `available`도 TUI의 thread 표시나 queue 소비를 증명하지 않습니다.
   `codex_terminal_follow_up`은 활성 thread를 확인할 수 없어 `unavailable`입니다.
   `codex_mcp`는 별도로 `unknown`을 표시합니다. 모델 응답이나 daemon 상태는 MCP 인증 성공의
   근거가 아닙니다. `codex_apps` 시작 실패가 401 `token_revoked`이면 provider가 저장된 ChatGPT
