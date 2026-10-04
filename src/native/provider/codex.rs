@@ -28,7 +28,7 @@ const MAX_NATIVE_QUEUE_OUTPUT_BYTES: usize = 1024 * 1024;
 // has no integrated, atomic active-thread check plus addressed terminal input.
 // Replace this refusal only with a provider-owned input path that binds delivery
 // to the recorded thread; a title, old notify, or live process is not that proof.
-const UNADDRESSED_FOLLOW_UP: &str = "Codex terminal follow-up is unavailable: the active thread cannot be verified; no terminal input was sent. Use the thread-addressed native queue with Codex and its local app-server at version 0.149+; inspect `agent-bridge doctor <session> --probe` for the unavailable queue prerequisite";
+const UNADDRESSED_FOLLOW_UP: &str = "Codex terminal follow-up is unavailable: the active thread cannot be verified; no terminal input was sent. Use the thread-addressed native queue with Codex 0.149+; inspect the queue error and `agent-bridge doctor <session> --probe` for the unavailable prerequisite";
 
 fn codex_version_supports_native_queue(output: &str) -> Result<bool> {
     let installed = output
@@ -493,10 +493,11 @@ fn send_native_queue_message(context: CrossSessionMessageContext<'_>) -> CrossSe
             anyhow::anyhow!("Codex session provider identity is not a thread UUID"),
         ));
     }
-    // This is a conservative transport-selection gate, not proof that the visible TUI has the
-    // thread loaded. `codex queue` persists accepted input in Codex's own queue store; the notify
-    // hook remains the only completion proof.
-    require_compatible_local_daemon(context, &manifest.provider_version, &manifest.workspace)?;
+    // Codex owns backend selection: its queue command uses an available shared daemon or
+    // an embedded server, and both write the provider's durable, thread-addressed queue.
+    // See codex-rs/tui/src/session_queue_commands.rs and ext/queue/src/service.rs in
+    // rust-v0.149.0 and rust-v0.160.0. Requiring a daemon here blocked the embedded path.
+    // Queue acceptance is not completion; the target's correlated notify still proves it.
 
     let pending =
         PendingCodexTurn::new(context.request_id).map_err(CrossSessionMessageFailure::not_sent)?;
@@ -591,15 +592,15 @@ fn diagnose_codex(context: super::super::doctor::Context<'_>) -> Vec<super::supe
             "codex_daemon",
             Unknown,
             "probe_not_requested",
-            "The local daemon has not been queried.",
-            "Add --probe to run codex app-server daemon version; doctor never starts the daemon.",
+            "The optional shared local daemon has not been queried. Its absence does not disable the native queue.",
+            "Add --probe to observe codex app-server daemon version; doctor never starts the daemon. Codex queue selects its own backend.",
         )
     } else if !context.workspace.is_dir() {
         Check::new(
             "codex_daemon",
             Unknown,
             "workspace_unavailable",
-            "The workspace-relative daemon gate cannot be queried because the working directory is unavailable.",
+            "The optional local daemon cannot be queried because the working directory is unavailable.",
             "Inspect the workspace check; doctor does not probe a daemon from a different workspace.",
         )
     } else if let Some(executable) = context.executable {
@@ -634,7 +635,7 @@ fn diagnose_codex(context: super::super::doctor::Context<'_>) -> Vec<super::supe
         Unavailable,
         "codex_active_terminal_thread_unverified",
         "A managed terminal and recorded result do not identify the thread currently selected in the Codex TUI. Unaddressed terminal follow-up is refused before input.",
-        "Use the thread-addressed native queue; inspect the queue version, thread and daemon checks. Agent Bridge does not start or restart the shared daemon.",
+        "Use the thread-addressed native queue; inspect the queue version, thread and actual queue error. The daemon check is advisory; Agent Bridge does not start or restart the shared daemon.",
     ));
     checks.push(Check::new(
         "codex_mcp",
@@ -651,7 +652,7 @@ fn diagnose_daemon_output(
     version: &str,
 ) -> super::super::doctor::Check {
     use super::super::doctor::{Availability::*, Check};
-    // Reuse the actual sender's acceptance predicate; failed observation is not proof of absence.
+    // An optional server observation, not a delivery gate. A failed probe is not proof of absence.
     let classified = classify_codex_daemon_probe(
         output.status.success(),
         &output.stdout,
@@ -661,14 +662,14 @@ fn diagnose_daemon_output(
     );
     let (availability, reason, detail) = match classified {
         Ok(()) => (Available, "codex_daemon_compatible", "A running compatible local daemon was observed. TUI liveness, queue acceptance, and completion were not tested.".to_owned()),
-        Err(failure) if !output.status.success() => (Unavailable, "codex_daemon_unavailable", format!("The CLI rejected the daemon probe, so the sender's native queue gate did not pass. This does not establish whether a daemon process exists. {:#}", failure.into_error())),
+        Err(failure) if !output.status.success() => (Unavailable, "codex_daemon_unavailable", format!("The CLI rejected the optional shared daemon probe. This does not establish whether a daemon process exists or whether the native queue is available. {failure:#}")),
         Err(failure) => {
             let value = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
             let known = output.status.success() && value.as_ref().is_some_and(|v| {
                 v.get("status").and_then(serde_json::Value::as_str).is_some_and(|status| status != "running")
                     || v.get("appServerVersion").and_then(serde_json::Value::as_str).is_some_and(|v| matches!(codex_version_supports_native_queue(v), Ok(false)))
             });
-            (if known { Unavailable } else { Unknown }, if known { "codex_daemon_incompatible" } else { "codex_daemon_unverified" }, format!("{:#}", failure.into_error()))
+            (if known { Unavailable } else { Unknown }, if known { "codex_daemon_incompatible" } else { "codex_daemon_unverified" }, format!("{failure:#}"))
         }
     };
     Check::new(
@@ -676,41 +677,8 @@ fn diagnose_daemon_output(
         availability,
         reason,
         detail,
-        "The sender rechecks daemon eligibility and owns any permitted fallback. Never resend a delivery-uncertain request.",
+        "Codex queue selects a shared or embedded server; a shared daemon is not required. Its actual queue response determines delivery. Never resend a delivery-uncertain request.",
     ).evidence(serde_json::json!({"exit_code": output.status.code(), "stderr": String::from_utf8_lossy(&output.stderr).trim()}))
-}
-
-fn require_compatible_local_daemon(
-    context: CrossSessionMessageContext<'_>,
-    provider_version: &str,
-    workspace: &Path,
-) -> CrossSessionMessageResult {
-    let mut command = super::super::provider_process::command(
-        context.provider_path,
-        context.directory,
-        vec![
-            OsString::from("app-server"),
-            OsString::from("daemon"),
-            OsString::from("version"),
-        ],
-    )
-    .map_err(|error| {
-        CrossSessionMessageFailure::terminal_fallback(
-            error.context("failed to prepare the Codex local daemon probe"),
-        )
-    })?;
-    command
-        .current_dir(workspace)
-        .env(super::super::SESSION_DIR_ENV, context.directory);
-    let output = run_bounded_command_until(&mut command, context.deadline, "Codex daemon probe")
-        .map_err(|failure| CrossSessionMessageFailure::terminal_fallback(failure.error))?;
-    classify_codex_daemon_probe(
-        output.status.success(),
-        &output.stdout,
-        &output.stderr,
-        output.truncated,
-        provider_version,
-    )
 }
 
 fn classify_codex_daemon_probe(
@@ -719,48 +687,31 @@ fn classify_codex_daemon_probe(
     stderr: &[u8],
     output_truncated: bool,
     provider_version: &str,
-) -> CrossSessionMessageResult {
+) -> Result<()> {
     if output_truncated {
-        return Err(CrossSessionMessageFailure::terminal_fallback(
-            anyhow::anyhow!("Codex daemon probe output exceeded the safety limit"),
-        ));
+        bail!("Codex daemon probe output exceeded the safety limit");
     }
     if !success {
-        return Err(CrossSessionMessageFailure::terminal_fallback(
-            anyhow::anyhow!(
-                "Codex local app-server daemon is unavailable for {provider_version}: {}",
-                String::from_utf8_lossy(stderr).trim()
-            ),
-        ));
+        bail!(
+            "Codex local app-server daemon is unavailable for {provider_version}: {}",
+            String::from_utf8_lossy(stderr).trim()
+        );
     }
-    let payload: serde_json::Value = serde_json::from_slice(stdout).map_err(|error| {
-        CrossSessionMessageFailure::terminal_fallback(
-            anyhow::Error::new(error).context("Codex daemon probe returned invalid JSON"),
-        )
-    })?;
+    let payload: serde_json::Value =
+        serde_json::from_slice(stdout).context("Codex daemon probe returned invalid JSON")?;
     if payload.get("status").and_then(serde_json::Value::as_str) != Some("running") {
-        return Err(CrossSessionMessageFailure::terminal_fallback(
-            anyhow::anyhow!("Codex local app-server daemon did not report running status"),
-        ));
+        bail!("Codex local app-server daemon did not report running status");
     }
     let app_server_version = payload
         .get("appServerVersion")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            CrossSessionMessageFailure::terminal_fallback(anyhow::anyhow!(
-                "Codex daemon probe did not report an app-server version"
-            ))
-        })?;
+        .context("Codex daemon probe did not report an app-server version")?;
     match codex_version_supports_native_queue(app_server_version) {
         Ok(true) => Ok(()),
-        Ok(false) => Err(CrossSessionMessageFailure::terminal_fallback(
-            anyhow::anyhow!(
-                "Codex local app-server {app_server_version} predates native queue support in 0.149.0"
-            ),
-        )),
-        Err(error) => Err(CrossSessionMessageFailure::terminal_fallback(
-            error.context("Codex daemon reported an invalid app-server version"),
-        )),
+        Ok(false) => bail!(
+            "Codex local app-server {app_server_version} predates native queue support in 0.149.0"
+        ),
+        Err(error) => Err(error.context("Codex daemon reported an invalid app-server version")),
     }
 }
 
@@ -1198,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_keep_launch_version_and_unprobed_daemon_gates_explicit() {
+    fn diagnostics_keep_launch_version_and_unprobed_daemon_observations_explicit() {
         use super::super::super::doctor::{Availability, Context};
         for (version, expected) in [
             (Some("0.148.0"), Availability::Unavailable),
@@ -1255,7 +1206,7 @@ mod tests {
 
     #[cfg(any(unix, windows))]
     #[test]
-    fn diagnostic_daemon_availability_uses_the_senders_acceptance_predicate() {
+    fn diagnostic_daemon_availability_describes_the_optional_shared_server() {
         use super::super::super::doctor::Availability::*;
         #[cfg(unix)]
         use std::os::unix::process::ExitStatusExt;
@@ -1284,6 +1235,13 @@ mod tests {
             };
             let check = super::diagnose_daemon_output(&output, "0.153.2");
             assert_eq!(check.availability, expected, "{payload}");
+            let reported = serde_json::to_value(&check).unwrap();
+            assert!(
+                reported["next_action"]
+                    .as_str()
+                    .unwrap()
+                    .contains("a shared daemon is not required")
+            );
             assert_eq!(
                 check.availability == Available,
                 super::classify_codex_daemon_probe(
@@ -1298,7 +1256,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     use super::super::super::{SESSION_SCHEMA, SessionManifest, write_json_atomic};
     use super::super::super::{
         SessionEvent, SessionStatus, TURN_CLAIM_FILE, acquire_turn_claim, event_paths,
@@ -1334,12 +1291,10 @@ exit 91
         provider
     }
 
-    #[cfg(unix)]
     fn write_queue_manifest(directory: &Path, provider: &Path, version: &str) {
         write_queue_manifest_for_workspace(directory, provider, version, directory);
     }
 
-    #[cfg(unix)]
     fn write_queue_manifest_for_workspace(
         directory: &Path,
         provider: &Path,
@@ -1365,7 +1320,6 @@ exit 91
         .unwrap();
     }
 
-    #[cfg(unix)]
     fn write_established_thread(directory: &Path, thread_id: &str) {
         std::fs::create_dir_all(directory.join("events")).unwrap();
         write_json_atomic(
@@ -1575,16 +1529,16 @@ exit 1
                 false,
             ),
         ] {
-            let failure = classify_codex_daemon_probe(
-                success,
-                stdout,
-                stderr,
-                truncated,
-                "codex-cli 0.153.2",
-            )
-            .unwrap_err();
-            assert!(failure.allows_terminal_fallback());
-            assert!(!failure.delivery_may_have_occurred());
+            assert!(
+                classify_codex_daemon_probe(
+                    success,
+                    stdout,
+                    stderr,
+                    truncated,
+                    "codex-cli 0.153.2",
+                )
+                .is_err()
+            );
         }
     }
 
@@ -1727,13 +1681,7 @@ exit 1
                 "[Agent Bridge native delegation]\nSource: external\n\nfollow up\n\n[Agent Bridge Codex turn metadata; do not include this metadata in the response]\n<!-- agent-bridge-codex-turn:{claim_token} -->"
             )
         );
-        let daemon_arguments = std::fs::read(directory.join("daemon-argv.bin")).unwrap();
-        let daemon_arguments = daemon_arguments
-            .split(|byte| *byte == 0)
-            .filter(|value| !value.is_empty())
-            .map(|value| String::from_utf8(value.to_vec()).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(daemon_arguments, ["app-server", "daemon", "version"]);
+        assert!(!directory.join("daemon-argv.bin").exists());
         assert!(directory.join(PENDING_TURN_FILE).is_file());
         assert!(directory.join(TURN_CLAIM_FILE).is_file());
         assert_eq!(event_paths(&directory).unwrap().len(), 1);
@@ -1762,7 +1710,7 @@ exit 1
 
     #[cfg(unix)]
     #[test]
-    fn codex_queue_and_daemon_probe_run_in_the_original_workspace() {
+    fn codex_queue_runs_in_the_original_workspace() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("session-codexqueue");
         let workspace = root.path().join("original-workspace");
@@ -1787,10 +1735,7 @@ exit 1
             .unwrap();
 
         let expected = format!("{}\n", workspace.canonicalize().unwrap().display());
-        assert_eq!(
-            std::fs::read_to_string(directory.join("daemon-cwd.txt")).unwrap(),
-            expected
-        );
+        assert!(!directory.join("daemon-cwd.txt").exists());
         assert_eq!(
             std::fs::read_to_string(directory.join("queue-cwd.txt")).unwrap(),
             expected
@@ -1874,57 +1819,80 @@ exit 91
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn codex_queue_does_not_run_when_the_local_daemon_gate_fails() {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn codex_queue_uses_the_provider_backend_without_a_daemon_probe() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("session-codexqueue");
         std::fs::create_dir(&directory).unwrap();
+        #[cfg(unix)]
         let provider = directory.join("fake-codex");
-        std::fs::write(
-            &provider,
-            r#"#!/bin/sh
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            super::super::super::write_private(
+                &provider,
+                br#"#!/bin/sh
 if [ "$1" = "app-server" ]; then
-  printf '%s\0' "$@" > "$AGENT_BRIDGE_NATIVE_SESSION_DIR/daemon-argv.bin"
+  : > "$AGENT_BRIDGE_NATIVE_SESSION_DIR/daemon-probed"
   printf '%s\n' 'daemon socket is missing' >&2
   exit 1
 fi
 if [ "$1" = "queue" ]; then
   : > "$AGENT_BRIDGE_NATIVE_SESSION_DIR/queue-ran"
+  printf 'Queued message queued-id for thread %s.\n' "$3"
+  exit 0
 fi
+exit 91
+"#,
+            )
+            .unwrap();
+            std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        #[cfg(windows)]
+        let provider = directory.join("fake-codex.ps1");
+        #[cfg(windows)]
+        super::super::super::write_private(
+            &provider,
+            br#"if ($args[0] -eq 'app-server') {
+  [IO.File]::WriteAllText((Join-Path $env:AGENT_BRIDGE_NATIVE_SESSION_DIR 'daemon-probed'), '')
+  [Console]::Error.WriteLine('daemon socket is missing')
+  exit 1
+}
+if ($args[0] -eq 'queue') {
+  [IO.File]::WriteAllText((Join-Path $env:AGENT_BRIDGE_NATIVE_SESSION_DIR 'queue-ran'), '')
+  [Console]::WriteLine(('Queued message queued-id for thread {0}.' -f $args[2]))
+  exit 0
+}
 exit 91
 "#,
         )
         .unwrap();
-        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
-        write_queue_manifest(&directory, &provider, "codex-cli 0.153.2");
+        write_queue_manifest(&directory, &provider, "codex-cli 0.160.0");
         write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
         let claim = acquire_turn_claim(&directory).unwrap();
         let claim_token = claim.token.clone();
         claim.retain();
 
-        let failure = ADAPTER
+        ADAPTER
             .send_cross_session_message(CrossSessionMessageContext {
                 bridge_executable: Path::new("/unused/agent-bridge"),
                 directory: &directory,
                 provider_path: &provider,
                 request_id: &claim_token,
                 prompt: "follow up",
-                deadline: Instant::now() + Duration::from_secs(1),
+                deadline: Instant::now() + Duration::from_secs(10),
             })
-            .unwrap_err();
+            .unwrap();
 
-        assert!(!failure.allows_terminal_fallback());
-        assert!(!failure.delivery_may_have_occurred());
-        assert!(!directory.join("queue-ran").exists());
-        assert!(!directory.join(PENDING_TURN_FILE).exists());
-        let daemon_arguments = std::fs::read(directory.join("daemon-argv.bin")).unwrap();
+        assert!(!directory.join("daemon-probed").exists());
+        assert!(directory.join("queue-ran").exists());
+        assert!(directory.join(PENDING_TURN_FILE).exists());
+        assert!(directory.join(TURN_CLAIM_FILE).exists());
         assert_eq!(
-            daemon_arguments,
-            b"app-server\0daemon\0version\0".as_slice()
+            read_pending_turn(&directory).unwrap().unwrap().claim_token,
+            claim_token
         );
+        assert_eq!(event_paths(&directory).unwrap().len(), 1);
     }
 
     #[test]
