@@ -48,6 +48,10 @@ jobs:
       - run: cargo test --all-targets --all-features -- --test-threads=1
 
   release-build:
+    # Keep these check names stable so that the main ruleset can require them.
+    # Without a name the check would carry the archive name, which changes with
+    # every version.
+    name: release-build (${{ matrix.target }})
     env:
       RUSTUP_TOOLCHAIN: 1.97.1
       PACKAGE: tabcli
