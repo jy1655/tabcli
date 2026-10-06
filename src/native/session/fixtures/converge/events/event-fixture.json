@@ -1,0 +1,8 @@
+{
+  "provider": "codex",
+  "message": "completed before owner exit",
+  "error": null,
+  "provider_session_id": "provider-session",
+  "turn_id": "provider-turn",
+  "created_unix_ms": 99
+}

@@ -1,6 +1,8 @@
 //! Workspace consent is evidence, not a provider permission mode. Provider stores are
 //! read only; their schemas and the way a managed CLI accepts trust belong to adapters.
 use super::*;
+use crate::native::session::SessionState;
+use crate::native::session::{Reader, RecordReader, RecordStore};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct Identity {
@@ -223,7 +225,7 @@ fn with_record<T>(
         bail!("invalid workspace consent directory");
     }
     fs::create_dir_all(parent)?;
-    set_private_directory_permissions(parent)?;
+    RecordStore::at(parent).set_directory_private()?;
     let lock_path = path.with_extension("lock");
     if fs::symlink_metadata(&lock_path).is_ok_and(|m| !m.is_file() || m.file_type().is_symlink()) {
         bail!("invalid workspace consent lock");
@@ -234,7 +236,7 @@ fn with_record<T>(
         .read(true)
         .write(true)
         .open(lock_path)?;
-    set_private_file_permissions(&lock)?;
+    RecordStore::set_file_private(&lock)?;
     lock.lock()?;
     let record = read_store(&path)?
         .map(|s| serde_json::from_str(&s))
@@ -309,7 +311,7 @@ fn assess_with(root: &Path, requested: &Path, homes: &Homes) -> Result<Assessmen
                     break;
                 }
             }
-            write_json_atomic(path, &record)?;
+            RecordStore::at(path).write_json(&record)?;
         }
         if assessment.source.is_some() {
             assessment.state = "verified".into();
@@ -325,11 +327,16 @@ pub(super) fn prepare(directory: &Path, requested: &Path) -> Result<()> {
         requested,
         &Homes::current()?,
     )?;
-    write_json_atomic(&directory.join(SESSION_FILE), &assessment)
+    Store::open_unchecked(directory)
+        .private(SESSION_FILE)
+        .write_json(&assessment)
 }
 
 pub(super) fn authorized(directory: &Path, target: FirstPartyCli) -> Result<bool> {
-    let Some(text) = read_regular_text_if_present(&directory.join(SESSION_FILE))? else {
+    let Some(text) = Reader::open_unchecked(directory)
+        .private(SESSION_FILE)
+        .text()?
+    else {
         return Ok(false);
     };
     let assessment: Assessment = serde_json::from_str(&text)?;
@@ -359,10 +366,13 @@ pub(super) fn authorized(directory: &Path, target: FirstPartyCli) -> Result<bool
 }
 
 pub(super) fn applied(directory: &Path, method: &str) -> Result<()> {
-    let path = directory.join(SESSION_FILE);
-    let mut assessment: Assessment = read_json(&path)?;
+    let path = Reader::open_unchecked(directory)
+        .private(SESSION_FILE)
+        .path()
+        .to_owned();
+    let mut assessment: Assessment = RecordReader::at(&path).json()?;
     assessment.applied = Some(method.to_owned());
-    write_json_atomic(&path, &assessment)
+    RecordStore::at(&path).write_json(&assessment)
 }
 
 fn respond_to_workspace_dialog(
@@ -392,7 +402,7 @@ pub(super) fn complete_launch(
     {
         return Ok(());
     }
-    let manifest = read_manifest(directory)?;
+    let manifest = Reader::open_unchecked(directory).manifest()?;
     if target == FirstPartyCli::Claude && manifest.yolo {
         return Ok(());
     }
@@ -470,13 +480,16 @@ fn wait_for_native_trust_with(
     homes: &Homes,
     ready: &mut dyn FnMut() -> bool,
 ) -> Result<()> {
-    let manifest = read_manifest(directory)?;
+    let manifest = Reader::open_unchecked(directory).manifest()?;
     loop {
         // A session that has ended has no terminal left to send to, whatever becomes
         // of its workspace's trust, so this comes before the evidence. Without it the
         // launcher of a closed session went on waiting until its deadline.
-        if let Ok(status) = read_json::<SessionStatus>(&directory.join("status.json"))
-            && matches!(status.state.as_str(), "failed" | "exited" | "closed")
+        if let Ok(status) = Reader::open_unchecked(directory).status()
+            && matches!(
+                status.state,
+                SessionState::Failed | SessionState::Exited | SessionState::Closed
+            )
         {
             bail!(
                 "the session is {} and no longer waits for workspace trust; no initial console input was sent",
@@ -509,7 +522,10 @@ fn wait_for_native_trust_with(
 }
 
 pub(super) fn observe(directory: &Path) -> serde_json::Value {
-    match read_regular_text_if_present(&directory.join(SESSION_FILE)) {
+    match Reader::open_unchecked(directory)
+        .private(SESSION_FILE)
+        .text()
+    {
         Ok(Some(text)) => serde_json::from_str::<serde_json::Value>(&text)
             .unwrap_or_else(|e| serde_json::json!({"state":"unreadable","detail":e.to_string()})),
         Ok(None) => serde_json::Value::Null,
@@ -528,7 +544,7 @@ pub(super) fn run(args: &[String]) -> Result<()> {
     }
     let workspace = Path::new(workspace);
     let identity = identity(workspace)?;
-    let root = state_root()?;
+    let root = Reader::state_root()?;
     if action == "inspect" {
         let path = record_path(&root, &identity.path);
         let record = read_store(&path)?
@@ -552,7 +568,7 @@ pub(super) fn run(args: &[String]) -> Result<()> {
             source: if action == "reset" { None } else { source },
             revoked: action == "revoke",
         };
-        write_json_atomic(path, &record)?;
+        RecordStore::at(path).write_json(&record)?;
         println!("{}", serde_json::to_string_pretty(&record)?);
         Ok(())
     })

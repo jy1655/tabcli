@@ -1,3 +1,5 @@
+use crate::native::session::SessionState;
+use crate::native::session::{CoreRecord, Reader, RecordStore};
 // Native Ghostty scripting (installed dictionary; pinned upstream v1.3.1).
 // Creation runs only the launch host in a clean shell, never Bridge/provider input and
 // never a typed shell line: a key typed into the new surface must not edit the launch.
@@ -725,8 +727,8 @@ fn start_bound(
     deadline: Instant,
 ) -> Result<()> {
     launch_command(directory, command, std::env::var_os("PATH").as_deref())?;
-    let receipt =
-        crate::native::launch::read(directory)?.context("Ghostty launch has no pending receipt")?;
+    let receipt = crate::native::launch::read(&Reader::open_unchecked(directory))?
+        .context("Ghostty launch has no pending receipt")?;
     start_with_runner(
         runner,
         session,
@@ -856,10 +858,7 @@ fn parse_frame(typed: &[u8]) -> Result<Option<(String, PathBuf)>> {
 // the launcher's private session directory, its pending receipt and claim, the atomic
 // binding of a Ghostty surface to this session, and the script written for the host.
 fn verify_launch(directory: &Path, token: &str) -> Result<PathBuf> {
-    use crate::native::{
-        SessionStatus, TERMINAL_HANDLE_FILE, current_turn_claim_token, launch, read_json,
-        read_regular_text_if_present, unix_ms,
-    };
+    use crate::native::{SessionStatus, launch, unix_ms};
     let private = |path: &Path, directory: bool| -> Result<bool> {
         let metadata = std::fs::symlink_metadata(path)?;
         Ok(metadata.is_dir() == directory
@@ -875,18 +874,25 @@ fn verify_launch(directory: &Path, token: &str) -> Result<PathBuf> {
     if !directory.is_absolute() || !private(directory, true)? {
         bail!("Ghostty launch directory is not private to the current user");
     }
-    let receipt = launch::read(directory)?.context("missing Ghostty launch receipt")?;
-    let status: SessionStatus = read_json(&directory.join("status.json"))?;
+    let receipt = launch::read(&Reader::open_unchecked(directory))?
+        .context("missing Ghostty launch receipt")?;
+    let status: SessionStatus = Reader::open_unchecked(directory).status()?;
     if receipt.phase != launch::Phase::Pending
         || receipt.claim_token != token
         || unix_ms() >= receipt.deadline_unix_ms
-        || status.state != "launching"
-        || current_turn_claim_token(directory)?.as_deref() != Some(token)
+        || status.state != SessionState::Launching
+        || crate::native::session::turn::current_claim_token(
+            &crate::native::session::Reader::open_unchecked(directory),
+        )?
+        .as_deref()
+            != Some(token)
     {
         bail!("Ghostty launch was cancelled, timed out or is not the one sent to this terminal");
     }
     let surface: TerminalSession = serde_json::from_str(
-        &read_regular_text_if_present(&directory.join(TERMINAL_HANDLE_FILE))?
+        &Reader::open_unchecked(directory)
+            .record(CoreRecord::Terminal)
+            .text()?
             .context("Ghostty surface is not bound")?,
     )
     .context("invalid Ghostty surface binding")?;
@@ -930,7 +936,7 @@ fn launch_command(
         }
         None => String::new(),
     };
-    crate::native::write_private(&script, format!("{export}{command}\n").as_bytes())?;
+    RecordStore::at(&script).write_private(format!("{export}{command}\n").as_bytes())?;
     Ok(input)
 }
 pub(super) fn send_file(
@@ -1684,12 +1690,12 @@ mod tests {
             .unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "launching", None, None).unwrap();
+        update_status(directory.path(), SessionState::Launching, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
-        let token = claim.token.clone();
+        let token = claim.token().to_owned();
         claim.retain();
         launch::begin(
-            directory.path(),
+            &crate::native::session::Store::open_unchecked(directory.path()),
             &token,
             Instant::now() + Duration::from_secs(8),
         )
@@ -1788,10 +1794,12 @@ mod tests {
     #[test]
     fn creation_runs_only_the_host_and_the_start_writes_one_frame_and_no_enter() {
         let directory = launch_fixture();
-        let token = crate::native::launch::read(directory.path())
-            .unwrap()
-            .unwrap()
-            .claim_token;
+        let token = crate::native::launch::read(&crate::native::session::Reader::open_unchecked(
+            directory.path(),
+        ))
+        .unwrap()
+        .unwrap()
+        .claim_token;
         let mut f = existing();
         let handle = create_with_runner(&mut f, false, soon()).unwrap();
         assert_eq!(
@@ -1838,10 +1846,12 @@ mod tests {
             let directory = launch_fixture();
             bind_fixture(directory.path(), &surface);
             launch_command(directory.path(), ". '/launch.sh'", None).unwrap();
-            let token = crate::native::launch::read(directory.path())
-                .unwrap()
-                .unwrap()
-                .claim_token;
+            let token = crate::native::launch::read(
+                &crate::native::session::Reader::open_unchecked(directory.path()),
+            )
+            .unwrap()
+            .unwrap()
+            .claim_token;
             (directory, token)
         };
         let (directory, token) = prepared();
@@ -1895,7 +1905,9 @@ mod tests {
             let (directory, token) = prepared();
             let path = directory.path();
             let binding = path.join(TERMINAL_HANDLE_FILE);
-            let mut receipt = launch::read(path).unwrap().unwrap();
+            let mut receipt = launch::read(&crate::native::session::Reader::open_unchecked(path))
+                .unwrap()
+                .unwrap();
             let mut sent = (path.to_path_buf(), token.clone());
             match case {
                 "the token of another launch" => sent.1 = "1-2-3".into(),
@@ -1911,7 +1923,7 @@ mod tests {
                     &serde_json::json!({ "terminal": "iterm2", "session_id": "u2", "managed_session_id": path.file_name().unwrap().to_str().unwrap() }),
                 )
                 .unwrap(),
-                "cancelled" => update_status(path, "closed", None, None).unwrap(),
+                "cancelled" => update_status(path, SessionState::Closed, None, None).unwrap(),
                 "expired" => receipt.deadline_unix_ms = 0,
                 "already spawned" => receipt.phase = launch::Phase::Spawned,
                 "claim released" => {
@@ -1959,7 +1971,7 @@ mod tests {
             assert!(!owner.exists(), "{case}: the launch ran before the binding");
             bind_fixture(path, &handle);
             if case == "cancelled" {
-                crate::native::update_status(path, "closed", None, None).unwrap();
+                crate::native::update_status(path, SessionState::Closed, None, None).unwrap();
             }
             if case != "never addressed" {
                 start_bound(&mut f, &handle, &probe, path, soon()).unwrap();

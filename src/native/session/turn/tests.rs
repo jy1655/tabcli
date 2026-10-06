@@ -1,0 +1,217 @@
+use super::*;
+
+fn fixture(state: SessionState) -> (tempfile::TempDir, Store) {
+    let directory = tempfile::Builder::new()
+        .prefix("session-")
+        .tempdir()
+        .unwrap();
+    let store = Store::open_unchecked(directory.path());
+    fs::create_dir(store.record(CoreRecord::Events).path()).unwrap();
+    update_status(store.directory(), state, None, None).unwrap();
+    (directory, store)
+}
+
+fn event(message: &str) -> SessionEvent {
+    SessionEvent {
+        provider: "codex".to_owned(),
+        message: message.to_owned(),
+        error: None,
+        provider_session_id: Some("provider-session".to_owned()),
+        turn_id: Some("provider-turn".to_owned()),
+        created_unix_ms: Some(1),
+    }
+}
+
+#[test]
+fn claim_complete_publishes_once_and_releases_exclusive_ownership() {
+    let (_directory, store) = fixture(SessionState::Working);
+    let mut claimed = claim(&store, &[]).unwrap();
+    assert!(claim(&store, &[]).is_err());
+    assert!(!published(&store, Some(claimed.token())).unwrap());
+    let request_id = claimed.receipt().request_id.clone();
+    let event_name = claimed.receipt().event_file.clone();
+    claimed.complete(event("completed")).unwrap();
+    assert!(published(&store, Some(claimed.token())).unwrap());
+    assert!(current_claim_token(&store).unwrap().is_none());
+    assert_eq!(store.status().unwrap().state, SessionState::Ready);
+    assert_eq!(store.events().unwrap().len(), 1);
+    assert_eq!(store.event_strict(&event_name).unwrap(), event("completed"));
+    assert_eq!(
+        requests::list(&store).unwrap().receipts[0].request_id,
+        request_id
+    );
+    // Repeating either completion interface cannot publish twice.
+    claimed.complete(event("duplicate")).unwrap();
+    Report::for_claim(&store, FirstPartyCli::Codex, Some(claimed.token()))
+        .complete("duplicate", None, None)
+        .unwrap();
+    assert_eq!(store.events().unwrap().len(), 1);
+    assert!(claim(&store, &[]).is_ok());
+}
+
+#[test]
+fn claim_fail_records_failure_and_releases_ownership() {
+    let (_directory, store) = fixture(SessionState::Working);
+    store
+        .write_manifest(&SessionManifest {
+            schema: 1,
+            id: store
+                .directory()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            provider: "pi".to_owned(),
+            provider_path: PathBuf::from("pi"),
+            provider_version: "fixture".to_owned(),
+            workspace: store.directory().to_owned(),
+            title: "test".to_owned(),
+            model: None,
+            effort: None,
+            yolo: false,
+            created_unix_ms: 1,
+        })
+        .unwrap();
+    let mut claimed = claim(&store, &[]).unwrap();
+    let event_name = claimed.receipt().event_file.clone();
+    claimed.fail("turn failed").unwrap();
+    let result = store.event_strict(&event_name).unwrap();
+    assert_eq!(result.provider, "pi");
+    assert_eq!(result.error.as_deref(), Some("turn failed"));
+    assert!(result.message.is_empty());
+    assert_eq!(
+        store.status().unwrap().error.as_deref(),
+        Some("turn failed")
+    );
+    assert_eq!(store.status().unwrap().state, SessionState::Ready);
+    assert!(current_claim_token(&store).unwrap().is_none());
+    assert!(published(&store, Some(claimed.token())).unwrap());
+}
+
+#[test]
+fn dropped_claim_rolls_back_without_publishing() {
+    let (_directory, store) = fixture(SessionState::Ready);
+    let (claimed, baseline) = claim_ready(&store, "session-test", &[]).unwrap();
+    assert_eq!(baseline, 0);
+    assert_eq!(store.status().unwrap().state, SessionState::Claimed);
+    assert!(current_claim_token(&store).unwrap().is_some());
+    drop(claimed);
+    assert_eq!(store.status().unwrap().state, SessionState::Ready);
+    assert!(current_claim_token(&store).unwrap().is_none());
+    assert!(store.events().unwrap().is_empty());
+    // Initial claims also roll back, without imposing a ready status.
+    update_status(store.directory(), SessionState::Claimed, None, None).unwrap();
+    let claimed = claim(&store, &[]).unwrap();
+    drop(claimed);
+    assert!(current_claim_token(&store).unwrap().is_none());
+    assert_eq!(store.status().unwrap().state, SessionState::Claimed);
+}
+
+#[test]
+fn recovery_publishes_once_at_every_partial_completion() {
+    for completed_mutations in 0..=3 {
+        let (_directory, store) = fixture(SessionState::Working);
+        let claimed = claim(&store, &[]).unwrap();
+        let token = claimed.token().to_owned();
+        let name = claimed.receipt().event_file.clone();
+        let mut pending =
+            PendingTurnCompletion::new(&token, event("committed result"), None).unwrap();
+        pending.event_file = name.clone();
+        claimed.retain();
+        store.write_completion(&pending).unwrap();
+        if completed_mutations >= 1 {
+            write_completion_event(store.directory(), &pending).unwrap();
+        }
+        if completed_mutations >= 2 {
+            update_status(store.directory(), SessionState::Ready, None, None).unwrap();
+        }
+        if completed_mutations >= 3 {
+            release_claim_token(store.record(CoreRecord::TurnClaim).path(), &token).unwrap();
+        }
+        assert!(recover_pending_completion(store.directory()).unwrap());
+        assert!(!recover_pending_completion(store.directory()).unwrap());
+        assert_eq!(store.events().unwrap().len(), 1);
+        assert_eq!(
+            store.event_strict(&name).unwrap(),
+            event("committed result")
+        );
+        assert!(current_claim_token(&store).unwrap().is_none());
+        assert!(
+            store
+                .record(CoreRecord::Completion)
+                .text()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.status().unwrap().state, SessionState::Ready);
+        assert!(published(&store, Some(&token)).unwrap());
+    }
+}
+
+#[test]
+fn stale_report_cannot_complete_or_fail_a_replacement_claim() {
+    let (_directory, store) = fixture(SessionState::Working);
+    let stale = claim(&store, &[]).unwrap();
+    let stale_token = stale.token().to_owned();
+    drop(stale);
+    let current = claim(&store, &[]).unwrap();
+    let generation = store.status().unwrap().generation;
+    let report = Report::for_claim(&store, FirstPartyCli::Claude, Some(&stale_token));
+    report
+        .complete("stale result", Some("claude-session".to_owned()), None)
+        .unwrap();
+    report.fail("stale failure", None, None).unwrap();
+    assert_eq!(
+        current_claim_token(&store).unwrap().as_deref(),
+        Some(current.token())
+    );
+    assert!(store.events().unwrap().is_empty());
+    assert_eq!(store.status().unwrap().generation, generation);
+    assert_eq!(store.status().unwrap().state, SessionState::Working);
+    Report::for_claim(&store, FirstPartyCli::Claude, Some(current.token()))
+        .complete("current", None, None)
+        .unwrap();
+    assert_eq!(store.events().unwrap().len(), 1);
+    assert!(current_claim_token(&store).unwrap().is_none());
+}
+
+#[test]
+fn dropping_a_failed_completion_keeps_its_journal_recoverable() {
+    let (_directory, store) = fixture(SessionState::Working);
+    let mut claimed = claim(&store, &[]).unwrap();
+    let token = claimed.token().to_owned();
+    let name = claimed.receipt().event_file.clone();
+    let error = with_sync_failure(store.record(CoreRecord::Events).path(), || {
+        claimed.complete(event("interrupted completion"))
+    })
+    .unwrap_err();
+    assert!(injected_sync_failure(&error));
+    drop(claimed);
+    assert_eq!(
+        current_claim_token(&store).unwrap().as_deref(),
+        Some(token.as_str())
+    );
+    assert!(recover_pending_completion(store.directory()).unwrap());
+    assert!(!recover_pending_completion(store.directory()).unwrap());
+    assert_eq!(store.events().unwrap().len(), 1);
+    assert_eq!(
+        store.event_strict(&name).unwrap(),
+        event("interrupted completion")
+    );
+    assert!(current_claim_token(&store).unwrap().is_none());
+}
+
+#[test]
+fn retained_claim_stays_exclusive_until_report_completes() {
+    let (_directory, store) = fixture(SessionState::Working);
+    let claimed = claim(&store, &[]).unwrap();
+    let token = claimed.token().to_owned();
+    claimed.retain();
+    assert!(claim(&store, &[]).is_err());
+    Report::for_claim(&store, FirstPartyCli::Codex, Some(&token))
+        .complete("done", None, None)
+        .unwrap();
+    assert!(claim(&store, &[]).is_ok());
+    assert_eq!(store.events().unwrap().len(), 1);
+}

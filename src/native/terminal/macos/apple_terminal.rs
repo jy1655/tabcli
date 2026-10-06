@@ -1,3 +1,5 @@
+use crate::native::session::SessionState;
+use crate::native::session::{CoreRecord, Reader, RecordStore, Store};
 use std::{
     os::unix::fs::MetadataExt,
     path::Path,
@@ -306,8 +308,11 @@ pub(super) fn create_tab(
 // stops the bootstrap before the wrapper. A zsh with running or suspended jobs can
 // refuse exit and return to its prompt; the failed launch keeps its close proof.
 fn install_bootstrap(directory: &Path, host: &str, command: &str) -> Result<String> {
-    let path = directory.join(BOOTSTRAP_FILE);
-    crate::native::write_private(&path, format!("{host} || exit\n{command}\n").as_bytes())?;
+    let path = Reader::open_unchecked(directory)
+        .private(BOOTSTRAP_FILE)
+        .path()
+        .to_owned();
+    RecordStore::at(&path).write_private(format!("{host} || exit\n{command}\n").as_bytes())?;
     Ok(format!(
         ". {}",
         crate::native::shell_quote(path.as_os_str())
@@ -336,7 +341,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
     crate::native::require_valid_session_id(id)?;
     let released = release_start(directory, id);
     crate::native::launch::log(
-        directory,
+        &Store::open_unchecked(directory),
         &match &released {
             Ok(tty) => format!("terminal_host_released tty={tty}"),
             Err(error) => format!("terminal_host_refused: {error:#}"),
@@ -364,26 +369,32 @@ fn release_start(directory: &Path, id: &str) -> Result<String> {
 }
 
 fn wait_for_binding(directory: &Path, id: &str, tty: &str) -> Result<()> {
-    use crate::native::{
-        SessionStatus, TERMINAL_HANDLE_FILE, current_turn_claim_token, launch, read_json,
-        read_regular_text_if_present, unix_ms,
-    };
-    let initial = launch::read(directory)?.context("missing Terminal.app launch receipt")?;
+    use crate::native::{SessionStatus, launch, unix_ms};
+    let initial = launch::read(&Reader::open_unchecked(directory))?
+        .context("missing Terminal.app launch receipt")?;
     // The receipt's deadline is wall-clock time; the launch itself never waits longer.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let record = launch::read(directory)?.context("missing Terminal.app launch receipt")?;
-        let status: SessionStatus = read_json(&directory.join("status.json"))?;
+        let record = launch::read(&Reader::open_unchecked(directory))?
+            .context("missing Terminal.app launch receipt")?;
+        let status: SessionStatus = Reader::open_unchecked(directory).status()?;
         if Instant::now() >= deadline
             || unix_ms() >= record.deadline_unix_ms
             || record.phase != launch::Phase::Pending
             || record.claim_token != initial.claim_token
-            || status.state != "launching"
-            || current_turn_claim_token(directory)?.as_deref() != Some(initial.claim_token.as_str())
+            || status.state != SessionState::Launching
+            || crate::native::session::turn::current_claim_token(
+                &crate::native::session::Reader::open_unchecked(directory),
+            )?
+            .as_deref()
+                != Some(initial.claim_token.as_str())
         {
             bail!("Terminal.app launch was cancelled or timed out before its surface was bound");
         }
-        if let Some(text) = read_regular_text_if_present(&directory.join(TERMINAL_HANDLE_FILE))? {
+        if let Some(text) = Reader::open_unchecked(directory)
+            .record(CoreRecord::Terminal)
+            .text()?
+        {
             let surface: TerminalSession =
                 serde_json::from_str(&text).context("invalid Terminal.app surface binding")?;
             surface.verify_managed_session(id)?;
@@ -601,6 +612,7 @@ fn ownership_proof(session: &TerminalSession) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::{CLOSE_TAB_SCRIPT, VERIFY_TAB_SCRIPT, WAIT_FOR_CLOSE_SCRIPT};
+    use crate::native::session::SessionState;
 
     const WINDOW: &str = "8341";
     const TTY: &str = "/dev/ttys014";
@@ -1472,12 +1484,12 @@ end run
             .unwrap();
         set_private_directory_permissions(directory.path()).unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "launching", None, None).unwrap();
+        update_status(directory.path(), SessionState::Launching, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
-        let token = claim.token.clone();
+        let token = claim.token().to_owned();
         claim.retain();
         launch::begin(
-            directory.path(),
+            &crate::native::session::Store::open_unchecked(directory.path()),
             &token,
             std::time::Instant::now() + std::time::Duration::from_secs(20),
         )
@@ -1540,9 +1552,14 @@ end run
                 bind(directory, &handle);
             }
             match case {
-                "closed" | "failed" => update_status(directory, case, None, None).unwrap(),
+                "closed" | "failed" => {
+                    update_status(directory, case.parse().unwrap(), None, None).unwrap()
+                }
                 "expired" | "another claim" | "spawn attempted" => {
-                    let mut receipt = launch::read(directory).unwrap().unwrap();
+                    let mut receipt =
+                        launch::read(&crate::native::session::Reader::open_unchecked(directory))
+                            .unwrap()
+                            .unwrap();
                     match case {
                         "expired" => receipt.deadline_unix_ms = 0,
                         "another claim" => receipt.claim_token = "unrelated".into(),
@@ -1769,7 +1786,8 @@ end run
             match outcome {
                 "bound" => bind(directory, &binding(directory, &tty)),
                 "another tty" => bind(directory, &binding(directory, "/dev/ttys999")),
-                _ => crate::native::update_status(directory, "closed", None, None).unwrap(),
+                _ => crate::native::update_status(directory, SessionState::Closed, None, None)
+                    .unwrap(),
             }
         }
         if !read_tab_until(&mut master, &mut screen, deadline, |_| {

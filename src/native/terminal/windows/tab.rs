@@ -46,6 +46,7 @@
 //!
 //! Replace this with the creation and attestation of the root in the launcher when
 //! Windows Terminal can adopt a process that its caller created.
+use crate::native::session::{Reader, RecordReader, RecordStore, Store};
 use std::{
     cell::Cell,
     collections::BTreeMap,
@@ -149,7 +150,10 @@ struct HostProcess {
 /// never had one. A record that is there and cannot be read is an error: a close that
 /// went on without it could end the host with a failure code and leave its tab open.
 pub(super) fn recorded_host(directory: &Path) -> Result<Option<(u32, WindowsProcessIdentity)>> {
-    let path = directory.join(HOST_PROCESS_FILE);
+    let path = Reader::open_unchecked(directory)
+        .private(HOST_PROCESS_FILE)
+        .path()
+        .to_owned();
     // The record is written once, by a rename, before the root exists. Only another
     // handle on the file can keep it from being read, and not for long.
     let deadline = Instant::now() + HOST_RECORD_READ_WAIT;
@@ -180,12 +184,15 @@ pub(super) fn recorded_host(directory: &Path) -> Result<Option<(u32, WindowsProc
 /// it is still there. One that cannot be read is removed, and when it cannot be removed
 /// either the launch stops here, before a surface exists that no close could end.
 pub(super) fn forget_unreadable_host(directory: &Path) -> Result<()> {
-    let path = directory.join(HOST_PROCESS_FILE);
+    let path = Reader::open_unchecked(directory)
+        .private(HOST_PROCESS_FILE)
+        .path()
+        .to_owned();
     if read_record::<HostProcess>(&path).is_ok_and(|host| host.is_none_or(|host| host.schema == 1))
     {
         return Ok(());
     }
-    super::super::super::remove_file_if_present(&path).with_context(|| {
+    RecordStore::at(&path).remove().with_context(|| {
         format!(
             "the unreadable record of an abandoned Windows Terminal tab host could not be removed ({})",
             path.display()
@@ -198,7 +205,9 @@ pub(super) fn forget_unreadable_host(directory: &Path) -> Result<()> {
 fn record_host(directory: &Path) -> Result<()> {
     let pid = std::process::id();
     write_record(
-        &directory.join(HOST_PROCESS_FILE),
+        Reader::open_unchecked(directory)
+            .private(HOST_PROCESS_FILE)
+            .path(),
         &HostProcess {
             schema: 1,
             pid,
@@ -248,7 +257,12 @@ impl TabSurface {
         request.accepted = true;
         // Set first: a write that fails may still have reached the host.
         self.accepted.set(true);
-        write_record(&self.directory.join(REQUEST_FILE), &request)?;
+        write_record(
+            Reader::open_unchecked(&self.directory)
+                .private(REQUEST_FILE)
+                .path(),
+            &request,
+        )?;
         let deadline = startup_deadline.min(Instant::now() + START_TIMEOUT);
         loop {
             if let Some(offer) = read_offer(&self.directory, &self.request.attempt)? {
@@ -295,7 +309,12 @@ impl TabSurface {
     // a host that says it could not start the root: it has ended the root itself.
     pub(super) fn cleanup(&self, deadline: Instant) -> Result<()> {
         // The host stops at its next read, unless it has already seen the acceptance.
-        let _ = super::super::super::remove_file_if_present(&self.directory.join(REQUEST_FILE));
+        let _ = RecordStore::at(
+            Reader::open_unchecked(&self.directory)
+                .private(REQUEST_FILE)
+                .path(),
+        )
+        .remove();
         // A host that never saw an acceptance never decides.
         if self.accepted.get() && !self.gives_up_first() {
             let refused = read_offer(&self.directory, &self.request.attempt)
@@ -309,7 +328,12 @@ impl TabSurface {
             }
         }
         terminate_by_identity(self.pid, &self.identity, deadline)?;
-        let _ = super::super::super::remove_file_if_present(&self.directory.join(OFFER_FILE));
+        let _ = RecordStore::at(
+            Reader::open_unchecked(&self.directory)
+                .private(OFFER_FILE)
+                .path(),
+        )
+        .remove();
         Ok(())
     }
 
@@ -352,7 +376,12 @@ pub(super) fn offer(
         accepted: false,
     };
     cancel(directory);
-    write_record(&directory.join(REQUEST_FILE), &request)?;
+    write_record(
+        Reader::open_unchecked(directory)
+            .private(REQUEST_FILE)
+            .path(),
+        &request,
+    )?;
     let offered = (|| {
         let environment = environment_block(Some(&request.attempt));
         CreatedProcess::create(
@@ -505,17 +534,24 @@ fn host(directory: &Path, inherited_attempt: Option<&str>, console: &dyn HostCon
             // it does not find the host among the console's processes.
             console.leave_once_attached(&root);
             offer.started = true;
-            let _ = write_record(&directory.join(OFFER_FILE), &offer);
+            let _ = write_record(
+                Reader::open_unchecked(directory).private(OFFER_FILE).path(),
+                &offer,
+            );
             unsafe { WaitForSingleObject(root.process.as_raw_handle(), INFINITE) };
         }
         // Cancelled: the launcher has moved on and expects no offer.
         Ok(None) => {
-            let _ = super::super::super::remove_file_if_present(&directory.join(OFFER_FILE));
+            let _ = RecordStore::at(Reader::open_unchecked(directory).private(OFFER_FILE).path())
+                .remove();
         }
         // No error comes after the root was started.
         Err(error) => {
             offer.error = Some(format!("{error:#}"));
-            let _ = write_record(&directory.join(OFFER_FILE), &offer);
+            let _ = write_record(
+                Reader::open_unchecked(directory).private(OFFER_FILE).path(),
+                &offer,
+            );
         }
     }
 }
@@ -526,10 +562,9 @@ fn host(directory: &Path, inherited_attempt: Option<&str>, console: &dyn HostCon
 // after the launcher has given it up, and never ended alone after the host has started
 // it. Returns whether the caller decided.
 fn decide(directory: &Path) -> Result<bool> {
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(directory.join(DECISION_FILE))
+    match Store::open_unchecked(directory)
+        .private(DECISION_FILE)
+        .create_new()
     {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
@@ -624,7 +659,10 @@ fn host_root(
         offer.identity = Some(query_process_identity_from_handle(
             root.process.as_raw_handle(),
         )?);
-        write_record(&directory.join(OFFER_FILE), offer)?;
+        write_record(
+            Reader::open_unchecked(directory).private(OFFER_FILE).path(),
+            offer,
+        )?;
         loop {
             match read_request(directory)? {
                 Some(current) if current.attempt == request.attempt => {
@@ -773,13 +811,14 @@ fn write_record<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .tempfile_in(parent)?;
     std::io::Write::write_all(&mut temporary, &serde_json::to_vec(value)?)?;
     // The other side polls this record, and Windows refuses to replace a file that is open.
-    super::super::super::persist_record(temporary, path)
+    RecordStore::at(path)
+        .persist(temporary)
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 
 fn read_record<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
-    let Some(text) = super::super::super::read_regular_text_if_present(path)? else {
+    let Some(text) = RecordReader::at(path).text()? else {
         return Ok(None);
     };
     serde_json::from_str(&text)
@@ -788,19 +827,25 @@ fn read_record<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
 }
 
 fn read_request(directory: &Path) -> Result<Option<HostRequest>> {
-    Ok(read_record::<HostRequest>(&directory.join(REQUEST_FILE))?
-        .filter(|request| request.schema == 1 && !request.attempt.is_empty()))
+    Ok(read_record::<HostRequest>(
+        Reader::open_unchecked(directory)
+            .private(REQUEST_FILE)
+            .path(),
+    )?
+    .filter(|request| request.schema == 1 && !request.attempt.is_empty()))
 }
 
 // An offer of another attempt is a leftover and is not this launch's.
 fn read_offer(directory: &Path, attempt: &str) -> Result<Option<HostOffer>> {
-    Ok(read_record::<HostOffer>(&directory.join(OFFER_FILE))?
-        .filter(|offer| offer.schema == 1 && offer.attempt == attempt))
+    Ok(
+        read_record::<HostOffer>(Reader::open_unchecked(directory).private(OFFER_FILE).path())?
+            .filter(|offer| offer.schema == 1 && offer.attempt == attempt),
+    )
 }
 
 fn cancel(directory: &Path) {
     for file in [REQUEST_FILE, OFFER_FILE, DECISION_FILE] {
-        let _ = super::super::super::remove_file_if_present(&directory.join(file));
+        let _ = RecordStore::at(&directory.join(file)).remove();
     }
 }
 

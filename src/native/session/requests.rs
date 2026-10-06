@@ -1,7 +1,9 @@
 //! Immutable Bridge request addresses. Provider-owned correlation still decides completion.
-use super::*;
+#[cfg(test)]
+use crate::native::session::SessionState;
+use crate::native::session::{CoreRecord, Reader, RecordStore, Store};
+use crate::native::*;
 
-const REQUESTS_DIRECTORY: &str = "requests";
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A recorded result that a request was explicitly derived from, pinned at resolution time.
@@ -15,21 +17,21 @@ pub(crate) struct ContextSource {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(super) struct Receipt {
-    pub(super) schema: u32,
-    pub(super) request_id: String,
-    pub(super) claim_token: String,
-    pub(super) event_file: String,
+pub(in crate::native) struct Receipt {
+    pub(in crate::native) schema: u32,
+    pub(in crate::native) request_id: String,
+    pub(in crate::native) claim_token: String,
+    pub(in crate::native) event_file: String,
     #[serde(default)]
-    pub(super) created_unix_ms: Option<u128>,
+    pub(in crate::native) created_unix_ms: Option<u128>,
     #[serde(default)]
-    pub(super) source: Option<String>,
+    pub(in crate::native) source: Option<String>,
     // Receipts written before 0.0.7 have no provenance; they still deserialise as empty.
     #[serde(default)]
-    pub(super) context_sources: Vec<ContextSource>,
+    pub(in crate::native) context_sources: Vec<ContextSource>,
 }
 
-pub(super) fn valid_id(value: &str) -> bool {
+pub(in crate::native) fn valid_id(value: &str) -> bool {
     value.starts_with("request-")
         && value.len() > "request-".len()
         && value.len() <= 160
@@ -38,11 +40,11 @@ pub(super) fn valid_id(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-fn validate(receipt: &Receipt) -> Result<()> {
+pub(in crate::native) fn validate(receipt: &Receipt) -> Result<()> {
     if receipt.schema != 1
         || !valid_id(&receipt.request_id)
         || !valid_turn_claim_token(&receipt.claim_token)
-        || !valid_event_file_name(&receipt.event_file)
+        || !Reader::valid_event_file_name(&receipt.event_file)
         || receipt
             .context_sources
             .iter()
@@ -55,11 +57,11 @@ fn validate(receipt: &Receipt) -> Result<()> {
 
 /// The rules a receipt applies to each recorded source. Resolution applies the same
 /// rules before any session state exists, so a receipt never rejects a resolved source.
-pub(super) fn validate_context_source(source: &ContextSource) -> Result<()> {
+pub(in crate::native) fn validate_context_source(source: &ContextSource) -> Result<()> {
     if !valid_session_id(&source.session) {
         bail!("invalid source session id {:?}", source.session)
     }
-    if !valid_event_file_name(&source.event_id) {
+    if !Reader::valid_event_file_name(&source.event_id) {
         bail!("invalid source event id {:?}", source.event_id)
     }
     if let Some(request_id) = source.request_id.as_deref()
@@ -75,11 +77,12 @@ pub(super) fn validate_context_source(source: &ContextSource) -> Result<()> {
 
 // Called while creating the claim under its lifecycle lock, before any dispatch can begin.
 // Provenance comes from the caller's pinned resolution; it is never re-read here.
-pub(super) fn create(
-    directory: &Path,
+pub(in crate::native) fn create(
+    store: &Store,
     claim_token: &str,
     context_sources: &[ContextSource],
 ) -> Result<Receipt> {
+    let directory = store.directory();
     let receipt = Receipt {
         schema: 1,
         request_id: format!(
@@ -89,18 +92,23 @@ pub(super) fn create(
             REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ),
         claim_token: claim_token.to_owned(),
-        event_file: new_event_file_name()?,
+        event_file: Store::new_event_file_name()?,
         created_unix_ms: Some(unix_ms()),
         source: Some(delegation_source()),
         context_sources: context_sources.to_vec(),
     };
     validate(&receipt)?;
-    let root = directory.join(REQUESTS_DIRECTORY);
+    let root = Reader::open_unchecked(directory)
+        .record(CoreRecord::Requests)
+        .path()
+        .to_owned();
     fs::create_dir_all(&root)?;
-    set_private_directory_permissions(&root)?;
-    let path = root.join(format!("{claim_token}.json"));
+    RecordStore::at(&root).set_directory_private()?;
     // Atomic publication avoids exposing a partial receipt to readers after a crash.
-    write_json_atomic(&path, &receipt)?;
+    store
+        .record(CoreRecord::Requests)
+        .child(&format!("{claim_token}.json"))
+        .write_json(&receipt)?;
     Ok(receipt)
 }
 
@@ -108,8 +116,12 @@ pub(super) fn create(
 /// non-directory at that path is refused: `read_dir` and the receipt reads would follow
 /// a link out of the state root, and a receipt read from there would supply request
 /// identity for the session's events.
-fn requests_directory_present(directory: &Path) -> Result<bool> {
-    let root = directory.join(REQUESTS_DIRECTORY);
+fn requests_directory_present(reader: &Reader) -> Result<bool> {
+    let directory = reader.directory();
+    let root = Reader::open_unchecked(directory)
+        .record(CoreRecord::Requests)
+        .path()
+        .to_owned();
     match fs::symlink_metadata(&root) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             bail!(
@@ -129,17 +141,17 @@ fn requests_directory_present(directory: &Path) -> Result<bool> {
     }
 }
 
-pub(super) fn for_claim(directory: &Path, claim_token: &str) -> Result<Option<Receipt>> {
+pub(in crate::native) fn for_claim(reader: &Reader, claim_token: &str) -> Result<Option<Receipt>> {
     if !valid_turn_claim_token(claim_token) {
         bail!("invalid request claim token")
     }
-    if !requests_directory_present(directory)? {
+    if !requests_directory_present(reader)? {
         return Ok(None);
     }
-    let path = directory
-        .join(REQUESTS_DIRECTORY)
-        .join(format!("{claim_token}.json"));
-    let Some(text) = read_regular_text_if_present(&path)? else {
+    let record = reader
+        .record(CoreRecord::Requests)
+        .child(&format!("{claim_token}.json"));
+    let Some(text) = record.text()? else {
         return Ok(None);
     };
     let receipt: Receipt = serde_json::from_str(&text).context("invalid Bridge request receipt")?;
@@ -151,16 +163,20 @@ pub(super) fn for_claim(directory: &Path, claim_token: &str) -> Result<Option<Re
 }
 
 #[derive(Default)]
-pub(super) struct Index {
-    pub(super) receipts: Vec<Receipt>,
-    pub(super) unreadable: usize,
+pub(in crate::native) struct Index {
+    pub(in crate::native) receipts: Vec<Receipt>,
+    pub(in crate::native) unreadable: usize,
 }
 
-pub(super) fn list(directory: &Path) -> Result<Index> {
-    if !requests_directory_present(directory)? {
+pub(in crate::native) fn list(reader: &Reader) -> Result<Index> {
+    let directory = reader.directory();
+    if !requests_directory_present(reader)? {
         return Ok(Index::default());
     }
-    let root = directory.join(REQUESTS_DIRECTORY);
+    let root = Reader::open_unchecked(directory)
+        .record(CoreRecord::Requests)
+        .path()
+        .to_owned();
     let entries = match fs::read_dir(&root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Index::default()),
@@ -176,7 +192,7 @@ pub(super) fn list(directory: &Path) -> Result<Index> {
         if !valid_turn_claim_token(token) {
             continue;
         }
-        match for_claim(directory, token) {
+        match for_claim(&Reader::open_unchecked(directory), token) {
             Ok(Some(receipt)) => index.receipts.push(receipt),
             Ok(None) | Err(_) => index.unreadable += 1,
         }
@@ -210,12 +226,17 @@ mod tests {
         .unwrap();
         symlink(outside.path(), directory.join(REQUESTS_DIRECTORY)).unwrap();
 
-        let error = list(&directory).err().expect("refused").to_string();
+        let error = list(&Reader::open_unchecked(&directory))
+            .err()
+            .expect("refused")
+            .to_string();
         assert!(
             error.contains("refusing linked requests directory"),
             "{error}"
         );
-        let error = for_claim(&directory, "1-2-3").unwrap_err().to_string();
+        let error = for_claim(&Reader::open_unchecked(&directory), "1-2-3")
+            .unwrap_err()
+            .to_string();
         assert!(
             error.contains("refusing linked requests directory"),
             "{error}"
@@ -224,26 +245,40 @@ mod tests {
         // A regular file at the path is refused too; a missing path is an empty index.
         fs::remove_file(directory.join(REQUESTS_DIRECTORY)).unwrap();
         fs::write(directory.join(REQUESTS_DIRECTORY), b"").unwrap();
-        let error = list(&directory).err().expect("refused").to_string();
+        let error = list(&Reader::open_unchecked(&directory))
+            .err()
+            .expect("refused")
+            .to_string();
         assert!(
             error.contains("refusing non-directory requests path"),
             "{error}"
         );
         fs::remove_file(directory.join(REQUESTS_DIRECTORY)).unwrap();
-        assert!(list(&directory).unwrap().receipts.is_empty());
-        assert!(for_claim(&directory, "1-2-3").unwrap().is_none());
+        assert!(
+            list(&Reader::open_unchecked(&directory))
+                .unwrap()
+                .receipts
+                .is_empty()
+        );
+        assert!(
+            for_claim(&Reader::open_unchecked(&directory), "1-2-3")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn receipt_is_durable_before_dispatch_and_does_not_replace_provider_identity() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
-        let receipt = for_claim(directory.path(), &claim.token).unwrap().unwrap();
-        assert_eq!(receipt.request_id, claim.receipt.request_id);
-        assert_ne!(receipt.request_id, claim.token);
-        let token = claim.token.clone();
+        let receipt = for_claim(&Reader::open_unchecked(directory.path()), claim.token())
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.request_id, claim.receipt().request_id);
+        assert_ne!(receipt.request_id, claim.token());
+        let token = claim.token().to_owned();
         claim.retain();
         record_provider_result_for_claim(
             directory.path(),
@@ -259,7 +294,7 @@ mod tests {
         assert_eq!(event.provider_session_id.as_deref(), Some("native-owner"));
         assert_eq!(event.turn_id.as_deref(), Some("native-turn"));
         assert_eq!(
-            for_claim(directory.path(), &token)
+            for_claim(&Reader::open_unchecked(directory.path()), &token)
                 .unwrap()
                 .unwrap()
                 .request_id,
@@ -291,12 +326,14 @@ mod tests {
         };
         let directory = tempfile::tempdir().unwrap();
         let receipt = create(
-            directory.path(),
+            &Store::open_unchecked(directory.path()),
             "1-2-3",
             &[source.clone(), legacy_event.clone()],
         )
         .unwrap();
-        let stored = for_claim(directory.path(), "1-2-3").unwrap().unwrap();
+        let stored = for_claim(&Reader::open_unchecked(directory.path()), "1-2-3")
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.request_id, receipt.request_id);
         assert_eq!(stored.context_sources, vec![source, legacy_event]);
         let text = fs::read_to_string(directory.path().join("requests/1-2-3.json")).unwrap();
@@ -315,12 +352,12 @@ mod tests {
     fn receipt_failure_releases_the_claim_before_dispatch_and_preserves_ready_state() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "ready", None, None).unwrap();
+        update_status(directory.path(), SessionState::Ready, None, None).unwrap();
         fs::write(directory.path().join(REQUESTS_DIRECTORY), "not a directory").unwrap();
         assert!(acquire_ready_turn_claim(directory.path(), "session-test").is_err());
         assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
         let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
-        assert_eq!(status.state, "ready");
+        assert_eq!(status.state.as_str(), "ready");
         assert!(event_paths(directory.path()).unwrap().is_empty());
     }
 
@@ -329,10 +366,10 @@ mod tests {
         for completed_mutations in 0..=3 {
             let directory = tempfile::tempdir().unwrap();
             fs::create_dir(directory.path().join("events")).unwrap();
-            update_status(directory.path(), "working", None, None).unwrap();
+            update_status(directory.path(), SessionState::Working, None, None).unwrap();
             let claim = acquire_turn_claim(directory.path()).unwrap();
-            let receipt = claim.receipt.clone();
-            let token = claim.token.clone();
+            let receipt = claim.receipt().clone();
+            let token = claim.token().to_owned();
             claim.retain();
             let event = SessionEvent {
                 provider: "codex".to_owned(),
@@ -349,13 +386,15 @@ mod tests {
                 write_pending_completion_event(directory.path(), &pending).unwrap();
             }
             if completed_mutations >= 2 {
-                update_status(directory.path(), "ready", None, None).unwrap();
+                update_status(directory.path(), SessionState::Ready, None, None).unwrap();
             }
             if completed_mutations >= 3 {
                 release_turn_claim_token(&directory.path().join(TURN_CLAIM_FILE), &token).unwrap();
             }
             recover_pending_completion(directory.path()).unwrap();
-            let recovered = for_claim(directory.path(), &token).unwrap().unwrap();
+            let recovered = for_claim(&Reader::open_unchecked(directory.path()), &token)
+                .unwrap()
+                .unwrap();
             assert_eq!(recovered.request_id, receipt.request_id);
             assert_eq!(recovered.event_file, receipt.event_file);
             let stored: SessionEvent =
@@ -368,9 +407,9 @@ mod tests {
     fn damaged_optional_request_index_cannot_block_verified_completion() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
-        let token = claim.token.clone();
+        let token = claim.token().to_owned();
         claim.retain();
         fs::write(
             directory
@@ -396,6 +435,6 @@ mod tests {
             read_json::<SessionEvent>(&paths[0]).unwrap().message,
             "verified result"
         );
-        assert!(for_claim(directory.path(), &token).is_err());
+        assert!(for_claim(&Reader::open_unchecked(directory.path()), &token).is_err());
     }
 }

@@ -3,6 +3,10 @@ use super::{
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
     LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
 };
+#[cfg(test)]
+use crate::native::session::SessionState;
+use crate::native::session::turn;
+use crate::native::session::{Reader, RecordReader, Store};
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
 use semver::Version;
@@ -149,7 +153,7 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
-        let claim_token = super::super::current_turn_claim_token(context.directory)?
+        let claim_token = turn::current_claim_token(&Reader::open_unchecked(context.directory))?
             .context("Codex launch has no native turn claim")?;
         let pending = install_pending_turn(context.directory, &claim_token)?;
         let mut arguments = codex_launch_arguments(
@@ -220,7 +224,7 @@ impl NativeProviderAdapter for CodexAdapter {
                 .managed_session_id
                 .as_deref()
                 .context("Codex terminal has no managed session binding")
-                .and_then(super::super::session_directory)
+                .and_then(Reader::session_directory)
                 .map_err(terminal::TerminalSendFailure::not_sent)?;
             // A screen read costs a helper process and the wait polls ten times a second,
             // so the screen is read once per `COMPOSER_POLL`.
@@ -301,14 +305,12 @@ impl NativeProviderAdapter for CodexAdapter {
         {
             return Ok(());
         }
-        super::super::record_provider_result_for_claim(
-            directory,
+        turn::Report::for_claim(
+            &Store::open_unchecked(directory),
             FirstPartyCli::Codex,
-            message,
-            thread_id,
-            codex_owned_string(payload, "turn-id"),
             Some(&pending.claim_token),
         )
+        .complete(message, thread_id, codex_owned_string(payload, "turn-id"))
         .context("failed to record the correlated Codex result")
     }
 
@@ -467,7 +469,8 @@ impl CodexCommandFailure {
 }
 
 fn send_native_queue_message(context: CrossSessionMessageContext<'_>) -> CrossSessionMessageResult {
-    let manifest = super::super::read_manifest(context.directory)
+    let manifest = Reader::open_unchecked(context.directory)
+        .manifest()
         .map_err(CrossSessionMessageFailure::not_sent)?;
     match codex_version_supports_native_queue(&manifest.provider_version) {
         Ok(true) => {}
@@ -933,13 +936,16 @@ fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingCo
 }
 
 fn write_pending_turn(directory: &Path, pending: &PendingCodexTurn) -> Result<()> {
-    super::super::write_json_atomic(&directory.join(PENDING_TURN_FILE), pending)?;
+    Store::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .write_json(pending)?;
     Ok(())
 }
 
 fn read_pending_turn(directory: &Path) -> Result<Option<PendingCodexTurn>> {
-    let Some(text) =
-        super::super::read_regular_text_if_present(&directory.join(PENDING_TURN_FILE))?
+    let Some(text) = Reader::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .text()?
     else {
         return Ok(None);
     };
@@ -959,7 +965,9 @@ fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result<()> {
     if pending.claim_token != claim_token {
         return Ok(());
     }
-    super::super::remove_file_if_present(&directory.join(PENDING_TURN_FILE))
+    Store::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .remove()
 }
 
 fn correlated_prompt(prompt: &str, pending: &PendingCodexTurn) -> String {
@@ -1036,8 +1044,8 @@ fn codex_input_correlates(payload: &serde_json::Value, pending: &PendingCodexTur
 }
 
 fn established_codex_thread(directory: &Path) -> Result<Option<String>> {
-    for path in super::super::event_paths(directory)? {
-        let event: super::super::SessionEvent = super::super::read_json(&path)?;
+    for path in Reader::open_unchecked(directory).events()? {
+        let event: super::super::SessionEvent = RecordReader::at(&path).json()?;
         if event.provider == FirstPartyCli::Codex.as_str()
             && let Some(thread_id) = event.provider_session_id
         {
@@ -1338,7 +1346,7 @@ exit 91
 
     fn claim_pending_turn(directory: &Path) -> PendingCodexTurn {
         let claim = acquire_turn_claim(directory).unwrap();
-        let token = claim.token.clone();
+        let token = claim.token().to_owned();
         claim.retain();
         install_pending_turn(directory, &token).unwrap()
     }
@@ -1390,16 +1398,16 @@ exit 1
         // still shows A, has switched to B, or is displaying the agent picker.
         let managed_thread = "018f0000-0000-7000-8000-000000000001";
         write_established_thread(directory, managed_thread);
-        update_status(directory, "ready", None, None).unwrap();
+        update_status(directory, SessionState::Ready, None, None).unwrap();
         let (claim, _) =
             acquire_ready_turn_claim_with_context(directory, "session-codexqueue", &[]).unwrap();
-        update_status(directory, "working", None, None).unwrap();
+        update_status(directory, SessionState::Working, None, None).unwrap();
         let failure = ADAPTER
             .send_cross_session_message(CrossSessionMessageContext {
                 bridge_executable: Path::new("/unused/agent-bridge"),
                 directory,
                 provider_path: &provider,
-                request_id: &claim.token,
+                request_id: claim.token(),
                 prompt: "request addressed only to A",
                 deadline: Instant::now() + Duration::from_secs(2),
             })
@@ -1415,31 +1423,37 @@ exit 1
         let reason = format!("{:#}", failure.into_error());
         assert!(reason.contains("the active thread cannot be verified"));
         assert!(reason.contains("user message queue is unavailable"));
-        let receipt = super::super::super::requests::for_claim(directory, &claim.token)
-            .unwrap()
-            .unwrap();
-        let token = claim.token.clone();
+        let receipt = super::super::super::requests::for_claim(
+            &crate::native::session::Reader::open_unchecked(directory),
+            claim.token(),
+        )
+        .unwrap()
+        .unwrap();
+        let token = claim.token().to_owned();
         drop(claim);
         assert!(!directory.join(TURN_CLAIM_FILE).exists());
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
-        assert_eq!(status.state, "ready");
+        assert_eq!(status.state.as_str(), "ready");
         assert_eq!(event_paths(directory).unwrap().len(), 1);
         assert_eq!(
             established_codex_thread(directory).unwrap().as_deref(),
             Some(managed_thread)
         );
         assert_eq!(
-            super::super::super::requests::for_claim(directory, &token)
-                .unwrap()
-                .unwrap()
-                .request_id,
+            super::super::super::requests::for_claim(
+                &crate::native::session::Reader::open_unchecked(directory),
+                &token
+            )
+            .unwrap()
+            .unwrap()
+            .request_id,
             receipt.request_id
         );
         // A known pre-send refusal releases the claim and allows a later,
         // independently requested addressed turn; it never retries this prompt.
         let (next, _) =
             acquire_ready_turn_claim_with_context(directory, "session-codexqueue", &[]).unwrap();
-        assert_ne!(next.token, token);
+        assert_ne!(next.token(), token);
     }
 
     #[test]
@@ -1647,9 +1661,9 @@ exit 1
         write_queue_manifest(&directory, &provider, "codex-cli 0.153.2");
         let thread_id = "018f0000-0000-7000-8000-000000000001";
         write_established_thread(&directory, thread_id);
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let claim = acquire_turn_claim(&directory).unwrap();
-        let claim_token = claim.token.clone();
+        let claim_token = claim.token().to_owned();
         claim.retain();
         // The prompt as `tell` hands it to the adapter: already framed.
         let prompt = native_delegation_prompt("external", "follow up");
@@ -1702,7 +1716,7 @@ exit 1
         assert_eq!(event.provider_session_id.as_deref(), Some(thread_id));
         assert!(!directory.join(TURN_CLAIM_FILE).exists());
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
-        assert_eq!(status.state, "ready");
+        assert_eq!(status.state.as_str(), "ready");
 
         ADAPTER.handle_hook(&directory, &completion).unwrap();
         assert_eq!(event_paths(&directory).unwrap().len(), 2);
@@ -1720,7 +1734,7 @@ exit 1
         write_queue_manifest_for_workspace(&directory, &provider, "codex-cli 0.153.2", &workspace);
         write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
         let claim = acquire_turn_claim(&directory).unwrap();
-        let claim_token = claim.token.clone();
+        let claim_token = claim.token().to_owned();
         claim.retain();
 
         ADAPTER
@@ -1756,7 +1770,7 @@ exit 1
                 write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
             }
             let claim = acquire_turn_claim(&directory).unwrap();
-            let claim_token = claim.token.clone();
+            let claim_token = claim.token().to_owned();
             claim.retain();
 
             let failure = ADAPTER
@@ -1797,7 +1811,7 @@ exit 91
         write_queue_manifest(&directory, &provider, "codex-cli 0.153.2");
         write_established_thread(&directory, "human-readable-session-name");
         let claim = acquire_turn_claim(&directory).unwrap();
-        let claim_token = claim.token.clone();
+        let claim_token = claim.token().to_owned();
         claim.retain();
 
         let failure = ADAPTER
@@ -1870,7 +1884,7 @@ exit 91
         write_queue_manifest(&directory, &provider, "codex-cli 0.160.0");
         write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
         let claim = acquire_turn_claim(&directory).unwrap();
-        let claim_token = claim.token.clone();
+        let claim_token = claim.token().to_owned();
         claim.retain();
 
         ADAPTER
@@ -2018,7 +2032,7 @@ exit 91
         write_queue_manifest(&directory, &provider, "codex-cli 0.153.2");
         write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
         let claim = acquire_turn_claim(&directory).unwrap();
-        let claim_token = claim.token.clone();
+        let claim_token = claim.token().to_owned();
         claim.retain();
 
         // Give setup a separate bounded budget, then trigger the real timeout path
@@ -2123,7 +2137,7 @@ exit 91
     fn codex_hook_owns_the_official_notify_payload_schema() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let pending = claim_pending_turn(directory.path());
         let payload = serde_json::json!({
             "thread-id": "codex-thread",
@@ -2145,7 +2159,7 @@ exit 91
     fn codex_hook_correlates_exact_output_from_the_official_input_messages() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let pending = claim_pending_turn(directory.path());
         let payload = serde_json::json!({
             "type": "agent-turn-complete",
@@ -2178,7 +2192,7 @@ exit 91
     fn codex_hook_ignores_the_task_title_turn_that_quotes_the_prompt() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let pending = claim_pending_turn(directory.path());
         let prompt = correlated_prompt(
             &native_delegation_prompt(
@@ -2236,7 +2250,7 @@ exit 91
     fn codex_hook_accepts_the_prompt_behind_the_ide_context() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let pending = claim_pending_turn(directory.path());
         let prompt = correlated_prompt(
             &native_delegation_prompt("external", "Reply READY."),
@@ -2293,7 +2307,7 @@ exit 91
     fn codex_hook_ignores_notify_events_from_a_different_thread() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let initial_pending = claim_pending_turn(directory.path());
         ADAPTER
             .handle_hook(
@@ -2306,8 +2320,8 @@ exit 91
             )
             .unwrap();
         let _pending = claim_pending_turn(directory.path());
-        update_status(directory.path(), "claimed", None, None).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Claimed, None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
 
         ADAPTER
             .handle_hook(
@@ -2323,14 +2337,14 @@ exit 91
         assert_eq!(event_paths(directory.path()).unwrap().len(), 1);
         assert!(directory.path().join(TURN_CLAIM_FILE).exists());
         let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
-        assert_eq!(status.state, "working");
+        assert_eq!(status.state.as_str(), "working");
     }
 
     #[test]
     fn codex_hook_requires_the_established_thread_id_on_a_queued_turn() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let initial_pending = claim_pending_turn(directory.path());
         ADAPTER
             .handle_hook(
@@ -2343,8 +2357,8 @@ exit 91
             )
             .unwrap();
         let pending = claim_pending_turn(directory.path());
-        update_status(directory.path(), "claimed", None, None).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Claimed, None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
 
         ADAPTER
             .handle_hook(
@@ -2359,14 +2373,14 @@ exit 91
         assert_eq!(event_paths(directory.path()).unwrap().len(), 1);
         assert!(directory.path().join(TURN_CLAIM_FILE).exists());
         let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
-        assert_eq!(status.state, "working");
+        assert_eq!(status.state.as_str(), "working");
     }
 
     #[test]
     fn codex_hook_preserves_a_legitimate_title_shaped_result() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let pending = claim_pending_turn(directory.path());
 
         ADAPTER
@@ -2389,7 +2403,7 @@ exit 91
     fn codex_hook_does_not_bind_the_first_foreign_notify_event() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let _pending = claim_pending_turn(directory.path());
 
         ADAPTER
@@ -2411,7 +2425,7 @@ exit 91
     fn codex_hook_does_not_bind_a_delayed_new_turn_to_a_later_claim() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let initial_pending = claim_pending_turn(directory.path());
         ADAPTER
             .handle_hook(
@@ -2424,8 +2438,8 @@ exit 91
             )
             .unwrap();
         let _later_pending = claim_pending_turn(directory.path());
-        update_status(directory.path(), "claimed", None, None).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Claimed, None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
 
         ADAPTER
             .handle_hook(

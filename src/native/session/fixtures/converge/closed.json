@@ -1,0 +1,7 @@
+{
+  "state": "closed",
+  "generation": 9,
+  "updated_unix_ms": 123456789,
+  "exit_code": null,
+  "error": "native session process 0 is no longer running"
+}

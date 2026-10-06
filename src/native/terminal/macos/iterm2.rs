@@ -1,3 +1,5 @@
+use crate::native::session::SessionState;
+use crate::native::session::{CoreRecord, Reader};
 use std::{
     os::unix::fs::MetadataExt,
     path::Path,
@@ -397,29 +399,35 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
 }
 
 fn wait_for_binding(directory: &Path, id: &str, iterm_id: &str) -> Result<()> {
-    use crate::native::{
-        SessionStatus, TERMINAL_HANDLE_FILE, current_turn_claim_token, launch, read_json,
-        read_regular_text_if_present, unix_ms,
-    };
-    let initial = launch::read(directory)?.context("missing iTerm2 launch receipt")?;
+    use crate::native::{SessionStatus, launch, unix_ms};
+    let initial = launch::read(&Reader::open_unchecked(directory))?
+        .context("missing iTerm2 launch receipt")?;
     let remaining = initial
         .deadline_unix_ms
         .saturating_sub(unix_ms())
         .min(30_000);
     let deadline = Instant::now() + Duration::from_millis(remaining as u64);
     loop {
-        let record = launch::read(directory)?.context("missing iTerm2 launch receipt")?;
-        let status: SessionStatus = read_json(&directory.join("status.json"))?;
+        let record = launch::read(&Reader::open_unchecked(directory))?
+            .context("missing iTerm2 launch receipt")?;
+        let status: SessionStatus = Reader::open_unchecked(directory).status()?;
         if Instant::now() >= deadline
             || unix_ms() >= record.deadline_unix_ms
             || record.phase != launch::Phase::Pending
             || record.claim_token != initial.claim_token
-            || status.state != "launching"
-            || current_turn_claim_token(directory)?.as_deref() != Some(initial.claim_token.as_str())
+            || status.state != SessionState::Launching
+            || crate::native::session::turn::current_claim_token(
+                &crate::native::session::Reader::open_unchecked(directory),
+            )?
+            .as_deref()
+                != Some(initial.claim_token.as_str())
         {
             bail!("iTerm2 launch was cancelled or timed out before surface binding");
         }
-        if let Some(text) = read_regular_text_if_present(&directory.join(TERMINAL_HANDLE_FILE))? {
+        if let Some(text) = Reader::open_unchecked(directory)
+            .record(CoreRecord::Terminal)
+            .text()?
+        {
             let surface: TerminalSession =
                 serde_json::from_str(&text).context("invalid iTerm2 surface binding")?;
             surface.verify_managed_session(id)?;
@@ -1459,12 +1467,12 @@ end run
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "launching", None, None).unwrap();
+        update_status(directory.path(), SessionState::Launching, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
-        let token = claim.token.clone();
+        let token = claim.token().to_owned();
         claim.retain();
         launch::begin(
-            directory.path(),
+            &crate::native::session::Store::open_unchecked(directory.path()),
             &token,
             Instant::now() + Duration::from_secs(5),
         )
@@ -1506,9 +1514,9 @@ end run
             );
             match mode {
                 "wrong-owner" => crate::native::write_json_atomic(&directory.join(crate::native::TERMINAL_HANDLE_FILE), &serde_json::json!({ "terminal": "iterm2", "session_id": "owned-id", "managed_session_id": "session-other" })).unwrap(),
-                "cancelled" => crate::native::update_status(directory, "closed", None, None).unwrap(),
+                "cancelled" => crate::native::update_status(directory, SessionState::Closed, None, None).unwrap(),
                 "expired" | "changed-claim" => {
-                    let mut receipt = crate::native::launch::read(directory).unwrap().unwrap();
+                    let mut receipt = crate::native::launch::read(&crate::native::session::Reader::open_unchecked(directory)).unwrap().unwrap();
                     if mode == "expired" { receipt.deadline_unix_ms = 0; }
                     else { receipt.claim_token = "unrelated".into(); }
                     crate::native::write_json_atomic(&directory.join(crate::native::launch::FILE), &receipt).unwrap();
@@ -1643,7 +1651,13 @@ end run
                     )
                 });
                 if cancel {
-                    crate::native::update_status(directory.path(), "closed", None, None).unwrap();
+                    crate::native::update_status(
+                        directory.path(),
+                        SessionState::Closed,
+                        None,
+                        None,
+                    )
+                    .unwrap();
                 } else {
                     bind_fixture(directory.path(), "owned-id");
                 }

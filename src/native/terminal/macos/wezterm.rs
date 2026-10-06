@@ -1,3 +1,5 @@
+use crate::native::session::SessionState;
+use crate::native::session::{CoreRecord, Reader, Store};
 // WezTerm through its official CLI (pinned source: 20240203-110809-5046fc22).
 // Default: discover protected gui-sock-<pid> sockets in the macOS runtime directory,
 // verify the socket peer, installed GUI executable and process birth, then use a
@@ -918,35 +920,44 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
     })();
     // The pane ends with this process and takes the message with it.
     if let Err(error) = &started {
-        crate::native::launch::log(directory, &format!("wezterm_host_refused: {error:#}"));
+        crate::native::launch::log(
+            &Store::open_unchecked(directory),
+            &format!("wezterm_host_refused: {error:#}"),
+        );
     }
     started
 }
 
 fn wait_for_binding(directory: &Path, id: &str, pane: &str, socket: &Path) -> Result<()> {
-    use crate::native::{
-        SessionStatus, TERMINAL_HANDLE_FILE, current_turn_claim_token, launch, read_json,
-        read_regular_text_if_present, unix_ms,
-    };
-    let initial = launch::read(directory)?.context("missing WezTerm launch receipt")?;
+    use crate::native::{SessionStatus, launch, unix_ms};
+    let initial = launch::read(&Reader::open_unchecked(directory))?
+        .context("missing WezTerm launch receipt")?;
     let remaining = initial
         .deadline_unix_ms
         .saturating_sub(unix_ms())
         .min(30_000);
     let deadline = Instant::now() + Duration::from_millis(remaining as u64);
     loop {
-        let record = launch::read(directory)?.context("missing WezTerm launch receipt")?;
-        let status: SessionStatus = read_json(&directory.join("status.json"))?;
+        let record = launch::read(&Reader::open_unchecked(directory))?
+            .context("missing WezTerm launch receipt")?;
+        let status: SessionStatus = Reader::open_unchecked(directory).status()?;
         if Instant::now() >= deadline
             || unix_ms() >= record.deadline_unix_ms
             || record.phase != launch::Phase::Pending
             || record.claim_token != initial.claim_token
-            || status.state != "launching"
-            || current_turn_claim_token(directory)?.as_deref() != Some(initial.claim_token.as_str())
+            || status.state != SessionState::Launching
+            || crate::native::session::turn::current_claim_token(
+                &crate::native::session::Reader::open_unchecked(directory),
+            )?
+            .as_deref()
+                != Some(initial.claim_token.as_str())
         {
             bail!("WezTerm launch was cancelled or timed out before surface binding");
         }
-        if let Some(text) = read_regular_text_if_present(&directory.join(TERMINAL_HANDLE_FILE))? {
+        if let Some(text) = Reader::open_unchecked(directory)
+            .record(CoreRecord::Terminal)
+            .text()?
+        {
             let surface: TerminalSession =
                 serde_json::from_str(&text).context("invalid WezTerm surface binding")?;
             surface.verify_managed_session(id)?;
@@ -974,7 +985,9 @@ pub(super) fn send_file(
 ) -> TerminalSendResult {
     let (mux, pane, input) = (|| -> Result<_> {
         let (mux, pane) = target(session)?;
-        let mut input = fs::read(prompt_path).context("failed to read the prompt")?;
+        let mut input = crate::native::session::RecordReader::at(prompt_path)
+            .raw_bytes()
+            .context("failed to read the prompt")?;
         std::str::from_utf8(&input)
             .context("the prompt is not UTF-8 text, which the WezTerm CLI requires")?;
         input.push(b'\r');
@@ -2352,12 +2365,12 @@ mod tests {
             .unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "launching", None, None).unwrap();
+        update_status(directory.path(), SessionState::Launching, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
-        let token = claim.token.clone();
+        let token = claim.token().to_owned();
         claim.retain();
         launch::begin(
-            directory.path(),
+            &crate::native::session::Store::open_unchecked(directory.path()),
             &token,
             Instant::now() + Duration::from_secs(20),
         )
@@ -2508,7 +2521,8 @@ mod tests {
                     )
                 });
                 if cancelled {
-                    crate::native::update_status(directory, "closed", None, None).unwrap();
+                    crate::native::update_status(directory, SessionState::Closed, None, None)
+                        .unwrap();
                 } else {
                     bind(directory, &session);
                 }
@@ -2602,10 +2616,14 @@ mod tests {
             }
             match case {
                 "cancelled" => {
-                    crate::native::update_status(directory, "closed", None, None).unwrap()
+                    crate::native::update_status(directory, SessionState::Closed, None, None)
+                        .unwrap()
                 }
                 "expired" | "another claim" => {
-                    let mut receipt = launch::read(directory).unwrap().unwrap();
+                    let mut receipt =
+                        launch::read(&crate::native::session::Reader::open_unchecked(directory))
+                            .unwrap()
+                            .unwrap();
                     if case == "expired" {
                         receipt.deadline_unix_ms = 0;
                     } else {

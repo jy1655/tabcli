@@ -3,6 +3,10 @@ use super::{
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
     LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
 };
+#[cfg(test)]
+use crate::native::session::SessionState;
+use crate::native::session::turn;
+use crate::native::session::{Reader, RecordStore, Store};
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -130,11 +134,11 @@ impl NativeProviderAdapter for PiAdapter {
     }
 
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
-        let claim_token = super::super::current_turn_claim_token(context.directory)?
+        let claim_token = turn::current_claim_token(&Reader::open_unchecked(context.directory))?
             .context("Pi launch has no native turn claim")?;
         let pending = install_pending_turn(context.directory, &claim_token)?;
         let extension_path = context.directory.join("pi-agent-bridge.js");
-        super::super::write_private(&extension_path, bridge_extension().as_bytes())?;
+        RecordStore::at(&extension_path).write_private(bridge_extension().as_bytes())?;
         let mut arguments = vec![
             OsString::from("--extension"),
             extension_path.into_os_string(),
@@ -199,7 +203,7 @@ impl NativeProviderAdapter for PiAdapter {
                 .managed_session_id
                 .as_deref()
                 .context("Pi initial input has no managed session identity")
-                .and_then(super::super::session_directory)
+                .and_then(Reader::session_directory)
                 .map_err(terminal::TerminalSendFailure::not_sent)?;
             send_initial_prompt_after_startup(&directory, deadline, || {
                 terminal::send_file(session, prompt_path, deadline)
@@ -274,14 +278,12 @@ impl NativeProviderAdapter for PiAdapter {
         let Ok(message) = correlated_response(raw_message, &pending) else {
             return Ok(());
         };
-        super::super::record_provider_result_for_claim(
-            directory,
+        turn::Report::for_claim(
+            &Store::open_unchecked(directory),
             FirstPartyCli::Pi,
-            message,
-            provider_session_id,
-            turn_id,
             Some(&pending.claim_token),
         )
+        .complete(message, provider_session_id, turn_id)
         .context("failed to record the correlated Pi result")
     }
 
@@ -330,13 +332,14 @@ fn send_initial_prompt_after_startup(
                     "Pi startup has not confirmed that project trust was resolved; no initial console input was sent. Resolve the prompt in the managed terminal, then close and start a new Bridge session if this request timed out"
                 );
             }
-            if super::super::current_turn_claim_token(directory)?.as_deref()
+            if turn::current_claim_token(&Reader::open_unchecked(directory))?.as_deref()
                 != Some(pending.claim_token.as_str())
             {
                 bail!("Pi initial turn is no longer claimed; no initial console input was sent");
             }
-            if let Some(text) =
-                super::super::read_regular_text_if_present(&directory.join(STARTUP_READY_FILE))?
+            if let Some(text) = Reader::open_unchecked(directory)
+                .private(STARTUP_READY_FILE)
+                .text()?
             {
                 let ready: StartupReady =
                     serde_json::from_str(&text).context("invalid Pi startup receipt")?;
@@ -373,13 +376,16 @@ fn validate_claim_token(claim_token: &str) -> Result<()> {
 
 fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingPiTurn> {
     let pending = PendingPiTurn::new(claim_token)?;
-    super::super::write_json_atomic(&directory.join(PENDING_TURN_FILE), &pending)?;
+    Store::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .write_json(&pending)?;
     Ok(pending)
 }
 
 fn read_pending_turn(directory: &Path) -> Result<Option<PendingPiTurn>> {
-    let Some(text) =
-        super::super::read_regular_text_if_present(&directory.join(PENDING_TURN_FILE))?
+    let Some(text) = Reader::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .text()?
     else {
         return Ok(None);
     };
@@ -399,7 +405,9 @@ fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result<()> {
     if pending.claim_token != claim_token {
         return Ok(());
     }
-    super::super::remove_file_if_present(&directory.join(PENDING_TURN_FILE))
+    Store::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .remove()
 }
 
 fn correlated_prompt(prompt: &str, pending: &PendingPiTurn) -> String {
@@ -443,14 +451,12 @@ fn record_correlated_failure(
     turn_id: Option<String>,
     pending: &PendingPiTurn,
 ) -> Result<()> {
-    super::super::record_provider_failure_for_claim(
-        directory,
+    turn::Report::for_claim(
+        &Store::open_unchecked(directory),
         FirstPartyCli::Pi,
-        error,
-        provider_session_id,
-        turn_id,
         Some(&pending.claim_token),
     )
+    .fail(error, provider_session_id, turn_id)
     .context("failed to record the correlated Pi failure")
 }
 
@@ -478,8 +484,8 @@ impl PiFailureMonitor {
             .spawn(move || {
                 let result = monitor_hook_failures(&directory, &stop_for_thread);
                 if let Err(error) = &result {
-                    let _ = super::super::record_provider_monitor_failure(
-                        &error_directory,
+                    let _ = turn::Report::monitor_failure(
+                        &Store::open_unchecked(&error_directory),
                         FirstPartyCli::Pi,
                         &format!("Pi result recovery monitor failed: {error:#}"),
                     );
@@ -524,8 +530,10 @@ fn monitor_hook_failures(directory: &Path, stop: &AtomicBool) -> Result<()> {
 }
 
 fn consume_hook_failure(directory: &Path) -> Result<bool> {
-    let path = directory.join(HOOK_FAILURE_FILE);
-    let Some(text) = super::super::read_regular_text_if_present(&path)? else {
+    let Some(text) = Reader::open_unchecked(directory)
+        .private(HOOK_FAILURE_FILE)
+        .text()?
+    else {
         return Ok(false);
     };
     let signal: HookFailureSignal =
@@ -534,7 +542,9 @@ fn consume_hook_failure(directory: &Path) -> Result<bool> {
     if error.is_empty() {
         bail!("Pi hook failure recovery signal has no error");
     }
-    super::super::remove_file_if_present(&path)
+    Store::open_unchecked(directory)
+        .private(HOOK_FAILURE_FILE)
+        .remove()
         .context("failed to consume Pi hook failure recovery signal")?;
     let Some(pending) = read_pending_turn(directory)? else {
         return Ok(true);
@@ -786,7 +796,7 @@ mod tests {
 
     fn claim_pending_turn(directory: &Path) -> PendingPiTurn {
         let claim = acquire_turn_claim(directory).unwrap();
-        let token = claim.token.clone();
+        let token = claim.token().to_owned();
         claim.retain();
         install_pending_turn(directory, &token).unwrap()
     }
@@ -914,7 +924,7 @@ mod tests {
     fn pi_hook_owns_the_extension_payload_schema() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let pending = claim_pending_turn(directory.path());
         let payload = serde_json::json!({
             "session_id": "pi-session",
@@ -938,7 +948,7 @@ mod tests {
     fn pi_hook_preserves_an_exact_response_when_the_input_was_correlated() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let pending = claim_pending_turn(directory.path());
         let payload = serde_json::json!({
             "session_id": "pi-session",
@@ -959,7 +969,7 @@ mod tests {
     fn pi_hook_rejects_a_matching_claim_without_input_correlation() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let pending = claim_pending_turn(directory.path());
         let payload = serde_json::json!({
             "session_id": "pi-session",
@@ -978,7 +988,7 @@ mod tests {
     fn hook_transport_failure_signal_recovers_the_bridge_turn() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let pending = claim_pending_turn(directory.path());
         write_json_atomic(
             &directory.path().join(HOOK_FAILURE_FILE),
@@ -997,14 +1007,14 @@ mod tests {
         let error = wait_for_event(directory.path(), 0, Duration::from_secs(1)).unwrap_err();
         assert!(format!("{error:#}").contains("native hook exited with status 1"));
         let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
-        assert_eq!(status.state, "ready");
+        assert_eq!(status.state.as_str(), "ready");
     }
 
     #[test]
     fn pi_hook_does_not_bind_a_delayed_new_turn_to_a_later_claim() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let initial_pending = claim_pending_turn(directory.path());
         ADAPTER
             .handle_hook(
@@ -1019,8 +1029,8 @@ mod tests {
             )
             .unwrap();
         let _later_pending = claim_pending_turn(directory.path());
-        update_status(directory.path(), "claimed", None, None).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Claimed, None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
 
         ADAPTER
             .handle_hook(

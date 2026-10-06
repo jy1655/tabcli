@@ -3,6 +3,9 @@ use super::{
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
     LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
 };
+use crate::native::session::SessionState;
+use crate::native::session::turn;
+use crate::native::session::{Reader, RecordReader, Store};
 use agent_bridge::FirstPartyCli;
 use anyhow::Context;
 use anyhow::{Result, bail};
@@ -160,10 +163,13 @@ impl NativeProviderAdapter for AgyAdapter {
     }
 
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
-        let claim_token = super::super::current_turn_claim_token(context.directory)?
+        let claim_token = turn::current_claim_token(&Reader::open_unchecked(context.directory))?
             .context("Agy launch has no native turn claim")?;
         let pending = install_pending_turn(context.directory, &claim_token)?;
-        let log_path = context.directory.join(AGY_LOG_FILE);
+        let log_path = Reader::open_unchecked(context.directory)
+            .private(AGY_LOG_FILE)
+            .path()
+            .to_owned();
         let mut arguments = vec![
             OsString::from("--log-file"),
             log_path.as_os_str().to_owned(),
@@ -341,13 +347,16 @@ fn validate_claim_token(claim_token: &str) -> Result<()> {
 
 fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingAgyTurn> {
     let pending = PendingAgyTurn::new(claim_token)?;
-    super::super::write_json_atomic(&directory.join(PENDING_TURN_FILE), &pending)?;
+    Store::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .write_json(&pending)?;
     Ok(pending)
 }
 
 fn read_pending_turn(directory: &Path) -> Result<Option<PendingAgyTurn>> {
-    let Some(text) =
-        super::super::read_regular_text_if_present(&directory.join(PENDING_TURN_FILE))?
+    let Some(text) = Reader::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .text()?
     else {
         return Ok(None);
     };
@@ -367,7 +376,9 @@ fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result<()> {
     if pending.claim_token != claim_token {
         return Ok(());
     }
-    super::super::remove_file_if_present(&directory.join(PENDING_TURN_FILE))
+    Store::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .remove()
 }
 
 fn correlated_prompt(prompt: &str, pending: &PendingAgyTurn) -> String {
@@ -634,7 +645,7 @@ impl Clock for SystemClock {
 }
 
 fn read_log_bytes(log_path: &Path) -> Result<Option<Vec<u8>>> {
-    super::super::read_regular_bytes_if_present(log_path)
+    RecordReader::at(log_path).bytes()
 }
 
 // The trust evidence a paste needs (issue #48): Agy's trust store lists the exact
@@ -735,16 +746,26 @@ fn workspace_trust_missing(
 }
 
 fn wait_for_workspace_trust(directory: &Path, deadline: Instant) -> Result<()> {
-    let workspace = super::super::read_manifest(directory)?.workspace;
+    let workspace = Reader::open_unchecked(directory).manifest()?.workspace;
     let homes = super::super::consent::Homes::current()?;
-    let log_path = directory.join(AGY_LOG_FILE);
+    let log_path = Reader::open_unchecked(directory)
+        .private(AGY_LOG_FILE)
+        .path()
+        .to_owned();
     wait_for_workspace_trust_with(
         &mut || workspace_trust_missing(&workspace, &homes, &log_path),
         &mut || {
-            super::super::read_json::<super::super::SessionStatus>(&directory.join("status.json"))
+            Reader::open_unchecked(directory)
+                .status()
                 .ok()
                 .map(|status| status.state)
-                .filter(|state| matches!(state.as_str(), "failed" | "exited" | "closed"))
+                .filter(|state| {
+                    matches!(
+                        state,
+                        SessionState::Failed | SessionState::Exited | SessionState::Closed
+                    )
+                })
+                .map(|state| state.to_string())
         },
         deadline,
         STARTUP_POLL_INTERVAL,
@@ -765,7 +786,10 @@ fn deliver_terminal_turn(
 ) -> terminal::TerminalSendResult {
     use terminal::TerminalSendFailure;
     let directory = session_directory_of(session).map_err(TerminalSendFailure::not_sent)?;
-    let log_path = directory.join(AGY_LOG_FILE);
+    let log_path = Reader::open_unchecked(&directory)
+        .private(AGY_LOG_FILE)
+        .path()
+        .to_owned();
     let pending = read_pending_turn(&directory)
         .and_then(|pending| pending.context("Agy turn correlation state is missing"))
         .map_err(TerminalSendFailure::not_sent)?;
@@ -826,14 +850,15 @@ where
     S: FnOnce() -> terminal::TerminalSendResult,
     C: FnOnce() -> terminal::TerminalSendResult,
 {
-    let path = directory.join(format!("agy-input-{}.json", pending.claim_token));
+    let record = Store::open_unchecked(directory)
+        .private(&format!("agy-input-{}.json", pending.claim_token));
     let mut trace = serde_json::json!({
         "schema":1, "claim_token":pending.claim_token, "terminal":terminal,
         "pre_paste_offset":pre_paste_len, "prepared_unix_ms":super::super::unix_ms(),
         "outcome":"prepared", "paste_started_unix_ms":null,
         "paste_returned_unix_ms":null, "receipt_finished_unix_ms":null, "error":null,
     });
-    let _ = super::super::write_json_atomic(&path, &trace);
+    let _ = record.write_json(&trace);
     trace["paste_started_unix_ms"] = serde_json::json!(super::super::unix_ms());
     let result = send();
     trace["paste_returned_unix_ms"] = serde_json::json!(super::super::unix_ms());
@@ -847,7 +872,7 @@ where
     if let Err(error) = &result {
         trace["error"] = serde_json::json!(error.error().to_string());
     }
-    let _ = super::super::write_json_atomic(&path, &trace);
+    let _ = record.write_json(&trace);
     result
 }
 
@@ -865,7 +890,7 @@ fn session_directory_of(session: &terminal::TerminalSession) -> Result<PathBuf> 
         .managed_session_id
         .as_deref()
         .context("Agy terminal handle is missing its managed session binding")?;
-    super::super::session_directory(id)
+    Reader::session_directory(id)
 }
 
 fn input_receipt_window_end(now: Instant, deadline: Instant) -> Instant {
@@ -1641,7 +1666,10 @@ fn workspace_trust_check_with(
     const OBSERVATION: &str =
         "Observation only: doctor never answers the dialog or edits Agy's settings.";
     const WITHHELD: &str = "The Windows initial paste and every macOS follow-up are withheld meanwhile, because a paste onto the dialog is lost and its Enter would approve the folder; an argument-delivered initial prompt still runs behind the dialog.";
-    let log_path = directory.join(AGY_LOG_FILE);
+    let log_path = Reader::open_unchecked(directory)
+        .private(AGY_LOG_FILE)
+        .path()
+        .to_owned();
     let (availability, reason, detail) = match workspace_trust_missing(workspace, homes, &log_path) {
         Ok(None) => (
             Available,
@@ -1707,7 +1735,10 @@ fn input_receipt_check_for_platform(
             NEXT_ACTION,
         );
     };
-    let log_path = directory.join(AGY_LOG_FILE);
+    let log_path = Reader::open_unchecked(directory)
+        .private(AGY_LOG_FILE)
+        .path()
+        .to_owned();
     let log = match read_log_bytes(&log_path) {
         Ok(Some(log)) => log,
         Ok(None) => {
@@ -1800,8 +1831,8 @@ impl AgyMonitor {
             .spawn(move || {
                 let result = monitor_session(&directory, &log_path, &brain_root, &stop_for_thread);
                 if let Err(error) = &result {
-                    let _ = super::super::record_provider_monitor_failure(
-                        &error_directory,
+                    let _ = turn::Report::monitor_failure(
+                        &Store::open_unchecked(&error_directory),
                         FirstPartyCli::Agy,
                         &format!("Agy result monitor failed: {error:#}"),
                     );
@@ -1867,7 +1898,7 @@ impl TranscriptCursor {
             self.pending_results.clear();
         }
 
-        let mut file = OpenOptions::new().read(true).open(&self.path)?;
+        let mut file = RecordReader::at(&self.path).open()?;
         file.seek(SeekFrom::Start(self.offset))?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
@@ -1917,13 +1948,15 @@ impl TranscriptCursor {
             if let Some(pending) = read_pending_turn(directory)?
                 && let Ok(message) = correlated_response(&message, &pending)
             {
-                super::super::record_provider_result_for_claim(
-                    directory,
+                turn::Report::for_claim(
+                    &Store::open_unchecked(directory),
                     FirstPartyCli::Agy,
+                    Some(&pending.claim_token),
+                )
+                .complete(
                     message,
                     Some(conversation_id.to_owned()),
                     Some(step.to_string()),
-                    Some(&pending.claim_token),
                 )
                 .context("failed to record the correlated Agy result")?;
             }
@@ -2065,7 +2098,7 @@ struct MonitorState {
 
 impl MonitorState {
     fn poll(&mut self, directory: &Path, log_path: &Path, brain_root: &Path) -> Result<()> {
-        let log = super::super::read_regular_text_if_present(log_path)?;
+        let log = RecordReader::at(log_path).text()?;
         if let Some(log) = &log
             && let Some(newest_id) = parse_conversation_id(log)
             && self.conversation_id.as_deref() != Some(newest_id.as_str())
@@ -2092,13 +2125,15 @@ impl MonitorState {
                 && (pasted
                     || only_user_input_carries(&cursor.full_path, brain_root, &pending.marker)?)
             {
-                super::super::record_provider_failure_for_claim(
-                    directory,
+                turn::Report::for_claim(
+                    &Store::open_unchecked(directory),
                     FirstPartyCli::Agy,
+                    Some(&pending.claim_token),
+                )
+                .fail(
                     &format!("Agy turn failed: {error}"),
                     Some(id.to_owned()),
                     None,
-                    Some(&pending.claim_token),
                 )
                 .context("failed to record the Agy turn failure")?;
                 self.failed_claim = Some(pending.claim_token);
@@ -2373,7 +2408,7 @@ mod tests {
 
     fn claim_pending_turn(directory: &Path) -> PendingAgyTurn {
         let claim = acquire_turn_claim(directory).unwrap();
-        let token = claim.token.clone();
+        let token = claim.token().to_owned();
         claim.retain();
         install_pending_turn(directory, &token).unwrap()
     }
@@ -5513,7 +5548,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("session-doctor1");
         fs::create_dir_all(directory.join("events")).unwrap();
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         assert_eq!(
             input_receipt_check(Some(&directory)).reason_code,
             "agy_log_missing"
@@ -5608,7 +5643,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         assert_eq!(evidence["pending_marker_received"], true);
         assert_eq!(evidence["pending_marker"], pending.marker);
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
-        assert_eq!(status.state, "working");
+        assert_eq!(status.state.as_str(), "working");
     }
 
     // The launcher path for a lost initial paste: the gate passes (here the startup
@@ -5622,9 +5657,9 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("session-fMqSQc");
         fs::create_dir_all(directory.join("events")).unwrap();
-        update_status(&directory, "awaiting-initial-input", None, None).unwrap();
+        update_status(&directory, SessionState::AwaitingInitialInput, None, None).unwrap();
         let mut claim = acquire_turn_claim(&directory).unwrap();
-        let pending = install_pending_turn(&directory, &claim.token).unwrap();
+        let pending = install_pending_turn(&directory, claim.token()).unwrap();
 
         let startup = late_reload_startup_log();
         let start = Instant::now();
@@ -5641,7 +5676,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         // The read that passed the gate is the pre-paste offset: the whole startup
         // log. The launcher marks the session working before the paste.
         assert_eq!(pre_paste_len, startup.len());
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let pasted_at = clock.now();
         let after_paste = startup.clone() + &late_reload_completion();
         let failure = confirm_input_receipt_with(
@@ -5665,7 +5700,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         drop(claim);
 
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
-        assert_eq!(status.state, "working");
+        assert_eq!(status.state.as_str(), "working");
         let error = status
             .error
             .expect("the reason is recorded in status.error");
@@ -5845,11 +5880,11 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("session-QMFk6F");
         fs::create_dir_all(directory.join("events")).unwrap();
-        update_status(&directory, "ready", None, None).unwrap();
+        update_status(&directory, SessionState::Ready, None, None).unwrap();
         // A follow-up claims the ready session before it prepares the paste.
-        update_status(&directory, "claimed", None, None).unwrap();
+        update_status(&directory, SessionState::Claimed, None, None).unwrap();
         let mut claim = acquire_turn_claim(&directory).unwrap();
-        let pending = install_pending_turn(&directory, &claim.token).unwrap();
+        let pending = install_pending_turn(&directory, claim.token()).unwrap();
 
         let before_reload = &REAL_MACOS_INITIAL_TURN[..REAL_MACOS_INITIAL_TURN
             .rfind("I0924 21:32:19.637013")
@@ -5869,7 +5904,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
             "a static macOS log waits one quiet period; it cannot show the trust dialog"
         );
         assert_eq!(pre_paste_len, before_reload.len());
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let pasted_at = clock.now();
         let failure = confirm_input_receipt_with(
             &mut log_sequence(vec![
@@ -5890,7 +5925,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         drop(claim);
 
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
-        assert_eq!(status.state, "working");
+        assert_eq!(status.state.as_str(), "working");
         let error = status
             .error
             .expect("the reason is recorded in status.error");
@@ -6376,7 +6411,7 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         let directory = root.path().join("session-safe123");
         fs::create_dir(&directory).unwrap();
         fs::create_dir(directory.join("events")).unwrap();
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
 
         let id = "3e166585-bc21-43b7-b3d1-dec5e67688b3";
         let brain = root.path().join("brain");
@@ -6417,8 +6452,8 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         assert_eq!(event_paths(&directory).unwrap().len(), 1);
         assert!(directory.join(PENDING_TURN_FILE).is_file());
 
-        update_status(&directory, "claimed", None, None).unwrap();
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Claimed, None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let second_pending = claim_pending_turn(&directory);
         fs::write(
             transcript_path.with_file_name("transcript_full.jsonl"),
@@ -6439,8 +6474,8 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
             .append(true)
             .open(&transcript_path)
             .unwrap();
-        update_status(&directory, "claimed", None, None).unwrap();
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Claimed, None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let third_pending = claim_pending_turn(&directory);
         writeln!(
             transcript,
@@ -6457,7 +6492,7 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         assert_eq!(latest.provider_session_id.as_deref(), Some(id));
         assert_eq!(latest.turn_id.as_deref(), Some("4"));
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
-        assert_eq!(status.state, "ready");
+        assert_eq!(status.state.as_str(), "ready");
     }
 
     #[test]
@@ -6466,7 +6501,7 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         let directory = root.path().join("session-safe123");
         fs::create_dir(&directory).unwrap();
         fs::create_dir(directory.join("events")).unwrap();
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let brain = root.path().join("brain");
         let log = directory.join("agy.log");
         let first_id = "11111111-1111-1111-1111-111111111111";
@@ -6495,8 +6530,8 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         let mut monitor = MonitorState::default();
 
         monitor.poll(&directory, &log, &brain).unwrap();
-        update_status(&directory, "claimed", None, None).unwrap();
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Claimed, None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let second_pending = claim_pending_turn(&directory);
         fs::write(
             brain
@@ -6543,7 +6578,7 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         let directory = root.path().join("session-quota1");
         fs::create_dir(&directory).unwrap();
         fs::create_dir(directory.join("events")).unwrap();
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let brain = root.path().join("brain");
         let log = directory.join("agy.log");
         let id = "97ad12fd-9e7a-4556-83a4-8f0147343657";
@@ -6603,13 +6638,13 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
             "the failed turn releases its claim"
         );
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
-        assert_eq!(status.state, "ready");
+        assert_eq!(status.state.as_str(), "ready");
         assert_eq!(status.error.as_deref(), Some(error.as_str()));
 
         // A follow-up is claimed and its input already stands in the transcript, but
         // the log still ends with the first turn's error: that error is not its own.
-        update_status(&directory, "claimed", None, None).unwrap();
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Claimed, None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let second = claim_pending_turn(&directory);
         fs::write(
             &full,
@@ -6656,8 +6691,8 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         assert_eq!(status.error.as_deref(), Some(error.as_str()));
 
         // A result that is already written when the error is seen is recorded first.
-        update_status(&directory, "claimed", None, None).unwrap();
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Claimed, None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let third = claim_pending_turn(&directory);
         let mut appended = OpenOptions::new().append(true).open(&transcript).unwrap();
         writeln!(appended, "{}", planner_line(3, &marked("done", &third))).unwrap();
