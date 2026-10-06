@@ -1,0 +1,4 @@
+# Byte-for-byte fixtures: the convergence test compares the records Bridge writes against
+# these files with include_bytes!, so a checkout must never translate their line endings
+# (a Windows runner with autocrlf turned LF into CRLF and the comparison failed).
+src/native/session/fixtures/** -text
