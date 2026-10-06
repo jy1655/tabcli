@@ -531,10 +531,12 @@ src/providers/                 공통 provider 정책: 명령, 버전, model/eff
 src/native/provider/          provider별 실행, follow-up transport, 완료 monitor 선택
 src/native/provider_process.rs provider process 실행과 Windows shim 경계
 src/native/terminal/mod.rs     공통 terminal kind, session record, OS dispatch
-src/native/terminal/macos/     iTerm2, Terminal.app, Ghostty, WezTerm, Warp adapter
+src/native/terminal/ownership.rs owner record, surface ownership 검증, close authority
+src/native/terminal/macos/     iTerm2, Terminal.app, Ghostty, WezTerm, Warp adapter와 macOS process identity
 src/native/terminal/linux/     Linux transport 경계(현재 미지원)
 src/native/terminal/windows/   Windows console transport, process identity, ACL/security
-src/native.rs                  세션 상태, lifecycle, 명령 및 provider-neutral orchestration
+src/native/session/            세션 record의 Reader/Store, turn·close·repair lifecycle
+src/native.rs                  명령 parsing·dispatch와 provider-neutral orchestration
 src/native/tests.rs            provider-neutral native orchestration 단위 테스트
 ```
 

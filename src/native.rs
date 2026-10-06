@@ -45,6 +45,8 @@ use terminal::ownership::{
 };
 #[cfg(all(windows, test))]
 use terminal::ownership::{current_native_session_owner, verified_windows_native_owner};
+#[cfg(windows)]
+use terminal::{windows_console_handle_path, windows_console_root_never_ran};
 
 use provider_process::{
     command as provider_process_command, version_command as provider_version_command,
@@ -988,40 +990,6 @@ fn run_windows_console_control(
         timeout_ms.map(Duration::from_millis),
         &records,
     )
-}
-
-// The console root runs the wrapper, and the wrapper records itself as the owner before
-// it asks to spawn the provider. Without that record and without a spawn attempt in the
-// launch receipt, the root has not run its command. A receipt that cannot be read proves
-// nothing.
-#[cfg(windows)]
-fn windows_console_root_never_ran(directory: &Path) -> bool {
-    !Reader::open_unchecked(directory)
-        .record(CoreRecord::Owner)
-        .path()
-        .to_owned()
-        .exists()
-        && match launch::read(&Reader::open_unchecked(directory)) {
-            Ok(None) => true,
-            Ok(Some(record)) => record.phase == launch::Phase::Pending,
-            Err(_) => false,
-        }
-}
-
-#[cfg(windows)]
-fn windows_console_handle_path(directory: &Path, action: &str) -> PathBuf {
-    let closing = Reader::open_unchecked(directory)
-        .record(CoreRecord::TerminalClosing)
-        .path()
-        .to_owned();
-    if action == "close" && closing.is_file() {
-        closing
-    } else {
-        Reader::open_unchecked(directory)
-            .record(CoreRecord::Terminal)
-            .path()
-            .to_owned()
-    }
 }
 
 #[cfg(not(target_os = "windows"))]

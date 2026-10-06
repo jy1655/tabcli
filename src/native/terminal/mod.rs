@@ -484,6 +484,9 @@ pub(super) fn windows_console_host(directory: &Path) -> Result<()> {
     windows::run_console_host(directory)
 }
 
+#[cfg(target_os = "windows")]
+pub(super) use windows::ownership::{windows_console_handle_path, windows_console_root_never_ran};
+
 pub(super) fn iterm2_host(directory: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
