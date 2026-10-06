@@ -1,5 +1,7 @@
 use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, Reader};
+#[cfg(test)]
+use crate::native::terminal::ownership;
 use std::{
     os::unix::fs::MetadataExt,
     path::Path,
@@ -1546,7 +1548,7 @@ end run
             }
         } else {
             let id = directory.file_name().unwrap().to_str().unwrap();
-            let owner = crate::native::current_native_session_owner(id).unwrap();
+            let owner = ownership::current_native_session_owner(id).unwrap();
             let mut queued: libc::c_int = -1;
             assert_eq!(unsafe { libc::ioctl(0, libc::FIONREAD, &mut queued) }, 0);
             crate::native::write_json_atomic(&directory.join("owner-probe.json"), &serde_json::json!({ "pid": owner.pid, "group": owner.process_group, "queued_input": queued })).unwrap();

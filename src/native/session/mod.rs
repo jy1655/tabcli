@@ -1,9 +1,9 @@
 //! Views of one session's durable records.
 use super::{
-    NativeSessionOwner, ProviderProcessRecord, RecordedReopenRefusal, SESSION_SCHEMA,
-    STATE_DIR_ENV, SessionEvent, SessionManifest, SessionStatus, require_valid_session_id,
-    terminal, unix_ms,
+    ProviderProcessRecord, RecordedReopenRefusal, SESSION_SCHEMA, STATE_DIR_ENV, SessionEvent,
+    SessionManifest, SessionStatus, require_valid_session_id, terminal, unix_ms,
 };
+use crate::native::terminal::ownership::NativeSessionOwner;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{

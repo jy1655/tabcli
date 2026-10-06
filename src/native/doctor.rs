@@ -1,14 +1,15 @@
 //! Observations and advice only. No recovery, delivery, terminal control, or settings writes.
 use super::{
-    Duration, FirstPartyCli, Instant, NativeCommand, NativeSessionOwner, OsString, Output, Path,
-    Reader, ReopenMarker, Result, SESSION_DIR_ENV, SeekFrom, Serialize, SessionManifest, Stdio,
-    bail, cli_version_is_supported, consent, fs, is_executable, launch, option_value, provider,
+    Duration, FirstPartyCli, Instant, NativeCommand, OsString, Output, Path, Reader, ReopenMarker,
+    Result, SESSION_DIR_ENV, SeekFrom, Serialize, SessionManifest, Stdio, bail,
+    cli_version_is_supported, consent, fs, is_executable, launch, option_value, provider,
     provider_process, query, read_reopen_launch_refusal, refused_launch_cleanup,
     require_valid_session_id, resolve_provider, set_flag_once, set_once, terminal,
     terminal_safe_text, thread, unix_ms, valid_session_id,
 };
 use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, RecordReader};
+use crate::native::terminal::ownership::NativeSessionOwner;
 use crate::native::{FromStr, Read, Seek, provider_version_command};
 use anyhow::Context as _;
 use serde_json::{Value, json};

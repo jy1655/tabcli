@@ -87,9 +87,25 @@ _Avoid_: terminal (the application), screen
 The Bridge process that launched a session and is attested as controlling its surface.
 _Avoid_: parent, launcher process
 
+**Attestation**:
+The proof that a recorded owner is the live process it names: its PID, birth, controlling
+TTY and process groups (on Windows its process identity) match what the system reports now.
+_Avoid_: liveness check, validation
+
+**App incarnation**:
+One run of a terminal application, identified by its PID and birth. A Terminal.app window id
+and tty are identities only inside the incarnation that created them.
+_Avoid_: app instance, app process
+
 **Close**:
 The explicit end of a session: its surface is ended and a tombstone is recorded.
 _Avoid_: kill, teardown, cleanup
+
+**Close authority**:
+What a close may do to a surface, decided from the session's records and what is observed
+now: act with a live attested owner, act on the surface alone, or do nothing because the
+surface is proven absent. Anything else refuses the close and keeps the surface handle.
+_Avoid_: permission, ownership check
 
 **Repair**:
 Converging a session whose owner has died or whose close was interrupted to a consistent
