@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -180,6 +180,8 @@ impl Reader {
     pub(in crate::native) fn status(&self) -> Result<SessionStatus> {
         self.private(STATUS_FILE).json()
     }
+    // Read by the macOS and Windows ownership paths; Linux has no managed surface yet.
+    #[cfg(any(target_os = "macos", windows))]
     pub(in crate::native) fn owner(&self) -> Result<NativeSessionOwner> {
         self.private(SESSION_OWNER_FILE).json()
     }
@@ -533,6 +535,8 @@ impl RecordReader {
     pub(in crate::native) fn open(&self) -> std::io::Result<File> {
         OpenOptions::new().read(true).open(&self.path)
     }
+    // Read by the WezTerm and Windows paths; Linux has no managed surface that needs it.
+    #[cfg(any(target_os = "macos", windows))]
     pub(in crate::native) fn raw_bytes(&self) -> std::io::Result<Vec<u8>> {
         fs::read(&self.path)
     }

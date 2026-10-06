@@ -1092,7 +1092,7 @@ fn run_windows_console_control(
 // nothing.
 #[cfg(windows)]
 fn windows_console_root_never_ran(directory: &Path) -> bool {
-    !Reader::open_unchecked(&directory)
+    !Reader::open_unchecked(directory)
         .record(CoreRecord::Owner)
         .path()
         .to_owned()
@@ -1106,14 +1106,14 @@ fn windows_console_root_never_ran(directory: &Path) -> bool {
 
 #[cfg(windows)]
 fn windows_console_handle_path(directory: &Path, action: &str) -> PathBuf {
-    let closing = Reader::open_unchecked(&directory)
+    let closing = Reader::open_unchecked(directory)
         .record(CoreRecord::TerminalClosing)
         .path()
         .to_owned();
     if action == "close" && closing.is_file() {
         closing
     } else {
-        Reader::open_unchecked(&directory)
+        Reader::open_unchecked(directory)
             .record(CoreRecord::Terminal)
             .path()
             .to_owned()
@@ -2773,7 +2773,7 @@ fn verify_terminal_surface_ownership_with_timeout(
 
 #[cfg(windows)]
 fn verified_windows_native_owner(directory: &Path, expected_session_id: &str) -> Result<()> {
-    let owner_path = Reader::open_unchecked(&directory)
+    let owner_path = Reader::open_unchecked(directory)
         .record(CoreRecord::Owner)
         .path()
         .to_owned();

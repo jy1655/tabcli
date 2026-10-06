@@ -5,6 +5,9 @@ use crate::native::*;
 use std::process::Child;
 
 #[cfg(test)]
+// macOS and Windows tests address the launch record by this name; production code uses
+// the store.
+#[cfg(all(test, any(target_os = "macos", windows)))]
 pub(in crate::native) use super::LAUNCH_FILE as FILE;
 pub(in crate::native) const LOG: &str = "launch.log";
 pub(in crate::native) const STDERR_ENV: &str = "AGENT_BRIDGE_LAUNCH_STDERR_FD";

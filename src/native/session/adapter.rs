@@ -3,7 +3,7 @@
 //! host directory check. The adapter names its records; this module only moves bytes.
 use super::*;
 use serde::de::DeserializeOwned;
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
 
 impl RecordStore {
