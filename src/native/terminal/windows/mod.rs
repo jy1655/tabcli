@@ -1,3 +1,5 @@
+pub(in crate::native) mod ownership;
+
 use crate::native::session::{Reader, RecordStore, Store};
 use std::{
     ffi::OsStr,

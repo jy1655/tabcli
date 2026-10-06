@@ -1,4 +1,8 @@
 //! Explicit close, interrupted-close convergence, and dead-owner repair.
+use crate::native::terminal::ownership::{
+    close_dead_owner_surface, owner_blocks_prune, repair_owner_is_live,
+    retained_surface_outlives_owner,
+};
 use crate::native::*;
 
 #[cfg(target_os = "macos")]
@@ -530,6 +534,7 @@ where
 #[cfg(test)]
 pub(in crate::native) mod compatibility {
     use super::*;
+    use crate::native::terminal::ownership::close_dead_owner_surface_with;
     pub(in crate::native) fn mark_session_closed(
         directory: &Path,
         error: Option<String>,

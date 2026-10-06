@@ -2,9 +2,9 @@
 use super::{CoreRecord, Reader, RecordReader};
 #[cfg(windows)]
 use crate::native::terminal;
-#[cfg(target_os = "macos")]
-use crate::native::terminal::macos::ownership::mac_native_owner_is_live;
 use crate::native::terminal::ownership::NativeSessionOwner;
+#[cfg(target_os = "macos")]
+use crate::native::terminal::ownership::mac_native_owner_is_live;
 use agent_bridge::process_is_alive;
 #[cfg(not(any(target_os = "macos", windows)))]
 use anyhow::Result;
