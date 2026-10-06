@@ -267,8 +267,8 @@ fn release_validation_checks_the_annotated_tag_on_the_remote() {
     let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
     let validate = release_workflow_job(&workflow, "validate", "test");
 
-    // actions/checkout rewrites the local tag ref to the commit and, without persisted
-    // credentials, nothing can be fetched again from a private repository.
+    // actions/checkout rewrites the local tag ref to the commit, so only the remote still
+    // holds the tag object, and the check must not depend on a second fetch.
     assert!(validate.contains("persist-credentials: false"));
     assert!(validate.contains("git/ref/tags/${RELEASE_TAG}"));
     assert!(validate.contains("git/tags/${ref_sha}"));
