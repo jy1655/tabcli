@@ -1924,6 +1924,15 @@ pub(in crate::native) fn prepare_warp_close(
 
 #[cfg(target_os = "macos")]
 pub(in crate::native) fn terminate_owned_foreground_group(group: u32) -> Result<()> {
+    terminate_owned_foreground_group_with(group, Duration::from_secs(3), |_| {})
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_owned_foreground_group_with(
+    group: u32,
+    timeout: Duration,
+    mut observe: impl FnMut(Option<i32>),
+) -> Result<()> {
     let target = terminal::macos::apple_terminal::process_group_signal_target(group)?;
     if unsafe { libc::kill(target, libc::SIGTERM) } != 0 {
         let error = std::io::Error::last_os_error();
@@ -1932,14 +1941,21 @@ pub(in crate::native) fn terminate_owned_foreground_group(group: u32) -> Result<
         }
         return Err(error).context("could not stop the attested Warp foreground group");
     }
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + timeout;
     loop {
         if unsafe { libc::kill(target, 0) } != 0 {
             let error = std::io::Error::last_os_error();
+            observe(error.raw_os_error());
             if error.raw_os_error() == Some(libc::ESRCH) {
                 return Ok(());
             }
-            return Err(error).context("could not observe the stopped Warp foreground group");
+            // EPERM does not establish absence, including for a zombie-only group
+            // (measured on macOS 26.6.2, 2026-10-07, issue #85); only ESRCH does.
+            if error.raw_os_error() != Some(libc::EPERM) {
+                return Err(error).context("could not observe the stopped Warp foreground group");
+            }
+        } else {
+            observe(None);
         }
         if Instant::now() >= deadline {
             bail!("the attested Warp foreground group has not stopped; no tab close was sent");
@@ -1953,6 +1969,130 @@ mod tests {
     use std::{cell::Cell, os::unix::process::CommandExt};
 
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    struct ForegroundGroupChild(std::process::Child);
+
+    #[cfg(target_os = "macos")]
+    impl ForegroundGroupChild {
+        fn spawn() -> Self {
+            Self(
+                Command::new("/bin/sleep")
+                    .arg("30")
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+
+        fn wait_for_zombie(&self) {
+            let target = -(self.0.id() as i32);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if unsafe { libc::kill(target, 0) } != 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+                {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "child did not become a zombie");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for ForegroundGroupChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owned_foreground_group_termination_waits_for_zombie_reaping() {
+        let child = ForegroundGroupChild::spawn();
+        let group = child.0.id();
+        let (reap, ready) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let received = ready.recv_timeout(Duration::from_secs(5));
+            drop(child);
+            received
+        });
+        let mut probes = Vec::new();
+        let mut eperm_probes = 0;
+        let result =
+            terminate_owned_foreground_group_with(group, Duration::from_secs(3), |errno| {
+                probes.push(errno);
+                if errno == Some(libc::EPERM) {
+                    eperm_probes += 1;
+                    if eperm_probes == 2 {
+                        reap.send(()).unwrap();
+                    }
+                }
+            });
+        drop(reap);
+        let reaped = waiter.join();
+        assert!(result.is_ok(), "{result:?}");
+        reaped.unwrap().unwrap();
+        let gone = probes
+            .iter()
+            .position(|errno| *errno == Some(libc::ESRCH))
+            .unwrap();
+        assert!(
+            probes[..gone]
+                .iter()
+                .filter(|errno| **errno == Some(libc::EPERM))
+                .count()
+                >= 2,
+            "{probes:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owned_foreground_group_termination_times_out_before_zombie_reaping() {
+        let child = ForegroundGroupChild::spawn();
+        let timeout = Duration::from_secs(1);
+        let mut eperm_probes = 0;
+        let started = Instant::now();
+        let result = terminate_owned_foreground_group_with(child.0.id(), timeout, |errno| {
+            if errno == Some(libc::EPERM) {
+                eperm_probes += 1;
+            }
+        });
+        let elapsed = started.elapsed();
+        assert_eq!(
+            result.as_ref().unwrap_err().to_string(),
+            "the attested Warp foreground group has not stopped; no tab close was sent",
+            "{result:?}"
+        );
+        assert!(eperm_probes > 0, "no EPERM probe was observed");
+        assert!(elapsed >= timeout);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owned_foreground_group_termination_refuses_failed_signal_to_zombie() {
+        let child = ForegroundGroupChild::spawn();
+        assert_eq!(
+            unsafe { libc::kill(-(child.0.id() as i32), libc::SIGTERM) },
+            0
+        );
+        child.wait_for_zombie();
+        let error = terminate_owned_foreground_group(child.0.id()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "could not stop the attested Warp foreground group"
+        );
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
+    }
 
     struct FakeRunner {
         directory: PathBuf,
