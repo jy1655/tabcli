@@ -360,7 +360,7 @@ pub(super) fn offer(
     if unsafe { GetShellWindow() }.is_null() {
         bail!("this desktop has no shell window");
     }
-    let bridge = std::env::current_exe().context("failed to locate agent-bridge executable")?;
+    let bridge = std::env::current_exe().context("failed to locate the current executable")?;
     let terminal_command = terminal_command_line(&terminal, &bridge, directory, window)?;
     let budget = startup_deadline.saturating_duration_since(Instant::now());
     let offer_deadline = Instant::now() + OFFER_TIMEOUT.min(budget / 2);

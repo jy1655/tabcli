@@ -1,10 +1,15 @@
+use agent_bridge::PUBLIC_COMMAND;
 use std::ffi::OsString;
 
 use anyhow::{Result, bail};
 
 mod native;
 
-const LEGACY_REMOVAL_MESSAGE: &str = "the embedded multi-PTY TUI was removed in agent-bridge 0.0.1; use ask, tell, sessions, prune-sessions, or close-session";
+fn legacy_removal_message() -> String {
+    format!(
+        "the embedded multi-PTY TUI was removed in agent-bridge 0.0.1; use `{PUBLIC_COMMAND} ask`, `{PUBLIC_COMMAND} tell`, `{PUBLIC_COMMAND} sessions`, `{PUBLIC_COMMAND} prune-sessions`, or `{PUBLIC_COMMAND} close-session`"
+    )
+}
 
 #[derive(Debug)]
 enum Launch {
@@ -15,35 +20,35 @@ enum Launch {
 
 fn help_text() -> String {
     format!(
-        "agent-bridge {} — visible native terminal bridge for coding agent CLIs
+        "{PUBLIC_COMMAND} {} — Terminal Agent Bridge: visible terminal sessions for coding agent CLIs
 
 Usage:
-  agent-bridge ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]
+  {PUBLIC_COMMAND} ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]
       [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|warp|wezterm|windows-console>]
       [--yolo] [--timeout-secs N] [--detach] [--json] [--context-result <session>/<request-id>]...
-  agent-bridge self-test <codex|claude|agy|pi> [--workspace PATH]
+  {PUBLIC_COMMAND} self-test <codex|claude|agy|pi> [--workspace PATH]
       [--terminal <ghostty|iterm2|terminal|warp|wezterm|windows-console>] [--model MODEL] [--effort EFFORT]
       [--yolo] [--timeout-secs N] [--isolated] [--json]
-  agent-bridge tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
+  {PUBLIC_COMMAND} tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
       [--context-result <session>/<request-id>]...
-  agent-bridge reopen <closed-session> (--prompt TEXT | --prompt-file PATH) [--title NAME]
+  {PUBLIC_COMMAND} reopen <closed-session> (--prompt TEXT | --prompt-file PATH) [--title NAME]
       [--model MODEL] [--effort EFFORT] [--terminal <windows-console>] [--yolo] [--timeout-secs N]
       [--detach] [--json]
-  agent-bridge sessions [--workspace PATH] [--provider <codex|claude|agy|pi>] [--state STATE]
+  {PUBLIC_COMMAND} sessions [--workspace PATH] [--provider <codex|claude|agy|pi>] [--state STATE]
       [--sort <id|updated>] [--json]
-  agent-bridge inspect <session> [--timeline [--request REQUEST]] [--json]
-  agent-bridge result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
+  {PUBLIC_COMMAND} inspect <session> [--timeline [--request REQUEST]] [--json]
+  {PUBLIC_COMMAND} result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
       [--wait --timeout-secs N]
-  agent-bridge search <query> [--workspace PATH | --all-workspaces] [--provider <codex|claude|agy|pi>]
+  {PUBLIC_COMMAND} search <query> [--workspace PATH | --all-workspaces] [--provider <codex|claude|agy|pi>]
       [--limit N] [--json]
-  agent-bridge doctor <session> [--probe] [--json]
-  agent-bridge doctor --provider <codex|claude|agy|pi> [--probe] [--json]
-  agent-bridge consent <inspect|revoke|reset> PATH [--json]
-  agent-bridge settings [windows-tab-window <dedicated|current>] [--json]
-  agent-bridge settings macos-open-mode <tab-first|new-window> [--json]
-  agent-bridge prune-sessions --closed-before-days N --explicit [--json]
-  agent-bridge close-session <session> --explicit [--json]
-  agent-bridge --help | --version
+  {PUBLIC_COMMAND} doctor <session> [--probe] [--json]
+  {PUBLIC_COMMAND} doctor --provider <codex|claude|agy|pi> [--probe] [--json]
+  {PUBLIC_COMMAND} consent <inspect|revoke|reset> PATH [--json]
+  {PUBLIC_COMMAND} settings [windows-tab-window <dedicated|current>] [--json]
+  {PUBLIC_COMMAND} settings macos-open-mode <tab-first|new-window> [--json]
+  {PUBLIC_COMMAND} prune-sessions --closed-before-days N --explicit [--json]
+  {PUBLIC_COMMAND} close-session <session> --explicit [--json]
+  {PUBLIC_COMMAND} --help | --version
 
 Runtime:
   macOS detects Ghostty, iTerm2, Terminal.app, Warp, or WezTerm from the invoking environment
@@ -189,7 +194,7 @@ Migration:
 fn parse_args_from(args: impl IntoIterator<Item = OsString>) -> Result<Launch> {
     let args = args.into_iter().collect::<Vec<_>>();
     let Some(first) = args.first() else {
-        bail!(LEGACY_REMOVAL_MESSAGE);
+        bail!(legacy_removal_message());
     };
 
     if first == "--help" || first == "-h" {
@@ -237,7 +242,7 @@ fn parse_args_from(args: impl IntoIterator<Item = OsString>) -> Result<Launch> {
             | "-yolo"
     ) || !command.starts_with('-')
     {
-        bail!(LEGACY_REMOVAL_MESSAGE);
+        bail!(legacy_removal_message());
     }
 
     bail!("unknown command or option: {command}")
@@ -250,7 +255,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Launch::Version => {
-            println!("agent-bridge {}", env!("CARGO_PKG_VERSION"));
+            println!("{PUBLIC_COMMAND} {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Launch::Native(command) => native::run(command),
@@ -374,7 +379,7 @@ mod tests {
         ] {
             assert!(help.contains(expected), "help is missing {expected:?}");
         }
-        for removed in ["agent-bridge open", "agent-bridge prompt", "--restore"] {
+        for removed in ["tabcli open", "tabcli prompt", "--restore"] {
             assert!(!help.contains(removed), "help still advertises {removed:?}");
         }
     }

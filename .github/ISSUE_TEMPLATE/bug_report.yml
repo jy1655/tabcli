@@ -33,7 +33,7 @@ body:
     id: bridge-version
     attributes:
       label: Agent Bridge version
-      description: Paste the output of agent-bridge --version.
+      description: Paste the output of tabcli --version.
     validations:
       required: true
   - type: input

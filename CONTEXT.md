@@ -1,4 +1,4 @@
-# Agent Bridge
+# Terminal Agent Bridge (TAB)
 
 Agent Bridge launches, observes, continues, and closes first-party CLI sessions (Codex, Claude,
 Agy, Pi) inside terminal surfaces the user can see. This glossary names the concepts the code

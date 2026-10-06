@@ -26,7 +26,7 @@ fn cmd_environment_argument(value: &OsStr) -> String {
 }
 
 fn run_bridge(arguments: &[&OsStr]) -> Output {
-    let executable = Path::new(env!("CARGO_BIN_EXE_agent-bridge"));
+    let executable = Path::new(env!("CARGO_BIN_EXE_tabcli"));
     #[cfg(windows)]
     if let Ok(shell) = std::env::var("AGENT_BRIDGE_LIVE_CALLER_SHELL") {
         let mut command = match shell.as_str() {

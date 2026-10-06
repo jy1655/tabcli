@@ -51,7 +51,7 @@ git diff --check
 
 Run the test harness with one test thread, as required by AGENTS.md. This policy was adopted
 after deadline-sensitive fake-Codex tests failed under the parallel harness in
-[issue #46](https://github.com/jy1655/agent-bridge/issues/46); concurrency inside individual
+[issue #46](https://github.com/jy1655/tabcli/issues/46); concurrency inside individual
 tests remains enabled.
 
 Also check platform-gated code for Linux and Windows:

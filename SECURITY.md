@@ -1,7 +1,7 @@
 # Security policy
 
 Report a Bridge vulnerability through
-[private vulnerability reporting](https://github.com/jy1655/agent-bridge/security/advisories/new).
+[private vulnerability reporting](https://github.com/jy1655/tabcli/security/advisories/new).
 **Do not open a public issue for a vulnerability.** Security fixes target the latest release
 only. Reports and fixes are best effort, with no promised response time.
 

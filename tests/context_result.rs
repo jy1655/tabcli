@@ -67,7 +67,7 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        Command::new(env!("CARGO_BIN_EXE_tabcli"))
             .args(args)
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", self.root.path())
             .env_remove("AGENT_BRIDGE_NATIVE_SESSION_ID")
@@ -158,7 +158,7 @@ fn assert_unattachable(fixture: &Fixture, output: Output, address: &str, state: 
         "--event"
     };
     assert!(
-        text.contains(&format!("agent-bridge result {session} {flag} {id} --json")),
+        text.contains(&format!("tabcli result {session} {flag} {id} --json")),
         "{address}: {text}"
     );
     // Rejection precedes any receipt, so there is no request address to report.

@@ -7,8 +7,8 @@ Link the issue, or say there is none:
 ## Verification
 
 For each item, state what ran and the result, or why it was not run. See
-[Contributing](https://github.com/jy1655/agent-bridge/blob/main/CONTRIBUTING.md) and
-[Testing](https://github.com/jy1655/agent-bridge/blob/main/docs/testing.md).
+[Contributing](https://github.com/jy1655/tabcli/blob/main/CONTRIBUTING.md) and
+[Testing](https://github.com/jy1655/tabcli/blob/main/docs/testing.md).
 
 - [ ] `cargo test --all-targets --all-features -- --test-threads=1`
 - [ ] `cargo clippy --all-targets -- -D warnings`

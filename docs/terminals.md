@@ -24,11 +24,11 @@ absent does it check `TERM=xterm-ghostty`, then the presence of `ITERM_SESSION_I
 ownership of the invoking surface.
 
 ```sh
-agent-bridge settings macos-open-mode new-window
-agent-bridge ask codex --terminal wezterm --prompt "Explain this project."
+tabcli settings macos-open-mode new-window
+tabcli ask codex --terminal wezterm --prompt "Explain this project."
 ```
 
-Run `agent-bridge settings macos-open-mode tab-first` to restore the default.
+Run `tabcli settings macos-open-mode tab-first` to restore the default.
 
 The macOS default is `tab-first`: request a new tab in a safely usable existing local window, with a
 new window when a safe target or creation API is unavailable. `new-window` always requests a new
@@ -47,11 +47,11 @@ PowerShell or cmd. Bridge tries a Windows Terminal tab first, then a separate co
 uses a separate window named `agent-bridge` by default:
 
 ```powershell
-agent-bridge settings windows-tab-window current
-agent-bridge ask claude --workspace C:\path\to\project --prompt "Explain this project."
+tabcli settings windows-tab-window current
+tabcli ask claude --workspace C:\path\to\project --prompt "Explain this project."
 ```
 
-Run `agent-bridge settings windows-tab-window dedicated` to restore the default.
+Run `tabcli settings windows-tab-window dedicated` to restore the default.
 
 `windows-tab-window current` chooses the most recently used Windows Terminal window. The new tab
 becomes selected inside that window; Windows Terminal has no supported command to select the earlier
@@ -92,7 +92,7 @@ end only when no sibling panes remain. Warp requires exact proof within its boun
 ## Requirements and first-run prompts
 
 Provider installation, authentication, and workspace trust are separate from terminal support. Run
-`agent-bridge doctor --provider PROVIDER --probe` to check local prerequisites. Run `agent-bridge
+`tabcli doctor --provider PROVIDER --probe` to check local prerequisites. Run `tabcli
 self-test PROVIDER` when you want to open a surface and make real model calls. See
 [providers](providers.md) and
 [CLI reference](cli.md); a passing executable/version check is not a delivery guarantee.
@@ -163,14 +163,14 @@ selected tab or a window that appeared during launch provides no such authority.
 three outcomes is proven, Bridge refuses and keeps the handle. The
 [architecture reference](architecture.md) explains the records behind this decision.
 
-When a close fails, read the error and run `agent-bridge doctor SESSION`. Check the managed surface
-before retrying `agent-bridge close-session SESSION --explicit`. Bridge restores the handle after a
+When a close fails, read the error and run `tabcli doctor SESSION`. Check the managed surface
+before retrying `tabcli close-session SESSION --explicit`. Bridge restores the handle after a
 terminal close error so the retry addresses the same surface. If close was interrupted, the saved
 closing handle, close intent where applicable, and tombstone show what remains to do. Repeating a
 completed close does not close anything else. Recorded results remain available until you explicitly
 prune them.
 
-A dead owner does not prove that its surface closed (#69). Inspect the session and use `agent-bridge
+A dead owner does not prove that its surface closed (#69). Inspect the session and use `tabcli
 close-session SESSION --explicit` to close a retained surface. Repair first checks whether a
 completed result needs publication. On macOS, Terminal.app, Ghostty, WezTerm, and Warp keep handles
 for surfaces that can outlive their owner; they also keep a pending close intent. Those records do

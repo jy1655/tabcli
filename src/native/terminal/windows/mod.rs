@@ -726,7 +726,7 @@ fn console_helper_command(
     session: &TerminalSession,
     input: Option<&str>,
 ) -> Result<Command> {
-    let executable = std::env::current_exe().context("failed to locate agent-bridge executable")?;
+    let executable = std::env::current_exe().context("failed to locate the current executable")?;
     let managed_session_id = session
         .managed_session_id
         .as_deref()

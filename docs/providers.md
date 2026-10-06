@@ -45,7 +45,7 @@ Use an identifier accepted by your installed provider; Bridge does not maintain 
 To ask about a project, run:
 
 ```sh
-agent-bridge ask codex --workspace /path/to/project --prompt "Explain the project structure."
+tabcli ask codex --workspace /path/to/project --prompt "Explain the project structure."
 ```
 
 Replace `codex` with `claude`, `agy`, or `pi`. Install and sign in to that CLI first; the sections
@@ -70,7 +70,7 @@ result.
 
 With Codex older than 0.149.0, `tell` fails before anything is typed and restores the session to
 `ready`. Upgrade Codex and launch a new session. A follow-up also needs the thread UUID from the
-first completed turn. If the queue is unavailable, run `agent-bridge doctor <session> --probe`
+first completed turn. If the queue is unavailable, run `tabcli doctor <session> --probe`
 and inspect the reported prerequisite. Bridge never falls back to typing a follow-up: the
 surface could be showing another thread or a picker.
 
@@ -99,14 +99,14 @@ launch from inside Claude does not create a nested session with an undiscoverabl
 
 Messaging must be available in the running CLI's backend, features, and settings, and discovery
 must find the exact live local session. A recent version or saved inbound setting does not prove
-those conditions. If delivery fails, run `agent-bridge doctor <session>` and read the messaging
+those conditions. If delivery fails, run `tabcli doctor <session>` and read the messaging
 checks. Bridge does not substitute terminal input.
 
 A proven not-sent follow-up releases its claim and restores `ready`. A proven not-sent Windows
 initial delivery leaves the session `failed`; close it and start a new session. An uncertain
 delivery keeps a still-pending request claimed. The initial-delivery error says
 `could not be confirmed`; the follow-up error says `could not confirm delivery`. Do not repeat
-that prompt. Use `agent-bridge result <session> --request <request-id>` to inspect the original
+that prompt. Use `tabcli result <session> --request <request-id>` to inspect the original
 request, or explicitly close the session if you decide to abandon it.
 
 The messenger model sees a per-request reference, not your follow-up text. A `PreToolUse` hook

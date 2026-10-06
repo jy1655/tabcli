@@ -3,6 +3,7 @@ use super::*;
 use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, Reader};
 use crate::native::{EventsDirectory, SESSION_SCHEMA, valid_turn_claim_token};
+use agent_bridge::PUBLIC_COMMAND;
 use std::collections::BTreeMap;
 
 type Records = BTreeMap<String, std::result::Result<Option<Vec<u8>>, String>>;
@@ -400,7 +401,7 @@ pub(in crate::native) fn timeline_value(
             Ok(mut result) => {
                 result.as_object_mut().unwrap().remove("result");
                 result["result_command"] = json!(format!(
-                    "agent-bridge result {id} --request {} --json",
+                    "{PUBLIC_COMMAND} result {id} --request {} --json",
                     receipt.request_id
                 ));
                 result["delivery"] = json!(if completion_recorded {
@@ -414,7 +415,7 @@ pub(in crate::native) fn timeline_value(
                 incomplete = true;
                 json!({"request_id": receipt.request_id, "event_id": receipt.event_file,
                     "request_state": "unknown", "delivery": "unknown", "error": format!("{error:#}"),
-                    "result_command": format!("agent-bridge result {id} --request {} --json", receipt.request_id)})
+                    "result_command": format!("{PUBLIC_COMMAND} result {id} --request {} --json", receipt.request_id)})
             }
         };
         let mut summary = summary;
@@ -689,7 +690,7 @@ pub(in crate::native) fn timeline_value(
         "recovery_required": snapshot.pending.is_some(), "incomplete": incomplete,
         "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error,
         "requests": summaries, "entries": entries, "session_entries": session_entries,
-        "doctor_command": format!("agent-bridge doctor {id} --json")}),
+        "doctor_command": format!("{PUBLIC_COMMAND} doctor {id} --json")}),
     )
 }
 

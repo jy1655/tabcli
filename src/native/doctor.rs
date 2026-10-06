@@ -11,6 +11,7 @@ use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, RecordReader};
 use crate::native::terminal::ownership::NativeSessionOwner;
 use crate::native::{FromStr, Read, Seek, provider_version_command};
+use agent_bridge::PUBLIC_COMMAND;
 use anyhow::Context as _;
 use serde_json::{Value, json};
 
@@ -406,7 +407,7 @@ fn unknown_session_checks(id: &str, reason: &'static str, checks: &mut Vec<Check
     for check_id in ["session_state", "turn", "completion"] {
         checks.push(Check::new(check_id, Availability::Unknown, reason,
             "No consistent session snapshot was available; missing evidence is not a ready or completed state.",
-            format!("agent-bridge result {id} --list --json")));
+            format!("{PUBLIC_COMMAND} result {id} --list --json")));
     }
 }
 
@@ -422,10 +423,15 @@ fn session_checks(
         .iter()
         .find(|r| snapshot.claim.as_deref() == Some(&r.claim_token));
     let result_action = active.map_or_else(
-        || format!("agent-bridge result {} --list --json", snapshot.manifest.id),
+        || {
+            format!(
+                "{PUBLIC_COMMAND} result {} --list --json",
+                snapshot.manifest.id
+            )
+        },
         |r| {
             format!(
-                "agent-bridge result {} --request {} --json",
+                "{PUBLIC_COMMAND} result {} --request {} --json",
                 snapshot.manifest.id, r.request_id
             )
         },
@@ -520,7 +526,7 @@ fn session_checks(
     );
     if snapshot.pending.is_some() {
         completion = completion.command(vec![
-            "agent-bridge".to_owned(),
+            PUBLIC_COMMAND.to_owned(),
             "sessions".to_owned(),
             "--workspace".to_owned(),
             snapshot.manifest.workspace.to_string_lossy().into_owned(),

@@ -40,7 +40,7 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        Command::new(env!("CARGO_BIN_EXE_tabcli"))
             .args(args)
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", self.root.path())
             .output()
@@ -48,7 +48,7 @@ impl Fixture {
     }
 
     fn run_with_env(&self, args: &[&str], env: &[(&str, Option<&str>)]) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-bridge"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tabcli"));
         command
             .args(args)
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", self.root.path());
@@ -132,7 +132,7 @@ fn diagnostics_preserve_uncertain_delivery_and_address_the_exact_request() {
     assert_eq!(check(&value, "turn")["reason_code"], "delivery_unconfirmed");
     assert_eq!(
         check(&value, "turn")["next_action"],
-        "agent-bridge result session-doctor --request request-exact --json"
+        "tabcli result session-doctor --request request-exact --json"
     );
     assert_eq!(check(&value, "claude_messaging")["availability"], "unknown");
     assert_eq!(
@@ -169,7 +169,7 @@ fn active_and_recovery_states_are_diagnosed_without_repair() {
     assert_eq!(
         check(&value, "completion")["next_command"],
         json!([
-            "agent-bridge",
+            "tabcli",
             "sessions",
             "--workspace",
             fixture.root.path(),
@@ -334,7 +334,7 @@ fn provider_only_diagnostics_do_not_create_or_scan_a_session_store() {
     let root = tempfile::tempdir().unwrap();
     let missing = root.path().join("absent-store");
     let value = report(
-        Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        Command::new(env!("CARGO_BIN_EXE_tabcli"))
             .args(["doctor", "--provider", "claude", "--json"])
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", &missing)
             .output()
@@ -369,7 +369,7 @@ printf '2.1.280\n'
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
     let lock = fs::File::create(fixture.directory.join("turn.claim.lock")).unwrap();
     let before = files(&fixture.directory);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tabcli"))
         .args(["doctor", "session-doctor", "--probe", "--json"])
         .env("AGENT_BRIDGE_NATIVE_STATE_DIR", fixture.root.path())
         .env("AB_DOCTOR_TEST_DIR", fixture.root.path())

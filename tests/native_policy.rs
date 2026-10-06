@@ -6,7 +6,7 @@ use agent_bridge::{
 
 #[test]
 fn claude_message_guard_control_fails_closed_without_managed_state() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tabcli"))
         .args(["native-provider-control", "claude", "message-guard"])
         .env_remove("AGENT_BRIDGE_NATIVE_SESSION_DIR")
         .env_remove("AGENT_BRIDGE_NATIVE_STATE_DIR")
@@ -22,7 +22,7 @@ fn claude_message_guard_control_fails_closed_without_managed_state() {
 #[test]
 fn claude_message_receipt_control_records_nothing_without_managed_state() {
     let state = tempfile::tempdir().unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tabcli"))
         .args([
             "native-provider-control",
             "claude",
@@ -754,4 +754,102 @@ esac
                 + call.len();
         }
     }
+}
+
+#[test]
+fn public_identity_in_version_and_help() {
+    assert_eq!(agent_bridge::PUBLIC_COMMAND, "tabcli");
+    for (flag, expected) in [
+        ("--version", "tabcli 0.2.0"),
+        (
+            "--help",
+            "tabcli 0.2.0 — Terminal Agent Bridge: visible terminal sessions for coding agent CLIs",
+        ),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_tabcli"))
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(text.lines().next(), Some(expected));
+        if flag == "--version" {
+            assert_eq!(text, format!("{expected}\n"));
+        }
+    }
+}
+
+#[test]
+fn runtime_literals_survive_the_public_rename() {
+    // 0.1.x sessions, loaded extensions and hooks still consume these exact literals.
+    // Count each pinned assignment/literal across its defining source, including
+    // other platforms and every producer/consumer: an unchanged reader must not
+    // hide a renamed writer. This is not a snapshot of public branding. Review
+    // count changes as protocol changes, not as a fixture to regenerate blindly.
+    let contracts: std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>> =
+        serde_json::from_str(include_str!("runtime_contract.json")).unwrap();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (path, fragments) in contracts {
+        let source = std::fs::read_to_string(root.join(&path))
+            .unwrap()
+            .replace("\r\n", "\n");
+        // A test's copy of an old literal must not hide a changed production value.
+        // Inline test modules follow production code here; their names vary
+        // (tests, search_tests, elapsed_tests, startup_tests).
+        let production: String = source
+            .split_inclusive('\n')
+            .take_while(|line| !(line.starts_with("mod ") && line.trim_end().ends_with('{')))
+            .collect();
+        for (literal, expected_count) in fragments {
+            assert!(expected_count > 0 && !literal.is_empty());
+            assert_eq!(
+                production.matches(&literal).count(),
+                expected_count,
+                "{path}: {literal:?}: this is a runtime contract, see CONTRIBUTING.md / issue #76"
+            );
+        }
+    }
+}
+
+#[test]
+fn no_source_hint_uses_the_old_public_command() {
+    fn check(directory: &std::path::Path) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().unwrap() != "fixtures" {
+                    check(&path);
+                }
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                let source = std::fs::read_to_string(&path).unwrap();
+                let words = source.split_whitespace().collect::<Vec<_>>().join(" ");
+                for command in [
+                    "ask",
+                    "tell",
+                    "result",
+                    "inspect",
+                    "doctor",
+                    "sessions",
+                    "search",
+                    "consent",
+                    "settings",
+                    "self-test",
+                    "reopen",
+                    "close-session",
+                    "prune-sessions",
+                    "--version",
+                    "--help",
+                ] {
+                    let old_hint = format!("{} {command}", "agent-bridge");
+                    assert!(
+                        !words.contains(&old_hint),
+                        "old public command in {}: {old_hint}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+    check(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
 }

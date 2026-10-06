@@ -1,12 +1,22 @@
 [package]
-name = "agent-bridge"
-version = "0.1.2"
+name = "tabcli"
+version = "0.2.0"
 edition = "2024"
-description = "Visible terminal bridge for Codex, Claude, Agy, and Pi CLIs"
+description = "Terminal Agent Bridge (TAB): run Codex, Claude Code, Agy, and Pi CLIs in visible terminal tabs"
 license = "MIT"
-repository = "https://github.com/jy1655/agent-bridge"
+repository = "https://github.com/jy1655/tabcli"
 readme = "README.md"
 rust-version = "1.97.1"
+
+keywords = ["cli", "terminal", "coding-agents", "codex", "claude"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "agent_bridge"
+
+[[bin]]
+name = "tabcli"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"

@@ -4,7 +4,7 @@ use std::process::Command;
 
 #[test]
 fn self_test_help_explicitly_describes_real_calls_and_terminals() {
-    let output = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+    let output = Command::new(env!("CARGO_BIN_EXE_tabcli"))
         .args(["self-test", "--help"])
         .output()
         .unwrap();
@@ -26,7 +26,7 @@ fn unsupported_terminal_reports_failure_without_creating_a_session() {
     let foreign = root.path().join("session-foreign");
     std::fs::create_dir(&foreign).unwrap();
     std::fs::write(foreign.join("preserve"), b"unchanged").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+    let output = Command::new(env!("CARGO_BIN_EXE_tabcli"))
         .args(["self-test", "claude", "--terminal", "terminal", "--json"])
         .env("AGENT_BRIDGE_NATIVE_STATE_DIR", root.path())
         .output()
@@ -47,7 +47,7 @@ fn unsupported_terminal_reports_failure_without_creating_a_session() {
     );
     let new_root = root.path().join("new-root");
     assert!(!new_root.exists());
-    let human = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+    let human = Command::new(env!("CARGO_BIN_EXE_tabcli"))
         .args(["self-test", "claude", "--terminal", "terminal"])
         .env("AGENT_BRIDGE_NATIVE_STATE_DIR", &new_root)
         .output()
@@ -68,7 +68,7 @@ fn isolated_unsupported_terminal_keeps_a_private_root_below_the_configured_paren
     let foreign = parent.path().join("session-foreign");
     std::fs::create_dir(&foreign).unwrap();
     std::fs::write(foreign.join("preserve"), b"unchanged").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+    let output = Command::new(env!("CARGO_BIN_EXE_tabcli"))
         .args([
             "self-test",
             "claude",
@@ -102,7 +102,7 @@ fn isolated_unsupported_terminal_keeps_a_private_root_below_the_configured_paren
         std::fs::read(foreign.join("preserve")).unwrap(),
         b"unchanged"
     );
-    let human = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+    let human = Command::new(env!("CARGO_BIN_EXE_tabcli"))
         .args([
             "self-test",
             "--isolated",
@@ -133,7 +133,7 @@ fn isolated_unsupported_terminal_keeps_a_private_root_below_the_configured_paren
 #[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn isolated_without_a_configured_parent_uses_the_system_temporary_directory() {
-    let output = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+    let output = Command::new(env!("CARGO_BIN_EXE_tabcli"))
         .args([
             "self-test",
             "claude",
@@ -164,7 +164,7 @@ fn isolated_parser_rejects_duplicates_and_unknown_options_before_creating_a_root
         vec!["self-test", "--isolated", "claude", "--isolated"],
         vec!["self-test", "claude", "--isolated", "--unknown"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        let output = Command::new(env!("CARGO_BIN_EXE_tabcli"))
             .args(args)
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", &root)
             .output()

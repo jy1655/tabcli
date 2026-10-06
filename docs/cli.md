@@ -1,5 +1,7 @@
 # Command reference
 
+Terminal Agent Bridge (TAB) is installed as `tabcli`.
+
 Use `ask` to start a provider session, `result` to read its result, `tell` to continue it, and
 `close-session` to close it when you are done. These commands leave the provider visible in a
 terminal surface: the tab, window, pane, or console that Bridge creates for the session.
@@ -10,7 +12,7 @@ run in the later commands. The ids and results shown here are invented; JSON out
 the fields being discussed.
 
 ```sh
-agent-bridge ask codex --workspace /path/to/project --prompt "Where does this program start?"
+tabcli ask codex --workspace /path/to/project --prompt "Where does this program start?"
 ```
 
 ```text
@@ -24,7 +26,7 @@ The session is the provider conversation. The request identifies this prompt and
 that same result again without making another model call:
 
 ```sh
-agent-bridge result session-K7m2Qx --request request-1791285000000000000-4217-0 --json
+tabcli result session-K7m2Qx --request request-1791285000000000000-4217-0 --json
 ```
 
 ```json
@@ -41,7 +43,7 @@ The session stays open after a result. Send a follow-up to continue the same con
 gives it a new request id.
 
 ```sh
-agent-bridge tell session-K7m2Qx --prompt "Which function parses its arguments?"
+tabcli tell session-K7m2Qx --prompt "Which function parses its arguments?"
 ```
 
 ```text
@@ -54,7 +56,7 @@ parse_args_from parses the command-line arguments.
 Close the surface when you have finished. The recorded results remain available afterward.
 
 ```sh
-agent-bridge close-session session-K7m2Qx --explicit
+tabcli close-session session-K7m2Qx --explicit
 ```
 
 ```text
@@ -68,7 +70,7 @@ The synopses below use `PROVIDER` for `codex`, `claude`, `agy`, or `pi`. `SESSIO
 Bridge ids, not the provider's conversation or turn ids. See [providers](providers.md) for
 installation requirements and [terminals](terminals.md) for terminal selection.
 
-Run `agent-bridge --help` (or `-h`) for the main help and `agent-bridge --version` (or `-V`) for the
+Run `tabcli --help` (or `-h`) for the main help and `tabcli --version` (or `-V`) for the
 installed version; these flags take no further arguments. A public command followed immediately by
 `--help` also shows the main help.
 
@@ -77,14 +79,14 @@ installed version; these flags take no further arguments. A public command follo
 Start a new provider conversation when you do not want to continue an existing session.
 
 ```text
-agent-bridge ask PROVIDER [--workspace PATH] (--prompt TEXT | --prompt-file PATH)
+tabcli ask PROVIDER [--workspace PATH] (--prompt TEXT | --prompt-file PATH)
     [--title NAME] [--model MODEL] [--effort EFFORT] [--terminal TERMINAL]
     [--yolo] [--timeout-secs N] [--detach] [--json]
     [--context-result SESSION/REQUEST]...
 ```
 
 ```sh
-agent-bridge ask codex --prompt "Summarize this project." --detach --json
+tabcli ask codex --prompt "Summarize this project." --detach --json
 ```
 
 ```json
@@ -129,7 +131,7 @@ Without `--detach`, exit 0 means Bridge received a successful result. With it, e
 launch and delivery steps succeeded; retrieve the result using the returned request id.
 
 If the workspace cannot be resolved, check `--workspace` and use an existing directory. For a
-missing or too-old CLI, run `agent-bridge doctor --provider PROVIDER --probe`, then correct the
+missing or too-old CLI, run `tabcli doctor --provider PROVIDER --probe`, then correct the
 installation it reports. An Automation error calls for the
 [macOS permission checks](macos-permissions.md). If trust is unverified, look at the managed
 surface and answer a workspace-trust dialog only if you intend to trust that directory. For Agy, if
@@ -145,7 +147,7 @@ For timeout or delivery errors, follow the
 Use `tell` for the next prompt in a session whose previous request has finished.
 
 ```text
-agent-bridge tell SESSION (--prompt TEXT | --prompt-file PATH)
+tabcli tell SESSION (--prompt TEXT | --prompt-file PATH)
     [--timeout-secs N] [--detach] [--json] [--context-result SESSION/REQUEST]...
 ```
 
@@ -177,13 +179,13 @@ block duplicate delivery. Wait for that request or close the session; do not rep
 Use `reopen` to continue a closed Claude conversation on native Windows in a new Bridge session.
 
 ```text
-agent-bridge reopen SESSION (--prompt TEXT | --prompt-file PATH) [--title NAME]
+tabcli reopen SESSION (--prompt TEXT | --prompt-file PATH) [--title NAME]
     [--model MODEL] [--effort EFFORT] [--terminal windows-console] [--yolo]
     [--timeout-secs N] [--detach] [--json]
 ```
 
 ```powershell
-agent-bridge reopen session-C4r8Ta --prompt "Continue the review." --json
+tabcli reopen session-C4r8Ta --prompt "Continue the review." --json
 ```
 
 ```json
@@ -241,12 +243,12 @@ recorded refusal again and can release the marker once the provider process is v
 Run `sessions` to find a session id or list sessions left open by earlier commands.
 
 ```text
-agent-bridge sessions [--workspace PATH] [--provider PROVIDER] [--state STATE]
+tabcli sessions [--workspace PATH] [--provider PROVIDER] [--state STATE]
     [--sort id|updated] [--json]
 ```
 
 ```sh
-agent-bridge sessions --workspace /path/to/project --state ready --json
+tabcli sessions --workspace /path/to/project --state ready --json
 ```
 
 ```json
@@ -286,11 +288,11 @@ nonzero; check the path named in the error.
 Use `inspect` after a timeout or delivery error to read what Bridge recorded without changing it.
 
 ```text
-agent-bridge inspect SESSION [--timeline [--request REQUEST]] [--json]
+tabcli inspect SESSION [--timeline [--request REQUEST]] [--json]
 ```
 
 ```sh
-agent-bridge inspect session-K7m2Qx --json
+tabcli inspect session-K7m2Qx --json
 ```
 
 ```json
@@ -330,12 +332,12 @@ with inferred events.
 Use `result` to retrieve a recorded result or wait for one particular request to finish.
 
 ```text
-agent-bridge result SESSION [--latest | --list | --event EVENT | --request REQUEST]
+tabcli result SESSION [--latest | --list | --event EVENT | --request REQUEST]
     [--json] [--wait --timeout-secs N]
 ```
 
 ```sh
-agent-bridge result session-K7m2Qx --request request-1791285000000000000-4217-0 --wait --json
+tabcli result session-K7m2Qx --request request-1791285000000000000-4217-0 --wait --json
 ```
 
 ```json
@@ -380,12 +382,12 @@ it for the session's workspace, then query the request again.
 Use `search` when you remember text from a result but not its session or request id.
 
 ```text
-agent-bridge search QUERY [--workspace PATH | --all-workspaces] [--provider PROVIDER]
+tabcli search QUERY [--workspace PATH | --all-workspaces] [--provider PROVIDER]
     [--limit N] [--json]
 ```
 
 ```sh
-agent-bridge search "entry point" --workspace /path/to/project --json
+tabcli search "entry point" --workspace /path/to/project --json
 ```
 
 ```json
@@ -427,12 +429,12 @@ nonzero; check the argument or path named in the error.
 Run `doctor` to investigate a missing executable, failed launch, or unavailable delivery path.
 
 ```text
-agent-bridge doctor SESSION [--probe] [--json]
-agent-bridge doctor --provider PROVIDER [--probe] [--json]
+tabcli doctor SESSION [--probe] [--json]
+tabcli doctor --provider PROVIDER [--probe] [--json]
 ```
 
 ```sh
-agent-bridge doctor --provider codex --json
+tabcli doctor --provider codex --json
 ```
 
 ```json
@@ -471,12 +473,12 @@ read the installed version. A passing version check alone does not prove deliver
 Run `self-test` to check a real initial request, follow-up, and close with your installed setup.
 
 ```text
-agent-bridge self-test PROVIDER [--workspace PATH] [--terminal TERMINAL]
+tabcli self-test PROVIDER [--workspace PATH] [--terminal TERMINAL]
     [--model MODEL] [--effort EFFORT] [--yolo] [--timeout-secs N] [--isolated] [--json]
 ```
 
 ```sh
-agent-bridge self-test codex --workspace /path/to/project --json
+tabcli self-test codex --workspace /path/to/project --json
 ```
 
 ```json
@@ -507,7 +509,7 @@ reference](#json-field-reference).
 Exit 0 requires a fully verified round trip and cleanup. Outcomes are `passed`, `failed`,
 `timed_out`, `unsupported`, and `not_verified`. Authentication failures, unsupported delivery, trust
 dialogs, wrong results, or unverified cleanup prevent success. Read the failed step's `reason`.
-Split `request_address` at `/` and run `agent-bridge result SESSION --request REQUEST`. Resolve
+Split `request_address` at `/` and run `tabcli result SESSION --request REQUEST`. Resolve
 authentication in the provider CLI or answer a trust dialog yourself. If cleanup failed, inspect the
 reported session and use `close-session SESSION --explicit`; do not rerun the model prompt to test
 cleanup.
@@ -517,11 +519,11 @@ cleanup.
 Use `consent` to inspect or stop Bridge's reuse of workspace trust for a directory.
 
 ```text
-agent-bridge consent inspect|revoke|reset PATH [--json]
+tabcli consent inspect|revoke|reset PATH [--json]
 ```
 
 ```sh
-agent-bridge consent revoke /path/to/project
+tabcli consent revoke /path/to/project
 ```
 
 ```json
@@ -559,13 +561,13 @@ protection.
 Use `settings` to choose where future sessions open their terminal surfaces.
 
 ```text
-agent-bridge settings [--json]
-agent-bridge settings windows-tab-window dedicated|current [--json]
-agent-bridge settings macos-open-mode tab-first|new-window [--json]
+tabcli settings [--json]
+tabcli settings windows-tab-window dedicated|current [--json]
+tabcli settings macos-open-mode tab-first|new-window [--json]
 ```
 
 ```sh
-agent-bridge settings
+tabcli settings
 ```
 
 ```json
@@ -596,11 +598,11 @@ missing record uses defaults.
 Use `prune-sessions` to delete closed session records you no longer need.
 
 ```text
-agent-bridge prune-sessions --closed-before-days N --explicit [--json]
+tabcli prune-sessions --closed-before-days N --explicit [--json]
 ```
 
 ```sh
-agent-bridge prune-sessions --closed-before-days 30 --explicit
+tabcli prune-sessions --closed-before-days 30 --explicit
 ```
 
 ```text
@@ -630,7 +632,7 @@ before pruning.
 Run `close-session` when you have finished with a session or want to stop waiting for it.
 
 ```text
-agent-bridge close-session SESSION --explicit [--json]
+tabcli close-session SESSION --explicit [--json]
 ```
 
 See the command and output in the [opening workflow](#command-reference).

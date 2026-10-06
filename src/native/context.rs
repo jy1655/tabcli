@@ -6,6 +6,7 @@ use super::{
     AtomicU64, Ordering, Result, SystemTime, UNIX_EPOCH, bail, query, requests, valid_session_id,
 };
 use crate::native::{Context, Path, Reader, terminal_safe_text, validate_terminal_input};
+use agent_bridge::PUBLIC_COMMAND;
 use requests::ContextSource;
 
 pub(crate) const MAX_CONTEXT_RESULTS: usize = 8;
@@ -60,10 +61,16 @@ impl ContextResultRef {
     fn query_hint(&self) -> String {
         match &self.selector {
             ContextSelector::Request(id) => {
-                format!("agent-bridge result {} --request {id} --json", self.session)
+                format!(
+                    "{PUBLIC_COMMAND} result {} --request {id} --json",
+                    self.session
+                )
             }
             ContextSelector::Event(id) => {
-                format!("agent-bridge result {} --event {id} --json", self.session)
+                format!(
+                    "{PUBLIC_COMMAND} result {} --event {id} --json",
+                    self.session
+                )
             }
         }
     }
@@ -337,7 +344,7 @@ mod tests {
         assert_eq!(parsed[0].address(), "session-a/request-1");
         assert_eq!(
             parsed[1].query_hint(),
-            "agent-bridge result session-a --event event-2.json --json"
+            "tabcli result session-a --event event-2.json --json"
         );
         for rejected in [
             "session-a/latest",
@@ -662,7 +669,7 @@ mod tests {
                 "--event"
             };
             assert!(
-                error.contains(&format!("agent-bridge result {session} {flag} {id} --json")),
+                error.contains(&format!("tabcli result {session} {flag} {id} --json")),
                 "{address}: {error}"
             );
         }
@@ -685,7 +692,7 @@ mod tests {
         assert!(
             error.contains("request_state is unverifiable")
                 && error.contains("1 unreadable receipt")
-                && error.contains("agent-bridge result session-src --event event-0.json --json"),
+                && error.contains("tabcli result session-src --event event-0.json --json"),
             "{error}"
         );
         // Events with a readable mapping still attach, through either address.

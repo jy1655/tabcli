@@ -12,6 +12,7 @@ use super::{EVENTS_DIRECTORY, read_event_within_budget};
 use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, RecordReader};
 use crate::native::{Context, FromStr};
+use agent_bridge::PUBLIC_COMMAND;
 use serde_json::{Value, json};
 
 mod timeline;
@@ -1201,8 +1202,10 @@ fn search_session(
         };
         let request_id = receipt.map(|receipt| receipt.request_id.clone());
         let result_command = match &request_id {
-            Some(request_id) => format!("agent-bridge result {id} --request {request_id} --json"),
-            None => format!("agent-bridge result {id} --event {name} --json"),
+            Some(request_id) => {
+                format!("{PUBLIC_COMMAND} result {id} --request {request_id} --json")
+            }
+            None => format!("{PUBLIC_COMMAND} result {id} --event {name} --json"),
         };
         scan.hits.push(SearchHit {
             session: id.to_owned(),

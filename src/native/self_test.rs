@@ -1,5 +1,6 @@
 use super::*;
 use crate::native::session::{Reader, RecordStore, Store};
+use agent_bridge::PUBLIC_COMMAND;
 use serde_json::Value;
 
 // Let each public command report its timeout before the outer deadline.
@@ -602,7 +603,7 @@ pub(super) fn run(request: Request) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
-            "Agent Bridge {} self-test: {}",
+            "{PUBLIC_COMMAND} {} self-test: {}",
             report.bridge_version, report.provider
         );
         println!(

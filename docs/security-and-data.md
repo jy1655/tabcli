@@ -58,11 +58,11 @@ override, and Pi receives its one-run approval option.
 To see the recorded source for a workspace, run:
 
 ```sh
-agent-bridge consent inspect /path/to/project
+tabcli consent inspect /path/to/project
 ```
 
-Use `agent-bridge consent revoke /path/to/project` to stop sharing that decision. This leaves
-provider-owned trust unchanged. Use `agent-bridge consent reset /path/to/project` when you want
+Use `tabcli consent revoke /path/to/project` to stop sharing that decision. This leaves
+provider-owned trust unchanged. Use `tabcli consent reset /path/to/project` when you want
 a later launch to assess fresh evidence; reset clears Bridge's source and revocation decision,
 but does not approve the workspace. Shared records live in `workspace-consent/` under the state
 root. Each session keeps its own assessment in `workspace-consent.json`.
@@ -158,8 +158,8 @@ delete them or sign you out of the provider.
 List sessions before choosing which to close:
 
 ```sh
-agent-bridge sessions
-agent-bridge close-session session-example --explicit
+tabcli sessions
+tabcli close-session session-example --explicit
 ```
 
 Replace `session-example` with an id from the list. Close checks ownership and ends that session's
@@ -176,7 +176,7 @@ There is no automatic age-based pruning. To delete eligible closed session direc
 than thirty days, run:
 
 ```sh
-agent-bridge prune-sessions --closed-before-days 30 --explicit
+tabcli prune-sessions --closed-before-days 30 --explicit
 ```
 
 The day count must be positive. Prune requires both closed status and a closed tombstone older
