@@ -35,7 +35,7 @@ pub(in crate::native) struct MacProcBsdInfo {
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
 #[repr(C)]
-pub(in crate::native) struct MacKinfoProc {
+pub(super) struct MacKinfoProc {
     start_seconds: i64,
     start_microseconds: i32,
     _to_pid: [u8; 28],
@@ -43,7 +43,7 @@ pub(in crate::native) struct MacKinfoProc {
     _to_command: [u8; 199],
     command: [u8; 17],
     _to_parent: [u8; 300],
-    pub(in crate::native) parent_pid: i32,
+    pub(super) parent_pid: i32,
     _rest: [u8; 84],
 }
 
@@ -52,7 +52,7 @@ const _: () = assert!(std::mem::size_of::<MacKinfoProc>() == 648);
 
 #[cfg(target_os = "macos")]
 impl MacKinfoProc {
-    pub(in crate::native) fn identity(&self) -> Result<MacTerminalAppIdentity> {
+    pub(super) fn identity(&self) -> Result<MacTerminalAppIdentity> {
         Ok(MacTerminalAppIdentity {
             pid: u32::try_from(self.pid)?,
             start_seconds: u64::try_from(self.start_seconds)?,
@@ -71,7 +71,7 @@ unsafe extern "C" {
         buffer: *mut libc::c_void,
         buffer_size: libc::c_int,
     ) -> libc::c_int;
-    pub(in crate::native) fn proc_pidpath(
+    pub(super) fn proc_pidpath(
         pid: libc::c_int,
         buffer: *mut libc::c_void,
         buffer_size: u32,
@@ -188,9 +188,7 @@ pub(in crate::native) fn macos_process_info(pid: u32) -> Result<Option<MacProcBs
 // the processes of every user. PROC_PIDTBSDINFO answers only for the caller's own, and
 // the shell of a terminal tab is a child of the root-owned /usr/bin/login.
 #[cfg(target_os = "macos")]
-pub(in crate::native) fn macos_process_records(
-    name: &mut [libc::c_int],
-) -> Result<Vec<MacKinfoProc>> {
+pub(super) fn macos_process_records(name: &mut [libc::c_int]) -> Result<Vec<MacKinfoProc>> {
     let record = std::mem::size_of::<MacKinfoProc>();
     let length = libc::c_uint::try_from(name.len())?;
     let mut size = 0;
@@ -233,7 +231,7 @@ pub(in crate::native) fn macos_process_records(
 
 // The executable of a process of any user. `None`: no such process.
 #[cfg(target_os = "macos")]
-pub(in crate::native) fn macos_process_path(pid: u32) -> Result<Option<String>> {
+pub(super) fn macos_process_path(pid: u32) -> Result<Option<String>> {
     let mut path = [0u8; 4096];
     let count =
         unsafe { proc_pidpath(pid.try_into()?, path.as_mut_ptr().cast(), path.len() as u32) };
