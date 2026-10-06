@@ -1,0 +1,81 @@
+name: Bug report
+description: Report an unexpected Agent Bridge behavior in English or Korean.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Do not paste tokens, session directories, transcripts, or complete `doctor --json`
+        output. Remove prompts from commands and redact paths and identifiers.**
+        For vulnerabilities, use the private security-report link in the issue chooser.
+        If Bridge cannot start, give the release or source commit you attempted to use.
+        Write "not applicable" for terminal or provider fields that the failure does not involve.
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened, and what did you expect?
+      description: >-
+        List the steps to reproduce it and paste the error text with private details
+        removed.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command that was run
+      description: >-
+        Paste the command, removing prompt contents and replacing private paths and
+        identifiers. If no command ran, describe the installation step that failed.
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: bridge-version
+    attributes:
+      label: Agent Bridge version
+      description: Paste the output of tabcli --version.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and version
+      description: Enter the OS name and version; omit your computer name.
+    validations:
+      required: true
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal application and version
+      description: >-
+        Name the terminal application that launched Bridge and the application hosting the
+        managed session, with their versions.
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Provider CLI and version
+      description: Enter the CLI name and version; omit account details.
+    validations:
+      required: true
+  - type: dropdown
+    id: reproducibility
+    attributes:
+      label: Is it reproducible?
+      description: Choose what you observed; do not resend an uncertain prompt to answer this.
+      options:
+        - Always
+        - Sometimes
+        - Once so far
+        - Not attempted again
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Selected diagnostic fields (optional)
+      description: |
+        From existing doctor output, copy only id, availability, and reason_code from the
+        relevant checks entries. Omit evidence objects and the rest of the report; remove private
+        details from any error excerpt you add.

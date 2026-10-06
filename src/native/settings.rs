@@ -1,4 +1,4 @@
-//! Settings that a user changes with `agent-bridge settings`. They are one private
+//! Settings that a user changes with `tabcli settings`. They are one private
 //! record in the state root; a missing record, or a missing key, means the default.
 use super::*;
 use crate::native::session::{Reader, RecordReader, RecordStore, Store};

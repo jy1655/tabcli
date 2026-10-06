@@ -36,7 +36,7 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        Command::new(env!("CARGO_BIN_EXE_tabcli"))
             .args(args)
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", self.root.path())
             .output()
@@ -228,7 +228,7 @@ fn timeline_preserves_identity_closed_results_and_every_session_byte() {
     assert_eq!(logs[2]["detail"]["line"], 2);
     assert_eq!(
         selected["doctor_command"],
-        "agent-bridge doctor session-observe --json"
+        "tabcli doctor session-observe --json"
     );
     let human = fixture.run(&[
         "inspect",

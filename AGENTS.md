@@ -312,10 +312,11 @@ launch, observe, continue, and close without replacing the capabilities those CL
   result before relying on a tag push. Only a tag push publishes, and a published release
   is immutable.
 - In the Release workflow, verify tag properties through the GitHub API: the default
-  tag-push checkout rewrites the local tag ref to the commit, and a checkout without
-  persisted credentials cannot fetch again from this private repository. Only validation
-  resolves the tag name; later jobs check out the validated commit SHA, and publication
-  re-checks that the remote tag is still the validated tag object, because a tag can be
-  moved while the run is in progress.
+  tag-push checkout rewrites the local tag ref to the commit, so only the remote still
+  holds the tag object. Do not replace the API check with a second fetch: the checkout
+  keeps no credentials, and the check must not depend on the repository's visibility.
+  Only validation resolves the tag name; later jobs check out the validated commit SHA,
+  and publication re-checks that the remote tag is still the validated tag object,
+  because a tag can be moved while the run is in progress.
 - Release scripts receive workflow expressions through `env`, never inline, so the policy
   tests can execute the exact scripts against fixtures.

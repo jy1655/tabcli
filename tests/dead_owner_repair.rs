@@ -46,7 +46,7 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        Command::new(env!("CARGO_BIN_EXE_tabcli"))
             .args(args)
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", self.root.path())
             .output()

@@ -18,6 +18,10 @@ immutable preflight를 삭제하거나 경고로 바꾸는 절차가 아니다. 
    Clippy·fmt·`git diff --check`를 사용한다. Release workflow 또는 packaging을 바꿨으면
    `gh workflow run release.yml --ref <branch> -f tag=<existing-tag>`로 리허설을 먼저
    통과시킨다. 리허설은 기존 tag의 source를 빌드하므로 새 후보 binary의 검증을 대신하지 않는다.
+   workflow는 검증한 commit의 Cargo package 이름을 읽어 `tabcli` 또는 `agent-bridge`만
+   허용한다. 0.2.0 이전 tag는 `agent-bridge-<version>-<target>` archive에 실행 파일과
+   `LICENSE`만 넣고 `agent-bridge <version>`을 확인한다. `tabcli`는
+   `THIRD_PARTY_NOTICES.md`가 없으면 검증에 실패한다.
 2. 해당 **main push commit**의 CI가 모든 job에서 성공했는지 확인한다. PR merge ref,
    다른 commit, 실패한 run 또는 로컬 재빌드 결과를 대체품으로 쓰지 않는다.
    `gh run view <run-id> --json headSha,headBranch,event,conclusion,jobs`의 `headSha`가
@@ -31,7 +35,7 @@ immutable preflight를 삭제하거나 경고로 바꾸는 절차가 아니다. 
 검토한 후 다음 단계로 진행한다. 기존 tag나 게시 파일을 덮어쓰는 명령은 사용하지 않는다.
 
 ```sh
-release_repo=jy1655/agent-bridge
+release_repo=jy1655/tabcli
 release_tag='v<version>'
 release_commit='<validated-main-commit>'
 release_run='<successful-main-CI-run-id>'
@@ -52,10 +56,15 @@ gh run download "$release_run" -R "$release_repo" \
 immutable 조회 결과는 `true`여야 한다. artifact는 만료되지 않아야 하며, 각 archive와
 그 `.sha256`만 있어야 한다. 두 디렉터리에서 `shasum -a 256 -c <archive>.sha256`
 (Windows에서는 `Get-FileHash -Algorithm SHA256`)으로 checksum을 검증한다.
-tar 구성은 `agent-bridge`, `LICENSE`, zip 구성은 `agent-bridge.exe`, `LICENSE`와
-정확히 일치해야 한다. archive의 경로·파일 종류를 확인한 뒤 새 디렉터리에 해제한다.
-LICENSE는 해당 commit과 대조하고, 플랫폼별 binary의 `--version`은 해당 CI job의
-실행 결과와 일치해야 한다. authenticated runtime 결과는 별도이며 생략했으면 명시한다.
+0.2.0부터 archive 이름은 `tabcli-<version>-aarch64-apple-darwin.tar.gz`와
+`tabcli-<version>-x86_64-pc-windows-msvc.zip`이다.
+`tar -tzf <archive>`와 `unzip -Z1 <archive>`로 구성 파일을 확인한다.
+tar 구성은 `tabcli`, `LICENSE`, `THIRD_PARTY_NOTICES.md`, zip 구성은
+`tabcli.exe`, `LICENSE`, `THIRD_PARTY_NOTICES.md`와 정확히 일치해야 한다.
+archive의 경로·파일 종류를 확인한 뒤 새 디렉터리에 해제한다.
+LICENSE와 THIRD_PARTY_NOTICES.md는 해당 commit과 대조하고, 플랫폼별 binary의
+`--version`은 `tabcli <version>` 및 해당 CI job의 실행 결과와 일치해야 한다.
+authenticated runtime 결과는 별도이며 생략했으면 명시한다.
 
 ## Tag와 draft 검증
 
@@ -76,10 +85,10 @@ gh api "repos/$release_repo/git/ref/tags/$release_tag"
 gh api "repos/$release_repo/git/tags/<validated-tag-object-sha>"
 gh release create "$release_tag" -R "$release_repo" --verify-tag --draft \
   --title "$release_tag" --notes-file '<notes-from-validated-commit>' \
-  "$release_dir/macos/agent-bridge-<version>-aarch64-apple-darwin.tar.gz" \
-  "$release_dir/macos/agent-bridge-<version>-aarch64-apple-darwin.tar.gz.sha256" \
-  "$release_dir/windows/agent-bridge-<version>-x86_64-pc-windows-msvc.zip" \
-  "$release_dir/windows/agent-bridge-<version>-x86_64-pc-windows-msvc.zip.sha256"
+  "$release_dir/macos/tabcli-<version>-aarch64-apple-darwin.tar.gz" \
+  "$release_dir/macos/tabcli-<version>-aarch64-apple-darwin.tar.gz.sha256" \
+  "$release_dir/windows/tabcli-<version>-x86_64-pc-windows-msvc.zip" \
+  "$release_dir/windows/tabcli-<version>-x86_64-pc-windows-msvc.zip.sha256"
 ```
 
 draft의 REST API asset 목록은 이름 기준으로 네 파일과 정확히 일치해야 한다. 각
@@ -115,3 +124,5 @@ asset 교체·삭제나 tag 이동으로 복구하지 말고, 결함과 확인 �
 참고: [GitHub immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases),
 [release attestation 검증](https://cli.github.com/manual/gh_release_verify),
 [asset attestation 검증](https://cli.github.com/manual/gh_release_verify-asset).
+
+의존성을 변경하면 저장소 루트에서 `AGENT_BRIDGE_UPDATE_NOTICES=1 cargo test --test third_party_notices third_party_notices_match_lock -- --exact`를 실행해 `THIRD_PARTY_NOTICES.md`를 갱신한다. 갱신 모드는 `cargo metadata --locked`로 찾은 crate의 라이선스 원문을 사용하며 필요한 registry source를 내려받을 수 있다. 새 라이선스 표현이나 누락된 원문은 자동 대체하지 않고 검토 후 생성기를 갱신한다. crate에 포함된 `COPYRIGHT`, `AUTHORS`, `NOTICE`도 함께 보존하며 `r-efi`의 MIT 원문은 `AUTHORS`에서 읽는다. `CI`가 설정된 환경에서는 갱신 모드를 거부한다. 일반 테스트는 네트워크나 registry cache 없이 `Cargo.lock`과 고지 파일의 패키지·버전 일치를 검사한다.

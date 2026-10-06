@@ -50,7 +50,7 @@ impl Fixture {
     }
 
     fn run_in(&self, cwd: &Path, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        Command::new(env!("CARGO_BIN_EXE_tabcli"))
             .args(args)
             .current_dir(cwd)
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", self.root.path())
@@ -67,7 +67,7 @@ impl Fixture {
 
     /// The binary exactly as a user runs it: the test aids are closed.
     fn run_as_user(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+        Command::new(env!("CARGO_BIN_EXE_tabcli"))
             .args(args)
             .current_dir(&self.workspace_a)
             .env("AGENT_BRIDGE_NATIVE_STATE_DIR", self.root.path())
@@ -247,7 +247,7 @@ fn identical_bodies_in_two_requests_stay_two_addressable_hits() {
     assert_eq!(hits[0]["request_id"], "request-first");
     assert_eq!(
         hits[0]["result_command"],
-        "agent-bridge result session-a --request request-first --json"
+        "tabcli result session-a --request request-first --json"
     );
     assert_eq!(hits[1]["request_id"], "request-second");
     assert_eq!(hits[1]["event_id"], "event-2.json");
@@ -265,7 +265,7 @@ fn legacy_events_are_searchable_without_inventing_request_identity() {
     assert_eq!(hit["event_id"], "event-1.json");
     assert_eq!(
         hit["result_command"],
-        "agent-bridge result session-a --event event-1.json --json"
+        "tabcli result session-a --event event-1.json --json"
     );
 }
 
@@ -559,7 +559,7 @@ fn argument_and_state_errors_are_structured_with_json() {
         );
     }
 
-    let missing_root = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+    let missing_root = Command::new(env!("CARGO_BIN_EXE_tabcli"))
         .args(["search", "anything", "--all-workspaces", "--json"])
         .env(
             "AGENT_BRIDGE_NATIVE_STATE_DIR",
@@ -574,7 +574,7 @@ fn argument_and_state_errors_are_structured_with_json() {
 
     let file_root = fixture.root.path().join("not-a-directory");
     fs::write(&file_root, "x").unwrap();
-    let unreadable = Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+    let unreadable = Command::new(env!("CARGO_BIN_EXE_tabcli"))
         .args(["search", "anything", "--all-workspaces", "--json"])
         .env("AGENT_BRIDGE_NATIVE_STATE_DIR", &file_root)
         .output()

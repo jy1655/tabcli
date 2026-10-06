@@ -2,6 +2,9 @@ use anyhow::{Result, bail};
 use semver::Version;
 use std::time::{Duration, Instant};
 
+/// The command users install and run; runtime protocol identifiers stay independent.
+pub const PUBLIC_COMMAND: &str = "tabcli";
+
 pub mod providers;
 
 pub use providers::{FirstPartyCli, ProviderAdapter, provider_adapter, supported_clis};

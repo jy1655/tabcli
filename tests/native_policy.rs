@@ -6,7 +6,7 @@ use agent_bridge::{
 
 #[test]
 fn claude_message_guard_control_fails_closed_without_managed_state() {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tabcli"))
         .args(["native-provider-control", "claude", "message-guard"])
         .env_remove("AGENT_BRIDGE_NATIVE_SESSION_DIR")
         .env_remove("AGENT_BRIDGE_NATIVE_STATE_DIR")
@@ -22,7 +22,7 @@ fn claude_message_guard_control_fails_closed_without_managed_state() {
 #[test]
 fn claude_message_receipt_control_records_nothing_without_managed_state() {
     let state = tempfile::tempdir().unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_agent-bridge"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_tabcli"))
         .args([
             "native-provider-control",
             "claude",
@@ -267,8 +267,8 @@ fn release_validation_checks_the_annotated_tag_on_the_remote() {
     let workflow = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
     let validate = release_workflow_job(&workflow, "validate", "test");
 
-    // actions/checkout rewrites the local tag ref to the commit and, without persisted
-    // credentials, nothing can be fetched again from a private repository.
+    // actions/checkout rewrites the local tag ref to the commit, so only the remote still
+    // holds the tag object, and the check must not depend on a second fetch.
     assert!(validate.contains("persist-credentials: false"));
     assert!(validate.contains("git/ref/tags/${RELEASE_TAG}"));
     assert!(validate.contains("git/tags/${ref_sha}"));
@@ -379,10 +379,42 @@ fn release_artifact_job_is_isolated_from_mutable_terminal_app_installs() {
     );
 }
 
+fn workflow_step_script(workflow: &str, marker: &str) -> String {
+    let workflow = workflow.replace("\r\n", "\n");
+    let step = &workflow[workflow
+        .find(marker)
+        .unwrap_or_else(|| panic!("release workflow has no step {marker}"))..];
+    let run = "        run: |\n";
+    let body = &step[step.find(run).expect("step has no script") + run.len()..];
+    let script = body
+        .lines()
+        .take_while(|line| line.is_empty() || line.starts_with("          "))
+        .map(|line| line.strip_prefix("          ").unwrap_or(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !script.contains("${{"),
+        "workflow expressions must reach release scripts through env"
+    );
+    script
+}
+
+#[test]
+fn workflow_script_extraction_is_identical_for_lf_and_crlf() {
+    let workflow = "      - name: Example\n        run: |\n          first\n          second\n      - name: Next\n";
+    let marker = "      - name: Example\n";
+    let lf = workflow_step_script(workflow, marker);
+    let crlf = workflow_step_script(&workflow.replace('\n', "\r\n"), marker);
+
+    assert_eq!(lf, "first\nsecond");
+    assert_eq!(crlf, lf);
+}
+
 // The release scripts are executed exactly as the workflow holds them, against a throwaway
 // repository and stand-ins for `gh` and `sha256sum`.
 #[cfg(unix)]
 mod release_workflow_behavior {
+    use super::workflow_step_script;
     use std::{
         fs,
         os::unix::fs::PermissionsExt,
@@ -397,22 +429,7 @@ mod release_workflow_behavior {
     const LIGHTWEIGHT_TAG: &str = "commit\t1111111111111111111111111111111111111111";
 
     fn step_script(marker: &str) -> String {
-        let step = &WORKFLOW[WORKFLOW
-            .find(marker)
-            .unwrap_or_else(|| panic!("release workflow has no step {marker}"))..];
-        let run = "        run: |\n";
-        let body = &step[step.find(run).expect("step has no script") + run.len()..];
-        let script = body
-            .lines()
-            .take_while(|line| line.is_empty() || line.starts_with("          "))
-            .map(|line| line.strip_prefix("          ").unwrap_or(line))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !script.contains("${{"),
-            "workflow expressions must reach release scripts through env"
-        );
-        script
+        workflow_step_script(WORKFLOW, marker)
     }
 
     fn git(repository: &Path, arguments: &[&str]) -> String {
@@ -445,6 +462,10 @@ mod release_workflow_behavior {
     }
 
     fn fixture() -> Fixture {
+        package_fixture("tabcli", true)
+    }
+
+    fn package_fixture(package: &str, notices: bool) -> Fixture {
         let root = tempfile::tempdir().unwrap();
         let repository = root.path().join("repository");
         let bin = root.path().join("bin");
@@ -452,9 +473,13 @@ mod release_workflow_behavior {
         fs::create_dir(&bin).unwrap();
         fs::write(
             repository.join("Cargo.toml"),
-            "[package]\nname = \"fixture\"\nversion = \"1.2.3\"\n",
+            format!("[package]\nname = \"{package}\"\nversion = \"1.2.3\"\n"),
         )
         .unwrap();
+        if notices {
+            fs::write(repository.join("THIRD_PARTY_NOTICES.md"), "notices\n").unwrap();
+        }
+        fs::write(repository.join("LICENSE"), "license\n").unwrap();
         fs::write(repository.join("docs/releases/1.2.3.md"), "notes\n").unwrap();
         git(&repository, &["init", "-q"]);
         git(&repository, &["add", "-A"]);
@@ -485,7 +510,7 @@ case "$1 $2" in
   *) exit 1 ;;
 esac
 "#;
-        let sha256sum = "#!/bin/sh\nprintf 'feedface  %s\\n' \"$1\"\n";
+        let sha256sum = "#!/bin/sh\nif [ \"$1\" = -c ]; then exec shasum -a 256 \"$@\"; fi\nprintf 'feedface  %s\\n' \"$1\"\n";
         for (name, body) in [("gh", gh), ("sha256sum", sha256sum)] {
             fs::write(bin.join(name), body).unwrap();
             fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o700)).unwrap();
@@ -556,7 +581,7 @@ esac
             assert_eq!(
                 fs::read_to_string(&output_file).unwrap(),
                 format!(
-                    "version=1.2.3\nnotes=docs/releases/1.2.3.md\ncommit={}\ntag_object={TAG_OBJECT}\n",
+                    "version=1.2.3\nnotes=docs/releases/1.2.3.md\npackage=tabcli\ncommit={}\ntag_object={TAG_OBJECT}\n",
                     fixture.main_commit
                 )
             );
@@ -665,6 +690,238 @@ esac
     }
 
     #[test]
+    fn validation_derives_both_identities_from_the_validated_manifest() {
+        for (package, notices) in [("tabcli", true), ("agent-bridge", false)] {
+            let fixture = package_fixture(package, notices);
+            let main_tag = format!("v1.2.3\tcommit\t{}", fixture.main_commit);
+            for event in ["push", "workflow_dispatch"] {
+                let output_file = fixture.repository.join("github-output");
+                let _ = fs::remove_file(&output_file);
+                let output = fixture.run(
+                    &step_script("      - id: version\n"),
+                    &[
+                        ("FAKE_REF", VALIDATED_TAG),
+                        ("FAKE_TAG", &main_tag),
+                        ("GITHUB_EVENT_NAME", event),
+                        ("GITHUB_SHA", &fixture.main_commit),
+                    ],
+                );
+                assert!(output.status.success(), "{}", stdout(&output));
+                assert_eq!(
+                    fs::read_to_string(output_file).unwrap(),
+                    format!(
+                        "version=1.2.3\nnotes=docs/releases/1.2.3.md\npackage={package}\ncommit={}\ntag_object={TAG_OBJECT}\n",
+                        fixture.main_commit
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validation_rejects_unknown_packages_and_tabcli_without_notices() {
+        for (package, notices, reason) in [
+            ("unknown", true, "unsupported Cargo package"),
+            ("tabcli", false, "THIRD_PARTY_NOTICES.md is missing"),
+        ] {
+            let fixture = package_fixture(package, notices);
+            let main_tag = format!("v1.2.3\tcommit\t{}", fixture.main_commit);
+            let output = fixture.run(
+                &step_script("      - id: version\n"),
+                &[
+                    ("FAKE_REF", VALIDATED_TAG),
+                    ("FAKE_TAG", &main_tag),
+                    ("GITHUB_EVENT_NAME", "workflow_dispatch"),
+                ],
+            );
+            assert!(!output.status.success());
+            assert!(stdout(&output).contains(reason), "{}", stdout(&output));
+            assert!(!fixture.repository.join("github-output").exists());
+        }
+    }
+
+    fn executable(path: &Path, version: &str) {
+        fs::write(path, format!("#!/bin/sh\nprintf '%s\n' '{version}'\n")).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn package_macos(workflow: &str, marker: &str, package: &str, version_line: &str) -> Output {
+        let fixture = package_fixture(package, package == "tabcli");
+        let target = "aarch64-apple-darwin";
+        let release = fixture.repository.join(format!("target/{target}/release"));
+        fs::create_dir_all(&release).unwrap();
+        executable(&release.join(package), version_line);
+        let runner = fixture._root.path().join("runner");
+        fixture.run(
+            &workflow_step_script(workflow, marker),
+            &[
+                ("PACKAGE", package),
+                ("RELEASE_VERSION", "1.2.3"),
+                ("TARGET", target),
+                ("ARCHIVE", &format!("{package}-1.2.3-{target}.tar.gz")),
+                ("RUNNER_TEMP", runner.to_str().unwrap()),
+            ],
+        )
+    }
+
+    #[test]
+    fn macos_packaging_runs_both_release_identities_and_the_ci_candidate() {
+        for (workflow, marker, package) in [
+            (
+                WORKFLOW,
+                "      - name: Package macOS archive and checksum",
+                "tabcli",
+            ),
+            (
+                WORKFLOW,
+                "      - name: Package macOS archive and checksum",
+                "agent-bridge",
+            ),
+            (
+                include_str!("../.github/workflows/ci.yml"),
+                "      - name: Package and verify macOS candidate",
+                "tabcli",
+            ),
+        ] {
+            let output = package_macos(workflow, marker, package, &format!("{package} 1.2.3"));
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                stdout(&output),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn macos_packaging_rejects_a_version_line_naming_the_wrong_executable() {
+        for (workflow, marker, package, wrong) in [
+            (
+                WORKFLOW,
+                "      - name: Package macOS archive and checksum",
+                "tabcli",
+                "agent-bridge",
+            ),
+            (
+                WORKFLOW,
+                "      - name: Package macOS archive and checksum",
+                "agent-bridge",
+                "tabcli",
+            ),
+            (
+                include_str!("../.github/workflows/ci.yml"),
+                "      - name: Package and verify macOS candidate",
+                "tabcli",
+                "agent-bridge",
+            ),
+        ] {
+            let output = package_macos(workflow, marker, package, &format!("{wrong} 1.2.3"));
+            assert!(!output.status.success(), "accepted {wrong} as {package}");
+        }
+    }
+
+    fn release_assets(
+        fixture: &Fixture,
+        package: &str,
+        changed_platform: &str,
+        missing: Option<&str>,
+        extra: bool,
+    ) {
+        let dist = fixture.repository.join("dist");
+        let _ = fs::remove_dir_all(&dist);
+        fs::create_dir(&dist).unwrap();
+        let stage = fixture.repository.join("archive-stage");
+        fs::create_dir_all(&stage).unwrap();
+        for (platform, extension, suffix) in [
+            ("aarch64-apple-darwin", "tar.gz", ""),
+            ("x86_64-pc-windows-msvc", "zip", ".exe"),
+        ] {
+            let binary = format!("{package}{suffix}");
+            let mut members = vec![binary.as_str(), "LICENSE"];
+            if package == "tabcli" {
+                members.push("THIRD_PARTY_NOTICES.md");
+            }
+            if platform == changed_platform {
+                members.retain(|member| Some(*member) != missing);
+                if extra {
+                    members.push("extra");
+                }
+            }
+            for member in &members {
+                fs::write(stage.join(member), member).unwrap();
+            }
+            let archive = dist.join(format!("{package}-1.2.3-{platform}.{extension}"));
+            let mut command = if extension == "zip" {
+                let mut command = Command::new("zip");
+                command.arg("-q").arg(&archive);
+                command
+            } else {
+                let mut command = Command::new("tar");
+                command.arg("-czf").arg(&archive);
+                command
+            };
+            let output = command.current_dir(&stage).args(&members).output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let checksum = Command::new("shasum")
+                .args(["-a", "256"])
+                .arg(archive.file_name().unwrap())
+                .current_dir(&dist)
+                .output()
+                .unwrap();
+            assert!(checksum.status.success());
+            fs::write(
+                dist.join(format!(
+                    "{}.sha256",
+                    archive.file_name().unwrap().to_str().unwrap()
+                )),
+                checksum.stdout,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn downloaded_assets_require_exact_members_for_both_identities_and_platforms() {
+        for package in ["tabcli", "agent-bridge"] {
+            let fixture = package_fixture(package, package == "tabcli");
+            let run = || {
+                fixture.run(
+                    &step_script("      - name: Verify downloaded release assets"),
+                    &[("PACKAGE", package), ("RELEASE_VERSION", "1.2.3")],
+                )
+            };
+            release_assets(&fixture, package, "", None, false);
+            let accepted = run();
+            assert!(accepted.status.success(), "{accepted:?}");
+            for (platform, suffix) in [
+                ("aarch64-apple-darwin", ""),
+                ("x86_64-pc-windows-msvc", ".exe"),
+            ] {
+                let binary = format!("{package}{suffix}");
+                let mut members = vec![binary.as_str(), "LICENSE"];
+                if package == "tabcli" {
+                    members.push("THIRD_PARTY_NOTICES.md");
+                }
+                for missing in members {
+                    release_assets(&fixture, package, platform, Some(missing), false);
+                    assert!(
+                        !run().status.success(),
+                        "accepted missing {missing} in {platform}"
+                    );
+                }
+                release_assets(&fixture, package, platform, None, true);
+                assert!(
+                    !run().status.success(),
+                    "accepted extra member in {platform}"
+                );
+            }
+            release_assets(&fixture, package, "", None, false);
+            fs::write(fixture.repository.join("dist/extra-asset"), "extra").unwrap();
+            assert!(!run().status.success(), "accepted a fifth asset");
+        }
+    }
+
+    #[test]
     fn a_moved_tag_is_never_given_a_release() {
         let fixture = fixture();
         let script = step_script("      - name: Publish verified release assets\n");
@@ -752,6 +1009,228 @@ esac
                 .find(call)
                 .unwrap_or_else(|| panic!("{call} is missing or out of order in:\n{calls}"))
                 + call.len();
+        }
+    }
+}
+
+#[test]
+fn public_identity_in_version_and_help() {
+    assert_eq!(agent_bridge::PUBLIC_COMMAND, "tabcli");
+    for (flag, expected) in [
+        ("--version", "tabcli 0.2.0"),
+        (
+            "--help",
+            "tabcli 0.2.0 — Terminal Agent Bridge: visible terminal sessions for coding agent CLIs",
+        ),
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_tabcli"))
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(text.lines().next(), Some(expected));
+        if flag == "--version" {
+            assert_eq!(text, format!("{expected}\n"));
+        }
+    }
+}
+
+#[test]
+fn runtime_literals_survive_the_public_rename() {
+    // 0.1.x sessions, loaded extensions and hooks still consume these exact literals.
+    // Count each pinned assignment/literal across its defining source, including
+    // other platforms and every producer/consumer: an unchanged reader must not
+    // hide a renamed writer. This is not a snapshot of public branding. Review
+    // count changes as protocol changes, not as a fixture to regenerate blindly.
+    let contracts: std::collections::BTreeMap<String, std::collections::BTreeMap<String, usize>> =
+        serde_json::from_str(include_str!("runtime_contract.json")).unwrap();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for (path, fragments) in contracts {
+        let source = std::fs::read_to_string(root.join(&path))
+            .unwrap()
+            .replace("\r\n", "\n");
+        // A test's copy of an old literal must not hide a changed production value.
+        // Inline test modules follow production code here; their names vary
+        // (tests, search_tests, elapsed_tests, startup_tests).
+        let production: String = source
+            .split_inclusive('\n')
+            .take_while(|line| !(line.starts_with("mod ") && line.trim_end().ends_with('{')))
+            .collect();
+        for (literal, expected_count) in fragments {
+            assert!(expected_count > 0 && !literal.is_empty());
+            assert_eq!(
+                production.matches(&literal).count(),
+                expected_count,
+                "{path}: {literal:?}: this is a runtime contract, see CONTRIBUTING.md / issue #76"
+            );
+        }
+    }
+}
+
+#[test]
+fn no_source_hint_uses_the_old_public_command() {
+    fn check(directory: &std::path::Path) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().unwrap() != "fixtures" {
+                    check(&path);
+                }
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                let source = std::fs::read_to_string(&path).unwrap();
+                let words = source.split_whitespace().collect::<Vec<_>>().join(" ");
+                for command in [
+                    "ask",
+                    "tell",
+                    "result",
+                    "inspect",
+                    "doctor",
+                    "sessions",
+                    "search",
+                    "consent",
+                    "settings",
+                    "self-test",
+                    "reopen",
+                    "close-session",
+                    "prune-sessions",
+                    "--version",
+                    "--help",
+                ] {
+                    let old_hint = format!("{} {command}", "agent-bridge");
+                    assert!(
+                        !words.contains(&old_hint),
+                        "old public command in {}: {old_hint}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+    check(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+}
+
+// PowerShell packaging runs on the Windows test runners; Unix tests also inspect real ZIPs
+// with the publication script, but do not stand in for this native execution.
+#[cfg(windows)]
+mod windows_release_packaging {
+    use super::workflow_step_script;
+    use std::{fs, process::Command};
+
+    fn package(
+        workflow: &str,
+        marker: &str,
+        identity: &str,
+        printed_identity: &str,
+    ) -> std::process::Output {
+        let root = tempfile::tempdir().unwrap();
+        let target = "x86_64-pc-windows-msvc";
+        let release = root.path().join(format!("target/{target}/release"));
+        fs::create_dir_all(&release).unwrap();
+        let source = root.path().join("fixture.rs");
+        fs::write(
+            &source,
+            format!("fn main() {{ println!(\"{printed_identity} 1.2.3\"); }}"),
+        )
+        .unwrap();
+        let compiled = Command::new("rustc")
+            .arg(&source)
+            .arg("-o")
+            .arg(release.join(format!("{identity}.exe")))
+            .output()
+            .unwrap();
+        assert!(compiled.status.success(), "{compiled:?}");
+        fs::write(root.path().join("LICENSE"), "license").unwrap();
+        if identity == "tabcli" {
+            fs::write(root.path().join("THIRD_PARTY_NOTICES.md"), "notices").unwrap();
+        }
+        let script = root.path().join("package.ps1");
+        fs::write(
+            &script,
+            format!(
+                "$ErrorActionPreference = 'Stop'\n{}",
+                workflow_step_script(workflow, marker)
+            ),
+        )
+        .unwrap();
+        Command::new("pwsh")
+            .args(["-NoProfile", "-NonInteractive", "-File"])
+            .arg(script)
+            .current_dir(root.path())
+            .env("PACKAGE", identity)
+            .env("RELEASE_VERSION", "1.2.3")
+            .env("TARGET", target)
+            .env("ARCHIVE", format!("{identity}-1.2.3-{target}.zip"))
+            .env("RUNNER_TEMP", root.path().join("runner"))
+            .output()
+            .unwrap()
+    }
+
+    #[test]
+    fn windows_packaging_runs_both_release_identities_and_the_ci_candidate() {
+        for (workflow, marker, identity) in [
+            (
+                include_str!("../.github/workflows/release.yml"),
+                "      - name: Package Windows archive and checksum",
+                "tabcli",
+            ),
+            (
+                include_str!("../.github/workflows/release.yml"),
+                "      - name: Package Windows archive and checksum",
+                "agent-bridge",
+            ),
+            (
+                include_str!("../.github/workflows/ci.yml"),
+                "      - name: Package and verify Windows candidate",
+                "tabcli",
+            ),
+        ] {
+            let output = package(workflow, marker, identity, identity);
+            assert!(output.status.success(), "{output:?}");
+        }
+    }
+
+    #[test]
+    fn windows_packaging_and_version_check_reject_the_wrong_executable_name() {
+        for (workflow, marker, identity, wrong) in [
+            (
+                include_str!("../.github/workflows/release.yml"),
+                "      - name: Package Windows archive and checksum",
+                "tabcli",
+                "agent-bridge",
+            ),
+            (
+                include_str!("../.github/workflows/release.yml"),
+                "      - name: Package Windows archive and checksum",
+                "agent-bridge",
+                "tabcli",
+            ),
+            (
+                include_str!("../.github/workflows/ci.yml"),
+                "      - name: Package and verify Windows candidate",
+                "tabcli",
+                "agent-bridge",
+            ),
+            (
+                include_str!("../.github/workflows/release.yml"),
+                "      - name: Verify binary version",
+                "tabcli",
+                "agent-bridge",
+            ),
+            (
+                include_str!("../.github/workflows/release.yml"),
+                "      - name: Verify binary version",
+                "agent-bridge",
+                "tabcli",
+            ),
+        ] {
+            let output = package(workflow, marker, identity, wrong);
+            assert!(!output.status.success(), "accepted {wrong} as {identity}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("unexpected binary version"),
+                "{output:?}"
+            );
         }
     }
 }

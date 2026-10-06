@@ -8,6 +8,7 @@ use crate::native::session::SessionState;
 use crate::native::session::turn;
 use crate::native::session::{Reader, RecordReader, Store};
 use agent_bridge::FirstPartyCli;
+use agent_bridge::PUBLIC_COMMAND;
 use anyhow::{Context, Result, bail};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -32,7 +33,11 @@ const MAX_NATIVE_QUEUE_OUTPUT_BYTES: usize = 1024 * 1024;
 // has no integrated, atomic active-thread check plus addressed terminal input.
 // Replace this refusal only with a provider-owned input path that binds delivery
 // to the recorded thread; a title, old notify, or live process is not that proof.
-const UNADDRESSED_FOLLOW_UP: &str = "Codex terminal follow-up is unavailable: the active thread cannot be verified; no terminal input was sent. Use the thread-addressed native queue with Codex 0.149+; inspect the queue error and `agent-bridge doctor <session> --probe` for the unavailable prerequisite";
+fn unaddressed_follow_up() -> String {
+    format!(
+        "Codex terminal follow-up is unavailable: the active thread cannot be verified; no terminal input was sent. Use the thread-addressed native queue with Codex 0.149+; inspect the queue error and `{PUBLIC_COMMAND} doctor <session> --probe` for the unavailable prerequisite"
+    )
+}
 
 fn codex_version_supports_native_queue(output: &str) -> Result<bool> {
     let installed = output
@@ -276,7 +281,7 @@ impl NativeProviderAdapter for CodexAdapter {
         send_native_queue_message(context).map_err(|failure| {
             if failure.allows_terminal_fallback() {
                 CrossSessionMessageFailure::not_sent(
-                    failure.into_error().context(UNADDRESSED_FOLLOW_UP),
+                    failure.into_error().context(unaddressed_follow_up()),
                 )
             } else {
                 failure
@@ -325,7 +330,7 @@ impl NativeProviderAdapter for CodexAdapter {
         _deadline: Instant,
     ) -> terminal::TerminalSendResult {
         Err(terminal::TerminalSendFailure::not_sent(anyhow::anyhow!(
-            UNADDRESSED_FOLLOW_UP
+            unaddressed_follow_up()
         )))
     }
 
@@ -335,7 +340,7 @@ impl NativeProviderAdapter for CodexAdapter {
         _prompt: &str,
         _claim_token: &str,
     ) -> Result<String> {
-        bail!(UNADDRESSED_FOLLOW_UP)
+        bail!(unaddressed_follow_up())
     }
 
     fn cancel_terminal_follow_up(&self, directory: &Path, claim_token: &str) -> Result<()> {
@@ -1057,6 +1062,17 @@ fn established_codex_thread(directory: &Path) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recovery_hint_uses_the_public_command() {
+        let hint = super::unaddressed_follow_up();
+        assert!(hint.contains("`tabcli doctor <session> --probe`"));
+        assert!(hint.contains(&format!(
+            "`{} doctor <session> --probe`",
+            agent_bridge::PUBLIC_COMMAND
+        )));
+        assert!(!hint.contains(&format!("{} doctor", "agent-bridge")));
+    }
+
     #[test]
     fn workspace_trust_override_uses_a_toml_value_for_paths_with_dots_and_quotes() {
         for workspace in [

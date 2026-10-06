@@ -1,3 +1,4 @@
+use agent_bridge::PUBLIC_COMMAND;
 #[cfg(test)]
 mod tests;
 
@@ -1116,7 +1117,7 @@ fn launch_created_session(
         &expected_claim_token,
         deadline,
     )?;
-    let executable = std::env::current_exe().context("failed to locate agent-bridge executable")?;
+    let executable = std::env::current_exe().context("failed to locate the current executable")?;
     let bridge_command = bridge_shell_command(
         &created.manifest.workspace,
         created
@@ -1298,7 +1299,7 @@ fn launch_created_session(
                 .initial_prompt()
                 .context("failed to read the preserved initial prompt")?;
             let bridge_executable =
-                std::env::current_exe().context("failed to locate agent-bridge executable")?;
+                std::env::current_exe().context("failed to locate the current executable")?;
             remaining_turn_timeout(deadline, timeout)?;
             verify_reopened_conversation_exclusive(
                 provider,
@@ -1404,7 +1405,7 @@ fn launch_created_session(
     )
     .with_context(|| {
         format!(
-            "session {} in {} did not return a successful result; use `agent-bridge inspect {}` to inspect its recorded state",
+            "session {} in {} did not return a successful result; use `{PUBLIC_COMMAND} inspect {}` to inspect its recorded state",
             created.id,
             terminal_session.kind.display_name(),
             created.id
@@ -2675,7 +2676,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
             };
             let correlation_id = provider_turn_id.as_deref().unwrap_or(&claim_token);
             let bridge_executable =
-                std::env::current_exe().context("failed to locate agent-bridge executable")?;
+                std::env::current_exe().context("failed to locate the current executable")?;
             update_status(&directory, SessionState::Working, None, None)?;
             match provider::send_cross_session_message(
                 provider,
@@ -2765,7 +2766,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
     )
     .with_context(|| {
         format!(
-            "session {} in {} did not return a successful result; use `agent-bridge inspect {}` to inspect its recorded state",
+            "session {} in {} did not return a successful result; use `{PUBLIC_COMMAND} inspect {}` to inspect its recorded state",
             request.id,
             terminal_session.kind.display_name(),
             request.id
@@ -3366,7 +3367,7 @@ fn finish_request_with_extra(
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
         return Err(error).with_context(|| format!(
-            "session {session}, request {request_id}; inspect with `agent-bridge result {session} --request {request_id} --json`; this error alone is not proof of non-delivery; inspect the recorded outcome before deciding whether to retry"
+            "session {session}, request {request_id}; inspect with `{PUBLIC_COMMAND} result {session} --request {request_id} --json`; this error alone is not proof of non-delivery; inspect the recorded outcome before deciding whether to retry"
         ));
     }
     Ok(())
@@ -3542,7 +3543,7 @@ fn run_session_inner(directory: &Path) -> Result<()> {
         .context("failed to read initial prompt")?;
     let initial_prompt_transport = provider::initial_prompt_transport(provider);
 
-    let executable = std::env::current_exe().context("failed to locate agent-bridge executable")?;
+    let executable = std::env::current_exe().context("failed to locate the current executable")?;
     let mut policy_arguments = provider_launch_args(provider, manifest.yolo)
         .into_iter()
         .map(OsString::from)

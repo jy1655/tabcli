@@ -11,13 +11,13 @@ Claude를 처음 실행할 때의 폴더 신뢰·도구 권한, macOS 권한, Co
 | macOS가 다른 앱 제어를 허용할지 묻거나 Apple Events 권한 오류 발생 | 호출 앱에서 대상 앱으로의 Automation 권한 | 사용자가 시스템 설정 → 개인정보 보호 및 보안 → 자동화에서 실제 호출 앱과 제어 대상의 조합을 확인합니다. |
 | Claude의 폴더 신뢰 또는 도구 실행 허용 화면 | Claude의 workspace 신뢰·도구 정책 | Bridge에 넘길 workspace에서 직접 Claude를 실행해 내용을 확인하고 승인합니다. `/permissions`로 규칙을 확인합니다. 터미널 앱 전체에 대한 제어 승인으로 기록하지 않습니다. |
 | 키체인 접근 창, `CSSMERR_CSP_OPERATION_AUTH_DENIED`, 로그인 불가 표시 | 자격증명 접근 또는 인증 문제의 단서 | 사용자가 요청 앱과 키체인 항목을 확인합니다. 인증 실패만으로 키체인 문제나 토큰 폐기를 단정하지 않습니다. |
-| Warp Control 접근 실패 또는 생성 기능 미제공 | Warp의 endpoint·Scripting·TabConfigs 가용성 | [지원 범위](../README.md#지원-범위)의 조건과 실제 오류를 확인합니다. Claude 승인으로 Warp 기능이 활성화되지는 않습니다. |
+| Warp Control 접근 실패 또는 생성 기능 미제공 | Warp의 endpoint·Scripting·TabConfigs 가용성 | [지원 범위](../README.ko.md#지원-범위)의 조건과 실제 오류를 확인합니다. Claude 승인으로 Warp 기능이 활성화되지는 않습니다. |
 
 2026-10-03에 확인한 [Computer Use 공식 문서](https://learn.chatgpt.com/docs/computer-use)는 터미널 앱 조작을 통한 보안 정책 우회를 제한합니다. 같은 날 Warp(`dev.warp.Warp-Stable`)와 Terminal.app(`com.apple.Terminal`) 접근에서 위 오류를 재확인했습니다. 따라서 이 오류를 단순한 “자동 승인 검토 거절”로 보고하지 않습니다. 일반 앱의 Always allow 설정, Full Access, Bridge의 `--yolo`로 이 제한을 해제한다고 안내하지 않습니다. 거절된 앱 조작을 다른 UI 기술로 재시도하지 않습니다.
 
 같은 공식 문서는 파일 편집과 shell 명령이 별도의 승인·sandbox 정책을 따른다고 구분합니다. 따라서 Computer Use 거절만으로 모든 CLI 통합 검사를 사용자 수동 실행으로 제한하지 않습니다. 허용된 shell 도구에서 제품의 기존 CLI/API를 검사할 수 있습니다. 실제 shell 호출이 별도로 거절되면 그 사유를 따라야 하며, 이 설명은 해당 거절의 우회를 허용하지 않습니다.
 
-[Auto-review](https://learn.chatgpt.com/docs/sandboxing/auto-review)는 승인 요청의 검토자를 바꾸는 기능입니다. Computer Use의 앱 승인과 별개이며, 자동 검토가 모든 동작을 허용하거나 OS 권한을 대신 부여하지 않습니다. `--yolo` 역시 [각 provider의 권한 옵션](../README.md#권한과-세션-경계)을 전달할 뿐입니다.
+[Auto-review](https://learn.chatgpt.com/docs/sandboxing/auto-review)는 승인 요청의 검토자를 바꾸는 기능입니다. Computer Use의 앱 승인과 별개이며, 자동 검토가 모든 동작을 허용하거나 OS 권한을 대신 부여하지 않습니다. `--yolo` 역시 [각 provider의 권한 옵션](../README.ko.md#사용-전에-알아둘-경계)을 전달할 뿐입니다.
 
 ## Claude를 처음 사용할 때
 
@@ -42,9 +42,9 @@ Automation 권한은 Claude 안의 도구 승인과 다릅니다. 실제 제어�
 git rev-parse HEAD
 git status --short
 cargo build --locked
-shasum -a 256 target/debug/agent-bridge
+shasum -a 256 target/debug/tabcli
 
-ab_binary="$PWD/target/debug/agent-bridge"
+ab_binary="$PWD/target/debug/tabcli"
 ab_workspace="$PWD"
 ab_report_dir="$(mktemp -d "${TMPDIR:-/tmp}/agent-bridge-check.XXXXXX")"
 ```

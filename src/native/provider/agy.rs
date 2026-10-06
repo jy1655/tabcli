@@ -2848,10 +2848,10 @@ W0924 21:32:08.448803     204 cache.go:135] Cache(userInfo): Singleflight refres
 E0924 21:32:08.448822     204 errorreport.go:224] failed to get load code assist response: error getting token source: You are not logged into Antigravity.
 I0924 21:32:08.452158     261 manager.go:1331] Reloading system slash commands and skills
 I0924 21:32:08.452191     261 manager.go:1308] Reloading system slash commands
-I0924 21:32:08.452164     128 gemini_extensions.go:28] Detecting Gemini extensions in /Users/jyh/.gemini/extensions
+I0924 21:32:08.452164     128 gemini_extensions.go:28] Detecting Gemini extensions in /Users/tester/.gemini/extensions
 I0924 21:32:08.452226     128 gemini_extensions.go:49] No extensions found
 I0924 21:32:08.452205     261 manager.go:1312] Slash commands unchanged, skipping update
-I0924 21:32:08.458864     258 encoder_embed.go:85] Installing/updating embedded webm_encoder binary to /Users/jyh/.gemini/antigravity-cli/bin/webm_encoder
+I0924 21:32:08.458864     258 encoder_embed.go:85] Installing/updating embedded webm_encoder binary to /Users/tester/.gemini/antigravity-cli/bin/webm_encoder
 I0924 21:32:08.459241       1 analytics.go:187] CLI startup completed (took 285.555917ms)
 W0924 21:32:08.461411     204 cache.go:135] Cache(loadCodeAssistResponse): Singleflight refresh failed: error getting token source: You are not logged into Antigravity.
 E0924 21:32:08.461511     204 errorreport.go:224] error getting token source: You are not logged into Antigravity.
