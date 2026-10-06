@@ -50,14 +50,14 @@ closed session-K7m2Qx
 
 ## 지원 범위
 
-구현 여부와 로그인한 CLI로 실제 실행해 확인한 범위를 구분합니다. 아래 표는 과거 실행 기록 중 일부를 요약합니다. 연결된 기록에 당시 버전, 설정과 한계를 남겼으며, 0.2.0의 모든 조합을 검증했다는 뜻은 아닙니다.
+구현 여부와 로그인한 CLI로 실제 실행해 확인한 범위를 구분합니다. 아래 표는 과거 실행 기록 중 일부를 요약합니다. 연결된 기록에 당시 버전, 설정과 한계를 남겼으며, 0.2.1의 모든 조합을 검증했다는 뜻은 아닙니다.
 
 | 플랫폼 / 터미널 | 상태 | 로그인 후 실행 검증 |
 | --- | --- | --- |
-| macOS / iTerm2 | 구현됨 | Codex, 2026-10-06 |
-| macOS / Terminal.app | 구현됨 | Codex, 2026-10-06 |
-| macOS / Ghostty | 구현됨 | Codex, 2026-10-06 |
-| macOS / WezTerm | 구현됨 | Codex/Claude, 2026-10-06; Agy, 2026-10-04 |
+| macOS / iTerm2 | 구현됨 | Codex, 2026-10-07 |
+| macOS / Terminal.app | 구현됨 | Codex, 2026-10-07 |
+| macOS / Ghostty | 구현됨 | Codex, 2026-10-07 |
+| macOS / WezTerm | 구현됨 | Codex/Claude/Agy, 2026-10-07 |
 | macOS / Warp | 제한적 | 미검증 |
 | Windows에서 직접 실행 | 구현됨 | 네 CLI 모두, 2026-10-02 |
 | Windows Terminal 탭 | 우선 사용 | 탭 생성/후속 요청/종료, 2026-10-01 |
@@ -77,6 +77,7 @@ Warp는 접근이 허용된 공식 Control 연결과 탭·창 생성 기능이 �
 
 Codex 후속 요청에는 0.149.0 이상이 필요하며 공유 데몬은 필요하지 않습니다. Claude는 최소 버전을 충족하고, 사용하는 백엔드와 설정에서 세션 간 메시지 전달도 지원해야 합니다. 전달 경로와 오류 처리는 [에이전트 CLI 요구 사항](docs/providers.md)을 따릅니다.
 
+- [2026-10-07 macOS](docs/verification/2026-10-07-macos-0.2.1.md): 위의 네 터미널에서 Codex를, WezTerm에서 Claude를 CLI 기본값으로 검증했습니다. Agy는 WezTerm에서 `--yolo`로 검증했습니다. 화면이 잠긴 상태에서는 Terminal.app과 Ghostty가 요청부터 종료까지의 과정을 마치지 못했습니다. 기본 권한 모드의 Agy와 Pi는 첫 결과를 기다리다 시간이 초과되어, 성공한 검증에 포함하지 않습니다.
 - [2026-10-06 macOS](docs/verification/2026-10-06-macos-0.1.2.md): 위의 네 터미널에서 Codex를, WezTerm에서 Claude를 검증했습니다. 기본 권한 모드 대신 `--yolo`를 사용했습니다.
 - [2026-10-04 macOS](docs/verification/2026-10-04-macos-0.1.1.md): Codex·Claude·Agy를 CLI 기본값으로 검증했습니다. 최근 WezTerm에서 실행한 Pi 검사는 인증에 실패했습니다. 요청부터 후속 요청과 종료까지 성공한 검증에는 포함하지 않습니다.
 - [2026-10-02 Windows](docs/verification/2026-10-02-windows.md): 네 CLI를 검증했습니다. 각 세션이 탭인지 별도 콘솔 창인지는 기록에서 구분하지 않습니다.
@@ -87,17 +88,17 @@ Codex 후속 요청에는 0.149.0 이상이 필요하며 공유 데몬은 필요
 
 [GitHub Releases](https://github.com/jy1655/tabcli/releases)에서 운영체제에 맞는 압축 파일과 같은 이름의 `.sha256` 파일을 받습니다. 미리 빌드된 파일을 설치할 때는 Rust가 필요하지 않습니다. Apple Silicon macOS는 `tabcli-<version>-aarch64-apple-darwin.tar.gz`, x64 Windows는 `tabcli-<version>-x86_64-pc-windows-msvc.zip`을 사용합니다.
 
-0.2.0을 설치한다면 다운로드한 디렉터리에서 압축을 풀기 전에 체크섬을 확인합니다. macOS에서는 체크섬 명령이 `OK`를 출력한 경우에만 다음 명령으로 진행합니다.
+0.2.1을 설치한다면 다운로드한 디렉터리에서 압축을 풀기 전에 체크섬을 확인합니다. macOS에서는 체크섬 명령이 `OK`를 출력한 경우에만 다음 명령으로 진행합니다.
 
 ```sh
-shasum -a 256 -c tabcli-0.2.0-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf tabcli-0.2.0-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c tabcli-0.2.1-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf tabcli-0.2.1-aarch64-apple-darwin.tar.gz
 ```
 
 Windows에서는 PowerShell에서 실행합니다.
 
 ```powershell
-$archive = "tabcli-0.2.0-x86_64-pc-windows-msvc.zip"
+$archive = "tabcli-0.2.1-x86_64-pc-windows-msvc.zip"
 $expected = (Get-Content "$archive.sha256").Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "checksum mismatch" }
@@ -109,7 +110,7 @@ Expand-Archive $archive -DestinationPath .\tabcli
 소스에서 설치하려면 Rust 1.97.1 이상과 Cargo가 필요합니다.
 
 ```sh
-cargo install --git https://github.com/jy1655/tabcli --tag v0.2.0 --locked
+cargo install --git https://github.com/jy1655/tabcli --tag v0.2.1 --locked
 ```
 
 이 패키지는 crates.io에 등록되어 있지 않습니다. 그곳의 `agent-bridge`와 `tab-cli`는 이 프로젝트와 무관합니다. 실행 파일과 Cargo 패키지 이름은 모두 `tabcli`입니다.
@@ -160,7 +161,7 @@ Bridge는 모델 클라이언트나 샌드박스가 아닙니다. 직접 실행�
 - [터미널](docs/terminals.md): 화면 생성 위치, 설정, 소유권과 검증 범위입니다.
 - [에이전트 CLI](docs/providers.md): CLI 요구 사항, 전달 경로와 결과 처리 방식입니다.
 - [보안과 데이터](docs/security-and-data.md): 권한, 작업 디렉터리 신뢰와 보관되는 기록입니다.
-- [macOS 승인](docs/macos-permissions.md): Automation과 CLI 승인을 구분하는 한국어 문서입니다.
+- [macOS 승인](docs/macos-permissions.md): Automation과 CLI 승인을 구분하는 영어 문서입니다.
 - [구조](docs/architecture.md): 모듈, 세션 기록과 세션 상태 변경 규칙입니다.
 - [검증](docs/testing.md): 자동 검사와 로그인한 CLI의 수동 실행 검사 절차입니다.
 - [릴리스 노트](docs/releases/README.md): 버전별 변경과 검증 기록입니다.

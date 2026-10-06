@@ -78,7 +78,9 @@ Runtime:
 Self-test:
   self-test makes real model calls and opens a real terminal. It runs in the
   ordinary state root, reports its path, and closes only the session it creates.
-  It never resends an uncertain prompt or automatically approves workspace trust.
+  It never resends an uncertain prompt. It follows ask's workspace-consent rules:
+  verified consent for the exact workspace is reused through the provider's own
+  approval, and without it self-test approves no workspace trust itself.
   --timeout-secs is a per-command budget (default 120); cleanup uses the normal
   explicit-close contract. Closed records remain in the registry for inspection.
   --isolated keeps the run apart from your sessions in a private directory of its

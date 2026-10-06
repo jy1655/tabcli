@@ -62,14 +62,14 @@ see [diagnostics](docs/cli.md#doctor).
 ## Support
 
 These tables summarize selected historical runs. The linked records identify the tested versions,
-settings, and limitations. These are not checks of every combination on version 0.2.0.
+settings, and limitations. These are not checks of every combination on version 0.2.1.
 
 | Platform / terminal | Status | Recorded live evidence |
 | --- | --- | --- |
-| macOS / iTerm2 | Implemented | Codex, 2026-10-06 |
-| macOS / Terminal.app | Implemented | Codex, 2026-10-06 |
-| macOS / Ghostty | Implemented | Codex, 2026-10-06 |
-| macOS / WezTerm | Implemented | Codex/Claude, 2026-10-06; Agy, 2026-10-04 |
+| macOS / iTerm2 | Implemented | Codex, 2026-10-07 |
+| macOS / Terminal.app | Implemented | Codex, 2026-10-07 |
+| macOS / Ghostty | Implemented | Codex, 2026-10-07 |
+| macOS / WezTerm | Implemented | Codex/Claude/Agy, 2026-10-07 |
 | macOS / Warp | Limited | Not verified |
 | Native Windows | Implemented | All four providers, 2026-10-02 |
 | Windows Terminal tab | Preferred surface | Tab creation/follow-up/close, 2026-10-01 |
@@ -97,6 +97,10 @@ Codex follow-ups require 0.149.0 or newer; no shared daemon is required. Claude 
 cross-session messaging in its installed backend and configuration, not only a recent version.
 See [provider requirements](docs/providers.md) for delivery paths and failure handling.
 
+- [2026-10-07 macOS](docs/verification/2026-10-07-macos-0.2.1.md): Codex in the four terminals
+  above and Claude in WezTerm with provider defaults; Agy in WezTerm with `--yolo`. With the
+  screen locked, Terminal.app and Ghostty did not complete a round trip. Agy's default-mode
+  attempt and Pi's attempt timed out; they were not round-trip passes.
 - [2026-10-06 macOS](docs/verification/2026-10-06-macos-0.1.2.md): Codex in the four terminals
   above and Claude in WezTerm, using `--yolo`, not default approval modes.
 - [2026-10-04 macOS](docs/verification/2026-10-04-macos-0.1.1.md): Codex, Claude, and Agy with
@@ -115,18 +119,18 @@ Download the archive for your platform and its matching `.sha256` file from
 `tabcli-<version>-aarch64-apple-darwin.tar.gz` for Apple Silicon macOS, or
 `tabcli-<version>-x86_64-pc-windows-msvc.zip` for x64 Windows.
 
-For version 0.2.0, verify the checksum in the download directory before extracting.
+For version 0.2.1, verify the checksum in the download directory before extracting.
 On macOS, continue only if the checksum command reports `OK`:
 
 ```sh
-shasum -a 256 -c tabcli-0.2.0-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf tabcli-0.2.0-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c tabcli-0.2.1-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf tabcli-0.2.1-aarch64-apple-darwin.tar.gz
 ```
 
 On Windows, run these commands in PowerShell:
 
 ```powershell
-$archive = "tabcli-0.2.0-x86_64-pc-windows-msvc.zip"
+$archive = "tabcli-0.2.1-x86_64-pc-windows-msvc.zip"
 $expected = (Get-Content "$archive.sha256").Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "checksum mismatch" }
@@ -139,7 +143,7 @@ Put the extracted `tabcli` (macOS) or `tabcli.exe` (Windows) in a directory on y
 To install from source, use Rust 1.97.1 or newer and Cargo:
 
 ```sh
-cargo install --git https://github.com/jy1655/tabcli --tag v0.2.0 --locked
+cargo install --git https://github.com/jy1655/tabcli --tag v0.2.1 --locked
 ```
 
 The package is not on crates.io. The crates named `agent-bridge` and `tab-cli` there are unrelated
@@ -148,7 +152,7 @@ projects. The executable and Cargo package are both named `tabcli`.
 Before the first launch, install and sign in to the provider CLI, and resolve its workspace-trust
 prompt for your project. The iTerm2, Terminal.app, and Ghostty integrations use macOS Automation.
 If launch reports an Apple Events permission error, follow the
-[macOS permission checks](docs/macos-permissions.md) (Korean). Native Windows requires PowerShell 7
+[macOS permission checks](docs/macos-permissions.md). Native Windows requires PowerShell 7
 (`pwsh.exe`) on `PATH`, even when you invoke Bridge from cmd.
 
 ## Everyday use
@@ -223,7 +227,7 @@ it by path. Installing `tabcli` does not update those running sessions' hooks.
 - [Terminals](docs/terminals.md): surface selection, settings, ownership, and verification limits.
 - [Providers](docs/providers.md): CLI requirements, delivery paths, and result handling.
 - [Security and data](docs/security-and-data.md): permissions, trust, and local records.
-- [macOS permissions](docs/macos-permissions.md): Automation and provider approvals (Korean).
+- [macOS permissions](docs/macos-permissions.md): Automation and provider approvals.
 - [Architecture](docs/architecture.md): modules, session records, and lifecycle contracts.
 - [Testing](docs/testing.md): automated checks and manual authenticated runs.
 - [Release notes](docs/releases/README.md): changes and recorded verification by version.

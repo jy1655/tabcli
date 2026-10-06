@@ -99,8 +99,8 @@ self-test PROVIDER` when you want to open a surface and make real model calls. S
 
 On macOS, install the selected application. The iTerm2, Terminal.app, and Ghostty scripting routes
 can require macOS Automation consent. If the first launch times out in Automation, check for a
-visible system prompt and follow [macOS permissions](macos-permissions.md), which is currently in
-Korean. Review and answer prompts yourself; Bridge does not grant system access. After handling the
+visible system prompt and follow [macOS permissions](macos-permissions.md).
+Review and answer prompts yourself; Bridge does not grant system access. After handling the
 permission prompt, inspect the failed session and close any surface it created before starting
 another. WezTerm uses its official CLI and a verified local GUI connection.
 
@@ -185,7 +185,7 @@ Bridge accepts that hidden, empty object as closed. A later query or retry canno
 observation as proof on its own. When restoring focus, Bridge selects only a previously visible
 window, so it does not bring the closed empty object back. See the
 [cleanup evidence](verification/2026-10-02-terminal-cleanup.md) and
-[follow-up verification](verification/2026-10-03-v0.1.0-issues.md).
+[follow-up verification](verification/2026-10-03-v0.1.0-issues.md) (Korean).
 
 On Windows, close ends the processes it finds in the managed console. It ends a remaining attested
 tab host last, with a successful exit, so Windows Terminal does not retain a failed tab. A process
@@ -215,9 +215,10 @@ you select something else during launch, it leaves your selection alone under th
 - Warp: the implemented Control/URI route does not establish a general foreground-restoration
   guarantee. Keyboard preservation for an authenticated round trip is not verified here.
 
-The [macOS focus record](verification/2026-10-03-v0.1.0-focus.md) includes actual typing checks and
-earlier failures, followed by corrections and final checks. A model result alone does not verify
-keyboard preservation. The later [M12] round trips do not repeat every physical-input test.
+The [macOS focus record](verification/2026-10-03-v0.1.0-focus.md) (Korean) includes actual typing
+checks and earlier failures, followed by corrections and final checks. A model result alone does
+not verify keyboard preservation. The later [M12] round trips do not repeat every physical-input
+test.
 
 Foreground restoration covers surface startup and a further 600 ms settling period. It is best
 effort; failure to identify or restore the host window does not fail the launch. It does not
