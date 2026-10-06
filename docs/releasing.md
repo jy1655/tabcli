@@ -115,3 +115,5 @@ asset 교체·삭제나 tag 이동으로 복구하지 말고, 결함과 확인 �
 참고: [GitHub immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases),
 [release attestation 검증](https://cli.github.com/manual/gh_release_verify),
 [asset attestation 검증](https://cli.github.com/manual/gh_release_verify-asset).
+
+의존성을 변경하면 저장소 루트에서 `AGENT_BRIDGE_UPDATE_NOTICES=1 cargo test --test third_party_notices third_party_notices_match_lock -- --exact`를 실행해 `THIRD_PARTY_NOTICES.md`를 갱신한다. 갱신 모드는 `cargo metadata --locked`로 찾은 crate의 라이선스 원문을 사용하며 필요한 registry source를 내려받을 수 있다. 새 라이선스 표현이나 누락된 원문은 자동 대체하지 않고 검토 후 생성기를 갱신한다. crate에 포함된 `COPYRIGHT`, `AUTHORS`, `NOTICE`도 함께 보존하며 `r-efi`의 MIT 원문은 `AUTHORS`에서 읽는다. `CI`가 설정된 환경에서는 갱신 모드를 거부한다. 일반 테스트는 네트워크나 registry cache 없이 `Cargo.lock`과 고지 파일의 패키지·버전 일치를 검사한다.
