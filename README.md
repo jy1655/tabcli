@@ -6,7 +6,7 @@
 
 macOS에서는 Codex의 WezTerm·Ghostty·Terminal.app 왕복과 Claude·Agy의 WezTerm 왕복을 확인했습니다. Terminal.app은 자동화 승인 후 통과했습니다. iTerm2의 자동화 시간 초과, Pi의 무효 OAuth 로그인, Warp의 Control endpoint 부재는 성공으로 처리하지 않았습니다. 환경·테스트 결과와 검증 범위는 [macOS 0.1.1 검증 기록](docs/verification/2026-10-04-macos-0.1.1.md)에 있습니다.
 
-이 문서와 설치 예시는 **v0.1.1**을 기준으로 합니다. macOS에서는 iTerm2·Terminal.app·Ghostty·WezTerm을 지원합니다. Agent Bridge는 자신을 실행한 터미널을 감지해 같은 앱의 새 surface에서 세션을 시작하고, 자신이 만든 surface만 제어합니다. Terminal.app에서는 기존 tab/window를 사용하지 않고 항상 전용 새 window를 엽니다. 감지할 수 없는 호스트에서는 Terminal.app으로 안전하게 fallback합니다. 이미 독립적으로 실행 중인 임의의 CLI에는 사후 attach하지 않습니다.
+이 문서와 설치 예시는 **v0.1.2**를 기준으로 합니다. macOS에서는 iTerm2·Terminal.app·Ghostty·WezTerm을 지원합니다. Agent Bridge는 자신을 실행한 터미널을 감지해 같은 앱의 새 surface에서 세션을 시작하고, 자신이 만든 surface만 제어합니다. Terminal.app에서는 기존 tab/window를 사용하지 않고 항상 전용 새 window를 엽니다. 감지할 수 없는 호스트에서는 Terminal.app으로 안전하게 fallback합니다. 이미 독립적으로 실행 중인 임의의 CLI에는 사후 attach하지 않습니다.
 
 ## 지원 범위
 
@@ -75,13 +75,13 @@ provider별 console follow-up은 각 adapter 내부에 격리되어 있으며, b
 macOS에서 Claude의 폴더 신뢰·도구 권한을 승인했어도 터미널 제어 권한이나 Computer Use 접근이 승인된 것은 아닙니다. 처음 사용할 때와 권한 오류가 날 때는 [macOS 초기 승인과 실앱 검증](docs/macos-permissions.md)의 오류별 구분과 Computer Use 없이 실행하는 CLI `self-test` 절차를 확인하세요.
 
 ```sh
-git clone --branch v0.1.1 --depth 1 https://github.com/jy1655/agent-bridge.git
+git clone --branch v0.1.2 --depth 1 https://github.com/jy1655/agent-bridge.git
 cd agent-bridge
 cargo install --path . --locked
 agent-bridge --version
 ```
 
-마지막 명령은 `agent-bridge 0.1.1`을 출력해야 합니다. 개발 중인 `main`이 아니라 릴리스 tag에서 설치해야 설치본과 소스의 경계가 명확합니다.
+마지막 명령은 `agent-bridge 0.1.2`를 출력해야 합니다. 개발 중인 `main`이 아니라 릴리스 tag에서 설치해야 설치본과 소스의 경계가 명확합니다.
 
 Windows 명령줄 한도를 넘는 요청은 `--prompt-file`로 전달합니다. 파일은 UTF-8 텍스트로 읽고 CRLF는 LF로 정규화하며, Agent Bridge가 원본을 삭제하거나 수정하지 않습니다. 단독 CR과 그 밖의 제출·escape 제어문자는 거부합니다.
 
@@ -90,13 +90,13 @@ Windows 명령줄 한도를 넘는 요청은 `--prompt-file`로 전달합니다.
 GitHub Release에는 Apple Silicon macOS용 `agent-bridge-<version>-aarch64-apple-darwin.tar.gz`와 64비트 Windows용 `agent-bridge-<version>-x86_64-pc-windows-msvc.zip`을 게시하며, 각 archive와 같은 이름의 `.sha256` 파일을 함께 제공합니다. prebuilt archive 설치에는 Rust가 필요하지 않습니다. archive를 푼 뒤 macOS에서는 `agent-bridge`, Windows에서는 `agent-bridge.exe`를 `PATH`에 있는 디렉터리로 옮깁니다. 다운로드한 파일은 실행 전에 체크섬을 검증하세요.
 
 ```sh
-shasum -a 256 -c agent-bridge-0.1.1-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf agent-bridge-0.1.1-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c agent-bridge-0.1.2-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf agent-bridge-0.1.2-aarch64-apple-darwin.tar.gz
 ./agent-bridge --version
 ```
 
 ```powershell
-$archive = "agent-bridge-0.1.1-x86_64-pc-windows-msvc.zip"
+$archive = "agent-bridge-0.1.2-x86_64-pc-windows-msvc.zip"
 $expected = (Get-Content "$archive.sha256").Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "checksum mismatch" }
