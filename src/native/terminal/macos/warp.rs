@@ -29,6 +29,11 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const STARTUP_CLEANUP_RESERVE: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MAX_CONTROL_OUTPUT: usize = 1024 * 1024;
+// Names the adapter gives its exclusive records and its host directory in diagnostics; the
+// session module publishes the bytes and knows nothing about Warp.
+const EXCLUSIVE_RECORD_LABEL: &str = "Warp";
+const EXCLUSIVE_TEMPORARY_PREFIX: &str = ".agent-bridge-warp-";
+const HOST_SESSION_DIRECTORY_LABEL: &str = "Warp host session";
 const TITLE_PROOF_ATTEMPTS: u32 = 3;
 
 const REQUIRED_ACTIONS: &[&str] = &[
@@ -494,7 +499,7 @@ where
             .private(HOST_PLAN_FILE)
             .path(),
     )
-    .write_new_json(&plan)?;
+    .write_new_json(EXCLUSIVE_RECORD_LABEL, EXCLUSIVE_TEMPORARY_PREFIX, &plan)?;
     let mut decision = HostDecisionGuard::new(directory, attempt);
 
     let config_name = format!("agent-bridge-{attempt}");
@@ -630,7 +635,7 @@ where
             .private(CONTROL_FILE)
             .path(),
     )
-    .write_new_json(&control)
+    .write_new_json(EXCLUSIVE_RECORD_LABEL, EXCLUSIVE_TEMPORARY_PREFIX, &control)
     {
         decision.publish(HostAction::Abort)?;
         return match close_bound_exact(runner, &client, &session, &control, cleanup_deadline) {
@@ -1322,7 +1327,11 @@ fn write_tab_config(
         serde_json::to_string(&host_command)?,
     );
     let path = config_dir.join(format!("{name}.toml"));
-    RecordStore::at(&path).write_new_bytes(escape_unportable(&configuration).as_bytes())?;
+    RecordStore::at(&path).write_new_bytes(
+        EXCLUSIVE_RECORD_LABEL,
+        EXCLUSIVE_TEMPORARY_PREFIX,
+        escape_unportable(&configuration).as_bytes(),
+    )?;
     Ok(path)
 }
 
@@ -1361,7 +1370,11 @@ fn write_launch_config(
         "active_window_index": 0
     }))?;
     let path = config_dir.join(format!("{name}.yaml"));
-    RecordStore::at(&path).write_new_bytes(escape_unportable(&configuration).as_bytes())?;
+    RecordStore::at(&path).write_new_bytes(
+        EXCLUSIVE_RECORD_LABEL,
+        EXCLUSIVE_TEMPORARY_PREFIX,
+        escape_unportable(&configuration).as_bytes(),
+    )?;
     Ok(path)
 }
 
@@ -1550,11 +1563,15 @@ fn write_decision(directory: &Path, attempt: &str, action: HostAction) -> Result
             .private(HOST_DECISION_FILE)
             .path(),
     )
-    .write_new_json(&HostDecision {
-        schema: RECORD_SCHEMA,
-        attempt: attempt.to_owned(),
-        action,
-    })
+    .write_new_json(
+        EXCLUSIVE_RECORD_LABEL,
+        EXCLUSIVE_TEMPORARY_PREFIX,
+        &HostDecision {
+            schema: RECORD_SCHEMA,
+            attempt: attempt.to_owned(),
+            action,
+        },
+    )
 }
 
 fn load_binding(directory: &Path, session: &TerminalSession) -> Result<ControlBinding> {
@@ -1739,7 +1756,8 @@ pub(in crate::native) fn run_host(directory: &Path, attempt: &str) -> Result<()>
     if !crate::native::valid_session_id(session_id) {
         bail!("Warp host session directory has an invalid session id");
     }
-    Reader::open_unchecked(directory).validate_private_session_directory()?;
+    Reader::open_unchecked(directory)
+        .validate_private_session_directory(HOST_SESSION_DIRECTORY_LABEL)?;
     let plan: HostPlan = RecordReader::at(
         Reader::open_unchecked(directory)
             .private(HOST_PLAN_FILE)
@@ -1761,13 +1779,17 @@ pub(in crate::native) fn run_host(directory: &Path, attempt: &str) -> Result<()>
             .private(HOST_OFFER_FILE)
             .path(),
     )
-    .write_new_json(&HostOffer {
-        schema: RECORD_SCHEMA,
-        attempt: attempt.to_owned(),
-        directory: directory.to_owned(),
-        pid: std::process::id(),
-        tty,
-    })?;
+    .write_new_json(
+        EXCLUSIVE_RECORD_LABEL,
+        EXCLUSIVE_TEMPORARY_PREFIX,
+        &HostOffer {
+            schema: RECORD_SCHEMA,
+            attempt: attempt.to_owned(),
+            directory: directory.to_owned(),
+            pid: std::process::id(),
+            tty,
+        },
+    )?;
     loop {
         if Instant::now() >= monotonic_deadline || wall_ms()? >= plan.deadline_unix_ms {
             bail!("Warp host decision timed out");
@@ -1854,7 +1876,11 @@ fn read_record<T: DeserializeOwned>(path: &Path, label: &str) -> Result<T> {
 
 #[cfg(test)]
 fn write_new_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    crate::native::session::RecordStore::at(path).write_new_json(value)
+    crate::native::session::RecordStore::at(path).write_new_json(
+        EXCLUSIVE_RECORD_LABEL,
+        EXCLUSIVE_TEMPORARY_PREFIX,
+        value,
+    )
 }
 
 #[cfg(test)]

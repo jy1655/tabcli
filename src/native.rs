@@ -278,14 +278,6 @@ struct MacTerminalAppIdentity {
     start_microseconds: u64,
 }
 
-#[cfg(target_os = "macos")]
-#[derive(Deserialize, Serialize)]
-struct TerminalCloseIntent {
-    managed_session_id: String,
-    terminal: terminal::TerminalSession,
-    owner: NativeSessionOwner,
-}
-
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct NativeProcessIdentity {
@@ -2063,7 +2055,7 @@ fn close_surface_after_reopen_verification_failure_with(
 // status when the close itself reports nothing, so a session closed because of a detected
 // conflict still says why.
 fn close_session_surface(directory: &Path, id: &str, reason: Option<String>) -> Result<()> {
-    close_repaired_session_state_with_reason(directory, reason, |session| {
+    session::close::close(&Store::open_unchecked(directory), reason, |session| {
         let authority = verify_terminal_close_authority(directory, id, session)?;
         if authority == TerminalCloseAuthority::Absent {
             return Ok(terminal::CloseOutcome::Missing);
@@ -2092,7 +2084,12 @@ fn close_session_surface(directory: &Path, id: &str, reason: Option<String>) -> 
             // tab.close/kill-pane can end the owner while surface cleanup still fails.
             // Preserve this exact requested close before its first external mutation.
             let (owner, _) = verified_macos_terminal_owner(directory, id, session, None)?;
-            record_terminal_close_intent(directory, id, session, &owner)?;
+            session::close::record_terminal_close_intent(
+                &Store::open_unchecked(directory),
+                id,
+                session,
+                &owner,
+            )?;
         }
         #[cfg(not(target_os = "macos"))]
         let _ = has_native_owner;
@@ -2109,6 +2106,7 @@ fn close_session_surface(directory: &Path, id: &str, reason: Option<String>) -> 
         }
         terminal::close_session(session)
     })
+    .map(|_| ())
 }
 
 // What the read-only gates established about a closed source session.
@@ -2877,7 +2875,12 @@ fn terminate_apple_terminal_owner(
             .context("Terminal.app identity was not recorded")?,
         &terminal_app_instances()?,
     )?;
-    record_terminal_close_intent(directory, expected_session_id, session, &owner)?;
+    session::close::record_terminal_close_intent(
+        &Store::open_unchecked(directory),
+        expected_session_id,
+        session,
+        &owner,
+    )?;
     terminal::macos::apple_terminal::terminate_process_groups(process_group, shell_process_group)
 }
 
@@ -2902,7 +2905,12 @@ fn prepare_warp_close(
     }
     let group = verified_terminal_owner_process_group(owner, live)?;
     verified_terminal_shell_process_group(owner, live, shell)?;
-    record_terminal_close_intent(directory, id, session, owner)?;
+    session::close::record_terminal_close_intent(
+        &Store::open_unchecked(directory),
+        id,
+        session,
+        owner,
+    )?;
     stop(group)
 }
 
@@ -2972,75 +2980,6 @@ fn record_legacy_terminal_app(
         Store::open_unchecked(directory).write_owner(owner)?;
     }
     Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn record_terminal_close_intent(
-    directory: &Path,
-    expected_session_id: &str,
-    session: &terminal::TerminalSession,
-    owner: &NativeSessionOwner,
-) -> Result<()> {
-    Store::open_unchecked(directory)
-        .record(CoreRecord::TerminalCloseIntent)
-        .write_json(&TerminalCloseIntent {
-            managed_session_id: expected_session_id.to_owned(),
-            terminal: session.clone(),
-            owner: owner.clone(),
-        })
-}
-
-// An explicit close can end the owner before the window is gone, so a
-// close that fails after it can never verify that owner again, and the owner's death
-// says nothing about the window. The intent that the close recorded first lets only
-// that close finish: it names this managed session, this exact handle and this exact
-// owner record, with the owner's whole identity. Anything else, unreadable or not,
-// grants nothing.
-#[cfg(target_os = "macos")]
-fn terminal_close_intent_owner(
-    directory: &Path,
-    session: &terminal::TerminalSession,
-) -> Result<Option<NativeSessionOwner>> {
-    if !surface_outlives_owner(session.kind) {
-        return Ok(None);
-    }
-    let (Some(intent), Some(owner)) = (
-        Reader::open_unchecked(directory)
-            .record(CoreRecord::TerminalCloseIntent)
-            .text()?,
-        Reader::open_unchecked(directory)
-            .record(CoreRecord::Owner)
-            .text()?,
-    ) else {
-        return Ok(None);
-    };
-    let (Ok(intent), Ok(owner)) = (
-        serde_json::from_str::<TerminalCloseIntent>(&intent),
-        serde_json::from_str::<NativeSessionOwner>(&owner),
-    ) else {
-        return Ok(None);
-    };
-    let attested = matches!(
-        (
-            owner.terminal_tty_device,
-            owner.process_start_seconds,
-            owner.process_start_microseconds,
-            owner.process_group,
-            owner.terminal_process_group,
-        ),
-        (Some(_), Some(_), Some(_), Some(_), Some(_))
-    );
-    let bound = session.managed_session_id.as_deref() == Some(intent.managed_session_id.as_str())
-        && owner.managed_session_id.as_deref() == Some(intent.managed_session_id.as_str());
-    let exact = intent.terminal == *session
-        && serde_json::to_value(&intent.owner)? == serde_json::to_value(&owner)?;
-    Ok((attested && bound && exact).then_some(owner))
-}
-
-#[cfg(target_os = "macos")]
-fn terminal_close_resumable(directory: &Path, session: &terminal::TerminalSession) -> Result<bool> {
-    Ok(terminal_close_intent_owner(directory, session)?
-        .is_some_and(|owner| !process_is_alive(owner.pid)))
 }
 
 #[cfg(test)]
@@ -4284,7 +4223,7 @@ fn sessions_query(
             // same lifecycle lock, so a listing publishes every finished turn before it
             // decides on the owner without a separate recovery pass.
             if repair {
-                let _ = repair_dead_native_owner(&directory);
+                let _ = session::close::repair_dead_owner(&Store::open_unchecked(&directory));
             }
             let status = Reader::open_unchecked(&directory).status().ok();
             let state = status
@@ -4411,8 +4350,8 @@ fn prune_closed_sessions(root: &Path, cutoff_unix_ms: u128) -> Result<Vec<String
             || status.state != SessionState::Closed
             || closed.updated_unix_ms > cutoff_unix_ms
             || status.updated_unix_ms > cutoff_unix_ms
-            || has_active_session_capability(&directory)
-            || native_owner_blocks_prune(&directory)?
+            || Reader::open_unchecked(&directory).has_active_session_capability()
+            || Reader::open_unchecked(&directory).native_owner_blocks_prune()?
         {
             continue;
         }
@@ -4434,72 +4373,6 @@ fn prune_closed_sessions(root: &Path, cutoff_unix_ms: u128) -> Result<Vec<String
     }
     removed.sort();
     Ok(removed)
-}
-
-fn has_active_session_capability(directory: &Path) -> bool {
-    [
-        CoreRecord::Terminal.name(),
-        CoreRecord::TerminalClosing.name(),
-        CoreRecord::TurnClaim.name(),
-        CoreRecord::Completion.name(),
-        CoreRecord::LegacyResumePending.name(),
-        CoreRecord::LegacyResumeRunning.name(),
-    ]
-    .into_iter()
-    .any(|name| {
-        fs::symlink_metadata(Reader::open_unchecked(directory).private(name).path()).is_ok()
-    })
-}
-
-fn native_owner_blocks_prune(directory: &Path) -> Result<bool> {
-    let path = Reader::open_unchecked(directory)
-        .record(CoreRecord::Owner)
-        .path()
-        .to_owned();
-    let text = match session::RecordReader::at(&path).text() {
-        Ok(Some(text)) => text,
-        Ok(None) => return Ok(false),
-        Err(_) => return Ok(true),
-    };
-    let owner = match serde_json::from_str::<NativeSessionOwner>(&text) {
-        Ok(owner) => owner,
-        Err(_) => return Ok(true),
-    };
-
-    #[cfg(windows)]
-    {
-        let Some(identity) = &owner.windows_process_identity else {
-            return Ok(true);
-        };
-        if !process_is_alive(owner.pid) {
-            return Ok(false);
-        }
-        match terminal::windows_process_identity(owner.pid) {
-            Ok(live) => Ok(&live == identity),
-            Err(_) => Ok(true),
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if !process_is_alive(owner.pid) {
-            return Ok(false);
-        }
-        let (Some(seconds), Some(microseconds)) = (
-            owner.process_start_seconds,
-            owner.process_start_microseconds,
-        ) else {
-            return Ok(true);
-        };
-        match live_native_process_identity(owner.pid) {
-            Ok(live) => Ok(live.process_start_seconds == seconds
-                && live.process_start_microseconds == microseconds),
-            Err(_) => Ok(true),
-        }
-    }
-    #[cfg(not(any(target_os = "macos", windows)))]
-    {
-        Ok(process_is_alive(owner.pid))
-    }
 }
 
 fn run_close(request: CloseRequest) -> Result<()> {
@@ -4616,7 +4489,11 @@ fn verify_terminal_close_authority_with_observations(
             // again, and only once the owner it verified no longer exists. A live owner,
             // or a PID that is alive again, keeps the rules below.
             #[cfg(target_os = "macos")]
-            if terminal_close_resumable(directory, session)? {
+            if session::close::terminal_close_resumable(
+                &Reader::open_unchecked(directory),
+                session,
+                retained_surface_outlives_owner(session),
+            )? {
                 session.verify_managed_session(expected_session_id)?;
                 if session.kind == terminal::TerminalKind::AppleTerminal {
                     let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
@@ -4749,164 +4626,6 @@ fn verify_terminal_close_authority_with_observations(
         verify_terminal_surface_ownership(directory, expected_session_id, session)?;
         Ok(TerminalCloseAuthority::LiveOwner)
     }
-}
-
-#[cfg(test)]
-fn close_repaired_session_state<F>(directory: &Path, close_terminal: F) -> Result<()>
-where
-    F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
-{
-    close_repaired_session_state_with_reason(directory, None, close_terminal)
-}
-
-// Repairs a dead native owner first, then closes. A repair failure is the recorded close
-// error; otherwise `reason` (if any) is kept in the closed status.
-fn close_repaired_session_state_with_reason<F>(
-    directory: &Path,
-    reason: Option<String>,
-    close_terminal: F,
-) -> Result<()>
-where
-    F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
-{
-    let repair_error = repair_dead_native_owner(directory)
-        .err()
-        .map(|error| format!("pre-close session repair failed: {error:#}"));
-    close_session_state_with_error(directory, repair_error.or(reason), close_terminal)
-}
-
-#[cfg(test)]
-fn close_session_state<F>(directory: &Path, close_terminal: F) -> Result<()>
-where
-    F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
-{
-    close_session_state_with_error(directory, None, close_terminal)
-}
-
-fn close_session_state_with_error<F>(
-    directory: &Path,
-    close_error: Option<String>,
-    mut close_terminal: F,
-) -> Result<()>
-where
-    F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
-{
-    let claim_path = Reader::open_unchecked(directory)
-        .record(CoreRecord::TurnClaim)
-        .path()
-        .to_owned();
-    let _turn_lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
-    let status: SessionStatus = Reader::open_unchecked(directory).status()?;
-    if status.state == SessionState::Closed {
-        let consume_result = consume_terminal_handle(directory, None);
-        let close_result = mark_session_closed_locked(directory, &claim_path, close_error);
-        consume_result?;
-        return close_result;
-    }
-
-    let terminal_path = Reader::open_unchecked(directory)
-        .record(CoreRecord::Terminal)
-        .path()
-        .to_owned();
-    let closing_path = Reader::open_unchecked(directory)
-        .record(CoreRecord::TerminalClosing)
-        .path()
-        .to_owned();
-    if Reader::open_unchecked(directory)
-        .record(CoreRecord::TerminalClosed)
-        .path()
-        .to_owned()
-        .exists()
-    {
-        let consume_result = consume_terminal_handle(directory, None);
-        let close_result = mark_session_closed_locked(directory, &claim_path, close_error);
-        consume_result?;
-        return close_result;
-    }
-    match Store::open_unchecked(directory).claim_terminal_handle()? {
-        Ok(()) => (),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if !closing_path.exists() {
-                return mark_session_closed_locked(directory, &claim_path, close_error);
-            }
-            // A prior closer may have stopped after atomically claiming the handle but before
-            // invoking the terminal adapter. The turn-claim lock serializes recovery, so resume
-            // that durable close transaction instead of reporting success with a live surface.
-        }
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to claim terminal handle {}",
-                    terminal_path.display()
-                )
-            });
-        }
-    }
-
-    let terminal =
-        match session::RecordReader::at(&closing_path).json::<terminal::TerminalSession>() {
-            Ok(terminal) => terminal,
-            Err(error) => {
-                restore_terminal_handle(&closing_path, &terminal_path)?;
-                return Err(error);
-            }
-        };
-    if let Err(error) = close_terminal(&terminal) {
-        restore_terminal_handle(&closing_path, &terminal_path)?;
-        return Err(error);
-    }
-
-    let consume_result = consume_terminal_handle(directory, Some(terminal.kind));
-    let close_result = mark_session_closed_locked(directory, &claim_path, close_error);
-    consume_result?;
-    close_result
-}
-
-fn restore_terminal_handle(closing_path: &Path, terminal_path: &Path) -> Result<()> {
-    RecordStore::at(closing_path)
-        .rename_to(&RecordStore::at(terminal_path))
-        .with_context(|| {
-            format!(
-                "failed to restore terminal handle {} after close failure",
-                terminal_path.display()
-            )
-        })
-}
-
-fn consume_terminal_handle(
-    directory: &Path,
-    terminal_kind: Option<terminal::TerminalKind>,
-) -> Result<()> {
-    let tombstone_result =
-        Store::open_unchecked(directory).write_terminal_closed(&serde_json::json!({
-            "consumed": true,
-            "terminal": terminal_kind.map(terminal::TerminalKind::as_str),
-        }));
-    let active_result = RecordStore::at(
-        Reader::open_unchecked(directory)
-            .record(CoreRecord::Terminal)
-            .path(),
-    )
-    .remove();
-    let closing_result = RecordStore::at(
-        Reader::open_unchecked(directory)
-            .record(CoreRecord::TerminalClosing)
-            .path(),
-    )
-    .remove();
-    #[cfg(target_os = "macos")]
-    let intent_result = RecordStore::at(
-        Reader::open_unchecked(directory)
-            .record(CoreRecord::TerminalCloseIntent)
-            .path(),
-    )
-    .remove();
-    #[cfg(not(target_os = "macos"))]
-    let intent_result = Ok(());
-    tombstone_result?;
-    active_result?;
-    closing_result?;
-    intent_result
 }
 
 fn finish_request(outcome: Result<()>, json: bool, session: &str, request_id: &str) -> Result<()> {
@@ -5406,64 +5125,6 @@ fn valid_status_transition(current: &SessionState, next: &SessionState) -> bool 
     current.clone().transition_allowed(next.clone())
 }
 
-// Finishes a close whose tombstone was written but whose later cleanup steps did not run.
-// The tombstone is preserved unchanged: status.json is rewritten from it (update_status
-// copies the tombstone whenever one exists), and the turn claim, the journal, and the
-// legacy resume markers are removed in the same order the uninterrupted close uses. A
-// journaled completion is settled exactly as that close settles it: an event it already
-// wrote stays published when it matches the journal, is set aside when it does not, and a
-// journal without an event is discarded.
-fn converge_interrupted_close_locked(
-    directory: &Path,
-    claim_path: &Path,
-    tombstone: &SessionStatus,
-) -> Result<bool> {
-    let mut changed = false;
-    let status_matches = Reader::open_unchecked(directory)
-        .status_if_present()?
-        .is_some_and(|status| {
-            status.state == tombstone.state
-                && status.generation == tombstone.generation
-                && status.error == tombstone.error
-        });
-    if !status_matches {
-        update_status(
-            directory,
-            SessionState::Closed,
-            None,
-            tombstone.error.clone(),
-        )?;
-        changed = true;
-    }
-    let completion_path = Reader::open_unchecked(directory)
-        .record(CoreRecord::Completion)
-        .path()
-        .to_owned();
-    if completion_path.exists() {
-        set_aside_unverified_completion_event_for_close(directory)?;
-        changed = true;
-    }
-    if claim_path.exists() {
-        remove_turn_claim_locked(claim_path)?;
-        changed = true;
-    }
-    RecordStore::at(&completion_path).remove()?;
-    for name in [
-        CoreRecord::LegacyResumePending.name(),
-        CoreRecord::LegacyResumeRunning.name(),
-    ] {
-        let path = Reader::open_unchecked(directory)
-            .private(name)
-            .path()
-            .to_owned();
-        if path.exists() {
-            RecordStore::at(&path).remove()?;
-            changed = true;
-        }
-    }
-    Ok(changed)
-}
-
 /// Largest event the publication predicate compares with its journal. It bounds only that
 /// comparison: a larger journaled event is never read for a verdict and never published,
 /// and the size policy at journal creation keeps new completions under it. It is the byte
@@ -5471,290 +5132,6 @@ fn converge_interrupted_close_locked(
 /// does not bound the read of an ordinary, non-journaled event by `result`, `inspect`, or
 /// `--context-result`; only a search bounds those reads, with its byte budget.
 const EVENT_READ_LIMIT: u64 = 64 * 1024 * 1024;
-
-/// The first settlement step of a close that finds a completion journal in place. The
-/// tombstone is the close's commit point, but an event the interrupted completion already
-/// wrote is the provider's authoritative result: when it matches the journal byte for byte
-/// it stays published (the receipt already maps the request to it), and when it does not
-/// match, or is too large to compare, it is moved aside under an `unpublished-` name that
-/// no query reads. A journal whose event was never written needs no step here and is
-/// discarded when the close removes the journal; a session whose `events` directory is
-/// missing altogether holds no event to verify and settles the same way, so a close is
-/// never left permanently unsettled by that damage. A link or a non-directory at `events`
-/// is still rejected, and the journal then stays in place with the claim. The move is
-/// idempotent, so an interrupted close converges on the next run.
-///
-/// The close removes the journal only after this step and after the turn claim is
-/// released: while the claim is installed, the journal is the evidence that the event at
-/// its path is the committed result, so an interruption before claim release would
-/// otherwise hide a published result until the next recovery. The journal is also the
-/// only evidence that a set-aside event was unverified, so the move is made durable
-/// before the journal can be discarded: the rename syncs `events/` itself, and a run that
-/// finds the event already moved aside by an interrupted close, which may have stopped
-/// between the rename and that sync, syncs `events/` again before it returns. A committed
-/// event gets the same barrier: the completion that wrote it may have stopped between its
-/// rename and the sync of `events/`, so the close syncs the directory before the journal,
-/// the only proof that the entry is the result, is removed.
-fn set_aside_unverified_completion_event_for_close(directory: &Path) -> Result<()> {
-    let completion_path = Reader::open_unchecked(directory)
-        .record(CoreRecord::Completion)
-        .path()
-        .to_owned();
-    let Some(text) = session::RecordReader::at(&completion_path).text()? else {
-        return Ok(());
-    };
-    if Reader::open_unchecked(directory).events_directory_state()? == EventsDirectory::Missing {
-        return Ok(());
-    }
-    let Ok(pending) = serde_json::from_str::<PendingTurnCompletion>(&text) else {
-        return Ok(());
-    };
-    if validate_pending_completion(&pending).is_err() {
-        return Ok(());
-    }
-    let events = Reader::open_unchecked(directory)
-        .record(CoreRecord::Events)
-        .path()
-        .to_owned();
-    let set_aside = Store::open_unchecked(directory)
-        .unpublished_event(&pending.event_file)
-        .path()
-        .to_owned();
-    match journaled_event_state(directory, &pending)? {
-        JournaledEventState::Mismatched | JournaledEventState::Oversized(_) => {
-            RecordStore::at(&events.join(&pending.event_file))
-                .rename_to(&RecordStore::at(&set_aside))
-                .context(
-                    "failed to set aside a completion event that disagrees with its journal",
-                )?;
-        }
-        JournaledEventState::Absent => {
-            if fs::symlink_metadata(&set_aside).is_ok() {
-                Store::open_unchecked(directory).sync_set_aside_event_directory()?;
-            }
-        }
-        JournaledEventState::Committed => sync_committed_event_directory(directory)?,
-    }
-    Ok(())
-}
-
-fn mark_session_closed(directory: &Path, error: Option<String>) -> Result<()> {
-    let claim_path = Reader::open_unchecked(directory)
-        .record(CoreRecord::TurnClaim)
-        .path()
-        .to_owned();
-    let _lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
-    mark_session_closed_locked(directory, &claim_path, error)
-}
-
-fn mark_session_closed_locked(
-    directory: &Path,
-    claim_path: &Path,
-    error: Option<String>,
-) -> Result<()> {
-    let consume_result = if Reader::open_unchecked(directory)
-        .record(CoreRecord::Terminal)
-        .path()
-        .to_owned()
-        .exists()
-        || Reader::open_unchecked(directory)
-            .record(CoreRecord::TerminalClosing)
-            .path()
-            .to_owned()
-            .exists()
-    {
-        consume_terminal_handle(directory, None)
-    } else {
-        Ok(())
-    };
-    let status_result = update_status(directory, SessionState::Closed, None, error);
-    let (pending_result, running_result, claim_result) = if status_result.is_ok() {
-        // An event the journal disagrees with is set aside first, then the claim is
-        // released, and only then is the journal removed: every interruption of this order
-        // leaves a state in which a committed event stays published and an unverified one
-        // stays hidden. The journal is kept whenever an earlier step failed.
-        let claim_result = set_aside_unverified_completion_event_for_close(directory)
-            .and_then(|()| remove_turn_claim_locked(claim_path));
-        let pending_result = if claim_result.is_ok() {
-            RecordStore::at(
-                Reader::open_unchecked(directory)
-                    .record(CoreRecord::Completion)
-                    .path(),
-            )
-            .remove()
-        } else {
-            Ok(())
-        }
-        .and_then(|()| {
-            RecordStore::at(
-                Reader::open_unchecked(directory)
-                    .record(CoreRecord::LegacyResumePending)
-                    .path(),
-            )
-            .remove()
-        });
-        (
-            pending_result,
-            RecordStore::at(
-                Reader::open_unchecked(directory)
-                    .record(CoreRecord::LegacyResumeRunning)
-                    .path(),
-            )
-            .remove(),
-            claim_result,
-        )
-    } else {
-        (Ok(()), Ok(()), Ok(()))
-    };
-    consume_result?;
-    status_result?;
-    pending_result?;
-    running_result?;
-    claim_result
-}
-
-fn repair_dead_native_owner(directory: &Path) -> Result<bool> {
-    repair_dead_native_owner_with_terminal_close(directory, terminal::close_session)
-}
-
-fn repair_dead_native_owner_with_terminal_close<F>(
-    directory: &Path,
-    mut close_terminal: F,
-) -> Result<bool>
-where
-    F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
-{
-    #[cfg(not(windows))]
-    let _ = &mut close_terminal;
-    // Completion recovery runs first so a live owner's finished turn is published before
-    // anything else is decided. Its failure is damage (a missing `events/`, a journal
-    // whose event cannot be compared), not a reason to leave a dead owner's session
-    // installed forever: the owner check still runs, a dead owner's session is closed as
-    // it would be without the damage (the close settles the journal without publishing),
-    // and the damage is reported in the close error. Under a live owner, or when the
-    // owner cannot be shown dead, the damage is the result.
-    let recovery_damage = recover_pending_completion(directory).err();
-    let untouched = |damage: Option<anyhow::Error>| match damage {
-        Some(error) => Err(error),
-        None => Ok(false),
-    };
-    if launch::repair(&Store::open_unchecked(directory))? {
-        return untouched(recovery_damage);
-    }
-    let status: SessionStatus = Reader::open_unchecked(directory).status()?;
-    if !matches!(
-        status.state,
-        SessionState::Launching
-            | SessionState::AwaitingInitialInput
-            | SessionState::Running
-            | SessionState::Ready
-            | SessionState::Claimed
-            | SessionState::ResumePending
-            | SessionState::Working
-            | SessionState::Exited
-            | SessionState::Failed
-    ) {
-        return untouched(recovery_damage);
-    }
-    let owner_path = Reader::open_unchecked(directory)
-        .record(CoreRecord::Owner)
-        .path()
-        .to_owned();
-    let owner = match session::RecordReader::at(&owner_path).raw_text() {
-        Ok(text) => serde_json::from_str::<NativeSessionOwner>(&text)
-            .with_context(|| format!("invalid JSON in {}", owner_path.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return untouched(recovery_damage);
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", owner_path.display()));
-        }
-    };
-    #[cfg(windows)]
-    match &owner.windows_process_identity {
-        Some(identity) => {
-            if terminal::verify_windows_process_identity(owner.pid, identity).is_ok() {
-                return untouched(recovery_damage);
-            }
-        }
-        // Pre-identity (v0.0.2) Windows owner records carry only a PID. Their identity is
-        // unknown, not dead: while the PID is alive the session is left alone and inspect
-        // reports `identity_matches: null`; only a dead PID lets repair proceed.
-        None => {
-            if process_is_alive(owner.pid) {
-                return untouched(recovery_damage);
-            }
-        }
-    }
-    #[cfg(target_os = "macos")]
-    if mac_native_owner_is_live(&owner)? {
-        return untouched(recovery_damage);
-    }
-    #[cfg(all(not(windows), not(target_os = "macos")))]
-    if process_is_alive(owner.pid) {
-        return untouched(recovery_damage);
-    }
-    let mut repair_error = status
-        .error
-        .clone()
-        .unwrap_or_else(|| format!("native session process {} is no longer running", owner.pid));
-    if let Some(damage) = &recovery_damage {
-        repair_error = format!("{repair_error}; completion recovery failed: {damage:#}");
-    }
-    let repair_error = Some(repair_error);
-    #[cfg(windows)]
-    {
-        if matches!(status.state, SessionState::Exited | SessionState::Failed) {
-            mark_session_closed(directory, repair_error)?;
-            return Ok(true);
-        }
-        // The visible console root can outlive a failed native-session owner. Reuse the same
-        // atomic terminal-handle claim as explicit close so concurrent repair callers cannot
-        // perform the external close side effect twice.
-        close_session_state_with_error(directory, repair_error, |session| {
-            if session.kind != terminal::TerminalKind::WindowsConsole {
-                bail!("dead Windows native owner has a non-Windows terminal handle")
-            }
-            close_terminal(session)
-        })
-        .context("failed to close a Windows console whose native owner exited")?;
-        Ok(true)
-    }
-    #[cfg(not(windows))]
-    {
-        // An explicit close that began its teardown still has to close the surface or
-        // prove it absent. Even a damaged/mismatched intent must preserve that pending
-        // cleanup: it grants no authority, but is not evidence of a vanished surface.
-        // The explicit close validates the full intent before using it as authority.
-        #[cfg(target_os = "macos")]
-        if Reader::open_unchecked(directory)
-            .record(CoreRecord::TerminalCloseIntent)
-            .bytes()?
-            .is_some()
-        {
-            return untouched(recovery_damage);
-        }
-        // A native owner ending on its own does not prove that a terminal window
-        // disappeared. Keep the exact handle for the affected macOS adapters even
-        // before a first explicit close. This gives no authority to send a close:
-        // the normal live-owner/previous-intent checks must still pass.
-        #[cfg(target_os = "macos")]
-        for name in [
-            CoreRecord::Terminal.name(),
-            CoreRecord::TerminalClosing.name(),
-        ] {
-            if let Some(bytes) = Reader::open_unchecked(directory).private(name).bytes()? {
-                let surface: terminal::TerminalSession = serde_json::from_slice(&bytes)
-                    .with_context(|| format!("invalid retained terminal handle {name}"))?;
-                if surface_outlives_owner(surface.kind) {
-                    return untouched(recovery_damage);
-                }
-            }
-        }
-        mark_session_closed(directory, repair_error)?;
-        Ok(true)
-    }
-}
 
 // macOS repair deliberately retains a surface that may outlive its owner. That
 // cleanup obligation must not turn a known process exit into a request timeout.
@@ -6023,4 +5400,97 @@ fn sanitize_title(value: &str) -> Result<String> {
         bail!("--title cannot be empty");
     }
     Ok(title)
+}
+
+// Platform identity checks remain outside the session records layer.
+fn owner_blocks_prune(owner: &NativeSessionOwner) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        let Some(identity) = &owner.windows_process_identity else {
+            return Ok(true);
+        };
+        if !process_is_alive(owner.pid) {
+            return Ok(false);
+        }
+        match terminal::windows_process_identity(owner.pid) {
+            Ok(live) => Ok(&live == identity),
+            Err(_) => Ok(true),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if !process_is_alive(owner.pid) {
+            return Ok(false);
+        }
+        let (Some(seconds), Some(microseconds)) = (
+            owner.process_start_seconds,
+            owner.process_start_microseconds,
+        ) else {
+            return Ok(true);
+        };
+        match live_native_process_identity(owner.pid) {
+            Ok(live) => Ok(live.process_start_seconds == seconds
+                && live.process_start_microseconds == microseconds),
+            Err(_) => Ok(true),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        Ok(process_is_alive(owner.pid))
+    }
+}
+
+fn repair_owner_is_live(owner: &NativeSessionOwner) -> Result<bool> {
+    #[cfg(windows)]
+    match &owner.windows_process_identity {
+        Some(identity) => {
+            if terminal::verify_windows_process_identity(owner.pid, identity).is_ok() {
+                return Ok(true);
+            }
+        }
+        // Pre-identity (v0.0.2) Windows owner records carry only a PID. Their identity is
+        // unknown, not dead: while the PID is alive the session is left alone and inspect
+        // reports `identity_matches: null`; only a dead PID lets repair proceed.
+        None => {
+            if process_is_alive(owner.pid) {
+                return Ok(true);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if mac_native_owner_is_live(owner)? {
+        return Ok(true);
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    if process_is_alive(owner.pid) {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn retained_surface_outlives_owner(session: &terminal::TerminalSession) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        surface_outlives_owner(session.kind)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = session;
+        false
+    }
+}
+
+fn close_dead_owner_surface(session: &terminal::TerminalSession) -> Result<terminal::CloseOutcome> {
+    close_dead_owner_surface_with(session, terminal::close_session)
+}
+
+fn close_dead_owner_surface_with(
+    session: &terminal::TerminalSession,
+    mut closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
+) -> Result<terminal::CloseOutcome> {
+    #[cfg(windows)]
+    if session.kind != terminal::TerminalKind::WindowsConsole {
+        bail!("dead Windows native owner has a non-Windows terminal handle")
+    }
+    closer(session)
 }

@@ -18,6 +18,7 @@ use std::{
 };
 #[cfg(target_os = "macos")]
 mod adapter;
+pub(in crate::native) mod close;
 mod names;
 pub(in crate::native) mod requests;
 pub(in crate::native) mod turn;
@@ -559,7 +560,7 @@ impl Store {
     /// Publish an accepted completion before repairing its session's dead owner.
     pub(in crate::native) fn converge(&self) -> Result<()> {
         turn::recover_pending_completion(self.directory())?;
-        super::repair_dead_native_owner(self.directory())?;
+        close::repair_dead_owner(self)?;
         Ok(())
     }
 }

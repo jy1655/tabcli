@@ -7,8 +7,9 @@ pub(in crate::native) const CLOSED_STATUS_FILE: &str = "closed.json";
 pub(in crate::native) const TERMINAL_HANDLE_FILE: &str = "terminal.json";
 pub(in crate::native) const TERMINAL_CLOSING_FILE: &str = "terminal.closing.json";
 pub(in crate::native) const TERMINAL_TOMBSTONE_FILE: &str = "terminal.closed.json";
-// An explicit Terminal.app or Warp close writes it after verifying the live owner
-// and surface, before teardown/close; see `terminal_close_intent_owner`.
+// An explicit close of a surface whose owner must be verified first writes it after
+// verifying the live owner and surface, before teardown/close; see
+// `terminal_close_intent_owner`.
 #[cfg(target_os = "macos")]
 pub(in crate::native) const TERMINAL_CLOSE_INTENT_FILE: &str = "terminal.close-intent.json";
 // v0.0.2 native-Windows Claude sessions may still carry these files. New sessions never

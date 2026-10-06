@@ -824,7 +824,11 @@ pub(in crate::native) fn recover_pending_completion_locked(
         .path()
         .to_owned();
     if let Some(tombstone) = Reader::open_unchecked(directory).closed_if_present()? {
-        return converge_interrupted_close_locked(directory, claim_path, &tombstone);
+        return super::close::converge_interrupted(
+            &Store::open_unchecked(directory),
+            claim_path,
+            &tombstone,
+        );
     }
     let Some(text) = session::RecordReader::at(&completion_path).text()? else {
         return Ok(false);

@@ -1,3 +1,4 @@
+use super::session::close::compatibility::*;
 use super::*;
 use agent_bridge::FirstPartyCli;
 use std::process::Command;
@@ -1119,46 +1120,6 @@ fn explicit_close_remains_available_with_a_corrupt_completion_journal() {
 }
 
 #[test]
-fn explicit_close_consumes_the_handle_and_repeated_close_skips_the_adapter() {
-    let directory = tempfile::tempdir().unwrap();
-    fs::create_dir(directory.path().join("events")).unwrap();
-    write_json_atomic(
-        &directory.path().join("terminal.json"),
-        &terminal::TerminalSession {
-            kind: terminal::TerminalKind::Iterm2,
-            id: "missing-iterm-session".to_owned(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        },
-    )
-    .unwrap();
-    update_status(directory.path(), SessionState::Working, None, None).unwrap();
-    let claim = acquire_turn_claim(directory.path()).unwrap();
-    claim.retain();
-    let mut close_calls = 0;
-
-    for _ in 0..2 {
-        close_session_state(directory.path(), |session| {
-            assert_eq!(session.kind, terminal::TerminalKind::Iterm2);
-            assert_eq!(session.id, "missing-iterm-session");
-            close_calls += 1;
-            Ok(terminal::CloseOutcome::Missing)
-        })
-        .unwrap();
-    }
-
-    assert_eq!(close_calls, 1);
-    assert!(!directory.path().join("terminal.json").exists());
-    assert!(directory.path().join("terminal.closed.json").exists());
-    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
-    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
-    assert_eq!(status.state.as_str(), "closed");
-}
-
-#[test]
 fn explicit_close_restores_the_terminal_handle_after_adapter_failure() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
@@ -1243,45 +1204,6 @@ fn concurrent_close_requests_share_one_terminal_handle_claim() {
     first.join().unwrap().unwrap();
 
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(
-        read_json::<SessionStatus>(&directory.path().join("status.json"))
-            .unwrap()
-            .state
-            .as_str(),
-        "closed"
-    );
-}
-
-#[test]
-fn interrupted_terminal_close_resumes_from_the_claimed_handle() {
-    let directory = tempfile::tempdir().unwrap();
-    fs::create_dir(directory.path().join("events")).unwrap();
-    write_json_atomic(
-        &directory.path().join(TERMINAL_CLOSING_FILE),
-        &terminal::TerminalSession {
-            kind: terminal::TerminalKind::Iterm2,
-            id: "interrupted-close".to_owned(),
-            tab_id: None,
-            window_id: None,
-            managed_session_id: None,
-            wezterm_mux: None,
-            windows_process_identity: None,
-        },
-    )
-    .unwrap();
-    update_status(directory.path(), SessionState::Working, None, None).unwrap();
-    let mut calls = 0;
-
-    close_session_state(directory.path(), |session| {
-        calls += 1;
-        assert_eq!(session.id, "interrupted-close");
-        Ok(terminal::CloseOutcome::Closed)
-    })
-    .unwrap();
-
-    assert_eq!(calls, 1);
-    assert!(!directory.path().join(TERMINAL_CLOSING_FILE).exists());
-    assert!(directory.path().join(TERMINAL_TOMBSTONE_FILE).exists());
     assert_eq!(
         read_json::<SessionStatus>(&directory.path().join("status.json"))
             .unwrap()
@@ -11917,4 +11839,93 @@ fn attested_terminal_absence_does_not_accept_another_app_instances_reply() {
         0,
         "no app is queried when its address is ambiguous"
     );
+}
+
+// An explicit close after a failed startup whose wrapper recorded itself and ended.
+// A surface with an app-unique native id (an iTerm2 session, a Windows console) is
+// still closed by that id. A macOS surface that can outlive its owner is not: a
+// failed launch is no close intent, and an owner record without the whole identity
+// does not even allow the observation that could prove the surface gone.
+// Close authority is terminal-kind policy, so this test lives at the native boundary and
+// not in `session::launch`, which must know nothing about terminal kinds.
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn explicit_close_recovers_a_failed_startup_only_through_a_stable_native_id() {
+    // The launch fixture: a launching session whose claim the launcher retains and whose
+    // launch receipt `begin` wrote, as in `session::launch`'s own tests.
+    let directory = tempfile::Builder::new()
+        .prefix("session-")
+        .tempdir()
+        .unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), SessionState::Launching, None, None).unwrap();
+    let claim = acquire_turn_claim(directory.path()).unwrap();
+    let token = claim.token().to_owned();
+    claim.retain();
+    launch::begin(
+        &Store::open_unchecked(directory.path()),
+        &token,
+        Instant::now() + Duration::from_secs(30),
+    )
+    .unwrap();
+    let id = directory.path().file_name().unwrap().to_str().unwrap();
+    let mut record = launch::read(&Reader::open_unchecked(directory.path()))
+        .unwrap()
+        .unwrap();
+    record.phase = launch::Phase::Spawning;
+    write_json_atomic(&directory.path().join(launch::FILE), &record).unwrap();
+    update_status(
+        directory.path(),
+        SessionState::Failed,
+        None,
+        Some("spawn uncertain".to_owned()),
+    )
+    .unwrap();
+    write_json_atomic(
+        &directory.path().join(SESSION_OWNER_FILE),
+        &NativeSessionOwner {
+            pid: u32::MAX,
+            managed_session_id: Some(id.to_owned()),
+            ..NativeSessionOwner::default()
+        },
+    )
+    .unwrap();
+    let authority = |kind, managed_session_id: &str| {
+        verify_terminal_close_authority_with_observations(
+            directory.path(),
+            id,
+            &terminal::TerminalSession {
+                kind,
+                id: "missing-owned-surface".to_owned(),
+                managed_session_id: Some(managed_session_id.to_owned()),
+                tab_id: None,
+                window_id: None,
+                wezterm_mux: None,
+                windows_process_identity: None,
+            },
+            || panic!("an unproven owner allows no surface observation"),
+            |_| panic!("no app incarnation is recorded"),
+            || panic!("no app incarnation is recorded"),
+        )
+    };
+    assert_eq!(
+        authority(terminal::TerminalKind::Iterm2, id).unwrap(),
+        TerminalCloseAuthority::SurfaceOnly
+    );
+    assert!(authority(terminal::TerminalKind::Iterm2, "session-foreign").is_err());
+    #[cfg(target_os = "macos")]
+    for kind in [
+        terminal::TerminalKind::AppleTerminal,
+        terminal::TerminalKind::Warp,
+        terminal::TerminalKind::WezTerm,
+    ] {
+        let error = authority(kind, id).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no terminal observation or close was sent"),
+            "{kind:?}: {error:#}"
+        );
+    }
+    assert!(directory.path().join(TURN_CLAIM_FILE).exists());
 }
