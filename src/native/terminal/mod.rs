@@ -1,3 +1,5 @@
+pub(in crate::native) mod ownership;
+
 use std::{path::Path, str::FromStr, time::Instant};
 
 #[cfg(not(target_os = "macos"))]

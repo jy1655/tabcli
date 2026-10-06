@@ -1,5 +1,7 @@
 use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, Reader, RecordStore};
+#[cfg(test)]
+use crate::native::terminal::ownership;
 // Native Ghostty scripting (installed dictionary; pinned upstream v1.3.1).
 // Creation runs only the launch host in a clean shell, never Bridge/provider input and
 // never a typed shell line: a key typed into the new surface must not edit the launch.
@@ -1777,7 +1779,7 @@ mod tests {
         }
         let directory = PathBuf::from(std::env::var_os("AB_GHOSTTY_PROBE_DIR").unwrap());
         let id = directory.file_name().unwrap().to_str().unwrap();
-        let owner = crate::native::current_native_session_owner(id).unwrap();
+        let owner = ownership::current_native_session_owner(id).unwrap();
         let mut queued: libc::c_int = -1;
         assert_eq!(unsafe { libc::ioctl(0, libc::FIONREAD, &mut queued) }, 0);
         crate::native::write_json_atomic(

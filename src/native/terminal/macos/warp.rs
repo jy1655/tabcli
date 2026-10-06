@@ -1,4 +1,7 @@
+use super::process;
 use crate::native::session::{Reader, RecordReader, RecordStore};
+#[cfg(test)]
+use crate::native::terminal::ownership;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
@@ -306,7 +309,7 @@ struct ProcessRunner;
 
 impl WarpRunner for ProcessRunner {
     fn process_birth(&mut self, pid: u32) -> Result<Option<(u64, u64)>> {
-        crate::native::macos_process_start(pid)
+        process::macos_process_start(pid)
     }
 
     fn control(
@@ -3486,7 +3489,7 @@ mod tests {
                 std::process::exit(7);
             }
         } else {
-            let result = crate::native::current_native_session_owner("session-warp-r2-probe");
+            let result = ownership::current_native_session_owner("session-warp-r2-probe");
             let value = match result {
                 Ok(owner) => json!({"ok": true, "pid": owner.pid, "group": owner.process_group}),
                 Err(error) => json!({"ok": false, "error": format!("{error:#}")}),
@@ -3843,7 +3846,7 @@ mod tests {
         fn process_birth(&mut self, pid: u32) -> Result<Option<(u64, u64)>> {
             match self.injected_birth {
                 Some(birth) => Ok(birth),
-                None => crate::native::macos_process_start(pid),
+                None => process::macos_process_start(pid),
             }
         }
         fn control(
@@ -3872,12 +3875,12 @@ mod tests {
         let (temp, client, attempt) = fixture();
         let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
         let pid = child.id();
-        let birth_result = crate::native::macos_process_start(pid);
+        let birth_result = process::macos_process_start(pid);
         child.kill().unwrap();
         child.wait().unwrap();
         let birth = birth_result.unwrap().expect("owned probe alive");
         assert_eq!(
-            crate::native::macos_process_start(pid).unwrap(),
+            process::macos_process_start(pid).unwrap(),
             None,
             "owned probe death must be verified independently"
         );

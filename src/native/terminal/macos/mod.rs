@@ -1,3 +1,5 @@
+pub(in crate::native) mod process;
+
 use std::{
     env,
     path::Path,

@@ -15,6 +15,23 @@ use session::*;
 mod settings;
 mod terminal;
 
+#[cfg(all(target_os = "macos", test))]
+use terminal::macos::process::macos_process_info;
+#[cfg(target_os = "macos")]
+use terminal::macos::process::{
+    live_native_process_identity, macos_process_path, macos_process_records, macos_process_start,
+    macos_processes_named, terminal_tty_device,
+};
+use terminal::ownership::MacTerminalAppIdentity;
+#[cfg(test)]
+use terminal::ownership::verify_terminal_owner_attestation;
+#[cfg(any(target_os = "macos", test))]
+use terminal::ownership::{
+    MacTerminalShellIdentity, NativeProcessIdentity, native_owner_identity_matches,
+    verified_terminal_owner_process_group, verified_terminal_shell_process_group,
+};
+use terminal::ownership::{NativeSessionOwner, current_native_session_owner};
+
 use provider_process::{
     command as provider_process_command, version_command as provider_version_command,
 };
@@ -233,133 +250,6 @@ struct ReopenMarker {
     #[serde(default)]
     reopened_by: Option<String>,
     created_unix_ms: u128,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-struct NativeSessionOwner {
-    pid: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    managed_session_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    terminal_tty: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    terminal_tty_device: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    process_start_seconds: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    process_start_microseconds: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    process_group: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    terminal_process_group: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    terminal_shell: Option<MacTerminalShellIdentity>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    terminal_app: Option<MacTerminalAppIdentity>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    windows_process_identity: Option<terminal::WindowsProcessIdentity>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct MacTerminalShellIdentity {
-    pid: u32,
-    process_group: u32,
-    terminal_tty_device: u64,
-    process_start_seconds: u64,
-    process_start_microseconds: u64,
-}
-
-// Captured from the verified native owner's ancestor chain before provider start.
-// A Terminal window id and tty are identities only inside this app incarnation.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-struct MacTerminalAppIdentity {
-    pid: u32,
-    start_seconds: u64,
-    start_microseconds: u64,
-}
-
-#[cfg(any(target_os = "macos", test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct NativeProcessIdentity {
-    pid: u32,
-    parent_pid: u32,
-    terminal_tty_device: u64,
-    process_group: u32,
-    terminal_process_group: u32,
-    process_start_seconds: u64,
-    process_start_microseconds: u64,
-}
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct MacProcBsdInfo {
-    _flags: u32,
-    _status: u32,
-    _exit_status: u32,
-    pid: u32,
-    parent_pid: u32,
-    _uid: u32,
-    _gid: u32,
-    _real_uid: u32,
-    _real_gid: u32,
-    _saved_uid: u32,
-    _saved_gid: u32,
-    _reserved: u32,
-    _command: [libc::c_char; 16],
-    _name: [libc::c_char; 32],
-    _open_files: u32,
-    process_group: u32,
-    _job_control_count: u32,
-    terminal_tty_device: u32,
-    terminal_process_group: u32,
-    _nice: i32,
-    process_start_seconds: u64,
-    process_start_microseconds: u64,
-}
-
-// `struct kinfo_proc` of <sys/sysctl.h> on 64-bit macOS, which libc does not define: the
-// start time, the PID, the command name and the parent PID at their offsets (0, 8, 40, 243
-// and 560 of 648 bytes), the rest as padding.
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct MacKinfoProc {
-    start_seconds: i64,
-    start_microseconds: i32,
-    _to_pid: [u8; 28],
-    pid: i32,
-    _to_command: [u8; 199],
-    command: [u8; 17],
-    _to_parent: [u8; 300],
-    parent_pid: i32,
-    _rest: [u8; 84],
-}
-
-#[cfg(target_os = "macos")]
-const _: () = assert!(std::mem::size_of::<MacKinfoProc>() == 648);
-
-#[cfg(target_os = "macos")]
-impl MacKinfoProc {
-    fn identity(&self) -> Result<MacTerminalAppIdentity> {
-        Ok(MacTerminalAppIdentity {
-            pid: u32::try_from(self.pid)?,
-            start_seconds: u64::try_from(self.start_seconds)?,
-            start_microseconds: u64::try_from(self.start_microseconds)?,
-        })
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[link(name = "proc")]
-unsafe extern "C" {
-    fn proc_pidinfo(
-        pid: libc::c_int,
-        flavor: libc::c_int,
-        arg: u64,
-        buffer: *mut libc::c_void,
-        buffer_size: libc::c_int,
-    ) -> libc::c_int;
-    fn proc_pidpath(pid: libc::c_int, buffer: *mut libc::c_void, buffer_size: u32) -> libc::c_int;
 }
 
 struct CreatedSession {
@@ -2982,279 +2872,6 @@ fn record_legacy_terminal_app(
     Ok(())
 }
 
-#[cfg(test)]
-fn verify_terminal_owner_attestation(
-    expected_session_id: &str,
-    session: &terminal::TerminalSession,
-    owner: &NativeSessionOwner,
-    live: &NativeProcessIdentity,
-    surface_tty_device: u64,
-) -> Result<()> {
-    if session.kind != terminal::TerminalKind::AppleTerminal {
-        bail!("native-session TTY attestation is only valid for Terminal.app")
-    }
-    session.verify_managed_session(expected_session_id)?;
-    if session.window_id.as_deref().is_none_or(str::is_empty) {
-        bail!("Terminal.app session record is missing its dedicated window id")
-    }
-    if owner.managed_session_id.as_deref() != Some(expected_session_id) {
-        bail!("native-session owner is not bound to this managed session")
-    }
-    if owner.terminal_tty.as_deref() != Some(session.id.as_str()) {
-        bail!("native-session owner is attached to a different terminal TTY")
-    }
-    if owner.pid != live.pid {
-        bail!("native-session owner PID no longer identifies the live process")
-    }
-    let owner_tty_device = owner
-        .terminal_tty_device
-        .context("native-session owner is missing its controlling TTY device")?;
-    if owner_tty_device != live.terminal_tty_device || owner_tty_device != surface_tty_device {
-        bail!("Terminal.app TTY no longer belongs to the native-session owner")
-    }
-    let owner_start_seconds = owner
-        .process_start_seconds
-        .context("native-session owner is missing its process start time")?;
-    let owner_start_microseconds = owner
-        .process_start_microseconds
-        .context("native-session owner is missing its process start time")?;
-    if owner_start_seconds != live.process_start_seconds
-        || owner_start_microseconds != live.process_start_microseconds
-    {
-        bail!("native-session owner PID was reused by another process")
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn current_native_session_owner(session_id: &str) -> Result<NativeSessionOwner> {
-    let pid = std::process::id();
-    let live = live_native_process_identity(pid)?;
-    let terminal_tty = current_terminal_tty()?;
-    let terminal_tty_device = terminal_tty_device(Path::new(&terminal_tty))?;
-    if live.terminal_tty_device != terminal_tty_device {
-        bail!("native-session process is not attached to its reported terminal TTY")
-    }
-    let live_shell = live_native_process_identity(live.parent_pid)?;
-    let terminal_shell = MacTerminalShellIdentity {
-        pid: live_shell.pid,
-        process_group: live_shell.process_group,
-        terminal_tty_device: live_shell.terminal_tty_device,
-        process_start_seconds: live_shell.process_start_seconds,
-        process_start_microseconds: live_shell.process_start_microseconds,
-    };
-    let owner = NativeSessionOwner {
-        pid,
-        managed_session_id: Some(session_id.to_owned()),
-        terminal_tty: Some(terminal_tty),
-        terminal_tty_device: Some(terminal_tty_device),
-        process_start_seconds: Some(live.process_start_seconds),
-        process_start_microseconds: Some(live.process_start_microseconds),
-        process_group: Some(live.process_group),
-        terminal_process_group: Some(live.terminal_process_group),
-        terminal_shell: Some(terminal_shell),
-        terminal_app: None,
-        windows_process_identity: None,
-    };
-    verified_terminal_owner_process_group(&owner, &live)?;
-    verified_terminal_shell_process_group(&owner, &live, &live_shell)?;
-    Ok(owner)
-}
-
-#[cfg(windows)]
-fn current_native_session_owner(session_id: &str) -> Result<NativeSessionOwner> {
-    let pid = std::process::id();
-    Ok(NativeSessionOwner {
-        pid,
-        managed_session_id: Some(session_id.to_owned()),
-        windows_process_identity: Some(terminal::windows_process_identity(pid)?),
-        ..NativeSessionOwner::default()
-    })
-}
-
-#[cfg(not(any(target_os = "macos", windows)))]
-fn current_native_session_owner(session_id: &str) -> Result<NativeSessionOwner> {
-    Ok(NativeSessionOwner {
-        pid: std::process::id(),
-        managed_session_id: Some(session_id.to_owned()),
-        ..NativeSessionOwner::default()
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn current_terminal_tty() -> Result<String> {
-    let mut buffer = [0 as libc::c_char; libc::PATH_MAX as usize];
-    let error = unsafe { libc::ttyname_r(libc::STDIN_FILENO, buffer.as_mut_ptr(), buffer.len()) };
-    if error != 0 {
-        return Err(std::io::Error::from_raw_os_error(error))
-            .context("failed to resolve native-session controlling TTY");
-    }
-    let tty = unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) }
-        .to_str()
-        .context("native-session controlling TTY is not valid UTF-8")?;
-    Ok(tty.to_owned())
-}
-
-#[cfg(target_os = "macos")]
-fn terminal_tty_device(path: &Path) -> Result<u64> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("failed to inspect terminal TTY {}", path.display()))?;
-    if !metadata.file_type().is_char_device() {
-        bail!("terminal TTY is not a character device: {}", path.display())
-    }
-    Ok(metadata.rdev())
-}
-
-#[cfg(target_os = "macos")]
-fn live_native_process_identity(pid: u32) -> Result<NativeProcessIdentity> {
-    const PROC_PIDTBSDINFO: libc::c_int = 3;
-
-    let pid_value = libc::c_int::try_from(pid).context("native-session PID is out of range")?;
-    let buffer_size = libc::c_int::try_from(std::mem::size_of::<MacProcBsdInfo>())
-        .context("macOS process-info structure is too large")?;
-    let mut info = std::mem::MaybeUninit::<MacProcBsdInfo>::zeroed();
-    let returned = unsafe {
-        proc_pidinfo(
-            pid_value,
-            PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            buffer_size,
-        )
-    };
-    if returned != buffer_size {
-        if returned <= 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("failed to inspect native-session process {pid}"));
-        }
-        bail!("macOS returned an incomplete identity for native-session process {pid}")
-    }
-    let info = unsafe { info.assume_init() };
-    if info.pid != pid {
-        bail!("macOS returned the wrong native-session process identity")
-    }
-    if info.terminal_tty_device == u32::MAX {
-        bail!("native-session process has no controlling TTY")
-    }
-    Ok(NativeProcessIdentity {
-        pid,
-        parent_pid: info.parent_pid,
-        terminal_tty_device: u64::from(info.terminal_tty_device),
-        process_group: info.process_group,
-        terminal_process_group: info.terminal_process_group,
-        process_start_seconds: info.process_start_seconds,
-        process_start_microseconds: info.process_start_microseconds,
-    })
-}
-
-// The birth of any process, with or without a controlling TTY. `None`: no such process.
-#[cfg(target_os = "macos")]
-fn macos_process_start(pid: u32) -> Result<Option<(u64, u64)>> {
-    Ok(macos_process_info(pid)?
-        .map(|info| (info.process_start_seconds, info.process_start_microseconds)))
-}
-
-#[cfg(target_os = "macos")]
-fn macos_process_info(pid: u32) -> Result<Option<MacProcBsdInfo>> {
-    const PROC_PIDTBSDINFO: libc::c_int = 3;
-
-    let pid_value = libc::c_int::try_from(pid).context("PID is out of range")?;
-    let buffer_size = libc::c_int::try_from(std::mem::size_of::<MacProcBsdInfo>())
-        .context("macOS process-info structure is too large")?;
-    let mut info = std::mem::MaybeUninit::<MacProcBsdInfo>::zeroed();
-    let returned = unsafe {
-        proc_pidinfo(
-            pid_value,
-            PROC_PIDTBSDINFO,
-            0,
-            info.as_mut_ptr().cast(),
-            buffer_size,
-        )
-    };
-    if returned != buffer_size {
-        let error = std::io::Error::last_os_error();
-        if returned <= 0 && error.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(None);
-        }
-        return Err(error).with_context(|| format!("failed to inspect process {pid}"));
-    }
-    let info = unsafe { info.assume_init() };
-    if info.pid != pid {
-        bail!("macOS returned the identity of another process for {pid}")
-    }
-    Ok(Some(info))
-}
-
-// The kernel's process records for one sysctl name, as `ps` reads them. They answer for
-// the processes of every user. PROC_PIDTBSDINFO answers only for the caller's own, and
-// the shell of a terminal tab is a child of the root-owned /usr/bin/login.
-#[cfg(target_os = "macos")]
-fn macos_process_records(name: &mut [libc::c_int]) -> Result<Vec<MacKinfoProc>> {
-    let record = std::mem::size_of::<MacKinfoProc>();
-    let length = libc::c_uint::try_from(name.len())?;
-    let mut size = 0;
-    let sized = unsafe {
-        libc::sysctl(
-            name.as_mut_ptr(),
-            length,
-            std::ptr::null_mut(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if sized != 0 {
-        return Err(std::io::Error::last_os_error()).context("failed to size the process table");
-    }
-    // Room for processes that start between the two calls. A table that grew past it is
-    // an error of the second call, never a short list.
-    let mut records = vec![unsafe { std::mem::zeroed::<MacKinfoProc>() }; size / record + 64];
-    let mut size = records.len() * record;
-    let read = unsafe {
-        libc::sysctl(
-            name.as_mut_ptr(),
-            length,
-            records.as_mut_ptr().cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if read != 0 {
-        return Err(std::io::Error::last_os_error()).context("failed to read the process table");
-    }
-    if !size.is_multiple_of(record) {
-        bail!("macOS returned an incomplete process record")
-    }
-    records.truncate(size / record);
-    Ok(records)
-}
-
-// The executable of a process of any user. `None`: no such process.
-#[cfg(target_os = "macos")]
-fn macos_process_path(pid: u32) -> Result<Option<String>> {
-    let mut path = [0u8; 4096];
-    let count =
-        unsafe { proc_pidpath(pid.try_into()?, path.as_mut_ptr().cast(), path.len() as u32) };
-    if count <= 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(None);
-        }
-        return Err(error).with_context(|| format!("could not read the executable of {pid}"));
-    }
-    let bytes = path
-        .get(..usize::try_from(count)?)
-        .context("incomplete executable path")?;
-    Ok(Some(
-        std::str::from_utf8(bytes)?
-            .trim_end_matches('\0')
-            .to_owned(),
-    ))
-}
-
 // One ancestor of the terminal shell: its incarnation, its parent and its executable.
 #[cfg(target_os = "macos")]
 fn terminal_app_ancestor(pid: u32) -> Result<(MacTerminalAppIdentity, u32, String)> {
@@ -3276,20 +2893,6 @@ fn terminal_app_ancestor(pid: u32) -> Result<(MacTerminalAppIdentity, u32, Strin
     let path = macos_process_path(pid)?
         .with_context(|| format!("Terminal.app ancestor {pid} ended during attestation"))?;
     Ok((identity, u32::try_from(record.parent_pid)?, path))
-}
-
-// Every running process with this command name, in PID order, each with its birth. The
-// command name is the executable's, whichever bundle it runs from and whoever owns it.
-#[cfg(target_os = "macos")]
-fn macos_processes_named(command: &[u8]) -> Result<Vec<MacTerminalAppIdentity>> {
-    let mut name = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
-    let mut processes = macos_process_records(&mut name)?
-        .iter()
-        .filter(|record| record.command.split(|byte| *byte == 0).next() == Some(command))
-        .map(MacKinfoProc::identity)
-        .collect::<Result<Vec<_>>>()?;
-    processes.sort_by_key(|process| process.pid);
-    Ok(processes)
 }
 
 // Every running process that `application "Terminal"` can be.
@@ -3505,36 +3108,6 @@ fn apple_terminal_startup_absent_with(
     )
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn native_owner_identity_matches(owner: &NativeSessionOwner, live: &NativeProcessIdentity) -> bool {
-    if owner.pid != live.pid {
-        return false;
-    }
-    match (
-        owner.terminal_tty_device,
-        owner.process_start_seconds,
-        owner.process_start_microseconds,
-        owner.process_group,
-        owner.terminal_process_group,
-    ) {
-        (None, None, None, None, None) => true,
-        (
-            Some(terminal_tty_device),
-            Some(process_start_seconds),
-            Some(process_start_microseconds),
-            Some(process_group),
-            Some(terminal_process_group),
-        ) => {
-            terminal_tty_device == live.terminal_tty_device
-                && process_start_seconds == live.process_start_seconds
-                && process_start_microseconds == live.process_start_microseconds
-                && process_group == live.process_group
-                && terminal_process_group == live.terminal_process_group
-        }
-        _ => false,
-    }
-}
-
 #[cfg(target_os = "macos")]
 fn mac_native_owner_is_live(owner: &NativeSessionOwner) -> Result<bool> {
     if matches!(
@@ -3561,63 +3134,6 @@ fn mac_native_owner_is_live(owner: &NativeSessionOwner) -> Result<bool> {
         }),
         Err(_) => Ok(false),
     }
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn verified_terminal_owner_process_group(
-    owner: &NativeSessionOwner,
-    live: &NativeProcessIdentity,
-) -> Result<u32> {
-    if owner.pid != live.pid {
-        bail!("native-session process group no longer belongs to the recorded owner")
-    }
-    match (owner.process_group, owner.terminal_process_group) {
-        (Some(process_group), Some(terminal_process_group)) => {
-            if process_group != live.process_group
-                || terminal_process_group != live.terminal_process_group
-            {
-                bail!("native-session process group identity changed")
-            }
-        }
-        (None, None) => {}
-        _ => bail!("native-session owner has an incomplete process group identity"),
-    }
-    let process_group = live.process_group;
-    let terminal_process_group = live.terminal_process_group;
-    if process_group != owner.pid || terminal_process_group != process_group {
-        bail!("native-session owner does not lead the terminal foreground process group")
-    }
-    Ok(process_group)
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn verified_terminal_shell_process_group(
-    owner: &NativeSessionOwner,
-    live_owner: &NativeProcessIdentity,
-    live_shell: &NativeProcessIdentity,
-) -> Result<u32> {
-    if owner.pid != live_owner.pid || live_owner.parent_pid != live_shell.pid {
-        bail!("Terminal.app shell no longer owns the native-session process")
-    }
-    if live_shell.terminal_tty_device != live_owner.terminal_tty_device {
-        bail!("Terminal.app shell is attached to a different TTY")
-    }
-    if live_shell.process_group != live_shell.pid
-        || live_shell.terminal_process_group != live_owner.process_group
-        || live_shell.process_group == live_owner.process_group
-    {
-        bail!("Terminal.app shell does not own the expected foreground job")
-    }
-    if let Some(recorded) = &owner.terminal_shell
-        && (recorded.pid != live_shell.pid
-            || recorded.process_group != live_shell.process_group
-            || recorded.terminal_tty_device != live_shell.terminal_tty_device
-            || recorded.process_start_seconds != live_shell.process_start_seconds
-            || recorded.process_start_microseconds != live_shell.process_start_microseconds)
-    {
-        bail!("Terminal.app shell identity changed")
-    }
-    Ok(live_shell.process_group)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

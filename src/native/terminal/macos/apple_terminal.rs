@@ -1,5 +1,7 @@
+use super::process;
 use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, Reader, RecordStore, Store};
+use crate::native::terminal::ownership;
 use std::{
     os::unix::fs::MetadataExt,
     path::Path,
@@ -353,9 +355,9 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
 fn release_start(directory: &Path, id: &str) -> Result<String> {
     // The binding names the tab by its tty, and the flush below must be this tab's:
     // standard input has to be the controlling terminal of this process.
-    let tty = crate::native::current_terminal_tty()?;
-    let live = crate::native::live_native_process_identity(std::process::id())?;
-    if live.terminal_tty_device != crate::native::terminal_tty_device(Path::new(&tty))? {
+    let tty = process::current_terminal_tty()?;
+    let live = process::live_native_process_identity(std::process::id())?;
+    if live.terminal_tty_device != process::terminal_tty_device(Path::new(&tty))? {
         bail!("Terminal.app launch host is not attached to the tty of its standard input");
     }
     wait_for_binding(directory, id, &tty)?;
@@ -522,12 +524,12 @@ fn close_session_with_deadline(
 
 pub(in crate::native) fn close_attested_session(
     session: &TerminalSession,
-    app: &crate::native::MacTerminalAppIdentity,
+    app: &ownership::MacTerminalAppIdentity,
 ) -> Result<CloseOutcome> {
     close_attested_session_with(
         session,
         app,
-        crate::native::macos_process_start,
+        process::macos_process_start,
         crate::native::terminal_app_instances,
         |script, arguments| run_terminal_automation(script, arguments, None),
     )
@@ -535,9 +537,9 @@ pub(in crate::native) fn close_attested_session(
 
 fn close_attested_session_with(
     session: &TerminalSession,
-    app: &crate::native::MacTerminalAppIdentity,
+    app: &ownership::MacTerminalAppIdentity,
     mut process_birth: impl FnMut(u32) -> Result<Option<(u64, u64)>>,
-    mut instances: impl FnMut() -> Result<Vec<crate::native::MacTerminalAppIdentity>>,
+    mut instances: impl FnMut() -> Result<Vec<ownership::MacTerminalAppIdentity>>,
     mut run: impl FnMut(&str, &[&str]) -> Result<String>,
 ) -> Result<CloseOutcome> {
     // Recheck before every transaction, including retries; a restarted app must
@@ -611,7 +613,7 @@ fn ownership_proof(session: &TerminalSession) -> Result<&str> {
 // `osascript`, and nothing talks to Terminal.
 #[cfg(test)]
 mod tests {
-    use super::{CLOSE_TAB_SCRIPT, VERIFY_TAB_SCRIPT, WAIT_FOR_CLOSE_SCRIPT};
+    use super::{CLOSE_TAB_SCRIPT, VERIFY_TAB_SCRIPT, WAIT_FOR_CLOSE_SCRIPT, ownership};
     use crate::native::session::SessionState;
 
     const WINDOW: &str = "8341";
@@ -652,7 +654,7 @@ mod tests {
     #[test]
     fn attested_close_rechecks_app_before_every_transaction() {
         let session = session();
-        let app = crate::native::MacTerminalAppIdentity {
+        let app = ownership::MacTerminalAppIdentity {
             pid: 1234,
             start_seconds: 100,
             start_microseconds: 42,
@@ -1674,7 +1676,7 @@ end run
         // tab, which fails unless the tab's shell is its parent and it leads a
         // foreground group of its own.
         let id = directory.file_name().unwrap().to_str().unwrap();
-        let owner = crate::native::current_native_session_owner(id).unwrap();
+        let owner = ownership::current_native_session_owner(id).unwrap();
         let shell = owner.terminal_shell.unwrap();
         crate::native::write_json_atomic(
             &directory.join("owner-probe.json"),

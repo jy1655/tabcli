@@ -1,5 +1,8 @@
+use super::process;
 use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, Reader, Store};
+#[cfg(test)]
+use crate::native::terminal::ownership;
 // WezTerm through its official CLI (pinned source: 20240203-110809-5046fc22).
 // Default: discover protected gui-sock-<pid> sockets in the macOS runtime directory,
 // verify the socket peer, installed GUI executable and process birth, then use a
@@ -182,7 +185,7 @@ impl Host for Installed {
         let mut child = command.spawn().context("failed to start WezTerm")?;
         let pid = child.id();
         // The birth is read while the child is not reaped, so the pid is still its own.
-        let (start_seconds, start_microseconds) = match crate::native::macos_process_start(pid) {
+        let (start_seconds, start_microseconds) = match process::macos_process_start(pid) {
             Ok(Some(birth)) => birth,
             failed => {
                 let _ = child.kill();
@@ -250,7 +253,7 @@ impl Host for Installed {
     }
 
     fn process_start(&self, pid: u32) -> Result<Option<(u64, u64)>> {
-        crate::native::macos_process_start(pid)
+        process::macos_process_start(pid)
     }
 
     fn terminate(&self, pid: u32) -> Result<()> {
@@ -335,7 +338,7 @@ fn safe_socket_path(path: &Path) -> Result<()> {
 fn verify_gui_executable(pid: u32, home: &str) -> Result<()> {
     let mut buffer = [0u8; 4096];
     let count = unsafe {
-        crate::native::proc_pidpath(
+        process::proc_pidpath(
             pid.try_into()?,
             buffer.as_mut_ptr().cast(),
             buffer.len() as u32,
@@ -2416,7 +2419,7 @@ mod tests {
             // The wrapper records itself as the leader of the foreground job of its shell;
             // this fails in a shell that does not run it as a job of its own.
             let id = directory.file_name().unwrap().to_str().unwrap();
-            let owner = crate::native::current_native_session_owner(id).unwrap();
+            let owner = ownership::current_native_session_owner(id).unwrap();
             let mut queued: libc::c_int = -1;
             assert_eq!(unsafe { libc::ioctl(0, libc::FIONREAD, &mut queued) }, 0);
             crate::native::write_json_atomic(

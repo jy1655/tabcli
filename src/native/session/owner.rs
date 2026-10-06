@@ -1,10 +1,10 @@
 //! Observation of a session's recorded owner process. Read-only: no record changes.
 use super::{CoreRecord, Reader, RecordReader};
-use crate::native::NativeSessionOwner;
 #[cfg(target_os = "macos")]
 use crate::native::mac_native_owner_is_live;
 #[cfg(windows)]
 use crate::native::terminal;
+use crate::native::terminal::ownership::NativeSessionOwner;
 use agent_bridge::process_is_alive;
 #[cfg(not(any(target_os = "macos", windows)))]
 use anyhow::Result;
