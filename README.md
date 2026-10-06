@@ -62,7 +62,7 @@ see [diagnostics](docs/cli.md#doctor).
 ## Support
 
 These tables summarize selected historical runs. The linked records identify the tested versions,
-settings, and limitations. These are not checks of every combination on version 0.2.0.
+settings, and limitations. These are not checks of every combination on version 0.2.1.
 
 | Platform / terminal | Status | Recorded live evidence |
 | --- | --- | --- |
@@ -115,18 +115,18 @@ Download the archive for your platform and its matching `.sha256` file from
 `tabcli-<version>-aarch64-apple-darwin.tar.gz` for Apple Silicon macOS, or
 `tabcli-<version>-x86_64-pc-windows-msvc.zip` for x64 Windows.
 
-For version 0.2.0, verify the checksum in the download directory before extracting.
+For version 0.2.1, verify the checksum in the download directory before extracting.
 On macOS, continue only if the checksum command reports `OK`:
 
 ```sh
-shasum -a 256 -c tabcli-0.2.0-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf tabcli-0.2.0-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c tabcli-0.2.1-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf tabcli-0.2.1-aarch64-apple-darwin.tar.gz
 ```
 
 On Windows, run these commands in PowerShell:
 
 ```powershell
-$archive = "tabcli-0.2.0-x86_64-pc-windows-msvc.zip"
+$archive = "tabcli-0.2.1-x86_64-pc-windows-msvc.zip"
 $expected = (Get-Content "$archive.sha256").Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "checksum mismatch" }
@@ -139,7 +139,7 @@ Put the extracted `tabcli` (macOS) or `tabcli.exe` (Windows) in a directory on y
 To install from source, use Rust 1.97.1 or newer and Cargo:
 
 ```sh
-cargo install --git https://github.com/jy1655/tabcli --tag v0.2.0 --locked
+cargo install --git https://github.com/jy1655/tabcli --tag v0.2.1 --locked
 ```
 
 The package is not on crates.io. The crates named `agent-bridge` and `tab-cli` there are unrelated
