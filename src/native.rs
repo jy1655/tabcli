@@ -10,6 +10,9 @@ mod provider_process;
 mod query;
 mod requests;
 mod self_test;
+mod session;
+
+use session::*;
 mod settings;
 mod terminal;
 
@@ -41,48 +44,6 @@ const STATE_DIR_ENV: &str = "AGENT_BRIDGE_NATIVE_STATE_DIR";
 const SESSION_DIR_ENV: &str = "AGENT_BRIDGE_NATIVE_SESSION_DIR";
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
 const SESSION_SCHEMA: u32 = 1;
-const TURN_CLAIM_FILE: &str = "turn.claim";
-const TURN_CLAIM_LOCK_FILE: &str = "turn.claim.lock";
-const TURN_COMPLETION_FILE: &str = "turn.completion.json";
-const STATUS_LOCK_FILE: &str = "status.lock";
-const SESSION_OWNER_FILE: &str = "native-session.json";
-const CLOSED_STATUS_FILE: &str = "closed.json";
-const TERMINAL_HANDLE_FILE: &str = "terminal.json";
-const TERMINAL_CLOSING_FILE: &str = "terminal.closing.json";
-const TERMINAL_TOMBSTONE_FILE: &str = "terminal.closed.json";
-// An explicit Terminal.app or Warp close writes it after verifying the live owner
-// and surface, before teardown/close; see `terminal_close_intent_owner`.
-#[cfg(target_os = "macos")]
-const TERMINAL_CLOSE_INTENT_FILE: &str = "terminal.close-intent.json";
-// v0.0.2 native-Windows Claude sessions may still carry these files. New sessions never
-// create them; explicit close and prune consume them so an upgrade cannot strand state.
-const LEGACY_RESUME_PENDING_FILE: &str = "resume.pending.json";
-const LEGACY_RESUME_RUNNING_FILE: &str = "resume.running.json";
-const UNPUBLISHED_EVENT_PREFIX: &str = "unpublished-";
-/// The state root's durability receipt. It exists only after some creator synced the
-/// directory entry of the root and of every ancestor up to the filesystem root or the
-/// user's home directory, so a root that lacks it is not assumed durable merely because
-/// it exists: the creator that made it may have stopped before those syncs.
-const STATE_ROOT_DURABLE_FILE: &str = "state-root.durable";
-/// Upper bound on the directory entries the state-root ancestry walk makes durable.
-const STATE_ROOT_ANCESTRY_SYNC_LIMIT: usize = 16;
-// Written into a closed source session by the one reopen that won its turn-claim lock. It is
-// the only file a reopen ever adds to the source; the source's tombstone, events, and
-// requests stay byte-for-byte intact.
-const REOPEN_MARKER_FILE: &str = "reopen.marker.json";
-// Written into the NEW session by a reopen gate that fails after the session exists: the
-// launch wrapper's pre-spawn ownership recheck or the post-launch holder check. It carries
-// the gate name across the process boundary so the reopen response can still report it,
-// and it is the durable evidence from which a later reopen reconciles a source marker
-// that its parent never settled (`verify_reopen_source_is_closed`).
-const REOPEN_REFUSAL_FILE: &str = "reopen.refusal.json";
-// Written by the launch wrapper immediately after it spawns the provider process and before
-// the session leaves its launch state: the provider's pid and, on Windows, its creation time
-// and executable path. The provider process is the only process that can hold a resumed
-// conversation (Windows does not end children with their parent, and the wrapper exits
-// after the provider), so a reopen refused after this point releases the source's marker
-// only once the process this record names is verified gone (`refused_launch_cleanup`).
-const PROVIDER_PROCESS_FILE: &str = "provider-process.json";
 static TURN_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
@@ -307,7 +268,7 @@ impl PendingTurnCompletion {
         Ok(Self {
             schema: 1,
             claim_token: claim_token.to_owned(),
-            event_file: new_event_file_name()?,
+            event_file: Store::new_event_file_name()?,
             event,
             status_error,
             status_state: status_state.to_owned(),
@@ -1142,10 +1103,10 @@ fn run_windows_console_control(
     input_name: Option<&str>,
     timeout_ms: Option<u64>,
 ) -> Result<()> {
-    let directory = session_directory(id)?;
-    let manifest = read_manifest(&directory)?;
+    let directory = Reader::session_directory(id)?;
+    let manifest = Reader::open_unchecked(&directory).manifest()?;
     let session: terminal::TerminalSession =
-        read_json(&windows_console_handle_path(&directory, action))?;
+        RecordReader::at(&windows_console_handle_path(&directory, action)).json()?;
     if session.kind != terminal::TerminalKind::WindowsConsole {
         bail!("managed session is not owned by the Windows console transport");
     }
@@ -1156,7 +1117,12 @@ fn run_windows_console_control(
     } else {
         verify_terminal_surface_ownership(&directory, id, &session)?;
     }
-    let input_path = input_name.map(|name| directory.join(name));
+    let input_path = input_name.map(|name| {
+        Reader::open_unchecked(&directory)
+            .private(name)
+            .path()
+            .to_owned()
+    });
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
     let submit_count = provider::terminal_submit_count(provider);
     let records = terminal::WindowsSessionRecords {
@@ -1179,8 +1145,12 @@ fn run_windows_console_control(
 // nothing.
 #[cfg(windows)]
 fn windows_console_root_never_ran(directory: &Path) -> bool {
-    !directory.join(SESSION_OWNER_FILE).exists()
-        && match launch::read(directory) {
+    !Reader::open_unchecked(&directory)
+        .record(CoreRecord::Owner)
+        .path()
+        .to_owned()
+        .exists()
+        && match launch::read(&Reader::open_unchecked(directory)) {
             Ok(None) => true,
             Ok(Some(record)) => record.phase == launch::Phase::Pending,
             Err(_) => false,
@@ -1189,11 +1159,17 @@ fn windows_console_root_never_ran(directory: &Path) -> bool {
 
 #[cfg(windows)]
 fn windows_console_handle_path(directory: &Path, action: &str) -> PathBuf {
-    let closing = directory.join(TERMINAL_CLOSING_FILE);
+    let closing = Reader::open_unchecked(&directory)
+        .record(CoreRecord::TerminalClosing)
+        .path()
+        .to_owned();
     if action == "close" && closing.is_file() {
         closing
     } else {
-        directory.join(TERMINAL_HANDLE_FILE)
+        Reader::open_unchecked(&directory)
+            .record(CoreRecord::Terminal)
+            .path()
+            .to_owned()
     }
 }
 
@@ -1315,7 +1291,11 @@ fn launch_created_session(
     let expected_claim_token = initial_claim.token.clone();
     let receipt = initial_claim.receipt.clone();
     *address = Some((created.id.clone(), receipt.request_id.clone()));
-    let launch_deadline = launch::begin(&created.directory, &expected_claim_token, deadline)?;
+    let launch_deadline = launch::begin(
+        &Store::open_unchecked(&created.directory),
+        &expected_claim_token,
+        deadline,
+    )?;
     let executable = std::env::current_exe().context("failed to locate agent-bridge executable")?;
     let bridge_command = bridge_shell_command(
         &created.manifest.workspace,
@@ -1326,8 +1306,8 @@ fn launch_created_session(
         &executable,
         &created.id,
     )?;
-    let bridge_command = launch::install_script(&created.directory, &bridge_command)?;
-    let terminal_handle_path = created.directory.join(TERMINAL_HANDLE_FILE);
+    let bridge_command =
+        launch::install_script(&Store::open_unchecked(&created.directory), &bridge_command)?;
     initial_claim.retain_in_place();
     let terminal_session = match terminal::open_bound_tab(
         terminal_kind,
@@ -1336,14 +1316,18 @@ fn launch_created_session(
         launch_deadline,
         |session| {
             session.managed_session_id = Some(created.id.clone());
-            write_json_atomic(&terminal_handle_path, session)
+            Store::open_unchecked(&created.directory).write_terminal(session)
         },
-        || remove_file_if_present(&terminal_handle_path),
+        || {
+            Store::open_unchecked(&created.directory)
+                .record(CoreRecord::Terminal)
+                .remove()
+        },
     ) {
         Ok(session) => session,
         Err(error) => {
             let _ = launch::fail(
-                &created.directory,
+                &Store::open_unchecked(&created.directory),
                 &format!("terminal launch failed: {error:#}"),
             );
             return Err(error).with_context(|| {
@@ -1358,7 +1342,11 @@ fn launch_created_session(
     // Once the terminal accepted the wrapper command, only a fenced launch failure may
     // release this claim. Detached callers also wait for provider startup, not its result.
     initial_claim.retain_in_place();
-    launch::wait(&created.directory, &terminal_session, launch_deadline)?;
+    launch::wait(
+        &Store::open_unchecked(&created.directory),
+        &terminal_session,
+        launch_deadline,
+    )?;
     // A trust response is separate from model input. Only verified consent and an
     // adapter-recognized exact workspace dialog may produce one guarded response.
     consent::complete_launch(&created.directory, provider, &terminal_session, deadline)?;
@@ -1388,8 +1376,8 @@ fn launch_created_session(
                 deadline,
                 ResumedHolderCheck::AfterLaunch,
             )?;
-            let initial_prompt_path = created.directory.join("initial-prompt.txt");
-            let initial_prompt = fs::read_to_string(&initial_prompt_path)
+            let initial_prompt = Reader::open_unchecked(&created.directory)
+                .initial_prompt()
                 .context("failed to read the preserved initial prompt")?;
             let initial_prompt =
                 provider::terminal_initial_prompt(provider, &created.directory, &initial_prompt)?;
@@ -1397,7 +1385,7 @@ fn launch_created_session(
                 .prefix("pending-prompt-")
                 .suffix(".txt")
                 .tempfile_in(&created.directory)?;
-            set_private_file_permissions(prompt_file.as_file())?;
+            RecordStore::set_file_private(prompt_file.as_file())?;
             prompt_file.write_all(&terminal_input_bytes(
                 terminal_session.kind,
                 &initial_prompt,
@@ -1433,8 +1421,13 @@ fn launch_created_session(
                 }
             }
             initial_claim.retain_in_place();
-            fs::remove_file(&initial_prompt_path)
-                .context("failed to remove the delivered initial prompt")?;
+            session::RecordStore::at(
+                Reader::open_unchecked(&created.directory)
+                    .record(CoreRecord::InitialPrompt)
+                    .path(),
+            )
+            .remove_raw()
+            .context("failed to remove the delivered initial prompt")?;
             Ok(())
         })();
         if let Err(error) = delivery {
@@ -1481,8 +1474,8 @@ fn launch_created_session(
                 ResumedHolderCheck::AfterLaunch,
             )?;
             let request_id = provider::new_cross_session_turn_id(provider)?;
-            let prompt_path = created.directory.join("initial-prompt.txt");
-            let prompt = fs::read_to_string(&prompt_path)
+            let prompt = Reader::open_unchecked(&created.directory)
+                .initial_prompt()
                 .context("failed to read the preserved initial prompt")?;
             let bridge_executable =
                 std::env::current_exe().context("failed to locate agent-bridge executable")?;
@@ -1508,8 +1501,13 @@ fn launch_created_session(
             ) {
                 Ok(()) => {
                     initial_claim.retain_in_place();
-                    fs::remove_file(&prompt_path)
-                        .context("failed to remove the delivered initial prompt")?;
+                    session::RecordStore::at(
+                        Reader::open_unchecked(&created.directory)
+                            .record(CoreRecord::InitialPrompt)
+                            .path(),
+                    )
+                    .remove_raw()
+                    .context("failed to remove the delivered initial prompt")?;
                     Ok(request_id)
                 }
                 Err(failure) if failure.delivery_may_have_occurred() => {
@@ -1684,7 +1682,7 @@ fn record_reopen_refusal(directory: &Path, gate: &'static str, detail: String) -
         cleanup: None,
         cleanup_detail: None,
     };
-    if let Err(error) = write_json_atomic(&directory.join(REOPEN_REFUSAL_FILE), &record) {
+    if let Err(error) = Store::open_unchecked(directory).write_reopen_refusal(&record) {
         return reopen_refusal(
             gate,
             format!("{detail}; the refusal record could not be written: {error:#}"),
@@ -1697,7 +1695,9 @@ fn record_reopen_refusal(directory: &Path, gate: &'static str, detail: String) -
 // other schema or phase is not a launch refusal and yields nothing, so the caller treats the
 // launch as not refused.
 fn read_reopen_launch_refusal(directory: &Path) -> Option<RecordedReopenRefusal> {
-    let text = read_regular_text_if_present(&directory.join(REOPEN_REFUSAL_FILE))
+    let text = Reader::open_unchecked(directory)
+        .record(CoreRecord::ReopenRefusal)
+        .text()
         .ok()
         .flatten()?;
     let record: RecordedReopenRefusal = serde_json::from_str(&text).ok()?;
@@ -1717,7 +1717,7 @@ fn record_reopen_refusal_cleanup_pending(directory: &Path, reason: &str) -> Resu
     };
     record.cleanup = Some(REOPEN_REFUSAL_CLEANUP_PENDING.to_owned());
     record.cleanup_detail = Some(reason.to_owned());
-    write_json_atomic(&directory.join(REOPEN_REFUSAL_FILE), &record)
+    Store::open_unchecked(directory).write_reopen_refusal(&record)
 }
 
 // The provider process a launch wrapper spawned for its session (`PROVIDER_PROCESS_FILE`).
@@ -1750,17 +1750,15 @@ fn record_provider_process(
     );
     #[cfg(not(windows))]
     let windows_process_identity = None;
-    write_json_atomic(
-        &directory.join(PROVIDER_PROCESS_FILE),
-        &ProviderProcessRecord {
+    Store::open_unchecked(directory)
+        .write_provider_process(&ProviderProcessRecord {
             schema: 1,
             managed_session_id: managed_session_id.to_owned(),
             pid,
             windows_process_identity,
             spawned_unix_ms: unix_ms(),
-        },
-    )
-    .context("failed to record the spawned provider process")
+        })
+        .context("failed to record the spawned provider process")
 }
 
 // Why a recorded provider process is known to be gone. Identity mismatches are only
@@ -1905,8 +1903,12 @@ fn refused_launch_cleanup(refused_directory: &Path, gate: &str) -> Result<Refuse
         .unwrap_or_default();
     // The refused session's own status decides whether cleanup is even possible, so it is
     // read like the other evidence here: a link at `status.json` is refused, not followed.
-    let status_path = refused_directory.join("status.json");
-    let state = read_regular_status_if_present(&status_path)?
+    let status_path = Reader::open_unchecked(refused_directory)
+        .record(CoreRecord::Status)
+        .path()
+        .to_owned();
+    let state = Reader::open_unchecked(refused_directory)
+        .regular_status_if_present()?
         .with_context(|| format!("failed to read {}", status_path.display()))?
         .state;
     if session_accepts_prompt(&state) || state == "working" {
@@ -1914,15 +1916,19 @@ fn refused_launch_cleanup(refused_directory: &Path, gate: &str) -> Result<Refuse
             "refused session {refused_session} is {state}"
         )));
     }
-    let record = query::optional_json::<ProviderProcessRecord>(
-        &refused_directory.join(PROVIDER_PROCESS_FILE),
-    )?;
+    let record = RecordReader::at(
+        Reader::open_unchecked(refused_directory)
+            .record(CoreRecord::ProviderProcess)
+            .path(),
+    )
+    .optional_json::<ProviderProcessRecord>()?;
     let Some(record) = record else {
         if gate == REOPEN_LAUNCH_GATE {
             return Ok(RefusedLaunchCleanup::NoProcessSpawned);
         }
         return Ok(RefusedLaunchCleanup::Pending(format!(
-            "refused session {refused_session} is {state} with no provider process record ({PROVIDER_PROCESS_FILE}), so the provider process it spawned cannot be verified gone"
+            "refused session {refused_session} is {state} with no provider process record ({}), so the provider process it spawned cannot be verified gone",
+            CoreRecord::ProviderProcess.name()
         )));
     };
     if record.schema != 1 || record.managed_session_id != refused_session {
@@ -1947,8 +1953,14 @@ fn refused_launch_cleanup(refused_directory: &Path, gate: &str) -> Result<Refuse
         }
     };
     let surface_closed = state == "closed"
-        && is_regular_file(&refused_directory.join(TERMINAL_TOMBSTONE_FILE))?
-        && read_regular_status_if_present(&refused_directory.join(CLOSED_STATUS_FILE))?
+        && RecordReader::at(
+            Reader::open_unchecked(refused_directory)
+                .record(CoreRecord::TerminalClosed)
+                .path(),
+        )
+        .is_regular_file()?
+        && Reader::open_unchecked(refused_directory)
+            .regular_closed_if_present()?
             .is_some_and(|closed| closed.state == "closed");
     Ok(RefusedLaunchCleanup::ProviderProcessGone {
         pid: record.pid,
@@ -2130,7 +2142,7 @@ fn close_session_surface(directory: &Path, id: &str, reason: Option<String>) -> 
         let _ = has_native_owner;
         #[cfg(target_os = "macos")]
         if session.kind == terminal::TerminalKind::AppleTerminal {
-            let owner: NativeSessionOwner = read_json(&directory.join(SESSION_OWNER_FILE))?;
+            let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
             return terminal::macos::apple_terminal::close_attested_session(
                 session,
                 owner
@@ -2160,7 +2172,7 @@ fn run_reopen(request: ReopenRequest) -> Result<()> {
     match address {
         Some((session, request_id)) => {
             let (outcome, gate) =
-                settle_reopen_outcome(session_directory, &source, &session, outcome);
+                settle_reopen_outcome(Reader::session_directory, &source, &session, outcome);
             let mut extra = serde_json::Map::new();
             extra.insert("source_session".to_owned(), serde_json::json!(source));
             extra.insert("gate".to_owned(), serde_json::json!(gate));
@@ -2236,7 +2248,7 @@ fn settle_reopen_outcome(
 fn run_reopen_inner(request: ReopenRequest, address: &mut Option<(String, String)>) -> Result<()> {
     let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
     let terminal_kind = terminal::select(request.terminal)?;
-    let source_directory = session_directory(&request.id)?;
+    let source_directory = Reader::session_directory(&request.id)?;
     // Every check against the source is read-only. Pending-completion recovery and dead-owner
     // repair are never run on it: a closed session has nothing to converge, and reopen must not
     // alter the record it continues from.
@@ -2361,9 +2373,12 @@ fn release_reopen_marker_after_refusal(
                 });
             bail!("{cleanup}{note}");
         }
-        let marker_path = source_directory.join(REOPEN_MARKER_FILE);
-        let _lock = lock_turn_claim(&source_directory.join(TURN_CLAIM_FILE))?;
-        let Some(text) = read_regular_text_if_present(&marker_path)? else {
+        let marker_path = Reader::open_unchecked(source_directory)
+            .record(CoreRecord::ReopenMarker)
+            .path()
+            .to_owned();
+        let _lock = Store::open_unchecked(source_directory).lock()?;
+        let Some(text) = session::RecordReader::at(&marker_path).text()? else {
             return Ok(());
         };
         let marker: ReopenMarker = serde_json::from_str(&text).context("invalid reopen marker")?;
@@ -2373,7 +2388,7 @@ fn release_reopen_marker_after_refusal(
                 marker.reopened_by
             );
         }
-        remove_file_if_present(&marker_path)
+        RecordStore::at(&marker_path).remove()
     })();
     let Err(release_error) = released else {
         return outcome;
@@ -2397,7 +2412,7 @@ fn release_reopen_marker_after_refusal(
 // validated before the identity is read, so a corrupt newest event refuses under
 // `request-unresolved` whether or not a receipt points at it.
 fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
-    let manifest = read_manifest(directory)?;
+    let manifest = Reader::open_unchecked(directory).manifest()?;
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
     verify_reopen_source_is_closed(directory, id)?;
     // The lifecycle readers' contract for `events`: it is a real directory inside the
@@ -2407,13 +2422,15 @@ fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
     // as a source without an identity. Neither can prove what the source delivered. An
     // absent directory is not rejected here: it holds no event, so the receipt and identity
     // gates below refuse for what is actually missing.
-    events_directory_state(directory).map_err(|error| {
-        reopen_refusal(
-            "request-unresolved",
-            format!("the recorded results of session {id} cannot be read: {error:#}"),
-        )
-    })?;
-    let index = requests::list(directory)?;
+    Reader::open_unchecked(directory)
+        .events_directory_state()
+        .map_err(|error| {
+            reopen_refusal(
+                "request-unresolved",
+                format!("the recorded results of session {id} cannot be read: {error:#}"),
+            )
+        })?;
+    let index = requests::list(&Reader::open_unchecked(directory))?;
     if index.unreadable > 0 {
         return Err(reopen_refusal(
             "request-unresolved",
@@ -2427,8 +2444,12 @@ fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
     // receipt whose event is missing, empty, malformed, or from another provider cannot
     // prove what that request delivered, whatever the latest event says.
     for receipt in &index.receipts {
-        let event_path = directory.join("events").join(&receipt.event_file);
-        if !is_regular_file(&event_path)? {
+        let event_path = Reader::open_unchecked(directory)
+            .record(CoreRecord::Events)
+            .path()
+            .to_owned()
+            .join(&receipt.event_file);
+        if !RecordReader::at(&event_path).is_regular_file()? {
             return Err(reopen_refusal(
                 "request-unresolved",
                 format!(
@@ -2437,7 +2458,7 @@ fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
                 ),
             ));
         }
-        let event = read_json::<SessionEvent>(&event_path).map_err(|error| {
+        let event = session::RecordReader::at(&event_path).json::<SessionEvent>().map_err(|error| {
             reopen_refusal(
                 "request-unresolved",
                 format!(
@@ -2498,8 +2519,8 @@ struct StaleReopenMarker {
 // inferred from the absence of records, and a marker that names a session without a launch
 // refusal, or with a launch refusal whose process may survive, stays consumed.
 fn verify_reopen_source_is_closed(directory: &Path, id: &str) -> Result<Option<StaleReopenMarker>> {
-    let closed = read_regular_status_if_present(&directory.join(CLOSED_STATUS_FILE))?;
-    let status = read_regular_status_if_present(&directory.join("status.json"))?;
+    let closed = Reader::open_unchecked(directory).regular_closed_if_present()?;
+    let status = Reader::open_unchecked(directory).regular_status_if_present()?;
     let state = status
         .as_ref()
         .map_or("unknown", |status| status.state.as_str());
@@ -2516,19 +2537,22 @@ fn verify_reopen_source_is_closed(directory: &Path, id: &str) -> Result<Option<S
         ));
     }
     for name in [
-        TURN_CLAIM_FILE,
-        TURN_COMPLETION_FILE,
-        TERMINAL_HANDLE_FILE,
-        TERMINAL_CLOSING_FILE,
+        CoreRecord::TurnClaim.name(),
+        CoreRecord::Completion.name(),
+        CoreRecord::Terminal.name(),
+        CoreRecord::TerminalClosing.name(),
     ] {
-        if fs::symlink_metadata(directory.join(name)).is_ok() {
+        if fs::symlink_metadata(Reader::open_unchecked(directory).private(name).path()).is_ok() {
             return Err(reopen_refusal(
                 "source-not-converged",
                 format!("session {id} still carries {name}; its close has not converged"),
             ));
         }
     }
-    let Some(text) = read_regular_text_if_present(&directory.join(REOPEN_MARKER_FILE))? else {
+    let Some(text) = Reader::open_unchecked(directory)
+        .record(CoreRecord::ReopenMarker)
+        .text()?
+    else {
         return Ok(None);
     };
     let refuse = |detail: String| Err(reopen_refusal("already-reopened", detail));
@@ -2590,8 +2614,8 @@ fn latest_provider_event_identity(
     id: &str,
 ) -> Result<Option<(String, String)>> {
     let mut newest = None;
-    for path in event_paths(directory)? {
-        let event: SessionEvent = read_json(&path).map_err(|error| {
+    for path in Reader::open_unchecked(directory).events()? {
+        let event: SessionEvent = session::RecordReader::at(&path).json().map_err(|error| {
             reopen_refusal(
                 "request-unresolved",
                 format!(
@@ -2620,7 +2644,9 @@ fn latest_provider_event_identity(
 }
 
 fn read_resumed_from(directory: &Path) -> Result<Option<ResumedFrom>> {
-    let provenance: ReopenProvenance = read_json(&directory.join("manifest.json"))?;
+    let provenance: ReopenProvenance = Reader::open_unchecked(directory)
+        .record(CoreRecord::Manifest)
+        .json()?;
     Ok(provenance.resumed_from)
 }
 
@@ -2637,7 +2663,9 @@ fn record_resumed_from(
             "resumed_from".to_owned(),
             serde_json::to_value(resumed_from)?,
         );
-    write_json_atomic(&directory.join("manifest.json"), &value)
+    Store::open_unchecked(directory)
+        .record(CoreRecord::Manifest)
+        .write_json(&value)
 }
 
 // The winner's hold on a closed source. Dropping it before `finalize` removes the marker
@@ -2651,8 +2679,9 @@ struct ReopenMarkerClaim {
 
 impl ReopenMarkerClaim {
     fn finalize(mut self, new_session_id: &str) -> Result<()> {
-        let _lock = lock_turn_claim(&self.path.with_file_name(TURN_CLAIM_FILE))?;
-        let text = read_regular_text_if_present(&self.path)?
+        let _lock = Store::open_unchecked((self.path).with_file_name("")).lock()?;
+        let text = session::RecordReader::at(&self.path)
+            .text()?
             .context("reopen marker disappeared before the new session was recorded")?;
         let mut marker: ReopenMarker =
             serde_json::from_str(&text).context("invalid reopen marker")?;
@@ -2660,7 +2689,7 @@ impl ReopenMarkerClaim {
             bail!("reopen marker belongs to a different reopen attempt");
         }
         marker.reopened_by = Some(new_session_id.to_owned());
-        write_json_atomic(&self.path, &marker)?;
+        session::RecordStore::at(&self.path).write_json(&marker)?;
         self.finalized = true;
         Ok(())
     }
@@ -2671,15 +2700,16 @@ impl Drop for ReopenMarkerClaim {
         if self.finalized {
             return;
         }
-        let Ok(_lock) = lock_turn_claim(&self.path.with_file_name(TURN_CLAIM_FILE)) else {
+        let Ok(_lock) = Store::open_unchecked((self.path).with_file_name("")).lock() else {
             return;
         };
-        let current = read_regular_text_if_present(&self.path)
+        let current = session::RecordReader::at(&self.path)
+            .text()
             .ok()
             .flatten()
             .and_then(|text| serde_json::from_str::<ReopenMarker>(&text).ok());
         if current.is_some_and(|marker| marker.claim == self.claim) {
-            let _ = remove_file_if_present(&self.path);
+            let _ = RecordStore::at(&self.path).remove();
         }
     }
 }
@@ -2692,13 +2722,16 @@ fn claim_reopen_marker(
     id: &str,
     provider_session_id: &str,
 ) -> Result<ReopenMarkerClaim> {
-    let path = directory.join(REOPEN_MARKER_FILE);
-    let _lock = lock_turn_claim(&directory.join(TURN_CLAIM_FILE))?;
+    let path = Reader::open_unchecked(directory)
+        .record(CoreRecord::ReopenMarker)
+        .path()
+        .to_owned();
+    let _lock = Store::open_unchecked(directory).lock()?;
     if let Some(stale) = verify_reopen_source_is_closed(directory, id)? {
         // The gate re-ran under the lock, so the stale marker still names a refused launch
         // whose cleanup is verified now; releasing it here is the reconciliation the
         // crashed or timed-out parent never performed.
-        remove_file_if_present(&path).with_context(|| {
+        RecordStore::at(&path).remove().with_context(|| {
             format!(
                 "could not release the stale reopen marker of session {id} (reopened as {}, refused at {}, {})",
                 stale.refused_session, stale.gate, stale.cleanup
@@ -2718,12 +2751,14 @@ fn claim_reopen_marker(
         reopened_by: None,
         created_unix_ms: unix_ms(),
     };
-    write_private(&path, &serde_json::to_vec_pretty(&marker)?).map_err(|error| {
-        reopen_refusal(
-            "already-reopened",
-            format!("could not claim session {id} for reopen: {error:#}"),
-        )
-    })?;
+    session::RecordStore::at(&path)
+        .write_private(&serde_json::to_vec_pretty(&marker)?)
+        .map_err(|error| {
+            reopen_refusal(
+                "already-reopened",
+                format!("could not claim session {id} for reopen: {error:#}"),
+            )
+        })?;
     Ok(ReopenMarkerClaim {
         path,
         claim,
@@ -2784,8 +2819,12 @@ fn verify_terminal_surface_ownership_with_timeout(
 
 #[cfg(windows)]
 fn verified_windows_native_owner(directory: &Path, expected_session_id: &str) -> Result<()> {
-    let owner_path = directory.join(SESSION_OWNER_FILE);
-    let owner_text = read_regular_text_if_present(&owner_path)?
+    let owner_path = Reader::open_unchecked(&directory)
+        .record(CoreRecord::Owner)
+        .path()
+        .to_owned();
+    let owner_text = session::RecordReader::at(&owner_path)
+        .text()?
         .with_context(|| "Windows terminal ownership requires a live native-session owner")?;
     let owner: NativeSessionOwner = serde_json::from_str(&owner_text)
         .with_context(|| format!("invalid JSON in {}", owner_path.display()))?;
@@ -2807,8 +2846,12 @@ fn verified_macos_terminal_owner(
     session: &terminal::TerminalSession,
     surface_tty: Option<&str>,
 ) -> Result<(NativeSessionOwner, NativeProcessIdentity)> {
-    let owner_path = directory.join(SESSION_OWNER_FILE);
-    let owner_text = read_regular_text_if_present(&owner_path)?
+    let owner_path = Reader::open_unchecked(directory)
+        .record(CoreRecord::Owner)
+        .path()
+        .to_owned();
+    let owner_text = session::RecordReader::at(&owner_path)
+        .text()?
         .with_context(|| "Terminal.app ownership requires a live native-session owner")?;
     let owner: NativeSessionOwner = serde_json::from_str(&owner_text)
         .with_context(|| format!("invalid JSON in {}", owner_path.display()))?;
@@ -2970,7 +3013,7 @@ fn record_legacy_terminal_app(
 ) -> Result<()> {
     if owner.terminal_app.is_none() {
         owner.terminal_app = Some(derive(owner)?);
-        write_json_atomic(&directory.join(SESSION_OWNER_FILE), owner)?;
+        Store::open_unchecked(directory).write_owner(owner)?;
     }
     Ok(())
 }
@@ -2982,14 +3025,13 @@ fn record_terminal_close_intent(
     session: &terminal::TerminalSession,
     owner: &NativeSessionOwner,
 ) -> Result<()> {
-    write_json_atomic(
-        &directory.join(TERMINAL_CLOSE_INTENT_FILE),
-        &TerminalCloseIntent {
+    Store::open_unchecked(directory)
+        .record(CoreRecord::TerminalCloseIntent)
+        .write_json(&TerminalCloseIntent {
             managed_session_id: expected_session_id.to_owned(),
             terminal: session.clone(),
             owner: owner.clone(),
-        },
-    )
+        })
 }
 
 // An explicit close can end the owner before the window is gone, so a
@@ -3007,8 +3049,12 @@ fn terminal_close_intent_owner(
         return Ok(None);
     }
     let (Some(intent), Some(owner)) = (
-        read_regular_text_if_present(&directory.join(TERMINAL_CLOSE_INTENT_FILE))?,
-        read_regular_text_if_present(&directory.join(SESSION_OWNER_FILE))?,
+        Reader::open_unchecked(directory)
+            .record(CoreRecord::TerminalCloseIntent)
+            .text()?,
+        Reader::open_unchecked(directory)
+            .record(CoreRecord::Owner)
+            .text()?,
     ) else {
         return Ok(None);
     };
@@ -3508,7 +3554,8 @@ fn apple_terminal_startup_absent_with(
     terminal_instances: impl Fn() -> Result<Vec<MacTerminalAppIdentity>>,
     surface_present: impl FnOnce() -> Result<bool>,
 ) -> Result<bool> {
-    let bound: terminal::TerminalSession = read_json(&directory.join(TERMINAL_HANDLE_FILE))
+    let bound: terminal::TerminalSession = Reader::open_unchecked(directory)
+        .terminal()
         .context("Terminal.app startup has no durable surface binding; cleanup is unverified")?;
     if surface.kind != terminal::TerminalKind::AppleTerminal
         || bound.kind != surface.kind
@@ -3525,7 +3572,9 @@ fn apple_terminal_startup_absent_with(
     }
     // The wrapper records itself only once it runs: a start command that was never
     // typed, or a wrapper that failed first, leaves no owner and no app incarnation.
-    let owner = read_regular_text_if_present(&directory.join(SESSION_OWNER_FILE))?
+    let owner = Reader::open_unchecked(directory)
+        .record(CoreRecord::Owner)
+        .text()?
         .map(|text| serde_json::from_str::<NativeSessionOwner>(&text))
         .transpose()
         .context("invalid Terminal.app startup owner record; the binding is retained")?;
@@ -3720,12 +3769,13 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
     // Attached results are resolved and pinned before the target is recovered, repaired,
     // claimed, or sent to, so a failed resolution leaves every session unchanged.
     let attached = context::resolve(&request.context_results)?;
-    let directory = session_directory(&request.id)?;
+    let directory = Reader::session_directory(&request.id)?;
     recover_pending_completion(&directory)?;
     repair_dead_native_owner(&directory)?;
-    let manifest = read_manifest(&directory)?;
+    let manifest = Reader::open_unchecked(&directory).manifest()?;
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
-    let terminal_session: terminal::TerminalSession = read_json(&directory.join("terminal.json"))?;
+    let terminal_session: terminal::TerminalSession =
+        Reader::open_unchecked(&directory).terminal()?;
     verify_terminal_surface_ownership_until(
         &directory,
         &request.id,
@@ -3733,7 +3783,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
         deadline,
         request.timeout,
     )?;
-    let previous_state = read_json::<SessionStatus>(&directory.join("status.json"))?.state;
+    let previous_state = Reader::open_unchecked(&directory).status()?.state;
     if !session_accepts_prompt(&previous_state) {
         bail!(
             "session {} is {previous_state}; tell requires the ready state",
@@ -3965,7 +4015,7 @@ fn deliver_terminal_follow_up(
             .prefix("pending-prompt-")
             .suffix(".txt")
             .tempfile_in(directory)?;
-        set_private_file_permissions(prompt_file.as_file())?;
+        RecordStore::set_file_private(prompt_file.as_file())?;
         prompt_file.write_all(&terminal_input_bytes(
             terminal_session.kind,
             &correlated_prompt,
@@ -4209,7 +4259,7 @@ fn initial_prompt_delay_within_budget(
 }
 
 fn run_sessions(request: SessionsRequest) -> Result<()> {
-    let sessions = sessions_in(&state_root()?, &request)?;
+    let sessions = sessions_in(&Reader::state_root()?, &request)?;
     if request.json {
         println!("{}", serde_json::to_string_pretty(&sessions)?);
     } else if sessions.is_empty() {
@@ -4259,7 +4309,7 @@ fn sessions_query(
                 continue;
             }
             let directory = entry.path();
-            let Ok(manifest) = read_manifest(&directory) else {
+            let Ok(manifest) = Reader::open_unchecked(&directory).manifest() else {
                 continue;
             };
             if request
@@ -4278,7 +4328,7 @@ fn sessions_query(
             if repair {
                 let _ = repair_dead_native_owner(&directory);
             }
-            let status = read_json::<SessionStatus>(&directory.join("status.json")).ok();
+            let status = Reader::open_unchecked(&directory).status().ok();
             let state = status
                 .as_ref()
                 .map(|value| value.state.as_str())
@@ -4286,8 +4336,7 @@ fn sessions_query(
             if request.state.as_ref().is_some_and(|filter| filter != state) {
                 continue;
             }
-            let terminal =
-                read_json::<terminal::TerminalSession>(&directory.join("terminal.json")).ok();
+            let terminal = Reader::open_unchecked(&directory).terminal().ok();
             sessions.push(serde_json::json!({
                 "id": manifest.id,
                 "provider": manifest.provider,
@@ -4308,7 +4357,7 @@ fn sessions_query(
                 "model": manifest.model,
                 "effort": manifest.effort,
                 "resumed_from": read_resumed_from(&directory).ok().flatten(),
-                "results": event_paths(&directory).map(|paths| paths.len()).unwrap_or(0),
+                "results": Reader::open_unchecked(&directory).events().map(|paths| paths.len()).unwrap_or(0),
             }));
         }
     }
@@ -4337,7 +4386,7 @@ fn run_prune(request: PruneRequest) -> Result<()> {
     let removed = if retention_ms > now_unix_ms {
         Vec::new()
     } else {
-        prune_closed_sessions(&state_root()?, now_unix_ms - retention_ms)?
+        prune_closed_sessions(&Reader::state_root()?, now_unix_ms - retention_ms)?
     };
     if request.json {
         println!(
@@ -4377,20 +4426,26 @@ fn prune_closed_sessions(root: &Path, cutoff_unix_ms: u128) -> Result<Vec<String
             continue;
         }
         let directory = entry.path();
-        if !is_regular_file(&directory.join("manifest.json"))? {
+        if !RecordReader::at(
+            Reader::open_unchecked(&directory)
+                .record(CoreRecord::Manifest)
+                .path(),
+        )
+        .is_regular_file()?
+        {
             continue;
         }
-        let Ok(manifest) = read_manifest(&directory) else {
+        let Ok(manifest) = Reader::open_unchecked(&directory).manifest() else {
             continue;
         };
         if manifest.id != id {
             continue;
         }
-        let closed = match read_regular_status_if_present(&directory.join(CLOSED_STATUS_FILE)) {
+        let closed = match Reader::open_unchecked(&directory).regular_closed_if_present() {
             Ok(Some(closed)) => closed,
             Ok(None) | Err(_) => continue,
         };
-        let status = match read_regular_status_if_present(&directory.join("status.json")) {
+        let status = match Reader::open_unchecked(&directory).regular_status_if_present() {
             Ok(Some(status)) => status,
             Ok(None) | Err(_) => continue,
         };
@@ -4414,7 +4469,8 @@ fn prune_closed_sessions(root: &Path, cutoff_unix_ms: u128) -> Result<Vec<String
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             continue;
         }
-        fs::remove_dir_all(&directory)
+        session::RecordStore::at(&directory)
+            .remove_directory_all()
             .with_context(|| format!("failed to prune closed session {id}"))?;
         removed.push(id);
     }
@@ -4424,37 +4480,25 @@ fn prune_closed_sessions(root: &Path, cutoff_unix_ms: u128) -> Result<Vec<String
 
 fn has_active_session_capability(directory: &Path) -> bool {
     [
-        TERMINAL_HANDLE_FILE,
-        TERMINAL_CLOSING_FILE,
-        TURN_CLAIM_FILE,
-        TURN_COMPLETION_FILE,
-        LEGACY_RESUME_PENDING_FILE,
-        LEGACY_RESUME_RUNNING_FILE,
+        CoreRecord::Terminal.name(),
+        CoreRecord::TerminalClosing.name(),
+        CoreRecord::TurnClaim.name(),
+        CoreRecord::Completion.name(),
+        CoreRecord::LegacyResumePending.name(),
+        CoreRecord::LegacyResumeRunning.name(),
     ]
     .into_iter()
-    .any(|name| fs::symlink_metadata(directory.join(name)).is_ok())
-}
-
-fn is_regular_file(path: &Path) -> Result<bool> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => Ok(metadata.is_file() && !metadata.file_type().is_symlink()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
-    }
-}
-
-fn read_regular_status_if_present(path: &Path) -> Result<Option<SessionStatus>> {
-    let Some(text) = read_regular_text_if_present(path)? else {
-        return Ok(None);
-    };
-    serde_json::from_str(&text)
-        .map(Some)
-        .with_context(|| format!("invalid JSON in {}", path.display()))
+    .any(|name| {
+        fs::symlink_metadata(Reader::open_unchecked(directory).private(name).path()).is_ok()
+    })
 }
 
 fn native_owner_blocks_prune(directory: &Path) -> Result<bool> {
-    let path = directory.join(SESSION_OWNER_FILE);
-    let text = match read_regular_text_if_present(&path) {
+    let path = Reader::open_unchecked(directory)
+        .record(CoreRecord::Owner)
+        .path()
+        .to_owned();
+    let text = match session::RecordReader::at(&path).text() {
         Ok(Some(text)) => text,
         Ok(None) => return Ok(false),
         Err(_) => return Ok(true),
@@ -4502,7 +4546,7 @@ fn native_owner_blocks_prune(directory: &Path) -> Result<bool> {
 
 fn run_close(request: CloseRequest) -> Result<()> {
     confirm_explicit_close(request.explicit)?;
-    let directory = session_directory(&request.id)?;
+    let directory = Reader::session_directory(&request.id)?;
     close_session_surface(&directory, &request.id, None)
         .with_context(|| format!("failed to close visible terminal session {}", request.id))?;
     if request.json {
@@ -4584,18 +4628,22 @@ fn verify_terminal_close_authority_with_observations(
     let _ = (&surface_present, &process_birth, &terminal_instances);
     #[cfg(any(target_os = "macos", windows))]
     {
-        if read_regular_text_if_present(&directory.join(SESSION_OWNER_FILE))?.is_some() {
+        if Reader::open_unchecked(directory)
+            .record(CoreRecord::Owner)
+            .text()?
+            .is_some()
+        {
             // An explicit close may reclaim the exact startup surface after its wrapper
             // died, including an uncertain spawn. This is not automatic failure cleanup:
             // neither a live/unknown owner nor an unbound/foreign handle gains authority.
             // Terminal.app, Warp and WezTerm gain none here: a failed launch is no close
             // intent, and the dead-owner rules below apply to them.
-            if let Some(launch) = launch::read(directory)?
+            if let Some(launch) = launch::read(&Reader::open_unchecked(directory))?
                 && launch.phase != launch::Phase::Spawned
                 && failed_start_has_native_close_identity(session.kind)
             {
-                let status: SessionStatus = read_json(&directory.join("status.json"))?;
-                let owner: NativeSessionOwner = read_json(&directory.join(SESSION_OWNER_FILE))?;
+                let status: SessionStatus = Reader::open_unchecked(directory).status()?;
+                let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
                 let observed = query::observe_owner_record(&owner);
                 if status.state == "failed"
                     && owner.managed_session_id.as_deref() == Some(expected_session_id)
@@ -4613,7 +4661,7 @@ fn verify_terminal_close_authority_with_observations(
             if terminal_close_resumable(directory, session)? {
                 session.verify_managed_session(expected_session_id)?;
                 if session.kind == terminal::TerminalKind::AppleTerminal {
-                    let owner: NativeSessionOwner = read_json(&directory.join(SESSION_OWNER_FILE))?;
+                    let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
                     let Some(app) = &owner.terminal_app else {
                         // An intent of 0.0.10 or earlier names no app incarnation, and
                         // its owner is gone: nothing can tie the window to an app now.
@@ -4638,7 +4686,7 @@ fn verify_terminal_close_authority_with_observations(
             }
             #[cfg(target_os = "macos")]
             {
-                let owner: NativeSessionOwner = read_json(&directory.join(SESSION_OWNER_FILE))?;
+                let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
                 if !mac_native_owner_is_live(&owner)? {
                     session.verify_managed_session(expected_session_id)?;
                     // A reused PID grants neither mutation nor absence authority. The
@@ -4695,7 +4743,7 @@ fn verify_terminal_close_authority_with_observations(
             verify_terminal_surface_ownership(directory, expected_session_id, session)?;
             return Ok(TerminalCloseAuthority::LiveOwner);
         }
-        let status: SessionStatus = read_json(&directory.join("status.json"))?;
+        let status: SessionStatus = Reader::open_unchecked(directory).status()?;
         if !matches!(status.state.as_str(), "launching" | "failed") {
             bail!(
                 "terminal close requires a live native-session owner while the session is {}",
@@ -4785,9 +4833,12 @@ fn close_session_state_with_error<F>(
 where
     F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
 {
-    let claim_path = directory.join(TURN_CLAIM_FILE);
-    let _turn_lock = lock_turn_claim(&claim_path)?;
-    let status: SessionStatus = read_json(&directory.join("status.json"))?;
+    let claim_path = Reader::open_unchecked(directory)
+        .record(CoreRecord::TurnClaim)
+        .path()
+        .to_owned();
+    let _turn_lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
+    let status: SessionStatus = Reader::open_unchecked(directory).status()?;
     if status.state == "closed" {
         let consume_result = consume_terminal_handle(directory, None);
         let close_result = mark_session_closed_locked(directory, &claim_path, close_error);
@@ -4795,20 +4846,27 @@ where
         return close_result;
     }
 
-    let terminal_path = directory.join(TERMINAL_HANDLE_FILE);
-    let closing_path = directory.join(TERMINAL_CLOSING_FILE);
-    if directory.join(TERMINAL_TOMBSTONE_FILE).exists() {
+    let terminal_path = Reader::open_unchecked(directory)
+        .record(CoreRecord::Terminal)
+        .path()
+        .to_owned();
+    let closing_path = Reader::open_unchecked(directory)
+        .record(CoreRecord::TerminalClosing)
+        .path()
+        .to_owned();
+    if Reader::open_unchecked(directory)
+        .record(CoreRecord::TerminalClosed)
+        .path()
+        .to_owned()
+        .exists()
+    {
         let consume_result = consume_terminal_handle(directory, None);
         let close_result = mark_session_closed_locked(directory, &claim_path, close_error);
         consume_result?;
         return close_result;
     }
-    fault_point("claiming the terminal handle for close")?;
-    match fs::rename(&terminal_path, &closing_path) {
-        Ok(()) => {
-            fault_point("syncing the claimed terminal handle's directory")?;
-            sync_parent_directory(&closing_path)?
-        }
+    match Store::open_unchecked(directory).claim_terminal_handle()? {
+        Ok(()) => (),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if !closing_path.exists() {
                 return mark_session_closed_locked(directory, &claim_path, close_error);
@@ -4827,13 +4885,14 @@ where
         }
     }
 
-    let terminal = match read_json::<terminal::TerminalSession>(&closing_path) {
-        Ok(terminal) => terminal,
-        Err(error) => {
-            restore_terminal_handle(&closing_path, &terminal_path)?;
-            return Err(error);
-        }
-    };
+    let terminal =
+        match session::RecordReader::at(&closing_path).json::<terminal::TerminalSession>() {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                restore_terminal_handle(&closing_path, &terminal_path)?;
+                return Err(error);
+            }
+        };
     if let Err(error) = close_terminal(&terminal) {
         restore_terminal_handle(&closing_path, &terminal_path)?;
         return Err(error);
@@ -4846,59 +4905,50 @@ where
 }
 
 fn restore_terminal_handle(closing_path: &Path, terminal_path: &Path) -> Result<()> {
-    rename_session_file(closing_path, terminal_path).with_context(|| {
-        format!(
-            "failed to restore terminal handle {} after close failure",
-            terminal_path.display()
-        )
-    })
+    RecordStore::at(closing_path)
+        .rename_to(&RecordStore::at(terminal_path))
+        .with_context(|| {
+            format!(
+                "failed to restore terminal handle {} after close failure",
+                terminal_path.display()
+            )
+        })
 }
 
 fn consume_terminal_handle(
     directory: &Path,
     terminal_kind: Option<terminal::TerminalKind>,
 ) -> Result<()> {
-    let tombstone_result = write_json_atomic(
-        &directory.join(TERMINAL_TOMBSTONE_FILE),
-        &serde_json::json!({
+    let tombstone_result =
+        Store::open_unchecked(directory).write_terminal_closed(&serde_json::json!({
             "consumed": true,
             "terminal": terminal_kind.map(terminal::TerminalKind::as_str),
-        }),
-    );
-    let active_result = remove_file_if_present(&directory.join(TERMINAL_HANDLE_FILE));
-    let closing_result = remove_file_if_present(&directory.join(TERMINAL_CLOSING_FILE));
+        }));
+    let active_result = RecordStore::at(
+        Reader::open_unchecked(directory)
+            .record(CoreRecord::Terminal)
+            .path(),
+    )
+    .remove();
+    let closing_result = RecordStore::at(
+        Reader::open_unchecked(directory)
+            .record(CoreRecord::TerminalClosing)
+            .path(),
+    )
+    .remove();
     #[cfg(target_os = "macos")]
-    let intent_result = remove_file_if_present(&directory.join(TERMINAL_CLOSE_INTENT_FILE));
+    let intent_result = RecordStore::at(
+        Reader::open_unchecked(directory)
+            .record(CoreRecord::TerminalCloseIntent)
+            .path(),
+    )
+    .remove();
     #[cfg(not(target_os = "macos"))]
     let intent_result = Ok(());
     tombstone_result?;
     active_result?;
     closing_result?;
     intent_result
-}
-
-fn remove_file_if_present(path: &Path) -> Result<()> {
-    fault_point("removing a record file")?;
-    match fs::remove_file(path) {
-        Ok(()) => {
-            fault_point("syncing a removed record's directory")?;
-            sync_parent_directory(path)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("failed to remove {}", path.display())),
-    }
-}
-
-pub(super) fn rename_session_file(from: &Path, to: &Path) -> Result<()> {
-    fault_point("renaming a record file")?;
-    fs::rename(from, to)
-        .with_context(|| format!("failed to rename {} to {}", from.display(), to.display()))?;
-    fault_point("syncing a renamed record's directory")?;
-    sync_parent_directory(to)?;
-    if from.parent() != to.parent() {
-        sync_parent_directory(from)?;
-    }
-    Ok(())
 }
 
 fn finish_request(outcome: Result<()>, json: bool, session: &str, request_id: &str) -> Result<()> {
@@ -4914,8 +4964,10 @@ fn finish_request_with_extra(
 ) -> Result<()> {
     if let Err(error) = outcome {
         if json {
-            let mut value = session_directory(session)
-                .and_then(|directory| query::request_result(&directory, request_id))
+            let mut value = Reader::session_directory(session)
+                .and_then(|directory| {
+                    query::request_result(&Reader::open_unchecked(&directory), request_id)
+                })
                 .unwrap_or_else(|_| {
                     serde_json::json!({
                         "schema_version": 1, "session": session, "request_id": request_id,
@@ -5007,16 +5059,16 @@ fn emit_session_result_with(
 }
 
 fn run_session(id: &str) -> Result<()> {
-    let directory = session_directory(id)?;
-    launch::log(&directory, "wrapper_started");
-    if let Some(record) = launch::read(&directory)? {
-        let status: SessionStatus = read_json(&directory.join("status.json"))?;
+    let directory = Reader::session_directory(id)?;
+    launch::log(&Store::open_unchecked(&directory), "wrapper_started");
+    if let Some(record) = launch::read(&Reader::open_unchecked(&directory))? {
+        let status: SessionStatus = Reader::open_unchecked(&directory).status()?;
         if record.phase != launch::Phase::Pending
             || status.state != "launching"
             || current_turn_claim_token(&directory)?.as_deref() != Some(&record.claim_token)
         {
             launch::log(
-                &directory,
+                &Store::open_unchecked(&directory),
                 "wrapper_exit_code=1; launch cancelled or already attempted",
             );
             bail!(
@@ -5034,20 +5086,23 @@ fn run_session(id: &str) -> Result<()> {
         let owner = {
             let mut owner = owner;
             let surface: terminal::TerminalSession =
-                read_json(&directory.join(TERMINAL_HANDLE_FILE))?;
+                Reader::open_unchecked(&directory).terminal()?;
             surface.verify_managed_session(id)?;
             if surface.kind == terminal::TerminalKind::AppleTerminal {
                 owner.terminal_app = Some(terminal_app_process(&owner)?);
             }
             owner
         };
-        write_json_atomic(&directory.join(SESSION_OWNER_FILE), &owner)?;
-        launch::log(&directory, "owner_recorded");
+        Store::open_unchecked(&directory).write_owner(&owner)?;
+        launch::log(&Store::open_unchecked(&directory), "owner_recorded");
         run_session_inner(&directory)
     })();
     match &result {
-        Ok(()) => launch::log(&directory, "wrapper_exit_code=0"),
-        Err(error) => launch::log(&directory, &format!("wrapper_exit_code=1; {error:#}")),
+        Ok(()) => launch::log(&Store::open_unchecked(&directory), "wrapper_exit_code=0"),
+        Err(error) => launch::log(
+            &Store::open_unchecked(&directory),
+            &format!("wrapper_exit_code=1; {error:#}"),
+        ),
     }
     if let Err(finalization_error) = finalize_native_session(&directory, &result) {
         return match result {
@@ -5061,16 +5116,19 @@ fn run_session(id: &str) -> Result<()> {
 }
 
 fn finalize_native_session(directory: &Path, result: &Result<()>) -> Result<()> {
-    let claim_path = directory.join(TURN_CLAIM_FILE);
-    let _claim_lock = lock_turn_claim(&claim_path)?;
-    if let Some(record) = launch::read(directory)?
+    let claim_path = Reader::open_unchecked(directory)
+        .record(CoreRecord::TurnClaim)
+        .path()
+        .to_owned();
+    let _claim_lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
+    if let Some(record) = launch::read(&Reader::open_unchecked(directory))?
         && record.phase != launch::Phase::Spawned
         && current_turn_claim_token(directory)?.as_deref() != Some(&record.claim_token)
     {
         return Ok(());
     }
     recover_pending_completion_locked(directory, &claim_path)?;
-    let status: SessionStatus = read_json(&directory.join("status.json"))?;
+    let status: SessionStatus = Reader::open_unchecked(directory).status()?;
     if !matches!(status.state.as_str(), "closed" | "exited" | "failed") {
         match result {
             Ok(()) => update_status(directory, "exited", Some(0), None)?,
@@ -5093,11 +5151,16 @@ fn finalize_native_session(directory: &Path, result: &Result<()>) -> Result<()> 
 }
 
 fn run_session_inner(directory: &Path) -> Result<()> {
-    let manifest = read_manifest(directory)?;
+    let manifest = Reader::open_unchecked(directory).manifest()?;
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
     check_provider_version(provider, &manifest.provider_path)?;
-    let prompt_path = directory.join("initial-prompt.txt");
-    let prompt = fs::read_to_string(&prompt_path).context("failed to read initial prompt")?;
+    let prompt_path = Reader::open_unchecked(directory)
+        .record(CoreRecord::InitialPrompt)
+        .path()
+        .to_owned();
+    let prompt = Reader::open_unchecked(directory)
+        .initial_prompt()
+        .context("failed to read initial prompt")?;
     let initial_prompt_transport = provider::initial_prompt_transport(provider);
 
     let executable = std::env::current_exe().context("failed to locate agent-bridge executable")?;
@@ -5200,21 +5263,26 @@ fn run_session_inner(directory: &Path) -> Result<()> {
     // Spawn and its durable identity are fenced against cancellation by the lifecycle
     // lock. Failed identity recording ends the child but stays delivery-uncertain: an
     // argument-delivered prompt could already have been consumed before cleanup.
-    let child = launch::spawn(directory, &mut provider_command, |child| {
-        record_provider_process(directory, &manifest.id, child)?;
-        match initial_prompt_transport {
-            provider::InitialPromptTransport::ProviderArgument => {
-                fs::remove_file(&prompt_path)
-                    .context("failed to remove the accepted initial prompt")?;
-                update_status(directory, "running", None, None)?;
+    let child = launch::spawn(
+        &Store::open_unchecked(directory),
+        &mut provider_command,
+        |child| {
+            record_provider_process(directory, &manifest.id, child)?;
+            match initial_prompt_transport {
+                provider::InitialPromptTransport::ProviderArgument => {
+                    session::RecordStore::at(&prompt_path)
+                        .remove_raw()
+                        .context("failed to remove the accepted initial prompt")?;
+                    update_status(directory, "running", None, None)?;
+                }
+                provider::InitialPromptTransport::ProviderCrossSessionMessageAfterLaunch
+                | provider::InitialPromptTransport::TerminalPasteAfterLaunch => {
+                    update_status(directory, "awaiting-initial-input", None, None)?;
+                }
             }
-            provider::InitialPromptTransport::ProviderCrossSessionMessageAfterLaunch
-            | provider::InitialPromptTransport::TerminalPasteAfterLaunch => {
-                update_status(directory, "awaiting-initial-input", None, None)?;
-            }
-        }
-        Ok(())
-    });
+            Ok(())
+        },
+    );
     let mut child = match child {
         Ok(child) => child,
         Err(error) => {
@@ -5231,7 +5299,7 @@ fn run_session_inner(directory: &Path) -> Result<()> {
     let status = child.wait();
     if let Ok(status) = &status {
         launch::log(
-            directory,
+            &Store::open_unchecked(directory),
             &format!("provider_exit_code={:?}", status.code()),
         );
     }
@@ -5253,8 +5321,8 @@ fn run_hook(provider: FirstPartyCli, argument_payload: Option<&str>) -> Result<(
     let directory = PathBuf::from(
         std::env::var_os(SESSION_DIR_ENV).context("native hook session directory is not set")?,
     );
-    validate_hook_directory(&directory)?;
-    let manifest = read_manifest(&directory)?;
+    Reader::open_unchecked(&directory).validate_hook_directory()?;
+    let manifest = Reader::open_unchecked(&directory).manifest()?;
     if manifest.provider != provider.as_str() {
         bail!(
             "hook provider {} does not match session provider {}",
@@ -5347,8 +5415,11 @@ fn record_provider_result_for_claim_condition(
         },
     };
     let expected_claim_token = Some(expected_claim_token.as_str());
-    let claim_path = directory.join(TURN_CLAIM_FILE);
-    let _claim_lock = lock_turn_claim(&claim_path)?;
+    let claim_path = Reader::open_unchecked(directory)
+        .record(CoreRecord::TurnClaim)
+        .path()
+        .to_owned();
+    let _claim_lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
     recover_pending_completion_locked(directory, &claim_path)?;
     if require_no_prior_provider_event && provider_has_completed_turn(directory, provider)? {
         return Ok(());
@@ -5451,8 +5522,11 @@ fn record_provider_failure_for_claim_condition(
         },
     };
     let expected_claim_token = Some(expected_claim_token.as_str());
-    let claim_path = directory.join(TURN_CLAIM_FILE);
-    let _claim_lock = lock_turn_claim(&claim_path)?;
+    let claim_path = Reader::open_unchecked(directory)
+        .record(CoreRecord::TurnClaim)
+        .path()
+        .to_owned();
+    let _claim_lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
     recover_pending_completion_locked(directory, &claim_path)?;
     if require_no_prior_provider_event && provider_has_completed_turn(directory, provider)? {
         return Ok(());
@@ -5489,10 +5563,13 @@ fn record_provider_monitor_failure(
     provider: FirstPartyCli,
     error: &str,
 ) -> Result<()> {
-    let claim_path = directory.join(TURN_CLAIM_FILE);
-    let _claim_lock = lock_turn_claim(&claim_path)?;
+    let claim_path = Reader::open_unchecked(directory)
+        .record(CoreRecord::TurnClaim)
+        .path()
+        .to_owned();
+    let _claim_lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
     recover_pending_completion_locked(directory, &claim_path)?;
-    let status: SessionStatus = read_json(&directory.join("status.json"))?;
+    let status: SessionStatus = Reader::open_unchecked(directory).status()?;
     if matches!(status.state.as_str(), "closed" | "exited" | "failed") {
         return Ok(());
     }
@@ -5524,8 +5601,8 @@ fn record_provider_monitor_failure(
 }
 
 fn provider_has_completed_turn(directory: &Path, provider: FirstPartyCli) -> Result<bool> {
-    for path in event_paths(directory)? {
-        let event: SessionEvent = read_json(&path)?;
+    for path in Reader::open_unchecked(directory).events()? {
+        let event: SessionEvent = session::RecordReader::at(&path).json()?;
         if event.provider == provider.as_str() {
             return Ok(true);
         }
@@ -5534,7 +5611,10 @@ fn provider_has_completed_turn(directory: &Path, provider: FirstPartyCli) -> Res
 }
 
 fn current_turn_claim_token(directory: &Path) -> Result<Option<String>> {
-    match fs::read_to_string(directory.join(TURN_CLAIM_FILE)) {
+    match Reader::open_unchecked(directory)
+        .record(CoreRecord::TurnClaim)
+        .raw_text()
+    {
         Ok(token) => Ok(Some(token.trim().to_owned())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).context("failed to inspect native turn claim"),
@@ -5548,7 +5628,7 @@ fn provider_completion_is_current(
     turn_id: Option<&str>,
     expected_claim_token: Option<&str>,
 ) -> Result<bool> {
-    let status: SessionStatus = read_json(&directory.join("status.json"))?;
+    let status: SessionStatus = Reader::open_unchecked(directory).status()?;
     if !matches!(
         status.state.as_str(),
         "running" | "working" | "resume-pending"
@@ -5556,7 +5636,10 @@ fn provider_completion_is_current(
         return Ok(false);
     }
     if let Some(expected_claim_token) = expected_claim_token {
-        let current = match fs::read_to_string(directory.join(TURN_CLAIM_FILE)) {
+        let current = match Reader::open_unchecked(directory)
+            .record(CoreRecord::TurnClaim)
+            .raw_text()
+        {
             Ok(current) => current,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error).context("failed to inspect native turn claim"),
@@ -5568,8 +5651,8 @@ fn provider_completion_is_current(
     let Some(turn_id) = turn_id else {
         return Ok(true);
     };
-    for path in event_paths(directory)? {
-        let event: SessionEvent = read_json(&path)?;
+    for path in Reader::open_unchecked(directory).events()? {
+        let event: SessionEvent = session::RecordReader::at(&path).json()?;
         if event.provider == provider.as_str()
             && event.provider_session_id.as_deref() == provider_session_id
             && event.turn_id.as_deref() == Some(turn_id)
@@ -5633,19 +5716,23 @@ fn commit_provider_completion_within_locked(
         PendingTurnCompletion::new_with_status(claim_token, event, status_error, status_state)?;
     // Request indexing must not prevent a provider-verified completion from publishing.
     // A missing or damaged receipt remains explicitly unresolved in request queries.
-    if let Ok(Some(receipt)) = requests::for_claim(directory, claim_token) {
+    if let Ok(Some(receipt)) = requests::for_claim(&Reader::open_unchecked(directory), claim_token)
+    {
         pending.event_file = receipt.event_file;
     }
     let pending = bound_pending_completion(pending, event_limit)?;
     // Every caller recovers under the lifecycle lock first, so a journal that still exists
     // here belongs to a completion that could not be recovered; refuse to replace it.
-    let completion_path = directory.join(TURN_COMPLETION_FILE);
+    let completion_path = Reader::open_unchecked(directory)
+        .record(CoreRecord::Completion)
+        .path()
+        .to_owned();
     if completion_path.exists() {
         bail!("a pending native turn completion is still awaiting recovery")
     }
     // The journal is published by rename so that a partial journal never exists at its
     // final path; the temporary file carries the same private permissions.
-    write_json_atomic(&completion_path, &pending)?;
+    Store::open_unchecked(directory).write_completion(&pending)?;
     recover_pending_completion_locked(directory, claim_path)?;
     Ok(())
 }
@@ -5673,35 +5760,12 @@ fn bound_pending_completion(
     Ok(pending)
 }
 
-fn read_regular_text_if_present(path: &Path) -> Result<Option<String>> {
-    Ok(read_regular_bytes_if_present(path)?
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
-}
-
-/// The raw bytes of a regular session file, so callers that must not alter a record can
-/// decode it strictly instead of through the lossy snapshot reader.
-fn read_regular_bytes_if_present(path: &Path) -> Result<Option<Vec<u8>>> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
-        }
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!("refusing non-regular session file: {}", path.display());
-    }
-    fs::read(path)
-        .map(Some)
-        .with_context(|| format!("failed to read {}", path.display()))
-}
-
 fn create_session(spec: SessionSpec) -> Result<CreatedSession> {
-    create_session_in(&state_root()?, spec)
+    create_session_in(&Reader::state_root()?, spec)
 }
 
 fn create_session_in(root: &Path, spec: SessionSpec) -> Result<CreatedSession> {
-    create_session_within(root, &home_directories(), spec)
+    create_session_within(root, &Reader::home_directories(), spec)
 }
 
 /// [`create_session_in`] with the directories whose own entries are taken as durable
@@ -5712,27 +5776,7 @@ fn create_session_within(
     durable_directories: &[PathBuf],
     spec: SessionSpec,
 ) -> Result<CreatedSession> {
-    let ancestry_error = create_state_root(root, durable_directories)?;
-    let temp = tempfile::Builder::new()
-        .prefix("session-")
-        .tempdir_in(root)?;
-    let directory = temp.keep();
-    set_private_directory_permissions(&directory)?;
-    // The session directory is itself a record: sync the root so its entry survives a
-    // crash the same way the files written inside it do.
-    sync_directory(root)
-        .with_context(|| format!("failed to sync state root {}", root.display()))?;
-    let id = directory
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("session directory name is not UTF-8")?
-        .to_owned();
-    require_valid_session_id(&id)?;
-    let events = directory.join("events");
-    fs::create_dir(&events)?;
-    set_private_directory_permissions(&events)?;
-    sync_directory(&directory)
-        .with_context(|| format!("failed to sync session directory {}", directory.display()))?;
+    let (directory, id, ancestry_error) = Store::create_directory(root, durable_directories)?;
     let manifest = SessionManifest {
         schema: SESSION_SCHEMA,
         id: id.clone(),
@@ -5746,11 +5790,10 @@ fn create_session_within(
         yolo: spec.yolo,
         created_unix_ms: unix_ms(),
     };
-    write_json_atomic(&directory.join("manifest.json"), &manifest)?;
-    write_private(
-        &directory.join("initial-prompt.txt"),
-        spec.prompt.as_bytes(),
-    )?;
+    Store::open_unchecked(&directory).write_manifest(&manifest)?;
+    Store::open_unchecked(&directory)
+        .record(CoreRecord::InitialPrompt)
+        .write_private(spec.prompt.as_bytes())?;
     // An ancestry sync failure never blocks the session: the root lacks its receipt, so
     // the next creation repeats the walk, and the launch status records what failed.
     update_status(&directory, "launching", None, ancestry_error)?;
@@ -5761,541 +5804,14 @@ fn create_session_within(
     })
 }
 
-/// The receipt stored at `STATE_ROOT_DURABLE_FILE`. Only its existence as a regular file
-/// carries meaning; the fields describe the walk that wrote it.
-#[derive(Serialize)]
-struct StateRootDurabilityReceipt {
-    schema: u32,
-    synced_unix_ms: u128,
-}
-
-/// Creates the state root and every missing ancestor, then makes the root's ancestry
-/// durable unless the durability receipt already proves it is. A directory entry is a
-/// record like the files inside it: the session directory is only durable once the root's
-/// entry is, and the root's entry is only durable once every ancestor's entry is.
-///
-/// The walk does not depend on who created the directories. A creator that made the root
-/// or an ancestor and stopped before the parent-directory syncs leaves an existing root
-/// whose ancestry is not durable, and a creator that probed while another was still
-/// creating sees only part of what the other made. So every creation that finds no
-/// receipt syncs the entry of the root and of each ancestor above it, nearest first, up to
-/// and including the entry that sits directly in the filesystem root or in one of
-/// `durable_directories`, whichever comes first, bounded by
-/// `STATE_ROOT_ANCESTRY_SYNC_LIMIT` entries. Concurrent creators may both walk; the syncs
-/// are idempotent. The receipt is written through [`write_json_atomic`], which also syncs
-/// the root, only after the walk succeeded.
-///
-/// Returns the walk's failure, if any, for the session's launch status: a missing receipt
-/// never blocks creation, and the receipt stays absent so the next creation walks again.
-fn create_state_root(root: &Path, durable_directories: &[PathBuf]) -> Result<Option<String>> {
-    let mut created = Vec::new();
-    let mut probe = root;
-    loop {
-        match fs::symlink_metadata(probe) {
-            Ok(_) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                created.push(probe.to_path_buf());
-                match probe.parent() {
-                    Some(parent) if !parent.as_os_str().is_empty() => probe = parent,
-                    _ => break,
-                }
-            }
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("failed to inspect state directory {}", probe.display())
-                });
-            }
-        }
-    }
-    for directory in created.iter().rev() {
-        // A concurrent creator may win the race; the ancestry walk below covers its
-        // entries and this creator's alike.
-        if let Err(error) = fs::create_dir(directory)
-            && !directory.is_dir()
-        {
-            return Err(error).with_context(|| {
-                format!("failed to create state directory {}", directory.display())
-            });
-        }
-    }
-    set_private_directory_permissions(root)?;
-    if state_root_durability_receipt_present(root) {
-        return Ok(None);
-    }
-    fault_point("syncing the state root's ancestry")?;
-    if let Err(error) = sync_state_root_ancestry(root, durable_directories) {
-        return Ok(Some(format!(
-            "state root ancestry was not made durable: {error:#}"
-        )));
-    }
-    let receipt = StateRootDurabilityReceipt {
-        schema: 1,
-        synced_unix_ms: unix_ms(),
-    };
-    write_json_atomic(&root.join(STATE_ROOT_DURABLE_FILE), &receipt)?;
-    Ok(None)
-}
-
-/// Whether the state root carries its durability receipt. Only a regular file counts; a
-/// missing, unreadable, or non-regular entry means the ancestry walk runs again, which is
-/// harmless when the ancestry was in fact durable.
-fn state_root_durability_receipt_present(root: &Path) -> bool {
-    fs::symlink_metadata(root.join(STATE_ROOT_DURABLE_FILE))
-        .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-}
-
-/// Syncs the directory that holds the entry of `root`, then the one that holds its
-/// parent's entry, and so on. The walk stops after the sync that makes durable an entry
-/// sitting directly in the filesystem root or in one of `durable_directories`, whose own
-/// entries are not the bridge's to establish, or after `STATE_ROOT_ANCESTRY_SYNC_LIMIT`
-/// entries.
-fn sync_state_root_ancestry(root: &Path, durable_directories: &[PathBuf]) -> Result<()> {
-    let mut entry = root;
-    for _ in 0..STATE_ROOT_ANCESTRY_SYNC_LIMIT {
-        let Some(parent) = entry.parent() else {
-            break;
-        };
-        let holder = if parent.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            parent
-        };
-        sync_directory(holder)
-            .with_context(|| format!("failed to sync state directory {}", holder.display()))?;
-        let holder_is_filesystem_root = parent.as_os_str().is_empty() || parent.parent().is_none();
-        if holder_is_filesystem_root
-            || durable_directories
-                .iter()
-                .any(|durable| same_directory(parent, durable))
-        {
-            break;
-        }
-        entry = parent;
-    }
-    Ok(())
-}
-
-/// Whether two paths name the same directory, by spelling or after canonicalisation.
-fn same_directory(left: &Path, right: &Path) -> bool {
-    left == right
-        || matches!(
-            (left.canonicalize(), right.canonicalize()),
-            (Ok(left), Ok(right)) if left == right
-        )
-}
-
-/// The directories whose own entries the state-root ancestry walk takes as durable: the
-/// user's home directory under either of the variables `default_state_root` reads.
-fn home_directories() -> Vec<PathBuf> {
-    ["HOME", "USERPROFILE"]
-        .into_iter()
-        .filter_map(std::env::var_os)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .collect()
-}
-
-fn state_root() -> Result<PathBuf> {
-    if let Some(root) = std::env::var_os(STATE_DIR_ENV) {
-        return Ok(PathBuf::from(root));
-    }
-    default_state_root(
-        std::env::var_os("HOME").as_deref(),
-        std::env::var_os("USERPROFILE").as_deref(),
-    )
-}
-
-fn default_state_root(
-    home: Option<&std::ffi::OsStr>,
-    user_profile: Option<&std::ffi::OsStr>,
-) -> Result<PathBuf> {
-    let home = home
-        .or(user_profile)
-        .map(PathBuf::from)
-        .context("neither HOME nor USERPROFILE is set")?;
-    Ok(home.join(".agent-bridge").join("native-sessions"))
-}
-
-fn session_directory(id: &str) -> Result<PathBuf> {
-    session_directory_in(&state_root()?, id)
-}
-
-fn session_directory_in(root: &Path, id: &str) -> Result<PathBuf> {
-    require_valid_session_id(id)?;
-    let directory = root.join(id);
-    let metadata = fs::symlink_metadata(&directory)
-        .with_context(|| format!("no such Agent Bridge session: {id}"))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        bail!("refusing non-directory Agent Bridge session: {id}");
-    }
-    Ok(directory)
-}
-
-fn validate_hook_directory(directory: &Path) -> Result<()> {
-    let root = state_root()?
-        .canonicalize()
-        .context("native state root is missing")?;
-    let canonical = directory
-        .canonicalize()
-        .context("native hook session directory is missing")?;
-    if canonical.parent() != Some(root.as_path()) {
-        bail!(
-            "refusing native hook directory outside state root: {}",
-            directory.display()
-        );
-    }
-    let id = canonical
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("native hook session id is not UTF-8")?;
-    require_valid_session_id(id)
-}
-
-fn read_manifest(directory: &Path) -> Result<SessionManifest> {
-    // The manifest decides a session's scope (workspace, provider) for every read-only
-    // query, so it is read like every other session record: a link at `manifest.json`
-    // would let content outside the state root steer a search or an attach, and is
-    // refused rather than followed.
-    let path = directory.join("manifest.json");
-    let bytes = read_regular_bytes_if_present(&path)?
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let manifest: SessionManifest = serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid JSON in {}", path.display()))?;
-    if manifest.schema != SESSION_SCHEMA {
-        bail!(
-            "unsupported session schema {} for {}",
-            manifest.schema,
-            manifest.id
-        );
-    }
-    let expected_id = directory.file_name().and_then(|name| name.to_str());
-    if expected_id != Some(manifest.id.as_str()) {
-        bail!("session manifest id does not match its directory");
-    }
-    Ok(manifest)
-}
-
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let text =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("invalid JSON in {}", path.display()))
-}
-
-// Durable record writes. Every helper below syncs the file it changed and then the
-// directory that holds its entry, so a crash after the helper returns cannot lose the
-// record on a POSIX file system that honours fsync. See README "권한과 세션 경계" for the
-// classification of which records go through these helpers and the platform limits.
-//
-// Under `cfg(test)` three thread-local hooks observe these helpers: `fault_point` refuses
-// the next filesystem mutation once an injected budget is spent, which models a process
-// that died between two mutations, `record_sync` logs every sync call in order, and
-// `sync_directory` refuses the directories named by `with_sync_failure`, which models a
-// sync the operating system rejects. All are inert outside tests.
-
-#[cfg(test)]
-thread_local! {
-    static FAULT_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-    static SYNC_LOG: std::cell::RefCell<Option<Vec<SyncRecord>>> =
-        const { std::cell::RefCell::new(None) };
-    /// Directories whose sync fails with an injected error while `with_sync_failure` runs.
-    static SYNC_FAILURES: std::cell::RefCell<Vec<PathBuf>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-    /// Every journaled event the publication predicate opened, in order, so a test can
-    /// prove when a search reads a journaled event and when it does not read it at all.
-    static PUBLICATION_READ_LOG: std::cell::RefCell<Option<Vec<PathBuf>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum SyncRecord {
-    File(PathBuf),
-    Directory(PathBuf),
-}
-
-/// Refuses the step that follows it once the injected fault budget reaches zero. A budget of
-/// `k` lets exactly `k` boundaries pass and then fails every later one, like a process that
-/// stopped there. Boundaries sit before each record mutation (temporary-file creation,
-/// permission and content writes, rename, removal) and between a rename or removal and the
-/// sync that makes it durable; a fault after a temporary file exists leaves it behind.
-fn fault_point(label: &str) -> Result<()> {
-    #[cfg(test)]
-    {
-        FAULT_BUDGET.with(|budget| match budget.get() {
-            None => Ok(()),
-            Some(0) => bail!("injected fault before {label}"),
-            Some(remaining) => {
-                budget.set(Some(remaining - 1));
-                Ok(())
-            }
-        })
-    }
-    #[cfg(not(test))]
-    {
-        let _ = label;
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-fn injected_fault(error: &anyhow::Error) -> bool {
-    format!("{error:#}").contains("injected fault before")
-}
-
-#[cfg(test)]
-fn with_fault_budget<T>(budget: usize, run: impl FnOnce() -> T) -> T {
-    FAULT_BUDGET.with(|cell| cell.set(Some(budget)));
-    let outcome = run();
-    FAULT_BUDGET.with(|cell| cell.set(None));
-    outcome
-}
-
-#[cfg(test)]
-fn with_sync_log<T>(run: impl FnOnce() -> T) -> (T, Vec<SyncRecord>) {
-    SYNC_LOG.with(|log| *log.borrow_mut() = Some(Vec::new()));
-    let outcome = run();
-    let records = SYNC_LOG.with(|log| log.borrow_mut().take().unwrap_or_default());
-    (outcome, records)
-}
-
-/// Runs `run` while every sync of `directory` on this thread fails with an injected
-/// error. The sync is still logged first, so a test sees that it was attempted.
-#[cfg(test)]
-fn with_sync_failure<T>(directory: &Path, run: impl FnOnce() -> T) -> T {
-    SYNC_FAILURES.with(|failures| failures.borrow_mut().push(directory.to_path_buf()));
-    let outcome = run();
-    SYNC_FAILURES.with(|failures| failures.borrow_mut().clear());
-    outcome
-}
-
-#[cfg(test)]
-fn injected_sync_failure(error: &anyhow::Error) -> bool {
-    format!("{error:#}").contains("injected sync failure for")
-}
-
-/// Runs `run` and returns, in order, the path of every journaled event the publication
-/// predicate opened on this thread while it ran.
-#[cfg(test)]
-fn with_publication_read_log<T>(run: impl FnOnce() -> T) -> (T, Vec<PathBuf>) {
-    PUBLICATION_READ_LOG.with(|log| *log.borrow_mut() = Some(Vec::new()));
-    let outcome = run();
-    let paths = PUBLICATION_READ_LOG.with(|log| log.borrow_mut().take().unwrap_or_default());
-    (outcome, paths)
-}
-
-fn record_publication_read(path: &Path) {
-    #[cfg(test)]
-    PUBLICATION_READ_LOG.with(|log| {
-        if let Some(log) = log.borrow_mut().as_mut() {
-            log.push(path.to_path_buf());
-        }
-    });
-    #[cfg(not(test))]
-    let _ = path;
-}
-
-#[derive(Clone, Copy)]
-enum SyncKind {
-    File,
-    Directory,
-}
-
-fn record_sync(kind: SyncKind, path: &Path) {
-    #[cfg(test)]
-    SYNC_LOG.with(|log| {
-        if let Some(log) = log.borrow_mut().as_mut() {
-            log.push(match kind {
-                SyncKind::File => SyncRecord::File(path.to_path_buf()),
-                SyncKind::Directory => SyncRecord::Directory(path.to_path_buf()),
-            });
-        }
-    });
-    #[cfg(not(test))]
-    {
-        let _ = (kind, path);
-    }
-}
-
-fn sync_file(file: &File, path: &Path) -> Result<()> {
-    record_sync(SyncKind::File, path);
-    file.sync_all()
-        .with_context(|| format!("failed to sync {}", path.display()))
-}
-
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let parent = path.parent().context("JSON path has no parent")?;
-    fault_point("creating a temporary record file")?;
-    let temporary = tempfile::Builder::new()
-        .prefix(".agent-bridge-")
-        .suffix(".tmp")
-        .tempfile_in(parent)?;
-    let mut temporary = fault_point_keeping_temporary(
-        "writing a temporary record's permissions and content",
-        temporary,
-    )?;
-    set_private_file_permissions(temporary.as_file())?;
-    temporary.write_all(&serde_json::to_vec_pretty(value)?)?;
-    temporary.flush()?;
-    sync_file(temporary.as_file(), temporary.path())?;
-    let temporary = fault_point_keeping_temporary(
-        "renaming a temporary record over its final path",
-        temporary,
-    )?;
-    let persisted = persist_record(temporary, path)
-        .with_context(|| format!("failed to persist {}", path.display()))?;
-    fault_point("syncing a renamed record")?;
-    sync_file(&persisted, path)?;
-    sync_parent_directory(path)?;
-    Ok(())
-}
-
-// How long a record replacement waits for another handle to the record to close.
-#[cfg(windows)]
-const RECORD_REPLACE_WAIT: Duration = Duration::from_secs(1);
-
-/// Renames a temporary record over its final path. Windows refuses to replace a file
-/// while any other handle to it is open, whatever that handle shares, and a caller that
-/// polls a record holds one for a moment on every read (2026-10-01: a launcher's read of
-/// `launch.json` failed the wrapper's replacement of it with access denied). The rename
-/// is therefore repeated for a bounded time on those two errors; a record that stays
-/// open, or cannot be replaced for another reason, still fails.
-fn persist_record(temporary: tempfile::NamedTempFile, path: &Path) -> std::io::Result<File> {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
-        let deadline = Instant::now() + RECORD_REPLACE_WAIT;
-        let mut temporary = temporary;
-        loop {
-            match temporary.persist(path) {
-                Ok(file) => return Ok(file),
-                Err(error)
-                    if Instant::now() < deadline
-                        && error.error.raw_os_error().is_some_and(|code| {
-                            [ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION].contains(&(code as u32))
-                        }) =>
-                {
-                    temporary = error.file;
-                    thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => return Err(error.error),
-            }
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        temporary.persist(path).map_err(|error| error.error)
-    }
-}
-
-/// A fault at a boundary after the temporary file exists leaves that file behind, exactly
-/// as an abrupt stop would; ordinary errors still remove it when the handle drops.
-fn fault_point_keeping_temporary(
-    label: &str,
-    temporary: tempfile::NamedTempFile,
-) -> Result<tempfile::NamedTempFile> {
-    match fault_point(label) {
-        Ok(()) => Ok(temporary),
-        Err(error) => {
-            #[cfg(test)]
-            {
-                let _ = temporary.keep();
-            }
-            Err(error)
-        }
-    }
-}
-
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    fault_point("creating a private record file")?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    // The file now exists at its final path; a fault here leaves it empty, as a stop would.
-    fault_point("writing a private record's permissions and content")?;
-    set_private_file_permissions(&file)?;
-    file.write_all(bytes)?;
-    file.flush()?;
-    fault_point("syncing a private record")?;
-    sync_file(&file, path)?;
-    sync_parent_directory(path)?;
-    Ok(())
-}
-
-fn sync_parent_directory(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("state path has no parent directory")?;
-    sync_directory(parent)
-        .with_context(|| format!("failed to sync state directory {}", parent.display()))
-}
-
-fn sync_directory(directory: &Path) -> Result<()> {
-    record_sync(SyncKind::Directory, directory);
-    #[cfg(test)]
-    if SYNC_FAILURES.with(|failures| failures.borrow().iter().any(|failed| failed == directory)) {
-        bail!("injected sync failure for {}", directory.display());
-    }
-    sync_directory_entries(directory)
-}
-
-#[cfg(unix)]
-fn sync_directory_entries(directory: &Path) -> Result<()> {
-    File::open(directory)?.sync_all()?;
-    Ok(())
-}
-
-// Windows flushes the directory's metadata through a handle opened with backup semantics.
-// NTFS journals directory entries, so this is a best-effort flush of the volume's cached
-// metadata rather than the POSIX guarantee that the entry itself reached stable storage.
-#[cfg(windows)]
-fn sync_directory_entries(directory: &Path) -> Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
-
-    OpenOptions::new()
-        .write(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(directory)?
-        .sync_all()?;
-    Ok(())
-}
-
-// No supported transport exists on other targets; the directory entry is left to the
-// operating system's own write-back and the records are not claimed durable there.
-#[cfg(not(any(unix, windows)))]
-fn sync_directory_entries(_directory: &Path) -> Result<()> {
-    Ok(())
-}
-
 fn update_status(
     directory: &Path,
     state: &str,
     exit_code: Option<i32>,
     error: Option<String>,
 ) -> Result<()> {
-    let _status_lock = lock_status(directory)?;
+    let _status_lock = Store::open_unchecked(directory).lock_status()?;
     update_status_locked(directory, state, exit_code, error)
-}
-
-struct StatusLock {
-    _file: File,
-}
-
-fn lock_status(directory: &Path) -> Result<StatusLock> {
-    let path = directory.join(STATUS_LOCK_FILE);
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    set_private_file_permissions(&file)?;
-    file.lock()
-        .with_context(|| "failed to lock native session status")?;
-    Ok(StatusLock { _file: file })
 }
 
 fn update_status_locked(
@@ -6304,14 +5820,13 @@ fn update_status_locked(
     exit_code: Option<i32>,
     error: Option<String>,
 ) -> Result<()> {
-    let status_path = directory.join("status.json");
-    let closed_path = directory.join(CLOSED_STATUS_FILE);
+    let store = Store::open_unchecked(directory);
     // The tombstone is the close's commit point: every later write, whatever state it
     // asks for, restores the tombstone unchanged and does not advance the generation.
-    if let Some(closed) = read_status_if_present(&closed_path)? {
-        return write_json_atomic(&status_path, &closed);
+    if let Some(closed) = store.closed_if_present()? {
+        return store.write_status(&closed);
     }
-    let current = read_status_if_present(&status_path)?;
+    let current = store.status_if_present()?;
     if let Some(current) = &current
         && !valid_status_transition(&current.state, state)
     {
@@ -6333,10 +5848,10 @@ fn update_status_locked(
         error,
     };
     if state == "closed" {
-        write_json_atomic(&closed_path, &status)?;
-        return write_json_atomic(&status_path, &status);
+        store.write_closed(&status)?;
+        return store.write_status(&status);
     }
-    write_json_atomic(&status_path, &status)
+    store.write_status(&status)
 }
 
 /// The session status transition contract. A same-state write is always allowed (it
@@ -6386,41 +5901,12 @@ fn valid_status_transition(current: &str, next: &str) -> bool {
         )
 }
 
-fn read_status_if_present(path: &Path) -> Result<Option<SessionStatus>> {
-    match fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text)
-            .map(Some)
-            .with_context(|| format!("invalid JSON in {}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
-    }
-}
-
 struct TurnClaim {
     path: PathBuf,
     token: String,
     receipt: requests::Receipt,
     retained: bool,
     rollback_state: Option<&'static str>,
-}
-
-struct TurnClaimLock {
-    _file: File,
-}
-
-fn lock_turn_claim(path: &Path) -> Result<TurnClaimLock> {
-    let lock_path = path.with_file_name(TURN_CLAIM_LOCK_FILE);
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("failed to open {}", lock_path.display()))?;
-    set_private_file_permissions(&file)?;
-    file.lock()
-        .with_context(|| "failed to lock native turn claim lifecycle")?;
-    Ok(TurnClaimLock { _file: file })
 }
 
 impl TurnClaim {
@@ -6460,8 +5946,11 @@ fn update_status_for_turn(
     state: &str,
     error: Option<String>,
 ) -> Result<bool> {
-    let claim_path = directory.join(TURN_CLAIM_FILE);
-    let _lock = lock_turn_claim(&claim_path)?;
+    let claim_path = Reader::open_unchecked(directory)
+        .record(CoreRecord::TurnClaim)
+        .path()
+        .to_owned();
+    let _lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
     update_status_for_turn_locked(directory, claim_token, state, error)
 }
 
@@ -6557,8 +6046,8 @@ fn rollback_turn_claim_token_with_error(
     state: &str,
     error: Option<String>,
 ) -> Result<bool> {
-    let _lock = lock_turn_claim(path)?;
-    let current = match fs::read_to_string(path) {
+    let _lock = Store::open_unchecked((path).with_file_name("")).lock()?;
+    let current = match session::RecordReader::at(path).raw_text() {
         Ok(current) => current,
         Err(read_error) if read_error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(false);
@@ -6586,8 +6075,11 @@ fn acquire_turn_claim_with_context(
     directory: &Path,
     context_sources: &[requests::ContextSource],
 ) -> Result<TurnClaim> {
-    let path = directory.join(TURN_CLAIM_FILE);
-    let _lock = lock_turn_claim(&path)?;
+    let path = Reader::open_unchecked(directory)
+        .record(CoreRecord::TurnClaim)
+        .path()
+        .to_owned();
+    let _lock = Store::open_unchecked((path).with_file_name("")).lock()?;
     create_turn_claim_locked(path, context_sources)
 }
 
@@ -6633,36 +6125,40 @@ where
     F: FnOnce() -> Result<()>,
     G: FnOnce(),
 {
-    let path = directory.join(TURN_CLAIM_FILE);
-    let state = read_json::<SessionStatus>(&directory.join("status.json"))?.state;
+    let path = Reader::open_unchecked(directory)
+        .record(CoreRecord::TurnClaim)
+        .path()
+        .to_owned();
+    let state = Reader::open_unchecked(directory).status()?.state;
     if !session_accepts_prompt(&state) {
         bail!("session {session_id} is {state}; tell requires the ready state");
     }
     let mut claim = {
-        let _lock = lock_turn_claim(&path)?;
-        let state = read_json::<SessionStatus>(&directory.join("status.json"))?.state;
+        let _lock = Store::open_unchecked((path).with_file_name("")).lock()?;
+        let state = Reader::open_unchecked(directory).status()?.state;
         if !session_accepts_prompt(&state) {
             bail!("session {session_id} is {state}; tell requires the ready state");
         }
         create_turn_claim_locked(path.clone(), context_sources)?
     };
     if let Err(error) = after_claim() {
-        let _lock = lock_turn_claim(&path)?;
+        let _lock = Store::open_unchecked((path).with_file_name("")).lock()?;
         let _ = release_turn_claim_token_locked(&path, &claim.token);
         claim.retain();
         return Err(error);
     }
-    let _lock = lock_turn_claim(&path)?;
-    let current = fs::read_to_string(&path)
+    let _lock = Store::open_unchecked((path).with_file_name("")).lock()?;
+    let current = session::RecordReader::at(&path)
+        .raw_text()
         .with_context(|| "native turn claim disappeared before it could start")?;
     if current.trim() != claim.token {
         bail!("native turn claim changed before it could start");
     }
-    let state = read_json::<SessionStatus>(&directory.join("status.json"))?.state;
+    let state = Reader::open_unchecked(directory).status()?.state;
     if !session_accepts_prompt(&state) {
         bail!("session {session_id} is {state}; tell requires the ready state");
     }
-    let baseline = event_paths(directory)?.len();
+    let baseline = Reader::open_unchecked(directory).events()?.len();
     before_publish();
     if let Err(error) = update_status(directory, "claimed", None, None) {
         let _ = release_turn_claim_token_locked(&path, &claim.token);
@@ -6677,27 +6173,20 @@ fn create_turn_claim_locked(
     path: PathBuf,
     context_sources: &[requests::ContextSource],
 ) -> Result<TurnClaim> {
-    fault_point("creating the turn claim")?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .with_context(|| "another tell request already owns this session turn")?;
-    set_private_file_permissions(&file)?;
+    let store = Store::open_unchecked(path.with_file_name(""));
+    let mut file = store.create_claim_file()?;
     let token = format!(
         "{}-{}-{}",
         std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
         TURN_CLAIM_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     );
-    writeln!(file, "{token}")?;
-    file.flush()?;
-    sync_file(&file, &path)?;
-    sync_parent_directory(&path)?;
+    store.write_claim_token(&mut file, &token)?;
     let directory = path
         .parent()
         .context("turn claim has no session directory")?;
-    let receipt = match requests::create(directory, &token, context_sources) {
+    let receipt = match requests::create(&Store::open_unchecked(directory), &token, context_sources)
+    {
         Ok(receipt) => receipt,
         Err(error) => {
             let _ = remove_turn_claim_locked(&path);
@@ -6714,12 +6203,12 @@ fn create_turn_claim_locked(
 }
 
 fn release_turn_claim_token(path: &Path, expected_token: &str) -> Result<()> {
-    let _lock = lock_turn_claim(path)?;
+    let _lock = Store::open_unchecked((path).with_file_name("")).lock()?;
     release_turn_claim_token_locked(path, expected_token)
 }
 
 fn release_turn_claim_token_locked(path: &Path, expected_token: &str) -> Result<()> {
-    let token = match fs::read_to_string(path) {
+    let token = match session::RecordReader::at(path).raw_text() {
         Ok(token) => token,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error).context("failed to inspect native turn claim"),
@@ -6727,7 +6216,9 @@ fn release_turn_claim_token_locked(path: &Path, expected_token: &str) -> Result<
     if token.trim() != expected_token {
         return Ok(());
     }
-    remove_file_if_present(path).context("failed to release native turn claim")
+    RecordStore::at(path)
+        .remove()
+        .context("failed to release native turn claim")
 }
 
 #[cfg(test)]
@@ -6738,7 +6229,9 @@ fn release_turn_claim(directory: &Path) -> Result<()> {
 }
 
 fn remove_turn_claim_locked(path: &Path) -> Result<()> {
-    remove_file_if_present(path).context("failed to release native turn claim")
+    RecordStore::at(path)
+        .remove()
+        .context("failed to release native turn claim")
 }
 
 fn valid_turn_claim_token(token: &str) -> bool {
@@ -6750,8 +6243,11 @@ fn valid_turn_claim_token(token: &str) -> bool {
 }
 
 fn recover_pending_completion(directory: &Path) -> Result<bool> {
-    let claim_path = directory.join(TURN_CLAIM_FILE);
-    let _lock = lock_turn_claim(&claim_path)?;
+    let claim_path = Reader::open_unchecked(directory)
+        .record(CoreRecord::TurnClaim)
+        .path()
+        .to_owned();
+    let _lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
     recover_pending_completion_locked(directory, &claim_path)
 }
 
@@ -6770,18 +6266,21 @@ fn recover_pending_completion(directory: &Path) -> Result<bool> {
 /// they discard the journal of an event that already matches it: the completion that wrote
 /// the event may have stopped between its rename and that sync.
 fn recover_pending_completion_locked(directory: &Path, claim_path: &Path) -> Result<bool> {
-    let completion_path = directory.join(TURN_COMPLETION_FILE);
-    if let Some(tombstone) = read_status_if_present(&directory.join(CLOSED_STATUS_FILE))? {
+    let completion_path = Reader::open_unchecked(directory)
+        .record(CoreRecord::Completion)
+        .path()
+        .to_owned();
+    if let Some(tombstone) = Reader::open_unchecked(directory).closed_if_present()? {
         return converge_interrupted_close_locked(directory, claim_path, &tombstone);
     }
-    let Some(text) = read_regular_text_if_present(&completion_path)? else {
+    let Some(text) = session::RecordReader::at(&completion_path).text()? else {
         return Ok(false);
     };
     let pending: PendingTurnCompletion =
         serde_json::from_str(&text).context("invalid pending native turn completion")?;
     validate_pending_completion(&pending)?;
 
-    match fs::read_to_string(claim_path) {
+    match session::RecordReader::at(claim_path).raw_text() {
         Ok(current) if current.trim() == pending.claim_token => {
             write_pending_completion_event(directory, &pending)?;
             update_status(
@@ -6791,7 +6290,7 @@ fn recover_pending_completion_locked(directory: &Path, claim_path: &Path) -> Res
                 pending.status_error.clone(),
             )?;
             release_turn_claim_token_locked(claim_path, &pending.claim_token)?;
-            remove_file_if_present(&completion_path)?;
+            RecordStore::at(&completion_path).remove()?;
             Ok(true)
         }
         Ok(_) => bail!("pending native completion belongs to a different turn claim"),
@@ -6807,7 +6306,7 @@ fn recover_pending_completion_locked(directory: &Path, claim_path: &Path) -> Res
                     bail!("claim-free pending completion event does not match its journal")
                 }
             }
-            let status: SessionStatus = read_json(&directory.join("status.json"))?;
+            let status: SessionStatus = Reader::open_unchecked(directory).status()?;
             if status.state != pending.status_state || status.error != pending.status_error {
                 bail!("claim-free pending completion has no matching terminal status")
             }
@@ -6815,7 +6314,7 @@ fn recover_pending_completion_locked(directory: &Path, claim_path: &Path) -> Res
             // journal is the last evidence of the result, so its removal is preceded by
             // the same barrier regardless of which run released the claim.
             sync_committed_event_directory(directory)?;
-            remove_file_if_present(&completion_path)?;
+            RecordStore::at(&completion_path).remove()?;
             Ok(true)
         }
         Err(error) => Err(error).context("failed to inspect pending completion turn claim"),
@@ -6835,17 +6334,21 @@ fn converge_interrupted_close_locked(
     tombstone: &SessionStatus,
 ) -> Result<bool> {
     let mut changed = false;
-    let status_path = directory.join("status.json");
-    let status_matches = read_status_if_present(&status_path)?.is_some_and(|status| {
-        status.state == tombstone.state
-            && status.generation == tombstone.generation
-            && status.error == tombstone.error
-    });
+    let status_matches = Reader::open_unchecked(directory)
+        .status_if_present()?
+        .is_some_and(|status| {
+            status.state == tombstone.state
+                && status.generation == tombstone.generation
+                && status.error == tombstone.error
+        });
     if !status_matches {
         update_status(directory, "closed", None, tombstone.error.clone())?;
         changed = true;
     }
-    let completion_path = directory.join(TURN_COMPLETION_FILE);
+    let completion_path = Reader::open_unchecked(directory)
+        .record(CoreRecord::Completion)
+        .path()
+        .to_owned();
     if completion_path.exists() {
         set_aside_unverified_completion_event_for_close(directory)?;
         changed = true;
@@ -6854,11 +6357,17 @@ fn converge_interrupted_close_locked(
         remove_turn_claim_locked(claim_path)?;
         changed = true;
     }
-    remove_file_if_present(&completion_path)?;
-    for name in [LEGACY_RESUME_PENDING_FILE, LEGACY_RESUME_RUNNING_FILE] {
-        let path = directory.join(name);
+    RecordStore::at(&completion_path).remove()?;
+    for name in [
+        CoreRecord::LegacyResumePending.name(),
+        CoreRecord::LegacyResumeRunning.name(),
+    ] {
+        let path = Reader::open_unchecked(directory)
+            .private(name)
+            .path()
+            .to_owned();
         if path.exists() {
-            remove_file_if_present(&path)?;
+            RecordStore::at(&path).remove()?;
             changed = true;
         }
     }
@@ -6908,114 +6417,9 @@ fn journaled_event_state(
     directory: &Path,
     pending: &PendingTurnCompletion,
 ) -> Result<JournaledEventState> {
-    Ok(journaled_event_state_within(directory, pending, EVENT_READ_LIMIT)?.state)
-}
-
-/// [`journaled_event_state`] that reads at most `limit + 1` bytes of the event. The size
-/// is checked before the file is opened, and a file that grows under the read is still
-/// reported as oversized: the read is cut after `limit + 1` bytes, and that one extra byte
-/// is what detects the overflow, so a caller charging a byte budget may see one byte more
-/// than `limit` in `bytes_read`. The `events` directory is validated before anything under
-/// it is opened, so a link planted there is never followed by a publication read.
-fn journaled_event_state_within(
-    directory: &Path,
-    pending: &PendingTurnCompletion,
-    limit: u64,
-) -> Result<JournaledEventRead> {
-    use std::io::Read as _;
-    require_events_directory(directory)?;
-    let path = directory.join("events").join(&pending.event_file);
-    let outcome = |state, bytes_read, committed_text| JournaledEventRead {
-        state,
-        bytes_read,
-        committed_text,
-    };
-    let metadata = match fs::symlink_metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(outcome(JournaledEventState::Absent, 0, None));
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
-        }
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!("refusing non-regular session file: {}", path.display());
-    }
-    if metadata.len() > limit {
-        return Ok(outcome(
-            JournaledEventState::Oversized(metadata.len()),
-            0,
-            None,
-        ));
-    }
-    let file = match File::open(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(outcome(JournaledEventState::Absent, 0, None));
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", path.display()));
-        }
-    };
-    record_publication_read(&path);
-    let mut stored = Vec::with_capacity(metadata.len() as usize);
-    file.take(limit + 1)
-        .read_to_end(&mut stored)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let bytes_read = stored.len() as u64;
-    if bytes_read > limit {
-        return Ok(outcome(
-            JournaledEventState::Oversized(bytes_read),
-            bytes_read,
-            None,
-        ));
-    }
-    Ok(if stored == serde_json::to_vec_pretty(&pending.event)? {
-        // The journal's bytes are canonical JSON, so the stored text is valid UTF-8.
-        let text = String::from_utf8_lossy(&stored).into_owned();
-        outcome(JournaledEventState::Committed, bytes_read, Some(text))
-    } else {
-        outcome(JournaledEventState::Mismatched, bytes_read, None)
-    })
-}
-
-/// What stands at a session's `events` path when it is safe to say anything about it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EventsDirectory {
-    /// A real directory inside the session directory.
-    Present,
-    /// Nothing at all: the session holds no event record.
-    Missing,
-}
-
-/// Inspects a session's `events` path with `symlink_metadata`, so a symlink or Windows
-/// junction is rejected rather than followed, as is a non-directory file or an unreadable
-/// entry. A missing path is reported, not rejected: readers and lifecycle steps decide
-/// what an absent directory means for them.
-fn events_directory_state(directory: &Path) -> Result<EventsDirectory> {
-    let events = directory.join("events");
-    match fs::symlink_metadata(&events) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            bail!("events directory is a symlink")
-        }
-        Ok(metadata) if !metadata.is_dir() => bail!("events is not a directory"),
-        Ok(_) => Ok(EventsDirectory::Present),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(EventsDirectory::Missing),
-        Err(error) => bail!("events directory is unreadable: {error}"),
-    }
-}
-
-/// A session's `events` must be a real directory inside the session directory before any
-/// record under it is opened: the shared event listing turns a missing or non-directory
-/// `events` path into an empty list, a search must not present that damage as "no
-/// results", and a link planted there would carry a publication read outside the state
-/// root. Built on [`events_directory_state`], so a link is rejected rather than followed.
-fn require_events_directory(directory: &Path) -> Result<()> {
-    match events_directory_state(directory)? {
-        EventsDirectory::Present => Ok(()),
-        EventsDirectory::Missing => bail!("events directory is missing"),
-    }
+    Ok(Reader::open_unchecked(directory)
+        .journaled_event_state_within(pending, EVENT_READ_LIMIT)?
+        .state)
 }
 
 /// The first settlement step of a close that finds a completion journal in place. The
@@ -7042,11 +6446,14 @@ fn require_events_directory(directory: &Path) -> Result<()> {
 /// rename and the sync of `events/`, so the close syncs the directory before the journal,
 /// the only proof that the entry is the result, is removed.
 fn set_aside_unverified_completion_event_for_close(directory: &Path) -> Result<()> {
-    let completion_path = directory.join(TURN_COMPLETION_FILE);
-    let Some(text) = read_regular_text_if_present(&completion_path)? else {
+    let completion_path = Reader::open_unchecked(directory)
+        .record(CoreRecord::Completion)
+        .path()
+        .to_owned();
+    let Some(text) = session::RecordReader::at(&completion_path).text()? else {
         return Ok(());
     };
-    if events_directory_state(directory)? == EventsDirectory::Missing {
+    if Reader::open_unchecked(directory).events_directory_state()? == EventsDirectory::Missing {
         return Ok(());
     }
     let Ok(pending) = serde_json::from_str::<PendingTurnCompletion>(&text) else {
@@ -7055,20 +6462,25 @@ fn set_aside_unverified_completion_event_for_close(directory: &Path) -> Result<(
     if validate_pending_completion(&pending).is_err() {
         return Ok(());
     }
-    let events = directory.join("events");
-    let set_aside = events.join(format!("{UNPUBLISHED_EVENT_PREFIX}{}", pending.event_file));
+    let events = Reader::open_unchecked(directory)
+        .record(CoreRecord::Events)
+        .path()
+        .to_owned();
+    let set_aside = Store::open_unchecked(directory)
+        .unpublished_event(&pending.event_file)
+        .path()
+        .to_owned();
     match journaled_event_state(directory, &pending)? {
         JournaledEventState::Mismatched | JournaledEventState::Oversized(_) => {
-            rename_session_file(&events.join(&pending.event_file), &set_aside).context(
-                "failed to set aside a completion event that disagrees with its journal",
-            )?;
+            RecordStore::at(&events.join(&pending.event_file))
+                .rename_to(&RecordStore::at(&set_aside))
+                .context(
+                    "failed to set aside a completion event that disagrees with its journal",
+                )?;
         }
         JournaledEventState::Absent => {
             if fs::symlink_metadata(&set_aside).is_ok() {
-                fault_point("syncing a set-aside completion event's directory")?;
-                sync_directory(&events).with_context(|| {
-                    format!("failed to sync state directory {}", events.display())
-                })?;
+                Store::open_unchecked(directory).sync_set_aside_event_directory()?;
             }
         }
         JournaledEventState::Committed => sync_committed_event_directory(directory)?,
@@ -7085,10 +6497,7 @@ fn set_aside_unverified_completion_event_for_close(directory: &Path) -> Result<(
 /// idempotent when the completion already made the entry durable, and it is a fault
 /// boundary like every other sync that follows a rename.
 fn sync_committed_event_directory(directory: &Path) -> Result<()> {
-    fault_point("syncing a committed completion event's directory")?;
-    let events = directory.join("events");
-    sync_directory(&events)
-        .with_context(|| format!("failed to sync state directory {}", events.display()))
+    Store::open_unchecked(directory).sync_committed_event_directory()
 }
 
 fn validate_pending_completion(pending: &PendingTurnCompletion) -> Result<()> {
@@ -7101,7 +6510,7 @@ fn validate_pending_completion(pending: &PendingTurnCompletion) -> Result<()> {
     {
         bail!("invalid pending native completion identity")
     }
-    if !valid_event_file_name(&pending.event_file) {
+    if !Reader::valid_event_file_name(&pending.event_file) {
         bail!("invalid pending native completion event file")
     }
     if pending.event.error != pending.status_error {
@@ -7135,17 +6544,24 @@ fn write_pending_completion_event(directory: &Path, pending: &PendingTurnComplet
                     "pending native completion event is {size} bytes, over the {EVENT_READ_LIMIT} byte read limit"
                 )
             }
-            write_json_atomic(
-                &directory.join("events").join(&pending.event_file),
-                &pending.event,
+            RecordStore::at(
+                &Reader::open_unchecked(directory)
+                    .record(CoreRecord::Events)
+                    .path()
+                    .to_owned()
+                    .join(&pending.event_file),
             )
+            .write_json(&pending.event)
         }
     }
 }
 
 fn mark_session_closed(directory: &Path, error: Option<String>) -> Result<()> {
-    let claim_path = directory.join(TURN_CLAIM_FILE);
-    let _lock = lock_turn_claim(&claim_path)?;
+    let claim_path = Reader::open_unchecked(directory)
+        .record(CoreRecord::TurnClaim)
+        .path()
+        .to_owned();
+    let _lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
     mark_session_closed_locked(directory, &claim_path, error)
 }
 
@@ -7154,8 +6570,16 @@ fn mark_session_closed_locked(
     claim_path: &Path,
     error: Option<String>,
 ) -> Result<()> {
-    let consume_result = if directory.join(TERMINAL_HANDLE_FILE).exists()
-        || directory.join(TERMINAL_CLOSING_FILE).exists()
+    let consume_result = if Reader::open_unchecked(directory)
+        .record(CoreRecord::Terminal)
+        .path()
+        .to_owned()
+        .exists()
+        || Reader::open_unchecked(directory)
+            .record(CoreRecord::TerminalClosing)
+            .path()
+            .to_owned()
+            .exists()
     {
         consume_terminal_handle(directory, None)
     } else {
@@ -7170,14 +6594,31 @@ fn mark_session_closed_locked(
         let claim_result = set_aside_unverified_completion_event_for_close(directory)
             .and_then(|()| remove_turn_claim_locked(claim_path));
         let pending_result = if claim_result.is_ok() {
-            remove_file_if_present(&directory.join(TURN_COMPLETION_FILE))
+            RecordStore::at(
+                Reader::open_unchecked(directory)
+                    .record(CoreRecord::Completion)
+                    .path(),
+            )
+            .remove()
         } else {
             Ok(())
         }
-        .and_then(|()| remove_file_if_present(&directory.join(LEGACY_RESUME_PENDING_FILE)));
+        .and_then(|()| {
+            RecordStore::at(
+                Reader::open_unchecked(directory)
+                    .record(CoreRecord::LegacyResumePending)
+                    .path(),
+            )
+            .remove()
+        });
         (
             pending_result,
-            remove_file_if_present(&directory.join(LEGACY_RESUME_RUNNING_FILE)),
+            RecordStore::at(
+                Reader::open_unchecked(directory)
+                    .record(CoreRecord::LegacyResumeRunning)
+                    .path(),
+            )
+            .remove(),
             claim_result,
         )
     } else {
@@ -7215,10 +6656,10 @@ where
         Some(error) => Err(error),
         None => Ok(false),
     };
-    if launch::repair(directory)? {
+    if launch::repair(&Store::open_unchecked(directory))? {
         return untouched(recovery_damage);
     }
-    let status: SessionStatus = read_json(&directory.join("status.json"))?;
+    let status: SessionStatus = Reader::open_unchecked(directory).status()?;
     if !matches!(
         status.state.as_str(),
         "launching"
@@ -7233,8 +6674,11 @@ where
     ) {
         return untouched(recovery_damage);
     }
-    let owner_path = directory.join(SESSION_OWNER_FILE);
-    let owner = match fs::read_to_string(&owner_path) {
+    let owner_path = Reader::open_unchecked(directory)
+        .record(CoreRecord::Owner)
+        .path()
+        .to_owned();
+    let owner = match session::RecordReader::at(&owner_path).raw_text() {
         Ok(text) => serde_json::from_str::<NativeSessionOwner>(&text)
             .with_context(|| format!("invalid JSON in {}", owner_path.display()))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -7301,7 +6745,11 @@ where
         // cleanup: it grants no authority, but is not evidence of a vanished surface.
         // The explicit close validates the full intent before using it as authority.
         #[cfg(target_os = "macos")]
-        if read_regular_bytes_if_present(&directory.join(TERMINAL_CLOSE_INTENT_FILE))?.is_some() {
+        if Reader::open_unchecked(directory)
+            .record(CoreRecord::TerminalCloseIntent)
+            .bytes()?
+            .is_some()
+        {
             return untouched(recovery_damage);
         }
         // A native owner ending on its own does not prove that a terminal window
@@ -7309,8 +6757,11 @@ where
         // before a first explicit close. This gives no authority to send a close:
         // the normal live-owner/previous-intent checks must still pass.
         #[cfg(target_os = "macos")]
-        for name in [TERMINAL_HANDLE_FILE, TERMINAL_CLOSING_FILE] {
-            if let Some(bytes) = read_regular_bytes_if_present(&directory.join(name))? {
+        for name in [
+            CoreRecord::Terminal.name(),
+            CoreRecord::TerminalClosing.name(),
+        ] {
+            if let Some(bytes) = Reader::open_unchecked(directory).private(name).bytes()? {
                 let surface: terminal::TerminalSession = serde_json::from_slice(&bytes)
                     .with_context(|| format!("invalid retained terminal handle {name}"))?;
                 if surface_outlives_owner(surface.kind) {
@@ -7323,60 +6774,16 @@ where
     }
 }
 
-#[cfg(test)]
-fn write_event(directory: &Path, event: &SessionEvent) -> Result<()> {
-    write_json_atomic(
-        &directory.join("events").join(new_event_file_name()?),
-        event,
-    )
-}
-
-fn new_event_file_name() -> Result<String> {
-    Ok(format!(
-        "event-{}-{}.json",
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos(),
-        std::process::id()
-    ))
-}
-
-fn valid_event_file_name(name: &str) -> bool {
-    name.starts_with("event-")
-        && name.ends_with(".json")
-        && name.len() <= 128
-        && Path::new(name).file_name().and_then(|value| value.to_str()) == Some(name)
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
-}
-
-fn event_paths(directory: &Path) -> Result<Vec<PathBuf>> {
-    let events = directory.join("events");
-    let mut paths = Vec::new();
-    if !events.is_dir() {
-        return Ok(paths);
-    }
-    for entry in fs::read_dir(events)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file()
-            && entry
-                .file_name()
-                .to_str()
-                .is_some_and(valid_event_file_name)
-        {
-            paths.push(entry.path());
-        }
-    }
-    paths.sort();
-    Ok(paths)
-}
-
 // macOS repair deliberately retains a surface that may outlive its owner. That
 // cleanup obligation must not turn a known process exit into a request timeout.
 // This only diagnoses a dead PID: a reused/live PID or an unknown identity is not
 // proof of death, and nothing here consumes the surface or the pending claim.
 #[cfg(target_os = "macos")]
 fn require_running_wait_owner(directory: &Path) -> Result<()> {
-    if let Some(text) = read_regular_text_if_present(&directory.join(SESSION_OWNER_FILE))? {
+    if let Some(text) = Reader::open_unchecked(directory)
+        .record(CoreRecord::Owner)
+        .text()?
+    {
         let owner: NativeSessionOwner =
             serde_json::from_str(&text).context("invalid native-session owner record")?;
         if !process_is_alive(owner.pid) {
@@ -7398,7 +6805,7 @@ fn wait_for_status(
     loop {
         recover_pending_completion(directory)?;
         repair_dead_native_owner(directory)?;
-        if let Ok(status) = read_json::<SessionStatus>(&directory.join("status.json")) {
+        if let Ok(status) = Reader::open_unchecked(directory).status() {
             if matches!(status.state.as_str(), "failed" | "exited" | "closed") {
                 let reason = status
                     .error
@@ -7459,13 +6866,13 @@ fn wait_for_event_for_turn_until(
     loop {
         recover_pending_completion(directory)?;
         repair_dead_native_owner(directory)?;
-        let paths = event_paths(directory)?;
+        let paths = Reader::open_unchecked(directory).events()?;
         if paths.len() > baseline {
             let candidates = &paths[baseline..];
             let event = if let Some(expected_turn_id) = expected_turn_id {
                 let mut matched = None;
                 for path in candidates {
-                    let event: SessionEvent = read_json(path)?;
+                    let event: SessionEvent = session::RecordReader::at(path).json()?;
                     if event.turn_id.as_deref() == Some(expected_turn_id) {
                         matched = Some(event);
                         break;
@@ -7473,9 +6880,10 @@ fn wait_for_event_for_turn_until(
                 }
                 matched
             } else {
-                Some(read_json(
-                    candidates.first().context("event path disappeared")?,
-                )?)
+                Some(
+                    RecordReader::at(candidates.first().context("event path disappeared")?)
+                        .json()?,
+                )
             };
             if let Some(event) = event
                 && turn_completion_was_published(directory, expected_claim_token)?
@@ -7486,7 +6894,7 @@ fn wait_for_event_for_turn_until(
                 return Ok(event);
             }
         }
-        if let Ok(status) = read_json::<SessionStatus>(&directory.join("status.json"))
+        if let Ok(status) = Reader::open_unchecked(directory).status()
             && matches!(status.state.as_str(), "failed" | "exited" | "closed")
         {
             let reason = status
@@ -7509,13 +6917,17 @@ fn turn_completion_was_published(
     expected_claim_token: Option<&str>,
 ) -> Result<bool> {
     if let Some(expected_token) = expected_claim_token {
-        return match fs::read_to_string(directory.join(TURN_CLAIM_FILE)) {
+        return match Reader::open_unchecked(directory)
+            .record(CoreRecord::TurnClaim)
+            .raw_text()
+        {
             Ok(current_token) => Ok(current_token.trim() != expected_token),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
             Err(error) => Err(error).context("failed to inspect native turn claim"),
         };
     }
-    Ok(read_json::<SessionStatus>(&directory.join("status.json"))
+    Ok(Reader::open_unchecked(directory)
+        .status()
         .is_ok_and(|status| status.state == "ready"))
 }
 
@@ -7778,44 +7190,4 @@ fn sanitize_title(value: &str) -> Result<String> {
         bail!("--title cannot be empty");
     }
     Ok(title)
-}
-
-#[cfg(unix)]
-fn set_private_directory_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn set_private_directory_permissions(path: &Path) -> Result<()> {
-    terminal::windows_set_private_permissions(path, true)
-}
-
-#[cfg(unix)]
-fn set_private_file_permissions(file: &fs::File) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(windows)]
-fn set_private_file_permissions(file: &fs::File) -> Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
-
-    let mut path = vec![0u16; 32768];
-    let length = unsafe {
-        GetFinalPathNameByHandleW(
-            file.as_raw_handle(),
-            path.as_mut_ptr(),
-            path.len() as u32,
-            0,
-        )
-    };
-    if length == 0 || length as usize >= path.len() {
-        return Err(std::io::Error::last_os_error()).context("failed to resolve private file path");
-    }
-    path.truncate(length as usize);
-    terminal::windows_set_private_permissions(&PathBuf::from(String::from_utf16(&path)?), false)
 }

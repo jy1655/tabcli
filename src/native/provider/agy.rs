@@ -3,6 +3,7 @@ use super::{
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
     LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
 };
+use crate::native::session::{Reader, RecordReader, Store};
 use agent_bridge::FirstPartyCli;
 use anyhow::Context;
 use anyhow::{Result, bail};
@@ -163,7 +164,10 @@ impl NativeProviderAdapter for AgyAdapter {
         let claim_token = super::super::current_turn_claim_token(context.directory)?
             .context("Agy launch has no native turn claim")?;
         let pending = install_pending_turn(context.directory, &claim_token)?;
-        let log_path = context.directory.join(AGY_LOG_FILE);
+        let log_path = Reader::open_unchecked(context.directory)
+            .private(AGY_LOG_FILE)
+            .path()
+            .to_owned();
         let mut arguments = vec![
             OsString::from("--log-file"),
             log_path.as_os_str().to_owned(),
@@ -341,13 +345,16 @@ fn validate_claim_token(claim_token: &str) -> Result<()> {
 
 fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingAgyTurn> {
     let pending = PendingAgyTurn::new(claim_token)?;
-    super::super::write_json_atomic(&directory.join(PENDING_TURN_FILE), &pending)?;
+    Store::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .write_json(&pending)?;
     Ok(pending)
 }
 
 fn read_pending_turn(directory: &Path) -> Result<Option<PendingAgyTurn>> {
-    let Some(text) =
-        super::super::read_regular_text_if_present(&directory.join(PENDING_TURN_FILE))?
+    let Some(text) = Reader::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .text()?
     else {
         return Ok(None);
     };
@@ -367,7 +374,9 @@ fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result<()> {
     if pending.claim_token != claim_token {
         return Ok(());
     }
-    super::super::remove_file_if_present(&directory.join(PENDING_TURN_FILE))
+    Store::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .remove()
 }
 
 fn correlated_prompt(prompt: &str, pending: &PendingAgyTurn) -> String {
@@ -634,7 +643,7 @@ impl Clock for SystemClock {
 }
 
 fn read_log_bytes(log_path: &Path) -> Result<Option<Vec<u8>>> {
-    super::super::read_regular_bytes_if_present(log_path)
+    RecordReader::at(log_path).bytes()
 }
 
 // The trust evidence a paste needs (issue #48): Agy's trust store lists the exact
@@ -735,13 +744,17 @@ fn workspace_trust_missing(
 }
 
 fn wait_for_workspace_trust(directory: &Path, deadline: Instant) -> Result<()> {
-    let workspace = super::super::read_manifest(directory)?.workspace;
+    let workspace = Reader::open_unchecked(directory).manifest()?.workspace;
     let homes = super::super::consent::Homes::current()?;
-    let log_path = directory.join(AGY_LOG_FILE);
+    let log_path = Reader::open_unchecked(directory)
+        .private(AGY_LOG_FILE)
+        .path()
+        .to_owned();
     wait_for_workspace_trust_with(
         &mut || workspace_trust_missing(&workspace, &homes, &log_path),
         &mut || {
-            super::super::read_json::<super::super::SessionStatus>(&directory.join("status.json"))
+            Reader::open_unchecked(directory)
+                .status()
                 .ok()
                 .map(|status| status.state)
                 .filter(|state| matches!(state.as_str(), "failed" | "exited" | "closed"))
@@ -765,7 +778,10 @@ fn deliver_terminal_turn(
 ) -> terminal::TerminalSendResult {
     use terminal::TerminalSendFailure;
     let directory = session_directory_of(session).map_err(TerminalSendFailure::not_sent)?;
-    let log_path = directory.join(AGY_LOG_FILE);
+    let log_path = Reader::open_unchecked(&directory)
+        .private(AGY_LOG_FILE)
+        .path()
+        .to_owned();
     let pending = read_pending_turn(&directory)
         .and_then(|pending| pending.context("Agy turn correlation state is missing"))
         .map_err(TerminalSendFailure::not_sent)?;
@@ -826,14 +842,15 @@ where
     S: FnOnce() -> terminal::TerminalSendResult,
     C: FnOnce() -> terminal::TerminalSendResult,
 {
-    let path = directory.join(format!("agy-input-{}.json", pending.claim_token));
+    let record = Store::open_unchecked(directory)
+        .private(&format!("agy-input-{}.json", pending.claim_token));
     let mut trace = serde_json::json!({
         "schema":1, "claim_token":pending.claim_token, "terminal":terminal,
         "pre_paste_offset":pre_paste_len, "prepared_unix_ms":super::super::unix_ms(),
         "outcome":"prepared", "paste_started_unix_ms":null,
         "paste_returned_unix_ms":null, "receipt_finished_unix_ms":null, "error":null,
     });
-    let _ = super::super::write_json_atomic(&path, &trace);
+    let _ = record.write_json(&trace);
     trace["paste_started_unix_ms"] = serde_json::json!(super::super::unix_ms());
     let result = send();
     trace["paste_returned_unix_ms"] = serde_json::json!(super::super::unix_ms());
@@ -847,7 +864,7 @@ where
     if let Err(error) = &result {
         trace["error"] = serde_json::json!(error.error().to_string());
     }
-    let _ = super::super::write_json_atomic(&path, &trace);
+    let _ = record.write_json(&trace);
     result
 }
 
@@ -865,7 +882,7 @@ fn session_directory_of(session: &terminal::TerminalSession) -> Result<PathBuf> 
         .managed_session_id
         .as_deref()
         .context("Agy terminal handle is missing its managed session binding")?;
-    super::super::session_directory(id)
+    Reader::session_directory(id)
 }
 
 fn input_receipt_window_end(now: Instant, deadline: Instant) -> Instant {
@@ -1641,7 +1658,10 @@ fn workspace_trust_check_with(
     const OBSERVATION: &str =
         "Observation only: doctor never answers the dialog or edits Agy's settings.";
     const WITHHELD: &str = "The Windows initial paste and every macOS follow-up are withheld meanwhile, because a paste onto the dialog is lost and its Enter would approve the folder; an argument-delivered initial prompt still runs behind the dialog.";
-    let log_path = directory.join(AGY_LOG_FILE);
+    let log_path = Reader::open_unchecked(directory)
+        .private(AGY_LOG_FILE)
+        .path()
+        .to_owned();
     let (availability, reason, detail) = match workspace_trust_missing(workspace, homes, &log_path) {
         Ok(None) => (
             Available,
@@ -1707,7 +1727,10 @@ fn input_receipt_check_for_platform(
             NEXT_ACTION,
         );
     };
-    let log_path = directory.join(AGY_LOG_FILE);
+    let log_path = Reader::open_unchecked(directory)
+        .private(AGY_LOG_FILE)
+        .path()
+        .to_owned();
     let log = match read_log_bytes(&log_path) {
         Ok(Some(log)) => log,
         Ok(None) => {
@@ -1867,7 +1890,7 @@ impl TranscriptCursor {
             self.pending_results.clear();
         }
 
-        let mut file = OpenOptions::new().read(true).open(&self.path)?;
+        let mut file = RecordReader::at(&self.path).open()?;
         file.seek(SeekFrom::Start(self.offset))?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
@@ -2065,7 +2088,7 @@ struct MonitorState {
 
 impl MonitorState {
     fn poll(&mut self, directory: &Path, log_path: &Path, brain_root: &Path) -> Result<()> {
-        let log = super::super::read_regular_text_if_present(log_path)?;
+        let log = RecordReader::at(log_path).text()?;
         if let Some(log) = &log
             && let Some(newest_id) = parse_conversation_id(log)
             && self.conversation_id.as_deref() != Some(newest_id.as_str())

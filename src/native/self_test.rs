@@ -1,4 +1,5 @@
 use super::*;
+use crate::native::session::{Reader, RecordStore, Store};
 use serde_json::Value;
 
 // Let each public command report its timeout before the outer deadline.
@@ -181,13 +182,13 @@ impl Operations for Installed {
     }
 
     fn metadata(&self, session: &str) -> Result<(String, Option<String>)> {
-        let directory = session_directory_in(&self.root, session)?;
-        let manifest = read_manifest(&directory)?;
-        let terminal =
-            read_json::<terminal::TerminalSession>(&directory.join(TERMINAL_HANDLE_FILE))
-                .or_else(|_| read_json(&directory.join(TERMINAL_TOMBSTONE_FILE)))
-                .ok()
-                .map(|terminal| terminal.kind.as_str().to_owned());
+        let directory = Reader::session_directory_in(&self.root, session)?;
+        let manifest = Reader::open_unchecked(&directory).manifest()?;
+        let terminal = Reader::open_unchecked(&directory)
+            .terminal()
+            .or_else(|_| Reader::open_unchecked(&directory).terminal_closed())
+            .ok()
+            .map(|terminal| terminal.kind.as_str().to_owned());
         Ok((manifest.provider_version, terminal))
     }
 }
@@ -582,12 +583,15 @@ pub(super) fn run(request: Request) -> Result<()> {
             None => builder.tempdir()?,
         };
         let root = directory.keep();
-        set_private_directory_permissions(&root)?;
+        RecordStore::at(&root).set_directory_private()?;
         root
     } else {
-        state_root()?
+        Reader::state_root()?
     };
-    let marker = format!("AB_{}", new_event_file_name()?.trim_end_matches(".json"));
+    let marker = format!(
+        "AB_{}",
+        Store::new_event_file_name()?.trim_end_matches(".json")
+    );
     let mut installed = Installed {
         executable: std::env::current_exe()?,
         root: root.clone(),

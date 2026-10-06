@@ -1,5 +1,14 @@
 //! Observations and advice only. No recovery, delivery, terminal control, or settings writes.
-use super::*;
+use super::{
+    Duration, FirstPartyCli, Instant, NativeCommand, NativeSessionOwner, OsString, Output, Path,
+    Reader, ReopenMarker, Result, SESSION_DIR_ENV, SeekFrom, Serialize, SessionManifest, Stdio,
+    bail, cli_version_is_supported, consent, fs, is_executable, launch, option_value, provider,
+    provider_process, query, read_reopen_launch_refusal, refused_launch_cleanup,
+    require_valid_session_id, resolve_provider, set_flag_once, set_once, terminal,
+    terminal_safe_text, thread, unix_ms, valid_session_id,
+};
+use crate::native::session::{CoreRecord, RecordReader};
+use crate::native::{FromStr, Read, Seek, provider_version_command};
 use anyhow::Context as _;
 use serde_json::{Value, json};
 
@@ -133,7 +142,7 @@ pub(super) fn run(request: DoctorRequest) -> Result<()> {
     let directory = request
         .session
         .as_ref()
-        .and_then(|id| match session_directory(id) {
+        .and_then(|id| match Reader::session_directory(id) {
             Ok(directory) => Some(directory),
             Err(error) => {
                 checks.push(Check::new(
@@ -188,9 +197,9 @@ pub(super) fn run(request: DoctorRequest) -> Result<()> {
         });
     }
     let manifest = directory.as_ref().and_then(|directory| {
-        let manifest = match query::observe_snapshot(directory) {
+        let manifest = match query::observe_snapshot(&Reader::open_unchecked(directory)) {
             Ok(snapshot) => {
-                session_checks(directory, &snapshot, &mut checks, &mut observations);
+                session_checks(&Reader::open_unchecked(directory), &snapshot, &mut checks, &mut observations);
                 // Moving the manifest out drops the snapshot's shared lock here, before probes.
                 Some(snapshot.manifest)
             }
@@ -198,15 +207,15 @@ pub(super) fn run(request: DoctorRequest) -> Result<()> {
                 let reason = if error.is::<query::SnapshotBusy>() { "records_busy" } else { "records_unreadable" };
                 checks.push(Check::new("session_records", Unknown, reason, format!("{error:#}"), "Inspect the records without deleting locks or resending a request; retry if a writer is active."));
                 unknown_session_checks(request.session.as_deref().unwrap(), reason, &mut checks);
-                read_manifest(directory).ok()
+                Reader::open_unchecked(directory).manifest().ok()
             }
         };
-        owner_check(directory, request.session.as_deref().unwrap(), &mut checks);
-        terminal_check(directory, request.session.as_deref().unwrap(), &mut checks);
+        owner_check(&Reader::open_unchecked(directory), request.session.as_deref().unwrap(), &mut checks);
+        terminal_check(&Reader::open_unchecked(directory), request.session.as_deref().unwrap(), &mut checks);
         if request.probe {
-            surface_check(directory, deadline, &mut checks);
+            surface_check(&Reader::open_unchecked(directory), deadline, &mut checks);
         }
-        reopen_marker_check(directory, request.session.as_deref().unwrap(), &mut checks);
+        reopen_marker_check(&Reader::open_unchecked(directory), request.session.as_deref().unwrap(), &mut checks);
         manifest
     });
     let provider = match manifest
@@ -400,7 +409,7 @@ fn unknown_session_checks(id: &str, reason: &'static str, checks: &mut Vec<Check
 }
 
 fn session_checks(
-    directory: &Path,
+    reader: &Reader,
     snapshot: &query::Snapshot,
     checks: &mut Vec<Check>,
     observations: &mut Value,
@@ -421,7 +430,7 @@ fn session_checks(
     );
     let request_state = active.map(|r| {
         snapshot
-            .result(directory, &query::Selector::Request(r.request_id.clone()))
+            .result(reader, &query::Selector::Request(r.request_id.clone()))
             .map(|value| value["request_state"].clone())
             .unwrap_or(json!("unknown"))
     });
@@ -519,12 +528,16 @@ fn session_checks(
     }
 }
 
-fn surface_check(directory: &Path, deadline: Instant, checks: &mut Vec<Check>) {
+fn surface_check(reader: &Reader, deadline: Instant, checks: &mut Vec<Check>) {
+    let directory = reader.directory();
     use Availability::*;
     let result = (|| -> Result<bool> {
-        let session = query::optional_json::<terminal::TerminalSession>(
-            &directory.join(TERMINAL_HANDLE_FILE),
-        )?
+        let session = RecordReader::at(
+            Reader::open_unchecked(directory)
+                .record(CoreRecord::Terminal)
+                .path(),
+        )
+        .optional_json::<terminal::TerminalSession>()?
         .context("no active terminal handle is recorded")?;
         session.verify_managed_session(
             directory
@@ -549,9 +562,15 @@ fn surface_check(directory: &Path, deadline: Instant, checks: &mut Vec<Check>) {
         "Inspect the launch log and exact request; this read-only probe does not release a claim or resend input."));
 }
 
-fn owner_check(directory: &Path, id: &str, checks: &mut Vec<Check>) {
+fn owner_check(reader: &Reader, id: &str, checks: &mut Vec<Check>) {
+    let directory = reader.directory();
     use Availability::*;
-    let owner = query::optional_json::<NativeSessionOwner>(&directory.join(SESSION_OWNER_FILE));
+    let owner = RecordReader::at(
+        Reader::open_unchecked(directory)
+            .record(CoreRecord::Owner)
+            .path(),
+    )
+    .optional_json::<NativeSessionOwner>();
     let (availability, reason, detail, evidence) = match owner {
         Ok(Some(owner)) if owner.managed_session_id.as_deref() == Some(id) => {
             let observed = query::observe_owner_record(&owner);
@@ -597,9 +616,16 @@ fn owner_check(directory: &Path, id: &str, checks: &mut Vec<Check>) {
 // source lock (`refused_launch_cleanup`, which verifies the recorded provider process, not
 // the launch wrapper or the closed surface); doctor neither releases nor annotates the
 // marker.
-fn reopen_marker_check(directory: &Path, id: &str, checks: &mut Vec<Check>) {
+fn reopen_marker_check(reader: &Reader, id: &str, checks: &mut Vec<Check>) {
+    let directory = reader.directory();
     use Availability::*;
-    let marker = match query::optional_json::<ReopenMarker>(&directory.join(REOPEN_MARKER_FILE)) {
+    let marker = match RecordReader::at(
+        Reader::open_unchecked(directory)
+            .record(CoreRecord::ReopenMarker)
+            .path(),
+    )
+    .optional_json::<ReopenMarker>()
+    {
         Ok(Some(marker)) => marker,
         Ok(None) => return,
         Err(error) => {
@@ -677,9 +703,16 @@ fn reopen_marker_check(directory: &Path, id: &str, checks: &mut Vec<Check>) {
     })));
 }
 
-fn terminal_check(directory: &Path, id: &str, checks: &mut Vec<Check>) {
+fn terminal_check(reader: &Reader, id: &str, checks: &mut Vec<Check>) {
+    let directory = reader.directory();
     use Availability::*;
-    match query::optional_json::<Value>(&directory.join(TERMINAL_TOMBSTONE_FILE)) {
+    match RecordReader::at(
+        Reader::open_unchecked(directory)
+            .record(CoreRecord::TerminalClosed)
+            .path(),
+    )
+    .optional_json::<Value>()
+    {
         Ok(Some(value)) => {
             let consumed = value.get("consumed").and_then(Value::as_bool) == Some(true);
             checks.push(Check::new(
@@ -707,7 +740,12 @@ fn terminal_check(directory: &Path, id: &str, checks: &mut Vec<Check>) {
         }
         Ok(None) => (),
     }
-    match query::optional_json::<terminal::TerminalSession>(&directory.join(TERMINAL_CLOSING_FILE))
+    match RecordReader::at(
+        Reader::open_unchecked(directory)
+            .record(CoreRecord::TerminalClosing)
+            .path(),
+    )
+    .optional_json::<terminal::TerminalSession>()
     {
         Ok(Some(terminal)) => {
             let bound = terminal.verify_managed_session(id).is_ok();
@@ -729,9 +767,12 @@ fn terminal_check(directory: &Path, id: &str, checks: &mut Vec<Check>) {
         }
         Ok(None) => (),
     }
-    let (availability, reason, detail, evidence) = match query::optional_json::<
-        terminal::TerminalSession,
-    >(&directory.join(TERMINAL_HANDLE_FILE))
+    let (availability, reason, detail, evidence) = match RecordReader::at(
+        Reader::open_unchecked(directory)
+            .record(CoreRecord::Terminal)
+            .path(),
+    )
+    .optional_json::<terminal::TerminalSession>()
     {
         Ok(Some(terminal)) => {
             let supported = terminal.kind.supported_on_this_platform();

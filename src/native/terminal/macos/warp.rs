@@ -1,8 +1,9 @@
+use crate::native::session::{Reader, RecordReader, RecordStore};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     fs::{self, File},
-    io::{Read, Seek, SeekFrom, Write},
+    io::Read,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -488,7 +489,12 @@ where
         deadline_unix_ms,
         decision_timeout_ms,
     };
-    write_new_json(&directory.join(HOST_PLAN_FILE), &plan)?;
+    RecordStore::at(
+        Reader::open_unchecked(directory)
+            .private(HOST_PLAN_FILE)
+            .path(),
+    )
+    .write_new_json(&plan)?;
     let mut decision = HostDecisionGuard::new(directory, attempt);
 
     let config_name = format!("agent-bridge-{attempt}");
@@ -619,7 +625,13 @@ where
         decision.abort_before_cleanup().context("Warp title proof failed and Abort could not be established; unproven residual surface preserved")?;
         return Err(error).context("Warp random title ownership remains unproven; a residual launch tab may remain; no final rename or close was attempted");
     }
-    if let Err(binding_error) = write_new_json(&directory.join(CONTROL_FILE), &control) {
+    if let Err(binding_error) = RecordStore::at(
+        Reader::open_unchecked(directory)
+            .private(CONTROL_FILE)
+            .path(),
+    )
+    .write_new_json(&control)
+    {
         decision.publish(HostAction::Abort)?;
         return match close_bound_exact(runner, &client, &session, &control, cleanup_deadline) {
             Ok(_) => Err(binding_error).context("failed to persist the Warp control binding"),
@@ -789,7 +801,12 @@ pub(super) fn verify_surface(
 ) -> Result<String> {
     let directory = session_directory(session)?;
     let binding = load_binding(&directory, session)?;
-    let offer: HostOffer = read_record(&directory.join(HOST_OFFER_FILE), "Warp host offer")?;
+    let offer: HostOffer = RecordReader::at(
+        Reader::open_unchecked(&directory)
+            .private(HOST_OFFER_FILE)
+            .path(),
+    )
+    .read_adapter_record("Warp host offer", MAX_CONTROL_OUTPUT as u64)?;
     validate_offer(&offer, &binding.attempt, &directory)?;
     let deadline = deadline_from_timeout(timeout.unwrap_or(CONTROL_TIMEOUT))?;
     let mut runner = ProcessRunner;
@@ -1305,7 +1322,7 @@ fn write_tab_config(
         serde_json::to_string(&host_command)?,
     );
     let path = config_dir.join(format!("{name}.toml"));
-    write_new_bytes(&path, escape_unportable(&configuration).as_bytes())?;
+    RecordStore::at(&path).write_new_bytes(escape_unportable(&configuration).as_bytes())?;
     Ok(path)
 }
 
@@ -1344,7 +1361,7 @@ fn write_launch_config(
         "active_window_index": 0
     }))?;
     let path = config_dir.join(format!("{name}.yaml"));
-    write_new_bytes(&path, escape_unportable(&configuration).as_bytes())?;
+    RecordStore::at(&path).write_new_bytes(escape_unportable(&configuration).as_bytes())?;
     Ok(path)
 }
 
@@ -1403,7 +1420,7 @@ struct ConfigFileGuard(PathBuf);
 
 impl Drop for ConfigFileGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
+        let _ = RecordStore::at(&self.0).remove_raw();
     }
 }
 
@@ -1432,10 +1449,12 @@ impl<'a> HostDecisionGuard<'a> {
         if let Err(publish_error) = self.publish(HostAction::Abort) {
             // write_new_json never fails after publishing its hard link, but another
             // decision can already occupy the path. Never replace that decision.
-            let decision: HostDecision = read_record(
-                &self.directory.join(HOST_DECISION_FILE),
-                "Warp host decision",
+            let decision: HostDecision = RecordReader::at(
+                Reader::open_unchecked(self.directory)
+                    .private(HOST_DECISION_FILE)
+                    .path(),
             )
+            .read_adapter_record("Warp host decision", MAX_CONTROL_OUTPUT as u64)
             .with_context(|| format!("failed to publish Warp host abort: {publish_error:#}"))?;
             if decision.schema != RECORD_SCHEMA || decision.attempt != self.attempt {
                 bail!("existing Warp host decision does not match this launch attempt");
@@ -1497,10 +1516,14 @@ fn wait_for_offer<R: WarpRunner>(
     attempt: &str,
     deadline: Instant,
 ) -> Result<HostOffer> {
-    let path = directory.join(HOST_OFFER_FILE);
+    let path = Reader::open_unchecked(directory)
+        .private(HOST_OFFER_FILE)
+        .path()
+        .to_owned();
     loop {
         if path.exists() {
-            let offer: HostOffer = read_record(&path, "Warp host offer")?;
+            let offer: HostOffer = RecordReader::at(&path)
+                .read_adapter_record("Warp host offer", MAX_CONTROL_OUTPUT as u64)?;
             validate_offer(&offer, attempt, directory)?;
             return Ok(offer);
         }
@@ -1522,57 +1545,26 @@ fn validate_offer(offer: &HostOffer, attempt: &str, directory: &Path) -> Result<
 }
 
 fn write_decision(directory: &Path, attempt: &str, action: HostAction) -> Result<()> {
-    write_new_json(
-        &directory.join(HOST_DECISION_FILE),
-        &HostDecision {
-            schema: RECORD_SCHEMA,
-            attempt: attempt.to_owned(),
-            action,
-        },
+    RecordStore::at(
+        Reader::open_unchecked(directory)
+            .private(HOST_DECISION_FILE)
+            .path(),
     )
-}
-
-fn write_new_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    write_new_bytes(path, &serde_json::to_vec_pretty(value)?)
-}
-
-fn write_new_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().context("Warp record path has no parent")?;
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".agent-bridge-warp-")
-        .suffix(".tmp")
-        .tempfile_in(parent)?;
-    temporary
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o600))?;
-    temporary.as_file_mut().write_all(bytes)?;
-    temporary.as_file_mut().flush()?;
-    temporary.as_file().sync_all()?;
-    fs::hard_link(temporary.path(), path)
-        .with_context(|| format!("failed to publish exclusive Warp record {}", path.display()))?;
-    // Once the link exists the waiting host may act on it, so a directory-sync failure
-    // cannot be reported as "not published" and retried as the opposite decision.
-    let _ = File::open(parent).and_then(|directory| directory.sync_all());
-    Ok(())
-}
-
-fn read_record<T: DeserializeOwned>(path: &Path, label: &str) -> Result<T> {
-    let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("{label} is missing: {}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!("refusing non-regular {label}: {}", path.display());
-    }
-    if metadata.len() > MAX_CONTROL_OUTPUT as u64 {
-        bail!("{label} exceeds the bounded record limit");
-    }
-    let bytes = fs::read(path).with_context(|| format!("failed to read {label}"))?;
-    serde_json::from_slice(&bytes).with_context(|| format!("invalid {label}"))
+    .write_new_json(&HostDecision {
+        schema: RECORD_SCHEMA,
+        attempt: attempt.to_owned(),
+        action,
+    })
 }
 
 fn load_binding(directory: &Path, session: &TerminalSession) -> Result<ControlBinding> {
     require_exact_ids(session)?;
-    let binding: ControlBinding =
-        read_record(&directory.join(CONTROL_FILE), "Warp control binding")?;
+    let binding: ControlBinding = RecordReader::at(
+        Reader::open_unchecked(directory)
+            .private(CONTROL_FILE)
+            .path(),
+    )
+    .read_adapter_record("Warp control binding", MAX_CONTROL_OUTPUT as u64)?;
     if binding.schema != RECORD_SCHEMA || binding.instance_id != session.id {
         bail!("Warp control binding does not match the terminal handle");
     }
@@ -1616,7 +1608,7 @@ fn session_directory(session: &TerminalSession) -> Result<PathBuf> {
         .managed_session_id
         .as_deref()
         .context("Warp terminal handle is missing its managed session binding")?;
-    crate::native::session_directory(id)
+    Reader::session_directory(id)
 }
 
 fn installed_control_clients() -> Result<Vec<ControlClient>> {
@@ -1709,21 +1701,13 @@ fn run_bounded(mut command: Command, deadline: Instant) -> Result<CommandOutput>
         }
         thread::sleep(Duration::from_millis(10));
     };
-    let stdout = read_bounded_file(stdout)?;
-    let stderr = read_bounded_file(stderr)?;
+    let stdout = RecordReader::read_bounded_file(stdout, MAX_CONTROL_OUTPUT as u64)?;
+    let stderr = RecordReader::read_bounded_file(stderr, MAX_CONTROL_OUTPUT as u64)?;
     Ok(CommandOutput {
         success: status.success(),
         stdout,
         stderr,
     })
-}
-
-fn read_bounded_file(mut file: File) -> Result<Vec<u8>> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut retained = Vec::new();
-    file.take(MAX_CONTROL_OUTPUT as u64 + 1)
-        .read_to_end(&mut retained)?;
-    Ok(retained)
 }
 
 fn random_token() -> Result<String> {
@@ -1755,8 +1739,13 @@ pub(in crate::native) fn run_host(directory: &Path, attempt: &str) -> Result<()>
     if !crate::native::valid_session_id(session_id) {
         bail!("Warp host session directory has an invalid session id");
     }
-    validate_private_session_directory(directory)?;
-    let plan: HostPlan = read_record(&directory.join(HOST_PLAN_FILE), "Warp host plan")?;
+    Reader::open_unchecked(directory).validate_private_session_directory()?;
+    let plan: HostPlan = RecordReader::at(
+        Reader::open_unchecked(directory)
+            .private(HOST_PLAN_FILE)
+            .path(),
+    )
+    .read_adapter_record("Warp host plan", MAX_CONTROL_OUTPUT as u64)?;
     if plan.schema != RECORD_SCHEMA || plan.attempt != attempt {
         bail!("Warp host plan does not match this launch attempt");
     }
@@ -1767,23 +1756,29 @@ pub(in crate::native) fn run_host(directory: &Path, attempt: &str) -> Result<()>
         .checked_add(Duration::from_millis(plan.decision_timeout_ms))
         .context("Warp host decision timeout is too large")?;
     let tty = controlling_tty()?;
-    write_new_json(
-        &directory.join(HOST_OFFER_FILE),
-        &HostOffer {
-            schema: RECORD_SCHEMA,
-            attempt: attempt.to_owned(),
-            directory: directory.to_owned(),
-            pid: std::process::id(),
-            tty,
-        },
-    )?;
+    RecordStore::at(
+        Reader::open_unchecked(directory)
+            .private(HOST_OFFER_FILE)
+            .path(),
+    )
+    .write_new_json(&HostOffer {
+        schema: RECORD_SCHEMA,
+        attempt: attempt.to_owned(),
+        directory: directory.to_owned(),
+        pid: std::process::id(),
+        tty,
+    })?;
     loop {
         if Instant::now() >= monotonic_deadline || wall_ms()? >= plan.deadline_unix_ms {
             bail!("Warp host decision timed out");
         }
-        let decision_path = directory.join(HOST_DECISION_FILE);
+        let decision_path = Reader::open_unchecked(directory)
+            .private(HOST_DECISION_FILE)
+            .path()
+            .to_owned();
         if decision_path.exists() {
-            let decision: HostDecision = read_record(&decision_path, "Warp host decision")?;
+            let decision: HostDecision = RecordReader::at(&decision_path)
+                .read_adapter_record("Warp host decision", MAX_CONTROL_OUTPUT as u64)?;
             if decision.schema != RECORD_SCHEMA || decision.attempt != attempt {
                 bail!("Warp host decision does not match this launch attempt");
             }
@@ -1794,29 +1789,6 @@ pub(in crate::native) fn run_host(directory: &Path, attempt: &str) -> Result<()>
         }
         thread::sleep(POLL_INTERVAL);
     }
-}
-
-fn validate_private_session_directory(directory: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = fs::symlink_metadata(directory).with_context(|| {
-        format!(
-            "no such Warp host session directory: {}",
-            directory.display()
-        )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        bail!(
-            "refusing non-directory Warp host session path: {}",
-            directory.display()
-        );
-    }
-    // The hidden host executes the plan only from a session directory that another
-    // account cannot replace or populate.
-    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
-        bail!("Warp host session directory is not private to the current user");
-    }
-    Ok(())
 }
 
 fn controlling_tty() -> Result<String> {
@@ -1872,6 +1844,17 @@ fn host_deadlines(deadline: Instant) -> Result<(u64, u64)> {
 fn shell_quote(value: &OsStr) -> String {
     let value = value.to_string_lossy();
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(test)]
+fn read_record<T: DeserializeOwned>(path: &Path, label: &str) -> Result<T> {
+    crate::native::session::RecordReader::at(path)
+        .read_adapter_record(label, MAX_CONTROL_OUTPUT as u64)
+}
+
+#[cfg(test)]
+fn write_new_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    crate::native::session::RecordStore::at(path).write_new_json(value)
 }
 
 #[cfg(test)]

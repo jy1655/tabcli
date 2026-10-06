@@ -3,6 +3,7 @@ use super::{
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
     LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
 };
+use crate::native::session::{Reader, RecordReader, Store};
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
 use semver::Version;
@@ -220,7 +221,7 @@ impl NativeProviderAdapter for CodexAdapter {
                 .managed_session_id
                 .as_deref()
                 .context("Codex terminal has no managed session binding")
-                .and_then(super::super::session_directory)
+                .and_then(Reader::session_directory)
                 .map_err(terminal::TerminalSendFailure::not_sent)?;
             // A screen read costs a helper process and the wait polls ten times a second,
             // so the screen is read once per `COMPOSER_POLL`.
@@ -467,7 +468,8 @@ impl CodexCommandFailure {
 }
 
 fn send_native_queue_message(context: CrossSessionMessageContext<'_>) -> CrossSessionMessageResult {
-    let manifest = super::super::read_manifest(context.directory)
+    let manifest = Reader::open_unchecked(context.directory)
+        .manifest()
         .map_err(CrossSessionMessageFailure::not_sent)?;
     match codex_version_supports_native_queue(&manifest.provider_version) {
         Ok(true) => {}
@@ -933,13 +935,16 @@ fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingCo
 }
 
 fn write_pending_turn(directory: &Path, pending: &PendingCodexTurn) -> Result<()> {
-    super::super::write_json_atomic(&directory.join(PENDING_TURN_FILE), pending)?;
+    Store::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .write_json(pending)?;
     Ok(())
 }
 
 fn read_pending_turn(directory: &Path) -> Result<Option<PendingCodexTurn>> {
-    let Some(text) =
-        super::super::read_regular_text_if_present(&directory.join(PENDING_TURN_FILE))?
+    let Some(text) = Reader::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .text()?
     else {
         return Ok(None);
     };
@@ -959,7 +964,9 @@ fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result<()> {
     if pending.claim_token != claim_token {
         return Ok(());
     }
-    super::super::remove_file_if_present(&directory.join(PENDING_TURN_FILE))
+    Store::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .remove()
 }
 
 fn correlated_prompt(prompt: &str, pending: &PendingCodexTurn) -> String {
@@ -1036,8 +1043,8 @@ fn codex_input_correlates(payload: &serde_json::Value, pending: &PendingCodexTur
 }
 
 fn established_codex_thread(directory: &Path) -> Result<Option<String>> {
-    for path in super::super::event_paths(directory)? {
-        let event: super::super::SessionEvent = super::super::read_json(&path)?;
+    for path in Reader::open_unchecked(directory).events()? {
+        let event: super::super::SessionEvent = RecordReader::at(&path).json()?;
         if event.provider == FirstPartyCli::Codex.as_str()
             && let Some(thread_id) = event.provider_session_id
         {
@@ -1415,9 +1422,12 @@ exit 1
         let reason = format!("{:#}", failure.into_error());
         assert!(reason.contains("the active thread cannot be verified"));
         assert!(reason.contains("user message queue is unavailable"));
-        let receipt = super::super::super::requests::for_claim(directory, &claim.token)
-            .unwrap()
-            .unwrap();
+        let receipt = super::super::super::requests::for_claim(
+            &crate::native::session::Reader::open_unchecked(directory),
+            &claim.token,
+        )
+        .unwrap()
+        .unwrap();
         let token = claim.token.clone();
         drop(claim);
         assert!(!directory.join(TURN_CLAIM_FILE).exists());
@@ -1429,10 +1439,13 @@ exit 1
             Some(managed_thread)
         );
         assert_eq!(
-            super::super::super::requests::for_claim(directory, &token)
-                .unwrap()
-                .unwrap()
-                .request_id,
+            super::super::super::requests::for_claim(
+                &crate::native::session::Reader::open_unchecked(directory),
+                &token
+            )
+            .unwrap()
+            .unwrap()
+            .request_id,
             receipt.request_id
         );
         // A known pre-send refusal releases the claim and allows a later,

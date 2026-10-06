@@ -1,6 +1,7 @@
 //! Settings that a user changes with `agent-bridge settings`. They are one private
 //! record in the state root; a missing record, or a missing key, means the default.
 use super::*;
+use crate::native::session::{Reader, RecordReader, RecordStore, Store};
 
 const FILE: &str = "settings.json";
 const USAGE: &str = "settings takes no argument to show the settings, or macos-open-mode <tab-first|new-window> or windows-tab-window <dedicated|current> to change one; --json is accepted";
@@ -82,8 +83,8 @@ struct Record {
 }
 
 fn read(root: &Path) -> Result<Record> {
-    let path = root.join(FILE);
-    let Some(text) = read_regular_text_if_present(&path)? else {
+    let path = Reader::open_unchecked(root).private(FILE).path().to_owned();
+    let Some(text) = RecordReader::at(&path).text()? else {
         return Ok(Record {
             schema: 1,
             windows_tab_window: None,
@@ -111,7 +112,7 @@ pub(super) fn macos_open_mode(root: &Path) -> Result<MacosOpenMode> {
 }
 
 pub(super) fn run(args: &[String]) -> Result<()> {
-    let settings = apply(&state_root()?, args)?;
+    let settings = apply(&Reader::state_root()?, args)?;
     println!("{}", serde_json::to_string_pretty(&settings)?);
     Ok(())
 }
@@ -130,22 +131,24 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
         [] => {}
         ["macos-open-mode", value] => {
             let value = value.parse::<MacosOpenMode>()?;
-            create_state_root(root, &home_directories())?;
+            Store::create_state_root(root, &Reader::home_directories())?;
             let mut record = read(root)?;
             record.macos_open_mode = Some(value);
-            write_json_atomic(&root.join(FILE), &record)?;
+            RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
+                .write_json(&record)?;
         }
         ["windows-tab-window", value] => {
             let value = value.parse::<WindowsTabWindow>()?;
-            create_state_root(root, &home_directories())?;
+            Store::create_state_root(root, &Reader::home_directories())?;
             let mut record = read(root)?;
             record.windows_tab_window = Some(value);
-            write_json_atomic(&root.join(FILE), &record)?;
+            RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
+                .write_json(&record)?;
         }
         _ => bail!(USAGE),
     }
     Ok(serde_json::json!({
-        "settings_file": root.join(FILE),
+        "settings_file": Reader::open_unchecked(root).private(FILE).path().to_owned(),
         "windows_tab_window": windows_tab_window(root)?.as_str(),
         "macos_open_mode": macos_open_mode(root)?.as_str(),
     }))

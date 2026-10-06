@@ -1,3 +1,4 @@
+use crate::native::session::{CoreRecord, Reader, RecordStore, Store};
 use std::{
     os::unix::fs::MetadataExt,
     path::Path,
@@ -306,8 +307,11 @@ pub(super) fn create_tab(
 // stops the bootstrap before the wrapper. A zsh with running or suspended jobs can
 // refuse exit and return to its prompt; the failed launch keeps its close proof.
 fn install_bootstrap(directory: &Path, host: &str, command: &str) -> Result<String> {
-    let path = directory.join(BOOTSTRAP_FILE);
-    crate::native::write_private(&path, format!("{host} || exit\n{command}\n").as_bytes())?;
+    let path = Reader::open_unchecked(directory)
+        .private(BOOTSTRAP_FILE)
+        .path()
+        .to_owned();
+    RecordStore::at(&path).write_private(format!("{host} || exit\n{command}\n").as_bytes())?;
     Ok(format!(
         ". {}",
         crate::native::shell_quote(path.as_os_str())
@@ -336,7 +340,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
     crate::native::require_valid_session_id(id)?;
     let released = release_start(directory, id);
     crate::native::launch::log(
-        directory,
+        &Store::open_unchecked(directory),
         &match &released {
             Ok(tty) => format!("terminal_host_released tty={tty}"),
             Err(error) => format!("terminal_host_refused: {error:#}"),
@@ -364,16 +368,15 @@ fn release_start(directory: &Path, id: &str) -> Result<String> {
 }
 
 fn wait_for_binding(directory: &Path, id: &str, tty: &str) -> Result<()> {
-    use crate::native::{
-        SessionStatus, TERMINAL_HANDLE_FILE, current_turn_claim_token, launch, read_json,
-        read_regular_text_if_present, unix_ms,
-    };
-    let initial = launch::read(directory)?.context("missing Terminal.app launch receipt")?;
+    use crate::native::{SessionStatus, current_turn_claim_token, launch, unix_ms};
+    let initial = launch::read(&Reader::open_unchecked(directory))?
+        .context("missing Terminal.app launch receipt")?;
     // The receipt's deadline is wall-clock time; the launch itself never waits longer.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let record = launch::read(directory)?.context("missing Terminal.app launch receipt")?;
-        let status: SessionStatus = read_json(&directory.join("status.json"))?;
+        let record = launch::read(&Reader::open_unchecked(directory))?
+            .context("missing Terminal.app launch receipt")?;
+        let status: SessionStatus = Reader::open_unchecked(directory).status()?;
         if Instant::now() >= deadline
             || unix_ms() >= record.deadline_unix_ms
             || record.phase != launch::Phase::Pending
@@ -383,7 +386,10 @@ fn wait_for_binding(directory: &Path, id: &str, tty: &str) -> Result<()> {
         {
             bail!("Terminal.app launch was cancelled or timed out before its surface was bound");
         }
-        if let Some(text) = read_regular_text_if_present(&directory.join(TERMINAL_HANDLE_FILE))? {
+        if let Some(text) = Reader::open_unchecked(directory)
+            .record(CoreRecord::Terminal)
+            .text()?
+        {
             let surface: TerminalSession =
                 serde_json::from_str(&text).context("invalid Terminal.app surface binding")?;
             surface.verify_managed_session(id)?;
@@ -1477,7 +1483,7 @@ end run
         let token = claim.token.clone();
         claim.retain();
         launch::begin(
-            directory.path(),
+            &crate::native::session::Store::open_unchecked(directory.path()),
             &token,
             std::time::Instant::now() + std::time::Duration::from_secs(20),
         )
@@ -1542,7 +1548,10 @@ end run
             match case {
                 "closed" | "failed" => update_status(directory, case, None, None).unwrap(),
                 "expired" | "another claim" | "spawn attempted" => {
-                    let mut receipt = launch::read(directory).unwrap().unwrap();
+                    let mut receipt =
+                        launch::read(&crate::native::session::Reader::open_unchecked(directory))
+                            .unwrap()
+                            .unwrap();
                     match case {
                         "expired" => receipt.deadline_unix_ms = 0,
                         "another claim" => receipt.claim_token = "unrelated".into(),

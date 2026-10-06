@@ -1,3 +1,4 @@
+use crate::native::session::{Reader, RecordStore, Store};
 use std::{
     ffi::OsStr,
     os::windows::ffi::OsStrExt,
@@ -103,7 +104,7 @@ where
         .and_then(super::super::settings::windows_tab_window)
         .unwrap_or_else(|error| {
             super::super::launch::log(
-                directory,
+                &Store::open_unchecked(directory),
                 &format!("settings could not be read, using the dedicated window: {error:#}"),
             );
             super::super::settings::WindowsTabWindow::default()
@@ -124,7 +125,7 @@ where
     ) {
         Ok(tab) => {
             super::super::launch::log(
-                directory,
+                &Store::open_unchecked(directory),
                 &format!(
                     "surface=windows-terminal-tab window={}",
                     tab_window.as_str()
@@ -134,7 +135,7 @@ where
         }
         Err(reason) => {
             super::super::launch::log(
-                directory,
+                &Store::open_unchecked(directory),
                 &format!("surface=console-window; no Windows Terminal tab: {reason:#}"),
             );
             // The session has no tab host. What an abandoned one left must be readable
@@ -173,7 +174,7 @@ where
             || lookup.as_mut().and_then(WindowLookup::poll),
             FOREGROUND_SETTLE,
         );
-        super::super::launch::log(directory, &summary);
+        super::super::launch::log(&Store::open_unchecked(directory), &summary);
     }
     Ok(session)
 }
@@ -623,7 +624,7 @@ pub(super) fn guarded_dialog_input(
     deadline: Instant,
 ) -> Result<bool> {
     use std::io::Write;
-    let directory = super::super::session_directory(
+    let directory = Reader::session_directory(
         session
             .managed_session_id
             .as_deref()
@@ -633,7 +634,7 @@ pub(super) fn guarded_dialog_input(
         .prefix("pending-prompt-")
         .suffix(".txt")
         .tempfile_in(directory)?;
-    super::super::set_private_file_permissions(file.as_file())?;
+    RecordStore::set_file_private(file.as_file())?;
     file.write_all(&serde_json::to_vec(input)?)?;
     file.flush()?;
     let mut command = console_helper_command(
@@ -833,7 +834,9 @@ pub(super) fn console_control(
         }
         "dialog" => {
             let path = input_path.context("dialog requires an input record")?;
-            let input: super::GuardedDialogInput = serde_json::from_slice(&std::fs::read(path)?)?;
+            let input: super::GuardedDialogInput = serde_json::from_slice(
+                &crate::native::session::RecordReader::at(path).raw_bytes()?,
+            )?;
             if input.screen != attached_screen()? {
                 println!("changed");
             } else {
@@ -853,7 +856,8 @@ pub(super) fn console_control(
                 .checked_add(timeout)
                 .context("Windows console input timeout is too large")?;
             let path = input_path.context("send requires a prompt path")?;
-            let input = std::fs::read_to_string(path)
+            let input = crate::native::session::RecordReader::at(path)
+                .raw_text()
                 .with_context(|| format!("failed to read prompt payload {}", path.display()))?;
             write_console_input(&input, submit_count, deadline)
         }

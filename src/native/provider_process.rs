@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use crate::native::session::{RecordReader, RecordStore};
 use std::{
     ffi::OsString,
     path::Path,
@@ -30,7 +32,7 @@ use windows_sys::Win32::{
 };
 
 #[cfg(windows)]
-use super::{terminal, write_private};
+use super::terminal;
 
 pub(super) fn command(
     executable: &Path,
@@ -247,7 +249,7 @@ impl Drop for ProviderProcessTree {
 
 #[cfg(windows)]
 fn ensure_private_forwarder(path: &Path, expected: &[u8]) -> Result<()> {
-    match std::fs::read(path) {
+    match RecordReader::at(path).raw_bytes() {
         Ok(existing) if existing == expected => return Ok(()),
         Ok(_) => bail!(
             "refusing to replace a mismatched provider forwarder {}",
@@ -260,9 +262,9 @@ fn ensure_private_forwarder(path: &Path, expected: &[u8]) -> Result<()> {
         }
         Err(_) => {}
     }
-    match write_private(path, expected) {
+    match RecordStore::at(path).write_private(expected) {
         Ok(()) => Ok(()),
-        Err(write_error) => match std::fs::read(path) {
+        Err(write_error) => match RecordReader::at(path).raw_bytes() {
             Ok(existing) if existing == expected => Ok(()),
             _ => Err(write_error)
                 .with_context(|| format!("failed to create provider forwarder {}", path.display())),

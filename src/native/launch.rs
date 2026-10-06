@@ -1,22 +1,25 @@
 //! Provider-neutral startup receipt and fencing. A terminal accepting a command is not
 //! evidence that its wrapper ran. The lifecycle lock serializes cancellation with spawn.
 use super::*;
+use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore};
 use std::process::Child;
 
-pub(super) const FILE: &str = "launch.json";
+#[cfg(test)]
+pub(super) use super::session::LAUNCH_FILE as FILE;
 pub(super) const LOG: &str = "launch.log";
 pub(super) const STDERR_ENV: &str = "AGENT_BRIDGE_LAUNCH_STDERR_FD";
 pub(super) const STDOUT_ENV: &str = "AGENT_BRIDGE_LAUNCH_STDOUT_FD";
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(super) fn install_script(directory: &Path, contents: &str) -> Result<String> {
+pub(super) fn install_script(store: &Store, contents: &str) -> Result<String> {
+    let directory = store.directory();
     // A new terminal can still be in canonical input mode while its shell starts. A
     // long write-text command was truncated there in macOS LIVE (#50). Send only a
     // quoted script path; source it in the original shell to preserve owner/TTY identity.
     #[cfg(unix)]
     {
         let path = directory.join("launch.sh");
-        write_private(&path, contents.as_bytes())?;
+        RecordStore::at(&path).write_private(contents.as_bytes())?;
         Ok(format!(". {}", shell_quote(path.as_os_str())))
     }
     #[cfg(not(unix))]
@@ -45,8 +48,10 @@ pub(super) struct Record {
     pub(super) phase: Phase,
 }
 
-pub(super) fn read(directory: &Path) -> Result<Option<Record>> {
-    let record = read_regular_text_if_present(&directory.join(FILE))?
+pub(super) fn read(reader: &Reader) -> Result<Option<Record>> {
+    let record = reader
+        .record(CoreRecord::Launch)
+        .text()?
         .map(|text| serde_json::from_str::<Record>(&text))
         .transpose()
         .context("invalid launch receipt")?;
@@ -58,65 +63,58 @@ pub(super) fn read(directory: &Path) -> Result<Option<Record>> {
     Ok(record)
 }
 
-pub(super) fn log(directory: &Path, message: &str) {
+pub(super) fn log(store: &Store, message: &str) {
+    let directory = store.directory();
     // Diagnostics are auxiliary. A missing/unwritable log must never stop valid input.
-    let path = directory.join(LOG);
+    let path = Reader::open_unchecked(directory)
+        .private(LOG)
+        .path()
+        .to_owned();
     let _ = (|| -> Result<()> {
         if !path.exists() {
-            let _ = write_private(&path, b"");
+            let _ = RecordStore::at(&path).write_private(b"");
         }
-        if !is_regular_file(&path)? {
+        if !RecordReader::at(&path).is_regular_file()? {
             return Ok(());
         }
-        let mut file = OpenOptions::new().append(true).open(&path)?;
         // One write per line: the launcher and the wrapper append at the same time.
-        file.write_all(format!("{} {message}\n", unix_ms()).as_bytes())?;
+        RecordStore::at(&path).append(|| format!("{} {message}\n", unix_ms()).into_bytes())?;
         Ok(())
     })();
 }
 
-pub(super) fn begin(directory: &Path, token: &str, request_deadline: Instant) -> Result<Instant> {
+pub(super) fn begin(store: &Store, token: &str, request_deadline: Instant) -> Result<Instant> {
+    let directory = store.directory();
     let budget = request_deadline
         .saturating_duration_since(Instant::now())
         .min(START_TIMEOUT);
     let deadline = Instant::now() + budget;
-    let _lock = lock_turn_claim(&directory.join(TURN_CLAIM_FILE))?;
-    write_json_atomic(
-        &directory.join(FILE),
-        &Record {
+    let _lock = Store::open_unchecked(directory).lock()?;
+    Store::open_unchecked(directory)
+        .record(CoreRecord::Launch)
+        .write_json(&Record {
             schema: 1,
             claim_token: token.to_owned(),
             deadline_unix_ms: unix_ms() + budget.as_millis(),
             phase: Phase::Pending,
-        },
-    )?;
-    log(directory, "launch_pending; waiting for provider spawn");
+        })?;
+    log(store, "launch_pending; waiting for provider spawn");
     Ok(deadline)
 }
 
-fn try_lock(directory: &Path) -> Result<Option<TurnClaimLock>> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(directory.join(TURN_CLAIM_LOCK_FILE))?;
-    set_private_file_permissions(&file)?;
-    match file.try_lock() {
-        Ok(()) => Ok(Some(TurnClaimLock { _file: file })),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
-    }
-}
-
-fn fail_locked(directory: &Path, record: &Record, reason: &str) -> Result<()> {
+fn fail_locked(store: &Store, record: &Record, reason: &str) -> Result<()> {
+    let directory = store.directory();
     if current_turn_claim_token(directory)?.as_deref() != Some(&record.claim_token) {
         return Ok(());
     }
-    let status: SessionStatus = read_json(&directory.join("status.json"))?;
+    let status: SessionStatus = store.status()?;
     if status.state != "launching" {
         if status.state == "failed" && record.phase == Phase::Pending {
-            remove_turn_claim_locked(&directory.join(TURN_CLAIM_FILE))?;
+            remove_turn_claim_locked(
+                Reader::open_unchecked(directory)
+                    .record(CoreRecord::TurnClaim)
+                    .path(),
+            )?;
         }
         return Ok(());
     }
@@ -127,20 +125,24 @@ fn fail_locked(directory: &Path, record: &Record, reason: &str) -> Result<()> {
     };
     update_status(directory, "failed", None, Some(reason.clone()))?;
     if record.phase == Phase::Pending {
-        remove_turn_claim_locked(&directory.join(TURN_CLAIM_FILE))?;
+        remove_turn_claim_locked(
+            Reader::open_unchecked(directory)
+                .record(CoreRecord::TurnClaim)
+                .path(),
+        )?;
     }
-    log(directory, &reason);
+    log(store, &reason);
     Ok(())
 }
 
-pub(super) fn fail(directory: &Path, reason: &str) -> Result<()> {
-    let Some(_lock) = try_lock(directory)? else {
+pub(super) fn fail(store: &Store, reason: &str) -> Result<()> {
+    let Some(_lock) = store.try_lock()? else {
         bail!("{reason}; provider startup is in progress; the claim is retained");
     };
-    if let Some(record) = read(directory)?
+    if let Some(record) = read(store)?
         && record.phase != Phase::Spawned
     {
-        fail_locked(directory, &record, reason)?;
+        fail_locked(store, &record, reason)?;
     }
     Ok(())
 }
@@ -152,7 +154,8 @@ fn confirmed(directory: &Path, record: &Record, status: &SessionStatus) -> bool 
                 status.state.as_str(),
                 "running" | "awaiting-initial-input" | "working" | "ready"
             )
-            && read_json::<ProviderProcessRecord>(&directory.join(PROVIDER_PROCESS_FILE))
+            && Reader::open_unchecked(directory)
+                .provider_process()
                 .is_ok_and(|p| {
                     directory.file_name().and_then(|n| n.to_str())
                         == Some(p.managed_session_id.as_str())
@@ -161,21 +164,22 @@ fn confirmed(directory: &Path, record: &Record, status: &SessionStatus) -> bool 
 
 /// Called before old dead-owner repair. A new launch with an uncertain spawn must not
 /// be silently closed/released by the legacy owner-only repair path.
-pub(super) fn repair(directory: &Path) -> Result<bool> {
-    let Some(record) = read(directory)? else {
+pub(super) fn repair(store: &Store) -> Result<bool> {
+    let directory = store.directory();
+    let Some(record) = read(store)? else {
         return Ok(false);
     };
-    let status: SessionStatus = read_json(&directory.join("status.json"))?;
+    let status: SessionStatus = store.status()?;
     if confirmed(directory, &record, &status) {
         return Ok(false);
     }
-    let Some(_lock) = try_lock(directory)? else {
+    let Some(_lock) = store.try_lock()? else {
         return Ok(true);
     };
-    let Some(record) = read(directory)? else {
+    let Some(record) = read(store)? else {
         return Ok(false);
     };
-    let status: SessionStatus = read_json(&directory.join("status.json"))?;
+    let status: SessionStatus = store.status()?;
     if confirmed(directory, &record, &status) {
         return Ok(false);
     }
@@ -183,23 +187,23 @@ pub(super) fn repair(directory: &Path) -> Result<bool> {
         return Ok(false);
     }
     if status.state == "launching" {
-        let owner = query::observe_owner(directory);
+        let owner = query::observe_owner(store);
         if unix_ms() >= record.deadline_unix_ms {
             fail_locked(
-                directory,
+                store,
                 &record,
                 "provider launch timed out before startup was confirmed",
             )?;
         } else if owner.process_alive == Some(false) || owner.identity_matches == Some(false) {
             fail_locked(
-                directory,
+                store,
                 &record,
                 "native launch wrapper exited before startup was confirmed",
             )?;
         }
     } else if status.state == "failed" {
         fail_locked(
-            directory,
+            store,
             &record,
             status.error.as_deref().unwrap_or("provider launch failed"),
         )?;
@@ -208,13 +212,14 @@ pub(super) fn repair(directory: &Path) -> Result<bool> {
 }
 
 pub(super) fn wait(
-    directory: &Path,
+    store: &Store,
     surface: &terminal::TerminalSession,
     deadline: Instant,
 ) -> Result<()> {
+    let directory = store.directory();
     let mut next_probe = Instant::now() + Duration::from_secs(1);
     loop {
-        let status: SessionStatus = read_json(&directory.join("status.json"))?;
+        let status: SessionStatus = store.status()?;
         if matches!(status.state.as_str(), "failed" | "closed" | "exited") {
             bail!(
                 "{}",
@@ -223,7 +228,7 @@ pub(super) fn wait(
                     .unwrap_or_else(|| format!("launch entered {}", status.state))
             );
         }
-        if read(directory)?.is_some_and(|record| confirmed(directory, &record, &status)) {
+        if read(store)?.is_some_and(|record| confirmed(directory, &record, &status)) {
             return Ok(());
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -242,27 +247,34 @@ pub(super) fn wait(
             None
         };
         if let Some(reason) = reason {
-            let Some(_lock) = try_lock(directory)? else {
+            let Some(_lock) = store.try_lock()? else {
                 bail!(
                     "{reason}; startup is still holding the lifecycle lock, execution is uncertain; the claim is retained"
                 );
             };
-            let record = read(directory)?.context("launch receipt disappeared")?;
-            let status: SessionStatus = read_json(&directory.join("status.json"))?;
+            let record = read(store)?.context("launch receipt disappeared")?;
+            let status: SessionStatus = store.status()?;
             if confirmed(directory, &record, &status) {
                 return Ok(());
             }
-            fail_locked(directory, &record, reason)?;
-            let status: SessionStatus = read_json(&directory.join("status.json"))?;
+            fail_locked(store, &record, reason)?;
+            let status: SessionStatus = store.status()?;
             bail!("{}", status.error.as_deref().unwrap_or(reason));
         }
         thread::sleep(remaining.min(Duration::from_millis(100)));
     }
 }
 
-fn check_spawn_locked(directory: &Path, record: Option<&Record>) -> Result<()> {
-    let status: SessionStatus = read_json(&directory.join("status.json"))?;
-    if status.state != "launching" || directory.join(CLOSED_STATUS_FILE).exists() {
+fn check_spawn_locked(store: &Store, record: Option<&Record>) -> Result<()> {
+    let directory = store.directory();
+    let status: SessionStatus = store.status()?;
+    if status.state != "launching"
+        || Reader::open_unchecked(directory)
+            .record(CoreRecord::Closed)
+            .path()
+            .to_owned()
+            .exists()
+    {
         bail!("provider launch cancelled: session is {}", status.state);
     }
     if let Some(record) = record {
@@ -279,16 +291,19 @@ fn check_spawn_locked(directory: &Path, record: Option<&Record>) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn spawn<F>(directory: &Path, command: &mut Command, record_process: F) -> Result<Child>
+pub(super) fn spawn<F>(store: &Store, command: &mut Command, record_process: F) -> Result<Child>
 where
     F: FnOnce(&mut Child) -> Result<()>,
 {
-    let _lock = lock_turn_claim(&directory.join(TURN_CLAIM_FILE))?;
-    let mut record = read(directory)?;
-    check_spawn_locked(directory, record.as_ref())?;
+    let directory = store.directory();
+    let _lock = Store::open_unchecked(directory).lock()?;
+    let mut record = read(store)?;
+    check_spawn_locked(store, record.as_ref())?;
     if let Some(record) = &mut record {
         record.phase = Phase::Spawning;
-        write_json_atomic(&directory.join(FILE), record)?;
+        Store::open_unchecked(directory)
+            .record(CoreRecord::Launch)
+            .write_json(record)?;
     }
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -296,7 +311,9 @@ where
             // Command::spawn returning Err establishes that it started no provider.
             if let Some(record) = &mut record {
                 record.phase = Phase::Pending;
-                write_json_atomic(&directory.join(FILE), record)?;
+                Store::open_unchecked(directory)
+                    .record(CoreRecord::Launch)
+                    .write_json(record)?;
             }
             return Err(error).context("failed to spawn provider process");
         }
@@ -312,19 +329,22 @@ where
         record.phase = Phase::Spawned;
         // The authoritative process record is already durable. An auxiliary handshake
         // write must not kill a successfully started provider; readers also see its record.
-        if let Err(error) = write_json_atomic(&directory.join(FILE), record) {
+        if let Err(error) = Store::open_unchecked(directory)
+            .record(CoreRecord::Launch)
+            .write_json(record)
+        {
             log(
-                directory,
+                store,
                 &format!("launch receipt update failed after spawn: {error:#}"),
             );
         }
     }
-    log(directory, &format!("provider_spawned pid={}", child.id()));
+    log(store, &format!("provider_spawned pid={}", child.id()));
     Ok(child)
 }
 
 pub(super) fn uncertain(directory: &Path) -> bool {
-    read(directory)
+    read(&Reader::open_unchecked(directory))
         .ok()
         .flatten()
         .is_some_and(|record| record.phase == Phase::Spawning)
@@ -407,7 +427,7 @@ mod tests {
         let token = claim.token.clone();
         claim.retain();
         begin(
-            directory.path(),
+            &Store::open_unchecked(directory.path()),
             &token,
             Instant::now() + Duration::from_secs(30),
         )
@@ -444,10 +464,12 @@ mod tests {
     #[test]
     fn cancelled_launch_cannot_spawn_late() {
         let (directory, _) = fixture();
-        fail(directory.path(), "launch timed out").unwrap();
-        let error = spawn(directory.path(), &mut child_command(), |_| {
-            panic!("cancelled provider spawned")
-        })
+        fail(&Store::open_unchecked(directory.path()), "launch timed out").unwrap();
+        let error = spawn(
+            &Store::open_unchecked(directory.path()),
+            &mut child_command(),
+            |_| panic!("cancelled provider spawned"),
+        )
         .unwrap_err();
         assert!(error.to_string().contains("cancelled"));
         assert!(!directory.path().join(PROVIDER_PROCESS_FILE).exists());
@@ -461,15 +483,19 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let worker = thread::spawn(move || {
-            spawn(&path, &mut child_command(), |child| {
-                entered_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-                record_started(&path, child)
-            })
+            spawn(
+                &Store::open_unchecked(&path),
+                &mut child_command(),
+                |child| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    record_started(&path, child)
+                },
+            )
             .unwrap()
         });
         entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert!(fail(directory.path(), "launch timed out").is_err());
+        assert!(fail(&Store::open_unchecked(directory.path()), "launch timed out").is_err());
         assert_eq!(
             current_turn_claim_token(directory.path()).unwrap(),
             Some(token)
@@ -483,7 +509,10 @@ mod tests {
         release_tx.send(()).unwrap();
         let mut child = worker.join().unwrap();
         assert_eq!(
-            read(directory.path()).unwrap().unwrap().phase,
+            read(&Reader::open_unchecked(directory.path()))
+                .unwrap()
+                .unwrap()
+                .phase,
             Phase::Spawned
         );
         child.kill().unwrap();
@@ -495,12 +524,17 @@ mod tests {
         let (directory, _) = fixture();
         fs::remove_file(directory.path().join(LOG)).unwrap();
         fs::create_dir(directory.path().join(LOG)).unwrap();
-        let mut child = spawn(directory.path(), &mut child_command(), |child| {
-            record_started(directory.path(), child)
-        })
+        let mut child = spawn(
+            &Store::open_unchecked(directory.path()),
+            &mut child_command(),
+            |child| record_started(directory.path(), child),
+        )
         .unwrap();
         assert_eq!(
-            read(directory.path()).unwrap().unwrap().phase,
+            read(&Reader::open_unchecked(directory.path()))
+                .unwrap()
+                .unwrap()
+                .phase,
             Phase::Spawned
         );
         child.kill().unwrap();
@@ -511,14 +545,17 @@ mod tests {
     fn failed_spawn_does_not_claim_a_process_was_started() {
         let (directory, _) = fixture();
         let error = spawn(
-            directory.path(),
+            &Store::open_unchecked(directory.path()),
             &mut Command::new(directory.path().join("missing-provider")),
             |_| unreachable!(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("spawn"));
         assert_eq!(
-            read(directory.path()).unwrap().unwrap().phase,
+            read(&Reader::open_unchecked(directory.path()))
+                .unwrap()
+                .unwrap()
+                .phase,
             Phase::Pending
         );
         finalize_native_session(directory.path(), &Err(error)).unwrap();
@@ -535,7 +572,9 @@ mod tests {
     fn explicit_close_recovers_a_failed_startup_only_through_a_stable_native_id() {
         let (directory, _) = fixture();
         let id = directory.path().file_name().unwrap().to_str().unwrap();
-        let mut record = read(directory.path()).unwrap().unwrap();
+        let mut record = read(&Reader::open_unchecked(directory.path()))
+            .unwrap()
+            .unwrap();
         record.phase = Phase::Spawning;
         write_json_atomic(&directory.path().join(FILE), &record).unwrap();
         update_status(
@@ -677,7 +716,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let script = format!("# {}\nprintf 'SCRIPT_OK\\n'\nexit 3", "x".repeat(8192));
-        let command = install_script(directory.path(), &script).unwrap();
+        let command = install_script(&Store::open_unchecked(directory.path()), &script).unwrap();
         assert!(command.len() < 512);
         assert_eq!(
             fs::read_to_string(directory.path().join("launch.sh")).unwrap(),

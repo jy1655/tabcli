@@ -4530,7 +4530,7 @@ fn legacy_owner_without_process_identity_is_repaired_only_when_its_pid_is_dead()
 /// abrupt stop would) are best-effort records: observation must ignore them.
 fn assert_journal_settled(directory: &Path) {
     assert!(!directory.join(TURN_COMPLETION_FILE).exists());
-    query::observe_snapshot(directory).unwrap();
+    query::observe_snapshot(&Reader::open_unchecked(directory)).unwrap();
 }
 
 #[test]
@@ -5233,7 +5233,7 @@ fn seed_event_written_completion(directory: &Path, event_message: &str) -> (Stri
 }
 
 fn request_state(directory: &Path, request_id: &str) -> (String, String) {
-    let value = query::request_result(directory, request_id).unwrap();
+    let value = query::request_result(&Reader::open_unchecked(directory), request_id).unwrap();
     (
         value["request_state"].as_str().unwrap().to_owned(),
         value["session_state"].as_str().unwrap().to_owned(),
@@ -6165,9 +6165,13 @@ fn a_journaled_event_over_the_read_limit_is_never_published_or_compared() {
     assert!(read.committed_text.is_none());
     // Beyond the limit the record is not published.
     assert_eq!(request_state(&directory, &request_id).0, "completed");
-    let snapshot = query::Snapshot::read_within(&directory, size - 1).unwrap();
+    let snapshot =
+        query::Snapshot::read_within(&Reader::open_unchecked(&directory), size - 1).unwrap();
     let value = snapshot
-        .result(&directory, &query::Selector::Request(request_id.clone()))
+        .result(
+            &Reader::open_unchecked(&directory),
+            &query::Selector::Request(request_id.clone()),
+        )
         .unwrap();
     assert_eq!(value["request_state"], "recovery_required");
 }
@@ -6204,7 +6208,13 @@ fn timeline_rejects_a_log_change_during_a_consistent_lifecycle_snapshot() {
     fs::write(directory.path().join(launch::LOG), "1 before\n").unwrap();
     let error = query::with_snapshot_hook(
         |directory| fs::write(directory.join(launch::LOG), "2 after\n").unwrap(),
-        || query::timeline_value(directory.path(), "session-query", Some(&request)),
+        || {
+            query::timeline_value(
+                &Reader::open_unchecked(directory.path()),
+                "session-query",
+                Some(&request),
+            )
+        },
     )
     .unwrap_err();
     assert!(error.is::<query::SnapshotBusy>(), "{error:#}");
@@ -6217,7 +6227,13 @@ fn timeline_reports_busy_without_repair_when_status_keeps_changing() {
     let error = query::with_snapshot_retry_window(Duration::ZERO, || {
         query::with_snapshot_hook(
             |directory| update_status(directory, "working", None, None).unwrap(),
-            || query::timeline_value(directory.path(), "session-query", Some(&request)),
+            || {
+                query::timeline_value(
+                    &Reader::open_unchecked(directory.path()),
+                    "session-query",
+                    Some(&request),
+                )
+            },
         )
     })
     .unwrap_err();
@@ -6252,8 +6268,12 @@ fn timeline_uses_the_existing_publication_predicate_at_every_completion_boundary
             release_turn_claim_token(&directory.path().join(TURN_CLAIM_FILE), &token).unwrap();
         }
         let before = snapshot_directory(directory.path());
-        let value =
-            query::timeline_value(directory.path(), "session-query", Some(&request)).unwrap();
+        let value = query::timeline_value(
+            &Reader::open_unchecked(directory.path()),
+            "session-query",
+            Some(&request),
+        )
+        .unwrap();
         assert_eq!(
             value["requests"][0]["request_state"],
             if mutations == 0 {
@@ -6425,7 +6445,7 @@ fn a_completion_over_the_read_limit_is_journaled_as_an_explicit_failure() {
     assert!(fs::metadata(&event_path).unwrap().len() < EVENT_READ_LIMIT);
     assert!(!settled.claim_present);
     assert!(!settled.journal_present);
-    let value = query::request_result(&directory, &request_id).unwrap();
+    let value = query::request_result(&Reader::open_unchecked(&directory), &request_id).unwrap();
     assert_eq!(value["error"], error);
 }
 
@@ -6625,7 +6645,8 @@ fn queries_reject_an_events_directory_link_before_reading_through_it() {
     );
 
     // The general snapshot rejects the link instead of reporting the event behind it.
-    let error = query::request_result(&directory, &request_id).unwrap_err();
+    let error =
+        query::request_result(&Reader::open_unchecked(&directory), &request_id).unwrap_err();
     assert!(
         format!("{error:#}").contains("events directory is a symlink"),
         "{error:#}"
@@ -6647,7 +6668,8 @@ fn queries_reject_an_events_directory_link_before_reading_through_it() {
     // changes neither verdict.
     fs::remove_file(&external_event).unwrap();
     fs::create_dir(&external_event).unwrap();
-    let error = query::request_result(&directory, &request_id).unwrap_err();
+    let error =
+        query::request_result(&Reader::open_unchecked(&directory), &request_id).unwrap_err();
     assert!(
         format!("{error:#}").contains("events directory is a symlink"),
         "{error:#}"
@@ -6707,7 +6729,9 @@ fn ordinary_queries_keep_the_per_event_limit_across_a_forced_retry() {
         })
     };
 
-    let result = retried(&|| query::request_result(&directory, &request_id).unwrap());
+    let result = retried(&|| {
+        query::request_result(&Reader::open_unchecked(&directory), &request_id).unwrap()
+    });
     assert_eq!(result["request_state"], "completed");
     assert_eq!(result["event_id"], event_id);
     assert_eq!(result["result"].as_str().map(str::len), Some(message.len()));
@@ -8060,7 +8084,7 @@ fn reopen_gates_refuse_open_unconverged_identity_less_and_delivery_uncertain_sou
         Some(REOPEN_TEST_CONVERSATION),
         true,
     );
-    let receipt = requests::create(&unresolved, "9-9-9", &[]).unwrap();
+    let receipt = requests::create(&Store::open_unchecked(&unresolved), "9-9-9", &[]).unwrap();
     assert!(!unresolved.join("events").join(&receipt.event_file).exists());
     let error = inspect_reopen_source(&unresolved, "session-reopenunres").unwrap_err();
     assert_eq!(
@@ -8420,7 +8444,7 @@ fn inspect_reports_resumed_from_for_reopened_sessions_and_schema_one_readers_sti
     );
     update_status(&directory, "ready", None, None).unwrap();
     assert_eq!(
-        query::inspect_value(&directory, id).unwrap()["resumed_from"],
+        query::inspect_value(&Reader::open_unchecked(&directory), id).unwrap()["resumed_from"],
         serde_json::Value::Null
     );
     assert_eq!(read_resumed_from(&directory).unwrap(), None);
@@ -8436,7 +8460,7 @@ fn inspect_reports_resumed_from_for_reopened_sessions_and_schema_one_readers_sti
         &resumed_from,
     )
     .unwrap();
-    let value = query::inspect_value(&directory, id).unwrap();
+    let value = query::inspect_value(&Reader::open_unchecked(&directory), id).unwrap();
     assert_eq!(
         value["resumed_from"],
         serde_json::json!({
@@ -8664,7 +8688,7 @@ fn reopen_refuses_receipts_whose_recorded_result_is_empty_malformed_or_foreign()
     ] {
         fs::write(&older_legacy_path, contents).unwrap();
         assert_eq!(
-            requests::list(&source)
+            requests::list(&Reader::open_unchecked(&source))
                 .unwrap()
                 .receipts
                 .iter()
@@ -9376,7 +9400,7 @@ fn a_refused_follow_up_never_overwrites_the_status_of_the_turn_that_claimed_afte
             .trim(),
         next_token
     );
-    let receipts = requests::list(directory).unwrap();
+    let receipts = requests::list(&Reader::open_unchecked(directory)).unwrap();
     assert_eq!(receipts.unreadable, 0);
     let mut recorded: Vec<&str> = receipts
         .receipts
@@ -9513,7 +9537,8 @@ fn a_holder_that_registers_after_the_post_launch_scan_is_caught_before_the_initi
             .contains(&foreign.id().to_string()),
         "{status:?}"
     );
-    let result = query::request_result(&directory, &refused_request).unwrap();
+    let result =
+        query::request_result(&Reader::open_unchecked(&directory), &refused_request).unwrap();
     assert_eq!(result["request_state"], "unresolved", "{result}");
     assert_eq!(result["session_state"], "ready", "{result}");
 
@@ -9735,7 +9760,7 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
             "{label}: claim not released"
         );
         // The receipt survives with its outcome unresolved: nothing was delivered.
-        let result = query::request_result(&new, &request_id).unwrap();
+        let result = query::request_result(&Reader::open_unchecked(&new), &request_id).unwrap();
         assert_eq!(result["request_state"], "unresolved", "{label}: {result}");
         assert_eq!(result["result"], serde_json::Value::Null, "{label}");
 
@@ -10302,7 +10327,7 @@ fn surviving_provider_process_retains_the_source_marker_until_it_is_verified_gon
     let status: SessionStatus = read_json(&new.join("status.json")).unwrap();
     assert_eq!(status.state, "closed");
     assert!(new.join(TERMINAL_TOMBSTONE_FILE).is_file());
-    assert!(query::observe_owner(&new).process_alive == Some(false));
+    assert!(query::observe_owner(&Reader::open_unchecked(&new)).process_alive == Some(false));
 
     let condition = format!(
         "provider process {} of refused session {new_id} is still running",
@@ -10742,7 +10767,8 @@ fn observed_elapsed_queries_preserve_existing_records_and_timestamp_boundaries()
                 "list: {label}"
             );
         }
-        let inspect = query::inspect_value(&directory, "session-elapsed").unwrap();
+        let inspect =
+            query::inspect_value(&Reader::open_unchecked(&directory), "session-elapsed").unwrap();
         if has_event {
             assert_eq!(
                 inspect["latest_result"]["bridge_observed_elapsed_ms"],
@@ -10788,7 +10814,8 @@ fn observed_elapsed_requires_a_published_result_and_keeps_inspect_available() {
     event.created_unix_ms = receipt.created_unix_ms;
     write_json_atomic(&directory.join("events").join(&receipt.event_file), &event).unwrap();
     claim.retain();
-    let pending = query::request_result(&directory, &receipt.request_id).unwrap();
+    let pending =
+        query::request_result(&Reader::open_unchecked(&directory), &receipt.request_id).unwrap();
     assert_eq!(pending["request_state"], "pending");
     assert_eq!(
         pending["bridge_observed_elapsed_ms"],
@@ -10800,7 +10827,8 @@ fn observed_elapsed_requires_a_published_result_and_keeps_inspect_available() {
     );
     fs::remove_file(directory.join("events").join(&receipt.event_file)).unwrap();
     release_turn_claim(&directory).unwrap();
-    let unresolved = query::request_result(&directory, &receipt.request_id).unwrap();
+    let unresolved =
+        query::request_result(&Reader::open_unchecked(&directory), &receipt.request_id).unwrap();
     assert_eq!(unresolved["request_state"], "unresolved");
     assert_eq!(
         unresolved["bridge_observed_elapsed_reason"],
@@ -10817,7 +10845,11 @@ fn observed_elapsed_requires_a_published_result_and_keeps_inspect_available() {
         &event,
     )
     .unwrap();
-    let inspected = query::inspect_value(&directory, "session-elapsed-boundary").unwrap();
+    let inspected = query::inspect_value(
+        &Reader::open_unchecked(&directory),
+        "session-elapsed-boundary",
+    )
+    .unwrap();
     assert_eq!(
         inspected["requests"][0]["bridge_observed_elapsed_ms"],
         serde_json::Value::Null
@@ -10848,7 +10880,13 @@ fn timeline_aba_replacement_keeps_summary_and_entry_together() {
                 fs::write(&path, &original).unwrap();
             }
         },
-        || query::timeline_value(directory.path(), "session-query", Some(&request)),
+        || {
+            query::timeline_value(
+                &Reader::open_unchecked(directory.path()),
+                "session-query",
+                Some(&request),
+            )
+        },
     )
     .unwrap();
     let completion = value["entries"]
@@ -11189,9 +11227,16 @@ fn write_failed_launch_with_owner(
 ) -> NativeSessionOwner {
     let owner = write_attested_apple_terminal_state(directory, "launching", owner_pid);
     let token = current_turn_claim_token(directory).unwrap().unwrap();
-    launch::begin(directory, &token, Instant::now() + Duration::from_secs(30)).unwrap();
+    launch::begin(
+        &Store::open_unchecked(directory),
+        &token,
+        Instant::now() + Duration::from_secs(30),
+    )
+    .unwrap();
     if phase == launch::Phase::Spawning {
-        let mut record = launch::read(directory).unwrap().unwrap();
+        let mut record = launch::read(&Reader::open_unchecked(directory))
+            .unwrap()
+            .unwrap();
         record.phase = phase;
         write_json_atomic(&directory.join(launch::FILE), &record).unwrap();
     }
@@ -11303,7 +11348,11 @@ fn failed_launch_with_a_recorded_owner_gets_no_close_without_a_prior_intent() {
                     || tombstone
                     || status.state != "failed"
                     || current_turn_claim_token(directory.path()).unwrap() != claim
-                    || launch::read(directory.path()).unwrap().unwrap().phase != phase
+                    || launch::read(&Reader::open_unchecked(directory.path()))
+                        .unwrap()
+                        .unwrap()
+                        .phase
+                        != phase
                 {
                     failures.push(format!(
                         "{case}: handle, claim or state was not retained (result {result:?}, state {})",
@@ -11372,7 +11421,10 @@ fn ownerless_warp_and_wezterm_failures_only_consume_proven_absence() {
                     assert!(!directory.path().join(TERMINAL_TOMBSTONE_FILE).exists());
                     assert_eq!(current_turn_claim_token(directory.path()).unwrap(), claim);
                     assert_eq!(
-                        launch::read(directory.path()).unwrap().unwrap().phase,
+                        launch::read(&Reader::open_unchecked(directory.path()))
+                            .unwrap()
+                            .unwrap()
+                            .phase,
                         phase
                     );
                 }

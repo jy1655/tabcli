@@ -2,7 +2,10 @@
 //! Resolution is read-only and provider-neutral: it observes source sessions through the
 //! same snapshot machinery as `result`, pins the selected event, and renders the attachment
 //! text. The combined prompt then travels through each provider's existing transport.
-use super::*;
+use super::{
+    AtomicU64, Ordering, Result, SystemTime, UNIX_EPOCH, bail, query, requests, valid_session_id,
+};
+use crate::native::{Context, Path, Reader, terminal_safe_text, validate_terminal_input};
 use requests::ContextSource;
 
 pub(crate) const MAX_CONTEXT_RESULTS: usize = 8;
@@ -35,7 +38,7 @@ impl ContextResultRef {
         }
         let selector = if requests::valid_id(selector) {
             ContextSelector::Request(selector.to_owned())
-        } else if valid_event_file_name(selector) {
+        } else if Reader::valid_event_file_name(selector) {
             ContextSelector::Event(selector.to_owned())
         } else {
             return Err(invalid());
@@ -211,15 +214,16 @@ pub(crate) fn resolve(references: &[ContextResultRef]) -> Result<ResolvedContext
     if references.is_empty() {
         return Ok(ResolvedContext::default());
     }
-    resolve_in(&state_root()?, references)
+    resolve_in(&Reader::state_root()?, references)
 }
 
 pub(crate) fn resolve_in(root: &Path, references: &[ContextResultRef]) -> Result<ResolvedContext> {
     let mut entries = Vec::with_capacity(references.len());
     for reference in references {
-        let directory = session_directory_in(root, &reference.session)
+        let directory = Reader::session_directory_in(root, &reference.session)
             .map_err(|error| unattachable(reference, "missing", Some(format!("{error:#}"))))?;
-        let snapshot = query::observe_snapshot(&directory).map_err(|error| {
+        let reader = Reader::open_unchecked(&directory);
+        let snapshot = query::observe_snapshot(&reader).map_err(|error| {
             let state = if error.is::<query::SnapshotBusy>() {
                 "busy"
             } else {
@@ -228,7 +232,7 @@ pub(crate) fn resolve_in(root: &Path, references: &[ContextResultRef]) -> Result
             unattachable(reference, state, Some(format!("{error:#}")))
         })?;
         let value = snapshot
-            .result(&directory, &reference.selector())
+            .result(&reader, &reference.selector())
             .map_err(|error| unattachable(reference, "unreadable", Some(format!("{error:#}"))))?;
         let state = value["request_state"].as_str().unwrap_or("unknown");
         if state != "completed" || value["result"].is_null() || !value["error"].is_null() {
@@ -257,7 +261,8 @@ pub(crate) fn resolve_in(root: &Path, references: &[ContextResultRef]) -> Result
         }
         // Publication was decided by name; the record must exist under exactly that name,
         // or a case-insensitive filesystem may have opened a different file.
-        let exact = event_paths(&directory)
+        let exact = Reader::open_unchecked(&directory)
+            .events()
             .map_err(|error| unreadable(format!("{error:#}")))?
             .into_iter()
             .any(|path| path.file_name().and_then(|name| name.to_str()) == Some(&event_id));
@@ -266,7 +271,7 @@ pub(crate) fn resolve_in(root: &Path, references: &[ContextResultRef]) -> Result
                 "recorded event filename {event_id} does not match an events/ entry exactly"
             )));
         }
-        let event = read_event_strictly(&directory, &event_id).map_err(unreadable)?;
+        let event = reader.event_strict(&event_id).map_err(unreadable)?;
         drop(snapshot);
         if event.error.is_some() {
             return Err(unattachable(reference, "failed", None));
@@ -301,24 +306,10 @@ pub(crate) fn resolve_in(root: &Path, references: &[ContextResultRef]) -> Result
     render(&entries)
 }
 
-/// The attached body must be the recorded bytes, so the event is decoded strictly here
-/// instead of through the lossy snapshot reader that decides publication and state.
-fn read_event_strictly(
-    directory: &Path,
-    event_id: &str,
-) -> std::result::Result<SessionEvent, String> {
-    let path = directory.join("events").join(event_id);
-    let bytes = read_regular_bytes_if_present(&path)
-        .map_err(|error| format!("{error:#}"))?
-        .ok_or_else(|| format!("recorded event {event_id} is missing"))?;
-    let text = String::from_utf8(bytes)
-        .map_err(|_| format!("recorded event {event_id} is not valid UTF-8"))?;
-    serde_json::from_str(&text).map_err(|error| format!("invalid JSON in {event_id}: {error}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::*;
     use serde_json::{Value, json};
 
     fn parse_all(values: &[&str]) -> Result<Vec<ContextResultRef>> {
@@ -731,10 +722,11 @@ mod tests {
         )
         .unwrap();
         // The lossy snapshot reader still reports the record as a published success.
-        let snapshot = query::observe_snapshot(&directory).unwrap();
+        let reader = Reader::open_unchecked(&directory);
+        let snapshot = query::observe_snapshot(&reader).unwrap();
         let value = snapshot
             .result(
-                &directory,
+                &Reader::open_unchecked(&directory),
                 &query::Selector::Request("request-done".to_owned()),
             )
             .unwrap();
@@ -836,13 +828,15 @@ mod tests {
         assert_eq!(baseline, 0);
         let receipt = claim.receipt.clone();
         assert_eq!(receipt.context_sources, resolved.sources);
-        let stored = requests::for_claim(&target, &claim.token).unwrap().unwrap();
+        let stored = requests::for_claim(&Reader::open_unchecked(&target), &claim.token)
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.context_sources, resolved.sources);
 
-        let snapshot = query::observe_snapshot(&target).unwrap();
+        let snapshot = query::observe_snapshot(&Reader::open_unchecked(&target)).unwrap();
         let value = snapshot
             .result(
-                &target,
+                &Reader::open_unchecked(&target),
                 &query::Selector::Request(receipt.request_id.clone()),
             )
             .unwrap();

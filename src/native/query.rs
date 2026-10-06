@@ -1,5 +1,18 @@
 //! Read-only views of durable session records. Never recover, send, or close here.
-use super::*;
+#[cfg(target_os = "macos")]
+use super::mac_native_owner_is_live;
+use super::{
+    DEFAULT_TIMEOUT_SECS, Deserialize, Duration, EVENT_READ_LIMIT, File, FirstPartyCli, Instant,
+    JournaledEventRead, JournaledEventState, NativeCommand, NativeSessionOwner, Path, PathBuf,
+    PendingTurnCompletion, Reader, Result, Serialize, SessionEvent, SessionManifest, SessionStatus,
+    bail, checked_deadline_from, consent, fs, launch, option_value, parse_timeout,
+    process_is_alive, read_resumed_from, requests, require_valid_session_id, set_flag_once,
+    set_once, terminal, terminal_safe_text, thread, valid_session_id, validate_pending_completion,
+};
+#[cfg(test)]
+use super::{EVENTS_DIRECTORY, read_event_within_budget};
+use crate::native::session::{CoreRecord, RecordReader};
+use crate::native::{Context, FromStr};
 use serde_json::{Value, json};
 
 mod timeline;
@@ -74,7 +87,7 @@ pub(super) fn parse_result(args: &[String]) -> Result<NativeCommand> {
             "--list" => set_once(&mut selector, Selector::List, "result selector")?,
             "--event" => {
                 let id = option_value(options, &mut index, "--event")?;
-                if !valid_event_file_name(id) {
+                if !Reader::valid_event_file_name(id) {
                     bail!("invalid result event id")
                 }
                 set_once(
@@ -120,14 +133,7 @@ pub(super) fn parse_result(args: &[String]) -> Result<NativeCommand> {
     }))
 }
 
-#[derive(Debug)]
-pub(super) struct SnapshotBusy;
-impl std::fmt::Display for SnapshotBusy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "session records are changing; retry the read-only query")
-    }
-}
-impl std::error::Error for SnapshotBusy {}
+pub(super) use super::session::SnapshotBusy;
 
 pub(super) struct Snapshot {
     pub(super) manifest: SessionManifest,
@@ -199,15 +205,6 @@ enum PublicationRead {
     Deferred,
 }
 
-pub(super) fn optional_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
-    read_regular_text_if_present(path)?
-        .map(|text| {
-            serde_json::from_str(&text)
-                .with_context(|| format!("invalid JSON in {}", path.display()))
-        })
-        .transpose()
-}
-
 // Bridge wall-clock time from receipt creation to the published completion event's
 // timestamp, including dispatch and delivery waits; never model or billing time.
 pub(super) fn observed_elapsed(
@@ -245,41 +242,29 @@ fn elapsed_text(value: &Value) -> String {
 }
 
 impl Snapshot {
-    pub(super) fn read(directory: &Path) -> Result<Self> {
-        Self::read_with(directory, PublicationRead::Within(EVENT_READ_LIMIT))
+    pub(super) fn read(reader: &Reader) -> Result<Self> {
+        Self::read_with(reader, PublicationRead::Within(EVENT_READ_LIMIT))
     }
 
     /// [`Snapshot::read`] whose publication check reads at most `event_limit` bytes of a
     /// journaled event.
     #[cfg(test)]
-    pub(super) fn read_within(directory: &Path, event_limit: u64) -> Result<Self> {
-        Self::read_with(directory, PublicationRead::Within(event_limit))
+    pub(super) fn read_within(reader: &Reader, event_limit: u64) -> Result<Self> {
+        Self::read_with(reader, PublicationRead::Within(event_limit))
     }
 
     /// [`Snapshot::read`] deciding a journaled event's publication as `publication` says.
-    fn read_with(directory: &Path, publication: PublicationRead) -> Result<Self> {
-        // Open an existing lifecycle lock without creating it or changing permissions.
-        let lock_path = directory.join(TURN_CLAIM_LOCK_FILE);
-        let lock = match File::open(&lock_path) {
-            Ok(file) => {
-                match file.try_lock_shared() {
-                    Ok(()) => (),
-                    Err(std::fs::TryLockError::WouldBlock) => return Err(SnapshotBusy.into()),
-                    Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
-                }
-                Some(file)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error).context("failed to observe native lifecycle lock"),
-        };
+    fn read_with(reader: &Reader, publication: PublicationRead) -> Result<Self> {
+        let directory = reader.directory();
+        let lock = reader.lock_shared()?;
         let state_files = [
-            "status.json",
-            TURN_CLAIM_FILE,
-            TURN_COMPLETION_FILE,
-            launch::FILE,
+            CoreRecord::Status.name(),
+            CoreRecord::TurnClaim.name(),
+            CoreRecord::Completion.name(),
+            CoreRecord::Launch.name(),
         ];
         let before = state_files
-            .map(|name| read_regular_text_if_present(&directory.join(name)))
+            .map(|name| reader.private(name).text())
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
         let status: SessionStatus = serde_json::from_str(
@@ -294,11 +279,10 @@ impl Snapshot {
                 validate_pending_completion(pending)?;
                 // The predicate validates `events` before it opens anything under it, so
                 // a link planted there is rejected instead of followed by this read.
-                Some(journaled_event_state_within(
-                    directory,
-                    pending,
-                    event_limit,
-                )?)
+                Some(
+                    Reader::open_unchecked(directory)
+                        .journaled_event_state_within(pending, event_limit)?,
+                )
             }
             (Some(pending), PublicationRead::Deferred) => {
                 validate_pending_completion(pending)?;
@@ -307,27 +291,28 @@ impl Snapshot {
             (None, _) => None,
         };
         before_consistency_check(directory);
-        let (index, request_index_error) = match requests::list(directory) {
+        let (index, request_index_error) = match requests::list(&Reader::open_unchecked(directory))
+        {
             Ok(index) => (index, None),
             Err(error) => (requests::Index::default(), Some(format!("{error:#}"))),
         };
         let snapshot = Self {
-            manifest: read_manifest(directory)?,
+            manifest: reader.manifest()?,
             status,
             receipts: index.receipts,
             unreadable_requests: index.unreadable,
             request_index_error,
-            paths: event_paths(directory)?,
+            paths: reader.events()?,
             claim: before[1].as_deref().map(|text| text.trim().to_owned()),
             pending,
-            launch: launch::read(directory)?,
+            launch: launch::read(reader)?,
             pending_event,
             _lock: lock,
         };
         // Status also has its own writer lock. Check for a moving snapshot even with a
         // lifecycle reader lock, and support old records that have no lock file at all.
         for (index, name) in state_files.iter().enumerate() {
-            if read_regular_text_if_present(&directory.join(name))? != before[index] {
+            if reader.private(name).text()? != before[index] {
                 return Err(SnapshotBusy.into());
             }
         }
@@ -366,15 +351,15 @@ impl Snapshot {
             .is_some_and(|receipt| self.claim.as_deref() == Some(&receipt.claim_token))
     }
 
-    fn event(&self, directory: &Path, name: &str) -> Result<Option<SessionEvent>> {
+    fn event(&self, reader: &Reader, name: &str) -> Result<Option<SessionEvent>> {
         if !self.published(name) {
             return Ok(None);
         }
-        optional_json(&directory.join("events").join(name))
+        RecordReader::at(reader.event(name).path()).optional_json()
     }
 
-    pub(super) fn result(&self, directory: &Path, selector: &Selector) -> Result<Value> {
-        self.result_with(selector, |name| self.event(directory, name))
+    pub(super) fn result(&self, reader: &Reader, selector: &Selector) -> Result<Value> {
+        self.result_with(selector, |name| self.event(reader, name))
     }
 
     // Timeline uses cached strict bytes; ordinary queries keep their reader.
@@ -472,8 +457,8 @@ impl Snapshot {
 
 /// The snapshot every non-search query observes: its publication check compares a
 /// journaled event within the fixed [`EVENT_READ_LIMIT`] on every attempt.
-pub(super) fn observe_snapshot(directory: &Path) -> Result<Snapshot> {
-    observe_snapshot_with(directory, PublicationRead::Within(EVENT_READ_LIMIT))
+pub(super) fn observe_snapshot(reader: &Reader) -> Result<Snapshot> {
+    observe_snapshot_with(reader, PublicationRead::Within(EVENT_READ_LIMIT))
 }
 
 /// How long a busy snapshot is retried before a read-only query gives up.
@@ -507,10 +492,10 @@ fn snapshot_retry_window() -> Duration {
 
 /// Retries a busy snapshot for [`SNAPSHOT_RETRY_WINDOW`]; every attempt decides a journaled
 /// event's publication as `publication` says.
-fn observe_snapshot_with(directory: &Path, publication: PublicationRead) -> Result<Snapshot> {
+fn observe_snapshot_with(reader: &Reader, publication: PublicationRead) -> Result<Snapshot> {
     let deadline = Instant::now() + snapshot_retry_window();
     loop {
-        match Snapshot::read_with(directory, publication) {
+        match Snapshot::read_with(reader, publication) {
             Err(error) if error.is::<SnapshotBusy>() && Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(25));
             }
@@ -526,8 +511,15 @@ pub(super) struct OwnerObservation {
     pub(super) error: Option<String>,
 }
 
-pub(super) fn observe_owner(directory: &Path) -> OwnerObservation {
-    let owner = match optional_json::<NativeSessionOwner>(&directory.join(SESSION_OWNER_FILE)) {
+pub(super) fn observe_owner(reader: &Reader) -> OwnerObservation {
+    let directory = reader.directory();
+    let owner = match RecordReader::at(
+        Reader::open_unchecked(directory)
+            .record(CoreRecord::Owner)
+            .path(),
+    )
+    .optional_json::<NativeSessionOwner>()
+    {
         Ok(Some(owner)) => owner,
         Ok(None) => return OwnerObservation::default(),
         Err(error) => {
@@ -574,8 +566,8 @@ pub(super) fn observe_owner_record(owner: &NativeSessionOwner) -> OwnerObservati
     }
 }
 
-pub(super) fn request_result(directory: &Path, request_id: &str) -> Result<Value> {
-    observe_snapshot(directory)?.result(directory, &Selector::Request(request_id.to_owned()))
+pub(super) fn request_result(reader: &Reader, request_id: &str) -> Result<Value> {
+    observe_snapshot(reader)?.result(reader, &Selector::Request(request_id.to_owned()))
 }
 
 fn print_json(value: &Value) -> Result<()> {
@@ -665,12 +657,12 @@ pub(super) fn run_result(request: ResultRequest) -> Result<()> {
 }
 
 fn result_value(request: &ResultRequest) -> Result<Value> {
-    result_value_in(&state_root()?, request)
+    result_value_in(&Reader::state_root()?, request)
 }
 
 /// The `result` command's value over one state root, including `--wait`.
 pub(super) fn result_value_in(root: &Path, request: &ResultRequest) -> Result<Value> {
-    let directory = session_directory_in(root, &request.id)?;
+    let directory = Reader::session_directory_in(root, &request.id)?;
     let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
     let mut last = json!({"schema_version": 1, "ok": true, "session": request.id,
         "request_id": match &request.selector { Selector::Request(id) => Some(id), _ => None },
@@ -678,9 +670,9 @@ pub(super) fn result_value_in(root: &Path, request: &ResultRequest) -> Result<Va
         "bridge_observed_elapsed_ms": null, "bridge_observed_elapsed_reason": "no_published_result"});
     loop {
         let observed = if request.wait {
-            Snapshot::read(&directory)
+            Snapshot::read(&Reader::open_unchecked(&directory))
         } else {
-            observe_snapshot(&directory)
+            observe_snapshot(&Reader::open_unchecked(&directory))
         };
         match observed {
             Ok(snapshot) => {
@@ -691,15 +683,19 @@ pub(super) fn result_value_in(root: &Path, request: &ResultRequest) -> Result<Va
                             .file_name()
                             .and_then(|n| n.to_str())
                             .context("invalid event file")?;
-                        let mut value =
-                            snapshot.result(&directory, &Selector::Event(name.to_owned()))?;
+                        let mut value = snapshot.result(
+                            &Reader::open_unchecked(&directory),
+                            &Selector::Event(name.to_owned()),
+                        )?;
                         value.as_object_mut().unwrap().remove("result");
                         events.push(value);
                     }
                     let mut requests = Vec::new();
                     for receipt in &snapshot.receipts {
-                        let mut value = snapshot
-                            .result(&directory, &Selector::Request(receipt.request_id.clone()))?;
+                        let mut value = snapshot.result(
+                            &Reader::open_unchecked(&directory),
+                            &Selector::Request(receipt.request_id.clone()),
+                        )?;
                         value.as_object_mut().unwrap().remove("result");
                         requests.push(value);
                     }
@@ -708,7 +704,7 @@ pub(super) fn result_value_in(root: &Path, request: &ResultRequest) -> Result<Va
                         "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error}),
                     );
                 }
-                last = snapshot.result(&directory, &request.selector)?;
+                last = snapshot.result(&Reader::open_unchecked(&directory), &request.selector)?;
                 if !request.wait
                     || matches!(
                         last["request_state"].as_str(),
@@ -717,7 +713,7 @@ pub(super) fn result_value_in(root: &Path, request: &ResultRequest) -> Result<Va
                 {
                     return Ok(last);
                 }
-                let owner = observe_owner(&directory);
+                let owner = observe_owner(&Reader::open_unchecked(&directory));
                 last["owner_process_alive"] = json!(owner.process_alive);
                 last["owner"] = json!(owner);
                 if owner.process_alive == Some(false) || owner.identity_matches == Some(false) {
@@ -770,8 +766,8 @@ pub(super) fn run_inspect(
 }
 
 fn inspect_inner(id: &str, json: bool) -> Result<()> {
-    let directory = session_directory(id)?;
-    let value = inspect_value(&directory, id)?;
+    let directory = Reader::session_directory(id)?;
+    let value = inspect_value(&Reader::open_unchecked(&directory), id)?;
     if json {
         return print_json(&value);
     }
@@ -801,17 +797,18 @@ fn inspect_inner(id: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn inspect_value(directory: &Path, id: &str) -> Result<Value> {
-    let snapshot = observe_snapshot(directory)?;
-    let owner = observe_owner(directory);
+pub(super) fn inspect_value(reader: &Reader, id: &str) -> Result<Value> {
+    let directory = reader.directory();
+    let snapshot = observe_snapshot(reader)?;
+    let owner = observe_owner(reader);
     let resumed_from = read_resumed_from(directory)?;
-    let mut latest = snapshot.result(directory, &Selector::Latest)?;
+    let mut latest = snapshot.result(reader, &Selector::Latest)?;
     latest.as_object_mut().unwrap().remove("result");
     let request_refs = snapshot
         .receipts
         .iter()
         .map(|receipt| {
-            let (elapsed, elapsed_reason) = match snapshot.event(directory, &receipt.event_file) {
+            let (elapsed, elapsed_reason) = match snapshot.event(reader, &receipt.event_file) {
                 Ok(event) => observed_elapsed(Some(receipt), event.as_ref()),
                 Err(_) => (None, Some("unreadable_result")),
             };
@@ -1124,55 +1121,13 @@ fn excerpt(message: &str, match_start: usize, match_chars: usize) -> String {
     }
 }
 
-/// Reads one event without exceeding the remaining byte budget. `Ok(None)` means the
-/// file disappeared during the scan; `Err(Ok(bytes))` means the file is too large for the
-/// budget and was not consumed; `Err(Err(error))` is an I/O failure.
-fn read_event_within_budget(path: &Path, remaining: u64) -> Result<Option<String>, Result<u64>> {
-    use std::io::Read as _;
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(Err(
-                anyhow::Error::new(error).context(format!("failed to inspect {}", path.display()))
-            ));
-        }
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(Err(anyhow::anyhow!(
-            "refusing non-regular session file: {}",
-            path.display()
-        )));
-    }
-    if metadata.len() > remaining {
-        return Err(Ok(metadata.len()));
-    }
-    // The file may have grown since the metadata read: never read past the budget.
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(Err(
-                anyhow::Error::new(error).context(format!("failed to read {}", path.display()))
-            ));
-        }
-    };
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    if let Err(error) = file.take(remaining + 1).read_to_end(&mut bytes) {
-        return Err(Err(
-            anyhow::Error::new(error).context(format!("failed to read {}", path.display()))
-        ));
-    }
-    if bytes.len() as u64 > remaining {
-        return Err(Ok(bytes.len() as u64));
-    }
-    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
-}
-
 /// The shared event listing turns a missing or non-directory `events` path into an
 /// empty list; a search must not present that damage as "no results".
-fn check_events_directory(directory: &Path) -> Result<(), String> {
-    require_events_directory(directory).map_err(|error| format!("{error:#}"))
+fn check_events_directory(reader: &Reader) -> Result<(), String> {
+    let directory = reader.directory();
+    Reader::open_unchecked(directory)
+        .require_events_directory()
+        .map_err(|error| format!("{error:#}"))
 }
 
 enum SessionScan {
@@ -1183,12 +1138,13 @@ enum SessionScan {
 fn search_session(
     request: &SearchRequest,
     query_lower: &str,
-    directory: &Path,
+    reader: &Reader,
     id: &str,
     scan: &mut SearchScan,
 ) -> Result<SessionScan, String> {
+    let directory = reader.directory();
     // The manifest alone decides scope, so out-of-scope sessions are never snapshotted.
-    let manifest = read_manifest(directory).map_err(|error| format!("{error:#}"))?;
+    let manifest = reader.manifest().map_err(|error| format!("{error:#}"))?;
     if let SearchScope::Workspace(workspace) = &request.scope
         && workspace != &manifest.workspace
     {
@@ -1205,14 +1161,14 @@ fn search_session(
     }
     // `events` is validated before anything is read through it, and again after the
     // snapshot listed it.
-    check_events_directory(directory)?;
+    check_events_directory(reader)?;
     // The snapshot reads no event: a journaled event's publication is decided below, at
     // the event's own position in the scan, so a busy retry costs nothing and the
     // journal's presence never changes which records the scan examines before it.
-    let snapshot = observe_snapshot_with(directory, PublicationRead::Deferred)
+    let snapshot = observe_snapshot_with(reader, PublicationRead::Deferred)
         .map_err(|error| format!("{error:#}"))?;
     scan.sessions_scanned += 1;
-    check_events_directory(directory)?;
+    check_events_directory(reader)?;
     // A damaged request index loses event-to-request mappings. Events that still have a
     // readable receipt are searched; the rest are skipped and counted, never reported
     // as legacy `request_id: null` hits.
@@ -1246,7 +1202,8 @@ fn search_session(
                 // bytes it compared. A record the budget cannot hold stops the scan with
                 // the same reason an ordinary record would, so the result is the same
                 // once the journal is gone and the event is read the ordinary way.
-                let read = journaled_event_state_within(directory, pending, remaining)
+                let read = Reader::open_unchecked(directory)
+                    .journaled_event_state_within(pending, remaining)
                     .map_err(|error| format!("{name}: {error:#}"))?;
                 scan.bytes_read += read.bytes_read;
                 match read.state {
@@ -1265,11 +1222,14 @@ fn search_session(
                     }
                 }
             }
-            None => read_event_within_budget(path, remaining).inspect(|text| {
-                if let Some(text) = text {
-                    scan.bytes_read += text.len() as u64;
-                }
-            }),
+            None => reader
+                .event(name)
+                .event_within_budget(remaining)
+                .inspect(|text| {
+                    if let Some(text) = text {
+                        scan.bytes_read += text.len() as u64;
+                    }
+                }),
         };
         let event: SessionEvent = match read {
             Ok(Some(text)) => {
@@ -1336,7 +1296,7 @@ fn search_session(
 }
 
 fn search_value(request: &SearchRequest) -> Result<Value> {
-    search_value_in(&state_root()?, request)
+    search_value_in(&Reader::state_root()?, request)
 }
 
 /// The `search` command's value over one state root.
@@ -1376,7 +1336,13 @@ pub(super) fn search_value_in(root: &Path, request: &SearchRequest) -> Result<Va
     for id in &ids {
         let budget = match scan.exhausted_budget() {
             Some(budget) => Some(budget),
-            None => match search_session(request, &query_lower, &root.join(id), id, &mut scan) {
+            None => match search_session(
+                request,
+                &query_lower,
+                &Reader::open_unchecked(root.join(id)),
+                id,
+                &mut scan,
+            ) {
                 Ok(SessionScan::Done) => None,
                 Ok(SessionScan::Budget(budget)) => Some(budget),
                 Err(reason) => {
@@ -1563,10 +1529,10 @@ mod search_tests {
             .unwrap_err()
             .unwrap_err();
         assert!(error.to_string().contains("non-regular"), "{error}");
-        assert!(check_events_directory(directory.path()).is_err());
-        fs::write(directory.path().join("events"), "x").unwrap();
+        assert!(check_events_directory(&Reader::open_unchecked(directory.path())).is_err());
+        fs::write(directory.path().join(EVENTS_DIRECTORY), "x").unwrap();
         assert_eq!(
-            check_events_directory(directory.path()).unwrap_err(),
+            check_events_directory(&Reader::open_unchecked(directory.path())).unwrap_err(),
             "events is not a directory"
         );
     }

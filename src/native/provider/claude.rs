@@ -3,6 +3,7 @@ use super::{
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
     LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
 };
+use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -194,7 +195,7 @@ impl PendingTurnFile {
 impl Drop for PendingTurnFile {
     fn drop(&mut self) {
         if !self.retained {
-            let _ = super::super::remove_file_if_present(&self.path);
+            let _ = RecordStore::at(&self.path).remove();
         }
     }
 }
@@ -202,7 +203,7 @@ impl Drop for PendingTurnFile {
 impl Drop for MessageGuardFiles {
     fn drop(&mut self) {
         for path in &self.paths {
-            let _ = super::super::remove_file_if_present(path);
+            let _ = RecordStore::at(path).remove();
         }
     }
 }
@@ -272,12 +273,10 @@ impl NativeProviderAdapter for ClaudeAdapter {
         &self,
         context: super::super::doctor::Context<'_>,
     ) -> Vec<super::super::doctor::Check> {
-        use super::super::{
-            doctor::{Availability::*, Check},
-            query,
-        };
+        use super::super::doctor::{Availability::*, Check};
         let setting = context.directory.map(|directory| {
-            query::optional_json::<serde_json::Value>(&directory.join("claude-settings.json"))
+            RecordReader::at(&directory.join("claude-settings.json"))
+                .optional_json::<serde_json::Value>()
         });
         let (availability, reason, detail) = match setting {
             Some(Ok(Some(value))) if value.get("crossSessionInbound").and_then(serde_json::Value::as_str) == Some("accept") =>
@@ -557,7 +556,7 @@ fn require_exact_claude_trust_scope(workspace: &Path) -> Result<()> {
 
 fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Result<LaunchPlan> {
     let settings_path = context.directory.join("claude-settings.json");
-    super::super::write_json_atomic(&settings_path, &hook_settings(context.bridge_executable))?;
+    RecordStore::at(&settings_path).write_json(&hook_settings(context.bridge_executable))?;
     let arguments = vec![
         OsString::from("--settings"),
         settings_path.into_os_string(),
@@ -617,7 +616,7 @@ fn claude_initial_prompt_transport(windows: bool) -> InitialPromptTransport {
 fn prepare_resume_for_platform(context: ResumeContext<'_>, windows: bool) -> Result<ResumePlan> {
     verify_reopen_available_for_platform(context.provider_session_id, windows)?;
     let settings_path = context.directory.join("claude-settings.json");
-    super::super::write_json_atomic(&settings_path, &hook_settings(context.bridge_executable))?;
+    RecordStore::at(&settings_path).write_json(&hook_settings(context.bridge_executable))?;
     Ok(ResumePlan {
         arguments: vec![
             OsString::from("--resume"),
@@ -809,7 +808,7 @@ fn live_conversation_holders(
             continue;
         }
         let path = entry.path();
-        let Some(text) = super::super::read_regular_text_if_present(&path)? else {
+        let Some(text) = RecordReader::at(&path).text()? else {
             continue;
         };
         let record = match validated_registry_record(stem, &text) {
@@ -963,13 +962,15 @@ fn proc_start_filetime(value: &serde_json::Value) -> Option<u64> {
 // delivery boundaries run, taken at doctor time only; it proves nothing about the interval
 // between two scans. `None` for a session that did not resume a conversation.
 fn resumed_conversation_holders_check(directory: &Path) -> Option<super::super::doctor::Check> {
-    use super::super::{
-        doctor::{Availability::*, Check},
-        query,
-    };
-    let manifest = query::optional_json::<serde_json::Value>(&directory.join("manifest.json"))
-        .ok()
-        .flatten()?;
+    use super::super::doctor::{Availability::*, Check};
+    let manifest = RecordReader::at(
+        Reader::open_unchecked(directory)
+            .record(CoreRecord::Manifest)
+            .path(),
+    )
+    .optional_json::<serde_json::Value>()
+    .ok()
+    .flatten()?;
     let provider_session_id = manifest
         .get("resumed_from")?
         .get("provider_session_id")?
@@ -1140,8 +1141,10 @@ fn handle_hook(directory: &Path, payload: &serde_json::Value) -> Result<()> {
 }
 
 fn handle_correlated_stop(directory: &Path, payload: &serde_json::Value) -> Result<()> {
-    let pending_path = directory.join(PENDING_TURN_FILE);
-    let Some(pending_text) = super::super::read_regular_text_if_present(&pending_path)? else {
+    let Some(pending_text) = Reader::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .text()?
+    else {
         return handle_uncorrelated_stop(directory, payload);
     };
     let pending: PendingCrossSessionTurn =
@@ -1185,8 +1188,11 @@ fn handle_uncorrelated_stop(directory: &Path, payload: &serde_json::Value) -> Re
 }
 
 fn handle_stop_failure(directory: &Path, payload: &serde_json::Value) -> Result<()> {
-    let pending_path = directory.join(PENDING_TURN_FILE);
-    if super::super::read_regular_text_if_present(&pending_path)?.is_some() {
+    if Reader::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .text()?
+        .is_some()
+    {
         // SendMessage does not return the target prompt identity that would let
         // Agent Bridge bind this failure to the delivered request. Leave the
         // pending turn claimed instead of attributing an unrelated failure.
@@ -1251,8 +1257,8 @@ fn read_message_hook_input(request_id: &str) -> Result<(MessengerFiles, serde_js
         std::env::var_os(super::super::SESSION_DIR_ENV)
             .context("Claude message hook session directory is not set")?,
     );
-    super::super::validate_hook_directory(&directory)?;
-    let manifest = super::super::read_manifest(&directory)?;
+    Reader::open_unchecked(&directory).validate_hook_directory()?;
+    let manifest = Reader::open_unchecked(&directory).manifest()?;
     if manifest.provider != agent_bridge::FirstPartyCli::Claude.as_str() {
         bail!("Claude message hook session has a different provider")
     }
@@ -1280,7 +1286,8 @@ fn read_message_guard(files: &MessengerFiles, request_id: &str) -> Result<Messag
     if canonical_guard.parent() != Some(canonical_directory.as_path()) {
         bail!("Claude message guard file is outside its managed session");
     }
-    let guard_text = super::super::read_regular_text_if_present(&files.guard)?
+    let guard_text = RecordReader::at(&files.guard)
+        .text()?
         .context("Claude message guard file is missing")?;
     let guard: MessageGuard =
         serde_json::from_str(&guard_text).context("invalid Claude message guard JSON")?;
@@ -1351,14 +1358,7 @@ fn message_guard_decision(
 // Evidence is read back by the sender moments later and never has to survive a crash, so the
 // hooks skip the durable writes that would add disk latency inside Claude's hook timeout.
 fn create_message_evidence<T: Serialize>(path: &Path, evidence: &T) -> Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    super::super::set_private_file_permissions(&file)?;
-    file.write_all(&serde_json::to_vec(evidence)?)?;
-    Ok(())
+    RecordStore::at(path).write_json_if_absent(evidence)
 }
 
 // Claude's PostToolUse payload reports the input that actually ran. Only that report proves
@@ -1388,13 +1388,10 @@ fn record_message_receipt(
         return Ok(());
     }
     // A second executed SendMessage can never belong to one confirmed delivery.
-    super::super::write_json_atomic(
-        &files.receipt,
-        &MessageReceipt {
-            tool_use_id: None,
-            verified: false,
-        },
-    )
+    RecordStore::at(&files.receipt).write_json(&MessageReceipt {
+        tool_use_id: None,
+        verified: false,
+    })
 }
 
 fn send_cross_session_message(
@@ -1616,7 +1613,7 @@ fn unconfirmed_delivery_failure(
 // call in the stream as blocked before it ran.
 fn send_provably_did_not_run(stdout: &[u8], files: &MessengerFiles) -> Result<bool> {
     for evidence in files.evidence() {
-        if super::super::read_regular_text_if_present(evidence)?.is_some() {
+        if RecordReader::at(evidence).text()?.is_some() {
             return Ok(false);
         }
     }
@@ -1625,8 +1622,13 @@ fn send_provably_did_not_run(stdout: &[u8], files: &MessengerFiles) -> Result<bo
 
 fn install_pending_turn(directory: &Path, request_id: &str) -> Result<PendingTurnFile> {
     let pending = PendingCrossSessionTurn::new(request_id)?;
-    let path = directory.join(PENDING_TURN_FILE);
-    super::super::write_json_atomic(&path, &pending)?;
+    let path = Reader::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .path()
+        .to_owned();
+    Store::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .write_json(&pending)?;
     Ok(PendingTurnFile {
         path,
         retained: false,
@@ -1796,9 +1798,9 @@ fn install_message_guard(
 ) -> Result<MessageGuardFiles> {
     // Evidence left by an interrupted attempt at this request must not speak for this one.
     for evidence in files.evidence() {
-        super::super::remove_file_if_present(evidence)?;
+        RecordStore::at(evidence).remove()?;
     }
-    super::super::write_json_atomic(&files.guard, guard)?;
+    RecordStore::at(&files.guard).write_json(guard)?;
     let send_message_hook = |action: &str| {
         serde_json::json!({
             "matcher": "SendMessage",
@@ -1817,8 +1819,8 @@ fn install_message_guard(
             "PostToolUse": [send_message_hook("message-receipt")]
         }
     });
-    if let Err(error) = super::super::write_json_atomic(&files.settings, &settings) {
-        let _ = super::super::remove_file_if_present(&files.guard);
+    if let Err(error) = RecordStore::at(&files.settings).write_json(&settings) {
+        let _ = RecordStore::at(&files.guard).remove();
         return Err(error).context("failed to install Claude message guard settings");
     }
     Ok(MessageGuardFiles {
@@ -1986,7 +1988,8 @@ fn confirm_executed_payload(files: &MessengerFiles, send_id: &str) -> Result<()>
 }
 
 fn read_message_evidence<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
-    super::super::read_regular_text_if_present(path)?
+    RecordReader::at(path)
+        .text()?
         .map(|text| {
             serde_json::from_str(&text)
                 .with_context(|| format!("invalid Claude message evidence in {}", path.display()))

@@ -3,6 +3,7 @@ use super::{
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
     LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
 };
+use crate::native::session::{Reader, RecordStore, Store};
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -134,7 +135,7 @@ impl NativeProviderAdapter for PiAdapter {
             .context("Pi launch has no native turn claim")?;
         let pending = install_pending_turn(context.directory, &claim_token)?;
         let extension_path = context.directory.join("pi-agent-bridge.js");
-        super::super::write_private(&extension_path, bridge_extension().as_bytes())?;
+        RecordStore::at(&extension_path).write_private(bridge_extension().as_bytes())?;
         let mut arguments = vec![
             OsString::from("--extension"),
             extension_path.into_os_string(),
@@ -199,7 +200,7 @@ impl NativeProviderAdapter for PiAdapter {
                 .managed_session_id
                 .as_deref()
                 .context("Pi initial input has no managed session identity")
-                .and_then(super::super::session_directory)
+                .and_then(Reader::session_directory)
                 .map_err(terminal::TerminalSendFailure::not_sent)?;
             send_initial_prompt_after_startup(&directory, deadline, || {
                 terminal::send_file(session, prompt_path, deadline)
@@ -335,8 +336,9 @@ fn send_initial_prompt_after_startup(
             {
                 bail!("Pi initial turn is no longer claimed; no initial console input was sent");
             }
-            if let Some(text) =
-                super::super::read_regular_text_if_present(&directory.join(STARTUP_READY_FILE))?
+            if let Some(text) = Reader::open_unchecked(directory)
+                .private(STARTUP_READY_FILE)
+                .text()?
             {
                 let ready: StartupReady =
                     serde_json::from_str(&text).context("invalid Pi startup receipt")?;
@@ -373,13 +375,16 @@ fn validate_claim_token(claim_token: &str) -> Result<()> {
 
 fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingPiTurn> {
     let pending = PendingPiTurn::new(claim_token)?;
-    super::super::write_json_atomic(&directory.join(PENDING_TURN_FILE), &pending)?;
+    Store::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .write_json(&pending)?;
     Ok(pending)
 }
 
 fn read_pending_turn(directory: &Path) -> Result<Option<PendingPiTurn>> {
-    let Some(text) =
-        super::super::read_regular_text_if_present(&directory.join(PENDING_TURN_FILE))?
+    let Some(text) = Reader::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .text()?
     else {
         return Ok(None);
     };
@@ -399,7 +404,9 @@ fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result<()> {
     if pending.claim_token != claim_token {
         return Ok(());
     }
-    super::super::remove_file_if_present(&directory.join(PENDING_TURN_FILE))
+    Store::open_unchecked(directory)
+        .private(PENDING_TURN_FILE)
+        .remove()
 }
 
 fn correlated_prompt(prompt: &str, pending: &PendingPiTurn) -> String {
@@ -524,8 +531,10 @@ fn monitor_hook_failures(directory: &Path, stop: &AtomicBool) -> Result<()> {
 }
 
 fn consume_hook_failure(directory: &Path) -> Result<bool> {
-    let path = directory.join(HOOK_FAILURE_FILE);
-    let Some(text) = super::super::read_regular_text_if_present(&path)? else {
+    let Some(text) = Reader::open_unchecked(directory)
+        .private(HOOK_FAILURE_FILE)
+        .text()?
+    else {
         return Ok(false);
     };
     let signal: HookFailureSignal =
@@ -534,7 +543,9 @@ fn consume_hook_failure(directory: &Path) -> Result<bool> {
     if error.is_empty() {
         bail!("Pi hook failure recovery signal has no error");
     }
-    super::super::remove_file_if_present(&path)
+    Store::open_unchecked(directory)
+        .private(HOOK_FAILURE_FILE)
+        .remove()
         .context("failed to consume Pi hook failure recovery signal")?;
     let Some(pending) = read_pending_turn(directory)? else {
         return Ok(true);

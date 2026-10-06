@@ -1,5 +1,7 @@
 //! A read-only projection of retained evidence, not a history of inferred transitions.
 use super::*;
+use crate::native::session::{CoreRecord, Reader};
+use crate::native::{EventsDirectory, SESSION_SCHEMA, valid_turn_claim_token};
 use std::collections::BTreeMap;
 
 type Records = BTreeMap<String, std::result::Result<Option<Vec<u8>>, String>>;
@@ -7,36 +9,6 @@ type Records = BTreeMap<String, std::result::Result<Option<Vec<u8>>, String>>;
 // Auxiliary launch diagnostics retain at most 1 MiB; all other reads use
 // the existing 64 MiB event limit. Oversized files are evidence gaps.
 const LOG_READ_LIMIT: u64 = 1024 * 1024;
-
-fn read_record(path: &Path, limit: u64) -> Result<Option<Vec<u8>>> {
-    use std::io::Read as _;
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!("refusing non-regular session file: {}", path.display());
-    }
-    if metadata.len() > limit {
-        bail!(
-            "record is {} bytes, over the {limit} byte read limit",
-            metadata.len()
-        );
-    }
-    let file = File::open(path)?;
-    let mut bytes = Vec::new();
-    file.take(limit).read_to_end(&mut bytes)?;
-    let size = fs::metadata(path)?.len();
-    if size != bytes.len() as u64 && size <= limit {
-        return Err(SnapshotBusy.into());
-    }
-    if size > limit {
-        bail!("record is {size} bytes, over the {limit} byte read limit");
-    }
-    std::str::from_utf8(&bytes).context("invalid UTF-8")?;
-    Ok(Some(bytes))
-}
 
 fn parsed<T: for<'de> Deserialize<'de>>(records: &Records, source: &str) -> Result<Option<T>> {
     let bytes = records
@@ -87,7 +59,7 @@ fn receipt_index(records: &Records) -> requests::Index {
             if r.schema != 1
                 || !requests::valid_id(&r.request_id)
                 || source != &format!("requests/{}.json", r.claim_token)
-                || !valid_event_file_name(&r.event_file)
+                || !Reader::valid_event_file_name(&r.event_file)
                 || r.context_sources
                     .iter()
                     .any(|s| requests::validate_context_source(s).is_err())
@@ -109,33 +81,36 @@ fn receipt_index(records: &Records) -> requests::Index {
     index
 }
 
-fn records(directory: &Path, request: Option<&str>) -> Result<Records> {
+fn records(reader: &Reader, request: Option<&str>) -> Result<Records> {
+    let directory = reader.directory();
     let mut records = Records::new();
     for name in [
-        "manifest.json",
-        "status.json",
-        TURN_CLAIM_FILE,
-        TURN_COMPLETION_FILE,
-        launch::FILE,
+        CoreRecord::Manifest.name(),
+        CoreRecord::Status.name(),
+        CoreRecord::TurnClaim.name(),
+        CoreRecord::Completion.name(),
+        CoreRecord::Launch.name(),
         launch::LOG,
-        CLOSED_STATUS_FILE,
-        TERMINAL_CLOSING_FILE,
-        TERMINAL_TOMBSTONE_FILE,
+        CoreRecord::Closed.name(),
+        CoreRecord::TerminalClosing.name(),
+        CoreRecord::TerminalClosed.name(),
     ] {
         records.insert(
             name.to_owned(),
-            read_record(
-                &directory.join(name),
-                if name == launch::LOG {
+            reader
+                .private(name)
+                .timeline(if name == launch::LOG {
                     LOG_READ_LIMIT
                 } else {
                     EVENT_READ_LIMIT
-                },
-            )
-            .map_err(|e| format!("{e:#}")),
+                })
+                .map_err(|e| format!("{e:#}")),
         );
     }
-    let root = directory.join("requests");
+    let root = Reader::open_unchecked(directory)
+        .record(CoreRecord::Requests)
+        .path()
+        .to_owned();
     let index = (|| -> Result<Option<Vec<u8>>> {
         let m = match fs::symlink_metadata(&root) {
             Ok(m) => m,
@@ -154,7 +129,11 @@ fn records(directory: &Path, request: Option<&str>) -> Result<Records> {
             {
                 records.insert(
                     format!("requests/{name}"),
-                    read_record(&root.join(name), EVENT_READ_LIMIT).map_err(|e| format!("{e:#}")),
+                    reader
+                        .record(CoreRecord::Requests)
+                        .child(name)
+                        .timeline(EVENT_READ_LIMIT)
+                        .map_err(|e| format!("{e:#}")),
                 );
             }
         }
@@ -162,9 +141,12 @@ fn records(directory: &Path, request: Option<&str>) -> Result<Records> {
     })();
     records.insert("requests/".to_owned(), index.map_err(|e| format!("{e:#}")));
     let receipts = receipt_index(&records);
-    let present = matches!(events_directory_state(directory)?, EventsDirectory::Present);
+    let present = matches!(
+        Reader::open_unchecked(directory).events_directory_state()?,
+        EventsDirectory::Present
+    );
     for path in if present {
-        event_paths(directory)?
+        reader.events()?
     } else {
         Vec::new()
     } {
@@ -178,7 +160,10 @@ fn records(directory: &Path, request: Option<&str>) -> Result<Records> {
             }
             records.insert(
                 format!("events/{name}"),
-                read_record(&path, EVENT_READ_LIMIT).map_err(|e| format!("{e:#}")),
+                reader
+                    .event(name)
+                    .timeline(EVENT_READ_LIMIT)
+                    .map_err(|e| format!("{e:#}")),
             );
         }
     }
@@ -198,7 +183,7 @@ fn snapshot(records: &Records) -> Result<Snapshot> {
     }
     let index = receipt_index(records);
     let manifest: SessionManifest =
-        parsed(records, "manifest.json")?.context("session has no manifest")?;
+        parsed(records, CoreRecord::Manifest.name())?.context("session has no manifest")?;
     if manifest.schema != SESSION_SCHEMA {
         bail!(
             "unsupported session schema {} for {}",
@@ -206,7 +191,7 @@ fn snapshot(records: &Records) -> Result<Snapshot> {
             manifest.id
         );
     }
-    let pending: Option<PendingTurnCompletion> = optional(records, TURN_COMPLETION_FILE)?;
+    let pending: Option<PendingTurnCompletion> = optional(records, CoreRecord::Completion.name())?;
     if let Some(p) = &pending {
         validate_pending_completion(p)?;
     }
@@ -232,14 +217,14 @@ fn snapshot(records: &Records) -> Result<Snapshot> {
             })
         })
         .transpose()?;
-    let launch: Option<launch::Record> = optional(records, launch::FILE)?;
+    let launch: Option<launch::Record> = optional(records, CoreRecord::Launch.name())?;
     if launch
         .as_ref()
         .is_some_and(|l| l.schema != 1 || l.claim_token.is_empty())
     {
         bail!("invalid launch receipt identity");
     }
-    let claim = records[TURN_CLAIM_FILE]
+    let claim = records[CoreRecord::TurnClaim.name()]
         .as_ref()
         .ok()
         .and_then(|v| v.as_ref())
@@ -247,7 +232,7 @@ fn snapshot(records: &Records) -> Result<Snapshot> {
         .transpose()?;
     Ok(Snapshot {
         manifest,
-        status: if records["status.json"].is_err() {
+        status: if records[CoreRecord::Status.name()].is_err() {
             SessionStatus {
                 state: "unknown".to_owned(),
                 generation: 0,
@@ -256,7 +241,7 @@ fn snapshot(records: &Records) -> Result<Snapshot> {
                 error: None,
             }
         } else {
-            parsed(records, "status.json")?.context("session has no status record")?
+            parsed(records, CoreRecord::Status.name())?.context("session has no status record")?
         },
         receipts: index.receipts,
         unreadable_requests: index.unreadable,
@@ -276,10 +261,10 @@ fn snapshot(records: &Records) -> Result<Snapshot> {
 
 fn event(records: &Records, snapshot: &Snapshot, name: &str) -> Result<Option<SessionEvent>> {
     for source in [
-        "status.json",
-        TURN_CLAIM_FILE,
-        TURN_COMPLETION_FILE,
-        launch::FILE,
+        CoreRecord::Status.name(),
+        CoreRecord::TurnClaim.name(),
+        CoreRecord::Completion.name(),
+        CoreRecord::Launch.name(),
     ] {
         if let Err(error) = &records[source] {
             bail!("{source}: {error}");
@@ -323,30 +308,13 @@ fn sort(entries: &mut [Value]) {
 }
 
 pub(in crate::native) fn timeline_value(
-    directory: &Path,
+    reader: &Reader,
     id: &str,
     request: Option<&str>,
 ) -> Result<Value> {
-    // Keep the lifecycle reader lock while collecting and checking retained bytes.
-    let lock = match File::open(directory.join(TURN_CLAIM_LOCK_FILE)) {
-        Ok(file) => {
-            let deadline = Instant::now() + snapshot_retry_window();
-            loop {
-                match file.try_lock_shared() {
-                    Ok(()) => break,
-                    Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(25))
-                    }
-                    Err(std::fs::TryLockError::WouldBlock) => return Err(SnapshotBusy.into()),
-                    Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
-                }
-            }
-            Some(file)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error).context("failed to observe native lifecycle lock"),
-    };
-    let before = records(directory, request)?;
+    let directory = reader.directory();
+    let lock = reader.lock_shared_with_retry(snapshot_retry_window())?;
+    let before = records(reader, request)?;
     let mut snapshot = snapshot(&before)?;
     snapshot._lock = lock;
     if directory.file_name().and_then(|n| n.to_str()) != Some(snapshot.manifest.id.as_str()) {
@@ -386,10 +354,10 @@ pub(in crate::native) fn timeline_value(
         || snapshot.request_index_error.is_some()
         || before.values().any(|r| r.is_err());
     for (source, stage) in [
-        (TURN_CLAIM_FILE, "turn_claim"),
-        (TURN_COMPLETION_FILE, "completion_journal"),
-        (launch::FILE, "launch_phase"),
-        ("status.json", "status"),
+        (CoreRecord::TurnClaim.name(), "turn_claim"),
+        (CoreRecord::Completion.name(), "completion_journal"),
+        (CoreRecord::Launch.name(), "launch_phase"),
+        (CoreRecord::Status.name(), "status"),
     ] {
         if let Err(error) = &before[source] {
             session_entries.push(entry(
@@ -547,16 +515,16 @@ pub(in crate::native) fn timeline_value(
     ));
     session_entries.push(entry(id, None, None, "request_index", None, "requests/",
         if snapshot.request_index_error.is_some() || snapshot.unreadable_requests > 0 { "unreadable" }
-        else if directory.join("requests").exists() { "observed" } else { "missing" },
+        else if Reader::open_unchecked(directory).record(CoreRecord::Requests).path().to_owned().exists() { "observed" } else { "missing" },
         json!({"unreadable_requests": snapshot.unreadable_requests, "error": snapshot.request_index_error})));
-    if snapshot.launch.is_none() && before[launch::FILE].is_ok() {
+    if snapshot.launch.is_none() && before[CoreRecord::Launch.name()].is_ok() {
         session_entries.push(entry(
             id,
             None,
             None,
             "launch_phase",
             None,
-            launch::FILE,
+            CoreRecord::Launch.name(),
             "missing",
             Value::Null,
         ));
@@ -572,7 +540,7 @@ pub(in crate::native) fn timeline_value(
             receipt.map(|r| r.event_file.as_str()),
             "launch_phase",
             None,
-            launch::FILE,
+            CoreRecord::Launch.name(),
             "observed",
             json!({"phase": launch.phase, "deadline_unix_ms": launch.deadline_unix_ms}),
         );
@@ -592,7 +560,7 @@ pub(in crate::native) fn timeline_value(
             Some(&pending.event_file),
             "completion_journal",
             None,
-            TURN_COMPLETION_FILE,
+            CoreRecord::Completion.name(),
             "observed",
             json!({"published": snapshot.published(&pending.event_file)}),
         );
@@ -604,22 +572,22 @@ pub(in crate::native) fn timeline_value(
             session_entries.push(e);
         }
     }
-    if before["status.json"].is_ok() {
+    if before[CoreRecord::Status.name()].is_ok() {
         session_entries.push(entry(
             id,
             None,
             None,
             "status",
             Some(snapshot.status.updated_unix_ms),
-            "status.json",
+            CoreRecord::Status.name(),
             "observed",
             json!(snapshot.status),
         ));
     }
     for (source, stage) in [
-        (CLOSED_STATUS_FILE, "closed_status"),
-        (TERMINAL_CLOSING_FILE, "terminal_closing"),
-        (TERMINAL_TOMBSTONE_FILE, "terminal_closed"),
+        (CoreRecord::Closed.name(), "closed_status"),
+        (CoreRecord::TerminalClosing.name(), "terminal_closing"),
+        (CoreRecord::TerminalClosed.name(), "terminal_closed"),
         (launch::LOG, "launch_log"),
     ] {
         let read = before.get(source).expect("fixed source");
@@ -659,9 +627,9 @@ pub(in crate::native) fn timeline_value(
                 }
             }
             Ok(Some(_)) => {
-                let parsed = if source == CLOSED_STATUS_FILE {
+                let parsed = if source == CoreRecord::Closed.name() {
                     parsed::<SessionStatus>(&before, source).map(|v| v.map(|v| json!(v)))
-                } else if source == TERMINAL_CLOSING_FILE {
+                } else if source == CoreRecord::TerminalClosing.name() {
                     parsed::<terminal::TerminalSession>(&before, source)
                         .map(|v| v.map(|v| json!(v)))
                 } else {
@@ -715,7 +683,7 @@ pub(in crate::native) fn timeline_value(
             }
         }
     }
-    if before != records(directory, request)? {
+    if before != records(reader, request)? {
         return Err(SnapshotBusy.into());
     }
     sort(&mut entries);
@@ -731,7 +699,11 @@ pub(in crate::native) fn timeline_value(
 }
 
 pub(super) fn run(id: &str, json: bool, request: Option<&str>) -> Result<()> {
-    let value = timeline_value(&session_directory(id)?, id, request)?;
+    let value = timeline_value(
+        &Reader::open_unchecked(Reader::session_directory(id)?),
+        id,
+        request,
+    )?;
     if json {
         return print_json(&value);
     }
