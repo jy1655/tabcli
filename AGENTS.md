@@ -292,8 +292,12 @@ launch, observe, continue, and close without replacing the capabilities those CL
 - The self-test runs in the ordinary state root by default and in a private directory
   only with `--isolated` (owner's decision, 2026-10-02): its purpose is to check the
   installed setup as it is. It closes only what it created, bounds every command it
-  runs, never resends after an uncertain delivery, never approves trust, and never
-  deletes a record. Nothing else may call it.
+  runs, never resends after an uncertain delivery, and never deletes a record. It
+  follows `ask`'s workspace-consent rules (owner's decision, 2026-10-06): verified
+  consent for the exact workspace is reused through the provider's own approval, as
+  in `ask`, and without it the self-test approves no workspace trust itself. An
+  explicit `--yolo` only forwards the provider's own bypass option. `--isolated`
+  separates Bridge's records, not a provider's trust store. Nothing else may call it.
 
 ## Change and Verification Rules
 

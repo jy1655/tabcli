@@ -87,8 +87,11 @@ terminal input, so follow-ups without a provider-native input path are unsupport
 
 Self-test launches a session, verifies the exact marker result of the initial request, sends
 one follow-up, verifies a distinct request and result event, and closes its owned session.
-Close is confirmed through a read-only inspection. It never resends an uncertain prompt,
-automatically approves workspace trust, or deletes records. Every invoked command is bounded.
+Close is confirmed through a read-only inspection. It never resends an uncertain prompt or
+deletes records. It follows `ask`'s workspace-consent rules: it reuses verified consent for the
+exact workspace through the provider's own approval, and without that consent it approves no
+workspace trust itself. An explicit `--yolo` only forwards the provider's own bypass option.
+Every invoked command is bounded.
 Only a fully verified round trip and close exit successfully.
 
 The default is the ordinary state root, whose path is reported. Closed records remain there.
