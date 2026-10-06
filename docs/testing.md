@@ -1,0 +1,126 @@
+# Testing
+
+Run the automated checks below for a code change; use `self-test` when you need to exercise
+a provider in a visible terminal surface. Report the two separately.
+
+## Automated checks
+
+Run the required local checks from the repository root:
+
+```sh
+cargo test --all-targets --all-features -- --test-threads=1
+cargo clippy --all-targets -- -D warnings
+cargo fmt -- --check
+git diff --check
+```
+
+Run the test harness with one test thread, as required by AGENTS.md. This policy was adopted
+after deadline-sensitive fake-Codex tests failed under the parallel harness in
+[issue #46](https://github.com/jy1655/agent-bridge/issues/46); concurrency inside individual
+tests remains enabled.
+For a lifecycle or concurrency fix, reproduce the partial transition or race deterministically
+before changing the implementation.
+
+Also check platform-gated code with the two cross-target Clippy commands in
+[Contributing](../CONTRIBUTING.md). Installing `rust-std` for each target is enough for those
+checks. Cross-target checks do not run tests on the target platform.
+
+On macOS, `macos_terminal_applescripts_compile_without_opening_a_tab` compiles the iTerm2,
+Terminal.app, and Ghostty scripts with the installed application dictionaries. Install Ghostty
+and iTerm2 in their normal Applications locations before running the suite. This test compiles
+scripts without opening a surface; it does not verify live Automation consent or delivery.
+
+Check which test was ignored before interpreting the count:
+
+- `tests/native_live.rs` contains four provider smoke tests requiring authenticated Codex,
+  Claude, Agy, or Pi and a visible supported terminal surface. They are manual live tests.
+- The WezTerm adapter has an ignored live test that starts, binds, and ends its own real surface.
+- The self-test unit tests contain an ignored subprocess fixture used by a deadline test.
+  It is not an authenticated provider test and should not be counted as one.
+
+An ignored live test has not exercised the provider. Use `self-test` for an authenticated round
+trip rather than enabling every ignored test, which also runs the subprocess fixture.
+
+## What CI runs
+
+[The CI workflow](../.github/workflows/ci.yml) runs on pushes and pull requests to the main branch:
+
+| Job | Platform | Checks |
+| --- | --- | --- |
+| Minimum Rust | Ubuntu, Rust 1.97.1 | Formatting, all-feature Clippy, serial all-feature tests |
+| Stable Rust | Ubuntu, macOS, Windows | Formatting, all-feature Clippy, serial all-feature tests |
+| Release candidate | Apple Silicon macOS, x86-64 Windows | Locked build and package checks |
+
+The formatting command in CI is `cargo fmt --all -- --check`; Clippy uses
+`cargo clippy --all-targets --all-features -- -D warnings`. Tests use the serial command above.
+The macOS stable job installs Ghostty and iTerm2 for the AppleScript compile test.
+The release-candidate job packages the executable and license, checks the archive checksum,
+extracts it, and checks the extracted binary's version. This is not an authenticated live test.
+Linux CI checks portable code; Linux managed sessions remain unsupported.
+
+## Manual live verification
+
+Self-test opens a real surface and makes real model calls. Authenticate the selected CLI,
+review the workspace, and make sure the terminal application answers before starting.
+For macOS system approvals, see [macOS permissions](macos-permissions.md) (Korean).
+
+To test this checkout, run the following from the repository root after reviewing the workspace:
+
+```sh
+cargo run --locked -- self-test codex --workspace . --json
+```
+
+If the managed terminal shows a workspace-trust dialog, review and answer it yourself.
+Self-test does not answer it. A failed command does not mean that no prompt reached the provider.
+Record failed and timed-out attempts. Before another run, check the terminal application and
+the report's close outcome for any session created. Do not resend a prompt whose delivery is
+uncertain. A timeout before a surface exists is not a pass; a later pass does not establish
+the cause of that timeout.
+
+For release verification, run the packaged candidate's executable instead and record its path
+and SHA-256.
+
+Replace `codex` with `claude`, `agy`, or `pi` for that provider. Use `--terminal` to select a
+supported terminal explicitly; consult [Terminals](terminals.md) for limits. Warp needs its
+Scripting opt-in and a reachable authorized Control endpoint. Its control API cannot submit
+terminal input, so follow-ups without a provider-native input path are unsupported.
+
+Self-test launches a session, verifies the exact marker result of the initial request, sends
+one follow-up, verifies a distinct request and result event, and closes its owned session.
+Close is confirmed through a read-only inspection. It never resends an uncertain prompt,
+automatically approves workspace trust, or deletes records. Every invoked command is bounded.
+Only a fully verified round trip and close exit successfully.
+
+The default is the ordinary state root, whose path is reported. Closed records remain there.
+`--isolated` uses a private directory: ordinary-root settings and consent records do not apply,
+and that directory remains until you remove it. `--timeout-secs` is a per-command budget,
+defaulting to 120 seconds, not a budget for the whole run; close uses separate bounded calls.
+Record any model, effort, or bypass override you add to the command.
+
+## Record the evidence
+
+Create a dated Markdown record under `docs/verification/`. Include:
+
+- The tested commit, Bridge version, binary SHA-256, build method, OS, and architecture.
+- Provider CLI and terminal versions, caller environment, and relevant consent settings.
+- Commands and explicit overrides, including whether ordinary or isolated records were used.
+- Automated check results, with ignored tests and checks not run stated separately.
+- Each live provider/terminal combination, session identifiers, step outcomes, and close outcome.
+- Failed and timed-out attempts, observations supporting the diagnosis, and what remains unknown.
+- Unexercised combinations and paths, including the providers' default permission modes if unused.
+
+Keep full evidence privately and publish only reviewed, redacted excerpts. Do not upload session
+directories, transcripts, tokens, or complete diagnostics; see [Security](../SECURITY.md).
+
+The [macOS 0.1.2 record](verification/2026-10-06-macos-0.1.2.md) is an example: it records
+Codex round trips in WezTerm, Terminal.app, iTerm2, and Ghostty, plus Claude in WezTerm.
+It explicitly leaves Warp, Agy, Pi, native Windows runtime behavior, and default approval modes
+unverified for that candidate. Those runs used bypass overrides, unlike the example above.
+The record also preserves surface-creation timeouts instead of counting them as passes.
+
+A macOS run cannot verify native Windows console behavior. A native Windows run cannot verify
+macOS scripting, surface ownership, or system approvals. Use an appropriate host for each;
+cross-compilation and CI unit tests cannot substitute for authenticated live runs.
+Release notes must name the combinations exercised and link the dated evidence, then state
+unexercised combinations as not verified. Earlier records establish only their recorded
+versions and conditions, not a fresh runtime pass for the current candidate.
