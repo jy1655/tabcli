@@ -1,3 +1,4 @@
+pub(in crate::native) mod ownership;
 pub(in crate::native) mod process;
 
 use std::{
@@ -118,7 +119,7 @@ where
             cleanup_started_surface_with(
                 &cleanup_session,
                 || {
-                    crate::native::apple_terminal_startup_absent(
+                    apple_terminal::apple_terminal_startup_absent(
                         directory,
                         &cleanup_session,
                         deadline,

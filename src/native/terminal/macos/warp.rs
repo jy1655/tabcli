@@ -1,7 +1,13 @@
 use super::process;
+use crate::native::session::{self, Store};
 use crate::native::session::{Reader, RecordReader, RecordStore};
+use crate::native::terminal;
 #[cfg(test)]
 use crate::native::terminal::ownership;
+use crate::native::terminal::ownership::{
+    NativeProcessIdentity, NativeSessionOwner, native_owner_identity_matches,
+    verified_terminal_owner_process_group, verified_terminal_shell_process_group,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
@@ -1884,6 +1890,62 @@ fn write_new_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         EXCLUSIVE_TEMPORARY_PREFIX,
         value,
     )
+}
+
+// Warp preserves normal close warnings. Stop only the fully attested foreground
+// job before requesting tab.close; never suppress warnings or signal by tty name.
+#[cfg(target_os = "macos")]
+pub(in crate::native) fn prepare_warp_close(
+    directory: &Path,
+    id: &str,
+    session: &terminal::TerminalSession,
+    owner: &NativeSessionOwner,
+    live: &NativeProcessIdentity,
+    shell: &NativeProcessIdentity,
+    stop: impl FnOnce(u32) -> Result<()>,
+) -> Result<()> {
+    session.verify_managed_session(id)?;
+    if session.kind != terminal::TerminalKind::Warp
+        || owner.managed_session_id.as_deref() != Some(id)
+        || !native_owner_identity_matches(owner, live)
+    {
+        bail!("Warp close owner identity changed");
+    }
+    let group = verified_terminal_owner_process_group(owner, live)?;
+    verified_terminal_shell_process_group(owner, live, shell)?;
+    session::close::record_terminal_close_intent(
+        &Store::open_unchecked(directory),
+        id,
+        session,
+        owner,
+    )?;
+    stop(group)
+}
+
+#[cfg(target_os = "macos")]
+pub(in crate::native) fn terminate_owned_foreground_group(group: u32) -> Result<()> {
+    let target = terminal::macos::apple_terminal::process_group_signal_target(group)?;
+    if unsafe { libc::kill(target, libc::SIGTERM) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(error).context("could not stop the attested Warp foreground group");
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if unsafe { libc::kill(target, 0) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            return Err(error).context("could not observe the stopped Warp foreground group");
+        }
+        if Instant::now() >= deadline {
+            bail!("the attested Warp foreground group has not stopped; no tab close was sent");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[cfg(test)]
