@@ -24,6 +24,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       notes: ${{ steps.version.outputs.notes }}
+      package: ${{ steps.version.outputs.package }}
       commit: ${{ steps.version.outputs.commit }}
       tag_object: ${{ steps.version.outputs.tag_object }}
     steps:
@@ -59,10 +60,21 @@ jobs:
           fi
           git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null || fail "origin/main was not fetched"
           git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main || fail "commit of $RELEASE_TAG is not contained in main"
+          package="$(awk '
+            /^\[package\]$/ { in_package = 1; next }
+            /^\[/ { in_package = 0 }
+            in_package && /^name = "/ { sub(/^name = "/, ""); sub(/".*$/, ""); print }
+          ' Cargo.toml)"
+          case "$package" in
+            tabcli) test -f THIRD_PARTY_NOTICES.md || fail "THIRD_PARTY_NOTICES.md is missing" ;;
+            agent-bridge) ;;
+            *) fail "unsupported Cargo package: $package" ;;
+          esac
           notes="docs/releases/$tag_version.md"
           test -f "$notes" || fail "$notes is missing"
           echo "version=$tag_version" >> "$GITHUB_OUTPUT"
           echo "notes=$notes" >> "$GITHUB_OUTPUT"
+          echo "package=$package" >> "$GITHUB_OUTPUT"
           # A tag can be moved while this run is in progress. Later jobs build this commit and
           # publish only while the remote tag is still this tag object.
           echo "commit=$tag_commit" >> "$GITHUB_OUTPUT"
@@ -117,16 +129,20 @@ jobs:
     needs: [validate, test]
     env:
       RUSTUP_TOOLCHAIN: 1.97.1
+      PACKAGE: ${{ needs.validate.outputs.package }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      TARGET: ${{ matrix.target }}
+      ARCHIVE: ${{ matrix.archive }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: macos-15
             target: aarch64-apple-darwin
-            archive: agent-bridge-${{ needs.validate.outputs.version }}-aarch64-apple-darwin.tar.gz
+            archive: ${{ needs.validate.outputs.package }}-${{ needs.validate.outputs.version }}-aarch64-apple-darwin.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            archive: agent-bridge-${{ needs.validate.outputs.version }}-x86_64-pc-windows-msvc.zip
+            archive: ${{ needs.validate.outputs.package }}-${{ needs.validate.outputs.version }}-x86_64-pc-windows-msvc.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
@@ -135,15 +151,16 @@ jobs:
           persist-credentials: false
       - name: Install pinned Rust toolchain
         shell: pwsh
-        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --target ${{ matrix.target }}
-      - run: cargo build --release --locked --target ${{ matrix.target }}
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal --target $env:TARGET
+      - shell: pwsh
+        run: cargo build --release --locked --target $env:TARGET
       - name: Verify binary version
         shell: pwsh
         run: |
           $suffix = if ($IsWindows) { ".exe" } else { "" }
-          $binary = Join-Path "target/${{ matrix.target }}/release" "agent-bridge$suffix"
+          $binary = Join-Path "target/$env:TARGET/release" "$env:PACKAGE$suffix"
           $actual = & $binary --version
-          if ($actual.Trim() -ne "agent-bridge ${{ needs.validate.outputs.version }}") {
+          if ($LASTEXITCODE -ne 0 -or $actual.Trim() -cne "$env:PACKAGE $env:RELEASE_VERSION") {
             throw "unexpected binary version: $actual"
           }
       - name: Package macOS archive and checksum
@@ -151,37 +168,50 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          archive="${{ matrix.archive }}"
           stage="$RUNNER_TEMP/agent-bridge-package"
           verify="$RUNNER_TEMP/agent-bridge-verify"
           mkdir -p "$stage" "$verify"
-          cp "target/${{ matrix.target }}/release/agent-bridge" "$stage/agent-bridge"
+          members=("$PACKAGE" LICENSE)
+          if [ "$PACKAGE" = tabcli ]; then
+            members+=(THIRD_PARTY_NOTICES.md)
+          fi
+          cp "target/$TARGET/release/$PACKAGE" "$stage/$PACKAGE"
           cp LICENSE "$stage/LICENSE"
-          tar -C "$stage" -czf "$archive" agent-bridge LICENSE
-          shasum -a 256 "$archive" > "$archive.sha256"
-          shasum -a 256 -c "$archive.sha256"
-          tar -C "$verify" -xzf "$archive"
-          test -f "$verify/LICENSE"
-          test "$("$verify/agent-bridge" --version)" = "agent-bridge ${{ needs.validate.outputs.version }}"
+          if [ "$PACKAGE" = tabcli ]; then
+            cp THIRD_PARTY_NOTICES.md "$stage/THIRD_PARTY_NOTICES.md"
+          fi
+          tar -C "$stage" -czf "$ARCHIVE" "${members[@]}"
+          shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+          shasum -a 256 -c "$ARCHIVE.sha256"
+          test "$(tar -tzf "$ARCHIVE" | LC_ALL=C sort)" = "$(printf '%s\n' "${members[@]}" | LC_ALL=C sort)"
+          tar -C "$verify" -xzf "$ARCHIVE"
+          test "$("$verify/$PACKAGE" --version)" = "$PACKAGE $RELEASE_VERSION"
       - name: Package Windows archive and checksum
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $archive = "${{ matrix.archive }}"
+          $archive = $env:ARCHIVE
           $stage = Join-Path $env:RUNNER_TEMP "agent-bridge-package"
           $verify = Join-Path $env:RUNNER_TEMP "agent-bridge-verify"
           New-Item -ItemType Directory -Force -Path $stage, $verify | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/agent-bridge.exe" "$stage/agent-bridge.exe"
+          $members = @("$env:PACKAGE.exe", "LICENSE")
+          if ($env:PACKAGE -eq "tabcli") { $members += "THIRD_PARTY_NOTICES.md" }
+          Copy-Item "target/$env:TARGET/release/$env:PACKAGE.exe" "$stage/$env:PACKAGE.exe"
           Copy-Item LICENSE "$stage/LICENSE"
-          Compress-Archive -LiteralPath "$stage/agent-bridge.exe", "$stage/LICENSE" -DestinationPath $archive
+          if ($env:PACKAGE -eq "tabcli") { Copy-Item THIRD_PARTY_NOTICES.md "$stage/THIRD_PARTY_NOTICES.md" }
+          Compress-Archive -LiteralPath @($members | ForEach-Object { Join-Path $stage $_ }) -DestinationPath $archive
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
           "$hash  $archive" | Set-Content -Encoding ascii -NoNewline "$archive.sha256"
           $expected = (Get-Content "$archive.sha256").Split()[0]
           if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant() -ne $expected) { throw "checksum mismatch" }
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $archive).Path)
+          try {
+            $actualMembers = @($zip.Entries | ForEach-Object { $_.FullName } | Sort-Object)
+            if (($actualMembers -join "`n") -cne (($members | Sort-Object) -join "`n")) { throw "unexpected archive members" }
+          } finally { $zip.Dispose() }
           Expand-Archive -LiteralPath $archive -DestinationPath $verify
-          if (-not (Test-Path "$verify/LICENSE")) { throw "LICENSE missing from archive" }
-          $actual = & "$verify/agent-bridge.exe" --version
-          if ($actual.Trim() -ne "agent-bridge ${{ needs.validate.outputs.version }}") { throw "unexpected binary version: $actual" }
+          $actual = & "$verify/$env:PACKAGE.exe" --version
+          if ($LASTEXITCODE -ne 0 -or $actual.Trim() -cne "$env:PACKAGE $env:RELEASE_VERSION") { throw "unexpected binary version: $actual" }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.target }}
@@ -207,14 +237,23 @@ jobs:
       - name: Verify downloaded release assets
         env:
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          PACKAGE: ${{ needs.validate.outputs.package }}
         shell: bash
         run: |
           set -euo pipefail
           cd dist
           test "$(find . -maxdepth 1 -type f | wc -l | tr -d ' ')" = "4"
+          macos="$PACKAGE-$RELEASE_VERSION-aarch64-apple-darwin.tar.gz"
+          windows="$PACKAGE-$RELEASE_VERSION-x86_64-pc-windows-msvc.zip"
+          test "$(find . -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort)" = "$(printf '%s\n' "$macos" "$macos.sha256" "$windows" "$windows.sha256" | LC_ALL=C sort)"
           sha256sum -c ./*.sha256
-          test "$(tar -tzf "agent-bridge-$RELEASE_VERSION-aarch64-apple-darwin.tar.gz" | LC_ALL=C sort | tr '\n' ' ')" = "LICENSE agent-bridge "
-          test "$(unzip -Z1 "agent-bridge-$RELEASE_VERSION-x86_64-pc-windows-msvc.zip" | LC_ALL=C sort | tr '\n' ' ')" = "LICENSE agent-bridge.exe "
+          case "$PACKAGE" in
+            tabcli) notices="THIRD_PARTY_NOTICES.md " ;;
+            agent-bridge) notices="" ;;
+            *) echo "::error::unsupported package: $PACKAGE"; exit 1 ;;
+          esac
+          test "$(tar -tzf "$PACKAGE-$RELEASE_VERSION-aarch64-apple-darwin.tar.gz" | LC_ALL=C sort | tr '\n' ' ')" = "LICENSE $notices$PACKAGE "
+          test "$(unzip -Z1 "$PACKAGE-$RELEASE_VERSION-x86_64-pc-windows-msvc.zip" | LC_ALL=C sort | tr '\n' ' ')" = "LICENSE $notices$PACKAGE.exe "
       - name: Require immutable releases before publication
         env:
           GH_TOKEN: ${{ secrets.IMMUTABLE_RELEASES_READ_TOKEN }}
