@@ -4,6 +4,7 @@ use super::{
     LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
 };
 use crate::native::session::SessionState;
+use crate::native::session::turn;
 use crate::native::session::{Reader, RecordReader, Store};
 use agent_bridge::FirstPartyCli;
 use anyhow::Context;
@@ -162,7 +163,7 @@ impl NativeProviderAdapter for AgyAdapter {
     }
 
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
-        let claim_token = super::super::current_turn_claim_token(context.directory)?
+        let claim_token = turn::current_claim_token(&Reader::open_unchecked(context.directory))?
             .context("Agy launch has no native turn claim")?;
         let pending = install_pending_turn(context.directory, &claim_token)?;
         let log_path = Reader::open_unchecked(context.directory)
@@ -1830,8 +1831,8 @@ impl AgyMonitor {
             .spawn(move || {
                 let result = monitor_session(&directory, &log_path, &brain_root, &stop_for_thread);
                 if let Err(error) = &result {
-                    let _ = super::super::record_provider_monitor_failure(
-                        &error_directory,
+                    let _ = turn::Report::monitor_failure(
+                        &Store::open_unchecked(&error_directory),
                         FirstPartyCli::Agy,
                         &format!("Agy result monitor failed: {error:#}"),
                     );
@@ -1947,13 +1948,15 @@ impl TranscriptCursor {
             if let Some(pending) = read_pending_turn(directory)?
                 && let Ok(message) = correlated_response(&message, &pending)
             {
-                super::super::record_provider_result_for_claim(
-                    directory,
+                turn::Report::for_claim(
+                    &Store::open_unchecked(directory),
                     FirstPartyCli::Agy,
+                    Some(&pending.claim_token),
+                )
+                .complete(
                     message,
                     Some(conversation_id.to_owned()),
                     Some(step.to_string()),
-                    Some(&pending.claim_token),
                 )
                 .context("failed to record the correlated Agy result")?;
             }
@@ -2122,13 +2125,15 @@ impl MonitorState {
                 && (pasted
                     || only_user_input_carries(&cursor.full_path, brain_root, &pending.marker)?)
             {
-                super::super::record_provider_failure_for_claim(
-                    directory,
+                turn::Report::for_claim(
+                    &Store::open_unchecked(directory),
                     FirstPartyCli::Agy,
+                    Some(&pending.claim_token),
+                )
+                .fail(
                     &format!("Agy turn failed: {error}"),
                     Some(id.to_owned()),
                     None,
-                    Some(&pending.claim_token),
                 )
                 .context("failed to record the Agy turn failure")?;
                 self.failed_claim = Some(pending.claim_token);
@@ -2403,7 +2408,7 @@ mod tests {
 
     fn claim_pending_turn(directory: &Path) -> PendingAgyTurn {
         let claim = acquire_turn_claim(directory).unwrap();
-        let token = claim.token.clone();
+        let token = claim.token().to_owned();
         claim.retain();
         install_pending_turn(directory, &token).unwrap()
     }
@@ -5654,7 +5659,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         fs::create_dir_all(directory.join("events")).unwrap();
         update_status(&directory, SessionState::AwaitingInitialInput, None, None).unwrap();
         let mut claim = acquire_turn_claim(&directory).unwrap();
-        let pending = install_pending_turn(&directory, &claim.token).unwrap();
+        let pending = install_pending_turn(&directory, claim.token()).unwrap();
 
         let startup = late_reload_startup_log();
         let start = Instant::now();
@@ -5879,7 +5884,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         // A follow-up claims the ready session before it prepares the paste.
         update_status(&directory, SessionState::Claimed, None, None).unwrap();
         let mut claim = acquire_turn_claim(&directory).unwrap();
-        let pending = install_pending_turn(&directory, &claim.token).unwrap();
+        let pending = install_pending_turn(&directory, claim.token()).unwrap();
 
         let before_reload = &REAL_MACOS_INITIAL_TURN[..REAL_MACOS_INITIAL_TURN
             .rfind("I0924 21:32:19.637013")

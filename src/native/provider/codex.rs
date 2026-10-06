@@ -5,6 +5,7 @@ use super::{
 };
 #[cfg(test)]
 use crate::native::session::SessionState;
+use crate::native::session::turn;
 use crate::native::session::{Reader, RecordReader, Store};
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
@@ -152,7 +153,7 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
-        let claim_token = super::super::current_turn_claim_token(context.directory)?
+        let claim_token = turn::current_claim_token(&Reader::open_unchecked(context.directory))?
             .context("Codex launch has no native turn claim")?;
         let pending = install_pending_turn(context.directory, &claim_token)?;
         let mut arguments = codex_launch_arguments(
@@ -304,14 +305,12 @@ impl NativeProviderAdapter for CodexAdapter {
         {
             return Ok(());
         }
-        super::super::record_provider_result_for_claim(
-            directory,
+        turn::Report::for_claim(
+            &Store::open_unchecked(directory),
             FirstPartyCli::Codex,
-            message,
-            thread_id,
-            codex_owned_string(payload, "turn-id"),
             Some(&pending.claim_token),
         )
+        .complete(message, thread_id, codex_owned_string(payload, "turn-id"))
         .context("failed to record the correlated Codex result")
     }
 
@@ -1347,7 +1346,7 @@ exit 91
 
     fn claim_pending_turn(directory: &Path) -> PendingCodexTurn {
         let claim = acquire_turn_claim(directory).unwrap();
-        let token = claim.token.clone();
+        let token = claim.token().to_owned();
         claim.retain();
         install_pending_turn(directory, &token).unwrap()
     }
@@ -1408,7 +1407,7 @@ exit 1
                 bridge_executable: Path::new("/unused/agent-bridge"),
                 directory,
                 provider_path: &provider,
-                request_id: &claim.token,
+                request_id: claim.token(),
                 prompt: "request addressed only to A",
                 deadline: Instant::now() + Duration::from_secs(2),
             })
@@ -1426,11 +1425,11 @@ exit 1
         assert!(reason.contains("user message queue is unavailable"));
         let receipt = super::super::super::requests::for_claim(
             &crate::native::session::Reader::open_unchecked(directory),
-            &claim.token,
+            claim.token(),
         )
         .unwrap()
         .unwrap();
-        let token = claim.token.clone();
+        let token = claim.token().to_owned();
         drop(claim);
         assert!(!directory.join(TURN_CLAIM_FILE).exists());
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
@@ -1454,7 +1453,7 @@ exit 1
         // independently requested addressed turn; it never retries this prompt.
         let (next, _) =
             acquire_ready_turn_claim_with_context(directory, "session-codexqueue", &[]).unwrap();
-        assert_ne!(next.token, token);
+        assert_ne!(next.token(), token);
     }
 
     #[test]
@@ -1664,7 +1663,7 @@ exit 1
         write_established_thread(&directory, thread_id);
         update_status(&directory, SessionState::Working, None, None).unwrap();
         let claim = acquire_turn_claim(&directory).unwrap();
-        let claim_token = claim.token.clone();
+        let claim_token = claim.token().to_owned();
         claim.retain();
         // The prompt as `tell` hands it to the adapter: already framed.
         let prompt = native_delegation_prompt("external", "follow up");
@@ -1735,7 +1734,7 @@ exit 1
         write_queue_manifest_for_workspace(&directory, &provider, "codex-cli 0.153.2", &workspace);
         write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
         let claim = acquire_turn_claim(&directory).unwrap();
-        let claim_token = claim.token.clone();
+        let claim_token = claim.token().to_owned();
         claim.retain();
 
         ADAPTER
@@ -1771,7 +1770,7 @@ exit 1
                 write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
             }
             let claim = acquire_turn_claim(&directory).unwrap();
-            let claim_token = claim.token.clone();
+            let claim_token = claim.token().to_owned();
             claim.retain();
 
             let failure = ADAPTER
@@ -1812,7 +1811,7 @@ exit 91
         write_queue_manifest(&directory, &provider, "codex-cli 0.153.2");
         write_established_thread(&directory, "human-readable-session-name");
         let claim = acquire_turn_claim(&directory).unwrap();
-        let claim_token = claim.token.clone();
+        let claim_token = claim.token().to_owned();
         claim.retain();
 
         let failure = ADAPTER
@@ -1885,7 +1884,7 @@ exit 91
         write_queue_manifest(&directory, &provider, "codex-cli 0.160.0");
         write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
         let claim = acquire_turn_claim(&directory).unwrap();
-        let claim_token = claim.token.clone();
+        let claim_token = claim.token().to_owned();
         claim.retain();
 
         ADAPTER
@@ -2033,7 +2032,7 @@ exit 91
         write_queue_manifest(&directory, &provider, "codex-cli 0.153.2");
         write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
         let claim = acquire_turn_claim(&directory).unwrap();
-        let claim_token = claim.token.clone();
+        let claim_token = claim.token().to_owned();
         claim.retain();
 
         // Give setup a separate bounded budget, then trigger the real timeout path

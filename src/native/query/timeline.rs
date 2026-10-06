@@ -57,14 +57,8 @@ fn receipt_index(records: &Records) -> requests::Index {
     {
         let read = parsed::<requests::Receipt>(records, source).and_then(|r| {
             let r = r.context("missing receipt")?;
-            if r.schema != 1
-                || !requests::valid_id(&r.request_id)
-                || source != &format!("requests/{}.json", r.claim_token)
-                || !Reader::valid_event_file_name(&r.event_file)
-                || r.context_sources
-                    .iter()
-                    .any(|s| requests::validate_context_source(s).is_err())
-            {
+            requests::validate(&r)?;
+            if source != &format!("requests/{}.json", r.claim_token) {
                 bail!("invalid Bridge request receipt");
             }
             Ok(r)

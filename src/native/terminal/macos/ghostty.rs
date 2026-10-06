@@ -858,7 +858,7 @@ fn parse_frame(typed: &[u8]) -> Result<Option<(String, PathBuf)>> {
 // the launcher's private session directory, its pending receipt and claim, the atomic
 // binding of a Ghostty surface to this session, and the script written for the host.
 fn verify_launch(directory: &Path, token: &str) -> Result<PathBuf> {
-    use crate::native::{SessionStatus, current_turn_claim_token, launch, unix_ms};
+    use crate::native::{SessionStatus, launch, unix_ms};
     let private = |path: &Path, directory: bool| -> Result<bool> {
         let metadata = std::fs::symlink_metadata(path)?;
         Ok(metadata.is_dir() == directory
@@ -881,7 +881,11 @@ fn verify_launch(directory: &Path, token: &str) -> Result<PathBuf> {
         || receipt.claim_token != token
         || unix_ms() >= receipt.deadline_unix_ms
         || status.state != SessionState::Launching
-        || current_turn_claim_token(directory)?.as_deref() != Some(token)
+        || crate::native::session::turn::current_claim_token(
+            &crate::native::session::Reader::open_unchecked(directory),
+        )?
+        .as_deref()
+            != Some(token)
     {
         bail!("Ghostty launch was cancelled, timed out or is not the one sent to this terminal");
     }
@@ -1688,7 +1692,7 @@ mod tests {
         std::fs::create_dir(directory.path().join("events")).unwrap();
         update_status(directory.path(), SessionState::Launching, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
-        let token = claim.token.clone();
+        let token = claim.token().to_owned();
         claim.retain();
         launch::begin(
             &crate::native::session::Store::open_unchecked(directory.path()),

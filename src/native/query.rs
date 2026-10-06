@@ -339,15 +339,12 @@ impl Snapshot {
         // close releases the claim before it removes the journal, so the journal outlives
         // every interruption that could otherwise hide a committed event. A snapshot that
         // deferred the comparison has no verdict yet, and no verdict publishes nothing.
-        if self.journal_for(event).is_some() {
-            return self
-                .pending_event
-                .as_ref()
-                .is_some_and(|read| read.state == JournaledEventState::Committed);
-        }
-        !self
-            .receipt_for_event(event)
-            .is_some_and(|receipt| self.claim.as_deref() == Some(&receipt.claim_token))
+        super::turn::event_published(
+            self.journal_for(event).is_some(),
+            self.pending_event.as_ref(),
+            self.receipt_for_event(event)
+                .is_some_and(|receipt| self.claim.as_deref() == Some(&receipt.claim_token)),
+        )
     }
 
     fn event(&self, reader: &Reader, name: &str) -> Result<Option<SessionEvent>> {

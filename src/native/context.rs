@@ -826,9 +826,9 @@ mod tests {
             acquire_ready_turn_claim_with_context(&target, "session-dst", &resolved.sources)
                 .unwrap();
         assert_eq!(baseline, 0);
-        let receipt = claim.receipt.clone();
+        let receipt = claim.receipt().clone();
         assert_eq!(receipt.context_sources, resolved.sources);
-        let stored = requests::for_claim(&Reader::open_unchecked(&target), &claim.token)
+        let stored = requests::for_claim(&Reader::open_unchecked(&target), claim.token())
             .unwrap()
             .unwrap();
         assert_eq!(stored.context_sources, resolved.sources);

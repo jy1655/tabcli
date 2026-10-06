@@ -929,7 +929,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
 }
 
 fn wait_for_binding(directory: &Path, id: &str, pane: &str, socket: &Path) -> Result<()> {
-    use crate::native::{SessionStatus, current_turn_claim_token, launch, unix_ms};
+    use crate::native::{SessionStatus, launch, unix_ms};
     let initial = launch::read(&Reader::open_unchecked(directory))?
         .context("missing WezTerm launch receipt")?;
     let remaining = initial
@@ -946,7 +946,11 @@ fn wait_for_binding(directory: &Path, id: &str, pane: &str, socket: &Path) -> Re
             || record.phase != launch::Phase::Pending
             || record.claim_token != initial.claim_token
             || status.state != SessionState::Launching
-            || current_turn_claim_token(directory)?.as_deref() != Some(initial.claim_token.as_str())
+            || crate::native::session::turn::current_claim_token(
+                &crate::native::session::Reader::open_unchecked(directory),
+            )?
+            .as_deref()
+                != Some(initial.claim_token.as_str())
         {
             bail!("WezTerm launch was cancelled or timed out before surface binding");
         }
@@ -2363,7 +2367,7 @@ mod tests {
         fs::create_dir(directory.path().join("events")).unwrap();
         update_status(directory.path(), SessionState::Launching, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
-        let token = claim.token.clone();
+        let token = claim.token().to_owned();
         claim.retain();
         launch::begin(
             &crate::native::session::Store::open_unchecked(directory.path()),

@@ -1,8 +1,8 @@
 //! Immutable Bridge request addresses. Provider-owned correlation still decides completion.
-use super::*;
 #[cfg(test)]
 use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, Reader, RecordStore, Store};
+use crate::native::*;
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -17,21 +17,21 @@ pub(crate) struct ContextSource {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(super) struct Receipt {
-    pub(super) schema: u32,
-    pub(super) request_id: String,
-    pub(super) claim_token: String,
-    pub(super) event_file: String,
+pub(in crate::native) struct Receipt {
+    pub(in crate::native) schema: u32,
+    pub(in crate::native) request_id: String,
+    pub(in crate::native) claim_token: String,
+    pub(in crate::native) event_file: String,
     #[serde(default)]
-    pub(super) created_unix_ms: Option<u128>,
+    pub(in crate::native) created_unix_ms: Option<u128>,
     #[serde(default)]
-    pub(super) source: Option<String>,
+    pub(in crate::native) source: Option<String>,
     // Receipts written before 0.0.7 have no provenance; they still deserialise as empty.
     #[serde(default)]
-    pub(super) context_sources: Vec<ContextSource>,
+    pub(in crate::native) context_sources: Vec<ContextSource>,
 }
 
-pub(super) fn valid_id(value: &str) -> bool {
+pub(in crate::native) fn valid_id(value: &str) -> bool {
     value.starts_with("request-")
         && value.len() > "request-".len()
         && value.len() <= 160
@@ -40,7 +40,7 @@ pub(super) fn valid_id(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-fn validate(receipt: &Receipt) -> Result<()> {
+pub(in crate::native) fn validate(receipt: &Receipt) -> Result<()> {
     if receipt.schema != 1
         || !valid_id(&receipt.request_id)
         || !valid_turn_claim_token(&receipt.claim_token)
@@ -57,7 +57,7 @@ fn validate(receipt: &Receipt) -> Result<()> {
 
 /// The rules a receipt applies to each recorded source. Resolution applies the same
 /// rules before any session state exists, so a receipt never rejects a resolved source.
-pub(super) fn validate_context_source(source: &ContextSource) -> Result<()> {
+pub(in crate::native) fn validate_context_source(source: &ContextSource) -> Result<()> {
     if !valid_session_id(&source.session) {
         bail!("invalid source session id {:?}", source.session)
     }
@@ -77,7 +77,7 @@ pub(super) fn validate_context_source(source: &ContextSource) -> Result<()> {
 
 // Called while creating the claim under its lifecycle lock, before any dispatch can begin.
 // Provenance comes from the caller's pinned resolution; it is never re-read here.
-pub(super) fn create(
+pub(in crate::native) fn create(
     store: &Store,
     claim_token: &str,
     context_sources: &[ContextSource],
@@ -141,7 +141,7 @@ fn requests_directory_present(reader: &Reader) -> Result<bool> {
     }
 }
 
-pub(super) fn for_claim(reader: &Reader, claim_token: &str) -> Result<Option<Receipt>> {
+pub(in crate::native) fn for_claim(reader: &Reader, claim_token: &str) -> Result<Option<Receipt>> {
     if !valid_turn_claim_token(claim_token) {
         bail!("invalid request claim token")
     }
@@ -163,12 +163,12 @@ pub(super) fn for_claim(reader: &Reader, claim_token: &str) -> Result<Option<Rec
 }
 
 #[derive(Default)]
-pub(super) struct Index {
-    pub(super) receipts: Vec<Receipt>,
-    pub(super) unreadable: usize,
+pub(in crate::native) struct Index {
+    pub(in crate::native) receipts: Vec<Receipt>,
+    pub(in crate::native) unreadable: usize,
 }
 
-pub(super) fn list(reader: &Reader) -> Result<Index> {
+pub(in crate::native) fn list(reader: &Reader) -> Result<Index> {
     let directory = reader.directory();
     if !requests_directory_present(reader)? {
         return Ok(Index::default());
@@ -273,12 +273,12 @@ mod tests {
         fs::create_dir(directory.path().join("events")).unwrap();
         update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
-        let receipt = for_claim(&Reader::open_unchecked(directory.path()), &claim.token)
+        let receipt = for_claim(&Reader::open_unchecked(directory.path()), claim.token())
             .unwrap()
             .unwrap();
-        assert_eq!(receipt.request_id, claim.receipt.request_id);
-        assert_ne!(receipt.request_id, claim.token);
-        let token = claim.token.clone();
+        assert_eq!(receipt.request_id, claim.receipt().request_id);
+        assert_ne!(receipt.request_id, claim.token());
+        let token = claim.token().to_owned();
         claim.retain();
         record_provider_result_for_claim(
             directory.path(),
@@ -368,8 +368,8 @@ mod tests {
             fs::create_dir(directory.path().join("events")).unwrap();
             update_status(directory.path(), SessionState::Working, None, None).unwrap();
             let claim = acquire_turn_claim(directory.path()).unwrap();
-            let receipt = claim.receipt.clone();
-            let token = claim.token.clone();
+            let receipt = claim.receipt().clone();
+            let token = claim.token().to_owned();
             claim.retain();
             let event = SessionEvent {
                 provider: "codex".to_owned(),
@@ -409,7 +409,7 @@ mod tests {
         fs::create_dir(directory.path().join("events")).unwrap();
         update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
-        let token = claim.token.clone();
+        let token = claim.token().to_owned();
         claim.retain();
         fs::write(
             directory

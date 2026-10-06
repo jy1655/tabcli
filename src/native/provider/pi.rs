@@ -5,6 +5,7 @@ use super::{
 };
 #[cfg(test)]
 use crate::native::session::SessionState;
+use crate::native::session::turn;
 use crate::native::session::{Reader, RecordStore, Store};
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
@@ -133,7 +134,7 @@ impl NativeProviderAdapter for PiAdapter {
     }
 
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
-        let claim_token = super::super::current_turn_claim_token(context.directory)?
+        let claim_token = turn::current_claim_token(&Reader::open_unchecked(context.directory))?
             .context("Pi launch has no native turn claim")?;
         let pending = install_pending_turn(context.directory, &claim_token)?;
         let extension_path = context.directory.join("pi-agent-bridge.js");
@@ -277,14 +278,12 @@ impl NativeProviderAdapter for PiAdapter {
         let Ok(message) = correlated_response(raw_message, &pending) else {
             return Ok(());
         };
-        super::super::record_provider_result_for_claim(
-            directory,
+        turn::Report::for_claim(
+            &Store::open_unchecked(directory),
             FirstPartyCli::Pi,
-            message,
-            provider_session_id,
-            turn_id,
             Some(&pending.claim_token),
         )
+        .complete(message, provider_session_id, turn_id)
         .context("failed to record the correlated Pi result")
     }
 
@@ -333,7 +332,7 @@ fn send_initial_prompt_after_startup(
                     "Pi startup has not confirmed that project trust was resolved; no initial console input was sent. Resolve the prompt in the managed terminal, then close and start a new Bridge session if this request timed out"
                 );
             }
-            if super::super::current_turn_claim_token(directory)?.as_deref()
+            if turn::current_claim_token(&Reader::open_unchecked(directory))?.as_deref()
                 != Some(pending.claim_token.as_str())
             {
                 bail!("Pi initial turn is no longer claimed; no initial console input was sent");
@@ -452,14 +451,12 @@ fn record_correlated_failure(
     turn_id: Option<String>,
     pending: &PendingPiTurn,
 ) -> Result<()> {
-    super::super::record_provider_failure_for_claim(
-        directory,
+    turn::Report::for_claim(
+        &Store::open_unchecked(directory),
         FirstPartyCli::Pi,
-        error,
-        provider_session_id,
-        turn_id,
         Some(&pending.claim_token),
     )
+    .fail(error, provider_session_id, turn_id)
     .context("failed to record the correlated Pi failure")
 }
 
@@ -487,8 +484,8 @@ impl PiFailureMonitor {
             .spawn(move || {
                 let result = monitor_hook_failures(&directory, &stop_for_thread);
                 if let Err(error) = &result {
-                    let _ = super::super::record_provider_monitor_failure(
-                        &error_directory,
+                    let _ = turn::Report::monitor_failure(
+                        &Store::open_unchecked(&error_directory),
                         FirstPartyCli::Pi,
                         &format!("Pi result recovery monitor failed: {error:#}"),
                     );
@@ -799,7 +796,7 @@ mod tests {
 
     fn claim_pending_turn(directory: &Path) -> PendingPiTurn {
         let claim = acquire_turn_claim(directory).unwrap();
-        let token = claim.token.clone();
+        let token = claim.token().to_owned();
         claim.retain();
         install_pending_turn(directory, &token).unwrap()
     }

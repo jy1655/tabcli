@@ -461,49 +461,6 @@ fn monitor_failures_are_journaled_against_the_current_claim() {
 }
 
 #[test]
-fn pending_completion_recovery_converges_after_every_partial_mutation() {
-    for completed_mutations in 0..=3 {
-        let directory = tempfile::tempdir().unwrap();
-        fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), SessionState::Working, None, None).unwrap();
-        let claim = acquire_turn_claim(directory.path()).unwrap();
-        let claim_token = claim.token.clone();
-        claim.retain();
-        let event = SessionEvent {
-            provider: FirstPartyCli::Codex.as_str().to_owned(),
-            message: "committed result".to_owned(),
-            error: None,
-            provider_session_id: Some("provider-session".to_owned()),
-            turn_id: Some("provider-turn".to_owned()),
-            created_unix_ms: Some(1),
-        };
-        let pending = PendingTurnCompletion::new(&claim_token, event, None).unwrap();
-        write_json_atomic(&directory.path().join(TURN_COMPLETION_FILE), &pending).unwrap();
-        if completed_mutations >= 1 {
-            write_pending_completion_event(directory.path(), &pending).unwrap();
-        }
-        if completed_mutations >= 2 {
-            update_status(directory.path(), SessionState::Ready, None, None).unwrap();
-        }
-        if completed_mutations >= 3 {
-            release_turn_claim_token(&directory.path().join(TURN_CLAIM_FILE), &claim_token)
-                .unwrap();
-        }
-
-        assert!(recover_pending_completion(directory.path()).unwrap());
-
-        let paths = event_paths(directory.path()).unwrap();
-        assert_eq!(paths.len(), 1);
-        let stored: SessionEvent = read_json(&paths[0]).unwrap();
-        assert_eq!(stored.message, "committed result");
-        assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
-        assert!(!directory.path().join(TURN_COMPLETION_FILE).exists());
-        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
-        assert_eq!(status.state.as_str(), "ready");
-    }
-}
-
-#[test]
 fn terminal_status_cannot_regress_and_generation_is_monotonic() {
     let directory = tempfile::tempdir().unwrap();
     update_status(directory.path(), SessionState::Launching, None, None).unwrap();
@@ -574,7 +531,7 @@ fn completion_and_process_exit_converge_in_either_serialized_order() {
         update_status(directory.path(), SessionState::Launching, None, None).unwrap();
         update_status(directory.path(), SessionState::Running, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
-        let claim_token = claim.token.clone();
+        let claim_token = claim.token().to_owned();
         claim.retain();
 
         let complete = || {
@@ -604,30 +561,6 @@ fn completion_and_process_exit_converge_in_either_serialized_order() {
             usize::from(completion_first)
         );
     }
-}
-
-#[test]
-fn stale_provider_completion_cannot_release_a_replacement_claim() {
-    let directory = tempfile::tempdir().unwrap();
-    fs::create_dir(directory.path().join("events")).unwrap();
-    update_status(directory.path(), SessionState::Working, None, None).unwrap();
-    let claim = acquire_turn_claim(directory.path()).unwrap();
-    claim.retain();
-
-    record_provider_result_for_claim(
-        directory.path(),
-        FirstPartyCli::Claude,
-        "stale result",
-        Some("claude-session".to_owned()),
-        None,
-        Some("stale-claim-token"),
-    )
-    .unwrap();
-
-    assert!(directory.path().join(TURN_CLAIM_FILE).exists());
-    assert!(event_paths(directory.path()).unwrap().is_empty());
-    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
-    assert_eq!(status.state.as_str(), "working");
 }
 
 #[test]
@@ -671,7 +604,7 @@ fn correlated_wait_ignores_other_completed_turns() {
     fs::create_dir(directory.path().join("events")).unwrap();
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
     let claim = acquire_turn_claim(directory.path()).unwrap();
-    let claim_token = claim.token.clone();
+    let claim_token = claim.token().to_owned();
     claim.retain();
     for (turn_id, message) in [
         ("claude-turn-other", "other result"),
@@ -742,7 +675,7 @@ fn completed_event_uses_its_own_released_claim_not_a_later_turns_claim() {
     fs::create_dir(directory.path().join("events")).unwrap();
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
     let completed_claim = acquire_turn_claim(directory.path()).unwrap();
-    let completed_token = completed_claim.token.clone();
+    let completed_token = completed_claim.token().to_owned();
     write_event(
         directory.path(),
         &SessionEvent {
@@ -780,7 +713,7 @@ fn completed_event_waits_for_its_own_claim_to_be_released() {
     fs::create_dir(directory.path().join("events")).unwrap();
     update_status(directory.path(), SessionState::Ready, None, None).unwrap();
     let claim = acquire_turn_claim(directory.path()).unwrap();
-    let claim_token = claim.token.clone();
+    let claim_token = claim.token().to_owned();
     claim.retain();
     write_event(
         directory.path(),
@@ -928,7 +861,7 @@ fn failed_closed_publication_keeps_legacy_resume_and_claim_capabilities() {
         fs::read_to_string(directory.path().join(TURN_CLAIM_FILE))
             .unwrap()
             .trim(),
-        claim.token
+        claim.token()
     );
 }
 
@@ -2826,18 +2759,6 @@ fn terminal_delivery_preflight_rejects_only_the_unstarted_windows_submit_plan() 
 }
 
 #[test]
-fn native_turn_claim_is_exclusive_until_the_hook_releases_it() {
-    let directory = tempfile::tempdir().unwrap();
-    let claim = acquire_turn_claim(directory.path()).unwrap();
-    assert!(acquire_turn_claim(directory.path()).is_err());
-
-    claim.retain();
-    assert!(acquire_turn_claim(directory.path()).is_err());
-    release_turn_claim(directory.path()).unwrap();
-    assert!(acquire_turn_claim(directory.path()).is_ok());
-}
-
-#[test]
 fn stale_turn_claim_cannot_release_a_new_owner() {
     let directory = tempfile::tempdir().unwrap();
     let stale = acquire_turn_claim(directory.path()).unwrap();
@@ -2872,23 +2793,6 @@ fn claim_release_waits_for_the_lifecycle_lock_before_deleting() {
     finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     release.join().unwrap();
     assert!(!path.exists());
-}
-
-#[test]
-fn unretained_tell_claim_restores_ready_state() {
-    let directory = tempfile::tempdir().unwrap();
-    fs::create_dir(directory.path().join("events")).unwrap();
-    update_status(directory.path(), SessionState::Ready, None, None).unwrap();
-
-    let (claim, baseline) = acquire_ready_turn_claim(directory.path(), "session-test").unwrap();
-    assert_eq!(baseline, 0);
-    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
-    assert_eq!(status.state.as_str(), "claimed");
-
-    drop(claim);
-    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
-    assert_eq!(status.state.as_str(), "ready");
-    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
 }
 
 #[test]
@@ -3009,7 +2913,7 @@ fn late_cross_session_uncertainty_cannot_write_into_a_newer_turn() {
     assert_eq!(status.error, None);
     assert_eq!(
         current_turn_claim_token(directory.path()).unwrap(),
-        Some(newer.token.clone())
+        Some(newer.token().to_owned())
     );
     newer.retain();
 }
@@ -4455,7 +4359,7 @@ fn interrupted_close_converges_when_recovery_runs() {
     fs::create_dir(directory.path().join("events")).unwrap();
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
     let claim = acquire_turn_claim(directory.path()).unwrap();
-    let claim_token = claim.token.clone();
+    let claim_token = claim.token().to_owned();
     claim.retain();
     let pending = sample_completion(&claim_token, "late result");
     write_json_atomic(&directory.path().join(TURN_COMPLETION_FILE), &pending).unwrap();
@@ -4496,7 +4400,7 @@ fn delayed_terminal_delivery_failure_cannot_overwrite_a_replacement_turn() {
         "turn A result",
         Some("codex-session".to_owned()),
         Some("codex-turn-a".to_owned()),
-        Some(&stale_claim.token),
+        Some(stale_claim.token()),
     )
     .unwrap();
     let replacement = acquire_turn_claim(directory.path()).unwrap();
@@ -4571,7 +4475,7 @@ fn provider_completion_converges_after_a_fault_before_every_mutation() {
         write_test_manifest(&directory);
         update_status(&directory, SessionState::Working, None, None).unwrap();
         let claim = acquire_turn_claim(&directory).unwrap();
-        let claim_token = claim.token.clone();
+        let claim_token = claim.token().to_owned();
         claim.retain();
         let complete = || {
             record_provider_result_for_claim(
@@ -4842,7 +4746,7 @@ fn turn_lifecycle_converges_under_every_completion_exit_and_failure_order() {
                     "hook result",
                     Some("codex-session".to_owned()),
                     Some("codex-turn".to_owned()),
-                    Some(&claim.token),
+                    Some(claim.token()),
                 )
                 .unwrap(),
                 TurnEvent::MonitorFailure => record_provider_monitor_failure(
@@ -4921,7 +4825,7 @@ fn result_wait_repairs_a_dead_owner_and_ends_the_wait() {
     fs::create_dir(directory.path().join("events")).unwrap();
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
     let claim = acquire_turn_claim(directory.path()).unwrap();
-    let claim_token = claim.token.clone();
+    let claim_token = claim.token().to_owned();
     claim.retain();
     write_json_atomic(
         &directory.path().join(SESSION_OWNER_FILE),
@@ -5258,9 +5162,9 @@ fn seed_event_written_completion(directory: &Path, event_message: &str) -> (Stri
     write_test_manifest(directory);
     update_status(directory, SessionState::Working, None, None).unwrap();
     let claim = acquire_turn_claim(directory).unwrap();
-    let request_id = claim.receipt.request_id.clone();
-    let mut pending = sample_completion(&claim.token, "late result");
-    pending.event_file = claim.receipt.event_file.clone();
+    let request_id = claim.receipt().request_id.clone();
+    let mut pending = sample_completion(claim.token(), "late result");
+    pending.event_file = claim.receipt().event_file.clone();
     claim.retain();
     write_json_atomic(&directory.join(TURN_COMPLETION_FILE), &pending).unwrap();
     let event_path = directory.join("events").join(&pending.event_file);
@@ -5379,7 +5283,7 @@ fn late_initial_cross_session_uncertainty_cannot_write_into_a_newer_turn() {
         "initial result",
         None,
         Some("claude-turn-1".to_owned()),
-        Some(&initial.token),
+        Some(initial.token()),
     )
     .unwrap();
     let (replacement, _) = acquire_ready_turn_claim(directory.path(), "session-test").unwrap();
@@ -5399,7 +5303,7 @@ fn late_initial_cross_session_uncertainty_cannot_write_into_a_newer_turn() {
     assert_eq!(after.generation, before.generation);
     assert_eq!(
         current_turn_claim_token(directory.path()).unwrap(),
-        Some(replacement.token.clone())
+        Some(replacement.token().to_owned())
     );
     replacement.retain();
 }
@@ -5416,7 +5320,7 @@ fn initial_cross_session_uncertainty_keeps_its_own_claim_and_records_its_reason(
         &mut initial,
         &anyhow::anyhow!("executed input was not reported").context("delivery unconfirmed"),
     );
-    let token = initial.token.clone();
+    let token = initial.token().to_owned();
     drop(initial);
 
     let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
@@ -5818,9 +5722,9 @@ fn seed_close_fixture(journaled_event: JournaledEventState) -> CloseFixture {
     write_test_manifest(&directory);
     update_status(&directory, SessionState::Working, None, None).unwrap();
     let claim = acquire_turn_claim(&directory).unwrap();
-    let request_id = claim.receipt.request_id.clone();
-    let mut pending = sample_completion(&claim.token, "late result");
-    pending.event_file = claim.receipt.event_file.clone();
+    let request_id = claim.receipt().request_id.clone();
+    let mut pending = sample_completion(claim.token(), "late result");
+    pending.event_file = claim.receipt().event_file.clone();
     claim.retain();
     write_json_atomic(&directory.join(TURN_COMPLETION_FILE), &pending).unwrap();
     let event_path = directory.join("events").join(&pending.event_file);
@@ -6086,9 +5990,9 @@ fn seed_event_written_completion_with(
     write_test_manifest(directory);
     update_status(directory, SessionState::Working, None, None).unwrap();
     let claim = acquire_turn_claim(directory).unwrap();
-    let request_id = claim.receipt.request_id.clone();
-    let mut pending = sample_completion(&claim.token, journal_message);
-    pending.event_file = claim.receipt.event_file.clone();
+    let request_id = claim.receipt().request_id.clone();
+    let mut pending = sample_completion(claim.token(), journal_message);
+    pending.event_file = claim.receipt().event_file.clone();
     claim.retain();
     write_json_atomic(&directory.join(TURN_COMPLETION_FILE), &pending).unwrap();
     let event_path = directory.join("events").join(&pending.event_file);
@@ -6238,9 +6142,9 @@ fn seed_claimed_session(directory: &Path) -> (String, String, PathBuf) {
     write_test_manifest(directory);
     update_status(directory, SessionState::Working, None, None).unwrap();
     let claim = acquire_turn_claim(directory).unwrap();
-    let request_id = claim.receipt.request_id.clone();
-    let event_path = directory.join("events").join(&claim.receipt.event_file);
-    let token = claim.token.clone();
+    let request_id = claim.receipt().request_id.clone();
+    let event_path = directory.join("events").join(&claim.receipt().event_file);
+    let token = claim.token().to_owned();
     claim.retain();
     (request_id, token, event_path)
 }
@@ -7007,9 +6911,9 @@ fn claim_free_recovery_refuses_an_equivalent_event_in_another_encoding() {
     write_test_manifest(&directory);
     update_status(&directory, SessionState::Working, None, None).unwrap();
     let claim = acquire_turn_claim(&directory).unwrap();
-    let request_id = claim.receipt.request_id.clone();
-    let mut pending = sample_completion(&claim.token, "late result");
-    pending.event_file = claim.receipt.event_file.clone();
+    let request_id = claim.receipt().request_id.clone();
+    let mut pending = sample_completion(claim.token(), "late result");
+    pending.event_file = claim.receipt().event_file.clone();
     claim.retain();
     write_json_atomic(&directory.join(TURN_COMPLETION_FILE), &pending).unwrap();
     // Journal, event, terminal status, and claim release all exist, but the event bytes
@@ -7416,9 +7320,9 @@ fn seed_completion_stopped_before_its_events_sync() -> UnsyncedCommittedEvent {
         write_test_manifest(&directory);
         update_status(&directory, SessionState::Working, None, None).unwrap();
         let claim = acquire_turn_claim(&directory).unwrap();
-        let claim_token = claim.token.clone();
-        let request_id = claim.receipt.request_id.clone();
-        let event_path = directory.join("events").join(&claim.receipt.event_file);
+        let claim_token = claim.token().to_owned();
+        let request_id = claim.receipt().request_id.clone();
+        let event_path = directory.join("events").join(&claim.receipt().event_file);
         claim.retain();
         let (outcome, log) = with_sync_log(|| {
             with_fault_budget(budget, || {
@@ -7660,9 +7564,9 @@ fn seed_claim_free_completion_with_an_unsynced_event() -> UnsyncedCommittedEvent
     write_test_manifest(&directory);
     update_status(&directory, SessionState::Working, None, None).unwrap();
     let claim = acquire_turn_claim(&directory).unwrap();
-    let request_id = claim.receipt.request_id.clone();
-    let mut pending = sample_completion(&claim.token, "late result");
-    pending.event_file = claim.receipt.event_file.clone();
+    let request_id = claim.receipt().request_id.clone();
+    let mut pending = sample_completion(claim.token(), "late result");
+    pending.event_file = claim.receipt().event_file.clone();
     claim.retain();
     write_json_atomic(&directory.join(TURN_COMPLETION_FILE), &pending).unwrap();
     let event_path = directory.join("events").join(&pending.event_file);
@@ -7852,7 +7756,7 @@ fn write_closed_reopen_source(
     .unwrap();
     update_status(&directory, SessionState::Running, None, None).unwrap();
     let claim = acquire_turn_claim(&directory).unwrap();
-    let token = claim.token.clone();
+    let token = claim.token().to_owned();
     claim.retain();
     let provider = FirstPartyCli::from_str(provider).unwrap();
     if completed {
@@ -8270,7 +8174,7 @@ fn late_hook_carrying_the_previous_marker_into_the_new_directory_is_ignored() {
     fs::create_dir(directory.path().join("events")).unwrap();
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
     let claim = acquire_turn_claim(directory.path()).unwrap();
-    let token = claim.token.clone();
+    let token = claim.token().to_owned();
     claim.retain();
     let new_request = "claude-turn-2-2-2";
     write_json_atomic(
@@ -9421,7 +9325,7 @@ fn a_refused_follow_up_never_overwrites_the_status_of_the_turn_that_claimed_afte
     fs::create_dir(directory.join("events")).unwrap();
     update_status(directory, SessionState::Ready, None, None).unwrap();
     let (mut refused, _) = acquire_ready_turn_claim(directory, "session-test").unwrap();
-    let refused_request = refused.receipt.request_id.clone();
+    let refused_request = refused.receipt().request_id.clone();
     let refusal = anyhow::anyhow!("reopen refused (reopen-conflict): held by pid 4242");
 
     // The refused claim is released out from under the refusal before it is recorded, and
@@ -9429,8 +9333,8 @@ fn a_refused_follow_up_never_overwrites_the_status_of_the_turn_that_claimed_afte
     release_turn_claim(directory).unwrap();
     update_status(directory, SessionState::Ready, None, None).unwrap();
     let (next, _) = acquire_ready_turn_claim(directory, "session-test").unwrap();
-    let next_token = next.token.clone();
-    let next_request = next.receipt.request_id.clone();
+    let next_token = next.token().to_owned();
+    let next_request = next.receipt().request_id.clone();
     update_status(directory, SessionState::Working, None, None).unwrap();
 
     let reported =
@@ -9546,7 +9450,7 @@ fn a_holder_that_registers_after_the_post_launch_scan_is_caught_before_the_initi
         update_status(&directory, state.parse().unwrap(), None, None).unwrap();
     }
     let (mut claim, _) = acquire_ready_turn_claim_with_context(&directory, id, &[]).unwrap();
-    let refused_request = claim.receipt.request_id.clone();
+    let refused_request = claim.receipt().request_id.clone();
     assert_eq!(
         read_json::<SessionStatus>(&directory.join("status.json"))
             .unwrap()
@@ -9725,7 +9629,7 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
         .unwrap();
         update_status(&new, SessionState::Launching, None, None).unwrap();
         let mut initial_claim = acquire_turn_claim(&new).unwrap();
-        let request_id = initial_claim.receipt.request_id.clone();
+        let request_id = initial_claim.receipt().request_id.clone();
         update_status(&new, SessionState::AwaitingInitialInput, None, None).unwrap();
 
         let error = verify_reopened_conversation_exclusive(
@@ -10873,8 +10777,8 @@ fn observed_elapsed_requires_a_published_result_and_keeps_inspect_available() {
     write_test_manifest(&directory);
     update_status(&directory, SessionState::Working, None, None).unwrap();
     let claim = acquire_turn_claim(&directory).unwrap();
-    let receipt = claim.receipt.clone();
-    let mut event = sample_completion(&claim.token, "not published").event;
+    let receipt = claim.receipt().clone();
+    let mut event = sample_completion(claim.token(), "not published").event;
     event.created_unix_ms = receipt.created_unix_ms;
     write_json_atomic(&directory.join("events").join(&receipt.event_file), &event).unwrap();
     claim.retain();
@@ -10968,7 +10872,7 @@ fn completion_journal_without_result_time_cannot_publish_or_release_claim() {
     fs::create_dir(directory.path().join("events")).unwrap();
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
     let claim = acquire_turn_claim(directory.path()).unwrap();
-    let mut pending = sample_completion(&claim.token, "untimed result");
+    let mut pending = sample_completion(claim.token(), "untimed result");
     pending.event.created_unix_ms = None;
     claim.retain();
     let mut journal = serde_json::to_value(&pending).unwrap();

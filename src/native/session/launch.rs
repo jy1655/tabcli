@@ -108,7 +108,9 @@ pub(in crate::native) fn begin(
 
 fn fail_locked(store: &Store, record: &Record, reason: &str) -> Result<()> {
     let directory = store.directory();
-    if current_turn_claim_token(directory)?.as_deref() != Some(&record.claim_token) {
+    if turn::current_claim_token(&Reader::open_unchecked(directory))?.as_deref()
+        != Some(&record.claim_token)
+    {
         return Ok(());
     }
     let status: SessionStatus = store.status()?;
@@ -287,7 +289,9 @@ fn check_spawn_locked(store: &Store, record: Option<&Record>) -> Result<()> {
         if record.phase != Phase::Pending {
             bail!("provider launch already attempted; refusing a second spawn");
         }
-        if current_turn_claim_token(directory)?.as_deref() != Some(&record.claim_token) {
+        if turn::current_claim_token(&Reader::open_unchecked(directory))?.as_deref()
+            != Some(&record.claim_token)
+        {
             bail!("provider launch claim no longer belongs to this wrapper");
         }
         if unix_ms() >= record.deadline_unix_ms {
@@ -434,7 +438,7 @@ mod tests {
         fs::create_dir(directory.path().join("events")).unwrap();
         update_status(directory.path(), SessionState::Launching, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
-        let token = claim.token.clone();
+        let token = claim.token().to_owned();
         claim.retain();
         begin(
             &Store::open_unchecked(directory.path()),

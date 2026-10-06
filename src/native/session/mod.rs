@@ -1,8 +1,8 @@
 //! Views of one session's durable records.
 use super::{
-    JournaledEventRead, JournaledEventState, NativeSessionOwner, PendingTurnCompletion,
-    ProviderProcessRecord, RecordedReopenRefusal, SESSION_SCHEMA, STATE_DIR_ENV, SessionEvent,
-    SessionManifest, SessionStatus, require_valid_session_id, terminal, unix_ms,
+    NativeSessionOwner, ProviderProcessRecord, RecordedReopenRefusal, SESSION_SCHEMA,
+    STATE_DIR_ENV, SessionEvent, SessionManifest, SessionStatus, require_valid_session_id,
+    terminal, unix_ms,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,9 @@ use std::{
 #[cfg(target_os = "macos")]
 mod adapter;
 mod names;
+pub(in crate::native) mod requests;
+pub(in crate::native) mod turn;
+use turn::{JournaledEventRead, JournaledEventState, PendingTurnCompletion};
 mod primitives;
 mod reads;
 #[cfg(test)]
@@ -555,7 +558,7 @@ pub(in crate::native) mod launch;
 impl Store {
     /// Publish an accepted completion before repairing its session's dead owner.
     pub(in crate::native) fn converge(&self) -> Result<()> {
-        super::recover_pending_completion(self.directory())?;
+        turn::recover_pending_completion(self.directory())?;
         super::repair_dead_native_owner(self.directory())?;
         Ok(())
     }

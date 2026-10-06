@@ -5,6 +5,7 @@ use super::{
 };
 #[cfg(test)]
 use crate::native::session::SessionState;
+use crate::native::session::turn;
 use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -1164,13 +1165,15 @@ fn handle_correlated_stop(directory: &Path, payload: &serde_json::Value) -> Resu
     let Ok(message) = correlated_response(message, &pending) else {
         return Ok(());
     };
-    super::super::record_provider_result_for_claim(
-        directory,
+    turn::Report::for_claim(
+        &Store::open_unchecked(directory),
         agent_bridge::FirstPartyCli::Claude,
+        None,
+    )
+    .complete(
         message,
         claude_owned_string(payload, "session_id"),
         Some(pending.request_id),
-        None,
     )
     .context("failed to record the correlated Claude result")
 }
@@ -1180,13 +1183,11 @@ fn handle_uncorrelated_stop(directory: &Path, payload: &serde_json::Value) -> Re
         .map(str::trim)
         .filter(|message| !message.is_empty())
         .context("Claude Stop hook payload has no assistant result")?;
-    super::super::record_initial_provider_result(
-        directory,
+    turn::Report::initial(
+        &Store::open_unchecked(directory),
         agent_bridge::FirstPartyCli::Claude,
-        message,
-        claude_owned_string(payload, "session_id"),
-        None,
     )
+    .complete(message, claude_owned_string(payload, "session_id"), None)
 }
 
 fn handle_stop_failure(directory: &Path, payload: &serde_json::Value) -> Result<()> {
@@ -1212,13 +1213,11 @@ fn handle_stop_failure(directory: &Path, payload: &serde_json::Value) -> Result<
         || format!("Claude turn failed: {error}"),
         |detail| format!("Claude turn failed: {error}: {detail}"),
     );
-    super::super::record_initial_provider_failure(
-        directory,
+    turn::Report::initial(
+        &Store::open_unchecked(directory),
         agent_bridge::FirstPartyCli::Claude,
-        &error,
-        claude_owned_string(payload, "session_id"),
-        None,
-    )?;
+    )
+    .fail(&error, claude_owned_string(payload, "session_id"), None)?;
     Ok(())
 }
 
