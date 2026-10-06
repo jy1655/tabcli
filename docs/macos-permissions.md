@@ -92,7 +92,7 @@ Record the following separately.
 
 - CLI exit code 0 and `outcome: "passed"` in JSON; `ask`, `initial_result`, `tell`, `follow_up_result`, and `cleanup` all `passed`.
 - The tested commit, binary SHA-256, provider version, terminal, workspace, session, request/event, and state root.
-- The new tab/window appearing and disappearing, preservation of existing tabs/windows, and effects on focus and keyboard input that the user actually observed. Do not claim to have confirmed that the surface disappeared based only on `session_state: "closed"` and `cleanup: passed` in JSON.
+- The new tab/window appearing and disappearing, preservation of existing tabs/windows, and effects on focus and keyboard input that the user actually observed. Do not claim to have confirmed that the surface disappeared based only on `session_state: "closed"` and a passed `cleanup` step in JSON.
 - If an approval screen appeared, its exact type, requesting app and workspace, and the scope the user selected. Do not record passwords or tokens.
 
 This candidate does not support terminal-based follow-up submission for Agy or Pi in Warp. First-run approval does not resolve that failure; do not extend a successful Claude round trip to all four providers.
@@ -111,4 +111,4 @@ If you need to preserve the exact window and tab IDs of a failed run, run each c
 
 ## Checking keyboard input and focus during startup
 
-A successful provider round trip and cleanup in `self-test` do not replace physical keyboard verification. With the screen unlocked, check separately with another app in the foreground and while typing in the same terminal's input area. The startup gate discards keys received while the new surface is briefly selected; it does not resend them to the original input area. Do not force restoration if the user selects another window, tab, or app. Record each terminal's behavior, the original failures, and results after the fixes separately in the [0.1.0 focus verification record](verification/2026-10-03-v0.1.0-focus.md) (Korean).
+A successful provider round trip and cleanup in `self-test` do not replace physical keyboard verification. With the screen unlocked, check separately with another app in the foreground and while typing in the same terminal's input area. In iTerm2, Terminal.app, Ghostty, and WezTerm, the startup gate discards keys received while the new surface is briefly selected; it does not resend them to the original input area. The Warp host does not discard startup input, and keyboard preservation in Warp is not verified. Do not force restoration if the user selects another window, tab, or app. Record each terminal's behavior, the original failures, and results after the fixes separately in the [0.1.0 focus verification record](verification/2026-10-03-v0.1.0-focus.md) (Korean).
