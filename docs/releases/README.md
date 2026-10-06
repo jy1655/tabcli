@@ -6,6 +6,8 @@ Older notes retain their own requirements and limitations; use the
 [providers](../providers.md) and [terminals](../terminals.md) pages for current behavior.
 Each note separates live checks from automated tests.
 
+- [0.2.0](0.2.0.md) (2026-10-07): Renames the command and package to `tabcli`; your sessions and
+  settings are read as they are. Update scripts that call `agent-bridge`.
 - [0.1.2](0.1.2.md) (2026-10-06): Reorganizes session records and terminal ownership;
   no migration or behavior change.
 - [0.1.1](0.1.1.md) (2026-10-04): Codex follow-ups work without a shared daemon.
