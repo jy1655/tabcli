@@ -2,9 +2,9 @@
 
 로컬에 설치되고 로그인된 `codex`, `claude`, `agy`, `pi` CLI를 사용자가 볼 수 있는 실제 터미널 세션에서 연결하는 브리지입니다. API 키나 로그인 토큰을 대신 소유하지 않고 각 CLI의 기존 인증·설정·대화형 UI를 그대로 사용합니다.
 
-0.1.1은 Codex `tell`의 shared daemon 사전 조건을 제거합니다. 공식 `queue`가 사용 가능한 서버를 선택하며, 대상 대화와 완료 알림 검증은 유지합니다. 변경 내용은 [릴리스 노트](docs/releases/0.1.1.md), 근거와 검증 범위는 [Codex queue 검증 기록](docs/verification/2026-10-04-codex-queue.md)에 있습니다.
+0.1.2는 내부 구조를 정리한 유지보수 릴리스입니다. 명령, 출력, 세션 디렉터리의 record, provider transport, close·repair 판정은 0.1.1과 같으며 옮길 것이 없습니다. 세션 record를 `session::Reader`/`session::Store` 뒤로, surface ownership과 close authority를 terminal module 뒤로 옮겼습니다. 변경 내용은 [릴리스 노트](docs/releases/0.1.2.md)에 있습니다.
 
-macOS에서는 Codex의 WezTerm·Ghostty·Terminal.app 왕복과 Claude·Agy의 WezTerm 왕복을 확인했습니다. Terminal.app은 자동화 승인 후 통과했습니다. iTerm2의 자동화 시간 초과, Pi의 무효 OAuth 로그인, Warp의 Control endpoint 부재는 성공으로 처리하지 않았습니다. 환경·테스트 결과와 검증 범위는 [macOS 0.1.1 검증 기록](docs/verification/2026-10-04-macos-0.1.1.md)에 있습니다.
+macOS에서는 0.1.2 후보로 Codex의 WezTerm·Terminal.app·iTerm2·Ghostty 왕복과 Claude의 WezTerm 왕복, 0.1.1이 만든 세션을 0.1.2가 이어받아 닫는 경로를 확인했습니다. Warp·Agy·Pi와 native Windows·Linux의 runtime은 이번에 실행하지 않았습니다. 환경·세션·첫 시도 실패 기록과 검증 범위는 [macOS 0.1.2 검증 기록](docs/verification/2026-10-06-macos-0.1.2.md)에 있습니다. Codex `tell`의 queue 동작과 0.1.1의 검증 범위는 [0.1.1 릴리스 노트](docs/releases/0.1.1.md)와 [macOS 0.1.1 검증 기록](docs/verification/2026-10-04-macos-0.1.1.md)을 참고하세요.
 
 이 문서와 설치 예시는 **v0.1.2**를 기준으로 합니다. macOS에서는 iTerm2·Terminal.app·Ghostty·WezTerm을 지원합니다. Agent Bridge는 자신을 실행한 터미널을 감지해 같은 앱의 새 surface에서 세션을 시작하고, 자신이 만든 surface만 제어합니다. Terminal.app에서는 기존 tab/window를 사용하지 않고 항상 전용 새 window를 엽니다. 감지할 수 없는 호스트에서는 Terminal.app으로 안전하게 fallback합니다. 이미 독립적으로 실행 중인 임의의 CLI에는 사후 attach하지 않습니다.
 
@@ -551,6 +551,10 @@ src/native/tests.rs            provider-neutral native orchestration 단위 테�
 이 영수증은 trust **절차의 종료**만 뜻합니다. 사용자가 신뢰를 거절해도 Pi는 보호된 리소스를 제외하고 시작할 수 있으므로, 영수증을 다른 provider의 승인 근거로 쓰지 않습니다. Bridge는 `project_trust`의 결정을 반환하거나 Pi trust store를 수정하지 않습니다. 명시적 `--yolo`의 기존 Pi `--approve` 매핑은 그대로 적용됩니다.
 
 Pi의 초기 입력 보호는 0.0.8부터 포함됩니다. 공용 consent 기록, provider 간 trust 공유, Codex·Agy의 Windows 초기 입력 보호는 0.0.9에 포함됩니다. macOS는 기존 인자 전달 경로를 사용합니다. native Windows에서는 Agy와 Codex의 공유 consent를 0.0.9에서, Pi의 공유 consent와 초기 입력 보호를 0.0.10에서 LIVE로 확인했습니다. Claude는 미검증입니다.
+
+## 0.1.2 업데이트
+
+동작 변경이 없는 구조 정리입니다. 세션 record 접근과 turn·close·repair lifecycle을 `src/native/session/`으로([#73](https://github.com/jy1655/agent-bridge/pull/73)), owner record·process identity·close authority와 close 실행을 `src/native/terminal/`로([#74](https://github.com/jy1655/agent-bridge/pull/74)) 옮겼습니다. 명령과 출력, on-disk record, provider transport는 0.1.1과 같습니다. 용어는 [CONTEXT.md](CONTEXT.md)에 정리했습니다. 검증 범위는 [0.1.2 릴리스 노트](docs/releases/0.1.2.md)를 참고하세요.
 
 ## 0.1.1 업데이트
 
