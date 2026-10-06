@@ -66,10 +66,10 @@ settings, and limitations. These are not checks of every combination on version 
 
 | Platform / terminal | Status | Recorded live evidence |
 | --- | --- | --- |
-| macOS / iTerm2 | Implemented | Codex, 2026-10-06 |
-| macOS / Terminal.app | Implemented | Codex, 2026-10-06 |
-| macOS / Ghostty | Implemented | Codex, 2026-10-06 |
-| macOS / WezTerm | Implemented | Codex/Claude, 2026-10-06; Agy, 2026-10-04 |
+| macOS / iTerm2 | Implemented | Codex, 2026-10-07 |
+| macOS / Terminal.app | Implemented | Codex, 2026-10-07 |
+| macOS / Ghostty | Implemented | Codex, 2026-10-07 |
+| macOS / WezTerm | Implemented | Codex/Claude/Agy, 2026-10-07 |
 | macOS / Warp | Limited | Not verified |
 | Native Windows | Implemented | All four providers, 2026-10-02 |
 | Windows Terminal tab | Preferred surface | Tab creation/follow-up/close, 2026-10-01 |
@@ -97,6 +97,10 @@ Codex follow-ups require 0.149.0 or newer; no shared daemon is required. Claude 
 cross-session messaging in its installed backend and configuration, not only a recent version.
 See [provider requirements](docs/providers.md) for delivery paths and failure handling.
 
+- [2026-10-07 macOS](docs/verification/2026-10-07-macos-0.2.1.md): Codex in the four terminals
+  above and Claude in WezTerm with provider defaults; Agy in WezTerm with `--yolo`. With the
+  screen locked, Terminal.app and Ghostty did not complete a round trip. Agy's default-mode
+  attempt and Pi's attempt timed out; they were not round-trip passes.
 - [2026-10-06 macOS](docs/verification/2026-10-06-macos-0.1.2.md): Codex in the four terminals
   above and Claude in WezTerm, using `--yolo`, not default approval modes.
 - [2026-10-04 macOS](docs/verification/2026-10-04-macos-0.1.1.md): Codex, Claude, and Agy with
