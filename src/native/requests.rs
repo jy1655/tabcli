@@ -1,5 +1,7 @@
 //! Immutable Bridge request addresses. Provider-owned correlation still decides completion.
 use super::*;
+#[cfg(test)]
+use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, Reader, RecordStore, Store};
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -269,7 +271,7 @@ mod tests {
     fn receipt_is_durable_before_dispatch_and_does_not_replace_provider_identity() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
         let receipt = for_claim(&Reader::open_unchecked(directory.path()), &claim.token)
             .unwrap()
@@ -350,12 +352,12 @@ mod tests {
     fn receipt_failure_releases_the_claim_before_dispatch_and_preserves_ready_state() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "ready", None, None).unwrap();
+        update_status(directory.path(), SessionState::Ready, None, None).unwrap();
         fs::write(directory.path().join(REQUESTS_DIRECTORY), "not a directory").unwrap();
         assert!(acquire_ready_turn_claim(directory.path(), "session-test").is_err());
         assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
         let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
-        assert_eq!(status.state, "ready");
+        assert_eq!(status.state.as_str(), "ready");
         assert!(event_paths(directory.path()).unwrap().is_empty());
     }
 
@@ -364,7 +366,7 @@ mod tests {
         for completed_mutations in 0..=3 {
             let directory = tempfile::tempdir().unwrap();
             fs::create_dir(directory.path().join("events")).unwrap();
-            update_status(directory.path(), "working", None, None).unwrap();
+            update_status(directory.path(), SessionState::Working, None, None).unwrap();
             let claim = acquire_turn_claim(directory.path()).unwrap();
             let receipt = claim.receipt.clone();
             let token = claim.token.clone();
@@ -384,7 +386,7 @@ mod tests {
                 write_pending_completion_event(directory.path(), &pending).unwrap();
             }
             if completed_mutations >= 2 {
-                update_status(directory.path(), "ready", None, None).unwrap();
+                update_status(directory.path(), SessionState::Ready, None, None).unwrap();
             }
             if completed_mutations >= 3 {
                 release_turn_claim_token(&directory.path().join(TURN_CLAIM_FILE), &token).unwrap();
@@ -405,7 +407,7 @@ mod tests {
     fn damaged_optional_request_index_cannot_block_verified_completion() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
         let token = claim.token.clone();
         claim.retain();

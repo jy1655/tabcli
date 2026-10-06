@@ -1,3 +1,4 @@
+use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, Reader, RecordStore, Store};
 use std::{
     os::unix::fs::MetadataExt,
@@ -381,7 +382,7 @@ fn wait_for_binding(directory: &Path, id: &str, tty: &str) -> Result<()> {
             || unix_ms() >= record.deadline_unix_ms
             || record.phase != launch::Phase::Pending
             || record.claim_token != initial.claim_token
-            || status.state != "launching"
+            || status.state != SessionState::Launching
             || current_turn_claim_token(directory)?.as_deref() != Some(initial.claim_token.as_str())
         {
             bail!("Terminal.app launch was cancelled or timed out before its surface was bound");
@@ -607,6 +608,7 @@ fn ownership_proof(session: &TerminalSession) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use super::{CLOSE_TAB_SCRIPT, VERIFY_TAB_SCRIPT, WAIT_FOR_CLOSE_SCRIPT};
+    use crate::native::session::SessionState;
 
     const WINDOW: &str = "8341";
     const TTY: &str = "/dev/ttys014";
@@ -1478,7 +1480,7 @@ end run
             .unwrap();
         set_private_directory_permissions(directory.path()).unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "launching", None, None).unwrap();
+        update_status(directory.path(), SessionState::Launching, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
         let token = claim.token.clone();
         claim.retain();
@@ -1546,7 +1548,9 @@ end run
                 bind(directory, &handle);
             }
             match case {
-                "closed" | "failed" => update_status(directory, case, None, None).unwrap(),
+                "closed" | "failed" => {
+                    update_status(directory, case.parse().unwrap(), None, None).unwrap()
+                }
                 "expired" | "another claim" | "spawn attempted" => {
                     let mut receipt =
                         launch::read(&crate::native::session::Reader::open_unchecked(directory))
@@ -1778,7 +1782,8 @@ end run
             match outcome {
                 "bound" => bind(directory, &binding(directory, &tty)),
                 "another tty" => bind(directory, &binding(directory, "/dev/ttys999")),
-                _ => crate::native::update_status(directory, "closed", None, None).unwrap(),
+                _ => crate::native::update_status(directory, SessionState::Closed, None, None)
+                    .unwrap(),
             }
         }
         if !read_tab_until(&mut master, &mut screen, deadline, |_| {

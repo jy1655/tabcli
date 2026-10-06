@@ -542,3 +542,21 @@ impl RecordStore {
             .open(&self.path)
     }
 }
+
+#[cfg(test)]
+pub(super) mod tests;
+
+mod owner;
+mod state;
+pub(in crate::native) use owner::{observe_owner, observe_owner_record};
+pub(in crate::native) use state::SessionState;
+pub(in crate::native) mod launch;
+
+impl Store {
+    /// Publish an accepted completion before repairing its session's dead owner.
+    pub(in crate::native) fn converge(&self) -> Result<()> {
+        super::recover_pending_completion(self.directory())?;
+        super::repair_dead_native_owner(self.directory())?;
+        Ok(())
+    }
+}

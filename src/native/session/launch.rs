@@ -1,17 +1,17 @@
 //! Provider-neutral startup receipt and fencing. A terminal accepting a command is not
 //! evidence that its wrapper ran. The lifecycle lock serializes cancellation with spawn.
-use super::*;
 use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore};
+use crate::native::*;
 use std::process::Child;
 
 #[cfg(test)]
-pub(super) use super::session::LAUNCH_FILE as FILE;
-pub(super) const LOG: &str = "launch.log";
-pub(super) const STDERR_ENV: &str = "AGENT_BRIDGE_LAUNCH_STDERR_FD";
-pub(super) const STDOUT_ENV: &str = "AGENT_BRIDGE_LAUNCH_STDOUT_FD";
+pub(in crate::native) use super::LAUNCH_FILE as FILE;
+pub(in crate::native) const LOG: &str = "launch.log";
+pub(in crate::native) const STDERR_ENV: &str = "AGENT_BRIDGE_LAUNCH_STDERR_FD";
+pub(in crate::native) const STDOUT_ENV: &str = "AGENT_BRIDGE_LAUNCH_STDOUT_FD";
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(super) fn install_script(store: &Store, contents: &str) -> Result<String> {
+pub(in crate::native) fn install_script(store: &Store, contents: &str) -> Result<String> {
     let directory = store.directory();
     // A new terminal can still be in canonical input mode while its shell starts. A
     // long write-text command was truncated there in macOS LIVE (#50). Send only a
@@ -33,7 +33,7 @@ pub(super) fn install_script(store: &Store, contents: &str) -> Result<String> {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Phase {
+pub(in crate::native) enum Phase {
     Pending,
     // Durable before spawn: a crash here cannot prove that no child exists.
     Spawning,
@@ -41,14 +41,14 @@ pub(super) enum Phase {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(super) struct Record {
-    pub(super) schema: u32,
-    pub(super) claim_token: String,
-    pub(super) deadline_unix_ms: u128,
-    pub(super) phase: Phase,
+pub(in crate::native) struct Record {
+    pub(in crate::native) schema: u32,
+    pub(in crate::native) claim_token: String,
+    pub(in crate::native) deadline_unix_ms: u128,
+    pub(in crate::native) phase: Phase,
 }
 
-pub(super) fn read(reader: &Reader) -> Result<Option<Record>> {
+pub(in crate::native) fn read(reader: &Reader) -> Result<Option<Record>> {
     let record = reader
         .record(CoreRecord::Launch)
         .text()?
@@ -63,7 +63,7 @@ pub(super) fn read(reader: &Reader) -> Result<Option<Record>> {
     Ok(record)
 }
 
-pub(super) fn log(store: &Store, message: &str) {
+pub(in crate::native) fn log(store: &Store, message: &str) {
     let directory = store.directory();
     // Diagnostics are auxiliary. A missing/unwritable log must never stop valid input.
     let path = Reader::open_unchecked(directory)
@@ -83,7 +83,11 @@ pub(super) fn log(store: &Store, message: &str) {
     })();
 }
 
-pub(super) fn begin(store: &Store, token: &str, request_deadline: Instant) -> Result<Instant> {
+pub(in crate::native) fn begin(
+    store: &Store,
+    token: &str,
+    request_deadline: Instant,
+) -> Result<Instant> {
     let directory = store.directory();
     let budget = request_deadline
         .saturating_duration_since(Instant::now())
@@ -108,8 +112,8 @@ fn fail_locked(store: &Store, record: &Record, reason: &str) -> Result<()> {
         return Ok(());
     }
     let status: SessionStatus = store.status()?;
-    if status.state != "launching" {
-        if status.state == "failed" && record.phase == Phase::Pending {
+    if status.state != SessionState::Launching {
+        if status.state == SessionState::Failed && record.phase == Phase::Pending {
             remove_turn_claim_locked(
                 Reader::open_unchecked(directory)
                     .record(CoreRecord::TurnClaim)
@@ -123,7 +127,7 @@ fn fail_locked(store: &Store, record: &Record, reason: &str) -> Result<()> {
     } else {
         reason.to_owned()
     };
-    update_status(directory, "failed", None, Some(reason.clone()))?;
+    update_status(directory, SessionState::Failed, None, Some(reason.clone()))?;
     if record.phase == Phase::Pending {
         remove_turn_claim_locked(
             Reader::open_unchecked(directory)
@@ -135,7 +139,7 @@ fn fail_locked(store: &Store, record: &Record, reason: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn fail(store: &Store, reason: &str) -> Result<()> {
+pub(in crate::native) fn fail(store: &Store, reason: &str) -> Result<()> {
     let Some(_lock) = store.try_lock()? else {
         bail!("{reason}; provider startup is in progress; the claim is retained");
     };
@@ -147,30 +151,30 @@ pub(super) fn fail(store: &Store, reason: &str) -> Result<()> {
     Ok(())
 }
 
-fn confirmed(directory: &Path, record: &Record, status: &SessionStatus) -> bool {
+fn confirmed(reader: &Reader, record: &Record, status: &SessionStatus) -> bool {
     record.phase == Phase::Spawned
         || (record.phase == Phase::Spawning
             && matches!(
-                status.state.as_str(),
-                "running" | "awaiting-initial-input" | "working" | "ready"
+                status.state,
+                SessionState::Running
+                    | SessionState::AwaitingInitialInput
+                    | SessionState::Working
+                    | SessionState::Ready
             )
-            && Reader::open_unchecked(directory)
-                .provider_process()
-                .is_ok_and(|p| {
-                    directory.file_name().and_then(|n| n.to_str())
-                        == Some(p.managed_session_id.as_str())
-                }))
+            && reader.provider_process().is_ok_and(|p| {
+                reader.directory().file_name().and_then(|n| n.to_str())
+                    == Some(p.managed_session_id.as_str())
+            }))
 }
 
 /// Called before old dead-owner repair. A new launch with an uncertain spawn must not
 /// be silently closed/released by the legacy owner-only repair path.
-pub(super) fn repair(store: &Store) -> Result<bool> {
-    let directory = store.directory();
+pub(in crate::native) fn repair(store: &Store) -> Result<bool> {
     let Some(record) = read(store)? else {
         return Ok(false);
     };
     let status: SessionStatus = store.status()?;
-    if confirmed(directory, &record, &status) {
+    if confirmed(store, &record, &status) {
         return Ok(false);
     }
     let Some(_lock) = store.try_lock()? else {
@@ -180,14 +184,14 @@ pub(super) fn repair(store: &Store) -> Result<bool> {
         return Ok(false);
     };
     let status: SessionStatus = store.status()?;
-    if confirmed(directory, &record, &status) {
+    if confirmed(store, &record, &status) {
         return Ok(false);
     }
-    if status.state == "closed" {
+    if status.state == SessionState::Closed {
         return Ok(false);
     }
-    if status.state == "launching" {
-        let owner = query::observe_owner(store);
+    if status.state == SessionState::Launching {
+        let owner = super::observe_owner(store);
         if unix_ms() >= record.deadline_unix_ms {
             fail_locked(
                 store,
@@ -201,7 +205,7 @@ pub(super) fn repair(store: &Store) -> Result<bool> {
                 "native launch wrapper exited before startup was confirmed",
             )?;
         }
-    } else if status.state == "failed" {
+    } else if status.state == SessionState::Failed {
         fail_locked(
             store,
             &record,
@@ -211,16 +215,18 @@ pub(super) fn repair(store: &Store) -> Result<bool> {
     Ok(true)
 }
 
-pub(super) fn wait(
+pub(in crate::native) fn wait(
     store: &Store,
     surface: &terminal::TerminalSession,
     deadline: Instant,
 ) -> Result<()> {
-    let directory = store.directory();
     let mut next_probe = Instant::now() + Duration::from_secs(1);
     loop {
         let status: SessionStatus = store.status()?;
-        if matches!(status.state.as_str(), "failed" | "closed" | "exited") {
+        if matches!(
+            status.state,
+            SessionState::Failed | SessionState::Closed | SessionState::Exited
+        ) {
             bail!(
                 "{}",
                 status
@@ -228,7 +234,7 @@ pub(super) fn wait(
                     .unwrap_or_else(|| format!("launch entered {}", status.state))
             );
         }
-        if read(store)?.is_some_and(|record| confirmed(directory, &record, &status)) {
+        if read(store)?.is_some_and(|record| confirmed(store, &record, &status)) {
             return Ok(());
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -254,7 +260,7 @@ pub(super) fn wait(
             };
             let record = read(store)?.context("launch receipt disappeared")?;
             let status: SessionStatus = store.status()?;
-            if confirmed(directory, &record, &status) {
+            if confirmed(store, &record, &status) {
                 return Ok(());
             }
             fail_locked(store, &record, reason)?;
@@ -268,7 +274,7 @@ pub(super) fn wait(
 fn check_spawn_locked(store: &Store, record: Option<&Record>) -> Result<()> {
     let directory = store.directory();
     let status: SessionStatus = store.status()?;
-    if status.state != "launching"
+    if status.state != SessionState::Launching
         || Reader::open_unchecked(directory)
             .record(CoreRecord::Closed)
             .path()
@@ -291,7 +297,11 @@ fn check_spawn_locked(store: &Store, record: Option<&Record>) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn spawn<F>(store: &Store, command: &mut Command, record_process: F) -> Result<Child>
+pub(in crate::native) fn spawn<F>(
+    store: &Store,
+    command: &mut Command,
+    record_process: F,
+) -> Result<Child>
 where
     F: FnOnce(&mut Child) -> Result<()>,
 {
@@ -343,15 +353,15 @@ where
     Ok(child)
 }
 
-pub(super) fn uncertain(directory: &Path) -> bool {
-    read(&Reader::open_unchecked(directory))
+pub(in crate::native) fn uncertain(reader: &Reader) -> bool {
+    read(reader)
         .ok()
         .flatten()
         .is_some_and(|record| record.phase == Phase::Spawning)
 }
 
 /// Called with the read-only snapshot's lifecycle lock held.
-pub(super) fn diagnostic(
+pub(in crate::native) fn diagnostic(
     record: Option<&Record>,
     status: &SessionStatus,
     claim: Option<&str>,
@@ -360,7 +370,7 @@ pub(super) fn diagnostic(
     if record.phase == Phase::Spawned {
         return None;
     }
-    if status.state == "failed" {
+    if status.state == SessionState::Failed {
         return Some((
             if record.phase == Phase::Spawning {
                 "launch_uncertain"
@@ -373,7 +383,7 @@ pub(super) fn diagnostic(
                 .unwrap_or_else(|| "provider launch failed".to_owned()),
         ));
     }
-    if status.state == "launching"
+    if status.state == SessionState::Launching
         && claim == Some(&record.claim_token)
         && unix_ms() >= record.deadline_unix_ms
     {
@@ -384,7 +394,7 @@ pub(super) fn diagnostic(
 
 /// The shell redirects only Bridge's stderr. The provider keeps the original terminal
 /// stderr, so logging does not turn its interactive surface into a pipe or a file.
-pub(super) fn provider_stderr(command: &mut Command) {
+pub(in crate::native) fn provider_stderr(command: &mut Command) {
     command.env_remove(STDERR_ENV);
     command.env_remove(STDOUT_ENV);
     #[cfg(unix)]
@@ -398,7 +408,7 @@ pub(super) fn provider_stderr(command: &mut Command) {
     }
 }
 
-pub(super) fn restore_stdout() -> Result<()> {
+pub(in crate::native) fn restore_stdout() -> Result<()> {
     #[cfg(unix)]
     if std::env::var(STDOUT_ENV).as_deref() == Ok("4") {
         // SAFETY: the launch shell supplies fd 4 as its original stdout. This runs at
@@ -422,7 +432,7 @@ mod tests {
             .tempdir()
             .unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "launching", None, None).unwrap();
+        update_status(directory.path(), SessionState::Launching, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
         let token = claim.token.clone();
         claim.retain();
@@ -458,7 +468,7 @@ mod tests {
     fn record_started(directory: &Path, child: &mut Child) -> Result<()> {
         let id = directory.file_name().unwrap().to_str().unwrap();
         record_provider_process(directory, id, child)?;
-        update_status(directory, "running", None, None)
+        update_status(directory, SessionState::Running, None, None)
     }
 
     #[test]
@@ -503,7 +513,8 @@ mod tests {
         assert_eq!(
             read_json::<SessionStatus>(&directory.path().join("status.json"))
                 .unwrap()
-                .state,
+                .state
+                .as_str(),
             "launching"
         );
         release_tx.send(()).unwrap();
@@ -579,7 +590,7 @@ mod tests {
         write_json_atomic(&directory.path().join(FILE), &record).unwrap();
         update_status(
             directory.path(),
-            "failed",
+            SessionState::Failed,
             None,
             Some("spawn uncertain".to_owned()),
         )

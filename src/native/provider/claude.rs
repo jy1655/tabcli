@@ -3,6 +3,8 @@ use super::{
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
     LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
 };
+#[cfg(test)]
+use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -2682,7 +2684,8 @@ mod tests {
     fn initial_stop_owns_the_official_claude_hook_payload_schema() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        super::super::super::update_status(directory.path(), "working", None, None).unwrap();
+        super::super::super::update_status(directory.path(), SessionState::Working, None, None)
+            .unwrap();
         let claim = super::super::super::acquire_turn_claim(directory.path()).unwrap();
         claim.retain();
         let payload = serde_json::json!({
@@ -2708,7 +2711,8 @@ mod tests {
     fn delayed_uncorrelated_stop_cannot_complete_a_later_turn() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        super::super::super::update_status(directory.path(), "working", None, None).unwrap();
+        super::super::super::update_status(directory.path(), SessionState::Working, None, None)
+            .unwrap();
         let first_claim = super::super::super::acquire_turn_claim(directory.path()).unwrap();
         first_claim.retain();
         let payload = serde_json::json!({
@@ -2720,8 +2724,10 @@ mod tests {
 
         let later_claim = super::super::super::acquire_turn_claim(directory.path()).unwrap();
         later_claim.retain();
-        super::super::super::update_status(directory.path(), "claimed", None, None).unwrap();
-        super::super::super::update_status(directory.path(), "working", None, None).unwrap();
+        super::super::super::update_status(directory.path(), SessionState::Claimed, None, None)
+            .unwrap();
+        super::super::super::update_status(directory.path(), SessionState::Working, None, None)
+            .unwrap();
         handle_hook(directory.path(), &payload).unwrap();
 
         assert_eq!(
@@ -2742,7 +2748,8 @@ mod tests {
     fn correlated_stop_records_only_the_expected_claude_turn() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        super::super::super::update_status(directory.path(), "working", None, None).unwrap();
+        super::super::super::update_status(directory.path(), SessionState::Working, None, None)
+            .unwrap();
         let claim = super::super::super::acquire_turn_claim(directory.path()).unwrap();
         claim.retain();
         let pending = PendingCrossSessionTurn::new("claude-turn-safe123").unwrap();
@@ -2782,7 +2789,8 @@ mod tests {
     fn unmarked_claude_stop_keeps_the_pending_turn_uncommitted() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        super::super::super::update_status(directory.path(), "working", None, None).unwrap();
+        super::super::super::update_status(directory.path(), SessionState::Working, None, None)
+            .unwrap();
         let claim = super::super::super::acquire_turn_claim(directory.path()).unwrap();
         claim.retain();
         let pending = PendingCrossSessionTurn::new("claude-turn-safe123").unwrap();
@@ -2817,7 +2825,8 @@ mod tests {
     fn stop_failure_does_not_claim_an_uncorrelated_pending_turn() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        super::super::super::update_status(directory.path(), "working", None, None).unwrap();
+        super::super::super::update_status(directory.path(), SessionState::Working, None, None)
+            .unwrap();
         let claim = super::super::super::acquire_turn_claim(directory.path()).unwrap();
         claim.retain();
         let pending = PendingCrossSessionTurn::new("claude-turn-safe123").unwrap();

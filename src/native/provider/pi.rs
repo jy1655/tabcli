@@ -3,6 +3,8 @@ use super::{
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
     LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
 };
+#[cfg(test)]
+use crate::native::session::SessionState;
 use crate::native::session::{Reader, RecordStore, Store};
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
@@ -925,7 +927,7 @@ mod tests {
     fn pi_hook_owns_the_extension_payload_schema() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let pending = claim_pending_turn(directory.path());
         let payload = serde_json::json!({
             "session_id": "pi-session",
@@ -949,7 +951,7 @@ mod tests {
     fn pi_hook_preserves_an_exact_response_when_the_input_was_correlated() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let pending = claim_pending_turn(directory.path());
         let payload = serde_json::json!({
             "session_id": "pi-session",
@@ -970,7 +972,7 @@ mod tests {
     fn pi_hook_rejects_a_matching_claim_without_input_correlation() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let pending = claim_pending_turn(directory.path());
         let payload = serde_json::json!({
             "session_id": "pi-session",
@@ -989,7 +991,7 @@ mod tests {
     fn hook_transport_failure_signal_recovers_the_bridge_turn() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let pending = claim_pending_turn(directory.path());
         write_json_atomic(
             &directory.path().join(HOOK_FAILURE_FILE),
@@ -1008,14 +1010,14 @@ mod tests {
         let error = wait_for_event(directory.path(), 0, Duration::from_secs(1)).unwrap_err();
         assert!(format!("{error:#}").contains("native hook exited with status 1"));
         let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
-        assert_eq!(status.state, "ready");
+        assert_eq!(status.state.as_str(), "ready");
     }
 
     #[test]
     fn pi_hook_does_not_bind_a_delayed_new_turn_to_a_later_claim() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let initial_pending = claim_pending_turn(directory.path());
         ADAPTER
             .handle_hook(
@@ -1030,8 +1032,8 @@ mod tests {
             )
             .unwrap();
         let _later_pending = claim_pending_turn(directory.path());
-        update_status(directory.path(), "claimed", None, None).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Claimed, None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
 
         ADAPTER
             .handle_hook(

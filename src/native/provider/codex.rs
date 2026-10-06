@@ -3,6 +3,8 @@ use super::{
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
     LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
 };
+#[cfg(test)]
+use crate::native::session::SessionState;
 use crate::native::session::{Reader, RecordReader, Store};
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
@@ -1397,10 +1399,10 @@ exit 1
         // still shows A, has switched to B, or is displaying the agent picker.
         let managed_thread = "018f0000-0000-7000-8000-000000000001";
         write_established_thread(directory, managed_thread);
-        update_status(directory, "ready", None, None).unwrap();
+        update_status(directory, SessionState::Ready, None, None).unwrap();
         let (claim, _) =
             acquire_ready_turn_claim_with_context(directory, "session-codexqueue", &[]).unwrap();
-        update_status(directory, "working", None, None).unwrap();
+        update_status(directory, SessionState::Working, None, None).unwrap();
         let failure = ADAPTER
             .send_cross_session_message(CrossSessionMessageContext {
                 bridge_executable: Path::new("/unused/agent-bridge"),
@@ -1432,7 +1434,7 @@ exit 1
         drop(claim);
         assert!(!directory.join(TURN_CLAIM_FILE).exists());
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
-        assert_eq!(status.state, "ready");
+        assert_eq!(status.state.as_str(), "ready");
         assert_eq!(event_paths(directory).unwrap().len(), 1);
         assert_eq!(
             established_codex_thread(directory).unwrap().as_deref(),
@@ -1660,7 +1662,7 @@ exit 1
         write_queue_manifest(&directory, &provider, "codex-cli 0.153.2");
         let thread_id = "018f0000-0000-7000-8000-000000000001";
         write_established_thread(&directory, thread_id);
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let claim = acquire_turn_claim(&directory).unwrap();
         let claim_token = claim.token.clone();
         claim.retain();
@@ -1715,7 +1717,7 @@ exit 1
         assert_eq!(event.provider_session_id.as_deref(), Some(thread_id));
         assert!(!directory.join(TURN_CLAIM_FILE).exists());
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
-        assert_eq!(status.state, "ready");
+        assert_eq!(status.state.as_str(), "ready");
 
         ADAPTER.handle_hook(&directory, &completion).unwrap();
         assert_eq!(event_paths(&directory).unwrap().len(), 2);
@@ -2136,7 +2138,7 @@ exit 91
     fn codex_hook_owns_the_official_notify_payload_schema() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let pending = claim_pending_turn(directory.path());
         let payload = serde_json::json!({
             "thread-id": "codex-thread",
@@ -2158,7 +2160,7 @@ exit 91
     fn codex_hook_correlates_exact_output_from_the_official_input_messages() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let pending = claim_pending_turn(directory.path());
         let payload = serde_json::json!({
             "type": "agent-turn-complete",
@@ -2191,7 +2193,7 @@ exit 91
     fn codex_hook_ignores_the_task_title_turn_that_quotes_the_prompt() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let pending = claim_pending_turn(directory.path());
         let prompt = correlated_prompt(
             &native_delegation_prompt(
@@ -2249,7 +2251,7 @@ exit 91
     fn codex_hook_accepts_the_prompt_behind_the_ide_context() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let pending = claim_pending_turn(directory.path());
         let prompt = correlated_prompt(
             &native_delegation_prompt("external", "Reply READY."),
@@ -2306,7 +2308,7 @@ exit 91
     fn codex_hook_ignores_notify_events_from_a_different_thread() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let initial_pending = claim_pending_turn(directory.path());
         ADAPTER
             .handle_hook(
@@ -2319,8 +2321,8 @@ exit 91
             )
             .unwrap();
         let _pending = claim_pending_turn(directory.path());
-        update_status(directory.path(), "claimed", None, None).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Claimed, None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
 
         ADAPTER
             .handle_hook(
@@ -2336,14 +2338,14 @@ exit 91
         assert_eq!(event_paths(directory.path()).unwrap().len(), 1);
         assert!(directory.path().join(TURN_CLAIM_FILE).exists());
         let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
-        assert_eq!(status.state, "working");
+        assert_eq!(status.state.as_str(), "working");
     }
 
     #[test]
     fn codex_hook_requires_the_established_thread_id_on_a_queued_turn() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let initial_pending = claim_pending_turn(directory.path());
         ADAPTER
             .handle_hook(
@@ -2356,8 +2358,8 @@ exit 91
             )
             .unwrap();
         let pending = claim_pending_turn(directory.path());
-        update_status(directory.path(), "claimed", None, None).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Claimed, None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
 
         ADAPTER
             .handle_hook(
@@ -2372,14 +2374,14 @@ exit 91
         assert_eq!(event_paths(directory.path()).unwrap().len(), 1);
         assert!(directory.path().join(TURN_CLAIM_FILE).exists());
         let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
-        assert_eq!(status.state, "working");
+        assert_eq!(status.state.as_str(), "working");
     }
 
     #[test]
     fn codex_hook_preserves_a_legitimate_title_shaped_result() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let pending = claim_pending_turn(directory.path());
 
         ADAPTER
@@ -2402,7 +2404,7 @@ exit 91
     fn codex_hook_does_not_bind_the_first_foreign_notify_event() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let _pending = claim_pending_turn(directory.path());
 
         ADAPTER
@@ -2424,7 +2426,7 @@ exit 91
     fn codex_hook_does_not_bind_a_delayed_new_turn_to_a_later_claim() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
         let initial_pending = claim_pending_turn(directory.path());
         ADAPTER
             .handle_hook(
@@ -2437,8 +2439,8 @@ exit 91
             )
             .unwrap();
         let _later_pending = claim_pending_turn(directory.path());
-        update_status(directory.path(), "claimed", None, None).unwrap();
-        update_status(directory.path(), "working", None, None).unwrap();
+        update_status(directory.path(), SessionState::Claimed, None, None).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
 
         ADAPTER
             .handle_hook(

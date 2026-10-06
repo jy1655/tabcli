@@ -1,3 +1,4 @@
+use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, Reader};
 use std::{
     os::unix::fs::MetadataExt,
@@ -414,7 +415,7 @@ fn wait_for_binding(directory: &Path, id: &str, iterm_id: &str) -> Result<()> {
             || unix_ms() >= record.deadline_unix_ms
             || record.phase != launch::Phase::Pending
             || record.claim_token != initial.claim_token
-            || status.state != "launching"
+            || status.state != SessionState::Launching
             || current_turn_claim_token(directory)?.as_deref() != Some(initial.claim_token.as_str())
         {
             bail!("iTerm2 launch was cancelled or timed out before surface binding");
@@ -1462,7 +1463,7 @@ end run
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "launching", None, None).unwrap();
+        update_status(directory.path(), SessionState::Launching, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
         let token = claim.token.clone();
         claim.retain();
@@ -1509,7 +1510,7 @@ end run
             );
             match mode {
                 "wrong-owner" => crate::native::write_json_atomic(&directory.join(crate::native::TERMINAL_HANDLE_FILE), &serde_json::json!({ "terminal": "iterm2", "session_id": "owned-id", "managed_session_id": "session-other" })).unwrap(),
-                "cancelled" => crate::native::update_status(directory, "closed", None, None).unwrap(),
+                "cancelled" => crate::native::update_status(directory, SessionState::Closed, None, None).unwrap(),
                 "expired" | "changed-claim" => {
                     let mut receipt = crate::native::launch::read(&crate::native::session::Reader::open_unchecked(directory)).unwrap().unwrap();
                     if mode == "expired" { receipt.deadline_unix_ms = 0; }
@@ -1646,7 +1647,13 @@ end run
                     )
                 });
                 if cancel {
-                    crate::native::update_status(directory.path(), "closed", None, None).unwrap();
+                    crate::native::update_status(
+                        directory.path(),
+                        SessionState::Closed,
+                        None,
+                        None,
+                    )
+                    .unwrap();
                 } else {
                     bind_fixture(directory.path(), "owned-id");
                 }

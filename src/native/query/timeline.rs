@@ -1,5 +1,6 @@
 //! A read-only projection of retained evidence, not a history of inferred transitions.
 use super::*;
+use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, Reader};
 use crate::native::{EventsDirectory, SESSION_SCHEMA, valid_turn_claim_token};
 use std::collections::BTreeMap;
@@ -234,7 +235,7 @@ fn snapshot(records: &Records) -> Result<Snapshot> {
         manifest,
         status: if records[CoreRecord::Status.name()].is_err() {
             SessionStatus {
-                state: "unknown".to_owned(),
+                state: SessionState::Unknown("unknown".to_owned()),
                 generation: 0,
                 updated_unix_ms: 0,
                 exit_code: None,

@@ -1,3 +1,4 @@
+use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, Reader, RecordStore};
 // Native Ghostty scripting (installed dictionary; pinned upstream v1.3.1).
 // Creation runs only the launch host in a clean shell, never Bridge/provider input and
@@ -879,7 +880,7 @@ fn verify_launch(directory: &Path, token: &str) -> Result<PathBuf> {
     if receipt.phase != launch::Phase::Pending
         || receipt.claim_token != token
         || unix_ms() >= receipt.deadline_unix_ms
-        || status.state != "launching"
+        || status.state != SessionState::Launching
         || current_turn_claim_token(directory)?.as_deref() != Some(token)
     {
         bail!("Ghostty launch was cancelled, timed out or is not the one sent to this terminal");
@@ -1685,7 +1686,7 @@ mod tests {
             .unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "launching", None, None).unwrap();
+        update_status(directory.path(), SessionState::Launching, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
         let token = claim.token.clone();
         claim.retain();
@@ -1918,7 +1919,7 @@ mod tests {
                     &serde_json::json!({ "terminal": "iterm2", "session_id": "u2", "managed_session_id": path.file_name().unwrap().to_str().unwrap() }),
                 )
                 .unwrap(),
-                "cancelled" => update_status(path, "closed", None, None).unwrap(),
+                "cancelled" => update_status(path, SessionState::Closed, None, None).unwrap(),
                 "expired" => receipt.deadline_unix_ms = 0,
                 "already spawned" => receipt.phase = launch::Phase::Spawned,
                 "claim released" => {
@@ -1966,7 +1967,7 @@ mod tests {
             assert!(!owner.exists(), "{case}: the launch ran before the binding");
             bind_fixture(path, &handle);
             if case == "cancelled" {
-                crate::native::update_status(path, "closed", None, None).unwrap();
+                crate::native::update_status(path, SessionState::Closed, None, None).unwrap();
             }
             if case != "never addressed" {
                 start_bound(&mut f, &handle, &probe, path, soon()).unwrap();

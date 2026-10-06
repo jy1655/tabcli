@@ -1,6 +1,7 @@
 //! Workspace consent is evidence, not a provider permission mode. Provider stores are
 //! read only; their schemas and the way a managed CLI accepts trust belong to adapters.
 use super::*;
+use crate::native::session::SessionState;
 use crate::native::session::{Reader, RecordReader, RecordStore};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -485,7 +486,10 @@ fn wait_for_native_trust_with(
         // of its workspace's trust, so this comes before the evidence. Without it the
         // launcher of a closed session went on waiting until its deadline.
         if let Ok(status) = Reader::open_unchecked(directory).status()
-            && matches!(status.state.as_str(), "failed" | "exited" | "closed")
+            && matches!(
+                status.state,
+                SessionState::Failed | SessionState::Exited | SessionState::Closed
+            )
         {
             bail!(
                 "the session is {} and no longer waits for workspace trust; no initial console input was sent",

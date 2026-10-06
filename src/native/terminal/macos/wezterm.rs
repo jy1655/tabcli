@@ -1,3 +1,4 @@
+use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, Reader, Store};
 // WezTerm through its official CLI (pinned source: 20240203-110809-5046fc22).
 // Default: discover protected gui-sock-<pid> sockets in the macOS runtime directory,
@@ -944,7 +945,7 @@ fn wait_for_binding(directory: &Path, id: &str, pane: &str, socket: &Path) -> Re
             || unix_ms() >= record.deadline_unix_ms
             || record.phase != launch::Phase::Pending
             || record.claim_token != initial.claim_token
-            || status.state != "launching"
+            || status.state != SessionState::Launching
             || current_turn_claim_token(directory)?.as_deref() != Some(initial.claim_token.as_str())
         {
             bail!("WezTerm launch was cancelled or timed out before surface binding");
@@ -2360,7 +2361,7 @@ mod tests {
             .unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), "launching", None, None).unwrap();
+        update_status(directory.path(), SessionState::Launching, None, None).unwrap();
         let claim = acquire_turn_claim(directory.path()).unwrap();
         let token = claim.token.clone();
         claim.retain();
@@ -2516,7 +2517,8 @@ mod tests {
                     )
                 });
                 if cancelled {
-                    crate::native::update_status(directory, "closed", None, None).unwrap();
+                    crate::native::update_status(directory, SessionState::Closed, None, None)
+                        .unwrap();
                 } else {
                     bind(directory, &session);
                 }
@@ -2610,7 +2612,8 @@ mod tests {
             }
             match case {
                 "cancelled" => {
-                    crate::native::update_status(directory, "closed", None, None).unwrap()
+                    crate::native::update_status(directory, SessionState::Closed, None, None)
+                        .unwrap()
                 }
                 "expired" | "another claim" => {
                     let mut receipt =

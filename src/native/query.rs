@@ -1,16 +1,15 @@
 //! Read-only views of durable session records. Never recover, send, or close here.
-#[cfg(target_os = "macos")]
-use super::mac_native_owner_is_live;
 use super::{
     DEFAULT_TIMEOUT_SECS, Deserialize, Duration, EVENT_READ_LIMIT, File, FirstPartyCli, Instant,
-    JournaledEventRead, JournaledEventState, NativeCommand, NativeSessionOwner, Path, PathBuf,
-    PendingTurnCompletion, Reader, Result, Serialize, SessionEvent, SessionManifest, SessionStatus,
-    bail, checked_deadline_from, consent, fs, launch, option_value, parse_timeout,
-    process_is_alive, read_resumed_from, requests, require_valid_session_id, set_flag_once,
-    set_once, terminal, terminal_safe_text, thread, valid_session_id, validate_pending_completion,
+    JournaledEventRead, JournaledEventState, NativeCommand, Path, PathBuf, PendingTurnCompletion,
+    Reader, Result, Serialize, SessionEvent, SessionManifest, SessionStatus, bail,
+    checked_deadline_from, consent, fs, launch, option_value, parse_timeout, read_resumed_from,
+    requests, require_valid_session_id, set_flag_once, set_once, terminal, terminal_safe_text,
+    thread, valid_session_id, validate_pending_completion,
 };
 #[cfg(test)]
 use super::{EVENTS_DIRECTORY, read_event_within_budget};
+use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, RecordReader};
 use crate::native::{Context, FromStr};
 use serde_json::{Value, json};
@@ -422,7 +421,7 @@ impl Snapshot {
         {
             "recovery_required"
         } else if launch_failure.is_some() {
-            if self.status.state == "failed" {
+            if self.status.state == SessionState::Failed {
                 "failed"
             } else {
                 "unresolved"
@@ -504,67 +503,7 @@ fn observe_snapshot_with(reader: &Reader, publication: PublicationRead) -> Resul
     }
 }
 
-#[derive(Default, Serialize)]
-pub(super) struct OwnerObservation {
-    pub(super) process_alive: Option<bool>,
-    pub(super) identity_matches: Option<bool>,
-    pub(super) error: Option<String>,
-}
-
-pub(super) fn observe_owner(reader: &Reader) -> OwnerObservation {
-    let directory = reader.directory();
-    let owner = match RecordReader::at(
-        Reader::open_unchecked(directory)
-            .record(CoreRecord::Owner)
-            .path(),
-    )
-    .optional_json::<NativeSessionOwner>()
-    {
-        Ok(Some(owner)) => owner,
-        Ok(None) => return OwnerObservation::default(),
-        Err(error) => {
-            return OwnerObservation {
-                error: Some(format!("{error:#}")),
-                ..OwnerObservation::default()
-            };
-        }
-    };
-    observe_owner_record(&owner)
-}
-
-pub(super) fn observe_owner_record(owner: &NativeSessionOwner) -> OwnerObservation {
-    let observation = OwnerObservation {
-        process_alive: Some(process_is_alive(owner.pid)),
-        ..OwnerObservation::default()
-    };
-    if observation.process_alive == Some(false) {
-        return observation;
-    }
-    #[cfg(target_os = "macos")]
-    let identity = (owner.process_start_seconds.is_some()
-        && owner.process_start_microseconds.is_some()
-        && owner.terminal_tty_device.is_some()
-        && owner.process_group.is_some()
-        && owner.terminal_process_group.is_some())
-    .then(|| mac_native_owner_is_live(owner));
-    #[cfg(windows)]
-    let identity = owner.windows_process_identity.as_ref().map(|identity| {
-        terminal::verify_windows_process_identity(owner.pid, identity).map(|()| true)
-    });
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let identity: Option<Result<bool>> = None;
-    match identity {
-        Some(Ok(matches)) => OwnerObservation {
-            identity_matches: Some(matches),
-            ..observation
-        },
-        Some(Err(error)) => OwnerObservation {
-            error: Some(format!("{error:#}")),
-            ..observation
-        },
-        None => observation,
-    }
-}
+pub(super) use super::session::{observe_owner, observe_owner_record};
 
 pub(super) fn request_result(reader: &Reader, request_id: &str) -> Result<Value> {
     observe_snapshot(reader)?.result(reader, &Selector::Request(request_id.to_owned()))
@@ -724,8 +663,8 @@ pub(super) fn result_value_in(root: &Path, request: &ResultRequest) -> Result<Va
                     return Ok(last);
                 }
                 if matches!(
-                    snapshot.status.state.as_str(),
-                    "closed" | "failed" | "exited"
+                    snapshot.status.state,
+                    SessionState::Closed | SessionState::Failed | SessionState::Exited
                 ) {
                     last["request_state"] = json!("unresolved");
                     return Ok(last);

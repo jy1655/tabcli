@@ -3,6 +3,7 @@ use super::{
     CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
     LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
 };
+use crate::native::session::SessionState;
 use crate::native::session::{Reader, RecordReader, Store};
 use agent_bridge::FirstPartyCli;
 use anyhow::Context;
@@ -757,7 +758,13 @@ fn wait_for_workspace_trust(directory: &Path, deadline: Instant) -> Result<()> {
                 .status()
                 .ok()
                 .map(|status| status.state)
-                .filter(|state| matches!(state.as_str(), "failed" | "exited" | "closed"))
+                .filter(|state| {
+                    matches!(
+                        state,
+                        SessionState::Failed | SessionState::Exited | SessionState::Closed
+                    )
+                })
+                .map(|state| state.to_string())
         },
         deadline,
         STARTUP_POLL_INTERVAL,
@@ -5536,7 +5543,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("session-doctor1");
         fs::create_dir_all(directory.join("events")).unwrap();
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         assert_eq!(
             input_receipt_check(Some(&directory)).reason_code,
             "agy_log_missing"
@@ -5631,7 +5638,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         assert_eq!(evidence["pending_marker_received"], true);
         assert_eq!(evidence["pending_marker"], pending.marker);
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
-        assert_eq!(status.state, "working");
+        assert_eq!(status.state.as_str(), "working");
     }
 
     // The launcher path for a lost initial paste: the gate passes (here the startup
@@ -5645,7 +5652,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("session-fMqSQc");
         fs::create_dir_all(directory.join("events")).unwrap();
-        update_status(&directory, "awaiting-initial-input", None, None).unwrap();
+        update_status(&directory, SessionState::AwaitingInitialInput, None, None).unwrap();
         let mut claim = acquire_turn_claim(&directory).unwrap();
         let pending = install_pending_turn(&directory, &claim.token).unwrap();
 
@@ -5664,7 +5671,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         // The read that passed the gate is the pre-paste offset: the whole startup
         // log. The launcher marks the session working before the paste.
         assert_eq!(pre_paste_len, startup.len());
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let pasted_at = clock.now();
         let after_paste = startup.clone() + &late_reload_completion();
         let failure = confirm_input_receipt_with(
@@ -5688,7 +5695,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         drop(claim);
 
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
-        assert_eq!(status.state, "working");
+        assert_eq!(status.state.as_str(), "working");
         let error = status
             .error
             .expect("the reason is recorded in status.error");
@@ -5868,9 +5875,9 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("session-QMFk6F");
         fs::create_dir_all(directory.join("events")).unwrap();
-        update_status(&directory, "ready", None, None).unwrap();
+        update_status(&directory, SessionState::Ready, None, None).unwrap();
         // A follow-up claims the ready session before it prepares the paste.
-        update_status(&directory, "claimed", None, None).unwrap();
+        update_status(&directory, SessionState::Claimed, None, None).unwrap();
         let mut claim = acquire_turn_claim(&directory).unwrap();
         let pending = install_pending_turn(&directory, &claim.token).unwrap();
 
@@ -5892,7 +5899,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
             "a static macOS log waits one quiet period; it cannot show the trust dialog"
         );
         assert_eq!(pre_paste_len, before_reload.len());
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let pasted_at = clock.now();
         let failure = confirm_input_receipt_with(
             &mut log_sequence(vec![
@@ -5913,7 +5920,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         drop(claim);
 
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
-        assert_eq!(status.state, "working");
+        assert_eq!(status.state.as_str(), "working");
         let error = status
             .error
             .expect("the reason is recorded in status.error");
@@ -6399,7 +6406,7 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         let directory = root.path().join("session-safe123");
         fs::create_dir(&directory).unwrap();
         fs::create_dir(directory.join("events")).unwrap();
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
 
         let id = "3e166585-bc21-43b7-b3d1-dec5e67688b3";
         let brain = root.path().join("brain");
@@ -6440,8 +6447,8 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         assert_eq!(event_paths(&directory).unwrap().len(), 1);
         assert!(directory.join(PENDING_TURN_FILE).is_file());
 
-        update_status(&directory, "claimed", None, None).unwrap();
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Claimed, None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let second_pending = claim_pending_turn(&directory);
         fs::write(
             transcript_path.with_file_name("transcript_full.jsonl"),
@@ -6462,8 +6469,8 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
             .append(true)
             .open(&transcript_path)
             .unwrap();
-        update_status(&directory, "claimed", None, None).unwrap();
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Claimed, None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let third_pending = claim_pending_turn(&directory);
         writeln!(
             transcript,
@@ -6480,7 +6487,7 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         assert_eq!(latest.provider_session_id.as_deref(), Some(id));
         assert_eq!(latest.turn_id.as_deref(), Some("4"));
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
-        assert_eq!(status.state, "ready");
+        assert_eq!(status.state.as_str(), "ready");
     }
 
     #[test]
@@ -6489,7 +6496,7 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         let directory = root.path().join("session-safe123");
         fs::create_dir(&directory).unwrap();
         fs::create_dir(directory.join("events")).unwrap();
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let brain = root.path().join("brain");
         let log = directory.join("agy.log");
         let first_id = "11111111-1111-1111-1111-111111111111";
@@ -6518,8 +6525,8 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         let mut monitor = MonitorState::default();
 
         monitor.poll(&directory, &log, &brain).unwrap();
-        update_status(&directory, "claimed", None, None).unwrap();
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Claimed, None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let second_pending = claim_pending_turn(&directory);
         fs::write(
             brain
@@ -6566,7 +6573,7 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         let directory = root.path().join("session-quota1");
         fs::create_dir(&directory).unwrap();
         fs::create_dir(directory.join("events")).unwrap();
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let brain = root.path().join("brain");
         let log = directory.join("agy.log");
         let id = "97ad12fd-9e7a-4556-83a4-8f0147343657";
@@ -6626,13 +6633,13 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
             "the failed turn releases its claim"
         );
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
-        assert_eq!(status.state, "ready");
+        assert_eq!(status.state.as_str(), "ready");
         assert_eq!(status.error.as_deref(), Some(error.as_str()));
 
         // A follow-up is claimed and its input already stands in the transcript, but
         // the log still ends with the first turn's error: that error is not its own.
-        update_status(&directory, "claimed", None, None).unwrap();
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Claimed, None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let second = claim_pending_turn(&directory);
         fs::write(
             &full,
@@ -6679,8 +6686,8 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         assert_eq!(status.error.as_deref(), Some(error.as_str()));
 
         // A result that is already written when the error is seen is recorded first.
-        update_status(&directory, "claimed", None, None).unwrap();
-        update_status(&directory, "working", None, None).unwrap();
+        update_status(&directory, SessionState::Claimed, None, None).unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
         let third = claim_pending_turn(&directory);
         let mut appended = OpenOptions::new().append(true).open(&transcript).unwrap();
         writeln!(appended, "{}", planner_line(3, &marked("done", &third))).unwrap();

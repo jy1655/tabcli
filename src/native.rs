@@ -4,7 +4,6 @@ mod tests;
 mod consent;
 mod context;
 mod doctor;
-mod launch;
 mod provider;
 mod provider_process;
 mod query;
@@ -186,7 +185,7 @@ struct SessionManifest {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct SessionStatus {
-    state: String,
+    state: SessionState,
     #[serde(default)]
     generation: u64,
     updated_unix_ms: u128,
@@ -244,25 +243,25 @@ struct PendingTurnCompletion {
     event: SessionEvent,
     status_error: Option<String>,
     #[serde(default = "default_completion_status_state")]
-    status_state: String,
+    status_state: SessionState,
 }
 
 impl PendingTurnCompletion {
     #[cfg(test)]
     fn new(claim_token: &str, event: SessionEvent, status_error: Option<String>) -> Result<Self> {
-        Self::new_with_status(claim_token, event, status_error, "ready")
+        Self::new_with_status(claim_token, event, status_error, SessionState::Ready)
     }
 
     fn new_with_status(
         claim_token: &str,
         event: SessionEvent,
         status_error: Option<String>,
-        status_state: &str,
+        status_state: SessionState,
     ) -> Result<Self> {
         if !valid_turn_claim_token(claim_token) {
             bail!("invalid native completion claim token")
         }
-        if !matches!(status_state, "ready" | "failed") {
+        if !matches!(status_state, SessionState::Ready | SessionState::Failed) {
             bail!("invalid native completion status state")
         }
         Ok(Self {
@@ -271,13 +270,13 @@ impl PendingTurnCompletion {
             event_file: Store::new_event_file_name()?,
             event,
             status_error,
-            status_state: status_state.to_owned(),
+            status_state,
         })
     }
 }
 
-fn default_completion_status_state() -> String {
-    "ready".to_owned()
+fn default_completion_status_state() -> SessionState {
+    SessionState::Ready
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -1359,7 +1358,7 @@ fn launch_created_session(
         let delivery = (|| -> Result<()> {
             wait_for_status(
                 &created.directory,
-                "awaiting-initial-input",
+                SessionState::AwaitingInitialInput,
                 deadline,
                 timeout,
             )?;
@@ -1407,7 +1406,7 @@ fn launch_created_session(
                 deadline,
                 ResumedHolderCheck::BeforeInitialDelivery,
             )?;
-            update_status(&created.directory, "working", None, None)?;
+            update_status(&created.directory, SessionState::Working, None, None)?;
             match provider::send_initial_prompt(
                 provider,
                 &terminal_session,
@@ -1456,7 +1455,7 @@ fn launch_created_session(
         let delivery = (|| -> Result<String> {
             wait_for_status(
                 &created.directory,
-                "awaiting-initial-input",
+                SessionState::AwaitingInitialInput,
                 deadline,
                 timeout,
             )?;
@@ -1487,7 +1486,7 @@ fn launch_created_session(
                 deadline,
                 ResumedHolderCheck::BeforeInitialDelivery,
             )?;
-            update_status(&created.directory, "working", None, None)?;
+            update_status(&created.directory, SessionState::Working, None, None)?;
             match provider::send_cross_session_message(
                 provider,
                 provider::CrossSessionMessageContext {
@@ -1525,7 +1524,7 @@ fn launch_created_session(
                     let error = failure.into_error();
                     let _ = update_status(
                         &created.directory,
-                        "failed",
+                        SessionState::Failed,
                         None,
                         Some(format!("{error:#}")),
                     );
@@ -1539,7 +1538,7 @@ fn launch_created_session(
                 if !initial_claim.retained {
                     let _ = update_status(
                         &created.directory,
-                        "failed",
+                        SessionState::Failed,
                         None,
                         Some(format!("{error:#}")),
                     );
@@ -1911,7 +1910,7 @@ fn refused_launch_cleanup(refused_directory: &Path, gate: &str) -> Result<Refuse
         .regular_status_if_present()?
         .with_context(|| format!("failed to read {}", status_path.display()))?
         .state;
-    if session_accepts_prompt(&state) || state == "working" {
+    if session_accepts_prompt(&state) || state == SessionState::Working {
         return Ok(RefusedLaunchCleanup::Pending(format!(
             "refused session {refused_session} is {state}"
         )));
@@ -1952,7 +1951,7 @@ fn refused_launch_cleanup(refused_directory: &Path, gate: &str) -> Result<Refuse
             )));
         }
     };
-    let surface_closed = state == "closed"
+    let surface_closed = state == SessionState::Closed
         && RecordReader::at(
             Reader::open_unchecked(refused_directory)
                 .record(CoreRecord::TerminalClosed)
@@ -1961,7 +1960,7 @@ fn refused_launch_cleanup(refused_directory: &Path, gate: &str) -> Result<Refuse
         .is_regular_file()?
         && Reader::open_unchecked(refused_directory)
             .regular_closed_if_present()?
-            .is_some_and(|closed| closed.state == "closed");
+            .is_some_and(|closed| closed.state == SessionState::Closed);
     Ok(RefusedLaunchCleanup::ProviderProcessGone {
         pid: record.pid,
         evidence,
@@ -2304,7 +2303,7 @@ fn run_reopen_inner(request: ReopenRequest, address: &mut Option<(String, String
     {
         let _ = update_status(
             &created.directory,
-            "failed",
+            SessionState::Failed,
             None,
             Some(format!("{error:#}")),
         );
@@ -2524,10 +2523,10 @@ fn verify_reopen_source_is_closed(directory: &Path, id: &str) -> Result<Option<S
     let state = status
         .as_ref()
         .map_or("unknown", |status| status.state.as_str());
-    if state != "closed"
+    if state != SessionState::Closed.as_str()
         || closed
             .as_ref()
-            .is_none_or(|closed| closed.state != "closed")
+            .is_none_or(|closed| closed.state != SessionState::Closed)
     {
         return Err(reopen_refusal(
             "source-not-closed",
@@ -3770,8 +3769,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
     // claimed, or sent to, so a failed resolution leaves every session unchanged.
     let attached = context::resolve(&request.context_results)?;
     let directory = Reader::session_directory(&request.id)?;
-    recover_pending_completion(&directory)?;
-    repair_dead_native_owner(&directory)?;
+    Store::open_unchecked(&directory).converge()?;
     let manifest = Reader::open_unchecked(&directory).manifest()?;
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
     let terminal_session: terminal::TerminalSession =
@@ -3839,7 +3837,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
             let correlation_id = provider_turn_id.as_deref().unwrap_or(&claim_token);
             let bridge_executable =
                 std::env::current_exe().context("failed to locate agent-bridge executable")?;
-            update_status(&directory, "working", None, None)?;
+            update_status(&directory, SessionState::Working, None, None)?;
             match provider::send_cross_session_message(
                 provider,
                 provider::CrossSessionMessageContext {
@@ -3892,7 +3890,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
                     let error = failure.into_error();
                     let _ = update_status(
                         &directory,
-                        &previous_state,
+                        previous_state.clone(),
                         None,
                         Some(format!("{error:#}")),
                     );
@@ -3957,7 +3955,7 @@ fn refuse_follow_up_to_shared_conversation(
     resumed_from: Option<&ResumedFrom>,
     deadline: Instant,
     claim: &mut TurnClaim,
-    previous_state: &str,
+    previous_state: &SessionState,
 ) -> Result<()> {
     let Err(error) = verify_reopened_conversation_exclusive(
         provider,
@@ -3981,10 +3979,10 @@ fn refuse_follow_up_to_shared_conversation(
 fn record_follow_up_refusal(
     id: &str,
     claim: &mut TurnClaim,
-    previous_state: &str,
+    previous_state: &SessionState,
     error: anyhow::Error,
 ) -> anyhow::Error {
-    match claim.release_now_with_reason(previous_state, format!("{error:#}")) {
+    match claim.release_now_with_reason(previous_state.clone(), format!("{error:#}")) {
         Ok(true) => error,
         Ok(false) => error.context(format!(
             "the turn claim of session {id} already belonged to another request; its status was left unchanged"
@@ -4049,7 +4047,7 @@ fn deliver_terminal_follow_up(
                 });
         }
     };
-    update_status(directory, "working", None, None)?;
+    update_status(directory, SessionState::Working, None, None)?;
     let send_timeout = match remaining_turn_timeout(deadline, requested_timeout) {
         Ok(timeout) => timeout,
         Err(error) => {
@@ -4449,8 +4447,8 @@ fn prune_closed_sessions(root: &Path, cutoff_unix_ms: u128) -> Result<Vec<String
             Ok(Some(status)) => status,
             Ok(None) | Err(_) => continue,
         };
-        if closed.state != "closed"
-            || status.state != "closed"
+        if closed.state != SessionState::Closed
+            || status.state != SessionState::Closed
             || closed.updated_unix_ms > cutoff_unix_ms
             || status.updated_unix_ms > cutoff_unix_ms
             || has_active_session_capability(&directory)
@@ -4645,7 +4643,7 @@ fn verify_terminal_close_authority_with_observations(
                 let status: SessionStatus = Reader::open_unchecked(directory).status()?;
                 let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
                 let observed = query::observe_owner_record(&owner);
-                if status.state == "failed"
+                if status.state == SessionState::Failed
                     && owner.managed_session_id.as_deref() == Some(expected_session_id)
                     && (observed.process_alive == Some(false)
                         || observed.identity_matches == Some(false))
@@ -4744,7 +4742,7 @@ fn verify_terminal_close_authority_with_observations(
             return Ok(TerminalCloseAuthority::LiveOwner);
         }
         let status: SessionStatus = Reader::open_unchecked(directory).status()?;
-        if !matches!(status.state.as_str(), "launching" | "failed") {
+        if !matches!(status.state, SessionState::Launching | SessionState::Failed) {
             bail!(
                 "terminal close requires a live native-session owner while the session is {}",
                 status.state
@@ -4839,7 +4837,7 @@ where
         .to_owned();
     let _turn_lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
     let status: SessionStatus = Reader::open_unchecked(directory).status()?;
-    if status.state == "closed" {
+    if status.state == SessionState::Closed {
         let consume_result = consume_terminal_handle(directory, None);
         let close_result = mark_session_closed_locked(directory, &claim_path, close_error);
         consume_result?;
@@ -5064,7 +5062,7 @@ fn run_session(id: &str) -> Result<()> {
     if let Some(record) = launch::read(&Reader::open_unchecked(&directory))? {
         let status: SessionStatus = Reader::open_unchecked(&directory).status()?;
         if record.phase != launch::Phase::Pending
-            || status.state != "launching"
+            || status.state != SessionState::Launching
             || current_turn_claim_token(&directory)?.as_deref() != Some(&record.claim_token)
         {
             launch::log(
@@ -5129,22 +5127,26 @@ fn finalize_native_session(directory: &Path, result: &Result<()>) -> Result<()> 
     }
     recover_pending_completion_locked(directory, &claim_path)?;
     let status: SessionStatus = Reader::open_unchecked(directory).status()?;
-    if !matches!(status.state.as_str(), "closed" | "exited" | "failed") {
+    if !matches!(
+        status.state,
+        SessionState::Closed | SessionState::Exited | SessionState::Failed
+    ) {
         match result {
-            Ok(()) => update_status(directory, "exited", Some(0), None)?,
+            Ok(()) => update_status(directory, SessionState::Exited, Some(0), None)?,
             Err(error) => {
-                let reason = if launch::uncertain(directory) {
+                let reason = if launch::uncertain(&Reader::open_unchecked(directory)) {
                     format!(
                         "{error:#}; provider spawn is uncertain; the claim is retained, do not resend"
                     )
                 } else {
                     format!("{error:#}")
                 };
-                update_status(directory, "failed", Some(1), Some(reason))?;
+                update_status(directory, SessionState::Failed, Some(1), Some(reason))?;
             }
         }
     }
-    if launch::uncertain(directory) && status.state != "closed" {
+    if launch::uncertain(&Reader::open_unchecked(directory)) && status.state != SessionState::Closed
+    {
         return Ok(());
     }
     remove_turn_claim_locked(&claim_path)
@@ -5273,11 +5275,11 @@ fn run_session_inner(directory: &Path) -> Result<()> {
                     session::RecordStore::at(&prompt_path)
                         .remove_raw()
                         .context("failed to remove the accepted initial prompt")?;
-                    update_status(directory, "running", None, None)?;
+                    update_status(directory, SessionState::Running, None, None)?;
                 }
                 provider::InitialPromptTransport::ProviderCrossSessionMessageAfterLaunch
                 | provider::InitialPromptTransport::TerminalPasteAfterLaunch => {
-                    update_status(directory, "awaiting-initial-input", None, None)?;
+                    update_status(directory, SessionState::AwaitingInitialInput, None, None)?;
                 }
             }
             Ok(())
@@ -5570,13 +5572,16 @@ fn record_provider_monitor_failure(
     let _claim_lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
     recover_pending_completion_locked(directory, &claim_path)?;
     let status: SessionStatus = Reader::open_unchecked(directory).status()?;
-    if matches!(status.state.as_str(), "closed" | "exited" | "failed") {
+    if matches!(
+        status.state,
+        SessionState::Closed | SessionState::Exited | SessionState::Failed
+    ) {
         return Ok(());
     }
     let Some(claim_token) = current_turn_claim_token(directory)? else {
         return update_status(
             directory,
-            "failed",
+            SessionState::Failed,
             None,
             Some(terminal_safe_text(error, true)),
         );
@@ -5596,7 +5601,7 @@ fn record_provider_monitor_failure(
         &claim_token,
         event,
         Some(error),
-        "failed",
+        SessionState::Failed,
     )
 }
 
@@ -5630,8 +5635,8 @@ fn provider_completion_is_current(
 ) -> Result<bool> {
     let status: SessionStatus = Reader::open_unchecked(directory).status()?;
     if !matches!(
-        status.state.as_str(),
-        "running" | "working" | "resume-pending"
+        status.state,
+        SessionState::Running | SessionState::Working | SessionState::ResumePending
     ) {
         return Ok(false);
     }
@@ -5676,7 +5681,7 @@ fn commit_provider_completion_locked(
         claim_token,
         event,
         status_error,
-        "ready",
+        SessionState::Ready,
     )
 }
 
@@ -5686,7 +5691,7 @@ fn commit_provider_completion_with_status_locked(
     claim_token: &str,
     event: SessionEvent,
     status_error: Option<String>,
-    status_state: &str,
+    status_state: SessionState,
 ) -> Result<()> {
     commit_provider_completion_within_locked(
         directory,
@@ -5709,7 +5714,7 @@ fn commit_provider_completion_within_locked(
     claim_token: &str,
     event: SessionEvent,
     status_error: Option<String>,
-    status_state: &str,
+    status_state: SessionState,
     event_limit: u64,
 ) -> Result<()> {
     let mut pending =
@@ -5756,7 +5761,7 @@ fn bound_pending_completion(
     pending.event.message = String::new();
     pending.event.error = Some(error.clone());
     pending.status_error = Some(error);
-    pending.status_state = "failed".to_owned();
+    pending.status_state = SessionState::Failed;
     Ok(pending)
 }
 
@@ -5796,7 +5801,7 @@ fn create_session_within(
         .write_private(spec.prompt.as_bytes())?;
     // An ancestry sync failure never blocks the session: the root lacks its receipt, so
     // the next creation repeats the walk, and the launch status records what failed.
-    update_status(&directory, "launching", None, ancestry_error)?;
+    update_status(&directory, SessionState::Launching, None, ancestry_error)?;
     Ok(CreatedSession {
         id,
         directory,
@@ -5806,7 +5811,7 @@ fn create_session_within(
 
 fn update_status(
     directory: &Path,
-    state: &str,
+    state: SessionState,
     exit_code: Option<i32>,
     error: Option<String>,
 ) -> Result<()> {
@@ -5816,7 +5821,7 @@ fn update_status(
 
 fn update_status_locked(
     directory: &Path,
-    state: &str,
+    state: SessionState,
     exit_code: Option<i32>,
     error: Option<String>,
 ) -> Result<()> {
@@ -5828,7 +5833,7 @@ fn update_status_locked(
     }
     let current = store.status_if_present()?;
     if let Some(current) = &current
-        && !valid_status_transition(&current.state, state)
+        && !current.state.clone().transition_allowed(state.clone())
     {
         bail!(
             "invalid native session status transition {} -> {state}",
@@ -5841,64 +5846,22 @@ fn update_status_locked(
         .checked_add(1)
         .context("native session status generation overflowed")?;
     let status = SessionStatus {
-        state: state.to_owned(),
+        state: state.clone(),
         generation,
         updated_unix_ms: unix_ms(),
         exit_code,
         error,
     };
-    if state == "closed" {
+    if state == SessionState::Closed {
         store.write_closed(&status)?;
         return store.write_status(&status);
     }
     store.write_status(&status)
 }
 
-/// The session status transition contract. A same-state write is always allowed (it
-/// refreshes the timestamp or error and still takes a new generation); every other write
-/// must appear in this table or `update_status` rejects it without advancing the
-/// generation. `exited`, `failed`, and `closed` are terminal except that the first two may
-/// still be closed; `closed` accepts nothing else. The one exception to the generation
-/// increment is the `closed.json` tombstone: once it exists, `update_status` no longer
-/// consults this table and rewrites `status.json` as a copy of the tombstone, so the
-/// tombstone's generation, timestamp, and error are preserved rather than advanced. The
-/// README section "권한과 세션 경계" carries the same table for operators.
-///
-/// | From                    | To                                                 |
-/// | ----------------------- | -------------------------------------------------- |
-/// | `launching`             | `running`, `awaiting-initial-input`, `failed`, `closed` |
-/// | `awaiting-initial-input`| `working`, `exited`, `failed`, `closed`            |
-/// | `running`               | `ready`, `exited`, `failed`, `closed`              |
-/// | `ready`                 | `claimed`, `exited`, `failed`, `closed`            |
-/// | `claimed`               | `working`, `ready`, `exited`, `failed`, `closed`   |
-/// | `working`               | `ready`, `exited`, `failed`, `closed`              |
-/// | `resume-pending`        | `working`, `ready`, `exited`, `failed`, `closed`   |
-/// | `exited`, `failed`      | `closed`                                           |
-/// | `closed`                | (none)                                             |
-fn valid_status_transition(current: &str, next: &str) -> bool {
-    current == next
-        || matches!(
-            (current, next),
-            (
-                "launching",
-                "running" | "awaiting-initial-input" | "failed" | "closed"
-            ) | (
-                "awaiting-initial-input",
-                "working" | "exited" | "failed" | "closed"
-            ) | ("running", "ready" | "exited" | "failed" | "closed")
-                | ("ready", "claimed" | "exited" | "failed" | "closed")
-                | (
-                    "claimed",
-                    "working" | "ready" | "exited" | "failed" | "closed"
-                )
-                | ("working", "ready" | "exited" | "failed" | "closed")
-                | (
-                    "resume-pending",
-                    "working" | "ready" | "exited" | "failed" | "closed"
-                )
-                | ("exited" | "failed", "closed")
-                | ("closed", "closed")
-        )
+#[cfg(test)]
+fn valid_status_transition(current: &SessionState, next: &SessionState) -> bool {
+    current.clone().transition_allowed(next.clone())
 }
 
 struct TurnClaim {
@@ -5906,7 +5869,7 @@ struct TurnClaim {
     token: String,
     receipt: requests::Receipt,
     retained: bool,
-    rollback_state: Option<&'static str>,
+    rollback_state: Option<SessionState>,
 }
 
 impl TurnClaim {
@@ -5918,7 +5881,7 @@ impl TurnClaim {
     // under the lifecycle lock and only while the claim file still holds this token. Returns
     // whether that write happened; a claim that another request already owns is left alone
     // together with the status it published. Dropping the claim later does nothing more.
-    fn release_now_with_reason(&mut self, state: &str, reason: String) -> Result<bool> {
+    fn release_now_with_reason(&mut self, state: SessionState, reason: String) -> Result<bool> {
         if self.retained {
             return Ok(false);
         }
@@ -5943,7 +5906,7 @@ impl TurnClaim {
 fn update_status_for_turn(
     directory: &Path,
     claim_token: &str,
-    state: &str,
+    state: SessionState,
     error: Option<String>,
 ) -> Result<bool> {
     let claim_path = Reader::open_unchecked(directory)
@@ -5957,7 +5920,7 @@ fn update_status_for_turn(
 fn update_status_for_turn_locked(
     directory: &Path,
     claim_token: &str,
-    state: &str,
+    state: SessionState,
     error: Option<String>,
 ) -> Result<bool> {
     if current_turn_claim_token(directory)?.as_deref() != Some(claim_token) {
@@ -5976,9 +5939,9 @@ fn record_initial_prompt_delivery_failure(
     let error = terminal_safe_text(&format!("{error:#}"), true);
     if delivery_started {
         claim.retain_in_place();
-        let _ = update_status_for_turn(directory, &claim.token, "working", Some(error));
+        let _ = update_status_for_turn(directory, &claim.token, SessionState::Working, Some(error));
     } else {
-        let _ = update_status(directory, "failed", None, Some(error));
+        let _ = update_status(directory, SessionState::Failed, None, Some(error));
     }
 }
 
@@ -5993,7 +5956,7 @@ fn record_follow_up_terminal_delivery_failure(
     if failure.delivery_may_have_occurred() {
         claim.retain_in_place();
         let error = terminal_safe_text(&format!("{:#}", failure.error()), true);
-        let _ = update_status_for_turn(directory, &claim.token, "working", Some(error));
+        let _ = update_status_for_turn(directory, &claim.token, SessionState::Working, Some(error));
     }
 }
 
@@ -6010,13 +5973,13 @@ fn record_cross_session_delivery_uncertainty(
 ) {
     claim.retain_in_place();
     let error = terminal_safe_text(&format!("{error:#}"), true);
-    let _ = update_status_for_turn(directory, &claim.token, "working", Some(error));
+    let _ = update_status_for_turn(directory, &claim.token, SessionState::Working, Some(error));
 }
 
 impl Drop for TurnClaim {
     fn drop(&mut self) {
         if !self.retained {
-            if let Some(state) = self.rollback_state {
+            if let Some(state) = self.rollback_state.clone() {
                 let _ = rollback_turn_claim_token(&self.path, &self.token, state);
             } else {
                 let _ = release_turn_claim_token(&self.path, &self.token);
@@ -6025,7 +5988,7 @@ impl Drop for TurnClaim {
     }
 }
 
-fn rollback_turn_claim_token(path: &Path, expected_token: &str, state: &str) -> Result<()> {
+fn rollback_turn_claim_token(path: &Path, expected_token: &str, state: SessionState) -> Result<()> {
     rollback_turn_claim_token_with_error(path, expected_token, state, None).map(|_| ())
 }
 
@@ -6043,7 +6006,7 @@ fn rollback_turn_claim_token(path: &Path, expected_token: &str, state: &str) -> 
 fn rollback_turn_claim_token_with_error(
     path: &Path,
     expected_token: &str,
-    state: &str,
+    state: SessionState,
     error: Option<String>,
 ) -> Result<bool> {
     let _lock = Store::open_unchecked((path).with_file_name("")).lock()?;
@@ -6160,12 +6123,12 @@ where
     }
     let baseline = Reader::open_unchecked(directory).events()?.len();
     before_publish();
-    if let Err(error) = update_status(directory, "claimed", None, None) {
+    if let Err(error) = update_status(directory, SessionState::Claimed, None, None) {
         let _ = release_turn_claim_token_locked(&path, &claim.token);
         claim.retain();
         return Err(error);
     }
-    claim.rollback_state = Some("ready");
+    claim.rollback_state = Some(SessionState::Ready);
     Ok((claim, baseline))
 }
 
@@ -6285,7 +6248,7 @@ fn recover_pending_completion_locked(directory: &Path, claim_path: &Path) -> Res
             write_pending_completion_event(directory, &pending)?;
             update_status(
                 directory,
-                &pending.status_state,
+                pending.status_state.clone(),
                 None,
                 pending.status_error.clone(),
             )?;
@@ -6342,7 +6305,12 @@ fn converge_interrupted_close_locked(
                 && status.error == tombstone.error
         });
     if !status_matches {
-        update_status(directory, "closed", None, tombstone.error.clone())?;
+        update_status(
+            directory,
+            SessionState::Closed,
+            None,
+            tombstone.error.clone(),
+        )?;
         changed = true;
     }
     let completion_path = Reader::open_unchecked(directory)
@@ -6506,7 +6474,10 @@ fn validate_pending_completion(pending: &PendingTurnCompletion) -> Result<()> {
     }
     if pending.schema != 1
         || !valid_turn_claim_token(&pending.claim_token)
-        || !matches!(pending.status_state.as_str(), "ready" | "failed")
+        || !matches!(
+            pending.status_state,
+            SessionState::Ready | SessionState::Failed
+        )
     {
         bail!("invalid pending native completion identity")
     }
@@ -6585,7 +6556,7 @@ fn mark_session_closed_locked(
     } else {
         Ok(())
     };
-    let status_result = update_status(directory, "closed", None, error);
+    let status_result = update_status(directory, SessionState::Closed, None, error);
     let (pending_result, running_result, claim_result) = if status_result.is_ok() {
         // An event the journal disagrees with is set aside first, then the claim is
         // released, and only then is the journal removed: every interruption of this order
@@ -6661,16 +6632,16 @@ where
     }
     let status: SessionStatus = Reader::open_unchecked(directory).status()?;
     if !matches!(
-        status.state.as_str(),
-        "launching"
-            | "awaiting-initial-input"
-            | "running"
-            | "ready"
-            | "claimed"
-            | "resume-pending"
-            | "working"
-            | "exited"
-            | "failed"
+        status.state,
+        SessionState::Launching
+            | SessionState::AwaitingInitialInput
+            | SessionState::Running
+            | SessionState::Ready
+            | SessionState::Claimed
+            | SessionState::ResumePending
+            | SessionState::Working
+            | SessionState::Exited
+            | SessionState::Failed
     ) {
         return untouched(recovery_damage);
     }
@@ -6722,7 +6693,7 @@ where
     let repair_error = Some(repair_error);
     #[cfg(windows)]
     {
-        if matches!(status.state.as_str(), "exited" | "failed") {
+        if matches!(status.state, SessionState::Exited | SessionState::Failed) {
             mark_session_closed(directory, repair_error)?;
             return Ok(true);
         }
@@ -6798,15 +6769,17 @@ fn require_running_wait_owner(directory: &Path) -> Result<()> {
 
 fn wait_for_status(
     directory: &Path,
-    expected_state: &str,
+    expected_state: SessionState,
     deadline: Instant,
     requested: Duration,
 ) -> Result<SessionStatus> {
     loop {
-        recover_pending_completion(directory)?;
-        repair_dead_native_owner(directory)?;
+        Store::open_unchecked(directory).converge()?;
         if let Ok(status) = Reader::open_unchecked(directory).status() {
-            if matches!(status.state.as_str(), "failed" | "exited" | "closed") {
+            if matches!(
+                status.state,
+                SessionState::Failed | SessionState::Exited | SessionState::Closed
+            ) {
                 let reason = status
                     .error
                     .unwrap_or_else(|| format!("session entered state {}", status.state));
@@ -6864,8 +6837,7 @@ fn wait_for_event_for_turn_until(
     requested: Duration,
 ) -> Result<SessionEvent> {
     loop {
-        recover_pending_completion(directory)?;
-        repair_dead_native_owner(directory)?;
+        Store::open_unchecked(directory).converge()?;
         let paths = Reader::open_unchecked(directory).events()?;
         if paths.len() > baseline {
             let candidates = &paths[baseline..];
@@ -6895,7 +6867,10 @@ fn wait_for_event_for_turn_until(
             }
         }
         if let Ok(status) = Reader::open_unchecked(directory).status()
-            && matches!(status.state.as_str(), "failed" | "exited" | "closed")
+            && matches!(
+                status.state,
+                SessionState::Failed | SessionState::Exited | SessionState::Closed
+            )
         {
             let reason = status
                 .error
@@ -6928,10 +6903,14 @@ fn turn_completion_was_published(
     }
     Ok(Reader::open_unchecked(directory)
         .status()
-        .is_ok_and(|status| status.state == "ready"))
+        .is_ok_and(|status| status.state == SessionState::Ready))
 }
 
 fn unix_ms() -> u128 {
+    #[cfg(test)]
+    if let Some(now) = session::tests::FIXED_UNIX_MS.get() {
+        return now;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -7122,8 +7101,8 @@ fn validate_shell_command_component(value: &std::ffi::OsStr, field: &str) -> Res
     Ok(())
 }
 
-fn session_accepts_prompt(state: &str) -> bool {
-    state == "ready"
+fn session_accepts_prompt(state: &SessionState) -> bool {
+    *state == SessionState::Ready
 }
 
 fn delegation_source() -> String {

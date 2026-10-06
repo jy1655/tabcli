@@ -7,6 +7,7 @@ use super::{
     require_valid_session_id, resolve_provider, set_flag_once, set_once, terminal,
     terminal_safe_text, thread, unix_ms, valid_session_id,
 };
+use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, RecordReader};
 use crate::native::{FromStr, Read, Seek, provider_version_command};
 use anyhow::Context as _;
@@ -450,7 +451,7 @@ fn session_checks(
     ));
     checks.push(Check::new(
         "session_state",
-        if snapshot.status.state == "ready" {
+        if snapshot.status.state == SessionState::Ready {
             Available
         } else {
             Unavailable
@@ -460,11 +461,15 @@ fn session_checks(
         &result_action,
     ));
     let (availability, reason, detail) = match (&snapshot.claim, &snapshot.status.error) {
-        (Some(_), Some(_)) if snapshot.status.state == "working" && snapshot.pending.is_none() => (
-            Unknown,
-            "delivery_unconfirmed",
-            "A turn remains claimed with an error. Delivery may have occurred; do not resend.",
-        ),
+        (Some(_), Some(_))
+            if snapshot.status.state == SessionState::Working && snapshot.pending.is_none() =>
+        {
+            (
+                Unknown,
+                "delivery_unconfirmed",
+                "A turn remains claimed with an error. Delivery may have occurred; do not resend.",
+            )
+        }
         (Some(_), _) => (
             Unavailable,
             "turn_in_progress",
