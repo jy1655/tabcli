@@ -99,8 +99,8 @@ self-test PROVIDER` when you want to open a surface and make real model calls. S
 
 On macOS, install the selected application. The iTerm2, Terminal.app, and Ghostty scripting routes
 can require macOS Automation consent. If the first launch times out in Automation, check for a
-visible system prompt and follow [macOS permissions](macos-permissions.md), which is currently in
-Korean. Review and answer prompts yourself; Bridge does not grant system access. After handling the
+visible system prompt and follow [macOS permissions](macos-permissions.md).
+Review and answer prompts yourself; Bridge does not grant system access. After handling the
 permission prompt, inspect the failed session and close any surface it created before starting
 another. WezTerm uses its official CLI and a verified local GUI connection.
 

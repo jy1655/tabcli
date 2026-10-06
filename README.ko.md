@@ -160,7 +160,7 @@ Bridge는 모델 클라이언트나 샌드박스가 아닙니다. 직접 실행�
 - [터미널](docs/terminals.md): 화면 생성 위치, 설정, 소유권과 검증 범위입니다.
 - [에이전트 CLI](docs/providers.md): CLI 요구 사항, 전달 경로와 결과 처리 방식입니다.
 - [보안과 데이터](docs/security-and-data.md): 권한, 작업 디렉터리 신뢰와 보관되는 기록입니다.
-- [macOS 승인](docs/macos-permissions.md): Automation과 CLI 승인을 구분하는 한국어 문서입니다.
+- [macOS 승인](docs/macos-permissions.md): Automation과 CLI 승인을 구분하는 영어 문서입니다.
 - [구조](docs/architecture.md): 모듈, 세션 기록과 세션 상태 변경 규칙입니다.
 - [검증](docs/testing.md): 자동 검사와 로그인한 CLI의 수동 실행 검사 절차입니다.
 - [릴리스 노트](docs/releases/README.md): 버전별 변경과 검증 기록입니다.

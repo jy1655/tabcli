@@ -83,7 +83,7 @@ there is one. Include a concrete before/after example when it helps explain the 
 - Report live verification separately, with provider, terminal, platform, versions, and a link
   to the run record. Mark combinations you did not exercise "not verified".
 
-For release workflow or packaging changes, follow [Releasing](docs/releasing.md) (Korean).
+For release workflow or packaging changes, follow [Releasing](docs/releasing.md).
 The release rehearsal must finish and its result must be read before relying on a tag push;
 see the exact requirements in [AGENTS.md](AGENTS.md).
 

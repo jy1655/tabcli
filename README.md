@@ -148,7 +148,7 @@ projects. The executable and Cargo package are both named `tabcli`.
 Before the first launch, install and sign in to the provider CLI, and resolve its workspace-trust
 prompt for your project. The iTerm2, Terminal.app, and Ghostty integrations use macOS Automation.
 If launch reports an Apple Events permission error, follow the
-[macOS permission checks](docs/macos-permissions.md) (Korean). Native Windows requires PowerShell 7
+[macOS permission checks](docs/macos-permissions.md). Native Windows requires PowerShell 7
 (`pwsh.exe`) on `PATH`, even when you invoke Bridge from cmd.
 
 ## Everyday use
@@ -223,7 +223,7 @@ it by path. Installing `tabcli` does not update those running sessions' hooks.
 - [Terminals](docs/terminals.md): surface selection, settings, ownership, and verification limits.
 - [Providers](docs/providers.md): CLI requirements, delivery paths, and result handling.
 - [Security and data](docs/security-and-data.md): permissions, trust, and local records.
-- [macOS permissions](docs/macos-permissions.md): Automation and provider approvals (Korean).
+- [macOS permissions](docs/macos-permissions.md): Automation and provider approvals.
 - [Architecture](docs/architecture.md): modules, session records, and lifecycle contracts.
 - [Testing](docs/testing.md): automated checks and manual authenticated runs.
 - [Release notes](docs/releases/README.md): changes and recorded verification by version.

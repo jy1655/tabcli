@@ -62,7 +62,7 @@ Linux CI checks portable code; Linux managed sessions remain unsupported.
 
 Self-test opens a real surface and makes real model calls. Authenticate the selected CLI,
 review the workspace, and make sure the terminal application answers before starting.
-For macOS system approvals, see [macOS permissions](macos-permissions.md) (Korean).
+For macOS system approvals, see [macOS permissions](macos-permissions.md).
 
 To test this checkout, run the following from the repository root after reviewing the workspace:
 
