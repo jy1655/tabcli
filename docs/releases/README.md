@@ -6,6 +6,8 @@ Older notes retain their own requirements and limitations; use the
 [providers](../providers.md) and [terminals](../terminals.md) pages for current behavior.
 Each note separates live checks from automated tests.
 
+- [0.2.6](0.2.6.md) (2026-10-07): Uses the provider Report path for completion tests, separates
+  Request observation from JSON, and concentrates Reopen and Agy Result evidence rules.
 - [0.2.5](0.2.5.md) (2026-10-07): Repairs dead owners despite completion recovery damage;
   removes unused delivery fallback and consolidates status writes and helper containment.
 - [0.2.4](0.2.4.md) (2026-10-07): Consolidates launch waits and delivery settlement, preserves
