@@ -1147,10 +1147,13 @@ fn launch_created_session(
     ) {
         Ok(session) => session,
         Err(error) => {
-            let _ = launch::fail(
-                &Store::open_unchecked(&created.directory),
-                &format!("terminal launch failed: {error:#}"),
-            );
+            let error =
+                match launch::terminal_failed(&Store::open_unchecked(&created.directory), &error) {
+                    Ok(()) => error,
+                    Err(record_error) => {
+                        error.context(format!("terminal launch failure handoff: {record_error:#}"))
+                    }
+                };
             return Err(error).with_context(|| {
                 format!(
                     "failed to open {} surface for session {}",
@@ -3786,6 +3789,8 @@ fn update_status_locked(
     let store = Store::open_unchecked(directory);
     // The tombstone is the close's commit point: every later write, whatever state it
     // asks for, restores the tombstone unchanged and does not advance the generation.
+    // launch::terminal_failed can separately append a residual-surface diagnostic to
+    // both records under this lock without changing their lifecycle fields.
     if let Some(closed) = store.closed_if_present()? {
         return store.write_status(&closed);
     }

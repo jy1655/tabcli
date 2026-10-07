@@ -542,7 +542,30 @@ fn orchestrate(
                     Outcome::NotVerified,
                     "close could not be confirmed; inspect the reported session in the reported state root",
                 );
+            } else if observed.value["error"]
+                .as_str()
+                .is_some_and(|error| error.contains(launch::RESIDUAL_SURFACE_MARKER))
+            {
+                reject(
+                    &mut closed,
+                    Outcome::NotVerified,
+                    "close succeeded but a residual surface is recorded",
+                );
             }
+        }
+        if closed.outcome != Outcome::Passed {
+            let reason = format!(
+                "session {session}: surface cleanup not verified; {}; stored state={}; recorded error={:?}",
+                closed
+                    .reason
+                    .as_deref()
+                    .unwrap_or("close was not confirmed"),
+                state.as_deref().unwrap_or("unknown"),
+                observed.value["error"]
+                    .as_str()
+                    .unwrap_or("no recorded surface error"),
+            );
+            reject(&mut closed, Outcome::NotVerified, &reason);
         }
         if cleanup.outcome == Outcome::Passed {
             cleanup.outcome = closed.outcome;

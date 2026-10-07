@@ -304,10 +304,10 @@ fn cleanup_failure_retains_session_and_observed_state() {
         ok(json!({"ok":true,"stored_state":"working"})),
     ]);
     let report = run_fake(&mut fake);
-    assert_eq!(report.outcome, Outcome::Failed);
+    assert_eq!(report.outcome, Outcome::NotVerified);
     assert_eq!(report.session.as_deref(), Some("session-owned"));
     assert_eq!(report.session_state.as_deref(), Some("working"));
-    assert_eq!(report.steps[4].outcome, Outcome::Failed);
+    assert_eq!(report.steps[4].outcome, Outcome::NotVerified);
 }
 
 #[test]
@@ -745,7 +745,15 @@ fn command_deadlines_skip_later_requests_and_still_attempt_cleanup() {
             "AB_marker".to_owned(),
         );
         let step = &report.steps[hang_at.min(4)];
-        assert_eq!(step.outcome, Outcome::TimedOut, "command {hang_at}");
+        assert_eq!(
+            step.outcome,
+            if hang_at < 4 {
+                Outcome::TimedOut
+            } else {
+                Outcome::NotVerified
+            },
+            "command {hang_at}"
+        );
         assert!(
             step.reason
                 .as_deref()
@@ -782,7 +790,7 @@ fn isolated_cleanup_attempts_remaining_sessions_after_a_failed_close() {
         PathBuf::from("private-root"),
         "AB_marker".to_owned(),
     );
-    assert_eq!(report.steps[4].outcome, Outcome::TimedOut);
+    assert_eq!(report.steps[4].outcome, Outcome::NotVerified);
     assert_eq!(report.cleanup_sessions.len(), 2);
     assert_eq!(report.cleanup_sessions[1].outcome, Outcome::Passed);
     assert!(fake.replies.is_empty());
@@ -802,4 +810,78 @@ fn invalid_reported_session_is_never_a_close_target() {
     assert_eq!(fake.calls.len(), 1);
     assert_eq!(report.steps[4].outcome, Outcome::NotVerified);
     assert!(report.cleanup_sessions.is_empty());
+}
+
+#[test]
+fn retained_launch_surface_cleanup_is_not_verified_until_closed() {
+    for closed in [false, true] {
+        let retained = "terminal launch failed; exact Ghostty handle retained: u2 tab=t2 window=w1";
+        let close = if closed {
+            ok(json!({"session":"session-owned", "closed":true}))
+        } else {
+            error("Ghostty automation timed out before it started")
+        };
+        let inspect = ok(
+            json!({"stored_state": if closed { "closed" } else { "failed" },
+            "error": if closed { Value::Null } else { json!(retained) }}),
+        );
+        let mut fake = fake([error(retained), close, inspect]);
+        let report = run_fake(&mut fake);
+        let cleanup = &report.steps[4];
+        assert_eq!(
+            cleanup.outcome,
+            if closed {
+                Outcome::Passed
+            } else {
+                Outcome::NotVerified
+            }
+        );
+        assert_ne!(report.outcome, Outcome::Passed);
+        assert_eq!(report.cleanup_sessions[0].outcome, cleanup.outcome);
+        if !closed {
+            let reason = cleanup.reason.as_deref().unwrap();
+            for identity in ["session-owned", "Ghostty", "u2", "t2", "w1"] {
+                assert!(reason.contains(identity), "{reason}");
+            }
+        }
+    }
+}
+
+#[test]
+fn closed_residual_surface_cleanup_is_not_verified() {
+    let residual = format!(
+        "Ghostty u2 tab=t2 window=w1; {}",
+        launch::RESIDUAL_SURFACE_MARKER
+    );
+    for recorded_error in [None, Some("ordinary launch error"), Some(residual.as_str())] {
+        let mut replies = cleanup();
+        replies[1].value["error"] = json!(recorded_error);
+        let mut fake = fake(
+            [
+                accepted("request-1"),
+                result("request-1", "event-1.json"),
+                accepted("request-2"),
+                result("request-2", "event-2.json"),
+            ]
+            .into_iter()
+            .chain(replies),
+        );
+        let report = run_fake(&mut fake);
+        let expected = if recorded_error == Some(residual.as_str()) {
+            Outcome::NotVerified
+        } else {
+            Outcome::Passed
+        };
+        assert_eq!(
+            report.steps[4].outcome, expected,
+            "recorded error={recorded_error:?}"
+        );
+        assert_eq!(report.cleanup_sessions[0].outcome, expected);
+        assert_eq!(report.outcome, expected);
+        if expected == Outcome::NotVerified {
+            let reason = report.steps[4].reason.as_deref().unwrap();
+            assert!(reason.contains("session-owned"));
+            assert!(reason.contains(&residual));
+        }
+    }
 }

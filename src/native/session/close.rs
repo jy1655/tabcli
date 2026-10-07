@@ -151,7 +151,8 @@ where
     let status: SessionStatus = store.status()?;
     if status.state == SessionState::Closed {
         let consume_result = consume_terminal_handle(store, None);
-        let close_result = mark_session_closed_locked(store, &claim_path, close_error);
+        let close_result =
+            mark_session_closed_locked(store, &claim_path, close_error.or(status.error));
         consume_result?;
         return close_result;
     }
@@ -169,10 +170,37 @@ where
         consume_result?;
         return close_result;
     }
+    // No ownership gate sees a handle-less session. Fence this close while the
+    // pending launcher can still return a surface, under the same lifecycle lock.
+    if status.state == SessionState::Launching
+        && !terminal_path.exists()
+        && !closing_path.exists()
+        && store.closed_if_present()?.is_none()
+        && let Some(record) = launch::read(store)?
+        && record.phase == launch::Phase::Pending
+        && record.deadline_unix_ms > unix_ms()
+    {
+        bail!(
+            "the launcher is still creating the surface for this session (launch deadline {}); no handle exists yet and nothing was closed; close again after the deadline or once the session has failed",
+            record.deadline_unix_ms
+        );
+    }
     match store.claim_terminal_handle()? {
         Ok(()) => (),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if !closing_path.exists() {
+                // No adapter will run for this residual surface. Keep its warning in
+                // the new tombstone; ordinary handle-less failures keep prior behavior.
+                let close_error = match status
+                    .error
+                    .filter(|error| error.contains(launch::RESIDUAL_SURFACE_MARKER))
+                {
+                    Some(residual) => Some(match close_error {
+                        Some(error) => format!("{error}; {residual}"),
+                        None => residual,
+                    }),
+                    None => close_error,
+                };
                 return mark_session_closed_locked(store, &claim_path, close_error);
             }
             // A prior closer may have stopped after atomically claiming the handle but before

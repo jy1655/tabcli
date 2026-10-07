@@ -512,7 +512,11 @@ dialogs, wrong results, or unverified cleanup prevent success. Read the failed s
 Split `request_address` at `/` and run `tabcli result SESSION --request REQUEST`. Resolve
 authentication in the provider CLI or answer a trust dialog yourself. If cleanup failed, inspect the
 reported session and use `close-session SESSION --explicit`; do not rerun the model prompt to test
-cleanup.
+cleanup. An unconfirmed close is `not_verified`, including a close that times out. Its reason
+names the session and includes the recorded launch error when a failed launch retained a surface.
+A closed session whose error names a residual surface makes cleanup `not_verified` even when
+close itself succeeded. If self-test's explicit close confirms that surface is gone, cleanup passes
+even though the launch failed.
 
 ## consent
 
@@ -640,6 +644,25 @@ See the command and output in the [opening workflow](#command-reference).
 `--explicit` is required because this ends the session's surface. You can close active, exited, or
 failed sessions. Repeating a completed close succeeds without closing another surface. Bridge
 records the close in a tombstone and keeps the result history.
+
+While a session is `launching` with no surface handle and a pending launch deadline still in the
+future, close refuses without changing the session or its claim:
+
+```text
+the launcher is still creating the surface for this session (launch deadline <unix ms>); no handle exists yet and nothing was closed; close again after the deadline or once the session has failed
+```
+
+After the deadline, or once launch is no longer pending, a handle-less close proceeds. If the
+launcher subsequently reports a retained Ghostty surface, the session stays closed with no new
+handle. Its error names the exact surface and says it may remain and is not closed by Bridge.
+The warning is appended to any existing error and survives repeated close. Check the surface
+in Ghostty; another Bridge close does not close it.
+
+If the failed-launch handoff happens before close, while the launch still owns its claim and the
+session is still `launching`, the launcher saves the proven terminal, tab, and window ids in
+`terminal.json` and records `failed`. Explicit close uses that handle through
+Ghostty's close script, even if no provider started. It records `closed` only after confirmed
+closure; another close failure keeps the handle.
 
 Human output is `closed SESSION`. JSON has `ok`, `session`, and `closed`.
 

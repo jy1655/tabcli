@@ -74,7 +74,7 @@ adapters above them are macOS-only.
 | --- | --- | --- | --- | --- |
 | macOS | iTerm2 | Tab or window | Session scripting | Session |
 | macOS | Terminal.app | Window | Window/TTY scripting | Window |
-| macOS | Ghostty | Tab or window | Terminal scripting | Owned surface |
+| macOS | Ghostty | Tab or window | Terminal scripting | Owned surface; proven failed-launch handle retained |
 | macOS | WezTerm | Tab/private GUI | Exact-pane CLI | Pane; scoped GUI |
 | macOS | Warp | Tab/window URI | Unsupported | Bound tab/window |
 | Windows | Terminal tab | Tab | Console input | Console and tab |
@@ -162,6 +162,17 @@ alone, or leave it alone because it is proven absent. That decision is close aut
 selected tab or a window that appeared during launch provides no such authority. If none of the
 three outcomes is proven, Bridge refuses and keeps the handle. The
 [architecture reference](architecture.md) explains the records behind this decision.
+
+If Ghostty initialization fails after Bridge proves the created terminal, tab, and window ids,
+Bridge attempts the existing scoped cleanup once. If cleanup cannot confirm closure, the adapter
+returns those ids as data. When the launch still owns its claim and is still `launching`, the
+launcher saves them in `terminal.json` and records `failed`; explicit close can close that exact
+surface later. A handle-less close during pending creation is refused until the launch deadline.
+If close completes after that deadline but before the failed-launch handoff, no handle is added
+to the closed session. Its error and launch log name the residual surface, which may remain and
+is not closed by Bridge. Repeating close preserves the warning and does not close that surface.
+Unproven creation evidence grants no close authority. This preserves failure evidence after an
+automation timeout; it does not establish what caused the timeout.
 
 When a close fails, read the error and run `tabcli doctor SESSION`. Check the managed surface
 before retrying `tabcli close-session SESSION --explicit`. Bridge restores the handle after a
