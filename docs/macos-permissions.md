@@ -109,6 +109,20 @@ For an experimental session whose handle has already been consumed, `close-sessi
 
 If you need to preserve the exact window and tab IDs of a failed run, run each command from `ask --detach --json` through `result`, `tell`, and `close-session` instead of `self-test`, and preserve the `ask` response. The current self-test report has no surface ID, and closing a session consumes its terminal handle; do not rely on reconstructing it afterward. If screen observations differ from JSON, retract PASS and record what the person saw first.
 
+## Launching with the screen locked
+
+A launch may need the screen unlocked, not only the keyboard check below. On 2026-10-07, with the
+screen locked and the display off, `self-test codex` did not complete in Terminal.app (Codex
+started, no result within the budget) or in Ghostty (the tab was created, then
+`Ghostty automation timed out` after 28 s), while the same command passed in WezTerm and iTerm2,
+and had passed in all four terminals an hour earlier with the screen unlocked. Simple Apple Events
+queries such as `count windows` answered during the lock. The cause of the first-attempt timeouts
+recorded in [#80](https://github.com/jy1655/tabcli/issues/80) is not established; whether the
+screen was locked then was not recorded. Before you read a timeout as a regression, check the lock
+state (`ioreg -n Root -d1 | grep CGSSessionScreenIsLocked` prints a line only while locked) and
+repeat the launch with the screen unlocked. A launch that times out before a surface handle exists
+sent no prompt; one that times out after the surface exists keeps the handle in the session's records (#86).
+
 ## Checking keyboard input and focus during startup
 
 A successful provider round trip and cleanup in `self-test` do not replace physical keyboard verification. With the screen unlocked, check separately with another app in the foreground and while typing in the same terminal's input area. In iTerm2, Terminal.app, Ghostty, and WezTerm, the startup gate discards keys received while the new surface is briefly selected; it does not resend them to the original input area. The Warp host does not discard startup input, and keyboard preservation in Warp is not verified. Do not force restoration if the user selects another window, tab, or app. Record each terminal's behavior, the original failures, and results after the fixes separately in the [0.1.0 focus verification record](verification/2026-10-03-v0.1.0-focus.md) (Korean).
