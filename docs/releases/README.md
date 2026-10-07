@@ -6,6 +6,8 @@ Older notes retain their own requirements and limitations; use the
 [providers](../providers.md) and [terminals](../terminals.md) pages for current behavior.
 Each note separates live checks from automated tests.
 
+- [0.2.5](0.2.5.md) (2026-10-07): Repairs dead owners despite completion recovery damage;
+  removes unused delivery fallback and consolidates status writes and helper containment.
 - [0.2.4](0.2.4.md) (2026-10-07): Consolidates launch waits and delivery settlement, preserves
   delivery failure reasons and residual-surface evidence, and localizes timeout diagnostics.
 - [0.2.3](0.2.3.md) (2026-10-07): Keeps the record of a Warp launch that fails after its tab

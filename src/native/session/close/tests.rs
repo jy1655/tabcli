@@ -1,16 +1,9 @@
 use super::*;
 
-#[test]
-fn converge_repairs_dead_owner_even_when_completion_recovery_is_damaged() {
+fn damaged_completion_fixture() -> (tempfile::TempDir, Store) {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open_unchecked(directory.path());
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
-    store
-        .write_owner(&NativeSessionOwner {
-            pid: 0,
-            ..Default::default()
-        })
-        .unwrap();
     store
         .record(CoreRecord::TurnClaim)
         .write_private(b"1-2-3\n")
@@ -30,6 +23,39 @@ fn converge_repairs_dead_owner_even_when_completion_recovery_is_damaged() {
             },
             status_error: None,
             status_state: SessionState::Ready,
+        })
+        .unwrap();
+    (directory, store)
+}
+
+#[test]
+fn converge_preserves_damaged_completion_without_a_proven_dead_owner() {
+    for pid in [None, Some(std::process::id())] {
+        let (_directory, store) = damaged_completion_fixture();
+        if let Some(pid) = pid {
+            store
+                .write_owner(&NativeSessionOwner {
+                    pid,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        let before = store.record(CoreRecord::Status).bytes().unwrap();
+        assert!(store.converge().is_err());
+        assert_eq!(store.record(CoreRecord::Status).bytes().unwrap(), before);
+        assert!(store.closed_if_present().unwrap().is_none());
+        assert!(store.record(CoreRecord::Completion).path().exists());
+        assert!(store.record(CoreRecord::TurnClaim).path().exists());
+    }
+}
+
+#[test]
+fn converge_repairs_dead_owner_even_when_completion_recovery_is_damaged() {
+    let (_directory, store) = damaged_completion_fixture();
+    store
+        .write_owner(&NativeSessionOwner {
+            pid: 0,
+            ..Default::default()
         })
         .unwrap();
     // The missing events directory prevents publication. Repair must still settle
