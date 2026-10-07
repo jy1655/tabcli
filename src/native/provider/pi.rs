@@ -27,6 +27,18 @@ pub(super) static ADAPTER: PiAdapter = PiAdapter;
 
 pub(super) struct PiAdapter;
 
+pub(super) fn result_timeout_diagnostic() -> super::super::doctor::ResultTimeoutDiagnostic {
+    super::super::doctor::ResultTimeoutDiagnostic {
+        probe: true,
+        // Credential configuration belongs to the session, not a submitted request.
+        detail: |check, _request_id| {
+            (check["id"] == "pi_provider_credentials")
+                .then(|| check["detail"].as_str())
+                .flatten()
+        },
+    }
+}
+
 const HOOK_FAILURE_FILE: &str = "pi-hook-failure.json";
 const PENDING_TURN_FILE: &str = "pi-pending-turn.json";
 #[cfg(any(windows, test))]

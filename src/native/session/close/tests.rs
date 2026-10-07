@@ -1,6 +1,75 @@
 use super::*;
 
 #[test]
+fn residual_surface_clears_only_after_the_adapter_confirms_close_or_absence() {
+    for typed in [false, true] {
+        for outcome in [
+            terminal::CloseOutcome::Closed,
+            terminal::CloseOutcome::Missing,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open_unchecked(directory.path());
+            fs::create_dir(directory.path().join("events")).unwrap();
+            update_status_with_residual(
+                directory.path(),
+                SessionState::Failed,
+                None,
+                Some(launch::RESIDUAL_SURFACE_MARKER.to_owned()),
+                typed.then_some(launch::ResidualSurface::Unverified),
+            )
+            .unwrap();
+            store
+                .write_terminal(&terminal::TerminalSession {
+                    kind: terminal::TerminalKind::Iterm2,
+                    id: "exact-retained-surface".to_owned(),
+                    tab_id: None,
+                    window_id: None,
+                    managed_session_id: None,
+                    wezterm_mux: None,
+                    windows_process_identity: None,
+                })
+                .unwrap();
+            let refusal = close(&store, None, |surface| {
+                assert_eq!(surface.id, "exact-retained-surface");
+                bail!("close authority not established")
+            });
+            assert!(refusal.is_err());
+            assert_eq!(
+                store.status().unwrap().residual_surface(),
+                Some(launch::ResidualSurface::Unverified)
+            );
+            assert!(store.record(CoreRecord::Terminal).path().exists());
+            // A normal status change cannot erase the typed or migrated legacy fact.
+            update_status(directory.path(), SessionState::Failed, None, None).unwrap();
+            assert_eq!(
+                store.status().unwrap().residual_surface(),
+                Some(launch::ResidualSurface::Unverified)
+            );
+            close(&store, None, |_| Ok(outcome)).unwrap();
+            let closed = store.status().unwrap();
+            assert_eq!(
+                closed.residual_surface,
+                Some(launch::ResidualSurface::Cleared)
+            );
+            assert_eq!(closed.residual_surface(), None);
+            store.converge().unwrap();
+            close(&store, None, |_| {
+                panic!("consumed handle must not close again")
+            })
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(store.status().unwrap()).unwrap(),
+                serde_json::to_value(&closed).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(store.closed_if_present().unwrap().unwrap()).unwrap(),
+                serde_json::to_value(closed).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
 fn converge_publishes_completion_before_repairing_dead_owner() {
     super::super::tests::with_fixed_time(|| {
         let directory = tempfile::tempdir().unwrap();
@@ -13,6 +82,7 @@ fn converge_publishes_completion_before_repairing_dead_owner() {
                 updated_unix_ms: 100,
                 exit_code: None,
                 error: None,
+                residual_surface: None,
             })
             .unwrap();
         store
@@ -182,6 +252,7 @@ fn interrupted_close_without_tombstone_converges_after_owner_exit() {
             updated_unix_ms: 100,
             exit_code: Some(0),
             error: None,
+            residual_surface: None,
         })
         .unwrap();
     store

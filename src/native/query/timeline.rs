@@ -235,6 +235,7 @@ fn snapshot(records: &Records) -> Result<Snapshot> {
                 updated_unix_ms: 0,
                 exit_code: None,
                 error: None,
+                residual_surface: None,
             }
         } else {
             parsed(records, CoreRecord::Status.name())?.context("session has no status record")?

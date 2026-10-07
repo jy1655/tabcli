@@ -191,10 +191,8 @@ where
             if !closing_path.exists() {
                 // No adapter will run for this residual surface. Keep its warning in
                 // the new tombstone; ordinary handle-less failures keep prior behavior.
-                let close_error = match status
-                    .error
-                    .filter(|error| error.contains(launch::RESIDUAL_SURFACE_MARKER))
-                {
+                let residual = status.residual_surface().and(status.error);
+                let close_error = match residual {
                     Some(residual) => Some(match close_error {
                         Some(error) => format!("{error}; {residual}"),
                         None => residual,
@@ -231,7 +229,13 @@ where
     }
 
     let consume_result = consume_terminal_handle(store, Some(terminal.kind.as_str()));
-    let close_result = mark_session_closed_locked(store, &claim_path, close_error);
+    // Only this path has the adapter's positive close/absence result. No-handle
+    // close, repair, and replay of a consumed handle cannot clear the observation.
+    let cleared = status
+        .residual_surface()
+        .map(|_| launch::ResidualSurface::Cleared);
+    let close_result =
+        mark_session_closed_with_residual_locked(store, &claim_path, close_error, cleared);
     consume_result?;
     close_result
 }
@@ -283,6 +287,7 @@ pub(in crate::native) fn converge_interrupted(
         status.state == tombstone.state
             && status.generation == tombstone.generation
             && status.error == tombstone.error
+            && status.residual_surface == tombstone.residual_surface
     });
     if !status_matches {
         update_status(
@@ -388,6 +393,15 @@ fn mark_session_closed_locked(
     claim_path: &Path,
     error: Option<String>,
 ) -> Result<()> {
+    mark_session_closed_with_residual_locked(store, claim_path, error, None)
+}
+
+fn mark_session_closed_with_residual_locked(
+    store: &Store,
+    claim_path: &Path,
+    error: Option<String>,
+    residual_surface: Option<launch::ResidualSurface>,
+) -> Result<()> {
     let directory = store.directory();
     let consume_result = if store
         .record(CoreRecord::Terminal)
@@ -404,7 +418,13 @@ fn mark_session_closed_locked(
     } else {
         Ok(())
     };
-    let status_result = update_status(directory, SessionState::Closed, None, error);
+    let status_result = update_status_with_residual(
+        directory,
+        SessionState::Closed,
+        None,
+        error,
+        residual_surface,
+    );
     let (pending_result, running_result, claim_result) = if status_result.is_ok() {
         // An event the journal disagrees with is set aside first, then the claim is
         // released, and only then is the journal removed: every interruption of this order

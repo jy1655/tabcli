@@ -18,6 +18,35 @@ use serde_json::{Value, json};
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PROBE_OUTPUT: u64 = 64 * 1024;
 
+// A provider owns which observation can explain a timed-out result and whether it
+// needs an explicit probe. The caller owns the bound on executing the command.
+pub(super) struct ResultTimeoutDiagnostic {
+    pub(super) probe: bool,
+    pub(super) detail: for<'a> fn(&'a Value, &str) -> Option<&'a str>,
+}
+
+pub(super) fn result_timeout_detail(
+    provider: FirstPartyCli,
+    session: &str,
+    request_id: &str,
+    mut observe: impl FnMut(&[String]) -> Option<Value>,
+) -> Option<String> {
+    let diagnostic = provider::result_timeout_diagnostic(provider)?;
+    let mut args = vec!["doctor".to_owned(), session.to_owned()];
+    if diagnostic.probe {
+        args.push("--probe".to_owned());
+    }
+    args.push("--json".to_owned());
+    let report = observe(&args)?;
+    if report["session"] != session {
+        return None;
+    }
+    report["checks"]
+        .as_array()?
+        .iter()
+        .find_map(|check| (diagnostic.detail)(check, request_id).map(str::to_owned))
+}
+
 #[derive(Debug)]
 pub(crate) struct DoctorRequest {
     session: Option<String>,

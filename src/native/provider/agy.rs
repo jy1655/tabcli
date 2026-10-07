@@ -30,6 +30,18 @@ pub(super) static ADAPTER: AgyAdapter = AgyAdapter;
 
 pub(super) struct AgyAdapter;
 
+pub(super) fn result_timeout_diagnostic() -> super::super::doctor::ResultTimeoutDiagnostic {
+    super::super::doctor::ResultTimeoutDiagnostic {
+        probe: false,
+        detail: |check, request_id| {
+            (check["reason_code"] == "agy_tool_confirmation_observed"
+                && check["evidence"]["request_id"] == request_id)
+                .then(|| check["detail"].as_str())
+                .flatten()
+        },
+    }
+}
+
 const PENDING_TURN_FILE: &str = "agy-pending-turn.json";
 const TRANSCRIPT_FILE: &str = "transcript.jsonl";
 const FULL_TRANSCRIPT_FILE: &str = "transcript_full.jsonl";
@@ -510,8 +522,8 @@ fn correlated_response<'a>(message: &'a str, pending: &PendingAgyTurn) -> Result
 //   truncated), and a partial trailing line all stay uncertain and never `not_sent`.
 //   The paste is never repeated. A lost paste therefore ends as delivery-uncertain:
 //   the launcher keeps the turn claim, leaves the session `working`, and writes the
-//   receipt error to `status.error` (`record_initial_prompt_delivery_failure` for
-//   the initial prompt, `record_follow_up_terminal_delivery_failure` for `tell`).
+//   receipt error to `status.error` (`Claim::settle_delivery` for both
+//   the initial prompt and `tell`).
 //   The caller must inspect that error (or `doctor <session>`) and then close the
 //   session with `close-session --explicit` or launch a new one; the bridge never
 //   re-pastes or cleans up on its own.
@@ -5777,7 +5789,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
     // the claim or the composer.
     #[test]
     fn lost_initial_paste_ends_delivery_uncertain_with_the_reason_in_status_json() {
-        use super::super::super::{TURN_CLAIM_FILE, record_initial_prompt_delivery_failure};
+        use super::super::super::TURN_CLAIM_FILE;
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("session-fMqSQc");
         fs::create_dir_all(directory.join("events")).unwrap();
@@ -5815,12 +5827,14 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         .unwrap_err();
         assert!(failure.delivery_may_have_occurred());
 
-        record_initial_prompt_delivery_failure(
-            &directory,
-            &mut claim,
-            failure.delivery_may_have_occurred(),
-            failure.error(),
-        );
+        {
+            let delivery_error = failure.error();
+            let _ = claim.settle_delivery(if failure.delivery_may_have_occurred() {
+                turn::Delivery::Uncertain(delivery_error)
+            } else {
+                turn::Delivery::NotSent(delivery_error)
+            });
+        };
         drop(claim);
 
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
@@ -6000,7 +6014,7 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
     // claim retained.
     #[test]
     fn lost_macos_follow_up_paste_ends_delivery_uncertain_with_the_reason_in_status_json() {
-        use super::super::super::{TURN_CLAIM_FILE, record_follow_up_terminal_delivery_failure};
+        use super::super::super::TURN_CLAIM_FILE;
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("session-QMFk6F");
         fs::create_dir_all(directory.join("events")).unwrap();
@@ -6045,7 +6059,14 @@ I0924 21:32:19.644263     623 manager.go:1312] Slash commands unchanged, skippin
         .unwrap_err();
         assert!(failure.delivery_may_have_occurred());
 
-        record_follow_up_terminal_delivery_failure(&directory, &mut claim, &failure);
+        {
+            let delivery_error = failure.error();
+            let _ = claim.settle_delivery(if failure.delivery_may_have_occurred() {
+                turn::Delivery::Uncertain(delivery_error)
+            } else {
+                turn::Delivery::NotSent(delivery_error)
+            });
+        };
         drop(claim);
 
         let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();

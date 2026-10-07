@@ -1806,6 +1806,11 @@ mod tests {
             assert!(after.error.as_deref().unwrap().contains("u2"));
             before.error = after.error.clone();
             assert_eq!(
+                after.residual_surface,
+                Some(launch::ResidualSurface::Unverified)
+            );
+            before.residual_surface = after.residual_surface;
+            assert_eq!(
                 serde_json::to_value(before).unwrap(),
                 serde_json::to_value(&after).unwrap()
             );

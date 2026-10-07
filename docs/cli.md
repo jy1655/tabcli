@@ -534,7 +534,7 @@ authentication in the provider CLI or answer a trust dialog yourself. If cleanup
 reported session and use `close-session SESSION --explicit`; do not rerun the model prompt to test
 cleanup. An unconfirmed close is `not_verified`, including a close that times out. Its reason
 names the session and includes the recorded launch error when a failed launch retained a surface.
-A closed session whose error names a residual surface makes cleanup `not_verified` even when
+A closed session with an unverified residual surface makes cleanup `not_verified` even when
 close itself succeeded. If self-test's explicit close confirms that surface is gone, cleanup passes
 even though the launch failed.
 
@@ -841,6 +841,12 @@ Fields: `schema_version`, `ok`, `session`, `provider`, `workspace`, `title`, `st
 and `provider_version_at_launch`. Request references include `request_id`, `created_unix_ms`,
 `source`, `event_id`, `context_sources`, `active`, and the two elapsed-time fields described under
 `result`.
+
+`residual_surface` is optionally `"unverified"` when a failed launch left a surface whose cleanup
+has not been confirmed. It persists independently of `error`, including after a handle-less
+close. Only the terminal adapter's confirmed close or absence clears it. Older records with
+the residual-surface warning are recognized without being rewritten. Ordinary inspections omit
+this field; it grants no additional close authority.
 
 ### result
 

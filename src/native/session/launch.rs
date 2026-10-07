@@ -12,10 +12,56 @@ pub(in crate::native) use super::LAUNCH_FILE as FILE;
 pub(in crate::native) const LOG: &str = "launch.log";
 pub(in crate::native) const STDERR_ENV: &str = "AGENT_BRIDGE_LAUNCH_STDERR_FD";
 pub(in crate::native) const STDOUT_ENV: &str = "AGENT_BRIDGE_LAUNCH_STDOUT_FD";
-// Shared diagnostic marker: a cancelled launch left no handle Bridge can close.
+// Retained for older readers and for reading records written before residual_surface.
 pub(in crate::native) const RESIDUAL_SURFACE_MARKER: &str =
     "the surface may remain and is not closed by Bridge";
 const START_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whether cleanup of a surface left by a failed launch has been confirmed. This
+/// observation grants no close authority and does not bind a terminal handle.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::native) enum ResidualSurface {
+    Unverified,
+    Cleared,
+}
+
+impl SessionStatus {
+    pub(in crate::native) fn residual_surface(&self) -> Option<ResidualSurface> {
+        if self.residual_surface == Some(ResidualSurface::Cleared) {
+            return None;
+        }
+        self.residual_surface.or_else(|| {
+            self.error
+                .as_deref()
+                .is_some_and(|error| error.contains(RESIDUAL_SURFACE_MARKER))
+                .then_some(ResidualSurface::Unverified)
+        })
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "launch/binding_tests.rs"]
+pub(in crate::native) mod binding_tests;
+
+#[cfg(target_os = "macos")]
+fn binding_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = binding_tests::now() {
+        return now;
+    }
+    Instant::now()
+}
+
+#[cfg(target_os = "macos")]
+fn binding_sleep() {
+    let delay = Duration::from_millis(10);
+    #[cfg(test)]
+    if binding_tests::retry(delay) {
+        return;
+    }
+    thread::sleep(delay);
+}
 
 pub(in crate::native) fn install_script(store: &Store, contents: &str) -> Result<String> {
     let directory = store.directory();
@@ -69,6 +115,81 @@ pub(in crate::native) fn read(reader: &Reader) -> Result<Option<Record>> {
     Ok(record)
 }
 
+/// The existing macOS launch hosts have distinct diagnostics and two wait budgets.
+/// Keeping their selection here leaves adapters responsible only for surface identity.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+pub(in crate::native) enum BindingHost {
+    Iterm2,
+    AppleTerminal,
+    WezTerm,
+}
+
+/// Observe a pending launch until its managed surface is bound. This is an ordered,
+/// unlocked observation, not authorization to spawn; `spawn` owns that final fence.
+#[cfg(target_os = "macos")]
+pub(in crate::native) fn wait_for_binding(
+    reader: &Reader,
+    session_id: &str,
+    host: BindingHost,
+) -> Result<terminal::TerminalSession> {
+    let (name, cancelled) = match host {
+        BindingHost::Iterm2 => (
+            "iTerm2",
+            "iTerm2 launch was cancelled or timed out before surface binding",
+        ),
+        BindingHost::AppleTerminal => (
+            "Terminal.app",
+            "Terminal.app launch was cancelled or timed out before its surface was bound",
+        ),
+        BindingHost::WezTerm => (
+            "WezTerm",
+            "WezTerm launch was cancelled or timed out before surface binding",
+        ),
+    };
+    let initial = read(reader)?.with_context(|| format!("missing {name} launch receipt"))?;
+    #[cfg(test)]
+    binding_tests::checkpoint(binding_tests::Point::InitialReceipt);
+    // Preserve both budgets: after wall-clock rollback or a receipt extension,
+    // Terminal.app may continue beyond the initial receipt's remaining duration.
+    let budget = match host {
+        BindingHost::AppleTerminal => START_TIMEOUT,
+        BindingHost::Iterm2 | BindingHost::WezTerm => Duration::from_millis(
+            initial
+                .deadline_unix_ms
+                .saturating_sub(unix_ms())
+                .min(30_000) as u64,
+        ),
+    };
+    let deadline = binding_now() + budget;
+    #[cfg(test)]
+    binding_tests::checkpoint(binding_tests::Point::BudgetCaptured);
+    loop {
+        let record = read(reader)?.with_context(|| format!("missing {name} launch receipt"))?;
+        // Status is read even after expiry. Keep claim and binding reads lazy: these
+        // short circuits also determine which damaged-record error the host reports.
+        let status: SessionStatus = reader.status()?;
+        if binding_now() >= deadline
+            || unix_ms() >= record.deadline_unix_ms
+            || record.phase != Phase::Pending
+            || record.claim_token != initial.claim_token
+            || status.state != SessionState::Launching
+            || turn::current_claim_token(reader)?.as_deref() != Some(initial.claim_token.as_str())
+        {
+            bail!("{cancelled}");
+        }
+        #[cfg(test)]
+        binding_tests::checkpoint(binding_tests::Point::BeforeBinding);
+        if let Some(text) = reader.record(CoreRecord::Terminal).text()? {
+            let surface: terminal::TerminalSession = serde_json::from_str(&text)
+                .with_context(|| format!("invalid {name} surface binding"))?;
+            surface.verify_managed_session(session_id)?;
+            return Ok(surface);
+        }
+        binding_sleep();
+    }
+}
+
 pub(in crate::native) fn log(store: &Store, message: &str) {
     let directory = store.directory();
     // Diagnostics are auxiliary. A missing/unwritable log must never stop valid input.
@@ -113,6 +234,15 @@ pub(in crate::native) fn begin(
 }
 
 fn fail_locked(store: &Store, record: &Record, reason: &str) -> Result<()> {
+    fail_locked_with_residual(store, record, reason, None)
+}
+
+fn fail_locked_with_residual(
+    store: &Store,
+    record: &Record,
+    reason: &str,
+    residual_surface: Option<ResidualSurface>,
+) -> Result<()> {
     let directory = store.directory();
     if turn::current_claim_token(&Reader::open_unchecked(directory))?.as_deref()
         != Some(&record.claim_token)
@@ -135,7 +265,13 @@ fn fail_locked(store: &Store, record: &Record, reason: &str) -> Result<()> {
     } else {
         reason.to_owned()
     };
-    update_status(directory, SessionState::Failed, None, Some(reason.clone()))?;
+    update_status_with_residual(
+        directory,
+        SessionState::Failed,
+        None,
+        Some(reason.clone()),
+        residual_surface,
+    )?;
     if record.phase == Phase::Pending {
         remove_turn_claim_locked(
             Reader::open_unchecked(directory)
@@ -201,6 +337,7 @@ pub(in crate::native) fn terminal_failed(store: &Store, error: &anyhow::Error) -
                 Some(existing) => format!("{existing}; {message}"),
                 None => message.clone(),
             });
+            diagnostic.residual_surface = Some(ResidualSurface::Unverified);
             if diagnostic.state == SessionState::Closed {
                 store.write_closed(&diagnostic)?;
             }
@@ -219,10 +356,17 @@ pub(in crate::native) fn terminal_failed(store: &Store, error: &anyhow::Error) -
             .to_owned(),
     );
     let persisted = store.write_terminal(&surface);
+    let residual =
+        (retained.unverified_cleanup || persisted.is_err()).then_some(ResidualSurface::Unverified);
+    let reason = if residual.is_some() && !reason.contains(RESIDUAL_SURFACE_MARKER) {
+        format!("{reason}; {RESIDUAL_SURFACE_MARKER}")
+    } else {
+        reason
+    };
     // Even a failed record write must leave the launch failure and exact surface in
     // status.error. Return the write error as well; never claim persistence succeeded.
     if let Some(record) = record {
-        fail_locked(store, &record, &reason)?;
+        fail_locked_with_residual(store, &record, &reason, residual)?;
     }
     persisted.context("failed to persist the retained launch surface")
 }
@@ -547,6 +691,87 @@ mod tests {
         let id = directory.file_name().unwrap().to_str().unwrap();
         record_provider_process(directory, id, child)?;
         update_status(directory, SessionState::Running, None, None)
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn retained_surface_record_failure_is_durable() {
+        let (directory, _) = fixture();
+        let store = Store::open_unchecked(directory.path());
+        let surface = serde_json::from_value(serde_json::json!({
+            "terminal":"ghostty", "session_id":"u2", "tab_id":"t2", "window_id":"w1"
+        }))
+        .unwrap();
+        let error =
+            terminal::RetainedLaunchSurface::new(surface, "exact cleanup failed".to_owned()).into();
+        let handle = store.record(CoreRecord::Terminal).path().to_owned();
+        fs::create_dir(&handle).unwrap();
+        assert!(terminal_failed(&store, &error).is_err());
+        fs::remove_dir(&handle).unwrap();
+        assert_eq!(store.status().unwrap().state, SessionState::Failed);
+        assert_eq!(
+            store.status().unwrap().residual_surface(),
+            Some(ResidualSurface::Unverified)
+        );
+        session::close::close(&store, None, |_| {
+            panic!("no persisted handle grants authority")
+        })
+        .unwrap();
+        assert_eq!(
+            store.status().unwrap().residual_surface(),
+            Some(ResidualSurface::Unverified)
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn unbound_residual_survives_changed_diagnostics_and_repeated_close() {
+        for closed_first in [false, true] {
+            let (directory, _) = fixture();
+            let store = Store::open_unchecked(directory.path());
+            fail(&store, "launch cancelled").unwrap();
+            if closed_first {
+                session::close::close(&store, None, |_| panic!("no surface is bound")).unwrap();
+            }
+            let surface = serde_json::from_value(serde_json::json!({
+                "terminal":"ghostty", "session_id":"u2", "tab_id":"t2", "window_id":"w1"
+            }))
+            .unwrap();
+            let error =
+                terminal::RetainedLaunchSurface::new(surface, "late failure".to_owned()).into();
+            assert!(terminal_failed(&store, &error).is_err());
+            let mut status = store.status().unwrap();
+            assert_eq!(status.residual_surface, Some(ResidualSurface::Unverified));
+            status.error = Some("new diagnostic wording".to_owned());
+            store.write_status(&status).unwrap();
+            if closed_first {
+                store.write_closed(&status).unwrap();
+                // Simulate interruption after the tombstone amendment but before the
+                // status amendment. Close convergence must restore the typed fact.
+                status.residual_surface = None;
+                store.write_status(&status).unwrap();
+                store.converge().unwrap();
+                assert_eq!(
+                    store.status().unwrap().residual_surface,
+                    Some(ResidualSurface::Unverified)
+                );
+            }
+            for _ in 0..2 {
+                session::close::close(&store, None, |_| {
+                    panic!("residual evidence grants no authority")
+                })
+                .unwrap();
+                let status = store.status().unwrap();
+                assert_eq!(status.state, SessionState::Closed);
+                assert_eq!(status.residual_surface(), Some(ResidualSurface::Unverified));
+                assert_eq!(status.error.as_deref(), Some("new diagnostic wording"));
+                assert_eq!(
+                    store.closed_if_present().unwrap().unwrap().residual_surface,
+                    Some(ResidualSurface::Unverified)
+                );
+                assert!(!store.record(CoreRecord::Terminal).path().exists());
+            }
+        }
     }
 
     #[test]

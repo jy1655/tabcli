@@ -853,9 +853,18 @@ fn closed_residual_surface_cleanup_is_not_verified() {
         "Ghostty u2 tab=t2 window=w1; {}",
         launch::RESIDUAL_SURFACE_MARKER
     );
-    for recorded_error in [None, Some("ordinary launch error"), Some(residual.as_str())] {
+    for (recorded_error, residual_recorded) in [
+        (None, false),
+        (Some("ordinary launch error"), false),
+        (Some(residual.as_str()), true),
+        (Some("the diagnostic wording changed"), true),
+        (None, true),
+    ] {
         let mut replies = cleanup();
         replies[1].value["error"] = json!(recorded_error);
+        if residual_recorded {
+            replies[1].value["residual_surface"] = json!("unverified");
+        }
         let mut fake = fake(
             [
                 accepted("request-1"),
@@ -867,7 +876,7 @@ fn closed_residual_surface_cleanup_is_not_verified() {
             .chain(replies),
         );
         let report = run_fake(&mut fake);
-        let expected = if recorded_error == Some(residual.as_str()) {
+        let expected = if residual_recorded {
             Outcome::NotVerified
         } else {
             Outcome::Passed
@@ -881,7 +890,9 @@ fn closed_residual_surface_cleanup_is_not_verified() {
         if expected == Outcome::NotVerified {
             let reason = report.steps[4].reason.as_deref().unwrap();
             assert!(reason.contains("session-owned"));
-            assert!(reason.contains(&residual));
+            if let Some(recorded_error) = recorded_error {
+                assert!(reason.contains(recorded_error));
+            }
         }
     }
 }
@@ -891,7 +902,13 @@ fn agy_result_timeouts_append_only_the_same_requests_doctor_observation() {
     const REASON: &str = "waiting timed out; the request was not cancelled or resent";
     const DETAIL: &str = "This session's agy.log shows the pending turn waiting for user approval of RunCommand in the terminal. Bridge does not answer it. This is the last observed confirmation, not proof that the dialog is still open.";
     for follow_up in [false, true] {
-        for evidence in ["matching", "other-request", "missing", "doctor-error"] {
+        for evidence in [
+            "matching",
+            "other-request",
+            "other-session",
+            "missing",
+            "doctor-error",
+        ] {
             let id = if follow_up { "request-2" } else { "request-1" };
             let mut replies = vec![accepted("request-1")];
             if follow_up {
@@ -903,9 +920,9 @@ fn agy_result_timeouts_append_only_the_same_requests_doctor_observation() {
             replies.push(match evidence {
                 "doctor-error" => error("doctor timed out"),
                 "missing" => ok(json!({"session":"session-owned", "checks":[]})),
-                _ => ok(json!({"session":"session-owned", "checks":[{
+                _ => ok(json!({"session":if evidence == "other-session" {"session-other"} else {"session-owned"}, "checks":[{
                     "reason_code":"agy_tool_confirmation_observed", "detail":DETAIL,
-                    "evidence":{"request_id":if evidence == "matching" {id} else {"request-other"}}
+                    "evidence":{"request_id":if evidence == "other-request" {"request-other"} else {id}}
                 }]})),
             });
             replies.extend(cleanup());

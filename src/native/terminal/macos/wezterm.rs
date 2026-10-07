@@ -1,6 +1,5 @@
 use super::process;
-use crate::native::session::SessionState;
-use crate::native::session::{CoreRecord, Reader, Store};
+use crate::native::session::{Reader, Store};
 #[cfg(test)]
 use crate::native::terminal::ownership;
 // WezTerm through its official CLI (pinned source: 20240203-110809-5046fc22).
@@ -932,50 +931,17 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
 }
 
 fn wait_for_binding(directory: &Path, id: &str, pane: &str, socket: &Path) -> Result<()> {
-    use crate::native::{SessionStatus, launch, unix_ms};
-    let initial = launch::read(&Reader::open_unchecked(directory))?
-        .context("missing WezTerm launch receipt")?;
-    let remaining = initial
-        .deadline_unix_ms
-        .saturating_sub(unix_ms())
-        .min(30_000);
-    let deadline = Instant::now() + Duration::from_millis(remaining as u64);
-    loop {
-        let record = launch::read(&Reader::open_unchecked(directory))?
-            .context("missing WezTerm launch receipt")?;
-        let status: SessionStatus = Reader::open_unchecked(directory).status()?;
-        if Instant::now() >= deadline
-            || unix_ms() >= record.deadline_unix_ms
-            || record.phase != launch::Phase::Pending
-            || record.claim_token != initial.claim_token
-            || status.state != SessionState::Launching
-            || crate::native::session::turn::current_claim_token(
-                &crate::native::session::Reader::open_unchecked(directory),
-            )?
-            .as_deref()
-                != Some(initial.claim_token.as_str())
-        {
-            bail!("WezTerm launch was cancelled or timed out before surface binding");
-        }
-        if let Some(text) = Reader::open_unchecked(directory)
-            .record(CoreRecord::Terminal)
-            .text()?
-        {
-            let surface: TerminalSession =
-                serde_json::from_str(&text).context("invalid WezTerm surface binding")?;
-            surface.verify_managed_session(id)?;
-            if surface.kind != TerminalKind::WezTerm
-                || surface.id != pane
-                || surface
-                    .wezterm_mux
-                    .is_none_or(|mux| Path::new(&mux.socket) != socket)
-            {
-                bail!("WezTerm surface binding does not name the pane of this launch host");
-            }
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(10));
+    use crate::native::launch::{BindingHost, wait_for_binding};
+    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BindingHost::WezTerm)?;
+    if surface.kind != TerminalKind::WezTerm
+        || surface.id != pane
+        || surface
+            .wezterm_mux
+            .is_none_or(|mux| Path::new(&mux.socket) != socket)
+    {
+        bail!("WezTerm surface binding does not name the pane of this launch host");
     }
+    Ok(())
 }
 
 // The prompt and its Enter are one write to the pty. Only a call that never started is
@@ -1151,6 +1117,15 @@ pub(super) fn close_session_until(
 
 #[cfg(test)]
 mod tests {
+    use crate::native::session::SessionState;
+
+    #[test]
+    fn host_binding_partial_transitions() {
+        crate::native::launch::binding_tests::characterize("WezTerm", |directory, id| {
+            wait_for_binding(directory, id, "host-id", Path::new("/tmp/binding-socket"))
+        });
+    }
+
     use std::{
         cell::RefCell, os::unix::process::ExitStatusExt, path::PathBuf, process::ExitStatus,
     };

@@ -87,6 +87,11 @@ _Avoid_: terminal (the application), screen
 The Bridge process that launched a session and is attested as controlling its surface.
 _Avoid_: parent, launcher process
 
+**Residual surface**:
+A surface left by a failed launch whose cleanup has not been confirmed. Recording it does
+not grant close authority; a closed session can still have a residual surface.
+_Avoid_: orphan (absence of an owner does not prove this observation)
+
 **Attestation**:
 The proof that a recorded owner is the live process it names: its PID, birth, controlling
 TTY and process groups (on Windows its process identity) match what the system reports now.
