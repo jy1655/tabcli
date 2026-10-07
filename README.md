@@ -97,7 +97,10 @@ Codex follow-ups require 0.149.0 or newer; no shared daemon is required. Claude 
 cross-session messaging in its installed backend and configuration, not only a recent version.
 See [provider requirements](docs/providers.md) for delivery paths and failure handling.
 
-- [2026-10-07 macOS](docs/verification/2026-10-07-macos-0.2.1.md): Codex in the four terminals
+- [2026-10-07 macOS, 0.2.2](docs/verification/2026-10-07-macos-0.2.2.md): Codex in the four
+  terminals above, Claude in WezTerm, Agy in WezTerm in its default permission mode and with
+  `--yolo`, and Pi in WezTerm with a logged-in provider, all with the screen unlocked.
+- [2026-10-07 macOS, 0.2.1](docs/verification/2026-10-07-macos-0.2.1.md): Codex in the four terminals
   above and Claude in WezTerm with provider defaults; Agy in WezTerm with `--yolo`. With the
   screen locked, Terminal.app and Ghostty did not complete a round trip. Agy's default-mode
   attempt and Pi's attempt timed out; they were not round-trip passes.
