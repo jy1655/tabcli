@@ -1212,56 +1212,6 @@ impl Claim {
     pub(in crate::native) fn receipt(&self) -> &requests::Receipt {
         &self.receipt
     }
-
-    /// Publish a completion of this claim. A stale owner leaves the current turn alone.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "owning-command completion interface; current commands retain for asynchronous reports"
-        )
-    )]
-    pub(in crate::native) fn complete(&mut self, event: SessionEvent) -> Result<()> {
-        let directory = self
-            .path
-            .parent()
-            .context("turn claim has no session directory")?;
-        let store = Store::open_unchecked(directory);
-        let _lock = store.lock()?;
-        // Once publication begins, recovery owns any partial journal. A failed write
-        // must not let Drop roll its claim back out from under that journal.
-        self.retained = true;
-        recover_pending_completion_locked(directory, &self.path)?;
-        if !claim_is_current(directory, Some(self.token()))? {
-            return Ok(());
-        }
-        let error = event.error.clone();
-        commit_completion_locked(directory, &self.path, self.token(), event, error)?;
-        Ok(())
-    }
-
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "owning-command failure interface; current commands retain for asynchronous reports"
-        )
-    )]
-    pub(in crate::native) fn fail(&mut self, error: &str) -> Result<()> {
-        let directory = self
-            .path
-            .parent()
-            .context("turn claim has no session directory")?;
-        let provider = Reader::open_unchecked(directory).manifest()?.provider;
-        self.complete(SessionEvent {
-            provider,
-            message: String::new(),
-            error: Some(terminal_safe_text(error, true)),
-            provider_session_id: None,
-            turn_id: None,
-            created_unix_ms: Some(unix_ms()),
-        })
-    }
 }
 
 /// An adapter's completion handle. Provider identity is explicit: constructing a report

@@ -34,6 +34,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 
 - `src/main.rs` contains top-level dispatch and help; `src/native.rs` parses native commands,
   coordinates launch and delivery, and defines the shared manifest and event types.
+- `src/native/reopen.rs` owns Reopen source reservations, provenance, launch refusals,
+  and their settlement, including read-only marker diagnostics. It creates the new Session
+  and records its provenance before finalizing the source marker. Launch and delivery keep
+  their existing holder-check timing; provider adapters supply the holder evidence.
 - `src/providers/` defines the CLI identities, minimum versions, and model, effort, and bypass
   argument mappings. The library uses these mappings before the native launch path.
 - `src/native/provider/` owns each provider's launch and resume plans, trust interpretation,
@@ -57,6 +61,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   timeline views using the session readers and common publication rules. Queries get a `Reader`,
   not a `Store`. To expose an adapter-private fact, add an observation to that adapter's interface;
   do not read its private record from the query or call repair.
+  Request observation precedes JSON rendering. Context attachment resolution uses the same
+  observation and requires strict event decoding, an exact event name, and verifiable provenance;
+  it does not reconstruct Request meaning from command JSON. Timeline retains its cached strict
+  reads, and search retains its cumulative byte budget.
 - `src/native/doctor.rs` combines read-only shared observations with provider diagnostics and
   optional bounded probes. Providers choose which observation can explain a result timeout;
   `doctor` assembles that read and `self_test` bounds its execution. A diagnostic report is not
@@ -165,6 +173,12 @@ Readers apply the same publication predicate without completing these writes. Th
 or result query can report recovery needed without making an unpublished completion into a
 result. Timeline entries describe observed records; derived request summaries are identified as
 such rather than invented as historical events.
+
+Commands hold a Claim for Delivery and settlement; provider adapters report completion through
+`turn::Report`. Completion tests use that same interface, including interrupted publication and
+late delivery outcomes. Agy keeps its Result evidence reader inside its adapter: both the monitor
+and diagnostics resolve truncated transcript rows and correlate the complete body there, while
+only the monitor publishes the Result or records a subsequent failure.
 
 ## Record and adapter seams
 

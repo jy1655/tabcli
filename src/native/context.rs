@@ -238,65 +238,10 @@ pub(crate) fn resolve_in(root: &Path, references: &[ContextResultRef]) -> Result
             };
             unattachable(reference, state, Some(format!("{error:#}")))
         })?;
-        let value = snapshot
-            .result(&reader, &reference.selector())
-            .map_err(|error| unattachable(reference, "unreadable", Some(format!("{error:#}"))))?;
-        let state = value["request_state"].as_str().unwrap_or("unknown");
-        if state != "completed" || value["result"].is_null() || !value["error"].is_null() {
-            return Err(unattachable(reference, state, None));
-        }
-        let unreadable = |detail: String| unattachable(reference, "unreadable", Some(detail));
-        let event_id = value["event_id"]
-            .as_str()
-            .map(str::to_owned)
-            .ok_or_else(|| unreadable("no event id".to_owned()))?;
-        let request_id = value["request_id"].as_str().map(str::to_owned);
-        // A legacy event is one that a fully readable request index simply does not map.
-        // While any receipt is unreadable, an unmapped event may still belong to an active
-        // claim, so the snapshot's publication decision for it cannot be trusted.
-        if request_id.is_none()
-            && (snapshot.unreadable_requests > 0 || snapshot.request_index_error.is_some())
-        {
-            let mut detail = format!(
-                "the request index has {} unreadable receipt(s), so the event may still belong to an active request",
-                snapshot.unreadable_requests
-            );
-            if let Some(error) = &snapshot.request_index_error {
-                detail = format!("{detail}; {error}");
-            }
-            return Err(unattachable(reference, "unverifiable", Some(detail)));
-        }
-        // Publication was decided by name; the record must exist under exactly that name,
-        // or a case-insensitive filesystem may have opened a different file.
-        let exact = Reader::open_unchecked(&directory)
-            .events()
-            .map_err(|error| unreadable(format!("{error:#}")))?
-            .into_iter()
-            .any(|path| path.file_name().and_then(|name| name.to_str()) == Some(&event_id));
-        if !exact {
-            return Err(unreadable(format!(
-                "recorded event filename {event_id} does not match an events/ entry exactly"
-            )));
-        }
-        let event = reader.event_strict(&event_id).map_err(unreadable)?;
+        let (source, message) = snapshot
+            .attachable_result(&reader, &reference.selector(), &reference.session)
+            .map_err(|failure| unattachable(reference, failure.state, failure.detail))?;
         drop(snapshot);
-        if event.error.is_some() {
-            return Err(unattachable(reference, "failed", None));
-        }
-        let source = ContextSource {
-            session: reference.session.clone(),
-            request_id,
-            event_id,
-            provider: value["provider"]
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| unreadable("no provider".to_owned()))?,
-            created_unix_ms: event
-                .created_unix_ms
-                .ok_or_else(|| unreadable("no event creation time".to_owned()))?,
-        };
-        requests::validate_context_source(&source)
-            .map_err(|error| unreadable(format!("invalid recorded provenance: {error:#}")))?;
         if entries
             .iter()
             .any(|(existing, _): &(ContextSource, String)| {
@@ -308,7 +253,7 @@ pub(crate) fn resolve_in(root: &Path, references: &[ContextResultRef]) -> Result
                 reference.address()
             );
         }
-        entries.push((source, event.message));
+        entries.push((source, message));
     }
     render(&entries)
 }

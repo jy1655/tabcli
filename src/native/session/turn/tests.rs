@@ -51,7 +51,9 @@ fn journal_comparison_requires_exact_bytes_inside_the_read_limit() {
 fn delivery_settlement_regression_late_not_sent_preserves_newer_turn() {
     let (_directory, store) = fixture(SessionState::Working);
     let mut old = claim(&store, &[]).unwrap();
-    old.complete(event("already completed")).unwrap();
+    Report::for_claim(&store, FirstPartyCli::Codex, Some(old.token()))
+        .complete("already completed", None, None)
+        .unwrap();
     let (newer, _) = claim_ready(&store, "session-test", &[]).unwrap();
     let before = fs::read(store.record(CoreRecord::Status).path()).unwrap();
     old.settle_delivery(Delivery::NotSent(&anyhow::anyhow!("late not sent")))
@@ -92,25 +94,32 @@ fn delivery_settlement_regression_not_sent_keeps_failure_reason() {
 }
 
 #[test]
-fn claim_complete_publishes_once_and_releases_exclusive_ownership() {
+fn report_complete_publishes_once_and_releases_exclusive_ownership() {
     let (_directory, store) = fixture(SessionState::Working);
-    let mut claimed = claim(&store, &[]).unwrap();
+    let claimed = claim(&store, &[]).unwrap();
     assert!(claim(&store, &[]).is_err());
     assert!(!published(&store, Some(claimed.token())).unwrap());
     let request_id = claimed.receipt().request_id.clone();
     let event_name = claimed.receipt().event_file.clone();
-    claimed.complete(event("completed")).unwrap();
+    Report::for_claim(&store, FirstPartyCli::Codex, Some(claimed.token()))
+        .complete("completed", None, None)
+        .unwrap();
     assert!(published(&store, Some(claimed.token())).unwrap());
     assert!(current_claim_token(&store).unwrap().is_none());
     assert_eq!(store.status().unwrap().state, SessionState::Ready);
     assert_eq!(store.events().unwrap().len(), 1);
-    assert_eq!(store.event_strict(&event_name).unwrap(), event("completed"));
+    let completed = store.event_strict(&event_name).unwrap();
+    assert_eq!(completed.message, "completed");
+    assert!(completed.error.is_none());
+    assert!(completed.created_unix_ms.is_some());
     assert_eq!(
         requests::list(&store).unwrap().receipts[0].request_id,
         request_id
     );
-    // Repeating either completion interface cannot publish twice.
-    claimed.complete(event("duplicate")).unwrap();
+    // Repeating the provider completion cannot publish twice.
+    Report::for_claim(&store, FirstPartyCli::Codex, Some(claimed.token()))
+        .complete("duplicate", None, None)
+        .unwrap();
     Report::for_claim(&store, FirstPartyCli::Codex, Some(claimed.token()))
         .complete("duplicate", None, None)
         .unwrap();
@@ -183,7 +192,8 @@ fn delivery_reports_after_completion_never_resurrect_or_mutate_a_turn() {
         for outcome in ["sent", "not_sent", "uncertain"] {
             let (_directory, store) = fixture(SessionState::Working);
             let mut old = claim(&store, &[]).unwrap();
-            old.complete(event("completed before the sender settled"))
+            Report::for_claim(&store, FirstPartyCli::Codex, Some(old.token()))
+                .complete("completed before the sender settled", None, None)
                 .unwrap();
             let newer = successor.then(|| claim_ready(&store, "session-test", &[]).unwrap().0);
             let before = fs::read(store.record(CoreRecord::Status).path()).unwrap();
@@ -290,7 +300,9 @@ fn delivery_begin_refuses_closed_and_replaced_claims() {
     for closed in [false, true] {
         let (_directory, store) = fixture(SessionState::Working);
         let mut old = claim(&store, &[]).unwrap();
-        old.complete(event("completed")).unwrap();
+        Report::for_claim(&store, FirstPartyCli::Codex, Some(old.token()))
+            .complete("completed", None, None)
+            .unwrap();
         let newer = if closed {
             session::close::close(&store, None, |_| panic!("no surface")).unwrap();
             None
@@ -336,32 +348,13 @@ fn delivery_uncertainty_and_post_send_cleanup_failures_keep_the_claim() {
 }
 
 #[test]
-fn claim_fail_records_failure_and_releases_ownership() {
+fn report_fail_records_failure_and_releases_ownership() {
     let (_directory, store) = fixture(SessionState::Working);
-    store
-        .write_manifest(&SessionManifest {
-            schema: 1,
-            id: store
-                .directory()
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_owned(),
-            provider: "pi".to_owned(),
-            provider_path: PathBuf::from("pi"),
-            provider_version: "fixture".to_owned(),
-            workspace: store.directory().to_owned(),
-            title: "test".to_owned(),
-            model: None,
-            effort: None,
-            yolo: false,
-            created_unix_ms: 1,
-        })
-        .unwrap();
-    let mut claimed = claim(&store, &[]).unwrap();
+    let claimed = claim(&store, &[]).unwrap();
     let event_name = claimed.receipt().event_file.clone();
-    claimed.fail("turn failed").unwrap();
+    Report::for_claim(&store, FirstPartyCli::Pi, Some(claimed.token()))
+        .fail("turn failed", None, None)
+        .unwrap();
     let result = store.event_strict(&event_name).unwrap();
     assert_eq!(result.provider, "pi");
     assert_eq!(result.error.as_deref(), Some("turn failed"));
@@ -468,8 +461,13 @@ fn dropping_a_failed_completion_keeps_its_journal_recoverable() {
     let mut claimed = claim(&store, &[]).unwrap();
     let token = claimed.token().to_owned();
     let name = claimed.receipt().event_file.clone();
+    claimed.settle_delivery(Delivery::Sent).unwrap();
     let error = with_sync_failure(store.record(CoreRecord::Events).path(), || {
-        claimed.complete(event("interrupted completion"))
+        Report::for_claim(&store, FirstPartyCli::Codex, Some(claimed.token())).complete(
+            "interrupted completion",
+            None,
+            None,
+        )
     })
     .unwrap_err();
     assert!(injected_sync_failure(&error));
@@ -482,8 +480,8 @@ fn dropping_a_failed_completion_keeps_its_journal_recoverable() {
     assert!(!recover_pending_completion(store.directory()).unwrap());
     assert_eq!(store.events().unwrap().len(), 1);
     assert_eq!(
-        store.event_strict(&name).unwrap(),
-        event("interrupted completion")
+        store.event_strict(&name).unwrap().message,
+        "interrupted completion"
     );
     assert!(current_claim_token(&store).unwrap().is_none());
 }

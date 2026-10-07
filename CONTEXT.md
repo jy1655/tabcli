@@ -117,6 +117,15 @@ Converging a session whose owner has died or whose close was interrupted to a co
 recorded state, without resending anything.
 _Avoid_: recovery (reserved for the completion journal), fix-up
 
+**Reopen**:
+Starting a new session that continues the provider conversation of a closed session. The
+source remains closed; the new session has its own identity and surface.
+_Avoid_: restart, unclose
+
+**Reopen marker**:
+The record in a closed source session that identifies the reopen holding or consuming it.
+_Avoid_: resume lock, continuation token
+
 ### Trust
 
 **Workspace trust**:
