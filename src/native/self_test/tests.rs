@@ -949,6 +949,76 @@ fn agy_result_timeouts_append_only_the_same_requests_doctor_observation() {
 }
 
 #[test]
+fn pi_result_timeouts_append_session_credentials_without_resending() {
+    const REASON: &str = "waiting timed out; the request was not cancelled or resent";
+    for follow_up in [false, true] {
+        for evidence in [
+            "ready",
+            "not_ready",
+            "unknown",
+            "other-session",
+            "missing",
+            "doctor-error",
+        ] {
+            let id = if follow_up { "request-2" } else { "request-1" };
+            let mut replies = vec![accepted("request-1")];
+            if follow_up {
+                replies.extend([result("request-1", "event-1.json"), accepted("request-2")]);
+            }
+            let mut timeout = error(REASON);
+            timeout.value = json!({"session":"session-owned", "request_id":id, "timed_out":true});
+            replies.push(timeout);
+            let detail = format!(
+                "Pi provider credentials {evidence} for openai: diagnostic observation only."
+            );
+            replies.push(match evidence {
+                "doctor-error" => error("doctor timed out"),
+                "missing" => ok(json!({"session":"session-owned", "checks":[]})),
+                _ => ok(json!({"session":if evidence == "other-session" {"other"} else {"session-owned"}, "checks":[{
+                    "id":"pi_provider_credentials", "detail":detail, "evidence":{"status":evidence}
+                }]})),
+            });
+            replies.extend(cleanup());
+            let mut fake = fake(replies);
+            let mut req = request(&[]);
+            req.ask.provider = FirstPartyCli::Pi;
+            let report = orchestrate(
+                &req,
+                &mut fake,
+                PathBuf::from("root"),
+                "AB_marker".to_owned(),
+            );
+            let step = &report.steps[if follow_up { 3 } else { 1 }];
+            assert_eq!(step.outcome, Outcome::TimedOut);
+            let expected = if matches!(evidence, "ready" | "not_ready" | "unknown") {
+                format!("{REASON}; {detail}")
+            } else {
+                REASON.to_owned()
+            };
+            assert_eq!(step.reason.as_deref(), Some(expected.as_str()));
+            assert_eq!(report.steps[4].outcome, Outcome::Passed);
+            assert!(fake.replies.is_empty());
+            assert_eq!(
+                fake.calls
+                    .iter()
+                    .filter(|args| args[0] == "doctor")
+                    .collect::<Vec<_>>(),
+                vec![&arguments(&[
+                    "doctor",
+                    "session-owned",
+                    "--probe",
+                    "--json"
+                ])]
+            );
+            assert_eq!(
+                fake.calls.iter().filter(|args| args[0] == "tell").count(),
+                usize::from(follow_up)
+            );
+        }
+    }
+}
+
+#[test]
 fn all_providers_keep_the_exact_marker_contract_without_tools() {
     for provider in [
         FirstPartyCli::Agy,

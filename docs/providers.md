@@ -211,8 +211,21 @@ the managed surface, then close and start a new Bridge session. Follow-ups use t
 Bridge installs a session-local extension that checks the actual `before_agent_start` prompt
 against the claim. It collects the result at `agent_end` and reports it at `agent_settled`, so an
 accepted prompt can produce an exact result body without an added marker. The result includes
-Pi's session and turn identity. Provider errors are recorded too; a separate failure signal
+Pi's session and turn identity. Errors reported by those events are recorded too; a separate failure signal
 preserves an error when the extension cannot deliver the result to Bridge.
+
+Pi 1.0.0 can reject a prompt for missing credentials before an agent turn starts, without
+an extension event identifying that refusal. Bridge therefore leaves that request pending
+and claimed. `doctor SESSION --probe` reports `pi_provider_credentials` using Pi's
+`auth check --no-refresh --json`, without a model call or credential output. It first asks
+Pi to resolve the recorded qualified model, then checks its provider with `--provider`;
+unqualified names, unknown providers, or a different resolved provider remain `unknown`.
+The two commands share a three-second budget within doctor's five-second probe budget.
+`ready` means credentials are configured, not that they are valid or accepted. `not_ready`
+means Pi reports no configured credentials. Missing commands, timeouts, and unreadable or
+unsupported responses are `unknown`. Without a session model or `--probe`, no auth check
+runs. A self-test result timeout includes this observation before cleanup; it does not
+record a failed request, release its claim, or resend input.
 
 `reopen` refuses Pi sessions because Bridge cannot verify whether a live process still holds
 the conversation. Start a new session instead.

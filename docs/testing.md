@@ -84,6 +84,14 @@ inclusion in a self-test result timeout reason. They do not prove that the new w
 prevents approval prompts. For live verification, record the installed Agy version and
 compare default-mode runs with the old and new wording. Bridge does not answer approvals.
 
+For Pi, an initial or follow-up result timeout reads `doctor SESSION --probe --json`
+within five seconds before cleanup and includes the session's provider credential readiness
+in the step reason. Pi's `ready` status proves configuration only, not successful authentication.
+The diagnostic does not prove a prompt refusal or change the pending request or claim.
+Unit fixtures cover ready, missing credentials, unknown provider, missing command, timeout,
+malformed output, model resolution, and timeout reason enrichment; they do not verify a
+managed Pi turn or the TUI's refusal events.
+
 An unconfirmed self-test close is `not_verified`, including a timeout. The cleanup reason names
 the session and carries its recorded surface error. A Ghostty failed-launch handle remains available
 to explicit close only when its handoff precedes close and the launch still owns the session.
