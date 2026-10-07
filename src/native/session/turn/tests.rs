@@ -185,6 +185,63 @@ fn delivery_reports_after_completion_never_resurrect_or_mutate_a_turn() {
 }
 
 #[test]
+fn delivery_settlement_after_close_preserves_the_tombstone() {
+    for interrupted in [false, true] {
+        for outcome in ["sent", "not_sent", "uncertain"] {
+            let (_directory, store) = fixture(SessionState::Working);
+            let mut claimed = claim(&store, &[]).unwrap();
+            claimed.begin_delivery().unwrap();
+            update_status_with_residual(
+                store.directory(),
+                SessionState::Working,
+                None,
+                Some("unverified surface".to_owned()),
+                Some(launch::ResidualSurface::Unverified),
+            )
+            .unwrap();
+            if interrupted {
+                // A close committed its tombstone before claim/journal cleanup.
+                let pending =
+                    PendingTurnCompletion::new(claimed.token(), event("unpublished"), None)
+                        .unwrap();
+                store.write_completion(&pending).unwrap();
+                let mut closed = store.status().unwrap();
+                closed.state = SessionState::Closed;
+                closed.generation += 1;
+                store.write_closed(&closed).unwrap();
+            } else {
+                session::close::close(&store, None, |_| panic!("no bound surface")).unwrap();
+            }
+            let tombstone = store.record(CoreRecord::Closed).bytes().unwrap().unwrap();
+            let error = anyhow::anyhow!("late delivery report");
+            claimed
+                .settle_delivery(match outcome {
+                    "sent" => Delivery::Sent,
+                    "not_sent" => Delivery::NotSent(&error),
+                    _ => Delivery::Uncertain(&error),
+                })
+                .unwrap();
+            drop(claimed);
+            assert_eq!(
+                store.record(CoreRecord::Closed).bytes().unwrap().unwrap(),
+                tombstone
+            );
+            assert!(store.events().unwrap().is_empty());
+            // Sent only retains; Uncertain may restore status. The normal convergence
+            // owns any still-pending close cleanup, not delivery settlement.
+            store.converge().unwrap();
+            assert_eq!(
+                store.record(CoreRecord::Status).bytes().unwrap().unwrap(),
+                tombstone
+            );
+            assert!(current_claim_token(&store).unwrap().is_none());
+            assert!(!store.record(CoreRecord::Completion).path().exists());
+            assert!(store.events().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
 fn delivery_refusal_recovers_a_completion_before_rolling_back() {
     let (_directory, store) = fixture(SessionState::Working);
     let mut claimed = claim(&store, &[]).unwrap();
