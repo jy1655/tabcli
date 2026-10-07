@@ -458,6 +458,14 @@ local capability/version probes, with a five-second probe budget. It does not la
 deliver a prompt, start a daemon, repair records, or change settings. Historical launch
 configuration and current observations are reported separately.
 
+For Pi, `checks` includes `pi_provider_credentials`. With a session's explicit
+`provider/model` and `--probe`, Pi's local, non-refreshing auth check reports
+`evidence.status` as `ready`, `not_ready`, or `unknown`, alongside `provider`, `authType`,
+and `exit_code`. The detail explains the reason; `ready` means configured, not accepted.
+Without a session model (including `doctor --provider pi`) or without `--probe`, the
+status is `unknown`. Pi confirms model resolution before the provider check; no default
+model or provider is guessed, no credential is printed, and no model call is made.
+
 Human output prints checks, availability, reason codes, detail, evidence, and suggested next
 actions. Availability is `available`, `unavailable`, or `unknown`. See the [JSON field
 reference](#json-field-reference).
@@ -501,7 +509,11 @@ On an Agy result timeout, self-test reads `doctor SESSION --json` before cleanup
 reports a tool confirmation for that request, the step's `reason` includes the tool and
 approval observation. Without that evidence, the timeout reason is unchanged. The step
 remains `timed_out`; Bridge does not answer the approval or resend the request. `result`
-and `inspect` retain their existing output; use `doctor` for this Agy log diagnosis.
+and `inspect` retain their existing output; use `doctor` for this Agy log diagnosis. On a
+Pi result timeout, self-test calls `doctor SESSION --probe --json` within five seconds
+and appends the same session's credential readiness to the step reason. This is a
+configuration observation, not proof of why the turn timed out; the request stays pending
+and claimed until ordinary cleanup closes the session.
 
 `--isolated` defaults to off. Normally the test uses the ordinary state root, including its settings
 and consent records. Isolation creates a private directory; ordinary settings and consent do not
@@ -661,16 +673,24 @@ the launcher is still creating the surface for this session (launch deadline <un
 ```
 
 After the deadline, or once launch is no longer pending, a handle-less close proceeds. If the
-launcher subsequently reports a retained Ghostty surface, the session stays closed with no new
+launcher subsequently reports a retained Ghostty or Warp surface, the session stays closed with no new
 handle. Its error names the exact surface and says it may remain and is not closed by Bridge.
 The warning is appended to any existing error and survives repeated close. Check the surface
-in Ghostty; another Bridge close does not close it.
+in that terminal; another Bridge close does not close it.
 
 If the failed-launch handoff happens before close, while the launch still owns its claim and the
 session is still `launching`, the launcher saves the proven terminal, tab, and window ids in
 `terminal.json` and records `failed`. Explicit close uses that handle through
 Ghostty's close script, even if no provider started. It records `closed` only after confirmed
 closure; another close failure keeps the handle.
+
+For Warp, a proven tab whose control-binding write and exact cleanup both fail is also saved
+in `terminal.json`, with `failed` status and a residual-surface warning naming its ids. A confirmed
+cleanup saves no handle. The retained ids do not replace Warp's missing app incarnation/control
+binding, and ownerless startup authority still permits absence verification only. Recovery close
+for this failure is not implemented (#87); an explicit close refuses and preserves the handle
+when absence cannot be proved. Check the named tab in Warp. This failure has not been observed
+live, and Warp remains not live-verified (#63).
 
 Human output is `closed SESSION`. JSON has `ok`, `session`, and `closed`.
 
@@ -801,7 +821,8 @@ Fields: `schema_version`, `bridge_version`, `provider`, `provider_version`, `ter
 and `cleanup_sessions`. Steps contain `name`, `outcome`, `elapsed_ms`, `request_address`,
 `event_address`, and `reason`; cleanup entries contain `session`, `session_state`, `outcome`, and
 `reason`. An Agy result timeout can append the same request's tool-confirmation observation
-from `doctor` to the existing step `reason`; no field is added.
+from `doctor` to the existing step `reason`; a Pi result timeout can append the session's
+provider credential readiness. No field is added.
 
 ### sessions
 

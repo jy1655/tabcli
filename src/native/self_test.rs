@@ -482,17 +482,29 @@ fn orchestrate(
                 &report.marker,
                 first_event.as_deref(),
             );
-            if current.outcome == Outcome::TimedOut && ask.provider == FirstPartyCli::Agy {
-                let diagnosis =
-                    operations.call(&arguments(&["doctor", session, "--json"]), COMMAND_MARGIN);
+            if current.outcome == Outcome::TimedOut
+                && matches!(ask.provider, FirstPartyCli::Agy | FirstPartyCli::Pi)
+            {
+                let args = if ask.provider == FirstPartyCli::Pi {
+                    arguments(&["doctor", session, "--probe", "--json"])
+                } else {
+                    arguments(&["doctor", session, "--json"])
+                };
+                let diagnosis = operations.call(&args, COMMAND_MARGIN);
                 if diagnosis.ok
                     && diagnosis.value["session"] == session
                     && let Some(checks) = diagnosis.value["checks"].as_array()
                     && let Some(detail) = checks.iter().find_map(|check| {
-                        (check["reason_code"] == "agy_tool_confirmation_observed"
-                            && check["evidence"]["request_id"] == request_id)
-                            .then(|| check["detail"].as_str())
-                            .flatten()
+                        (match ask.provider {
+                            FirstPartyCli::Agy => {
+                                check["reason_code"] == "agy_tool_confirmation_observed"
+                                    && check["evidence"]["request_id"] == request_id
+                            }
+                            FirstPartyCli::Pi => check["id"] == "pi_provider_credentials",
+                            _ => false,
+                        })
+                        .then(|| check["detail"].as_str())
+                        .flatten()
                     })
                 {
                     current.reason = Some(format!(

@@ -84,6 +84,14 @@ inclusion in a self-test result timeout reason. They do not prove that the new w
 prevents approval prompts. For live verification, record the installed Agy version and
 compare default-mode runs with the old and new wording. Bridge does not answer approvals.
 
+For Pi, an initial or follow-up result timeout reads `doctor SESSION --probe --json`
+within five seconds before cleanup and includes the session's provider credential readiness
+in the step reason. Pi's `ready` status proves configuration only, not successful authentication.
+The diagnostic does not prove a prompt refusal or change the pending request or claim.
+Unit fixtures cover ready, missing credentials, unknown provider, missing command, timeout,
+malformed output, model resolution, and timeout reason enrichment; they do not verify a
+managed Pi turn or the TUI's refusal events.
+
 An unconfirmed self-test close is `not_verified`, including a timeout. The cleanup reason names
 the session and carries its recorded surface error. A Ghostty failed-launch handle remains available
 to explicit close only when its handoff precedes close and the launch still owns the session.
@@ -93,6 +101,13 @@ surface makes cleanup `not_verified` even when close itself succeeded. A success
 close can pass cleanup, but does not turn the failed launch into a passed round trip. Unit tests
 reproduce both orderings, failed discovery, and failed cleanup with a fake Ghostty runner; they do
 not verify locked-screen behavior or the cause of an automation timeout.
+
+Warp fake-runner tests cover control-binding write failure with confirmed cleanup (no handle)
+and unconfirmed cleanup (retained handle and failed status), close refusal during pending
+creation, and late handoff into an already closed session with a warning that survives repeated
+close. Recovery through Warp's exact close after this write failure remains unimplemented:
+the saved surface ids do not replace the missing control binding. These tests establish neither
+a live record-write failure nor live Warp support (#63, #87).
 
 For release verification, run the packaged candidate's executable instead and record its path
 and SHA-256.
