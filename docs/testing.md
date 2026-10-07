@@ -111,6 +111,12 @@ even if a diagnostic write fails. These deterministic transitions do not prove l
 delivery. Residual-surface tests cover legacy records, diagnostic changes, interrupted tombstone
 amendments, handle persistence failures, and positive versus refused adapter closes.
 
+Turn completion fixtures use the provider Report interface; Claim has no separate completion
+path. Reopen's deterministic tests live with its module and cover source reservation, provenance
+failure, concurrent attempts, late refusals, and surviving provider processes. Agy's transcript
+test also compares read-only Result evidence with incremental publication before and after a
+truncated row's full body arrives. These tests require no authenticated provider.
+
 Warp fake-runner tests cover control-binding write failure with confirmed cleanup (no handle)
 and unconfirmed cleanup (retained handle and failed status), close refusal during pending
 creation, and late handoff into an already closed session with a warning that survives repeated

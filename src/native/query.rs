@@ -153,6 +153,136 @@ pub(super) struct Snapshot {
     _lock: Option<File>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RequestState {
+    Completed,
+    Failed,
+    RecoveryRequired,
+    Pending,
+    Unresolved,
+    Unavailable,
+}
+
+impl RequestState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::RecoveryRequired => "recovery_required",
+            Self::Pending => "pending",
+            Self::Unresolved => "unresolved",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    fn ends_wait(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Unresolved | Self::RecoveryRequired
+        )
+    }
+}
+
+/// One Request's meaning, independent of its command's JSON representation. The
+/// snapshot retains the lifecycle read lock; each caller keeps its own read policy.
+struct RequestObservation<'a> {
+    snapshot: &'a Snapshot,
+    receipt: Option<&'a requests::Receipt>,
+    event_id: Option<&'a str>,
+    event: Option<SessionEvent>,
+    state: RequestState,
+    error: Option<String>,
+}
+
+impl RequestObservation<'_> {
+    fn value(&self) -> Value {
+        let snapshot = self.snapshot;
+        let event = self.event.as_ref();
+        let (elapsed, elapsed_reason) = observed_elapsed(self.receipt, event);
+        json!({
+            "bridge_observed_elapsed_ms": elapsed, "bridge_observed_elapsed_reason": elapsed_reason,
+            "schema_version": 1, "ok": true, "session": snapshot.manifest.id,
+            "provider": snapshot.manifest.provider, "workspace": snapshot.manifest.workspace,
+            "request_id": self.receipt.map(|r| &r.request_id), "event_id": self.event_id,
+            "context_sources": self.receipt.map(|r| r.context_sources.as_slice()).unwrap_or_default(),
+            "request_state": self.state, "session_state": snapshot.status.state,
+            "result": event.map(|e| &e.message), "error": self.error,
+            "session_error": snapshot.status.error,
+            "provider_session_id": event.and_then(|e| e.provider_session_id.as_ref()),
+            "turn_id": event.and_then(|e| e.turn_id.as_ref()),
+            "created_unix_ms": event.map(|e| e.created_unix_ms),
+            "recovery_required": snapshot.pending.is_some(),
+            "unreadable_requests": snapshot.unreadable_requests,
+            "request_index_error": snapshot.request_index_error,
+        })
+    }
+
+    fn attachment(
+        &self,
+        reader: &Reader,
+        session: &str,
+    ) -> std::result::Result<(requests::ContextSource, String), AttachmentFailure> {
+        let refuse = |state, detail| AttachmentFailure { state, detail };
+        let unreadable = |detail| refuse("unreadable", Some(detail));
+        if self.state != RequestState::Completed || self.event.is_none() || self.error.is_some() {
+            return Err(refuse(self.state.as_str(), None));
+        }
+        let event_id = self
+            .event_id
+            .ok_or_else(|| unreadable("no event id".to_owned()))?;
+        let request_id = self.receipt.map(|r| r.request_id.clone());
+        let snapshot = self.snapshot;
+        // An unmapped event is legacy only when the entire Receipt index was readable.
+        if request_id.is_none()
+            && (snapshot.unreadable_requests > 0 || snapshot.request_index_error.is_some())
+        {
+            let mut detail = format!(
+                "the request index has {} unreadable receipt(s), so the event may still belong to an active request",
+                snapshot.unreadable_requests
+            );
+            if let Some(error) = &snapshot.request_index_error {
+                detail = format!("{detail}; {error}");
+            }
+            return Err(refuse("unverifiable", Some(detail)));
+        }
+        // A case-insensitive filesystem must not silently select a different event name.
+        let exact = reader
+            .events()
+            .map_err(|e| unreadable(format!("{e:#}")))?
+            .iter()
+            .any(|path| path.file_name().and_then(|name| name.to_str()) == Some(event_id));
+        if !exact {
+            return Err(unreadable(format!(
+                "recorded event filename {event_id} does not match an events/ entry exactly"
+            )));
+        }
+        // Attachments deliberately re-read strictly; ordinary queries and the timeline
+        // retain their distinct readers. Do not substitute the lossy event above.
+        let event = reader.event_strict(event_id).map_err(unreadable)?;
+        if event.error.is_some() {
+            return Err(refuse("failed", None));
+        }
+        let source = requests::ContextSource {
+            session: session.to_owned(),
+            request_id,
+            event_id: event_id.to_owned(),
+            provider: snapshot.manifest.provider.clone(),
+            created_unix_ms: event
+                .created_unix_ms
+                .ok_or_else(|| unreadable("no event creation time".to_owned()))?,
+        };
+        requests::validate_context_source(&source)
+            .map_err(|e| unreadable(format!("invalid recorded provenance: {e:#}")))?;
+        Ok((source, event.message))
+    }
+}
+
+pub(super) struct AttachmentFailure {
+    pub(super) state: &'static str,
+    pub(super) detail: Option<String>,
+}
+
 #[cfg(test)]
 type SnapshotHook = Box<dyn FnMut(&Path)>;
 
@@ -356,7 +486,29 @@ impl Snapshot {
     }
 
     pub(super) fn result(&self, reader: &Reader, selector: &Selector) -> Result<Value> {
-        self.result_with(selector, |name| self.event(reader, name))
+        Ok(self.observe_result(reader, selector)?.value())
+    }
+
+    fn observe_result<'a>(
+        &'a self,
+        reader: &Reader,
+        selector: &'a Selector,
+    ) -> Result<RequestObservation<'a>> {
+        self.observe_result_with(selector, |name| self.event(reader, name))
+    }
+
+    pub(super) fn attachable_result(
+        &self,
+        reader: &Reader,
+        selector: &Selector,
+        session: &str,
+    ) -> std::result::Result<(requests::ContextSource, String), AttachmentFailure> {
+        self.observe_result(reader, selector)
+            .map_err(|e| AttachmentFailure {
+                state: "unreadable",
+                detail: Some(format!("{e:#}")),
+            })?
+            .attachment(reader, session)
     }
 
     // Timeline uses cached strict bytes; ordinary queries keep their reader.
@@ -365,6 +517,14 @@ impl Snapshot {
         selector: &Selector,
         read_event: impl FnOnce(&str) -> Result<Option<SessionEvent>>,
     ) -> Result<Value> {
+        Ok(self.observe_result_with(selector, read_event)?.value())
+    }
+
+    fn observe_result_with<'a>(
+        &'a self,
+        selector: &'a Selector,
+        read_event: impl FnOnce(&str) -> Result<Option<SessionEvent>>,
+    ) -> Result<RequestObservation<'a>> {
         let receipt = match selector {
             Selector::Request(id) => Some(
                 self.receipts
@@ -410,45 +570,42 @@ impl Snapshot {
             });
         let state = if let Some(event) = &event {
             if event.error.is_some() {
-                "failed"
+                RequestState::Failed
             } else {
-                "completed"
+                RequestState::Completed
             }
         } else if name
             .is_some_and(|name| self.pending.as_ref().is_some_and(|p| p.event_file == name))
         {
-            "recovery_required"
+            RequestState::RecoveryRequired
         } else if launch_failure.is_some() {
             if self.status.state == SessionState::Failed {
-                "failed"
+                RequestState::Failed
             } else {
-                "unresolved"
+                RequestState::Unresolved
             }
         } else if receipt.is_some_and(|r| self.claim.as_deref() == Some(&r.claim_token)) {
-            "pending"
+            RequestState::Pending
         } else if receipt.is_some() {
-            "unresolved"
+            RequestState::Unresolved
         } else {
-            "unavailable"
+            RequestState::Unavailable
         };
-        let (elapsed, elapsed_reason) = observed_elapsed(receipt, event.as_ref());
-        Ok(json!({
-            "bridge_observed_elapsed_ms": elapsed, "bridge_observed_elapsed_reason": elapsed_reason,
-            "schema_version": 1, "ok": true, "session": self.manifest.id,
-            "provider": self.manifest.provider, "workspace": self.manifest.workspace,
-            "request_id": receipt.map(|r| &r.request_id), "event_id": name,
-            "context_sources": receipt.map(|r| r.context_sources.as_slice()).unwrap_or_default(),
-            "request_state": state, "session_state": self.status.state,
-            "result": event.as_ref().map(|e| &e.message),
-            "error": event.as_ref().and_then(|e| e.error.as_ref()).or_else(||
-                if event.is_none() { launch_failure.as_ref().map(|(_, detail)| detail) } else { None }),
-            "session_error": self.status.error,
-            "provider_session_id": event.as_ref().and_then(|e| e.provider_session_id.as_ref()),
-            "turn_id": event.as_ref().and_then(|e| e.turn_id.as_ref()),
-            "created_unix_ms": event.as_ref().map(|e| e.created_unix_ms),
-            "recovery_required": self.pending.is_some(),
-            "unreadable_requests": self.unreadable_requests, "request_index_error": self.request_index_error,
-        }))
+        let error = event.as_ref().and_then(|e| e.error.clone()).or_else(|| {
+            if event.is_none() {
+                launch_failure.map(|(_, detail)| detail)
+            } else {
+                None
+            }
+        });
+        Ok(RequestObservation {
+            snapshot: self,
+            receipt,
+            event_id: name,
+            event,
+            state,
+            error,
+        })
     }
 }
 
@@ -641,30 +798,29 @@ pub(super) fn result_value_in(root: &Path, request: &ResultRequest) -> Result<Va
                         "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error}),
                     );
                 }
-                last = snapshot.result(&Reader::open_unchecked(&directory), &request.selector)?;
-                if !request.wait
-                    || matches!(
-                        last["request_state"].as_str(),
-                        Some("completed" | "failed" | "unresolved" | "recovery_required")
-                    )
-                {
-                    return Ok(last);
+                let mut observation = snapshot
+                    .observe_result(&Reader::open_unchecked(&directory), &request.selector)?;
+                if !request.wait || observation.state.ends_wait() {
+                    return Ok(observation.value());
                 }
                 let owner = observe_owner(&Reader::open_unchecked(&directory));
-                last["owner_process_alive"] = json!(owner.process_alive);
-                last["owner"] = json!(owner);
-                if owner.process_alive == Some(false) || owner.identity_matches == Some(false) {
-                    last["request_state"] = json!("unresolved");
-                    last["error"] = json!(
-                        "recorded native owner is no longer live; run sessions for this workspace to recover its state, then inspect the request"
+                let ended =
+                    owner.process_alive == Some(false) || owner.identity_matches == Some(false);
+                if ended {
+                    observation.state = RequestState::Unresolved;
+                    observation.error = Some(
+                        "recorded native owner is no longer live; run sessions for this workspace to recover its state, then inspect the request".to_owned()
                     );
-                    return Ok(last);
-                }
-                if matches!(
+                } else if matches!(
                     snapshot.status.state,
                     SessionState::Closed | SessionState::Failed | SessionState::Exited
                 ) {
-                    last["request_state"] = json!("unresolved");
+                    observation.state = RequestState::Unresolved;
+                }
+                last = observation.value();
+                last["owner_process_alive"] = json!(owner.process_alive);
+                last["owner"] = json!(owner);
+                if observation.state.ends_wait() {
                     return Ok(last);
                 }
             }

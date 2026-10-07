@@ -85,7 +85,7 @@ fn agy_trust_prompt_key(screen: &str, workspace: &Path) -> Option<terminal::Dial
     Some(terminal::DialogKey::Enter)
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct PendingAgyTurn {
     schema: u32,
     claim_token: String,
@@ -1981,35 +1981,102 @@ impl TranscriptCursor {
         }
 
         while let Some(result) = self.pending_results.front() {
-            let message = if result.truncated {
-                let Some(message) = read_full_result(&self.full_path, brain_root, result.step)?
-                else {
-                    break;
-                };
-                message
-            } else {
-                result.message.clone()
-            };
             let step = result.step;
-            if let Some(pending) = read_pending_turn(directory)?
-                && let Ok(message) = correlated_response(&message, &pending)
-            {
-                turn::Report::for_claim(
-                    &Store::open_unchecked(directory),
-                    FirstPartyCli::Agy,
-                    Some(&pending.claim_token),
-                )
-                .complete(
+            let evidence = ResultReader {
+                full_path: &self.full_path,
+                brain_root,
+            }
+            .observe(result, || read_pending_turn(directory))?;
+            match evidence {
+                ResultEvidence::Incomplete => break,
+                ResultEvidence::Unrelated => (),
+                ResultEvidence::Correlated {
+                    claim_token,
                     message,
-                    Some(conversation_id.to_owned()),
-                    Some(step.to_string()),
-                )
-                .context("failed to record the correlated Agy result")?;
+                } => {
+                    turn::Report::for_claim(
+                        &Store::open_unchecked(directory),
+                        FirstPartyCli::Agy,
+                        Some(&claim_token),
+                    )
+                    .complete(
+                        &message,
+                        Some(conversation_id.to_owned()),
+                        Some(step.to_string()),
+                    )
+                    .context("failed to record the correlated Agy result")?;
+                }
             }
             self.greatest_result_step = Some(step);
             self.pending_results.pop_front();
         }
         Ok(())
+    }
+}
+
+/// Read-only interpretation shared by the incremental monitor and a one-shot diagnostic.
+/// Full-result lookup precedes the pending-turn read, just as it does in the monitor:
+/// a truncated row whose full body has not arrived must not consume or bind a turn.
+struct ResultReader<'a> {
+    full_path: &'a Path,
+    brain_root: &'a Path,
+}
+
+enum ResultEvidence {
+    Incomplete,
+    Unrelated,
+    Correlated {
+        claim_token: String,
+        message: String,
+    },
+}
+
+impl ResultReader<'_> {
+    fn observe(
+        &self,
+        result: &PlannerResult,
+        read_pending: impl FnOnce() -> Result<Option<PendingAgyTurn>>,
+    ) -> Result<ResultEvidence> {
+        let message = if result.truncated {
+            let Some(message) = read_full_result(self.full_path, self.brain_root, result.step)?
+            else {
+                return Ok(ResultEvidence::Incomplete);
+            };
+            message
+        } else {
+            result.message.clone()
+        };
+        let Some(pending) = read_pending()? else {
+            return Ok(ResultEvidence::Unrelated);
+        };
+        let Ok(message) = correlated_response(&message, &pending) else {
+            return Ok(ResultEvidence::Unrelated);
+        };
+        Ok(ResultEvidence::Correlated {
+            message: message.to_owned(),
+            claim_token: pending.claim_token,
+        })
+    }
+
+    fn contains(&self, paths: &[PathBuf], pending: &PendingAgyTurn) -> Result<bool> {
+        for path in paths {
+            if validated_file_metadata(path, self.brain_root)?.is_none() {
+                continue;
+            }
+            if let Some(text) = RecordReader::at(path).text()? {
+                for line in text.lines() {
+                    if let Some(result) = parse_planner_result(line)
+                        && matches!(
+                            self.observe(&result, || Ok(Some(pending.clone())))?,
+                            ResultEvidence::Correlated { .. }
+                        )
+                    {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
     }
 }
 
@@ -2206,26 +2273,13 @@ fn pending_tool_confirmation(directory: &Path, brain: &Path) -> Result<Option<(S
     }
     // A transcript result may precede the monitor's publication. Observe it without
     // running the monitor or publishing anything, using its parser and correlation.
-    for path in [logs.join(TRANSCRIPT_FILE), full.clone()] {
-        if validated_file_metadata(&path, brain)?.is_none() {
-            continue;
-        }
-        if let Some(text) = RecordReader::at(&path).text()? {
-            for line in text.lines() {
-                if let Some(result) = parse_planner_result(line) {
-                    let message = if result.truncated {
-                        read_full_result(&full, brain, result.step)?
-                    } else {
-                        Some(result.message)
-                    };
-                    if message
-                        .is_some_and(|message| correlated_response(&message, &pending).is_ok())
-                    {
-                        return Ok(None);
-                    }
-                }
-            }
-        }
+    if (ResultReader {
+        full_path: &full,
+        brain_root: brain,
+    })
+    .contains(&[logs.join(TRANSCRIPT_FILE), full.clone()], &pending)?
+    {
+        return Ok(None);
     }
     Ok(Some((tool, receipt.request_id.clone())))
 }
@@ -6721,6 +6775,29 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         update_status(&directory, SessionState::Claimed, None, None).unwrap();
         update_status(&directory, SessionState::Working, None, None).unwrap();
         let second_pending = claim_pending_turn(&directory);
+        let full_path = transcript_path.with_file_name("transcript_full.jsonl");
+        let results = ResultReader {
+            full_path: &full_path,
+            brain_root: &brain,
+        };
+        let truncated = PlannerResult {
+            step: 3,
+            message: "short...".to_owned(),
+            truncated: true,
+        };
+        assert!(matches!(
+            results
+                .observe(&truncated, || panic!(
+                    "incomplete evidence must not bind a turn"
+                ))
+                .unwrap(),
+            ResultEvidence::Incomplete
+        ));
+        assert!(
+            !results
+                .contains(std::slice::from_ref(&transcript_path), &second_pending)
+                .unwrap()
+        );
         fs::write(
             transcript_path.with_file_name("transcript_full.jsonl"),
             format!(
@@ -6730,6 +6807,14 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
             ),
         )
         .unwrap();
+        let before = fs::read(directory.join("status.json")).unwrap();
+        assert!(
+            results
+                .contains(std::slice::from_ref(&transcript_path), &second_pending)
+                .unwrap()
+        );
+        assert_eq!(fs::read(directory.join("status.json")).unwrap(), before);
+        assert_eq!(event_paths(&directory).unwrap().len(), 1);
         cursor.poll(&directory, &brain, id).unwrap();
         let paths = event_paths(&directory).unwrap();
         assert_eq!(paths.len(), 2);

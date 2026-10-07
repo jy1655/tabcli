@@ -31,8 +31,7 @@
     "native-session": 6,
     "native-terminal-host": 3,
     "native-warp-host": 6,
-    "native-wezterm-host": 3,
-    "status.json": 1
+    "native-wezterm-host": 3
   },
   "src/native/consent.rs": {
     "const SESSION_FILE: &str = \"workspace-consent.json\";": 1,
@@ -48,8 +47,9 @@
   "src/native/context.rs": {
     "[Agent Bridge context result {index}/{total}]": 1
   },
-  "src/native/doctor.rs": {
-    "provider-process.json": 1
+  "src/native/reopen.rs": {
+    "provider-process.json": 1,
+    "status.json": 1
   },
   "src/native/provider/agy.rs": {
     "const PENDING_TURN_FILE: &str = \"agy-pending-turn.json\";": 1,
