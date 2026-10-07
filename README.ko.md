@@ -77,6 +77,7 @@ Warp는 접근이 허용된 공식 Control 연결과 탭·창 생성 기능이 �
 
 Codex 후속 요청에는 0.149.0 이상이 필요하며 공유 데몬은 필요하지 않습니다. Claude는 최소 버전을 충족하고, 사용하는 백엔드와 설정에서 세션 간 메시지 전달도 지원해야 합니다. 전달 경로와 오류 처리는 [에이전트 CLI 요구 사항](docs/providers.md)을 따릅니다.
 
+- [2026-10-07 macOS, 0.2.3](docs/verification/2026-10-07-macos-0.2.3.md): iTerm2의 Codex, WezTerm의 Pi(로그인된 provider와 자격 증명이 없는 provider, #83의 사유 확인), WezTerm의 Claude와 Agy를 검증했습니다. Warp는 실행하지 않았습니다.
 - [2026-10-07 macOS, 0.2.2](docs/verification/2026-10-07-macos-0.2.2.md): 화면이 잠기지 않은 상태에서 위의 네 터미널의 Codex, WezTerm의 Claude, WezTerm의 Agy(기본 권한 모드와 `--yolo`), 로그인된 provider로 WezTerm의 Pi를 검증했습니다.
 - [2026-10-07 macOS, 0.2.1](docs/verification/2026-10-07-macos-0.2.1.md): 위의 네 터미널에서 Codex를, WezTerm에서 Claude를 CLI 기본값으로 검증했습니다. Agy는 WezTerm에서 `--yolo`로 검증했습니다. 화면이 잠긴 상태에서는 Terminal.app과 Ghostty가 요청부터 종료까지의 과정을 마치지 못했습니다. 기본 권한 모드의 Agy와 Pi는 첫 결과를 기다리다 시간이 초과되어, 성공한 검증에 포함하지 않습니다.
 - [2026-10-06 macOS](docs/verification/2026-10-06-macos-0.1.2.md): 위의 네 터미널에서 Codex를, WezTerm에서 Claude를 검증했습니다. 기본 권한 모드 대신 `--yolo`를 사용했습니다.

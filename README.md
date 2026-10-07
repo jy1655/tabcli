@@ -97,6 +97,9 @@ Codex follow-ups require 0.149.0 or newer; no shared daemon is required. Claude 
 cross-session messaging in its installed backend and configuration, not only a recent version.
 See [provider requirements](docs/providers.md) for delivery paths and failure handling.
 
+- [2026-10-07 macOS, 0.2.3](docs/verification/2026-10-07-macos-0.2.3.md): Codex in iTerm2, Pi in
+  WezTerm with a logged-in provider and with a provider that has no credentials (the #83
+  reason), and Claude and Agy in WezTerm; Warp was not run.
 - [2026-10-07 macOS, 0.2.2](docs/verification/2026-10-07-macos-0.2.2.md): Codex in the four
   terminals above, Claude in WezTerm, Agy in WezTerm in its default permission mode and with
   `--yolo`, and Pi in WezTerm with a logged-in provider, all with the screen unlocked.
