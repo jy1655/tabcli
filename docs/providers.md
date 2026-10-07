@@ -68,6 +68,15 @@ Codex chooses a shared or embedded server; you do not need to start a shared dae
 for Codex's exact queue acceptance, then for the turn's completion. Acceptance alone is not a
 result.
 
+A Bridge-launched Codex TUI runs on its embedded app server. Bridge passes its `notify` hook and
+the verified workspace trust as process-local `-c` overrides, and Codex keeps a TUI with such
+overrides off the shared background server (read from the 0.160.1 source; a warning was first
+recorded with 0.159.3). When Codex's daemon auto-start is enabled, the TUI's startup history
+says `Running without the shared background server: command-line configuration overrides (-c,
+--enable, --disable, or --search) requires embedded mode.` That line is expected (#89): result
+correlation and `tell` were verified in this mode. `/agents` in that TUI offers to start a
+background server; Bridge never answers that dialog, and you do not need to either.
+
 With Codex older than 0.149.0, `tell` fails before anything is typed and restores the session to
 `ready`. Upgrade Codex and launch a new session. A follow-up also needs the thread UUID from the
 first completed turn. If the queue is unavailable, run `tabcli doctor <session> --probe`
