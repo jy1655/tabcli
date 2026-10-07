@@ -1,6 +1,21 @@
-//! The recorded session state and its transition contract.
+//! Status transitions, diagnostic amendments, and their serialized record.
+use super::{CoreRecord, Store, launch, unix_ms};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::path::Path;
 use std::{convert::Infallible, fmt, str::FromStr};
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(in crate::native) struct SessionStatus {
+    pub(in crate::native) state: SessionState,
+    #[serde(default)]
+    pub(in crate::native) generation: u64,
+    pub(in crate::native) updated_unix_ms: u128,
+    pub(in crate::native) exit_code: Option<i32>,
+    pub(in crate::native) error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::native) residual_surface: Option<launch::ResidualSurface>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::native) enum SessionState {
@@ -37,6 +52,10 @@ impl<'de> Deserialize<'de> for SessionState {
 }
 
 impl SessionState {
+    pub(in crate::native) fn accepts_prompt(&self) -> bool {
+        *self == Self::Ready
+    }
+
     pub(in crate::native) fn as_str(&self) -> &str {
         match self {
             Self::Launching => "launching",
@@ -128,10 +147,130 @@ impl fmt::Display for SessionState {
     }
 }
 
+pub(in crate::native) fn update_status(
+    directory: &Path,
+    state: SessionState,
+    exit_code: Option<i32>,
+    error: Option<String>,
+) -> Result<()> {
+    update_status_with_residual(directory, state, exit_code, error, None)
+}
+
+pub(in crate::native) fn update_status_with_residual(
+    directory: &Path,
+    state: SessionState,
+    exit_code: Option<i32>,
+    error: Option<String>,
+    residual_surface: Option<launch::ResidualSurface>,
+) -> Result<()> {
+    Store::open_unchecked(directory).update_status(state, exit_code, error, residual_surface)
+}
+
+impl Store {
+    pub(in crate::native) fn update_status(
+        &self,
+        state: SessionState,
+        exit_code: Option<i32>,
+        error: Option<String>,
+        residual_surface: Option<launch::ResidualSurface>,
+    ) -> Result<()> {
+        let _status_lock = self.lock_status()?;
+        let store = self;
+        // The tombstone is the close's commit point: every later write, whatever state it
+        // asks for, restores the tombstone unchanged and does not advance the generation.
+        // launch::terminal_failed can separately append a residual-surface diagnostic to
+        // both records under this lock without changing their lifecycle fields.
+        if let Some(closed) = store.closed_if_present()? {
+            return store.persist_status(&closed);
+        }
+        let current = store.status_if_present()?;
+        if let Some(current) = &current
+            && !current.state.clone().transition_allowed(state.clone())
+        {
+            bail!(
+                "invalid native session status transition {} -> {state}",
+                current.state
+            )
+        }
+        let generation = current
+            .as_ref()
+            .map_or(0, |status| status.generation)
+            .checked_add(1)
+            .context("native session status generation overflowed")?;
+        let status = SessionStatus {
+            state: state.clone(),
+            generation,
+            updated_unix_ms: unix_ms(),
+            exit_code,
+            error,
+            residual_surface: residual_surface.or_else(|| {
+                current.and_then(|status| {
+                    status
+                        .residual_surface
+                        .or_else(|| status.residual_surface())
+                })
+            }),
+        };
+        if state == SessionState::Closed {
+            store.record(CoreRecord::Closed).write_json(&status)?;
+            return store.persist_status(&status);
+        }
+        store.persist_status(&status)
+    }
+
+    fn persist_status(&self, status: &SessionStatus) -> Result<()> {
+        self.record(CoreRecord::Status).write_json(status)
+    }
+
+    /// Add failed-launch evidence without advancing or reopening the lifecycle.
+    pub(in crate::native) fn record_residual_surface(&self, message: &str) -> Result<()> {
+        let _status_lock = self.lock_status()?;
+        let mut status = self
+            .closed_if_present()?
+            .map_or_else(|| self.status(), Ok)?;
+        status.error = Some(match status.error {
+            Some(existing) => format!("{existing}; {message}"),
+            None => message.to_owned(),
+        });
+        status.residual_surface = Some(launch::ResidualSurface::Unverified);
+        if status.state == SessionState::Closed {
+            self.record(CoreRecord::Closed).write_json(&status)?;
+        }
+        self.persist_status(&status)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::native::SessionStatus;
+
+    #[test]
+    fn refused_status_writes_preserve_the_record_bytes() {
+        for generation in [7, u64::MAX] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open_unchecked(directory.path());
+            store
+                .write_status(&SessionStatus {
+                    state: SessionState::Ready,
+                    generation,
+                    updated_unix_ms: 100,
+                    exit_code: None,
+                    error: Some("keep reason".to_owned()),
+                    residual_surface: None,
+                })
+                .unwrap();
+            let before = store.record(CoreRecord::Status).bytes().unwrap();
+            let next = if generation == u64::MAX {
+                SessionState::Claimed
+            } else {
+                SessionState::Working
+            };
+            assert!(store.update_status(next, None, None, None).is_err());
+            assert_eq!(store.record(CoreRecord::Status).bytes().unwrap(), before);
+            assert!(store.closed_if_present().unwrap().is_none());
+        }
+    }
 
     macro_rules! round_trip {
         ($test:ident, $variant:ident, $text:literal) => {

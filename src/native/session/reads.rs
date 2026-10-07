@@ -149,18 +149,13 @@ pub(in crate::native) fn journaled_event_state_within(
         .read_to_end(&mut stored)
         .with_context(|| format!("failed to read {}", path.display()))?;
     let bytes_read = stored.len() as u64;
-    if bytes_read > limit {
-        return Ok(outcome(
-            JournaledEventState::Oversized(bytes_read),
-            bytes_read,
-            None,
-        ));
-    }
-    Ok(if stored == serde_json::to_vec_pretty(&pending.event)? {
+    let state = turn::journaled_event_state_of(pending, &stored, limit)?;
+    let text = if state == JournaledEventState::Committed {
         // The journal's bytes are canonical JSON, so the stored text is valid UTF-8.
         let text = String::from_utf8_lossy(&stored).into_owned();
-        outcome(JournaledEventState::Committed, bytes_read, Some(text))
+        Some(text)
     } else {
-        outcome(JournaledEventState::Mismatched, bytes_read, None)
-    })
+        None
+    };
+    Ok(outcome(state, bytes_read, text))
 }

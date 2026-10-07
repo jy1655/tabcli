@@ -33,7 +33,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 ## Module map and dependencies
 
 - `src/main.rs` contains top-level dispatch and help; `src/native.rs` parses native commands,
-  coordinates launch and delivery, and defines the shared manifest, status, and event types.
+  coordinates launch and delivery, and defines the shared manifest and event types.
 - `src/providers/` defines the CLI identities, minimum versions, and model, effort, and bypass
   argument mappings. The library uses these mappings before the native launch path.
 - `src/native/provider/` owns each provider's launch and resume plans, trust interpretation,
@@ -47,9 +47,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   claims and events; `turn` owns delivery settlement, completion and recovery; `close` owns
   close-record transitions and dead-owner repair; `launch` coordinates spawn, cancellation,
   and the full macOS binding wait, with surface identity checks supplied by terminal adapters.
-  `state` defines serialized
-  states and permitted transitions. `native.rs::update_status_locked` applies those rules,
-  advances generations, and preserves closed tombstones.
+  `state` owns the serialized status and its writes: `Store::update_status` applies
+  permitted transitions and generations, while `Store::record_residual_surface` amends
+  diagnostics without changing lifecycle fields. Both preserve closed tombstones.
 - Within `src/native/session/`, start with `reads.rs` for decoding and read budgets,
   `primitives.rs` for filesystem durability and private-record permissions, and `owner.rs` for
   read-only observations of the recorded owner.
@@ -169,8 +169,9 @@ such rather than invented as historical events.
 ## Record and adapter seams
 
 `session::Reader` opens a read-only view without recovery or mutation. `session::Store` exposes
-writes and a reader view. Constructing a Store performs no recovery. `Store::converge` recovers
-accepted completions before repairing dead owners; call it from a mutating command where needed.
+writes and a reader view. Constructing a Store performs no recovery. `Store::converge` calls dead-owner repair, which recovers accepted completions first and
+retains recovery damage in a dead owner's close diagnostic; call it from a mutating command
+where needed.
 `RecordReader` and `RecordStore` provide the primitives for names and schemas owned by adapters.
 
 The native provider contract requires explicit launch configuration, initial delivery,

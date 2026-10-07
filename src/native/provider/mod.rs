@@ -80,7 +80,6 @@ pub(super) struct CrossSessionMessageFailure {
     error: anyhow::Error,
     delivery_may_have_occurred: bool,
     retryable_discovery_failure: bool,
-    terminal_fallback_allowed: bool,
 }
 
 impl CrossSessionMessageFailure {
@@ -89,7 +88,6 @@ impl CrossSessionMessageFailure {
             error,
             delivery_may_have_occurred: false,
             retryable_discovery_failure: false,
-            terminal_fallback_allowed: false,
         }
     }
 
@@ -98,7 +96,6 @@ impl CrossSessionMessageFailure {
             error,
             delivery_may_have_occurred: false,
             retryable_discovery_failure: true,
-            terminal_fallback_allowed: false,
         }
     }
 
@@ -107,16 +104,6 @@ impl CrossSessionMessageFailure {
             error,
             delivery_may_have_occurred: true,
             retryable_discovery_failure: false,
-            terminal_fallback_allowed: false,
-        }
-    }
-
-    pub(super) fn terminal_fallback(error: anyhow::Error) -> Self {
-        Self {
-            error,
-            delivery_may_have_occurred: false,
-            retryable_discovery_failure: false,
-            terminal_fallback_allowed: true,
         }
     }
 
@@ -126,10 +113,6 @@ impl CrossSessionMessageFailure {
 
     pub(super) fn should_retry_discovery(&self) -> bool {
         self.retryable_discovery_failure
-    }
-
-    pub(super) fn allows_terminal_fallback(&self) -> bool {
-        self.terminal_fallback_allowed
     }
 
     pub(super) fn into_error(self) -> anyhow::Error {
@@ -182,7 +165,7 @@ impl ActiveCompletionMonitor {
 pub(super) enum FollowUpTransport {
     TerminalPasteFallback,
     ProviderCrossSessionMessage,
-    ProviderCrossSessionMessageWithTerminalPasteFallback,
+    ProviderQueue,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -197,9 +180,7 @@ impl FollowUpTransport {
         match self {
             Self::TerminalPasteFallback => "terminal-paste-fallback",
             Self::ProviderCrossSessionMessage => "provider-cross-session-message",
-            Self::ProviderCrossSessionMessageWithTerminalPasteFallback => {
-                "provider-cross-session-message-with-terminal-paste-fallback"
-            }
+            Self::ProviderQueue => "provider-native-queue",
         }
     }
 }

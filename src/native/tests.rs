@@ -2441,7 +2441,7 @@ fn bridge_shell_command_rejects_controls_in_dynamic_components() {
 
 #[test]
 fn follow_up_prompts_only_enter_a_completed_live_cli_turn() {
-    assert!(session_accepts_prompt(&SessionState::Ready));
+    assert!(SessionState::Ready.accepts_prompt());
     for state in [
         "launching",
         "running",
@@ -2451,7 +2451,7 @@ fn follow_up_prompts_only_enter_a_completed_live_cli_turn() {
         "closed",
     ] {
         assert!(
-            !session_accepts_prompt(&state.parse().unwrap()),
+            !state.parse::<SessionState>().unwrap().accepts_prompt(),
             "accepted {state}"
         );
     }
@@ -2461,7 +2461,7 @@ fn follow_up_prompts_only_enter_a_completed_live_cli_turn() {
 fn every_provider_declares_its_current_follow_up_transport() {
     assert_eq!(
         provider::follow_up_transport(FirstPartyCli::Codex).as_str(),
-        "provider-cross-session-message-with-terminal-paste-fallback"
+        "provider-native-queue"
     );
     for provider in [FirstPartyCli::Agy, FirstPartyCli::Pi] {
         assert_eq!(
@@ -2472,63 +2472,6 @@ fn every_provider_declares_its_current_follow_up_transport() {
     assert_eq!(
         provider::follow_up_transport(FirstPartyCli::Claude).as_str(),
         "provider-cross-session-message"
-    );
-}
-
-#[test]
-fn provider_cross_session_failures_keep_terminal_fallback_explicit() {
-    let unavailable = provider::CrossSessionMessageFailure::terminal_fallback(anyhow::anyhow!(
-        "native transport unavailable"
-    ));
-    assert!(unavailable.allows_terminal_fallback());
-    assert!(!unavailable.delivery_may_have_occurred());
-
-    let uncertain = provider::CrossSessionMessageFailure::delivery_uncertain(anyhow::anyhow!(
-        "delivery uncertain"
-    ));
-    assert!(!uncertain.allows_terminal_fallback());
-    assert!(uncertain.delivery_may_have_occurred());
-}
-
-#[test]
-fn codex_hybrid_transport_falls_back_before_delivery_but_not_after_uncertainty() {
-    let transport =
-        provider::FollowUpTransport::ProviderCrossSessionMessageWithTerminalPasteFallback;
-    let unavailable = provider::CrossSessionMessageFailure::terminal_fallback(anyhow::anyhow!(
-        "daemon unavailable"
-    ));
-    assert_eq!(
-        cross_session_failure_action(transport, &unavailable),
-        CrossSessionFailureAction::TerminalFallback
-    );
-
-    let uncertain = provider::CrossSessionMessageFailure::delivery_uncertain(anyhow::anyhow!(
-        "queue timed out"
-    ));
-    assert_eq!(
-        cross_session_failure_action(transport, &uncertain),
-        CrossSessionFailureAction::Uncertain
-    );
-
-    let claude_not_sent =
-        provider::CrossSessionMessageFailure::not_sent(anyhow::anyhow!("Claude discovery failed"));
-    assert_eq!(
-        cross_session_failure_action(
-            provider::FollowUpTransport::ProviderCrossSessionMessage,
-            &claude_not_sent,
-        ),
-        CrossSessionFailureAction::ReturnError
-    );
-
-    let claude_misclassified_fallback = provider::CrossSessionMessageFailure::terminal_fallback(
-        anyhow::anyhow!("must stay provider-native"),
-    );
-    assert_eq!(
-        cross_session_failure_action(
-            provider::FollowUpTransport::ProviderCrossSessionMessage,
-            &claude_misclassified_fallback,
-        ),
-        CrossSessionFailureAction::ReturnError
     );
 }
 

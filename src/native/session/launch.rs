@@ -326,24 +326,9 @@ pub(in crate::native) fn terminal_failed(store: &Store, error: &anyhow::Error) -
         // Diagnostic-only amendment: never bind or reopen a cancelled launch. The
         // tombstone must carry the warning too, or later status convergence erases it.
         // Preserve state, generation, timestamps and exit code under the status lock.
-        (|| -> Result<()> {
-            let _status_lock = store.lock_status()?;
-            let closed = store.closed_if_present()?;
-            let mut diagnostic = match closed {
-                Some(closed) => closed,
-                None => store.status()?,
-            };
-            diagnostic.error = Some(match diagnostic.error {
-                Some(existing) => format!("{existing}; {message}"),
-                None => message.clone(),
-            });
-            diagnostic.residual_surface = Some(ResidualSurface::Unverified);
-            if diagnostic.state == SessionState::Closed {
-                store.write_closed(&diagnostic)?;
-            }
-            store.write_status(&diagnostic)
-        })()
-        .with_context(|| message.clone())?;
+        store
+            .record_residual_surface(&message)
+            .with_context(|| message.clone())?;
         bail!("{message}");
     }
     let mut surface = retained.surface.clone();

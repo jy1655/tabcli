@@ -217,18 +217,6 @@ struct SessionManifest {
     created_unix_ms: u128,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct SessionStatus {
-    state: SessionState,
-    #[serde(default)]
-    generation: u64,
-    updated_unix_ms: u128,
-    exit_code: Option<i32>,
-    error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    residual_surface: Option<launch::ResidualSurface>,
-}
-
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct SessionEvent {
     provider: String,
@@ -1711,7 +1699,7 @@ fn refused_launch_cleanup(refused_directory: &Path, gate: &str) -> Result<Refuse
         .regular_status_if_present()?
         .with_context(|| format!("failed to read {}", status_path.display()))?
         .state;
-    if session_accepts_prompt(&state) || state == SessionState::Working {
+    if state.accepts_prompt() || state == SessionState::Working {
         return Ok(RefusedLaunchCleanup::Pending(format!(
             "refused session {refused_session} is {state}"
         )));
@@ -2540,29 +2528,6 @@ fn verify_terminal_surface_ownership_until(
     )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CrossSessionFailureAction {
-    TerminalFallback,
-    Uncertain,
-    ReturnError,
-}
-
-fn cross_session_failure_action(
-    transport: provider::FollowUpTransport,
-    failure: &provider::CrossSessionMessageFailure,
-) -> CrossSessionFailureAction {
-    if transport
-        == provider::FollowUpTransport::ProviderCrossSessionMessageWithTerminalPasteFallback
-        && failure.allows_terminal_fallback()
-    {
-        CrossSessionFailureAction::TerminalFallback
-    } else if failure.delivery_may_have_occurred() {
-        CrossSessionFailureAction::Uncertain
-    } else {
-        CrossSessionFailureAction::ReturnError
-    }
-}
-
 fn run_tell(request: TellRequest) -> Result<()> {
     let json = request.json;
     let mut address = None;
@@ -2598,7 +2563,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
         request.timeout,
     )?;
     let previous_state = Reader::open_unchecked(&directory).status()?.state;
-    if !session_accepts_prompt(&previous_state) {
+    if !previous_state.accepts_prompt() {
         bail!(
             "session {} is {previous_state}; tell requires the ready state",
             request.id
@@ -2644,7 +2609,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
             )?;
         }
         provider::FollowUpTransport::ProviderCrossSessionMessage
-        | provider::FollowUpTransport::ProviderCrossSessionMessageWithTerminalPasteFallback => {
+        | provider::FollowUpTransport::ProviderQueue => {
             let prepared = (|| -> Result<_> {
                 remaining_turn_timeout(deadline, request.timeout)?;
                 let provider_turn_id = if follow_up_transport
@@ -2679,33 +2644,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
                 },
             ) {
                 Ok(()) => expected_turn_id = provider_turn_id,
-                Err(failure)
-                    if cross_session_failure_action(follow_up_transport, &failure)
-                        == CrossSessionFailureAction::TerminalFallback =>
-                {
-                    let unavailable = failure.into_error();
-                    deliver_terminal_follow_up(
-                        provider,
-                        follow_up_transport,
-                        &directory,
-                        &request.id,
-                        &terminal_session,
-                        &prompt,
-                        &claim_token,
-                        &mut claim,
-                        deadline,
-                        request.timeout,
-                    )
-                    .with_context(|| {
-                        format!(
-                            "provider native follow-up was unavailable ({unavailable:#}); terminal fallback also failed"
-                        )
-                    })?;
-                }
-                Err(failure)
-                    if cross_session_failure_action(follow_up_transport, &failure)
-                        == CrossSessionFailureAction::Uncertain =>
-                {
+                Err(failure) if failure.delivery_may_have_occurred() => {
                     let error = failure.into_error();
                     let _ = claim.settle_delivery(turn::Delivery::Uncertain(&error));
                     return Err(error).with_context(|| {
@@ -3762,76 +3701,6 @@ fn create_session_within(
     })
 }
 
-fn update_status(
-    directory: &Path,
-    state: SessionState,
-    exit_code: Option<i32>,
-    error: Option<String>,
-) -> Result<()> {
-    update_status_with_residual(directory, state, exit_code, error, None)
-}
-
-fn update_status_with_residual(
-    directory: &Path,
-    state: SessionState,
-    exit_code: Option<i32>,
-    error: Option<String>,
-    residual_surface: Option<launch::ResidualSurface>,
-) -> Result<()> {
-    let _status_lock = Store::open_unchecked(directory).lock_status()?;
-    update_status_locked(directory, state, exit_code, error, residual_surface)
-}
-
-fn update_status_locked(
-    directory: &Path,
-    state: SessionState,
-    exit_code: Option<i32>,
-    error: Option<String>,
-    residual_surface: Option<launch::ResidualSurface>,
-) -> Result<()> {
-    let store = Store::open_unchecked(directory);
-    // The tombstone is the close's commit point: every later write, whatever state it
-    // asks for, restores the tombstone unchanged and does not advance the generation.
-    // launch::terminal_failed can separately append a residual-surface diagnostic to
-    // both records under this lock without changing their lifecycle fields.
-    if let Some(closed) = store.closed_if_present()? {
-        return store.write_status(&closed);
-    }
-    let current = store.status_if_present()?;
-    if let Some(current) = &current
-        && !current.state.clone().transition_allowed(state.clone())
-    {
-        bail!(
-            "invalid native session status transition {} -> {state}",
-            current.state
-        )
-    }
-    let generation = current
-        .as_ref()
-        .map_or(0, |status| status.generation)
-        .checked_add(1)
-        .context("native session status generation overflowed")?;
-    let status = SessionStatus {
-        state: state.clone(),
-        generation,
-        updated_unix_ms: unix_ms(),
-        exit_code,
-        error,
-        residual_surface: residual_surface.or_else(|| {
-            current.and_then(|status| {
-                status
-                    .residual_surface
-                    .or_else(|| status.residual_surface())
-            })
-        }),
-    };
-    if state == SessionState::Closed {
-        store.write_closed(&status)?;
-        return store.write_status(&status);
-    }
-    store.write_status(&status)
-}
-
 #[cfg(test)]
 fn valid_status_transition(current: &SessionState, next: &SessionState) -> bool {
     current.clone().transition_allowed(next.clone())
@@ -4042,10 +3911,6 @@ fn validate_shell_command_component(value: &std::ffi::OsStr, field: &str) -> Res
         );
     }
     Ok(())
-}
-
-fn session_accepts_prompt(state: &SessionState) -> bool {
-    *state == SessionState::Ready
 }
 
 fn delegation_source() -> String {
