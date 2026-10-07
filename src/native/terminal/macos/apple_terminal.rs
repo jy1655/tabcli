@@ -5,7 +5,6 @@ use super::process::{
     macos_processes_named,
 };
 use crate::native::session;
-use crate::native::session::SessionState;
 use crate::native::session::{CoreRecord, Reader, RecordStore, Store};
 use crate::native::terminal;
 use crate::native::terminal::ownership;
@@ -383,45 +382,19 @@ fn release_start(directory: &Path, id: &str) -> Result<String> {
 }
 
 fn wait_for_binding(directory: &Path, id: &str, tty: &str) -> Result<()> {
-    use crate::native::{SessionStatus, launch, unix_ms};
-    let initial = launch::read(&Reader::open_unchecked(directory))?
-        .context("missing Terminal.app launch receipt")?;
-    // The receipt's deadline is wall-clock time; the launch itself never waits longer.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let record = launch::read(&Reader::open_unchecked(directory))?
-            .context("missing Terminal.app launch receipt")?;
-        let status: SessionStatus = Reader::open_unchecked(directory).status()?;
-        if Instant::now() >= deadline
-            || unix_ms() >= record.deadline_unix_ms
-            || record.phase != launch::Phase::Pending
-            || record.claim_token != initial.claim_token
-            || status.state != SessionState::Launching
-            || crate::native::session::turn::current_claim_token(
-                &crate::native::session::Reader::open_unchecked(directory),
-            )?
-            .as_deref()
-                != Some(initial.claim_token.as_str())
-        {
-            bail!("Terminal.app launch was cancelled or timed out before its surface was bound");
-        }
-        if let Some(text) = Reader::open_unchecked(directory)
-            .record(CoreRecord::Terminal)
-            .text()?
-        {
-            let surface: TerminalSession =
-                serde_json::from_str(&text).context("invalid Terminal.app surface binding")?;
-            surface.verify_managed_session(id)?;
-            if surface.kind != TerminalKind::AppleTerminal
-                || surface.id != tty
-                || surface.window_id.as_deref().is_none_or(str::is_empty)
-            {
-                bail!("Terminal.app surface binding does not name the tty of this launch host");
-            }
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    use crate::native::launch::{BindingHost, wait_for_binding};
+    let surface = wait_for_binding(
+        &Reader::open_unchecked(directory),
+        id,
+        BindingHost::AppleTerminal,
+    )?;
+    if surface.kind != TerminalKind::AppleTerminal
+        || surface.id != tty
+        || surface.window_id.as_deref().is_none_or(str::is_empty)
+    {
+        bail!("Terminal.app surface binding does not name the tty of this launch host");
     }
+    Ok(())
 }
 
 pub(super) fn send_file(
@@ -922,6 +895,13 @@ pub(in crate::native) fn apple_terminal_startup_absent_with(
 // `osascript`, and nothing talks to Terminal.
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn host_binding_partial_transitions() {
+        crate::native::launch::binding_tests::characterize("Terminal.app", |directory, id| {
+            super::wait_for_binding(directory, id, "host-id")
+        });
+    }
+
     use super::{CLOSE_TAB_SCRIPT, VERIFY_TAB_SCRIPT, WAIT_FOR_CLOSE_SCRIPT, ownership};
     use crate::native::session::SessionState;
 

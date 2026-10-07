@@ -1,5 +1,4 @@
-use crate::native::session::SessionState;
-use crate::native::session::{CoreRecord, Reader};
+use crate::native::session::Reader;
 #[cfg(test)]
 use crate::native::terminal::ownership;
 use std::{
@@ -401,45 +400,12 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
 }
 
 fn wait_for_binding(directory: &Path, id: &str, iterm_id: &str) -> Result<()> {
-    use crate::native::{SessionStatus, launch, unix_ms};
-    let initial = launch::read(&Reader::open_unchecked(directory))?
-        .context("missing iTerm2 launch receipt")?;
-    let remaining = initial
-        .deadline_unix_ms
-        .saturating_sub(unix_ms())
-        .min(30_000);
-    let deadline = Instant::now() + Duration::from_millis(remaining as u64);
-    loop {
-        let record = launch::read(&Reader::open_unchecked(directory))?
-            .context("missing iTerm2 launch receipt")?;
-        let status: SessionStatus = Reader::open_unchecked(directory).status()?;
-        if Instant::now() >= deadline
-            || unix_ms() >= record.deadline_unix_ms
-            || record.phase != launch::Phase::Pending
-            || record.claim_token != initial.claim_token
-            || status.state != SessionState::Launching
-            || crate::native::session::turn::current_claim_token(
-                &crate::native::session::Reader::open_unchecked(directory),
-            )?
-            .as_deref()
-                != Some(initial.claim_token.as_str())
-        {
-            bail!("iTerm2 launch was cancelled or timed out before surface binding");
-        }
-        if let Some(text) = Reader::open_unchecked(directory)
-            .record(CoreRecord::Terminal)
-            .text()?
-        {
-            let surface: TerminalSession =
-                serde_json::from_str(&text).context("invalid iTerm2 surface binding")?;
-            surface.verify_managed_session(id)?;
-            if surface.kind != TerminalKind::Iterm2 || surface.id != iterm_id {
-                bail!("iTerm2 surface binding does not match this launch host");
-            }
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    use crate::native::launch::{BindingHost, wait_for_binding};
+    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BindingHost::Iterm2)?;
+    if surface.kind != TerminalKind::Iterm2 || surface.id != iterm_id {
+        bail!("iTerm2 surface binding does not match this launch host");
     }
+    Ok(())
 }
 
 pub(super) fn send_file(
@@ -500,6 +466,15 @@ pub(super) fn close_session_until(
 
 #[cfg(test)]
 mod tests {
+    use crate::native::session::SessionState;
+
+    #[test]
+    fn host_binding_partial_transitions() {
+        crate::native::launch::binding_tests::characterize("iTerm2", |directory, id| {
+            wait_for_binding(directory, id, "host-id")
+        });
+    }
+
     use super::*;
 
     fn osascript(script: &str) -> String {

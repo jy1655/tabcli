@@ -17,6 +17,29 @@ pub(in crate::native) const RESIDUAL_SURFACE_MARKER: &str =
     "the surface may remain and is not closed by Bridge";
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(all(test, target_os = "macos"))]
+#[path = "launch/binding_tests.rs"]
+pub(in crate::native) mod binding_tests;
+
+#[cfg(target_os = "macos")]
+fn binding_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = binding_tests::now() {
+        return now;
+    }
+    Instant::now()
+}
+
+#[cfg(target_os = "macos")]
+fn binding_sleep() {
+    let delay = Duration::from_millis(10);
+    #[cfg(test)]
+    if binding_tests::retry(delay) {
+        return;
+    }
+    thread::sleep(delay);
+}
+
 pub(in crate::native) fn install_script(store: &Store, contents: &str) -> Result<String> {
     let directory = store.directory();
     // A new terminal can still be in canonical input mode while its shell starts. A
@@ -67,6 +90,81 @@ pub(in crate::native) fn read(reader: &Reader) -> Result<Option<Record>> {
         bail!("invalid launch receipt identity");
     }
     Ok(record)
+}
+
+/// The existing macOS launch hosts have distinct diagnostics and two wait budgets.
+/// Keeping their selection here leaves adapters responsible only for surface identity.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+pub(in crate::native) enum BindingHost {
+    Iterm2,
+    AppleTerminal,
+    WezTerm,
+}
+
+/// Observe a pending launch until its managed surface is bound. This is an ordered,
+/// unlocked observation, not authorization to spawn; `spawn` owns that final fence.
+#[cfg(target_os = "macos")]
+pub(in crate::native) fn wait_for_binding(
+    reader: &Reader,
+    session_id: &str,
+    host: BindingHost,
+) -> Result<terminal::TerminalSession> {
+    let (name, cancelled) = match host {
+        BindingHost::Iterm2 => (
+            "iTerm2",
+            "iTerm2 launch was cancelled or timed out before surface binding",
+        ),
+        BindingHost::AppleTerminal => (
+            "Terminal.app",
+            "Terminal.app launch was cancelled or timed out before its surface was bound",
+        ),
+        BindingHost::WezTerm => (
+            "WezTerm",
+            "WezTerm launch was cancelled or timed out before surface binding",
+        ),
+    };
+    let initial = read(reader)?.with_context(|| format!("missing {name} launch receipt"))?;
+    #[cfg(test)]
+    binding_tests::checkpoint(binding_tests::Point::InitialReceipt);
+    // Preserve both budgets: after wall-clock rollback or a receipt extension,
+    // Terminal.app may continue beyond the initial receipt's remaining duration.
+    let budget = match host {
+        BindingHost::AppleTerminal => START_TIMEOUT,
+        BindingHost::Iterm2 | BindingHost::WezTerm => Duration::from_millis(
+            initial
+                .deadline_unix_ms
+                .saturating_sub(unix_ms())
+                .min(30_000) as u64,
+        ),
+    };
+    let deadline = binding_now() + budget;
+    #[cfg(test)]
+    binding_tests::checkpoint(binding_tests::Point::BudgetCaptured);
+    loop {
+        let record = read(reader)?.with_context(|| format!("missing {name} launch receipt"))?;
+        // Status is read even after expiry. Keep claim and binding reads lazy: these
+        // short circuits also determine which damaged-record error the host reports.
+        let status: SessionStatus = reader.status()?;
+        if binding_now() >= deadline
+            || unix_ms() >= record.deadline_unix_ms
+            || record.phase != Phase::Pending
+            || record.claim_token != initial.claim_token
+            || status.state != SessionState::Launching
+            || turn::current_claim_token(reader)?.as_deref() != Some(initial.claim_token.as_str())
+        {
+            bail!("{cancelled}");
+        }
+        #[cfg(test)]
+        binding_tests::checkpoint(binding_tests::Point::BeforeBinding);
+        if let Some(text) = reader.record(CoreRecord::Terminal).text()? {
+            let surface: terminal::TerminalSession = serde_json::from_str(&text)
+                .with_context(|| format!("invalid {name} surface binding"))?;
+            surface.verify_managed_session(session_id)?;
+            return Ok(surface);
+        }
+        binding_sleep();
+    }
 }
 
 pub(in crate::native) fn log(store: &Store, message: &str) {
