@@ -1,6 +1,52 @@
 use super::*;
 
 #[test]
+fn converge_repairs_dead_owner_even_when_completion_recovery_is_damaged() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_unchecked(directory.path());
+    update_status(directory.path(), SessionState::Working, None, None).unwrap();
+    store
+        .write_owner(&NativeSessionOwner {
+            pid: 0,
+            ..Default::default()
+        })
+        .unwrap();
+    store
+        .record(CoreRecord::TurnClaim)
+        .write_private(b"1-2-3\n")
+        .unwrap();
+    store
+        .write_completion(&PendingTurnCompletion {
+            schema: 1,
+            claim_token: "1-2-3".to_owned(),
+            event_file: "event-fixture.json".to_owned(),
+            event: SessionEvent {
+                provider: "codex".to_owned(),
+                message: "unpublished".to_owned(),
+                error: None,
+                provider_session_id: None,
+                turn_id: None,
+                created_unix_ms: Some(99),
+            },
+            status_error: None,
+            status_state: SessionState::Ready,
+        })
+        .unwrap();
+    // The missing events directory prevents publication. Repair must still settle
+    // the dead owner's session, retaining the damage in its tombstone.
+    store.converge().unwrap();
+    let closed = store
+        .closed_if_present()
+        .unwrap()
+        .expect("dead owner must be repaired");
+    assert_eq!(closed.state, SessionState::Closed);
+    assert!(closed.error.unwrap().contains("completion recovery failed"));
+    assert!(!store.record(CoreRecord::Completion).path().exists());
+    assert!(!store.record(CoreRecord::TurnClaim).path().exists());
+    assert!(!store.record(CoreRecord::Events).path().exists());
+}
+
+#[test]
 fn residual_surface_clears_only_after_the_adapter_confirms_close_or_absence() {
     for typed in [false, true] {
         for outcome in [

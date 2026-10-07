@@ -246,10 +246,6 @@ impl NativeProviderAdapter for AgyAdapter {
         deadline: Instant,
     ) -> terminal::TerminalSendResult {
         if cfg!(windows) {
-            let directory =
-                session_directory_of(session).map_err(terminal::TerminalSendFailure::not_sent)?;
-            wait_for_workspace_trust(&directory, deadline)
-                .map_err(terminal::TerminalSendFailure::not_sent)?;
             deliver_terminal_turn(
                 session,
                 prompt_path,
@@ -320,10 +316,6 @@ impl NativeProviderAdapter for AgyAdapter {
             // approves the folder (issue #48, see `wait_for_workspace_trust_with`).
             // Every follow-up therefore waits for the trust evidence, then for the
             // macOS readiness rule, and requires the receipt.
-            let directory =
-                session_directory_of(session).map_err(terminal::TerminalSendFailure::not_sent)?;
-            wait_for_workspace_trust(&directory, deadline)
-                .map_err(terminal::TerminalSendFailure::not_sent)?;
             deliver_terminal_turn(
                 session,
                 prompt_path,
@@ -788,11 +780,50 @@ fn wait_for_workspace_trust(directory: &Path, deadline: Instant) -> Result<()> {
     )
 }
 
-// Pastes one framed turn into the managed terminal and confirms its receipt. The
-// caller has already waited for workspace trust. With a readiness rule the paste
-// waits for Agy's startup burst to settle first (the Windows initial prompt, every
-// macOS follow-up); without one it pastes at once (a Windows follow-up, whose initial
-// paste already waited).
+// Only preparation can produce a paste-ready turn. Consuming it issues one paste
+// and checks the receipt against the offset from the read that passed readiness.
+struct PreparedTerminalTurn<'a> {
+    directory: &'a Path,
+    pending: PendingAgyTurn,
+    pre_paste_len: usize,
+}
+
+impl<'a> PreparedTerminalTurn<'a> {
+    fn prepare_with(
+        directory: &'a Path,
+        trust: impl FnOnce() -> Result<()>,
+        readiness: impl FnOnce() -> Result<usize>,
+    ) -> Result<Self> {
+        trust()?;
+        let pending =
+            read_pending_turn(directory)?.context("Agy turn correlation state is missing")?;
+        let pre_paste_len = readiness()?;
+        Ok(Self {
+            directory,
+            pending,
+            pre_paste_len,
+        })
+    }
+
+    fn deliver(
+        self,
+        terminal: &str,
+        send: impl FnOnce() -> terminal::TerminalSendResult,
+        confirm: impl FnOnce(&PendingAgyTurn, usize) -> terminal::TerminalSendResult,
+    ) -> terminal::TerminalSendResult {
+        trace_terminal_delivery(
+            self.directory,
+            &self.pending,
+            self.pre_paste_len,
+            terminal,
+            send,
+            || confirm(&self.pending, self.pre_paste_len),
+        )
+    }
+}
+
+// A Windows follow-up has already passed startup trust/readiness in its initial
+// paste; all other pastes wait for both gates here before preparing the turn.
 fn deliver_terminal_turn(
     session: &terminal::TerminalSession,
     prompt_path: &Path,
@@ -805,40 +836,40 @@ fn deliver_terminal_turn(
         .private(AGY_LOG_FILE)
         .path()
         .to_owned();
-    let pending = read_pending_turn(&directory)
-        .and_then(|pending| pending.context("Agy turn correlation state is missing"))
-        .map_err(TerminalSendFailure::not_sent)?;
-    // The paste is issued right after the read that supplies `pre_paste_len`, so
-    // only lines that start after this offset can be evidence for this submission.
-    // A gated paste takes the offset from the very read that passed the readiness
-    // gate: there is no later read whose discontinuity or fresh activity could go
-    // unjudged between the ready decision and the paste.
-    let pre_paste_len = if let Some(timing) = readiness {
-        wait_for_startup_readiness_with(
-            &mut || read_log_bytes(&log_path),
-            deadline,
-            timing,
-            STARTUP_POLL_INTERVAL,
-            &mut SystemClock,
-        )
-        .map_err(TerminalSendFailure::not_sent)?
-    } else {
-        let log = read_log_bytes(&log_path)
-            .context("Agy log could not be read before the console paste")
-            .map_err(TerminalSendFailure::not_sent)?;
-        follow_up_pre_paste_offset(log.as_deref()).map_err(TerminalSendFailure::not_sent)?
-    };
-    trace_terminal_delivery(
+    let prepared = PreparedTerminalTurn::prepare_with(
         &directory,
-        &pending,
-        pre_paste_len,
+        || {
+            if readiness.is_some() {
+                wait_for_workspace_trust(&directory, deadline)?;
+            }
+            Ok(())
+        },
+        || {
+            if let Some(timing) = readiness {
+                // No later log read may replace the gate's receipt offset.
+                wait_for_startup_readiness_with(
+                    &mut || read_log_bytes(&log_path),
+                    deadline,
+                    timing,
+                    STARTUP_POLL_INTERVAL,
+                    &mut SystemClock,
+                )
+            } else {
+                let log = read_log_bytes(&log_path)
+                    .context("Agy log could not be read before the console paste")?;
+                follow_up_pre_paste_offset(log.as_deref())
+            }
+        },
+    )
+    .map_err(TerminalSendFailure::not_sent)?;
+    prepared.deliver(
         session.kind.as_str(),
         || terminal::send_file(session, prompt_path, deadline),
-        || {
-            // The composer state after an unconfirmed paste is unknown; never paste again.
+        |pending, pre_paste_len| {
+            // The composer after an unconfirmed paste is unknown; never paste again.
             confirm_input_receipt_with(
                 &mut || read_log_bytes(&log_path),
-                &pending,
+                pending,
                 pre_paste_len,
                 Instant::now(),
                 deadline,
@@ -2381,6 +2412,96 @@ fn parse_transcript_line(line: &str) -> Option<(u64, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn paste_preparation_requires_trust_correlation_and_readiness_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let readiness_reads = std::cell::Cell::new(0);
+        let readiness = || {
+            readiness_reads.set(readiness_reads.get() + 1);
+            Ok(26060)
+        };
+        assert!(
+            PreparedTerminalTurn::prepare_with(
+                tmp.path(),
+                || bail!("session ended during trust wait"),
+                readiness
+            )
+            .is_err()
+        );
+        assert_eq!(readiness_reads.get(), 0);
+        assert!(PreparedTerminalTurn::prepare_with(tmp.path(), || Ok(()), readiness).is_err());
+        assert_eq!(
+            readiness_reads.get(),
+            0,
+            "missing correlation must prevent a paste"
+        );
+        install_pending_turn(tmp.path(), "1-2-3").unwrap();
+        assert!(
+            PreparedTerminalTurn::prepare_with(tmp.path(), || Ok(()), || bail!("not ready"))
+                .is_err()
+        );
+        assert!(!tmp.path().join("agy-input-1-2-3.json").exists());
+    }
+
+    #[test]
+    fn prepared_paste_uses_the_ready_read_offset_once_and_never_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_pending_turn(tmp.path(), "1-2-3").unwrap();
+        for failure in ["none", "not-sent", "send-uncertain", "receipt-uncertain"] {
+            let order = std::cell::RefCell::new(Vec::new());
+            let prepared = PreparedTerminalTurn::prepare_with(
+                tmp.path(),
+                || {
+                    order.borrow_mut().push("trust");
+                    Ok(())
+                },
+                || {
+                    order.borrow_mut().push("ready-read");
+                    Ok(26060)
+                },
+            )
+            .unwrap();
+            let result = prepared.deliver(
+                "iterm2",
+                || {
+                    order.borrow_mut().push("paste");
+                    match failure {
+                        "not-sent" => Err(terminal::TerminalSendFailure::not_sent(
+                            anyhow::anyhow!("not sent"),
+                        )),
+                        "send-uncertain" => Err(terminal::TerminalSendFailure::delivery_uncertain(
+                            anyhow::anyhow!("uncertain"),
+                        )),
+                        _ => Ok(()),
+                    }
+                },
+                |pending, offset| {
+                    order.borrow_mut().push("receipt");
+                    assert_eq!(offset, 26060);
+                    assert_eq!(pending.claim_token, "1-2-3");
+                    if failure == "receipt-uncertain" {
+                        Err(terminal::TerminalSendFailure::delivery_uncertain(
+                            anyhow::anyhow!("no receipt"),
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            let expected = if matches!(failure, "not-sent" | "send-uncertain") {
+                vec!["trust", "ready-read", "paste"]
+            } else {
+                vec!["trust", "ready-read", "paste", "receipt"]
+            };
+            assert_eq!(*order.borrow(), expected);
+            match failure {
+                "none" => result.unwrap(),
+                "not-sent" => assert!(!result.unwrap_err().delivery_may_have_occurred()),
+                _ => assert!(result.unwrap_err().delivery_may_have_occurred()),
+            }
+        }
+    }
+
     #[test]
     fn missing_receipt_is_traced_once_and_trace_failure_does_not_cancel_delivery() {
         let tmp = tempfile::tempdir().unwrap();

@@ -1017,10 +1017,10 @@ esac
 fn public_identity_in_version_and_help() {
     assert_eq!(agent_bridge::PUBLIC_COMMAND, "tabcli");
     for (flag, expected) in [
-        ("--version", "tabcli 0.2.4"),
+        ("--version", "tabcli 0.2.5"),
         (
             "--help",
-            "tabcli 0.2.4 — Terminal Agent Bridge: visible terminal sessions for coding agent CLIs",
+            "tabcli 0.2.5 — Terminal Agent Bridge: visible terminal sessions for coding agent CLIs",
         ),
     ] {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_tabcli"))

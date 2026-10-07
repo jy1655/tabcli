@@ -21,26 +21,7 @@ use std::{
     time::Duration,
 };
 
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-#[cfg(windows)]
-use std::os::windows::{
-    io::{AsRawHandle, FromRawHandle, OwnedHandle},
-    process::CommandExt,
-};
-#[cfg(windows)]
-use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
-    System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
-    },
-    System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject,
-    },
-    System::Threading::{CREATE_SUSPENDED, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
-};
+use crate::native::provider_process::{ProviderProcessTree, configure_process_tree};
 
 use super::super::terminal;
 
@@ -1480,7 +1461,7 @@ fn send_cross_session_message_inner(
         plan.arguments,
     )
     .map_err(CrossSessionMessageFailure::not_sent)?;
-    configure_messenger_process_tree(&mut command);
+    configure_process_tree(&mut command);
     super::apply_environment_removals(&mut command, CLAUDE_CODE_SESSION_MARKERS);
     let mut stdout = tempfile::tempfile()
         .context("failed to create Claude messenger stdout buffer")
@@ -1510,7 +1491,7 @@ fn send_cross_session_message_inner(
             )
         })
         .map_err(CrossSessionMessageFailure::not_sent)?;
-    let process_tree = match ClaudeMessengerProcessTree::attach(&child) {
+    let process_tree = match ProviderProcessTree::attach(&child) {
         Ok(process_tree) => process_tree,
         Err(error) => {
             terminate_child(&mut child);
@@ -1636,157 +1617,12 @@ fn install_pending_turn(directory: &Path, request_id: &str) -> Result<PendingTur
     })
 }
 
-fn configure_messenger_process_tree(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        command.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        command.creation_flags(CREATE_SUSPENDED);
-    }
-    #[cfg(not(any(unix, windows)))]
-    let _ = command;
-}
-
-struct ClaudeMessengerProcessTree {
-    #[cfg(unix)]
-    process_group: i32,
-    #[cfg(windows)]
-    job: HANDLE,
-}
-
-impl ClaudeMessengerProcessTree {
-    fn attach(child: &Child) -> Result<Self> {
-        #[cfg(unix)]
-        {
-            let process_group = i32::try_from(child.id())
-                .context("Claude messenger process id cannot identify its process group")?;
-            Ok(Self { process_group })
-        }
-        #[cfg(windows)]
-        {
-            let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-            if job.is_null() {
-                return Err(std::io::Error::last_os_error())
-                    .context("failed to create Claude messenger containment job");
-            }
-            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let configured = unsafe {
-                SetInformationJobObject(
-                    job,
-                    JobObjectExtendedLimitInformation,
-                    std::ptr::addr_of!(limits).cast(),
-                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                )
-            };
-            if configured == 0 {
-                let error = std::io::Error::last_os_error();
-                unsafe {
-                    CloseHandle(job);
-                }
-                return Err(error).context("failed to configure Claude messenger containment job");
-            }
-            let assigned = unsafe {
-                AssignProcessToJobObject(job, child.as_raw_handle().cast::<core::ffi::c_void>())
-            };
-            if assigned == 0 {
-                let error = std::io::Error::last_os_error();
-                unsafe {
-                    CloseHandle(job);
-                }
-                return Err(error).context("failed to contain the Claude messenger process tree");
-            }
-            Ok(Self { job })
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = child;
-            Ok(Self {})
-        }
-    }
-
-    fn resume(&self, child: &Child) -> Result<()> {
-        #[cfg(windows)]
-        {
-            resume_suspended_process(child.id())
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = (self, child);
-            Ok(())
-        }
-    }
-
-    fn terminate(&self) {
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(-self.process_group, libc::SIGKILL);
-        }
-        #[cfg(windows)]
-        unsafe {
-            TerminateJobObject(self.job, 1);
-        }
-    }
-}
-
-#[cfg(windows)]
-fn resume_suspended_process(pid: u32) -> Result<()> {
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error())
-            .context("failed to enumerate the suspended Claude messenger thread");
-    }
-    let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot) };
-    let mut entry = THREADENTRY32 {
-        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
-        ..Default::default()
-    };
-    if unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) } == 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("failed to inspect the suspended Claude messenger thread");
-    }
-    loop {
-        if entry.th32OwnerProcessID == pid {
-            let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-            if thread.is_null() {
-                return Err(std::io::Error::last_os_error())
-                    .context("failed to open the suspended Claude messenger thread");
-            }
-            let thread = unsafe { OwnedHandle::from_raw_handle(thread) };
-            let previous = unsafe { ResumeThread(thread.as_raw_handle()) };
-            if previous == u32::MAX {
-                return Err(std::io::Error::last_os_error())
-                    .context("failed to resume the contained Claude messenger process");
-            }
-            if previous != 1 {
-                bail!("contained Claude messenger had unexpected suspension count {previous}");
-            }
-            return Ok(());
-        }
-        if unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } == 0 {
-            break;
-        }
-    }
-    bail!("suspended Claude messenger has no owned primary thread")
-}
-
-#[cfg(windows)]
-impl Drop for ClaudeMessengerProcessTree {
-    fn drop(&mut self) {
-        unsafe {
-            CloseHandle(self.job);
-        }
-    }
-}
-
 fn terminate_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
 }
 
-fn terminate_child_tree(child: &mut Child, process_tree: &ClaudeMessengerProcessTree) {
+fn terminate_child_tree(child: &mut Child, process_tree: &ProviderProcessTree) {
     process_tree.terminate();
     terminate_child(child);
 }
@@ -3400,7 +3236,7 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        configure_messenger_process_tree(&mut command);
+        configure_process_tree(&mut command);
 
         let mut child = command.spawn().unwrap();
         thread::sleep(Duration::from_millis(200));
@@ -3408,7 +3244,7 @@ mod tests {
             child.try_wait().unwrap().is_none(),
             "messenger executed before it could be assigned to the containment job"
         );
-        let process_tree = ClaudeMessengerProcessTree::attach(&child).unwrap();
+        let process_tree = ProviderProcessTree::attach(&child).unwrap();
         terminate_child_tree(&mut child, &process_tree);
     }
 
@@ -3421,10 +3257,10 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        configure_messenger_process_tree(&mut command);
+        configure_process_tree(&mut command);
 
         let mut child = command.spawn().unwrap();
-        let process_tree = ClaudeMessengerProcessTree::attach(&child).unwrap();
+        let process_tree = ProviderProcessTree::attach(&child).unwrap();
         process_tree.resume(&child).unwrap();
         assert!(child.wait().unwrap().success());
     }

@@ -23,6 +23,31 @@ fn event(message: &str) -> SessionEvent {
 }
 
 #[test]
+fn journal_comparison_requires_exact_bytes_inside_the_read_limit() {
+    let pending = PendingTurnCompletion::new("1-2-3", event("한글 result"), None).unwrap();
+    let canonical = serde_json::to_vec_pretty(&pending.event).unwrap();
+    let limit = canonical.len() as u64;
+    assert_eq!(
+        journaled_event_state_of(&pending, &canonical, limit).unwrap(),
+        JournaledEventState::Committed
+    );
+    assert_eq!(
+        journaled_event_state_of(&pending, &canonical, limit - 1).unwrap(),
+        JournaledEventState::Oversized(limit)
+    );
+    for bytes in [
+        serde_json::to_vec(&pending.event).unwrap(),
+        b"\xff".to_vec(),
+        Vec::new(),
+    ] {
+        assert_eq!(
+            journaled_event_state_of(&pending, &bytes, limit).unwrap(),
+            JournaledEventState::Mismatched
+        );
+    }
+}
+
+#[test]
 fn delivery_settlement_regression_late_not_sent_preserves_newer_turn() {
     let (_directory, store) = fixture(SessionState::Working);
     let mut old = claim(&store, &[]).unwrap();

@@ -1,7 +1,7 @@
 //! Views of one session's durable records.
 use super::{
     ProviderProcessRecord, RecordedReopenRefusal, SESSION_SCHEMA, STATE_DIR_ENV, SessionEvent,
-    SessionManifest, SessionStatus, require_valid_session_id, terminal, unix_ms,
+    SessionManifest, require_valid_session_id, terminal, unix_ms,
 };
 use crate::native::terminal::ownership::NativeSessionOwner;
 use anyhow::{Context, Result, bail};
@@ -283,6 +283,7 @@ impl Store {
     pub(in crate::native) fn try_lock(&self) -> Result<Option<TurnClaimLock>> {
         try_lock(&self.directory)
     }
+    #[cfg(test)]
     pub(in crate::native) fn write_status(&self, value: &SessionStatus) -> Result<()> {
         self.private(STATUS_FILE).write_json(value)
     }
@@ -292,6 +293,7 @@ impl Store {
     pub(in crate::native) fn write_completion(&self, value: &PendingTurnCompletion) -> Result<()> {
         self.private(TURN_COMPLETION_FILE).write_json(value)
     }
+    #[cfg(test)]
     pub(in crate::native) fn write_closed(&self, value: &SessionStatus) -> Result<()> {
         self.private(CLOSED_STATUS_FILE).write_json(value)
     }
@@ -557,13 +559,17 @@ pub(super) mod tests;
 mod owner;
 mod state;
 pub(in crate::native) use owner::{observe_owner, observe_owner_record};
-pub(in crate::native) use state::SessionState;
+pub(in crate::native) use state::{
+    SessionState, SessionStatus, update_status, update_status_with_residual,
+};
 pub(in crate::native) mod launch;
 
 impl Store {
     /// Publish an accepted completion before repairing its session's dead owner.
     pub(in crate::native) fn converge(&self) -> Result<()> {
-        turn::recover_pending_completion(self.directory())?;
+        // Repair owns recovery and preserves its damage while settling a dead owner.
+        // An earlier recovery here both duplicated work and skipped that settlement
+        // when a completion record could not be published.
         close::repair_dead_owner(self)?;
         Ok(())
     }

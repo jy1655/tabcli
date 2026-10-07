@@ -707,13 +707,13 @@ where
         .path()
         .to_owned();
     let state = Reader::open_unchecked(directory).status()?.state;
-    if !session_accepts_prompt(&state) {
+    if !state.accepts_prompt() {
         bail!("session {session_id} is {state}; tell requires the ready state");
     }
     let mut claim = {
         let _lock = Store::open_unchecked((path).with_file_name("")).lock()?;
         let state = Reader::open_unchecked(directory).status()?.state;
-        if !session_accepts_prompt(&state) {
+        if !state.accepts_prompt() {
             bail!("session {session_id} is {state}; tell requires the ready state");
         }
         create_turn_claim_locked(path.clone(), context_sources)?
@@ -732,7 +732,7 @@ where
         bail!("native turn claim changed before it could start");
     }
     let state = Reader::open_unchecked(directory).status()?.state;
-    if !session_accepts_prompt(&state) {
+    if !state.accepts_prompt() {
         bail!("session {session_id} is {state}; tell requires the ready state");
     }
     let baseline = Reader::open_unchecked(directory).events()?.len();
@@ -930,6 +930,23 @@ pub(in crate::native) struct JournaledEventRead {
     pub(in crate::native) state: JournaledEventState,
     pub(in crate::native) bytes_read: u64,
     pub(in crate::native) committed_text: Option<String>,
+}
+
+/// Compare bytes already read by a bounded reader. Timeline supplies its retained
+/// read here; publication readers supply their single bounded file read.
+pub(in crate::native) fn journaled_event_state_of(
+    pending: &PendingTurnCompletion,
+    bytes: &[u8],
+    limit: u64,
+) -> Result<JournaledEventState> {
+    if bytes.len() as u64 > limit {
+        return Ok(JournaledEventState::Oversized(bytes.len() as u64));
+    }
+    Ok(if bytes == serde_json::to_vec_pretty(&pending.event)? {
+        JournaledEventState::Committed
+    } else {
+        JournaledEventState::Mismatched
+    })
 }
 
 /// The single byte-match predicate: a journaled event is committed exactly when its file

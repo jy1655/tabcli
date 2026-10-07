@@ -264,10 +264,9 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 
     fn follow_up_transport(&self) -> FollowUpTransport {
-        // This shared branch uses claim-based queue correlation rather than the
-        // messenger's generated turn identity. The adapter refuses unaddressed
-        // terminal fallback until Codex can bind it to the managed thread.
-        FollowUpTransport::ProviderCrossSessionMessageWithTerminalPasteFallback
+        // The queue addresses the established thread and correlates by the claim.
+        // It never falls back to input in the TUI's currently selected conversation.
+        FollowUpTransport::ProviderQueue
     }
 
     fn new_cross_session_turn_id(&self) -> Result<String> {
@@ -278,15 +277,7 @@ impl NativeProviderAdapter for CodexAdapter {
         &self,
         context: CrossSessionMessageContext<'_>,
     ) -> CrossSessionMessageResult {
-        send_native_queue_message(context).map_err(|failure| {
-            if failure.allows_terminal_fallback() {
-                CrossSessionMessageFailure::not_sent(
-                    failure.into_error().context(unaddressed_follow_up()),
-                )
-            } else {
-                failure
-            }
-        })
+        send_native_queue_message(context)
     }
 
     fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()> {
@@ -473,6 +464,10 @@ impl CodexCommandFailure {
     }
 }
 
+fn queue_unavailable(error: anyhow::Error) -> CrossSessionMessageFailure {
+    CrossSessionMessageFailure::not_sent(error.context(unaddressed_follow_up()))
+}
+
 fn send_native_queue_message(context: CrossSessionMessageContext<'_>) -> CrossSessionMessageResult {
     let manifest = Reader::open_unchecked(context.directory)
         .manifest()
@@ -480,26 +475,24 @@ fn send_native_queue_message(context: CrossSessionMessageContext<'_>) -> CrossSe
     match codex_version_supports_native_queue(&manifest.provider_version) {
         Ok(true) => {}
         Ok(false) => {
-            return Err(CrossSessionMessageFailure::terminal_fallback(
-                anyhow::anyhow!(
-                    "Codex {} predates native queue support in 0.149.0",
-                    manifest.provider_version
-                ),
-            ));
+            return Err(queue_unavailable(anyhow::anyhow!(
+                "Codex {} predates native queue support in 0.149.0",
+                manifest.provider_version
+            )));
         }
         Err(error) => return Err(CrossSessionMessageFailure::not_sent(error)),
     }
     let thread_id = established_codex_thread(context.directory)
         .map_err(CrossSessionMessageFailure::not_sent)?
         .ok_or_else(|| {
-            CrossSessionMessageFailure::terminal_fallback(anyhow::anyhow!(
+            queue_unavailable(anyhow::anyhow!(
                 "Codex session has no established provider thread id"
             ))
         })?;
     if !valid_codex_thread_id(&thread_id) {
-        return Err(CrossSessionMessageFailure::terminal_fallback(
-            anyhow::anyhow!("Codex session provider identity is not a thread UUID"),
-        ));
+        return Err(queue_unavailable(anyhow::anyhow!(
+            "Codex session provider identity is not a thread UUID"
+        )));
     }
     // Codex owns backend selection: its queue command uses an available shared daemon or
     // an embedded server, and both write the provider's durable, thread-addressed queue.
@@ -516,9 +509,7 @@ fn send_native_queue_message(context: CrossSessionMessageContext<'_>) -> CrossSe
         arguments,
     )
     .map_err(|error| {
-        CrossSessionMessageFailure::terminal_fallback(
-            error.context("failed to prepare the Codex queue command"),
-        )
+        queue_unavailable(error.context("failed to prepare the Codex queue command"))
     })?;
     command
         .current_dir(&manifest.workspace)
@@ -533,9 +524,7 @@ fn send_native_queue_message(context: CrossSessionMessageContext<'_>) -> CrossSe
             output.truncated,
             &thread_id,
         ),
-        Err(failure) if !failure.delivery_may_have_started => {
-            Err(CrossSessionMessageFailure::terminal_fallback(failure.error))
-        }
+        Err(failure) if !failure.delivery_may_have_started => Err(queue_unavailable(failure.error)),
         Err(failure) => Err(CrossSessionMessageFailure::delivery_uncertain(
             failure.error,
         )),
@@ -891,7 +880,7 @@ fn classify_codex_queue_output(
     let rejected_before_enqueue = codex_queue_rejected_before_enqueue(&stderr, thread_id);
     let error = anyhow::anyhow!("Codex queue failed: {}", stderr.trim());
     if target_missing || native_queue_unavailable || rejected_before_enqueue {
-        Err(CrossSessionMessageFailure::terminal_fallback(error))
+        Err(queue_unavailable(error))
     } else {
         Err(CrossSessionMessageFailure::delivery_uncertain(error))
     }
@@ -1385,10 +1374,7 @@ exit 91
     #[cfg(unix)]
     #[test]
     fn unavailable_queue_never_selects_unaddressed_terminal_input() {
-        use super::super::super::{
-            CrossSessionFailureAction, acquire_ready_turn_claim_with_context,
-            cross_session_failure_action,
-        };
+        use super::super::super::acquire_ready_turn_claim_with_context;
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir().unwrap();
@@ -1430,8 +1416,8 @@ exit 1
             .unwrap_err();
 
         assert_eq!(
-            cross_session_failure_action(ADAPTER.follow_up_transport(), &failure),
-            CrossSessionFailureAction::ReturnError,
+            ADAPTER.follow_up_transport(),
+            FollowUpTransport::ProviderQueue,
             "a queue rejection must not select a paste into an unverified active thread"
         );
         assert!(!failure.delivery_may_have_occurred());
@@ -1623,12 +1609,11 @@ exit 1
             let failure =
                 classify_codex_queue_output(true, stdout, b"", truncated, thread_id).unwrap_err();
             assert!(failure.delivery_may_have_occurred());
-            assert!(!failure.allows_terminal_fallback());
         }
     }
 
     #[test]
-    fn codex_queue_falls_back_only_for_explicit_pre_delivery_unavailability() {
+    fn codex_queue_reports_not_sent_only_for_explicit_pre_delivery_unavailability() {
         let thread_id = "018f0000-0000-7000-8000-000000000001";
         for stderr in [
             format!(
@@ -1651,7 +1636,7 @@ exit 1
             let failure =
                 classify_codex_queue_output(false, b"", stderr.as_bytes(), false, thread_id)
                     .unwrap_err();
-            assert!(failure.allows_terminal_fallback(), "{stderr}");
+            assert!(failure.error.to_string().contains(&unaddressed_follow_up()), "{stderr}");
             assert!(!failure.delivery_may_have_occurred(), "{stderr}");
         }
 
@@ -1664,7 +1649,6 @@ exit 1
         )
         .unwrap_err();
         assert!(failure.delivery_may_have_occurred());
-        assert!(!failure.allows_terminal_fallback());
     }
 
     #[cfg(unix)]
@@ -1800,7 +1784,6 @@ exit 1
                 })
                 .unwrap_err();
 
-            assert!(!failure.allows_terminal_fallback(), "{version}");
             assert!(!failure.delivery_may_have_occurred(), "{version}");
             assert!(!directory.join(PENDING_TURN_FILE).exists(), "{version}");
         }
@@ -1841,7 +1824,6 @@ exit 91
             })
             .unwrap_err();
 
-        assert!(!failure.allows_terminal_fallback());
         assert!(!failure.delivery_may_have_occurred());
         assert!(
             !directory.join("provider-ran").exists(),
@@ -2074,7 +2056,6 @@ exit 91
             .unwrap_err();
 
         let delivery_uncertain = failure.delivery_may_have_occurred();
-        let allows_fallback = failure.allows_terminal_fallback();
         let reason = format!("{:#}", failure.into_error());
         assert!(reason.contains("Codex queue timed out"), "{reason}");
         QUEUE_TIMEOUT_READY.with(|path| {
@@ -2084,7 +2065,6 @@ exit 91
             );
         });
         assert!(delivery_uncertain, "{reason}");
-        assert!(!allows_fallback, "{reason}");
         assert!(directory.join(PENDING_TURN_FILE).is_file());
         assert!(directory.join("queue-started").is_file());
         assert_eq!(
