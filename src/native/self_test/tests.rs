@@ -885,3 +885,101 @@ fn closed_residual_surface_cleanup_is_not_verified() {
         }
     }
 }
+
+#[test]
+fn agy_result_timeouts_append_only_the_same_requests_doctor_observation() {
+    const REASON: &str = "waiting timed out; the request was not cancelled or resent";
+    const DETAIL: &str = "This session's agy.log shows the pending turn waiting for user approval of RunCommand in the terminal. Bridge does not answer it. This is the last observed confirmation, not proof that the dialog is still open.";
+    for follow_up in [false, true] {
+        for evidence in ["matching", "other-request", "missing", "doctor-error"] {
+            let id = if follow_up { "request-2" } else { "request-1" };
+            let mut replies = vec![accepted("request-1")];
+            if follow_up {
+                replies.extend([result("request-1", "event-1.json"), accepted("request-2")]);
+            }
+            let mut timeout = error(REASON);
+            timeout.value = json!({"session":"session-owned", "request_id": id, "timed_out":true});
+            replies.push(timeout);
+            replies.push(match evidence {
+                "doctor-error" => error("doctor timed out"),
+                "missing" => ok(json!({"session":"session-owned", "checks":[]})),
+                _ => ok(json!({"session":"session-owned", "checks":[{
+                    "reason_code":"agy_tool_confirmation_observed", "detail":DETAIL,
+                    "evidence":{"request_id":if evidence == "matching" {id} else {"request-other"}}
+                }]})),
+            });
+            replies.extend(cleanup());
+            let mut fake = fake(replies);
+            let mut req = request(&[]);
+            req.ask.provider = FirstPartyCli::Agy;
+            let report = orchestrate(
+                &req,
+                &mut fake,
+                PathBuf::from("root"),
+                "AB_marker".to_owned(),
+            );
+            let step = &report.steps[if follow_up { 3 } else { 1 }];
+            assert_eq!(step.outcome, Outcome::TimedOut);
+            assert_eq!(
+                step.reason.as_deref(),
+                Some(
+                    if evidence == "matching" {
+                        format!("{REASON}; {DETAIL}")
+                    } else {
+                        REASON.to_owned()
+                    }
+                    .as_str()
+                )
+            );
+            assert_eq!(report.steps[4].outcome, Outcome::Passed);
+            assert!(fake.replies.is_empty());
+            assert_eq!(
+                fake.calls
+                    .iter()
+                    .filter(|args| args[0] == "doctor")
+                    .collect::<Vec<_>>(),
+                vec![&arguments(&["doctor", "session-owned", "--json"])]
+            );
+            assert_eq!(
+                fake.calls.iter().filter(|args| args[0] == "tell").count(),
+                usize::from(follow_up)
+            );
+        }
+    }
+}
+
+#[test]
+fn all_providers_keep_the_exact_marker_contract_without_tools() {
+    for provider in [
+        FirstPartyCli::Agy,
+        FirstPartyCli::Codex,
+        FirstPartyCli::Claude,
+        FirstPartyCli::Pi,
+    ] {
+        let mut fake = fake(
+            [
+                accepted("request-1"),
+                result("request-1", "event-1.json"),
+                accepted("request-2"),
+                result("request-2", "event-2.json"),
+            ]
+            .into_iter()
+            .chain(cleanup()),
+        );
+        let mut req = request(&[]);
+        req.ask.provider = provider;
+        let report = orchestrate(
+            &req,
+            &mut fake,
+            PathBuf::from("root"),
+            "AB_marker".to_owned(),
+        );
+        assert_eq!(report.outcome, Outcome::Passed);
+        assert_eq!(
+            fake.calls[0][5],
+            "No tool, command, or file is needed. Reply with exactly this marker and nothing else: AB_marker"
+        );
+        assert_eq!(fake.calls[0][5], fake.calls[2][3]);
+        assert!(!fake.calls.iter().any(|args| args[0] == "doctor"));
+    }
+}

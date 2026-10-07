@@ -31,6 +31,8 @@ pub(super) static ADAPTER: AgyAdapter = AgyAdapter;
 pub(super) struct AgyAdapter;
 
 const PENDING_TURN_FILE: &str = "agy-pending-turn.json";
+const TRANSCRIPT_FILE: &str = "transcript.jsonl";
+const FULL_TRANSCRIPT_FILE: &str = "transcript_full.jsonl";
 
 // The only line Agy draws under its trust dialog is the footer with the selected
 // model's label, and `agy models` (1.2.14) lists these families. The footer appears
@@ -158,6 +160,7 @@ impl NativeProviderAdapter for AgyAdapter {
         // still show the trust dialog.
         if let Some(directory) = context.directory {
             checks.push(workspace_trust_check(context.workspace, directory));
+            checks.push(tool_confirmation_check(directory));
         }
         checks
     }
@@ -1877,7 +1880,7 @@ struct TranscriptCursor {
 
 impl TranscriptCursor {
     fn new(path: PathBuf) -> Self {
-        let full_path = path.with_file_name("transcript_full.jsonl");
+        let full_path = path.with_file_name(FULL_TRANSCRIPT_FILE);
         Self {
             path,
             full_path,
@@ -2035,32 +2038,153 @@ fn read_full_result(path: &Path, brain_root: &Path, step: u64) -> Result<Option<
 const TURN_START_MARKER: &str = "Forwarding user message to conversation ";
 const TURN_FAILURE_MARKER: &str = "agent executor error: ";
 
-// The terminal error of the newest turn when the log shows that turn to be the
-// pending one, and whether it was pasted (bound by its receipt) or is the first,
-// argument-delivered turn (still to be bound by the transcript).
-fn pending_turn_failure(log: &[u8], pending: &PendingAgyTurn) -> Option<(String, bool)> {
+// Both failure and approval observations use the same newest-turn binding. The
+// argument-delivered first turn still needs the full transcript's sole input.
+#[derive(Default)]
+struct PendingTurnLog {
+    pasted: bool,
+    failure: Option<String>,
+    confirmation: Option<String>,
+}
+
+fn pending_turn_log(log: &[u8], pending: &PendingAgyTurn) -> PendingTurnLog {
     let mut turns = 0_usize;
     let mut receipt = None;
-    let (mut ours, mut pasted) = (false, false);
-    let mut failure = None;
+    let mut ours = false;
+    let mut observation = PendingTurnLog::default();
     for line in complete_log_lines(log) {
         if let Some(input) = parse_input_receipt(&line) {
             receipt = Some(receipt_matches(&input, pending));
         } else if line.contains(TURN_START_MARKER) {
-            (ours, pasted) = match receipt.take() {
+            let (matches, pasted) = match receipt.take() {
                 Some(matches) => (matches, true),
                 None => (turns == 0, false),
             };
+            ours = matches;
             turns += 1;
-            failure = None;
-        } else if ours
-            && failure.is_none()
-            && let Some((_, error)) = line.split_once(TURN_FAILURE_MARKER)
-        {
-            failure = Some(error.trim().to_owned());
+            observation = PendingTurnLog {
+                pasted,
+                ..Default::default()
+            };
+        } else if ours {
+            if let Some((_, error)) = line.split_once(TURN_FAILURE_MARKER) {
+                observation
+                    .failure
+                    .get_or_insert_with(|| error.trim().to_owned());
+            } else if let Some(tool) = parse_tool_confirmation(&line) {
+                observation.confirmation = Some(tool.to_owned());
+            }
         }
     }
-    failure.map(|error| (error, pasted))
+    observation
+}
+
+fn pending_turn_failure(log: &[u8], pending: &PendingAgyTurn) -> Option<(String, bool)> {
+    let observation = pending_turn_log(log, pending);
+    observation.failure.map(|error| (error, observation.pasted))
+}
+
+// Observed once: Agy 1.3.0, 2026-10-07, issue #82. The line identifies a tool,
+// not its command or a documented approval lifecycle. Do not infer approval from
+// unrelated later log activity; this is a log observation, not a failure signal.
+fn parse_tool_confirmation(line: &str) -> Option<&str> {
+    let (_, tail) = line.split_once("Surfacing tool confirmation: \"")?;
+    let (tool, step) = tail.split_once("\" at step ")?;
+    (!tool.is_empty()
+        && tool.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !step.is_empty()
+        && step.bytes().all(|c| c.is_ascii_digit()))
+    .then_some(tool)
+}
+
+fn tool_confirmation_check(directory: &Path) -> super::super::doctor::Check {
+    use super::super::doctor::{Availability::Unknown, Check};
+    let observation = brain_root().and_then(|brain| pending_tool_confirmation(directory, &brain));
+    let (reason, detail, evidence) = match observation {
+        Ok(Some((tool, request_id))) => (
+            "agy_tool_confirmation_observed",
+            format!(
+                "This session's {AGY_LOG_FILE} shows the pending turn waiting for user approval of {tool} in the terminal. Bridge does not answer it. This is the last observed confirmation, not proof that the dialog is still open."
+            ),
+            serde_json::json!({"log": directory.join(AGY_LOG_FILE), "tool": tool, "request_id": request_id}),
+        ),
+        Ok(None) => (
+            "agy_tool_confirmation_unobserved",
+            format!(
+                "No tool confirmation is attributable to the pending turn in this session's {AGY_LOG_FILE}."
+            ),
+            serde_json::Value::Null,
+        ),
+        Err(error) => (
+            "agy_tool_confirmation_unverified",
+            format!("The pending turn's tool confirmation could not be verified: {error:#}"),
+            serde_json::Value::Null,
+        ),
+    };
+    Check::new("agy_tool_confirmation", Unknown, reason, detail,
+        "Observation only. Review any approval prompt in the managed terminal yourself; Bridge does not approve, resend, or release the turn claim.")
+        .evidence(evidence)
+}
+
+fn pending_tool_confirmation(directory: &Path, brain: &Path) -> Result<Option<(String, String)>> {
+    let reader = Reader::open_unchecked(directory);
+    let snapshot = super::super::query::observe_snapshot(&reader)?;
+    let Some(pending) = read_pending_turn(directory)? else {
+        return Ok(None);
+    };
+    if snapshot.status.state != SessionState::Working
+        || snapshot.status.error.is_some()
+        || snapshot.pending.is_some()
+        || snapshot.claim.as_deref() != Some(&pending.claim_token)
+    {
+        return Ok(None);
+    }
+    let Some(receipt) = snapshot
+        .receipts
+        .iter()
+        .find(|r| r.claim_token == pending.claim_token)
+    else {
+        return Ok(None);
+    };
+    let Some(log) = reader.private(AGY_LOG_FILE).text()? else {
+        return Ok(None);
+    };
+    let observed = pending_turn_log(log.as_bytes(), &pending);
+    let Some(tool) = observed.confirmation.filter(|_| observed.failure.is_none()) else {
+        return Ok(None);
+    };
+    let Some(id) = parse_conversation_id(&log) else {
+        return Ok(None);
+    };
+    let logs = brain.join(id).join(".system_generated").join("logs");
+    let full = logs.join(FULL_TRANSCRIPT_FILE);
+    if !observed.pasted && !only_user_input_carries(&full, brain, &pending.marker)? {
+        return Ok(None);
+    }
+    // A transcript result may precede the monitor's publication. Observe it without
+    // running the monitor or publishing anything, using its parser and correlation.
+    for path in [logs.join(TRANSCRIPT_FILE), full.clone()] {
+        if validated_file_metadata(&path, brain)?.is_none() {
+            continue;
+        }
+        if let Some(text) = RecordReader::at(&path).text()? {
+            for line in text.lines() {
+                if let Some(result) = parse_planner_result(line) {
+                    let message = if result.truncated {
+                        read_full_result(&full, brain, result.step)?
+                    } else {
+                        Some(result.message)
+                    };
+                    if message
+                        .is_some_and(|message| correlated_response(&message, &pending).is_ok())
+                    {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+    }
+    Ok(Some((tool, receipt.request_id.clone())))
 }
 
 fn only_user_input_carries(path: &Path, brain_root: &Path, marker: &str) -> Result<bool> {
@@ -2107,7 +2231,7 @@ impl MonitorState {
                 .join(&newest_id)
                 .join(".system_generated")
                 .join("logs")
-                .join("transcript.jsonl");
+                .join(TRANSCRIPT_FILE);
             self.conversation_id = Some(newest_id);
             self.transcript = Some(TranscriptCursor::new(path));
         }
@@ -6559,6 +6683,186 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         assert_eq!(second.message, "after clear");
         assert_eq!(second.provider_session_id.as_deref(), Some(second_id));
         assert_eq!(second.turn_id.as_deref(), Some("1"));
+    }
+
+    // Composite fixture: existing real startup/receipt excerpts (2026-09-24),
+    // the Forwarding line from the real 2026-10-01 quota fixture, and the exact
+    // confirmation text observed once with Agy 1.3.0 on 2026-10-07 in issue #82.
+    // This is not a captured continuous 1.3.0 log; no command text was observed.
+    const APPROVAL_FORWARDED: &str = "I1001 17:23:48.670594     402 conversation_manager.go:699] Forwarding user message to conversation 97ad12fd-9e7a-4556-83a4-8f0147343657 (items=1, media=0)\n";
+    const APPROVAL_LINE: &str = "Surfacing tool confirmation: \"RunCommand\" at step 2\n";
+
+    fn approval_log(pending: &PendingAgyTurn) -> String {
+        REAL_QUIET_STARTUP.to_owned()
+            + &receipt_line(&go_quoted(
+                &terminal_correlated_prompt("reply", pending, false).unwrap(),
+            ))
+            + REAL_SUCCESS_AFTER_RECEIPT
+            + "Created conversation 97ad12fd-9e7a-4556-83a4-8f0147343657\n"
+            + APPROVAL_FORWARDED
+            + APPROVAL_LINE
+    }
+
+    #[test]
+    fn tool_confirmation_uses_failure_binding_and_rejects_other_turns() {
+        let pending = PendingAgyTurn::new("82-1-0").unwrap();
+        let log = approval_log(&pending);
+        assert_eq!(
+            pending_turn_log(log.as_bytes(), &pending)
+                .confirmation
+                .as_deref(),
+            Some("RunCommand")
+        );
+        for log in [
+            APPROVAL_LINE.to_owned() + APPROVAL_FORWARDED,
+            log.clone() + APPROVAL_FORWARDED + APPROVAL_LINE,
+            approval_log(&PendingAgyTurn::new("82-2-0").unwrap()),
+        ] {
+            assert!(
+                pending_turn_log(log.as_bytes(), &pending)
+                    .confirmation
+                    .is_none()
+            );
+        }
+        let failed = log + "agent executor error: quota exhausted\n";
+        let observed = pending_turn_log(failed.as_bytes(), &pending);
+        assert_eq!(observed.failure.as_deref(), Some("quota exhausted"));
+        assert_eq!(
+            pending_turn_failure(failed.as_bytes(), &pending),
+            Some(("quota exhausted".to_owned(), true))
+        );
+        for line in [
+            "Surfacing tool confirmation: \"\" at step 2",
+            "Surfacing tool confirmation: \"RunCommand\" at step x",
+            "Surfacing tool confirmation: \"RunCommand\" at step 2 trailing",
+        ] {
+            assert!(parse_tool_confirmation(line).is_none());
+        }
+    }
+
+    #[test]
+    fn tool_confirmation_is_read_only_and_yields_to_results_and_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-approval");
+        fs::create_dir(&directory).unwrap();
+        fs::create_dir(directory.join("events")).unwrap();
+        let store = Store::open_unchecked(&directory);
+        store
+            .write_manifest(&super::super::super::SessionManifest {
+                schema: 1,
+                id: "session-approval".to_owned(),
+                provider: "agy".to_owned(),
+                provider_path: PathBuf::from("agy"),
+                provider_version: "fixture 1.3.0".to_owned(),
+                workspace: directory.clone(),
+                title: "approval fixture".to_owned(),
+                model: None,
+                effort: None,
+                yolo: false,
+                created_unix_ms: 1,
+            })
+            .unwrap();
+        update_status(&directory, SessionState::Working, None, None).unwrap();
+        let pending = claim_pending_turn(&directory);
+        let brain = root.path().join("brain");
+        let logs = brain.join("97ad12fd-9e7a-4556-83a4-8f0147343657/.system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let transcript = logs.join("transcript.jsonl");
+        let full = logs.join("transcript_full.jsonl");
+        fs::write(&transcript, "").unwrap();
+        let log_path = directory.join(AGY_LOG_FILE);
+        let log = approval_log(&pending);
+        super::super::super::write_private(&log_path, log.as_bytes()).unwrap();
+        let before = fs::read(directory.join("status.json")).unwrap();
+        let request = super::super::super::requests::for_claim(
+            &Reader::open_unchecked(&directory),
+            &pending.claim_token,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            pending_tool_confirmation(&directory, &brain).unwrap(),
+            Some(("RunCommand".to_owned(), request.request_id))
+        );
+        assert_eq!(fs::read(directory.join("status.json")).unwrap(), before);
+        assert!(event_paths(&directory).unwrap().is_empty());
+        assert_eq!(
+            turn::current_claim_token(&Reader::open_unchecked(&directory)).unwrap(),
+            Some(pending.claim_token.clone())
+        );
+
+        // No receipt: the argument-delivered initial turn needs the sole full input.
+        let initial = "Created conversation 97ad12fd-9e7a-4556-83a4-8f0147343657\n".to_owned()
+            + APPROVAL_FORWARDED
+            + APPROVAL_LINE;
+        fs::write(&log_path, &initial).unwrap();
+        assert!(
+            pending_tool_confirmation(&directory, &brain)
+                .unwrap()
+                .is_none()
+        );
+        let input =
+            serde_json::json!({"type":"USER_INPUT", "content": pending.marker}).to_string() + "\n";
+        fs::write(&full, &input).unwrap();
+        assert!(
+            pending_tool_confirmation(&directory, &brain)
+                .unwrap()
+                .is_some()
+        );
+        fs::write(&full, input.clone() + &input).unwrap();
+        assert!(
+            pending_tool_confirmation(&directory, &brain)
+                .unwrap()
+                .is_none()
+        );
+        fs::write(&log_path, &log).unwrap();
+        update_status(
+            &directory,
+            SessionState::Working,
+            None,
+            Some("receipt missing".to_owned()),
+        )
+        .unwrap();
+        assert!(
+            pending_tool_confirmation(&directory, &brain)
+                .unwrap()
+                .is_none()
+        );
+        update_status(&directory, SessionState::Working, None, None).unwrap();
+        fs::write(
+            &log_path,
+            log.clone() + "agent executor error: quota exhausted\n",
+        )
+        .unwrap();
+        assert!(
+            pending_tool_confirmation(&directory, &brain)
+                .unwrap()
+                .is_none()
+        );
+        fs::write(&log_path, &log).unwrap();
+        fs::write(
+            &transcript,
+            planner_line(3, &marked("done", &pending)) + "\n",
+        )
+        .unwrap();
+        assert!(
+            pending_tool_confirmation(&directory, &brain)
+                .unwrap()
+                .is_none()
+        );
+        // Diagnosis did not consume the result: the ordinary monitor still records it.
+        MonitorState::default()
+            .poll(&directory, &log_path, &brain)
+            .unwrap();
+        assert_eq!(event_paths(&directory).unwrap().len(), 1);
+        assert!(
+            pending_tool_confirmation(&directory, &brain)
+                .unwrap()
+                .is_none()
+        );
+        let event: SessionEvent = read_json(&event_paths(&directory).unwrap()[0]).unwrap();
+        assert_eq!(event.message, "done");
+        assert!(event.error.is_none());
     }
 
     // A turn Agy gives up on is recorded as a failed request at once instead of

@@ -77,6 +77,13 @@ the report's close outcome for any session created. Do not resend a prompt whose
 uncertain. A timeout before a surface exists is not a pass; a later pass does not establish
 the cause of that timeout.
 
+The exact-marker prompt says that no tool, command, or file is needed. Agy nevertheless
+requested a `RunCommand` approval with the earlier wording in one default-mode run
+(Agy 1.3.0, 2026-10-07). Unit fixtures verify the read-only `doctor` observation and its
+inclusion in a self-test result timeout reason. They do not prove that the new wording
+prevents approval prompts. For live verification, record the installed Agy version and
+compare default-mode runs with the old and new wording. Bridge does not answer approvals.
+
 An unconfirmed self-test close is `not_verified`, including a timeout. The cleanup reason names
 the session and carries its recorded surface error. A Ghostty failed-launch handle remains available
 to explicit close only when its handoff precedes close and the launch still owns the session.

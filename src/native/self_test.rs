@@ -332,7 +332,9 @@ fn orchestrate(
     let started = Instant::now();
     let ask = &request.ask;
     let timeout = ask.timeout.as_secs().to_string();
-    let prompt = format!("Reply with exactly this marker and nothing else: {marker}");
+    let prompt = format!(
+        "No tool, command, or file is needed. Reply with exactly this marker and nothing else: {marker}"
+    );
     let mut report = Report {
         schema_version: 1,
         bridge_version: env!("CARGO_PKG_VERSION"),
@@ -480,6 +482,25 @@ fn orchestrate(
                 &report.marker,
                 first_event.as_deref(),
             );
+            if current.outcome == Outcome::TimedOut && ask.provider == FirstPartyCli::Agy {
+                let diagnosis =
+                    operations.call(&arguments(&["doctor", session, "--json"]), COMMAND_MARGIN);
+                if diagnosis.ok
+                    && diagnosis.value["session"] == session
+                    && let Some(checks) = diagnosis.value["checks"].as_array()
+                    && let Some(detail) = checks.iter().find_map(|check| {
+                        (check["reason_code"] == "agy_tool_confirmation_observed"
+                            && check["evidence"]["request_id"] == request_id)
+                            .then(|| check["detail"].as_str())
+                            .flatten()
+                    })
+                {
+                    current.reason = Some(format!(
+                        "{}; {detail}",
+                        current.reason.as_deref().unwrap_or("waiting timed out")
+                    ));
+                }
+            }
             if name == "initial_result" {
                 first_event = reply.value["event_id"].as_str().map(str::to_owned);
             }

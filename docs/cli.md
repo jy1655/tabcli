@@ -495,6 +495,14 @@ initial result, a follow-up result, and cleanup. Workspace, terminal, model, eff
 JSON options follow `ask`; prompts and titles are generated internally. `--timeout-secs` defaults to
 120 per command, not for the entire test. Cleanup commands have separate bounded budgets.
 
+Both turns ask: `No tool, command, or file is needed. Reply with exactly this marker and
+nothing else: <marker>`. The result must still equal the generated marker exactly.
+On an Agy result timeout, self-test reads `doctor SESSION --json` before cleanup. If it
+reports a tool confirmation for that request, the step's `reason` includes the tool and
+approval observation. Without that evidence, the timeout reason is unchanged. The step
+remains `timed_out`; Bridge does not answer the approval or resend the request. `result`
+and `inspect` retain their existing output; use `doctor` for this Agy log diagnosis.
+
 `--isolated` defaults to off. Normally the test uses the ordinary state root, including its settings
 and consent records. Isolation creates a private directory; ordinary settings and consent do not
 apply. The directory remains afterward. In either mode, the test closes only sessions it created,
@@ -792,7 +800,8 @@ Fields: `schema_version`, `bridge_version`, `provider`, `provider_version`, `ter
 `state_root`, `isolated`, `marker`, `session`, `session_state`, `outcome`, `elapsed_ms`, `steps`,
 and `cleanup_sessions`. Steps contain `name`, `outcome`, `elapsed_ms`, `request_address`,
 `event_address`, and `reason`; cleanup entries contain `session`, `session_state`, `outcome`, and
-`reason`.
+`reason`. An Agy result timeout can append the same request's tool-confirmation observation
+from `doctor` to the existing step `reason`; no field is added.
 
 ### sessions
 
