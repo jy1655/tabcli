@@ -1091,6 +1091,10 @@ fn explicit_close_repairs_failed_launch_without_terminal_record() {
     assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
     let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
     assert_eq!(status.state.as_str(), "closed");
+    assert!(
+        status.error.is_none(),
+        "ordinary launch errors are not retained by handle-less close"
+    );
 }
 
 #[test]

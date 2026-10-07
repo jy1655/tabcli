@@ -112,6 +112,29 @@ pub(super) struct TerminalSession {
     pub(super) wezterm_mux: Option<WezTermMux>,
 }
 
+// Only an adapter that has proven its exact surface may return this error. The
+// shared launcher persists the handle; it grants no new adapter close authority.
+#[derive(Debug)]
+pub(super) struct RetainedLaunchSurface {
+    pub(super) surface: TerminalSession,
+    message: String,
+}
+
+impl RetainedLaunchSurface {
+    #[cfg(target_os = "macos")]
+    pub(super) fn new(surface: TerminalSession, message: String) -> Self {
+        Self { surface, message }
+    }
+}
+
+impl std::fmt::Display for RetainedLaunchSurface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RetainedLaunchSurface {}
+
 // The WezTerm GUI incarnation that serves a session. A mux numbers its panes from 0
 // (`static PANE_ID` in mux/src/pane.rs), so the pane id of the session is an identity only
 // together with that process: its pid, its birth, and the socket it serves.

@@ -6,6 +6,9 @@ Older notes retain their own requirements and limitations; use the
 [providers](../providers.md) and [terminals](../terminals.md) pages for current behavior.
 Each note separates live checks from automated tests.
 
+- [0.2.2](0.2.2.md) (2026-10-07): Keeps the surface of a Ghostty launch that fails after its tab
+  exists so that a later close can close it; names a pending Agy tool approval in a timed-out
+  self-test; says that a launch may need the screen unlocked.
 - [0.2.1](0.2.1.md) (2026-10-07): Fixes a rare failure when closing a Warp session; the macOS
   permissions page and the release procedure are now in English.
 - [0.2.0](0.2.0.md) (2026-10-06): Renames the command and package to `tabcli`; your sessions and

@@ -646,10 +646,16 @@ fn create_with_runner(
         if proven {
             match close_with_runner(runner, &handle(&surface), deadline) {
                 Ok(_) => return Err(error),
-                Err(cleanup) => bail!(
-                    "{error:#}; exact Ghostty handle retained={:?}; cleanup failed: {cleanup:#}",
-                    handle(&surface)
-                ),
+                Err(cleanup) => {
+                    let retained = handle(&surface);
+                    let message = format!(
+                        "{error:#}; exact Ghostty handle retained={retained:?}; cleanup failed: {cleanup:#}"
+                    );
+                    return Err(crate::native::terminal::RetainedLaunchSurface::new(
+                        retained, message,
+                    )
+                    .into());
+                }
             }
         }
         bail!(
@@ -1093,6 +1099,7 @@ mod tests {
         wrong_terminal: bool,
         lost_input: bool,
         lost_close: bool,
+        close_timeout: bool,
         stays: bool,
         unreadable: bool,
         pauses: usize,
@@ -1407,6 +1414,9 @@ mod tests {
                     Ok("queued".into())
                 }
                 "close" => {
+                    if self.close_timeout {
+                        bail!("Ghostty automation timed out before it started");
+                    }
                     assert_eq!(args[0], "u2");
                     if self.move_on_close {
                         self.state.terminals.remove(&(
@@ -1539,6 +1549,10 @@ mod tests {
             f.unreadable = !wrong;
             let e = create_with_runner(&mut f, false, soon()).unwrap_err();
             assert!(format!("{e:#}").contains("no unproven cleanup"));
+            assert!(
+                e.downcast_ref::<crate::native::terminal::RetainedLaunchSurface>()
+                    .is_none()
+            );
             assert_eq!(f.created, 1);
             assert!(!f.calls.contains(&"close".into()));
         }
@@ -1549,6 +1563,10 @@ mod tests {
         f.init_failure = true;
         let e = create_with_runner(&mut f, false, soon()).unwrap_err();
         assert!(format!("{e:#}").contains("model did not become ready"));
+        assert!(
+            e.downcast_ref::<crate::native::terminal::RetainedLaunchSurface>()
+                .is_none()
+        );
         assert_eq!(
             f.calls.iter().filter(|s| *s == "probe").count(),
             DISCOVERY_ATTEMPTS
@@ -1557,6 +1575,269 @@ mod tests {
         assert_eq!(f.state.terminals.len(), 1);
         assert!(!f.calls.contains(&"input".into()));
     }
+    #[test]
+    fn failed_initialization_and_cleanup_preserve_recoverable_surface() {
+        use crate::native::{
+            launch,
+            session::{Store, close},
+        };
+        let directory = launch_fixture();
+        let store = Store::open_unchecked(directory.path());
+        let mut f = existing();
+        f.init_failure = true;
+        f.close_timeout = true;
+        let error = create_with_runner(&mut f, false, soon())
+            .unwrap_err()
+            .context("adapter creation failed");
+        let typed = error
+            .downcast_ref::<crate::native::terminal::RetainedLaunchSurface>()
+            .expect("the handle must survive error context as data");
+        assert_eq!(typed.surface.id, "u2");
+        launch::terminal_failed(&store, &error).unwrap();
+        assert_eq!(f.calls.iter().filter(|s| *s == "close").count(), 1);
+        assert_eq!(f.state.terminals.len(), 2);
+        assert!(!f.calls.contains(&"input".into()));
+        let retained = store
+            .terminal()
+            .expect("failed launch must persist its proven surface");
+        assert_eq!(retained.id, "u2");
+        assert_eq!(retained.tab_id.as_deref(), Some("t2"));
+        assert_eq!(retained.window_id.as_deref(), Some("w1"));
+        let id = directory.path().file_name().unwrap().to_str().unwrap();
+        assert_eq!(retained.managed_session_id.as_deref(), Some(id));
+        assert_eq!(store.status().unwrap().state, SessionState::Failed);
+        assert!(store.status().unwrap().error.unwrap().contains("u2"));
+        // The ordinary explicit-close transaction must keep a failed close recoverable.
+        assert!(
+            close::close(&store, None, |surface| {
+                crate::native::terminal::ownership::verify_terminal_close_authority(
+                    directory.path(),
+                    id,
+                    surface,
+                )?;
+                close_with_runner(&mut f, surface, soon())
+            })
+            .is_err()
+        );
+        assert_eq!(store.terminal().unwrap(), retained);
+        assert_eq!(store.status().unwrap().state, SessionState::Failed);
+        f.close_timeout = false;
+        close::close(&store, None, |surface| {
+            crate::native::terminal::ownership::verify_terminal_close_authority(
+                directory.path(),
+                id,
+                surface,
+            )?;
+            close_with_runner(&mut f, surface, soon())
+        })
+        .unwrap();
+        assert_eq!(store.status().unwrap().state, SessionState::Closed);
+        assert!(store.terminal().is_err());
+        assert_eq!(f.state.terminals.len(), 1);
+    }
+    #[test]
+    fn reverse_close_before_handoff_refuses_pending_creation() {
+        use crate::native::{
+            launch,
+            session::{CoreRecord, Store, close},
+        };
+        let directory = launch_fixture();
+        let store = Store::open_unchecked(directory.path());
+        let before = std::fs::read(store.record(CoreRecord::Status).path()).unwrap();
+        let claim = std::fs::read(store.record(CoreRecord::TurnClaim).path()).unwrap();
+        let refused = close::close(&store, None, |_| panic!("no handle exists yet"));
+        assert!(
+            refused.is_err(),
+            "close during pending creation must be refused, got {refused:?}"
+        );
+        let message = format!("{:#}", refused.unwrap_err());
+        assert!(
+            message.contains("launcher is still creating the surface"),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                &launch::read(&store)
+                    .unwrap()
+                    .unwrap()
+                    .deadline_unix_ms
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            std::fs::read(store.record(CoreRecord::Status).path()).unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::read(store.record(CoreRecord::TurnClaim).path()).unwrap(),
+            claim
+        );
+        assert!(store.closed_if_present().unwrap().is_none());
+        assert!(!store.record(CoreRecord::TerminalClosed).path().exists());
+        assert!(!store.record(CoreRecord::TerminalClosing).path().exists());
+        let mut f = existing();
+        f.init_failure = true;
+        f.close_timeout = true;
+        let error = create_with_runner(&mut f, false, soon()).unwrap_err();
+        launch::terminal_failed(&store, &error).unwrap();
+        assert_eq!(store.status().unwrap().state, SessionState::Failed);
+        assert_eq!(store.terminal().unwrap().id, "u2");
+        f.close_timeout = false;
+        let id = directory.path().file_name().unwrap().to_str().unwrap();
+        close::close(&store, None, |surface| {
+            crate::native::terminal::ownership::verify_terminal_close_authority(
+                directory.path(),
+                id,
+                surface,
+            )?;
+            close_with_runner(&mut f, surface, soon())
+        })
+        .unwrap();
+        assert_eq!(store.status().unwrap().state, SessionState::Closed);
+        assert_eq!(f.state.terminals.len(), 1);
+        assert!(store.terminal().is_err());
+    }
+
+    #[test]
+    fn reverse_close_after_deadline_reports_unbound_residual_surface() {
+        use crate::native::{
+            launch,
+            session::{CoreRecord, Store, close},
+        };
+        for (phase, expired, earlier) in [
+            (launch::Phase::Pending, true, None),
+            (launch::Phase::Spawning, false, Some("earlier close reason")),
+            (launch::Phase::Spawned, false, Some("earlier close reason")),
+        ] {
+            let directory = launch_fixture();
+            let store = Store::open_unchecked(directory.path());
+            let mut pending = launch::read(&store).unwrap().unwrap();
+            pending.phase = phase;
+            if expired {
+                pending.deadline_unix_ms = 0;
+            }
+            store
+                .record(CoreRecord::Launch)
+                .write_json(&pending)
+                .unwrap();
+            close::close(&store, earlier.map(str::to_owned), |_| {
+                panic!("no handle exists yet")
+            })
+            .unwrap();
+            assert_eq!(store.status().unwrap().state, SessionState::Closed);
+            let mut f = existing();
+            f.init_failure = true;
+            f.close_timeout = true;
+            let error = create_with_runner(&mut f, false, soon()).unwrap_err();
+            let reported = launch::terminal_failed(&store, &error);
+            let status = store.status().unwrap();
+            let has_handle = store.record(CoreRecord::Terminal).path().exists();
+            assert!(
+                !has_handle && status.error.as_deref().is_some_and(|e| e.contains("u2")),
+                "closed launch must report an unbound residual surface: handle_written={has_handle}, status.error={:?}",
+                status.error
+            );
+            assert_eq!(status.state, SessionState::Closed);
+            if let Some(earlier) = earlier {
+                assert!(status.error.as_deref().unwrap().starts_with(earlier));
+            }
+            let message = format!("{:#}", reported.unwrap_err());
+            for expected in [
+                "closed during the launch",
+                "u2",
+                "t2",
+                "w1",
+                "surface may remain",
+                "not closed by Bridge",
+            ] {
+                assert!(message.contains(expected), "{message}");
+                assert!(status.error.as_deref().unwrap().contains(expected));
+            }
+            assert!(
+                std::fs::read_to_string(directory.path().join(launch::LOG))
+                    .unwrap()
+                    .contains(&message)
+            );
+            assert_eq!(
+                store.closed_if_present().unwrap().unwrap().error,
+                status.error
+            );
+            close::close(&store, None, |_| {
+                panic!("a closed session grants no close authority")
+            })
+            .unwrap();
+            assert_eq!(store.status().unwrap().error, status.error);
+            assert!(!store.record(CoreRecord::Terminal).path().exists());
+            assert_eq!(f.calls.iter().filter(|s| *s == "close").count(), 1);
+            assert_eq!(f.state.terminals.len(), 2);
+        }
+    }
+
+    #[test]
+    fn lost_launch_claim_reports_residual_without_binding_or_state_change() {
+        use crate::native::{
+            launch,
+            session::{Store, close},
+        };
+        for state in [SessionState::Launching, SessionState::Failed] {
+            let directory = launch_fixture();
+            let store = Store::open_unchecked(directory.path());
+            store.record(CoreRecord::TurnClaim).remove().unwrap();
+            let mut before = store.status().unwrap();
+            before.state = state;
+            before.error = Some("earlier error".to_owned());
+            store.write_status(&before).unwrap();
+            let mut f = existing();
+            f.init_failure = true;
+            f.close_timeout = true;
+            let error = create_with_runner(&mut f, false, soon()).unwrap_err();
+            let report = launch::terminal_failed(&store, &error).unwrap_err();
+            assert!(format!("{report:#}").contains("surface may remain"));
+            assert!(!store.record(CoreRecord::Terminal).path().exists());
+            assert!(store.closed_if_present().unwrap().is_none());
+            let after = store.status().unwrap();
+            assert!(
+                after
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("earlier error; ")
+            );
+            assert!(after.error.as_deref().unwrap().contains("u2"));
+            before.error = after.error.clone();
+            assert_eq!(
+                serde_json::to_value(before).unwrap(),
+                serde_json::to_value(&after).unwrap()
+            );
+            // Let the creation deadline pass before either subsequent close. The
+            // missing claim already prevented the handoff from binding a handle.
+            let mut pending = launch::read(&store).unwrap().unwrap();
+            pending.deadline_unix_ms = 0;
+            store
+                .record(CoreRecord::Launch)
+                .write_json(&pending)
+                .unwrap();
+            for _ in 0..2 {
+                close::close(&store, None, |_| {
+                    panic!("an unbound residual grants no close authority")
+                })
+                .unwrap();
+                let closed = store.status().unwrap();
+                assert_eq!(closed.state, SessionState::Closed);
+                assert_eq!(
+                    closed.error, after.error,
+                    "handle-less close must keep the residual warning"
+                );
+                assert_eq!(
+                    store.closed_if_present().unwrap().unwrap().error,
+                    after.error
+                );
+                assert!(!store.record(CoreRecord::Terminal).path().exists());
+            }
+            assert_eq!(f.calls.iter().filter(|s| *s == "close").count(), 1);
+        }
+    }
+
     #[test]
     fn user_intervening_selection_is_preserved() {
         let mut f = existing();

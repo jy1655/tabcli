@@ -171,6 +171,20 @@ Bridge reads completed results from Agy's transcript and checks the claim and fi
 It can also report the observed quota-exhaustion failure from the log when the log proves it
 belongs to the pending turn. A result already written takes precedence over that failure.
 
+In the default permission mode, Agy can ask to run a command even for a self-test reply
+that needs no tools. This was observed once with Agy 1.3.0 on 2026-10-07: its log named
+`RunCommand`, but did not identify the command. The self-test now explicitly says that no
+tool, command, or file is needed; whether that prevents the prompt requires live testing.
+
+`doctor SESSION` reports `agy_tool_confirmation_observed` when this session's own `agy.log`
+binds a `Surfacing tool confirmation` line to the pending turn, with no result, receipt
+failure, or executor error. It names the tool and says the turn is waiting for approval in
+the terminal and Bridge does not answer it. This is the last observed confirmation, not
+proof that the dialog remains open: no approval-resolution signal has been verified.
+The observation neither fails the request nor releases its claim. A later result or executor
+error follows the ordinary monitor rules. A self-test result timeout includes this diagnosis
+in its step reason when `doctor --json` identifies the same request.
+
 `reopen` refuses Agy sessions. Its presence records do not prove who still holds a conversation,
 and Bridge's transcript reader follows only a newly created conversation. Start a new session.
 

@@ -12,6 +12,9 @@ pub(in crate::native) use super::LAUNCH_FILE as FILE;
 pub(in crate::native) const LOG: &str = "launch.log";
 pub(in crate::native) const STDERR_ENV: &str = "AGENT_BRIDGE_LAUNCH_STDERR_FD";
 pub(in crate::native) const STDOUT_ENV: &str = "AGENT_BRIDGE_LAUNCH_STDOUT_FD";
+// Shared diagnostic marker: a cancelled launch left no handle Bridge can close.
+pub(in crate::native) const RESIDUAL_SURFACE_MARKER: &str =
+    "the surface may remain and is not closed by Bridge";
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(in crate::native) fn install_script(store: &Store, contents: &str) -> Result<String> {
@@ -154,6 +157,74 @@ pub(in crate::native) fn fail(store: &Store, reason: &str) -> Result<()> {
         fail_locked(store, &record, reason)?;
     }
     Ok(())
+}
+
+// The launcher's terminal-creation failure handoff.
+pub(in crate::native) fn terminal_failed(store: &Store, error: &anyhow::Error) -> Result<()> {
+    let reason = format!("terminal launch failed: {error:#}");
+    let Some(retained) = error.downcast_ref::<terminal::RetainedLaunchSurface>() else {
+        return fail(store, &reason);
+    };
+    let _lock = store.lock()?;
+    let status = store.status()?;
+    let record = read(store)?;
+    let claim = turn::current_claim_token(store)?;
+    let owns_claim = record
+        .as_ref()
+        .is_some_and(|record| claim.as_deref() == Some(record.claim_token.as_str()));
+    if status.state != SessionState::Launching
+        || !owns_claim
+        || store.closed_if_present()?.is_some()
+    {
+        let disposition =
+            if status.state == SessionState::Closed || store.closed_if_present()?.is_some() {
+                "the session was closed during the launch"
+            } else {
+                "the session is no longer owned by this launch"
+            };
+        let message = format!(
+            "{disposition}; exact retained surface={:?}; {RESIDUAL_SURFACE_MARKER}; {reason}",
+            retained.surface
+        );
+        log(store, &message);
+        // Diagnostic-only amendment: never bind or reopen a cancelled launch. The
+        // tombstone must carry the warning too, or later status convergence erases it.
+        // Preserve state, generation, timestamps and exit code under the status lock.
+        (|| -> Result<()> {
+            let _status_lock = store.lock_status()?;
+            let closed = store.closed_if_present()?;
+            let mut diagnostic = match closed {
+                Some(closed) => closed,
+                None => store.status()?,
+            };
+            diagnostic.error = Some(match diagnostic.error {
+                Some(existing) => format!("{existing}; {message}"),
+                None => message.clone(),
+            });
+            if diagnostic.state == SessionState::Closed {
+                store.write_closed(&diagnostic)?;
+            }
+            store.write_status(&diagnostic)
+        })()
+        .with_context(|| message.clone())?;
+        bail!("{message}");
+    }
+    let mut surface = retained.surface.clone();
+    surface.managed_session_id = Some(
+        store
+            .directory()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("session directory has no session id")?
+            .to_owned(),
+    );
+    let persisted = store.write_terminal(&surface);
+    // Even a failed record write must leave the launch failure and exact surface in
+    // status.error. Return the write error as well; never claim persistence succeeded.
+    if let Some(record) = record {
+        fail_locked(store, &record, &reason)?;
+    }
+    persisted.context("failed to persist the retained launch surface")
 }
 
 fn confirmed(reader: &Reader, record: &Record, status: &SessionStatus) -> bool {
