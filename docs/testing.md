@@ -94,6 +94,13 @@ close can pass cleanup, but does not turn the failed launch into a passed round 
 reproduce both orderings, failed discovery, and failed cleanup with a fake Ghostty runner; they do
 not verify locked-screen behavior or the cause of an automation timeout.
 
+Warp fake-runner tests cover control-binding write failure with confirmed cleanup (no handle)
+and unconfirmed cleanup (retained handle and failed status), close refusal during pending
+creation, and late handoff into an already closed session with a warning that survives repeated
+close. Recovery through Warp's exact close after this write failure remains unimplemented:
+the saved surface ids do not replace the missing control binding. These tests establish neither
+a live record-write failure nor live Warp support (#63, #87).
+
 For release verification, run the packaged candidate's executable instead and record its path
 and SHA-256.
 

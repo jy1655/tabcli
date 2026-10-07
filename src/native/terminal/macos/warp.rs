@@ -649,9 +649,16 @@ where
         decision.publish(HostAction::Abort)?;
         return match close_bound_exact(runner, &client, &session, &control, cleanup_deadline) {
             Ok(_) => Err(binding_error).context("failed to persist the Warp control binding"),
-            Err(cleanup_error) => Err(anyhow!(
-                "failed to persist the Warp control binding: {binding_error:#}; exact surface cleanup also failed: {cleanup_error:#}"
-            )),
+            Err(cleanup_error) => {
+                // Keep the proven ids even though the missing control binding cannot
+                // authorize a later Warp close. The shared handoff preserves both the
+                // failed launch and a late residual surface without reopening a session.
+                let message = format!(
+                    "failed to persist the Warp control binding: {binding_error:#}; exact Warp handle retained={session:?}; exact surface cleanup also failed: {cleanup_error:#}; {}",
+                    crate::native::launch::RESIDUAL_SURFACE_MARKER
+                );
+                Err(crate::native::terminal::RetainedLaunchSurface::new(session, message).into())
+            }
         };
     }
     if let Err(bind_error) = bind(&mut session) {
@@ -2873,6 +2880,223 @@ mod tests {
         let decision: HostDecision =
             read_record(&directory.join(HOST_DECISION_FILE), "decision").unwrap();
         assert_eq!(decision.action, HostAction::Abort);
+    }
+
+    fn failed_binding_launch_fixture(directory: &Path) -> crate::native::session::Store {
+        use crate::native::{SessionState, acquire_turn_claim, launch, update_status};
+        fs::create_dir(directory).unwrap();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(directory.join("events")).unwrap();
+        update_status(directory, SessionState::Launching, None, None).unwrap();
+        let claim = acquire_turn_claim(directory).unwrap();
+        let token = claim.token().to_owned();
+        claim.retain();
+        let store = crate::native::session::Store::open_unchecked(directory);
+        launch::begin(&store, &token, Instant::now() + Duration::from_secs(30)).unwrap();
+        store
+    }
+
+    fn failed_binding_launch(
+        runner: &mut FakeRunner,
+        client: ControlClient,
+        attempt: &str,
+    ) -> anyhow::Error {
+        let directory = runner.directory.clone();
+        runner.block_control_binding = true;
+        open_bound_tab_with(
+            runner,
+            OpenRequest {
+                force_new_window: false,
+                clients: &[client],
+                command: "ignored",
+                directory: &directory,
+                deadline: Instant::now() + Duration::from_secs(2),
+                cleanup_deadline: Instant::now() + Duration::from_secs(3),
+                attempt,
+            },
+            |_| panic!("binding write failed before bind"),
+            || panic!("no binding to remove"),
+        )
+        .unwrap_err()
+        .context("adapter creation failed")
+    }
+
+    #[test]
+    fn failed_binding_cleanup_retains_only_unconfirmed_warp_surface() {
+        use crate::native::{
+            SessionState, launch, session::close, terminal::RetainedLaunchSurface,
+        };
+        for cancel_close in [false, true] {
+            let (temp, client, attempt) = fixture();
+            let directory = temp.path().join("session");
+            let store = failed_binding_launch_fixture(&directory);
+            let mut runner = FakeRunner::new(&directory, &attempt);
+            runner.cancel_close = cancel_close;
+            let error = failed_binding_launch(&mut runner, client, &attempt);
+            assert_eq!(
+                error.downcast_ref::<RetainedLaunchSurface>().is_some(),
+                cancel_close
+            );
+            launch::terminal_failed(&store, &error).unwrap();
+            assert_eq!(store.status().unwrap().state, SessionState::Failed);
+            assert_eq!(runner.tab_present, cancel_close);
+            assert_eq!(
+                runner
+                    .calls
+                    .iter()
+                    .filter(|args| args.get(1).is_some_and(|s| s == "close"))
+                    .count(),
+                1
+            );
+            let decision: HostDecision =
+                read_record(&directory.join(HOST_DECISION_FILE), "decision").unwrap();
+            assert_eq!(decision.action, HostAction::Abort);
+            if cancel_close {
+                let retained = store.terminal().unwrap();
+                assert_eq!(retained, session_with_managed_id("session"));
+                let message = store.status().unwrap().error.unwrap();
+                for expected in [
+                    "instance-1",
+                    "new-tab",
+                    "new-window",
+                    launch::RESIDUAL_SURFACE_MARKER,
+                ] {
+                    assert!(message.contains(expected), "{message}");
+                }
+                // A handle alone cannot replace Warp's missing app incarnation/control
+                // record. Failed recovery must preserve the handle and failure evidence.
+                assert!(
+                    close::close(&store, None, |surface| {
+                        load_binding(&directory, surface)?;
+                        panic!("missing control binding grants no control access")
+                    })
+                    .is_err()
+                );
+                assert_eq!(store.terminal().unwrap(), retained);
+                assert_eq!(store.status().unwrap().state, SessionState::Failed);
+            } else {
+                assert!(store.terminal().is_err());
+                assert!(
+                    !store
+                        .status()
+                        .unwrap()
+                        .error
+                        .unwrap()
+                        .contains(launch::RESIDUAL_SURFACE_MARKER)
+                );
+            }
+        }
+    }
+
+    fn session_with_managed_id(id: &str) -> TerminalSession {
+        TerminalSession {
+            managed_session_id: Some(id.to_owned()),
+            ..session()
+        }
+    }
+
+    #[test]
+    fn failed_binding_warp_close_before_handoff_refuses_pending_creation() {
+        use crate::native::{
+            SessionState, launch,
+            session::{CoreRecord, close},
+        };
+        let (temp, client, attempt) = fixture();
+        let directory = temp.path().join("session");
+        let store = failed_binding_launch_fixture(&directory);
+        let before = fs::read(store.record(CoreRecord::Status).path()).unwrap();
+        let claim = fs::read(store.record(CoreRecord::TurnClaim).path()).unwrap();
+        let error = close::close(&store, None, |_| panic!("no surface bound")).unwrap_err();
+        assert!(format!("{error:#}").contains("launcher is still creating the surface"));
+        assert_eq!(
+            fs::read(store.record(CoreRecord::Status).path()).unwrap(),
+            before
+        );
+        assert_eq!(
+            fs::read(store.record(CoreRecord::TurnClaim).path()).unwrap(),
+            claim
+        );
+        assert!(store.closed_if_present().unwrap().is_none());
+        let mut runner = FakeRunner::new(&directory, &attempt);
+        runner.cancel_close = true;
+        let error = failed_binding_launch(&mut runner, client, &attempt);
+        launch::terminal_failed(&store, &error).unwrap();
+        assert_eq!(store.status().unwrap().state, SessionState::Failed);
+        assert_eq!(
+            store.terminal().unwrap(),
+            session_with_managed_id("session")
+        );
+    }
+
+    #[test]
+    fn failed_binding_warp_late_handoff_keeps_closed_residual_warning() {
+        use crate::native::{
+            SessionState, launch,
+            session::{CoreRecord, close},
+        };
+        let (temp, client, attempt) = fixture();
+        let directory = temp.path().join("session");
+        let store = failed_binding_launch_fixture(&directory);
+        let mut pending = launch::read(&store).unwrap().unwrap();
+        pending.deadline_unix_ms = 0;
+        store
+            .record(CoreRecord::Launch)
+            .write_json(&pending)
+            .unwrap();
+        close::close(&store, Some("earlier reason".into()), |_| {
+            panic!("no surface bound")
+        })
+        .unwrap();
+        let mut runner = FakeRunner::new(&directory, &attempt);
+        runner.cancel_close = true;
+        let error = failed_binding_launch(&mut runner, client, &attempt);
+        let reported = launch::terminal_failed(&store, &error).unwrap_err();
+        let message = format!("{reported:#}");
+        for expected in [
+            "closed during the launch",
+            "instance-1",
+            "new-tab",
+            "new-window",
+            launch::RESIDUAL_SURFACE_MARKER,
+        ] {
+            assert!(message.contains(expected), "{message}");
+        }
+        let status = store.status().unwrap();
+        assert_eq!(status.state, SessionState::Closed);
+        assert!(
+            status
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("earlier reason; ")
+        );
+        assert!(status.error.as_deref().unwrap().contains(&message));
+        assert!(
+            fs::read_to_string(directory.join(launch::LOG))
+                .unwrap()
+                .contains(&message)
+        );
+        for _ in 0..2 {
+            close::close(&store, None, |_| {
+                panic!("closed session grants no close authority")
+            })
+            .unwrap();
+            assert!(store.terminal().is_err());
+            assert_eq!(store.status().unwrap().error, status.error);
+            assert_eq!(
+                store.closed_if_present().unwrap().unwrap().error,
+                status.error
+            );
+        }
+        assert!(runner.tab_present);
+        assert_eq!(
+            runner
+                .calls
+                .iter()
+                .filter(|args| args.get(1).is_some_and(|s| s == "close"))
+                .count(),
+            1
+        );
     }
 
     #[test]

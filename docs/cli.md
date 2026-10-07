@@ -661,16 +661,24 @@ the launcher is still creating the surface for this session (launch deadline <un
 ```
 
 After the deadline, or once launch is no longer pending, a handle-less close proceeds. If the
-launcher subsequently reports a retained Ghostty surface, the session stays closed with no new
+launcher subsequently reports a retained Ghostty or Warp surface, the session stays closed with no new
 handle. Its error names the exact surface and says it may remain and is not closed by Bridge.
 The warning is appended to any existing error and survives repeated close. Check the surface
-in Ghostty; another Bridge close does not close it.
+in that terminal; another Bridge close does not close it.
 
 If the failed-launch handoff happens before close, while the launch still owns its claim and the
 session is still `launching`, the launcher saves the proven terminal, tab, and window ids in
 `terminal.json` and records `failed`. Explicit close uses that handle through
 Ghostty's close script, even if no provider started. It records `closed` only after confirmed
 closure; another close failure keeps the handle.
+
+For Warp, a proven tab whose control-binding write and exact cleanup both fail is also saved
+in `terminal.json`, with `failed` status and a residual-surface warning naming its ids. A confirmed
+cleanup saves no handle. The retained ids do not replace Warp's missing app incarnation/control
+binding, and ownerless startup authority still permits absence verification only. Recovery close
+for this failure is not implemented (#87); an explicit close refuses and preserves the handle
+when absence cannot be proved. Check the named tab in Warp. This failure has not been observed
+live, and Warp remains not live-verified (#63).
 
 Human output is `closed SESSION`. JSON has `ok`, `session`, and `closed`.
 

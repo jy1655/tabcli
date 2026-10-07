@@ -174,6 +174,17 @@ is not closed by Bridge. Repeating close preserves the warning and does not clos
 Unproven creation evidence grants no close authority. This preserves failure evidence after an
 automation timeout; it does not establish what caused the timeout.
 
+If Warp proves the created tab but cannot save its control binding, it publishes Abort and
+attempts exact cleanup once. Confirmed cleanup leaves no handle. If cleanup cannot confirm
+absence, the launcher retains the proven instance, tab, and window ids in `terminal.json` and
+records `failed`, with the surface and residual warning in `status.error`. The same pending-close
+refusal and late-handoff rules apply. This handle does not restore the missing control binding:
+Warp requires its recorded app incarnation and control endpoint, and ownerless startup close
+still proves absence only. Explicit close cannot recover this tab; check the named surface in
+Warp. Persisting replacement control evidence and granting recovery close authority remain
+unimplemented (#87). Warp is not live-verified (#63), and this record-write failure has not
+been observed live.
+
 When a close fails, read the error and run `tabcli doctor SESSION`. Check the managed surface
 before retrying `tabcli close-session SESSION --explicit`. Bridge restores the handle after a
 terminal close error so the retry addresses the same surface. If close was interrupted, the saved
