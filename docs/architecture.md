@@ -44,8 +44,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   and close. Its `ownership` module owns owner identity, attestation, app incarnation, close
   authority, and the execution of an authorized close.
 - `src/native/session/` owns record access and durability. `requests` binds public requests to
-  claims and events; `turn` owns completion and recovery; `close` owns close-record transitions
-  and dead-owner repair; `launch` coordinates spawn and cancellation. `state` defines serialized
+  claims and events; `turn` owns delivery settlement, completion and recovery; `close` owns
+  close-record transitions and dead-owner repair; `launch` coordinates spawn, cancellation,
+  and the full macOS binding wait, with surface identity checks supplied by terminal adapters.
+  `state` defines serialized
   states and permitted transitions. `native.rs::update_status_locked` applies those rules,
   advances generations, and preserves closed tombstones.
 - Within `src/native/session/`, start with `reads.rs` for decoding and read budgets,
@@ -56,7 +58,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   not a `Store`. To expose an adapter-private fact, add an observation to that adapter's interface;
   do not read its private record from the query or call repair.
 - `src/native/doctor.rs` combines read-only shared observations with provider diagnostics and
-  optional bounded probes. A diagnostic report is not proof of successful delivery.
+  optional bounded probes. Providers choose which observation can explain a result timeout;
+  `doctor` assembles that read and `self_test` bounds its execution. A diagnostic report is not
+  proof of successful delivery.
 - `src/native/self_test.rs` runs the explicit public self-test through bounded commands, checks
   initial and follow-up results, and closes only its own sessions. It uses the ordinary state
   root unless isolation is requested; it is not called implicitly by another command.
@@ -106,7 +110,7 @@ before deciding that the operation never happened.
 | Record | Evidence or role |
 | --- | --- |
 | `manifest.json` | Recorded provider, workspace, launch choices, and session identity |
-| `status.json` | Current recorded state, generation, time, and diagnostic error |
+| `status.json` | Current recorded state, generation, time, diagnostic error, and optional residual-surface observation |
 | `initial-prompt.txt` | Initial prompt retained for launch/delivery |
 | `native-session.json` | Recorded owner identity used for attestation |
 | `provider-process.json` | Spawned provider identity, including refused-reopen checks |

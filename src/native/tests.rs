@@ -970,6 +970,7 @@ fn write_prune_test_session(
         updated_unix_ms: closed_unix_ms.unwrap_or(1_000),
         exit_code: None,
         error: None,
+        residual_surface: None,
     };
     write_json_atomic(&directory.join("status.json"), &status).unwrap();
     if let Some(updated_unix_ms) = closed_unix_ms {
@@ -981,6 +982,7 @@ fn write_prune_test_session(
                 updated_unix_ms,
                 exit_code: None,
                 error: None,
+                residual_surface: None,
             },
         )
         .unwrap();
@@ -2505,7 +2507,7 @@ fn codex_hybrid_transport_falls_back_before_delivery_but_not_after_uncertainty()
     ));
     assert_eq!(
         cross_session_failure_action(transport, &uncertain),
-        CrossSessionFailureAction::RetainClaim
+        CrossSessionFailureAction::Uncertain
     );
 
     let claude_not_sent =
@@ -2737,12 +2739,14 @@ fn initial_prompt_failures_distinguish_safe_abort_from_uncertain_delivery() {
             update_status(directory.path(), SessionState::Working, None, None).unwrap();
         }
 
-        record_initial_prompt_delivery_failure(
-            directory.path(),
-            &mut claim,
-            delivery_started,
-            &anyhow::anyhow!("terminal delivery failed"),
-        );
+        {
+            let delivery_error = &anyhow::anyhow!("terminal delivery failed");
+            let _ = claim.settle_delivery(if delivery_started {
+                turn::Delivery::Uncertain(delivery_error)
+            } else {
+                turn::Delivery::NotSent(delivery_error)
+            });
+        };
         drop(claim);
 
         let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
@@ -2775,7 +2779,14 @@ fn follow_up_terminal_send_failure_releases_only_confirmed_not_started_claims() 
             ))
         };
 
-        record_follow_up_terminal_delivery_failure(directory.path(), &mut claim, &failure);
+        {
+            let delivery_error = failure.error();
+            let _ = claim.settle_delivery(if failure.delivery_may_have_occurred() {
+                turn::Delivery::Uncertain(delivery_error)
+            } else {
+                turn::Delivery::NotSent(delivery_error)
+            });
+        };
         drop(claim);
 
         let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
@@ -2786,7 +2797,10 @@ fn follow_up_terminal_send_failure_releases_only_confirmed_not_started_claims() 
         } else {
             assert_eq!(status.state.as_str(), "ready");
             assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
-            assert_eq!(status.error, None);
+            assert_eq!(
+                status.error.as_deref(),
+                Some("terminal delivery did not start")
+            );
         }
     }
 }
@@ -2799,11 +2813,11 @@ fn follow_up_cross_session_uncertainty_keeps_the_claim_and_records_its_reason() 
     let (mut claim, _) = acquire_ready_turn_claim(directory.path(), "session-test").unwrap();
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
 
-    record_cross_session_delivery_uncertainty(
-        directory.path(),
-        &mut claim,
-        &anyhow::anyhow!("executed input was not reported").context("delivery unconfirmed"),
-    );
+    {
+        let _ = claim.settle_delivery(turn::Delivery::Uncertain(
+            &anyhow::anyhow!("executed input was not reported").context("delivery unconfirmed"),
+        ));
+    };
     drop(claim);
 
     let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
@@ -2827,11 +2841,11 @@ fn late_cross_session_uncertainty_cannot_write_into_a_newer_turn() {
     update_status(directory.path(), SessionState::Ready, None, None).unwrap();
     let (newer, _) = acquire_ready_turn_claim(directory.path(), "session-test").unwrap();
 
-    record_cross_session_delivery_uncertainty(
-        directory.path(),
-        &mut delivered,
-        &anyhow::anyhow!("late report for the completed turn"),
-    );
+    {
+        let _ = delivered.settle_delivery(turn::Delivery::Uncertain(&anyhow::anyhow!(
+            "late report for the completed turn"
+        )));
+    };
     drop(delivered);
 
     let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
@@ -4335,11 +4349,10 @@ fn delayed_terminal_delivery_failure_cannot_overwrite_a_replacement_turn() {
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
     let before: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
 
-    record_follow_up_terminal_delivery_failure(
-        directory.path(),
-        &mut stale_claim,
-        &delivery_uncertain_failure("turn A paste timed out"),
-    );
+    let failure = delivery_uncertain_failure("turn A paste timed out");
+    stale_claim
+        .settle_delivery(turn::Delivery::Uncertain(failure.error()))
+        .unwrap();
 
     let after: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
     assert_eq!(after.state.as_str(), "working");
@@ -4684,11 +4697,10 @@ fn turn_lifecycle_converges_under_every_completion_exit_and_failure_order() {
                 TurnEvent::ProcessExit => {
                     finalize_native_session(directory.path(), &Ok(())).unwrap()
                 }
-                TurnEvent::DelayedDeliveryFailure => record_follow_up_terminal_delivery_failure(
-                    directory.path(),
-                    &mut claim,
-                    &delivery_uncertain_failure("paste timed out"),
-                ),
+                TurnEvent::DelayedDeliveryFailure => {
+                    let failure = delivery_uncertain_failure("paste timed out");
+                    let _ = claim.settle_delivery(turn::Delivery::Uncertain(failure.error()));
+                }
             }
             let current: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
             assert!(
@@ -5216,11 +5228,11 @@ fn late_initial_cross_session_uncertainty_cannot_write_into_a_newer_turn() {
     let before: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
     assert_eq!(before.state.as_str(), "claimed");
 
-    record_cross_session_delivery_uncertainty(
-        directory.path(),
-        &mut initial,
-        &anyhow::anyhow!("late initial report"),
-    );
+    {
+        let _ = initial.settle_delivery(turn::Delivery::Uncertain(&anyhow::anyhow!(
+            "late initial report"
+        )));
+    };
     drop(initial);
 
     let after: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
@@ -5241,11 +5253,11 @@ fn initial_cross_session_uncertainty_keeps_its_own_claim_and_records_its_reason(
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
     let mut initial = acquire_turn_claim(directory.path()).unwrap();
 
-    record_cross_session_delivery_uncertainty(
-        directory.path(),
-        &mut initial,
-        &anyhow::anyhow!("executed input was not reported").context("delivery unconfirmed"),
-    );
+    {
+        let _ = initial.settle_delivery(turn::Delivery::Uncertain(
+            &anyhow::anyhow!("executed input was not reported").context("delivery unconfirmed"),
+        ));
+    };
     let token = initial.token().to_owned();
     drop(initial);
 
@@ -9589,7 +9601,9 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
 
         // The launch path: the delivery failure is recorded, the surface is closed through
         // the same path a detected conflict takes, and the initial claim is released.
-        record_initial_prompt_delivery_failure(&new, &mut initial_claim, false, &error);
+        initial_claim
+            .settle_delivery(turn::Delivery::NotSent(&error))
+            .unwrap();
         let mut closed_terminals = Vec::new();
         let reported =
             close_surface_after_reopen_verification_failure_with(new_id, error, |detected| {

@@ -117,13 +117,24 @@ pub(super) struct TerminalSession {
 #[derive(Debug)]
 pub(super) struct RetainedLaunchSurface {
     pub(super) surface: TerminalSession,
+    pub(super) unverified_cleanup: bool,
     message: String,
 }
 
 impl RetainedLaunchSurface {
     #[cfg(target_os = "macos")]
     pub(super) fn new(surface: TerminalSession, message: String) -> Self {
-        Self { surface, message }
+        Self {
+            surface,
+            message,
+            unverified_cleanup: false,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn with_unverified_cleanup(mut self) -> Self {
+        self.unverified_cleanup = true;
+        self
     }
 }
 

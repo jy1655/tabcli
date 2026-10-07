@@ -483,35 +483,16 @@ fn orchestrate(
                 first_event.as_deref(),
             );
             if current.outcome == Outcome::TimedOut
-                && matches!(ask.provider, FirstPartyCli::Agy | FirstPartyCli::Pi)
-            {
-                let args = if ask.provider == FirstPartyCli::Pi {
-                    arguments(&["doctor", session, "--probe", "--json"])
-                } else {
-                    arguments(&["doctor", session, "--json"])
-                };
-                let diagnosis = operations.call(&args, COMMAND_MARGIN);
-                if diagnosis.ok
-                    && diagnosis.value["session"] == session
-                    && let Some(checks) = diagnosis.value["checks"].as_array()
-                    && let Some(detail) = checks.iter().find_map(|check| {
-                        (match ask.provider {
-                            FirstPartyCli::Agy => {
-                                check["reason_code"] == "agy_tool_confirmation_observed"
-                                    && check["evidence"]["request_id"] == request_id
-                            }
-                            FirstPartyCli::Pi => check["id"] == "pi_provider_credentials",
-                            _ => false,
-                        })
-                        .then(|| check["detail"].as_str())
-                        .flatten()
+                && let Some(detail) =
+                    doctor::result_timeout_detail(ask.provider, session, request_id, |args| {
+                        let diagnosis = operations.call(args, COMMAND_MARGIN);
+                        diagnosis.ok.then_some(diagnosis.value)
                     })
-                {
-                    current.reason = Some(format!(
-                        "{}; {detail}",
-                        current.reason.as_deref().unwrap_or("waiting timed out")
-                    ));
-                }
+            {
+                current.reason = Some(format!(
+                    "{}; {detail}",
+                    current.reason.as_deref().unwrap_or("waiting timed out")
+                ));
             }
             if name == "initial_result" {
                 first_event = reply.value["event_id"].as_str().map(str::to_owned);
@@ -575,10 +556,7 @@ fn orchestrate(
                     Outcome::NotVerified,
                     "close could not be confirmed; inspect the reported session in the reported state root",
                 );
-            } else if observed.value["error"]
-                .as_str()
-                .is_some_and(|error| error.contains(launch::RESIDUAL_SURFACE_MARKER))
-            {
+            } else if !observed.value["residual_surface"].is_null() {
                 reject(
                     &mut closed,
                     Outcome::NotVerified,

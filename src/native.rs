@@ -225,6 +225,8 @@ struct SessionStatus {
     updated_unix_ms: u128,
     exit_code: Option<i32>,
     error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    residual_surface: Option<launch::ResidualSurface>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -1231,7 +1233,7 @@ fn launch_created_session(
                 deadline,
                 ResumedHolderCheck::BeforeInitialDelivery,
             )?;
-            update_status(&created.directory, SessionState::Working, None, None)?;
+            initial_claim.begin_delivery()?;
             match provider::send_initial_prompt(
                 provider,
                 &terminal_session,
@@ -1244,23 +1246,15 @@ fn launch_created_session(
                     return Err(failure.into_error());
                 }
             }
-            initial_claim.retain_in_place();
-            session::RecordStore::at(
-                Reader::open_unchecked(&created.directory)
-                    .record(CoreRecord::InitialPrompt)
-                    .path(),
-            )
-            .remove_raw()
-            .context("failed to remove the delivered initial prompt")?;
+            initial_claim.complete_initial_delivery()?;
             Ok(())
         })();
         if let Err(error) = delivery {
-            record_initial_prompt_delivery_failure(
-                &created.directory,
-                &mut initial_claim,
-                delivery_may_have_occurred,
-                &error,
-            );
+            let _ = initial_claim.settle_delivery(if delivery_may_have_occurred {
+                turn::Delivery::Uncertain(&error)
+            } else {
+                turn::Delivery::NotSent(&error)
+            });
             let error = close_surface_after_reopen_verification_failure(
                 &created.directory,
                 &created.id,
@@ -1277,6 +1271,7 @@ fn launch_created_session(
     } else if initial_prompt_transport
         == provider::InitialPromptTransport::ProviderCrossSessionMessageAfterLaunch
     {
+        let mut delivery_may_have_occurred = false;
         let delivery = (|| -> Result<String> {
             wait_for_status(
                 &created.directory,
@@ -1311,7 +1306,7 @@ fn launch_created_session(
                 deadline,
                 ResumedHolderCheck::BeforeInitialDelivery,
             )?;
-            update_status(&created.directory, SessionState::Working, None, None)?;
+            initial_claim.begin_delivery()?;
             match provider::send_cross_session_message(
                 provider,
                 provider::CrossSessionMessageContext {
@@ -1324,35 +1319,19 @@ fn launch_created_session(
                 },
             ) {
                 Ok(()) => {
-                    initial_claim.retain_in_place();
-                    session::RecordStore::at(
-                        Reader::open_unchecked(&created.directory)
-                            .record(CoreRecord::InitialPrompt)
-                            .path(),
-                    )
-                    .remove_raw()
-                    .context("failed to remove the delivered initial prompt")?;
+                    delivery_may_have_occurred = true;
+                    initial_claim.complete_initial_delivery()?;
                     Ok(request_id)
                 }
                 Err(failure) if failure.delivery_may_have_occurred() => {
+                    delivery_may_have_occurred = true;
                     let error = failure.into_error();
-                    record_cross_session_delivery_uncertainty(
-                        &created.directory,
-                        &mut initial_claim,
-                        &error,
-                    );
                     Err(error).context(
                         "Claude initial cross-session delivery could not be confirmed; the turn remains claimed until completion or explicit close",
                     )
                 }
                 Err(failure) => {
                     let error = failure.into_error();
-                    let _ = update_status(
-                        &created.directory,
-                        SessionState::Failed,
-                        None,
-                        Some(format!("{error:#}")),
-                    );
                     Err(error).context("Claude initial cross-session delivery was not sent")
                 }
             }
@@ -1360,14 +1339,11 @@ fn launch_created_session(
         match delivery {
             Ok(request_id) => expected_turn_id = Some(request_id),
             Err(error) => {
-                if !initial_claim.is_retained() {
-                    let _ = update_status(
-                        &created.directory,
-                        SessionState::Failed,
-                        None,
-                        Some(format!("{error:#}")),
-                    );
-                }
+                let _ = initial_claim.settle_delivery(if delivery_may_have_occurred {
+                    turn::Delivery::Uncertain(&error)
+                } else {
+                    turn::Delivery::NotSent(&error)
+                });
                 let error = close_surface_after_reopen_verification_failure(
                     &created.directory,
                     &created.id,
@@ -1383,7 +1359,7 @@ fn launch_created_session(
             }
         }
     } else {
-        initial_claim.retain();
+        initial_claim.settle_delivery(turn::Delivery::Sent)?;
     }
 
     if detach {
@@ -2567,7 +2543,7 @@ fn verify_terminal_surface_ownership_until(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CrossSessionFailureAction {
     TerminalFallback,
-    RetainClaim,
+    Uncertain,
     ReturnError,
 }
 
@@ -2581,7 +2557,7 @@ fn cross_session_failure_action(
     {
         CrossSessionFailureAction::TerminalFallback
     } else if failure.delivery_may_have_occurred() {
-        CrossSessionFailureAction::RetainClaim
+        CrossSessionFailureAction::Uncertain
     } else {
         CrossSessionFailureAction::ReturnError
     }
@@ -2669,18 +2645,28 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
         }
         provider::FollowUpTransport::ProviderCrossSessionMessage
         | provider::FollowUpTransport::ProviderCrossSessionMessageWithTerminalPasteFallback => {
-            remaining_turn_timeout(deadline, request.timeout)?;
-            let provider_turn_id = if follow_up_transport
-                == provider::FollowUpTransport::ProviderCrossSessionMessage
-            {
-                Some(provider::new_cross_session_turn_id(provider)?)
-            } else {
-                None
+            let prepared = (|| -> Result<_> {
+                remaining_turn_timeout(deadline, request.timeout)?;
+                let provider_turn_id = if follow_up_transport
+                    == provider::FollowUpTransport::ProviderCrossSessionMessage
+                {
+                    Some(provider::new_cross_session_turn_id(provider)?)
+                } else {
+                    None
+                };
+                let bridge_executable =
+                    std::env::current_exe().context("failed to locate the current executable")?;
+                claim.begin_delivery()?;
+                Ok((provider_turn_id, bridge_executable))
+            })();
+            let (provider_turn_id, bridge_executable) = match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let _ = claim.settle_delivery(turn::Delivery::NotSent(&error));
+                    return Err(error);
+                }
             };
             let correlation_id = provider_turn_id.as_deref().unwrap_or(&claim_token);
-            let bridge_executable =
-                std::env::current_exe().context("failed to locate the current executable")?;
-            update_status(&directory, SessionState::Working, None, None)?;
             match provider::send_cross_session_message(
                 provider,
                 provider::CrossSessionMessageContext {
@@ -2718,10 +2704,10 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
                 }
                 Err(failure)
                     if cross_session_failure_action(follow_up_transport, &failure)
-                        == CrossSessionFailureAction::RetainClaim =>
+                        == CrossSessionFailureAction::Uncertain =>
                 {
                     let error = failure.into_error();
-                    record_cross_session_delivery_uncertainty(&directory, &mut claim, &error);
+                    let _ = claim.settle_delivery(turn::Delivery::Uncertain(&error));
                     return Err(error).with_context(|| {
                         format!(
                             "provider follow-up transport {} could not confirm delivery; the turn remains claimed until the target reports completion or the session is explicitly closed",
@@ -2731,12 +2717,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
                 }
                 Err(failure) => {
                     let error = failure.into_error();
-                    let _ = update_status(
-                        &directory,
-                        previous_state.clone(),
-                        None,
-                        Some(format!("{error:#}")),
-                    );
+                    let _ = claim.settle_delivery(turn::Delivery::NotSent(&error));
                     return Err(error).with_context(|| {
                         format!(
                             "provider follow-up transport {} failed",
@@ -2747,7 +2728,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
             }
         }
     }
-    claim.retain();
+    claim.settle_delivery(turn::Delivery::Sent)?;
 
     if request.detach {
         return emit_session_result(
@@ -2875,6 +2856,7 @@ fn deliver_terminal_follow_up(
         Ok(prompt_file) => prompt_file,
         Err(error) => {
             let _ = provider::cancel_terminal_follow_up(provider, directory, claim_token);
+            let _ = claim.settle_delivery(turn::Delivery::NotSent(&error));
             return Err(error)
                 .with_context(|| {
                     format!(
@@ -2890,11 +2872,16 @@ fn deliver_terminal_follow_up(
                 });
         }
     };
-    update_status(directory, SessionState::Working, None, None)?;
+    if let Err(error) = claim.begin_delivery() {
+        let _ = provider::cancel_terminal_follow_up(provider, directory, claim_token);
+        let _ = claim.settle_delivery(turn::Delivery::NotSent(&error));
+        return Err(error);
+    }
     let send_timeout = match remaining_turn_timeout(deadline, requested_timeout) {
         Ok(timeout) => timeout,
         Err(error) => {
             let _ = provider::cancel_terminal_follow_up(provider, directory, claim_token);
+            let _ = claim.settle_delivery(turn::Delivery::NotSent(&error));
             return Err(error).with_context(|| {
                 format!(
                     "provider follow-up transport {} exhausted its total timeout before delivery",
@@ -2907,6 +2894,7 @@ fn deliver_terminal_follow_up(
         provider::validate_terminal_send_budget(provider, terminal_session.kind, send_timeout)
     {
         let _ = provider::cancel_terminal_follow_up(provider, directory, claim_token);
+        let _ = claim.settle_delivery(turn::Delivery::NotSent(&error));
         return Err(error).with_context(|| {
             format!(
                 "provider follow-up transport {} cannot start inside its remaining total timeout",
@@ -2920,7 +2908,11 @@ fn deliver_terminal_follow_up(
         if !failure.delivery_may_have_occurred() {
             let _ = provider::cancel_terminal_follow_up(provider, directory, claim_token);
         }
-        record_follow_up_terminal_delivery_failure(directory, claim, &failure);
+        let _ = claim.settle_delivery(if failure.delivery_may_have_occurred() {
+            turn::Delivery::Uncertain(failure.error())
+        } else {
+            turn::Delivery::NotSent(failure.error())
+        });
         let error = failure.into_error();
         return Err(error)
             .with_context(|| {
@@ -3776,8 +3768,18 @@ fn update_status(
     exit_code: Option<i32>,
     error: Option<String>,
 ) -> Result<()> {
+    update_status_with_residual(directory, state, exit_code, error, None)
+}
+
+fn update_status_with_residual(
+    directory: &Path,
+    state: SessionState,
+    exit_code: Option<i32>,
+    error: Option<String>,
+    residual_surface: Option<launch::ResidualSurface>,
+) -> Result<()> {
     let _status_lock = Store::open_unchecked(directory).lock_status()?;
-    update_status_locked(directory, state, exit_code, error)
+    update_status_locked(directory, state, exit_code, error, residual_surface)
 }
 
 fn update_status_locked(
@@ -3785,6 +3787,7 @@ fn update_status_locked(
     state: SessionState,
     exit_code: Option<i32>,
     error: Option<String>,
+    residual_surface: Option<launch::ResidualSurface>,
 ) -> Result<()> {
     let store = Store::open_unchecked(directory);
     // The tombstone is the close's commit point: every later write, whatever state it
@@ -3814,6 +3817,13 @@ fn update_status_locked(
         updated_unix_ms: unix_ms(),
         exit_code,
         error,
+        residual_surface: residual_surface.or_else(|| {
+            current.and_then(|status| {
+                status
+                    .residual_surface
+                    .or_else(|| status.residual_surface())
+            })
+        }),
     };
     if state == SessionState::Closed {
         store.write_closed(&status)?;

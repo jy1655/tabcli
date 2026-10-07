@@ -442,6 +442,14 @@ fn bound_pending_completion(
     Ok(pending)
 }
 
+/// The final delivery fact after the adapter has decided whether a fallback is safe.
+/// Settlement never sends input or publishes a provider result.
+pub(in crate::native) enum Delivery<'a> {
+    Sent,
+    NotSent(&'a anyhow::Error),
+    Uncertain(&'a anyhow::Error),
+}
+
 pub(in crate::native) struct Claim {
     path: PathBuf,
     token: String,
@@ -451,12 +459,68 @@ pub(in crate::native) struct Claim {
 }
 
 impl Claim {
-    pub(in crate::native) fn rollback_on_drop(&mut self) {
-        self.retained = false;
+    pub(in crate::native) fn begin_delivery(&mut self) -> Result<()> {
+        let directory = self
+            .path
+            .parent()
+            .context("turn claim has no session directory")?;
+        let store = Store::open_unchecked(directory);
+        let _lock = store.lock()?;
+        recover_pending_completion_locked(directory, &self.path)?;
+        if read_claim_token(directory)?.as_deref() != Some(self.token.as_str()) {
+            bail!("delivery refused: this turn no longer holds the session claim");
+        }
+        if store.closed_if_present()?.is_some() || store.status()?.state == SessionState::Closed {
+            bail!("delivery refused: the session is closed");
+        }
+        update_status(directory, SessionState::Working, None, None)
     }
 
-    pub(in crate::native) fn is_retained(&self) -> bool {
-        self.retained
+    pub(in crate::native) fn settle_delivery(&mut self, delivery: Delivery<'_>) -> Result<()> {
+        // In particular, a failed diagnostic write must never release uncertain input.
+        self.retained = true;
+        let directory = self
+            .path
+            .parent()
+            .context("turn claim has no session directory")?;
+        match delivery {
+            Delivery::Sent => Ok(()),
+            Delivery::Uncertain(error) => {
+                let error = terminal_safe_text(&format!("{error:#}"), true);
+                update_status_for_turn(directory, &self.token, SessionState::Working, Some(error))?;
+                Ok(())
+            }
+            Delivery::NotSent(error) => {
+                let error = terminal_safe_text(&format!("{error:#}"), true);
+                let _lock = Store::open_unchecked(directory).lock()?;
+                // A completion journal may have outlived its sender. Publish it before
+                // deciding whether this refusal still owns any state to roll back.
+                recover_pending_completion_locked(directory, &self.path)?;
+                rollback_turn_claim_token_with_error_locked(
+                    &self.path,
+                    &self.token,
+                    self.rollback_state.clone().unwrap_or(SessionState::Failed),
+                    Some(error),
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    pub(in crate::native) fn complete_initial_delivery(&mut self) -> Result<()> {
+        self.settle_delivery(Delivery::Sent)?;
+        let directory = self
+            .path
+            .parent()
+            .context("turn claim has no session directory")?;
+        Store::open_unchecked(directory)
+            .record(CoreRecord::InitialPrompt)
+            .remove_raw()
+            .context("failed to remove the delivered initial prompt")
+    }
+
+    pub(in crate::native) fn rollback_on_drop(&mut self) {
+        self.retained = false;
     }
 
     pub(in crate::native) fn retain_in_place(&mut self) {
@@ -520,52 +584,6 @@ fn update_status_for_turn_locked(
     Ok(true)
 }
 
-pub(in crate::native) fn record_initial_prompt_delivery_failure(
-    directory: &Path,
-    claim: &mut Claim,
-    delivery_started: bool,
-    error: &anyhow::Error,
-) {
-    let error = terminal_safe_text(&format!("{error:#}"), true);
-    if delivery_started {
-        claim.retain_in_place();
-        let _ = update_status_for_turn(directory, &claim.token, SessionState::Working, Some(error));
-    } else {
-        let _ = update_status(directory, SessionState::Failed, None, Some(error));
-    }
-}
-
-// The send can outlive the turn: the target may complete the delivered turn and a later
-// tell may claim the session before this sender learns that its paste timed out. The
-// failure then belongs to a released turn and must not touch the current turn's status.
-pub(in crate::native) fn record_follow_up_terminal_delivery_failure(
-    directory: &Path,
-    claim: &mut Claim,
-    failure: &terminal::TerminalSendFailure,
-) {
-    if failure.delivery_may_have_occurred() {
-        claim.retain_in_place();
-        let error = terminal_safe_text(&format!("{:#}", failure.error()), true);
-        let _ = update_status_for_turn(directory, &claim.token, SessionState::Working, Some(error));
-    }
-}
-
-// A turn that stays claimed looks like ordinary work from the state alone, so the status
-// keeps the reason until the target completes the turn or the session is closed. The target
-// can complete a delivered turn before its sender stops settling; the session status then
-// belongs to whichever turn holds the claim now, not to this report. The initial messenger
-// is no exception: on Windows the initial turn can complete and a later `tell` can install
-// a replacement claim before the initial messenger reports its uncertainty.
-pub(in crate::native) fn record_cross_session_delivery_uncertainty(
-    directory: &Path,
-    claim: &mut Claim,
-    error: &anyhow::Error,
-) {
-    claim.retain_in_place();
-    let error = terminal_safe_text(&format!("{error:#}"), true);
-    let _ = update_status_for_turn(directory, &claim.token, SessionState::Working, Some(error));
-}
-
 impl Drop for Claim {
     fn drop(&mut self) {
         if !self.retained {
@@ -600,6 +618,15 @@ fn rollback_turn_claim_token_with_error(
     error: Option<String>,
 ) -> Result<bool> {
     let _lock = Store::open_unchecked((path).with_file_name("")).lock()?;
+    rollback_turn_claim_token_with_error_locked(path, expected_token, state, error)
+}
+
+fn rollback_turn_claim_token_with_error_locked(
+    path: &Path,
+    expected_token: &str,
+    state: SessionState,
+    error: Option<String>,
+) -> Result<bool> {
     let current = match session::RecordReader::at(path).raw_text() {
         Ok(current) => current,
         Err(read_error) if read_error.kind() == std::io::ErrorKind::NotFound => {

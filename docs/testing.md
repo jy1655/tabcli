@@ -97,10 +97,19 @@ the session and carries its recorded surface error. A Ghostty failed-launch hand
 to explicit close only when its handoff precedes close and the launch still owns the session.
 A close after the launch deadline but before the handoff leaves the residual surface named in the
 closed session's error, with no recoverable handle; Bridge does not close it. That recorded residual
-surface makes cleanup `not_verified` even when close itself succeeded. A successful recovery
+surface is also preserved as typed status evidence and exposed by `inspect` as
+`residual_surface: "unverified"`; changing the error text cannot clear it. It makes cleanup
+`not_verified` even when a handle-less close succeeded. A successful recovery
 close can pass cleanup, but does not turn the failed launch into a passed round trip. Unit tests
 reproduce both orderings, failed discovery, and failed cleanup with a fake Ghostty runner; they do
 not verify locked-screen behavior or the cause of an automation timeout.
+
+Delivery tests exercise the Claim interface for sent, not-sent, and uncertain outcomes, both
+before and after provider completion or a successor claim. They verify that late reports cannot
+rewrite another turn, not-sent rollback preserves its reason, and uncertain input remains claimed
+even if a diagnostic write fails. These deterministic transitions do not prove live transport
+delivery. Residual-surface tests cover legacy records, diagnostic changes, interrupted tombstone
+amendments, handle persistence failures, and positive versus refused adapter closes.
 
 Warp fake-runner tests cover control-binding write failure with confirmed cleanup (no handle)
 and unconfirmed cleanup (retained handle and failed status), close refusal during pending

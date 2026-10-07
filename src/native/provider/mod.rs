@@ -301,6 +301,16 @@ pub(super) fn diagnose(
     adapter(provider).diagnose(context)
 }
 
+pub(super) fn result_timeout_diagnostic(
+    provider: FirstPartyCli,
+) -> Option<super::doctor::ResultTimeoutDiagnostic> {
+    match provider {
+        FirstPartyCli::Agy => Some(agy::result_timeout_diagnostic()),
+        FirstPartyCli::Pi => Some(pi::result_timeout_diagnostic()),
+        FirstPartyCli::Codex | FirstPartyCli::Claude => None,
+    }
+}
+
 pub(super) fn prepare_launch(
     provider: FirstPartyCli,
     context: LaunchContext<'_>,

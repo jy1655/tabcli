@@ -146,7 +146,7 @@ mod tests {
                 assert_eq!(state.to_string(), $text);
                 let status = SessionStatus {
                     state, generation: 7, updated_unix_ms: 100,
-                    exit_code: None, error: None,
+                    exit_code: None, error: None, residual_surface: None,
                 };
                 // The exact pretty JSON previously written with a String state.
                 let expected = concat!("{\n  \"state\": \"", $text,

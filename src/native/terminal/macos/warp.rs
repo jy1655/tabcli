@@ -657,7 +657,11 @@ where
                     "failed to persist the Warp control binding: {binding_error:#}; exact Warp handle retained={session:?}; exact surface cleanup also failed: {cleanup_error:#}; {}",
                     crate::native::launch::RESIDUAL_SURFACE_MARKER
                 );
-                Err(crate::native::terminal::RetainedLaunchSurface::new(session, message).into())
+                Err(
+                    crate::native::terminal::RetainedLaunchSurface::new(session, message)
+                        .with_unverified_cleanup()
+                        .into(),
+                )
             }
         };
     }

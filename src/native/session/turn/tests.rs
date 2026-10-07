@@ -23,6 +23,50 @@ fn event(message: &str) -> SessionEvent {
 }
 
 #[test]
+fn delivery_settlement_regression_late_not_sent_preserves_newer_turn() {
+    let (_directory, store) = fixture(SessionState::Working);
+    let mut old = claim(&store, &[]).unwrap();
+    old.complete(event("already completed")).unwrap();
+    let (newer, _) = claim_ready(&store, "session-test", &[]).unwrap();
+    let before = fs::read(store.record(CoreRecord::Status).path()).unwrap();
+    old.settle_delivery(Delivery::NotSent(&anyhow::anyhow!("late not sent")))
+        .unwrap();
+    drop(old);
+    assert_eq!(
+        fs::read(store.record(CoreRecord::Status).path()).unwrap(),
+        before
+    );
+    assert_eq!(
+        current_claim_token(&store).unwrap().as_deref(),
+        Some(newer.token())
+    );
+    assert_eq!(store.events().unwrap().len(), 1);
+    newer.retain();
+}
+
+#[test]
+fn delivery_settlement_regression_not_sent_keeps_failure_reason() {
+    let (_directory, store) = fixture(SessionState::Ready);
+    let (mut claim, _) = claim_ready(&store, "session-test", &[]).unwrap();
+    update_status(store.directory(), SessionState::Working, None, None).unwrap();
+    let failure = terminal::TerminalSendFailure::not_sent(anyhow::anyhow!("delivery refused"));
+    {
+        let delivery_error = failure.error();
+        let _ = claim.settle_delivery(if failure.delivery_may_have_occurred() {
+            turn::Delivery::Uncertain(delivery_error)
+        } else {
+            turn::Delivery::NotSent(delivery_error)
+        });
+    };
+    drop(claim);
+    let status = store.status().unwrap();
+    assert_eq!(status.state, SessionState::Ready);
+    assert_eq!(status.error.as_deref(), Some("delivery refused"));
+    assert!(current_claim_token(&store).unwrap().is_none());
+    assert!(store.events().unwrap().is_empty());
+}
+
+#[test]
 fn claim_complete_publishes_once_and_releases_exclusive_ownership() {
     let (_directory, store) = fixture(SessionState::Working);
     let mut claimed = claim(&store, &[]).unwrap();
@@ -47,6 +91,166 @@ fn claim_complete_publishes_once_and_releases_exclusive_ownership() {
         .unwrap();
     assert_eq!(store.events().unwrap().len(), 1);
     assert!(claim(&store, &[]).is_ok());
+}
+
+#[test]
+fn delivery_outcomes_keep_claims_and_receipts_distinct_from_results() {
+    for initial in [false, true] {
+        for outcome in ["sent", "not_sent", "uncertain"] {
+            let (_directory, store) = fixture(if initial {
+                SessionState::AwaitingInitialInput
+            } else {
+                SessionState::Ready
+            });
+            let mut claimed = if initial {
+                claim(&store, &[]).unwrap()
+            } else {
+                claim_ready(&store, "session-test", &[]).unwrap().0
+            };
+            let request = claimed.receipt().request_id.clone();
+            claimed.begin_delivery().unwrap();
+            let error = anyhow::anyhow!("delivery evidence");
+            claimed
+                .settle_delivery(match outcome {
+                    "sent" => Delivery::Sent,
+                    "not_sent" => Delivery::NotSent(&error),
+                    _ => Delivery::Uncertain(&error),
+                })
+                .unwrap();
+            drop(claimed);
+            let status = store.status().unwrap();
+            assert_eq!(
+                status.state,
+                if outcome == "not_sent" {
+                    if initial {
+                        SessionState::Failed
+                    } else {
+                        SessionState::Ready
+                    }
+                } else {
+                    SessionState::Working
+                }
+            );
+            assert_eq!(
+                status.error.as_deref(),
+                if outcome == "sent" {
+                    None
+                } else {
+                    Some("delivery evidence")
+                }
+            );
+            assert_eq!(
+                current_claim_token(&store).unwrap().is_some(),
+                outcome != "not_sent"
+            );
+            assert_eq!(
+                requests::list(&store).unwrap().receipts[0].request_id,
+                request
+            );
+            assert!(store.events().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn delivery_reports_after_completion_never_resurrect_or_mutate_a_turn() {
+    for successor in [false, true] {
+        for outcome in ["sent", "not_sent", "uncertain"] {
+            let (_directory, store) = fixture(SessionState::Working);
+            let mut old = claim(&store, &[]).unwrap();
+            old.complete(event("completed before the sender settled"))
+                .unwrap();
+            let newer = successor.then(|| claim_ready(&store, "session-test", &[]).unwrap().0);
+            let before = fs::read(store.record(CoreRecord::Status).path()).unwrap();
+            let token = current_claim_token(&store).unwrap();
+            let error = anyhow::anyhow!("late delivery report");
+            old.settle_delivery(match outcome {
+                "sent" => Delivery::Sent,
+                "not_sent" => Delivery::NotSent(&error),
+                _ => Delivery::Uncertain(&error),
+            })
+            .unwrap();
+            drop(old);
+            assert_eq!(
+                fs::read(store.record(CoreRecord::Status).path()).unwrap(),
+                before
+            );
+            assert_eq!(current_claim_token(&store).unwrap(), token);
+            assert_eq!(store.events().unwrap().len(), 1);
+            if let Some(newer) = newer {
+                newer.retain();
+            }
+        }
+    }
+}
+
+#[test]
+fn delivery_refusal_recovers_a_completion_before_rolling_back() {
+    let (_directory, store) = fixture(SessionState::Working);
+    let mut claimed = claim(&store, &[]).unwrap();
+    let pending = PendingTurnCompletion::new(claimed.token(), event("completed"), None).unwrap();
+    store.write_completion(&pending).unwrap();
+    claimed
+        .settle_delivery(Delivery::NotSent(&anyhow::anyhow!("late refusal")))
+        .unwrap();
+    drop(claimed);
+    assert_eq!(store.status().unwrap().state, SessionState::Ready);
+    assert!(store.status().unwrap().error.is_none());
+    assert!(current_claim_token(&store).unwrap().is_none());
+    assert_eq!(
+        store.event_strict(&pending.event_file).unwrap(),
+        event("completed")
+    );
+}
+
+#[test]
+fn delivery_begin_refuses_closed_and_replaced_claims() {
+    for closed in [false, true] {
+        let (_directory, store) = fixture(SessionState::Working);
+        let mut old = claim(&store, &[]).unwrap();
+        old.complete(event("completed")).unwrap();
+        let newer = if closed {
+            session::close::close(&store, None, |_| panic!("no surface")).unwrap();
+            None
+        } else {
+            Some(claim_ready(&store, "session-test", &[]).unwrap().0)
+        };
+        let before = fs::read(store.record(CoreRecord::Status).path()).unwrap();
+        assert!(old.begin_delivery().is_err());
+        assert_eq!(
+            fs::read(store.record(CoreRecord::Status).path()).unwrap(),
+            before
+        );
+        if let Some(newer) = newer {
+            newer.retain();
+        }
+    }
+}
+
+#[test]
+fn delivery_uncertainty_and_post_send_cleanup_failures_keep_the_claim() {
+    for cleanup in [false, true] {
+        let (_directory, store) = fixture(SessionState::Working);
+        let mut claimed = claim(&store, &[]).unwrap();
+        if cleanup {
+            fs::create_dir(store.record(CoreRecord::InitialPrompt).path()).unwrap();
+            assert!(claimed.complete_initial_delivery().is_err());
+        } else {
+            let path = store.record(CoreRecord::Status).path().to_owned();
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(path).unwrap();
+            assert!(
+                claimed
+                    .settle_delivery(Delivery::Uncertain(&anyhow::anyhow!("uncertain")))
+                    .is_err()
+            );
+        }
+        let token = claimed.token().to_owned();
+        drop(claimed);
+        assert_eq!(current_claim_token(&store).unwrap(), Some(token));
+        assert!(claim(&store, &[]).is_err());
+        assert!(store.events().unwrap().is_empty());
+    }
 }
 
 #[test]

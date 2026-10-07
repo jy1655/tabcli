@@ -758,7 +758,8 @@ pub(super) fn inspect_value(reader: &Reader, id: &str) -> Result<Value> {
             })
         })
         .collect::<Vec<_>>();
-    Ok(json!({
+    let residual_surface = snapshot.status.residual_surface();
+    let mut value = json!({
         "schema_version": 1, "ok": true, "session": id, "provider": snapshot.manifest.provider,
         "workspace": snapshot.manifest.workspace, "title": snapshot.manifest.title,
         "stored_state": snapshot.status.state, "generation": snapshot.status.generation,
@@ -772,7 +773,11 @@ pub(super) fn inspect_value(reader: &Reader, id: &str) -> Result<Value> {
         "recovery_required": snapshot.pending.is_some(), "turn_claimed": snapshot.claim.is_some(),
         "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error,
         "recorded_events": snapshot.paths.len(), "latest_result": latest, "requests": request_refs,
-    }))
+    });
+    if let Some(residual) = residual_surface {
+        value["residual_surface"] = serde_json::to_value(residual)?;
+    }
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------------------

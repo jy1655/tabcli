@@ -98,6 +98,49 @@ fn inspect_and_legacy_result_are_read_only_and_do_not_invent_request_identity() 
 }
 
 #[test]
+fn inspect_reports_typed_and_legacy_residual_surfaces_without_writing() {
+    for (typed, error, residual) in [
+        (None, "ordinary error", false),
+        (
+            None,
+            "the surface may remain and is not closed by Bridge",
+            true,
+        ),
+        (
+            Some("unverified"),
+            "wording changed without clearing the observation",
+            true,
+        ),
+        (
+            Some("cleared"),
+            "the surface may remain and is not closed by Bridge",
+            false,
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let mut status = json!({"state":"closed", "generation":3,
+            "updated_unix_ms":4, "exit_code":null, "error":error});
+        if let Some(typed) = typed {
+            status["residual_surface"] = json!(typed);
+        }
+        write(&fixture.directory.join("status.json"), &status);
+        let before = files(fixture.root.path());
+        let inspected = success(fixture.run(&["inspect", "session-observe", "--json"]));
+        assert_eq!(inspected["stored_state"], "closed");
+        assert_eq!(inspected["error"], error);
+        assert_eq!(
+            inspected["residual_surface"],
+            if residual {
+                json!("unverified")
+            } else {
+                Value::Null
+            }
+        );
+        assert_eq!(files(fixture.root.path()), before);
+    }
+}
+
+#[test]
 fn result_never_publishes_a_partial_completion_journal_or_recovers_it() {
     let fixture = Fixture::new();
     let event = fixture.event("event-1.json", "not committed yet");

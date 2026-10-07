@@ -55,7 +55,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: 1.97.1
       PACKAGE: tabcli
-      RELEASE_VERSION: 0.2.3
+      RELEASE_VERSION: 0.2.4
       TARGET: ${{ matrix.target }}
       ARCHIVE: ${{ matrix.archive }}
     strategy:
@@ -64,10 +64,10 @@ jobs:
         include:
           - os: macos-15
             target: aarch64-apple-darwin
-            archive: tabcli-0.2.3-aarch64-apple-darwin.tar.gz
+            archive: tabcli-0.2.4-aarch64-apple-darwin.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            archive: tabcli-0.2.3-x86_64-pc-windows-msvc.zip
+            archive: tabcli-0.2.4-x86_64-pc-windows-msvc.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
