@@ -101,6 +101,7 @@ pub(crate) enum NativeCommand {
         request: Option<String>,
     },
     Result(query::ResultRequest),
+    Wait(query::wait::WaitRequest),
     Search(query::SearchRequest),
     Status(query::status::StatusRequest),
     Doctor(doctor::DoctorRequest),
@@ -268,6 +269,7 @@ pub(crate) fn is_command(value: &str) -> bool {
             | "status"
             | "inspect"
             | "result"
+            | "wait"
             | "search"
             | "doctor"
             | "prune-sessions"
@@ -304,6 +306,7 @@ where
         "reopen" => parse_reopen(rest),
         "inspect" => query::parse_inspect(rest),
         "result" => query::parse_result(rest),
+        "wait" => query::wait::parse(rest),
         "search" => query::parse_search(rest),
         "doctor" => doctor::parse_args(rest),
         "sessions" => parse_sessions(rest),
@@ -869,6 +872,7 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
             request,
         } => query::run_inspect(&id, json, timeline, request.as_deref()),
         NativeCommand::Result(request) => query::run_result(request),
+        NativeCommand::Wait(request) => query::wait::run(request),
         NativeCommand::Search(request) => query::run_search(request),
         NativeCommand::Doctor(request) => doctor::run(request),
         NativeCommand::Sessions(request) => run_sessions(request),

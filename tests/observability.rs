@@ -1259,3 +1259,321 @@ fn status_human_strings_cannot_inject_terminal_controls() {
     assert!(text.contains("codex\\n\\u{1b}[31m"));
     assert!(!text.contains('\u{1b}'));
 }
+
+fn wait_second_session(fixture: &Fixture) -> PathBuf {
+    let directory = fixture.root.path().join("session-second");
+    fs::create_dir(&directory).unwrap();
+    fs::create_dir(directory.join("events")).unwrap();
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(fixture.directory.join("manifest.json")).unwrap())
+            .unwrap();
+    manifest["id"] = json!("session-second");
+    write(&directory.join("manifest.json"), &manifest);
+    fs::copy(
+        fixture.directory.join("status.json"),
+        directory.join("status.json"),
+    )
+    .unwrap();
+    fs::create_dir(directory.join("requests")).unwrap();
+    write(
+        &directory.join("requests/123-457-0.json"),
+        &json!({
+            "schema": 1, "request_id": "request-second", "claim_token": "123-457-0",
+            "event_file": "event-2.json", "created_unix_ms": 3
+        }),
+    );
+    fs::write(directory.join("turn.claim"), "123-457-0\n").unwrap();
+    directory
+}
+
+#[test]
+fn wait_selects_completed_and_preserves_other_claim_and_all_records() {
+    let fixture = Fixture::new();
+    request(&fixture, "123-456-0", "request-first", "event-1.json");
+    fixture.event("event-1.json", "first result");
+    wait_second_session(&fixture);
+    let before = files(fixture.root.path());
+    let value = success(fixture.run(&[
+        "wait",
+        "session-observe/request-first",
+        "session-second/request-second",
+        "--json",
+    ]));
+    assert_eq!(value["ended"]["address"], "session-observe/request-first");
+    assert_eq!(value["ended"]["result"], "first result");
+    assert_eq!(value["remaining"], json!(["session-second/request-second"]));
+    assert_eq!(value["timed_out"], false);
+    assert!(value["ended"].get("owner").is_none());
+    let human = fixture.run(&[
+        "wait",
+        "session-observe/request-first",
+        "session-second/request-second",
+    ]);
+    assert!(human.status.success());
+    assert!(
+        String::from_utf8(human.stdout)
+            .unwrap()
+            .ends_with("remaining: session-second/request-second\n")
+    );
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[test]
+fn wait_shared_timeout_preserves_both_pending_requests() {
+    let fixture = Fixture::new();
+    request(&fixture, "123-456-0", "request-first", "event-1.json");
+    fs::write(fixture.directory.join("turn.claim"), "123-456-0\n").unwrap();
+    wait_second_session(&fixture);
+    let before = files(fixture.root.path());
+    let output = fixture.run(&[
+        "wait",
+        "session-observe/request-first",
+        "session-second/request-second",
+        "--timeout-secs",
+        "1",
+        "--json",
+    ]);
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value,
+        json!({"schema_version": 1, "ok": false, "ended": null,
+        "remaining": ["session-observe/request-first", "session-second/request-second"],
+        "timed_out": true, "error": "waiting timed out; no request was cancelled or resent"})
+    );
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[test]
+fn wait_ties_follow_address_order_instead_of_session_group_order() {
+    let fixture = Fixture::new();
+    request(&fixture, "123-456-0", "request-first", "event-1.json");
+    fs::write(fixture.directory.join("turn.claim"), "123-456-0\n").unwrap();
+    request(&fixture, "123-458-0", "request-third", "event-3.json");
+    fixture.event("event-3.json", "third");
+    let second = wait_second_session(&fixture);
+    let event = fixture.event("event-2.json", "second");
+    write(&second.join("events/event-2.json"), &event);
+    fs::remove_file(second.join("turn.claim")).unwrap();
+    let value = success(fixture.run(&[
+        "wait",
+        "session-observe/request-first",
+        "session-second/request-second",
+        "session-observe/request-third",
+        "--json",
+    ]));
+    assert_eq!(value["ended"]["address"], "session-second/request-second");
+    assert_eq!(
+        value["remaining"],
+        json!([
+            "session-observe/request-first",
+            "session-observe/request-third"
+        ])
+    );
+}
+
+#[test]
+fn wait_busy_unconfirmed_session_does_not_block_a_completed_request() {
+    let fixture = Fixture::new();
+    request(&fixture, "123-456-0", "request-first", "event-1.json");
+    fixture.event("event-1.json", "completed");
+    let second = wait_second_session(&fixture);
+    let lock = fs::File::create(second.join("turn.claim.lock")).unwrap();
+    let before = files(fixture.root.path());
+    lock.lock().unwrap();
+    // Even a missing receipt cannot be confirmed while this session is busy.
+    let value = success(fixture.run(&[
+        "wait",
+        "session-second/request-missing",
+        "session-observe/request-first",
+        "--timeout-secs",
+        "1",
+        "--json",
+    ]));
+    lock.unlock().unwrap();
+    assert_eq!(value["ended"]["address"], "session-observe/request-first");
+    assert_eq!(
+        value["remaining"],
+        json!(["session-second/request-missing"])
+    );
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[test]
+fn wait_rejects_invalid_addresses_before_selecting_a_completed_request() {
+    for invalid in [
+        "session-second/request-missing",
+        "session-missing/request-missing",
+    ] {
+        let fixture = Fixture::new();
+        request(&fixture, "123-456-0", "request-first", "event-1.json");
+        fixture.event("event-1.json", "must not be returned");
+        wait_second_session(&fixture);
+        let before = files(fixture.root.path());
+        let started = std::time::Instant::now();
+        let output = fixture.run(&["wait", "session-observe/request-first", invalid, "--json"]);
+        assert!(!output.status.success());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["ended"], Value::Null);
+        assert_eq!(value["ok"], false);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("must not be returned"));
+        assert_eq!(files(fixture.root.path()), before);
+    }
+}
+
+#[test]
+fn wait_argument_errors_are_structured_json() {
+    let fixture = Fixture::new();
+    for args in [
+        vec![],
+        vec!["session-observe/latest"],
+        vec!["session-observe/event-1.json"],
+        vec!["../request-first"],
+        vec!["session-observe/request-first/extra"],
+        vec!["session-observe\\request-first"],
+        vec![
+            "session-observe/request-first",
+            "session-observe/request-first",
+        ],
+        vec!["session-observe/request-first", "--timeout-secs", "0"],
+        vec!["session-observe/request-first", "--timeout-secs"],
+        vec!["--latest"],
+        vec!["--json"],
+    ] {
+        let mut command = vec!["wait", "--json"];
+        command.extend(args);
+        let output = fixture.run(&command);
+        assert!(!output.status.success(), "{command:?}");
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["ok"], false);
+        assert!(value["error"].is_string());
+    }
+}
+
+#[test]
+fn wait_one_matches_public_result_wait_and_preserves_journal_and_dead_owner() {
+    for state in [
+        "completed",
+        "failed",
+        "unresolved",
+        "dead",
+        "closed",
+        "recovery_required",
+        "published",
+    ] {
+        let fixture = Fixture::new();
+        request(&fixture, "123-456-0", "request-first", "event-1.json");
+        if matches!(state, "dead" | "closed" | "published" | "recovery_required") {
+            fs::write(fixture.directory.join("turn.claim"), "123-456-0\n").unwrap();
+        }
+        if matches!(
+            state,
+            "completed" | "failed" | "published" | "recovery_required"
+        ) {
+            let mut event = fixture.event("event-1.json", "result");
+            if state == "failed" {
+                event["error"] = json!("provider failed");
+                write(&fixture.directory.join("events/event-1.json"), &event);
+            }
+            if matches!(state, "published" | "recovery_required") {
+                if state == "recovery_required" {
+                    event["message"] = json!("not published");
+                }
+                if state == "published" {
+                    // Publication compares bytes with SessionEvent's writer order.
+                    fs::write(
+                        fixture.directory.join("events/event-1.json"),
+                        concat!(
+                            "{\n  \"provider\": \"claude\",\n  \"message\": \"result\",",
+                            "\n  \"error\": null,\n  \"provider_session_id\": \"native-session\",",
+                            "\n  \"turn_id\": \"event-1.json\",\n  \"created_unix_ms\": 3\n}"
+                        ),
+                    )
+                    .unwrap();
+                }
+                write(
+                    &fixture.directory.join("turn.completion.json"),
+                    &json!({"schema": 1,
+                    "claim_token": "123-456-0", "event_file": "event-1.json", "event": event,
+                    "status_error": null, "status_state": "ready"}),
+                );
+            }
+        }
+        if matches!(state, "dead" | "completed") {
+            write(
+                &fixture.directory.join("native-session.json"),
+                &json!({"pid": u32::MAX}),
+            );
+        }
+        if state == "closed" {
+            write(
+                &fixture.directory.join("status.json"),
+                &json!({"state": "closed", "generation": 3,
+                "updated_unix_ms": 4, "exit_code": null, "error": null}),
+            );
+        }
+        let before = files(fixture.root.path());
+        let result = fixture.run(&[
+            "result",
+            "session-observe",
+            "--request",
+            "request-first",
+            "--wait",
+            "--json",
+        ]);
+        let waited = fixture.run(&["wait", "session-observe/request-first", "--json"]);
+        assert_eq!(result.status.code(), waited.status.code(), "{state}");
+        let mut value: Value = serde_json::from_slice(&waited.stdout).unwrap();
+        let top_ok = value["ok"].clone();
+        let top_timed_out = value["timed_out"].clone();
+        let ended = value["ended"].as_object_mut().unwrap();
+        ended.remove("address");
+        let mut bytes = serde_json::to_vec_pretty(ended).unwrap();
+        bytes.push(b'\n');
+        assert_eq!(bytes, result.stdout, "{state}");
+        // Fixed expectations, independent of the shared implementation: the public
+        // `result --wait` contract for each ending state, pinned by literal values.
+        let (success, request_state, error) = match state {
+            "completed" | "published" => (true, "completed", Value::Null),
+            "failed" => (false, "failed", json!("provider failed")),
+            "unresolved" | "closed" => (
+                false,
+                "unresolved",
+                json!(
+                    "request ended without a published successful result; inspect the session before sending another prompt"
+                ),
+            ),
+            "dead" => (
+                false,
+                "unresolved",
+                json!(
+                    "recorded native owner is no longer live; run sessions for this workspace to recover its state, then inspect the request"
+                ),
+            ),
+            "recovery_required" => (
+                false,
+                "recovery_required",
+                json!(
+                    "completion publication requires recovery; run sessions for this workspace, then query again"
+                ),
+            ),
+            _ => unreachable!(),
+        };
+        assert_eq!(waited.status.success(), success, "{state}");
+        assert_eq!(result.status.success(), success, "{state}");
+        assert_eq!(ended["ok"], json!(success), "{state}");
+        assert_eq!(top_ok, json!(success), "{state}");
+        assert_eq!(ended["request_state"], request_state, "{state}");
+        assert_eq!(ended["error"], error, "{state}");
+        assert_eq!(top_timed_out, false, "{state}");
+        if state == "dead" {
+            assert_eq!(ended["owner_process_alive"], false);
+        }
+        if matches!(state, "completed" | "published") {
+            assert_eq!(ended["result"], "result");
+            assert!(!ended.contains_key("owner"));
+        }
+        assert_eq!(files(fixture.root.path()), before);
+    }
+}
