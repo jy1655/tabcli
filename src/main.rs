@@ -64,8 +64,10 @@ Runtime:
   a new window because its native scripting API cannot create a new tab.
   Existing tabs are never adopted; close uses the recorded target and scope,
   independent of later settings changes. Use --terminal to override detection. An
-  unknown host falls back to Terminal.app. Warp requires its Scripting opt-in and a
-  reachable authorized official Warp Control endpoint. Its tab route also needs
+  unknown host falls back to Terminal.app. Warp requires a reachable authorized
+  official Warp Control endpoint, which its Stable and Preview builds cannot publish:
+  Warp's Scripting setting is behind an internal-only feature flag (see
+  docs/terminals.md). Its tab route also needs
   enabled TabConfigs; new-window mode uses the separate Launch Configuration URI.
   Its control API cannot submit terminal input, so follow-ups without a
   provider-native input path are unsupported.

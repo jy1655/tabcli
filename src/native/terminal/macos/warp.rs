@@ -1100,7 +1100,7 @@ fn discover_control_client<R: WarpRunner>(
     }
     if active_clients.is_empty() {
         bail!(
-            "no reachable authorized Warp Control endpoint was found; the target app must expose an official endpoint and authorize Scripting and required actions. Bundle or CLI version alone does not establish availability"
+            "no reachable authorized Warp Control endpoint was found; Warp publishes one only while its Scripting setting is on, and that setting is behind Warp's internal-only WarpControlCli feature flag, so a Stable or Preview build cannot expose it (see docs/terminals.md). Bundle or CLI version alone does not establish availability"
         );
     }
     if active_clients.len() != 1 {
