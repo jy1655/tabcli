@@ -283,14 +283,27 @@ fn fail_locked_with_residual(
     Ok(())
 }
 
+// The plain form, which the tests of this module and of close use.
+#[cfg(test)]
 pub(in crate::native) fn fail(store: &Store, reason: &str) -> Result<()> {
+    fail_deciding(store, reason, |_, reason| Ok(reason.to_owned()))
+}
+
+// `fail`, with the recorded wording decided under the lock from the launch record
+// and the other records as they are at that moment.
+fn fail_deciding(
+    store: &Store,
+    reason: &str,
+    wording: impl FnOnce(&Record, &str) -> Result<String>,
+) -> Result<()> {
     let Some(_lock) = store.try_lock()? else {
         bail!("{reason}; provider startup is in progress; the claim is retained");
     };
     if let Some(record) = read(store)?
         && record.phase != Phase::Spawned
     {
-        fail_locked(store, &record, reason)?;
+        let reason = wording(&record, reason)?;
+        fail_locked(store, &record, &reason)?;
     }
     Ok(())
 }
@@ -299,20 +312,20 @@ pub(in crate::native) fn fail(store: &Store, reason: &str) -> Result<()> {
 pub(in crate::native) fn terminal_failed(store: &Store, error: &anyhow::Error) -> Result<()> {
     let reason = format!("terminal launch failed: {error:#}");
     let Some(retained) = error.downcast_ref::<terminal::RetainedLaunchSurface>() else {
-        // Only a failure before a surface was bound and before the provider spawn began
-        // proves that nothing was sent: a bound surface keeps its handle, and a spawn in
-        // progress may already have carried the prompt (its own wording says so).
-        let unbound = Reader::open_unchecked(store.directory())
-            .record(CoreRecord::Terminal)
-            .text()?
-            .is_none();
-        let before_spawn = read(store)?.is_none_or(|record| record.phase == Phase::Pending);
-        let reason = if unbound && before_spawn {
-            format!("{reason}; no surface handle was recorded and no prompt was sent")
-        } else {
-            reason
-        };
-        return fail(store, &reason);
+        // Only a failure before a surface was bound (a close in progress moves the handle
+        // to the closing record and may give it back) and before the provider spawn began
+        // proves that nothing was sent. A bound surface keeps its handle, and a spawn in
+        // progress has its own wording. Decided under the lock, on the records as they are.
+        return fail_deciding(store, &reason, |record, reason| {
+            let reader = Reader::open_unchecked(store.directory());
+            let unbound = reader.record(CoreRecord::Terminal).text()?.is_none()
+                && reader.record(CoreRecord::TerminalClosing).text()?.is_none();
+            Ok(if unbound && record.phase == Phase::Pending {
+                format!("{reason}; no surface handle was recorded and no prompt was sent")
+            } else {
+                reason.to_owned()
+            })
+        });
     };
     let _lock = store.lock()?;
     let status = store.status()?;
@@ -726,6 +739,26 @@ mod tests {
             Some("terminal launch failed: Ghostty start failed")
         );
         assert!(store.terminal().is_ok());
+
+        // A handle that a close moved to the closing record is still a handle.
+        let (directory, _) = fixture();
+        let store = Store::open_unchecked(directory.path());
+        store
+            .record(CoreRecord::TerminalClosing)
+            .write_json(&surface)
+            .unwrap();
+        terminal_failed(&store, &anyhow::anyhow!("Ghostty start failed")).unwrap();
+        assert_eq!(
+            store.status().unwrap().error.as_deref(),
+            Some("terminal launch failed: Ghostty start failed")
+        );
+        assert!(
+            store
+                .record(CoreRecord::TerminalClosing)
+                .text()
+                .unwrap()
+                .is_some()
+        );
 
         // A spawn in progress may have carried the prompt: the spawn wording stays alone.
         let (directory, token) = fixture();
