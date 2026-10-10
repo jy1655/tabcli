@@ -150,9 +150,24 @@ pub(super) struct Context<'a> {
 }
 
 pub(super) fn run(request: DoctorRequest) -> Result<()> {
-    use Availability::*;
     let started = unix_ms();
     let deadline = Instant::now() + PROBE_TIMEOUT;
+    let diagnosis = assemble_checks(&request, deadline)?;
+    render_report(&request, started, diagnosis)
+}
+
+struct Diagnosis {
+    provider: Option<FirstPartyCli>,
+    manifest: Option<SessionManifest>,
+    scope: Value,
+    observations: Value,
+    checks: Vec<Check>,
+}
+
+// Keep record reads and probes interleaved in their original order. record_checks
+// releases its snapshot before any surface or provider probe uses the shared deadline.
+fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnosis> {
+    use Availability::*;
     let mut checks = vec![Check::new(
         "platform",
         if cfg!(any(target_os = "macos", windows)) {
@@ -266,6 +281,8 @@ pub(super) fn run(request: DoctorRequest) -> Result<()> {
     };
     let mut executable = None;
     let mut current_version = None;
+    let mut scope_workspace = None;
+    let mut consent_state = Value::Null;
     if let Some(provider) = provider {
         let resolved = match &manifest {
             Some(manifest) => Ok(manifest.provider_path.clone()),
@@ -348,6 +365,7 @@ pub(super) fn run(request: DoctorRequest) -> Result<()> {
         checks.push(Check::new("workspace", availability, reason, "Working directory observation; CLI version checks do not depend on this directory.", "Restore or inspect the recorded directory before workspace-relative operations.").evidence(json!({"path": workspace})));
         if let Some(directory) = &directory {
             let consent = consent::observe(directory);
+            consent_state = consent["state"].clone();
             let availability = if consent["state"] == "verified" {
                 Available
             } else {
@@ -369,10 +387,48 @@ pub(super) fn run(request: DoctorRequest) -> Result<()> {
                 deadline,
             },
         ));
+        scope_workspace = Some(workspace);
     }
+    let workspace = scope_workspace
+        .or_else(|| manifest.as_ref().map(|m| m.workspace.clone()))
+        .or_else(|| std::env::current_dir().ok());
+    let scope = json!({
+        "session": request.session,
+        "provider": provider.map(|p| p.as_str()),
+        "executable": executable,
+        "executable_source": executable.as_ref().map(|_| {
+            if manifest.is_some() { "launch_record" } else { "resolved_path" }
+        }),
+        "current_version": current_version,
+        "model": manifest.as_ref().and_then(|m| m.model.as_deref()),
+        "effort": manifest.as_ref().and_then(|m| m.effort.as_deref()),
+        "workspace": workspace,
+        "probe": request.probe,
+        "probe_budget_ms": PROBE_TIMEOUT.as_millis(),
+        "consent_state": consent_state,
+    });
+    Ok(Diagnosis {
+        provider,
+        manifest,
+        scope,
+        observations,
+        checks,
+    })
+}
+
+fn render_report(request: &DoctorRequest, started: u128, diagnosis: Diagnosis) -> Result<()> {
+    use Availability::*;
+    let Diagnosis {
+        provider,
+        manifest,
+        scope,
+        observations,
+        checks,
+    } = diagnosis;
     let report = json!({
         "schema_version": 1, "ok": true, "session": request.session,
         "provider": provider.map(|p| p.as_str()), "probe": request.probe,
+        "scope": scope,
         "started_unix_ms": started, "finished_unix_ms": unix_ms(),
         "configured": manifest.as_ref().map(|m| json!({
             "workspace": m.workspace, "provider_path": m.provider_path,
@@ -385,6 +441,10 @@ pub(super) fn run(request: DoctorRequest) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
+    println!(
+        "scope: {}",
+        terminal_safe_text(&report["scope"].to_string(), false)
+    );
     println!(
         "doctor: {}",
         request

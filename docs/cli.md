@@ -568,10 +568,33 @@ local capability/version probes, with a five-second probe budget. It does not la
 deliver a prompt, start a daemon, repair records, or change settings. Historical launch
 configuration and current observations are reported separately.
 
+The report starts human output with `scope`, describing the inputs used by these checks:
+
+- `session` is the requested session id, or null in provider-only mode; `provider` is the
+  recognized provider, or null when absent or unrecognized.
+- `executable` is the validated absolute executable path, or null if unusable.
+  `executable_source` is `launch_record` for a usable manifest path, `resolved_path` for
+  provider-only PATH resolution, or null. Session paths are never replaced through PATH.
+- `current_version` is the result of a successful version probe; otherwise it is null.
+  `configured.provider_version_at_launch` remains separate historical evidence.
+- `model` and `effort` are the manifest's launch overrides, not effective runtime settings;
+  both are null in provider-only mode.
+- `workspace` is the manifest workspace or the current directory, or null if the scope-only
+  current-directory lookup fails. The version probe runs in a scratch directory, so this
+  field does not name every probe's working directory.
+- `probe` records whether `--probe` was requested. `probe_budget_ms` is the shared 5000 ms
+  budget captured at report start, not a fresh allowance for each probe.
+- `consent_state` reuses the `state` from the existing `workspace_consent` observation, or
+  is null when that state was not observed, including provider-only mode.
+
+Scope is not proof of an effective runtime configuration or of delivery.
+
 For Pi, `checks` includes `pi_provider_credentials`. With a session's explicit
 `provider/model` and `--probe`, Pi's local, non-refreshing auth check reports
 `evidence.status` as `ready`, `not_ready`, or `unknown`, alongside `provider`, `authType`,
-and `exit_code`. The detail explains the reason; `ready` means configured, not accepted.
+`exit_code`, `model`, and `executable`. The last two identify the intended target where
+known, even on an early return; their presence does not mean a probe ran. The detail explains
+the reason; `ready` means configured, not accepted.
 Without a session model (including `doctor --provider pi`) or without `--probe`, the
 status is `unknown`. Pi confirms model resolution before the provider check; no default
 model or provider is guessed, no credential is printed, and no model call is made.
@@ -1006,10 +1029,17 @@ have `ok:false`, `ended:null`, `remaining:[]`, `timed_out:false`, and a top-leve
 
 ### doctor
 
-Fields: `schema_version`, `ok`, `session`, `provider`, `probe`, `started_unix_ms`,
+Fields: `schema_version`, `ok`, `session`, `provider`, `probe`, `scope`, `started_unix_ms`,
 `finished_unix_ms`, `configured`, `observations`, and `checks`. Each check has `id`, `availability`,
 `reason_code`, `observed_unix_ms`, `detail`, `next_action`, `evidence`, and optionally
 `next_command` as an argument array. Availability is `available`, `unavailable`, or `unknown`.
+
+`scope` has `session`, `provider`, `executable`, `executable_source`, `current_version`,
+`model`, `effort`, `workspace`, `probe`, `probe_budget_ms`, and `consent_state`, as described
+above. JSON object keys are serialized in sorted order (`scope` follows `schema_version`
+and precedes `session`); human output prints scope first. Pi credential evidence retains
+`status`, `provider`, `authType`, and `exit_code`, and adds nullable `model` and `executable`.
+No command stdout, stderr, or arbitrary error text is copied into that evidence.
 
 ### inspect --timeline
 

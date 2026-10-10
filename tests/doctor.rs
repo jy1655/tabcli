@@ -686,3 +686,252 @@ fn version_probes_drop_the_adapters_environment_removals() {
         );
     }
 }
+
+#[test]
+fn scope_reports_launch_inputs_and_reuses_consent_observation() {
+    let fixture = Fixture::new("pi");
+    let path = fixture.directory.join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["provider_path"] = json!(env!("CARGO_BIN_EXE_tabcli"));
+    manifest["effort"] = json!("high");
+    write(&path, &manifest);
+    write(
+        &fixture.directory.join("workspace-consent.json"),
+        &json!({"state":"verified", "provider":"pi"}),
+    );
+    let before = files(fixture.root.path());
+    let value = fixture.doctor();
+    assert_eq!(
+        value["scope"],
+        json!({
+            "session":"session-doctor", "provider":"pi",
+            "executable":env!("CARGO_BIN_EXE_tabcli"), "executable_source":"launch_record",
+            "current_version":null, "model":"recorded-model", "effort":"high",
+            "workspace":fixture.root.path(), "probe":false, "probe_budget_ms":5000,
+            "consent_state":"verified"
+        })
+    );
+    assert_eq!(
+        value["scope"]["consent_state"],
+        check(&value, "workspace_consent")["evidence"]["state"]
+    );
+    assert_eq!(value["configured"]["provider_version_at_launch"], "0.84.1");
+    assert_eq!(
+        value["observations"],
+        json!({
+            "stored_state":"ready", "generation":2, "updated_unix_ms":2, "session_error":null,
+            "active_request_id":null, "active_request_state":null, "recovery_required":false
+        })
+    );
+    assert_eq!(
+        value["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "platform",
+            "session_records",
+            "session_state",
+            "turn",
+            "completion",
+            "owner",
+            "terminal_record",
+            "provider_executable",
+            "provider_version",
+            "workspace",
+            "workspace_consent",
+            "pi_follow_up",
+            "pi_provider_credentials"
+        ]
+    );
+    let human = fixture.run(&["doctor", "session-doctor"]);
+    assert!(human.status.success());
+    assert!(
+        String::from_utf8(human.stdout)
+            .unwrap()
+            .starts_with("scope: {")
+    );
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[test]
+fn scope_keeps_unusable_launch_paths_null_without_path_substitution() {
+    let fixture = Fixture::new("pi");
+    let path = fixture.directory.join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for (executable, reason) in [
+        (PathBuf::from("relative-pi"), "executable_path_unverified"),
+        (
+            fixture.root.path().join("missing-pi"),
+            "executable_unavailable",
+        ),
+    ] {
+        manifest["provider_path"] = json!(executable);
+        write(&path, &manifest);
+        let before = files(fixture.root.path());
+        let value = report(fixture.run(&["doctor", "session-doctor", "--probe", "--json"]));
+        assert_eq!(check(&value, "provider_executable")["reason_code"], reason);
+        assert_eq!(
+            check(&value, "provider_version")["reason_code"],
+            "executable_unavailable"
+        );
+        assert!(value["scope"]["executable"].is_null());
+        assert!(value["scope"]["executable_source"].is_null());
+        assert!(value["scope"]["current_version"].is_null());
+        assert_eq!(value["configured"]["provider_path"], json!(executable));
+        assert_eq!(files(fixture.root.path()), before);
+    }
+}
+
+#[test]
+fn scope_of_damaged_or_unrecognized_manifest_keeps_unknown_checks() {
+    let fixture = Fixture::new("unrecognized");
+    let value = fixture.doctor();
+    assert!(value["scope"]["provider"].is_null());
+    assert!(value["scope"]["executable"].is_null());
+    assert_eq!(value["scope"]["workspace"], json!(fixture.root.path()));
+    assert_eq!(
+        check(&value, "provider")["reason_code"],
+        "provider_unrecognized"
+    );
+    fs::write(fixture.directory.join("manifest.json"), "not json").unwrap();
+    let before = files(fixture.root.path());
+    let value = fixture.doctor();
+    assert_eq!(
+        value["scope"],
+        json!({
+            "session":"session-doctor", "provider":null, "executable":null,
+            "executable_source":null, "current_version":null, "model":null, "effort":null,
+            "workspace":std::env::current_dir().unwrap(), "probe":false,
+            "probe_budget_ms":5000, "consent_state":null
+        })
+    );
+    for id in ["session_records", "session_state", "turn", "completion"] {
+        assert_eq!(check(&value, id)["availability"], "unknown");
+        assert_eq!(check(&value, id)["reason_code"], "records_unreadable");
+    }
+    assert_eq!(check(&value, "owner")["reason_code"], "owner_unverified");
+    assert_eq!(
+        check(&value, "terminal_record")["reason_code"],
+        "terminal_record_missing"
+    );
+    assert_eq!(value["observations"], json!({}));
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn scope_reports_resolved_path_and_only_successful_current_version() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new("pi");
+    let executable = fixture.root.path().join("pi");
+    fs::write(&executable, "#!/bin/sh\nprintf '1.0.0\\n'\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let run = |probe: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tabcli"));
+        command
+            .args(["doctor", "--provider", "pi", "--json"])
+            .env("PATH", fixture.root.path())
+            .env(
+                "AGENT_BRIDGE_NATIVE_STATE_DIR",
+                fixture.root.path().join("absent-store"),
+            )
+            .current_dir(fixture.root.path());
+        if probe {
+            command.arg("--probe");
+        }
+        report(command.output().unwrap())
+    };
+    let before = files(fixture.root.path());
+    let value = run(false);
+    assert_eq!(
+        value["scope"],
+        json!({
+            "session":null, "provider":"pi", "executable":executable.canonicalize().unwrap(),
+            "executable_source":"resolved_path", "current_version":null,
+            "model":null, "effort":null, "workspace":fixture.root.path().canonicalize().unwrap(),
+            "probe":false, "probe_budget_ms":5000, "consent_state":null
+        })
+    );
+    let value = run(true);
+    assert_eq!(value["scope"]["current_version"], "1.0.0");
+    assert_eq!(value["scope"]["probe"], true);
+    assert_eq!(files(fixture.root.path()), before);
+    // The same probe target in a session comes from its launch record.
+    let path = fixture.directory.join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    manifest["provider_path"] = json!(executable);
+    write(&path, &manifest);
+    let value = report(fixture.run(&["doctor", "session-doctor", "--probe", "--json"]));
+    assert_eq!(value["scope"]["executable_source"], "launch_record");
+    assert_eq!(value["scope"]["current_version"], "1.0.0");
+    fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
+    let value = run(true);
+    assert!(value["scope"]["current_version"].is_null());
+    assert_eq!(
+        check(&value, "provider_version")["reason_code"],
+        "version_probe_failed"
+    );
+    fs::remove_file(&executable).unwrap();
+    let value = run(true);
+    assert!(value["scope"]["executable"].is_null());
+    assert!(value["scope"]["executable_source"].is_null());
+    assert!(value["scope"]["current_version"].is_null());
+}
+
+#[cfg(unix)]
+#[test]
+fn scope_cwd_failure_does_not_hide_missing_or_damaged_session_checks() {
+    let fixture = Fixture::new("pi");
+    fs::write(fixture.directory.join("manifest.json"), "not json").unwrap();
+    let before = files(fixture.root.path());
+    for (session, reason, availability) in [
+        ("session-absent", "session_unavailable", "unavailable"),
+        ("session-doctor", "records_unreadable", "unknown"),
+    ] {
+        let cwd = tempfile::tempdir().unwrap();
+        // Delete only this child's cwd before exec; the test process keeps its cwd.
+        let value = report(
+            Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    r#"cd "$1" && rmdir "$1" && exec "$2" doctor "$3" --json"#,
+                    "doctor-deleted-cwd",
+                ])
+                .arg(cwd.path())
+                .arg(env!("CARGO_BIN_EXE_tabcli"))
+                .arg(session)
+                .env("AGENT_BRIDGE_NATIVE_STATE_DIR", fixture.root.path())
+                .output()
+                .unwrap(),
+        );
+        assert!(!cwd.path().exists());
+        assert!(value["scope"]["workspace"].is_null());
+        assert_eq!(value["scope"]["session"], session);
+        assert_eq!(check(&value, "session_records")["reason_code"], reason);
+        assert_eq!(
+            check(&value, "session_records")["availability"],
+            availability
+        );
+        for id in ["session_state", "turn", "completion"] {
+            assert_eq!(check(&value, id)["availability"], "unknown");
+            assert_eq!(check(&value, id)["reason_code"], reason);
+            assert_eq!(
+                check(&value, id)["detail"],
+                "No consistent session snapshot was available; missing evidence is not a ready or completed state."
+            );
+        }
+        if session == "session-doctor" {
+            assert_eq!(check(&value, "owner")["reason_code"], "owner_unverified");
+            assert_eq!(
+                check(&value, "terminal_record")["reason_code"],
+                "terminal_record_missing"
+            );
+        }
+        assert_eq!(value["observations"], json!({}));
+        assert_eq!(files(fixture.root.path()), before);
+        assert!(!fixture.root.path().join("session-absent").exists());
+    }
+}
