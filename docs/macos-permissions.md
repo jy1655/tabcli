@@ -129,7 +129,7 @@ sent no prompt; one that times out after the surface exists keeps the handle in 
 ran until Bridge's deadline and was ended there. When the launch recorded no surface handle, the
 session's error also says that no prompt was sent: Bridge has nothing to close, but a tab the
 terminal created anyway may remain, so look at the terminal before launching again. When the
-screen was locked at that moment the message says so. A new Ghostty surface was never observed to
+check finds the screen locked at that moment, the message says so. A new Ghostty surface was never observed to
 become ready while the screen was locked (2026-10-11, Ghostty 1.3.1, measured with Bridge's own
 scripts: the created tab answered its ids within half a second and then reported that its terminal
 surface model was not available for the whole poll), which is the same symptom as the 2026-10-07

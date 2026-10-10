@@ -299,12 +299,20 @@ pub(in crate::native) fn fail(store: &Store, reason: &str) -> Result<()> {
 pub(in crate::native) fn terminal_failed(store: &Store, error: &anyhow::Error) -> Result<()> {
     let reason = format!("terminal launch failed: {error:#}");
     let Some(retained) = error.downcast_ref::<terminal::RetainedLaunchSurface>() else {
-        // No adapter proved a surface, so nothing can be closed later; the prompt goes
-        // out only after creation, so none was sent.
-        return fail(
-            store,
-            &format!("{reason}; no surface handle was recorded and no prompt was sent"),
-        );
+        // Only a failure before a surface was bound and before the provider spawn began
+        // proves that nothing was sent: a bound surface keeps its handle, and a spawn in
+        // progress may already have carried the prompt (its own wording says so).
+        let unbound = Reader::open_unchecked(store.directory())
+            .record(CoreRecord::Terminal)
+            .text()?
+            .is_none();
+        let before_spawn = read(store)?.is_none_or(|record| record.phase == Phase::Pending);
+        let reason = if unbound && before_spawn {
+            format!("{reason}; no surface handle was recorded and no prompt was sent")
+        } else {
+            reason
+        };
+        return fail(store, &reason);
     };
     let _lock = store.lock()?;
     let status = store.status()?;
@@ -698,6 +706,41 @@ mod tests {
         );
         assert_eq!(status.residual_surface(), None);
         assert!(store.terminal().is_err());
+    }
+
+    #[test]
+    fn bound_surface_or_spawn_in_progress_keeps_its_own_failure_wording() {
+        // A surface bound before the failure keeps its handle, so the sentence is absent.
+        let (directory, _) = fixture();
+        let store = Store::open_unchecked(directory.path());
+        let surface: terminal::TerminalSession = serde_json::from_value(serde_json::json!({
+            "terminal":"ghostty", "session_id":"u2", "tab_id":"t2", "window_id":"w1"
+        }))
+        .unwrap();
+        store.write_terminal(&surface).unwrap();
+        terminal_failed(&store, &anyhow::anyhow!("Ghostty start failed")).unwrap();
+        let status = store.status().unwrap();
+        assert_eq!(status.state, SessionState::Failed);
+        assert_eq!(
+            status.error.as_deref(),
+            Some("terminal launch failed: Ghostty start failed")
+        );
+        assert!(store.terminal().is_ok());
+
+        // A spawn in progress may have carried the prompt: the spawn wording stays alone.
+        let (directory, token) = fixture();
+        let store = Store::open_unchecked(directory.path());
+        let mut record = read(&store).unwrap().unwrap();
+        assert_eq!(record.claim_token, token);
+        record.phase = Phase::Spawning;
+        store
+            .record(CoreRecord::Launch)
+            .write_json(&record)
+            .unwrap();
+        terminal_failed(&store, &anyhow::anyhow!("Ghostty start failed")).unwrap();
+        let error = store.status().unwrap().error.unwrap();
+        assert!(error.contains("provider spawn is uncertain"), "{error}");
+        assert!(!error.contains("no prompt was sent"), "{error}");
     }
 
     #[test]

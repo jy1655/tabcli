@@ -37,7 +37,9 @@ pub(super) fn run_until(
         // to become ready while the screen was locked (2026-10-11), and a first launch can
         // be waiting on an Automation prompt, so the message names the lock and the page
         // that says what to check.
-        let lock = match super::screen_locked(Instant::now() + Duration::from_secs(2)) {
+        // Half a second: the launcher keeps two seconds for cleanup after a timeout,
+        // and the IOKit query answers in well under that.
+        let lock = match super::screen_locked(Instant::now() + Duration::from_millis(500)) {
             Some(true) => "; the screen is locked",
             _ => "",
         };
