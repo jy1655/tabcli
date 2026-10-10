@@ -27,6 +27,12 @@ The read-only view of a session's records. A query holds a Reader and can theref
 and nothing else.
 _Avoid_: snapshot, inspector
 
+**Observation**:
+The read-only account of one session that a Reader yields: its recorded lifecycle, the
+active request and its state, its published results, and what those records imply. A query
+renders it rather than deriving its own; owner and surface facts are added to it on request.
+_Avoid_: view, summary, status report, listing row, snapshot (an internal read, not the account)
+
 **Store**:
 The read-write view of a session's records, held by a command that changes a session (ask,
 tell, hook, close, repair). A Store converges unfinished work before it is used.
