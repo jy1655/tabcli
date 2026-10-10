@@ -2074,10 +2074,17 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
         ),
     ] {
         let directory = tempfile::tempdir().unwrap();
-        let script = script.replace(
-            &format!("tell application \"{application}\""),
-            &format!("tell application \"{path}\""),
-        );
+        // iTerm2 scripts address the application by bundle identifier so that a launch
+        // finds it while it is not running (#99); the compiler is given the bundle path.
+        let script = script
+            .replace(
+                &format!("tell application \"{application}\""),
+                &format!("tell application \"{path}\""),
+            )
+            .replace(
+                "tell application id \"com.googlecode.iterm2\"",
+                &format!("tell application \"{path}\""),
+            );
         let source = directory.path().join("bridge.applescript");
         std::fs::write(&source, script).unwrap();
         let output = std::process::Command::new("/usr/bin/osacompile")
