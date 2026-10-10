@@ -118,16 +118,28 @@ WezTerm's CLI has no compare-and-send command, and a mux Lua callback is not ato
 updates and requires changing the user's configuration. Guarded responses need the mux to accept
 the screen comparison and key transmission in one request, atomic with screen updates.
 
-Warp requires its Scripting opt-in and a reachable, authorized official Warp Control endpoint. The
-tab route also requires enabled TabConfigs; new-window mode uses the separate Launch Configuration
-URI. Installed application/version checks alone are insufficient: required control actions and the
-bound instance must be available. Bridge uses ownership titles to prove the created surface. Warp's
-Control API cannot submit terminal input, so Agy/Pi follow-ups are unsupported there. Codex/Claude
-native input paths do not remove the terminal's creation and ownership checks. If the Control
-endpoint is unavailable, enable Scripting in Warp and check its endpoint, or select another
-terminal. Warp remains limited (#63); authenticated operation is not verified in [M11]/[M12].
-Guarded trust responses need screen reading and submission in Warp Control; its
-`input.insert` and `input.replace` actions only stage text and cannot submit it.
+Warp requires a reachable, authorized official Warp Control endpoint, which Warp publishes only
+while its Scripting setting is on. That setting, the control listener, and the `warpctrl` wrapper
+all sit behind Warp's `WarpControlCli` feature flag. In Warp's source at commit `c1ec372`
+(2026-10-10) the flag is listed in `DOGFOOD_FLAGS`, which only the internal Dev and Local builds
+enable: `PREVIEW_FLAGS` is empty, `RELEASE_FLAGS` and the default Cargo features leave it out, and
+no server experiment sets it. A Stable or Preview installation therefore shows no Settings >
+Scripting page and never publishes an endpoint, whatever the user does; its embedded CLI answers
+`No running Warp instances with local control were found` (Stable `0.2026.10.07.08.29.00`,
+2026-10-11). Warp's own specification (`specs/warp-control-cli/PRODUCT.md`) describes an opt-in on
+public channels, so the gap is upstream, not a Bridge check. The condition is removable when Warp
+enables the flag on a public channel, or with a Warp built with `--features warp_control_cli`; the
+adapter already knows the OSS channel bundle.
+
+The tab route also requires enabled TabConfigs; new-window mode uses the separate Launch
+Configuration URI. Installed application/version checks alone are insufficient: required control
+actions and the bound instance must be available. Bridge uses ownership titles to prove the created
+surface. Warp's Control API cannot submit terminal input, so Agy/Pi follow-ups are unsupported
+there. Codex/Claude native input paths do not remove the terminal's creation and ownership checks.
+If the Control endpoint is unavailable, select another terminal. Warp remains limited (#63);
+authenticated operation is not verified in [M11]/[M12]. Guarded trust responses need screen
+reading and submission in Warp Control; its `input.insert` and `input.replace` actions only stage
+text and cannot submit it.
 
 Claude Code 2.1.296 and Agy 1.3.3 provide no first-party flag or environment variable to record
 workspace trust before launch.
@@ -287,7 +299,8 @@ for the tested binary, CLI versions, settings, and date.
 Codex and Claude also pass on WezTerm in [M11]. Other provider/terminal combinations are not
 verified by these records. [M12] uses explicit bypass options; [M11] uses no model, effort, or
 bypass override. Pi on WezTerm reached an authentication failure in [M11]; cleanup passed, but that
-was not a successful round trip. Warp had no reachable endpoint in [M11] and was not run in [M12].
+was not a successful round trip. Warp had no reachable endpoint in [M11] and was not run in
+[M12]; the Stable build cannot publish one (see the `WarpControlCli` note under requirements).
 
 The four providers in [W02] are Codex, Claude, Agy, and Pi. [W01] also records tab surface/focus
 checks. It does not supply a four-provider console-window follow-up matrix. [M12] did not run native

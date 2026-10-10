@@ -134,8 +134,10 @@ For release verification, run the packaged candidate's executable instead and re
 and SHA-256.
 
 Replace `codex` with `claude`, `agy`, or `pi` for that provider. Use `--terminal` to select a
-supported terminal explicitly; consult [Terminals](terminals.md) for limits. Warp needs its
-Scripting opt-in and a reachable authorized Control endpoint. Its control API cannot submit
+supported terminal explicitly; consult [Terminals](terminals.md) for limits. Warp needs a
+reachable authorized Control endpoint, which its Stable and Preview builds cannot publish: the
+Scripting setting is behind Warp's internal-only `WarpControlCli` flag (see
+[requirements](terminals.md#requirements-and-first-run-prompts)). Its control API cannot submit
 terminal input, so follow-ups without a provider-native input path are unsupported.
 
 Self-test launches a session, verifies the exact marker result of the initial request, sends
