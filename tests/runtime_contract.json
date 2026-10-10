@@ -155,7 +155,7 @@
     "failed to read thread:": 1
   },
   "src/native/provider/pi.rs": {
-    "AGENT_BRIDGE_NATIVE_SESSION_DIR": 3,
+    "AGENT_BRIDGE_NATIVE_SESSION_DIR": 5,
     "AGENT_BRIDGE_EXECUTABLE": 1,
     "const HOOK_FAILURE_FILE: &str = \"pi-hook-failure.json\";": 1,
     "const PENDING_TURN_FILE: &str = \"pi-pending-turn.json\";": 1,

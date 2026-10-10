@@ -95,6 +95,13 @@ is not verified; see the [Windows verification record][win10].
 `reopen` refuses closed Codex sessions. Bridge still needs checks for the thread's writer lock
 and queued inputs before supporting resume; start a new session instead.
 
+`cancel` is unsupported in this release's Codex integration. As of the 0.162.1 source
+review, `turn/interrupt` needs a connection to the app server executing the turn; an
+external connection to Bridge's embedded TUI server was not verified. The legacy `notify`
+is not interruption acknowledgement, and follow-up queue progress after interruption is
+unverified. Support needs an official connection to that running backend, correlated
+interruption completion, and verified follow-up resumption.
+
 ## Claude Code
 
 Install and sign in to `claude` 2.1.234 or newer. Resolve workspace trust in Claude before launch,
@@ -144,6 +151,12 @@ macOS reopen is refused because its ownership path is not verified live. Bridge 
 effort, or bypass option from the closed source. Claude applies its own
 [resume rules](https://code.claude.com/docs/en/sessions#what-a-resumed-session-restores)
 and settings; omitting `--yolo` therefore does not prove that bypass is off.
+
+`cancel` is unsupported in this release's Claude integration. The 2.1.296 investigation
+found no documented interrupt operation in `SendMessage`, nor a way for SDK `interrupt()`
+to attach to this running TUI. User interruption does not fire `Stop`. Support needs an
+official addressed interrupt for the existing interactive session and a turn-correlated
+completion signal; starting a separate resumed process does not supply either.
 
 ## Agy
 
@@ -197,6 +210,12 @@ in its step reason when `doctor --json` identifies the same request.
 `reopen` refuses Agy sessions. Its presence records do not prove who still holds a conversation,
 and Bridge's transcript reader follows only a newly created conversation. Start a new session.
 
+`cancel` is unsupported in this release's Agy integration. The 1.3.3 investigation found
+no documented cancel CLI/RPC for the running TUI. Neither an interruption log with turn
+identity nor the `Stop` hook's behavior and reason on Esc was verified. Support needs an
+official addressed turn-interruption path and a correlated interruption signal; the
+observed quota-failure log is not evidence of cancellation.
+
 ## Pi
 
 Install and sign in to `pi` 0.84.1 or newer. If Pi asks you to resolve project trust, answer that
@@ -213,6 +232,54 @@ against the claim. It collects the result at `agent_end` and reports it at `agen
 accepted prompt can produce an exact result body without an added marker. The result includes
 Pi's session and turn identity. Errors reported by those events are recorded too; a separate failure signal
 preserves an error when the extension cannot deliver the result to Bridge.
+
+`cancel` supports sessions whose installed extension has reported schema 2 in
+`pi-startup-ready.json`. Bridge carries that capability evidence to each new Claim when
+installing its pending turn; the receipt must identify the current Claim. Schema 1,
+missing, or unreadable readiness is unsupported: start a new session.
+
+The extension uses Pi's official `ctx.abort()` API through an adapter-local fallback:
+every 200 ms during a run it reads Bridge's `cancel.json`, checks the active Claim and
+the correlated prompt, and calls abort at most once for that Claim. This is a polling
+interval, not a response-time guarantee. `pi-cancel-accepted.json` records the call;
+it is published with a temporary file and rename. A failed write never causes another
+abort. The adapter removes acceptance when installing the next Claim or rolling back
+its pending delivery. Acceptance alone never releases a Claim or creates a Result.
+
+Abort is not a completion acknowledgement. Only an accepted call for the same Claim,
+an `agent_end` whose last assistant message has either `stopReason: "aborted"` or
+`stopReason: "error"` with exactly `errorMessage: "This operation was aborted"`, and
+matching cancel intent produce a cancelled Result through the ordinary `agent_settled` hook.
+The second form was observed during a tool abort on Pi 1.0.4 (reported live run,
+2026-10-11 04:07 KST, session-CfVS05): Node's AbortError message reached the assistant's
+`errorMessage`. This is an exact, version-evidenced message match, not a general error
+or substring heuristic. Pi's [session abort][pi-session-abort] calls the agent's abort;
+the [agent loop][pi-agent-loop] forwards the stream's final assistant message and ends
+on either `error` or `aborted`, without normalizing that outcome. These source paths
+confirm propagation, not the exact backend throw site in that live run.
+Direct Esc without this evidence remains an ordinary failure; Bridge does not infer an
+actor. Normal completion can win the race. Retry or compaction waits may settle without
+a new `agent_end(aborted)`; the watcher stops at `agent_end`, and the Result then remains
+what Pi reported. Process exit before the result hook keeps the existing exit, close,
+and recovery semantics; the accepted record cannot confirm cancellation.
+
+Pi restores queued messages into the editor when aborting. Bridge does not use Pi's
+queue, so without input queued or left in the editor by the user, the editor is empty.
+**Inspect the managed surface before the next `tell` and clear or submit any restored
+input yourself.** Bridge does not delete editor contents or detect that they are empty;
+a terminal paste can otherwise combine with that input.
+
+This fallback follows Pi v1.0.4's [abort API][pi-abort], [context lifetime][pi-context],
+and [timer lifecycle rules][pi-lifecycle]. Replace the polling and private acceptance
+record when Pi provides an official endpoint addressing a running interactive session
+for interruption. Automated extension tests do not verify authenticated abort, restored
+editor contents, or subsequent delivery on macOS or Windows.
+
+[pi-abort]: https://github.com/earendil-works/pi/blob/v1.0.4/packages/coding-agent/src/core/extensions/types.ts
+[pi-context]: https://github.com/earendil-works/pi/blob/v1.0.4/packages/coding-agent/src/core/extensions/runner.ts
+[pi-lifecycle]: https://github.com/earendil-works/pi/blob/v1.0.4/packages/coding-agent/docs/extensions.md
+[pi-session-abort]: https://github.com/earendil-works/pi/blob/v1.0.4/packages/coding-agent/src/core/agent-session.ts#L2268
+[pi-agent-loop]: https://github.com/earendil-works/pi/blob/v1.0.4/packages/agent/src/agent-loop.ts#L354
 
 Pi 1.0.0 can reject a prompt for missing credentials before an agent turn starts, without
 an extension event identifying that refusal. Bridge therefore leaves that request pending
