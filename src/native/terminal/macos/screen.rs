@@ -6,7 +6,7 @@ use super::*;
 const ITERM: &str = r#"
 on run argv
     set wantedId to item 1 of argv
-    tell application "iTerm2"
+    tell application id "com.googlecode.iterm2"
         repeat with w in windows
             repeat with t in tabs of w
                 repeat with s in sessions of t

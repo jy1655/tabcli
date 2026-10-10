@@ -97,7 +97,9 @@ self-test PROVIDER` when you want to open a surface and make real model calls. S
 [providers](providers.md) and
 [CLI reference](cli.md); a passing executable/version check is not a delivery guarantee.
 
-On macOS, install the selected application. The iTerm2, Terminal.app, and Ghostty scripting routes
+On macOS, install the selected application. Bridge addresses iTerm2 by its bundle identifier,
+`com.googlecode.iterm2`, so a launch starts iTerm2 when it is not running; addressing it by name
+failed before it ran (#99). The iTerm2, Terminal.app, and Ghostty scripting routes
 can require macOS Automation consent. If the first launch times out in Automation, check for a
 visible system prompt and follow [macOS permissions](macos-permissions.md).
 Review and answer prompts yourself; Bridge does not grant system access. After handling the

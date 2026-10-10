@@ -45,7 +45,7 @@ on foregroundApplication()
 end foregroundApplication
 
 on itermIsRunning()
-    return application "iTerm2" is running
+    return application id "com.googlecode.iterm2" is running
 end itermIsRunning
 
 -- AppleScript answers `frontmost of application` itself, from what the system
@@ -58,57 +58,57 @@ end itermIsRunning
 -- the same script; without a dictionary, as in the replay of this handler,
 -- `properties` would read as `every property`.
 on itermIsActive()
-    tell application "iTerm2"
+    tell application id "com.googlecode.iterm2"
         set applicationProperties to «property pALL»
         return «property pisf» of applicationProperties
     end tell
 end itermIsActive
 
 on itermCurrentWindow()
-    tell application "iTerm2" to return current window
+    tell application id "com.googlecode.iterm2" to return current window
 end itermCurrentWindow
 
 on itermCurrentTabOf(aWindow)
-    tell application "iTerm2" to return current tab of aWindow
+    tell application id "com.googlecode.iterm2" to return current tab of aWindow
 end itermCurrentTabOf
 
 on itermSessionIdOfWindow(aWindow)
-    tell application "iTerm2" to return unique ID of current session of aWindow
+    tell application id "com.googlecode.iterm2" to return unique ID of current session of aWindow
 end itermSessionIdOfWindow
 
 on itermSelectedSessionId()
-    tell application "iTerm2"
+    tell application id "com.googlecode.iterm2"
         if current window is missing value then return missing value
         return unique ID of current session of current window
     end tell
 end itermSelectedSessionId
 
 on itermWindowIsVisible(aWindow)
-    tell application "iTerm2" to return visible of aWindow
+    tell application id "com.googlecode.iterm2" to return visible of aWindow
 end itermWindowIsVisible
 
 on itermSelectTab(aTab)
-    tell application "iTerm2"
+    tell application id "com.googlecode.iterm2"
         tell aTab to select
     end tell
 end itermSelectTab
 
 on itermSelectWindow(aWindow)
-    tell application "iTerm2"
+    tell application id "com.googlecode.iterm2"
         tell aWindow to select
     end tell
 end itermSelectWindow
 
 -- Both creations return the unique ID of the session they created, read once.
 on itermCreateWindow(bridgeCommand)
-    tell application "iTerm2"
+    tell application id "com.googlecode.iterm2"
         set newWindow to (create window with default profile command bridgeCommand)
         return unique ID of current session of newWindow
     end tell
 end itermCreateWindow
 
 on itermCreateTab(aWindow, bridgeCommand)
-    tell application "iTerm2"
+    tell application id "com.googlecode.iterm2"
         tell aWindow
             set newTab to (create tab with default profile command bridgeCommand)
         end tell
@@ -225,7 +225,7 @@ on run argv
     set wantedId to item 1 of argv
     set promptPath to item 2 of argv
     set carriageReturn to return
-    tell application "iTerm2"
+    tell application id "com.googlecode.iterm2"
         repeat with targetWindow in windows
             repeat with targetTab in tabs of targetWindow
                 repeat with targetSession in sessions of targetTab
@@ -247,7 +247,7 @@ on run argv
     set wantedId to item 1 of argv
     set matchedTty to missing value
     set matchCount to 0
-    tell application "iTerm2"
+    tell application id "com.googlecode.iterm2"
         repeat with targetWindow in windows
             repeat with targetTab in tabs of targetWindow
                 repeat with targetSession in sessions of targetTab
@@ -267,9 +267,9 @@ end run
 
 pub(in crate::native) const PRESENCE_SCRIPT: &str = r#"
 on run argv
-    if application "iTerm2" is not running then return "missing"
+    if application id "com.googlecode.iterm2" is not running then return "missing"
     set wantedId to item 1 of argv
-    tell application "iTerm2"
+    tell application id "com.googlecode.iterm2"
         repeat with targetWindow in windows
             repeat with targetTab in tabs of targetWindow
                 repeat with targetSession in sessions of targetTab
@@ -285,7 +285,7 @@ end run
 pub(in crate::native) const CLOSE_SESSION_SCRIPT: &str = r#"
 on run argv
     set wantedId to item 1 of argv
-    tell application "iTerm2"
+    tell application id "com.googlecode.iterm2"
         repeat with targetWindow in windows
             repeat with targetTab in tabs of targetWindow
                 repeat with targetSession in sessions of targetTab
@@ -1190,8 +1190,16 @@ end run
         let start = OPEN_TAB_SCRIPT.find("on itermIsActive()").unwrap();
         let end = OPEN_TAB_SCRIPT.find("end itermIsActive").unwrap();
         let handler = &OPEN_TAB_SCRIPT[start..end];
-        assert_eq!(handler.matches("tell application \"iTerm2\"").count(), 1);
-        let handler = handler.replace("tell application \"iTerm2\"", "tell applicationModel");
+        assert_eq!(
+            handler
+                .matches("tell application id \"com.googlecode.iterm2\"")
+                .count(),
+            1
+        );
+        let handler = handler.replace(
+            "tell application id \"com.googlecode.iterm2\"",
+            "tell applicationModel",
+        );
         for active in [true, false] {
             assert_eq!(
                 osascript(&format!(
