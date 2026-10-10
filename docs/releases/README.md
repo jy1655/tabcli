@@ -6,6 +6,9 @@ Older notes retain their own requirements and limitations; use the
 [providers](../providers.md) and [terminals](../terminals.md) pages for current behavior.
 Each note separates live checks from automated tests.
 
+- [0.4.0](0.4.0.md) (2026-10-11): Adds `cancel` for Pi sessions; starts iTerm2 when it is not
+  running; says what a terminal creation failure left behind; records per terminal why a guarded
+  trust response is or is not possible.
 - [0.3.0](0.3.0.md) (2026-10-11): Adds `status`, `wait`, and `hold`; renders `inspect` and doctor
   from one session observation; the doctor report states its scope.
 - [0.2.6](0.2.6.md) (2026-10-07): Uses the provider Report path for completion tests, separates
