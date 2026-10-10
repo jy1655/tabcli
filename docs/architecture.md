@@ -71,7 +71,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 - `src/native/doctor.rs` combines read-only shared observations with provider diagnostics and
   optional bounded probes. Providers choose which observation can explain a result timeout;
   `doctor` assembles that read and `self_test` bounds its execution. A diagnostic report is not
-  proof of successful delivery.
+  proof of successful delivery. The report states its scope using the check inputs and existing
+  observations.
 - `src/native/self_test.rs` runs the explicit public self-test through bounded commands, checks
   initial and follow-up results, and closes only its own sessions. It uses the ordinary state
   root unless isolation is requested; it is not called implicitly by another command.

@@ -339,7 +339,11 @@ fn credential_diagnosis(
     context: super::super::doctor::Context<'_>,
     mut probe: impl FnMut(&Path, &[&str], &Path, Instant) -> Result<std::process::Output>,
 ) -> super::super::doctor::Check {
-    let unknown = |reason| credential_check(None, "unknown", reason, None, None);
+    let target = (
+        context.manifest.and_then(|m| m.model.as_deref()),
+        context.executable,
+    );
+    let unknown = |reason| credential_check(None, "unknown", reason, None, None, target);
     let Some(model) = context.manifest.and_then(|m| m.model.as_deref()) else {
         return unknown(
             "No model is known; a session with an explicit provider/model is required.",
@@ -355,6 +359,7 @@ fn credential_diagnosis(
             "Credential probe not requested; use doctor SESSION --probe.",
             None,
             None,
+            target,
         );
     }
     let Some(executable) = context.executable else {
@@ -364,6 +369,7 @@ fn credential_diagnosis(
             "Pi command is missing or unavailable.",
             None,
             None,
+            target,
         );
     };
     // Pi 1.0.0's resolver can prefer a raw model id on another provider even when
@@ -379,7 +385,7 @@ fn credential_diagnosis(
         context.workspace,
         deadline,
     );
-    let resolution = parse_credentials(&provider, resolved);
+    let resolution = parse_credentials(&provider, resolved, target);
     if resolution.availability == super::super::doctor::Availability::Unknown {
         return resolution;
     }
@@ -398,6 +404,7 @@ fn credential_diagnosis(
             context.workspace,
             deadline,
         ),
+        target,
     )
 }
 
@@ -421,6 +428,7 @@ fn credential_check(
     reason: &str,
     auth_type: Option<&str>,
     exit_code: Option<i32>,
+    target: (Option<&str>, Option<&Path>),
 ) -> super::super::doctor::Check {
     use super::super::doctor::{Availability, Check};
     let (availability, code) = match status {
@@ -434,12 +442,13 @@ fn credential_check(
     Check::new("pi_provider_credentials", availability, code,
         format!("Pi provider credentials {status}{}: {reason}", provider.map(|p| format!(" for {p}")).unwrap_or_default()),
         "Inspect Pi's authentication setup. This observation does not fail, cancel, or resend a request.")
-        .evidence(serde_json::json!({"status": status, "provider": provider, "authType": auth_type, "exit_code": exit_code}))
+        .evidence(serde_json::json!({"status": status, "provider": provider, "authType": auth_type, "exit_code": exit_code, "model": target.0, "executable": target.1}))
 }
 
 fn parse_credentials(
     provider: &str,
     output: Result<std::process::Output>,
+    target: (Option<&str>, Option<&Path>),
 ) -> super::super::doctor::Check {
     let output = match output {
         Ok(output) => output,
@@ -452,7 +461,7 @@ fn parse_credentials(
             } else {
                 "Credential check could not run; Pi command missing or unavailable."
             };
-            return credential_check(Some(provider), "unknown", reason, None, None);
+            return credential_check(Some(provider), "unknown", reason, None, None, target);
         }
     };
     let exit = output.status.code();
@@ -472,6 +481,7 @@ fn parse_credentials(
             "Credential check returned malformed or unsupported JSON.",
             None,
             exit,
+            target,
         );
     };
     if value.provider != provider {
@@ -481,6 +491,7 @@ fn parse_credentials(
             "Provider not derivable: Pi did not confirm the model's provider.",
             None,
             exit,
+            target,
         );
     }
     let (status, reason, auth_type) = match (
@@ -520,7 +531,7 @@ fn parse_credentials(
             None,
         ),
     };
-    credential_check(Some(provider), status, reason, auth_type, exit)
+    credential_check(Some(provider), status, reason, auth_type, exit, target)
 }
 
 #[cfg(any(windows, test))]
@@ -1013,22 +1024,32 @@ mod tests {
             ("secret malformed JSON", 0, "unknown"),
             ("{}", 0, "unknown"),
         ] {
-            let check =
-                serde_json::to_value(parse_credentials("openai", auth_output(body, exit))).unwrap();
+            let check = serde_json::to_value(parse_credentials(
+                "openai",
+                auth_output(body, exit),
+                (Some("openai/test-model"), Some(Path::new("pi"))),
+            ))
+            .unwrap();
             assert_eq!(check["evidence"]["status"], expected, "{body}");
             assert_eq!(check["evidence"]["exit_code"], exit);
+            assert_eq!(check["evidence"]["model"], "openai/test-model");
+            assert_eq!(check["evidence"]["executable"], "pi");
             assert!(!check.to_string().contains("secret"));
             assert!(!check.to_string().contains("sensitive"));
         }
         for (error, detail) in [
-            ("command missing", "could not run"),
+            ("secret command missing", "could not run"),
             ("diagnostic probe timed out", "timed out"),
             ("diagnostic probe deadline exhausted", "timed out"),
         ] {
-            let check =
-                serde_json::to_value(parse_credentials("openai", Err(anyhow::anyhow!(error))))
-                    .unwrap();
+            let check = serde_json::to_value(parse_credentials(
+                "openai",
+                Err(anyhow::anyhow!(error)),
+                (Some("openai/test-model"), Some(Path::new("pi"))),
+            ))
+            .unwrap();
             assert_eq!(check["evidence"]["status"], "unknown");
+            assert!(!check.to_string().contains("secret"));
             assert!(check["detail"].as_str().unwrap().contains(detail));
         }
     }
@@ -1040,7 +1061,8 @@ mod tests {
             let output = serde_json::json!({
                 "status": "ready", "provider": "openai", "authType": auth_type
             });
-            let check = parse_credentials("openai", auth_output(&output.to_string(), 0));
+            let check =
+                parse_credentials("openai", auth_output(&output.to_string(), 0), (None, None));
             assert_eq!(check.availability, Availability::Available);
             assert_eq!(check.reason_code, "pi_provider_credentials_ready");
             let check = serde_json::to_value(check).unwrap();
@@ -1104,14 +1126,25 @@ mod tests {
                 .unwrap()
                 .contains("No model is known")
         );
+        assert!(check["evidence"]["model"].is_null());
+        assert_eq!(check["evidence"]["executable"], "pi");
+        assert!(check["evidence"]["exit_code"].is_null());
         for model in [None, Some("unqualified".into())] {
             manifest.model = model;
-            credential_diagnosis(
+            let check = credential_diagnosis(
                 doctor::Context {
                     manifest: Some(&manifest),
                     ..base
                 },
                 |_, _, _, _| panic!("no derivable provider"),
+            );
+            let check = serde_json::to_value(check).unwrap();
+            assert_eq!(
+                check["evidence"],
+                serde_json::json!({
+                    "status":"unknown", "provider":null, "authType":null, "exit_code":null,
+                    "model":manifest.model, "executable":"pi"
+                })
             );
         }
         manifest.model = Some("openai/gpt-4o-mini".into());
@@ -1126,6 +1159,14 @@ mod tests {
                 |_, _, _, _| panic!("must not run"),
             );
             assert_eq!(check.availability, doctor::Availability::Unknown);
+            let check = serde_json::to_value(check).unwrap();
+            assert_eq!(
+                check["evidence"],
+                serde_json::json!({
+                    "status":"unknown", "provider":"openai", "authType":null, "exit_code":null,
+                    "model":manifest.model, "executable":executable
+                })
+            );
         }
         for (resolved, credentials_missing) in
             [("openai", false), ("other", false), ("openai", true)]
@@ -1137,7 +1178,8 @@ mod tests {
                     manifest: Some(&manifest),
                     ..base
                 },
-                |_, args, _, deadline| {
+                |executable, args, _, deadline| {
+                    assert_eq!(Some(executable), base.executable);
                     calls.push(args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
                     deadlines.push(deadline);
                     if credentials_missing && calls.len() == 2 {
@@ -1191,6 +1233,20 @@ mod tests {
             } else {
                 assert_eq!(calls.len(), 1);
             }
+            let evidence = serde_json::to_value(&check).unwrap()["evidence"].clone();
+            assert_eq!(evidence["model"], "openai/gpt-4o-mini");
+            assert_eq!(evidence["executable"], "pi");
+            assert_eq!(evidence["provider"], "openai");
+            assert_eq!(evidence.as_object().unwrap().len(), 6);
+            assert_eq!(
+                evidence["authType"],
+                if resolved == "openai" && !credentials_missing {
+                    serde_json::json!("oauth")
+                } else {
+                    serde_json::Value::Null
+                }
+            );
+            assert!(!evidence.to_string().contains("sensitive"));
             if credentials_missing {
                 assert_eq!(check.id, "pi_provider_credentials");
                 assert_eq!(check.reason_code, "pi_provider_credentials_not_ready");
