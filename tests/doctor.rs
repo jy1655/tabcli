@@ -738,6 +738,7 @@ fn scope_reports_launch_inputs_and_reuses_consent_observation() {
             "completion",
             "owner",
             "terminal_record",
+            "hold",
             "provider_executable",
             "provider_version",
             "workspace",
@@ -933,5 +934,71 @@ fn scope_cwd_failure_does_not_hide_missing_or_damaged_session_checks() {
         assert_eq!(value["observations"], json!({}));
         assert_eq!(files(fixture.root.path()), before);
         assert!(!fixture.root.path().join("session-absent").exists());
+    }
+}
+
+#[test]
+fn hold_check_reports_each_part_without_changing_other_checks() {
+    let fixture = Fixture::new("claude");
+    let original = fixture.doctor();
+    assert_eq!(check(&original, "hold")["availability"], "available");
+    assert_eq!(check(&original, "hold")["reason_code"], "not_held");
+    for (record, availability, reason) in [
+        (
+            json!({"held":true,"created_unix_ms":1}),
+            "unavailable",
+            "session_held",
+        ),
+        (json!({"held":false}), "unknown", "hold_unreadable"),
+    ] {
+        write(&fixture.directory.join("hold.json"), &record);
+        let before = files(fixture.root.path());
+        let report = fixture.doctor();
+        let hold = check(&report, "hold");
+        assert_eq!(hold["availability"], availability);
+        assert_eq!(hold["reason_code"], reason);
+        if reason == "session_held" {
+            assert!(
+                hold["next_action"]
+                    .as_str()
+                    .unwrap()
+                    .contains("hold session-doctor --release")
+            );
+        }
+        let projection = |report: &Value| {
+            report["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|c| c["id"] != "hold")
+                .map(|c| {
+                    let mut c = c.clone();
+                    c.as_object_mut().unwrap().remove("observed_unix_ms");
+                    c
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(projection(&report), projection(&original));
+        assert_eq!(files(fixture.root.path()), before);
+    }
+    write(
+        &fixture.directory.join("hold.json"),
+        &json!({"held":true,"created_unix_ms":1}),
+    );
+    let closed =
+        json!({"state":"closed","generation":3,"updated_unix_ms":3,"exit_code":null,"error":null});
+    write(&fixture.directory.join("closed.json"), &closed);
+    for status_caught_up in [false, true] {
+        if status_caught_up {
+            write(&fixture.directory.join("status.json"), &closed);
+        }
+        let report = fixture.doctor();
+        assert_eq!(check(&report, "hold")["reason_code"], "session_held");
+        assert!(
+            !check(&report, "hold")["next_action"]
+                .as_str()
+                .unwrap()
+                .contains("--release")
+        );
     }
 }

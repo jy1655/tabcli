@@ -197,6 +197,12 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
                     "Check the explicit session id and state directory.",
                 ));
                 unknown_session_checks(id, "session_unavailable", &mut checks);
+                hold_check(
+                    &Err(anyhow::anyhow!("session unavailable")),
+                    false,
+                    id,
+                    &mut checks,
+                );
                 None
             }
         });
@@ -513,10 +519,56 @@ pub(super) fn record_checks(
             reader.manifest().ok()
         }
     };
-    let mut evidence = evidence.unwrap_or_else(|| SessionEvidence::read(reader));
+    let mut evidence = evidence.unwrap_or_else(|| match reader.lock_shared() {
+        Ok(lock) => SessionEvidence::read(
+            reader,
+            super::session::hold::observe(reader, lock.is_some()),
+        ),
+        Err(error) => SessionEvidence::read(reader, Err(error)),
+    });
     owner_check(&mut evidence, id, checks);
     terminal_check(&evidence, id, checks);
+    hold_check(
+        &evidence.held,
+        evidence.hold_release_allowed
+            && observations["stored_state"]
+                .as_str()
+                .is_some_and(|state| state != "closed"),
+        id,
+        checks,
+    );
     (manifest, evidence)
+}
+
+fn hold_check(held: &Result<bool>, release_allowed: bool, id: &str, checks: &mut Vec<Check>) {
+    let check = match held {
+        Ok(false) => Check::new(
+            "hold",
+            Availability::Available,
+            "not_held",
+            "No follow-up hold is recorded.",
+            "No hold release is needed.",
+        ),
+        Ok(true) => Check::new(
+            "hold",
+            Availability::Unavailable,
+            "session_held",
+            "The user's hold refuses follow-ups whose delivery has not begun.",
+            if release_allowed {
+                format!("{PUBLIC_COMMAND} hold {id} --release")
+            } else {
+                "Preserve the hold record; inspect the session's recorded lifecycle before taking action.".to_owned()
+            },
+        ),
+        Err(error) => Check::new(
+            "hold",
+            Availability::Unknown,
+            "hold_unreadable",
+            format!("{error:#}"),
+            format!("{PUBLIC_COMMAND} inspect {id} --json"),
+        ),
+    };
+    checks.push(check);
 }
 
 fn unknown_session_checks(id: &str, reason: &'static str, checks: &mut Vec<Check>) {

@@ -870,6 +870,10 @@ fn inspect_inner(id: &str, json: bool) -> Result<()> {
         "owner process alive: {}\nrecovery required: {}",
         value["owner_process_alive"], value["recovery_required"]
     );
+    println!("held: {}", value["held"]);
+    if let Some(error) = value["hold_error"].as_str() {
+        println!("hold error: {}", terminal_safe_text(error, true));
+    }
     if let Some(source) = value["resumed_from"]["session"].as_str() {
         println!("resumed from: {}", terminal_safe_text(source, false));
     }

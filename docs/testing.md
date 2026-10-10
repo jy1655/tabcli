@@ -104,6 +104,12 @@ close can pass cleanup, but does not turn the failed launch into a passed round 
 reproduce both orderings, failed discovery, and failed cleanup with a fake Ghostty runner; they do
 not verify locked-screen behavior or the cause of an automation timeout.
 
+Hold tests exercise four deterministic interleavings through the production writer: after the
+first admission, after claim creation, before delivery begins, and after it begins. Additional
+fixtures cover initial-delivery exclusion, failed settlement I/O, close ordering, idempotency,
+malformed records, read-only refusal, partial observations, close preservation, and pruning.
+They do not exercise authenticated provider delivery.
+
 Delivery tests exercise the Claim interface for sent, not-sent, and uncertain outcomes, both
 before and after provider completion or a successor claim. They verify that late reports cannot
 rewrite another turn, not-sent rollback preserves its reason, and uncertain input remains claimed

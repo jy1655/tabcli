@@ -456,6 +456,8 @@ pub(in crate::native) struct Claim {
     receipt: requests::Receipt,
     retained: bool,
     rollback_state: Option<SessionState>,
+    // Only claim_ready assigns this; initial claims never acquire a Hold gate.
+    follow_up_session: Option<String>,
 }
 
 impl Claim {
@@ -472,6 +474,9 @@ impl Claim {
         }
         if store.closed_if_present()?.is_some() || store.status()?.state == SessionState::Closed {
             bail!("delivery refused: the session is closed");
+        }
+        if let Some(id) = &self.follow_up_session {
+            session::hold::permit(&store, id)?;
         }
         update_status(directory, SessionState::Working, None, None)
     }
@@ -676,7 +681,14 @@ fn claim_ready_with_context(
     session_id: &str,
     context_sources: &[requests::ContextSource],
 ) -> Result<(Claim, usize)> {
-    claim_ready_with_callbacks(directory, session_id, || Ok(()), || {}, context_sources)
+    claim_ready_with_callbacks(
+        directory,
+        session_id,
+        || {},
+        || Ok(()),
+        || {},
+        context_sources,
+    )
 }
 
 #[cfg(test)]
@@ -688,17 +700,19 @@ pub(in crate::native) fn acquire_ready_turn_claim_after_claim<F>(
 where
     F: FnOnce() -> Result<()>,
 {
-    claim_ready_with_callbacks(directory, session_id, after_claim, || {}, &[])
+    claim_ready_with_callbacks(directory, session_id, || {}, after_claim, || {}, &[])
 }
 
-fn claim_ready_with_callbacks<F, G>(
+fn claim_ready_with_callbacks<B, F, G>(
     directory: &Path,
     session_id: &str,
+    before_claim: B,
     after_claim: F,
     before_publish: G,
     context_sources: &[requests::ContextSource],
 ) -> Result<(Claim, usize)>
 where
+    B: FnOnce(),
     F: FnOnce() -> Result<()>,
     G: FnOnce(),
 {
@@ -706,16 +720,11 @@ where
         .record(CoreRecord::TurnClaim)
         .path()
         .to_owned();
-    let state = Reader::open_unchecked(directory).status()?.state;
-    if !state.accepts_prompt() {
-        bail!("session {session_id} is {state}; tell requires the ready state");
-    }
+    session::hold::follow_up_admission(&Reader::open_unchecked(directory), session_id)?;
+    before_claim();
     let mut claim = {
         let _lock = Store::open_unchecked((path).with_file_name("")).lock()?;
-        let state = Reader::open_unchecked(directory).status()?.state;
-        if !state.accepts_prompt() {
-            bail!("session {session_id} is {state}; tell requires the ready state");
-        }
+        session::hold::follow_up_admission(&Reader::open_unchecked(directory), session_id)?;
         create_turn_claim_locked(path.clone(), context_sources)?
     };
     if let Err(error) = after_claim() {
@@ -731,10 +740,7 @@ where
     if current.trim() != claim.token {
         bail!("native turn claim changed before it could start");
     }
-    let state = Reader::open_unchecked(directory).status()?.state;
-    if !state.accepts_prompt() {
-        bail!("session {session_id} is {state}; tell requires the ready state");
-    }
+    session::hold::follow_up_admission(&Reader::open_unchecked(directory), session_id)?;
     let baseline = Reader::open_unchecked(directory).events()?.len();
     before_publish();
     if let Err(error) = update_status(directory, SessionState::Claimed, None, None) {
@@ -743,6 +749,7 @@ where
         return Err(error);
     }
     claim.rollback_state = Some(SessionState::Ready);
+    claim.follow_up_session = Some(session_id.to_owned());
     Ok((claim, baseline))
 }
 
@@ -776,6 +783,7 @@ fn create_turn_claim_locked(
         receipt,
         retained: false,
         rollback_state: None,
+        follow_up_session: None,
     })
 }
 
@@ -1346,6 +1354,7 @@ where
     claim_ready_with_callbacks(
         directory,
         session_id,
+        || {},
         after_claim,
         before_publish,
         context_sources,

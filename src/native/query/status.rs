@@ -1,5 +1,6 @@
 //! Read-only Session observations within a workspace and a shared scan budget.
 use super::*;
+use crate::native::session;
 use crate::native::session::OwnerObservation;
 use observation::{Observation, StatusObservation, SurfaceRecord};
 
@@ -88,6 +89,9 @@ fn attention(
     let observation = &observed.observation;
     let records = &observation.records;
     let mut flags = Vec::new();
+    if matches!(observation.evidence.held, Ok(true)) {
+        flags.push("held");
+    }
     if records.status.state == SessionState::Working
         && records.claim.is_some()
         && records.status.error.is_some()
@@ -119,7 +123,8 @@ fn attention(
         }
     }
     let index_incomplete = records.unreadable_requests > 0 || records.request_index_error.is_some();
-    if observation.evidence.owner.is_err()
+    if observation.evidence.held.is_err()
+        || observation.evidence.owner.is_err()
         || matches!(
             &observation.evidence.surface,
             SurfaceRecord::Closed(Err(_))
@@ -214,6 +219,7 @@ fn entry(mut observed: StatusObservation, id: &str) -> Value {
         "active_request": active, "latest_result": observed.latest.as_ref().ok(),
         "owner": owner, "attention": flags, "derived_from": "observation", "result_command": command,
     });
+    session::hold::add_fields(&mut value, &observation.evidence.held);
     if let Some(residual) = records.status.residual_surface() {
         value["residual_surface"] = json!(residual);
     }

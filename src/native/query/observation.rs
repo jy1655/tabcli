@@ -1,14 +1,17 @@
 //! One Session's recorded facts, partial read failures, and timed judgments.
 use super::*;
 use crate::native::reopen::ResumedFrom;
+use crate::native::session;
 use crate::native::session::OwnerObservation;
 use crate::native::terminal::ownership::NativeSessionOwner;
 use crate::native::unix_ms;
 
-/// Owner and Surface records are separate observations from the four lifecycle records.
+/// Hold, Owner and Surface records are separate observations from the four lifecycle records.
 /// They remain readable when the lifecycle records cannot form a consistent Observation.
 pub(in crate::native) struct SessionEvidence {
     pub(in crate::native) owner: Result<Option<NativeSessionOwner>>,
+    pub(in crate::native) held: Result<bool>,
+    pub(in crate::native) hold_release_allowed: bool,
     pub(in crate::native) surface: SurfaceRecord,
     #[allow(dead_code)] // Retained for callers that expose observation times.
     pub(in crate::native) observed_unix_ms: u128,
@@ -23,7 +26,7 @@ pub(in crate::native) enum SurfaceRecord {
 }
 
 impl SessionEvidence {
-    pub(in crate::native) fn read(reader: &Reader) -> Self {
+    pub(in crate::native) fn read(reader: &Reader, held: Result<bool>) -> Self {
         let observed_unix_ms = unix_ms();
         let owner = RecordReader::at(reader.record(CoreRecord::Owner).path()).optional_json();
         let surface = match RecordReader::at(reader.record(CoreRecord::TerminalClosed).path())
@@ -41,7 +44,12 @@ impl SessionEvidence {
                 ),
             },
         };
+        // An interrupted close can have its tombstone before status.json catches up.
+        let hold_release_allowed =
+            matches!(held, Ok(true)) && matches!(reader.closed_if_present(), Ok(None));
         Self {
+            hold_release_allowed,
+            held,
             owner,
             surface,
             observed_unix_ms,
@@ -161,9 +169,10 @@ impl Observation {
             &records.status,
             records.claim.as_deref(),
         );
+        let held = session::hold::observe(reader, records._lock.is_some());
         Self {
             records,
-            evidence: SessionEvidence::read(reader),
+            evidence: SessionEvidence::read(reader, held),
             resumed_from: read_resumed_from(reader.directory()),
             workspace_consent: consent::observe(reader.directory()),
             judgments: Judgments {
@@ -292,6 +301,7 @@ impl Observation {
             "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error,
             "recorded_events": snapshot.paths.len(), "latest_result": latest, "requests": request_refs,
         });
+        session::hold::add_fields(&mut value, &self.evidence.held);
         if let Some(residual) = residual_surface {
             value["residual_surface"] = serde_json::to_value(residual)?;
         }

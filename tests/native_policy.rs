@@ -1032,6 +1032,7 @@ fn public_identity_in_version_and_help() {
         let text = String::from_utf8(output.stdout).unwrap();
         assert_eq!(text.lines().next(), Some(expected));
         if flag == "--help" {
+            assert!(text.contains("tabcli hold <session> [--release] [--json]"));
             assert!(text.contains("tabcli status [--workspace PATH | --all-workspaces]"));
             assert!(text.contains("tabcli wait ADDRESS [ADDRESS ...] [--timeout-secs N] [--json]"));
         }
@@ -1088,6 +1089,7 @@ fn no_source_hint_uses_the_old_public_command() {
                 for command in [
                     "ask",
                     "tell",
+                    "hold",
                     "result",
                     "wait",
                     "inspect",

@@ -83,6 +83,12 @@ The first turn's prompt, delivered as part of launching the session.
 Any later turn's prompt, delivered with `tell` into the running session.
 _Avoid_: continuation, reply
 
+**Hold**:
+The user's recorded request that a session take no further follow-up: a follow-up whose delivery
+Bridge has not yet allowed to start is refused until the hold is released. A hold does not stop
+the current turn or direct input to the surface.
+_Avoid_: pause, freeze, mute, lock (the lock is a different thing)
+
 ### Surfaces and ownership
 
 **Surface**:

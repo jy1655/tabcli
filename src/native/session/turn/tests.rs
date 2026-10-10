@@ -499,3 +499,198 @@ fn retained_claim_stays_exclusive_until_report_completes() {
     assert!(claim(&store, &[]).is_ok());
     assert_eq!(store.events().unwrap().len(), 1);
 }
+
+fn hold_fixture(state: SessionState) -> (tempfile::TempDir, Store) {
+    let (directory, store) = fixture(state);
+    store
+        .record(CoreRecord::Manifest)
+        .write_json(&serde_json::json!({
+            "schema": 1, "id": directory.path().file_name().unwrap().to_str().unwrap(),
+            "provider": "codex", "provider_path": "codex", "provider_version": "0.159.3",
+            "workspace": directory.path(), "title": "hold fixture", "model": null,
+            "effort": null, "yolo": false, "created_unix_ms": 1
+        }))
+        .unwrap();
+    (directory, store)
+}
+
+fn assert_hold_receipt_unresolved(store: &Store) {
+    let receipts = requests::list(store).unwrap().receipts;
+    assert_eq!(receipts.len(), 1);
+    let value = crate::native::query::request_result(store, &receipts[0].request_id).unwrap();
+    assert_eq!(value["request_state"], "unresolved");
+}
+
+// H8: each callback is outside the lifecycle lock, so the production writer can run.
+#[test]
+fn hold_after_first_admission_refuses_before_claim_creation() {
+    let (_directory, store) = hold_fixture(SessionState::Ready);
+    let result = claim_ready_with_callbacks(
+        store.directory(),
+        "session-test",
+        || {
+            session::hold::change(&store, false).unwrap();
+        },
+        || Ok(()),
+        || {},
+        &[],
+    );
+    assert!(result.is_err());
+    assert!(current_claim_token(&store).unwrap().is_none());
+    assert!(requests::list(&store).unwrap().receipts.is_empty());
+    assert_eq!(store.status().unwrap().state, SessionState::Ready);
+}
+
+#[test]
+fn hold_after_claim_before_claimed_keeps_unresolved_receipt() {
+    let (_directory, store) = hold_fixture(SessionState::Ready);
+    let result = acquire_ready_turn_claim_after_claim(store.directory(), "session-test", || {
+        session::hold::change(&store, false)?;
+        Ok(())
+    });
+    assert!(result.is_err());
+    assert!(current_claim_token(&store).unwrap().is_none());
+    assert_hold_receipt_unresolved(&store);
+    assert!(store.events().unwrap().is_empty());
+    assert_eq!(store.status().unwrap().state, SessionState::Ready);
+}
+
+#[test]
+fn hold_after_claimed_before_delivery_rolls_back_with_reason() {
+    let (_directory, store) = hold_fixture(SessionState::Ready);
+    let (mut claimed, _) = claim_ready(&store, "session-test", &[]).unwrap();
+    session::hold::change(&store, false).unwrap();
+    let error = claimed.begin_delivery().unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "session session-test is held; release the hold before sending a follow-up"
+    );
+    claimed.settle_delivery(Delivery::NotSent(&error)).unwrap();
+    drop(claimed);
+    assert_eq!(store.status().unwrap().state, SessionState::Ready);
+    assert_eq!(
+        store.status().unwrap().error.as_deref(),
+        Some(error.to_string().as_str())
+    );
+    assert!(current_claim_token(&store).unwrap().is_none());
+    assert_hold_receipt_unresolved(&store);
+    assert!(store.events().unwrap().is_empty());
+}
+
+#[test]
+fn hold_after_delivery_began_does_not_refuse_delivery() {
+    for uncertain in [false, true] {
+        let (_directory, store) = hold_fixture(SessionState::Ready);
+        let (mut claimed, _) = claim_ready(&store, "session-test", &[]).unwrap();
+        claimed.begin_delivery().unwrap();
+        session::hold::change(&store, false).unwrap();
+        let error = anyhow::anyhow!("delivery uncertain");
+        claimed
+            .settle_delivery(if uncertain {
+                Delivery::Uncertain(&error)
+            } else {
+                Delivery::Sent
+            })
+            .unwrap();
+        drop(claimed);
+        assert_eq!(store.status().unwrap().state, SessionState::Working);
+        assert!(current_claim_token(&store).unwrap().is_some());
+        assert_eq!(requests::list(&store).unwrap().receipts.len(), 1);
+        assert!(store.events().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn initial_delivery_ignores_preexisting_valid_and_unreadable_hold() {
+    for malformed in [false, true] {
+        let (_directory, store) = hold_fixture(SessionState::AwaitingInitialInput);
+        if malformed {
+            store
+                .record(CoreRecord::Hold)
+                .write_private(b"malformed")
+                .unwrap();
+        } else {
+            session::hold::change(&store, false).unwrap();
+        }
+        let mut initial = claim(&store, &[]).unwrap();
+        initial.begin_delivery().unwrap();
+        initial.settle_delivery(Delivery::Sent).unwrap();
+        drop(initial);
+        assert_eq!(store.status().unwrap().state, SessionState::Working);
+        assert!(current_claim_token(&store).unwrap().is_some());
+    }
+}
+
+#[test]
+fn hold_delivery_refusal_does_not_claim_successful_rollback_on_io_failure() {
+    let (_directory, store) = hold_fixture(SessionState::Ready);
+    let (mut claimed, _) = claim_ready(&store, "session-test", &[]).unwrap();
+    session::hold::change(&store, false).unwrap();
+    let error = claimed.begin_delivery().unwrap_err();
+    let token = claimed.token().to_owned();
+    let failed =
+        session::with_fault_budget(0, || claimed.settle_delivery(Delivery::NotSent(&error)));
+    assert!(failed.is_err());
+    drop(claimed);
+    assert_eq!(store.status().unwrap().state, SessionState::Claimed);
+    assert_eq!(
+        current_claim_token(&store).unwrap().as_deref(),
+        Some(token.as_str())
+    );
+    assert_eq!(requests::list(&store).unwrap().receipts.len(), 1);
+    assert!(store.events().unwrap().is_empty());
+}
+
+#[test]
+fn hold_writer_waits_for_close_and_refuses_after_its_tombstone() {
+    use std::sync::mpsc;
+    let (_directory, store) = hold_fixture(SessionState::Ready);
+    let directory = store.directory().to_owned();
+    let (started, ready) = mpsc::channel();
+    let lock = store.lock().unwrap();
+    let writer = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        session::hold::change(&Store::open_unchecked(directory), false)
+    });
+    ready.recv().unwrap();
+    // Model close's terminal partial transition while it owns the lifecycle lock.
+    let mut closed = store.status().unwrap();
+    closed.state = SessionState::Closed;
+    store.write_closed(&closed).unwrap();
+    drop(lock);
+    let error = writer.join().unwrap().err().unwrap();
+    assert_eq!(
+        error.to_string(),
+        "the session is closed; a hold cannot be set or released"
+    );
+    assert!(store.record(CoreRecord::Hold).bytes().unwrap().is_none());
+}
+
+#[test]
+fn released_hold_allows_a_new_follow_up_and_unknown_hold_refuses() {
+    let (_directory, store) = hold_fixture(SessionState::Ready);
+    store
+        .record(CoreRecord::Hold)
+        .write_private(b"malformed")
+        .unwrap();
+    let error = claim_ready(&store, "session-test", &[]).err().unwrap();
+    assert_eq!(
+        error.to_string(),
+        "session session-test has an unreadable hold record; inspect it before sending a follow-up"
+    );
+    assert!(requests::list(&store).unwrap().receipts.is_empty());
+    session::hold::change(&store, false).unwrap();
+    assert!(claim_ready(&store, "session-test", &[]).is_err());
+    session::hold::change(&store, true).unwrap();
+    let (mut claimed, _) = claim_ready(&store, "session-test", &[]).unwrap();
+    claimed.begin_delivery().unwrap();
+    claimed.settle_delivery(Delivery::Sent).unwrap();
+    assert_eq!(store.status().unwrap().state, SessionState::Working);
+    // State refusal retains its exact original text even when also held.
+    session::hold::change(&store, false).unwrap();
+    let error = claim_ready(&store, "session-test", &[]).err().unwrap();
+    assert_eq!(
+        error.to_string(),
+        "session session-test is working; tell requires the ready state"
+    );
+}
