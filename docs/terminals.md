@@ -116,7 +116,7 @@ before answering it; guarded responses need scripting access to the exact termin
 
 WezTerm's CLI has no compare-and-send command, and a mux Lua callback is not atomic with screen
 updates and requires changing the user's configuration. Guarded responses need the mux to accept
-the screen comparison and key transmission together in one request.
+the screen comparison and key transmission in one request, atomic with screen updates.
 
 Warp requires its Scripting opt-in and a reachable, authorized official Warp Control endpoint. The
 tab route also requires enabled TabConfigs; new-window mode uses the separate Launch Configuration
