@@ -448,6 +448,45 @@ addressed that way; use event selection for legacy records. `recovery_required` 
 cannot publish the completion; `sessions` is the public command that can finish those updates. Run
 it for the session's workspace, then query the request again.
 
+## wait
+
+Wait for the first observed wait-ending condition among explicit request addresses.
+
+```text
+tabcli wait ADDRESS [ADDRESS ...] [--timeout-secs N] [--json]
+```
+
+```sh
+tabcli wait session-K7m2Qx/request-1791285000000000000-4217-0 session-P9n3Rs/request-1791285000000000000-4218-0 --json
+```
+
+Each address must be `SESSION/REQUEST`, with a Bridge request id. At least one address is
+required. Event names, `latest`, duplicate addresses, and paths are refused. Syntax and session
+directories are checked up front; receipts are validated when that session first yields a
+consistent observation. A busy session remains unconfirmed and does not block another session's
+completion. An invalid address found in a pass fails the command before any successful selection;
+later record deletion or damage is an error, not a pending request.
+
+The wait ends on `completed`, `failed`, `unresolved`, or `recovery_required`, or when a recorded
+owner is no longer live or a closed, failed, or exited session leaves the request unresolved.
+As with `result --wait`, only `completed` exits successfully. If more than one address ends in
+the same pass, the original input order wins, even across session groups. Sessions are observed
+sequentially: there is **no global ordering guarantee** about actual completion times.
+
+JSON contains `ended` (the selected result plus its `address`), `remaining`, and `timed_out`.
+`remaining` means addresses not selected in this answer; they may be busy, unconfirmed, or already
+ended. Human output has the same result lines as `result`, followed by one `remaining:` line.
+See the [JSON field reference](#wait-1).
+
+The shared timeout defaults to 900 seconds. At timeout, `ok` is false, `timed_out` is true,
+`ended` is null, and all addresses remain. The command exits nonzero with
+`waiting timed out; no request was cancelled or resent`. The deadline bounds polling and sleep;
+it cannot interrupt an ongoing filesystem or owner observation. Each pass reads one consistent
+snapshot per distinct session and releases its lock before reading the next session.
+
+This command is read-only. It never cancels, repairs, closes, or resends any request. After a
+timeout or uncertain delivery, inspect or wait on the same request; do not repeat its prompt.
+
 ## search
 
 Use `search` when you remember text from a result but not its session or request id.
@@ -843,7 +882,7 @@ consistent observation. `accepted` is the detached command acknowledgement, not 
 Error fallback output can use `unknown`. Request and session state are different: a session can
 remain usable after a request completes, and a closed session can retain results.
 
-`status`, `inspect`, timeline, `result`, `search`, and `doctor` only observe. They never repair, recover,
+`status`, `inspect`, timeline, `result`, `wait`, `search`, and `doctor` only observe. They never repair, recover,
 resend, close, or write records. The public `sessions` command performs repair as documented above.
 No query treats a missing result as an instruction to deliver the prompt again.
 
@@ -955,6 +994,15 @@ Single-result fields: `schema_version`, `ok`, `session`, `provider`, `workspace`
 can add `owner_process_alive`, `owner`, and `timed_out`. List JSON has `schema_version`, `ok`,
 `session`, `events`, `requests`, `unreadable_requests`, and `request_index_error`; event/request
 entries omit the result body.
+
+### wait
+
+Fields: `schema_version`, `ok`, `ended`, `remaining`, and `timed_out`. `ended` is null on
+timeout; otherwise it contains `address` plus the same single-result fields and waited-result
+error correction as `result --request --wait --json`. `remaining` is the input-ordered array of
+addresses not selected, including any already ended addresses. Timeout adds top-level `error`;
+other unsuccessful selected results carry their error in `ended.error`. Argument and read errors
+have `ok:false`, `ended:null`, `remaining:[]`, `timed_out:false`, and a top-level `error`.
 
 ### doctor
 

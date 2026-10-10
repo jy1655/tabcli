@@ -178,6 +178,10 @@ Then wait using the session and request ids it prints:
 tabcli result session-K7m2Qx --request request-1791285000000000000-4217-0 --wait
 ```
 
+Wait across several requests with `tabcli wait SESSION/REQUEST SESSION/REQUEST --json`.
+It returns the first observed wait-ending result and lists the unselected addresses in `remaining`;
+it never cancels or resends the others. See [wait](docs/cli.md#wait).
+
 List current-workspace observations without changing records with `tabcli status`; add `--all`
 to include closed sessions or `--all-workspaces` to remove the workspace filter.
 

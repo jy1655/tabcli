@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 pub(super) mod observation;
 pub(super) mod status;
 mod timeline;
+pub(super) mod wait;
 #[cfg(test)]
 pub(super) use timeline::timeline_value;
 
@@ -176,13 +177,6 @@ impl RequestState {
             Self::Unresolved => "unresolved",
             Self::Unavailable => "unavailable",
         }
-    }
-
-    fn ends_wait(self) -> bool {
-        matches!(
-            self,
-            Self::Completed | Self::Failed | Self::Unresolved | Self::RecoveryRequired
-        )
     }
 }
 
@@ -728,6 +722,19 @@ fn print_result(value: &Value, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn correct_unsuccessful_result(value: &mut Value) {
+    value["ok"] = json!(false);
+    if value["error"].is_null() {
+        value["error"] = json!(match value["request_state"].as_str() {
+            Some("unavailable") => "no published result is available for this selection",
+            Some("recovery_required") =>
+                "completion publication requires recovery; run sessions for this workspace, then query again",
+            _ =>
+                "request ended without a published successful result; inspect the session before sending another prompt",
+        });
+    }
+}
+
 pub(super) fn run_result(request: ResultRequest) -> Result<()> {
     let outcome = result_value(&request);
     match outcome {
@@ -737,17 +744,7 @@ pub(super) fn run_result(request: ResultRequest) -> Result<()> {
             let incomplete_wait = request.wait && value["request_state"] != "completed";
             let unsuccessful = incomplete_wait || empty_selection;
             if unsuccessful {
-                value["ok"] = json!(false);
-                if value["error"].is_null() {
-                    value["error"] = json!(match value["request_state"].as_str() {
-                        Some("unavailable") =>
-                            "no published result is available for this selection",
-                        Some("recovery_required") =>
-                            "completion publication requires recovery; run sessions for this workspace, then query again",
-                        _ =>
-                            "request ended without a published successful result; inspect the session before sending another prompt",
-                    });
-                }
+                correct_unsuccessful_result(&mut value);
             }
             if matches!(request.selector, Selector::List) {
                 if request.json {
@@ -793,86 +790,47 @@ fn result_value(request: &ResultRequest) -> Result<Value> {
 
 /// The `result` command's value over one state root, including `--wait`.
 pub(super) fn result_value_in(root: &Path, request: &ResultRequest) -> Result<Value> {
-    let directory = Reader::session_directory_in(root, &request.id)?;
-    let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
-    let mut last = json!({"schema_version": 1, "ok": true, "session": request.id,
-        "request_id": match &request.selector { Selector::Request(id) => Some(id), _ => None },
-        "request_state": "busy", "result": null,
-        "bridge_observed_elapsed_ms": null, "bridge_observed_elapsed_reason": "no_published_result"});
-    loop {
-        let observed = if request.wait {
-            Snapshot::read(&Reader::open_unchecked(&directory))
-        } else {
-            observe_snapshot(&Reader::open_unchecked(&directory))
+    if request.wait {
+        let Selector::Request(id) = &request.selector else {
+            bail!(
+                "--wait requires --request; waiting for the latest result could select another turn"
+            )
         };
-        match observed {
-            Ok(snapshot) => {
-                if matches!(request.selector, Selector::List) {
-                    let mut events = Vec::new();
-                    for path in &snapshot.paths {
-                        let name = path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .context("invalid event file")?;
-                        let mut value = snapshot.result(
-                            &Reader::open_unchecked(&directory),
-                            &Selector::Event(name.to_owned()),
-                        )?;
-                        value.as_object_mut().unwrap().remove("result");
-                        events.push(value);
-                    }
-                    let mut requests = Vec::new();
-                    for receipt in &snapshot.receipts {
-                        let mut value = snapshot.result(
-                            &Reader::open_unchecked(&directory),
-                            &Selector::Request(receipt.request_id.clone()),
-                        )?;
-                        value.as_object_mut().unwrap().remove("result");
-                        requests.push(value);
-                    }
-                    return Ok(
-                        json!({"schema_version": 1, "ok": true, "session": request.id, "events": events, "requests": requests,
-                        "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error}),
-                    );
-                }
-                let mut observation = snapshot
-                    .observe_result(&Reader::open_unchecked(&directory), &request.selector)?;
-                if !request.wait || observation.state.ends_wait() {
-                    return Ok(observation.value());
-                }
-                let owner = observe_owner(&Reader::open_unchecked(&directory));
-                let ended =
-                    owner.process_alive == Some(false) || owner.identity_matches == Some(false);
-                if ended {
-                    observation.state = RequestState::Unresolved;
-                    observation.error = Some(
-                        "recorded native owner is no longer live; run sessions for this workspace to recover its state, then inspect the request".to_owned()
-                    );
-                } else if matches!(
-                    snapshot.status.state,
-                    SessionState::Closed | SessionState::Failed | SessionState::Exited
-                ) {
-                    observation.state = RequestState::Unresolved;
-                }
-                last = observation.value();
-                last["owner_process_alive"] = json!(owner.process_alive);
-                last["owner"] = json!(owner);
-                if observation.state.ends_wait() {
-                    return Ok(last);
-                }
-            }
-            Err(error) if request.wait && error.is::<SnapshotBusy>() => (),
-            Err(error) => return Err(error),
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            last["ok"] = json!(false);
-            last["timed_out"] = json!(true);
-            last["error"] = json!("waiting timed out; the request was not cancelled or resent");
-            return Ok(last);
-        }
-        thread::sleep(remaining.min(Duration::from_millis(100)));
+        return wait::one(root, &request.id, id, request.timeout);
     }
+    let directory = Reader::session_directory_in(root, &request.id)?;
+    checked_deadline_from(Instant::now(), request.timeout)?;
+    let reader = Reader::open_unchecked(&directory);
+    let snapshot = observe_snapshot(&reader)?;
+    if matches!(request.selector, Selector::List) {
+        let mut events = Vec::new();
+        for path in &snapshot.paths {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .context("invalid event file")?;
+            let mut value = snapshot.result(
+                &Reader::open_unchecked(&directory),
+                &Selector::Event(name.to_owned()),
+            )?;
+            value.as_object_mut().unwrap().remove("result");
+            events.push(value);
+        }
+        let mut requests = Vec::new();
+        for receipt in &snapshot.receipts {
+            let mut value = snapshot.result(
+                &Reader::open_unchecked(&directory),
+                &Selector::Request(receipt.request_id.clone()),
+            )?;
+            value.as_object_mut().unwrap().remove("result");
+            requests.push(value);
+        }
+        return Ok(
+            json!({"schema_version": 1, "ok": true, "session": request.id, "events": events, "requests": requests,
+                        "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error}),
+        );
+    }
+    Ok(snapshot.observe_result(&reader, &request.selector)?.value())
 }
 
 pub(super) fn run_inspect(
