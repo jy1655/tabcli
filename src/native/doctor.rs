@@ -197,6 +197,7 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
                     "Check the explicit session id and state directory.",
                 ));
                 unknown_session_checks(id, "session_unavailable", &mut checks);
+                cancel_check(Some("unreadable"), id, &mut checks);
                 hold_check(
                     &Err(anyhow::anyhow!("session unavailable")),
                     false,
@@ -505,6 +506,7 @@ pub(super) fn record_checks(
     let manifest = match Observation::read(reader) {
         Ok(observation) => {
             session_checks(&observation, checks, observations);
+            cancel_check(observation.cancel.as_ref().map(|c| c.state), id, checks);
             evidence = Some(observation.evidence);
             Some(observation.records.manifest)
         }
@@ -516,6 +518,18 @@ pub(super) fn record_checks(
             };
             checks.push(Check::new("session_records", Availability::Unknown, reason, format!("{error:#}"), "Inspect the records without deleting locks or resending a request; retry if a writer is active."));
             unknown_session_checks(id, reason, checks);
+            let cancel = reader
+                .lock_shared()
+                .and_then(|lock| super::session::cancel::observe(reader, lock.is_some()));
+            cancel_check(
+                Some(match cancel {
+                    Ok(None) => "absent",
+                    Ok(Some(_)) => "requested",
+                    Err(_) => "unreadable",
+                }),
+                id,
+                checks,
+            );
             reader.manifest().ok()
         }
     };
@@ -538,6 +552,33 @@ pub(super) fn record_checks(
         checks,
     );
     (manifest, evidence)
+}
+
+fn cancel_check(state: Option<&str>, id: &str, checks: &mut Vec<Check>) {
+    let (availability, reason, detail) = match state {
+        None | Some("absent") => (
+            Availability::Available,
+            "cancel_absent",
+            "No cancel request is recorded.",
+        ),
+        Some("unreadable") => (
+            Availability::Unknown,
+            "cancel_unreadable",
+            "The cancel request cannot be read reliably; published results remain independent.",
+        ),
+        _ => (
+            Availability::Available,
+            "cancel_recorded",
+            "A cancel request is recorded; only a correlated provider result confirms interruption.",
+        ),
+    };
+    checks.push(Check::new(
+        "cancel",
+        availability,
+        reason,
+        detail,
+        format!("{PUBLIC_COMMAND} inspect {id} --json"),
+    ));
 }
 
 fn hold_check(held: &Result<bool>, release_allowed: bool, id: &str, checks: &mut Vec<Check>) {

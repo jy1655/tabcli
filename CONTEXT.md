@@ -89,6 +89,15 @@ Bridge has not yet allowed to start is refused until the hold is released. A hol
 the current turn or direct input to the surface.
 _Avoid_: pause, freeze, mute, lock (the lock is a different thing)
 
+**Cancel**:
+The user's recorded request to interrupt the current turn instead of waiting for its response.
+It belongs to that turn's Request, which ends as cancelled only when the provider's own signal,
+correlated to that turn, confirms interruption. Cancel does not close the session, change Hold,
+or deliver a follow-up. Requested means the intent is recorded, accepted means the provider
+integration handled the call, and cancelled means a correlated provider interruption was
+published as a Result.
+_Avoid_: stop, kill; abort and interrupt are provider API names only.
+
 ### Surfaces and ownership
 
 **Surface**:

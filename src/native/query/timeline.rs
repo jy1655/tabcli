@@ -81,6 +81,7 @@ fn records(reader: &Reader, request: Option<&str>) -> Result<Records> {
     let directory = reader.directory();
     let mut records = Records::new();
     for name in [
+        CoreRecord::Cancel.name(),
         CoreRecord::Manifest.name(),
         CoreRecord::Status.name(),
         CoreRecord::TurnClaim.name(),
@@ -347,6 +348,54 @@ pub(in crate::native) fn timeline_value(
     let mut incomplete = snapshot.unreadable_requests > 0
         || snapshot.request_index_error.is_some()
         || before.values().any(|r| r.is_err());
+    let source = CoreRecord::Cancel.name();
+    let cancel =
+        parsed::<crate::native::session::cancel::Cancel>(&before, source).and_then(|record| {
+            if let Some(record) = &record {
+                record.validate()?;
+            }
+            Ok(record)
+        });
+    match cancel {
+        Ok(Some(cancel)) if request.is_none_or(|r| r == cancel.request_id) => {
+            let receipt = snapshot
+                .receipts
+                .iter()
+                .find(|r| r.request_id == cancel.request_id && r.claim_token == cancel.claim_token);
+            let observed =
+                observation::CancelObservation::from_record(&cancel, &snapshot, |name| {
+                    event(&before, &snapshot, name)
+                });
+            incomplete |= observed.state == "unreadable";
+            let mut value = entry(
+                id,
+                receipt,
+                receipt.map(|r| r.event_file.as_str()),
+                "cancel_request",
+                Some(cancel.created_unix_ms),
+                source,
+                "observed",
+                json!({"claim_token":cancel.claim_token}),
+            );
+            value["request_id"] = json!(cancel.request_id);
+            value["cancel"] = json!({"state": observed.state, "derived_from": "result"});
+            entries.push(value);
+        }
+        Err(error) => {
+            incomplete = true;
+            session_entries.push(entry(
+                id,
+                None,
+                None,
+                "cancel_request",
+                None,
+                source,
+                "unreadable",
+                json!(format!("{error:#}")),
+            ));
+        }
+        _ => (),
+    }
     for (source, stage) in [
         (CoreRecord::TurnClaim.name(), "turn_claim"),
         (CoreRecord::Completion.name(), "completion_journal"),

@@ -123,6 +123,7 @@ fn record_provider_result_for_claim_condition(
         return Ok(());
     }
     let event = SessionEvent {
+        cancelled: false,
         provider: provider.as_str().to_owned(),
         message: message.to_owned(),
         error: None,
@@ -166,68 +167,12 @@ pub(in crate::native) fn record_provider_failure_for_claim(
     turn_id: Option<String>,
     expected_claim_token: Option<&str>,
 ) -> Result<()> {
-    record_provider_failure_for_claim_condition(
-        directory,
+    Report::for_claim(
+        &Store::open_unchecked(directory),
         provider,
-        error,
-        provider_session_id,
-        turn_id,
         expected_claim_token,
-        false,
     )
-}
-
-fn record_provider_failure_for_claim_condition(
-    directory: &Path,
-    provider: FirstPartyCli,
-    error: &str,
-    provider_session_id: Option<String>,
-    turn_id: Option<String>,
-    expected_claim_token: Option<&str>,
-    require_no_prior_provider_event: bool,
-) -> Result<()> {
-    let expected_claim_token = match expected_claim_token {
-        Some(token) => token.to_owned(),
-        None => match read_claim_token(directory)? {
-            Some(token) => token,
-            None => return Ok(()),
-        },
-    };
-    let expected_claim_token = Some(expected_claim_token.as_str());
-    let claim_path = Reader::open_unchecked(directory)
-        .record(CoreRecord::TurnClaim)
-        .path()
-        .to_owned();
-    let _claim_lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
-    recover_pending_completion_locked(directory, &claim_path)?;
-    if require_no_prior_provider_event && provider_has_completed_turn(directory, provider)? {
-        return Ok(());
-    }
-    if !provider_completion_is_current(
-        directory,
-        provider,
-        provider_session_id.as_deref(),
-        turn_id.as_deref(),
-        expected_claim_token,
-    )? {
-        return Ok(());
-    }
-    let error = terminal_safe_text(error, true);
-    let event = SessionEvent {
-        provider: provider.as_str().to_owned(),
-        message: String::new(),
-        error: Some(error.clone()),
-        provider_session_id,
-        turn_id,
-        created_unix_ms: Some(unix_ms()),
-    };
-    commit_completion_locked(
-        directory,
-        &claim_path,
-        expected_claim_token.context("provider completion has no claim token")?,
-        event,
-        Some(error),
-    )
+    .fail(error, provider_session_id, turn_id)
 }
 
 fn record_monitor_failure(directory: &Path, provider: FirstPartyCli, error: &str) -> Result<()> {
@@ -254,6 +199,7 @@ fn record_monitor_failure(directory: &Path, provider: FirstPartyCli, error: &str
     };
     let error = terminal_safe_text(error, true);
     let event = SessionEvent {
+        cancelled: false,
         provider: provider.as_str().to_owned(),
         message: String::new(),
         error: Some(error.clone()),
@@ -973,6 +919,11 @@ pub(in crate::native) fn journaled_event_state(
 pub(in crate::native) fn validate_pending_completion(
     pending: &PendingTurnCompletion,
 ) -> Result<()> {
+    if pending.event.cancelled
+        && (pending.event.error.is_none() || !pending.event.message.is_empty())
+    {
+        bail!("cancelled completion requires an error and no successful body");
+    }
     if pending.event.created_unix_ms.is_none() {
         bail!("pending native completion event is missing created_unix_ms")
     }
@@ -1286,14 +1237,81 @@ impl<'a> Report<'a> {
         provider_session_id: Option<String>,
         turn_id: Option<String>,
     ) -> Result<()> {
-        record_provider_failure_for_claim_condition(
-            self.store.directory(),
-            self.provider,
-            error,
+        self.failure(error, provider_session_id, turn_id, false)
+    }
+    #[allow(dead_code)] // Provider interruption reports are connected in the next integration.
+    pub(in crate::native) fn cancelled(
+        &self,
+        detail: &str,
+        provider_session_id: Option<String>,
+        turn_id: Option<String>,
+    ) -> Result<()> {
+        self.failure(detail, provider_session_id, turn_id, true)
+    }
+
+    fn failure(
+        &self,
+        error: &str,
+        provider_session_id: Option<String>,
+        turn_id: Option<String>,
+        cancellation: bool,
+    ) -> Result<()> {
+        let directory = self.store.directory();
+        let provider = self.provider;
+        let expected_claim_token = self.claim_token;
+        let require_no_prior_provider_event = self.initial;
+        let expected_claim_token = match expected_claim_token {
+            Some(token) => token.to_owned(),
+            None => match read_claim_token(directory)? {
+                Some(token) => token,
+                None => return Ok(()),
+            },
+        };
+        let expected_claim_token = Some(expected_claim_token.as_str());
+        let claim_path = Reader::open_unchecked(directory)
+            .record(CoreRecord::TurnClaim)
+            .path()
+            .to_owned();
+        let _claim_lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
+        recover_pending_completion_locked(directory, &claim_path)?;
+        if require_no_prior_provider_event && provider_has_completed_turn(directory, provider)? {
+            return Ok(());
+        }
+        if !provider_completion_is_current(
+            directory,
+            provider,
+            provider_session_id.as_deref(),
+            turn_id.as_deref(),
+            expected_claim_token,
+        )? {
+            return Ok(());
+        }
+        let cancelled = cancellation
+            && session::cancel::read(self.store)
+                .ok()
+                .flatten()
+                .is_some_and(|record| Some(record.claim_token.as_str()) == expected_claim_token);
+        let error = if cancelled {
+            format!("cancelled: {error}")
+        } else {
+            error.to_owned()
+        };
+        let error = terminal_safe_text(&error, true);
+        let event = SessionEvent {
+            cancelled,
+            provider: provider.as_str().to_owned(),
+            message: String::new(),
+            error: Some(error.clone()),
             provider_session_id,
             turn_id,
-            self.claim_token,
-            self.initial,
+            created_unix_ms: Some(unix_ms()),
+        };
+        commit_completion_locked(
+            directory,
+            &claim_path,
+            expected_claim_token.context("provider completion has no claim token")?,
+            event,
+            Some(error),
         )
     }
 }

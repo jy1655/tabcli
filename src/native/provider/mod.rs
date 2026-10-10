@@ -185,7 +185,18 @@ impl FollowUpTransport {
     }
 }
 
+pub(super) enum CancelSupport {
+    #[allow(dead_code)] // Provider support is added by the session-specific integration.
+    Supported,
+    Unsupported(String),
+}
+
+pub(super) fn cancel_support(provider: FirstPartyCli, directory: &Path) -> Result<CancelSupport> {
+    adapter(provider).cancel_support(directory)
+}
+
 trait NativeProviderAdapter: Sync {
+    fn cancel_support(&self, directory: &Path) -> Result<CancelSupport>;
     fn workspace_trust(
         &self,
         workspace: &Path,

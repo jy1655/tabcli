@@ -1817,3 +1817,316 @@ fn close_preserves_hold_and_prune_removes_its_directory() {
     assert_eq!(pruned["pruned"], json!(["session-observe"]));
     assert!(!fixture.directory.exists());
 }
+
+fn cancel_fixture() -> Fixture {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.directory.join("requests")).unwrap();
+    write(
+        &fixture.directory.join("requests/1-2-3.json"),
+        &json!({
+            "schema":1, "request_id":"request-cancel", "claim_token":"1-2-3",
+            "event_file":"event-1.json", "created_unix_ms":2
+        }),
+    );
+    write(
+        &fixture.directory.join("cancel.json"),
+        &json!({
+            "schema":1, "request_id":"request-cancel", "claim_token":"1-2-3", "created_unix_ms":3
+        }),
+    );
+    fixture
+}
+
+#[test]
+fn cancel_readers_render_outcomes_without_mutation() {
+    for cancelled in [false, true] {
+        let fixture = cancel_fixture();
+        write(
+            &fixture.directory.join("events/event-1.json"),
+            &json!({
+                "provider":"claude", "message":if cancelled { "" } else { "normal completion" },
+                "error":if cancelled { Some("cancelled: aborted") } else { None }, "cancelled":cancelled,
+                "provider_session_id":"native", "turn_id":"turn", "created_unix_ms":4
+            }),
+        );
+        let before = files(fixture.root.path());
+        let inspect = success(fixture.run(&["inspect", "session-observe", "--json"]));
+        assert_eq!(
+            inspect["cancel"],
+            json!({"request_id":"request-cancel", "requested_unix_ms":3, "state": if cancelled { "applied" } else { "not_applied" }})
+        );
+        let result = success(fixture.run(&[
+            "result",
+            "session-observe",
+            "--request",
+            "request-cancel",
+            "--json",
+        ]));
+        assert_eq!(
+            result["request_state"],
+            if cancelled { "cancelled" } else { "completed" }
+        );
+        let waited = fixture.run(&[
+            "result",
+            "session-observe",
+            "--request",
+            "request-cancel",
+            "--wait",
+            "--json",
+        ]);
+        assert_eq!(waited.status.success(), !cancelled);
+        let value: Value = serde_json::from_slice(&waited.stdout).unwrap();
+        assert_eq!(value["ok"], !cancelled);
+        assert_eq!(value["request_state"], result["request_state"]);
+        let waited = fixture.run(&["wait", "session-observe/request-cancel", "--json"]);
+        assert_eq!(waited.status.success(), !cancelled);
+        let timeline =
+            success(fixture.run(&["inspect", "session-observe", "--timeline", "--json"]));
+        let entry = timeline["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["stage"] == "cancel_request")
+            .unwrap();
+        assert_eq!(entry["request_id"], "request-cancel");
+        assert_eq!(
+            entry["cancel"],
+            json!({"state":if cancelled { "applied" } else { "not_applied" }, "derived_from":"result"})
+        );
+        let doctor: Value =
+            serde_json::from_slice(&fixture.run(&["doctor", "session-observe", "--json"]).stdout)
+                .unwrap();
+        assert!(
+            doctor["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["id"] == "cancel" && c["reason_code"] == "cancel_recorded")
+        );
+        let search = success(fixture.run(&["search", "aborted", "--all-workspaces", "--json"]));
+        assert!(search["hits"].as_array().unwrap().is_empty());
+        assert_eq!(files(fixture.root.path()), before);
+    }
+}
+
+#[test]
+fn cancel_requested_unreadable_and_absent_are_auxiliary_evidence() {
+    let fixture = cancel_fixture();
+    fs::write(fixture.directory.join("turn.claim"), "1-2-3\n").unwrap();
+    write(
+        &fixture.directory.join("status.json"),
+        &json!({"state":"working", "generation":3, "updated_unix_ms":3, "error":null, "exit_code":null}),
+    );
+    let before = files(fixture.root.path());
+    let inspected = success(fixture.run(&["inspect", "session-observe", "--json"]));
+    assert_eq!(inspected["cancel"]["state"], "requested");
+    let status = success(fixture.run(&["status", "--all-workspaces", "--json"]));
+    assert!(status.to_string().contains("cancel_requested"));
+    assert_eq!(files(fixture.root.path()), before);
+    fs::remove_file(fixture.directory.join("turn.claim")).unwrap();
+    fixture.event("event-1.json", "published success");
+    fs::write(fixture.directory.join("cancel.json"), b"{broken").unwrap();
+    let before = files(fixture.root.path());
+    let inspected = success(fixture.run(&["inspect", "session-observe", "--json"]));
+    assert_eq!(inspected["cancel"]["state"], "unreadable");
+    assert_eq!(inspected["latest_result"]["request_state"], "completed");
+    let timeline = success(fixture.run(&["inspect", "session-observe", "--timeline", "--json"]));
+    assert_eq!(timeline["incomplete"], true);
+    assert!(
+        timeline["session_entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["stage"] == "cancel_request" && e["record_state"] == "unreadable")
+    );
+    let doctor: Value =
+        serde_json::from_slice(&fixture.run(&["doctor", "session-observe", "--json"]).stdout)
+            .unwrap();
+    assert!(
+        doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == "cancel" && c["reason_code"] == "cancel_unreadable")
+    );
+    assert_eq!(files(fixture.root.path()), before);
+    fs::remove_file(fixture.directory.join("cancel.json")).unwrap();
+    assert_eq!(
+        success(fixture.run(&["inspect", "session-observe", "--json"]))["cancel"],
+        Value::Null
+    );
+    let doctor: Value =
+        serde_json::from_slice(&fixture.run(&["doctor", "session-observe", "--json"]).stdout)
+            .unwrap();
+    assert!(
+        doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == "cancel" && c["reason_code"] == "cancel_absent")
+    );
+}
+
+#[test]
+fn cancel_command_refusal_envelope_and_parse_errors() {
+    let fixture = cancel_fixture();
+    let output = fixture.run(&["cancel", "session-observe", "--json"]);
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value,
+        json!({"schema_version":1,"ok":false,"session":"session-observe","error":"session session-observe is ready; cancel requires the running or working state"})
+    );
+    for args in [
+        vec!["cancel", "--json"],
+        vec!["cancel", "session-observe", "--json", "--release"],
+        vec!["cancel", "session-observe", "--json", "--json"],
+    ] {
+        let output = fixture.run(&args);
+        assert!(!output.status.success());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["ok"], false);
+    }
+}
+
+#[test]
+fn cancel_all_providers_refuse_without_changing_claim_or_intent() {
+    for provider in ["codex", "claude", "agy", "pi"] {
+        for state in ["running", "working"] {
+            let fixture = cancel_fixture();
+            fs::remove_file(fixture.directory.join("cancel.json")).unwrap();
+            let path = fixture.directory.join("manifest.json");
+            let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            manifest["provider"] = json!(provider);
+            write(&path, &manifest);
+            write(
+                &fixture.directory.join("status.json"),
+                &json!({"state":state,"generation":3,"updated_unix_ms":3,"error":null,"exit_code":null}),
+            );
+            fs::write(fixture.directory.join("turn.claim"), "1-2-3\n").unwrap();
+            // The command may create its lifecycle lock; all other bytes must be retained.
+            let before = files(fixture.root.path());
+            let output = fixture.run(&["cancel", "session-observe", "--json"]);
+            assert!(!output.status.success());
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                value,
+                json!({"schema_version":1,"ok":false,"session":"session-observe",
+                "error":format!("in this release the Bridge integration for {provider} does not support cancel")})
+            );
+            let mut after = files(fixture.root.path());
+            after.retain(|(path, _)| path.file_name().unwrap() != "turn.claim.lock");
+            assert_eq!(before, after);
+        }
+    }
+}
+
+#[test]
+fn cancel_timeline_filters_retained_intent_and_rejects_non_utf8() {
+    let fixture = cancel_fixture();
+    write(
+        &fixture.directory.join("requests/4-5-6.json"),
+        &json!({
+            "schema":1,"request_id":"request-other","claim_token":"4-5-6","event_file":"event-2.json","created_unix_ms":4
+        }),
+    );
+    let value = success(fixture.run(&[
+        "inspect",
+        "session-observe",
+        "--timeline",
+        "--request",
+        "request-other",
+        "--json",
+    ]));
+    assert!(
+        !value["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["stage"] == "cancel_request")
+    );
+    fs::write(fixture.directory.join("cancel.json"), [0xff]).unwrap();
+    let before = files(fixture.root.path());
+    let value = success(fixture.run(&["inspect", "session-observe", "--timeline", "--json"]));
+    assert_eq!(value["incomplete"], true);
+    assert!(
+        value["session_entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["stage"] == "cancel_request" && e["record_state"] == "unreadable")
+    );
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[test]
+fn search_excludes_cancelled_even_when_stored_event_has_a_body() {
+    let fixture = cancel_fixture();
+    let mut event = fixture.event("event-1.json", "needle");
+    event["cancelled"] = json!(true);
+    write(&fixture.directory.join("events/event-1.json"), &event);
+    let found = success(fixture.run(&["search", "needle", "--all-workspaces", "--json"]));
+    assert!(found["hits"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn cancel_identity_mismatch_is_unreadable_in_every_reader_without_hiding_result() {
+    for cancelled in [false, true] {
+        let fixture = cancel_fixture();
+        let mut event = fixture.event("event-1.json", "published result");
+        if cancelled {
+            event["message"] = json!("");
+            event["error"] = json!("cancelled: interrupted");
+            event["cancelled"] = json!(true);
+            write(&fixture.directory.join("events/event-1.json"), &event);
+        }
+        write(
+            &fixture.directory.join("cancel.json"),
+            &json!({
+                "schema":1, "request_id":"request-cancel", "claim_token":"4-5-6", "created_unix_ms":3
+            }),
+        );
+        let before = files(fixture.root.path());
+        let inspect = success(fixture.run(&["inspect", "session-observe", "--json"]));
+        assert_eq!(inspect["cancel"]["state"], "unreadable");
+        let result = success(fixture.run(&[
+            "result",
+            "session-observe",
+            "--request",
+            "request-cancel",
+            "--json",
+        ]));
+        assert_eq!(
+            result["request_state"],
+            if cancelled { "cancelled" } else { "completed" }
+        );
+        assert_eq!(
+            inspect["latest_result"]["request_state"],
+            result["request_state"]
+        );
+        let timeline =
+            success(fixture.run(&["inspect", "session-observe", "--timeline", "--json"]));
+        assert_eq!(timeline["incomplete"], true);
+        let entry = timeline["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["stage"] == "cancel_request")
+            .unwrap();
+        assert_eq!(entry["cancel"]["state"], inspect["cancel"]["state"]);
+        assert_eq!(entry["cancel"]["derived_from"], "result");
+        let doctor: Value =
+            serde_json::from_slice(&fixture.run(&["doctor", "session-observe", "--json"]).stdout)
+                .unwrap();
+        assert!(
+            doctor["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["id"] == "cancel" && c["reason_code"] == "cancel_unreadable")
+        );
+        let status = success(fixture.run(&["status", "--all-workspaces", "--json"]));
+        assert!(!status.to_string().contains("cancel_requested"));
+        assert_eq!(files(fixture.root.path()), before);
+    }
+}

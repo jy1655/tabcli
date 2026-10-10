@@ -2,6 +2,7 @@ use agent_bridge::PUBLIC_COMMAND;
 #[cfg(test)]
 mod tests;
 
+mod cancel;
 mod consent;
 mod context;
 mod doctor;
@@ -95,6 +96,7 @@ pub(crate) enum NativeCommand {
     SelfTest(self_test::Request),
     Tell(TellRequest),
     Hold(hold::Request),
+    Cancel(cancel::Request),
     Reopen(ReopenRequest),
     Inspect {
         id: String,
@@ -230,6 +232,8 @@ struct SessionManifest {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct SessionEvent {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    cancelled: bool,
     provider: String,
     message: String,
     #[serde(default)]
@@ -267,6 +271,7 @@ pub(crate) fn is_command(value: &str) -> bool {
             | "settings"
             | "tell"
             | "hold"
+            | "cancel"
             | "reopen"
             | "sessions"
             | "status"
@@ -305,6 +310,7 @@ where
         "self-test" => self_test::parse(rest),
         "tell" => parse_tell(rest),
         "hold" => hold::parse(rest),
+        "cancel" => cancel::parse(rest),
         "consent" => Ok(NativeCommand::Consent(rest.to_vec())),
         "settings" => Ok(NativeCommand::Settings(rest.to_vec())),
         "reopen" => parse_reopen(rest),
@@ -869,6 +875,7 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
         NativeCommand::SelfTest(request) => self_test::run(request),
         NativeCommand::Tell(request) => run_tell(request),
         NativeCommand::Hold(request) => hold::run(request),
+        NativeCommand::Cancel(request) => cancel::run(request),
         NativeCommand::Reopen(request) => run_reopen(request),
         NativeCommand::Inspect {
             id,

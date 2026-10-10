@@ -736,6 +736,7 @@ fn scope_reports_launch_inputs_and_reuses_consent_observation() {
             "session_state",
             "turn",
             "completion",
+            "cancel",
             "owner",
             "terminal_record",
             "hold",

@@ -110,6 +110,12 @@ impl PendingAgyTurn {
 const AGY_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Agy exposes no verifiable ownership evidence for a conversation (presence locks are not held by the running process) and its transcript monitor binds only to a newly created conversation";
 
 impl NativeProviderAdapter for AgyAdapter {
+    fn cancel_support(&self, _directory: &Path) -> Result<super::CancelSupport> {
+        Ok(super::CancelSupport::Unsupported(
+            "in this release the Bridge integration for agy does not support cancel".to_owned(),
+        ))
+    }
+
     fn workspace_trust_key(&self, screen: &str, workspace: &Path) -> Option<terminal::DialogKey> {
         agy_trust_prompt_key(screen, workspace)
     }

@@ -90,7 +90,11 @@ impl RequestState {
     fn ends_wait(self) -> bool {
         matches!(
             self,
-            Self::Completed | Self::Failed | Self::Unresolved | Self::RecoveryRequired
+            Self::Completed
+                | Self::Cancelled
+                | Self::Failed
+                | Self::Unresolved
+                | Self::RecoveryRequired
         )
     }
 }

@@ -161,6 +161,7 @@ pub(super) struct Snapshot {
 pub(super) enum RequestState {
     Completed,
     Failed,
+    Cancelled,
     RecoveryRequired,
     Pending,
     Unresolved,
@@ -172,6 +173,7 @@ impl RequestState {
         match self {
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
             Self::RecoveryRequired => "recovery_required",
             Self::Pending => "pending",
             Self::Unresolved => "unresolved",
@@ -256,7 +258,7 @@ impl RequestObservation<'_> {
         // Attachments deliberately re-read strictly; ordinary queries and the timeline
         // retain their distinct readers. Do not substitute the lossy event above.
         let event = reader.event_strict(event_id).map_err(unreadable)?;
-        if event.error.is_some() {
+        if event.cancelled || event.error.is_some() {
             return Err(refuse("failed", None));
         }
         let source = requests::ContextSource {
@@ -585,7 +587,9 @@ impl Snapshot {
                 launch::diagnostic(self.launch.as_ref(), &self.status, self.claim.as_deref())
             });
         let state = if let Some(event) = &event {
-            if event.error.is_some() {
+            if event.cancelled {
+                RequestState::Cancelled
+            } else if event.error.is_some() {
                 RequestState::Failed
             } else {
                 RequestState::Completed
@@ -726,6 +730,7 @@ fn correct_unsuccessful_result(value: &mut Value) {
     value["ok"] = json!(false);
     if value["error"].is_null() {
         value["error"] = json!(match value["request_state"].as_str() {
+            Some("cancelled") => "request was cancelled without a successful result",
             Some("unavailable") => "no published result is available for this selection",
             Some("recovery_required") =>
                 "completion publication requires recovery; run sessions for this workspace, then query again",
@@ -1312,7 +1317,7 @@ fn search_session(
                 continue;
             }
         };
-        if event.error.is_some() {
+        if event.cancelled || event.error.is_some() {
             continue;
         }
         let Some(start) = find_case_insensitive(&event.message, query_lower) else {

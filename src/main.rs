@@ -32,6 +32,7 @@ Usage:
   {PUBLIC_COMMAND} tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
       [--context-result <session>/<request-id>]...
   {PUBLIC_COMMAND} hold <session> [--release] [--json]
+  {PUBLIC_COMMAND} cancel <session> [--json]
   {PUBLIC_COMMAND} reopen <closed-session> (--prompt TEXT | --prompt-file PATH) [--title NAME]
       [--model MODEL] [--effort EFFORT] [--terminal <windows-console>] [--yolo] [--timeout-secs N]
       [--detach] [--json]
@@ -345,6 +346,7 @@ mod tests {
             "ask <codex|claude|agy|pi>",
             "tell <session>",
             "hold <session> [--release] [--json]",
+            "cancel <session> [--json]",
             "reopen <closed-session> (--prompt TEXT | --prompt-file PATH)",
             "supports only Claude Code on native Windows",
             "sessions [--workspace PATH]",
