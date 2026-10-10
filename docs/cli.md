@@ -270,7 +270,7 @@ sorts ascending by id; `updated` sorts newest first, breaking ties by id.
 **The public command is not read-only.** For sessions matching workspace and provider, it attempts
 publication of recorded completions, completion of interrupted closes, and repair of sessions whose
 owner died before reading their state. The state filter is applied afterward. The internal read-only
-listing is not a public flag. Use `inspect`, `result`, or `search` when records must not change.
+listing is not a public flag. Use `status`, `inspect`, `result`, or `search` when records must not change.
 
 Human rows show id, state, provider, workspace, terminal, bypass flag, and recorded event count. An
 empty list prints `no native Agent Bridge sessions`. JSON is an array, not an `ok` envelope. The
@@ -282,6 +282,77 @@ and state filters, then the selected state root. Unreadable manifests are skippe
 errors do not always fail the command; use `inspect SESSION` or `doctor SESSION` to investigate a
 session that stays in an unexpected state. Root enumeration and other command-level I/O errors exit
 nonzero; check the path named in the error.
+
+## status
+
+Use `status` to list session observations without changing records.
+
+```text
+tabcli status [--workspace PATH | --all-workspaces] [--provider PROVIDER] [--all] [--json]
+```
+
+```sh
+tabcli status --workspace /path/to/project --json
+```
+
+```json
+{
+  "schema_version": 1,
+  "ok": true,
+  "filters": {
+    "workspace": "/path/to/project",
+    "all_workspaces": false,
+    "provider": null,
+    "include_closed": false
+  },
+  "sessions": [],
+  "incomplete": false,
+  "incomplete_reasons": [],
+  "scanned": {"sessions": 0, "listed": 0}
+}
+```
+
+The default scope is the canonical current workspace, as in `search`. `--workspace` overrides
+it; `--all-workspaces` removes it; they are mutually exclusive. Provider defaults to all
+providers. Workspace and provider filters are applied before reading session state or checking
+the owner process.
+Closed sessions are excluded by default; `--all` includes them. Failed and exited sessions are
+included. The closed filter uses the recorded status without changing it.
+The default output therefore does not show closed sessions or their residual surfaces.
+Unlike `sessions`, this command never repairs, recovers, or writes records.
+
+The ten-second budget is checked between operations, not a hard command deadline. Each busy
+session read retries for at most 250 ms or the remaining budget, whichever is shorter.
+Slow filesystem and process observations can outlast the budget. Each remaining session gets
+an incomplete reason when the budget is exhausted. Session state is read consistently; owner
+and terminal records are observed separately. The owner process is checked, but the terminal
+surface is not probed. At most two result events are decoded per listed session: the latest
+published event and the active request's published event when they differ. Result bodies are
+not returned.
+
+A required-record failure omits that session and adds its id and reason to `incomplete_reasons`.
+Unreadable owner or terminal records, reopen history, latest events, or request indexes leave
+the session in the list with attention flags. Fields whose evidence could not be read stay
+null. Attention does not change session or request state. Owner exit, identity mismatch, and
+missing observations are distinct facts; closed sessions have no owner liveness flags. A live
+owner whose identity was not observed is not flagged; a failed identity check is reported as
+`owner_unverified`.
+`scanned.sessions` counts session reads attempted after the workspace and provider filters,
+including failed reads and sessions excluded by the closed filter. `scanned.listed` counts
+returned entries.
+
+Entries with attention sort first, then by updated time descending, then by id ascending.
+Human output gives an attention marker, id, provider, state, active request state, latest result
+request state, and comma-separated attention flags. Missing request states show `-`. A footer
+gives listed/scanned counts and every incomplete reason. An empty list prints `no sessions to show`
+and exits 0. Partial observations also exit 0; argument and root-level read errors exit nonzero.
+With `--json`, argument errors also produce a structured error on stdout.
+
+`result_command` addresses a readable active receipt with `--request`, a claim without a
+readable receipt with `--list`, or otherwise the latest published result with `--event`.
+It is null when nothing is addressable. Active elapsed time is receipt-to-result time, as in
+`result`; without a published result it is null with `no_published_result`.
+See the [JSON field reference](#json-field-reference).
 
 ## inspect
 
@@ -772,7 +843,7 @@ consistent observation. `accepted` is the detached command acknowledgement, not 
 Error fallback output can use `unknown`. Request and session state are different: a session can
 remain usable after a request completes, and a closed session can retain results.
 
-`inspect`, timeline, `result`, `search`, and `doctor` only observe. They never repair, recover,
+`status`, `inspect`, timeline, `result`, `search`, and `doctor` only observe. They never repair, recover,
 resend, close, or write records. The public `sessions` command performs repair as documented above.
 No query treats a missing result as an instruction to deliver the prompt again.
 
@@ -830,6 +901,33 @@ Each array entry contains `id`, `provider`, `workspace`, `title`, `yolo`, `state
 `terminal_session_id`, `terminal_tab_id`, `terminal_window_id`, `iterm_session_id`,
 `created_unix_ms`, `updated_unix_ms`, `error`, `model`, `effort`, `resumed_from`, and `results`. The
 event count is not a count of successful published results.
+
+### status
+
+The envelope contains `schema_version`, `ok`, `filters`, `sessions`, `incomplete`,
+`incomplete_reasons`, and `scanned`. Filters contain `workspace` (canonical path or null),
+`all_workspaces`, `provider` (or null), and `include_closed`. Scan counts contain `sessions`
+(observation attempts after scope filtering) and `listed`. Each incomplete reason has
+`session` (null for a root-level problem) and `reason`.
+
+Each session contains `id`, `provider`, `workspace`, `title`, `model`, `effort`, `yolo`,
+`created_unix_ms`, `state`, `generation`, `updated_unix_ms`, `error`, `turn_claimed`,
+`recovery_required`, `unreadable_requests`, `request_index_error`, `active_request`,
+`latest_result`, `owner`, `attention`, `derived_from`, and `result_command`.
+`residual_surface` follows inspect's optional-field rule below.
+
+`active_request` is null or contains `request_id`, `request_state`,
+`bridge_observed_elapsed_ms`, and `bridge_observed_elapsed_reason`.
+`latest_result` is null or contains `event_id`, `request_id`, `request_state`, and
+`created_unix_ms`; it never includes the body. Legacy results can have a null request id.
+`owner` contains nullable `process_alive`, `identity_matches`, and `error`.
+`derived_from: "observation"` marks attention and the request objects as judgments.
+
+Attention flags are `delivery_unconfirmed`, `launch_timeout`, `launch_failed`,
+`launch_uncertain`, `claim_without_receipt`, `recovery_required`, `owner_exited`,
+`owner_identity_mismatch`, `owner_unverified`, `records_partially_unreadable`,
+`request_index_incomplete`, `residual_surface_unverified`, `session_failed`, and
+`session_exited`. No flag supplies repair or close authority.
 
 ### inspect
 

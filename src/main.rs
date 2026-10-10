@@ -7,7 +7,7 @@ mod native;
 
 fn legacy_removal_message() -> String {
     format!(
-        "the embedded multi-PTY TUI was removed in agent-bridge 0.0.1; use `{PUBLIC_COMMAND} ask`, `{PUBLIC_COMMAND} tell`, `{PUBLIC_COMMAND} sessions`, `{PUBLIC_COMMAND} prune-sessions`, or `{PUBLIC_COMMAND} close-session`"
+        "the embedded multi-PTY TUI was removed in agent-bridge 0.0.1; use `{PUBLIC_COMMAND} ask`, `{PUBLIC_COMMAND} tell`, `{PUBLIC_COMMAND} sessions`, `{PUBLIC_COMMAND} status`, `{PUBLIC_COMMAND} prune-sessions`, or `{PUBLIC_COMMAND} close-session`"
     )
 }
 
@@ -36,6 +36,7 @@ Usage:
       [--detach] [--json]
   {PUBLIC_COMMAND} sessions [--workspace PATH] [--provider <codex|claude|agy|pi>] [--state STATE]
       [--sort <id|updated>] [--json]
+  {PUBLIC_COMMAND} status [--workspace PATH | --all-workspaces] [--provider <codex|claude|agy|pi>] [--all] [--json]
   {PUBLIC_COMMAND} inspect <session> [--timeline [--request REQUEST]] [--json]
   {PUBLIC_COMMAND} result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
       [--wait --timeout-secs N]
@@ -339,6 +340,7 @@ mod tests {
             "reopen <closed-session> (--prompt TEXT | --prompt-file PATH)",
             "supports only Claude Code on native Windows",
             "sessions [--workspace PATH]",
+            "status [--workspace PATH | --all-workspaces]",
             "inspect <session> [--timeline [--request REQUEST]] [--json]",
             "result <session>",
             "search <query> [--workspace PATH | --all-workspaces]",

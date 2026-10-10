@@ -16,6 +16,7 @@ use agent_bridge::PUBLIC_COMMAND;
 use serde_json::{Value, json};
 
 pub(super) mod observation;
+pub(super) mod status;
 mod timeline;
 #[cfg(test)]
 pub(super) use timeline::timeline_value;
@@ -465,6 +466,14 @@ impl Snapshot {
         Ok(snapshot)
     }
 
+    fn latest_event_id(&self) -> Option<&str> {
+        self.paths
+            .iter()
+            .rev()
+            .filter_map(|p| p.file_name()?.to_str())
+            .find(|name| self.published(name))
+    }
+
     fn receipt_for_event(&self, event: &str) -> Option<&requests::Receipt> {
         self.receipts
             .iter()
@@ -561,12 +570,7 @@ impl Snapshot {
         let name = match selector {
             Selector::Request(_) => receipt.map(|r| r.event_file.as_str()),
             Selector::Event(name) => Some(name.as_str()),
-            Selector::Latest => self
-                .paths
-                .iter()
-                .rev()
-                .filter_map(|p| p.file_name()?.to_str())
-                .find(|name| self.published(name)),
+            Selector::Latest => self.latest_event_id(),
             Selector::List => bail!("list is not a single result selector"),
         };
         let receipt = receipt.or_else(|| name.and_then(|name| self.receipt_for_event(name)));
@@ -665,11 +669,26 @@ fn snapshot_retry_window() -> Duration {
 /// Retries a busy snapshot for [`SNAPSHOT_RETRY_WINDOW`]; every attempt decides a journaled
 /// event's publication as `publication` says.
 fn observe_snapshot_with(reader: &Reader, publication: PublicationRead) -> Result<Snapshot> {
-    let deadline = Instant::now() + snapshot_retry_window();
+    observe_snapshot_until(
+        reader,
+        publication,
+        Instant::now() + snapshot_retry_window(),
+    )
+}
+
+fn observe_snapshot_until(
+    reader: &Reader,
+    publication: PublicationRead,
+    deadline: Instant,
+) -> Result<Snapshot> {
+    let deadline = deadline.min(Instant::now() + snapshot_retry_window());
     loop {
         match Snapshot::read_with(reader, publication) {
             Err(error) if error.is::<SnapshotBusy>() && Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(25));
+                thread::sleep(
+                    Duration::from_millis(25)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
             }
             outcome => return outcome,
         }

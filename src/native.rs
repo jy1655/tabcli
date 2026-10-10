@@ -102,6 +102,7 @@ pub(crate) enum NativeCommand {
     },
     Result(query::ResultRequest),
     Search(query::SearchRequest),
+    Status(query::status::StatusRequest),
     Doctor(doctor::DoctorRequest),
     Sessions(SessionsRequest),
     Prune(PruneRequest),
@@ -264,6 +265,7 @@ pub(crate) fn is_command(value: &str) -> bool {
             | "tell"
             | "reopen"
             | "sessions"
+            | "status"
             | "inspect"
             | "result"
             | "search"
@@ -305,6 +307,7 @@ where
         "search" => query::parse_search(rest),
         "doctor" => doctor::parse_args(rest),
         "sessions" => parse_sessions(rest),
+        "status" => query::status::parse(rest),
         "prune-sessions" => parse_prune(rest),
         "close-session" => parse_close(rest),
         "native-session" => {
@@ -869,6 +872,7 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
         NativeCommand::Search(request) => query::run_search(request),
         NativeCommand::Doctor(request) => doctor::run(request),
         NativeCommand::Sessions(request) => run_sessions(request),
+        NativeCommand::Status(request) => query::status::run(request),
         NativeCommand::Prune(request) => run_prune(request),
         NativeCommand::Close(request) => run_close(request),
         NativeCommand::RunSession { id } => run_session(&id),

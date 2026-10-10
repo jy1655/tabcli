@@ -178,6 +178,9 @@ Then wait using the session and request ids it prints:
 tabcli result session-K7m2Qx --request request-1791285000000000000-4217-0 --wait
 ```
 
+List current-workspace observations without changing records with `tabcli status`; add `--all`
+to include closed sessions or `--all-workspaces` to remove the workspace filter.
+
 Find recorded sessions with `tabcli sessions --sort updated`; this command also repairs interrupted
 lifecycle changes and dead owners, so it is not read-only.
 

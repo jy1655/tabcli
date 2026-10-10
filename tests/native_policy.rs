@@ -1031,6 +1031,9 @@ fn public_identity_in_version_and_help() {
         assert!(output.stderr.is_empty());
         let text = String::from_utf8(output.stdout).unwrap();
         assert_eq!(text.lines().next(), Some(expected));
+        if flag == "--help" {
+            assert!(text.contains("tabcli status [--workspace PATH | --all-workspaces]"));
+        }
         if flag == "--version" {
             assert_eq!(text, format!("{expected}\n"));
         }
@@ -1088,6 +1091,7 @@ fn no_source_hint_uses_the_old_public_command() {
                     "inspect",
                     "doctor",
                     "sessions",
+                    "status",
                     "search",
                     "consent",
                     "settings",

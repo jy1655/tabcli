@@ -138,7 +138,6 @@ impl Observation {
 
     pub(super) fn read_locked(reader: &Reader) -> Result<Self> {
         let records = observe_snapshot(reader)?;
-        let evaluated_unix_ms = unix_ms();
         let active_state = records
             .receipts
             .iter()
@@ -148,12 +147,21 @@ impl Observation {
                     .observe_result(reader, &Selector::Request(r.request_id.clone()))
                     .map(|observed| observed.state)
             });
+        Ok(Self::from_records(reader, records, active_state))
+    }
+
+    fn from_records(
+        reader: &Reader,
+        records: Snapshot,
+        active_state: Option<Result<RequestState>>,
+    ) -> Self {
+        let evaluated_unix_ms = unix_ms();
         let launch_failure = launch::diagnostic(
             records.launch.as_ref(),
             &records.status,
             records.claim.as_deref(),
         );
-        Ok(Self {
+        Self {
             records,
             evidence: SessionEvidence::read(reader),
             resumed_from: read_resumed_from(reader.directory()),
@@ -163,7 +171,80 @@ impl Observation {
                 active_state,
                 launch_failure,
             },
-        })
+        }
+    }
+
+    /// Status decodes the latest published event and, only when different, the
+    /// active request's event. Both use the ordinary Result observation.
+    pub(super) fn read_for_status(
+        reader: &Reader,
+        deadline: Instant,
+        include_closed: bool,
+    ) -> Result<Option<StatusObservation>> {
+        let records =
+            observe_snapshot_until(reader, PublicationRead::Within(EVENT_READ_LIMIT), deadline)?;
+        if !include_closed && records.status.state == SessionState::Closed {
+            return Ok(None);
+        }
+        if Instant::now() >= deadline {
+            bail!("status time budget exhausted");
+        }
+        let latest_event_id = records.latest_event_id();
+        let latest = records.observe_result(reader, &Selector::Latest);
+        let active_value = |observed: &RequestObservation<'_>| {
+            let (elapsed, reason) = observed_elapsed(observed.receipt, observed.event.as_ref());
+            (
+                observed.state,
+                json!({
+                    "request_state": observed.state,
+                    "bridge_observed_elapsed_ms": elapsed,
+                    "bridge_observed_elapsed_reason": reason,
+                }),
+            )
+        };
+        let active = records
+            .receipts
+            .iter()
+            .find(|r| records.claim.as_deref() == Some(&r.claim_token))
+            .map(|receipt| {
+                if latest_event_id == Some(receipt.event_file.as_str()) {
+                    latest
+                        .as_ref()
+                        .map(&active_value)
+                        .map_err(|error| anyhow::anyhow!("{error:#}"))
+                } else {
+                    if Instant::now() >= deadline {
+                        bail!("status time budget exhausted");
+                    }
+                    records
+                        .observe_result(reader, &Selector::Request(receipt.request_id.clone()))
+                        .map(|observed| active_value(&observed))
+                }
+            });
+        let latest = latest.map(|observed| {
+            observed.event.as_ref().map_or(Value::Null, |event| {
+                json!({
+                    "event_id": observed.event_id,
+                    "request_id": observed.receipt.map(|receipt| &receipt.request_id),
+                    "request_state": observed.state,
+                    "created_unix_ms": event.created_unix_ms,
+                })
+            })
+        });
+        let active_state = active.as_ref().map(|result| {
+            result
+                .as_ref()
+                .map(|(state, _)| *state)
+                .map_err(|error| anyhow::anyhow!("{error:#}"))
+        });
+        let active = active.map(|result| result.map(|(_, value)| value));
+        let mut observation = Self::from_records(reader, records, active_state);
+        observation.records._lock.take();
+        Ok(Some(StatusObservation {
+            observation,
+            active,
+            latest,
+        }))
     }
 
     pub(in crate::native) fn active_request(&self) -> Option<&requests::Receipt> {
@@ -216,6 +297,12 @@ impl Observation {
         }
         Ok(value)
     }
+}
+
+pub(super) struct StatusObservation {
+    pub(super) observation: Observation,
+    pub(super) active: Option<Result<Value>>,
+    pub(super) latest: Result<Value>,
 }
 
 #[cfg(test)]

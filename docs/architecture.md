@@ -65,7 +65,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   observation and requires strict event decoding, an exact event name, and verifiable provenance;
   it does not reconstruct Request meaning from command JSON. Timeline retains its cached strict
   reads, and search retains its cumulative byte budget.
-  Inspect and doctor render one Observation per session from these readers and publication rules;
+  Inspect, doctor, and `status` render one Observation per session from these readers and publication rules;
   owner process observations and surface probes are added on request, while `sessions` keeps
   its own lock-free listing after its optional repair.
 - `src/native/doctor.rs` combines read-only shared observations with provider diagnostics and
