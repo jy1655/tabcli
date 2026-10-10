@@ -23,6 +23,8 @@ close-session
 ```
 
 A follow-up enters through `tell` in `native.rs` and claims the existing session before delivery.
+The admission checks read Hold without taking another lock; `claim_ready` identifies follow-up
+claims so the final `begin_delivery` hold gate excludes initial delivery.
 It uses the same completion journal and publication path. If delivery is uncertain, the claim
 stays held; neither a query nor repair resends the prompt.
 
@@ -104,6 +106,9 @@ The serialized state strings and permitted changes are:
 | `exited`, `failed` | `closed` |
 | `closed` | None |
 
+Hold is orthogonal to this state table: it refuses follow-ups whose delivery Bridge has not yet
+allowed to start, without changing the current turn.
+
 `resume-pending` remains readable for compatibility; it is not the modern `reopen` mechanism.
 Unknown state strings remain readable, but cannot transition to a known state. Status writes
 advance a generation; a closed tombstone instead fixes the terminal status and preserves its
@@ -122,6 +127,7 @@ before deciding that the operation never happened.
 | Record | Evidence or role |
 | --- | --- |
 | `manifest.json` | Recorded provider, workspace, launch choices, and session identity |
+| `hold.json` | User follow-up hold: `{held: true, created_unix_ms}`; absent means released, unreadable means unknown |
 | `status.json` | Current recorded state, generation, time, diagnostic error, and optional residual-surface observation |
 | `initial-prompt.txt` | Initial prompt retained for launch/delivery |
 | `native-session.json` | Recorded owner identity used for attestation |
@@ -190,6 +196,14 @@ only the monitor publishes the Result or records a subsequent failure.
 writes and a reader view. Constructing a Store performs no recovery. `Store::converge` calls dead-owner repair, which recovers accepted completions first and
 retains recovery damage in a dead owner's close diagnostic; call it from a mutating command
 where needed.
+`session::hold` writes and removes `hold.json` under the lifecycle lock using the atomic private
+writer and directory-synced removal, without a status write or status lock. Tell's read-only hold
+pre-check precedes convergence; admission repeats under the lifecycle lock before a claim and
+before delivery. Inspect, status, and doctor read Hold as a separate `SessionEvidence` part while
+holding the shared lifecycle lock, with legacy no-lock change detection. It is not a publication
+Snapshot input; damaged Hold records do not affect result, wait, search, or context reads.
+Timeline does not record hold history. Close preserves the record; prune removes its directory.
+
 `RecordReader` and `RecordStore` provide the primitives for names and schemas owned by adapters.
 
 The native provider contract requires explicit launch configuration, initial delivery,

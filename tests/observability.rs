@@ -1577,3 +1577,243 @@ fn wait_one_matches_public_result_wait_and_preserves_journal_and_dead_owner() {
         assert_eq!(files(fixture.root.path()), before);
     }
 }
+
+#[test]
+fn hold_and_release_are_idempotent_and_preserve_status() {
+    let fixture = Fixture::new();
+    let status = fs::read(fixture.directory.join("status.json")).unwrap();
+    for (release, expected_changed) in [
+        (true, false),
+        (false, true),
+        (false, false),
+        (true, true),
+        (true, false),
+    ] {
+        let before = fs::read(fixture.directory.join("hold.json")).ok();
+        let args = if release {
+            vec!["hold", "session-observe", "--release", "--json"]
+        } else {
+            vec!["hold", "session-observe", "--json"]
+        };
+        let value = success(fixture.run(&args));
+        assert_eq!(
+            value,
+            json!({"schema_version":1, "ok":true, "session":"session-observe",
+            "held": !release, "changed":expected_changed})
+        );
+        let after = fs::read(fixture.directory.join("hold.json")).ok();
+        if !expected_changed {
+            assert_eq!(before, after);
+        }
+        if let Some(bytes) = after {
+            let record: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(record["held"], true);
+            assert!(record["created_unix_ms"].as_u64().unwrap() > 0);
+        }
+        assert_eq!(
+            fs::read(fixture.directory.join("status.json")).unwrap(),
+            status
+        );
+    }
+}
+
+#[test]
+fn hold_normalizes_malformed_records_and_reports_previous_intent() {
+    for release in [false, true] {
+        let fixture = Fixture::new();
+        fs::write(fixture.directory.join("hold.json"), b"malformed").unwrap();
+        let args = if release {
+            vec!["hold", "session-observe", "--release", "--json"]
+        } else {
+            vec!["hold", "session-observe", "--json"]
+        };
+        let value = success(fixture.run(&args));
+        assert_eq!(value["held"], !release);
+        assert_eq!(value["changed"], true);
+        assert_eq!(value["previous"], "malformed");
+    }
+}
+
+#[test]
+fn hold_refuses_closed_set_and_release_before_reading_hold() {
+    let fixture = Fixture::new();
+    write(
+        &fixture.directory.join("closed.json"),
+        &json!({"state":"closed", "generation":3,
+        "updated_unix_ms":3, "exit_code":null, "error":null}),
+    );
+    // A malformed hold must not be normalized after the closed tombstone.
+    fs::write(fixture.directory.join("hold.json"), b"malformed").unwrap();
+    for release in [false, true] {
+        let args = if release {
+            vec!["hold", "session-observe", "--release", "--json"]
+        } else {
+            vec!["hold", "session-observe", "--json"]
+        };
+        let output = fixture.run(&args);
+        assert!(!output.status.success());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            value["error"],
+            "the session is closed; a hold cannot be set or released"
+        );
+        assert_eq!(
+            fs::read(fixture.directory.join("hold.json")).unwrap(),
+            b"malformed"
+        );
+    }
+}
+
+#[test]
+fn held_or_unreadable_tell_refuses_before_any_record_write() {
+    for malformed in [false, true] {
+        let fixture = Fixture::new();
+        if malformed {
+            fs::write(fixture.directory.join("hold.json"), b"malformed").unwrap();
+        } else {
+            write(
+                &fixture.directory.join("hold.json"),
+                &json!({"held":true,"created_unix_ms":1}),
+            );
+        }
+        // No lifecycle lock yet: converge would create it, so compare the whole directory.
+        let before = files(fixture.root.path());
+        let output = fixture.run(&[
+            "tell",
+            "session-observe",
+            "--prompt",
+            "must not send",
+            "--json",
+        ]);
+        assert!(!output.status.success());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let error = if malformed {
+            "session session-observe has an unreadable hold record; inspect it before sending a follow-up"
+        } else {
+            "session session-observe is held; release the hold before sending a follow-up"
+        };
+        assert_eq!(
+            value,
+            json!({"schema_version":1,"ok":false,"session":"session-observe","error":error})
+        );
+        assert_eq!(files(fixture.root.path()), before);
+    }
+}
+
+#[test]
+fn hold_observations_distinguish_absent_valid_malformed_and_nonregular() {
+    for record in ["absent", "held", "malformed", "nonregular"] {
+        let fixture = Fixture::new();
+        match record {
+            "held" => {
+                success(fixture.run(&["hold", "session-observe", "--json"]));
+            }
+            "malformed" => {
+                fs::write(fixture.directory.join("hold.json"), b"{\"held\":false}").unwrap();
+            }
+            "nonregular" => {
+                fs::create_dir(fixture.directory.join("hold.json")).unwrap();
+            }
+            _ => (),
+        }
+        fixture.event("event-1.json", "retained result");
+        let before = files(fixture.root.path());
+        let inspect = success(fixture.run(&["inspect", "session-observe", "--json"]));
+        let status = success(fixture.run(&["status", "--all-workspaces", "--json"]));
+        let entry = &status["sessions"][0];
+        let held = match record {
+            "held" => json!(true),
+            "absent" => json!(false),
+            _ => Value::Null,
+        };
+        assert_eq!(inspect["held"], held);
+        assert_eq!(entry["held"], held);
+        assert_eq!(inspect.get("hold_error").is_some(), held.is_null());
+        assert_eq!(entry.get("hold_error").is_some(), held.is_null());
+        let flags = entry["attention"].as_array().unwrap();
+        assert_eq!(flags.contains(&json!("held")), held == true);
+        assert_eq!(
+            flags.contains(&json!("records_partially_unreadable")),
+            held.is_null()
+        );
+        let result = success(fixture.run(&[
+            "result",
+            "session-observe",
+            "--event",
+            "event-1.json",
+            "--json",
+        ]));
+        assert_eq!(result["result"], "retained result");
+        let timeline =
+            success(fixture.run(&["inspect", "session-observe", "--timeline", "--json"]));
+        assert!(timeline.get("held").is_none());
+        assert_eq!(files(fixture.root.path()), before);
+    }
+}
+
+#[test]
+fn hold_argument_and_missing_session_errors_are_json() {
+    let fixture = Fixture::new();
+    for args in [
+        vec!["hold", "--json"],
+        vec!["hold", "session-missing", "--json"],
+        vec!["hold", "session-observe", "--unknown", "--json"],
+        vec![
+            "hold",
+            "session-observe",
+            "--release",
+            "--release",
+            "--json",
+        ],
+        vec!["hold", "session-observe", "session-other", "--json"],
+    ] {
+        let output = fixture.run(&args);
+        assert!(!output.status.success());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["ok"], false);
+        assert!(value["error"].is_string());
+    }
+    fs::write(fixture.directory.join("manifest.json"), b"malformed").unwrap();
+    let before = files(fixture.root.path());
+    assert!(
+        !fixture
+            .run(&["hold", "session-observe", "--json"])
+            .status
+            .success()
+    );
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[test]
+fn close_preserves_hold_and_prune_removes_its_directory() {
+    let fixture = Fixture::new();
+    success(fixture.run(&["hold", "session-observe", "--json"]));
+    let held = fs::read(fixture.directory.join("hold.json")).unwrap();
+    let close = fixture.run(&["close-session", "session-observe", "--explicit"]);
+    assert!(
+        close.status.success(),
+        "{}",
+        String::from_utf8_lossy(&close.stderr)
+    );
+    assert_eq!(fs::read(fixture.directory.join("hold.json")).unwrap(), held);
+    let status = success(fixture.run(&["status", "--all-workspaces", "--all", "--json"]));
+    assert_eq!(status["sessions"][0]["held"], true);
+    assert_eq!(status["sessions"][0]["state"], "closed");
+    // Age the retained records without waiting for the public one-day minimum.
+    for name in ["closed.json", "status.json"] {
+        let path = fixture.directory.join(name);
+        let mut record: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        record["updated_unix_ms"] = json!(1);
+        write(&path, &record);
+    }
+    let pruned = success(fixture.run(&[
+        "prune-sessions",
+        "--closed-before-days",
+        "1",
+        "--explicit",
+        "--json",
+    ]));
+    assert_eq!(pruned["pruned"], json!(["session-observe"]));
+    assert!(!fixture.directory.exists());
+}

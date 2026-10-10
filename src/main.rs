@@ -31,6 +31,7 @@ Usage:
       [--yolo] [--timeout-secs N] [--isolated] [--json]
   {PUBLIC_COMMAND} tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
       [--context-result <session>/<request-id>]...
+  {PUBLIC_COMMAND} hold <session> [--release] [--json]
   {PUBLIC_COMMAND} reopen <closed-session> (--prompt TEXT | --prompt-file PATH) [--title NAME]
       [--model MODEL] [--effort EFFORT] [--terminal <windows-console>] [--yolo] [--timeout-secs N]
       [--detach] [--json]
@@ -167,6 +168,11 @@ Session policy:
   restoration rules. The source is left unchanged except for a reopen marker that
   admits one reopen. inspect and sessions --json report resumed_from for the new
   session.
+
+  hold refuses follow-ups whose delivery Bridge has not yet allowed to start.
+  --release lifts the hold; the current turn, initial prompt and direct surface
+  input are unaffected. inspect/status report held as true, false or null when
+  unreadable; doctor includes a separate hold check. Closed holds are preserved.
 
   result reports bridge_observed_elapsed_ms from Bridge receipt creation to the
   published completion event, not model or billing time. Uncomputable values are
@@ -338,6 +344,7 @@ mod tests {
         for expected in [
             "ask <codex|claude|agy|pi>",
             "tell <session>",
+            "hold <session> [--release] [--json]",
             "reopen <closed-session> (--prompt TEXT | --prompt-file PATH)",
             "supports only Claude Code on native Windows",
             "sessions [--workspace PATH]",

@@ -153,9 +153,10 @@ tabcli tell SESSION (--prompt TEXT | --prompt-file PATH)
 
 See the command and output in the [opening workflow](#command-reference).
 
-Bridge first finishes any interrupted record updates and verifies that it still controls the
-surface. The session must be `ready`; an unfinished request blocks another follow-up. All listed
-options follow the shared rules; the timeout defaults to 900 seconds. There are no workspace, model,
+Bridge checks the hold before changing any target records, then finishes interrupted record
+updates and verifies that it still controls the surface. The session must be `ready` and not held;
+an unfinished request blocks another follow-up. A hold set after delivery began does not stop that
+turn. All listed options follow the shared rules; the timeout defaults to 900 seconds. There are no workspace, model,
 effort, title, terminal, or bypass options for a follow-up.
 
 Human and JSON output, including detached `accepted` and waited `completed`, match `ask`.
@@ -173,6 +174,33 @@ For an ownership error, run `doctor SESSION` and check the managed surface. Brid
 when it cannot prove that it controls that surface. For `delivery uncertain`, inspect the request
 named in the error. Bridge has not proved whether the provider received it and keeps the claim to
 block duplicate delivery. Wait for that request or close the session; do not repeat `tell`.
+
+## hold
+
+Record or release the user's request to refuse further follow-ups.
+
+```text
+tabcli hold SESSION [--release] [--json]
+```
+
+A hold refuses a follow-up whose delivery Bridge has not yet allowed to start. It does not stop
+an already allowed delivery, the current turn, the initial prompt, or direct input to the surface.
+`hold SESSION --release` allows later follow-ups to pass the hold check; they still require `ready`.
+An unreadable hold record also refuses admission until its intent can be read.
+
+The command requires a valid session manifest. Set and release are idempotent in intent:
+`changed` reports a change of hold intent, not an absence of filesystem writes or waiting.
+An already held set preserves the timestamp. A malformed record is normalized by set, or removed
+by release, with `previous: "malformed"` and `changed: true`. Filesystem read failures are errors.
+Both operations refuse a closed session. Close preserves its hold record; prune removes it with
+the session directory. Reopen creates a separate session and does not inherit the hold.
+
+Human output is one line. JSON success has `schema_version`, `ok`, `session`, `held`, and
+`changed`, plus `previous` when normalizing malformed intent. Errors exit nonzero; with `--json`,
+argument errors also produce a structured error on stdout. A Hold refusal in `tell` before a claim is
+returned has `{schema_version:1, ok:false, session, error}` and no request id. A receipt already
+created during a concurrent admission refusal remains unresolved and can be found with
+`result SESSION --list --json`; no request identity is invented for the error.
 
 ## reopen
 
@@ -331,7 +359,7 @@ published event and the active request's published event when they differ. Resul
 not returned.
 
 A required-record failure omits that session and adds its id and reason to `incomplete_reasons`.
-Unreadable owner or terminal records, reopen history, latest events, or request indexes leave
+Unreadable hold, owner or terminal records, reopen history, latest events, or request indexes leave
 the session in the list with attention flags. Fields whose evidence could not be read stay
 null. Attention does not change session or request state. Owner exit, identity mismatch, and
 missing observations are distinct facts; closed sessions have no owner liveness flags. A live
@@ -382,10 +410,13 @@ default, show stored state, owner observations, configuration, and request refer
 shows recorded evidence. `--request` requires `--timeline` and filters request evidence without
 removing session diagnostics.
 
-Human output shows session, provider, workspace, stored state, owner observations, errors, latest
+Human output shows session, provider, workspace, stored state, hold, owner observations, errors, latest
 result id, and request ids. In JSON, check `turn_claimed` for an active request and
 `recovery_required` for a completion journal that still needs recovery. See the [JSON field
 reference](#json-field-reference).
+
+The default inspection also reports `held` as true, false, or null with `hold_error` when unreadable.
+Timeline does not include hold history.
 
 Timeline output groups request summaries and recorded evidence. Derived request summaries carry
 `derived_from: "result"`; session diagnostics remain separate from request entries.
@@ -588,6 +619,11 @@ The report starts human output with `scope`, describing the inputs used by these
   is null when that state was not observed, including provider-only mode.
 
 Scope is not proof of an effective runtime configuration or of delivery.
+
+Session reports append a `hold` check after the other record checks: `available` / `not_held`,
+`unavailable` / `session_held`, or `unknown` / `hold_unreadable`. A held session's next action
+names `hold SESSION --release` only when it is known not to be closed; a closed session retains
+its hold as a record and cannot release it.
 
 For Pi, `checks` includes `pi_provider_credentials`. With a session's explicit
 `provider/model` and `--probe`, Pi's local, non-refreshing auth check reports
@@ -894,10 +930,13 @@ hyphens, and are at most 160 bytes.
 
 Session states are `launching`, `running`, `awaiting-initial-input`, `ready`, `claimed`, `working`,
 `resume-pending`, `exited`, `failed`, and `closed`. Older unknown strings are preserved; queries can
-report `unknown` for unreadable state. `tell` accepts only `ready`. `reopen` requires `closed` plus
+report `unknown` for unreadable state. `tell` accepts only `ready` and not held. `reopen` requires `closed` plus
 provider-specific evidence. Queries accept any recorded state; they can still fail on unreadable
 required records. `prune-sessions` requires `closed` records with no active capability or blocking
 owner.
+
+Hold is orthogonal to session state and refuses only follow-ups whose delivery Bridge has not yet
+allowed to start.
 
 Request states reported by `result` are `completed`, `failed`, `pending`, `unresolved`,
 `recovery_required`, and `unavailable`; a waiting read can report `busy` when it times out without a
@@ -947,6 +986,15 @@ compatibility field `iterm_session_id`, `result`, `provider_session_id`, `turn_i
 `bridge_observed_elapsed_ms`, and `bridge_observed_elapsed_reason`. A detached success has
 `request_state: "accepted"` and a null `result`; a waited success has `request_state: "completed"`.
 
+A pre-claim Hold refusal in `tell --json` has `schema_version`, `ok:false`, `session`, and `error`, without
+`request_id`; a claim-stage race can leave an unresolved receipt visible through `result --list`.
+
+### hold
+
+Fields: `schema_version`, `ok`, `session`, `held`, `changed`; malformed intent adds
+`previous: "malformed"`. Errors have `schema_version`, `ok:false`, `error`, and `session` when
+resolved by the command. `changed` means the hold intent changed.
+
 ### self-test
 
 Fields: `schema_version`, `bridge_version`, `provider`, `provider_version`, `terminal`,
@@ -976,7 +1024,9 @@ Each session contains `id`, `provider`, `workspace`, `title`, `model`, `effort`,
 `created_unix_ms`, `state`, `generation`, `updated_unix_ms`, `error`, `turn_claimed`,
 `recovery_required`, `unreadable_requests`, `request_index_error`, `active_request`,
 `latest_result`, `owner`, `attention`, `derived_from`, and `result_command`.
-`residual_surface` follows inspect's optional-field rule below.
+`held` is true for a valid hold, false for an absent record (including legacy sessions), or null
+with `hold_error` when the record cannot be read. A true value adds attention `held`; null adds
+`records_partially_unreadable`. `residual_surface` follows inspect's optional-field rule below.
 
 `active_request` is null or contains `request_id`, `request_state`,
 `bridge_observed_elapsed_ms`, and `bridge_observed_elapsed_reason`.
@@ -985,7 +1035,7 @@ Each session contains `id`, `provider`, `workspace`, `title`, `model`, `effort`,
 `owner` contains nullable `process_alive`, `identity_matches`, and `error`.
 `derived_from: "observation"` marks attention and the request objects as judgments.
 
-Attention flags are `delivery_unconfirmed`, `launch_timeout`, `launch_failed`,
+Attention flags are `held`, `delivery_unconfirmed`, `launch_timeout`, `launch_failed`,
 `launch_uncertain`, `claim_without_receipt`, `recovery_required`, `owner_exited`,
 `owner_identity_mismatch`, `owner_unverified`, `records_partially_unreadable`,
 `request_index_incomplete`, `residual_surface_unverified`, `session_failed`, and
@@ -1001,6 +1051,9 @@ Fields: `schema_version`, `ok`, `session`, `provider`, `workspace`, `title`, `st
 and `provider_version_at_launch`. Request references include `request_id`, `created_unix_ms`,
 `source`, `event_id`, `context_sources`, `active`, and the two elapsed-time fields described under
 `result`.
+
+`held` is true, false, or null with `hold_error`, using the same rules as `status`.
+These fields describe current intent; they do not add hold history to timeline.
 
 `residual_surface` is optionally `"unverified"` when a failed launch left a surface whose cleanup
 has not been confirmed. It persists independently of `error`, including after a handle-less
@@ -1033,6 +1086,9 @@ Fields: `schema_version`, `ok`, `session`, `provider`, `probe`, `scope`, `starte
 `finished_unix_ms`, `configured`, `observations`, and `checks`. Each check has `id`, `availability`,
 `reason_code`, `observed_unix_ms`, `detail`, `next_action`, `evidence`, and optionally
 `next_command` as an argument array. Availability is `available`, `unavailable`, or `unknown`.
+
+The session `hold` check has reason `not_held`, `session_held`, or `hold_unreadable`; its
+availability is respectively `available`, `unavailable`, or `unknown`.
 
 `scope` has `session`, `provider`, `executable`, `executable_source`, `current_version`,
 `model`, `effort`, `workspace`, `probe`, `probe_budget_ms`, and `consent_state`, as described

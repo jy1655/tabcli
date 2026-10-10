@@ -5,6 +5,7 @@ mod tests;
 mod consent;
 mod context;
 mod doctor;
+mod hold;
 mod provider;
 mod provider_process;
 mod query;
@@ -93,6 +94,7 @@ pub(crate) enum NativeCommand {
     Ask(AskRequest),
     SelfTest(self_test::Request),
     Tell(TellRequest),
+    Hold(hold::Request),
     Reopen(ReopenRequest),
     Inspect {
         id: String,
@@ -264,6 +266,7 @@ pub(crate) fn is_command(value: &str) -> bool {
             | "consent"
             | "settings"
             | "tell"
+            | "hold"
             | "reopen"
             | "sessions"
             | "status"
@@ -301,6 +304,7 @@ where
         "ask" => parse_ask(rest),
         "self-test" => self_test::parse(rest),
         "tell" => parse_tell(rest),
+        "hold" => hold::parse(rest),
         "consent" => Ok(NativeCommand::Consent(rest.to_vec())),
         "settings" => Ok(NativeCommand::Settings(rest.to_vec())),
         "reopen" => parse_reopen(rest),
@@ -864,6 +868,7 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
         NativeCommand::Ask(request) => run_ask(request),
         NativeCommand::SelfTest(request) => self_test::run(request),
         NativeCommand::Tell(request) => run_tell(request),
+        NativeCommand::Hold(request) => hold::run(request),
         NativeCommand::Reopen(request) => run_reopen(request),
         NativeCommand::Inspect {
             id,
@@ -1444,6 +1449,7 @@ fn verify_terminal_surface_ownership_until(
 
 fn run_tell(request: TellRequest) -> Result<()> {
     let json = request.json;
+    let session = request.id.clone();
     let mut address = None;
     let outcome = run_tell_inner(request, &mut address);
     match address {
@@ -1454,7 +1460,20 @@ fn run_tell(request: TellRequest) -> Result<()> {
             }
             finish_request_with_extra(outcome, json, &session, &request_id, extra)
         }
-        None => outcome,
+        None => {
+            if json
+                && let Err(error) = &outcome
+                && error.is::<session::hold::Refusal>()
+            {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": 1, "ok": false, "session": session, "error": format!("{error:#}")
+                    }))?
+                );
+            }
+            outcome
+        }
     }
 }
 
@@ -1464,6 +1483,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
     // claimed, or sent to, so a failed resolution leaves every session unchanged.
     let attached = context::resolve(&request.context_results)?;
     let directory = Reader::session_directory(&request.id)?;
+    session::hold::permit(&Reader::open_unchecked(&directory), &request.id)?;
     Store::open_unchecked(&directory).converge()?;
     let manifest = Reader::open_unchecked(&directory).manifest()?;
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
@@ -1476,13 +1496,8 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
         deadline,
         request.timeout,
     )?;
-    let previous_state = Reader::open_unchecked(&directory).status()?.state;
-    if !previous_state.accepts_prompt() {
-        bail!(
-            "session {} is {previous_state}; tell requires the ready state",
-            request.id
-        );
-    }
+    let previous_state =
+        session::hold::follow_up_admission(&Reader::open_unchecked(&directory), &request.id)?;
     let prompt = native_delegation_prompt(
         &delegation_source(),
         &attached.prompt_with_attachments(&request.prompt),

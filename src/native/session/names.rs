@@ -1,3 +1,4 @@
+pub(in crate::native) const HOLD_FILE: &str = "hold.json";
 pub(in crate::native) const TURN_CLAIM_FILE: &str = "turn.claim";
 pub(in crate::native) const TURN_CLAIM_LOCK_FILE: &str = "turn.claim.lock";
 pub(in crate::native) const TURN_COMPLETION_FILE: &str = "turn.completion.json";

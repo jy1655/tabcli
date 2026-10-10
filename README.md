@@ -38,6 +38,9 @@ request: request-1791285060000000000-4281-0
 parse_args_from parses the command-line arguments.
 ```
 
+Use `tabcli hold SESSION` to refuse further follow-ups until `tabcli hold SESSION --release`.
+The current turn continues.
+
 Close the session when you finish; its recorded results remain available.
 
 ```sh
