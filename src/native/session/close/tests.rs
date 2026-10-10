@@ -14,6 +14,7 @@ fn damaged_completion_fixture() -> (tempfile::TempDir, Store) {
             claim_token: "1-2-3".to_owned(),
             event_file: "event-fixture.json".to_owned(),
             event: SessionEvent {
+                cancelled: false,
                 provider: "codex".to_owned(),
                 message: "unpublished".to_owned(),
                 error: None,
@@ -173,6 +174,7 @@ fn converge_publishes_completion_before_repairing_dead_owner() {
                 claim_token: "1-2-3".to_owned(),
                 event_file: "event-fixture.json".to_owned(),
                 event: SessionEvent {
+                    cancelled: false,
                     provider: "codex".to_owned(),
                     message: "completed before owner exit".to_owned(),
                     error: None,

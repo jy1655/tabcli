@@ -372,6 +372,7 @@ mod tests {
             let token = claim.token().to_owned();
             claim.retain();
             let event = SessionEvent {
+                cancelled: false,
                 provider: "codex".to_owned(),
                 message: "same text".to_owned(),
                 error: None,

@@ -85,6 +85,12 @@ struct HookFailureSignal {
 const PI_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Pi exposes no verifiable ownership evidence for a session (no lock, pid, or registry under ~/.pi identifies a live writer)";
 
 impl NativeProviderAdapter for PiAdapter {
+    fn cancel_support(&self, _directory: &Path) -> Result<super::CancelSupport> {
+        Ok(super::CancelSupport::Unsupported(
+            "in this release the Bridge integration for pi does not support cancel".to_owned(),
+        ))
+    }
+
     fn workspace_trust_key(&self, _screen: &str, _workspace: &Path) -> Option<terminal::DialogKey> {
         None
     }

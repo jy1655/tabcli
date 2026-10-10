@@ -1033,6 +1033,7 @@ fn public_identity_in_version_and_help() {
         assert_eq!(text.lines().next(), Some(expected));
         if flag == "--help" {
             assert!(text.contains("tabcli hold <session> [--release] [--json]"));
+            assert!(text.contains("tabcli cancel <session> [--json]"));
             assert!(text.contains("tabcli status [--workspace PATH | --all-workspaces]"));
             assert!(text.contains("tabcli wait ADDRESS [ADDRESS ...] [--timeout-secs N] [--json]"));
         }

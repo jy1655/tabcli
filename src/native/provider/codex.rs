@@ -94,6 +94,12 @@ impl PendingCodexTurn {
 const CODEX_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Codex reopen is not implemented in this slice; it requires the thread writer-lock and queued_items gates and a live check of resume-while-held behavior";
 
 impl NativeProviderAdapter for CodexAdapter {
+    fn cancel_support(&self, _directory: &Path) -> Result<super::CancelSupport> {
+        Ok(super::CancelSupport::Unsupported(
+            "in this release the Bridge integration for codex does not support cancel".to_owned(),
+        ))
+    }
+
     fn workspace_trust_key(&self, _screen: &str, _workspace: &Path) -> Option<terminal::DialogKey> {
         None
     }
@@ -1338,6 +1344,7 @@ exit 91
         write_json_atomic(
             &directory.join("events/event-1.json"),
             &SessionEvent {
+                cancelled: false,
                 provider: "codex".to_owned(),
                 message: "initial result".to_owned(),
                 error: None,

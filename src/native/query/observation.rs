@@ -100,12 +100,75 @@ impl SessionEvidence {
     }
 }
 
+#[derive(Serialize)]
+pub(in crate::native) struct CancelObservation {
+    pub(in crate::native) request_id: Option<String>,
+    pub(in crate::native) requested_unix_ms: Option<u128>,
+    pub(in crate::native) state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip)]
+    pub(in crate::native) active: bool,
+}
+
+impl CancelObservation {
+    pub(super) fn from_record(
+        record: &session::cancel::Cancel,
+        records: &Snapshot,
+        read_event: impl FnOnce(&str) -> Result<Option<SessionEvent>>,
+    ) -> Self {
+        let selector = Selector::Request(record.request_id.clone());
+        let outcome = (|| {
+            let receipt = records
+                .receipts
+                .iter()
+                .find(|r| r.request_id == record.request_id)
+                .context("cancel record has no readable request receipt")?;
+            if receipt.claim_token != record.claim_token {
+                bail!("cancel record claim does not match its request receipt");
+            }
+            records.observe_result_with(&selector, read_event)
+        })();
+        let (state, error) = match outcome {
+            Ok(result) if result.state == RequestState::Cancelled => ("applied", None),
+            Ok(result) if result.event.is_some() => ("not_applied", None),
+            Ok(_) => ("requested", None),
+            Err(error) => ("unreadable", Some(format!("{error:#}"))),
+        };
+        Self {
+            request_id: Some(record.request_id.clone()),
+            requested_unix_ms: Some(record.created_unix_ms),
+            state,
+            error,
+            active: state == "requested"
+                && records.claim.as_deref() == Some(record.claim_token.as_str()),
+        }
+    }
+
+    pub(in crate::native) fn read(reader: &Reader, records: &Snapshot) -> Option<Self> {
+        match session::cancel::observe(reader, records._lock.is_some()) {
+            Ok(None) => None,
+            Ok(Some(record)) => Some(Self::from_record(&record, records, |name| {
+                records.event(reader, name)
+            })),
+            Err(error) => Some(Self {
+                request_id: None,
+                requested_unix_ms: None,
+                state: "unreadable",
+                error: Some(format!("{error:#}")),
+                active: false,
+            }),
+        }
+    }
+}
+
 /// Required lifecycle failures fail the read. Auxiliary failures stay with their part.
 /// Ordinary reads release the lifecycle lock before returning; inspect explicitly keeps
 /// it until its requested elapsed reads finish. Historical request elapsed values are
 /// read only by inspect's rendering.
 pub(in crate::native) struct Observation {
     pub(in crate::native) records: Snapshot,
+    pub(in crate::native) cancel: Option<CancelObservation>,
     pub(in crate::native) evidence: SessionEvidence,
     pub(in crate::native) resumed_from: Result<Option<ResumedFrom>>,
     pub(in crate::native) workspace_consent: Value,
@@ -170,7 +233,9 @@ impl Observation {
             records.claim.as_deref(),
         );
         let held = session::hold::observe(reader, records._lock.is_some());
+        let cancel = CancelObservation::read(reader, &records);
         Self {
+            cancel,
             records,
             evidence: SessionEvidence::read(reader, held),
             resumed_from: read_resumed_from(reader.directory()),
@@ -296,6 +361,7 @@ impl Observation {
                 "yolo": snapshot.manifest.yolo, "provider_version_at_launch": snapshot.manifest.provider_version},
             "resumed_from": resumed_from,
             "workspace_consent": self.workspace_consent,
+            "cancel": self.cancel,
             "owner_process_alive": owner.process_alive, "owner_identity_verified": owner.identity_matches == Some(true), "owner": owner,
             "recovery_required": snapshot.pending.is_some(), "turn_claimed": snapshot.claim.is_some(),
             "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error,

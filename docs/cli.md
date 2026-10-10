@@ -202,6 +202,31 @@ returned has `{schema_version:1, ok:false, session, error}` and no request id. A
 created during a concurrent admission refusal remains unresolved and can be found with
 `result SESSION --list --json`; no request identity is invented for the error.
 
+## cancel
+
+Use `cancel` to request interruption of the session's active Request. In this release no
+provider integration records a cancel yet; every `cancel` is refused with the provider's reason.
+See [provider support](providers.md) for the supported integrations and session requirements.
+
+```text
+tabcli cancel SESSION [--json]
+```
+
+The session must be `running` or `working`, with an active Claim and its Receipt, no
+published Result for that Request, and cancel support verified for that session. A Receipt
+exists before dispatch; recording a cancel does not prove the prompt has reached the provider.
+The provider integration must confirm that the addressed prompt is running before interrupting it.
+
+Success records intent and returns `state: "requested"`, the `request_id`, and
+`created_unix_ms`. It does not confirm interruption. Use `result SESSION --request REQUEST --wait`
+to await the outcome: only a correlated provider interruption produces `request_state: "cancelled"`.
+A normal completion can win the race. Cancel leaves the session, Hold, and follow-up delivery
+unchanged; a repeated cancel for the same Claim is refused.
+
+`inspect` shows the retained request as `requested`, `applied`, `not_applied`, or `unreadable`.
+The record survives completion and the next Claim; a later cancel replaces it, so its earlier
+intent is no longer visible. A damaged cancel record does not hide a published Result.
+
 ## reopen
 
 Use `reopen` to continue a closed Claude conversation on native Windows in a new Bridge session.
@@ -521,6 +546,7 @@ timeout or uncertain delivery, inspect or wait on the same request; do not repea
 ## search
 
 Use `search` when you remember text from a result but not its session or request id.
+Cancelled results are excluded, like other failed results.
 
 ```text
 tabcli search QUERY [--workspace PATH | --all-workspaces] [--provider PROVIDER]
@@ -995,6 +1021,12 @@ Fields: `schema_version`, `ok`, `session`, `held`, `changed`; malformed intent a
 `previous: "malformed"`. Errors have `schema_version`, `ok:false`, `error`, and `session` when
 resolved by the command. `changed` means the hold intent changed.
 
+### cancel
+
+Success fields: `schema_version`, `ok`, `session`, `request_id`, `state` (`requested`),
+`created_unix_ms`. Refusals return `schema_version`, `ok: false`, `session`, and `error`;
+parse errors may omit `session`.
+
 ### self-test
 
 Fields: `schema_version`, `bridge_version`, `provider`, `provider_version`, `terminal`,
@@ -1035,7 +1067,7 @@ with `hold_error` when the record cannot be read. A true value adds attention `h
 `owner` contains nullable `process_alive`, `identity_matches`, and `error`.
 `derived_from: "observation"` marks attention and the request objects as judgments.
 
-Attention flags are `held`, `delivery_unconfirmed`, `launch_timeout`, `launch_failed`,
+Attention flags are `cancel_requested`, `held`, `delivery_unconfirmed`, `launch_timeout`, `launch_failed`,
 `launch_uncertain`, `claim_without_receipt`, `recovery_required`, `owner_exited`,
 `owner_identity_mismatch`, `owner_unverified`, `records_partially_unreadable`,
 `request_index_incomplete`, `residual_surface_unverified`, `session_failed`, and
@@ -1053,6 +1085,11 @@ and `provider_version_at_launch`. Request references include `request_id`, `crea
 `result`.
 
 `held` is true, false, or null with `hold_error`, using the same rules as `status`.
+`cancel` is null when absent, otherwise `{request_id, requested_unix_ms, state}`; `state`
+is `requested`, `applied`, `not_applied`, or `unreadable`. Unreadable evidence includes `error`
+and may have null identity and time. Status adds `cancel_requested` only for an active Claim
+whose cancel is still requested. Timeline retains a `cancel_request` entry and labels its
+outcome interpretation with `derived_from: "result"`.
 These fields describe current intent; they do not add hold history to timeline.
 
 `residual_surface` is optionally `"unverified"` when a failed launch left a surface whose cleanup
@@ -1096,6 +1133,9 @@ above. JSON object keys are serialized in sorted order (`scope` follows `schema_
 and precedes `session`); human output prints scope first. Pi credential evidence retains
 `status`, `provider`, `authType`, and `exit_code`, and adds nullable `model` and `executable`.
 No command stdout, stderr, or arbitrary error text is copied into that evidence.
+
+The session `cancel` check has reason `cancel_absent`, `cancel_recorded`, or
+`cancel_unreadable`; recorded intent does not confirm interruption.
 
 ### inspect --timeline
 

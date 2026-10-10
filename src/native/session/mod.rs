@@ -18,6 +18,7 @@ use std::{
 };
 #[cfg(target_os = "macos")]
 mod adapter;
+pub(in crate::native) mod cancel;
 pub(in crate::native) mod close;
 pub(in crate::native) mod hold;
 mod names;
@@ -336,6 +337,7 @@ impl std::error::Error for SnapshotBusy {}
 #[derive(Clone, Copy)]
 pub(in crate::native) enum CoreRecord {
     Hold,
+    Cancel,
     TurnClaim,
     Completion,
     Owner,
@@ -361,6 +363,7 @@ impl CoreRecord {
     pub(in crate::native) fn name(self) -> &'static str {
         match self {
             Self::Hold => HOLD_FILE,
+            Self::Cancel => "cancel.json",
             Self::TurnClaim => TURN_CLAIM_FILE,
             Self::Completion => TURN_COMPLETION_FILE,
             Self::Owner => SESSION_OWNER_FILE,

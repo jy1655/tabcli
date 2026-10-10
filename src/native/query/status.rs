@@ -89,6 +89,13 @@ fn attention(
     let observation = &observed.observation;
     let records = &observation.records;
     let mut flags = Vec::new();
+    if observation
+        .cancel
+        .as_ref()
+        .is_some_and(|c| c.state == "requested" && c.active)
+    {
+        flags.push("cancel_requested");
+    }
     if matches!(observation.evidence.held, Ok(true)) {
         flags.push("held");
     }

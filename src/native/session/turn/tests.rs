@@ -13,6 +13,7 @@ fn fixture(state: SessionState) -> (tempfile::TempDir, Store) {
 
 fn event(message: &str) -> SessionEvent {
     SessionEvent {
+        cancelled: false,
         provider: "codex".to_owned(),
         message: message.to_owned(),
         error: None,
@@ -693,4 +694,107 @@ fn released_hold_allows_a_new_follow_up_and_unknown_hold_refuses() {
         error.to_string(),
         "session session-test is working; tell requires the ready state"
     );
+}
+
+#[test]
+fn report_failure_waits_for_lock_and_recovers_prior_completion() {
+    use std::sync::mpsc;
+    let (_directory, store) = fixture(SessionState::Working);
+    let claimed = claim(&store, &[]).unwrap();
+    let token = claimed.token().to_owned();
+    let name = claimed.receipt().event_file.clone();
+    claimed.retain();
+    let lock = store.lock().unwrap();
+    let mut pending =
+        PendingTurnCompletion::new(&token, event("earlier completion"), None).unwrap();
+    pending.event_file = name.clone();
+    store.write_completion(&pending).unwrap();
+    let directory = store.directory().to_owned();
+    let (started, ready) = mpsc::channel();
+    let (finished, done) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let store = Store::open_unchecked(directory);
+        started.send(()).unwrap();
+        let result = Report::for_claim(&store, FirstPartyCli::Codex, Some(&token)).fail(
+            "late failure",
+            None,
+            None,
+        );
+        finished.send(result).unwrap();
+    });
+    ready.recv().unwrap();
+    assert!(done.recv_timeout(Duration::from_millis(50)).is_err());
+    drop(lock);
+    done.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+    writer.join().unwrap();
+    assert_eq!(
+        store.event_strict(&name).unwrap(),
+        event("earlier completion")
+    );
+    assert_eq!(store.events().unwrap().len(), 1);
+    assert!(current_claim_token(&store).unwrap().is_none());
+    assert_eq!(store.status().unwrap().state, SessionState::Ready);
+    assert!(store.status().unwrap().error.is_none());
+    assert!(
+        store
+            .record(CoreRecord::Completion)
+            .bytes()
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn failure_reports_keep_claim_until_event_sync_and_recover_before_late_failure() {
+    for cancellation in [false, true] {
+        let (_directory, store) = fixture(SessionState::Working);
+        let claimed = claim(&store, &[]).unwrap();
+        let token = claimed.token().to_owned();
+        let receipt = claimed.receipt().clone();
+        claimed.retain();
+        if cancellation {
+            store.record(CoreRecord::Cancel).write_json(&serde_json::json!({
+                "schema":1, "request_id":receipt.request_id, "claim_token":token, "created_unix_ms":1
+            })).unwrap();
+        }
+        let report = Report::for_claim(&store, FirstPartyCli::Pi, Some(&token));
+        let error = with_sync_failure(store.record(CoreRecord::Events).path(), || {
+            if cancellation {
+                report.cancelled("interrupted", None, None)
+            } else {
+                report.fail("interrupted", None, None)
+            }
+        })
+        .unwrap_err();
+        assert!(injected_sync_failure(&error));
+        assert_eq!(
+            current_claim_token(&store).unwrap().as_deref(),
+            Some(token.as_str())
+        );
+        assert_eq!(store.status().unwrap().state, SessionState::Working);
+        let pending: PendingTurnCompletion = store.record(CoreRecord::Completion).json().unwrap();
+        assert_eq!(pending.event.cancelled, cancellation);
+        assert_eq!(
+            store.event_strict(&receipt.event_file).unwrap(),
+            pending.event
+        );
+        report
+            .fail("later failure must not replace the journal", None, None)
+            .unwrap();
+        assert_eq!(
+            store.event_strict(&receipt.event_file).unwrap(),
+            pending.event
+        );
+        assert_eq!(store.events().unwrap().len(), 1);
+        assert_eq!(store.status().unwrap().state, SessionState::Ready);
+        assert_eq!(store.status().unwrap().error, pending.event.error);
+        assert!(current_claim_token(&store).unwrap().is_none());
+        assert!(
+            store
+                .record(CoreRecord::Completion)
+                .bytes()
+                .unwrap()
+                .is_none()
+        );
+    }
 }

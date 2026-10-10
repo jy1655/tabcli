@@ -199,6 +199,12 @@ enum MessageGuardDecision {
 }
 
 impl NativeProviderAdapter for ClaudeAdapter {
+    fn cancel_support(&self, _directory: &Path) -> Result<super::CancelSupport> {
+        Ok(super::CancelSupport::Unsupported(
+            "in this release the Bridge integration for claude does not support cancel".to_owned(),
+        ))
+    }
+
     fn workspace_trust_key(&self, screen: &str, workspace: &Path) -> Option<terminal::DialogKey> {
         claude_trust_prompt_key(screen, workspace)
     }

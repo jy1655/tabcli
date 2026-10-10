@@ -127,6 +127,7 @@ before deciding that the operation never happened.
 | Record | Evidence or role |
 | --- | --- |
 | `manifest.json` | Recorded provider, workspace, launch choices, and session identity |
+| `cancel.json` | Latest cancel intent: `{schema: 1, request_id, claim_token, created_unix_ms}` |
 | `hold.json` | User follow-up hold: `{held: true, created_unix_ms}`; absent means released, unreadable means unknown |
 | `status.json` | Current recorded state, generation, time, diagnostic error, and optional residual-surface observation |
 | `initial-prompt.txt` | Initial prompt retained for launch/delivery |
@@ -203,6 +204,16 @@ before delivery. Inspect, status, and doctor read Hold as a separate `SessionEvi
 holding the shared lifecycle lock, with legacy no-lock change detection. It is not a publication
 Snapshot input; damaged Hold records do not affect result, wait, search, or context reads.
 Timeline does not record hold history. Close preserves the record; prune removes its directory.
+
+Cancel records intent for one Request under the lifecycle lock using the private atomic writer
+(and `persist_record` for replacement on Windows). It admits running or working sessions only
+with a Claim, its Receipt, no published Result, and session-specific adapter support. The record
+survives settlement and later Claims; a new cancel replaces stale intent. Report marks a
+provider interruption `cancelled` only with matching cancel evidence, otherwise it is an ordinary
+failure. A cancelled event has an error and no successful body; false is omitted to preserve
+legacy journal bytes. Cancel never changes the publication predicate or Claim-release barrier.
+Readers treat it as auxiliary evidence: malformed intent cannot hide a Result, and timeline
+marks its interpretation as derived. Replacement removes the earlier intent from observation.
 
 `RecordReader` and `RecordStore` provide the primitives for names and schemas owned by adapters.
 
