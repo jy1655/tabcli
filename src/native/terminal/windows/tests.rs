@@ -17,6 +17,32 @@ use windows_sys::Win32::System::Threading::{CREATE_SUSPENDED, OpenProcess, WaitF
 use windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE;
 
 #[test]
+fn dialog_decision_sends_only_when_screen_text_matches() {
+    let screen = "Trust this folder?\n> Yes  No\n";
+    assert_eq!(
+        super::dialog_decision(screen, screen),
+        super::DialogDecision::Send
+    );
+}
+
+#[test]
+fn dialog_decision_rejects_a_single_changed_cell() {
+    let screen = "Trust this folder?\n> Yes  No\n";
+    for (index, byte) in screen.bytes().enumerate() {
+        if byte == b'\n' {
+            continue;
+        }
+        let mut changed = screen.as_bytes().to_vec();
+        changed[index] = b'X';
+        assert_eq!(
+            super::dialog_decision(screen, std::str::from_utf8(&changed).unwrap()),
+            super::DialogDecision::Changed,
+            "cell {index}"
+        );
+    }
+}
+
+#[test]
 fn managed_console_removes_inherited_term_before_starting_the_bridge() {
     let command = console_command_line("Write-Output 'bridge'");
 

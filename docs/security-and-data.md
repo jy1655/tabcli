@@ -49,6 +49,14 @@ iTerm2, Terminal.app, and the native Windows console. In Ghostty, WezTerm, or Wa
 workspace in the provider before launching through Bridge. Consent alone does not enable a
 guarded response in those terminals.
 
+Ghostty exposes no screen text in its scripting dictionary; a guarded response needs access to
+the exact terminal's screen text. WezTerm has no CLI compare-and-send command, and a mux Lua
+callback is not atomic with screen updates and requires changing the user's configuration;
+the mux needs to accept the screen comparison and key transmission in one request. Warp Control's
+`input.insert` and `input.replace` only stage text, so guarded responses need screen reading and
+submission in Control. Claude Code 2.1.296 and Agy 1.3.3 provide no first-party flag or environment
+variable to record workspace trust before launch.
+
 Before responding, Bridge checks that it owns the surface and checks the captured screen again.
 It then checks that the provider saved its decision. Without verified consent, the dialog stays
 for you to answer. Bridge never writes a provider trust store directly; the provider saves the

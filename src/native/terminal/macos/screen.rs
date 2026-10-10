@@ -3,7 +3,7 @@ use super::*;
 
 // Stable creation-time handle only. A compare-and-send is one automation call;
 // an intervening repaint or changed selection sends no keys. Never targets front tab.
-const ITERM: &str = r#"
+pub(in crate::native) const ITERM: &str = r#"
 on run argv
     if application id "com.googlecode.iterm2" is not running then error "managed iTerm2 screen is missing"
     set wantedId to item 1 of argv
@@ -30,7 +30,7 @@ on run argv
 end run
 "#;
 
-const TERMINAL: &str = r#"
+pub(in crate::native) const TERMINAL: &str = r#"
 on run argv
     set wantedTty to item 1 of argv
     set wantedWindowId to item 2 of argv as integer
