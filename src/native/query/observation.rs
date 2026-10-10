@@ -210,7 +210,7 @@ impl Observation {
                 if latest_event_id == Some(receipt.event_file.as_str()) {
                     latest
                         .as_ref()
-                        .map(&active_value)
+                        .map(active_value)
                         .map_err(|error| anyhow::anyhow!("{error:#}"))
                 } else {
                     if Instant::now() >= deadline {
