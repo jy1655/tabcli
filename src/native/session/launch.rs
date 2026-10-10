@@ -299,7 +299,12 @@ pub(in crate::native) fn fail(store: &Store, reason: &str) -> Result<()> {
 pub(in crate::native) fn terminal_failed(store: &Store, error: &anyhow::Error) -> Result<()> {
     let reason = format!("terminal launch failed: {error:#}");
     let Some(retained) = error.downcast_ref::<terminal::RetainedLaunchSurface>() else {
-        return fail(store, &reason);
+        // No adapter proved a surface, so nothing can be closed later; the prompt goes
+        // out only after creation, so none was sent.
+        return fail(
+            store,
+            &format!("{reason}; no surface handle was recorded and no prompt was sent"),
+        );
     };
     let _lock = store.lock()?;
     let status = store.status()?;
@@ -676,6 +681,23 @@ mod tests {
         let id = directory.file_name().unwrap().to_str().unwrap();
         record_provider_process(directory, id, child)?;
         update_status(directory, SessionState::Running, None, None)
+    }
+
+    #[test]
+    fn unproven_terminal_failure_records_no_handle_and_no_prompt() {
+        let (directory, _) = fixture();
+        let store = Store::open_unchecked(directory.path());
+        terminal_failed(&store, &anyhow::anyhow!("iTerm2 automation timed out")).unwrap();
+        let status = store.status().unwrap();
+        assert_eq!(status.state, SessionState::Failed);
+        assert_eq!(
+            status.error.as_deref(),
+            Some(
+                "terminal launch failed: iTerm2 automation timed out; no surface handle was recorded and no prompt was sent"
+            )
+        );
+        assert_eq!(status.residual_surface(), None);
+        assert!(store.terminal().is_err());
     }
 
     #[test]

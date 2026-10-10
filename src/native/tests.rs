@@ -346,6 +346,7 @@ fn bounded_command_output_terminates_a_hung_child_at_the_deadline() {
     )
     .unwrap_err();
     assert!(failure.process_started());
+    assert!(failure.timed_out());
     let error = failure.into_error();
 
     assert!(format!("{error:#}").contains("test child timed out"));
@@ -365,6 +366,7 @@ fn bounded_command_output_identifies_a_pre_spawn_failure() {
     .unwrap_err();
 
     assert!(!failure.process_started());
+    assert!(!failure.timed_out());
     assert!(format!("{:#}", failure.into_error()).contains("failed to start missing test child"));
 }
 
