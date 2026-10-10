@@ -125,6 +125,35 @@ launch, observe, continue, and close without replacing the capabilities those CL
   the transcript before its log lines are written. Replace this with a per-turn failure
   signal when Agy provides one.
 
+## Current Pi Boundary
+
+- Pi v1.0.4 exposes `ctx.abort()` to an interactive extension, but no verified official
+  endpoint addresses that running interactive session from outside. Cancel therefore
+  reaches the official API through a Pi-owned record and polling fallback. Replace the
+  polling and acceptance record when Pi provides that addressed interruption endpoint.
+- A captured context resolves the runtime at call time; it does not identify a turn.
+  Start the 200 ms timer at `agent_start`, invalidate its run before clearing it at
+  `agent_end`, `agent_settled`, shutdown or a new run, and require both the current Claim
+  and its correlated prompt before aborting. A callback of an old run stops nothing.
+  The interval is not a response-time guarantee.
+- Call abort at most once for a Claim. The call and the atomic publication of
+  `pi-cancel-accepted.json` cannot be one operation; a failed publication never permits
+  another call. Acceptance is not completion. Only the same Claim's accepted call,
+  the last assistant's abort outcome at `agent_end`, and matching cancel intent permit
+  a cancelled Result at settlement. Recognize `stopReason: "aborted"`, or `"error"`
+  with exactly `errorMessage: "This operation was aborted"` (tool abort observed on
+  Pi 1.0.4, 2026-10-11). Do not classify other errors by an abort substring. Direct Esc
+  stays an ordinary failure and identifies no actor. Exit before reporting keeps the
+  ordinary recovery semantics.
+- The installed extension proves cancel capability with schema 2 startup readiness.
+  The adapter carries that evidence to the next Claim and clears its acceptance record
+  at pending-turn installation or rollback. Never upgrade a schema 1 session by version
+  inference. Other modules do not read Pi's acceptance record.
+- Retry and compaction can settle without a new aborted `agent_end`; record what Pi
+  reports, not what the cancel intended. Pi returns queued messages to the editor on
+  abort. Bridge uses no Pi queue and deletes no editor input. Tell the user to check
+  the surface before another `tell`, whose paste can combine with restored input.
+
 ## Current Codex Boundary
 
 - Codex gives no identity of a turn before its first `notify`. The adapter appends a turn

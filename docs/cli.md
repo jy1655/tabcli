@@ -204,8 +204,9 @@ created during a concurrent admission refusal remains unresolved and can be foun
 
 ## cancel
 
-Use `cancel` to request interruption of the session's active Request. In this release no
-provider integration records a cancel yet; every `cancel` is refused with the provider's reason.
+Use `cancel` to request interruption of the session's active Request. This release supports
+Pi only, when its installed extension has reported schema 2 startup readiness bound to the
+current Claim; older sessions must be replaced.
 See [provider support](providers.md) for the supported integrations and session requirements.
 
 ```text

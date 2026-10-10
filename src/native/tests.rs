@@ -9167,12 +9167,18 @@ fn every_provider_declares_session_specific_cancel_support() {
         match provider::cancel_support(provider, directory.path()).unwrap() {
             provider::CancelSupport::Unsupported(reason) => assert_eq!(
                 reason,
-                format!(
-                    "in this release the Bridge integration for {} does not support cancel",
-                    provider.as_str()
-                )
+                if provider == FirstPartyCli::Pi {
+                    "this session was started by an extension without cancel support; start a new session".to_owned()
+                } else {
+                    format!(
+                        "in this release the Bridge integration for {} does not support cancel",
+                        provider.as_str()
+                    )
+                }
             ),
-            provider::CancelSupport::Supported => panic!("PR1 has no provider cancel transport"),
+            provider::CancelSupport::Supported => {
+                panic!("no session capability evidence was installed")
+            }
         }
     }
 }

@@ -1990,7 +1990,7 @@ fn cancel_command_refusal_envelope_and_parse_errors() {
 }
 
 #[test]
-fn cancel_all_providers_refuse_without_changing_claim_or_intent() {
+fn cancel_without_provider_capability_refuses_without_changing_claim_or_intent() {
     for provider in ["codex", "claude", "agy", "pi"] {
         for state in ["running", "working"] {
             let fixture = cancel_fixture();
@@ -2009,10 +2009,17 @@ fn cancel_all_providers_refuse_without_changing_claim_or_intent() {
             let output = fixture.run(&["cancel", "session-observe", "--json"]);
             assert!(!output.status.success());
             let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let reason = if provider == "pi" {
+                "this session was started by an extension without cancel support; start a new session".to_owned()
+            } else {
+                format!(
+                    "in this release the Bridge integration for {provider} does not support cancel"
+                )
+            };
             assert_eq!(
                 value,
                 json!({"schema_version":1,"ok":false,"session":"session-observe",
-                "error":format!("in this release the Bridge integration for {provider} does not support cancel")})
+                "error":reason})
             );
             let mut after = files(fixture.root.path());
             after.retain(|(path, _)| path.file_name().unwrap() != "turn.claim.lock");

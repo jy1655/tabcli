@@ -41,10 +41,9 @@ pub(super) fn result_timeout_diagnostic() -> super::super::doctor::ResultTimeout
 
 const HOOK_FAILURE_FILE: &str = "pi-hook-failure.json";
 const PENDING_TURN_FILE: &str = "pi-pending-turn.json";
-#[cfg(any(windows, test))]
+const CANCEL_ACCEPTED_FILE: &str = "pi-cancel-accepted.json";
 const STARTUP_READY_FILE: &str = "pi-startup-ready.json";
 
-#[cfg(any(windows, test))]
 #[derive(Deserialize, Serialize)]
 struct StartupReady {
     schema: u32,
@@ -85,9 +84,21 @@ struct HookFailureSignal {
 const PI_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Pi exposes no verifiable ownership evidence for a session (no lock, pid, or registry under ~/.pi identifies a live writer)";
 
 impl NativeProviderAdapter for PiAdapter {
-    fn cancel_support(&self, _directory: &Path) -> Result<super::CancelSupport> {
+    fn cancel_support(&self, directory: &Path) -> Result<super::CancelSupport> {
+        let reader = Reader::open_unchecked(directory);
+        let ready = reader
+            .private(STARTUP_READY_FILE)
+            .optional_json::<StartupReady>();
+        if let Ok(Some(ready)) = ready
+            && ready.schema == 2
+            && !ready.session_id.trim().is_empty()
+            && turn::current_claim_token(&reader)?.as_deref() == Some(&ready.claim_token)
+        {
+            return Ok(super::CancelSupport::Supported);
+        }
         Ok(super::CancelSupport::Unsupported(
-            "in this release the Bridge integration for pi does not support cancel".to_owned(),
+            "this session was started by an extension without cancel support; start a new session"
+                .to_owned(),
         ))
     }
 
@@ -286,6 +297,19 @@ impl NativeProviderAdapter for PiAdapter {
             .map(str::trim)
             .filter(|error| !error.is_empty())
         {
+            if pi_string(payload, "agent_bridge_cancel_claim_token")
+                == Some(pending.claim_token.as_str())
+            {
+                // Report rechecks cancel.json under the lifecycle lock. Missing,
+                // damaged or different-claim intent remains an ordinary failure.
+                return turn::Report::for_claim(
+                    &Store::open_unchecked(directory),
+                    FirstPartyCli::Pi,
+                    Some(&pending.claim_token),
+                )
+                .cancelled(error, provider_session_id, turn_id)
+                .context("failed to record the correlated Pi interruption");
+            }
             return record_correlated_failure(
                 directory,
                 error,
@@ -568,7 +592,7 @@ fn send_initial_prompt_after_startup(
             {
                 let ready: StartupReady =
                     serde_json::from_str(&text).context("invalid Pi startup receipt")?;
-                if ready.schema != 1
+                if !matches!(ready.schema, 1 | 2)
                     || ready.claim_token != pending.claim_token
                     || ready.session_id.trim().is_empty()
                 {
@@ -601,9 +625,22 @@ fn validate_claim_token(claim_token: &str) -> Result<()> {
 
 fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingPiTurn> {
     let pending = PendingPiTurn::new(claim_token)?;
-    Store::open_unchecked(directory)
-        .private(PENDING_TURN_FILE)
-        .write_json(&pending)?;
+    let store = Store::open_unchecked(directory);
+    store.private(CANCEL_ACCEPTED_FILE).remove()?;
+    // Startup proves the installed extension's capability for the whole session.
+    // Carry that evidence to a follow-up claim before delivery, including after a
+    // rolled-back delivery; never upgrade a legacy extension's schema.
+    if let Ok(Some(mut ready)) = store
+        .private(STARTUP_READY_FILE)
+        .optional_json::<StartupReady>()
+        && ready.schema == 2
+        && validate_claim_token(&ready.claim_token).is_ok()
+        && !ready.session_id.trim().is_empty()
+    {
+        ready.claim_token = claim_token.to_owned();
+        store.private(STARTUP_READY_FILE).write_json(&ready)?;
+    }
+    store.private(PENDING_TURN_FILE).write_json(&pending)?;
     Ok(pending)
 }
 
@@ -630,6 +667,9 @@ fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result<()> {
     if pending.claim_token != claim_token {
         return Ok(());
     }
+    Store::open_unchecked(directory)
+        .private(CANCEL_ACCEPTED_FILE)
+        .remove()?;
     Store::open_unchecked(directory)
         .private(PENDING_TURN_FILE)
         .remove()
@@ -872,6 +912,51 @@ export default function (pi) {
   let undelivered = false;
   let activeClaimToken;
   let activePromptCorrelated = false;
+  let cancelTimer;
+  let runId = 0;
+  let abortClaimToken;
+
+  function stopCancelTimer() {
+    // Invalidate callbacks before clearing the timer or changing run correlation.
+    runId += 1;
+    if (cancelTimer !== undefined) clearInterval(cancelTimer);
+    cancelTimer = undefined;
+  }
+
+  function readRecord(name) {
+    const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
+    if (!directory) return undefined;
+    try { return JSON.parse(readFileSync(join(directory, name), "utf8")); }
+    catch { return undefined; }
+  }
+
+  function startCancelTimer(ctx) {
+    const thisRun = runId;
+    const claimToken = activeClaimToken;
+    if (!claimToken || !activePromptCorrelated) return;
+    // Pi v1.0.4 ctx is runtime-scoped, not a turn handle. This synchronous,
+    // non-overlapping callback must check both run lifetime and current claim.
+    cancelTimer = setInterval(() => {
+      if (thisRun !== runId || claimToken !== activeClaimToken
+          || !activePromptCorrelated || abortClaimToken === claimToken
+          || readActiveClaimToken() !== claimToken) return;
+      const cancel = readRecord("cancel.json");
+      if (cancel?.schema !== 1 || cancel.claim_token !== claimToken) return;
+      // Calling abort and publishing acceptance cannot be atomic. Never retry
+      // this claim after a thrown abort or a failed publication.
+      abortClaimToken = claimToken;
+      const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
+      const temporary = join(directory, `.pi-cancel-${process.pid}-${Date.now()}.tmp`);
+      try {
+        ctx.abort();
+        writeFileSync(temporary, JSON.stringify({ schema: 1, claim_token: claimToken }),
+          { encoding: "utf8", flag: "wx", mode: 0o600 });
+        renameSync(temporary, join(directory, "pi-cancel-accepted.json"));
+      } catch {
+        try { unlinkSync(temporary); } catch {}
+      }
+    }, 200);
+  }
 
   function readActiveClaimToken() {
     const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
@@ -887,6 +972,7 @@ export default function (pi) {
   // Official session_start follows project_trust resolution, including a user's decline.
   // Never return a trust decision here or persist one in Pi's provider-owned store.
   pi.on("session_start", (event, ctx) => {
+    stopCancelTimer();
     if (event.reason !== "startup") return;
     const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
     const claimToken = readActiveClaimToken();
@@ -894,7 +980,7 @@ export default function (pi) {
     const temporary = join(directory, `.pi-startup-${process.pid}-${Date.now()}.tmp`);
     try {
       writeFileSync(temporary, JSON.stringify({
-        schema: 1,
+        schema: 2,
         claim_token: claimToken,
         session_id: ctx.sessionManager.getSessionId(),
       }), { encoding: "utf8", flag: "wx", mode: 0o600 });
@@ -908,6 +994,7 @@ export default function (pi) {
   });
 
   pi.on("before_agent_start", (event) => {
+    stopCancelTimer();
     activeClaimToken = readActiveClaimToken();
     activePromptCorrelated = Boolean(
       activeClaimToken
@@ -916,6 +1003,7 @@ export default function (pi) {
   });
 
   pi.on("agent_start", (_event, ctx) => {
+    stopCancelTimer();
     if (undelivered && pending) {
       if (!persistHookFailure(pending, "a prior result remained undelivered")) {
         ctx.ui.notify("Agent Bridge still cannot recover the previous Pi result.", "warning");
@@ -924,9 +1012,11 @@ export default function (pi) {
       undelivered = false;
     }
     pending = undefined;
+    startCancelTimer(ctx);
   });
 
   pi.on("agent_end", (event, ctx) => {
+    stopCancelTimer();
     if (undelivered) return;
     if (!activePromptCorrelated || !activeClaimToken) {
       pending = undefined;
@@ -939,9 +1029,22 @@ export default function (pi) {
       agent_bridge_claim_token: activeClaimToken,
       agent_bridge_prompt_correlated: true,
     };
+    const assistant = event.messages.findLast((message) => message?.role === "assistant");
+    const accepted = readRecord("pi-cancel-accepted.json");
+    // Pi 1.0.4, observed 2026-10-11: abort during a tool can surface Node's
+    // AbortError message as errorMessage with stopReason "error". Match that
+    // exact message, never arbitrary errors containing "abort". agent-loop.ts
+    // forwards the stream's final assistant outcome without normalizing it.
+    const aborted = assistant?.stopReason === "aborted"
+      || (assistant?.stopReason === "error" && assistant.errorMessage === "This operation was aborted");
+    if (aborted && accepted?.schema === 1
+        && accepted.claim_token === activeClaimToken) {
+      pending.agent_bridge_cancel_claim_token = activeClaimToken;
+    }
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
+    stopCancelTimer();
     if (!pending) return;
     const payload = pending;
     const executable = process.env.AGENT_BRIDGE_EXECUTABLE;
@@ -957,6 +1060,11 @@ export default function (pi) {
       return;
     }
     pending = undefined;
+  });
+  pi.on("session_shutdown", () => {
+    stopCancelTimer();
+    activeClaimToken = undefined;
+    activePromptCorrelated = false;
   });
 }
 "#
@@ -1336,6 +1444,192 @@ mod tests {
     }
 
     #[test]
+    fn cancel_extension_executes_lifecycle_and_partial_failure_cases_in_node() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("extension.js"), bridge_extension()).unwrap();
+        let harness = directory.path().join("test.mjs");
+        fs::write(&harness, include_str!("pi_cancel_test.mjs")).unwrap();
+        let output = std::process::Command::new("node")
+            .arg(harness)
+            .arg(directory.path())
+            .output()
+            .expect("Node on PATH is required to execute the Pi extension tests");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn cancel_support_requires_schema_two_and_current_claim() {
+        let directory = tempfile::tempdir().unwrap();
+        let pending = claim_pending_turn(directory.path());
+        for (schema, token, session, supported) in [
+            (1, pending.claim_token.as_str(), "native", false),
+            (2, "1-2-3", "native", false),
+            (2, pending.claim_token.as_str(), "", false),
+            (3, pending.claim_token.as_str(), "native", false),
+            (2, pending.claim_token.as_str(), "native", true),
+        ] {
+            write_json_atomic(
+                &directory.path().join(STARTUP_READY_FILE),
+                &StartupReady {
+                    schema,
+                    claim_token: token.into(),
+                    session_id: session.into(),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(
+                    ADAPTER.cancel_support(directory.path()).unwrap(),
+                    super::super::CancelSupport::Supported
+                ),
+                supported
+            );
+        }
+        for contents in [None, Some("not-json")] {
+            fs::remove_file(directory.path().join(STARTUP_READY_FILE)).unwrap();
+            if let Some(contents) = contents {
+                fs::write(directory.path().join(STARTUP_READY_FILE), contents).unwrap();
+            }
+            assert!(matches!(
+                ADAPTER.cancel_support(directory.path()).unwrap(),
+                super::super::CancelSupport::Unsupported(_)
+            ));
+            // Restore for the next removal.
+            fs::write(directory.path().join(STARTUP_READY_FILE), "{}").unwrap();
+        }
+    }
+
+    #[test]
+    fn cancel_hook_requires_correlated_token_and_cancel_intent() {
+        for detail in [
+            "Pi turn ended with aborted",
+            "Pi turn ended with error: This operation was aborted",
+        ] {
+            for (evidence, correlated, expected) in [
+                ("matching", true, Some(true)),
+                ("missing_token", true, Some(false)),
+                ("wrong_token", true, Some(false)),
+                ("wrong_cancel", true, Some(false)),
+                ("missing_cancel", true, Some(false)),
+                ("malformed_cancel", true, Some(false)),
+                ("matching", false, None),
+            ] {
+                let directory = tempfile::tempdir().unwrap();
+                fs::create_dir(directory.path().join("events")).unwrap();
+                update_status(directory.path(), SessionState::Working, None, None).unwrap();
+                let pending = claim_pending_turn(directory.path());
+                let cancel_token = if evidence == "wrong_cancel" {
+                    "1-2-3"
+                } else {
+                    &pending.claim_token
+                };
+                if evidence != "missing_cancel" {
+                    write_json_atomic(
+                        &directory.path().join("cancel.json"),
+                        &serde_json::json!({
+                            "schema": 1, "request_id": "request-test",
+                            "claim_token": cancel_token, "created_unix_ms": 1,
+                        }),
+                    )
+                    .unwrap();
+                }
+                if evidence == "malformed_cancel" {
+                    fs::write(directory.path().join("cancel.json"), "not-json").unwrap();
+                }
+                let mut payload = serde_json::json!({
+                    "session_id": "pi-session", "turn_id": "pi-turn",
+                    "agent_bridge_claim_token": pending.claim_token,
+                    "agent_bridge_prompt_correlated": correlated,
+                    "agent_bridge_error": detail,
+                });
+                if evidence != "missing_token" {
+                    payload["agent_bridge_cancel_claim_token"] =
+                        serde_json::json!(if evidence == "wrong_token" {
+                            "1-2-3"
+                        } else {
+                            &pending.claim_token
+                        });
+                }
+                ADAPTER.handle_hook(directory.path(), &payload).unwrap();
+                let paths = event_paths(directory.path()).unwrap();
+                if let Some(cancelled) = expected {
+                    let event: SessionEvent = read_json(&paths[0]).unwrap();
+                    assert_eq!(event.cancelled, cancelled, "{evidence}");
+                    let expected_error = if cancelled {
+                        format!("cancelled: {detail}")
+                    } else {
+                        detail.to_owned()
+                    };
+                    assert_eq!(event.error.as_deref(), Some(expected_error.as_str()));
+                    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+                } else {
+                    assert!(paths.is_empty());
+                    assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancel_accepted_cleanup_is_owned_by_pending_turn_lifecycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let accepted = directory.path().join("pi-cancel-accepted.json");
+        install_pending_turn(directory.path(), "1-2-3").unwrap();
+        write_json_atomic(
+            &accepted,
+            &serde_json::json!({"schema":1,"claim_token":"1-2-3"}),
+        )
+        .unwrap();
+        install_pending_turn(directory.path(), "4-5-6").unwrap();
+        assert!(!accepted.exists());
+        write_json_atomic(
+            &accepted,
+            &serde_json::json!({"schema":1,"claim_token":"4-5-6"}),
+        )
+        .unwrap();
+        cancel_pending_turn(directory.path(), "1-2-3").unwrap();
+        assert!(
+            accepted.exists(),
+            "stale rollback cannot remove the new claim's record"
+        );
+        cancel_pending_turn(directory.path(), "4-5-6").unwrap();
+        assert!(!accepted.exists());
+    }
+
+    #[test]
+    fn cancel_support_survives_follow_up_and_delivery_rollback_without_upgrading_legacy() {
+        for schema in [1, 2] {
+            let directory = tempfile::tempdir().unwrap();
+            let pending = claim_pending_turn(directory.path());
+            write_json_atomic(
+                &directory.path().join(STARTUP_READY_FILE),
+                &StartupReady {
+                    schema,
+                    claim_token: pending.claim_token,
+                    session_id: "native".into(),
+                },
+            )
+            .unwrap();
+            for token in ["4-5-6", "7-8-9"] {
+                fs::write(directory.path().join(TURN_CLAIM_FILE), token).unwrap();
+                install_pending_turn(directory.path(), token).unwrap();
+                assert_eq!(
+                    matches!(
+                        ADAPTER.cancel_support(directory.path()).unwrap(),
+                        super::super::CancelSupport::Supported
+                    ),
+                    schema == 2
+                );
+                cancel_pending_turn(directory.path(), token).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn unresolved_project_trust_never_receives_the_initial_console_paste() {
         let directory = tempfile::tempdir().unwrap();
         claim_pending_turn(directory.path());
@@ -1354,37 +1648,39 @@ mod tests {
 
     #[test]
     fn startup_receipt_allows_one_paste_and_preserves_the_transport_outcome() {
-        let directory = tempfile::tempdir().unwrap();
-        let pending = claim_pending_turn(directory.path());
-        write_json_atomic(
-            &directory.path().join(STARTUP_READY_FILE),
-            &StartupReady {
-                schema: 1,
-                claim_token: pending.claim_token,
-                session_id: "pi-native-session".to_owned(),
-            },
-        )
-        .unwrap();
-        let sends = std::cell::Cell::new(0);
-        let failure = send_initial_prompt_after_startup(
-            directory.path(),
-            Instant::now() + Duration::from_secs(1),
-            || {
-                sends.set(sends.get() + 1);
-                Err(terminal::TerminalSendFailure::delivery_uncertain(
-                    anyhow::anyhow!("transport uncertain"),
-                ))
-            },
-        )
-        .unwrap_err();
-        assert_eq!(sends.get(), 1);
-        assert!(failure.delivery_may_have_occurred());
-        assert!(
-            failure
-                .into_error()
-                .to_string()
-                .contains("transport uncertain")
-        );
+        for schema in [1, 2] {
+            let directory = tempfile::tempdir().unwrap();
+            let pending = claim_pending_turn(directory.path());
+            write_json_atomic(
+                &directory.path().join(STARTUP_READY_FILE),
+                &StartupReady {
+                    schema,
+                    claim_token: pending.claim_token,
+                    session_id: "pi-native-session".to_owned(),
+                },
+            )
+            .unwrap();
+            let sends = std::cell::Cell::new(0);
+            let failure = send_initial_prompt_after_startup(
+                directory.path(),
+                Instant::now() + Duration::from_secs(1),
+                || {
+                    sends.set(sends.get() + 1);
+                    Err(terminal::TerminalSendFailure::delivery_uncertain(
+                        anyhow::anyhow!("transport uncertain"),
+                    ))
+                },
+            )
+            .unwrap_err();
+            assert_eq!(sends.get(), 1);
+            assert!(failure.delivery_may_have_occurred());
+            assert!(
+                failure
+                    .into_error()
+                    .to_string()
+                    .contains("transport uncertain")
+            );
+        }
     }
 
     #[test]
@@ -1395,7 +1691,7 @@ mod tests {
         for receipt in [
             "not-json".to_owned(),
             serde_json::json!({"schema": 1, "claim_token": "1-2-3", "session_id": "native"}).to_string(),
-            serde_json::json!({"schema": 2, "claim_token": pending.claim_token, "session_id": "native"}).to_string(),
+            serde_json::json!({"schema": 3, "claim_token": pending.claim_token, "session_id": "native"}).to_string(),
             serde_json::json!({"schema": 1, "claim_token": pending.claim_token, "session_id": ""}).to_string(),
         ] {
             fs::write(directory.path().join(STARTUP_READY_FILE), receipt).unwrap();
