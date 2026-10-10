@@ -220,6 +220,14 @@ Workspace trust stays with the provider. Bridge can reuse verified existing cons
 workspace; it does not grant new trust. If a trust dialog holds up work, review it in the managed
 surface. See [workspace trust and consent](docs/security-and-data.md#workspace-trust-and-consent).
 
+To see whose decision Bridge recorded for a directory, run `tabcli consent inspect PATH`.
+`consent revoke PATH` stops that reuse and leaves the provider's own trust alone; `consent reset PATH`
+clears the saved source and the revocation, so that the next launch assesses the directory again;
+it approves nothing itself. Only workspace trust is shared this way. Tool permissions, `--yolo`, credential
+prompts and every other provider approval are never answered by Bridge. Bridge records a directory's
+identity when it first records consent for it; a directory that was replaced before that point
+cannot be told from the original by its path.
+
 A delivery whose outcome is uncertain is never resent. Inspect the original request and wait for
 it, or explicitly close the session; repeating the prompt risks duplicate work. See
 [delivery and trust boundaries](docs/security-and-data.md#workspace-trust-and-consent).

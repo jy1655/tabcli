@@ -111,6 +111,12 @@ If you see `Ghostty native scripting dictionary is unavailable` or `Ghostty nati
 …`, install a compatible application there or select another terminal. Bridge reads
 `/Applications/Ghostty.app/Contents/Resources/Ghostty.sdef` and requires `new surface
 configuration`, `new tab`, `new window`, `select tab`, `input text`, and `close tab`.
+Ghostty's scripting dictionary exposes no screen text, so Bridge cannot check a trust dialog
+before answering it; guarded responses need scripting access to the exact terminal's screen text.
+
+WezTerm's CLI has no compare-and-send command, and a mux Lua callback is not atomic with screen
+updates and requires changing the user's configuration. Guarded responses need the mux to accept
+the screen comparison and key transmission in one request, atomic with screen updates.
 
 Warp requires its Scripting opt-in and a reachable, authorized official Warp Control endpoint. The
 tab route also requires enabled TabConfigs; new-window mode uses the separate Launch Configuration
@@ -120,6 +126,11 @@ Control API cannot submit terminal input, so Agy/Pi follow-ups are unsupported t
 native input paths do not remove the terminal's creation and ownership checks. If the Control
 endpoint is unavailable, enable Scripting in Warp and check its endpoint, or select another
 terminal. Warp remains limited (#63); authenticated operation is not verified in [M11]/[M12].
+Guarded trust responses need screen reading and submission in Warp Control; its
+`input.insert` and `input.replace` actions only stage text and cannot submit it.
+
+Claude Code 2.1.296 and Agy 1.3.3 provide no first-party flag or environment variable to record
+workspace trust before launch.
 
 On native Windows, install PowerShell 7 with `pwsh.exe` discoverable on an absolute `PATH` entry.
 Windows Terminal's `wt.exe` must likewise be discoverable for tabs; it is optional for the console

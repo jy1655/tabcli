@@ -45,9 +45,9 @@ directories, and a symlink alias cannot supply fresh consent. If the original pr
 its decision, Bridge does not silently choose another provider as the source.
 
 With verified existing consent, Bridge can answer Claude or Agy startup trust dialogs once in
-iTerm2, Terminal.app, and the native Windows console. In Ghostty, WezTerm, or Warp, approve the
-workspace in the provider before launching through Bridge. Consent alone does not enable a
-guarded response in those terminals.
+iTerm2, Terminal.app, and the native Windows console; see
+[terminal requirements and first-run prompts](terminals.md#requirements-and-first-run-prompts)
+for the terminal-specific limits.
 
 Before responding, Bridge checks that it owns the surface and checks the captured screen again.
 It then checks that the provider saved its decision. Without verified consent, the dialog stays

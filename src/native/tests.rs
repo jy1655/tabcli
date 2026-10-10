@@ -1965,6 +1965,18 @@ fn macos_terminal_adapters_never_set_or_verify_display_titles() {
 fn macos_terminal_applescripts_compile_without_opening_a_tab() {
     for (name, script, application, path) in [
         (
+            "iTerm2 guarded dialog",
+            terminal::macos::screen::ITERM,
+            "iTerm2",
+            "/Applications/iTerm.app",
+        ),
+        (
+            "Terminal.app guarded dialog",
+            terminal::macos::screen::TERMINAL,
+            "Terminal",
+            "/System/Applications/Utilities/Terminal.app",
+        ),
+        (
             "iTerm2 open tab",
             terminal::macos::iterm2::OPEN_TAB_SCRIPT,
             "iTerm2",
