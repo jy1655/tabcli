@@ -1970,6 +1970,18 @@ fn macos_terminal_adapters_never_set_or_verify_display_titles() {
 fn macos_terminal_applescripts_compile_without_opening_a_tab() {
     for (name, script, application, path) in [
         (
+            "iTerm2 guarded dialog",
+            terminal::macos::screen::ITERM,
+            "iTerm2",
+            "/Applications/iTerm.app",
+        ),
+        (
+            "Terminal.app guarded dialog",
+            terminal::macos::screen::TERMINAL,
+            "Terminal",
+            "/System/Applications/Utilities/Terminal.app",
+        ),
+        (
             "iTerm2 open tab",
             terminal::macos::iterm2::OPEN_TAB_SCRIPT,
             "iTerm2",
@@ -2079,10 +2091,17 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
         ),
     ] {
         let directory = tempfile::tempdir().unwrap();
-        let script = script.replace(
-            &format!("tell application \"{application}\""),
-            &format!("tell application \"{path}\""),
-        );
+        // iTerm2 scripts address the application by bundle identifier so that a launch
+        // finds it while it is not running (#99); the compiler is given the bundle path.
+        let script = script
+            .replace(
+                &format!("tell application \"{application}\""),
+                &format!("tell application \"{path}\""),
+            )
+            .replace(
+                "tell application id \"com.googlecode.iterm2\"",
+                &format!("tell application \"{path}\""),
+            );
         let source = directory.path().join("bridge.applescript");
         std::fs::write(&source, script).unwrap();
         let output = std::process::Command::new("/usr/bin/osacompile")

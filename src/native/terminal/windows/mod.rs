@@ -839,11 +839,12 @@ pub(super) fn console_control(
             let input: super::GuardedDialogInput = serde_json::from_slice(
                 &crate::native::session::RecordReader::at(path).raw_bytes()?,
             )?;
-            if input.screen != attached_screen()? {
-                println!("changed");
-            } else {
-                write_dialog_key(input.key)?;
-                println!("sent");
+            match dialog_decision(&input.screen, &attached_screen()?) {
+                DialogDecision::Changed => println!("changed"),
+                DialogDecision::Send => {
+                    write_dialog_key(input.key)?;
+                    println!("sent");
+                }
             }
             Ok(())
         }
@@ -955,6 +956,20 @@ fn end_tab_host(recorded: Option<&(u32, WindowsProcessIdentity)>) -> Result<()> 
         bail!("the stalled Windows Terminal tab host {pid} did not end");
     }
     Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum DialogDecision {
+    Changed,
+    Send,
+}
+
+fn dialog_decision(expected: &str, actual: &str) -> DialogDecision {
+    if expected == actual {
+        DialogDecision::Send
+    } else {
+        DialogDecision::Changed
+    }
 }
 
 fn attached_screen() -> Result<String> {
