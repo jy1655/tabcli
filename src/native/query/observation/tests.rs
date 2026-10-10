@@ -170,9 +170,12 @@ fn observation_is_read_only_and_releases_its_lock() {
         assert!(observation.evidence.surface_presence.is_none());
         assert!(observation.judgments.evaluated_unix_ms > 0);
         assert!(observation.evidence.observed_unix_ms > 0);
+        // Compare bytes before taking the writer lock: Windows refuses to read a file
+        // another handle holds exclusively, and the lock file is part of the directory.
+        assert_eq!(bytes(&fixture.directory), before);
         let writer = File::open(fixture.directory.join("turn.claim.lock")).unwrap();
         writer.try_lock().unwrap();
-        assert_eq!(bytes(&fixture.directory), before);
+        drop(writer);
     }
     fs::remove_file(fixture.directory.join("turn.claim.lock")).unwrap();
     let before = bytes(&fixture.directory);

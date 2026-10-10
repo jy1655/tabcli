@@ -1180,8 +1180,10 @@ fn status_omits_unreadable_required_records_with_session_reasons() {
 fn status_returns_busy_incomplete_without_writing_or_waiting_for_the_writer() {
     let fixture = Fixture::new();
     let lock = fs::File::create(fixture.directory.join("turn.claim.lock")).unwrap();
-    lock.lock().unwrap();
+    // Snapshot the bytes before locking: Windows refuses to read a file that another
+    // handle holds exclusively, and the lock file is part of the directory.
     let before = files(fixture.root.path());
+    lock.lock().unwrap();
     let started = std::time::Instant::now();
     let value = success(fixture.run(&["status", "--all-workspaces", "--json"]));
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
@@ -1193,6 +1195,7 @@ fn status_returns_busy_incomplete_without_writing_or_waiting_for_the_writer() {
             .unwrap()
             .contains("busy")
     );
+    drop(lock);
     assert_eq!(files(fixture.root.path()), before);
 }
 
