@@ -1770,6 +1770,10 @@ struct CommandOutputFailure {
         allow(dead_code)
     )]
     process_started: bool,
+    // The child ran until the deadline and was ended there. Only the macOS AppleScript
+    // runner asks; the other platforms carry the fact without reading it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    timed_out: bool,
 }
 
 impl CommandOutputFailure {
@@ -1777,6 +1781,7 @@ impl CommandOutputFailure {
         Self {
             error,
             process_started: false,
+            timed_out: false,
         }
     }
 
@@ -1784,7 +1789,18 @@ impl CommandOutputFailure {
         Self {
             error,
             process_started: true,
+            timed_out: false,
         }
+    }
+
+    fn ended_at_deadline(mut self) -> Self {
+        self.timed_out = true;
+        self
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn timed_out(&self) -> bool {
+        self.timed_out
     }
 
     #[cfg_attr(
@@ -1861,9 +1877,10 @@ fn command_output_with_stdin_until_classified(
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(CommandOutputFailure::started(anyhow::anyhow!(
-                    "{label} timed out"
-                )));
+                return Err(
+                    CommandOutputFailure::started(anyhow::anyhow!("{label} timed out"))
+                        .ended_at_deadline(),
+                );
             }
             Err(error) => {
                 let _ = child.kill();

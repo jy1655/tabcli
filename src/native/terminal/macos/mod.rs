@@ -248,6 +248,23 @@ pub(super) fn timeout_deadline(timeout: Duration) -> Result<Instant> {
         .context("terminal automation timeout is too large")
 }
 
+// Whether the screen of the login session is locked, read from IOKit's console-user
+// record (`CGSSessionScreenIsLocked` in `ioreg -n Root -d1`). None when the record could
+// not be read before the deadline.
+fn screen_locked(deadline: Instant) -> Option<bool> {
+    let mut command = std::process::Command::new("/usr/sbin/ioreg");
+    command.args(["-n", "Root", "-d", "1"]);
+    let output = crate::native::command_output_until(&mut command, deadline, "ioreg").ok()?;
+    output
+        .status
+        .success()
+        .then(|| screen_locked_in(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn screen_locked_in(ioreg: &str) -> bool {
+    ioreg.contains("\"CGSSessionScreenIsLocked\"=Yes")
+}
+
 fn close_response(terminal: TerminalKind, response: &str) -> Result<CloseOutcome> {
     match response {
         "closed" => Ok(CloseOutcome::Closed),
@@ -317,5 +334,19 @@ mod startup_tests {
             || panic!("successful binding must remain"),
         )
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod screen_lock_tests {
+    use super::screen_locked_in;
+
+    #[test]
+    fn the_lock_is_read_from_the_console_user_record() {
+        let locked = r#"      "IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes,"CGSSessionScreenLockedTime"=3939134436,"CGSSessionScreenIsLocked"=Yes,"kCGSSessionUserIDKey"=501})"#;
+        let unlocked = r#"      "IOConsoleUsers" = ({"kCGSSessionOnConsoleKey"=Yes,"kCGSSessionUserIDKey"=501})"#;
+        assert!(screen_locked_in(locked));
+        assert!(!screen_locked_in(unlocked));
+        assert!(!screen_locked_in(""));
     }
 }
