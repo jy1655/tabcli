@@ -220,8 +220,12 @@ on run argv
 end run
 "#;
 
+// The scripts below address iTerm2 by bundle identifier, which starts iTerm2 when it is
+// not running. Only the launch may do that: each of these first asks whether iTerm2 is
+// running, because a managed session cannot exist in an application that is not.
 pub(in crate::native) const SEND_FILE_SCRIPT: &str = r#"
 on run argv
+    if application id "com.googlecode.iterm2" is not running then error "Agent Bridge iTerm session not found; iTerm2 is not running"
     set wantedId to item 1 of argv
     set promptPath to item 2 of argv
     set carriageReturn to return
@@ -244,6 +248,7 @@ end run
 
 pub(in crate::native) const VERIFY_SESSION_SCRIPT: &str = r#"
 on run argv
+    if application id "com.googlecode.iterm2" is not running then error "Agent Bridge iTerm2 ownership proof found iTerm2 not running"
     set wantedId to item 1 of argv
     set matchedTty to missing value
     set matchCount to 0
@@ -284,6 +289,7 @@ end run
 
 pub(in crate::native) const CLOSE_SESSION_SCRIPT: &str = r#"
 on run argv
+    if application id "com.googlecode.iterm2" is not running then return "missing"
     set wantedId to item 1 of argv
     tell application id "com.googlecode.iterm2"
         repeat with targetWindow in windows

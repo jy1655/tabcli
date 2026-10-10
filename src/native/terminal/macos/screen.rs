@@ -5,6 +5,7 @@ use super::*;
 // an intervening repaint or changed selection sends no keys. Never targets front tab.
 const ITERM: &str = r#"
 on run argv
+    if application id "com.googlecode.iterm2" is not running then error "managed iTerm2 screen is missing"
     set wantedId to item 1 of argv
     tell application id "com.googlecode.iterm2"
         repeat with w in windows
