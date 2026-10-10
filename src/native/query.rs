@@ -15,6 +15,8 @@ use crate::native::{Context, FromStr};
 use agent_bridge::PUBLIC_COMMAND;
 use serde_json::{Value, json};
 
+pub(super) mod observation;
+pub(super) mod status;
 mod timeline;
 #[cfg(test)]
 pub(super) use timeline::timeline_value;
@@ -155,7 +157,7 @@ pub(super) struct Snapshot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum RequestState {
+pub(super) enum RequestState {
     Completed,
     Failed,
     RecoveryRequired,
@@ -165,7 +167,7 @@ enum RequestState {
 }
 
 impl RequestState {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Completed => "completed",
             Self::Failed => "failed",
@@ -306,6 +308,21 @@ pub(super) fn with_snapshot_hook<T>(
     let outcome = run();
     BEFORE_CONSISTENCY_CHECK.with(|cell| *cell.borrow_mut() = None);
     outcome
+}
+
+#[cfg(test)]
+thread_local! {
+    // Counts published event decode attempts, independently of path enumeration and
+    // the completion journal's bounded publication comparison.
+    static EVENT_READ_COUNT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn with_event_read_count<T>(run: impl FnOnce() -> T) -> (T, usize) {
+    let previous = EVENT_READ_COUNT.with(|count| count.replace(Some(0)));
+    let outcome = run();
+    let reads = EVENT_READ_COUNT.with(|count| count.replace(previous).unwrap());
+    (outcome, reads)
 }
 
 fn before_consistency_check(directory: &Path) {
@@ -449,6 +466,14 @@ impl Snapshot {
         Ok(snapshot)
     }
 
+    fn latest_event_id(&self) -> Option<&str> {
+        self.paths
+            .iter()
+            .rev()
+            .filter_map(|p| p.file_name()?.to_str())
+            .find(|name| self.published(name))
+    }
+
     fn receipt_for_event(&self, event: &str) -> Option<&requests::Receipt> {
         self.receipts
             .iter()
@@ -482,6 +507,8 @@ impl Snapshot {
         if !self.published(name) {
             return Ok(None);
         }
+        #[cfg(test)]
+        EVENT_READ_COUNT.with(|count| count.set(count.get().map(|reads| reads + 1)));
         RecordReader::at(reader.event(name).path()).optional_json()
     }
 
@@ -543,12 +570,7 @@ impl Snapshot {
         let name = match selector {
             Selector::Request(_) => receipt.map(|r| r.event_file.as_str()),
             Selector::Event(name) => Some(name.as_str()),
-            Selector::Latest => self
-                .paths
-                .iter()
-                .rev()
-                .filter_map(|p| p.file_name()?.to_str())
-                .find(|name| self.published(name)),
+            Selector::Latest => self.latest_event_id(),
             Selector::List => bail!("list is not a single result selector"),
         };
         let receipt = receipt.or_else(|| name.and_then(|name| self.receipt_for_event(name)));
@@ -647,11 +669,26 @@ fn snapshot_retry_window() -> Duration {
 /// Retries a busy snapshot for [`SNAPSHOT_RETRY_WINDOW`]; every attempt decides a journaled
 /// event's publication as `publication` says.
 fn observe_snapshot_with(reader: &Reader, publication: PublicationRead) -> Result<Snapshot> {
-    let deadline = Instant::now() + snapshot_retry_window();
+    observe_snapshot_until(
+        reader,
+        publication,
+        Instant::now() + snapshot_retry_window(),
+    )
+}
+
+fn observe_snapshot_until(
+    reader: &Reader,
+    publication: PublicationRead,
+    deadline: Instant,
+) -> Result<Snapshot> {
+    let deadline = deadline.min(Instant::now() + snapshot_retry_window());
     loop {
         match Snapshot::read_with(reader, publication) {
             Err(error) if error.is::<SnapshotBusy>() && Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(25));
+                thread::sleep(
+                    Duration::from_millis(25)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
             }
             outcome => return outcome,
         }
@@ -891,49 +928,7 @@ fn inspect_inner(id: &str, json: bool) -> Result<()> {
 }
 
 pub(super) fn inspect_value(reader: &Reader, id: &str) -> Result<Value> {
-    let directory = reader.directory();
-    let snapshot = observe_snapshot(reader)?;
-    let owner = observe_owner(reader);
-    let resumed_from = read_resumed_from(directory)?;
-    let mut latest = snapshot.result(reader, &Selector::Latest)?;
-    latest.as_object_mut().unwrap().remove("result");
-    let request_refs = snapshot
-        .receipts
-        .iter()
-        .map(|receipt| {
-            let (elapsed, elapsed_reason) = match snapshot.event(reader, &receipt.event_file) {
-                Ok(event) => observed_elapsed(Some(receipt), event.as_ref()),
-                Err(_) => (None, Some("unreadable_result")),
-            };
-            json!({
-                "request_id": receipt.request_id, "created_unix_ms": receipt.created_unix_ms, "source": receipt.source,
-                "event_id": receipt.event_file, "context_sources": receipt.context_sources,
-                "active": snapshot.claim.as_deref() == Some(&receipt.claim_token),
-                "bridge_observed_elapsed_ms": elapsed,
-                "bridge_observed_elapsed_reason": elapsed_reason,
-            })
-        })
-        .collect::<Vec<_>>();
-    let residual_surface = snapshot.status.residual_surface();
-    let mut value = json!({
-        "schema_version": 1, "ok": true, "session": id, "provider": snapshot.manifest.provider,
-        "workspace": snapshot.manifest.workspace, "title": snapshot.manifest.title,
-        "stored_state": snapshot.status.state, "generation": snapshot.status.generation,
-        "created_unix_ms": snapshot.manifest.created_unix_ms, "updated_unix_ms": snapshot.status.updated_unix_ms,
-        "error": snapshot.status.error, "exit_code": snapshot.status.exit_code,
-        "configured": {"model": snapshot.manifest.model, "effort": snapshot.manifest.effort,
-            "yolo": snapshot.manifest.yolo, "provider_version_at_launch": snapshot.manifest.provider_version},
-        "resumed_from": resumed_from,
-        "workspace_consent": consent::observe(directory),
-        "owner_process_alive": owner.process_alive, "owner_identity_verified": owner.identity_matches == Some(true), "owner": owner,
-        "recovery_required": snapshot.pending.is_some(), "turn_claimed": snapshot.claim.is_some(),
-        "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error,
-        "recorded_events": snapshot.paths.len(), "latest_result": latest, "requests": request_refs,
-    });
-    if let Some(residual) = residual_surface {
-        value["residual_surface"] = serde_json::to_value(residual)?;
-    }
-    Ok(value)
+    observation::Observation::read_locked(reader)?.inspect_value(reader, id)
 }
 
 // ---------------------------------------------------------------------------------------

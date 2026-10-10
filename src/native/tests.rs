@@ -5586,9 +5586,9 @@ fn record_rename_syncs_the_destination_directory_then_a_different_source_directo
 // one byte-match predicate, terminal-handle fault boundary
 // ---------------------------------------------------------------------------
 
-struct CloseFixture {
+pub(super) struct CloseFixture {
     root: tempfile::TempDir,
-    directory: PathBuf,
+    pub(super) directory: PathBuf,
     request_id: String,
     pending: PendingTurnCompletion,
     event_path: PathBuf,
@@ -5597,7 +5597,7 @@ struct CloseFixture {
 /// A working session under `session-fault` with a held claim, a journaled completion
 /// whose event is absent, committed, or mismatched, a terminal handle, and a legacy
 /// resume marker: everything an explicit close has to settle.
-fn seed_close_fixture(journaled_event: JournaledEventState) -> CloseFixture {
+pub(super) fn seed_close_fixture(journaled_event: JournaledEventState) -> CloseFixture {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("session-fault");
     fs::create_dir_all(directory.join("events")).unwrap();

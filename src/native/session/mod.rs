@@ -558,7 +558,7 @@ pub(super) mod tests;
 
 mod owner;
 mod state;
-pub(in crate::native) use owner::{observe_owner, observe_owner_record};
+pub(in crate::native) use owner::{OwnerObservation, observe_owner, observe_owner_record};
 pub(in crate::native) use state::{
     SessionState, SessionStatus, update_status, update_status_with_residual,
 };

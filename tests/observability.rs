@@ -991,3 +991,271 @@ fn timeline_launch_failure_without_completion_keeps_delivery_unknown() {
     assert_eq!(value["requests"][0]["request_state"], "failed");
     assert_eq!(value["requests"][0]["delivery"], "unknown");
 }
+
+fn status_session(
+    fixture: &Fixture,
+    id: &str,
+    state: &str,
+    updated: u64,
+    provider: &str,
+    workspace: &Path,
+) -> PathBuf {
+    let directory = fixture.root.path().join(id);
+    fs::create_dir_all(directory.join("events")).unwrap();
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(fixture.directory.join("manifest.json")).unwrap())
+            .unwrap();
+    manifest["id"] = json!(id);
+    manifest["provider"] = json!(provider);
+    manifest["workspace"] = json!(workspace);
+    write(&directory.join("manifest.json"), &manifest);
+    write(
+        &directory.join("status.json"),
+        &json!({"state":state,"generation":1,
+        "updated_unix_ms":updated,"exit_code":null,"error":null}),
+    );
+    directory
+}
+
+#[test]
+fn status_is_read_only_including_closed_tombstones_and_dead_owners() {
+    let fixture = Fixture::new();
+    fixture.event("event-1.json", "preserved");
+    write(
+        &fixture.directory.join("native-session.json"),
+        &json!({"pid":0,"managed_session_id":"session-observe"}),
+    );
+    let closed = status_session(
+        &fixture,
+        "session-closed",
+        "closed",
+        4,
+        "codex",
+        fixture.root.path(),
+    );
+    write(
+        &closed.join("closed.json"),
+        &json!({"state":"closed","generation":2,"updated_unix_ms":5,
+        "exit_code":null,"error":null}),
+    );
+    write(
+        &closed.join("status.json"),
+        &json!({"state":"closed","generation":2,"updated_unix_ms":4,
+        "exit_code":null,"error":null,"residual_surface":"unverified"}),
+    );
+    write(
+        &closed.join("native-session.json"),
+        &json!({"pid":0,"managed_session_id":"session-closed"}),
+    );
+    let before = files(fixture.root.path());
+    let value = success(fixture.run(&["status", "--all-workspaces", "--json"]));
+    assert_eq!(value["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(value["sessions"][0]["attention"], json!(["owner_exited"]));
+    assert_eq!(
+        value["sessions"][0]["latest_result"]["request_id"],
+        Value::Null
+    );
+    assert_eq!(
+        value["sessions"][0]["result_command"],
+        "tabcli result session-observe --event event-1.json --json"
+    );
+    assert_eq!(files(fixture.root.path()), before);
+    let value = success(fixture.run(&["status", "--all-workspaces", "--all", "--json"]));
+    assert_eq!(value["scanned"], json!({"sessions":2,"listed":2}));
+    let closed = value["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["id"] == "session-closed")
+        .unwrap();
+    assert_eq!(closed["attention"], json!(["residual_surface_unverified"]));
+    assert_eq!(closed["residual_surface"], "unverified");
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[test]
+fn status_scopes_before_observation_and_filters_provider() {
+    let fixture = Fixture::new();
+    let other_workspace = tempfile::tempdir().unwrap();
+    let other_path = other_workspace.path().canonicalize().unwrap();
+    let other = status_session(&fixture, "session-other", "exited", 4, "codex", &other_path);
+    let run_here = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_tabcli"))
+            .args(args)
+            .current_dir(fixture.root.path())
+            .env("AGENT_BRIDGE_NATIVE_STATE_DIR", fixture.root.path())
+            .output()
+            .unwrap()
+    };
+    let value = success(run_here(&["status", "--json"]));
+    assert_eq!(
+        value["filters"]["workspace"],
+        json!(fixture.root.path().canonicalize().unwrap())
+    );
+    assert_eq!(value["scanned"], json!({"sessions":1,"listed":1}));
+    let value = success(fixture.run(&[
+        "status",
+        "--workspace",
+        other_path.to_str().unwrap(),
+        "--json",
+    ]));
+    assert_eq!(value["sessions"][0]["id"], "session-other");
+    assert_eq!(value["sessions"][0]["state"], "exited");
+    let value = success(fixture.run(&[
+        "status",
+        "--all-workspaces",
+        "--provider",
+        "codex",
+        "--json",
+    ]));
+    assert_eq!(value["scanned"], json!({"sessions":1,"listed":1}));
+    let value = success(fixture.run(&["status", "--all-workspaces", "--json"]));
+    assert_eq!(value["scanned"], json!({"sessions":2,"listed":2}));
+    fs::write(other.join("status.json"), "{").unwrap();
+    let value = success(run_here(&["status", "--json"]));
+    assert_eq!(value["incomplete"], false);
+    let output = run_here(&["status", "--workspace", ".", "--all-workspaces", "--json"]);
+    assert!(!output.status.success());
+    let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(error["ok"], false);
+    assert!(error["error"].as_str().unwrap().contains("only one"));
+}
+
+#[test]
+fn status_sorts_attention_then_updated_then_id_and_includes_failed_by_default() {
+    let fixture = Fixture::new();
+    // A bound, live process gives a liveness fact even on hosts without identity observations.
+    write(
+        &fixture.directory.join("native-session.json"),
+        &json!({"pid":std::process::id(),"managed_session_id":"session-observe"}),
+    );
+    for (id, state, updated) in [
+        ("session-a", "ready", 10),
+        ("session-b", "failed", 10),
+        ("session-new", "ready", 20),
+    ] {
+        status_session(&fixture, id, state, updated, "codex", fixture.root.path());
+    }
+    let before = files(fixture.root.path());
+    let value = success(fixture.run(&["status", "--all-workspaces", "--json"]));
+    assert_eq!(files(fixture.root.path()), before);
+    let ids = value["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        ["session-new", "session-a", "session-b", "session-observe"]
+    );
+    assert!(
+        value["sessions"][2]["attention"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("session_failed"))
+    );
+    assert!(
+        value["sessions"][3]["attention"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn status_omits_unreadable_required_records_with_session_reasons() {
+    let fixture = Fixture::new();
+    fs::write(fixture.directory.join("status.json"), "{").unwrap();
+    let before = files(fixture.root.path());
+    let value = success(fixture.run(&["status", "--all-workspaces", "--json"]));
+    assert_eq!(value["sessions"], json!([]));
+    assert_eq!(value["incomplete"], true);
+    assert_eq!(value["incomplete_reasons"][0]["session"], "session-observe");
+    assert_eq!(value["scanned"], json!({"sessions":1,"listed":0}));
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[test]
+fn status_returns_busy_incomplete_without_writing_or_waiting_for_the_writer() {
+    let fixture = Fixture::new();
+    let lock = fs::File::create(fixture.directory.join("turn.claim.lock")).unwrap();
+    // Snapshot the bytes before locking: Windows refuses to read a file that another
+    // handle holds exclusively, and the lock file is part of the directory.
+    let before = files(fixture.root.path());
+    lock.lock().unwrap();
+    let started = std::time::Instant::now();
+    let value = success(fixture.run(&["status", "--all-workspaces", "--json"]));
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(value["scanned"], json!({"sessions":1,"listed":0}));
+    assert_eq!(value["incomplete_reasons"][0]["session"], "session-observe");
+    assert!(
+        value["incomplete_reasons"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("busy")
+    );
+    drop(lock);
+    assert_eq!(files(fixture.root.path()), before);
+}
+
+#[test]
+fn status_argument_errors_are_json_and_empty_human_output_succeeds() {
+    let fixture = Fixture::new();
+    for args in [
+        vec!["status", "--bad", "--json"],
+        vec!["status", "--provider", "unknown", "--json"],
+        vec!["status", "--all", "--all", "--json"],
+    ] {
+        let output = fixture.run(&args);
+        assert!(!output.status.success());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["sessions"], json!([]));
+    }
+    let output = fixture.run(&["status", "--all-workspaces", "--provider", "pi"]);
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "no sessions to show\n0 listed / 0 scanned\n"
+    );
+}
+
+#[test]
+fn status_root_errors_are_structured_and_missing_roots_are_empty() {
+    let fixture = Fixture::new();
+    let not_directory = fixture.root.path().join("not-directory");
+    fs::write(&not_directory, "not a directory").unwrap();
+    let run = |root: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_tabcli"))
+            .args(["status", "--all-workspaces", "--json"])
+            .env("AGENT_BRIDGE_NATIVE_STATE_DIR", root)
+            .output()
+            .unwrap()
+    };
+    let output = run(&not_directory);
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["ok"], false);
+    let missing = fixture.root.path().join("missing");
+    let value = success(run(&missing));
+    assert_eq!(value["scanned"], json!({"sessions":0,"listed":0}));
+    assert!(!missing.exists());
+}
+
+#[test]
+fn status_human_strings_cannot_inject_terminal_controls() {
+    let fixture = Fixture::new();
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(fixture.directory.join("manifest.json")).unwrap())
+            .unwrap();
+    manifest["provider"] = json!("codex\n\u{1b}[31m");
+    write(&fixture.directory.join("manifest.json"), &manifest);
+    let output = fixture.run(&["status", "--all-workspaces"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(text.lines().count(), 2);
+    assert!(text.contains("codex\\n\\u{1b}[31m"));
+    assert!(!text.contains('\u{1b}'));
+}

@@ -1,17 +1,15 @@
 //! Observations and advice only. No recovery, delivery, terminal control, or settings writes.
+use super::query::observation::{Observation, SessionEvidence, SurfaceRecord};
 use super::{
     Duration, FirstPartyCli, Instant, NativeCommand, OsString, Output, Path, Reader, Result,
     SESSION_DIR_ENV, SeekFrom, Serialize, SessionManifest, Stdio, bail, cli_version_is_supported,
-    consent, fs, is_executable, launch, option_value, provider, provider_process, query, reopen,
+    consent, fs, is_executable, option_value, provider, provider_process, query, reopen,
     require_valid_session_id, resolve_provider, set_flag_once, set_once, terminal,
     terminal_safe_text, thread, unix_ms,
 };
 use crate::native::session::SessionState;
-use crate::native::session::{CoreRecord, RecordReader};
-use crate::native::terminal::ownership::NativeSessionOwner;
 use crate::native::{FromStr, Read, Seek, provider_version_command};
 use agent_bridge::PUBLIC_COMMAND;
-use anyhow::Context as _;
 use serde_json::{Value, json};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -228,25 +226,25 @@ pub(super) fn run(request: DoctorRequest) -> Result<()> {
         });
     }
     let manifest = directory.as_ref().and_then(|directory| {
-        let manifest = match query::observe_snapshot(&Reader::open_unchecked(directory)) {
-            Ok(snapshot) => {
-                session_checks(&Reader::open_unchecked(directory), &snapshot, &mut checks, &mut observations);
-                // Moving the manifest out drops the snapshot's shared lock here, before probes.
-                Some(snapshot.manifest)
-            }
-            Err(error) => {
-                let reason = if error.is::<query::SnapshotBusy>() { "records_busy" } else { "records_unreadable" };
-                checks.push(Check::new("session_records", Unknown, reason, format!("{error:#}"), "Inspect the records without deleting locks or resending a request; retry if a writer is active."));
-                unknown_session_checks(request.session.as_deref().unwrap(), reason, &mut checks);
-                Reader::open_unchecked(directory).manifest().ok()
-            }
-        };
-        owner_check(&Reader::open_unchecked(directory), request.session.as_deref().unwrap(), &mut checks);
-        terminal_check(&Reader::open_unchecked(directory), request.session.as_deref().unwrap(), &mut checks);
+        let (manifest, mut evidence) = record_checks(
+            &Reader::open_unchecked(directory),
+            request.session.as_deref().unwrap(),
+            &mut checks,
+            &mut observations,
+        );
         if request.probe {
-            surface_check(&Reader::open_unchecked(directory), deadline, &mut checks);
+            surface_check(
+                &mut evidence,
+                &Reader::open_unchecked(directory),
+                deadline,
+                &mut checks,
+            );
         }
-        reopen::marker_check(&Reader::open_unchecked(directory), request.session.as_deref().unwrap(), &mut checks);
+        reopen::marker_check(
+            &Reader::open_unchecked(directory),
+            request.session.as_deref().unwrap(),
+            &mut checks,
+        );
         manifest
     });
     let provider = match manifest
@@ -431,6 +429,36 @@ pub(super) fn run(request: DoctorRequest) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn record_checks(
+    reader: &Reader,
+    id: &str,
+    checks: &mut Vec<Check>,
+    observations: &mut Value,
+) -> (Option<SessionManifest>, SessionEvidence) {
+    let mut evidence = None;
+    let manifest = match Observation::read(reader) {
+        Ok(observation) => {
+            session_checks(&observation, checks, observations);
+            evidence = Some(observation.evidence);
+            Some(observation.records.manifest)
+        }
+        Err(error) => {
+            let reason = if error.is::<query::SnapshotBusy>() {
+                "records_busy"
+            } else {
+                "records_unreadable"
+            };
+            checks.push(Check::new("session_records", Availability::Unknown, reason, format!("{error:#}"), "Inspect the records without deleting locks or resending a request; retry if a writer is active."));
+            unknown_session_checks(id, reason, checks);
+            reader.manifest().ok()
+        }
+    };
+    let mut evidence = evidence.unwrap_or_else(|| SessionEvidence::read(reader));
+    owner_check(&mut evidence, id, checks);
+    terminal_check(&evidence, id, checks);
+    (manifest, evidence)
+}
+
 fn unknown_session_checks(id: &str, reason: &'static str, checks: &mut Vec<Check>) {
     for check_id in ["session_state", "turn", "completion"] {
         checks.push(Check::new(check_id, Availability::Unknown, reason,
@@ -439,17 +467,10 @@ fn unknown_session_checks(id: &str, reason: &'static str, checks: &mut Vec<Check
     }
 }
 
-fn session_checks(
-    reader: &Reader,
-    snapshot: &query::Snapshot,
-    checks: &mut Vec<Check>,
-    observations: &mut Value,
-) {
+fn session_checks(observation: &Observation, checks: &mut Vec<Check>, observations: &mut Value) {
     use Availability::*;
-    let active = snapshot
-        .receipts
-        .iter()
-        .find(|r| snapshot.claim.as_deref() == Some(&r.claim_token));
+    let snapshot = &observation.records;
+    let active = observation.active_request();
     let result_action = active.map_or_else(
         || {
             format!(
@@ -464,11 +485,11 @@ fn session_checks(
             )
         },
     );
-    let request_state = active.map(|r| {
-        snapshot
-            .result(reader, &query::Selector::Request(r.request_id.clone()))
-            .map(|value| value["request_state"].clone())
-            .unwrap_or(json!("unknown"))
+    let request_state = observation.judgments.active_state.as_ref().map(|state| {
+        state
+            .as_ref()
+            .map(|state| state.as_str())
+            .unwrap_or("unknown")
     });
     *observations = json!({"stored_state": snapshot.status.state, "generation": snapshot.status.generation,
         "updated_unix_ms": snapshot.status.updated_unix_ms, "session_error": snapshot.status.error,
@@ -516,12 +537,8 @@ fn session_checks(
             "No active turn claim was observed.",
         ),
     };
-    let launch_failure = launch::diagnostic(
-        snapshot.launch.as_ref(),
-        &snapshot.status,
-        snapshot.claim.as_deref(),
-    );
-    let (availability, reason, detail) = if let Some((reason, detail)) = &launch_failure {
+    let launch_failure = &observation.judgments.launch_failure;
+    let (availability, reason, detail) = if let Some((reason, detail)) = launch_failure {
         (Unavailable, *reason, detail.as_str())
     } else {
         (availability, reason, detail)
@@ -568,31 +585,14 @@ fn session_checks(
     }
 }
 
-fn surface_check(reader: &Reader, deadline: Instant, checks: &mut Vec<Check>) {
-    let directory = reader.directory();
+fn surface_check(
+    evidence: &mut SessionEvidence,
+    reader: &Reader,
+    deadline: Instant,
+    checks: &mut Vec<Check>,
+) {
     use Availability::*;
-    let result = (|| -> Result<bool> {
-        let session = RecordReader::at(
-            Reader::open_unchecked(directory)
-                .record(CoreRecord::Terminal)
-                .path(),
-        )
-        .optional_json::<terminal::TerminalSession>()?
-        .context("no active terminal handle is recorded")?;
-        session.verify_managed_session(
-            directory
-                .file_name()
-                .and_then(|s| s.to_str())
-                .context("invalid session path")?,
-        )?;
-        let budget = deadline
-            .saturating_duration_since(Instant::now())
-            .min(Duration::from_secs(2));
-        if budget.is_zero() {
-            bail!("diagnostic probe deadline exhausted")
-        }
-        terminal::surface_present(&session, budget)
-    })();
+    let result = evidence.observe_surface(reader, deadline);
     let (availability, reason, detail) = match result {
         Ok(true) => (Available, "terminal_surface_present", "Recorded terminal surface is present; this does not prove provider readiness or delivery.".to_owned()),
         Ok(false) => (Unavailable, "terminal_surface_missing", "Recorded terminal surface is absent; a provider process may still survive it.".to_owned()),
@@ -602,18 +602,12 @@ fn surface_check(reader: &Reader, deadline: Instant, checks: &mut Vec<Check>) {
         "Inspect the launch log and exact request; this read-only probe does not release a claim or resend input."));
 }
 
-fn owner_check(reader: &Reader, id: &str, checks: &mut Vec<Check>) {
-    let directory = reader.directory();
+fn owner_check(evidence: &mut SessionEvidence, id: &str, checks: &mut Vec<Check>) {
     use Availability::*;
-    let owner = RecordReader::at(
-        Reader::open_unchecked(directory)
-            .record(CoreRecord::Owner)
-            .path(),
-    )
-    .optional_json::<NativeSessionOwner>();
+    let owner = &evidence.owner;
     let (availability, reason, detail, evidence) = match owner {
         Ok(Some(owner)) if owner.managed_session_id.as_deref() == Some(id) => {
-            let observed = query::observe_owner_record(&owner);
+            let observed = evidence.observe_owner();
             let (availability, reason) = match (observed.process_alive, observed.identity_matches) {
                 (Some(false), _) => (Unavailable, "owner_exited"),
                 (_, Some(false)) => (Unavailable, "owner_identity_mismatch"),
@@ -634,7 +628,7 @@ fn owner_check(reader: &Reader, id: &str, checks: &mut Vec<Check>) {
             "Owner record belongs to another managed session.".to_owned(),
             Value::Null,
         ),
-        Ok(Some(owner)) => (Unknown, "owner_unbound_legacy", "A legacy owner record has no managed-session binding; process observation is not proof of control authority.".to_owned(), json!(query::observe_owner_record(&owner))),
+        Ok(Some(_)) => (Unknown, "owner_unbound_legacy", "A legacy owner record has no managed-session binding; process observation is not proof of control authority.".to_owned(), json!(evidence.observe_owner())),
         Ok(None) => (
             Unknown,
             "owner_unverified",
@@ -651,107 +645,88 @@ fn owner_check(reader: &Reader, id: &str, checks: &mut Vec<Check>) {
     checks.push(Check::new("owner", availability, reason, detail, "Inspect the exact request result; do not infer delivery or resend from owner liveness.").evidence(evidence));
 }
 
-fn terminal_check(reader: &Reader, id: &str, checks: &mut Vec<Check>) {
-    let directory = reader.directory();
+fn terminal_check(evidence: &SessionEvidence, id: &str, checks: &mut Vec<Check>) {
     use Availability::*;
-    match RecordReader::at(
-        Reader::open_unchecked(directory)
-            .record(CoreRecord::TerminalClosed)
-            .path(),
-    )
-    .optional_json::<Value>()
-    {
-        Ok(Some(value)) => {
-            let consumed = value.get("consumed").and_then(Value::as_bool) == Some(true);
-            checks.push(Check::new(
-                "terminal_record",
-                if consumed { Unavailable } else { Unknown },
-                if consumed {
-                    "terminal_consumed"
-                } else {
-                    "terminal_tombstone_unreadable"
-                },
-                "A terminal tombstone is recorded; a consumed handle cannot be reused.",
-                "Inspect retained results; doctor does not reopen or delete terminal records.",
-            ));
-            return;
-        }
-        Err(error) => {
-            checks.push(Check::new(
-                "terminal_record",
-                Unknown,
-                "terminal_tombstone_unreadable",
-                format!("{error:#}"),
-                "Preserve the terminal records and inspect the close attempt.",
-            ));
-            return;
-        }
-        Ok(None) => (),
-    }
-    match RecordReader::at(
-        Reader::open_unchecked(directory)
-            .record(CoreRecord::TerminalClosing)
-            .path(),
-    )
-    .optional_json::<terminal::TerminalSession>()
-    {
-        Ok(Some(terminal)) => {
-            let bound = terminal.verify_managed_session(id).is_ok();
-            checks.push(Check::new("terminal_record", if bound { Unavailable } else { Unknown },
+    match &evidence.surface {
+        SurfaceRecord::Closed(record) => match record {
+            Ok(value) => {
+                let consumed = value.get("consumed").and_then(Value::as_bool) == Some(true);
+                checks.push(Check::new(
+                    "terminal_record",
+                    if consumed { Unavailable } else { Unknown },
+                    if consumed {
+                        "terminal_consumed"
+                    } else {
+                        "terminal_tombstone_unreadable"
+                    },
+                    "A terminal tombstone is recorded; a consumed handle cannot be reused.",
+                    "Inspect retained results; doctor does not reopen or delete terminal records.",
+                ));
+            }
+            Err(error) => {
+                checks.push(Check::new(
+                    "terminal_record",
+                    Unknown,
+                    "terminal_tombstone_unreadable",
+                    format!("{error:#}"),
+                    "Preserve the terminal records and inspect the close attempt.",
+                ));
+            }
+        },
+        SurfaceRecord::Closing(record) => match record {
+            Ok(terminal) => {
+                let bound = terminal.verify_managed_session(id).is_ok();
+                checks.push(Check::new("terminal_record", if bound { Unavailable } else { Unknown },
                 if bound { "terminal_close_in_progress" } else { "terminal_binding_unverified" },
                 "A claimed close handle remains; the close may still be running or require explicit recovery.",
                 "Inspect the prior close attempt. Finishing it requires an explicit close request and ownership verification."));
-            return;
-        }
-        Err(error) => {
-            checks.push(Check::new(
-                "terminal_record",
-                Unknown,
-                "terminal_record_unreadable",
-                format!("{error:#}"),
-                "Preserve and inspect the close handle.",
-            ));
-            return;
-        }
-        Ok(None) => (),
-    }
-    let (availability, reason, detail, evidence) = match RecordReader::at(
-        Reader::open_unchecked(directory)
-            .record(CoreRecord::Terminal)
-            .path(),
-    )
-    .optional_json::<terminal::TerminalSession>()
-    {
-        Ok(Some(terminal)) => {
-            let supported = terminal.kind.supported_on_this_platform();
-            let (availability, reason) = if !supported {
-                (Unavailable, "terminal_unsupported")
-            } else if terminal.verify_managed_session(id).is_err() || terminal.id.is_empty() {
-                (Unknown, "terminal_binding_unverified")
-            } else {
-                (Available, "terminal_record_found")
+            }
+            Err(error) => {
+                checks.push(Check::new(
+                    "terminal_record",
+                    Unknown,
+                    "terminal_record_unreadable",
+                    format!("{error:#}"),
+                    "Preserve and inspect the close handle.",
+                ));
+            }
+        },
+        SurfaceRecord::Active(record) => {
+            let (availability, reason, detail, evidence) = match record {
+                Ok(Some(terminal)) => {
+                    let supported = terminal.kind.supported_on_this_platform();
+                    let (availability, reason) = if !supported {
+                        (Unavailable, "terminal_unsupported")
+                    } else if terminal.verify_managed_session(id).is_err() || terminal.id.is_empty()
+                    {
+                        (Unknown, "terminal_binding_unverified")
+                    } else {
+                        (Available, "terminal_record_found")
+                    };
+                    (
+                        availability,
+                        reason,
+                        "Stored terminal metadata only; no live surface control was attempted."
+                            .to_owned(),
+                        json!({"terminal": terminal.kind}),
+                    )
+                }
+                Ok(None) => (
+                    Unavailable,
+                    "terminal_record_missing",
+                    "No active terminal handle is recorded.".to_owned(),
+                    Value::Null,
+                ),
+                Err(error) => (
+                    Unknown,
+                    "terminal_record_unreadable",
+                    format!("{error:#}"),
+                    Value::Null,
+                ),
             };
-            (
-                availability,
-                reason,
-                "Stored terminal metadata only; no live surface control was attempted.".to_owned(),
-                json!({"terminal": terminal.kind}),
-            )
+            checks.push(Check::new("terminal_record", availability, reason, detail, "Only tell/close revalidate their target surface; this observation grants no control authority.").evidence(evidence));
         }
-        Ok(None) => (
-            Unavailable,
-            "terminal_record_missing",
-            "No active terminal handle is recorded.".to_owned(),
-            Value::Null,
-        ),
-        Err(error) => (
-            Unknown,
-            "terminal_record_unreadable",
-            format!("{error:#}"),
-            Value::Null,
-        ),
-    };
-    checks.push(Check::new("terminal_record", availability, reason, detail, "Only tell/close revalidate their target surface; this observation grants no control authority.").evidence(evidence));
+    }
 }
 
 // Probe only explicitly requested local CLI information. Scratch files (including Windows
