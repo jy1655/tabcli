@@ -28,15 +28,8 @@ pub(super) fn parse(args: &[String]) -> Result<NativeCommand> {
             json,
         }))
     })();
-    if let Err(error) = &parsed
-        && args.iter().any(|arg| arg == "--json")
-    {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "schema_version": 1, "ok": false, "error": format!("{error:#}")
-            }))?
-        );
+    if let Err(error) = &parsed {
+        envelope::parse_failure(args, error, serde_json::Map::new())?;
     }
     parsed
 }
@@ -49,29 +42,31 @@ pub(super) fn run(request: Request) -> Result<()> {
         session::cancel::request(&store, &request.id)
     })();
     match outcome {
-        Ok(change) => {
-            if request.json {
-                let mut value = json!({"request_id": change.request_id, "state": "requested", "created_unix_ms": change.created_unix_ms});
-                value["schema_version"] = json!(1);
-                value["ok"] = json!(true);
-                value["session"] = json!(request.id);
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else {
+        Ok(change) => envelope::emit(
+            request.json,
+            &envelope::ok(
+                json!({
+                    "request_id": change.request_id, "state": "requested",
+                    "created_unix_ms": change.created_unix_ms, "session": request.id,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            || {
                 println!(
                     "session {}: cancel requested for {}",
                     request.id, change.request_id
                 );
-            }
-            Ok(())
-        }
+                Ok(())
+            },
+        ),
         Err(error) => {
             if request.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "schema_version": 1, "ok": false, "session": request.id, "error": format!("{error:#}")
-                    }))?
-                );
+                envelope::print(&envelope::error(
+                    &error,
+                    serde_json::Map::from_iter([("session".into(), json!(request.id))]),
+                ))?;
             }
             Err(error)
         }

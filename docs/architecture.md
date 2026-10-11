@@ -80,8 +80,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 - Within `src/native/session/`, start with `reads.rs` for decoding and read budgets,
   `primitives.rs` for filesystem durability and private-record permissions, and `owner.rs` for
   read-only observations of the recorded owner.
-- `src/native/query.rs` and `query/timeline.rs` assemble read-only inspection, result, search, and
-  timeline views using the session readers and common publication rules. Queries get a `Reader`,
+- `src/native/query.rs` and `query/timeline.rs` own command-specific observations and fields for
+  read-only inspection, result, search, and timeline output using the session readers and common
+  publication rules. Queries get a `Reader`,
   not a `Store`. To expose an adapter-private fact, add an observation to that adapter's interface;
   do not read its private record from the query or call repair.
   Request observation precedes JSON rendering. Context attachment resolution uses the same
@@ -91,6 +92,12 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   Inspect, doctor, and `status` render one Observation per session from these readers and publication rules;
   owner process observations and surface probes are added on request, while `sessions` keeps
   its own lock-free listing after its optional repair.
+- `src/native/envelope.rs` owns shared envelope defaults, conditional parse-error JSON emission,
+  and pretty JSON output. Commands retain their fields, override order, plain-text rendering,
+  and error propagation. The module performs no session reads or writes.
+  The schema-less success output of `prune-sessions` and `close-session`, and the reports of
+  `doctor`, `consent`, and `self_test`, retain their separate formats. The `sessions` array and
+  `settings` output are also separate and are not wrapped in an envelope.
 - `src/native/doctor.rs` combines read-only shared observations with provider diagnostics and
   optional bounded probes. Providers choose which observation can explain a result timeout;
   `doctor` assembles that read and `self_test` bounds its execution. A diagnostic report is not

@@ -523,18 +523,18 @@ pub(super) fn run_reopen(request: ReopenRequest) -> Result<()> {
             if let Err(error) = &outcome
                 && json
             {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "schema_version": 1,
-                        "ok": false,
-                        "source_session": source,
-                        "session": null,
-                        "request_id": null,
-                        "gate": reopen_refusal_gate(error),
-                        "error": format!("{error:#}"),
-                    }))?
-                );
+                envelope::print(&envelope::error(
+                    error,
+                    serde_json::json!({
+                    "source_session": source,
+                    "session": null,
+                    "request_id": null,
+                    "gate": reopen_refusal_gate(error),
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ))?;
             }
             outcome
         }

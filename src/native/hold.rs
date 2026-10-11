@@ -32,15 +32,8 @@ pub(super) fn parse(args: &[String]) -> Result<NativeCommand> {
             json,
         }))
     })();
-    if let Err(error) = &parsed
-        && args.iter().any(|arg| arg == "--json")
-    {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "schema_version": 1, "ok": false, "error": format!("{error:#}")
-            }))?
-        );
+    if let Err(error) = &parsed {
+        envelope::parse_failure(args, error, serde_json::Map::new())?;
     }
     parsed
 }
@@ -54,29 +47,23 @@ pub(super) fn run(request: Request) -> Result<()> {
     })();
     match outcome {
         Ok(change) => {
-            if request.json {
-                let mut value = serde_json::to_value(change)?;
-                value["schema_version"] = json!(1);
-                value["ok"] = json!(true);
-                value["session"] = json!(request.id);
-                println!("{}", serde_json::to_string_pretty(&value)?);
-            } else {
+            let mut fields = serde_json::to_value(&change)?.as_object().unwrap().clone();
+            fields.insert("session".into(), json!(request.id));
+            envelope::emit(request.json, &envelope::ok(fields), || {
                 println!(
                     "session {}: {}",
                     request.id,
                     if change.held { "held" } else { "hold released" }
                 );
-            }
-            Ok(())
+                Ok(())
+            })
         }
         Err(error) => {
             if request.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "schema_version": 1, "ok": false, "session": request.id, "error": format!("{error:#}")
-                    }))?
-                );
+                envelope::print(&envelope::error(
+                    &error,
+                    serde_json::Map::from_iter([("session".into(), json!(request.id))]),
+                ))?;
             }
             Err(error)
         }
