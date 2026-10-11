@@ -6,8 +6,7 @@ use crate::native::session::primitives::{EventsDirectory, unix_ms};
 use crate::native::session::state::{
     SessionState, SessionStatus, update_status, update_status_with_residual,
 };
-#[cfg(test)]
-use crate::native::session::turn::acquire_turn_claim;
+
 use crate::native::session::turn::{
     JournaledEventState, PendingTurnCompletion, journaled_event_state, recover_pending_completion,
     remove_turn_claim_locked, validate_pending_completion,

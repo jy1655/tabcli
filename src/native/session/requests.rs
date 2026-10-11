@@ -1,11 +1,7 @@
 //! Immutable Bridge request addresses. Provider-owned correlation still decides completion.
 use crate::native::session::primitives::{delegation_source, unix_ms, valid_session_id};
 use crate::native::session::turn::valid_turn_claim_token;
-#[cfg(test)]
-use crate::native::session::turn::{
-    acquire_ready_turn_claim, acquire_turn_claim, record_provider_result_for_claim,
-    release_turn_claim_token, write_pending_completion_event,
-};
+
 use crate::native::session::{CoreRecord, Reader, RecordStore, Store};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -220,9 +216,9 @@ pub(in crate::native) fn list(reader: &Reader) -> Result<Index> {
 mod tests {
     use super::*;
     use crate::native::session::names::*;
-    use crate::native::session::primitives::{event_paths, read_json, write_json_atomic};
+    use crate::native::session::primitives::{event_paths, read_json};
     use crate::native::session::schema::SessionEvent;
-    use crate::native::session::turn::{PendingTurnCompletion, recover_pending_completion};
+    use crate::native::session::turn;
     use crate::native::session::{SessionState, SessionStatus, update_status};
     use agent_bridge::FirstPartyCli;
 
@@ -289,7 +285,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
         update_status(directory.path(), SessionState::Working, None, None).unwrap();
-        let claim = acquire_turn_claim(directory.path()).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
         let receipt = for_claim(&Reader::open_unchecked(directory.path()), claim.token())
             .unwrap()
             .unwrap();
@@ -297,13 +293,15 @@ mod tests {
         assert_ne!(receipt.request_id, claim.token());
         let token = claim.token().to_owned();
         claim.retain();
-        record_provider_result_for_claim(
-            directory.path(),
+        turn::Report::for_claim(
+            &Store::open_unchecked(directory.path()),
             FirstPartyCli::Claude,
+            Some(&token),
+        )
+        .complete(
             "done",
             Some("native-owner".to_owned()),
             Some("native-turn".to_owned()),
-            Some(&token),
         )
         .unwrap();
         let event: SessionEvent =
@@ -371,7 +369,14 @@ mod tests {
         fs::create_dir(directory.path().join("events")).unwrap();
         update_status(directory.path(), SessionState::Ready, None, None).unwrap();
         fs::write(directory.path().join(REQUESTS_DIRECTORY), "not a directory").unwrap();
-        assert!(acquire_ready_turn_claim(directory.path(), "session-test").is_err());
+        assert!(
+            turn::claim_ready(
+                &Store::open_unchecked(directory.path()),
+                "session-test",
+                &[]
+            )
+            .is_err()
+        );
         assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
         let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
         assert_eq!(status.state.as_str(), "ready");
@@ -379,54 +384,11 @@ mod tests {
     }
 
     #[test]
-    fn immutable_request_mapping_survives_each_partial_completion_recovery() {
-        for completed_mutations in 0..=3 {
-            let directory = tempfile::tempdir().unwrap();
-            fs::create_dir(directory.path().join("events")).unwrap();
-            update_status(directory.path(), SessionState::Working, None, None).unwrap();
-            let claim = acquire_turn_claim(directory.path()).unwrap();
-            let receipt = claim.receipt().clone();
-            let token = claim.token().to_owned();
-            claim.retain();
-            let event = SessionEvent {
-                cancelled: false,
-                provider: "codex".to_owned(),
-                message: "same text".to_owned(),
-                error: None,
-                provider_session_id: Some("thread".to_owned()),
-                turn_id: Some("turn".to_owned()),
-                created_unix_ms: Some(1),
-            };
-            let mut pending = PendingTurnCompletion::new(&token, event, None).unwrap();
-            pending.event_file = receipt.event_file.clone();
-            write_json_atomic(&directory.path().join(TURN_COMPLETION_FILE), &pending).unwrap();
-            if completed_mutations >= 1 {
-                write_pending_completion_event(directory.path(), &pending).unwrap();
-            }
-            if completed_mutations >= 2 {
-                update_status(directory.path(), SessionState::Ready, None, None).unwrap();
-            }
-            if completed_mutations >= 3 {
-                release_turn_claim_token(&directory.path().join(TURN_CLAIM_FILE), &token).unwrap();
-            }
-            recover_pending_completion(directory.path()).unwrap();
-            let recovered = for_claim(&Reader::open_unchecked(directory.path()), &token)
-                .unwrap()
-                .unwrap();
-            assert_eq!(recovered.request_id, receipt.request_id);
-            assert_eq!(recovered.event_file, receipt.event_file);
-            let stored: SessionEvent =
-                read_json(&directory.path().join("events").join(recovered.event_file)).unwrap();
-            assert_eq!(stored, pending.event);
-        }
-    }
-
-    #[test]
     fn damaged_optional_request_index_cannot_block_verified_completion() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
         update_status(directory.path(), SessionState::Working, None, None).unwrap();
-        let claim = acquire_turn_claim(directory.path()).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
         let token = claim.token().to_owned();
         claim.retain();
         fs::write(
@@ -437,13 +399,15 @@ mod tests {
             "invalid",
         )
         .unwrap();
-        record_provider_result_for_claim(
-            directory.path(),
+        turn::Report::for_claim(
+            &Store::open_unchecked(directory.path()),
             FirstPartyCli::Codex,
+            Some(&token),
+        )
+        .complete(
             "verified result",
             Some("thread".to_owned()),
             Some("turn".to_owned()),
-            Some(&token),
         )
         .unwrap();
         assert!(!directory.path().join(TURN_CLAIM_FILE).exists());

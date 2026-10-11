@@ -1,5 +1,14 @@
 use super::*;
+use crate::native::query;
+use crate::native::reopen::tests::snapshot_directory;
+use crate::native::session::close::compatibility::mark_session_closed;
+use crate::native::session::names::{TURN_CLAIM_FILE, TURN_COMPLETION_FILE};
+use crate::native::session::primitives::{
+    injected_fault, injected_sync_failure, lock_turn_claim, read_json, with_fault_budget,
+    with_sync_failure, write_json_atomic, write_private,
+};
 use crate::native::session::state::update_status_with_residual;
+use crate::native::session::{Reader, Store};
 use crate::native::session::{launch, turn};
 use crate::native::terminal;
 use std::fs;
@@ -561,10 +570,17 @@ fn hold_after_first_admission_refuses_before_claim_creation() {
 #[test]
 fn hold_after_claim_before_claimed_keeps_unresolved_receipt() {
     let (_directory, store) = hold_fixture(SessionState::Ready);
-    let result = acquire_ready_turn_claim_after_claim(store.directory(), "session-test", || {
-        session::hold::change(&store, false)?;
-        Ok(())
-    });
+    let result = claim_ready_with_callbacks(
+        store.directory(),
+        "session-test",
+        || {},
+        || {
+            session::hold::change(&store, false)?;
+            Ok(())
+        },
+        || {},
+        &[],
+    );
     assert!(result.is_err());
     assert!(current_claim_token(&store).unwrap().is_none());
     assert_hold_receipt_unresolved(&store);
@@ -813,4 +829,619 @@ fn failure_reports_keep_claim_until_event_sync_and_recover_before_late_failure()
                 .is_none()
         );
     }
+}
+
+#[test]
+fn launch_fence_preserves_claim_status_and_receipt_on_drop() {
+    for fenced in [false, true] {
+        let (_directory, store) = fixture(SessionState::AwaitingInitialInput);
+        update_status(
+            store.directory(),
+            SessionState::AwaitingInitialInput,
+            None,
+            Some("launch diagnostic".into()),
+        )
+        .unwrap();
+        let mut claimed = claim(&store, &[]).unwrap();
+        assert_eq!(claimed.rollback_state, None);
+        let token = claimed.token().to_owned();
+        let claim_bytes = store.record(CoreRecord::TurnClaim).bytes().unwrap();
+        let status_bytes = store.record(CoreRecord::Status).bytes().unwrap();
+        let receipt = claimed.receipt().clone();
+        let receipt_path = store
+            .record(CoreRecord::Requests)
+            .path()
+            .join(format!("{}.json", receipt.claim_token));
+        let receipt_bytes = fs::read(&receipt_path).unwrap();
+        if fenced {
+            claimed.fence_launch();
+        }
+        drop(claimed);
+        assert_eq!(
+            store.record(CoreRecord::Status).bytes().unwrap(),
+            status_bytes
+        );
+        assert_eq!(fs::read(receipt_path).unwrap(), receipt_bytes);
+        assert!(store.events().unwrap().is_empty());
+        assert!(
+            store
+                .record(CoreRecord::Completion)
+                .bytes()
+                .unwrap()
+                .is_none()
+        );
+        if fenced {
+            assert_eq!(
+                store.record(CoreRecord::TurnClaim).bytes().unwrap(),
+                claim_bytes
+            );
+            assert_eq!(current_claim_token(&store).unwrap(), Some(token));
+            assert!(claim(&store, &[]).is_err());
+        } else {
+            assert!(current_claim_token(&store).unwrap().is_none());
+            assert!(claim(&store, &[]).is_ok());
+        }
+    }
+}
+
+#[test]
+fn startup_confirmation_restores_only_the_existing_drop_policy() {
+    for confirmed in [false, true] {
+        let (_directory, store) = fixture(SessionState::AwaitingInitialInput);
+        let mut claimed = claim(&store, &[]).unwrap();
+        let token = claimed.token().to_owned();
+        let status_bytes = store.record(CoreRecord::Status).bytes().unwrap();
+        let receipt_path = store
+            .record(CoreRecord::Requests)
+            .path()
+            .join(format!("{}.json", claimed.token()));
+        let receipt_bytes = fs::read(&receipt_path).unwrap();
+        claimed.fence_launch();
+        if confirmed {
+            claimed.startup_confirmed();
+        }
+        assert_eq!(claimed.rollback_state, None);
+        drop(claimed);
+        assert_eq!(
+            store.record(CoreRecord::Status).bytes().unwrap(),
+            status_bytes
+        );
+        assert_eq!(fs::read(receipt_path).unwrap(), receipt_bytes);
+        assert!(store.events().unwrap().is_empty());
+        assert!(
+            store
+                .record(CoreRecord::Completion)
+                .bytes()
+                .unwrap()
+                .is_none()
+        );
+        if confirmed {
+            assert!(current_claim_token(&store).unwrap().is_none());
+            assert!(claim(&store, &[]).is_ok());
+        } else {
+            assert_eq!(current_claim_token(&store).unwrap(), Some(token));
+            assert!(claim(&store, &[]).is_err());
+        }
+    }
+    let (_directory, store) = fixture(SessionState::Ready);
+    let (mut claimed, _) = claim_ready(&store, "session-test", &[]).unwrap();
+    assert_eq!(claimed.rollback_state, Some(SessionState::Ready));
+    let receipt_path = store
+        .record(CoreRecord::Requests)
+        .path()
+        .join(format!("{}.json", claimed.token()));
+    let receipt_bytes = fs::read(&receipt_path).unwrap();
+    claimed.fence_launch();
+    claimed.startup_confirmed();
+    assert_eq!(claimed.rollback_state, Some(SessionState::Ready));
+    drop(claimed);
+    assert!(current_claim_token(&store).unwrap().is_none());
+    assert_eq!(store.status().unwrap().state, SessionState::Ready);
+    assert_eq!(fs::read(receipt_path).unwrap(), receipt_bytes);
+    assert!(store.events().unwrap().is_empty());
+    assert!(
+        store
+            .record(CoreRecord::Completion)
+            .bytes()
+            .unwrap()
+            .is_none()
+    );
+    assert!(claim_ready(&store, "session-test", &[]).is_ok());
+}
+
+#[test]
+fn close_during_turn_claim_cannot_resurrect_the_session() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), SessionState::Ready, None, None).unwrap();
+    let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+    let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+    let waiter_directory = directory.path().to_owned();
+    let waiter = thread::spawn(move || {
+        claim_ready_with_callbacks(
+            &waiter_directory,
+            "session-closing123",
+            || {},
+            || {
+                claimed_tx.send(()).unwrap();
+                continue_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                Ok(())
+            },
+            || {},
+            &[],
+        )
+    });
+    claimed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+    mark_session_closed(directory.path(), None).unwrap();
+    continue_tx.send(()).unwrap();
+    let error = match waiter.join().unwrap() {
+        Ok(_) => panic!("closed session unexpectedly reacquired a turn"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("claim disappeared"));
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state.as_str(), "closed");
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+}
+
+#[test]
+fn close_cannot_interleave_between_ready_validation_and_claimed_publication() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), SessionState::Ready, None, None).unwrap();
+    let (publish_tx, publish_rx) = std::sync::mpsc::channel();
+    let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+    let tell_directory = directory.path().to_owned();
+    let tell = thread::spawn(move || {
+        claim_ready_with_callbacks(
+            &tell_directory,
+            "session-closing123",
+            || {},
+            || Ok(()),
+            || {
+                publish_tx.send(()).unwrap();
+                continue_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            },
+            &[],
+        )
+    });
+    publish_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let close_directory = directory.path().to_owned();
+    let close = thread::spawn(move || mark_session_closed(&close_directory, None));
+
+    continue_tx.send(()).unwrap();
+    let (claim, _) = tell.join().unwrap().unwrap();
+    drop(claim);
+    close.join().unwrap().unwrap();
+
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state.as_str(), "closed");
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+}
+
+#[test]
+fn timeline_uses_the_existing_publication_predicate_at_every_completion_boundary() {
+    for mutations in 0..=3 {
+        let (directory, store) = hold_fixture(SessionState::Working);
+        let claimed = claim(&store, &[]).unwrap();
+        let request = claimed.receipt().request_id.clone();
+        let token = claimed.token().to_owned();
+        let event_path = store
+            .record(CoreRecord::Events)
+            .path()
+            .join(&claimed.receipt().event_file);
+        claimed.retain();
+        let event = SessionEvent {
+            cancelled: false,
+            provider: "codex".to_owned(),
+            message: "same result".to_owned(),
+            error: None,
+            provider_session_id: Some("thread".to_owned()),
+            turn_id: Some("turn".to_owned()),
+            created_unix_ms: Some(5),
+        };
+        let mut pending = PendingTurnCompletion::new(&token, event, None).unwrap();
+        pending.event_file = event_path.file_name().unwrap().to_str().unwrap().to_owned();
+        write_json_atomic(&directory.path().join(TURN_COMPLETION_FILE), &pending).unwrap();
+        if mutations >= 1 {
+            write_completion_event(directory.path(), &pending).unwrap();
+        }
+        if mutations >= 2 {
+            update_status(directory.path(), SessionState::Ready, None, None).unwrap();
+        }
+        if mutations >= 3 {
+            release_claim_token(&directory.path().join(TURN_CLAIM_FILE), &token).unwrap();
+        }
+        let before = snapshot_directory(directory.path());
+        let value = query::timeline_value(
+            &Reader::open_unchecked(directory.path()),
+            "session-query",
+            Some(&request),
+        )
+        .unwrap();
+        assert_eq!(
+            value["requests"][0]["request_state"],
+            if mutations == 0 {
+                "recovery_required"
+            } else {
+                "completed"
+            }
+        );
+        assert_eq!(value["recovery_required"], true);
+        assert_eq!(
+            value["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["stage"] == "completion" && e["record_state"] == "observed")
+                .count(),
+            usize::from(mutations >= 1)
+        );
+        assert_eq!(snapshot_directory(directory.path()), before);
+    }
+}
+
+#[test]
+fn an_oversized_completion_settles_identically_whichever_write_it_stops_after() {
+    fn request_state(directory: &Path, request_id: &str) -> (String, String) {
+        let value = query::request_result(&Reader::open_unchecked(directory), request_id).unwrap();
+        (
+            value["request_state"].as_str().unwrap().to_owned(),
+            value["session_state"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    /// Everything a query or a lifecycle step can observe of a settled completion.
+    #[derive(Debug, PartialEq)]
+    struct SettledCompletion {
+        request: (String, String),
+        status: (String, Option<String>),
+        event: SessionEvent,
+        claim_present: bool,
+        journal_present: bool,
+    }
+
+    fn settled_completion(
+        directory: &Path,
+        request_id: &str,
+        event_path: &Path,
+    ) -> SettledCompletion {
+        let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+        SettledCompletion {
+            request: request_state(directory, request_id),
+            status: (status.state.to_string(), status.error),
+            event: read_json(event_path).unwrap(),
+            claim_present: directory.join(TURN_CLAIM_FILE).exists(),
+            journal_present: directory.join(TURN_COMPLETION_FILE).exists(),
+        }
+    }
+    // The size policy is applied when the journal is created: a completion whose event
+    // record would exceed the read limit is journaled as a failed completion whose error
+    // names the size. Stopping the commit before every record write, then recovering, must
+    // therefore reach one final state whether the event was written before the stop or not.
+    const LIMIT: u64 = 4096;
+    let event = event(&"x".repeat(LIMIT as usize));
+    let size = serde_json::to_vec_pretty(&event).unwrap().len() as u64;
+    assert!(size > LIMIT);
+    let expected_error =
+        format!("provider result of {size} bytes exceeds the {LIMIT} byte event limit");
+    let mut journal_only = 0;
+    let mut journal_and_event = 0;
+    let mut settled = Vec::new();
+    for budget in 0.. {
+        let (_root, store) = hold_fixture(SessionState::Working);
+        let directory = store.directory().to_owned();
+        let claimed = claim(&store, &[]).unwrap();
+        let request_id = claimed.receipt().request_id.clone();
+        let claim_token = claimed.token().to_owned();
+        let event_path = store
+            .record(CoreRecord::Events)
+            .path()
+            .join(&claimed.receipt().event_file);
+        claimed.retain();
+        let claim_path = directory.join(TURN_CLAIM_FILE);
+        let outcome = with_fault_budget(budget, || {
+            let _lock = lock_turn_claim(&claim_path).unwrap();
+            commit_completion_within_locked(
+                &directory,
+                &claim_path,
+                &claim_token,
+                event.clone(),
+                None,
+                SessionState::Ready,
+                LIMIT,
+            )
+        });
+        let interrupted = match outcome {
+            Ok(()) => false,
+            Err(error) => {
+                assert!(injected_fault(&error), "{error:#}");
+                true
+            }
+        };
+        let label = format!("budget {budget}");
+        let journal_present = directory.join(TURN_COMPLETION_FILE).exists();
+        if journal_present {
+            // The journal never holds a publishable record over the limit.
+            let pending: PendingTurnCompletion =
+                read_json(&directory.join(TURN_COMPLETION_FILE)).unwrap();
+            assert_eq!(pending.event.message, "", "{label}");
+            assert_eq!(pending.status_state.as_str(), "failed", "{label}");
+            assert_eq!(
+                pending.event.error.as_deref(),
+                Some(expected_error.as_str()),
+                "{label}"
+            );
+            if event_path.exists() {
+                journal_and_event += 1;
+            } else {
+                journal_only += 1;
+            }
+        } else if !event_path.exists() {
+            // The stop came before the journal: nothing to recover and the claim stays.
+            assert!(interrupted, "{label}");
+            assert!(!recover_pending_completion(&directory).unwrap(), "{label}");
+            assert_eq!(
+                request_state(&directory, &request_id),
+                ("pending".to_owned(), "working".to_owned()),
+                "{label}"
+            );
+            continue;
+        }
+        // Otherwise the journal was created (and possibly already settled and removed):
+        // recovery must converge on the one final state.
+        recover_pending_completion(&directory).unwrap();
+        settled.push(settled_completion(&directory, &request_id, &event_path));
+        assert!(!recover_pending_completion(&directory).unwrap(), "{label}");
+        if !interrupted {
+            break;
+        }
+    }
+    assert!(
+        journal_only >= 1,
+        "no stop between the journal and the event"
+    );
+    assert!(journal_and_event >= 1, "no stop after the event");
+    let first = &settled[0];
+    assert_eq!(first.request, ("failed".to_owned(), "failed".to_owned()));
+    assert_eq!(
+        first.status,
+        ("failed".to_owned(), Some(expected_error.clone()))
+    );
+    assert_eq!(first.event.message, "");
+    assert_eq!(first.event.error.as_deref(), Some(expected_error.as_str()));
+    assert_eq!(
+        first.event.provider_session_id.as_deref(),
+        Some("provider-session")
+    );
+    assert_eq!(first.event.turn_id.as_deref(), Some("provider-turn"));
+    assert!(!first.claim_present);
+    assert!(!first.journal_present);
+    for (index, state) in settled.iter().enumerate() {
+        assert_eq!(state, first, "stop {index} settled differently");
+    }
+}
+
+#[test]
+fn cancel_reproduced_pre_cancel_writer_bytes_preserve_publication_and_recovery() {
+    // Reproduced output of the pre-cancel writer at main commit 2947306, not a
+    // runtime capture. EVENT is the literal form of tests/interrupted_close.rs's
+    // event_text(). JOURNAL follows PendingTurnCompletion in session/turn.rs and
+    // SessionEvent in native.rs, in their declared field order. Both use
+    // session/primitives.rs::write_json_atomic: serde_json::to_vec_pretty, two-space
+    // indentation, and no trailing newline. These sources were read with git show
+    // 2947306:<path>; the separate main checkout was only read, never executed.
+    // Neither fixture is generated by the current serializer or has dynamic ids.
+    const EVENT: &[u8] = br#"{
+  "provider": "codex",
+  "message": "late result",
+  "error": null,
+  "provider_session_id": "thread",
+  "turn_id": "turn-7",
+  "created_unix_ms": 3
+}"#;
+    const JOURNAL: &[u8] = br#"{
+  "schema": 1,
+  "claim_token": "7-7-7",
+  "event_file": "event-7.json",
+  "event": {
+    "provider": "codex",
+    "message": "late result",
+    "error": null,
+    "provider_session_id": "thread",
+    "turn_id": "turn-7",
+    "created_unix_ms": 3
+  },
+  "status_error": null,
+  "status_state": "ready"
+}"#;
+    for stage in 0..=3 {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("events")).unwrap();
+        update_status(dir.path(), SessionState::Working, None, None).unwrap();
+        let token = "7-7-7";
+        write_private(&dir.path().join(TURN_CLAIM_FILE), token.as_bytes()).unwrap();
+        let event: SessionEvent = serde_json::from_slice(EVENT).unwrap();
+        let pending: PendingTurnCompletion = serde_json::from_slice(JOURNAL).unwrap();
+        assert!(!event.cancelled);
+        assert_eq!(serde_json::to_vec_pretty(&event).unwrap(), EVENT);
+        assert_eq!(serde_json::to_vec_pretty(&pending).unwrap(), JOURNAL);
+        write_private(&dir.path().join(TURN_COMPLETION_FILE), JOURNAL).unwrap();
+        if stage >= 1 {
+            write_private(&dir.path().join("events/event-7.json"), EVENT).unwrap();
+        }
+        if stage >= 2 {
+            update_status(dir.path(), SessionState::Ready, None, None).unwrap();
+        }
+        if stage >= 3 {
+            release_claim_token(&dir.path().join(TURN_CLAIM_FILE), token).unwrap();
+        }
+        let reader = Reader::open_unchecked(dir.path());
+        let read = reader
+            .journaled_event_state_within(&pending, EVENT_READ_LIMIT)
+            .unwrap();
+        assert_eq!(
+            session::turn::event_published(true, Some(&read), stage < 3),
+            stage >= 1
+        );
+        recover_pending_completion(dir.path()).unwrap();
+        assert_eq!(
+            fs::read(dir.path().join("events/event-7.json")).unwrap(),
+            EVENT
+        );
+        assert!(!dir.path().join(TURN_CLAIM_FILE).exists());
+    }
+}
+
+#[test]
+fn stale_turn_claim_cannot_release_a_new_owner() {
+    let directory = tempfile::tempdir().unwrap();
+    let stale = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
+    {
+        let store = Store::open_unchecked(directory.path());
+        let _lock = store.lock().unwrap();
+        remove_turn_claim_locked(store.record(CoreRecord::TurnClaim).path()).unwrap();
+    }
+    let current = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
+
+    drop(stale);
+
+    assert!(turn::claim(&Store::open_unchecked(directory.path()), &[]).is_err());
+    drop(current);
+    assert!(turn::claim(&Store::open_unchecked(directory.path()), &[]).is_ok());
+}
+
+#[test]
+fn immutable_request_mapping_survives_each_partial_completion_recovery() {
+    for completed_mutations in 0..=3 {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
+        let receipt = claim.receipt().clone();
+        let token = claim.token().to_owned();
+        claim.retain();
+        let event = SessionEvent {
+            cancelled: false,
+            provider: "codex".to_owned(),
+            message: "same text".to_owned(),
+            error: None,
+            provider_session_id: Some("thread".to_owned()),
+            turn_id: Some("turn".to_owned()),
+            created_unix_ms: Some(1),
+        };
+        let mut pending = PendingTurnCompletion::new(&token, event, None).unwrap();
+        pending.event_file = receipt.event_file.clone();
+        write_json_atomic(&directory.path().join(TURN_COMPLETION_FILE), &pending).unwrap();
+        if completed_mutations >= 1 {
+            write_completion_event(directory.path(), &pending).unwrap();
+        }
+        if completed_mutations >= 2 {
+            update_status(directory.path(), SessionState::Ready, None, None).unwrap();
+        }
+        if completed_mutations >= 3 {
+            release_claim_token(&directory.path().join(TURN_CLAIM_FILE), &token).unwrap();
+        }
+        recover_pending_completion(directory.path()).unwrap();
+        let recovered = requests::for_claim(&Reader::open_unchecked(directory.path()), &token)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.request_id, receipt.request_id);
+        assert_eq!(recovered.event_file, receipt.event_file);
+        let stored: SessionEvent =
+            read_json(&directory.path().join("events").join(recovered.event_file)).unwrap();
+        assert_eq!(stored, pending.event);
+    }
+}
+
+#[test]
+fn refusal_release_is_fenced_by_claim_ownership_without_publishing_events() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path();
+    fs::create_dir(directory.join("events")).unwrap();
+    update_status(directory, SessionState::Ready, None, None).unwrap();
+    let (mut refused, _) =
+        turn::claim_ready(&Store::open_unchecked(directory), "session-test", &[]).unwrap();
+    let refused_request = refused.receipt().request_id.clone();
+    let refusal = anyhow::anyhow!("reopen refused (reopen-conflict): held by pid 4242");
+
+    // The refused claim is released out from under the refusal before it is recorded, and
+    // the next `tell` claims the turn and starts working.
+    {
+        let store = Store::open_unchecked(directory);
+        let _lock = store.lock().unwrap();
+        remove_turn_claim_locked(store.record(CoreRecord::TurnClaim).path()).unwrap();
+    }
+    update_status(directory, SessionState::Ready, None, None).unwrap();
+    let (next, _) =
+        turn::claim_ready(&Store::open_unchecked(directory), "session-test", &[]).unwrap();
+    let next_token = next.token().to_owned();
+    let next_request = next.receipt().request_id.clone();
+    update_status(directory, SessionState::Working, None, None).unwrap();
+
+    let reported = format!("{refusal:#}");
+    assert!(
+        !refused
+            .release_now_with_reason(SessionState::Ready, reported.clone())
+            .unwrap()
+    );
+    drop(refused);
+
+    let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+    assert_eq!(status.state.as_str(), "working", "{status:?}");
+    assert_eq!(status.error, None, "{status:?}");
+    assert_eq!(
+        fs::read_to_string(directory.join(TURN_CLAIM_FILE))
+            .unwrap()
+            .trim(),
+        next_token
+    );
+    let receipts = requests::list(&Reader::open_unchecked(directory)).unwrap();
+    assert_eq!(receipts.unreadable, 0);
+    let mut recorded: Vec<&str> = receipts
+        .receipts
+        .iter()
+        .map(|receipt| receipt.request_id.as_str())
+        .collect();
+    recorded.sort_unstable();
+    let mut expected = [refused_request.as_str(), next_request.as_str()];
+    expected.sort_unstable();
+    assert_eq!(recorded, expected);
+    for receipt in &receipts.receipts {
+        assert!(
+            !directory.join("events").join(&receipt.event_file).exists(),
+            "{}: no result was recorded for either request",
+            receipt.request_id
+        );
+    }
+    next.retain();
+    assert!(directory.join(TURN_CLAIM_FILE).is_file());
+
+    // With the turn still its own, the refusal releases the claim and publishes its reason
+    // in the same write.
+    {
+        let store = Store::open_unchecked(directory);
+        let _lock = store.lock().unwrap();
+        remove_turn_claim_locked(store.record(CoreRecord::TurnClaim).path()).unwrap();
+    }
+    update_status(directory, SessionState::Ready, None, None).unwrap();
+    let (mut refused, _) =
+        turn::claim_ready(&Store::open_unchecked(directory), "session-test", &[]).unwrap();
+    let refusal = anyhow::anyhow!("reopen refused (reopen-conflict): held by pid 4242");
+    let reported = format!("{refusal:#}");
+    assert!(
+        refused
+            .release_now_with_reason(SessionState::Ready, reported.clone())
+            .unwrap()
+    );
+    drop(refused);
+    let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+    assert_eq!(status.state.as_str(), "ready", "{status:?}");
+    assert_eq!(
+        status.error.as_deref(),
+        Some(format!("{reported:#}").as_str())
+    );
+    assert!(!directory.join(TURN_CLAIM_FILE).exists());
 }

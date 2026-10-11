@@ -1,7 +1,8 @@
 use super::delivery::Clock;
 use super::monitor::parse_planner_result;
 use super::{PendingAgyTurn, install_pending_turn, terminal_correlated_prompt};
-use crate::native::acquire_turn_claim;
+use crate::native::session::{Store, turn};
+
 use anyhow::Result;
 use std::cell::Cell;
 use std::path::Path;
@@ -15,7 +16,7 @@ pub(super) fn parse_transcript_line(line: &str) -> Option<(u64, String)> {
 }
 
 pub(super) fn claim_pending_turn(directory: &Path) -> PendingAgyTurn {
-    let claim = acquire_turn_claim(directory).unwrap();
+    let claim = turn::claim(&Store::open_unchecked(directory), &[]).unwrap();
     let token = claim.token().to_owned();
     claim.retain();
     install_pending_turn(directory, &token).unwrap()

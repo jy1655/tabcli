@@ -2648,7 +2648,7 @@ mod tests {
         std::fs::create_dir(directory.path().join("events")).unwrap();
         super::super::super::update_status(directory.path(), SessionState::Working, None, None)
             .unwrap();
-        let claim = super::super::super::acquire_turn_claim(directory.path()).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
         claim.retain();
         let payload = serde_json::json!({
             "hook_event_name": "Stop",
@@ -2675,7 +2675,7 @@ mod tests {
         std::fs::create_dir(directory.path().join("events")).unwrap();
         super::super::super::update_status(directory.path(), SessionState::Working, None, None)
             .unwrap();
-        let first_claim = super::super::super::acquire_turn_claim(directory.path()).unwrap();
+        let first_claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
         first_claim.retain();
         let payload = serde_json::json!({
             "hook_event_name": "Stop",
@@ -2684,7 +2684,7 @@ mod tests {
         });
         handle_hook(directory.path(), &payload).unwrap();
 
-        let later_claim = super::super::super::acquire_turn_claim(directory.path()).unwrap();
+        let later_claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
         later_claim.retain();
         super::super::super::update_status(directory.path(), SessionState::Claimed, None, None)
             .unwrap();
@@ -2712,7 +2712,7 @@ mod tests {
         std::fs::create_dir(directory.path().join("events")).unwrap();
         super::super::super::update_status(directory.path(), SessionState::Working, None, None)
             .unwrap();
-        let claim = super::super::super::acquire_turn_claim(directory.path()).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
         claim.retain();
         let pending = PendingCrossSessionTurn::new("claude-turn-safe123").unwrap();
         super::super::super::write_private(
@@ -2753,7 +2753,7 @@ mod tests {
         std::fs::create_dir(directory.path().join("events")).unwrap();
         super::super::super::update_status(directory.path(), SessionState::Working, None, None)
             .unwrap();
-        let claim = super::super::super::acquire_turn_claim(directory.path()).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
         claim.retain();
         let pending = PendingCrossSessionTurn::new("claude-turn-safe123").unwrap();
         super::super::super::write_private(
@@ -2789,7 +2789,7 @@ mod tests {
         std::fs::create_dir(directory.path().join("events")).unwrap();
         super::super::super::update_status(directory.path(), SessionState::Working, None, None)
             .unwrap();
-        let claim = super::super::super::acquire_turn_claim(directory.path()).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
         claim.retain();
         let pending = PendingCrossSessionTurn::new("claude-turn-safe123").unwrap();
         super::super::super::write_private(

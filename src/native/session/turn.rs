@@ -1,18 +1,12 @@
 //! Claims, receipts, completion publication and recovery for one session.
 use crate::native::session;
 use crate::native::session::primitives::unix_ms;
-#[cfg(test)]
-use crate::native::session::primitives::{injected_sync_failure, with_sync_failure};
 use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
 use crate::native::session::state::{SessionState, SessionStatus, update_status};
 use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store, requests};
 #[cfg(target_os = "macos")]
 use crate::native::terminal::ownership::NativeSessionOwner;
 
-#[cfg(test)]
-use crate::native::session::{names::TURN_CLAIM_FILE, primitives::lock_turn_claim};
-#[cfg(test)]
-use agent_bridge::checked_deadline_from;
 #[cfg(target_os = "macos")]
 use agent_bridge::process_is_alive;
 use agent_bridge::{FirstPartyCli, terminal_safe_text};
@@ -75,44 +69,6 @@ fn default_completion_status_state() -> SessionState {
     SessionState::Ready
 }
 
-#[cfg(test)]
-pub(in crate::native) fn record_provider_result(
-    directory: &Path,
-    provider: FirstPartyCli,
-    message: &str,
-    provider_session_id: Option<String>,
-    turn_id: Option<String>,
-) -> Result<()> {
-    record_provider_result_for_claim(
-        directory,
-        provider,
-        message,
-        provider_session_id,
-        turn_id,
-        None,
-    )
-}
-
-#[cfg(test)]
-pub(in crate::native) fn record_provider_result_for_claim(
-    directory: &Path,
-    provider: FirstPartyCli,
-    message: &str,
-    provider_session_id: Option<String>,
-    turn_id: Option<String>,
-    expected_claim_token: Option<&str>,
-) -> Result<()> {
-    record_provider_result_for_claim_condition(
-        directory,
-        provider,
-        message,
-        provider_session_id,
-        turn_id,
-        expected_claim_token,
-        false,
-    )
-}
-
 fn record_provider_result_for_claim_condition(
     directory: &Path,
     provider: FirstPartyCli,
@@ -164,41 +120,6 @@ fn record_provider_result_for_claim_condition(
         event,
         None,
     )
-}
-
-#[cfg(test)]
-pub(in crate::native) fn record_provider_failure(
-    directory: &Path,
-    provider: FirstPartyCli,
-    error: &str,
-    provider_session_id: Option<String>,
-    turn_id: Option<String>,
-) -> Result<()> {
-    record_provider_failure_for_claim(
-        directory,
-        provider,
-        error,
-        provider_session_id,
-        turn_id,
-        None,
-    )
-}
-
-#[cfg(test)]
-pub(in crate::native) fn record_provider_failure_for_claim(
-    directory: &Path,
-    provider: FirstPartyCli,
-    error: &str,
-    provider_session_id: Option<String>,
-    turn_id: Option<String>,
-    expected_claim_token: Option<&str>,
-) -> Result<()> {
-    Report::for_claim(
-        &Store::open_unchecked(directory),
-        provider,
-        expected_claim_token,
-    )
-    .fail(error, provider_session_id, turn_id)
 }
 
 fn record_monitor_failure(directory: &Path, provider: FirstPartyCli, error: &str) -> Result<()> {
@@ -511,11 +432,16 @@ impl Claim {
         Ok(())
     }
 
-    pub(in crate::native) fn rollback_on_drop(&mut self) {
+    /// Records confirmed provider startup and consent: delivery now owns the existing
+    /// Drop policy. An initial claim still has no status rollback state.
+    pub(in crate::native) fn startup_confirmed(&mut self) {
         self.retained = false;
     }
 
-    pub(in crate::native) fn retain_in_place(&mut self) {
+    /// Records that launch failure publication owns this claim; Drop must not release it.
+    /// Once the terminal accepts the wrapper command, only a fenced launch failure may
+    /// release it. Detached callers also wait for provider startup, not its result.
+    pub(in crate::native) fn fence_launch(&mut self) {
         self.retained = true;
     }
 
@@ -536,7 +462,7 @@ impl Claim {
     }
 
     pub(in crate::native) fn retain(mut self) {
-        self.retain_in_place();
+        self.retained = true;
     }
 }
 
@@ -637,11 +563,6 @@ fn rollback_turn_claim_token_with_error_locked(
     Ok(true)
 }
 
-#[cfg(test)]
-pub(in crate::native) fn acquire_turn_claim(directory: &Path) -> Result<Claim> {
-    acquire_turn_claim_with_context(directory, &[])
-}
-
 // The receipt records the pinned context sources the caller already resolved.
 fn acquire_turn_claim_with_context(
     directory: &Path,
@@ -653,14 +574,6 @@ fn acquire_turn_claim_with_context(
         .to_owned();
     let _lock = Store::open_unchecked((path).with_file_name("")).lock()?;
     create_turn_claim_locked(path, context_sources)
-}
-
-#[cfg(test)]
-pub(in crate::native) fn acquire_ready_turn_claim(
-    directory: &Path,
-    session_id: &str,
-) -> Result<(Claim, usize)> {
-    acquire_ready_turn_claim_after_claim(directory, session_id, || Ok(()))
 }
 
 fn claim_ready_with_context(
@@ -676,18 +589,6 @@ fn claim_ready_with_context(
         || {},
         context_sources,
     )
-}
-
-#[cfg(test)]
-pub(in crate::native) fn acquire_ready_turn_claim_after_claim<F>(
-    directory: &Path,
-    session_id: &str,
-    after_claim: F,
-) -> Result<(Claim, usize)>
-where
-    F: FnOnce() -> Result<()>,
-{
-    claim_ready_with_callbacks(directory, session_id, || {}, after_claim, || {}, &[])
 }
 
 fn claim_ready_with_callbacks<B, F, G>(
@@ -791,13 +692,6 @@ fn release_turn_claim_token_locked(path: &Path, expected_token: &str) -> Result<
     RecordStore::at(path)
         .remove()
         .context("failed to release native turn claim")
-}
-
-#[cfg(test)]
-pub(in crate::native) fn release_turn_claim(directory: &Path) -> Result<()> {
-    let path = directory.join(TURN_CLAIM_FILE);
-    let _lock = lock_turn_claim(&path)?;
-    remove_turn_claim_locked(&path)
 }
 
 pub(in crate::native) fn remove_turn_claim_locked(path: &Path) -> Result<()> {
@@ -1078,34 +972,6 @@ pub(in crate::native) fn wait_for_status(
     }
 }
 
-#[cfg(test)]
-pub(in crate::native) fn wait_for_event(
-    directory: &Path,
-    baseline: usize,
-    timeout: Duration,
-) -> Result<SessionEvent> {
-    wait_for_event_for_turn(directory, baseline, None, None, timeout)
-}
-
-#[cfg(test)]
-pub(in crate::native) fn wait_for_event_for_turn(
-    directory: &Path,
-    baseline: usize,
-    expected_turn_id: Option<&str>,
-    expected_claim_token: Option<&str>,
-    timeout: Duration,
-) -> Result<SessionEvent> {
-    let deadline = checked_deadline_from(Instant::now(), timeout)?;
-    wait_for_event_for_turn_until(
-        directory,
-        baseline,
-        expected_turn_id,
-        expected_claim_token,
-        deadline,
-        timeout,
-    )
-}
-
 fn wait_for_event_for_turn_until(
     directory: &Path,
     baseline: usize,
@@ -1358,87 +1224,6 @@ impl<'a> Report<'a> {
 }
 
 #[cfg(test)]
-pub(in crate::native) fn commit_provider_completion_locked(
-    directory: &Path,
-    claim_path: &Path,
-    claim_token: &str,
-    event: SessionEvent,
-    status_error: Option<String>,
-) -> Result<()> {
-    commit_completion_locked(directory, claim_path, claim_token, event, status_error)
-}
-
-#[cfg(test)]
-pub(in crate::native) fn commit_provider_completion_within_locked(
-    directory: &Path,
-    claim_path: &Path,
-    claim_token: &str,
-    event: SessionEvent,
-    status_error: Option<String>,
-    status_state: SessionState,
-    event_limit: u64,
-) -> Result<()> {
-    commit_completion_within_locked(
-        directory,
-        claim_path,
-        claim_token,
-        event,
-        status_error,
-        status_state,
-        event_limit,
-    )
-}
-
-#[cfg(test)]
-pub(in crate::native) fn acquire_ready_turn_claim_with_context(
-    directory: &Path,
-    session_id: &str,
-    context_sources: &[requests::ContextSource],
-) -> Result<(Claim, usize)> {
-    claim_ready_with_context(directory, session_id, context_sources)
-}
-
-#[cfg(test)]
-pub(in crate::native) fn acquire_ready_turn_claim_with_callbacks<F, G>(
-    directory: &Path,
-    session_id: &str,
-    after_claim: F,
-    before_publish: G,
-    context_sources: &[requests::ContextSource],
-) -> Result<(Claim, usize)>
-where
-    F: FnOnce() -> Result<()>,
-    G: FnOnce(),
-{
-    claim_ready_with_callbacks(
-        directory,
-        session_id,
-        || {},
-        after_claim,
-        before_publish,
-        context_sources,
-    )
-}
-
-#[cfg(test)]
-pub(in crate::native) fn release_turn_claim_token(path: &Path, expected_token: &str) -> Result<()> {
-    release_claim_token(path, expected_token)
-}
-
-#[cfg(test)]
-pub(in crate::native) fn write_pending_completion_event(
-    directory: &Path,
-    pending: &PendingTurnCompletion,
-) -> Result<()> {
-    write_completion_event(directory, pending)
-}
-
-#[cfg(test)]
-pub(in crate::native) fn current_turn_claim_token(directory: &Path) -> Result<Option<String>> {
-    current_claim_token(&Reader::open_unchecked(directory))
-}
-
-#[cfg(test)]
 mod tests;
 
 /// Makes a committed event's directory entry durable before the journal that proves the
@@ -1465,15 +1250,6 @@ pub(in crate::native) fn event_published(
         return pending_event.is_some_and(|read| read.state == JournaledEventState::Committed);
     }
     !claim_matches_receipt
-}
-
-#[cfg(test)]
-pub(in crate::native) fn record_provider_monitor_failure(
-    directory: &Path,
-    provider: FirstPartyCli,
-    error: &str,
-) -> Result<()> {
-    record_monitor_failure(directory, provider, error)
 }
 
 #[cfg(all(test, target_os = "macos"))]

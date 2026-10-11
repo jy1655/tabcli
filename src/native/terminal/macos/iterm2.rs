@@ -1479,7 +1479,11 @@ end run
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
         update_status(directory.path(), SessionState::Launching, None, None).unwrap();
-        let claim = acquire_turn_claim(directory.path()).unwrap();
+        let claim = crate::native::session::turn::claim(
+            &crate::native::session::Store::open_unchecked(directory.path()),
+            &[],
+        )
+        .unwrap();
         let token = claim.token().to_owned();
         claim.retain();
         launch::begin(

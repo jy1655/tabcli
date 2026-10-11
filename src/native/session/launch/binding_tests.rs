@@ -3,6 +3,7 @@
 use super::*;
 use crate::native::session::names::*;
 use crate::native::session::{self, update_status};
+use crate::native::session::{Store, turn};
 use std::cell::RefCell;
 use std::{fs, path::Path};
 
@@ -125,7 +126,7 @@ pub(in crate::native) fn characterize(
         let directory = fixture.path();
         fs::create_dir(directory.join("events")).unwrap();
         update_status(directory, SessionState::Launching, None, None).unwrap();
-        let claim = acquire_turn_claim(directory).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(directory), &[]).unwrap();
         let token = claim.token().to_owned();
         claim.retain();
         let store = Store::open_unchecked(directory);

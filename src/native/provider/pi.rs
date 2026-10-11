@@ -1492,14 +1492,13 @@ mod tests {
     use std::fs;
 
     use super::super::super::{
-        SessionStatus, TURN_CLAIM_FILE, acquire_turn_claim, event_paths, read_json, update_status,
-        wait_for_event, write_json_atomic,
+        SessionStatus, TURN_CLAIM_FILE, event_paths, read_json, update_status, write_json_atomic,
     };
     use super::*;
     use crate::native::session::schema::SessionEvent;
 
     fn claim_pending_turn(directory: &Path) -> PendingPiTurn {
-        let claim = acquire_turn_claim(directory).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(directory), &[]).unwrap();
         let token = claim.token().to_owned();
         claim.retain();
         install_pending_turn(directory, &token).unwrap()
@@ -1896,7 +1895,16 @@ mod tests {
         assert!(consume_hook_failure(directory.path()).unwrap());
         assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
         assert!(!directory.path().join(HOOK_FAILURE_FILE).exists());
-        let error = wait_for_event(directory.path(), 0, Duration::from_secs(1)).unwrap_err();
+        let error = turn::wait(
+            &Store::open_unchecked(directory.path()),
+            0,
+            None,
+            None,
+            agent_bridge::checked_deadline_from(std::time::Instant::now(), Duration::from_secs(1))
+                .unwrap(),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
         assert!(format!("{error:#}").contains("native hook exited with status 1"));
         let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
         assert_eq!(status.state.as_str(), "ready");

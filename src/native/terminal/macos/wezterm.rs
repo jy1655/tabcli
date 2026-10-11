@@ -2636,7 +2636,7 @@ mod tests {
     // A session directory as a launch leaves it while it waits for its terminal: private,
     // status `launching`, the claim and the pending receipt.
     fn launch_fixture() -> tempfile::TempDir {
-        use crate::native::{acquire_turn_claim, launch, update_status};
+        use crate::native::{launch, update_status};
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::Builder::new()
             .prefix("session-wezterm-")
@@ -2645,7 +2645,11 @@ mod tests {
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
         update_status(directory.path(), SessionState::Launching, None, None).unwrap();
-        let claim = acquire_turn_claim(directory.path()).unwrap();
+        let claim = crate::native::session::turn::claim(
+            &crate::native::session::Store::open_unchecked(directory.path()),
+            &[],
+        )
+        .unwrap();
         let token = claim.token().to_owned();
         claim.retain();
         launch::begin(

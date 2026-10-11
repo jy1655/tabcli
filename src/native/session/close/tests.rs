@@ -2,6 +2,7 @@ use super::*;
 use crate::native::session::names::*;
 use crate::native::session::primitives::{SyncRecord, read_json, write_json_atomic};
 use crate::native::session::schema::SessionEvent;
+use crate::native::session::{Reader, Store, turn};
 
 fn damaged_completion_fixture() -> (tempfile::TempDir, Store) {
     let directory = tempfile::tempdir().unwrap();
@@ -251,7 +252,7 @@ fn explicit_close_consumes_the_handle_and_repeated_close_skips_the_adapter() {
     )
     .unwrap();
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
-    let claim = acquire_turn_claim(directory.path()).unwrap();
+    let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
     claim.retain();
     let store = Store::open_unchecked(directory.path());
     let mut tombstone = None;

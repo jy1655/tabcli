@@ -3015,12 +3015,16 @@ mod tests {
     }
 
     fn failed_binding_launch_fixture(directory: &Path) -> crate::native::session::Store {
-        use crate::native::{SessionState, acquire_turn_claim, launch, update_status};
+        use crate::native::{SessionState, launch, update_status};
         fs::create_dir(directory).unwrap();
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
         fs::create_dir(directory.join("events")).unwrap();
         update_status(directory, SessionState::Launching, None, None).unwrap();
-        let claim = acquire_turn_claim(directory).unwrap();
+        let claim = crate::native::session::turn::claim(
+            &crate::native::session::Store::open_unchecked(directory),
+            &[],
+        )
+        .unwrap();
         let token = claim.token().to_owned();
         claim.retain();
         let store = crate::native::session::Store::open_unchecked(directory);

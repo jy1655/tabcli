@@ -2007,9 +2007,7 @@ end run
     // A launch as it stands when the surface is opened: a private session directory,
     // the status `launching`, the retained initial claim and its pending receipt.
     fn launch_fixture() -> tempfile::TempDir {
-        use crate::native::{
-            acquire_turn_claim, launch, set_private_directory_permissions, update_status,
-        };
+        use crate::native::{launch, set_private_directory_permissions, update_status};
         let directory = tempfile::Builder::new()
             .prefix("session-terminal-")
             .tempdir()
@@ -2017,7 +2015,11 @@ end run
         set_private_directory_permissions(directory.path()).unwrap();
         std::fs::create_dir(directory.path().join("events")).unwrap();
         update_status(directory.path(), SessionState::Launching, None, None).unwrap();
-        let claim = acquire_turn_claim(directory.path()).unwrap();
+        let claim = crate::native::session::turn::claim(
+            &crate::native::session::Store::open_unchecked(directory.path()),
+            &[],
+        )
+        .unwrap();
         let token = claim.token().to_owned();
         claim.retain();
         launch::begin(

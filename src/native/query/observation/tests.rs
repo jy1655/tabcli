@@ -1,4 +1,5 @@
 use super::*;
+use crate::native::session::{Reader, Store, turn};
 use crate::native::{doctor, session, tests::seed_close_fixture};
 
 fn bytes(directory: &Path) -> Vec<(PathBuf, Vec<u8>)> {
@@ -47,8 +48,10 @@ fn damage_keeps_inspect_and_doctor_failure_scopes() {
         let fixture = seed_close_fixture(JournaledEventState::Committed);
         let directory = &fixture.directory;
         // Retain the event as an ordinary published result to isolate its decode failure.
-        fs::remove_file(directory.join("turn.completion.json")).unwrap();
-        session::turn::release_turn_claim(directory).unwrap();
+        session::turn::recover_pending_completion(directory).unwrap();
+        // Keep the original observation fixture: a published result while the provider works.
+        session::update_status(directory, SessionState::Claimed, None, None).unwrap();
+        session::update_status(directory, SessionState::Working, None, None).unwrap();
         let reader = Reader::open_unchecked(directory);
         let initial = Observation::read(&reader).unwrap();
         let receipt = &initial.records.receipts[0];
@@ -269,9 +272,15 @@ fn unlocked_turn_facts_cannot_guard_later_adapter_reads() {
         assert!(facts.active_request().is_some());
 
         // A real lifecycle writer can finish before the adapter examines its evidence.
-        session::turn::release_turn_claim(directory).unwrap();
+        session::turn::Report::for_claim(
+            &session::Store::open_unchecked(directory),
+            agent_bridge::FirstPartyCli::Codex,
+            Some(&pending_token),
+        )
+        .complete("completed", None, None)
+        .unwrap();
         if replace {
-            session::turn::acquire_turn_claim(directory)
+            turn::claim(&Store::open_unchecked(directory), &[])
                 .unwrap()
                 .retain();
         }
@@ -294,8 +303,7 @@ fn unlocked_turn_facts_cannot_guard_later_adapter_reads() {
 fn inspect_rejects_provenance_before_reading_latest_event() {
     let fixture = seed_close_fixture(JournaledEventState::Committed);
     let directory = &fixture.directory;
-    fs::remove_file(directory.join("turn.completion.json")).unwrap();
-    session::turn::release_turn_claim(directory).unwrap();
+    session::turn::recover_pending_completion(directory).unwrap();
     let reader = Reader::open_unchecked(directory);
     let event_path = reader.events().unwrap().remove(0);
     fs::write(&event_path, b"{").unwrap();
