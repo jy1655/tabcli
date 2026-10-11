@@ -341,8 +341,8 @@ impl Observation {
         })
         .collect::<Vec<_>>();
         let residual_surface = snapshot.status.residual_surface();
-        let mut value = json!({
-            "schema_version": 1, "ok": true, "session": id, "provider": snapshot.manifest.provider,
+        let mut value = envelope::ok(json!({
+            "session": id, "provider": snapshot.manifest.provider,
             "workspace": snapshot.manifest.workspace, "title": snapshot.manifest.title,
             "stored_state": snapshot.status.state, "generation": snapshot.status.generation,
             "created_unix_ms": snapshot.manifest.created_unix_ms, "updated_unix_ms": snapshot.status.updated_unix_ms,
@@ -356,7 +356,7 @@ impl Observation {
             "recovery_required": snapshot.pending.is_some(), "turn_claimed": snapshot.claim.is_some(),
             "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error,
             "recorded_events": snapshot.paths.len(), "latest_result": latest, "requests": request_refs,
-        });
+        }).as_object().unwrap().clone());
         session::hold::add_fields(&mut value, &self.evidence.held);
         if let Some(residual) = residual_surface {
             value["residual_surface"] = serde_json::to_value(residual)?;

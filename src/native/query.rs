@@ -1,4 +1,5 @@
 //! Read-only views of durable session records. Never recover, send, or close here.
+use super::envelope;
 use super::{
     DEFAULT_TIMEOUT_SECS, Duration, FirstPartyCli, Instant, JournaledEventState, NativeCommand,
     Path, PathBuf, Reader, Result, Serialize, SessionStatus, bail, checked_deadline_from, consent,
@@ -184,9 +185,9 @@ impl RequestObservation<'_> {
         let snapshot = self.snapshot;
         let event = self.event.as_ref();
         let (elapsed, elapsed_reason) = observed_elapsed(self.receipt, event);
-        json!({
+        envelope::ok(json!({
             "bridge_observed_elapsed_ms": elapsed, "bridge_observed_elapsed_reason": elapsed_reason,
-            "schema_version": 1, "ok": true, "session": snapshot.manifest.id,
+            "session": snapshot.manifest.id,
             "provider": snapshot.manifest.provider, "workspace": snapshot.manifest.workspace,
             "request_id": self.receipt.map(|r| &r.request_id), "event_id": self.event_id,
             "context_sources": self.receipt.map(|r| r.context_sources.as_slice()).unwrap_or_default(),
@@ -199,7 +200,7 @@ impl RequestObservation<'_> {
             "recovery_required": snapshot.pending.is_some(),
             "unreadable_requests": snapshot.unreadable_requests,
             "request_index_error": snapshot.request_index_error,
-        })
+        }).as_object().unwrap().clone())
     }
 
     fn attachment(
@@ -495,31 +496,25 @@ pub(super) fn request_result(reader: &Reader, request_id: &str) -> Result<Value>
     observe_snapshot(reader)?.result(reader, &Selector::Request(request_id.to_owned()))
 }
 
-fn print_json(value: &Value) -> Result<()> {
-    println!("{}", serde_json::to_string_pretty(value)?);
-    Ok(())
-}
-
 fn print_result(value: &Value, json: bool) -> Result<()> {
-    if json {
-        return print_json(value);
-    }
-    println!("session: {}", value["session"].as_str().unwrap_or("?"));
-    if let Some(id) = value["request_id"].as_str() {
-        println!("request: {id}");
-    }
-    println!(
-        "state: {}",
-        value["request_state"].as_str().unwrap_or("unknown")
-    );
-    println!("{}", elapsed_text(value));
-    if let Some(message) = value["result"].as_str() {
-        println!("\n{}", terminal_safe_text(message, true));
-    }
-    if let Some(error) = value["error"].as_str() {
-        println!("error: {}", terminal_safe_text(error, true));
-    }
-    Ok(())
+    envelope::emit(json, value, || {
+        println!("session: {}", value["session"].as_str().unwrap_or("?"));
+        if let Some(id) = value["request_id"].as_str() {
+            println!("request: {id}");
+        }
+        println!(
+            "state: {}",
+            value["request_state"].as_str().unwrap_or("unknown")
+        );
+        println!("{}", elapsed_text(value));
+        if let Some(message) = value["result"].as_str() {
+            println!("\n{}", terminal_safe_text(message, true));
+        }
+        if let Some(error) = value["error"].as_str() {
+            println!("error: {}", terminal_safe_text(error, true));
+        }
+        Ok(())
+    })
 }
 
 fn correct_unsuccessful_result(value: &mut Value) {
@@ -548,9 +543,7 @@ pub(super) fn run_result(request: ResultRequest) -> Result<()> {
                 correct_unsuccessful_result(&mut value);
             }
             if matches!(request.selector, Selector::List) {
-                if request.json {
-                    print_json(&value)?;
-                } else {
+                envelope::emit(request.json, &value, || {
                     for event in value["events"].as_array().into_iter().flatten() {
                         println!(
                             "{}\t{}\t{}\t{}",
@@ -560,7 +553,8 @@ pub(super) fn run_result(request: ResultRequest) -> Result<()> {
                             elapsed_text(event)
                         );
                     }
-                }
+                    Ok(())
+                })?;
             } else {
                 print_result(&value, request.json)?;
             }
@@ -576,9 +570,8 @@ pub(super) fn run_result(request: ResultRequest) -> Result<()> {
         }
         Err(error) => {
             if request.json {
-                print_json(&json!({"schema_version": 1, "ok": false,
-                "session": request.id, "request_id": match &request.selector { Selector::Request(id) => Some(id), _ => None },
-                "error": format!("{error:#}"), "result": null }))?;
+                envelope::print(&envelope::error(&error, json!({"session": request.id, "request_id": match &request.selector { Selector::Request(id) => Some(id), _ => None },
+                "result": null }).as_object().unwrap().clone()))?;
             }
             Err(error)
         }
@@ -627,8 +620,8 @@ pub(super) fn result_value_in(root: &Path, request: &ResultRequest) -> Result<Va
             requests.push(value);
         }
         return Ok(
-            json!({"schema_version": 1, "ok": true, "session": request.id, "events": events, "requests": requests,
-                        "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error}),
+            envelope::ok(json!({"session": request.id, "events": events, "requests": requests,
+                        "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error}).as_object().unwrap().clone()),
         );
     }
     Ok(snapshot.observe_result(&reader, &request.selector)?.value())
@@ -648,8 +641,14 @@ pub(super) fn run_inspect(
     if let Err(error) = &outcome
         && json
     {
-        print_json(&json!({"schema_version": 1, "ok": false, "session": id,
-            "stored_state": "unknown", "error": format!("{error:#}")}))?;
+        envelope::print(&envelope::error(
+            error,
+            json!({"session": id,
+            "stored_state": "unknown", })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ))?;
     }
     outcome
 }
@@ -657,37 +656,36 @@ pub(super) fn run_inspect(
 fn inspect_inner(id: &str, json: bool) -> Result<()> {
     let directory = Reader::session_directory(id)?;
     let value = inspect_value(&Reader::open_unchecked(&directory), id)?;
-    if json {
-        return print_json(&value);
-    }
-    println!(
-        "session: {id}\nprovider: {}\nstate (stored): {}\nworkspace: {}\nupdated: {}",
-        value["provider"].as_str().unwrap_or("?"),
-        terminal_safe_text(value["stored_state"].as_str().unwrap_or("unknown"), false),
-        terminal_safe_text(value["workspace"].as_str().unwrap_or("?"), false),
-        value["updated_unix_ms"]
-    );
-    println!(
-        "owner process alive: {}\nrecovery required: {}",
-        value["owner_process_alive"], value["recovery_required"]
-    );
-    println!("held: {}", value["held"]);
-    if let Some(error) = value["hold_error"].as_str() {
-        println!("hold error: {}", terminal_safe_text(error, true));
-    }
-    if let Some(source) = value["resumed_from"]["session"].as_str() {
-        println!("resumed from: {}", terminal_safe_text(source, false));
-    }
-    if let Some(error) = value["error"].as_str() {
-        println!("error: {}", terminal_safe_text(error, true));
-    }
-    if let Some(id) = value["latest_result"]["event_id"].as_str() {
-        println!("latest result: {id}");
-    }
-    for request in value["requests"].as_array().into_iter().flatten() {
-        println!("request: {}", request["request_id"].as_str().unwrap_or("?"));
-    }
-    Ok(())
+    envelope::emit(json, &value, || {
+        println!(
+            "session: {id}\nprovider: {}\nstate (stored): {}\nworkspace: {}\nupdated: {}",
+            value["provider"].as_str().unwrap_or("?"),
+            terminal_safe_text(value["stored_state"].as_str().unwrap_or("unknown"), false),
+            terminal_safe_text(value["workspace"].as_str().unwrap_or("?"), false),
+            value["updated_unix_ms"]
+        );
+        println!(
+            "owner process alive: {}\nrecovery required: {}",
+            value["owner_process_alive"], value["recovery_required"]
+        );
+        println!("held: {}", value["held"]);
+        if let Some(error) = value["hold_error"].as_str() {
+            println!("hold error: {}", terminal_safe_text(error, true));
+        }
+        if let Some(source) = value["resumed_from"]["session"].as_str() {
+            println!("resumed from: {}", terminal_safe_text(source, false));
+        }
+        if let Some(error) = value["error"].as_str() {
+            println!("error: {}", terminal_safe_text(error, true));
+        }
+        if let Some(id) = value["latest_result"]["event_id"].as_str() {
+            println!("latest result: {id}");
+        }
+        for request in value["requests"].as_array().into_iter().flatten() {
+            println!("request: {}", request["request_id"].as_str().unwrap_or("?"));
+        }
+        Ok(())
+    })
 }
 
 pub(super) fn inspect_value(reader: &Reader, id: &str) -> Result<Value> {
@@ -732,12 +730,14 @@ pub(super) fn parse_search(args: &[String]) -> Result<NativeCommand> {
     match parse_search_options(args) {
         Ok(command) => Ok(command),
         Err(error) => {
-            if args.iter().skip(1).any(|option| option == "--json") {
-                print_json(&search_error_value(
-                    args.first().filter(|query| !query.trim().is_empty()),
-                    &error,
-                ))?;
-            }
+            envelope::parse_failure(
+                args.get(1..).unwrap_or_default(),
+                &error,
+                json!({"query": args.first().filter(|query| !query.trim().is_empty()), "hits": []})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )?;
             Err(error)
         }
     }
@@ -754,8 +754,14 @@ fn search_test_aids_enabled() -> bool {
 }
 
 fn search_error_value(query: Option<&String>, error: &anyhow::Error) -> Value {
-    json!({"schema_version": 1, "ok": false, "query": query,
-        "error": format!("{error:#}"), "hits": []})
+    envelope::error(
+        error,
+        json!({"query": query,
+        "hits": []})
+        .as_object()
+        .unwrap()
+        .clone(),
+    )
 }
 
 fn parse_search_options(args: &[String]) -> Result<NativeCommand> {
@@ -1226,16 +1232,21 @@ pub(super) fn search_value_in(root: &Path, request: &SearchRequest) -> Result<Va
         SearchScope::Workspace(path) => (Some(path), false),
         SearchScope::AllWorkspaces => (None, true),
     };
-    Ok(json!({
-        "schema_version": 1, "ok": true, "query": request.query,
-        "filters": {
-            "workspace": workspace, "all_workspaces": all_workspaces,
-            "provider": request.provider.map(FirstPartyCli::as_str),
-        },
-        "limit": request.limit, "hits": scan.hits, "truncated": truncated,
-        "incomplete": !scan.reasons.is_empty(), "incomplete_reasons": scan.reasons,
-        "scanned": { "sessions": scan.sessions_scanned, "events": scan.events_read },
-    }))
+    Ok(envelope::ok(
+        json!({
+            "query": request.query,
+            "filters": {
+                "workspace": workspace, "all_workspaces": all_workspaces,
+                "provider": request.provider.map(FirstPartyCli::as_str),
+            },
+            "limit": request.limit, "hits": scan.hits, "truncated": truncated,
+            "incomplete": !scan.reasons.is_empty(), "incomplete_reasons": scan.reasons,
+            "scanned": { "sessions": scan.sessions_scanned, "events": scan.events_read },
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    ))
 }
 
 pub(super) fn run_search(request: SearchRequest) -> Result<()> {
@@ -1243,62 +1254,61 @@ pub(super) fn run_search(request: SearchRequest) -> Result<()> {
         Ok(value) => value,
         Err(error) => {
             if request.json {
-                print_json(&search_error_value(Some(&request.query), &error))?;
+                envelope::print(&search_error_value(Some(&request.query), &error))?;
             }
             return Err(error);
         }
     };
-    if request.json {
-        return print_json(&value);
-    }
-    let hits = value["hits"].as_array().cloned().unwrap_or_default();
-    for hit in &hits {
-        println!(
-            "{}\t{}\t{}\t{}\t{}",
-            hit["session"].as_str().unwrap_or("?"),
-            terminal_safe_text(hit["provider"].as_str().unwrap_or("?"), false),
-            hit["created_unix_ms"],
-            hit["request_id"]
-                .as_str()
-                .or(hit["event_id"].as_str())
-                .unwrap_or("?"),
-            hit["excerpt"].as_str().unwrap_or(""),
-        );
-    }
-    let reasons = value["incomplete_reasons"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let scanned = format!(
-        "{} session(s), {} event(s) examined",
-        value["scanned"]["sessions"], value["scanned"]["events"]
-    );
-    if hits.is_empty() && reasons.is_empty() {
-        println!("no results ({scanned})");
-    } else if hits.is_empty() {
-        println!("no hits, but the scan was incomplete ({scanned})");
-    } else {
-        let truncated = if value["truncated"].as_bool().unwrap_or(false) {
-            format!("; truncated to --limit {}", value["limit"])
-        } else {
-            String::new()
-        };
-        println!("{} hit(s) ({scanned}{truncated})", hits.len());
-    }
-    if !reasons.is_empty() {
-        println!(
-            "incomplete: {} reason(s); not every stored result was examined",
-            reasons.len()
-        );
-        for reason in &reasons {
+    envelope::emit(request.json, &value, || {
+        let hits = value["hits"].as_array().cloned().unwrap_or_default();
+        for hit in &hits {
             println!(
-                "  {}: {}",
-                reason["session"].as_str().unwrap_or("scan"),
-                terminal_safe_text(reason["reason"].as_str().unwrap_or("?"), false)
+                "{}\t{}\t{}\t{}\t{}",
+                hit["session"].as_str().unwrap_or("?"),
+                terminal_safe_text(hit["provider"].as_str().unwrap_or("?"), false),
+                hit["created_unix_ms"],
+                hit["request_id"]
+                    .as_str()
+                    .or(hit["event_id"].as_str())
+                    .unwrap_or("?"),
+                hit["excerpt"].as_str().unwrap_or(""),
             );
         }
-    }
-    Ok(())
+        let reasons = value["incomplete_reasons"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let scanned = format!(
+            "{} session(s), {} event(s) examined",
+            value["scanned"]["sessions"], value["scanned"]["events"]
+        );
+        if hits.is_empty() && reasons.is_empty() {
+            println!("no results ({scanned})");
+        } else if hits.is_empty() {
+            println!("no hits, but the scan was incomplete ({scanned})");
+        } else {
+            let truncated = if value["truncated"].as_bool().unwrap_or(false) {
+                format!("; truncated to --limit {}", value["limit"])
+            } else {
+                String::new()
+            };
+            println!("{} hit(s) ({scanned}{truncated})", hits.len());
+        }
+        if !reasons.is_empty() {
+            println!(
+                "incomplete: {} reason(s); not every stored result was examined",
+                reasons.len()
+            );
+            for reason in &reasons {
+                println!(
+                    "  {}: {}",
+                    reason["session"].as_str().unwrap_or("scan"),
+                    terminal_safe_text(reason["reason"].as_str().unwrap_or("?"), false)
+                );
+            }
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]

@@ -14,16 +14,18 @@ pub(crate) struct StatusRequest {
 }
 
 fn error_value(error: &anyhow::Error) -> Value {
-    json!({"schema_version": 1, "ok": false, "error": format!("{error:#}"), "sessions": []})
+    envelope::error(error, json!({"sessions": []}).as_object().unwrap().clone())
 }
 
 pub(in crate::native) fn parse(args: &[String]) -> Result<NativeCommand> {
     match parse_options(args) {
         Ok(request) => Ok(NativeCommand::Status(request)),
         Err(error) => {
-            if args.iter().any(|option| option == "--json") {
-                print_json(&error_value(&error))?;
-            }
+            envelope::parse_failure(
+                args,
+                &error,
+                json!({"sessions": []}).as_object().unwrap().clone(),
+            )?;
             Err(error)
         }
     }
@@ -331,11 +333,10 @@ fn value_in(root: &Path, request: &StatusRequest, budget: Duration) -> Result<Va
         SearchScope::Workspace(path) => (Some(path), false),
         SearchScope::AllWorkspaces => (None, true),
     };
-    Ok(json!({"schema_version": 1, "ok": true,
-        "filters": {"workspace": workspace, "all_workspaces": all_workspaces,
+    Ok(envelope::ok(json!({"filters": {"workspace": workspace, "all_workspaces": all_workspaces,
             "provider": request.provider.map(FirstPartyCli::as_str), "include_closed": request.include_closed},
         "scanned": {"sessions": scanned, "listed": sessions.len()}, "sessions": sessions,
-        "incomplete": !reasons.is_empty(), "incomplete_reasons": reasons}))
+        "incomplete": !reasons.is_empty(), "incomplete_reasons": reasons}).as_object().unwrap().clone()))
 }
 
 pub(in crate::native) fn run(request: StatusRequest) -> Result<()> {
@@ -345,18 +346,17 @@ pub(in crate::native) fn run(request: StatusRequest) -> Result<()> {
         Ok(value) => value,
         Err(error) => {
             if request.json {
-                print_json(&error_value(&error))?;
+                envelope::print(&error_value(&error))?;
             }
             return Err(error);
         }
     };
-    if request.json {
-        return print_json(&value);
-    }
-    for line in human_lines(&value) {
-        println!("{}", terminal_safe_text(&line, false));
-    }
-    Ok(())
+    envelope::emit(request.json, &value, || {
+        for line in human_lines(&value) {
+            println!("{}", terminal_safe_text(&line, false));
+        }
+        Ok(())
+    })
 }
 
 fn human_lines(value: &Value) -> Vec<String> {

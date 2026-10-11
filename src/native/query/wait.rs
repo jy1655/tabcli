@@ -38,17 +38,28 @@ pub(crate) struct WaitRequest {
 }
 
 fn error_value(error: &anyhow::Error) -> Value {
-    json!({"schema_version": 1, "ok": false, "ended": null,
-        "remaining": [], "timed_out": false, "error": format!("{error:#}")})
+    envelope::error(
+        error,
+        json!({"ended": null,
+        "remaining": [], "timed_out": false, })
+        .as_object()
+        .unwrap()
+        .clone(),
+    )
 }
 
 pub(in crate::native) fn parse(args: &[String]) -> Result<NativeCommand> {
     match parse_options(args) {
         Ok(request) => Ok(NativeCommand::Wait(request)),
         Err(error) => {
-            if args.iter().any(|arg| arg == "--json") {
-                print_json(&error_value(&error))?;
-            }
+            envelope::parse_failure(
+                args,
+                &error,
+                json!({"ended": null, "remaining": [], "timed_out": false})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )?;
             Err(error)
         }
     }
@@ -159,11 +170,11 @@ fn poll(root: &Path, addresses: &[Address], timeout: Duration) -> Result<Outcome
         .collect();
     let mut outcome = Outcome {
         selected: None,
-        last: addresses.iter().map(|address| json!({
-            "schema_version": 1, "ok": true, "session": address.session,
+        last: addresses.iter().map(|address| envelope::ok(json!({
+            "session": address.session,
             "request_id": address.request, "request_state": "busy", "result": null,
             "bridge_observed_elapsed_ms": null, "bridge_observed_elapsed_reason": "no_published_result"
-        })).collect(),
+        }).as_object().unwrap().clone())).collect(),
     };
     loop {
         for group in &groups {
@@ -227,19 +238,28 @@ fn value_in(root: &Path, request: &WaitRequest) -> Result<Value> {
         .map(|(_, address)| address.text())
         .collect();
     let Some(index) = outcome.selected else {
-        return Ok(json!({"schema_version": 1, "ok": false, "ended": null,
+        return Ok(envelope::error(
+            &anyhow::anyhow!("waiting timed out; no request was cancelled or resent"),
+            json!({"ended": null,
             "remaining": remaining, "timed_out": true,
-            "error": "waiting timed out; no request was cancelled or resent"}));
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ));
     };
     let mut ended = outcome.last.into_iter().nth(index).unwrap();
     if ended["request_state"] != "completed" {
         correct_unsuccessful_result(&mut ended);
     }
     ended["address"] = json!(request.addresses[index].text());
-    Ok(
-        json!({"schema_version": 1, "ok": ended["ok"], "ended": ended,
-        "remaining": remaining, "timed_out": false}),
-    )
+    Ok(envelope::ok(
+        json!({"ok": ended["ok"], "ended": ended,
+        "remaining": remaining, "timed_out": false})
+        .as_object()
+        .unwrap()
+        .clone(),
+    ))
 }
 
 pub(in crate::native) fn run(request: WaitRequest) -> Result<()> {
@@ -247,14 +267,12 @@ pub(in crate::native) fn run(request: WaitRequest) -> Result<()> {
         Ok(value) => value,
         Err(error) => {
             if request.json {
-                print_json(&error_value(&error))?;
+                envelope::print(&error_value(&error))?;
             }
             return Err(error);
         }
     };
-    if request.json {
-        print_json(&value)?;
-    } else {
+    envelope::emit(request.json, &value, || {
         if !value["ended"].is_null() {
             print_result(&value["ended"], false)?;
         } else if let Some(error) = value["error"].as_str() {
@@ -270,7 +288,8 @@ pub(in crate::native) fn run(request: WaitRequest) -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-    }
+        Ok(())
+    })?;
     if value["ok"] != true {
         bail!(
             "{}",

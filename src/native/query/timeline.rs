@@ -579,12 +579,12 @@ pub(in crate::native) fn timeline_value(
     sort(&mut entries);
     sort(&mut session_entries);
     Ok(
-        json!({"schema_version": 1, "ok": true, "session": id, "request_id": request,
+        envelope::ok(json!({"session": id, "request_id": request,
         "session_state": snapshot.status.state, "session_error": snapshot.status.error,
         "recovery_required": snapshot.pending.is_some(), "incomplete": incomplete,
         "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error,
         "requests": summaries, "entries": entries, "session_entries": session_entries,
-        "doctor_command": format!("{PUBLIC_COMMAND} doctor {id} --json")}),
+        "doctor_command": format!("{PUBLIC_COMMAND} doctor {id} --json")}).as_object().unwrap().clone()),
     )
 }
 
@@ -594,57 +594,56 @@ pub(super) fn run(id: &str, json: bool, request: Option<&str>) -> Result<()> {
         id,
         request,
     )?;
-    if json {
-        return print_json(&value);
-    }
-    println!(
-        "session: {id}\nstate (stored): {}\nincomplete: {}\nrecovery required: {}",
-        value["session_state"], value["incomplete"], value["recovery_required"]
-    );
-    for summary in value["requests"].as_array().into_iter().flatten() {
+    envelope::emit(json, &value, || {
         println!(
-            "request: {} event: {} state: {} delivery: {}",
-            summary["request_id"],
-            summary["event_id"],
-            summary["request_state"],
-            summary["delivery"]
+            "session: {id}\nstate (stored): {}\nincomplete: {}\nrecovery required: {}",
+            value["session_state"], value["incomplete"], value["recovery_required"]
         );
-        println!(
-            "  {}",
-            summary["result_command"].as_str().unwrap_or("unknown")
-        );
-        if let Some(error) = summary["error"].as_str() {
-            println!("  {}", terminal_safe_text(error, true));
-        }
-    }
-    if let Some(error) = value["session_error"].as_str() {
-        println!("error: {}", terminal_safe_text(error, true));
-    }
-    for group in ["entries", "session_entries"] {
-        println!("{group}:");
-        for e in value[group].as_array().into_iter().flatten() {
+        for summary in value["requests"].as_array().into_iter().flatten() {
             println!(
-                "  session={} request={} event={} time={} stage={} source={} record={} {}",
-                id,
-                e["request_id"],
-                e["event_id"],
-                if e["observed_unix_ms"].is_null() {
-                    "unknown".to_owned()
-                } else {
-                    e["observed_unix_ms"].to_string()
-                },
-                e["stage"],
-                e["source"],
-                e["record_state"],
-                terminal_safe_text(&e["detail"].to_string(), true)
+                "request: {} event: {} state: {} delivery: {}",
+                summary["request_id"],
+                summary["event_id"],
+                summary["request_state"],
+                summary["delivery"]
             );
+            println!(
+                "  {}",
+                summary["result_command"].as_str().unwrap_or("unknown")
+            );
+            if let Some(error) = summary["error"].as_str() {
+                println!("  {}", terminal_safe_text(error, true));
+            }
         }
-    }
-    println!(
-        "unreadable requests: {}\nrequest index error: {}\n{}",
-        value["unreadable_requests"],
-        value["request_index_error"],
-        value["doctor_command"].as_str().unwrap_or("unknown")
-    );
-    Ok(())
+        if let Some(error) = value["session_error"].as_str() {
+            println!("error: {}", terminal_safe_text(error, true));
+        }
+        for group in ["entries", "session_entries"] {
+            println!("{group}:");
+            for e in value[group].as_array().into_iter().flatten() {
+                println!(
+                    "  session={} request={} event={} time={} stage={} source={} record={} {}",
+                    id,
+                    e["request_id"],
+                    e["event_id"],
+                    if e["observed_unix_ms"].is_null() {
+                        "unknown".to_owned()
+                    } else {
+                        e["observed_unix_ms"].to_string()
+                    },
+                    e["stage"],
+                    e["source"],
+                    e["record_state"],
+                    terminal_safe_text(&e["detail"].to_string(), true)
+                );
+            }
+        }
+        println!(
+            "unreadable requests: {}\nrequest index error: {}\n{}",
+            value["unreadable_requests"],
+            value["request_index_error"],
+            value["doctor_command"].as_str().unwrap_or("unknown")
+        );
+        Ok(())
+    })
 }

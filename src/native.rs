@@ -19,6 +19,7 @@ mod consent;
 mod context;
 mod delivery;
 mod doctor;
+mod envelope;
 mod hold;
 mod process_env;
 mod provider;
@@ -1416,12 +1417,10 @@ fn run_tell(request: TellRequest) -> Result<()> {
                 && let Err(error) = &outcome
                 && error.is::<session::hold::Refusal>()
             {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "schema_version": 1, "ok": false, "session": session, "error": format!("{error:#}")
-                    }))?
-                );
+                envelope::print(&envelope::error(
+                    error,
+                    serde_json::Map::from_iter([("session".into(), serde_json::json!(session))]),
+                ))?;
             }
             outcome
         }
@@ -1939,16 +1938,18 @@ fn finish_request_with_extra(
                 })
                 .unwrap_or_else(|_| {
                     serde_json::json!({
-                        "schema_version": 1, "session": session, "request_id": request_id,
+                        "session": session, "request_id": request_id,
                         "request_state": "unknown", "result": null
                     })
                 });
-            value["ok"] = serde_json::json!(false);
-            value["error"] = serde_json::json!(format!("{error:#}"));
+            let fields = value.as_object_mut().unwrap();
+            fields.remove("ok");
+            fields.remove("error");
+            let mut value = envelope::error(&error, std::mem::take(fields));
             for (key, field) in extra {
                 value[key] = field;
             }
-            println!("{}", serde_json::to_string_pretty(&value)?);
+            envelope::print(&value)?;
         }
         return Err(error).with_context(|| format!(
             "session {session}, request {request_id}; inspect with `{PUBLIC_COMMAND} result {session} --request {request_id} --json`; this error alone is not proof of non-delivery; inspect the recorded outcome before deciding whether to retry"
@@ -1987,10 +1988,8 @@ fn emit_session_result_with(
 ) -> Result<()> {
     let request_id = &receipt.request_id;
     let (elapsed, elapsed_reason) = query::observed_elapsed(Some(receipt), event);
-    if json {
-        let mut value = serde_json::json!({
-                "ok": true,
-                "schema_version": 1,
+    let mut value = envelope::ok(
+        serde_json::json!({
                 "session": id,
                 "request_id": request_id,
                 "context_sources": receipt.context_sources,
@@ -2007,12 +2006,15 @@ fn emit_session_result_with(
                 "result": event.map(|value| value.message.as_str()),
                 "provider_session_id": event.and_then(|value| value.provider_session_id.as_deref()),
                 "turn_id": event.and_then(|value| value.turn_id.as_deref()),
-        });
-        for (key, field) in extra {
-            value[key.as_str()] = field.clone();
-        }
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    } else {
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    for (key, field) in extra {
+        value[key.as_str()] = field.clone();
+    }
+    envelope::emit(json, &value, || {
         println!("session: {id}\nrequest: {request_id}");
         for (key, field) in extra {
             if let Some(field) = field.as_str() {
@@ -2023,8 +2025,8 @@ fn emit_session_result_with(
             println!();
             println!("{}", terminal_safe_text(&event.message, true));
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn run_session(id: &str) -> Result<()> {
