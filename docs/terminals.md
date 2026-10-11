@@ -80,6 +80,10 @@ adapters above them are macOS-only.
 | Windows | Terminal tab | Tab | Console input | Console and tab |
 | Windows | Console window | Window fallback | Console input | Console |
 
+Temporary measure for #124: on Windows, each delayed submission Return waits for the console
+input buffer to drain before its existing 2 s delay, within the request deadline. Immediate
+single-Return input is unchanged; a drain timeout after typing leaves delivery uncertain.
+
 Codex follow-ups use its thread-addressed queue; Claude uses official cross-session messaging.
 Neither falls back to unaddressed terminal input. Agy and Pi need the terminal fallback, which rules
 out Warp for their follow-ups.

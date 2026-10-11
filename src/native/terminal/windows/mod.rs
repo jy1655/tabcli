@@ -12,14 +12,15 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use windows_sys::Win32::System::Console::{
-    AttachConsole, FreeConsole, GetConsoleProcessList, GetConsoleWindow, INPUT_RECORD, KEY_EVENT,
-    KEY_EVENT_RECORD, KEY_EVENT_RECORD_0, WriteConsoleInputW,
+    AttachConsole, FreeConsole, GetConsoleProcessList, GetConsoleWindow,
+    GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0,
+    WriteConsoleInputW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, SW_SHOWNOACTIVATE, WM_CLOSE};
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0,
-        WAIT_TIMEOUT,
+        CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
+        WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     Storage::FileSystem::{
         CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, SYNCHRONIZE,
@@ -1281,7 +1282,7 @@ fn write_console_input(input: &str, submit_count: usize, deadline: Instant) -> R
     let handle = unsafe {
         CreateFileW(
             console_name.as_ptr(),
-            GENERIC_WRITE,
+            GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             std::ptr::null(),
             OPEN_EXISTING,
@@ -1304,6 +1305,20 @@ fn write_console_input(input: &str, submit_count: usize, deadline: Instant) -> R
             // its confirmation Return and later submission Return out of that
             // batch so processing speed cannot decide which action they perform.
             let delay = super::windows_console_extra_submit_delay();
+            // Temporary measure for issue #124
+            wait_for_console_input_drain_with(
+                || {
+                    let mut pending = 0;
+                    if unsafe { GetNumberOfConsoleInputEvents(handle, &mut pending) } == 0 {
+                        return Err(std::io::Error::last_os_error())
+                            .context("failed to read managed Windows console input event count");
+                    }
+                    Ok(pending)
+                },
+                deadline - delay,
+                Duration::from_millis(50),
+                Instant::now,
+            )?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if delay >= remaining {
                 bail!("Windows console input timed out before the next submission Return");
@@ -1315,6 +1330,21 @@ fn write_console_input(input: &str, submit_count: usize, deadline: Instant) -> R
     })();
     unsafe { CloseHandle(handle) };
     result
+}
+
+fn wait_for_console_input_drain_with(
+    mut pending: impl FnMut() -> Result<u32>,
+    deadline: Instant,
+    poll: Duration,
+    mut now: impl FnMut() -> Instant,
+) -> Result<()> {
+    while now() < deadline {
+        if pending()? == 0 {
+            return Ok(());
+        }
+        std::thread::sleep(poll.min(deadline.saturating_duration_since(now())));
+    }
+    bail!("Windows console input was not consumed before the submission Return")
 }
 
 fn write_input_records(

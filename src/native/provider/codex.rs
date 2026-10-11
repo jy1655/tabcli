@@ -255,7 +255,18 @@ impl NativeProviderAdapter for CodexAdapter {
             )
             .map_err(terminal::TerminalSendFailure::not_sent)?;
         }
-        terminal::send_file(session, prompt_path, deadline)
+        terminal::send_file(session, prompt_path, deadline)?;
+        if cfg!(windows) {
+            // Temporary measure for issue #124
+            let submission_deadline = deadline.min(Instant::now() + Duration::from_secs(10));
+            wait_for_submission_with(
+                || terminal::read_screen(session, submission_deadline),
+                submission_deadline,
+                COMPOSER_POLL,
+                Instant::now,
+            )?;
+        }
+        Ok(())
     }
 
     fn terminal_initial_prompt(&self, directory: &Path, prompt: &str) -> Result<String> {
@@ -377,6 +388,39 @@ fn composer_is_ready(screen: &str) -> bool {
         composer |= line.trim() == COMPOSER_ROW;
     }
     composer
+}
+
+// Temporary measure for issue #124
+fn submission_observed(screen: &str) -> bool {
+    let mut composer = false;
+    for line in screen.lines().map(str::trim) {
+        if line.starts_with("› [Pasted Content") {
+            return false;
+        }
+        composer |= line == COMPOSER_ROW;
+    }
+    composer
+}
+
+fn wait_for_submission_with(
+    mut read_screen: impl FnMut() -> Result<String>,
+    deadline: Instant,
+    poll: Duration,
+    mut now: impl FnMut() -> Instant,
+) -> terminal::TerminalSendResult {
+    while now() < deadline {
+        match read_screen() {
+            Ok(screen) if submission_observed(&screen) && now() < deadline => return Ok(()),
+            Err(_) => break,
+            Ok(_) => {}
+        }
+        thread::sleep(poll.min(deadline.saturating_duration_since(now())));
+    }
+    Err(terminal::TerminalSendFailure::delivery_uncertain(
+        anyhow::anyhow!(
+            "Codex composer still holds the pasted prompt; the submission was not observed. Press Enter in the surface or close the session; Agent Bridge does not resend"
+        ),
+    ))
 }
 
 fn workspace_trust_override(workspace: &Path) -> Result<String> {
@@ -1119,6 +1163,87 @@ mod tests {
             );
             assert_eq!(parsed["value"].as_table().unwrap().len(), 1);
         }
+    }
+
+    #[test]
+    fn submission_observed_rejects_pasted_content_placeholder() {
+        let pasted = "› [Pasted Content 21657 chars]";
+        assert!(!submission_observed(pasted));
+        assert!(!submission_observed(&format!(
+            "{COMPOSER_ROW}\n  {pasted}  "
+        )));
+        assert!(!submission_observed(&format!("{pasted}\n{COMPOSER_ROW}")));
+    }
+
+    #[test]
+    fn submission_observed_accepts_empty_composer_while_turn_runs() {
+        let screen =
+            "  Working (esc to interrupt)\n› Ask Codex to do anything  \n  ? for shortcuts";
+        assert!(submission_observed(screen));
+    }
+
+    #[test]
+    fn submission_observed_rejects_empty_screen() {
+        for screen in ["", "\n  \n", "› Ask Codex to do anything else"] {
+            assert!(!submission_observed(screen));
+        }
+    }
+
+    #[test]
+    fn submission_check_accepts_observed_submission() {
+        let start = Instant::now();
+        let mut screens = ["› [Pasted Content 21657 chars]", COMPOSER_ROW].into_iter();
+        wait_for_submission_with(
+            || Ok(screens.next().unwrap().to_owned()),
+            start + Duration::from_secs(10),
+            Duration::ZERO,
+            || start,
+        )
+        .unwrap();
+        assert_eq!(screens.next(), None);
+    }
+
+    #[test]
+    fn submission_check_timeout_is_uncertain() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        let mut clock = [start, start, deadline].into_iter();
+        let mut reads = 0;
+        let failure = wait_for_submission_with(
+            || {
+                reads += 1;
+                Ok("› [Pasted Content 21657 chars]".to_owned())
+            },
+            deadline,
+            Duration::ZERO,
+            || clock.next().unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(reads, 1);
+        assert!(failure.delivery_may_have_occurred());
+        assert_eq!(
+            failure.error().to_string(),
+            "Codex composer still holds the pasted prompt; the submission was not observed. Press Enter in the surface or close the session; Agent Bridge does not resend"
+        );
+    }
+
+    #[test]
+    fn submission_check_screen_read_failure_is_uncertain() {
+        let start = Instant::now();
+        let failure = wait_for_submission_with(
+            || anyhow::bail!("screen unavailable"),
+            start + Duration::from_secs(10),
+            Duration::ZERO,
+            || start,
+        )
+        .unwrap_err();
+        assert!(failure.delivery_may_have_occurred());
+        assert!(
+            failure
+                .error()
+                .to_string()
+                .contains("submission was not observed")
+        );
     }
 
     // The screens an initial paste can meet, as Codex CLI 0.159.3 drew them on
