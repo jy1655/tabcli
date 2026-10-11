@@ -277,6 +277,49 @@ fn missing_console_process_converges_to_the_standard_missing_result() {
 }
 
 #[test]
+fn submission_return_waits_until_the_console_input_buffer_is_drained() {
+    let start = Instant::now();
+    let mut pending = [3, 2, 0].into_iter();
+    let mut calls = 0;
+    super::wait_for_console_input_drain_with(
+        || {
+            calls += 1;
+            Ok(pending.next().unwrap())
+        },
+        start + Duration::from_secs(1),
+        Duration::ZERO,
+        || start,
+    )
+    .unwrap();
+    assert_eq!(calls, 3);
+    assert_eq!(pending.next(), None);
+}
+
+#[test]
+fn submission_return_drain_times_out_at_the_deadline_as_uncertain() {
+    let start = Instant::now();
+    let deadline = start + Duration::from_millis(100);
+    let mut clock = [start, start, deadline].into_iter();
+    let mut calls = 0;
+    let error = super::wait_for_console_input_drain_with(
+        || {
+            calls += 1;
+            Ok(3)
+        },
+        deadline,
+        Duration::ZERO,
+        || clock.next().unwrap(),
+    )
+    .unwrap_err();
+    assert_eq!(calls, 1);
+    assert_eq!(
+        error.to_string(),
+        "Windows console input was not consumed before the submission Return"
+    );
+    assert!(!super::super::windows_console_helper_reports_send_not_started(&error.to_string()));
+}
+
+#[test]
 fn codex_paste_confirmation_and_submission_are_delayed_from_the_text_batch() {
     let immediate = super::super::windows_console_immediate_submit_count(2);
     let initial_records = build_console_input_records("prompt", immediate);

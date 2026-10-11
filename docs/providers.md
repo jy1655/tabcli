@@ -63,6 +63,11 @@ was sent. Check the managed surface and approve the workspace if you trust it. A
 initial request, close that session and run a new `ask`; `tell` requires a ready session.
 An empty screen does not count as a ready composer.
 
+Temporary measure for #124: after the Windows initial paste, Bridge waits up to 10 s (bounded by
+the request deadline) for the empty composer row with no `› [Pasted Content` row. If that submission
+evidence is absent or the screen cannot be read, delivery is uncertain and Bridge does not resend.
+Press Enter in the managed surface or close the session.
+
 `tell` uses `codex queue --thread <UUID> --message <TEXT>` to address the same conversation.
 Codex chooses a shared or embedded server; you do not need to start a shared daemon. Bridge waits
 for Codex's exact queue acceptance, then for the turn's completion. Acceptance alone is not a
