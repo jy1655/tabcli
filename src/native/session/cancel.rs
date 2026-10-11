@@ -3,10 +3,7 @@ use crate::native::provider;
 use crate::native::session::primitives::unix_ms;
 use crate::native::session::state::SessionState;
 use crate::native::session::turn::valid_turn_claim_token;
-#[cfg(test)]
-use crate::native::session::turn::{
-    acquire_ready_turn_claim, acquire_turn_claim, write_pending_completion_event,
-};
+
 use crate::native::session::{CoreRecord, Reader, Store, requests, turn};
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
@@ -150,7 +147,7 @@ mod tests {
         fs::create_dir(dir.path().join("events")).unwrap();
         update_status(dir.path(), SessionState::Working, None, None).unwrap();
         let store = Store::open_unchecked(dir.path());
-        let claim = acquire_turn_claim(dir.path()).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(dir.path()), &[]).unwrap();
         (dir, store, claim)
     }
 
@@ -199,9 +196,13 @@ mod tests {
         session::turn::Report::for_claim(&store, FirstPartyCli::Pi, Some(&token))
             .complete("done", None, None)
             .unwrap();
-        let next = acquire_ready_turn_claim(store.directory(), "session-test")
-            .unwrap()
-            .0;
+        let next = turn::claim_ready(
+            &Store::open_unchecked(store.directory()),
+            "session-test",
+            &[],
+        )
+        .unwrap()
+        .0;
         let next_token = next.token().to_owned();
         next.retain();
         update_status(store.directory(), SessionState::Working, None, None).unwrap();
@@ -237,17 +238,26 @@ mod tests {
     fn cancel_after_publication_refuses_before_claim_release() {
         let (_dir, store, claim) = fixture();
         let token = claim.token().to_owned();
-        let receipt = claim.receipt().clone();
         claim.retain();
-        let event: SessionEvent = serde_json::from_value(serde_json::json!({
-            "provider":"pi", "message":"done", "error":null,
-            "provider_session_id":null, "turn_id":null, "created_unix_ms":3
-        }))
-        .unwrap();
-        let mut pending = PendingTurnCompletion::new(&token, event, None).unwrap();
-        pending.event_file = receipt.event_file;
-        store.write_completion(&pending).unwrap();
-        write_pending_completion_event(store.directory(), &pending).unwrap();
+        let error =
+            session::primitives::with_sync_failure(store.record(CoreRecord::Events).path(), || {
+                turn::Report::for_claim(&store, FirstPartyCli::Pi, Some(&token))
+                    .complete("done", None, None)
+            })
+            .unwrap_err();
+        assert!(session::primitives::injected_sync_failure(&error));
+        assert_eq!(
+            turn::current_claim_token(&store).unwrap().as_deref(),
+            Some(token.as_str())
+        );
+        assert!(
+            store
+                .record(CoreRecord::Completion)
+                .bytes()
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(store.events().unwrap().len(), 1);
         let before = crate::native::reopen::tests::snapshot_directory(store.directory());
         assert!(
             supported(&store)

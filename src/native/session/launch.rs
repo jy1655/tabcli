@@ -2,8 +2,7 @@
 //! evidence that its wrapper ran. The lifecycle lock serializes cancellation with spawn.
 use crate::native::session::primitives::unix_ms;
 use crate::native::session::state::{SessionState, SessionStatus, update_status_with_residual};
-#[cfg(test)]
-use crate::native::session::turn::acquire_turn_claim;
+
 use crate::native::session::turn::remove_turn_claim_locked;
 use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store, turn};
 use crate::native::terminal;
@@ -726,7 +725,7 @@ mod tests {
             .unwrap();
         fs::create_dir(directory.path().join("events")).unwrap();
         update_status(directory.path(), SessionState::Launching, None, None).unwrap();
-        let claim = acquire_turn_claim(directory.path()).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
         let token = claim.token().to_owned();
         claim.retain();
         begin(

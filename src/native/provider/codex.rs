@@ -1483,8 +1483,8 @@ mod tests {
 
     use super::super::super::write_json_atomic;
     use super::super::super::{
-        SessionStatus, TURN_CLAIM_FILE, acquire_turn_claim, event_paths, native_delegation_prompt,
-        read_json, update_status,
+        SessionStatus, TURN_CLAIM_FILE, event_paths, native_delegation_prompt, read_json,
+        update_status,
     };
     use super::*;
     use crate::native::session::schema::SESSION_SCHEMA;
@@ -1566,7 +1566,7 @@ exit 91
     }
 
     fn claim_pending_turn(directory: &Path) -> PendingCodexTurn {
-        let claim = acquire_turn_claim(directory).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(directory), &[]).unwrap();
         let token = claim.token().to_owned();
         claim.retain();
         install_pending_turn(directory, &token).unwrap()
@@ -1590,7 +1590,6 @@ exit 91
     #[cfg(unix)]
     #[test]
     fn unavailable_queue_never_selects_unaddressed_terminal_input() {
-        use super::super::super::acquire_ready_turn_claim_with_context;
         use std::os::unix::fs::PermissionsExt;
 
         let root = tempfile::tempdir().unwrap();
@@ -1618,7 +1617,8 @@ exit 1
         write_established_thread(directory, managed_thread);
         update_status(directory, SessionState::Ready, None, None).unwrap();
         let (claim, _) =
-            acquire_ready_turn_claim_with_context(directory, "session-codexqueue", &[]).unwrap();
+            turn::claim_ready(&Store::open_unchecked(directory), "session-codexqueue", &[])
+                .unwrap();
         update_status(directory, SessionState::Working, None, None).unwrap();
         let failure = send_native_queue_message(CrossSessionMessageContext {
             bridge_executable: Path::new("/unused/agent-bridge"),
@@ -1669,7 +1669,8 @@ exit 1
         // A known pre-send refusal releases the claim and allows a later,
         // independently requested addressed turn; it never retries this prompt.
         let (next, _) =
-            acquire_ready_turn_claim_with_context(directory, "session-codexqueue", &[]).unwrap();
+            turn::claim_ready(&Store::open_unchecked(directory), "session-codexqueue", &[])
+                .unwrap();
         assert_ne!(next.token(), token);
     }
 
@@ -1876,7 +1877,7 @@ exit 1
         let thread_id = "018f0000-0000-7000-8000-000000000001";
         write_established_thread(&directory, thread_id);
         update_status(&directory, SessionState::Working, None, None).unwrap();
-        let claim = acquire_turn_claim(&directory).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
         let claim_token = claim.token().to_owned();
         claim.retain();
         // The prompt as `tell` hands it to the adapter: already framed.
@@ -1946,7 +1947,7 @@ exit 1
         let provider = write_successful_queue_provider(&directory);
         write_queue_manifest_for_workspace(&directory, &provider, "codex-cli 0.153.2", &workspace);
         write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
-        let claim = acquire_turn_claim(&directory).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
         let claim_token = claim.token().to_owned();
         claim.retain();
 
@@ -1981,7 +1982,7 @@ exit 1
             if include_thread {
                 write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
             }
-            let claim = acquire_turn_claim(&directory).unwrap();
+            let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
             let claim_token = claim.token().to_owned();
             claim.retain();
 
@@ -2020,7 +2021,7 @@ exit 91
         std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
         write_queue_manifest(&directory, &provider, "codex-cli 0.153.2");
         write_established_thread(&directory, "human-readable-session-name");
-        let claim = acquire_turn_claim(&directory).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
         let claim_token = claim.token().to_owned();
         claim.retain();
 
@@ -2091,7 +2092,7 @@ exit 91
         .unwrap();
         write_queue_manifest(&directory, &provider, "codex-cli 0.160.0");
         write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
-        let claim = acquire_turn_claim(&directory).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
         let claim_token = claim.token().to_owned();
         claim.retain();
 
@@ -2238,7 +2239,7 @@ exit 91
         std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
         write_queue_manifest(&directory, &provider, "codex-cli 0.153.2");
         write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
-        let claim = acquire_turn_claim(&directory).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
         let claim_token = claim.token().to_owned();
         claim.retain();
 

@@ -260,6 +260,7 @@ pub(crate) fn resolve_in(root: &Path, references: &[ContextResultRef]) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::session::{Store, turn};
     use crate::native::*;
     use serde_json::{Value, json};
 
@@ -773,9 +774,12 @@ mod tests {
         assert!(prompt.contains("recorded answer") && prompt.contains("legacy answer"));
 
         // The same call `tell` makes once resolution succeeds, up to the durable receipt.
-        let (claim, baseline) =
-            acquire_ready_turn_claim_with_context(&target, "session-dst", &resolved.sources)
-                .unwrap();
+        let (claim, baseline) = turn::claim_ready(
+            &Store::open_unchecked(&target),
+            "session-dst",
+            &resolved.sources,
+        )
+        .unwrap();
         assert_eq!(baseline, 0);
         let receipt = claim.receipt().clone();
         assert_eq!(receipt.context_sources, resolved.sources);

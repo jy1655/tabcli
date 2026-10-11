@@ -9,8 +9,9 @@ use super::super::{
     WINDOWS_STARTUP_READINESS_TIMING, install_pending_turn, read_pending_turn,
 };
 use super::*;
+use crate::native::session::Store;
 use crate::native::session::{SessionState, turn};
-use crate::native::{SessionStatus, acquire_turn_claim, read_json, terminal, update_status};
+use crate::native::{SessionStatus, read_json, terminal, update_status};
 use anyhow::bail;
 use std::fs;
 use std::time::{Duration, Instant};
@@ -198,7 +199,7 @@ fn lost_initial_paste_ends_delivery_uncertain_with_the_reason_in_status_json() {
     let directory = root.path().join("session-fMqSQc");
     fs::create_dir_all(directory.join("events")).unwrap();
     update_status(&directory, SessionState::AwaitingInitialInput, None, None).unwrap();
-    let mut claim = acquire_turn_claim(&directory).unwrap();
+    let mut claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
     let pending = install_pending_turn(&directory, claim.token()).unwrap();
 
     let startup = late_reload_startup_log();
@@ -274,7 +275,7 @@ fn lost_macos_follow_up_paste_ends_delivery_uncertain_with_the_reason_in_status_
     update_status(&directory, SessionState::Ready, None, None).unwrap();
     // A follow-up claims the ready session before it prepares the paste.
     update_status(&directory, SessionState::Claimed, None, None).unwrap();
-    let mut claim = acquire_turn_claim(&directory).unwrap();
+    let mut claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
     let pending = install_pending_turn(&directory, claim.token()).unwrap();
 
     let before_reload = &REAL_MACOS_INITIAL_TURN[..REAL_MACOS_INITIAL_TURN

@@ -138,8 +138,10 @@ fn each_auxiliary_failure_keeps_the_session_with_attention() {
     ] {
         let fixture = seed_close_fixture(JournaledEventState::Committed);
         let directory = &fixture.directory;
-        fs::remove_file(directory.join("turn.completion.json")).unwrap();
-        session::turn::release_turn_claim(directory).unwrap();
+        session::turn::recover_pending_completion(directory).unwrap();
+        // Keep the original observation fixture: a published result while the provider works.
+        session::update_status(directory, SessionState::Claimed, None, None).unwrap();
+        session::update_status(directory, SessionState::Working, None, None).unwrap();
         let reader = Reader::open_unchecked(directory);
         let observed = read(&reader);
         let receipt = &observed.observation.records.receipts[0];

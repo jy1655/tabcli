@@ -1212,7 +1212,7 @@ fn launch_created_session(
     )?;
     let bridge_command =
         launch::install_script(&Store::open_unchecked(&created.directory), &bridge_command)?;
-    initial_claim.retain_in_place();
+    initial_claim.fence_launch();
     let terminal_session = match terminal::open_bound_tab(
         terminal_kind,
         &bridge_command,
@@ -1240,9 +1240,6 @@ fn launch_created_session(
             });
         }
     };
-    // Once the terminal accepted the wrapper command, only a fenced launch failure may
-    // release this claim. Detached callers also wait for provider startup, not its result.
-    initial_claim.retain_in_place();
     launch::wait(
         &Store::open_unchecked(&created.directory),
         &terminal_session,
@@ -1252,7 +1249,7 @@ fn launch_created_session(
     // adapter-recognized exact workspace dialog may produce one guarded response.
     consent::complete_launch(&created.directory, provider, &terminal_session, deadline)?;
     // The existing delivery paths own rollback/uncertainty after confirmed startup.
-    initial_claim.rollback_on_drop();
+    initial_claim.startup_confirmed();
     let mut gate = |gate| {
         verify_reopened_conversation_exclusive(
             provider,

@@ -3,6 +3,7 @@ use crate::native::session::close::compatibility::*;
 use crate::native::session::schema::{
     ProviderProcessRecord, RecordedReopenRefusal, SESSION_SCHEMA, SessionEvent, SessionManifest,
 };
+use crate::native::session::{Reader, Store, turn};
 use crate::native::tests::{
     spawn_surviving_process, test_windows_process_identity, write_provider_process_record,
 };
@@ -147,30 +148,26 @@ fn write_closed_reopen_source(
     )
     .unwrap();
     update_status(&directory, SessionState::Running, None, None).unwrap();
-    let claim = acquire_turn_claim(&directory).unwrap();
+    let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
     let token = claim.token().to_owned();
     claim.retain();
     let provider = FirstPartyCli::from_str(provider).unwrap();
     if completed {
-        record_provider_result_for_claim(
-            &directory,
-            provider,
-            "done",
-            provider_session_id.map(str::to_owned),
-            Some("turn-1".to_owned()),
-            Some(&token),
-        )
-        .unwrap();
+        turn::Report::for_claim(&Store::open_unchecked(&directory), provider, Some(&token))
+            .complete(
+                "done",
+                provider_session_id.map(str::to_owned),
+                Some("turn-1".to_owned()),
+            )
+            .unwrap();
     } else {
-        record_provider_failure_for_claim(
-            &directory,
-            provider,
-            "the only turn failed",
-            provider_session_id.map(str::to_owned),
-            None,
-            Some(&token),
-        )
-        .unwrap();
+        turn::Report::for_claim(&Store::open_unchecked(&directory), provider, Some(&token))
+            .fail(
+                "the only turn failed",
+                provider_session_id.map(str::to_owned),
+                None,
+            )
+            .unwrap();
     }
     close_session_state(&directory, |_| Ok(terminal::CloseOutcome::Closed)).unwrap();
     assert!(directory.join(CLOSED_STATUS_FILE).is_file());
@@ -567,7 +564,7 @@ fn late_hook_carrying_the_previous_marker_into_the_new_directory_is_ignored() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
-    let claim = acquire_turn_claim(directory.path()).unwrap();
+    let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
     let token = claim.token().to_owned();
     claim.retain();
     let new_request = "claude-turn-2-2-2";
@@ -594,7 +591,7 @@ fn late_hook_carrying_the_previous_marker_into_the_new_directory_is_ignored() {
     .unwrap();
     assert!(event_paths(directory.path()).unwrap().is_empty());
     assert_eq!(
-        current_turn_claim_token(directory.path())
+        turn::current_claim_token(&Reader::open_unchecked(directory.path()))
             .unwrap()
             .as_deref(),
         Some(token.as_str())
@@ -874,7 +871,7 @@ fn resumed_session_launch_passes_the_official_resume_plan_and_no_policy_the_requ
     )
     .unwrap();
     update_status(&directory, SessionState::Launching, None, None).unwrap();
-    let claim = acquire_turn_claim(&directory).unwrap();
+    let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
     claim.retain();
 
     let result = run_session_inner(&directory);
@@ -1448,7 +1445,7 @@ fn resumed_session_launch_refuses_before_spawn_when_a_holder_registered_after_th
 
     let id = "session-reopenrecheck";
     let directory = write_reopen_launch_session(root.path(), id, &provider_path);
-    let claim = acquire_turn_claim(&directory).unwrap();
+    let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
     claim.retain();
     let result = run_session_inner(&directory);
     finalize_native_session(&directory, &result).unwrap();
@@ -1620,7 +1617,7 @@ fn a_later_tell_refusal_never_releases_the_marker_of_a_delivered_initial_prompt(
         .unwrap();
     #[cfg(windows)]
     write_live_registry_entry(&registry, foreign.id(), "foreign-resume");
-    let (mut claim, _) = acquire_ready_turn_claim_with_context(&new, new_id, &[]).unwrap();
+    let (mut claim, _) = turn::claim_ready(&Store::open_unchecked(&new), new_id, &[]).unwrap();
     let error = refuse_follow_up_to_shared_conversation(
         FirstPartyCli::Claude,
         &new,
@@ -1713,22 +1710,32 @@ fn a_later_tell_refusal_never_releases_the_marker_of_a_delivered_initial_prompt(
 // owner repair, or the pre-fix code that released the claim before writing the reason) and
 // a second `tell` can claim the turn and enter `working`. Recording the old refusal then
 // must not roll that turn back to `ready`: its claim, its receipt, and its status stay
-// intact, and only the refused request's receipt remains unresolved.
+// intact. The Claim test also covers an unresolved stale receipt; here a completed
+// stale turn exercises the reopen-specific error framing through Report.
 #[test]
 fn a_refused_follow_up_never_overwrites_the_status_of_the_turn_that_claimed_after_it() {
     let directory = tempfile::tempdir().unwrap();
     let directory = directory.path();
     fs::create_dir(directory.join("events")).unwrap();
     update_status(directory, SessionState::Ready, None, None).unwrap();
-    let (mut refused, _) = acquire_ready_turn_claim(directory, "session-test").unwrap();
+    let (mut refused, _) =
+        turn::claim_ready(&Store::open_unchecked(directory), "session-test", &[]).unwrap();
     let refused_request = refused.receipt().request_id.clone();
     let refusal = anyhow::anyhow!("reopen refused (reopen-conflict): held by pid 4242");
 
     // The refused claim is released out from under the refusal before it is recorded, and
     // the next `tell` claims the turn and starts working.
-    release_turn_claim(directory).unwrap();
+    refused.begin_delivery().unwrap();
+    turn::Report::for_claim(
+        &Store::open_unchecked(directory),
+        FirstPartyCli::Codex,
+        Some(refused.token()),
+    )
+    .complete("completed before refusal", None, None)
+    .unwrap();
     update_status(directory, SessionState::Ready, None, None).unwrap();
-    let (next, _) = acquire_ready_turn_claim(directory, "session-test").unwrap();
+    let (next, _) =
+        turn::claim_ready(&Store::open_unchecked(directory), "session-test", &[]).unwrap();
     let next_token = next.token().to_owned();
     let next_request = next.receipt().request_id.clone();
     update_status(directory, SessionState::Working, None, None).unwrap();
@@ -1763,8 +1770,9 @@ fn a_refused_follow_up_never_overwrites_the_status_of_the_turn_that_claimed_afte
     assert_eq!(recorded, expected);
     for receipt in &receipts.receipts {
         assert!(
-            !directory.join("events").join(&receipt.event_file).exists(),
-            "{}: no result was recorded for either request",
+            directory.join("events").join(&receipt.event_file).exists()
+                == (receipt.request_id == refused_request),
+            "{}: only the completed stale request has a result",
             receipt.request_id
         );
     }
@@ -1773,9 +1781,16 @@ fn a_refused_follow_up_never_overwrites_the_status_of_the_turn_that_claimed_afte
 
     // With the turn still its own, the refusal releases the claim and publishes its reason
     // in the same write.
-    release_turn_claim(directory).unwrap();
+    turn::Report::for_claim(
+        &Store::open_unchecked(directory),
+        FirstPartyCli::Codex,
+        Some(&next_token),
+    )
+    .complete("next completed", None, None)
+    .unwrap();
     update_status(directory, SessionState::Ready, None, None).unwrap();
-    let (mut refused, _) = acquire_ready_turn_claim(directory, "session-test").unwrap();
+    let (mut refused, _) =
+        turn::claim_ready(&Store::open_unchecked(directory), "session-test", &[]).unwrap();
     let refusal = anyhow::anyhow!("reopen refused (reopen-conflict): held by pid 4242");
     let reported =
         record_follow_up_refusal("session-test", &mut refused, &SessionState::Ready, refusal);
@@ -1845,7 +1860,7 @@ fn a_holder_that_registers_after_the_post_launch_scan_is_caught_before_the_initi
     for state in ["awaiting-initial-input", "working", "ready"] {
         update_status(&directory, state.parse().unwrap(), None, None).unwrap();
     }
-    let (mut claim, _) = acquire_ready_turn_claim_with_context(&directory, id, &[]).unwrap();
+    let (mut claim, _) = turn::claim_ready(&Store::open_unchecked(&directory), id, &[]).unwrap();
     let refused_request = claim.receipt().request_id.clone();
     assert_eq!(
         read_json::<SessionStatus>(&directory.join("status.json"))
@@ -1898,7 +1913,7 @@ fn a_holder_that_registers_after_the_post_launch_scan_is_caught_before_the_initi
     // is left to the delivery.
     let _ = foreign.kill();
     let _ = foreign.wait();
-    let (mut claim, _) = acquire_ready_turn_claim_with_context(&directory, id, &[]).unwrap();
+    let (mut claim, _) = turn::claim_ready(&Store::open_unchecked(&directory), id, &[]).unwrap();
     refuse_follow_up_to_shared_conversation(
         FirstPartyCli::Claude,
         &directory,
@@ -1915,7 +1930,7 @@ fn a_holder_that_registers_after_the_post_launch_scan_is_caught_before_the_initi
 
     // The managed registration disappearing is a verification failure, not exclusivity.
     fs::remove_file(registry.join(format!("{}.json", std::process::id()))).unwrap();
-    let (mut claim, _) = acquire_ready_turn_claim_with_context(&directory, id, &[]).unwrap();
+    let (mut claim, _) = turn::claim_ready(&Store::open_unchecked(&directory), id, &[]).unwrap();
     let error = refuse_follow_up_to_shared_conversation(
         FirstPartyCli::Claude,
         &directory,
@@ -2024,7 +2039,7 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
         )
         .unwrap();
         update_status(&new, SessionState::Launching, None, None).unwrap();
-        let mut initial_claim = acquire_turn_claim(&new).unwrap();
+        let mut initial_claim = turn::claim(&Store::open_unchecked(&new), &[]).unwrap();
         let request_id = initial_claim.receipt().request_id.clone();
         update_status(&new, SessionState::AwaitingInitialInput, None, None).unwrap();
 
