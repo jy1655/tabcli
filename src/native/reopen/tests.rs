@@ -2985,3 +2985,40 @@ fn close_deadline_reopen_refusals_preserve_conversation_warning() {
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 }
+
+#[test]
+fn reopen_refuses_a_journal_before_examining_request_results() {
+    for claimed in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let id = "session-reopenjournal";
+        let directory = write_closed_reopen_source(
+            root.path(),
+            id,
+            "claude",
+            Some(REOPEN_TEST_CONVERSATION),
+            true,
+        );
+        // Even an invalid journal and an unresolved receipt stop at convergence, before
+        // journal decoding or receipt/event validation. A claim takes precedence.
+        write_private(&directory.join(CoreRecord::Completion.name()), b"{").unwrap();
+        if claimed {
+            write_private(&directory.join(CoreRecord::TurnClaim.name()), b"1-2-3").unwrap();
+        }
+        requests::create(&Store::open_unchecked(&directory), "9-9-9", &[]).unwrap();
+        let before = snapshot_directory(&directory);
+        let error = inspect_reopen_source(&directory, id).unwrap_err();
+        let name = if claimed {
+            CoreRecord::TurnClaim.name()
+        } else {
+            CoreRecord::Completion.name()
+        };
+        assert_eq!(reopen_refusal_gate(&error), Some("source-not-converged"));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "reopen refused (source-not-converged): session {id} still carries {name}; its close has not converged"
+            )
+        );
+        assert_eq!(snapshot_directory(&directory), before);
+    }
+}

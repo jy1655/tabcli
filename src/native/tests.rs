@@ -5970,8 +5970,9 @@ fn a_journaled_event_over_the_read_limit_is_never_published_or_compared() {
     assert!(read.committed_text.is_none());
     // Beyond the limit the record is not published.
     assert_eq!(request_state(&directory, &request_id).0, "completed");
-    let snapshot =
-        query::Snapshot::read_within(&Reader::open_unchecked(&directory), size - 1).unwrap();
+    let snapshot = Reader::open_unchecked(&directory)
+        .snapshot_within(size - 1)
+        .unwrap();
     let value = snapshot
         .result(
             &Reader::open_unchecked(&directory),

@@ -168,7 +168,7 @@ fn poll(root: &Path, addresses: &[Address], timeout: Duration) -> Result<Outcome
     loop {
         for group in &groups {
             let reader = Reader::open_unchecked(&group.directory);
-            let snapshot = match Snapshot::read(&reader) {
+            let snapshot = match reader.snapshot() {
                 Ok(snapshot) => snapshot,
                 Err(error) if error.is::<SnapshotBusy>() => continue,
                 Err(error) => return Err(error),
@@ -307,9 +307,7 @@ mod tests {
     fn busy_after_a_good_observation_keeps_it_at_timeout() {
         let fixture = seed_close_fixture(JournaledEventState::Absent);
         let reader = Reader::open_unchecked(&fixture.directory);
-        let id = Snapshot::read(&reader).unwrap().receipts[0]
-            .request_id
-            .clone();
+        let id = reader.snapshot().unwrap().receipts[0].request_id.clone();
         fs::remove_file(fixture.directory.join("turn.completion.json")).unwrap();
         let mut calls = 0;
         let value = with_snapshot_hook(
@@ -344,7 +342,7 @@ mod tests {
         for damage in [false, true] {
             let fixture = seed_close_fixture(JournaledEventState::Absent);
             let reader = Reader::open_unchecked(&fixture.directory);
-            let snapshot = Snapshot::read(&reader).unwrap();
+            let snapshot = reader.snapshot().unwrap();
             let receipt = &snapshot.receipts[0];
             let id = receipt.request_id.clone();
             let path = fixture
@@ -392,9 +390,7 @@ mod tests {
         ] {
             let fixture = seed_close_fixture(JournaledEventState::Absent);
             let reader = Reader::open_unchecked(&fixture.directory);
-            let id = Snapshot::read(&reader).unwrap().receipts[0]
-                .request_id
-                .clone();
+            let id = reader.snapshot().unwrap().receipts[0].request_id.clone();
             fs::remove_file(fixture.directory.join("turn.completion.json")).unwrap();
             if let Some(owner) = owner {
                 write_json_atomic(&fixture.directory.join("native-session.json"), &owner).unwrap();
@@ -415,7 +411,7 @@ mod tests {
     fn same_session_addresses_share_one_snapshot() {
         let fixture = seed_close_fixture(JournaledEventState::Committed);
         let reader = Reader::open_unchecked(&fixture.directory);
-        let snapshot = Snapshot::read(&reader).unwrap();
+        let snapshot = reader.snapshot().unwrap();
         let mut receipt = serde_json::to_value(&snapshot.receipts[0]).unwrap();
         let first = snapshot.receipts[0].request_id.clone();
         drop(snapshot);

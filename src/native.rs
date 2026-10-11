@@ -72,9 +72,11 @@ use terminal::{windows_console_handle_path, windows_console_root_never_ran};
 #[cfg(all(test, windows))]
 use provider_process::command as provider_process_command;
 
+#[cfg(any(windows, test))]
+use std::fs::File;
 use std::{
     ffi::OsString,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{IsTerminal, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},

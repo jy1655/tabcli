@@ -799,10 +799,9 @@ fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
     // prove what that request delivered, whatever the latest event says.
     for receipt in &index.receipts {
         let event_path = Reader::open_unchecked(directory)
-            .record(CoreRecord::Events)
+            .event(&receipt.event_file)
             .path()
-            .to_owned()
-            .join(&receipt.event_file);
+            .to_owned();
         if !RecordReader::at(&event_path).is_regular_file()? {
             return Err(reopen_refusal(
                 "request-unresolved",

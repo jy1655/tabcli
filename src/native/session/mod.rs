@@ -28,6 +28,7 @@ use turn::{JournaledEventRead, JournaledEventState, PendingTurnCompletion};
 pub(in crate::native) mod primitives;
 mod reads;
 pub(in crate::native) mod schema;
+pub(in crate::native) mod snapshot;
 #[cfg(test)]
 pub(in crate::native) use names::*;
 #[cfg(not(test))]

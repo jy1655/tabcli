@@ -210,15 +210,11 @@ impl Observation {
 
     pub(super) fn read_locked(reader: &Reader) -> Result<Self> {
         let records = observe_snapshot(reader)?;
-        let active_state = records
-            .receipts
-            .iter()
-            .find(|r| records.claim.as_deref() == Some(&r.claim_token))
-            .map(|r| {
-                records
-                    .observe_result(reader, &Selector::Request(r.request_id.clone()))
-                    .map(|observed| observed.state)
-            });
+        let active_state = records.active_receipt().map(|r| {
+            records
+                .observe_result(reader, &Selector::Request(r.request_id.clone()))
+                .map(|observed| observed.state)
+        });
         Ok(Self::from_records(reader, records, active_state))
     }
 
@@ -277,25 +273,21 @@ impl Observation {
                 }),
             )
         };
-        let active = records
-            .receipts
-            .iter()
-            .find(|r| records.claim.as_deref() == Some(&r.claim_token))
-            .map(|receipt| {
-                if latest_event_id == Some(receipt.event_file.as_str()) {
-                    latest
-                        .as_ref()
-                        .map(active_value)
-                        .map_err(|error| anyhow::anyhow!("{error:#}"))
-                } else {
-                    if Instant::now() >= deadline {
-                        bail!("status time budget exhausted");
-                    }
-                    records
-                        .observe_result(reader, &Selector::Request(receipt.request_id.clone()))
-                        .map(|observed| active_value(&observed))
+        let active = records.active_receipt().map(|receipt| {
+            if latest_event_id == Some(receipt.event_file.as_str()) {
+                latest
+                    .as_ref()
+                    .map(active_value)
+                    .map_err(|error| anyhow::anyhow!("{error:#}"))
+            } else {
+                if Instant::now() >= deadline {
+                    bail!("status time budget exhausted");
                 }
-            });
+                records
+                    .observe_result(reader, &Selector::Request(receipt.request_id.clone()))
+                    .map(|observed| active_value(&observed))
+            }
+        });
         let latest = latest.map(|observed| {
             observed.event.as_ref().map_or(Value::Null, |event| {
                 json!({
@@ -323,10 +315,7 @@ impl Observation {
     }
 
     pub(in crate::native) fn active_request(&self) -> Option<&requests::Receipt> {
-        self.records
-            .receipts
-            .iter()
-            .find(|r| self.records.claim.as_deref() == Some(&r.claim_token))
+        self.records.active_receipt()
     }
 
     pub(super) fn inspect_value(mut self, reader: &Reader, id: &str) -> Result<Value> {
@@ -345,7 +334,7 @@ impl Observation {
             json!({
                 "request_id": receipt.request_id, "created_unix_ms": receipt.created_unix_ms, "source": receipt.source,
                 "event_id": receipt.event_file, "context_sources": receipt.context_sources,
-                "active": snapshot.claim.as_deref() == Some(&receipt.claim_token),
+                "active": snapshot.is_active(receipt),
                 "bridge_observed_elapsed_ms": elapsed,
                 "bridge_observed_elapsed_reason": elapsed_reason,
             })
