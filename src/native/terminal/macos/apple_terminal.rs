@@ -1,3 +1,4 @@
+use super::{DialogKey, GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
 pub(in crate::native) mod close_evidence;
 
 use super::process;
@@ -21,7 +22,7 @@ use anyhow::{Context, Result, bail};
 
 use super::{
     CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession,
-    applescript, close_response,
+    applescript, applescript::close_response,
 };
 
 // Ownership of the new window is proven by the tty of the tab that `do script`
@@ -836,6 +837,211 @@ pub(in crate::native) fn apple_terminal_startup_absent_with(
     )
 }
 
+type Start = fn(&TerminalSession, Instant) -> Result<()>;
+type Absence = fn(&Path, &TerminalSession, Instant) -> Result<bool>;
+pub(super) struct Adapter<S, A> {
+    pub(super) start: S,
+    absent: A,
+}
+pub(super) static ADAPTER: Adapter<Start, Absence> = Adapter {
+    // Terminal.app typed its start when it created the tab, and the start
+    // waits for the same binding. Nothing is typed after the creation.
+    start: |_, _| Ok(()),
+    absent: apple_terminal_startup_absent,
+};
+#[cfg(test)]
+pub(super) fn with_observations<'a, S, A>(start: &'a S, absent: &'a A) -> Adapter<&'a S, &'a A>
+where
+    S: Fn(&TerminalSession, Instant) -> Result<()>,
+    A: Fn(&Path, &TerminalSession, Instant) -> Result<bool>,
+{
+    Adapter { start, absent }
+}
+// Stable creation-time handle only. A compare-and-send is one automation call;
+// an intervening repaint or changed selection sends no keys. Never targets front tab.
+pub(in crate::native) const SCREEN_SCRIPT: &str = r#"
+on run argv
+    set wantedTty to item 1 of argv
+    set wantedWindowId to item 2 of argv as integer
+    if not application "Terminal" is running then error "Agent Bridge Terminal.app screen: not running"
+    tell application "Terminal"
+        set w to first window whose id is wantedWindowId
+        set matchedTab to missing value
+        set matchCount to 0
+        repeat with t in tabs of w
+            if tty of t is wantedTty then
+                set matchedTab to t
+                set matchCount to matchCount + 1
+            end if
+        end repeat
+        if matchCount is not 1 then error "managed Terminal screen is ambiguous or missing"
+        if (count of argv) is 2 then return "AB_SCREEN_BEGIN" & my screenOf(w, wantedTty) & "AB_SCREEN_END"
+        return my guardedAnswer(w, wantedTty, matchedTab, item 3 of argv, item 4 of argv)
+    end tell
+end run
+
+on screenOf(w, wantedTty)
+    if not application "Terminal" is running then error "Agent Bridge Terminal.app screen: not running"
+    tell application "Terminal"
+        -- "contents of <variable>" dereferences an AppleScript reference; use
+        -- the tab specifier to read Terminal's text property instead.
+        return contents of (first tab of w whose tty is wantedTty)
+    end tell
+end screenOf
+
+on sendKey(targetTab, keyName)
+    if not application "Terminal" is running then error "Agent Bridge Terminal.app screen: not running"
+    tell application "Terminal"
+        if keyName is "down-enter" then
+            do script ((ASCII character 27) & "[B") in targetTab
+        else
+            do script "" in targetTab
+        end if
+    end tell
+end sendKey
+
+-- The flow.
+on guardedAnswer(w, wantedTty, targetTab, expectedScreen, keyName)
+    set screenText to my screenOf(w, wantedTty)
+    if screenText is not expectedScreen then return "changed"
+    my sendKey(targetTab, keyName)
+    return "sent"
+end guardedAnswer
+"#;
+impl<S, A> MacTerminalAdapter for Adapter<S, A>
+where
+    S: Fn(&TerminalSession, Instant) -> Result<()>,
+    A: Fn(&Path, &TerminalSession, Instant) -> Result<bool>,
+{
+    fn open_bound_tab(
+        &self,
+        mode: MacosOpenMode,
+        command: &str,
+        directory: &Path,
+        deadline: Instant,
+        bind: super::BindSurface<'_>,
+        unbind: Box<dyn FnOnce() -> Result<()> + '_>,
+    ) -> Result<TerminalSession> {
+        super::open_with(
+            deadline,
+            |startup_deadline| {
+                if mode != MacosOpenMode::NewWindow {
+                    // Terminal.sdef exposes the tabs collection read-only. `do script in`
+                    // addresses an existing tab; it is not a new-tab creation command.
+                    // Replace this fallback if Terminal gains a native owned-tab API.
+                    eprintln!(
+                        "Terminal.app tab-first: its native scripting interface has no new-tab creation command; opening a new owned window"
+                    );
+                }
+                create_tab(command, directory, startup_deadline)
+            },
+            |session, deadline| (self.start)(session, deadline),
+            |session, deadline| {
+                if (self.absent)(directory, session, deadline)? {
+                    return Ok(());
+                }
+                bail!(
+                    "Terminal.app startup failed with a remaining surface; no new close or signal authority was granted and its binding is retained"
+                )
+            },
+            bind,
+            unbind,
+        )
+    }
+    fn send_file(
+        &self,
+        session: &TerminalSession,
+        prompt_path: &Path,
+        deadline: Instant,
+    ) -> TerminalSendResult {
+        send_file(session, prompt_path, deadline)
+    }
+    fn verify_surface(
+        &self,
+        _directory: &Path,
+        session: &TerminalSession,
+        timeout: Option<Duration>,
+    ) -> Result<Option<String>> {
+        verify_tab(session, timeout).map(Some)
+    }
+    fn surface_present(
+        &self,
+        _directory: &Path,
+        session: &TerminalSession,
+        timeout: Duration,
+    ) -> Result<bool> {
+        let response = applescript::run_until(
+            "Terminal.app",
+            VERIFY_TAB_SCRIPT,
+            &[
+                session.id.as_str(),
+                session
+                    .window_id
+                    .as_deref()
+                    .context("Terminal.app window id is missing")?,
+            ],
+            super::timeout_deadline(timeout)?,
+        )?;
+        match response.as_str() {
+            "missing" => Ok(false),
+            "present" => Ok(true),
+            tty if tty == session.id => Ok(true),
+            _ => bail!("unexpected terminal presence response: {response:?}"),
+        }
+    }
+    fn read_screen(&self, session: &TerminalSession, deadline: Instant) -> Result<String> {
+        let args = vec![
+            session.id.as_str(),
+            session
+                .window_id
+                .as_deref()
+                .context("Terminal window identity missing")?,
+        ];
+        let text =
+            applescript::run_until(session.kind.display_name(), SCREEN_SCRIPT, &args, deadline)?;
+        applescript::screen_text(&text)
+    }
+    fn guarded_dialog_input(
+        &self,
+        session: &TerminalSession,
+        input: &GuardedDialogInput,
+        deadline: Instant,
+    ) -> Result<bool> {
+        let mut args = vec![
+            session.id.as_str(),
+            session
+                .window_id
+                .as_deref()
+                .context("Terminal window identity missing")?,
+        ];
+        args.extend([
+            input.screen.as_str(),
+            match input.key {
+                DialogKey::Enter => "enter",
+                DialogKey::DownEnter => "down-enter",
+            },
+        ]);
+        let answer =
+            applescript::run_until(session.kind.display_name(), SCREEN_SCRIPT, &args, deadline)?;
+        applescript::guarded_answer(&answer)
+    }
+    fn close_session_until(
+        &self,
+        _directory: &Path,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<CloseOutcome> {
+        close_session_until(session, deadline)
+    }
+    fn close_owned_session(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<CloseOutcome> {
+        close_owned_session(directory, session, deadline)
+    }
+}
 // The shipped scripts, executed with Terminal replaced by records: only the reads and
 // the close are swapped for mock handlers, the scripts' own decisions run in
 // `osascript`, and nothing talks to Terminal.
@@ -1206,12 +1412,12 @@ end mockClose
                 "Agent Bridge Terminal.app send: not running",
             ),
             (
-                super::super::screen::TERMINAL,
+                super::SCREEN_SCRIPT,
                 vec![TTY, WINDOW],
                 "Agent Bridge Terminal.app screen: not running",
             ),
             (
-                super::super::screen::TERMINAL,
+                super::SCREEN_SCRIPT,
                 vec![TTY, WINDOW, "trust this directory?", "enter"],
                 "Agent Bridge Terminal.app screen: not running",
             ),
@@ -1225,11 +1431,7 @@ end mockClose
             (Ok("sent".into()), vec![format!("sent hello to {TTY}")])
         );
         assert_eq!(
-            replay(
-                super::super::screen::TERMINAL,
-                &running(&[LIVE]),
-                &[TTY, WINDOW]
-            ),
+            replay(super::SCREEN_SCRIPT, &running(&[LIVE]), &[TTY, WINDOW]),
             (
                 Ok("AB_SCREEN_BEGINtrust this directory?AB_SCREEN_END".into()),
                 vec![]
@@ -1247,7 +1449,7 @@ end mockClose
                 };
                 assert_eq!(
                     replay(
-                        super::super::screen::TERMINAL,
+                        super::SCREEN_SCRIPT,
                         &running(&[LIVE]),
                         &[TTY, WINDOW, screen, key]
                     ),
@@ -1265,7 +1467,7 @@ end mockClose
             "my sendKey(missing value, \"down-enter\")",
         ] {
             // Invoke the handler after the application's earlier running check.
-            let script = super::super::screen::TERMINAL
+            let script = super::SCREEN_SCRIPT
                 .replace("on run argv", "on originalRun(argv)")
                 .replacen("end run", "end originalRun", 1);
             let script = format!("{script}\non run\nreturn {call}\nend run\n");
@@ -2353,5 +2555,20 @@ end run
             assert_eq!(status.code(), Some(7), "{outcome}: {}", shown(&screen));
             assert!(log.contains("terminal_host_refused: "), "{outcome}: {log}");
         }
+    }
+}
+
+#[cfg(test)]
+mod screen_replay_tests {
+    #[test]
+    fn terminal_guarded_answer_replays_matching_and_changed_screens() {
+        super::applescript::replay::assert_guarded_replay(
+            super::SCREEN_SCRIPT,
+            "w, wantedTty",
+            "w & \":\" & wantedTty",
+            "\"window-id\", \"tty-id\", \"tab-id\"",
+            "window-id:tty-id",
+            "tab-id",
+        );
     }
 }

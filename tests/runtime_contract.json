@@ -300,7 +300,13 @@
     "const FILE: &str = \"settings.json\";": 1,
     "settings.json": 1
   },
+  "src/native/terminal/macos/applescript.rs": {
+    "AB_SCREEN_BEGIN": 1,
+    "AB_SCREEN_END": 1
+  },
   "src/native/terminal/macos/apple_terminal.rs": {
+    "AB_SCREEN_BEGIN": 1,
+    "AB_SCREEN_END": 1,
     "const BOOTSTRAP_FILE: &str = \"terminal-start.sh\";": 1,
     "launch.sh": 1,
     "native-terminal-host": 1,
@@ -317,6 +323,8 @@
     "\"closed\"": 1
   },
   "src/native/terminal/macos/iterm2.rs": {
+    "AB_SCREEN_BEGIN": 1,
+    "AB_SCREEN_END": 1,
     "native-iterm2-host": 1
   },
   "src/native/terminal/macos/ownership.rs": {
@@ -324,10 +332,6 @@
   },
   "src/native/terminal/macos/process.rs": {
     "native-session": 7
-  },
-  "src/native/terminal/macos/screen.rs": {
-    "AB_SCREEN_BEGIN": 3,
-    "AB_SCREEN_END": 3
   },
   "src/native/terminal/macos/warp.rs": {
     "const CONTROL_FILE: &str = \"warp-control.json\";": 1,

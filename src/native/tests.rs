@@ -1928,13 +1928,13 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
     for (name, script, application, path) in [
         (
             "iTerm2 guarded dialog",
-            terminal::macos::screen::ITERM,
+            terminal::macos::iterm2::SCREEN_SCRIPT,
             "iTerm2",
             "/Applications/iTerm.app",
         ),
         (
             "Terminal.app guarded dialog",
-            terminal::macos::screen::TERMINAL,
+            terminal::macos::apple_terminal::SCREEN_SCRIPT,
             "Terminal",
             "/System/Applications/Utilities/Terminal.app",
         ),

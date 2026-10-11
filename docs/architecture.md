@@ -62,6 +62,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 - `src/native/terminal/` selects and implements platform-specific surfaces, input, observation,
   and close. Its `ownership` module owns owner identity, attestation, close authority, and
   the execution of an authorized close; the Terminal.app adapter owns app incarnation.
+  macOS operations use `MacTerminalAdapter` through one kind lookup. Each adapter explicitly
+  supplies every operation. Shared `open_with` preserves binding and cleanup order; Warp
+  owns its open flow. `applescript` owns execution and common response vocabulary, while
+  each adapter owns its screen and presence scripts.
 - `src/native/session/` owns durable record schemas, record access, and durability.
   `schema` defines the shared manifest, event, provider-process, and reopen-refusal records and
   their constants; `primitives` owns session environment names, identity validation, and time
@@ -247,9 +251,10 @@ Windows. Terminal.app also records the app incarnation: a window identity in one
 is not authority over the same apparent identity after a restart.
 
 The terminal seam passes the session directory to verification, presence, close (including
-owned and dead-owner close), and guarded dialog input. Adapters read their session records
+owned and dead-owner close). Adapters read their session records
 from that directory. Warp requires the handle's managed session id to match the supplied
-private directory. Windows guarded input also requires the directory to match the helper
+private directory. macOS guarded input uses the surface handle. Windows guarded input
+receives the directory and requires it to match the helper
 child's state-root lookup; the child still resolves the session by id under its own root.
 
 Identity and close evidence stay with each adapter. Terminal.app keeps `terminal_app` in
@@ -285,6 +290,9 @@ repair settles the records without resending a prompt or guessing ownership of a
   capability as `SurfaceFacts` in its `facts.rs` module. The shared accessor dispatches these
   exhaustively by terminal kind on every build target; platform operation refusals remain separate.
   The three macOS adapters also declare macOS-only `BINDING` diagnostics and budgets there.
+  For macOS operations, implement every `MacTerminalAdapter` method explicitly and add the
+  adapter to its kind lookup. Reuse `open_with` for binding and cleanup unless the adapter
+  owns a distinct open protocol, as Warp does. Keep screen and presence scripts in the adapter.
   A creation preference in settings cannot substitute for recorded close authority.
 - For a new platform, start with the dispatch in `src/native/terminal/mod.rs` and the refusal
   paths in `src/native/terminal/linux/mod.rs`. Then read the process-identity code under the

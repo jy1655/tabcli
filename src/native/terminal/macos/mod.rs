@@ -7,11 +7,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::native::settings::MacosOpenMode;
 use anyhow::{Context, Result, bail};
 
 use super::{
-    CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession,
-    select_macos_terminal,
+    CloseOutcome, DialogKey, GuardedDialogInput, TerminalKind, TerminalSendFailure,
+    TerminalSendResult, TerminalSession, select_macos_terminal,
 };
 
 const STARTUP_CLEANUP_RESERVE: Duration = Duration::from_secs(2);
@@ -20,8 +21,6 @@ pub(in crate::native) mod apple_terminal;
 mod applescript;
 #[cfg(test)]
 pub(in crate::native) use applescript::testing as automation_testing;
-pub(in crate::native) mod screen;
-pub(super) use screen::{guarded_dialog_input, read_screen};
 pub(in crate::native) mod ghostty;
 pub(in crate::native) mod iterm2;
 pub(in crate::native) mod warp;
@@ -37,6 +36,68 @@ pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
         env::var_os("ITERM_SESSION_ID").is_some(),
         env::var_os("TERM_SESSION_ID").is_some(),
     ))
+}
+
+pub(super) type BindSurface<'a> = Box<dyn FnOnce(&mut TerminalSession) -> Result<()> + 'a>;
+
+pub(super) trait MacTerminalAdapter {
+    fn open_bound_tab(
+        &self,
+        mode: MacosOpenMode,
+        command: &str,
+        directory: &Path,
+        deadline: Instant,
+        bind: BindSurface<'_>,
+        unbind: Box<dyn FnOnce() -> Result<()> + '_>,
+    ) -> Result<TerminalSession>;
+    fn send_file(
+        &self,
+        session: &TerminalSession,
+        prompt_path: &Path,
+        deadline: Instant,
+    ) -> TerminalSendResult;
+    fn verify_surface(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        timeout: Option<Duration>,
+    ) -> Result<Option<String>>;
+    fn surface_present(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        timeout: Duration,
+    ) -> Result<bool>;
+    fn read_screen(&self, session: &TerminalSession, deadline: Instant) -> Result<String>;
+    fn guarded_dialog_input(
+        &self,
+        session: &TerminalSession,
+        input: &GuardedDialogInput,
+        deadline: Instant,
+    ) -> Result<bool>;
+    fn close_session_until(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<CloseOutcome>;
+    fn close_owned_session(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<CloseOutcome>;
+}
+
+pub(super) fn adapter(kind: TerminalKind) -> Result<&'static dyn MacTerminalAdapter> {
+    match kind {
+        TerminalKind::Iterm2 => Ok(&iterm2::ADAPTER),
+        TerminalKind::AppleTerminal => Ok(&apple_terminal::ADAPTER),
+        TerminalKind::Ghostty => Ok(&ghostty::ADAPTER),
+        TerminalKind::WezTerm => Ok(&wezterm::ADAPTER),
+        TerminalKind::Warp => Ok(&warp::ADAPTER),
+        TerminalKind::WindowsConsole => bail!("Windows Console is only available on Windows"),
+    }
 }
 
 pub(super) fn open_bound_tab<F, U>(
@@ -58,97 +119,39 @@ where
             .parent()
             .context("session directory has no state root")?,
     )?;
-    let force_new_window = mode == crate::native::settings::MacosOpenMode::NewWindow;
-    if kind == TerminalKind::Warp {
-        return warp::open_bound_tab_with_mode(
-            command,
-            directory,
-            deadline,
-            force_new_window,
-            bind,
-            unbind,
-        );
-    }
+    adapter(kind)?.open_bound_tab(
+        mode,
+        command,
+        directory,
+        deadline,
+        Box::new(bind),
+        Box::new(unbind),
+    )
+}
+
+pub(super) fn open_with(
+    deadline: Instant,
+    create: impl FnOnce(Instant) -> Result<TerminalSession>,
+    start: impl FnOnce(&TerminalSession, Instant) -> Result<()>,
+    cleanup: impl FnOnce(&TerminalSession, Instant) -> Result<()>,
+    bind: impl FnOnce(&mut TerminalSession) -> Result<()>,
+    unbind: impl FnOnce() -> Result<()>,
+) -> Result<TerminalSession> {
     let startup_deadline = deadline
         .checked_sub(STARTUP_CLEANUP_RESERVE)
         .filter(|candidate| *candidate > Instant::now())
         .context("terminal startup timeout leaves no room for exact surface cleanup")?;
-    let mut session = match kind {
-        TerminalKind::Iterm2 => iterm2::create_tab(mode, command, directory, startup_deadline),
-        TerminalKind::AppleTerminal => {
-            if !force_new_window {
-                // Terminal.sdef exposes the tabs collection read-only. `do script in`
-                // addresses an existing tab; it is not a new-tab creation command.
-                // Replace this fallback if Terminal gains a native owned-tab API.
-                eprintln!(
-                    "Terminal.app tab-first: its native scripting interface has no new-tab creation command; opening a new owned window"
-                );
-            }
-            apple_terminal::create_tab(command, directory, startup_deadline)
-        }
-        TerminalKind::Ghostty => ghostty::create_tab_with_mode(force_new_window, startup_deadline),
-        TerminalKind::Warp => unreachable!(),
-        TerminalKind::WezTerm => wezterm::create_surface(
-            &wezterm::Installed,
-            force_new_window,
-            command,
-            directory,
-            startup_deadline,
-        ),
-        TerminalKind::WindowsConsole => bail!("Windows Console is only available on Windows"),
-    }?;
+    let mut session = create(startup_deadline)?;
     let start_session = session.clone();
     let cleanup_session = session.clone();
     super::bind_surface_before_start(
         &mut session,
         bind,
-        || match start_session.kind {
-            // The creation command waits for the atomic binding above before it
-            // starts the wrapper. No shell command is typed into the new tab.
-            TerminalKind::Iterm2 => Ok(()),
-            // Terminal.app typed its start when it created the tab, and the start
-            // waits for the same binding. Nothing is typed after the creation.
-            TerminalKind::AppleTerminal => Ok(()),
-            TerminalKind::Ghostty => {
-                ghostty::start_session(&start_session, command, directory, startup_deadline)
-            }
-            TerminalKind::Warp => unreachable!(),
-            // The program of the pane waits for the binding above; nothing is typed.
-            TerminalKind::WezTerm => Ok(()),
-            TerminalKind::WindowsConsole => unreachable!(),
-        },
-        || {
-            cleanup_started_surface_with(
-                &cleanup_session,
-                || {
-                    apple_terminal::apple_terminal_startup_absent(
-                        directory,
-                        &cleanup_session,
-                        deadline,
-                    )
-                },
-                || close_session_until(directory, &cleanup_session, deadline).map(|_| ()),
-            )
-        },
+        || start(&start_session, startup_deadline),
+        || cleanup(&cleanup_session, deadline),
         unbind,
     )?;
     Ok(session)
-}
-
-fn cleanup_started_surface_with(
-    session: &TerminalSession,
-    absent: impl FnOnce() -> Result<bool>,
-    close: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    if session.kind == TerminalKind::AppleTerminal {
-        if absent()? {
-            return Ok(());
-        }
-        bail!(
-            "Terminal.app startup failed with a remaining surface; no new close or signal authority was granted and its binding is retained"
-        );
-    }
-    close()
 }
 
 pub(super) fn send_file(
@@ -156,18 +159,9 @@ pub(super) fn send_file(
     prompt_path: &Path,
     deadline: Instant,
 ) -> TerminalSendResult {
-    match session.kind {
-        TerminalKind::Iterm2 => iterm2::send_file(session, prompt_path, deadline),
-        TerminalKind::AppleTerminal => apple_terminal::send_file(session, prompt_path, deadline),
-        TerminalKind::Ghostty => ghostty::send_file(session, prompt_path, deadline),
-        TerminalKind::Warp => warp::send_file(session, prompt_path, deadline),
-        TerminalKind::WezTerm => {
-            wezterm::send_file(&wezterm::Installed, session, prompt_path, deadline)
-        }
-        TerminalKind::WindowsConsole => Err(TerminalSendFailure::not_sent(anyhow::anyhow!(
-            "Windows Console is only available on Windows"
-        ))),
-    }
+    adapter(session.kind)
+        .map_err(TerminalSendFailure::not_sent)?
+        .send_file(session, prompt_path, deadline)
 }
 
 pub(super) fn verify_surface(
@@ -175,16 +169,7 @@ pub(super) fn verify_surface(
     session: &TerminalSession,
     timeout: Option<Duration>,
 ) -> Result<Option<String>> {
-    match session.kind {
-        TerminalKind::Iterm2 => iterm2::verify_session(session, timeout).map(Some),
-        TerminalKind::AppleTerminal => apple_terminal::verify_tab(session, timeout).map(Some),
-        TerminalKind::Ghostty => ghostty::verify_surface(session, timeout).map(|()| None),
-        TerminalKind::Warp => warp::verify_surface(directory, session, timeout).map(Some),
-        TerminalKind::WezTerm => {
-            wezterm::verify_session(&wezterm::Installed, session, timeout).map(Some)
-        }
-        TerminalKind::WindowsConsole => bail!("Windows Console is only available on Windows"),
-    }
+    adapter(session.kind)?.verify_surface(directory, session, timeout)
 }
 
 pub(super) fn surface_present(
@@ -192,52 +177,19 @@ pub(super) fn surface_present(
     session: &TerminalSession,
     timeout: Duration,
 ) -> Result<bool> {
-    if session.kind == TerminalKind::Warp {
-        return warp::surface_present(directory, session, timeout);
-    }
-    if session.kind == TerminalKind::WezTerm {
-        return wezterm::surface_present(&wezterm::Installed, session, timeout);
-    }
-    if session.kind == TerminalKind::Ghostty {
-        return ghostty::surface_present(session, timeout);
-    }
-    let (label, script, args) = match session.kind {
-        TerminalKind::Iterm2 => ("iTerm2", iterm2::PRESENCE_SCRIPT, vec![session.id.as_str()]),
-        TerminalKind::AppleTerminal => (
-            "Terminal.app",
-            apple_terminal::VERIFY_TAB_SCRIPT,
-            vec![
-                session.id.as_str(),
-                session
-                    .window_id
-                    .as_deref()
-                    .context("Terminal.app window id is missing")?,
-            ],
-        ),
-        _ => bail!("terminal presence probe is unsupported for this host"),
-    };
-    let response = applescript::run_until(label, script, &args, timeout_deadline(timeout)?)?;
-    match response.as_str() {
-        "missing" => Ok(false),
-        "present" => Ok(true),
-        tty if session.kind == TerminalKind::AppleTerminal && tty == session.id => Ok(true),
-        _ => bail!("unexpected terminal presence response: {response:?}"),
-    }
+    adapter(session.kind)?.surface_present(directory, session, timeout)
 }
 
-// Terminal.app's managed close requires the owner's recorded app incarnation.
-// Other adapters receive the directory for their own close evidence.
-pub(super) fn close_owned_session(
-    directory: &Path,
+pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Result<String> {
+    adapter(session.kind)?.read_screen(session, deadline)
+}
+
+pub(super) fn guarded_dialog_input(
     session: &TerminalSession,
-    deadline: std::time::Instant,
-) -> Result<CloseOutcome> {
-    match session.kind {
-        TerminalKind::AppleTerminal => {
-            apple_terminal::close_owned_session(directory, session, deadline)
-        }
-        _ => close_session_until(directory, session, deadline),
-    }
+    input: &GuardedDialogInput,
+    deadline: Instant,
+) -> Result<bool> {
+    adapter(session.kind)?.guarded_dialog_input(session, input, deadline)
 }
 
 pub(super) fn close_session_until(
@@ -245,16 +197,15 @@ pub(super) fn close_session_until(
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
-    match session.kind {
-        TerminalKind::Iterm2 => iterm2::close_session_until(session, deadline),
-        TerminalKind::AppleTerminal => apple_terminal::close_session_until(session, deadline),
-        TerminalKind::Ghostty => ghostty::close_session_until(session, deadline),
-        TerminalKind::Warp => warp::close_session_until(directory, session, deadline),
-        TerminalKind::WezTerm => {
-            wezterm::close_session_until(&wezterm::Installed, session, deadline)
-        }
-        TerminalKind::WindowsConsole => bail!("Windows Console is only available on Windows"),
-    }
+    adapter(session.kind)?.close_session_until(directory, session, deadline)
+}
+
+pub(super) fn close_owned_session(
+    directory: &Path,
+    session: &TerminalSession,
+    deadline: Instant,
+) -> Result<CloseOutcome> {
+    adapter(session.kind)?.close_owned_session(directory, session, deadline)
 }
 
 pub(super) fn timeout_deadline(timeout: Duration) -> Result<Instant> {
@@ -285,20 +236,10 @@ fn screen_locked_in(ioreg: &str) -> bool {
     ioreg.contains("\"CGSSessionScreenIsLocked\"=Yes")
 }
 
-fn close_response(terminal: TerminalKind, response: &str) -> Result<CloseOutcome> {
-    match response {
-        "closed" => Ok(CloseOutcome::Closed),
-        "missing" => Ok(CloseOutcome::Missing),
-        _ => bail!(
-            "unexpected {} close response: {response:?}",
-            terminal.display_name()
-        ),
-    }
-}
-
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn prebind_cleanup_and_legacy_iterm_close_need_no_managed_id() {
@@ -308,24 +249,54 @@ mod startup_tests {
         }))
         .unwrap();
         assert!(legacy.managed_session_id.is_none());
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let calls = std::rc::Rc::new(Cell::new(0));
+        let runner_calls = calls.clone();
+        let unbound = Cell::new(false);
+        let adapter = adapter(TerminalKind::Iterm2).unwrap();
         automation_testing::with_runner(
-            |_| Ok("closed".into()),
+            move |_| {
+                let calls = &runner_calls;
+                calls.set(calls.get() + 1);
+                Ok(if calls.get() == 1 {
+                    "native-session-id"
+                } else {
+                    "closed"
+                }
+                .into())
+            },
             || {
-                cleanup_started_surface_with(
-                    &legacy,
-                    || panic!("iTerm2 needs no Terminal.app absence proof"),
-                    || close_session_until(directory.path(), &legacy, deadline).map(|_| ()),
-                )
-                .unwrap();
+                let error = adapter
+                    .open_bound_tab(
+                        MacosOpenMode::TabFirst,
+                        "true",
+                        directory.path(),
+                        deadline,
+                        Box::new(|session| {
+                            assert!(session.managed_session_id.is_none());
+                            assert_eq!(session.id, legacy.id);
+                            bail!("injected binding failure")
+                        }),
+                        Box::new(|| {
+                            unbound.set(true);
+                            Ok(())
+                        }),
+                    )
+                    .unwrap_err();
+                assert_eq!(error.to_string(), "injected binding failure");
+                assert_eq!(calls.get(), 2, "create then exact cleanup");
+                assert!(unbound.get());
                 assert_eq!(
-                    close_owned_session(directory.path(), &legacy, deadline).unwrap(),
+                    adapter
+                        .close_owned_session(directory.path(), &legacy, deadline)
+                        .unwrap(),
                     CloseOutcome::Closed
                 );
             },
         );
-        // Exercise the real execution boundary: its expired deadline prevents osascript.
-        let error = close_session_until(directory.path(), &legacy, Instant::now()).unwrap_err();
+        let error = adapter
+            .close_session_until(directory.path(), &legacy, Instant::now())
+            .unwrap_err();
         assert_eq!(
             error.to_string(),
             "iTerm2 automation timed out before it started"
@@ -340,44 +311,63 @@ mod startup_tests {
         }))
         .unwrap();
         std::fs::write(directory.path().join("native-session.json"), "broken").unwrap();
-        let error = close_owned_session(directory.path(), &session, Instant::now()).unwrap_err();
+        let error = adapter(session.kind)
+            .unwrap()
+            .close_owned_session(directory.path(), &session, Instant::now())
+            .unwrap_err();
         assert!(format!("{error:#}").contains("expected value"), "{error:#}");
     }
 
     #[test]
     fn terminal_startup_missing_app_proof_retains_binding_without_adapter() {
-        let mut session: TerminalSession = serde_json::from_value(serde_json::json!({
-            "terminal": "apple-terminal", "session_id": "/dev/ttys999", "window_id": "1001"
-        }))
-        .unwrap();
-        let cleanup_session = session.clone();
-        let bound = std::cell::Cell::new(false);
-        let calls = std::cell::Cell::new(0);
-        let result = super::super::bind_surface_before_start(
-            &mut session,
-            |_| {
-                bound.set(true);
-                Ok(())
+        let directory = tempfile::tempdir().unwrap();
+        let bound = Cell::new(false);
+        let calls = std::rc::Rc::new(Cell::new(0));
+        let runner_calls = calls.clone();
+        let absent_calls = Cell::new(0);
+        let start = |_: &TerminalSession, _: Instant| {
+            bail!("injected startup command failure before app owner record")
+        };
+        let absent = |_: &Path, _: &TerminalSession, _: Instant| {
+            absent_calls.set(absent_calls.get() + 1);
+            bail!("no app identity was recorded")
+        };
+        let local = apple_terminal::with_observations(&start, &absent);
+        let adapter: &dyn MacTerminalAdapter = &local;
+        let result = automation_testing::with_runner(
+            move |_| {
+                let calls = &runner_calls;
+                calls.set(calls.get() + 1);
+                assert_eq!(
+                    calls.get(),
+                    1,
+                    "unproved startup rollback reached a close adapter"
+                );
+                Ok("/dev/ttys999\n1001".into())
             },
-            || bail!("injected startup command failure before app owner record"),
             || {
-                cleanup_started_surface_with(
-                    &cleanup_session,
-                    || bail!("no app identity was recorded"),
-                    || {
-                        calls.set(calls.get() + 1);
+                adapter.open_bound_tab(
+                    MacosOpenMode::NewWindow,
+                    "true",
+                    directory.path(),
+                    Instant::now() + Duration::from_secs(10),
+                    Box::new(|_| {
+                        bound.set(true);
                         Ok(())
-                    },
+                    }),
+                    Box::new(|| {
+                        bound.set(false);
+                        Ok(())
+                    }),
                 )
             },
-            || {
-                bound.set(false);
-                Ok(())
-            },
         );
-        assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("injected startup command failure before app owner record"));
+        assert!(error.contains("no app identity was recorded"));
+        assert_eq!(absent_calls.get(), 1);
         assert_eq!(
-            calls.get(),
+            calls.get() - 1,
             0,
             "unproved startup rollback reached a close adapter"
         );
@@ -386,18 +376,38 @@ mod startup_tests {
 
     #[test]
     fn terminal_startup_success_never_uses_failed_start_cleanup() {
-        let mut session: TerminalSession = serde_json::from_value(serde_json::json!({
-            "terminal": "apple-terminal", "session_id": "/dev/ttys999", "window_id": "1001"
-        }))
-        .unwrap();
-        super::super::bind_surface_before_start(
-            &mut session,
-            |_| Ok(()),
-            || Ok(()),
-            || panic!("successful startup must not need failure cleanup"),
-            || panic!("successful binding must remain"),
+        let directory = tempfile::tempdir().unwrap();
+        let calls = std::rc::Rc::new(Cell::new(0));
+        let runner_calls = calls.clone();
+        let absent = |_: &Path, _: &TerminalSession, _: Instant| -> Result<bool> {
+            panic!("successful startup must not need failure cleanup")
+        };
+        // Keep the installed adapter's real no-op start, borrowing only cleanup observation.
+        let local = apple_terminal::with_observations(&apple_terminal::ADAPTER.start, &absent);
+        let adapter: &dyn MacTerminalAdapter = &local;
+        let session = automation_testing::with_runner(
+            move |_| {
+                let calls = &runner_calls;
+                calls.set(calls.get() + 1);
+                assert_eq!(calls.get(), 1, "successful startup must not close");
+                Ok("/dev/ttys999\n1001".into())
+            },
+            || {
+                adapter.open_bound_tab(
+                    MacosOpenMode::NewWindow,
+                    "true",
+                    directory.path(),
+                    Instant::now() + Duration::from_secs(10),
+                    Box::new(|session| {
+                        session.managed_session_id = Some("bound".into());
+                        Ok(())
+                    }),
+                    Box::new(|| panic!("successful binding must remain")),
+                )
+            },
         )
         .unwrap();
+        assert_eq!(session.managed_session_id.as_deref(), Some("bound"));
     }
 }
 
@@ -417,5 +427,379 @@ mod screen_lock_tests {
         assert!(screen_locked_in(locked));
         assert!(!screen_locked_in(unlocked));
         assert!(!screen_locked_in(""));
+    }
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+
+    fn handle(kind: TerminalKind) -> TerminalSession {
+        TerminalSession {
+            kind,
+            id: "surface".into(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: None,
+            wezterm_mux: None,
+            windows_process_identity: None,
+        }
+    }
+
+    #[test]
+    fn lookup_selects_each_operation_set_and_rejects_windows() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for (kind, expected) in [
+            (TerminalKind::Iterm2, "screen"),
+            (
+                TerminalKind::AppleTerminal,
+                "Terminal window identity missing",
+            ),
+            (
+                TerminalKind::Ghostty,
+                "managed dialog input unsupported for this terminal",
+            ),
+            (
+                TerminalKind::Warp,
+                "managed Warp screen reads and guarded input are unsupported; Warp Control input.insert/input.replace do not submit",
+            ),
+            (
+                TerminalKind::WezTerm,
+                "WezTerm handle does not name the process that owns its pane",
+            ),
+        ] {
+            let session = handle(kind);
+            let actual = automation_testing::with_runner(
+                |_| Ok("AB_SCREEN_BEGINscreenAB_SCREEN_END".into()),
+                || adapter(kind).unwrap().read_screen(&session, deadline),
+            );
+            let actual = actual.unwrap_or_else(|error| error.to_string());
+            assert_eq!(actual, expected, "{kind:?}");
+        }
+        assert_eq!(
+            adapter(TerminalKind::WindowsConsole)
+                .err()
+                .expect("unsupported kind")
+                .to_string(),
+            "Windows Console is only available on Windows"
+        );
+    }
+
+    #[test]
+    fn unsupported_guarded_input_and_windows_send_keep_their_classification() {
+        let input = GuardedDialogInput {
+            screen: "screen".into(),
+            key: DialogKey::Enter,
+        };
+        for (kind, expected) in [
+            (
+                TerminalKind::AppleTerminal,
+                "Terminal window identity missing",
+            ),
+            (
+                TerminalKind::Ghostty,
+                "managed dialog input unsupported for this terminal",
+            ),
+            (
+                TerminalKind::Warp,
+                "managed Warp screen reads and guarded input are unsupported; Warp Control input.insert/input.replace do not submit",
+            ),
+            (
+                TerminalKind::WezTerm,
+                "WezTerm cannot compare the screen and send a key in one call; answer the dialog in its pane",
+            ),
+        ] {
+            assert_eq!(
+                guarded_dialog_input(&handle(kind), &input, Instant::now())
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+        let failure = send_file(
+            &handle(TerminalKind::WindowsConsole),
+            Path::new("unused"),
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert!(!failure.delivery_may_have_occurred());
+        assert_eq!(
+            failure.error().to_string(),
+            "Windows Console is only available on Windows"
+        );
+        let failure = send_file(
+            &handle(TerminalKind::Warp),
+            Path::new("unused"),
+            Instant::now(),
+        )
+        .unwrap_err();
+        assert!(!failure.delivery_may_have_occurred());
+        assert_eq!(
+            failure.error().to_string(),
+            "Warp Control input.insert/input.replace only stage text and cannot submit it; managed Warp terminal input is unsupported"
+        );
+    }
+
+    #[test]
+    fn applescript_operations_preserve_responses_and_presence_order() {
+        let directory = tempfile::tempdir().unwrap();
+        for kind in [TerminalKind::Iterm2, TerminalKind::AppleTerminal] {
+            let mut session = handle(kind);
+            session.window_id = Some("window".into());
+            let adapter = adapter(kind).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            for (response, expected) in [("missing", false), ("present", true)] {
+                automation_testing::with_runner(
+                    move |_| Ok(response.into()),
+                    || {
+                        assert_eq!(
+                            adapter
+                                .surface_present(directory.path(), &session, Duration::from_secs(2))
+                                .unwrap(),
+                            expected
+                        );
+                    },
+                );
+            }
+            automation_testing::with_runner(
+                |_| Ok("surface".into()),
+                || {
+                    let result =
+                        adapter.surface_present(directory.path(), &session, Duration::from_secs(2));
+                    if kind == TerminalKind::AppleTerminal {
+                        assert!(result.unwrap());
+                    } else {
+                        assert_eq!(
+                            result.unwrap_err().to_string(),
+                            "unexpected terminal presence response: \"surface\""
+                        );
+                    }
+                },
+            );
+            automation_testing::with_runner(
+                |_| Ok("bad".into()),
+                || {
+                    assert_eq!(
+                        adapter
+                            .read_screen(&session, deadline)
+                            .unwrap_err()
+                            .to_string(),
+                        "invalid managed screen response"
+                    );
+                    assert_eq!(
+                        adapter
+                            .guarded_dialog_input(
+                                &session,
+                                &GuardedDialogInput {
+                                    screen: "".into(),
+                                    key: DialogKey::Enter
+                                },
+                                deadline
+                            )
+                            .unwrap_err()
+                            .to_string(),
+                        "unexpected guarded dialog input response"
+                    );
+                    assert_eq!(
+                        adapter
+                            .surface_present(directory.path(), &session, Duration::from_secs(2))
+                            .unwrap_err()
+                            .to_string(),
+                        "unexpected terminal presence response: \"bad\""
+                    );
+                },
+            );
+            automation_testing::with_runner(
+                |_| Ok("AB_SCREEN_BEGIN  screen\nAB_SCREEN_END".into()),
+                || {
+                    assert_eq!(
+                        adapter.read_screen(&session, deadline).unwrap(),
+                        "  screen\n"
+                    );
+                },
+            );
+            for key in [DialogKey::Enter, DialogKey::DownEnter] {
+                for (response, expected) in [("sent", true), ("changed", false)] {
+                    automation_testing::with_runner(
+                        move |_| Ok(response.into()),
+                        || {
+                            assert_eq!(
+                                adapter
+                                    .guarded_dialog_input(
+                                        &session,
+                                        &GuardedDialogInput {
+                                            screen: "".into(),
+                                            key
+                                        },
+                                        deadline
+                                    )
+                                    .unwrap(),
+                                expected
+                            );
+                        },
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            surface_present(
+                directory.path(),
+                &handle(TerminalKind::AppleTerminal),
+                Duration::from_secs(2)
+            )
+            .unwrap_err()
+            .to_string(),
+            "Terminal.app window id is missing"
+        );
+        assert_eq!(
+            surface_present(
+                directory.path(),
+                &handle(TerminalKind::Warp),
+                Duration::from_secs(2)
+            )
+            .unwrap_err()
+            .to_string(),
+            "Warp terminal handle is missing its managed session binding"
+        );
+        assert_eq!(
+            surface_present(
+                directory.path(),
+                &handle(TerminalKind::WezTerm),
+                Duration::from_secs(2)
+            )
+            .unwrap_err()
+            .to_string(),
+            "WezTerm handle does not name the process that owns its pane"
+        );
+        automation_testing::with_runner(
+            |_| bail!("injected Ghostty presence failure"),
+            || {
+                assert_eq!(
+                    surface_present(
+                        directory.path(),
+                        &handle(TerminalKind::Ghostty),
+                        Duration::from_secs(2)
+                    )
+                    .unwrap_err()
+                    .to_string(),
+                    "injected Ghostty presence failure"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn open_with_preserves_prebind_handles_deadlines_and_failure_order() {
+        use std::cell::RefCell;
+        for (failure, cleanup_fails, unbind_fails, expected) in [
+            ("none", false, false, vec!["create", "bind", "start"]),
+            ("create", false, false, vec!["create"]),
+            (
+                "bind",
+                false,
+                false,
+                vec!["create", "bind", "cleanup", "unbind"],
+            ),
+            (
+                "start",
+                false,
+                false,
+                vec!["create", "bind", "start", "cleanup", "unbind"],
+            ),
+            ("bind", true, false, vec!["create", "bind", "cleanup"]),
+            (
+                "start",
+                true,
+                false,
+                vec!["create", "bind", "start", "cleanup"],
+            ),
+            (
+                "bind",
+                false,
+                true,
+                vec!["create", "bind", "cleanup", "unbind"],
+            ),
+            (
+                "start",
+                false,
+                true,
+                vec!["create", "bind", "start", "cleanup", "unbind"],
+            ),
+        ] {
+            let trace = RefCell::new(Vec::new());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let startup = deadline - Duration::from_secs(2);
+            let result = open_with(
+                deadline,
+                |received| {
+                    trace.borrow_mut().push("create");
+                    assert_eq!(received, startup);
+                    if failure == "create" {
+                        bail!("create failed");
+                    }
+                    Ok(handle(TerminalKind::Iterm2))
+                },
+                |session, received| {
+                    trace.borrow_mut().push("start");
+                    assert_eq!(received, startup);
+                    assert!(session.managed_session_id.is_none());
+                    if failure == "start" {
+                        bail!("start failed");
+                    }
+                    Ok(())
+                },
+                |session, received| {
+                    trace.borrow_mut().push("cleanup");
+                    assert_eq!(received, deadline);
+                    assert!(session.managed_session_id.is_none());
+                    if cleanup_fails {
+                        bail!("cleanup failed");
+                    }
+                    Ok(())
+                },
+                |session| {
+                    trace.borrow_mut().push("bind");
+                    session.managed_session_id = Some("bound".into());
+                    if failure == "bind" {
+                        bail!("bind failed");
+                    }
+                    Ok(())
+                },
+                || {
+                    trace.borrow_mut().push("unbind");
+                    if unbind_fails {
+                        bail!("unbind failed");
+                    }
+                    Ok(())
+                },
+            );
+            assert_eq!(*trace.borrow(), expected);
+            if failure == "none" {
+                assert_eq!(result.unwrap().managed_session_id.as_deref(), Some("bound"));
+            } else {
+                let error = result.unwrap_err().to_string();
+                let mut expected = format!("{failure} failed");
+                if cleanup_fails {
+                    expected.push_str("; exact surface cleanup also failed: cleanup failed");
+                }
+                if unbind_fails {
+                    expected.push_str("; exact surface cleanup succeeded but its durable binding could not be removed: unbind failed");
+                }
+                assert_eq!(error, expected);
+            }
+        }
+        let error = open_with(
+            Instant::now(),
+            |_| panic!("no creation without reserve"),
+            |_, _| panic!(),
+            |_, _| panic!(),
+            |_| panic!(),
+            || panic!(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "terminal startup timeout leaves no room for exact surface cleanup"
+        );
     }
 }
