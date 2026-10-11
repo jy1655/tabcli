@@ -470,9 +470,15 @@ pub(super) fn close_surface_after_reopen_verification_failure(
     directory: &Path,
     id: &str,
     error: anyhow::Error,
+    deadline: std::time::Instant,
 ) -> anyhow::Error {
     close_surface_after_reopen_verification_failure_with(id, error, |detected| {
-        close_session_surface(directory, id, Some(format!("{detected:#}")))
+        close_session_surface(
+            directory,
+            id,
+            Some(format!("{detected:#}")),
+            deadline.min(crate::native::close_deadline()),
+        )
     })
 }
 

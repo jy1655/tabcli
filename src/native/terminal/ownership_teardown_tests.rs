@@ -76,6 +76,7 @@ fn r3_teardown_records_intent_before_signal_and_settles_every_kind() {
                     assert_eq!(intent.reason, OWNER_TEARDOWN_REASON);
                     Ok(())
                 },
+                crate::native::close_deadline(),
             )
         })
         .unwrap();
@@ -119,6 +120,7 @@ fn r3_attestation_changes_and_timeout_keep_handle_and_intent() {
                     signals.set(signals.get() + 1);
                     bail!("group disappearance unconfirmed: {failure}")
                 },
+                crate::native::close_deadline(),
             )
         });
         assert!(result.is_err());
@@ -155,7 +157,8 @@ fn r3_teardown_helper_retries_after_reattest_error() {
                 }
                 Ok((owner.clone(), live))
             },
-            |_| panic!("no signal")
+            |_| panic!("no signal"),
+            crate::native::close_deadline()
         )
         .is_err()
     );
@@ -169,6 +172,7 @@ fn r3_teardown_helper_retries_after_reattest_error() {
             signals.set(signals.get() + 1);
             Ok(())
         },
+        crate::native::close_deadline(),
     )
     .unwrap();
     assert_eq!(signals.get(), 1);
@@ -203,6 +207,7 @@ fn decision(
             attest_owner: &|| Ok(()),
             group_gone: &group_gone,
         },
+        crate::native::close_deadline(),
     )
 }
 
@@ -286,6 +291,7 @@ fn r3_terminal_incarnation_changes_or_old_window_in_new_app_refuse() {
                 attest_owner: &|| panic!("unproven absence must not attest or signal"),
                 group_gone: &|_| panic!("not a replay"),
             },
+            crate::native::close_deadline(),
         );
         let error = result.unwrap_err().to_string();
         assert!(
@@ -341,6 +347,7 @@ fn r3_owner_dying_during_live_intent_retry_cannot_bypass_group_check() {
             attest_owner: &|| bail!("owner is now dead"),
             group_gone: &|_| Ok(false),
         },
+        crate::native::close_deadline(),
     );
     assert!(
         result.is_err(),
@@ -443,6 +450,7 @@ fn damaged_teardown_refuses(path: &str) {
                 attest_owner: &|| panic!("dead owner"),
                 group_gone: &|_| Ok(false),
             },
+            crate::native::close_deadline(),
         );
         assert!(result.is_err(), "{path}, {payload}: granted {result:?}");
         assert_eq!(record.bytes().unwrap(), before);
@@ -496,4 +504,252 @@ fn r3_damaged_teardown_never_reads_as_legacy_intent() {
             Ok(true)
         ));
     }
+}
+
+#[test]
+fn close_deadline_expired_before_signal_sends_nothing() {
+    let signals = Cell::new(0);
+    let result = terminate_owned_foreground_group_with_io(
+        4242,
+        Duration::ZERO,
+        |_, _| {
+            signals.set(signals.get() + 1);
+            Ok(())
+        },
+        |_| {},
+    );
+    assert!(result.is_err());
+    assert_eq!(signals.get(), 0);
+}
+
+#[test]
+fn close_deadline_between_attestations_keeps_handle_and_intent() {
+    let (dir, owner, surface, live) = fixture(terminal::TerminalKind::WezTerm);
+    let store = Store::open_unchecked(dir.path());
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let attestations = Cell::new(0);
+    let signals = Cell::new(0);
+    let result = session::close::close(&store, None, deadline, |_| {
+        teardown_absent_owner_with(
+            &store,
+            "session-owner123",
+            &surface,
+            || {
+                attestations.set(attestations.get() + 1);
+                if attestations.get() == 2 {
+                    std::thread::sleep(
+                        deadline.saturating_duration_since(Instant::now())
+                            + Duration::from_millis(1),
+                    );
+                }
+                Ok((owner.clone(), live))
+            },
+            |_| {
+                signals.set(signals.get() + 1);
+                Ok(())
+            },
+            deadline,
+        )
+    });
+    assert!(result.is_err());
+    assert_eq!(signals.get(), 0);
+    assert!(store.record(CoreRecord::Terminal).path().exists());
+    assert!(
+        store
+            .record(CoreRecord::TerminalCloseIntent)
+            .path()
+            .exists()
+    );
+}
+
+#[test]
+fn close_deadline_after_authority_does_not_start_mutation() {
+    let now = Instant::now();
+    let clock = crate::native::TestCloseClock::new(now);
+    let deadline = now + Duration::from_secs(1);
+    let observed = Cell::new(false);
+    let result = close_owned_surface_with(
+        || {
+            observed.set(true);
+            clock.set(deadline);
+            Ok(TerminalCloseAuthority::LiveOwner)
+        },
+        || panic!("no teardown"),
+        |_| panic!("no adapter after expiry"),
+        deadline,
+    );
+    assert!(observed.get(), "authority must run before expiry");
+    assert!(result.unwrap_err().to_string().contains("deadline"));
+}
+
+#[test]
+fn close_deadline_shared_observations_policy_adapter_and_retry() {
+    for stage in ["proof", "presence", "policy", "adapter"] {
+        let (dir, owner, surface, live) = fixture(terminal::TerminalKind::Warp);
+        let store = Store::open_unchecked(dir.path());
+        // A previous attempt's intent remains evidence, not cached authority.
+        session::close::record_terminal_close_intent(&store, "session-owner123", &surface, &owner)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let expire = |at| {
+            if stage == at {
+                std::thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                );
+            }
+        };
+        let proof_calls = Cell::new(0);
+        let decide = |until| {
+            verify_terminal_close_authority_with_observers(
+                dir.path(),
+                "session-owner123",
+                &surface,
+                || {
+                    expire("presence");
+                    Ok(false)
+                },
+                |_| Ok(None),
+                || Ok(vec![]),
+                CloseObservers {
+                    owner_record: &|_| panic!("not startup"),
+                    pid_alive: &|_| true,
+                    mac_owner_live: &|_| Ok(true),
+                    resumable: &|| Ok(false),
+                    ownership_proof: &|| {
+                        proof_calls.set(proof_calls.get() + 1);
+                        expire("proof");
+                        if stage == "presence" {
+                            bail!("surface proof refused")
+                        }
+                        Ok(())
+                    },
+                    attest_owner: &|| Ok(()),
+                    group_gone: &|_| panic!("no dead-owner replay"),
+                },
+                until,
+            )
+        };
+        let result = session::close::close(&store, None, deadline, |_| {
+            close_owned_surface_with(
+                || decide(deadline),
+                || panic!("expired observation grants no teardown"),
+                |_| {
+                    let shell = NativeProcessIdentity {
+                        pid: 4000,
+                        process_group: 4000,
+                        process_start_seconds: 1,
+                        process_start_microseconds: 0,
+                        ..live
+                    };
+                    prepare_warp_close(
+                        dir.path(),
+                        "session-owner123",
+                        &surface,
+                        &owner,
+                        &live,
+                        &shell,
+                        |_| {
+                            expire("policy");
+                            close_remaining(deadline)?;
+                            Ok(())
+                        },
+                        deadline,
+                    )?;
+                    close_remaining(deadline)?;
+                    expire("adapter");
+                    Ok(CloseOutcome::Closed)
+                },
+                deadline,
+            )
+        });
+        assert!(
+            format!("{:#}", result.unwrap_err()).contains("deadline"),
+            "{stage}"
+        );
+        assert!(
+            store.record(CoreRecord::Terminal).path().exists(),
+            "{stage}"
+        );
+        assert!(
+            store
+                .record(CoreRecord::TerminalCloseIntent)
+                .path()
+                .exists(),
+            "{stage}"
+        );
+        assert_ne!(store.status().unwrap().state, SessionState::Closed);
+        let before = proof_calls.get();
+        // The next attempt observes again and may safely refuse; it promises no success.
+        let retry = session::close::close(&store, None, crate::native::close_deadline(), |_| {
+            let _ = decide(crate::native::close_deadline())?;
+            bail!("fresh authority still refuses cleanup")
+        });
+        assert!(retry.is_err());
+        assert_eq!(proof_calls.get(), before + 1);
+        assert!(store.record(CoreRecord::Terminal).path().exists());
+    }
+}
+
+#[test]
+fn close_deadline_after_signal_eperm_does_not_prove_exit() {
+    let deadline = Instant::now() + Duration::from_millis(10);
+    let signals = Cell::new(0);
+    let result = terminate_owned_foreground_group_until_with_io(
+        4242,
+        deadline,
+        |_, signal| {
+            if signal == libc::SIGTERM {
+                signals.set(signals.get() + 1);
+                std::thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+                );
+                Ok(())
+            } else {
+                Err(std::io::Error::from_raw_os_error(libc::EPERM))
+            }
+        },
+        |_| {},
+    );
+    assert!(result.unwrap_err().to_string().contains("deadline"));
+    assert_eq!(signals.get(), 1);
+}
+
+#[test]
+fn terminal_owner_second_verification_uses_close_deadline() {
+    use std::rc::Rc;
+    let (dir, _, surface, _) = fixture(terminal::TerminalKind::AppleTerminal);
+    let calls = Rc::new(Cell::new(0));
+    let observed_calls = Rc::clone(&calls);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let tty = surface.id.clone();
+    let result = terminal::macos::automation_testing::with_runner(
+        move |until| {
+            let until = until.expect("every close verification must use bounded automation");
+            observed_calls.set(observed_calls.get() + 1);
+            if observed_calls.get() == 1 {
+                Ok(tty.clone())
+            } else {
+                assert_eq!(until, deadline);
+                bail!("Terminal.app did not answer before the deadline")
+            }
+        },
+        || {
+            // The first authority proof answers; the second verification stalls.
+            terminal::verify_macos_surface(
+                &surface,
+                Some(crate::native::close_remaining(deadline)?),
+            )?;
+            terminate_apple_terminal_owner(dir.path(), "session-owner123", &surface, deadline)
+        },
+    );
+    assert!(format!("{:#}", result.unwrap_err()).contains("deadline"));
+    assert_eq!(calls.get(), 2);
+    let store = Store::open_unchecked(dir.path());
+    assert!(store.record(CoreRecord::Terminal).path().exists());
+    assert!(
+        !store
+            .record(CoreRecord::TerminalCloseIntent)
+            .path()
+            .exists()
+    );
 }

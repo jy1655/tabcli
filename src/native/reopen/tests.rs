@@ -1139,12 +1139,14 @@ fn reopen_refusal_record_carries_the_gate_and_only_a_holder_check_failure_closes
         directory.path(),
         "session-reopenrefuse",
         anyhow::anyhow!("delivery failed"),
+        crate::native::close_deadline(),
     );
     assert_eq!(format!("{passed:#}"), "delivery failed");
     let passed = close_surface_after_reopen_verification_failure(
         directory.path(),
         "session-reopenrefuse",
         error,
+        crate::native::close_deadline(),
     );
     assert_eq!(reopen_refusal_gate(&passed), Some("provider-unsupported"));
     assert_eq!(snapshot_directory(directory.path()), before);
@@ -2063,10 +2065,15 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
                 if !close_succeeds {
                     anyhow::bail!("terminal adapter unavailable");
                 }
-                close_session_state_with_error(&new, Some(format!("{detected:#}")), |session| {
-                    closed_terminals.push(session.id.clone());
-                    Ok(terminal::CloseOutcome::Closed)
-                })
+                close_session_state_with_error(
+                    &new,
+                    Some(format!("{detected:#}")),
+                    |session| {
+                        closed_terminals.push(session.id.clone());
+                        Ok(terminal::CloseOutcome::Closed)
+                    },
+                    crate::native::close_deadline(),
+                )
             });
         drop(initial_claim);
         assert_eq!(
@@ -2432,10 +2439,15 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
     // session consumes its handle. The closed surface is not evidence either while the
     // provider process survives it.
     let mut closed_terminals = Vec::new();
-    close_session_state_with_error(&new, Some("refused".to_owned()), |session| {
-        closed_terminals.push(session.id.clone());
-        Ok(terminal::CloseOutcome::Closed)
-    })
+    close_session_state_with_error(
+        &new,
+        Some("refused".to_owned()),
+        |session| {
+            closed_terminals.push(session.id.clone());
+            Ok(terminal::CloseOutcome::Closed)
+        },
+        crate::native::close_deadline(),
+    )
     .unwrap();
     assert_eq!(closed_terminals, [format!("{new_id}-terminal")]);
     assert!(new.join(TERMINAL_TOMBSTONE_FILE).is_file());
@@ -2670,10 +2682,15 @@ fn surviving_provider_process_retains_the_source_marker_until_it_is_verified_gon
     // The parent closed the surface (the console is gone) and the wrapper died with it;
     // the provider ignored the console close.
     let mut closed_terminals = Vec::new();
-    close_session_state_with_error(&new, Some(format!("{refusal:#}")), |session| {
-        closed_terminals.push(session.id.clone());
-        Ok(terminal::CloseOutcome::Closed)
-    })
+    close_session_state_with_error(
+        &new,
+        Some(format!("{refusal:#}")),
+        |session| {
+            closed_terminals.push(session.id.clone());
+            Ok(terminal::CloseOutcome::Closed)
+        },
+        crate::native::close_deadline(),
+    )
     .unwrap();
     assert_eq!(closed_terminals, [format!("{new_id}-terminal")]);
     write_json_atomic(
@@ -2945,4 +2962,23 @@ fn uninspectable_provider_process_retains_the_marker() {
         "{refused:#}"
     );
     assert!(source.join(REOPEN_MARKER_FILE).is_file());
+}
+
+#[test]
+fn close_deadline_reopen_refusals_preserve_conversation_warning() {
+    for gate in [REOPEN_CONFLICT_GATE, REOPEN_VERIFICATION_FAILED_GATE] {
+        let directory = tempfile::tempdir().unwrap();
+        let error = close_surface_after_reopen_verification_failure(
+            directory.path(),
+            "session-reopenrefuse",
+            reopen_refusal(gate, "no prompt was delivered".into()),
+            Instant::now(),
+        );
+        let text = format!("{error:#}");
+        assert_eq!(reopen_refusal_gate(&error), Some(gate));
+        assert!(text.contains("may still hold the conversation"));
+        assert!(text.contains("deadline"));
+        assert!(text.contains("--timeout-secs"));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
 }

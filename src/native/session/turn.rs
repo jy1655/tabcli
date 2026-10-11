@@ -1007,7 +1007,7 @@ pub(in crate::native) fn wait_for_status(
     requested: Duration,
 ) -> Result<SessionStatus> {
     loop {
-        Store::open_unchecked(directory).converge()?;
+        Store::open_unchecked(directory).converge_until(deadline)?;
         if let Ok(status) = Reader::open_unchecked(directory).status() {
             if matches!(
                 status.state,
@@ -1074,7 +1074,7 @@ fn wait_for_event_for_turn_until(
     requested: Duration,
 ) -> Result<SessionEvent> {
     loop {
-        Store::open_unchecked(directory).converge()?;
+        Store::open_unchecked(directory).converge_until(deadline)?;
         let paths = Reader::open_unchecked(directory).events()?;
         if paths.len() > baseline {
             let candidates = &paths[baseline..];

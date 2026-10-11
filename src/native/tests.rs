@@ -2972,12 +2972,17 @@ pub(super) fn write_attested_apple_terminal_state(
 // ended the owner (it is already gone here), and the adapter close failed.
 #[cfg(target_os = "macos")]
 fn fail_apple_terminal_close_after_teardown(directory: &Path, owner: &NativeSessionOwner) {
-    let failure = close_session_state_with_error(directory, None, |session| {
-        record_terminal_close_intent(directory, "session-owner123", session, owner)?;
-        Err(anyhow::anyhow!(
-            "Terminal.app automation failed: AppleEvent timed out."
-        ))
-    })
+    let failure = close_session_state_with_error(
+        directory,
+        None,
+        |session| {
+            record_terminal_close_intent(directory, "session-owner123", session, owner)?;
+            Err(anyhow::anyhow!(
+                "Terminal.app automation failed: AppleEvent timed out."
+            ))
+        },
+        crate::native::close_deadline(),
+    )
     .unwrap_err();
     assert!(failure.to_string().contains("timed out"));
 }
@@ -3032,6 +3037,7 @@ fn apple_terminal_close_retry_after_teardown_reaches_the_adapter() {
                     Ok(Some((app.start_seconds, app.start_microseconds)))
                 },
                 || Ok(vec![owner.terminal_app.clone().unwrap()]),
+                crate::native::close_deadline()
             )
             .unwrap()
                 == TerminalCloseAuthority::SurfaceOnly
@@ -3073,6 +3079,7 @@ fn apple_terminal_close_retry_without_app_incarnation_never_reaches_the_adapter(
                 || Ok(present),
                 |_| panic!("no app incarnation is recorded"),
                 || Ok(Vec::new()),
+                crate::native::close_deadline(),
             )?;
             assert_eq!(
                 authority,
@@ -3145,6 +3152,7 @@ fn apple_terminal_incarnation_gates_retry_and_read_only_absence() {
                         }
                         Ok(instances)
                     },
+                    crate::native::close_deadline(),
                 )?;
                 if authority == TerminalCloseAuthority::Absent {
                     Ok(terminal::CloseOutcome::Missing)
@@ -3367,17 +3375,28 @@ fn warp_close_retry_preserves_authority_after_partial_surface_cleanup() {
     handle.tab_id = Some("tab-test".into());
     handle.window_id = Some("window-test".into());
     write_json_atomic(&directory.path().join(TERMINAL_HANDLE_FILE), &handle).unwrap();
-    close_session_state_with_error(directory.path(), None, |session| {
-        record_terminal_close_intent(directory.path(), "session-owner123", session, &owner)?;
-        bail!("managed Warp tab is closed but its dedicated empty window remains")
-    })
+    close_session_state_with_error(
+        directory.path(),
+        None,
+        |session| {
+            record_terminal_close_intent(directory.path(), "session-owner123", session, &owner)?;
+            bail!("managed Warp tab is closed but its dedicated empty window remains")
+        },
+        crate::native::close_deadline(),
+    )
     .unwrap_err();
 
     assert!(!repair_dead_native_owner(directory.path()).unwrap());
     // Guard the production authority call so a regression never probes a real app.
     assert!(terminal_close_resumable(directory.path(), &handle).unwrap());
     assert!(
-        verify_terminal_close_authority(directory.path(), "session-owner123", &handle).unwrap()
+        verify_terminal_close_authority(
+            directory.path(),
+            "session-owner123",
+            &handle,
+            crate::native::close_deadline()
+        )
+        .unwrap()
             == TerminalCloseAuthority::SurfaceOnly
     );
     let mut calls = 0;
@@ -3413,17 +3432,28 @@ fn wezterm_close_retry_preserves_authority_after_partial_surface_cleanup() {
     handle.tab_id = None;
     handle.window_id = None;
     write_json_atomic(&directory.path().join(TERMINAL_HANDLE_FILE), &handle).unwrap();
-    close_session_state_with_error(directory.path(), None, |session| {
-        record_terminal_close_intent(directory.path(), "session-owner123", session, &owner)?;
-        bail!("managed WezTerm pane is closed but its process remains")
-    })
+    close_session_state_with_error(
+        directory.path(),
+        None,
+        |session| {
+            record_terminal_close_intent(directory.path(), "session-owner123", session, &owner)?;
+            bail!("managed WezTerm pane is closed but its process remains")
+        },
+        crate::native::close_deadline(),
+    )
     .unwrap_err();
 
     assert!(!repair_dead_native_owner(directory.path()).unwrap());
     // Guard the production authority call so a regression never probes a real app.
     assert!(terminal_close_resumable(directory.path(), &handle).unwrap());
     assert!(
-        verify_terminal_close_authority(directory.path(), "session-owner123", &handle).unwrap()
+        verify_terminal_close_authority(
+            directory.path(),
+            "session-owner123",
+            &handle,
+            crate::native::close_deadline()
+        )
+        .unwrap()
             == TerminalCloseAuthority::SurfaceOnly
     );
     let mut calls = 0;
@@ -3639,6 +3669,7 @@ fn terminal_close_transaction_preserves_its_terminal_reason() {
         directory.path(),
         Some("native session process stopped".to_owned()),
         |_| panic!("a missing terminal handle must not call the adapter"),
+        crate::native::close_deadline(),
     )
     .unwrap();
 
@@ -3732,15 +3763,26 @@ fn explicit_close_allows_only_bound_ownerless_launch_failures() {
     )
     .unwrap();
     assert!(
-        verify_terminal_close_authority(directory.path(), "session-owner123", &session).unwrap()
+        verify_terminal_close_authority(
+            directory.path(),
+            "session-owner123",
+            &session,
+            crate::native::close_deadline()
+        )
+        .unwrap()
             == TerminalCloseAuthority::SurfaceOnly
     );
 
     let ready_directory = tempfile::tempdir().unwrap();
     update_status(ready_directory.path(), SessionState::Ready, None, None).unwrap();
     assert!(
-        verify_terminal_close_authority(ready_directory.path(), "session-owner123", &session)
-            .is_err()
+        verify_terminal_close_authority(
+            ready_directory.path(),
+            "session-owner123",
+            &session,
+            crate::native::close_deadline()
+        )
+        .is_err()
     );
 
     let launching_directory = tempfile::tempdir().unwrap();
@@ -3756,6 +3798,7 @@ fn explicit_close_allows_only_bound_ownerless_launch_failures() {
             launching_directory.path(),
             "session-different456",
             &session,
+            crate::native::close_deadline()
         )
         .is_err()
     );
@@ -4483,6 +4526,7 @@ fn explicit_close_converges_after_every_fault_with(journaled_event: JournaledEve
                     adapter_calls += 1;
                     Ok(terminal::CloseOutcome::Closed)
                 },
+                crate::native::close_deadline(),
             )
         });
         match outcome {
@@ -5709,6 +5753,7 @@ fn close_boundary_queries_agree_with(journaled_event: JournaledEventState) {
                 &fixture.directory,
                 Some("closed by the maintainer".to_owned()),
                 |_| Ok(terminal::CloseOutcome::Closed),
+                crate::native::close_deadline(),
             )
         });
         match outcome {
@@ -6691,6 +6736,7 @@ fn close_settles_a_journaled_completion_when_the_events_directory_is_missing() {
                 &fixture.directory,
                 Some("closed by the maintainer".to_owned()),
                 |_| Ok(terminal::CloseOutcome::Closed),
+                crate::native::close_deadline(),
             )
         };
         let assert_settled = |phase: &str| {
@@ -6776,6 +6822,7 @@ fn close_still_rejects_a_linked_events_directory() {
         &fixture.directory,
         Some("closed by the maintainer".to_owned()),
         |_| Ok(terminal::CloseOutcome::Closed),
+        crate::native::close_deadline(),
     )
     .unwrap_err();
     assert!(
@@ -6983,6 +7030,7 @@ fn recovery_syncs_an_interrupted_quarantine_before_discarding_its_journal() {
                     &fixture.directory,
                     Some("closed by the maintainer".to_owned()),
                     |_| Ok(terminal::CloseOutcome::Closed),
+                    crate::native::close_deadline(),
                 )
             })
         });
@@ -7365,6 +7413,7 @@ fn close_syncs_a_committed_event_before_discarding_its_journal() {
                     &fixture.directory,
                     Some("closed by the maintainer".to_owned()),
                     |_| Ok(terminal::CloseOutcome::Closed),
+                    crate::native::close_deadline(),
                 )
             })
         });
@@ -7952,6 +8001,7 @@ fn assert_dead_owner_preserves_unverified_surface(kind: terminal::TerminalKind) 
                         Ok(Some((app.start_seconds, app.start_microseconds)))
                     },
                     || Ok(vec![owner.terminal_app.clone().unwrap()]),
+                    crate::native::close_deadline(),
                 )?;
                 panic!("a dead owner without intent must grant no adapter authority")
             });
@@ -8023,6 +8073,7 @@ fn dead_owner_exact_absence_can_finish_without_adapter_or_signal() {
                     Ok(Some((app.start_seconds, app.start_microseconds)))
                 },
                 || Ok(vec![owner.terminal_app.clone().unwrap()]),
+                crate::native::close_deadline(),
             )?;
             assert_eq!(authority, TerminalCloseAuthority::Absent);
             Ok(terminal::CloseOutcome::Missing)
@@ -8069,6 +8120,7 @@ fn dead_owner_absence_errors_and_reused_or_incomplete_owners_retain_handle() {
                     Ok(Some((app.start_seconds, app.start_microseconds)))
                 },
                 || Ok(vec![owner.terminal_app.clone().unwrap()]),
+                crate::native::close_deadline(),
             )?;
             panic!("unproven absence must never close or signal")
         });
@@ -8235,6 +8287,7 @@ fn failed_launch_with_a_recorded_owner_gets_no_close_without_a_prior_intent() {
                             Ok(Some((app.start_seconds, app.start_microseconds)))
                         },
                         || Ok(vec![app.clone()]),
+                        crate::native::close_deadline(),
                     )?;
                     if authority == TerminalCloseAuthority::Absent {
                         return Ok(terminal::CloseOutcome::Missing);
@@ -8325,6 +8378,7 @@ fn ownerless_warp_and_wezterm_failures_only_consume_proven_absence() {
                         },
                         |_| panic!("these adapters own their process identity checks"),
                         || panic!("this is not a Terminal.app surface"),
+                        crate::native::close_deadline(),
                     )?;
                     if authority == TerminalCloseAuthority::Absent {
                         return Ok(terminal::CloseOutcome::Missing);
@@ -8384,6 +8438,7 @@ fn ghostty_failed_start_native_id_recovery_does_not_need_a_prior_intent() {
                     || panic!("the exact native-ID close adapter verifies its target"),
                     |_| panic!("no Terminal.app process observation"),
                     || panic!("no Terminal.app instance observation"),
+                    crate::native::close_deadline()
                 )
                 .unwrap(),
                 TerminalCloseAuthority::SurfaceOnly
@@ -8424,6 +8479,7 @@ fn failed_launch_keeps_the_prior_intent_retry_and_the_stable_id_recovery() {
                     || panic!("{kind:?}/{phase:?}: no surface observation is needed"),
                     |_| Ok(Some((app.start_seconds, app.start_microseconds))),
                     || Ok(vec![app.clone()]),
+                    crate::native::close_deadline(),
                 )?;
                 assert_eq!(
                     authority,
@@ -8630,6 +8686,7 @@ fn terminal_record_without_app_incarnation_is_consumed_only_by_proven_absence() 
                             _ => Ok(vec![terminal_instance(1234, 100)]),
                         }
                     },
+                    crate::native::close_deadline(),
                 )?;
                 if authority == TerminalCloseAuthority::Absent {
                     return Ok(terminal::CloseOutcome::Missing);
@@ -8807,11 +8864,21 @@ fn close_uses_the_stored_creation_scope_of_a_wezterm_session() {
             .unwrap(),
         );
         write_json_atomic(&directory.path().join(TERMINAL_HANDLE_FILE), &handle).unwrap();
-        close_session_state_with_error(directory.path(), None, |session| {
-            assert_eq!(session, &handle);
-            record_terminal_close_intent(directory.path(), "session-owner123", session, &owner)?;
-            bail!("managed WezTerm pane is closed but its tab remains")
-        })
+        close_session_state_with_error(
+            directory.path(),
+            None,
+            |session| {
+                assert_eq!(session, &handle);
+                record_terminal_close_intent(
+                    directory.path(),
+                    "session-owner123",
+                    session,
+                    &owner,
+                )?;
+                bail!("managed WezTerm pane is closed but its tab remains")
+            },
+            crate::native::close_deadline(),
+        )
         .unwrap_err();
 
         let mut other_scope = handle.clone();
@@ -8836,6 +8903,7 @@ fn close_uses_the_stored_creation_scope_of_a_wezterm_session() {
                 || panic!("the recorded intent needs no surface observation"),
                 |_| panic!("a WezTerm handle names no Terminal.app incarnation"),
                 || panic!("a WezTerm handle lists no Terminal.app instances"),
+                crate::native::close_deadline(),
             )?;
             assert_eq!(authority, TerminalCloseAuthority::SurfaceOnly);
             closed = Some(session.clone());
@@ -8937,6 +9005,7 @@ fn explicit_close_recovers_a_failed_startup_only_through_a_stable_native_id() {
             || panic!("an unproven owner allows no surface observation"),
             |_| panic!("no app incarnation is recorded"),
             || panic!("no app incarnation is recorded"),
+            crate::native::close_deadline(),
         )
     };
     assert_eq!(
@@ -9121,4 +9190,83 @@ fn provider_launch_and_version_builders_preserve_their_exact_environments() {
             &[],
         );
     }
+}
+
+#[test]
+fn close_deadline_cli_accepts_only_command_specific_range() {
+    for value in ["1", "60", "3600"] {
+        assert!(
+            parse_args([
+                "close-session",
+                "session-safe123",
+                "--explicit",
+                "--timeout-secs",
+                value
+            ])
+            .is_ok()
+        );
+    }
+    for value in ["0", "3601", "-1", "abc", "18446744073709551616"] {
+        assert!(
+            parse_args([
+                "close-session",
+                "session-safe123",
+                "--explicit",
+                "--timeout-secs",
+                value
+            ])
+            .is_err()
+        );
+    }
+    assert!(
+        parse_args([
+            "close-session",
+            "session-safe123",
+            "--explicit",
+            "--timeout-secs"
+        ])
+        .is_err()
+    );
+    assert!(
+        parse_args([
+            "close-session",
+            "session-safe123",
+            "--explicit",
+            "--timeout-secs",
+            "1",
+            "--timeout-secs",
+            "2"
+        ])
+        .is_err()
+    );
+    assert!(parse_args(["close-session", "session-safe123", "--timeout-secs", "1"]).is_err());
+    assert!(parse_timeout("3601").is_ok());
+}
+
+#[test]
+fn close_deadline_cli_default_and_bounds() {
+    for (options, expected) in [
+        (vec![], 60),
+        (vec!["--timeout-secs", "1"], 1),
+        (vec!["--timeout-secs", "3600"], 3600),
+    ] {
+        let mut args = vec!["close-session", "session-safe123", "--explicit"];
+        args.extend(options);
+        let NativeCommand::Close(request) = parse_args(args).unwrap() else {
+            panic!()
+        };
+        assert_eq!(request.timeout, Duration::from_secs(expected));
+    }
+    let NativeCommand::Tell(request) = parse_args([
+        "tell",
+        "session-safe123",
+        "--timeout-secs",
+        "3601",
+        "--prompt",
+        "hello",
+    ])
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(request.timeout, Duration::from_secs(3601));
 }

@@ -849,10 +849,6 @@ pub(super) fn surface_present(session: &TerminalSession, timeout: Duration) -> R
     tab_present_with(&mut runner, &client, session, deadline)
 }
 
-pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
-    close_session_until(session, deadline_from_timeout(CONTROL_TIMEOUT)?)
-}
-
 pub(super) fn close_session_until(
     session: &TerminalSession,
     deadline: Instant,
@@ -946,8 +942,16 @@ fn close_exact<R: WarpRunner>(
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
+    ensure_time(
+        deadline,
+        "Warp exact tab disappearance; tab remains present or absence is unverified",
+    )?;
     require_exact_ids(session)?;
     let was_present = tab_present_with(runner, client, session, deadline)?;
+    ensure_time(
+        deadline,
+        "Warp exact tab disappearance; tab remains present or absence is unverified",
+    )?;
     if was_present {
         match control_json::<OkResponse, _>(runner, client, &tab_args("close", session)?, deadline)
         {
@@ -972,14 +976,19 @@ fn close_exact<R: WarpRunner>(
             deadline,
             "Warp exact tab disappearance; tab remains present or absence is unverified",
         )?;
-        if !tab_present_with(runner, client, session, deadline)? {
+        let present = tab_present_with(runner, client, session, deadline)?;
+        ensure_time(
+            deadline,
+            "Warp exact tab disappearance; tab remains present or absence is unverified",
+        )?;
+        if !present {
             return Ok(if was_present {
                 CloseOutcome::Closed
             } else {
                 CloseOutcome::Missing
             });
         }
-        runner.pause(POLL_INTERVAL);
+        runner.pause(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 
@@ -2805,7 +2814,7 @@ mod tests {
                 // A handle alone cannot replace Warp's missing app incarnation/control
                 // record. Failed recovery must preserve the handle and failure evidence.
                 assert!(
-                    close::close(&store, None, |surface| {
+                    close::close(&store, None, crate::native::close_deadline(), |surface| {
                         load_binding(&directory, surface)?;
                         panic!("missing control binding grants no control access")
                     })
@@ -2845,7 +2854,10 @@ mod tests {
         let store = failed_binding_launch_fixture(&directory);
         let before = fs::read(store.record(CoreRecord::Status).path()).unwrap();
         let claim = fs::read(store.record(CoreRecord::TurnClaim).path()).unwrap();
-        let error = close::close(&store, None, |_| panic!("no surface bound")).unwrap_err();
+        let error = close::close(&store, None, crate::native::close_deadline(), |_| {
+            panic!("no surface bound")
+        })
+        .unwrap_err();
         assert!(format!("{error:#}").contains("launcher is still creating the surface"));
         assert_eq!(
             fs::read(store.record(CoreRecord::Status).path()).unwrap(),
@@ -2882,9 +2894,12 @@ mod tests {
             .record(CoreRecord::Launch)
             .write_json(&pending)
             .unwrap();
-        close::close(&store, Some("earlier reason".into()), |_| {
-            panic!("no surface bound")
-        })
+        close::close(
+            &store,
+            Some("earlier reason".into()),
+            crate::native::close_deadline(),
+            |_| panic!("no surface bound"),
+        )
         .unwrap();
         let mut runner = FakeRunner::new(&directory, &attempt);
         runner.cancel_close = true;
@@ -2916,7 +2931,7 @@ mod tests {
                 .contains(&message)
         );
         for _ in 0..2 {
-            close::close(&store, None, |_| {
+            close::close(&store, None, crate::native::close_deadline(), |_| {
                 panic!("closed session grants no close authority")
             })
             .unwrap();

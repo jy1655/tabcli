@@ -8,6 +8,10 @@ use anyhow::{Context, Result, bail};
 use super::super::TerminalSendFailure;
 
 pub(super) fn run(application: &str, script: &str, arguments: &[&str]) -> Result<String> {
+    #[cfg(test)]
+    if let Some(result) = testing::run(None) {
+        return result;
+    }
     let output = command(script, arguments)
         .output()
         .context("failed to execute /usr/bin/osascript")?;
@@ -20,6 +24,10 @@ pub(super) fn run_until(
     arguments: &[&str],
     deadline: Instant,
 ) -> Result<String> {
+    #[cfg(test)]
+    if let Some(result) = testing::run(Some(deadline)) {
+        return result;
+    }
     if Instant::now() >= deadline {
         bail!("{application} automation timed out before it started");
     }
@@ -140,5 +148,31 @@ mod tests {
         let text = format!("{error:#}");
         assert!(text.contains("Test automation failed"), "{text}");
         assert!(!text.contains("did not answer"), "{text}");
+    }
+}
+
+// Substitute only the external automation boundary; close dispatch remains production code.
+#[cfg(test)]
+pub(in crate::native) mod testing {
+    use super::*;
+    type Runner = Box<dyn FnMut(Option<Instant>) -> Result<String>>;
+    thread_local! {
+        static RUNNER: std::cell::RefCell<Option<Runner>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn run(deadline: Option<Instant>) -> Option<Result<String>> {
+        RUNNER.with(|runner| runner.borrow_mut().as_mut().map(|run| run(deadline)))
+    }
+    pub(in crate::native) fn with_runner<T>(
+        runner: impl FnMut(Option<Instant>) -> Result<String> + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset(Option<Runner>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                RUNNER.with(|runner| *runner.borrow_mut() = self.0.take());
+            }
+        }
+        let _reset = Reset(RUNNER.with(|slot| slot.replace(Some(Box::new(runner)))));
+        run()
     }
 }

@@ -102,7 +102,7 @@ fn residual_surface_clears_only_after_the_adapter_confirms_close_or_absence() {
                     windows_process_identity: None,
                 })
                 .unwrap();
-            let refusal = close(&store, None, |surface| {
+            let refusal = close(&store, None, crate::native::close_deadline(), |surface| {
                 assert_eq!(surface.id, "exact-retained-surface");
                 bail!("close authority not established")
             });
@@ -118,7 +118,10 @@ fn residual_surface_clears_only_after_the_adapter_confirms_close_or_absence() {
                 store.status().unwrap().residual_surface(),
                 Some(launch::ResidualSurface::Unverified)
             );
-            close(&store, None, |_| Ok(outcome.into())).unwrap();
+            close(&store, None, crate::native::close_deadline(), |_| {
+                Ok(outcome.into())
+            })
+            .unwrap();
             let closed = store.status().unwrap();
             assert_eq!(
                 closed.residual_surface,
@@ -126,7 +129,7 @@ fn residual_surface_clears_only_after_the_adapter_confirms_close_or_absence() {
             );
             assert_eq!(closed.residual_surface(), None);
             store.converge().unwrap();
-            close(&store, None, |_| {
+            close(&store, None, crate::native::close_deadline(), |_| {
                 panic!("consumed handle must not close again")
             })
             .unwrap();
@@ -242,7 +245,7 @@ fn explicit_close_consumes_the_handle_and_repeated_close_skips_the_adapter() {
 
     for attempt in 0..2 {
         let (outcome, syncs) = with_sync_log(|| {
-            close(&store, None, |session| {
+            close(&store, None, crate::native::close_deadline(), |session| {
                 assert_eq!(session.kind, terminal::TerminalKind::Iterm2);
                 assert_eq!(session.id, "missing-iterm-session");
                 close_calls += 1;
@@ -296,11 +299,16 @@ fn interrupted_terminal_close_resumes_from_the_claimed_handle() {
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
     let mut calls = 0;
 
-    close(&Store::open_unchecked(directory.path()), None, |session| {
-        calls += 1;
-        assert_eq!(session.id, "interrupted-close");
-        Ok(terminal::CloseOutcome::Closed.into())
-    })
+    close(
+        &Store::open_unchecked(directory.path()),
+        None,
+        crate::native::close_deadline(),
+        |session| {
+            calls += 1;
+            assert_eq!(session.id, "interrupted-close");
+            Ok(terminal::CloseOutcome::Closed.into())
+        },
+    )
     .unwrap();
 
     assert_eq!(calls, 1);
@@ -418,4 +426,70 @@ fn reader_reports_capabilities_and_owner_evidence_without_writes() {
     // Windows requires attested identity even for a dead PID, exactly as before.
     assert_eq!(reader.native_owner_blocks_prune().unwrap(), cfg!(windows));
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn close_deadline_converge_keeps_expired_callers_records() {
+    let (_directory, store) = damaged_completion_fixture();
+    store
+        .write_owner(&NativeSessionOwner {
+            pid: 0,
+            ..Default::default()
+        })
+        .unwrap();
+    let status = store.record(CoreRecord::Status).bytes().unwrap();
+    let error = store.converge_until(Instant::now()).unwrap_err();
+    assert!(format!("{error:#}").contains("deadline"));
+    assert_eq!(store.record(CoreRecord::Status).bytes().unwrap(), status);
+    assert!(store.record(CoreRecord::Completion).path().exists());
+    assert!(store.record(CoreRecord::TurnClaim).path().exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn close_deadline_repair_after_slow_owner_observation_does_not_settle() {
+    let (_directory, store) = damaged_completion_fixture();
+    store
+        .write_owner(&NativeSessionOwner {
+            pid: 0,
+            ..Default::default()
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let result = repair_dead_owner_with(
+        &store,
+        |_| {
+            std::thread::sleep(
+                deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+            );
+            Ok(false)
+        },
+        |_| false,
+        |_| panic!("expired repair must not close"),
+        deadline,
+    );
+    assert!(result.unwrap_err().to_string().contains("deadline"));
+    assert!(store.closed_if_present().unwrap().is_none());
+}
+
+#[test]
+fn close_deadline_preclose_repair_does_not_get_another_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_unchecked(directory.path());
+    let deadline = Instant::now() + Duration::from_millis(10);
+    let result = close_with_repair(
+        &store,
+        None,
+        || {
+            std::thread::sleep(
+                deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+            );
+            Ok(false)
+        },
+        |_| panic!("repair spent the close deadline"),
+        deadline,
+    );
+    assert!(result.unwrap_err().to_string().contains("deadline"));
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
 }

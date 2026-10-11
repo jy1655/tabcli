@@ -23,3 +23,10 @@ pub(super) fn send_file(
 pub(super) fn close_session(_session: &TerminalSession) -> Result<CloseOutcome> {
     bail!("visible terminal sessions are not yet supported on Linux")
 }
+
+pub(super) fn close_session_until(
+    session: &TerminalSession,
+    _deadline: std::time::Instant,
+) -> Result<CloseOutcome> {
+    close_session(session)
+}

@@ -796,7 +796,7 @@ mod tests {
             store.status().unwrap().residual_surface(),
             Some(ResidualSurface::Unverified)
         );
-        session::close::close(&store, None, |_| {
+        session::close::close(&store, None, crate::native::close_deadline(), |_| {
             panic!("no persisted handle grants authority")
         })
         .unwrap();
@@ -814,7 +814,10 @@ mod tests {
             let store = Store::open_unchecked(directory.path());
             fail(&store, "launch cancelled").unwrap();
             if closed_first {
-                session::close::close(&store, None, |_| panic!("no surface is bound")).unwrap();
+                session::close::close(&store, None, crate::native::close_deadline(), |_| {
+                    panic!("no surface is bound")
+                })
+                .unwrap();
             }
             let surface = serde_json::from_value(serde_json::json!({
                 "terminal":"ghostty", "session_id":"u2", "tab_id":"t2", "window_id":"w1"
@@ -840,7 +843,7 @@ mod tests {
                 );
             }
             for _ in 0..2 {
-                session::close::close(&store, None, |_| {
+                session::close::close(&store, None, crate::native::close_deadline(), |_| {
                     panic!("residual evidence grants no authority")
                 })
                 .unwrap();

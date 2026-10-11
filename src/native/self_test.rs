@@ -5,7 +5,7 @@ use serde_json::Value;
 
 // Let each public command report its timeout before the outer deadline.
 const COMMAND_MARGIN: Duration = Duration::from_secs(5);
-// Each close and read-only confirmation gets its own fixed deadline.
+// Close gets its public budget plus the command margin; inspect gets 10 seconds.
 const CLEANUP_BUDGET: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
@@ -531,8 +531,15 @@ fn orchestrate(
     for session in targets {
         let close_start = Instant::now();
         let reply = operations.call(
-            &arguments(&["close-session", &session, "--explicit", "--json"]),
-            CLEANUP_BUDGET,
+            &arguments(&[
+                "close-session",
+                &session,
+                "--explicit",
+                "--timeout-secs",
+                "10",
+                "--json",
+            ]),
+            CLEANUP_BUDGET + COMMAND_MARGIN,
         );
         let mut closed = step("cleanup", close_start, &reply);
         let observed =

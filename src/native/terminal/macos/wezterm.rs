@@ -53,7 +53,6 @@ use super::super::WezTermMux;
 use super::{CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession};
 use crate::native::{CommandOutputFailure, shell_quote};
 
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(100);
 // How long the GUI may take to paint a new tab and record its pane as focused. A window in
@@ -1035,10 +1034,6 @@ pub(super) fn read_screen(
     .map_err(CommandOutputFailure::into_error)
 }
 
-pub(super) fn close_session(host: &dyn Host, session: &TerminalSession) -> Result<CloseOutcome> {
-    close_session_until(host, session, super::timeout_deadline(CLOSE_TIMEOUT)?)
-}
-
 // Every step reads the state again, so a close that failed part of the way is finished by
 // the next one: a pane that is gone is not killed again, and a process that was left
 // without panes is ended.
@@ -1047,12 +1042,14 @@ pub(super) fn close_session_until(
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
+    crate::native::close_remaining(deadline)?;
     let (mux, pane) = target(session)?;
     let mut outcome = CloseOutcome::Missing;
     let mut kill: Option<Result<()>> = None;
     let mut without_panes_since: Option<Instant> = None;
     let mut asked_to_end = false;
     loop {
+        crate::native::close_remaining(deadline)?;
         let waiting_for = match listed(host, mux, deadline) {
             Ok(None) => {
                 forget_socket(host, mux);
@@ -1070,6 +1067,7 @@ pub(super) fn close_session_until(
                 }
                 match kill.take() {
                     None => {
+                        crate::native::close_remaining(deadline)?;
                         outcome = CloseOutcome::Closed;
                         kill = Some(
                             call(
@@ -1102,6 +1100,7 @@ pub(super) fn close_session_until(
                 let since = *without_panes_since.get_or_insert_with(Instant::now);
                 if !asked_to_end && since.elapsed() >= EXIT_GRACE {
                     asked_to_end = true;
+                    crate::native::close_remaining(deadline)?;
                     host.terminate(mux.pid)?;
                 }
                 anyhow!(
@@ -1115,7 +1114,10 @@ pub(super) fn close_session_until(
         if Instant::now() >= deadline {
             return Err(waiting_for);
         }
-        thread::sleep(POLL);
+        thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
+        if Instant::now() >= deadline {
+            return Err(waiting_for);
+        }
     }
 }
 

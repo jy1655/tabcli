@@ -51,7 +51,7 @@ Usage:
   {PUBLIC_COMMAND} settings [windows-tab-window <dedicated|current>] [--json]
   {PUBLIC_COMMAND} settings macos-open-mode <tab-first|new-window> [--json]
   {PUBLIC_COMMAND} prune-sessions --closed-before-days N --explicit [--json]
-  {PUBLIC_COMMAND} close-session <session> --explicit [--json]
+  {PUBLIC_COMMAND} close-session <session> --explicit [--timeout-secs N] [--json]
   {PUBLIC_COMMAND} --help | --version
 
 Runtime:

@@ -460,11 +460,6 @@ pub(super) fn verify_session(
     Ok(tty)
 }
 
-pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
-    let response = applescript::run("iTerm2", CLOSE_SESSION_SCRIPT, &[&session.id])?;
-    close_response(TerminalKind::Iterm2, &response)
-}
-
 pub(super) fn close_session_until(
     session: &TerminalSession,
     deadline: Instant,

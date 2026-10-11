@@ -423,12 +423,15 @@ pub(super) fn send_file(
 }
 
 pub(super) fn verify_tab(session: &TerminalSession, timeout: Option<Duration>) -> Result<String> {
+    verify_tab_with_deadline(session, timeout.map(super::timeout_deadline).transpose()?)
+}
+
+fn verify_tab_with_deadline(
+    session: &TerminalSession,
+    deadline: Option<Instant>,
+) -> Result<String> {
     let window_id = ownership_proof(session)?;
-    let response = run_terminal_automation(
-        VERIFY_TAB_SCRIPT,
-        &[&session.id, window_id],
-        timeout.map(super::timeout_deadline).transpose()?,
-    )?;
+    let response = run_terminal_automation(VERIFY_TAB_SCRIPT, &[&session.id, window_id], deadline)?;
     if response != session.id {
         bail!("Agent Bridge Terminal.app owned tab is missing");
     }
@@ -438,6 +441,7 @@ pub(super) fn verify_tab(session: &TerminalSession, timeout: Option<Duration>) -
 pub(super) fn close_owned_session(
     directory: &Path,
     session: &TerminalSession,
+    deadline: std::time::Instant,
 ) -> Result<CloseOutcome> {
     let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
     close_attested_session(
@@ -446,11 +450,8 @@ pub(super) fn close_owned_session(
             .terminal_app
             .as_ref()
             .context("Terminal.app close has no app incarnation")?,
+        deadline,
     )
-}
-
-pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
-    close_session_with_deadline(session, None)
 }
 
 pub(super) fn close_session_until(
@@ -472,13 +473,15 @@ fn close_session_with_deadline(
 pub(in crate::native) fn close_attested_session(
     session: &TerminalSession,
     app: &ownership::MacTerminalAppIdentity,
+    deadline: std::time::Instant,
 ) -> Result<CloseOutcome> {
     close_attested_session_with(
         session,
         app,
         process::macos_process_start,
         terminal_app_instances,
-        |script, arguments| run_terminal_automation(script, arguments, None),
+        |script, arguments| run_terminal_automation(script, arguments, Some(deadline)),
+        deadline,
     )
 }
 
@@ -488,19 +491,24 @@ fn close_attested_session_with(
     mut process_birth: impl FnMut(u32) -> Result<Option<(u64, u64)>>,
     mut instances: impl FnMut() -> Result<Vec<ownership::MacTerminalAppIdentity>>,
     mut run: impl FnMut(&str, &[&str]) -> Result<String>,
+    deadline: std::time::Instant,
 ) -> Result<CloseOutcome> {
     // Recheck before every transaction, including retries; a restarted app must
     // never inherit the old window/tty's close authority.
     close_session_with(session, |script, arguments| {
+        crate::native::close_remaining(deadline)?;
         if !terminal_app_alive_with(app, &mut process_birth)? {
             return Ok("missing".into());
         }
         require_unique_terminal_app(app, &instances()?)?;
+        crate::native::close_remaining(deadline)?;
         let reply = run(script, arguments)?;
+        crate::native::close_remaining(deadline)?;
         if !terminal_app_alive_with(app, &mut process_birth)? {
             return Ok("missing".into());
         }
         require_unique_terminal_app(app, &instances()?)?;
+        crate::native::close_remaining(deadline)?;
         Ok(reply)
     })
 }
@@ -556,12 +564,15 @@ fn ownership_proof(session: &TerminalSession) -> Result<&str> {
 }
 
 #[cfg(target_os = "macos")]
-pub(in crate::native) fn verified_close_tty(session: &terminal::TerminalSession) -> Result<String> {
+pub(in crate::native) fn verified_close_tty(
+    session: &terminal::TerminalSession,
+    deadline: Instant,
+) -> Result<String> {
     if session.kind != terminal::TerminalKind::AppleTerminal {
         bail!("Terminal.app ownership proof received a different terminal kind")
     }
-    terminal::verify_macos_surface(session, None)?
-        .context("Terminal.app ownership proof did not return a TTY")
+    crate::native::close_remaining(deadline)?;
+    verify_tab_with_deadline(session, Some(deadline))
 }
 
 // A record of 0.0.10 or earlier names no app incarnation. While its owner is live and
@@ -905,6 +916,51 @@ mod tests {
     }
 
     #[test]
+    fn close_deadline_attested_transactions_stop_after_expiry() {
+        for expire_at in [0, 1, 2] {
+            let app = ownership::MacTerminalAppIdentity {
+                pid: 1234,
+                start_seconds: 100,
+                start_microseconds: 42,
+            };
+            let now = Instant::now();
+            let clock = crate::native::TestCloseClock::new(now);
+            let deadline = now + Duration::from_secs(1);
+            let calls = std::cell::Cell::new(0);
+            let births = std::cell::Cell::new(0);
+            let result = super::close_attested_session_with(
+                &session(),
+                &app,
+                |_| {
+                    births.set(births.get() + 1);
+                    Ok(Some((100, 42)))
+                },
+                || {
+                    if expire_at == 0 {
+                        clock.set(deadline);
+                    }
+                    Ok(vec![app.clone()])
+                },
+                |_, _| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == expire_at {
+                        clock.set(deadline);
+                    }
+                    Ok(if calls.get() == 1 {
+                        "closed"
+                    } else {
+                        "missing"
+                    }
+                    .into())
+                },
+                deadline,
+            );
+            assert!(result.unwrap_err().to_string().contains("deadline"));
+            assert_eq!(calls.get(), expire_at);
+            assert!(births.get() >= 1);
+        }
+    }
+    #[test]
     fn attested_close_rechecks_app_before_every_transaction() {
         let session = session();
         let app = ownership::MacTerminalAppIdentity {
@@ -959,6 +1015,7 @@ mod tests {
                     }
                     .into())
                 },
+                crate::native::close_deadline(),
             );
             assert_eq!(
                 result.is_ok(),

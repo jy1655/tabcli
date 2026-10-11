@@ -333,3 +333,33 @@ fn private_acl_is_one_protected_current_user_entry() {
     );
     assert_eq!(private_sddl("S-1-5-21-1", false), "D:P(A;;FA;;;S-1-5-21-1)");
 }
+
+#[test]
+fn close_deadline_console_helper_is_bounded() {
+    let powershell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let mut command = std::process::Command::new(&powershell);
+    command.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Start-Sleep -Seconds 30",
+    ]);
+    let started = Instant::now();
+    let error =
+        super::run_console_helper_command(&mut command, started + Duration::from_millis(100))
+            .unwrap_err();
+    assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    let mut command = std::process::Command::new(&powershell);
+    command.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "[Console]::Error.WriteLine('own close timeout'); exit 1",
+    ]);
+    let error =
+        super::run_console_helper_command(&mut command, Instant::now() + Duration::from_secs(10))
+            .unwrap_err();
+    assert_eq!(error.to_string(), "own close timeout");
+}
