@@ -130,6 +130,7 @@ trait NativeProviderAdapter: Sync {
         homes: &super::consent::Homes,
     ) -> Result<super::consent::Trust>;
     fn workspace_trust_key(&self, screen: &str, workspace: &Path) -> Option<terminal::DialogKey>;
+    fn result_timeout_diagnostic(&self) -> Option<super::doctor::ResultTimeoutDiagnostic>;
     fn diagnose(&self, context: super::doctor::Context<'_>) -> Vec<super::doctor::Check>;
     // Caller-environment variables removed from every short-lived provider query the
     // bridge runs (version preflight, doctor probes). Each adapter states its own list;
@@ -210,11 +211,7 @@ pub(super) fn diagnose(
 pub(super) fn result_timeout_diagnostic(
     provider: FirstPartyCli,
 ) -> Option<super::doctor::ResultTimeoutDiagnostic> {
-    match provider {
-        FirstPartyCli::Agy => Some(agy::result_timeout_diagnostic()),
-        FirstPartyCli::Pi => Some(pi::result_timeout_diagnostic()),
-        FirstPartyCli::Codex | FirstPartyCli::Claude => None,
-    }
+    adapter(provider).result_timeout_diagnostic()
 }
 
 pub(super) fn prepare_launch(

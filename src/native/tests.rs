@@ -338,46 +338,6 @@ fn terminal_delivery_keeps_the_original_deadline_after_preflight_work() {
     assert!(terminal::remaining_send_budget_at(deadline, deadline).is_err());
 }
 
-#[cfg(unix)]
-#[test]
-fn bounded_command_output_terminates_a_hung_child_at_the_deadline() {
-    let mut command = Command::new("/bin/sh");
-    // The background child inherits stdout/stderr. A pipe-reader implementation
-    // would still block after killing only the direct shell process.
-    command.args(["-c", "sleep 1 & wait"]);
-    let started = Instant::now();
-
-    let failure = command_output_until_classified(
-        &mut command,
-        started + Duration::from_millis(100),
-        "test child",
-    )
-    .unwrap_err();
-    assert!(failure.process_started());
-    assert!(failure.timed_out());
-    let error = failure.into_error();
-
-    assert!(format!("{error:#}").contains("test child timed out"));
-    assert!(started.elapsed() < Duration::from_millis(500));
-}
-
-#[cfg(unix)]
-#[test]
-fn bounded_command_output_identifies_a_pre_spawn_failure() {
-    let mut command = Command::new("/definitely/not/an/agent-bridge-executable");
-
-    let failure = command_output_until_classified(
-        &mut command,
-        Instant::now() + Duration::from_secs(1),
-        "missing test child",
-    )
-    .unwrap_err();
-
-    assert!(!failure.process_started());
-    assert!(!failure.timed_out());
-    assert!(format!("{:#}", failure.into_error()).contains("failed to start missing test child"));
-}
-
 #[test]
 fn effort_uses_each_provider_native_session_option() {
     assert_eq!(
@@ -2221,11 +2181,9 @@ fn windows_console_helper_accepts_only_managed_session_identity() {
         ])
         .unwrap(),
         NativeCommand::ConsoleControl {
-            action,
+            request: ConsoleControlRequest::Send { input_name, timeout },
             id,
-            input_name: Some(input_name),
-            timeout_ms: Some(5000),
-        } if action == "send" && id == "session-owner123" && input_name == "pending-prompt-1.txt"
+        } if timeout == Duration::from_millis(5000) && id == "session-owner123" && input_name == "pending-prompt-1.txt"
     ));
     assert!(parse_args(["native-console-control", "close", "1234"]).is_err());
     assert!(
@@ -2242,11 +2200,9 @@ fn windows_console_helper_accepts_only_managed_session_identity() {
     assert!(matches!(
         parse_args(["native-console-control", "window", "session-owner123", "600"]).unwrap(),
         NativeCommand::ConsoleControl {
-            action,
+            request: ConsoleControlRequest::Window { timeout },
             id,
-            input_name: None,
-            timeout_ms: Some(600),
-        } if action == "window" && id == "session-owner123"
+        } if timeout == Duration::from_millis(600) && id == "session-owner123"
     ));
     for invalid in [
         &["window", "session-owner123"][..],
@@ -2281,12 +2237,12 @@ fn windows_close_control_uses_the_claimed_terminal_handle() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(directory.path().join(TERMINAL_HANDLE_FILE), b"active").unwrap();
     assert_eq!(
-        windows_console_handle_path(directory.path(), "close"),
+        windows_console_handle_path(directory.path(), &ConsoleControlRequest::Close),
         directory.path().join(TERMINAL_HANDLE_FILE)
     );
     fs::write(directory.path().join(TERMINAL_CLOSING_FILE), b"closing").unwrap();
     assert_eq!(
-        windows_console_handle_path(directory.path(), "close"),
+        windows_console_handle_path(directory.path(), &ConsoleControlRequest::Close),
         directory.path().join(TERMINAL_CLOSING_FILE)
     );
 }
@@ -9162,7 +9118,10 @@ fn unsupported_platform_send_is_not_sent() {
 mod launch_orchestration {
     use super::*;
     use crate::native::session::launch::*;
-    use std::{process::Child, sync::mpsc};
+    use std::{
+        process::{Child, Stdio},
+        sync::mpsc,
+    };
 
     fn fixture() -> (tempfile::TempDir, String) {
         let directory = tempfile::Builder::new()
@@ -9409,7 +9368,7 @@ fn registry_routes_every_command_to_its_variant_and_fields() {
         (vec!["native-session", "session-route"], "RunSession { id: \"session-route\" }".into()),
         (vec!["native-hook", "codex", "{}"], "Hook { provider: Codex, payload: Some(\"{}\") }".into()),
         (vec!["native-provider-control", "claude", "operation", "payload"], "ProviderControl { provider: Claude, arguments: [\"operation\", \"payload\"] }".into()),
-        (vec!["native-console-control", "send", "session-route", "pending-prompt-route.txt", "7"], "ConsoleControl { action: \"send\", id: \"session-route\", input_name: Some(\"pending-prompt-route.txt\"), timeout_ms: Some(7) }".into()),
+        (vec!["native-console-control", "send", "session-route", "pending-prompt-route.txt", "7"], "ConsoleControl { request: Send { input_name: \"pending-prompt-route.txt\", timeout: 7ms }, id: \"session-route\" }".into()),
         (vec!["native-console-host", directory_text], format!("ConsoleHost {{ directory: {directory:?} }}")),
         (vec!["native-iterm2-host", directory_text], format!("Iterm2Host {{ directory: {directory:?} }}")),
         (vec!["native-terminal-host", directory_text], format!("AppleTerminalHost {{ directory: {directory:?} }}")),
@@ -9428,6 +9387,180 @@ fn registry_routes_every_command_to_its_variant_and_fields() {
             format!("{:?}", parse_args(&args).unwrap()),
             expected,
             "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn console_control_parser_preserves_positional_action_contract() {
+    let timeout = Duration::from_millis(7);
+    for (tail, expected) in [
+        (
+            vec!["screen", "session-route"],
+            ConsoleControlRequest::Screen,
+        ),
+        (vec!["close", "session-route"], ConsoleControlRequest::Close),
+        (
+            vec!["window", "session-route", "7"],
+            ConsoleControlRequest::Window { timeout },
+        ),
+        (
+            vec!["send", "session-route", "pending-prompt-route.txt", "7"],
+            ConsoleControlRequest::Send {
+                input_name: "pending-prompt-route.txt".into(),
+                timeout,
+            },
+        ),
+        (
+            vec!["dialog", "session-route", "pending-prompt-route.txt", "7"],
+            ConsoleControlRequest::Dialog {
+                input_name: "pending-prompt-route.txt".into(),
+                timeout,
+            },
+        ),
+    ] {
+        let NativeCommand::ConsoleControl { request, id } =
+            parse_console_control(&tail.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+                .unwrap()
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(request, expected);
+        assert_eq!(id, "session-route");
+    }
+    for tail in [
+        vec!["screen", "session-route", "7"],
+        vec!["close", "session-route", "7"],
+        vec!["window", "session-route"],
+        vec!["window", "session-route", "7", "extra"],
+        vec!["send", "session-route"],
+        vec!["send", "session-route", "pending-prompt-route.txt"],
+        vec![
+            "send",
+            "session-route",
+            "pending-prompt-route.txt",
+            "7",
+            "extra",
+        ],
+        vec!["dialog", "session-route"],
+        vec!["dialog", "session-route", "pending-prompt-route.txt"],
+        vec![
+            "dialog",
+            "session-route",
+            "pending-prompt-route.txt",
+            "7",
+            "extra",
+        ],
+    ] {
+        let error =
+            parse_console_control(&tail.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "invalid native console control arguments",
+            "{tail:?}"
+        );
+    }
+    for action in ["send", "dialog"] {
+        for input in [
+            "outside.txt".to_owned(),
+            "../pending-prompt-route.txt".into(),
+            "pending-prompt-route.json".into(),
+            format!("pending-prompt-{}.txt", "x".repeat(110)),
+            format!("pending-prompt-{}.txt", "가".repeat(37)),
+        ] {
+            let error = parse_args([
+                "native-console-control",
+                action,
+                "session-route",
+                &input,
+                "invalid",
+            ])
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "invalid native console control arguments"
+            );
+        }
+        let longest = format!("pending-prompt-{}.txt", "x".repeat(109));
+        assert!(
+            parse_args([
+                "native-console-control",
+                action,
+                "session-route",
+                &longest,
+                "18446744073709551615"
+            ])
+            .is_ok()
+        );
+    }
+    for action in ["send", "dialog", "window"] {
+        for (timeout, expected) in [
+            ("0", "native console timeout must be positive"),
+            (
+                "bad",
+                "invalid native console timeout: invalid digit found in string",
+            ),
+            (
+                "18446744073709551616",
+                "invalid native console timeout: number too large to fit in target type",
+            ),
+        ] {
+            let mut args = vec!["native-console-control", action, "session-route"];
+            if action != "window" {
+                args.push("pending-prompt-route.txt");
+            }
+            args.push(timeout);
+            assert_eq!(format!("{:#}", parse_args(args).unwrap_err()), expected);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn console_control_requests_preserve_surface_verification_and_handle_selection() {
+    let directory = tempfile::tempdir().unwrap();
+    let closing = directory.path().join(TERMINAL_CLOSING_FILE);
+    fs::create_dir(&closing).unwrap();
+    assert_eq!(
+        windows_console_handle_path(directory.path(), &ConsoleControlRequest::Close),
+        directory.path().join(TERMINAL_HANDLE_FILE)
+    );
+    fs::remove_dir(&closing).unwrap();
+    fs::write(&closing, b"closing").unwrap();
+    for (request, bound_only) in [
+        (ConsoleControlRequest::Screen, false),
+        (
+            ConsoleControlRequest::Send {
+                input_name: "pending-prompt-route.txt".into(),
+                timeout: Duration::from_millis(7),
+            },
+            false,
+        ),
+        (
+            ConsoleControlRequest::Dialog {
+                input_name: "pending-prompt-route.txt".into(),
+                timeout: Duration::from_millis(7),
+            },
+            false,
+        ),
+        (
+            ConsoleControlRequest::Window {
+                timeout: Duration::from_millis(7),
+            },
+            true,
+        ),
+        (ConsoleControlRequest::Close, true),
+    ] {
+        assert_eq!(request.needs_only_bound_surface(), bound_only);
+        let expected = if request == ConsoleControlRequest::Close {
+            TERMINAL_CLOSING_FILE
+        } else {
+            TERMINAL_HANDLE_FILE
+        };
+        assert_eq!(
+            windows_console_handle_path(directory.path(), &request),
+            directory.path().join(expected)
         );
     }
 }

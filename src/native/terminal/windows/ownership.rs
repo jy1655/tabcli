@@ -46,12 +46,15 @@ pub(in crate::native) fn windows_console_root_never_ran(directory: &Path) -> boo
         }
 }
 
-pub(in crate::native) fn windows_console_handle_path(directory: &Path, action: &str) -> PathBuf {
+pub(in crate::native) fn windows_console_handle_path(
+    directory: &Path,
+    request: &crate::native::ConsoleControlRequest,
+) -> PathBuf {
     let closing = Reader::open_unchecked(directory)
         .record(CoreRecord::TerminalClosing)
         .path()
         .to_owned();
-    if action == "close" && closing.is_file() {
+    if matches!(request, crate::native::ConsoleControlRequest::Close) && closing.is_file() {
         closing
     } else {
         Reader::open_unchecked(directory)

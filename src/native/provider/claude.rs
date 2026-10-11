@@ -315,6 +315,10 @@ impl Transport for ClaudeMessage {
 }
 
 impl NativeProviderAdapter for ClaudeAdapter {
+    fn result_timeout_diagnostic(&self) -> Option<super::super::doctor::ResultTimeoutDiagnostic> {
+        None
+    }
+
     fn launch_trust(&self) -> crate::native::consent::LaunchTrust {
         crate::native::consent::LaunchTrust {
             answers_launch_dialog: true,
@@ -591,7 +595,7 @@ fn require_exact_claude_trust_scope(workspace: &Path) -> Result<()> {
         return Ok(());
     }
     let mut command = git_workspace_command(workspace)?;
-    let output = super::super::command_output_until(
+    let output = crate::native::process_env::command_output_until(
         &mut command,
         Instant::now() + Duration::from_secs(2),
         "Claude workspace trust scope",

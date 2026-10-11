@@ -206,7 +206,7 @@ pub(super) fn tool_confirmation_check(directory: &Path) -> super::super::super::
     let observation = brain_root().and_then(|brain| pending_tool_confirmation(directory, &brain));
     let (reason, detail, evidence) = match observation {
         Ok(Some((tool, request_id))) => (
-            "agy_tool_confirmation_observed",
+            super::AGY_TOOL_CONFIRMATION_OBSERVED,
             format!(
                 "This session's {AGY_LOG_FILE} shows the pending turn waiting for user approval of {tool} in the terminal. Bridge does not answer it. This is the last observed confirmation, not proof that the dialog is still open."
             ),

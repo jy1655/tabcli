@@ -32,17 +32,7 @@ pub(super) static ADAPTER: AgyAdapter = AgyAdapter;
 
 pub(super) struct AgyAdapter;
 
-pub(super) fn result_timeout_diagnostic() -> super::super::doctor::ResultTimeoutDiagnostic {
-    super::super::doctor::ResultTimeoutDiagnostic {
-        probe: false,
-        detail: |check, request_id| {
-            (check["reason_code"] == "agy_tool_confirmation_observed"
-                && check["evidence"]["request_id"] == request_id)
-                .then(|| check["detail"].as_str())
-                .flatten()
-        },
-    }
-}
+const AGY_TOOL_CONFIRMATION_OBSERVED: &str = "agy_tool_confirmation_observed";
 
 const PENDING_TURN_FILE: &str = "agy-pending-turn.json";
 const TRANSCRIPT_FILE: &str = "transcript.jsonl";
@@ -228,6 +218,18 @@ impl Transport for AgyPaste {
 }
 
 impl NativeProviderAdapter for AgyAdapter {
+    fn result_timeout_diagnostic(&self) -> Option<super::super::doctor::ResultTimeoutDiagnostic> {
+        Some(super::super::doctor::ResultTimeoutDiagnostic {
+            probe: false,
+            detail: |check, request_id| {
+                (check.reason_code.as_deref() == Some(AGY_TOOL_CONFIRMATION_OBSERVED)
+                    && check.request_id.as_deref() == Some(request_id))
+                .then_some(check.detail.as_deref())
+                .flatten()
+            },
+        })
+    }
+
     fn launch_trust(&self) -> crate::native::consent::LaunchTrust {
         crate::native::consent::LaunchTrust {
             answers_launch_dialog: true,

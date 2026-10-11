@@ -29,17 +29,7 @@ pub(super) static ADAPTER: PiAdapter = PiAdapter;
 
 pub(super) struct PiAdapter;
 
-pub(super) fn result_timeout_diagnostic() -> super::super::doctor::ResultTimeoutDiagnostic {
-    super::super::doctor::ResultTimeoutDiagnostic {
-        probe: true,
-        // Credential configuration belongs to the session, not a submitted request.
-        detail: |check, _request_id| {
-            (check["id"] == "pi_provider_credentials")
-                .then(|| check["detail"].as_str())
-                .flatten()
-        },
-    }
-}
+const PI_PROVIDER_CREDENTIALS: &str = "pi_provider_credentials";
 
 const HOOK_FAILURE_FILE: &str = "pi-hook-failure.json";
 const PENDING_TURN_FILE: &str = "pi-pending-turn.json";
@@ -187,6 +177,18 @@ impl Transport for PiPaste {
 const APPLIED_MARKER: &str = "pi-approve-once";
 
 impl NativeProviderAdapter for PiAdapter {
+    fn result_timeout_diagnostic(&self) -> Option<super::super::doctor::ResultTimeoutDiagnostic> {
+        Some(super::super::doctor::ResultTimeoutDiagnostic {
+            probe: true,
+            // Credential configuration belongs to the session, not a submitted request.
+            detail: |check, _request_id| {
+                (check.id.as_deref() == Some(PI_PROVIDER_CREDENTIALS))
+                    .then_some(check.detail.as_deref())
+                    .flatten()
+            },
+        })
+    }
+
     fn launch_trust(&self) -> crate::native::consent::LaunchTrust {
         crate::native::consent::LaunchTrust {
             answers_launch_dialog: false,
@@ -504,7 +506,7 @@ fn credential_check(
         ),
         _ => (Availability::Unknown, "pi_provider_credentials_unknown"),
     };
-    Check::new("pi_provider_credentials", availability, code,
+    Check::new(PI_PROVIDER_CREDENTIALS, availability, code,
         format!("Pi provider credentials {status}{}: {reason}", provider.map(|p| format!(" for {p}")).unwrap_or_default()),
         "Inspect Pi's authentication setup. This observation does not fail, cancel, or resend a request.")
         .evidence(serde_json::json!({"status": status, "provider": provider, "authType": auth_type, "exit_code": exit_code, "model": target.0, "executable": target.1}))

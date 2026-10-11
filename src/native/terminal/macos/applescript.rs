@@ -55,7 +55,7 @@ impl Automation for Osascript {
             bail!("{application} automation timed out before it started");
         }
         let mut command = command(script, arguments);
-        let output = crate::native::command_output_until_classified(
+        let output = crate::native::process_env::command_output_until_classified(
         &mut command,
         deadline,
         &format!("{application} automation"),
@@ -94,7 +94,7 @@ impl Automation for Osascript {
             )));
         }
         let mut command = command(script, arguments);
-        let output = crate::native::command_output_until_classified(
+        let output = crate::native::process_env::command_output_until_classified(
             &mut command,
             deadline,
             &format!("{application} automation"),

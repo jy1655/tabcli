@@ -1,17 +1,19 @@
 //! Observations and advice only. No recovery, delivery, terminal control, or settings writes.
 use super::query::observation::{Observation, SessionEvidence, SurfaceRecord};
 use super::{
-    Duration, FirstPartyCli, Instant, NativeCommand, OsString, Output, Path, Reader, Result,
-    SeekFrom, Serialize, Stdio, bail, cli_version_is_supported, consent, fs, is_executable,
-    option_value, provider, provider_process, query, reopen, resolve_provider, set_flag_once,
-    set_once, terminal, terminal_safe_text, thread,
+    Duration, FirstPartyCli, Instant, NativeCommand, OsString, Path, Reader, Result, Serialize,
+    bail, cli_version_is_supported, consent, fs, is_executable, option_value, provider,
+    provider_process, query, reopen, resolve_provider, set_flag_once, set_once, terminal,
+    terminal_safe_text, thread,
 };
 use crate::native::session::SessionState;
 use crate::native::session::primitives::{SESSION_DIR_ENV, require_valid_session_id, unix_ms};
 use crate::native::session::schema::SessionManifest;
-use crate::native::{FromStr, Read, Seek, process_env};
+use crate::native::{FromStr, Read, process_env};
 use agent_bridge::PUBLIC_COMMAND;
 use serde_json::{Value, json};
+use std::io::{Seek, SeekFrom};
+use std::process::{Output, Stdio};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PROBE_OUTPUT: u64 = 64 * 1024;
@@ -20,7 +22,27 @@ const MAX_PROBE_OUTPUT: u64 = 64 * 1024;
 // needs an explicit probe. The caller owns the bound on executing the command.
 pub(super) struct ResultTimeoutDiagnostic {
     pub(super) probe: bool,
-    pub(super) detail: for<'a> fn(&'a Value, &str) -> Option<&'a str>,
+    pub(super) detail: for<'a> fn(&'a TimeoutCheck, &str) -> Option<&'a str>,
+}
+
+// A row from the child doctor's JSON, including sparse or malformed observations.
+// Read each field independently so an unrelated row cannot hide a later diagnosis.
+pub(super) struct TimeoutCheck {
+    pub(super) id: Option<String>,
+    pub(super) reason_code: Option<String>,
+    pub(super) request_id: Option<String>,
+    pub(super) detail: Option<String>,
+}
+
+impl TimeoutCheck {
+    fn from_row(row: &Value) -> Self {
+        Self {
+            id: row["id"].as_str().map(str::to_owned),
+            reason_code: row["reason_code"].as_str().map(str::to_owned),
+            request_id: row["evidence"]["request_id"].as_str().map(str::to_owned),
+            detail: row["detail"].as_str().map(str::to_owned),
+        }
+    }
 }
 
 pub(super) fn result_timeout_detail(
@@ -39,10 +61,10 @@ pub(super) fn result_timeout_detail(
     if report["session"] != session {
         return None;
     }
-    report["checks"]
-        .as_array()?
-        .iter()
-        .find_map(|check| (diagnostic.detail)(check, request_id).map(str::to_owned))
+    report["checks"].as_array()?.iter().find_map(|row| {
+        let check = TimeoutCheck::from_row(row);
+        (diagnostic.detail)(&check, request_id).map(str::to_owned)
+    })
 }
 
 #[derive(Debug)]
@@ -1052,5 +1074,118 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("timed out"), "{error:#}");
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn agy_timeout_predicate_requires_only_reason_and_matching_request() {
+        let diagnostic = provider::result_timeout_diagnostic(FirstPartyCli::Agy).unwrap();
+        assert!(!diagnostic.probe);
+        let row = json!({
+            "reason_code": "agy_tool_confirmation_observed",
+            "evidence": {"request_id": "request-current"},
+            "detail": "approval needed"
+        });
+        let check = TimeoutCheck::from_row(&row);
+        assert_eq!(
+            (diagnostic.detail)(&check, "request-current"),
+            Some("approval needed")
+        );
+        assert_eq!((diagnostic.detail)(&check, "request-other"), None);
+        for (field, value) in [
+            ("reason_code", json!("other")),
+            ("reason_code", json!(17)),
+            ("evidence", json!({"request_id": 17})),
+            ("evidence", Value::Null),
+            ("detail", json!(17)),
+        ] {
+            let mut changed = row.clone();
+            changed[field] = value;
+            assert_eq!(
+                (diagnostic.detail)(&TimeoutCheck::from_row(&changed), "request-current"),
+                None
+            );
+        }
+        let mut unrelated = row;
+        unrelated["id"] = json!("unrelated");
+        unrelated["availability"] = json!("available");
+        assert_eq!(
+            (diagnostic.detail)(&TimeoutCheck::from_row(&unrelated), "request-current"),
+            Some("approval needed")
+        );
+    }
+
+    #[test]
+    fn pi_timeout_predicate_requires_only_credentials_id() {
+        let diagnostic = provider::result_timeout_diagnostic(FirstPartyCli::Pi).unwrap();
+        assert!(diagnostic.probe);
+        for availability in ["available", "unavailable", "unknown"] {
+            let row = json!({
+                "id": "pi_provider_credentials", "detail": "credentials observation",
+                "availability": availability, "reason_code": "unrelated",
+                "evidence": {"request_id": "request-other"}
+            });
+            let check = TimeoutCheck::from_row(&row);
+            assert_eq!(
+                (diagnostic.detail)(&check, "request-current"),
+                Some("credentials observation")
+            );
+        }
+        for row in [
+            json!({"id": "other", "detail": "ignored"}),
+            json!({"id": 17, "detail": "ignored"}),
+            json!({"id": "pi_provider_credentials", "detail": false}),
+            json!({"detail": "ignored"}),
+        ] {
+            assert_eq!(
+                (diagnostic.detail)(&TimeoutCheck::from_row(&row), "request-current"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_rows_preserve_sparse_matches_and_first_matching_detail() {
+        for (provider, row) in [
+            (
+                FirstPartyCli::Agy,
+                json!({"reason_code": "agy_tool_confirmation_observed", "evidence": {"request_id": "request-current"}, "detail": "first"}),
+            ),
+            (
+                FirstPartyCli::Pi,
+                json!({"id": "pi_provider_credentials", "detail": "first"}),
+            ),
+        ] {
+            let mut missing_detail = row.clone();
+            missing_detail["detail"] = json!(3);
+            let mut later = row.clone();
+            later["detail"] = json!("second");
+            assert_eq!(
+                result_timeout_detail(provider, "session-owned", "request-current", |_| Some(
+                    json!({
+                        "session": "session-owned",
+                        "checks": [null, 7, [], {}, missing_detail, row, later]
+                    })
+                )),
+                Some("first".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn codex_and_claude_timeout_diagnostics_do_not_observe() {
+        for provider in [FirstPartyCli::Codex, FirstPartyCli::Claude] {
+            assert!(provider::result_timeout_diagnostic(provider).is_none());
+            assert_eq!(
+                result_timeout_detail(provider, "session-owned", "request-current", |_| panic!(
+                    "no diagnostic may run"
+                )),
+                None
+            );
+        }
     }
 }
