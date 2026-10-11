@@ -1,16 +1,12 @@
-use super::ownership::verified_macos_terminal_owner;
 use super::process;
 use super::process::{
-    live_native_process_identity, macos_process_path, macos_process_records, macos_process_start,
-    macos_processes_named,
+    macos_process_path, macos_process_records, macos_process_start, macos_processes_named,
 };
-use crate::native::session;
 use crate::native::session::{CoreRecord, Reader, RecordStore, Store};
 use crate::native::terminal;
 use crate::native::terminal::ownership;
 use crate::native::terminal::ownership::{
-    MacTerminalAppIdentity, MacTerminalShellIdentity, NativeProcessIdentity, NativeSessionOwner,
-    verified_terminal_owner_process_group, verified_terminal_shell_process_group,
+    MacTerminalAppIdentity, MacTerminalShellIdentity, NativeSessionOwner,
 };
 use agent_bridge::process_is_alive;
 use std::{
@@ -439,57 +435,18 @@ pub(super) fn verify_tab(session: &TerminalSession, timeout: Option<Duration>) -
     Ok(response)
 }
 
-pub(in crate::native) fn process_group_signal_target(process_group: u32) -> Result<libc::pid_t> {
-    let process_group = libc::pid_t::try_from(process_group)
-        .context("Terminal.app process group is out of range")?;
-    if process_group <= 0 {
-        bail!("Terminal.app process group must be positive")
-    }
-    process_group
-        .checked_neg()
-        .context("Terminal.app process group cannot be represented as a signal target")
-}
-
-pub(in crate::native) fn close_signal_plan(
-    managed_process_group: u32,
-    shell_process_group: u32,
-) -> Result<[(libc::pid_t, libc::c_int); 2]> {
-    if managed_process_group == shell_process_group {
-        bail!("Terminal.app managed and shell process groups must be distinct")
-    }
-    Ok([
-        (
-            process_group_signal_target(managed_process_group)?,
-            libc::SIGTERM,
-        ),
-        (
-            process_group_signal_target(shell_process_group)?,
-            libc::SIGKILL,
-        ),
-    ])
-}
-
-pub(in crate::native) fn terminate_process_groups(
-    managed_process_group: u32,
-    shell_process_group: u32,
-) -> Result<()> {
-    for (target, signal) in close_signal_plan(managed_process_group, shell_process_group)? {
-        let result = unsafe { libc::kill(target, signal) };
-        if result == 0 {
-            continue;
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            continue;
-        }
-        return Err(error).with_context(|| {
-            format!(
-                "failed to send signal {signal} to Terminal.app process group {}",
-                target.checked_neg().unwrap_or_default()
-            )
-        });
-    }
-    Ok(())
+pub(super) fn close_owned_session(
+    directory: &Path,
+    session: &TerminalSession,
+) -> Result<CloseOutcome> {
+    let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
+    close_attested_session(
+        session,
+        owner
+            .terminal_app
+            .as_ref()
+            .context("Terminal.app close has no app incarnation")?,
+    )
 }
 
 pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
@@ -599,44 +556,12 @@ fn ownership_proof(session: &TerminalSession) -> Result<&str> {
 }
 
 #[cfg(target_os = "macos")]
-fn verified_apple_terminal_owner(
-    directory: &Path,
-    expected_session_id: &str,
-    session: &terminal::TerminalSession,
-) -> Result<(NativeSessionOwner, NativeProcessIdentity)> {
+pub(in crate::native) fn verified_close_tty(session: &terminal::TerminalSession) -> Result<String> {
     if session.kind != terminal::TerminalKind::AppleTerminal {
         bail!("Terminal.app ownership proof received a different terminal kind")
     }
-    let surface_tty = terminal::verify_macos_surface(session, None)?
-        .context("Terminal.app ownership proof did not return a TTY")?;
-    verified_macos_terminal_owner(directory, expected_session_id, session, Some(&surface_tty))
-}
-
-#[cfg(target_os = "macos")]
-pub(in crate::native) fn terminate_apple_terminal_owner(
-    directory: &Path,
-    expected_session_id: &str,
-    session: &terminal::TerminalSession,
-) -> Result<()> {
-    let (mut owner, live) = verified_apple_terminal_owner(directory, expected_session_id, session)?;
-    let process_group = verified_terminal_owner_process_group(&owner, &live)?;
-    let live_shell = live_native_process_identity(live.parent_pid)?;
-    let shell_process_group = verified_terminal_shell_process_group(&owner, &live, &live_shell)?;
-    record_legacy_terminal_app(directory, &mut owner, terminal_app_process)?;
-    require_unique_terminal_app(
-        owner
-            .terminal_app
-            .as_ref()
-            .context("Terminal.app identity was not recorded")?,
-        &terminal_app_instances()?,
-    )?;
-    session::close::record_terminal_close_intent(
-        &Store::open_unchecked(directory),
-        expected_session_id,
-        session,
-        &owner,
-    )?;
-    terminal::macos::apple_terminal::terminate_process_groups(process_group, shell_process_group)
+    terminal::verify_macos_surface(session, None)?
+        .context("Terminal.app ownership proof did not return a TTY")
 }
 
 // A record of 0.0.10 or earlier names no app incarnation. While its owner is live and

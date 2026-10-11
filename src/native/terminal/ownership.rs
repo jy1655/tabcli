@@ -1,8 +1,10 @@
 use super as terminal;
 #[cfg(target_os = "macos")]
+use super::PreClosePolicy;
+#[cfg(target_os = "macos")]
 use super::macos::apple_terminal::{
-    require_unique_terminal_app, terminal_app_alive_with, terminal_app_instances,
-    terminal_app_process, terminal_surface_absent, terminate_apple_terminal_owner,
+    record_legacy_terminal_app, require_unique_terminal_app, terminal_app_alive_with,
+    terminal_app_instances, terminal_app_process, terminal_surface_absent, verified_close_tty,
 };
 #[cfg(target_os = "macos")]
 pub(in crate::native) use super::macos::ownership::mac_native_owner_is_live;
@@ -14,8 +16,6 @@ use super::macos::process::macos_process_start;
 use super::macos::process::{
     current_terminal_tty, live_native_process_identity, terminal_tty_device,
 };
-#[cfg(target_os = "macos")]
-use super::macos::warp::{prepare_warp_close, terminate_owned_foreground_group};
 #[cfg(windows)]
 pub(in crate::native) use super::windows::ownership::verified_windows_native_owner;
 use super::{CloseOutcome, TerminalSession};
@@ -30,6 +30,8 @@ use agent_bridge::process_is_alive;
 use anyhow::Context;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use std::time::Instant;
 use std::{path::Path, time::Duration};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -317,32 +319,6 @@ pub(in crate::native) fn verify_terminal_surface_ownership_with_timeout(
     Ok(())
 }
 
-// The macOS surfaces that can outlive their native owner: Terminal.app keeps the window
-// of an ended shell, and Warp, WezTerm and Ghostty surfaces can remain. Outside the
-// native-ID failed-start recovery below, only the close that recorded its intent first
-// may reach a surface after its owner ended. Otherwise only proven absence consumes the
-// handle; repair itself never closes it.
-#[cfg(target_os = "macos")]
-pub(in crate::native) fn surface_outlives_owner(kind: terminal::TerminalKind) -> bool {
-    matches!(
-        kind,
-        terminal::TerminalKind::AppleTerminal
-            | terminal::TerminalKind::Warp
-            | terminal::TerminalKind::WezTerm
-            | terminal::TerminalKind::Ghostty
-    )
-}
-
-#[cfg(any(target_os = "macos", windows))]
-fn failed_start_has_native_close_identity(kind: terminal::TerminalKind) -> bool {
-    matches!(
-        kind,
-        terminal::TerminalKind::Iterm2
-            | terminal::TerminalKind::Ghostty
-            | terminal::TerminalKind::WindowsConsole
-    )
-}
-
 pub(in crate::native) fn verify_terminal_close_authority(
     directory: &Path,
     expected_session_id: &str,
@@ -423,7 +399,7 @@ pub(in crate::native) fn verify_terminal_close_authority_with_observations(
                 session::close::terminal_close_resumable(
                     &Reader::open_unchecked(directory),
                     session,
-                    retained_surface_outlives_owner(session),
+                    terminal::surface_outlives_owner(session),
                 )
             },
             ownership_proof: &|| {
@@ -478,7 +454,7 @@ fn verify_terminal_close_authority_with_observers(
             // intent, and the dead-owner rules below apply to them.
             if let Some(launch) = launch::read(&Reader::open_unchecked(directory))?
                 && launch.phase != launch::Phase::Spawned
-                && failed_start_has_native_close_identity(session.kind)
+                && terminal::close_policy(session.kind).failed_start_identity
             {
                 let status: SessionStatus = Reader::open_unchecked(directory).status()?;
                 let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
@@ -498,7 +474,7 @@ fn verify_terminal_close_authority_with_observers(
             #[cfg(target_os = "macos")]
             if (observers.resumable)()? {
                 session.verify_managed_session(expected_session_id)?;
-                if session.kind == terminal::TerminalKind::AppleTerminal {
+                if terminal::close_policy(session.kind).requires_app_incarnation {
                     let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
                     let Some(app) = &owner.terminal_app else {
                         // An intent of 0.0.10 or earlier names no app incarnation, and
@@ -547,7 +523,7 @@ fn verify_terminal_close_authority_with_observers(
                             "dead native-session owner identity is incomplete, foreign, or its PID is reused; no terminal observation or close was sent"
                         );
                     }
-                    let absent = if session.kind == terminal::TerminalKind::AppleTerminal {
+                    let absent = if terminal::close_policy(session.kind).requires_app_incarnation {
                         terminal_surface_absent(
                             owner.terminal_app.as_ref(),
                             &process_birth,
@@ -567,7 +543,7 @@ fn verify_terminal_close_authority_with_observers(
                 }
                 // A live owner of 0.0.10 or earlier names no app incarnation: the close
                 // derives it from that owner's own ancestry before it records its intent.
-                if session.kind == terminal::TerminalKind::AppleTerminal
+                if terminal::close_policy(session.kind).requires_app_incarnation
                     && let Some(app) = &owner.terminal_app
                 {
                     if !terminal_app_alive_with(app, &process_birth)? {
@@ -596,7 +572,7 @@ fn verify_terminal_close_authority_with_observers(
         // that no wrapper recorded here, so nothing is closed: the handle is consumed
         // once the window is proven gone.
         #[cfg(target_os = "macos")]
-        if session.kind == terminal::TerminalKind::AppleTerminal {
+        if terminal::close_policy(session.kind).requires_app_incarnation {
             if terminal_surface_absent(None, &process_birth, &terminal_instances, surface_present)?
             {
                 return Ok(TerminalCloseAuthority::Absent);
@@ -606,10 +582,7 @@ fn verify_terminal_close_authority_with_observers(
             );
         }
         #[cfg(target_os = "macos")]
-        if matches!(
-            session.kind,
-            terminal::TerminalKind::Warp | terminal::TerminalKind::WezTerm
-        ) {
+        if !terminal::close_policy(session.kind).failed_start_identity {
             if !surface_present().context(
                 "could not prove absence of the ownerless startup surface; no close was sent",
             )? {
@@ -619,7 +592,7 @@ fn verify_terminal_close_authority_with_observers(
                 "startup has no native owner or close intent and its surface is not proven gone; no close was sent and the surface handle is retained"
             );
         }
-        if !failed_start_has_native_close_identity(session.kind) {
+        if !terminal::close_policy(session.kind).failed_start_identity {
             bail!("startup surface has no supported native close identity; its handle is retained");
         }
         Ok(TerminalCloseAuthority::SurfaceOnly)
@@ -697,20 +670,6 @@ pub(in crate::native) fn repair_owner_is_live(owner: &NativeSessionOwner) -> Res
     Ok(false)
 }
 
-pub(in crate::native) fn retained_surface_outlives_owner(
-    session: &terminal::TerminalSession,
-) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        surface_outlives_owner(session.kind)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = session;
-        false
-    }
-}
-
 pub(in crate::native) fn close_dead_owner_surface(
     session: &terminal::TerminalSession,
 ) -> Result<terminal::CloseOutcome> {
@@ -739,49 +698,208 @@ pub(in crate::native) fn close_owned_surface(
     }
     let has_native_owner = authority == TerminalCloseAuthority::LiveOwner;
     #[cfg(target_os = "macos")]
-    if has_native_owner && session.kind == terminal::TerminalKind::AppleTerminal {
-        terminate_apple_terminal_owner(directory, id, session)?;
-    }
-    #[cfg(target_os = "macos")]
-    if has_native_owner && session.kind == terminal::TerminalKind::Warp {
-        let (owner, live) = verified_macos_terminal_owner(directory, id, session, None)?;
-        let shell = live_native_process_identity(live.parent_pid)?;
-        prepare_warp_close(
-            directory,
-            id,
-            session,
-            &owner,
-            &live,
-            &shell,
-            terminate_owned_foreground_group,
-        )?;
-    }
-    #[cfg(target_os = "macos")]
-    if has_native_owner && session.kind == terminal::TerminalKind::WezTerm {
-        // tab.close/kill-pane can end the owner while surface cleanup still fails.
-        // Preserve this exact requested close before its first external mutation.
-        let (owner, _) = verified_macos_terminal_owner(directory, id, session, None)?;
-        session::close::record_terminal_close_intent(
-            &Store::open_unchecked(directory),
-            id,
-            session,
-            &owner,
-        )?;
+    {
+        if has_native_owner {
+            prepare_owned_surface_close(directory, id, session)?;
+        }
+        terminal::macos::close_owned_session(directory, session)
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = has_native_owner;
-    #[cfg(target_os = "macos")]
-    if session.kind == terminal::TerminalKind::AppleTerminal {
-        let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
-        return terminal::macos::apple_terminal::close_attested_session(
-            session,
-            owner
-                .terminal_app
-                .as_ref()
-                .context("Terminal.app close has no app incarnation")?,
-        );
+    {
+        let _ = has_native_owner;
+        terminal::close_session(session)
     }
-    terminal::close_session(session)
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_owned_surface_close(
+    directory: &Path,
+    id: &str,
+    surface: &TerminalSession,
+) -> Result<()> {
+    match terminal::close_policy(surface.kind).pre_close {
+        PreClosePolicy::None => Ok(()),
+        PreClosePolicy::RecordIntent => {
+            // The adapter close can end the owner even when surface cleanup fails.
+            let (owner, _) = verified_macos_terminal_owner(directory, id, surface, None)?;
+            session::close::record_terminal_close_intent(
+                &Store::open_unchecked(directory),
+                id,
+                surface,
+                &owner,
+            )
+        }
+        PreClosePolicy::StopForegroundGroup => {
+            let (owner, live) = verified_macos_terminal_owner(directory, id, surface, None)?;
+            let shell = live_native_process_identity(live.parent_pid)?;
+            prepare_warp_close(
+                directory,
+                id,
+                surface,
+                &owner,
+                &live,
+                &shell,
+                terminate_owned_foreground_group,
+            )
+        }
+        PreClosePolicy::StopOwnerAndShellGroups => {
+            terminate_apple_terminal_owner(directory, id, surface)
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn process_group_signal_target(process_group: u32) -> Result<libc::pid_t> {
+    let process_group = libc::pid_t::try_from(process_group)
+        .context("Terminal.app process group is out of range")?;
+    if process_group <= 0 {
+        bail!("Terminal.app process group must be positive")
+    }
+    process_group
+        .checked_neg()
+        .context("Terminal.app process group cannot be represented as a signal target")
+}
+
+#[cfg(target_os = "macos")]
+fn close_signal_plan(
+    managed_process_group: u32,
+    shell_process_group: u32,
+) -> Result<[(libc::pid_t, libc::c_int); 2]> {
+    if managed_process_group == shell_process_group {
+        bail!("Terminal.app managed and shell process groups must be distinct")
+    }
+    Ok([
+        (
+            process_group_signal_target(managed_process_group)?,
+            libc::SIGTERM,
+        ),
+        (
+            process_group_signal_target(shell_process_group)?,
+            libc::SIGKILL,
+        ),
+    ])
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_process_groups(managed_process_group: u32, shell_process_group: u32) -> Result<()> {
+    for (target, signal) in close_signal_plan(managed_process_group, shell_process_group)? {
+        let result = unsafe { libc::kill(target, signal) };
+        if result == 0 {
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            continue;
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "failed to send signal {signal} to Terminal.app process group {}",
+                target.checked_neg().unwrap_or_default()
+            )
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(in crate::native) fn terminate_apple_terminal_owner(
+    directory: &Path,
+    expected_session_id: &str,
+    session: &terminal::TerminalSession,
+) -> Result<()> {
+    let surface_tty = verified_close_tty(session)?;
+    let (mut owner, live) =
+        verified_macos_terminal_owner(directory, expected_session_id, session, Some(&surface_tty))?;
+    let process_group = verified_terminal_owner_process_group(&owner, &live)?;
+    let live_shell = live_native_process_identity(live.parent_pid)?;
+    let shell_process_group = verified_terminal_shell_process_group(&owner, &live, &live_shell)?;
+    record_legacy_terminal_app(directory, &mut owner, terminal_app_process)?;
+    require_unique_terminal_app(
+        owner
+            .terminal_app
+            .as_ref()
+            .context("Terminal.app identity was not recorded")?,
+        &terminal_app_instances()?,
+    )?;
+    session::close::record_terminal_close_intent(
+        &Store::open_unchecked(directory),
+        expected_session_id,
+        session,
+        &owner,
+    )?;
+    terminate_process_groups(process_group, shell_process_group)
+}
+
+// Warp preserves normal close warnings. Stop only the fully attested foreground
+// job before requesting tab.close; never suppress warnings or signal by tty name.
+#[cfg(target_os = "macos")]
+pub(in crate::native) fn prepare_warp_close(
+    directory: &Path,
+    id: &str,
+    session: &terminal::TerminalSession,
+    owner: &NativeSessionOwner,
+    live: &NativeProcessIdentity,
+    shell: &NativeProcessIdentity,
+    stop: impl FnOnce(u32) -> Result<()>,
+) -> Result<()> {
+    session.verify_managed_session(id)?;
+    if session.kind != terminal::TerminalKind::Warp
+        || owner.managed_session_id.as_deref() != Some(id)
+        || !native_owner_identity_matches(owner, live)
+    {
+        bail!("Warp close owner identity changed");
+    }
+    let group = verified_terminal_owner_process_group(owner, live)?;
+    verified_terminal_shell_process_group(owner, live, shell)?;
+    session::close::record_terminal_close_intent(
+        &Store::open_unchecked(directory),
+        id,
+        session,
+        owner,
+    )?;
+    stop(group)
+}
+
+#[cfg(target_os = "macos")]
+pub(in crate::native) fn terminate_owned_foreground_group(group: u32) -> Result<()> {
+    terminate_owned_foreground_group_with(group, Duration::from_secs(3), |_| {})
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_owned_foreground_group_with(
+    group: u32,
+    timeout: Duration,
+    mut observe: impl FnMut(Option<i32>),
+) -> Result<()> {
+    let target = process_group_signal_target(group)?;
+    if unsafe { libc::kill(target, libc::SIGTERM) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(error).context("could not stop the attested Warp foreground group");
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        if unsafe { libc::kill(target, 0) } != 0 {
+            let error = std::io::Error::last_os_error();
+            observe(error.raw_os_error());
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            // EPERM does not establish absence, including for a zombie-only group
+            // (measured on macOS 26.6.2, 2026-10-07, issue #85); only ESRCH does.
+            if error.raw_os_error() != Some(libc::EPERM) {
+                return Err(error).context("could not observe the stopped Warp foreground group");
+            }
+        } else {
+            observe(None);
+        }
+        if Instant::now() >= deadline {
+            bail!("the attested Warp foreground group has not stopped; no tab close was sent");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 pub(in crate::native) fn current_surface_owner(
@@ -1014,7 +1132,7 @@ mod close_authority_tests {
                         Ok(session::close::terminal_close_intent_owner(
                             &Reader::open_unchecked(directory.path()),
                             &handle,
-                            retained_surface_outlives_owner(&handle),
+                            terminal::surface_outlives_owner(&handle),
                         )?
                         .is_some_and(|owner| {
                             assert_eq!(owner.pid, 123);
@@ -1684,4 +1802,226 @@ mod close_authority_tests {
     // There is no current TerminalKind that reaches "no supported native close
     // identity" on macOS: AppleTerminal/Warp/WezTerm return earlier and every
     // remaining kind (including WindowsConsole) has native close identity.
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod process_close_tests {
+    use super::*;
+    use crate::native::session::close::compatibility::terminal_close_intent_owner;
+    use crate::native::tests::write_attested_apple_terminal_state;
+    use crate::native::{TERMINAL_CLOSE_INTENT_FILE, TERMINAL_HANDLE_FILE, read_json};
+    use std::fs;
+    use std::{os::unix::process::CommandExt, process::Command};
+
+    #[test]
+    fn terminal_app_close_signal_targets_and_plan() {
+        assert_eq!(process_group_signal_target(4242).unwrap(), -4242);
+        assert!(process_group_signal_target(0).is_err());
+        assert!(process_group_signal_target(i32::MAX as u32 + 1).is_err());
+        assert_eq!(
+            close_signal_plan(4242, 4000).unwrap(),
+            [(-4242, libc::SIGTERM), (-4000, libc::SIGKILL)]
+        );
+    }
+    #[cfg(target_os = "macos")]
+    struct ForegroundGroupChild(std::process::Child);
+
+    #[cfg(target_os = "macos")]
+    impl ForegroundGroupChild {
+        fn spawn() -> Self {
+            Self(
+                Command::new("/bin/sleep")
+                    .arg("30")
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+
+        fn wait_for_zombie(&self) {
+            let target = -(self.0.id() as i32);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if unsafe { libc::kill(target, 0) } != 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+                {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "child did not become a zombie");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for ForegroundGroupChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owned_foreground_group_termination_waits_for_zombie_reaping() {
+        let child = ForegroundGroupChild::spawn();
+        let group = child.0.id();
+        let (reap, ready) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let received = ready.recv_timeout(Duration::from_secs(5));
+            drop(child);
+            received
+        });
+        let mut probes = Vec::new();
+        let mut eperm_probes = 0;
+        let result =
+            terminate_owned_foreground_group_with(group, Duration::from_secs(3), |errno| {
+                probes.push(errno);
+                if errno == Some(libc::EPERM) {
+                    eperm_probes += 1;
+                    if eperm_probes == 2 {
+                        reap.send(()).unwrap();
+                    }
+                }
+            });
+        drop(reap);
+        let reaped = waiter.join();
+        assert!(result.is_ok(), "{result:?}");
+        reaped.unwrap().unwrap();
+        let gone = probes
+            .iter()
+            .position(|errno| *errno == Some(libc::ESRCH))
+            .unwrap();
+        assert!(
+            probes[..gone]
+                .iter()
+                .filter(|errno| **errno == Some(libc::EPERM))
+                .count()
+                >= 2,
+            "{probes:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owned_foreground_group_termination_times_out_before_zombie_reaping() {
+        let child = ForegroundGroupChild::spawn();
+        let timeout = Duration::from_secs(1);
+        let mut eperm_probes = 0;
+        let started = Instant::now();
+        let result = terminate_owned_foreground_group_with(child.0.id(), timeout, |errno| {
+            if errno == Some(libc::EPERM) {
+                eperm_probes += 1;
+            }
+        });
+        let elapsed = started.elapsed();
+        assert_eq!(
+            result.as_ref().unwrap_err().to_string(),
+            "the attested Warp foreground group has not stopped; no tab close was sent",
+            "{result:?}"
+        );
+        assert!(eperm_probes > 0, "no EPERM probe was observed");
+        assert!(elapsed >= timeout);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owned_foreground_group_termination_refuses_failed_signal_to_zombie() {
+        let child = ForegroundGroupChild::spawn();
+        assert_eq!(
+            unsafe { libc::kill(-(child.0.id() as i32), libc::SIGTERM) },
+            0
+        );
+        child.wait_for_zombie();
+        let error = terminate_owned_foreground_group(child.0.id()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "could not stop the attested Warp foreground group"
+        );
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn warp_close_records_intent_before_stopping_only_attested_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = write_attested_apple_terminal_state(directory.path(), "ready", 4242);
+        let mut handle: terminal::TerminalSession =
+            read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
+        handle.kind = terminal::TerminalKind::Warp;
+        let live = NativeProcessIdentity {
+            pid: 4242,
+            parent_pid: 4000,
+            terminal_tty_device: 7,
+            process_group: 4242,
+            terminal_process_group: 4242,
+            process_start_seconds: 1_790_000_000,
+            process_start_microseconds: 42,
+        };
+        let shell = NativeProcessIdentity {
+            pid: 4000,
+            parent_pid: 3000,
+            terminal_tty_device: 7,
+            process_group: 4000,
+            terminal_process_group: 4242,
+            process_start_seconds: 1,
+            process_start_microseconds: 0,
+        };
+        let result = prepare_warp_close(
+            directory.path(),
+            "session-owner123",
+            &handle,
+            &owner,
+            &live,
+            &shell,
+            |group| {
+                assert_eq!(group, 4242);
+                assert!(terminal_close_intent_owner(directory.path(), &handle)?.is_some());
+                bail!("injected still-running group: adapter must not run")
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("still-running"));
+        assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
+        fs::remove_file(directory.path().join(TERMINAL_CLOSE_INTENT_FILE)).unwrap();
+        let changed = NativeProcessIdentity {
+            process_start_microseconds: 43,
+            ..live
+        };
+        assert!(
+            prepare_warp_close(
+                directory.path(),
+                "session-owner123",
+                &handle,
+                &owner,
+                &changed,
+                &shell,
+                |_| panic!("changed owner must not be signalled")
+            )
+            .is_err()
+        );
+        assert!(!directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn owned_foreground_group_termination_waits_for_real_private_process_exit() {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = child.id();
+        let waiter = std::thread::spawn(move || child.wait().unwrap());
+        let result = terminate_owned_foreground_group(group);
+        let status = waiter.join().unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!status.success());
+    }
 }

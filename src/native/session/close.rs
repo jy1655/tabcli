@@ -1,7 +1,6 @@
 //! Explicit close, interrupted-close convergence, and dead-owner repair.
 use crate::native::terminal::ownership::{
     close_dead_owner_surface, owner_blocks_prune, repair_owner_is_live,
-    retained_surface_outlives_owner,
 };
 use crate::native::*;
 
@@ -459,7 +458,7 @@ pub(in crate::native) fn repair_dead_owner(store: &Store) -> Result<bool> {
     repair_dead_owner_with(
         store,
         repair_owner_is_live,
-        retained_surface_outlives_owner,
+        terminal::surface_outlives_owner,
         close_dead_owner_surface,
     )
 }
@@ -618,7 +617,7 @@ pub(in crate::native) mod compatibility {
         repair_dead_owner_with(
             &Store::open_unchecked(directory),
             repair_owner_is_live,
-            retained_surface_outlives_owner,
+            terminal::surface_outlives_owner,
             |session| close_dead_owner_surface_with(session, &mut closer),
         )
     }
@@ -639,7 +638,7 @@ pub(in crate::native) mod compatibility {
         super::terminal_close_intent_owner(
             &Reader::open_unchecked(directory),
             session,
-            retained_surface_outlives_owner(session),
+            terminal::surface_outlives_owner(session),
         )
     }
     #[cfg(target_os = "macos")]
@@ -650,7 +649,7 @@ pub(in crate::native) mod compatibility {
         super::terminal_close_resumable(
             &Reader::open_unchecked(directory),
             session,
-            retained_surface_outlives_owner(session),
+            terminal::surface_outlives_owner(session),
         )
     }
 }

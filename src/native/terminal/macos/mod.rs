@@ -1,3 +1,15 @@
+pub(super) fn close_policy(kind: TerminalKind) -> super::close_policy::ClosePolicy {
+    use super::close_policy::{apple_terminal, ghostty, iterm2, warp, wezterm, windows};
+    match kind {
+        TerminalKind::Iterm2 => iterm2::CLOSE_POLICY,
+        TerminalKind::AppleTerminal => apple_terminal::CLOSE_POLICY,
+        TerminalKind::Ghostty => ghostty::CLOSE_POLICY,
+        TerminalKind::Warp => warp::CLOSE_POLICY,
+        TerminalKind::WezTerm => wezterm::CLOSE_POLICY,
+        TerminalKind::WindowsConsole => windows::CLOSE_POLICY,
+    }
+}
+
 pub(in crate::native) mod ownership;
 pub(in crate::native) mod process;
 
@@ -226,6 +238,18 @@ pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
         TerminalKind::Warp => warp::close_session(session),
         TerminalKind::WezTerm => wezterm::close_session(&wezterm::Installed, session),
         TerminalKind::WindowsConsole => bail!("Windows Console is only available on Windows"),
+    }
+}
+
+// Terminal.app's managed close requires the owner's recorded app incarnation.
+// Other adapters close by their own handle alone.
+pub(super) fn close_owned_session(
+    directory: &Path,
+    session: &TerminalSession,
+) -> Result<CloseOutcome> {
+    match session.kind {
+        TerminalKind::AppleTerminal => apple_terminal::close_owned_session(directory, session),
+        _ => close_session(session),
     }
 }
 

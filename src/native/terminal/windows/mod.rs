@@ -1,3 +1,15 @@
+pub(super) fn close_policy(kind: TerminalKind) -> super::close_policy::ClosePolicy {
+    use super::close_policy::{apple_terminal, ghostty, iterm2, warp, wezterm, windows};
+    match kind {
+        TerminalKind::Iterm2 => iterm2::CLOSE_POLICY,
+        TerminalKind::AppleTerminal => apple_terminal::CLOSE_POLICY,
+        TerminalKind::Ghostty => ghostty::CLOSE_POLICY,
+        TerminalKind::Warp => warp::CLOSE_POLICY,
+        TerminalKind::WezTerm => wezterm::CLOSE_POLICY,
+        TerminalKind::WindowsConsole => windows::CLOSE_POLICY,
+    }
+}
+
 pub(in crate::native) mod ownership;
 
 use crate::native::session::{Reader, RecordStore, Store};
