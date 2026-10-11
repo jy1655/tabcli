@@ -858,7 +858,7 @@ pub(super) fn close_session_until(
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
-    crate::native::close_remaining(deadline)?;
+    crate::native::session::close::budget::close_remaining(deadline)?;
     validate_session_directory(directory, session)?;
     let binding = load_binding(directory, session)?;
     let mut runner = ProcessRunner;
@@ -1657,7 +1657,7 @@ fn validate_session_directory(directory: &Path, session: &TerminalSession) -> Re
     if directory.file_name().and_then(|name| name.to_str()) != Some(id) {
         bail!("Warp managed session binding does not match the supplied session directory");
     }
-    crate::native::require_valid_session_id(id)?;
+    crate::native::session::primitives::require_valid_session_id(id)?;
     Reader::open_unchecked(directory)
         .validate_private_session_directory(HOST_SESSION_DIRECTORY_LABEL)
 }
@@ -1787,7 +1787,7 @@ pub(in crate::native) fn run_host(directory: &Path, attempt: &str) -> Result<()>
         .file_name()
         .and_then(|name| name.to_str())
         .context("Warp host session directory has no UTF-8 session id")?;
-    if !crate::native::valid_session_id(session_id) {
+    if !crate::native::session::primitives::valid_session_id(session_id) {
         bail!("Warp host session directory has an invalid session id");
     }
     Reader::open_unchecked(directory)
@@ -3102,10 +3102,15 @@ mod tests {
                 // A handle alone cannot replace Warp's missing app incarnation/control
                 // record. Failed recovery must preserve the handle and failure evidence.
                 assert!(
-                    close::close(&store, None, crate::native::close_deadline(), |surface| {
-                        load_binding(&directory, surface)?;
-                        panic!("missing control binding grants no control access")
-                    })
+                    close::close(
+                        &store,
+                        None,
+                        crate::native::session::close::budget::close_deadline(),
+                        |surface| {
+                            load_binding(&directory, surface)?;
+                            panic!("missing control binding grants no control access")
+                        }
+                    )
                     .is_err()
                 );
                 assert_eq!(store.terminal().unwrap(), retained);
@@ -3142,9 +3147,12 @@ mod tests {
         let store = failed_binding_launch_fixture(&directory);
         let before = fs::read(store.record(CoreRecord::Status).path()).unwrap();
         let claim = fs::read(store.record(CoreRecord::TurnClaim).path()).unwrap();
-        let error = close::close(&store, None, crate::native::close_deadline(), |_| {
-            panic!("no surface bound")
-        })
+        let error = close::close(
+            &store,
+            None,
+            crate::native::session::close::budget::close_deadline(),
+            |_| panic!("no surface bound"),
+        )
         .unwrap_err();
         assert!(format!("{error:#}").contains("launcher is still creating the surface"));
         assert_eq!(
@@ -3185,7 +3193,7 @@ mod tests {
         close::close(
             &store,
             Some("earlier reason".into()),
-            crate::native::close_deadline(),
+            crate::native::session::close::budget::close_deadline(),
             |_| panic!("no surface bound"),
         )
         .unwrap();
@@ -3219,9 +3227,12 @@ mod tests {
                 .contains(&message)
         );
         for _ in 0..2 {
-            close::close(&store, None, crate::native::close_deadline(), |_| {
-                panic!("closed session grants no close authority")
-            })
+            close::close(
+                &store,
+                None,
+                crate::native::session::close::budget::close_deadline(),
+                |_| panic!("closed session grants no close authority"),
+            )
             .unwrap();
             assert!(store.terminal().is_err());
             assert_eq!(store.status().unwrap().error, status.error);

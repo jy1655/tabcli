@@ -2,9 +2,8 @@
 //! Resolution is read-only and provider-neutral: it observes source sessions through the
 //! same snapshot machinery as `result`, pins the selected event, and renders the attachment
 //! text. The combined prompt then travels through each provider's existing transport.
-use super::{
-    AtomicU64, Ordering, Result, SystemTime, UNIX_EPOCH, bail, query, requests, valid_session_id,
-};
+use super::{AtomicU64, Ordering, Result, SystemTime, UNIX_EPOCH, bail, query, requests};
+use crate::native::session::primitives::valid_session_id;
 use crate::native::{Context, Path, Reader, terminal_safe_text, validate_terminal_input};
 use agent_bridge::PUBLIC_COMMAND;
 use requests::ContextSource;

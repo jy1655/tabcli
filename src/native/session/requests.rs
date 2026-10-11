@@ -1,8 +1,19 @@
 //! Immutable Bridge request addresses. Provider-owned correlation still decides completion.
+use crate::native::session::primitives::{delegation_source, unix_ms, valid_session_id};
+use crate::native::session::turn::valid_turn_claim_token;
 #[cfg(test)]
-use crate::native::session::SessionState;
+use crate::native::session::turn::{
+    acquire_ready_turn_claim, acquire_turn_claim, record_provider_result_for_claim,
+    release_turn_claim_token, write_pending_completion_event,
+};
 use crate::native::session::{CoreRecord, Reader, RecordStore, Store};
-use crate::native::*;
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use std::{
+    fs::{self},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -208,6 +219,12 @@ pub(in crate::native) fn list(reader: &Reader) -> Result<Index> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::session::names::*;
+    use crate::native::session::primitives::{event_paths, read_json, write_json_atomic};
+    use crate::native::session::schema::SessionEvent;
+    use crate::native::session::turn::{PendingTurnCompletion, recover_pending_completion};
+    use crate::native::session::{SessionState, SessionStatus, update_status};
+    use agent_bridge::FirstPartyCli;
 
     // A `requests` path that is a link (or a file) is refused by both the index and the
     // per-claim read, so no receipt outside the state root can name a request.

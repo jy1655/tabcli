@@ -1,15 +1,16 @@
 //! Read-only views of durable session records. Never recover, send, or close here.
 use super::{
-    DEFAULT_TIMEOUT_SECS, Deserialize, Duration, EVENT_READ_LIMIT, File, FirstPartyCli, Instant,
-    JournaledEventRead, JournaledEventState, NativeCommand, Path, PathBuf, PendingTurnCompletion,
-    Reader, Result, Serialize, SessionEvent, SessionManifest, SessionStatus, bail,
-    checked_deadline_from, consent, fs, launch, option_value, parse_timeout, read_resumed_from,
-    requests, require_valid_session_id, set_flag_once, set_once, terminal, terminal_safe_text,
-    thread, valid_session_id, validate_pending_completion,
+    DEFAULT_TIMEOUT_SECS, Deserialize, Duration, File, FirstPartyCli, Instant, JournaledEventRead,
+    JournaledEventState, NativeCommand, Path, PathBuf, PendingTurnCompletion, Reader, Result,
+    Serialize, SessionStatus, bail, checked_deadline_from, consent, fs, launch, option_value,
+    parse_timeout, read_resumed_from, requests, set_flag_once, set_once, terminal,
+    terminal_safe_text, thread, validate_pending_completion,
 };
 #[cfg(test)]
 use super::{EVENTS_DIRECTORY, read_event_within_budget};
 use crate::native::session::SessionState;
+use crate::native::session::primitives::{require_valid_session_id, valid_session_id};
+use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent, SessionManifest};
 use crate::native::session::{CoreRecord, RecordReader};
 use crate::native::{Context, FromStr};
 use agent_bridge::PUBLIC_COMMAND;

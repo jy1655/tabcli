@@ -1,6 +1,43 @@
 //! Record I/O and durability; lifecycle decisions remain in native.
 use super::*;
 
+pub(in crate::native) const STATE_DIR_ENV: &str = "AGENT_BRIDGE_NATIVE_STATE_DIR";
+pub(in crate::native) const SESSION_DIR_ENV: &str = "AGENT_BRIDGE_NATIVE_SESSION_DIR";
+
+pub(in crate::native) fn valid_session_id(value: &str) -> bool {
+    value.starts_with("session-")
+        && value.len() <= 96
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+pub(in crate::native) fn require_valid_session_id(value: &str) -> Result<()> {
+    if !valid_session_id(value) {
+        bail!("invalid Agent Bridge session id: {value:?}");
+    }
+    Ok(())
+}
+
+// macOS repair deliberately retains a surface that may outlive its owner. That
+// cleanup obligation must not turn a known process exit into a request timeout.
+// This only diagnoses a dead PID: a reused/live PID or an unknown identity is not
+// proof of death, and nothing here consumes the surface or the pending claim.
+pub(in crate::native) fn unix_ms() -> u128 {
+    #[cfg(test)]
+    if let Some(now) = super::tests::FIXED_UNIX_MS.get() {
+        return now;
+    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+pub(in crate::native) fn delegation_source() -> String {
+    std::env::var("AGENT_BRIDGE_NATIVE_SESSION_ID").unwrap_or_else(|_| "external".to_owned())
+}
+
 pub(in crate::native) fn is_regular_file(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => Ok(metadata.is_file() && !metadata.file_type().is_symlink()),
@@ -484,7 +521,7 @@ pub(in crate::native) fn persist_record(
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
-        let deadline = crate::native::close_now() + RECORD_REPLACE_WAIT;
+        let deadline = crate::native::session::close::budget::close_now() + RECORD_REPLACE_WAIT;
         let deadline = close::budget::deadline().map_or(deadline, |close| deadline.min(close));
         let mut temporary = temporary;
         loop {
@@ -493,7 +530,7 @@ pub(in crate::native) fn persist_record(
             match temporary.persist(path) {
                 Ok(file) => return Ok(file),
                 Err(error)
-                    if crate::native::close_now() < deadline
+                    if crate::native::session::close::budget::close_now() < deadline
                         && error.error.raw_os_error().is_some_and(|code| {
                             [ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION].contains(&(code as u32))
                         }) =>
@@ -501,10 +538,11 @@ pub(in crate::native) fn persist_record(
                     temporary = error.file;
                     #[cfg(test)]
                     close_io_test::at(close_io_test::Point::RecordReplaceRetry);
-                    thread::sleep(
-                        Duration::from_millis(5)
-                            .min(deadline.saturating_duration_since(crate::native::close_now())),
-                    );
+                    thread::sleep(Duration::from_millis(5).min(
+                        deadline.saturating_duration_since(
+                            crate::native::session::close::budget::close_now(),
+                        ),
+                    ));
                 }
                 Err(error) => return Err(error.error),
             }
@@ -648,7 +686,7 @@ fn lock_for_close_or_block(file: &File, name: &'static str) -> Result<()> {
     };
     let mut contended = false;
     loop {
-        let remaining = crate::native::close_remaining(deadline).map_err(|error| {
+        let remaining = crate::native::session::close::budget::close_remaining(deadline).map_err(|error| {
             if contended {
                 error.context(format!(
                     "another close or turn holds the session's {name} lock; nothing was changed while waiting for this lock; earlier close work is not rolled back"

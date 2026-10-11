@@ -5,9 +5,7 @@
     "reopen.refusal.json": 1
   },
   "src/native.rs": {
-    "AGENT_BRIDGE_NATIVE_STATE_DIR": 1,
-    "AGENT_BRIDGE_NATIVE_SESSION_DIR": 1,
-    "AGENT_BRIDGE_NATIVE_SESSION_ID": 2,
+    "AGENT_BRIDGE_NATIVE_SESSION_ID": 1,
     "AGENT_BRIDGE_EXECUTABLE": 1,
     ".prefix(\"pending-prompt-\")": 2,
     "const NATIVE_DELEGATION_HEADER: &str = \"[Agent Bridge native delegation]\";": 1,
@@ -251,6 +249,9 @@
     "turn.completion.json": 1
   },
   "src/native/session/primitives.rs": {
+    "AGENT_BRIDGE_NATIVE_STATE_DIR": 1,
+    "AGENT_BRIDGE_NATIVE_SESSION_DIR": 1,
+    "AGENT_BRIDGE_NATIVE_SESSION_ID": 1,
     ".prefix(\".agent-bridge-\")": 1,
     ".prefix(\"session-\")": 1,
     "home.join(\".agent-bridge\").join(\"native-sessions\")": 1,

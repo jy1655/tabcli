@@ -1,4 +1,5 @@
 use crate::native::session::SessionState;
+use crate::native::session::primitives::unix_ms;
 use crate::native::session::{CoreRecord, Reader, RecordStore};
 #[cfg(test)]
 use crate::native::terminal::ownership;
@@ -573,9 +574,9 @@ fn bootstrap(executable: &OsStr) -> Result<String> {
     crate::native::validate_shell_command_component(executable, "Agent Bridge executable")?;
     Ok(format!(
         "/bin/zsh -f -i -c {}",
-        crate::native::shell_quote(OsStr::new(&format!(
+        crate::native::terminal::shell_quote(OsStr::new(&format!(
             "start=$({} native-ghostty-host) || exit; . \"$start\"",
-            crate::native::shell_quote(executable)
+            crate::native::terminal::shell_quote(executable)
         )))
     ))
 }
@@ -866,7 +867,7 @@ fn parse_frame(typed: &[u8]) -> Result<Option<(String, PathBuf)>> {
 // the launcher's private session directory, its pending receipt and claim, the atomic
 // binding of a Ghostty surface to this session, and the script written for the host.
 fn verify_launch(directory: &Path, token: &str) -> Result<PathBuf> {
-    use crate::native::{SessionStatus, launch, unix_ms};
+    use crate::native::{SessionStatus, launch};
     let private = |path: &Path, directory: bool| -> Result<bool> {
         let metadata = std::fs::symlink_metadata(path)?;
         Ok(metadata.is_dir() == directory
@@ -878,7 +879,7 @@ fn verify_launch(directory: &Path, token: &str) -> Result<PathBuf> {
         .file_name()
         .and_then(|name| name.to_str())
         .context("invalid Ghostty launch directory")?;
-    crate::native::require_valid_session_id(id)?;
+    crate::native::session::primitives::require_valid_session_id(id)?;
     if !directory.is_absolute() || !private(directory, true)? {
         bail!("Ghostty launch directory is not private to the current user");
     }
@@ -933,14 +934,20 @@ fn launch_command(
     // it; the returned line is what that shell then runs.
     let script = directory.join("ghostty-start.sh");
     crate::native::validate_shell_command_component(script.as_os_str(), "Ghostty startup path")?;
-    let input = format!(". {}", crate::native::shell_quote(script.as_os_str()));
+    let input = format!(
+        ". {}",
+        crate::native::terminal::shell_quote(script.as_os_str())
+    );
     if input.len() >= 1024 {
         bail!("Ghostty startup path exceeds the canonical input line limit");
     }
     let export = match path {
         Some(path) => {
             crate::native::validate_shell_command_component(path, "Ghostty launch PATH")?;
-            format!("export PATH={}\n", crate::native::shell_quote(path))
+            format!(
+                "export PATH={}\n",
+                crate::native::terminal::shell_quote(path)
+            )
         }
         None => String::new(),
     };
@@ -1008,20 +1015,20 @@ fn close_with_runner(
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
-    crate::native::close_remaining(deadline)?;
+    crate::native::session::close::budget::close_remaining(deadline)?;
     let (tab, window) = ownership_proof(session)?;
     let before = snapshot(runner, deadline)?;
-    crate::native::close_remaining(deadline)?;
+    crate::native::session::close::budget::close_remaining(deadline)?;
     if !present(&before, session)? {
         return Ok(CloseOutcome::Missing);
     }
     // Exactly one native close. A failed reply can still have closed the terminal.
-    crate::native::close_remaining(deadline)?;
+    crate::native::session::close::budget::close_remaining(deadline)?;
     let answer = runner.run(CLOSE_TAB_SCRIPT, &[&session.id, tab, window], deadline);
     for attempt in 0..DISCOVERY_ATTEMPTS {
-        crate::native::close_remaining(deadline)?;
+        crate::native::session::close::budget::close_remaining(deadline)?;
         let after = snapshot(runner, deadline)?;
-        crate::native::close_remaining(deadline)?;
+        crate::native::session::close::budget::close_remaining(deadline)?;
         if !present(&after, session)? {
             return Ok(CloseOutcome::Closed);
         }
@@ -1092,11 +1099,14 @@ mod tests {
             &script,
             format!(
                 "{} --version",
-                crate::native::shell_quote(provider.as_os_str())
+                crate::native::terminal::shell_quote(provider.as_os_str())
             ),
         )
         .unwrap();
-        let source = format!(". {}", crate::native::shell_quote(script.as_os_str()));
+        let source = format!(
+            ". {}",
+            crate::native::terminal::shell_quote(script.as_os_str())
+        );
         let run = |command: &str| {
             Command::new("/bin/zsh")
                 .args(["-f", "-c", command])
@@ -1692,29 +1702,39 @@ mod tests {
         assert!(store.status().unwrap().error.unwrap().contains("u2"));
         // The ordinary explicit-close transaction must keep a failed close recoverable.
         assert!(
-            close::close(&store, None, crate::native::close_deadline(), |surface| {
-                crate::native::terminal::ownership::verify_terminal_close_authority(
-                    directory.path(),
-                    id,
-                    surface,
-                    crate::native::close_deadline(),
-                )?;
-                close_with_runner(&mut f, surface, soon()).map(Into::into)
-            })
+            close::close(
+                &store,
+                None,
+                crate::native::session::close::budget::close_deadline(),
+                |surface| {
+                    crate::native::terminal::ownership::verify_terminal_close_authority(
+                        directory.path(),
+                        id,
+                        surface,
+                        crate::native::session::close::budget::close_deadline(),
+                    )?;
+                    close_with_runner(&mut f, surface, soon()).map(Into::into)
+                }
+            )
             .is_err()
         );
         assert_eq!(store.terminal().unwrap(), retained);
         assert_eq!(store.status().unwrap().state, SessionState::Failed);
         f.close_timeout = false;
-        close::close(&store, None, crate::native::close_deadline(), |surface| {
-            crate::native::terminal::ownership::verify_terminal_close_authority(
-                directory.path(),
-                id,
-                surface,
-                crate::native::close_deadline(),
-            )?;
-            close_with_runner(&mut f, surface, soon()).map(Into::into)
-        })
+        close::close(
+            &store,
+            None,
+            crate::native::session::close::budget::close_deadline(),
+            |surface| {
+                crate::native::terminal::ownership::verify_terminal_close_authority(
+                    directory.path(),
+                    id,
+                    surface,
+                    crate::native::session::close::budget::close_deadline(),
+                )?;
+                close_with_runner(&mut f, surface, soon()).map(Into::into)
+            },
+        )
         .unwrap();
         assert_eq!(store.status().unwrap().state, SessionState::Closed);
         assert!(store.terminal().is_err());
@@ -1730,9 +1750,12 @@ mod tests {
         let store = Store::open_unchecked(directory.path());
         let before = std::fs::read(store.record(CoreRecord::Status).path()).unwrap();
         let claim = std::fs::read(store.record(CoreRecord::TurnClaim).path()).unwrap();
-        let refused = close::close(&store, None, crate::native::close_deadline(), |_| {
-            panic!("no handle exists yet")
-        });
+        let refused = close::close(
+            &store,
+            None,
+            crate::native::session::close::budget::close_deadline(),
+            |_| panic!("no handle exists yet"),
+        );
         assert!(
             refused.is_err(),
             "close during pending creation must be refused, got {refused:?}"
@@ -1771,15 +1794,20 @@ mod tests {
         assert_eq!(store.terminal().unwrap().id, "u2");
         f.close_timeout = false;
         let id = directory.path().file_name().unwrap().to_str().unwrap();
-        close::close(&store, None, crate::native::close_deadline(), |surface| {
-            crate::native::terminal::ownership::verify_terminal_close_authority(
-                directory.path(),
-                id,
-                surface,
-                crate::native::close_deadline(),
-            )?;
-            close_with_runner(&mut f, surface, soon()).map(Into::into)
-        })
+        close::close(
+            &store,
+            None,
+            crate::native::session::close::budget::close_deadline(),
+            |surface| {
+                crate::native::terminal::ownership::verify_terminal_close_authority(
+                    directory.path(),
+                    id,
+                    surface,
+                    crate::native::session::close::budget::close_deadline(),
+                )?;
+                close_with_runner(&mut f, surface, soon()).map(Into::into)
+            },
+        )
         .unwrap();
         assert_eq!(store.status().unwrap().state, SessionState::Closed);
         assert_eq!(f.state.terminals.len(), 1);
@@ -1811,7 +1839,7 @@ mod tests {
             close::close(
                 &store,
                 earlier.map(str::to_owned),
-                crate::native::close_deadline(),
+                crate::native::session::close::budget::close_deadline(),
                 |_| panic!("no handle exists yet"),
             )
             .unwrap();
@@ -1853,9 +1881,12 @@ mod tests {
                 store.closed_if_present().unwrap().unwrap().error,
                 status.error
             );
-            close::close(&store, None, crate::native::close_deadline(), |_| {
-                panic!("a closed session grants no close authority")
-            })
+            close::close(
+                &store,
+                None,
+                crate::native::session::close::budget::close_deadline(),
+                |_| panic!("a closed session grants no close authority"),
+            )
             .unwrap();
             assert_eq!(store.status().unwrap().error, status.error);
             assert!(!store.record(CoreRecord::Terminal).path().exists());
@@ -1914,9 +1945,12 @@ mod tests {
                 .write_json(&pending)
                 .unwrap();
             for _ in 0..2 {
-                close::close(&store, None, crate::native::close_deadline(), |_| {
-                    panic!("an unbound residual grants no close authority")
-                })
+                close::close(
+                    &store,
+                    None,
+                    crate::native::session::close::budget::close_deadline(),
+                    |_| panic!("an unbound residual grants no close authority"),
+                )
                 .unwrap();
                 let closed = store.status().unwrap();
                 assert_eq!(closed.state, SessionState::Closed);
@@ -2040,7 +2074,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("launch.sh");
         std::fs::write(&script, "true\n").unwrap();
-        let source = format!(". {}", crate::native::shell_quote(script.as_os_str()));
+        let source = format!(
+            ". {}",
+            crate::native::terminal::shell_quote(script.as_os_str())
+        );
         let path = format!("/{}:/usr/bin:/bin", "p".repeat(1300));
         let command =
             launch_command(directory.path(), &source, Some(std::ffi::OsStr::new(&path))).unwrap();
@@ -2108,7 +2145,7 @@ mod tests {
             &launch,
             format!(
                 "printf started > {}; exit\n",
-                crate::native::shell_quote(marker.as_os_str())
+                crate::native::terminal::shell_quote(marker.as_os_str())
             ),
         )
         .unwrap();
@@ -2122,7 +2159,10 @@ mod tests {
         start_bound(
             &mut f,
             &handle,
-            &format!(". {}", crate::native::shell_quote(launch.as_os_str())),
+            &format!(
+                ". {}",
+                crate::native::terminal::shell_quote(launch.as_os_str())
+            ),
             directory.path(),
             soon(),
         )
@@ -2335,8 +2375,8 @@ mod tests {
             let owner = path.join("owner-probe.json");
             let probe = format!(
                 "AB_GHOSTTY_PROBE=owner AB_GHOSTTY_PROBE_DIR={} {} {PROBE}; exit $?",
-                crate::native::shell_quote(path.as_os_str()),
-                crate::native::shell_quote(std::env::current_exe().unwrap().as_os_str())
+                crate::native::terminal::shell_quote(path.as_os_str()),
+                crate::native::terminal::shell_quote(std::env::current_exe().unwrap().as_os_str())
             );
             let mut f = existing();
             f.pty = Some(Pty {

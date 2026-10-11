@@ -1,6 +1,13 @@
 //! The user's request to interrupt one claimed turn.
-use super::{CoreRecord, Reader, Store, requests, turn, unix_ms};
-use crate::native::{SessionState, provider, valid_turn_claim_token};
+use crate::native::provider;
+use crate::native::session::primitives::unix_ms;
+use crate::native::session::state::SessionState;
+use crate::native::session::turn::valid_turn_claim_token;
+#[cfg(test)]
+use crate::native::session::turn::{
+    acquire_ready_turn_claim, acquire_turn_claim, write_pending_completion_event,
+};
+use crate::native::session::{CoreRecord, Reader, Store, requests, turn};
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -96,7 +103,9 @@ fn request_with_support(
         .as_ref()
         .filter(|p| p.event_file == receipt.event_file);
     let published = journaled
-        .map(|p| store.journaled_event_state_within(p, crate::native::EVENT_READ_LIMIT))
+        .map(|p| {
+            store.journaled_event_state_within(p, crate::native::session::schema::EVENT_READ_LIMIT)
+        })
         .transpose()?;
     if turn::event_published(journaled.is_some(), published.as_ref(), true) {
         return Err(Refusal(format!(
@@ -131,7 +140,10 @@ fn request_with_support(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native::*;
+    use crate::native::session::schema::SessionEvent;
+    use crate::native::session::turn::PendingTurnCompletion;
+    use crate::native::session::{self, update_status};
+    use std::fs;
 
     fn fixture() -> (tempfile::TempDir, Store, session::turn::Claim) {
         let dir = tempfile::tempdir().unwrap();

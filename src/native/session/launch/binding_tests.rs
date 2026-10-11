@@ -1,7 +1,10 @@
 //! Characterization shared by the three real host entry points. The script runs only
 //! at read boundaries on the calling test thread; no scheduler or wall-clock wait.
 use super::*;
+use crate::native::session::names::*;
+use crate::native::session::{self, update_status};
 use std::cell::RefCell;
+use std::{fs, path::Path};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::native) enum Point {

@@ -1253,7 +1253,7 @@ fn run_message_receipt(request_id: &str) -> Result<()> {
 
 fn read_message_hook_input(request_id: &str) -> Result<(MessengerFiles, serde_json::Value)> {
     let directory = PathBuf::from(
-        std::env::var_os(super::super::SESSION_DIR_ENV)
+        std::env::var_os(crate::native::session::primitives::SESSION_DIR_ENV)
             .context("Claude message hook session directory is not set")?,
     );
     Reader::open_unchecked(&directory).validate_hook_directory()?;
@@ -1471,9 +1471,10 @@ fn messenger_command(
         CLAUDE_CODE_SESSION_MARKERS,
     )?;
     configure_process_tree(&mut command);
-    command
-        .current_dir(directory)
-        .env(super::super::SESSION_DIR_ENV, directory);
+    command.current_dir(directory).env(
+        crate::native::session::primitives::SESSION_DIR_ENV,
+        directory,
+    );
     Ok(command)
 }
 
@@ -1992,7 +1993,10 @@ mod tests {
         crate::native::process_env::tests::assert_provider_environment(
             &command,
             super::CLAUDE_CODE_SESSION_MARKERS,
-            &[(crate::native::SESSION_DIR_ENV, Some(directory.as_os_str()))],
+            &[(
+                crate::native::session::primitives::SESSION_DIR_ENV,
+                Some(directory.as_os_str()),
+            )],
         );
     }
 
@@ -2591,7 +2595,7 @@ mod tests {
         handle_hook(directory.path(), &payload).unwrap();
 
         let events = super::super::super::event_paths(directory.path()).unwrap();
-        let event: super::super::super::SessionEvent =
+        let event: crate::native::session::schema::SessionEvent =
             super::super::super::read_json(&events[0]).unwrap();
         assert_eq!(event.message, "initial result");
         assert_eq!(
@@ -2662,7 +2666,7 @@ mod tests {
 
         let events = super::super::super::event_paths(directory.path()).unwrap();
         assert_eq!(events.len(), 1);
-        let event: super::super::super::SessionEvent =
+        let event: crate::native::session::schema::SessionEvent =
             super::super::super::read_json(&events[0]).unwrap();
         assert_eq!(event.message, "correlated result");
         assert_eq!(

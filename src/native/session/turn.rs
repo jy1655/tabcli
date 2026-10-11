@@ -1,5 +1,31 @@
 //! Claims, receipts, completion publication and recovery for one session.
-use crate::native::*;
+use crate::native::session;
+use crate::native::session::primitives::unix_ms;
+#[cfg(test)]
+use crate::native::session::primitives::{injected_sync_failure, with_sync_failure};
+use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
+use crate::native::session::state::{SessionState, SessionStatus, update_status};
+use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store, requests};
+#[cfg(target_os = "macos")]
+use crate::native::terminal::ownership::NativeSessionOwner;
+
+#[cfg(test)]
+use crate::native::session::{names::TURN_CLAIM_FILE, primitives::lock_turn_claim};
+#[cfg(test)]
+use agent_bridge::checked_deadline_from;
+#[cfg(target_os = "macos")]
+use agent_bridge::process_is_alive;
+use agent_bridge::{FirstPartyCli, terminal_safe_text};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+pub(in crate::native) static TURN_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(in crate::native) struct PendingTurnCompletion {

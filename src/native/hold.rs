@@ -1,5 +1,6 @@
 //! Set or release the user's follow-up hold.
 use super::*;
+use crate::native::session::primitives::require_valid_session_id;
 use serde_json::json;
 
 #[derive(Debug)]

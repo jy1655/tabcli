@@ -1,4 +1,8 @@
 use super::*;
+use crate::native::session::state::update_status_with_residual;
+use crate::native::session::{launch, turn};
+use crate::native::terminal;
+use std::fs;
 
 fn fixture(state: SessionState) -> (tempfile::TempDir, Store) {
     let directory = tempfile::Builder::new()
@@ -246,9 +250,12 @@ fn delivery_settlement_after_close_preserves_the_tombstone() {
                 closed.generation += 1;
                 store.write_closed(&closed).unwrap();
             } else {
-                session::close::close(&store, None, crate::native::close_deadline(), |_| {
-                    panic!("no bound surface")
-                })
+                session::close::close(
+                    &store,
+                    None,
+                    crate::native::session::close::budget::close_deadline(),
+                    |_| panic!("no bound surface"),
+                )
                 .unwrap();
             }
             let tombstone = store.record(CoreRecord::Closed).bytes().unwrap().unwrap();
@@ -308,9 +315,12 @@ fn delivery_begin_refuses_closed_and_replaced_claims() {
             .complete("completed", None, None)
             .unwrap();
         let newer = if closed {
-            session::close::close(&store, None, crate::native::close_deadline(), |_| {
-                panic!("no surface")
-            })
+            session::close::close(
+                &store,
+                None,
+                crate::native::session::close::budget::close_deadline(),
+                |_| panic!("no surface"),
+            )
             .unwrap();
             None
         } else {

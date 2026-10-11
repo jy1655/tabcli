@@ -62,7 +62,7 @@ fn timeout_screen_lock(probe: impl FnOnce(Instant) -> Option<bool>) -> Option<bo
     let diagnostic_deadline = Instant::now() + Duration::from_millis(500);
     let deadline = match crate::native::session::close::budget::deadline() {
         Some(close) => {
-            crate::native::close_remaining(close).ok()?;
+            crate::native::session::close::budget::close_remaining(close).ok()?;
             diagnostic_deadline.min(close)
         }
         None => diagnostic_deadline,
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn close_deadline_timeout_skips_diagnostic_probe_only_inside_close() {
         let now = Instant::now();
-        let _clock = crate::native::TestCloseClock::new(now);
+        let _clock = crate::native::session::close::budget::TestCloseClock::new(now);
         {
             let _budget = crate::native::session::close::budget::Scope::enter(now);
             assert_eq!(

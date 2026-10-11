@@ -2,6 +2,11 @@
 //! Provider adapters retain conversation-holder evidence; terminal ownership retains Close authority.
 use super::doctor::{Availability, Check};
 use super::*;
+use crate::native::session::primitives::{delegation_source, unix_ms, valid_session_id};
+use crate::native::session::schema::{
+    ProviderProcessRecord, RecordedReopenRefusal, SessionEvent, SessionManifest,
+};
+use crate::native::session::turn::TURN_CLAIM_SEQUENCE;
 use serde_json::{Value, json};
 
 // Where a reopened session's provider conversation came from: the closed Bridge session and
@@ -88,19 +93,6 @@ const REOPEN_REFUSAL_LAUNCH_PHASE: &str = "launch";
 // next reopen attempt; the release decision itself is always taken from the session's live
 // records, never from this field.
 const REOPEN_REFUSAL_CLEANUP_PENDING: &str = "pending";
-
-#[derive(Debug, Deserialize, Serialize)]
-pub(super) struct RecordedReopenRefusal {
-    schema: u32,
-    phase: String,
-    gate: String,
-    detail: String,
-    created_unix_ms: u128,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cleanup: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    cleanup_detail: Option<String>,
-}
 
 // Records a launch-phase gate refusal that happened after the new session existed, then
 // returns the typed refusal. Only the launch phase writes this record; follow-up refusals
@@ -477,7 +469,7 @@ pub(super) fn close_surface_after_reopen_verification_failure(
             directory,
             id,
             Some(format!("{detected:#}")),
-            deadline.min(crate::native::close_deadline()),
+            deadline.min(crate::native::session::close::budget::close_deadline()),
         )
     })
 }

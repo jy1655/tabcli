@@ -1,8 +1,11 @@
 //! A read-only projection of retained evidence, not a history of inferred transitions.
 use super::*;
 use crate::native::session::SessionState;
+use crate::native::session::schema::{
+    EVENT_READ_LIMIT, SESSION_SCHEMA, SessionEvent, SessionManifest,
+};
 use crate::native::session::{CoreRecord, Reader, turn};
-use crate::native::{EventsDirectory, SESSION_SCHEMA, valid_turn_claim_token};
+use crate::native::{EventsDirectory, valid_turn_claim_token};
 use agent_bridge::PUBLIC_COMMAND;
 use std::collections::BTreeMap;
 

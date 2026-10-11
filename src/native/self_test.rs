@@ -1,4 +1,7 @@
 use super::*;
+use crate::native::session::primitives::{
+    STATE_DIR_ENV, require_valid_session_id, valid_session_id,
+};
 use crate::native::session::{Reader, RecordStore, Store};
 use agent_bridge::PUBLIC_COMMAND;
 use serde_json::Value;

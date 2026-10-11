@@ -1,10 +1,10 @@
 //! Views of one session's durable records.
-use super::{
-    ProviderProcessRecord, RecordedReopenRefusal, SESSION_SCHEMA, STATE_DIR_ENV, SessionEvent,
-    SessionManifest, require_valid_session_id, terminal, unix_ms,
-};
+use crate::native::terminal;
 use crate::native::terminal::ownership::NativeSessionOwner;
 use anyhow::{Context, Result, bail};
+use schema::{
+    ProviderProcessRecord, RecordedReopenRefusal, SESSION_SCHEMA, SessionEvent, SessionManifest,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -25,8 +25,9 @@ mod names;
 pub(in crate::native) mod requests;
 pub(in crate::native) mod turn;
 use turn::{JournaledEventRead, JournaledEventState, PendingTurnCompletion};
-mod primitives;
+pub(in crate::native) mod primitives;
 mod reads;
+pub(in crate::native) mod schema;
 #[cfg(test)]
 pub(in crate::native) use names::*;
 #[cfg(not(test))]
@@ -565,23 +566,24 @@ pub(super) mod tests;
 mod owner;
 mod state;
 pub(in crate::native) use owner::{OwnerObservation, observe_owner, observe_owner_record};
-pub(in crate::native) use state::{
-    SessionState, SessionStatus, update_status, update_status_with_residual,
-};
+pub(in crate::native) use state::{SessionState, SessionStatus, update_status};
 pub(in crate::native) mod launch;
 
 impl Store {
     /// Publish an accepted completion before repairing its session's dead owner.
     #[cfg(test)]
     pub(in crate::native) fn converge(&self) -> Result<()> {
-        self.converge_until(crate::native::close_deadline())
+        self.converge_until(crate::native::session::close::budget::close_deadline())
     }
 
     pub(in crate::native) fn converge_until(&self, deadline: std::time::Instant) -> Result<()> {
         // Repair owns recovery and preserves its damage while settling a dead owner.
         // An earlier recovery here both duplicated work and skipped that settlement
         // when a completion record could not be published.
-        close::repair_dead_owner_until(self, deadline.min(crate::native::close_deadline()))?;
+        close::repair_dead_owner_until(
+            self,
+            deadline.min(crate::native::session::close::budget::close_deadline()),
+        )?;
         Ok(())
     }
 }

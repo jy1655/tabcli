@@ -2,6 +2,7 @@
 use super::*;
 use crate::native::session;
 use crate::native::session::OwnerObservation;
+use crate::native::session::primitives::valid_session_id;
 use observation::{Observation, StatusObservation, SurfaceRecord};
 
 #[derive(Debug)]

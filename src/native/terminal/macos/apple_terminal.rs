@@ -310,8 +310,8 @@ fn launch_bootstrap(command: &str, directory: &Path) -> Result<String> {
         std::env::current_exe().context("failed to resolve Agent Bridge executable")?;
     let host = format!(
         "{} native-terminal-host {}",
-        crate::native::shell_quote(executable.as_os_str()),
-        crate::native::shell_quote(directory.as_os_str())
+        crate::native::terminal::shell_quote(executable.as_os_str()),
+        crate::native::terminal::shell_quote(directory.as_os_str())
     );
     install_bootstrap(directory, &host, command)
 }
@@ -329,7 +329,7 @@ fn install_bootstrap(directory: &Path, host: &str, command: &str) -> Result<Stri
     RecordStore::at(&path).write_private(format!("{host} || exit\n{command}\n").as_bytes())?;
     Ok(format!(
         ". {}",
-        crate::native::shell_quote(path.as_os_str())
+        crate::native::terminal::shell_quote(path.as_os_str())
     ))
 }
 
@@ -352,7 +352,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .context("invalid Terminal.app launch directory")?;
-    crate::native::require_valid_session_id(id)?;
+    crate::native::session::primitives::require_valid_session_id(id)?;
     let released = release_start(directory, id);
     crate::native::launch::log(
         &Store::open_unchecked(directory),
@@ -496,19 +496,19 @@ fn close_attested_session_with(
     // Recheck before every transaction, including retries; a restarted app must
     // never inherit the old window/tty's close authority.
     close_session_with(session, |script, arguments| {
-        crate::native::close_remaining(deadline)?;
+        crate::native::session::close::budget::close_remaining(deadline)?;
         if !terminal_app_alive_with(app, &mut process_birth)? {
             return Ok("missing".into());
         }
         require_unique_terminal_app(app, &instances()?)?;
-        crate::native::close_remaining(deadline)?;
+        crate::native::session::close::budget::close_remaining(deadline)?;
         let reply = run(script, arguments)?;
-        crate::native::close_remaining(deadline)?;
+        crate::native::session::close::budget::close_remaining(deadline)?;
         if !terminal_app_alive_with(app, &mut process_birth)? {
             return Ok("missing".into());
         }
         require_unique_terminal_app(app, &instances()?)?;
-        crate::native::close_remaining(deadline)?;
+        crate::native::session::close::budget::close_remaining(deadline)?;
         Ok(reply)
     })
 }
@@ -571,7 +571,7 @@ pub(in crate::native) fn verified_close_tty(
     if session.kind != terminal::TerminalKind::AppleTerminal {
         bail!("Terminal.app ownership proof received a different terminal kind")
     }
-    crate::native::close_remaining(deadline)?;
+    crate::native::session::close::budget::close_remaining(deadline)?;
     verify_tab_with_deadline(session, Some(deadline))
 }
 
@@ -861,13 +861,13 @@ mod tests {
             bootstrap,
             format!(
                 ". {}",
-                crate::native::shell_quote(directory.join(BOOTSTRAP_FILE).as_os_str())
+                crate::native::terminal::shell_quote(directory.join(BOOTSTRAP_FILE).as_os_str())
             )
         );
         let script = std::fs::read_to_string(directory.join(BOOTSTRAP_FILE)).unwrap();
         assert!(script.contains(&format!(
             "native-terminal-host {}",
-            crate::native::shell_quote(directory.as_os_str())
+            crate::native::terminal::shell_quote(directory.as_os_str())
         )));
         assert!(script.ends_with(&format!("{wrapper}\n")));
     }
@@ -930,7 +930,7 @@ mod tests {
                 start_microseconds: 42,
             };
             let now = Instant::now();
-            let clock = crate::native::TestCloseClock::new(now);
+            let clock = crate::native::session::close::budget::TestCloseClock::new(now);
             let deadline = now + Duration::from_secs(1);
             let calls = std::cell::Cell::new(0);
             let births = std::cell::Cell::new(0);
@@ -1021,7 +1021,7 @@ mod tests {
                     }
                     .into())
                 },
-                crate::native::close_deadline(),
+                crate::native::session::close::budget::close_deadline(),
             );
             assert_eq!(
                 result.is_ok(),
@@ -1585,18 +1585,23 @@ end mockClose
         let handle = store.record(CoreRecord::Terminal).bytes().unwrap();
         let mut terminal = running(&[KILLED]);
         let mut closes = Vec::new();
-        let first = close::close(&store, None, crate::native::close_deadline(), |surface| {
-            super::close_session_with(surface, |script, arguments| {
-                let (reply, events) = replay(script, &terminal, arguments);
-                if !events.is_empty() {
-                    terminal = running(&[HIDDEN_EMPTY]);
-                    closes.extend(events);
-                    anyhow::bail!("automation deadline expired after close, reply lost");
-                }
-                reply.map_err(anyhow::Error::msg)
-            })
-            .map(Into::into)
-        });
+        let first = close::close(
+            &store,
+            None,
+            crate::native::session::close::budget::close_deadline(),
+            |surface| {
+                super::close_session_with(surface, |script, arguments| {
+                    let (reply, events) = replay(script, &terminal, arguments);
+                    if !events.is_empty() {
+                        terminal = running(&[HIDDEN_EMPTY]);
+                        closes.extend(events);
+                        anyhow::bail!("automation deadline expired after close, reply lost");
+                    }
+                    reply.map_err(anyhow::Error::msg)
+                })
+                .map(Into::into)
+            },
+        );
         assert!(first.unwrap_err().to_string().contains("reply lost"));
         assert_eq!(closes, ["closed 8341"]);
         assert_eq!(store.record(CoreRecord::Terminal).bytes().unwrap(), handle);
@@ -1604,17 +1609,22 @@ end mockClose
         let (presence, events) = replay(VERIFY_TAB_SCRIPT, &terminal, &[TTY, WINDOW]);
         assert!(presence.unwrap_err().contains("no longer matches a tab"));
         assert!(events.is_empty());
-        let retry = close::close(&store, None, crate::native::close_deadline(), |surface| {
-            super::close_session_with(surface, |script, arguments| {
-                let (reply, events) = replay(script, &terminal, arguments);
-                assert!(
-                    events.is_empty(),
-                    "a new close has no reply-based authority"
-                );
-                reply.map_err(anyhow::Error::msg)
-            })
-            .map(Into::into)
-        });
+        let retry = close::close(
+            &store,
+            None,
+            crate::native::session::close::budget::close_deadline(),
+            |surface| {
+                super::close_session_with(surface, |script, arguments| {
+                    let (reply, events) = replay(script, &terminal, arguments);
+                    assert!(
+                        events.is_empty(),
+                        "a new close has no reply-based authority"
+                    );
+                    reply.map_err(anyhow::Error::msg)
+                })
+                .map(Into::into)
+            },
+        );
         assert!(
             retry
                 .unwrap_err()
@@ -1922,12 +1932,14 @@ end run
                     &script,
                     format!(
                         "printf started > {}; exit\n",
-                        crate::native::shell_quote(marker.as_os_str())
+                        crate::native::terminal::shell_quote(marker.as_os_str())
                     ),
                 )
                 .unwrap();
-                let bridge_command =
-                    format!(". {}", crate::native::shell_quote(script.as_os_str()));
+                let bridge_command = format!(
+                    ". {}",
+                    crate::native::terminal::shell_quote(script.as_os_str())
+                );
                 let end = if typed_after_creation { "\r" } else { "\n" };
                 let typed = format!(
                     "{}{bridge_command}{end}exit{end}",
@@ -2143,7 +2155,10 @@ end run
         let path = directory.path().join("terminal-start.sh");
         assert_eq!(
             start,
-            format!(". {}", crate::native::shell_quote(path.as_os_str()))
+            format!(
+                ". {}",
+                crate::native::terminal::shell_quote(path.as_os_str())
+            )
         );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -2240,7 +2255,7 @@ end run
         let foreign_input = outcome == "another standard input";
         let probe = format!(
             "{} --exact native::terminal::macos::apple_terminal::tests::terminal_app_start_probe --nocapture --test-threads=1",
-            crate::native::shell_quote(std::env::current_exe().unwrap().as_os_str())
+            crate::native::terminal::shell_quote(std::env::current_exe().unwrap().as_os_str())
         );
         let start = super::install_bootstrap(
             directory,

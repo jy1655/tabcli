@@ -1,5 +1,8 @@
 use super::*;
 use crate::native::session::close::compatibility::*;
+use crate::native::session::schema::{
+    ProviderProcessRecord, RecordedReopenRefusal, SESSION_SCHEMA, SessionEvent, SessionManifest,
+};
 use crate::native::tests::{
     spawn_surviving_process, test_windows_process_identity, write_provider_process_record,
 };
@@ -1139,14 +1142,14 @@ fn reopen_refusal_record_carries_the_gate_and_only_a_holder_check_failure_closes
         directory.path(),
         "session-reopenrefuse",
         anyhow::anyhow!("delivery failed"),
-        crate::native::close_deadline(),
+        crate::native::session::close::budget::close_deadline(),
     );
     assert_eq!(format!("{passed:#}"), "delivery failed");
     let passed = close_surface_after_reopen_verification_failure(
         directory.path(),
         "session-reopenrefuse",
         error,
-        crate::native::close_deadline(),
+        crate::native::session::close::budget::close_deadline(),
     );
     assert_eq!(reopen_refusal_gate(&passed), Some("provider-unsupported"));
     assert_eq!(snapshot_directory(directory.path()), before);
@@ -2072,7 +2075,7 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
                         closed_terminals.push(session.id.clone());
                         Ok(terminal::CloseOutcome::Closed)
                     },
-                    crate::native::close_deadline(),
+                    crate::native::session::close::budget::close_deadline(),
                 )
             });
         drop(initial_claim);
@@ -2446,7 +2449,7 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
             closed_terminals.push(session.id.clone());
             Ok(terminal::CloseOutcome::Closed)
         },
-        crate::native::close_deadline(),
+        crate::native::session::close::budget::close_deadline(),
     )
     .unwrap();
     assert_eq!(closed_terminals, [format!("{new_id}-terminal")]);
@@ -2689,7 +2692,7 @@ fn surviving_provider_process_retains_the_source_marker_until_it_is_verified_gon
             closed_terminals.push(session.id.clone());
             Ok(terminal::CloseOutcome::Closed)
         },
-        crate::native::close_deadline(),
+        crate::native::session::close::budget::close_deadline(),
     )
     .unwrap();
     assert_eq!(closed_terminals, [format!("{new_id}-terminal")]);

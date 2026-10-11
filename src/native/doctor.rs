@@ -2,12 +2,13 @@
 use super::query::observation::{Observation, SessionEvidence, SurfaceRecord};
 use super::{
     Duration, FirstPartyCli, Instant, NativeCommand, OsString, Output, Path, Reader, Result,
-    SESSION_DIR_ENV, SeekFrom, Serialize, SessionManifest, Stdio, bail, cli_version_is_supported,
-    consent, fs, is_executable, option_value, provider, provider_process, query, reopen,
-    require_valid_session_id, resolve_provider, set_flag_once, set_once, terminal,
-    terminal_safe_text, thread, unix_ms,
+    SeekFrom, Serialize, Stdio, bail, cli_version_is_supported, consent, fs, is_executable,
+    option_value, provider, provider_process, query, reopen, resolve_provider, set_flag_once,
+    set_once, terminal, terminal_safe_text, thread,
 };
 use crate::native::session::SessionState;
+use crate::native::session::primitives::{SESSION_DIR_ENV, require_valid_session_id, unix_ms};
+use crate::native::session::schema::SessionManifest;
 use crate::native::{FromStr, Read, Seek, process_env};
 use agent_bridge::PUBLIC_COMMAND;
 use serde_json::{Value, json};
