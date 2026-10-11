@@ -84,7 +84,7 @@ impl SessionEvidence {
             if budget.is_zero() {
                 bail!("diagnostic probe deadline exhausted")
             }
-            terminal::surface_present(&session, budget)
+            terminal::surface_present(directory, &session, budget)
         })())
     }
 

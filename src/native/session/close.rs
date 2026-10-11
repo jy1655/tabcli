@@ -703,7 +703,13 @@ pub(in crate::native) fn repair_dead_owner_until(store: &Store, deadline: Instan
         store,
         repair_owner_is_live,
         terminal::surface_outlives_owner,
-        |surface| terminal::ownership::close_dead_owner_surface_until(surface, deadline),
+        |surface| {
+            terminal::ownership::close_dead_owner_surface_until(
+                store.directory(),
+                surface,
+                deadline,
+            )
+        },
         deadline,
     )
 }

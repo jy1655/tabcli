@@ -388,7 +388,7 @@ fn respond_to_workspace_dialog(
         );
     }
     applied(directory, "workspace-dialog-response-pending")?;
-    terminal::guarded_dialog_input(session, input, deadline)
+    terminal::guarded_dialog_input(directory, session, input, deadline)
 }
 
 pub(super) fn complete_launch(

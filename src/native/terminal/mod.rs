@@ -463,17 +463,21 @@ pub(super) const fn guards_dialog_input(kind: TerminalKind) -> bool {
 }
 
 pub(super) fn guarded_dialog_input(
+    directory: &Path,
     session: &TerminalSession,
     input: &GuardedDialogInput,
     deadline: Instant,
 ) -> Result<bool> {
     #[cfg(target_os = "macos")]
-    return macos::guarded_dialog_input(session, input, deadline);
+    {
+        let _ = directory;
+        macos::guarded_dialog_input(session, input, deadline)
+    }
     #[cfg(windows)]
-    return windows::guarded_dialog_input(session, input, deadline);
+    return windows::guarded_dialog_input(directory, session, input, deadline);
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = (session, input, deadline);
+        let _ = (directory, session, input, deadline);
         bail!("managed dialog input unsupported on this platform");
     }
 }
@@ -491,33 +495,36 @@ pub(super) fn remaining_send_budget_at(
 
 #[cfg(target_os = "macos")]
 pub(super) fn verify_macos_surface(
+    directory: &Path,
     session: &TerminalSession,
     timeout: Option<std::time::Duration>,
 ) -> Result<Option<String>> {
-    macos::verify_surface(session, timeout)
+    macos::verify_surface(directory, session, timeout)
 }
 
 pub(super) fn close_session_until(
+    directory: &Path,
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
     crate::native::close_remaining(deadline)?;
-    platform::close_session_until(session, deadline)
+    platform::close_session_until(directory, session, deadline)
 }
 
 /// Read-only presence check. Unlike control authorization, absence and an inspection
 /// error have different meanings. Never open a terminal app merely to diagnose it.
 pub(super) fn surface_present(
+    directory: &Path,
     session: &TerminalSession,
     timeout: std::time::Duration,
 ) -> Result<bool> {
     #[cfg(target_os = "macos")]
     {
-        macos::surface_present(session, timeout)
+        macos::surface_present(directory, session, timeout)
     }
     #[cfg(windows)]
     {
-        let _ = timeout;
+        let _ = (directory, timeout);
         let pid: u32 = session.id.parse().context("invalid Windows console pid")?;
         if !agent_bridge::process_is_alive(pid) {
             return Ok(false);
@@ -530,7 +537,7 @@ pub(super) fn surface_present(
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
-        let _ = (session, timeout);
+        let _ = (directory, session, timeout);
         bail!("terminal surface probes are unsupported on this platform")
     }
 }

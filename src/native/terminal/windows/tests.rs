@@ -489,3 +489,80 @@ fn close_deadline_new_helper_observes_gone_root_and_ends_recorded_live_host() {
     );
     assert_eq!(host.wait().unwrap().code(), Some(0));
 }
+
+#[test]
+fn guarded_dialog_file_stays_private_in_the_supplied_helper_directory() {
+    use crate::native::{
+        consent,
+        terminal::{self, DialogKey, GuardedDialogInput, TerminalSession},
+    };
+    use std::{path::PathBuf, process::Command};
+    const CHILD: &str = "AB_WINDOWS_DIALOG_DIRECTORY_TEST";
+    const TEST: &str = "native::terminal::windows::tests::guarded_dialog_file_stays_private_in_the_supplied_helper_directory";
+    if std::env::var_os(CHILD).is_none() {
+        let root = tempfile::tempdir().unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .env("AGENT_BRIDGE_NATIVE_STATE_DIR", root.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let root = PathBuf::from(std::env::var_os("AGENT_BRIDGE_NATIVE_STATE_DIR").unwrap());
+    let directory = root.join("session-dialog");
+    fs::create_dir(&directory).unwrap();
+    let handle: TerminalSession = serde_json::from_value(serde_json::json!({
+        "terminal":"windows-console", "session_id":"1", "managed_session_id":"session-dialog"
+    }))
+    .unwrap();
+    let input = GuardedDialogInput {
+        screen: "exact dialog".into(),
+        key: DialogKey::Enter,
+    };
+    let file = super::dialog_input_file(&directory, &handle, &input).unwrap();
+    assert_eq!(file.path().parent(), Some(directory.as_path()));
+    let bytes = consent::read_store(file.path()).unwrap().unwrap(); // checks owner and ACL on the read handle
+    assert_eq!(bytes, serde_json::to_string(&input).unwrap());
+    drop(file);
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+    let other_root = tempfile::tempdir().unwrap();
+    let other = other_root.path().join("session-dialog");
+    fs::create_dir(&other).unwrap();
+    let error = terminal::guarded_dialog_input(
+        &other,
+        &handle,
+        &input,
+        Instant::now() + Duration::from_secs(2),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("helper state root"), "{error:#}");
+    for id in [None, Some("session-other".into())] {
+        let mut wrong = handle.clone();
+        wrong.managed_session_id = id;
+        let error = terminal::guarded_dialog_input(
+            &directory,
+            &wrong,
+            &input,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("managed session"), "{error:#}");
+    }
+    // The existing command boundary refuses to spawn the helper, after the temporary
+    // file was created; returning must remove that file again.
+    assert_eq!(
+        terminal::guarded_dialog_input(&directory, &handle, &input, Instant::now())
+            .unwrap_err()
+            .to_string(),
+        "managed console dialog input timed out before it started"
+    );
+    assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(&other).unwrap().count(), 0);
+}

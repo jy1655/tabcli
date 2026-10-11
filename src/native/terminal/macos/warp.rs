@@ -648,8 +648,7 @@ where
                 // authorize a later Warp close. The shared handoff preserves both the
                 // failed launch and a late residual surface without reopening a session.
                 let message = format!(
-                    "failed to persist the Warp control binding: {binding_error:#}; exact Warp handle retained={session:?}; exact surface cleanup also failed: {cleanup_error:#}; {}",
-                    crate::native::launch::RESIDUAL_SURFACE_MARKER
+                    "failed to persist the Warp control binding: {binding_error:#}; exact Warp handle retained={session:?}; exact surface cleanup also failed: {cleanup_error:#}"
                 );
                 Err(
                     crate::native::terminal::RetainedLaunchSurface::new(session, message)
@@ -815,18 +814,19 @@ pub(super) fn send_file(
 }
 
 pub(super) fn verify_surface(
+    directory: &Path,
     session: &TerminalSession,
     timeout: Option<Duration>,
 ) -> Result<String> {
-    let directory = session_directory(session)?;
-    let binding = load_binding(&directory, session)?;
+    validate_session_directory(directory, session)?;
+    let binding = load_binding(directory, session)?;
     let offer: HostOffer = RecordReader::at(
-        Reader::open_unchecked(&directory)
+        Reader::open_unchecked(directory)
             .private(HOST_OFFER_FILE)
             .path(),
     )
     .read_adapter_record("Warp host offer", MAX_CONTROL_OUTPUT as u64)?;
-    validate_offer(&offer, &binding.attempt, &directory)?;
+    validate_offer(&offer, &binding.attempt, directory)?;
     let deadline = deadline_from_timeout(timeout.unwrap_or(CONTROL_TIMEOUT))?;
     let mut runner = ProcessRunner;
     let Some(client) = binding_client_if_present(&mut runner, &binding, deadline)? else {
@@ -838,9 +838,13 @@ pub(super) fn verify_surface(
     Ok(offer.tty)
 }
 
-pub(super) fn surface_present(session: &TerminalSession, timeout: Duration) -> Result<bool> {
-    let directory = session_directory(session)?;
-    let binding = load_binding(&directory, session)?;
+pub(super) fn surface_present(
+    directory: &Path,
+    session: &TerminalSession,
+    timeout: Duration,
+) -> Result<bool> {
+    validate_session_directory(directory, session)?;
+    let binding = load_binding(directory, session)?;
     let mut runner = ProcessRunner;
     let deadline = deadline_from_timeout(timeout)?;
     let Some(client) = binding_client_if_present(&mut runner, &binding, deadline)? else {
@@ -850,11 +854,13 @@ pub(super) fn surface_present(session: &TerminalSession, timeout: Duration) -> R
 }
 
 pub(super) fn close_session_until(
+    directory: &Path,
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
-    let directory = session_directory(session)?;
-    let binding = load_binding(&directory, session)?;
+    crate::native::close_remaining(deadline)?;
+    validate_session_directory(directory, session)?;
+    let binding = load_binding(directory, session)?;
     let mut runner = ProcessRunner;
     let Some(client) = binding_client_if_present(&mut runner, &binding, deadline)? else {
         return Ok(CloseOutcome::Missing);
@@ -1643,12 +1649,17 @@ impl ControlBinding {
     }
 }
 
-fn session_directory(session: &TerminalSession) -> Result<PathBuf> {
+fn validate_session_directory(directory: &Path, session: &TerminalSession) -> Result<()> {
     let id = session
         .managed_session_id
         .as_deref()
         .context("Warp terminal handle is missing its managed session binding")?;
-    Reader::session_directory(id)
+    if directory.file_name().and_then(|name| name.to_str()) != Some(id) {
+        bail!("Warp managed session binding does not match the supplied session directory");
+    }
+    crate::native::require_valid_session_id(id)?;
+    Reader::open_unchecked(directory)
+        .validate_private_session_directory(HOST_SESSION_DIRECTORY_LABEL)
 }
 
 fn installed_control_clients() -> Result<Vec<ControlClient>> {
@@ -2502,6 +2513,279 @@ mod tests {
     }
 
     #[test]
+    fn public_seam_uses_supplied_directory_without_global_rescue() {
+        use crate::native::terminal;
+        const CHILD: &str = "AB_WARP_DIRECTORY_TEST";
+        const TEST: &str = "native::terminal::macos::warp::tests::public_seam_uses_supplied_directory_without_global_rescue";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
+                .env(CHILD, "1")
+                .env("AGENT_BRIDGE_NATIVE_STATE_DIR", root.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (temp, client, attempt) = fixture();
+        let directory = temp.path().join("session-test");
+        let global = PathBuf::from(std::env::var_os("AGENT_BRIDGE_NATIVE_STATE_DIR").unwrap())
+            .join("session-test");
+        for path in [&directory, &global] {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let binding = ControlBinding {
+            schema: RECORD_SCHEMA,
+            attempt: attempt.clone(),
+            bundle: client.bundle.clone(),
+            executable: client.executable.clone(),
+            inject_warpctrl: false,
+            app_id: client.app_id.clone(),
+            channel: client.channel.clone(),
+            scheme: client.scheme.clone(),
+            instance_id: "instance-1".into(),
+            pid: std::process::id(),
+            protocol_version: 1,
+            process_birth: process::macos_process_start(std::process::id()).unwrap(),
+        };
+        // The executable is a fixture, never a terminal application. Unexpected control fails.
+        let inspect = json!({"instance_id":"instance-1", "pid":binding.pid,
+            "protocol_version":1, "actions":[], "app_id":client.app_id, "channel":client.channel});
+        let tab =
+            json!({"action":"tab.inspect", "tab":{"tab_id":"new-tab", "window_id":"new-window"}});
+        fs::write(&client.executable, format!("#!/bin/sh\ncase \"$3 $4\" in\n'instance inspect') echo '{}' ;;\n'tab inspect') echo '{}' ;;\n*) exit 99 ;;\nesac\n", inspect, tab)).unwrap();
+        RecordStore::at(&global.join(CONTROL_FILE))
+            .write_json(&binding)
+            .unwrap();
+        let offer = HostOffer {
+            schema: RECORD_SCHEMA,
+            attempt,
+            directory: directory.clone(),
+            pid: 1,
+            tty: "/dev/fixture".into(),
+        };
+        RecordStore::at(&directory.join(HOST_OFFER_FILE))
+            .write_json(&offer)
+            .unwrap();
+        RecordStore::at(&global.join(HOST_OFFER_FILE))
+            .write_json(&HostOffer {
+                schema: offer.schema,
+                attempt: offer.attempt.clone(),
+                directory: global.clone(),
+                pid: offer.pid,
+                tty: offer.tty.clone(),
+            })
+            .unwrap();
+        fn snapshot(path: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+            let mut records = BTreeMap::new();
+            for entry in fs::read_dir(path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    records.insert(path.clone(), None);
+                    records.extend(snapshot(&path));
+                } else {
+                    records.insert(path.clone(), Some(fs::read(path).unwrap()));
+                }
+            }
+            records
+        }
+        for state in ["missing", "damaged", "present", "absent"] {
+            match state {
+                "missing" => {}
+                "damaged" => fs::write(directory.join(CONTROL_FILE), "broken").unwrap(),
+                _ => {
+                    let mut supplied = binding.clone();
+                    if state == "absent" {
+                        supplied.pid = i32::MAX as u32;
+                    }
+                    RecordStore::at(&directory.join(CONTROL_FILE))
+                        .write_json(&supplied)
+                        .unwrap();
+                }
+            }
+            let before = (snapshot(temp.path()), snapshot(global.parent().unwrap()));
+            let present = terminal::surface_present(&directory, &session(), Duration::from_secs(2));
+            let verified = terminal::verify_macos_surface(
+                &directory,
+                &session(),
+                Some(Duration::from_secs(2)),
+            );
+            match state {
+                "present" => {
+                    assert!(present.unwrap());
+                    assert_eq!(verified.unwrap().as_deref(), Some("/dev/fixture"));
+                }
+                "absent" => {
+                    assert!(!present.unwrap());
+                    assert!(verified.is_err());
+                }
+                _ => {
+                    assert!(present.is_err(), "global record rescued {state}");
+                    assert!(verified.is_err());
+                }
+            }
+            for close in [
+                terminal::close_session_until,
+                super::super::close_owned_session,
+                ownership::close_dead_owner_surface_until,
+            ] {
+                let result = close(
+                    &directory,
+                    &session(),
+                    Instant::now() + Duration::from_secs(2),
+                );
+                if state == "absent" {
+                    assert_eq!(result.unwrap(), CloseOutcome::Missing);
+                } else {
+                    assert!(result.is_err());
+                }
+            }
+            assert_eq!(
+                before,
+                (snapshot(temp.path()), snapshot(global.parent().unwrap()))
+            );
+        }
+        // Doctor must observe this Reader's directory, not the process-global root.
+        // Keep a valid, present handle and binding at the global root in every case.
+        use crate::native::{doctor, query::observation::SessionEvidence, session::Store};
+        Store::open_unchecked(&global)
+            .write_terminal(&session())
+            .unwrap();
+        for state in ["present", "absent", "malformed", "mismatched"] {
+            let mut supplied = binding.clone();
+            if state == "absent" {
+                supplied.pid = i32::MAX as u32;
+            }
+            RecordStore::at(&directory.join(CONTROL_FILE))
+                .write_json(&supplied)
+                .unwrap();
+            if state == "malformed" {
+                fs::write(directory.join(CONTROL_FILE), "broken").unwrap();
+            }
+            let mut handle = session();
+            if state == "mismatched" {
+                handle.managed_session_id = Some("session-other".into());
+            }
+            Store::open_unchecked(&directory)
+                .write_terminal(&handle)
+                .unwrap();
+            let before = (snapshot(temp.path()), snapshot(global.parent().unwrap()));
+            let reader = Reader::open_unchecked(&directory);
+            let mut evidence = SessionEvidence::read(&reader, Ok(false));
+            let check = doctor::surface_check_for_test(&mut evidence, &reader);
+            assert_eq!(check.id, "terminal_surface");
+            let observed = evidence
+                .surface_presence
+                .as_ref()
+                .expect("doctor must call observe_surface");
+            match state {
+                "present" => {
+                    assert!(*observed.as_ref().unwrap());
+                    assert_eq!(check.availability, doctor::Availability::Available);
+                    assert_eq!(check.reason_code, "terminal_surface_present");
+                }
+                "absent" => {
+                    assert!(!*observed.as_ref().unwrap());
+                    assert_eq!(check.availability, doctor::Availability::Unavailable);
+                    assert_eq!(check.reason_code, "terminal_surface_missing");
+                }
+                _ => {
+                    let error = observed.as_ref().unwrap_err();
+                    assert_eq!(check.availability, doctor::Availability::Unknown);
+                    assert_eq!(check.reason_code, "terminal_surface_unverified");
+                    if state == "mismatched" {
+                        assert!(
+                            error
+                                .to_string()
+                                .contains("belongs to managed session session-other"),
+                            "{error:#}"
+                        );
+                    }
+                    let rendered = serde_json::to_value(&check).unwrap();
+                    assert!(
+                        rendered["detail"]
+                            .as_str()
+                            .unwrap()
+                            .contains(&format!("{error:#}"))
+                    );
+                }
+            }
+            assert_eq!(
+                before,
+                (snapshot(temp.path()), snapshot(global.parent().unwrap())),
+                "{state}"
+            );
+        }
+        for id in [None, Some("session-other".to_owned())] {
+            let mut handle = session();
+            handle.managed_session_id = id;
+            let error =
+                terminal::surface_present(&directory, &handle, Duration::from_secs(1)).unwrap_err();
+            assert!(error.to_string().contains("managed session"), "{error:#}");
+        }
+        RecordStore::at(&directory.join(CONTROL_FILE))
+            .write_json(&binding)
+            .unwrap();
+        let wrong_offer = HostOffer {
+            directory: global.clone(),
+            ..offer
+        };
+        RecordStore::at(&directory.join(HOST_OFFER_FILE))
+            .write_json(&wrong_offer)
+            .unwrap();
+        assert!(
+            terminal::verify_macos_surface(&directory, &session(), None)
+                .unwrap_err()
+                .to_string()
+                .contains("host offer")
+        );
+        for close in [
+            terminal::close_session_until,
+            super::super::close_owned_session,
+            ownership::close_dead_owner_surface_until,
+        ] {
+            assert!(
+                close(&directory, &session(), Instant::now())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("deadline")
+            );
+        }
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            terminal::surface_present(&directory, &session(), Duration::from_secs(1))
+                .unwrap_err()
+                .to_string()
+                .contains("private")
+        );
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let link_parent = tempfile::tempdir().unwrap();
+        let link = link_parent.path().join("session-test");
+        fs::write(&link, "not a directory").unwrap();
+        assert!(
+            terminal::surface_present(&link, &session(), Duration::from_secs(1))
+                .unwrap_err()
+                .to_string()
+                .contains("non-directory")
+        );
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&directory, &link).unwrap();
+        assert!(
+            terminal::surface_present(&link, &session(), Duration::from_secs(1))
+                .unwrap_err()
+                .to_string()
+                .contains("non-directory")
+        );
+    }
+
+    #[test]
     fn production_orchestration_binds_before_releasing_host() {
         let (temp, client, attempt) = fixture();
         let config_dir = client.config_dir.clone();
@@ -2784,6 +3068,10 @@ mod tests {
             assert_eq!(
                 error.downcast_ref::<RetainedLaunchSurface>().is_some(),
                 cancel_close
+            );
+            assert!(
+                !format!("{error:#}").contains(launch::RESIDUAL_SURFACE_MARKER),
+                "the adapter must return only the typed handoff"
             );
             launch::terminal_failed(&store, &error).unwrap();
             assert_eq!(store.status().unwrap().state, SessionState::Failed);

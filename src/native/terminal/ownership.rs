@@ -310,7 +310,7 @@ pub(in crate::native) fn verify_terminal_surface_ownership_with_timeout(
     }
     #[cfg(target_os = "macos")]
     {
-        let surface_tty = terminal::verify_macos_surface(session, timeout)?;
+        let surface_tty = terminal::verify_macos_surface(directory, session, timeout)?;
         verified_macos_terminal_owner(
             directory,
             expected_session_id,
@@ -333,7 +333,7 @@ pub(in crate::native) fn verify_terminal_close_authority(
         directory,
         expected_session_id,
         session,
-        || terminal::surface_present(session, close_remaining(deadline)?),
+        || terminal::surface_present(directory, session, close_remaining(deadline)?),
         deadline,
     )
 }
@@ -768,12 +768,13 @@ pub(in crate::native) fn repair_owner_is_live(owner: &NativeSessionOwner) -> Res
 }
 
 pub(in crate::native) fn close_dead_owner_surface_until(
+    directory: &Path,
     session: &terminal::TerminalSession,
     deadline: std::time::Instant,
 ) -> Result<terminal::CloseOutcome> {
     close_dead_owner_surface_with(
         session,
-        |surface| terminal::close_session_until(surface, deadline),
+        |surface| terminal::close_session_until(directory, surface, deadline),
         deadline,
     )
 }
@@ -832,7 +833,7 @@ pub(in crate::native) fn close_owned_surface(
         if authority == TerminalCloseAuthority::Absent {
             return Ok(terminal::CloseOutcome::Missing.into());
         }
-        terminal::close_session_until(session, deadline).map(Into::into)
+        terminal::close_session_until(directory, session, deadline).map(Into::into)
     }
 }
 

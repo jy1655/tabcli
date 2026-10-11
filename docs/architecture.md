@@ -228,6 +228,23 @@ live process and surface: PID birth, TTY and process groups on macOS, and proces
 Windows. Terminal.app also records the app incarnation: a window identity in one run of the app
 is not authority over the same apparent identity after a restart.
 
+The terminal seam passes the session directory to verification, presence, close (including
+owned and dead-owner close), and guarded dialog input. Adapters read their session records
+from that directory. Warp requires the handle's managed session id to match the supplied
+private directory. Windows guarded input also requires the directory to match the helper
+child's state-root lookup; the child still resolves the session by id under its own root.
+
+Identity and close evidence stay with each adapter. Terminal.app keeps `terminal_app` in
+the owner record. Warp keeps its control binding in adapter-private `warp-control.json`.
+WezTerm keeps `wezterm_mux` in the surface handle. Windows keeps the console root's process
+identity in the handle and also uses `console-host-process.json` and owner and launch
+evidence for close. iTerm2 and Ghostty use their native ids.
+
+The launcher owns the residual-surface compatibility marker in stored and returned launch
+diagnostics; adapters return the typed retained-surface handoff and its cleanup uncertainty.
+The recovery close in #87 is not implemented. Its authority decision waits for Warp runtime
+evidence from a `warp_control_cli` build or an upstream change.
+
 Close authority selects one of four outcomes: close with an attested owner, close a proven
 owned surface, end a live attested owner whose surface is proven absent, or record that the
 surface is absent. An ambiguous identity refuses close and

@@ -139,7 +139,7 @@ where
                         deadline,
                     )
                 },
-                || close_session_until(&cleanup_session, deadline).map(|_| ()),
+                || close_session_until(directory, &cleanup_session, deadline).map(|_| ()),
             )
         },
         unbind,
@@ -183,6 +183,7 @@ pub(super) fn send_file(
 }
 
 pub(super) fn verify_surface(
+    directory: &Path,
     session: &TerminalSession,
     timeout: Option<Duration>,
 ) -> Result<Option<String>> {
@@ -190,7 +191,7 @@ pub(super) fn verify_surface(
         TerminalKind::Iterm2 => iterm2::verify_session(session, timeout).map(Some),
         TerminalKind::AppleTerminal => apple_terminal::verify_tab(session, timeout).map(Some),
         TerminalKind::Ghostty => ghostty::verify_surface(session, timeout).map(|()| None),
-        TerminalKind::Warp => warp::verify_surface(session, timeout).map(Some),
+        TerminalKind::Warp => warp::verify_surface(directory, session, timeout).map(Some),
         TerminalKind::WezTerm => {
             wezterm::verify_session(&wezterm::Installed, session, timeout).map(Some)
         }
@@ -198,9 +199,13 @@ pub(super) fn verify_surface(
     }
 }
 
-pub(super) fn surface_present(session: &TerminalSession, timeout: Duration) -> Result<bool> {
+pub(super) fn surface_present(
+    directory: &Path,
+    session: &TerminalSession,
+    timeout: Duration,
+) -> Result<bool> {
     if session.kind == TerminalKind::Warp {
-        return warp::surface_present(session, timeout);
+        return warp::surface_present(directory, session, timeout);
     }
     if session.kind == TerminalKind::WezTerm {
         return wezterm::surface_present(&wezterm::Installed, session, timeout);
@@ -233,7 +238,7 @@ pub(super) fn surface_present(session: &TerminalSession, timeout: Duration) -> R
 }
 
 // Terminal.app's managed close requires the owner's recorded app incarnation.
-// Other adapters close by their own handle alone.
+// Other adapters receive the directory for their own close evidence.
 pub(super) fn close_owned_session(
     directory: &Path,
     session: &TerminalSession,
@@ -243,11 +248,12 @@ pub(super) fn close_owned_session(
         TerminalKind::AppleTerminal => {
             apple_terminal::close_owned_session(directory, session, deadline)
         }
-        _ => close_session_until(session, deadline),
+        _ => close_session_until(directory, session, deadline),
     }
 }
 
 pub(super) fn close_session_until(
+    directory: &Path,
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
@@ -255,7 +261,7 @@ pub(super) fn close_session_until(
         TerminalKind::Iterm2 => iterm2::close_session_until(session, deadline),
         TerminalKind::AppleTerminal => apple_terminal::close_session_until(session, deadline),
         TerminalKind::Ghostty => ghostty::close_session_until(session, deadline),
-        TerminalKind::Warp => warp::close_session_until(session, deadline),
+        TerminalKind::Warp => warp::close_session_until(directory, session, deadline),
         TerminalKind::WezTerm => {
             wezterm::close_session_until(&wezterm::Installed, session, deadline)
         }
@@ -305,6 +311,50 @@ fn close_response(terminal: TerminalKind, response: &str) -> Result<CloseOutcome
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+
+    #[test]
+    fn prebind_cleanup_and_legacy_iterm_close_need_no_managed_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let legacy: TerminalSession = serde_json::from_value(serde_json::json!({
+            "iterm_session_id":"native-session-id"
+        }))
+        .unwrap();
+        assert!(legacy.managed_session_id.is_none());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        automation_testing::with_runner(
+            |_| Ok("closed".into()),
+            || {
+                cleanup_started_surface_with(
+                    &legacy,
+                    || panic!("iTerm2 needs no Terminal.app absence proof"),
+                    || close_session_until(directory.path(), &legacy, deadline).map(|_| ()),
+                )
+                .unwrap();
+                assert_eq!(
+                    close_owned_session(directory.path(), &legacy, deadline).unwrap(),
+                    CloseOutcome::Closed
+                );
+            },
+        );
+        // Exercise the real execution boundary: its expired deadline prevents osascript.
+        let error = close_session_until(directory.path(), &legacy, Instant::now()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "iTerm2 automation timed out before it started"
+        );
+    }
+
+    #[test]
+    fn expired_terminal_owned_close_still_reads_owner_evidence_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let session: TerminalSession = serde_json::from_value(serde_json::json!({
+            "terminal": "apple-terminal", "session_id": "/dev/ttys999", "window_id": "1001"
+        }))
+        .unwrap();
+        std::fs::write(directory.path().join("native-session.json"), "broken").unwrap();
+        let error = close_owned_session(directory.path(), &session, Instant::now()).unwrap_err();
+        assert!(format!("{error:#}").contains("expected value"), "{error:#}");
+    }
 
     #[test]
     fn terminal_startup_missing_app_proof_retains_binding_without_adapter() {
