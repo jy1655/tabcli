@@ -101,6 +101,7 @@ impl Processes {
                                     })
                                 },
                             },
+                            crate::native::close_deadline(),
                         )
                     },
                     || {
@@ -110,16 +111,27 @@ impl Processes {
                             surface,
                             || self.attest(store, live),
                             |group| {
-                                terminate_owned_foreground_group_with_io(
+                                let now = Instant::now();
+                                let clock = crate::native::TestCloseClock::new(now);
+                                let deadline = now + Duration::from_secs(3);
+                                terminate_owned_foreground_group_until_with_io(
                                     group,
-                                    Duration::ZERO,
-                                    |target, signal| self.signal(target, signal),
+                                    deadline,
+                                    |target, signal| {
+                                        let result = self.signal(target, signal);
+                                        if signal == libc::SIGTERM {
+                                            clock.set(deadline);
+                                        }
+                                        result
+                                    },
                                     |_| {},
                                 )
                             },
+                            crate::native::close_deadline(),
                         )
                     },
                     |_| panic!("absence/teardown must not call a surface adapter"),
+                    crate::native::close_deadline(),
                 )
             },
         )

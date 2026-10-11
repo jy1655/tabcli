@@ -23,6 +23,7 @@ use super::macos::process::{
 pub(in crate::native) use super::windows::ownership::verified_windows_native_owner;
 #[cfg(any(target_os = "macos", windows))]
 use crate::native::SessionStatus;
+use crate::native::close_remaining;
 #[cfg(target_os = "macos")]
 use crate::native::session::{self, Store};
 #[cfg(any(target_os = "macos", windows))]
@@ -286,6 +287,7 @@ pub(in crate::native) fn verified_terminal_shell_process_group(
     Ok(live_shell.process_group)
 }
 
+#[cfg(windows)]
 pub(in crate::native) fn verify_terminal_surface_ownership(
     directory: &Path,
     expected_session_id: &str,
@@ -325,10 +327,15 @@ pub(in crate::native) fn verify_terminal_close_authority(
     directory: &Path,
     expected_session_id: &str,
     session: &terminal::TerminalSession,
+    deadline: std::time::Instant,
 ) -> Result<TerminalCloseAuthority> {
-    verify_terminal_close_authority_with_presence(directory, expected_session_id, session, || {
-        terminal::surface_present(session, Duration::from_secs(3))
-    })
+    verify_terminal_close_authority_with_presence(
+        directory,
+        expected_session_id,
+        session,
+        || terminal::surface_present(session, close_remaining(deadline)?),
+        deadline,
+    )
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -348,6 +355,7 @@ fn verify_terminal_close_authority_with_presence(
     expected_session_id: &str,
     session: &terminal::TerminalSession,
     surface_present: impl FnOnce() -> Result<bool>,
+    deadline: std::time::Instant,
 ) -> Result<TerminalCloseAuthority> {
     verify_terminal_close_authority_with_observations(
         directory,
@@ -375,6 +383,7 @@ fn verify_terminal_close_authority_with_presence(
                 bail!("macOS app observation is unavailable on this platform")
             }
         },
+        deadline,
     )
 }
 
@@ -385,6 +394,7 @@ pub(in crate::native) fn verify_terminal_close_authority_with_observations(
     surface_present: impl FnOnce() -> Result<bool>,
     process_birth: impl Fn(u32) -> Result<Option<(u64, u64)>>,
     terminal_instances: impl Fn() -> Result<Vec<MacTerminalAppIdentity>>,
+    deadline: std::time::Instant,
 ) -> Result<TerminalCloseAuthority> {
     verify_terminal_close_authority_with_observers(
         directory,
@@ -416,9 +426,15 @@ pub(in crate::native) fn verify_terminal_close_authority_with_observations(
             #[cfg(target_os = "macos")]
             group_gone: &owner_group_gone,
             ownership_proof: &|| {
-                verify_terminal_surface_ownership(directory, expected_session_id, session)
+                verify_terminal_surface_ownership_with_timeout(
+                    directory,
+                    expected_session_id,
+                    session,
+                    Some(close_remaining(deadline)?),
+                )
             },
         },
+        deadline,
     )
 }
 
@@ -440,6 +456,7 @@ struct CloseObservers<'a> {
     group_gone: &'a dyn Fn(u32) -> Result<bool>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_terminal_close_authority_with_observers(
     directory: &Path,
     expected_session_id: &str,
@@ -448,7 +465,24 @@ fn verify_terminal_close_authority_with_observers(
     process_birth: impl Fn(u32) -> Result<Option<(u64, u64)>>,
     terminal_instances: impl Fn() -> Result<Vec<MacTerminalAppIdentity>>,
     observers: CloseObservers<'_>,
+    deadline: std::time::Instant,
 ) -> Result<TerminalCloseAuthority> {
+    close_remaining(deadline)?;
+    let surface_present = || {
+        close_remaining(deadline)?;
+        let result = surface_present();
+        close_remaining(deadline)?;
+        result
+    };
+    let proof = observers.ownership_proof;
+    let ownership_proof = || {
+        close_remaining(deadline)?;
+        let result = proof();
+        close_remaining(deadline)?;
+        result
+    };
+    let mut observers = observers;
+    observers.ownership_proof = &ownership_proof;
     let _ = (
         directory,
         expected_session_id,
@@ -595,6 +629,7 @@ fn verify_terminal_close_authority_with_observers(
                     (observers.ownership_proof)()
                 };
                 if let Err(error) = proof {
+                    close_remaining(deadline)?;
                     let absent = if terminal::close_policy(session.kind).requires_app_incarnation {
                         terminal_surface_absent(
                             owner.terminal_app.as_ref(),
@@ -732,32 +767,42 @@ pub(in crate::native) fn repair_owner_is_live(owner: &NativeSessionOwner) -> Res
     Ok(false)
 }
 
-pub(in crate::native) fn close_dead_owner_surface(
+pub(in crate::native) fn close_dead_owner_surface_until(
     session: &terminal::TerminalSession,
+    deadline: std::time::Instant,
 ) -> Result<terminal::CloseOutcome> {
-    close_dead_owner_surface_with(session, terminal::close_session)
+    close_dead_owner_surface_with(
+        session,
+        |surface| terminal::close_session_until(surface, deadline),
+        deadline,
+    )
 }
 
 pub(in crate::native) fn close_dead_owner_surface_with(
     session: &terminal::TerminalSession,
     mut closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
+    deadline: std::time::Instant,
 ) -> Result<terminal::CloseOutcome> {
     #[cfg(windows)]
     if session.kind != terminal::TerminalKind::WindowsConsole {
         bail!("dead Windows native owner has a non-Windows terminal handle")
     }
-    closer(session)
+    close_remaining(deadline)?;
+    let outcome = closer(session)?;
+    close_remaining(deadline)?;
+    Ok(outcome)
 }
 
 pub(in crate::native) fn close_owned_surface(
     directory: &Path,
     id: &str,
     session: &TerminalSession,
+    deadline: std::time::Instant,
 ) -> Result<terminal::CloseResult> {
     #[cfg(target_os = "macos")]
     {
         close_owned_surface_with(
-            || verify_terminal_close_authority(directory, id, session),
+            || verify_terminal_close_authority(directory, id, session, deadline),
             || {
                 teardown_absent_owner_with(
                     &Store::open_unchecked(directory),
@@ -765,27 +810,29 @@ pub(in crate::native) fn close_owned_surface(
                     session,
                     || verified_macos_terminal_owner(directory, id, session, None),
                     |group| {
-                        terminate_owned_foreground_group(group).context(
+                        terminate_owned_foreground_group_until(group, deadline).context(
                             "could not confirm disappearance of the absent surface owner's group",
                         )
                     },
+                    deadline,
                 )
             },
             |has_native_owner| {
                 if has_native_owner {
-                    prepare_owned_surface_close(directory, id, session)?;
+                    prepare_owned_surface_close(directory, id, session, deadline)?;
                 }
-                terminal::macos::close_owned_session(directory, session)
+                terminal::macos::close_owned_session(directory, session, deadline)
             },
+            deadline,
         )
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let authority = verify_terminal_close_authority(directory, id, session)?;
+        let authority = verify_terminal_close_authority(directory, id, session, deadline)?;
         if authority == TerminalCloseAuthority::Absent {
             return Ok(terminal::CloseOutcome::Missing.into());
         }
-        terminal::close_session(session).map(Into::into)
+        terminal::close_session_until(session, deadline).map(Into::into)
     }
 }
 
@@ -796,8 +843,12 @@ fn close_owned_surface_with(
     authority: impl FnOnce() -> Result<TerminalCloseAuthority>,
     teardown: impl FnOnce() -> Result<terminal::CloseResult>,
     close_surface: impl FnOnce(bool) -> Result<CloseOutcome>,
+    deadline: std::time::Instant,
 ) -> Result<terminal::CloseResult> {
-    match authority()? {
+    close_remaining(deadline)?;
+    let authority = authority()?;
+    close_remaining(deadline)?;
+    match authority {
         TerminalCloseAuthority::OwnerTeardown => teardown(),
         TerminalCloseAuthority::TeardownComplete(reason) => Ok(terminal::CloseResult {
             outcome: CloseOutcome::Missing,
@@ -840,8 +891,11 @@ fn teardown_absent_owner_with(
     surface: &TerminalSession,
     mut attest: impl FnMut() -> Result<(NativeSessionOwner, NativeProcessIdentity)>,
     stop: impl FnOnce(u32) -> Result<()>,
+    deadline: std::time::Instant,
 ) -> Result<terminal::CloseResult> {
+    close_remaining(deadline)?;
     let (owner, live) = attest()?;
+    close_remaining(deadline)?;
     let group = verified_terminal_owner_process_group(&owner, &live)?;
     session::close::record_terminal_teardown_intent(
         store,
@@ -855,14 +909,18 @@ fn teardown_absent_owner_with(
     session::close::interruption::at(session::close::interruption::Point::IntentPublished);
     // The second full attestation reads the owner, tty and parent shell again.
     // A replacement record, even if it attests successfully, is not this intent.
+    close_remaining(deadline)?;
     let (again, current) = attest()?;
+    close_remaining(deadline)?;
     if serde_json::to_value(&owner)? != serde_json::to_value(&again)?
         || !native_owner_identity_matches(&owner, &current)
         || verified_terminal_owner_process_group(&again, &current)? != group
     {
         bail!("the teardown owner changed after intent publication; no signal was sent");
     }
+    close_remaining(deadline)?;
     stop(group)?;
+    close_remaining(deadline)?;
     Ok(terminal::CloseResult {
         outcome: CloseOutcome::Missing,
         reason: Some(OWNER_TEARDOWN_REASON.to_owned()),
@@ -874,12 +932,15 @@ fn prepare_owned_surface_close(
     directory: &Path,
     id: &str,
     surface: &TerminalSession,
+    deadline: std::time::Instant,
 ) -> Result<()> {
+    close_remaining(deadline)?;
     match terminal::close_policy(surface.kind).pre_close {
         PreClosePolicy::None => Ok(()),
         PreClosePolicy::RecordIntent => {
             // The adapter close can end the owner even when surface cleanup fails.
             let (owner, _) = verified_macos_terminal_owner(directory, id, surface, None)?;
+            close_remaining(deadline)?;
             session::close::record_terminal_close_intent(
                 &Store::open_unchecked(directory),
                 id,
@@ -890,14 +951,23 @@ fn prepare_owned_surface_close(
         PreClosePolicy::StopForegroundGroup => {
             let (owner, live) = verified_macos_terminal_owner(directory, id, surface, None)?;
             let shell = live_native_process_identity(live.parent_pid)?;
-            prepare_warp_close(directory, id, surface, &owner, &live, &shell, |group| {
-                terminate_owned_foreground_group(group).context(
-                    "the attested Warp foreground group was not stopped; no tab close was sent",
-                )
-            })
+            prepare_warp_close(
+                directory,
+                id,
+                surface,
+                &owner,
+                &live,
+                &shell,
+                |group| {
+                    terminate_owned_foreground_group_until(group, deadline).context(
+                        "the attested Warp foreground group was not stopped; no tab close was sent",
+                    )
+                },
+                deadline,
+            )
         }
         PreClosePolicy::StopOwnerAndShellGroups => {
-            terminate_apple_terminal_owner(directory, id, surface)
+            terminate_apple_terminal_owner(directory, id, surface, deadline)
         }
     }
 }
@@ -935,8 +1005,13 @@ fn close_signal_plan(
 }
 
 #[cfg(target_os = "macos")]
-fn terminate_process_groups(managed_process_group: u32, shell_process_group: u32) -> Result<()> {
+fn terminate_process_groups(
+    managed_process_group: u32,
+    shell_process_group: u32,
+    deadline: std::time::Instant,
+) -> Result<()> {
     for (target, signal) in close_signal_plan(managed_process_group, shell_process_group)? {
+        close_remaining(deadline)?;
         let result = unsafe { libc::kill(target, signal) };
         if result == 0 {
             continue;
@@ -960,8 +1035,10 @@ pub(in crate::native) fn terminate_apple_terminal_owner(
     directory: &Path,
     expected_session_id: &str,
     session: &terminal::TerminalSession,
+    deadline: std::time::Instant,
 ) -> Result<()> {
-    let surface_tty = verified_close_tty(session)?;
+    close_remaining(deadline)?;
+    let surface_tty = verified_close_tty(session, deadline)?;
     let (mut owner, live) =
         verified_macos_terminal_owner(directory, expected_session_id, session, Some(&surface_tty))?;
     let process_group = verified_terminal_owner_process_group(&owner, &live)?;
@@ -975,18 +1052,20 @@ pub(in crate::native) fn terminate_apple_terminal_owner(
             .context("Terminal.app identity was not recorded")?,
         &terminal_app_instances()?,
     )?;
+    close_remaining(deadline)?;
     session::close::record_terminal_close_intent(
         &Store::open_unchecked(directory),
         expected_session_id,
         session,
         &owner,
     )?;
-    terminate_process_groups(process_group, shell_process_group)
+    terminate_process_groups(process_group, shell_process_group, deadline)
 }
 
 // Warp preserves normal close warnings. Stop only the fully attested foreground
 // job before requesting tab.close; never suppress warnings or signal by tty name.
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 pub(in crate::native) fn prepare_warp_close(
     directory: &Path,
     id: &str,
@@ -995,6 +1074,7 @@ pub(in crate::native) fn prepare_warp_close(
     live: &NativeProcessIdentity,
     shell: &NativeProcessIdentity,
     stop: impl FnOnce(u32) -> Result<()>,
+    deadline: std::time::Instant,
 ) -> Result<()> {
     session.verify_managed_session(id)?;
     if session.kind != terminal::TerminalKind::Warp
@@ -1005,21 +1085,34 @@ pub(in crate::native) fn prepare_warp_close(
     }
     let group = verified_terminal_owner_process_group(owner, live)?;
     verified_terminal_shell_process_group(owner, live, shell)?;
+    close_remaining(deadline)?;
     session::close::record_terminal_close_intent(
         &Store::open_unchecked(directory),
         id,
         session,
         owner,
     )?;
+    close_remaining(deadline)?;
     stop(group)
 }
 
 #[cfg(target_os = "macos")]
+fn terminate_owned_foreground_group_until(group: u32, deadline: Instant) -> Result<()> {
+    close_remaining(deadline)?;
+    terminate_owned_foreground_group_until_with_io(
+        group,
+        deadline.min(Instant::now() + Duration::from_secs(3)),
+        signal_process_group,
+        |_| {},
+    )
+}
+
+#[cfg(all(test, target_os = "macos"))]
 pub(in crate::native) fn terminate_owned_foreground_group(group: u32) -> Result<()> {
     terminate_owned_foreground_group_with(group, Duration::from_secs(3), |_| {})
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 fn terminate_owned_foreground_group_with(
     group: u32,
     timeout: Duration,
@@ -1037,13 +1130,24 @@ fn signal_process_group(target: libc::pid_t, signal: libc::c_int) -> std::io::Re
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 fn terminate_owned_foreground_group_with_io(
     group: u32,
     timeout: Duration,
+    signal: impl FnMut(libc::pid_t, libc::c_int) -> std::io::Result<()>,
+    observe: impl FnMut(Option<i32>),
+) -> Result<()> {
+    terminate_owned_foreground_group_until_with_io(group, Instant::now() + timeout, signal, observe)
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_owned_foreground_group_until_with_io(
+    group: u32,
+    deadline: Instant,
     mut signal: impl FnMut(libc::pid_t, libc::c_int) -> std::io::Result<()>,
     mut observe: impl FnMut(Option<i32>),
 ) -> Result<()> {
+    close_remaining(deadline)?;
     let target = process_group_signal_target(group)?;
     if let Err(error) = signal(target, libc::SIGTERM) {
         if error.raw_os_error() == Some(libc::ESRCH) {
@@ -1053,7 +1157,6 @@ fn terminate_owned_foreground_group_with_io(
     }
     #[cfg(test)]
     session::close::interruption::at(session::close::interruption::Point::SignalSent);
-    let deadline = Instant::now() + timeout;
     loop {
         if let Err(error) = signal(target, 0) {
             observe(error.raw_os_error());
@@ -1069,10 +1172,13 @@ fn terminate_owned_foreground_group_with_io(
         } else {
             observe(None);
         }
-        if Instant::now() >= deadline {
+        if crate::native::close_now() >= deadline {
             bail!("the attested process group was not confirmed gone before the deadline");
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(
+            Duration::from_millis(20)
+                .min(deadline.saturating_duration_since(crate::native::close_now())),
+        );
     }
 }
 
@@ -1324,6 +1430,7 @@ mod close_authority_tests {
                         Ok(())
                     },
                 },
+                crate::native::close_deadline(),
             );
             assert_eq!(*trace.borrow(), calls, "{:?}: {result:?}", self.kind);
             if let Some(chain) = error_chain {
@@ -2273,6 +2380,7 @@ mod process_close_tests {
                 assert!(terminal_close_intent_owner(directory.path(), &handle)?.is_some());
                 bail!("injected still-running group: adapter must not run")
             },
+            crate::native::close_deadline(),
         );
         assert!(result.unwrap_err().to_string().contains("still-running"));
         assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
@@ -2289,7 +2397,8 @@ mod process_close_tests {
                 &owner,
                 &changed,
                 &shell,
-                |_| panic!("changed owner must not be signalled")
+                |_| panic!("changed owner must not be signalled"),
+                crate::native::close_deadline()
             )
             .is_err()
         );

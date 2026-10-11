@@ -497,8 +497,12 @@ pub(super) fn verify_macos_surface(
     macos::verify_surface(session, timeout)
 }
 
-pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
-    platform::close_session(session)
+pub(super) fn close_session_until(
+    session: &TerminalSession,
+    deadline: Instant,
+) -> Result<CloseOutcome> {
+    crate::native::close_remaining(deadline)?;
+    platform::close_session_until(session, deadline)
 }
 
 /// Read-only presence check. Unlike control authorization, absence and an inspection

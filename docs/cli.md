@@ -697,7 +697,9 @@ tabcli self-test codex --workspace /path/to/project --json
 This opens a visible surface and makes real model calls through the public commands. It checks the
 initial result, a follow-up result, and cleanup. Workspace, terminal, model, effort, bypass, and
 JSON options follow `ask`; prompts and titles are generated internally. `--timeout-secs` defaults to
-120 per command, not for the entire test. Cleanup commands have separate bounded budgets.
+120 per command, not for the entire test. Cleanup calls `close-session` with
+`--timeout-secs 10` and a 15-second outer budget so the child can report its timeout before
+self-test ends it. These budgets do not guarantee that the close finishes.
 
 Both turns ask: `No tool, command, or file is needed. Reply with exactly this marker and
 nothing else: <marker>`. The result must still equal the generated marker exactly.
@@ -852,7 +854,7 @@ before pruning.
 Run `close-session` when you have finished with a session or want to stop waiting for it.
 
 ```text
-tabcli close-session SESSION --explicit [--json]
+tabcli close-session SESSION --explicit [--timeout-secs N] [--json]
 ```
 
 See the command and output in the [opening workflow](#command-reference).
@@ -860,6 +862,17 @@ See the command and output in the [opening workflow](#command-reference).
 `--explicit` is required because this ends the session's surface. You can close active, exited, or
 failed sessions. Repeating a completed close succeeds without closing another surface. Bridge
 records the close in a tombstone and keeps the result history.
+
+`--timeout-secs N` sets the maximum time the close may take, in whole seconds from 1 through
+3600; the default is 60 seconds. The budget covers observation, ownership checks, lock waits,
+process teardown, and terminal automation. It does not guarantee that the close finishes.
+A timeout means the close was not confirmed and may have partly happened. A rerun observes
+the session and establishes authority again; it may still refuse the close.
+
+Every open session loads its terminal, including finished sessions that were never closed. When
+you delegate many tasks, cap the number of open sessions, count finished but unclosed ones, and
+close a session before you open its replacement. If the terminal answers slowly, give the close a
+longer `--timeout-secs`.
 
 On macOS, a terminal application can end while the session's processes survive, as observed
 after iTerm2 was killed. If the ownership proof fails, Bridge checks whether the recorded
@@ -927,7 +940,8 @@ Use these options only with commands whose synopsis lists them:
 | `--context-result SESSION/REQUEST` | None; up to eight attachments on `ask` or `tell`. |
 
 `--timeout-secs` defaults to 900 for `ask`, `tell`, `reopen`, and `result --wait`, and to 120 per
-`self-test` command. The value must fit the supported clock range.
+`self-test` command. For `close-session`, it defaults to 60 and accepts 1 through 3600.
+The value must fit the supported clock range.
 
 Prompts must contain non-whitespace text. Control characters other than newline and tab are
 rejected. Bridge trims the prompt's outer whitespace and adds delegation framing and provider

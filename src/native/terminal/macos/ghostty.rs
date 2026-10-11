@@ -1008,14 +1008,20 @@ fn close_with_runner(
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
+    crate::native::close_remaining(deadline)?;
     let (tab, window) = ownership_proof(session)?;
-    if !present(&snapshot(runner, deadline)?, session)? {
+    let before = snapshot(runner, deadline)?;
+    crate::native::close_remaining(deadline)?;
+    if !present(&before, session)? {
         return Ok(CloseOutcome::Missing);
     }
     // Exactly one native close. A failed reply can still have closed the terminal.
+    crate::native::close_remaining(deadline)?;
     let answer = runner.run(CLOSE_TAB_SCRIPT, &[&session.id, tab, window], deadline);
     for attempt in 0..DISCOVERY_ATTEMPTS {
+        crate::native::close_remaining(deadline)?;
         let after = snapshot(runner, deadline)?;
+        crate::native::close_remaining(deadline)?;
         if !present(&after, session)? {
             return Ok(CloseOutcome::Closed);
         }
@@ -1025,9 +1031,7 @@ fn close_with_runner(
     }
     bail!("Ghostty owned surface remains; handle retained; close response={answer:?}")
 }
-pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
-    close_session_until(session, super::timeout_deadline(Duration::from_secs(10))?)
-}
+
 pub(super) fn close_session_until(
     session: &TerminalSession,
     deadline: Instant,
@@ -1116,6 +1120,52 @@ mod tests {
             0o600
         );
         assert_eq!(run(&source).status.code(), Some(127));
+    }
+
+    #[test]
+    fn close_deadline_during_disappearance_keeps_failure() {
+        struct Slow {
+            calls: usize,
+            deadline: Instant,
+        }
+        impl Runner for Slow {
+            fn capable(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn run(&mut self, script: &str, _: &[&str], deadline: Instant) -> Result<String> {
+                assert_eq!(deadline, self.deadline);
+                self.calls += 1;
+                match self.calls {
+                    1 => {
+                        assert_eq!(script, SNAPSHOT_SCRIPT);
+                        Ok("front\tw1\nwindow\tw1\tt2\ntab\tw1\tt2\nterminal\tw1\tt2\tu2".into())
+                    }
+                    2 => {
+                        assert_eq!(script, CLOSE_TAB_SCRIPT);
+                        Ok("closed".into())
+                    }
+                    3 => {
+                        assert_eq!(script, SNAPSHOT_SCRIPT);
+                        std::thread::sleep(
+                            deadline.saturating_duration_since(Instant::now())
+                                + Duration::from_millis(1),
+                        );
+                        Ok("none".into())
+                    }
+                    _ => panic!("close must be sent once"),
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(10);
+        let mut runner = Slow { calls: 0, deadline };
+        let surface = handle(&CreatedSurface {
+            tab_id: "t2".into(),
+            window_id: "w1".into(),
+            terminal_id: "u2".into(),
+        });
+        let error = close_with_runner(&mut runner, &surface, deadline).unwrap_err();
+        assert!(format!("{error:#}").contains("deadline"));
+        assert_eq!(runner.calls, 3);
     }
     #[derive(Default)]
     struct Fake {
@@ -1642,11 +1692,12 @@ mod tests {
         assert!(store.status().unwrap().error.unwrap().contains("u2"));
         // The ordinary explicit-close transaction must keep a failed close recoverable.
         assert!(
-            close::close(&store, None, |surface| {
+            close::close(&store, None, crate::native::close_deadline(), |surface| {
                 crate::native::terminal::ownership::verify_terminal_close_authority(
                     directory.path(),
                     id,
                     surface,
+                    crate::native::close_deadline(),
                 )?;
                 close_with_runner(&mut f, surface, soon()).map(Into::into)
             })
@@ -1655,11 +1706,12 @@ mod tests {
         assert_eq!(store.terminal().unwrap(), retained);
         assert_eq!(store.status().unwrap().state, SessionState::Failed);
         f.close_timeout = false;
-        close::close(&store, None, |surface| {
+        close::close(&store, None, crate::native::close_deadline(), |surface| {
             crate::native::terminal::ownership::verify_terminal_close_authority(
                 directory.path(),
                 id,
                 surface,
+                crate::native::close_deadline(),
             )?;
             close_with_runner(&mut f, surface, soon()).map(Into::into)
         })
@@ -1678,7 +1730,9 @@ mod tests {
         let store = Store::open_unchecked(directory.path());
         let before = std::fs::read(store.record(CoreRecord::Status).path()).unwrap();
         let claim = std::fs::read(store.record(CoreRecord::TurnClaim).path()).unwrap();
-        let refused = close::close(&store, None, |_| panic!("no handle exists yet"));
+        let refused = close::close(&store, None, crate::native::close_deadline(), |_| {
+            panic!("no handle exists yet")
+        });
         assert!(
             refused.is_err(),
             "close during pending creation must be refused, got {refused:?}"
@@ -1717,11 +1771,12 @@ mod tests {
         assert_eq!(store.terminal().unwrap().id, "u2");
         f.close_timeout = false;
         let id = directory.path().file_name().unwrap().to_str().unwrap();
-        close::close(&store, None, |surface| {
+        close::close(&store, None, crate::native::close_deadline(), |surface| {
             crate::native::terminal::ownership::verify_terminal_close_authority(
                 directory.path(),
                 id,
                 surface,
+                crate::native::close_deadline(),
             )?;
             close_with_runner(&mut f, surface, soon()).map(Into::into)
         })
@@ -1753,9 +1808,12 @@ mod tests {
                 .record(CoreRecord::Launch)
                 .write_json(&pending)
                 .unwrap();
-            close::close(&store, earlier.map(str::to_owned), |_| {
-                panic!("no handle exists yet")
-            })
+            close::close(
+                &store,
+                earlier.map(str::to_owned),
+                crate::native::close_deadline(),
+                |_| panic!("no handle exists yet"),
+            )
             .unwrap();
             assert_eq!(store.status().unwrap().state, SessionState::Closed);
             let mut f = existing();
@@ -1795,7 +1853,7 @@ mod tests {
                 store.closed_if_present().unwrap().unwrap().error,
                 status.error
             );
-            close::close(&store, None, |_| {
+            close::close(&store, None, crate::native::close_deadline(), |_| {
                 panic!("a closed session grants no close authority")
             })
             .unwrap();
@@ -1856,7 +1914,7 @@ mod tests {
                 .write_json(&pending)
                 .unwrap();
             for _ in 0..2 {
-                close::close(&store, None, |_| {
+                close::close(&store, None, crate::native::close_deadline(), |_| {
                     panic!("an unbound residual grants no close authority")
                 })
                 .unwrap();

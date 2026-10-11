@@ -572,11 +572,16 @@ pub(in crate::native) mod launch;
 
 impl Store {
     /// Publish an accepted completion before repairing its session's dead owner.
+    #[cfg(test)]
     pub(in crate::native) fn converge(&self) -> Result<()> {
+        self.converge_until(crate::native::close_deadline())
+    }
+
+    pub(in crate::native) fn converge_until(&self, deadline: std::time::Instant) -> Result<()> {
         // Repair owns recovery and preserves its damage while settling a dead owner.
         // An earlier recovery here both duplicated work and skipped that settlement
         // when a completion record could not be published.
-        close::repair_dead_owner(self)?;
+        close::repair_dead_owner_until(self, deadline.min(crate::native::close_deadline()))?;
         Ok(())
     }
 }

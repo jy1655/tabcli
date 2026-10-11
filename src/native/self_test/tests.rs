@@ -5,14 +5,16 @@ use std::collections::VecDeque;
 struct Fake {
     replies: VecDeque<Reply>,
     calls: Vec<Vec<String>>,
+    budgets: Vec<Duration>,
     sessions: Vec<Value>,
     ownership_error: bool,
     isolated: bool,
 }
 
 impl Operations for Fake {
-    fn call(&mut self, args: &[String], _: Duration) -> Reply {
+    fn call(&mut self, args: &[String], budget: Duration) -> Reply {
         self.calls.push(args.to_vec());
+        self.budgets.push(budget);
         self.replies.pop_front().expect("unexpected operation")
     }
     fn private_sessions(&self) -> Result<Vec<String>> {
@@ -78,6 +80,7 @@ fn fake(replies: impl IntoIterator<Item = Reply>) -> Fake {
     Fake {
         replies: replies.into_iter().collect(),
         calls: Vec::new(),
+        budgets: Vec::new(),
         sessions: vec![
             json!({"id":"session-foreign","title":"different title"}),
             json!({"id":"session-similar","title":"Agent Bridge self-test AB_marker extra"}),
@@ -109,7 +112,14 @@ fn run_fake(fake: &mut Fake) -> Report {
             .iter()
             .filter(|args| args[0] == "close-session")
             .all(|args| args
-                == &arguments(&["close-session", "session-owned", "--explicit", "--json"]))
+                == &arguments(&[
+                    "close-session",
+                    "session-owned",
+                    "--explicit",
+                    "--timeout-secs",
+                    "10",
+                    "--json"
+                ]))
     );
     report
 }
@@ -1067,5 +1077,77 @@ fn all_providers_keep_the_exact_marker_contract_without_tools() {
         );
         assert_eq!(fake.calls[0][5], fake.calls[2][3]);
         assert!(!fake.calls.iter().any(|args| args[0] == "doctor"));
+    }
+}
+
+#[test]
+fn close_deadline_cleanup_budgets() {
+    let mut fake = fake([error("ask failed")].into_iter().chain(cleanup()));
+    run_fake(&mut fake);
+    for (args, budget) in fake.calls.iter().zip(&fake.budgets) {
+        if args[0] == "close-session" {
+            assert_eq!(*budget, Duration::from_secs(15));
+            assert!(args.windows(2).any(|pair| pair == ["--timeout-secs", "10"]));
+        } else if args[0] == "inspect" {
+            assert_eq!(*budget, Duration::from_secs(10));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn close_deadline_child_report_and_outer_timeout_continue_cleanup() {
+    use std::os::unix::fs::PermissionsExt;
+    for hangs in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("private-close-fixture");
+        fs::write(&executable, if hangs {
+            "#!/bin/sh\nexec /bin/sleep 60\n"
+        } else {
+            "#!/bin/sh\nprintf '%s\\n' '{\"ok\":false,\"error\":\"close deadline expired; use --timeout-secs\"}'\nexit 1\n"
+        }).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut installed = Installed {
+            executable,
+            root: directory.path().into(),
+            isolated: true,
+        };
+        let reply = installed.call(
+            &arguments(&[
+                "close-session",
+                "session-owned",
+                "--explicit",
+                "--timeout-secs",
+                "10",
+            ]),
+            CLEANUP_BUDGET + COMMAND_MARGIN,
+        );
+        assert!(!reply.ok);
+        assert!(reply.error.as_deref().unwrap().contains(if hangs {
+            "did not return"
+        } else {
+            "close deadline"
+        }));
+        let mut ask = error("launch failed");
+        ask.value = json!({"session":"session-owned"});
+        let mut fake = fake([
+            ask,
+            reply,
+            ok(json!({"stored_state":"working"})),
+            ok(json!({"ok":true,"session":"session-other","closed":true})),
+            ok(json!({"ok":true,"stored_state":"closed"})),
+        ]);
+        fake.isolated = true;
+        fake.sessions = vec![json!({"id":"session-owned"}), json!({"id":"session-other"})];
+        let report = orchestrate(
+            &request(&["--isolated"]),
+            &mut fake,
+            directory.path().into(),
+            "AB_marker".into(),
+        );
+        assert_eq!(report.cleanup_sessions.len(), 2);
+        assert_eq!(report.cleanup_sessions[0].outcome, Outcome::NotVerified);
+        assert_eq!(report.cleanup_sessions[1].outcome, Outcome::Passed);
+        assert!(fake.replies.is_empty());
     }
 }

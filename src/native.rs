@@ -202,6 +202,7 @@ pub(crate) struct CloseRequest {
     id: String,
     explicit: bool,
     json: bool,
+    timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -780,19 +781,75 @@ fn parse_close(args: &[String]) -> Result<NativeCommand> {
     require_valid_session_id(id)?;
     let mut explicit = false;
     let mut json = false;
-    for option in options {
-        match option.as_str() {
+    let mut timeout = None;
+    let mut index = 0;
+    while index < options.len() {
+        match options[index].as_str() {
             "--explicit" => set_flag_once(&mut explicit, "--explicit")?,
             "--json" => set_flag_once(&mut json, "--json")?,
-            _ => bail!("unknown close-session option: {option}"),
+            "--timeout-secs" => {
+                index += 1;
+                let value = options
+                    .get(index)
+                    .context("--timeout-secs requires a value")?;
+                let duration = parse_timeout(value)?;
+                if duration > Duration::from_secs(3600) {
+                    bail!("close-session --timeout-secs must be in 1..=3600");
+                }
+                set_once(&mut timeout, duration, "--timeout-secs")?;
+            }
+            option => bail!("unknown close-session option: {option}"),
         }
+        index += 1;
     }
     confirm_explicit_close(explicit)?;
     Ok(NativeCommand::Close(CloseRequest {
         id: id.to_owned(),
         explicit,
         json,
+        timeout: timeout.unwrap_or(CLOSE_TIMEOUT),
     }))
+}
+
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(60);
+fn close_deadline() -> Instant {
+    Instant::now() + CLOSE_TIMEOUT
+}
+fn close_remaining(deadline: Instant) -> Result<Duration> {
+    deadline.checked_duration_since(close_now()).filter(|remaining| !remaining.is_zero())
+        .context("close deadline expired; closing was not confirmed and terminal-side work may have occurred; use --timeout-secs for a longer budget")
+}
+
+// Close tests can advance this clock at an action boundary without scheduler races.
+fn close_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = CLOSE_TEST_TIME.with(std::cell::Cell::get) {
+        return now;
+    }
+    Instant::now()
+}
+
+#[cfg(test)]
+thread_local! {
+    static CLOSE_TEST_TIME: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+struct TestCloseClock(Option<Instant>);
+#[cfg(test)]
+impl TestCloseClock {
+    fn new(now: Instant) -> Self {
+        Self(CLOSE_TEST_TIME.with(|time| time.replace(Some(now))))
+    }
+    fn set(&self, now: Instant) {
+        CLOSE_TEST_TIME.with(|time| time.set(Some(now)));
+    }
+}
+#[cfg(test)]
+impl Drop for TestCloseClock {
+    fn drop(&mut self) {
+        CLOSE_TEST_TIME.with(|time| time.set(self.0));
+    }
 }
 
 fn parse_hook(args: &[String]) -> Result<NativeCommand> {
@@ -1242,6 +1299,7 @@ fn launch_created_session(
                 &created.directory,
                 &created.id,
                 error,
+                deadline,
             );
             return Err(error).with_context(|| {
                 format!(
@@ -1331,6 +1389,7 @@ fn launch_created_session(
                     &created.directory,
                     &created.id,
                     error,
+                    deadline,
                 );
                 return Err(error).with_context(|| {
                     format!(
@@ -1429,10 +1488,18 @@ fn record_provider_process(
 // does, through the same terminal-close authority checks. `reason` is kept in the closed
 // status when the close itself reports nothing, so a session closed because of a detected
 // conflict still says why.
-fn close_session_surface(directory: &Path, id: &str, reason: Option<String>) -> Result<()> {
-    session::close::close(&Store::open_unchecked(directory), reason, |session| {
-        terminal::ownership::close_owned_surface(directory, id, session)
-    })
+fn close_session_surface(
+    directory: &Path,
+    id: &str,
+    reason: Option<String>,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    session::close::close(
+        &Store::open_unchecked(directory),
+        reason,
+        deadline,
+        |session| terminal::ownership::close_owned_surface(directory, id, session, deadline),
+    )
     .map(|_| ())
 }
 
@@ -1489,7 +1556,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
     let attached = context::resolve(&request.context_results)?;
     let directory = Reader::session_directory(&request.id)?;
     session::hold::permit(&Reader::open_unchecked(&directory), &request.id)?;
-    Store::open_unchecked(&directory).converge()?;
+    Store::open_unchecked(&directory).converge_until(deadline)?;
     let manifest = Reader::open_unchecked(&directory).manifest()?;
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
     let terminal_session: terminal::TerminalSession =
@@ -2151,9 +2218,10 @@ fn prune_closed_sessions(root: &Path, cutoff_unix_ms: u128) -> Result<Vec<String
 }
 
 fn run_close(request: CloseRequest) -> Result<()> {
+    let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
     confirm_explicit_close(request.explicit)?;
     let directory = Reader::session_directory(&request.id)?;
-    close_session_surface(&directory, &request.id, None)
+    close_session_surface(&directory, &request.id, None, deadline)
         .with_context(|| format!("failed to close visible terminal session {}", request.id))?;
     if request.json {
         println!(

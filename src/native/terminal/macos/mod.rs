@@ -30,6 +30,8 @@ const STARTUP_CLEANUP_RESERVE: Duration = Duration::from_secs(2);
 
 pub(in crate::native) mod apple_terminal;
 mod applescript;
+#[cfg(test)]
+pub(in crate::native) use applescript::testing as automation_testing;
 pub(in crate::native) mod screen;
 pub(super) use screen::{guarded_dialog_input, read_screen};
 pub(in crate::native) mod ghostty;
@@ -230,30 +232,25 @@ pub(super) fn surface_present(session: &TerminalSession, timeout: Duration) -> R
     }
 }
 
-pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
-    match session.kind {
-        TerminalKind::Iterm2 => iterm2::close_session(session),
-        TerminalKind::AppleTerminal => apple_terminal::close_session(session),
-        TerminalKind::Ghostty => ghostty::close_session(session),
-        TerminalKind::Warp => warp::close_session(session),
-        TerminalKind::WezTerm => wezterm::close_session(&wezterm::Installed, session),
-        TerminalKind::WindowsConsole => bail!("Windows Console is only available on Windows"),
-    }
-}
-
 // Terminal.app's managed close requires the owner's recorded app incarnation.
 // Other adapters close by their own handle alone.
 pub(super) fn close_owned_session(
     directory: &Path,
     session: &TerminalSession,
+    deadline: std::time::Instant,
 ) -> Result<CloseOutcome> {
     match session.kind {
-        TerminalKind::AppleTerminal => apple_terminal::close_owned_session(directory, session),
-        _ => close_session(session),
+        TerminalKind::AppleTerminal => {
+            apple_terminal::close_owned_session(directory, session, deadline)
+        }
+        _ => close_session_until(session, deadline),
     }
 }
 
-fn close_session_until(session: &TerminalSession, deadline: Instant) -> Result<CloseOutcome> {
+pub(super) fn close_session_until(
+    session: &TerminalSession,
+    deadline: Instant,
+) -> Result<CloseOutcome> {
     match session.kind {
         TerminalKind::Iterm2 => iterm2::close_session_until(session, deadline),
         TerminalKind::AppleTerminal => apple_terminal::close_session_until(session, deadline),

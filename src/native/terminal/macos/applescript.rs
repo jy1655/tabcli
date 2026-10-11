@@ -8,6 +8,10 @@ use anyhow::{Context, Result, bail};
 use super::super::TerminalSendFailure;
 
 pub(super) fn run(application: &str, script: &str, arguments: &[&str]) -> Result<String> {
+    #[cfg(test)]
+    if let Some(result) = testing::run(None) {
+        return result;
+    }
     let output = command(script, arguments)
         .output()
         .context("failed to execute /usr/bin/osascript")?;
@@ -20,6 +24,10 @@ pub(super) fn run_until(
     arguments: &[&str],
     deadline: Instant,
 ) -> Result<String> {
+    #[cfg(test)]
+    if let Some(result) = testing::run(Some(deadline)) {
+        return result;
+    }
     if Instant::now() >= deadline {
         bail!("{application} automation timed out before it started");
     }
@@ -39,7 +47,7 @@ pub(super) fn run_until(
         // that says what to check.
         // Half a second: the launcher keeps two seconds for cleanup after a timeout,
         // and the IOKit query answers in well under that.
-        let lock = match super::screen_locked(Instant::now() + Duration::from_millis(500)) {
+        let lock = match timeout_screen_lock(super::screen_locked) {
             Some(true) => "; the screen is locked",
             _ => "",
         };
@@ -48,6 +56,18 @@ pub(super) fn run_until(
         ))
     })?;
     parse_output(application, output)
+}
+
+fn timeout_screen_lock(probe: impl FnOnce(Instant) -> Option<bool>) -> Option<bool> {
+    let diagnostic_deadline = Instant::now() + Duration::from_millis(500);
+    let deadline = match crate::native::session::close::budget::deadline() {
+        Some(close) => {
+            crate::native::close_remaining(close).ok()?;
+            diagnostic_deadline.min(close)
+        }
+        None => diagnostic_deadline,
+    };
+    probe(deadline)
 }
 
 pub(super) fn run_send_until(
@@ -129,6 +149,28 @@ mod tests {
     }
 
     #[test]
+    fn close_deadline_timeout_skips_diagnostic_probe_only_inside_close() {
+        let now = Instant::now();
+        let _clock = crate::native::TestCloseClock::new(now);
+        {
+            let _budget = crate::native::session::close::budget::Scope::enter(now);
+            assert_eq!(
+                timeout_screen_lock(|_| panic!("expired close must not start a probe")),
+                None
+            );
+        }
+        let mut probed = false;
+        assert_eq!(
+            timeout_screen_lock(|_| {
+                probed = true;
+                Some(true)
+            }),
+            Some(true)
+        );
+        assert!(probed, "ordinary automation keeps its diagnostic");
+    }
+
+    #[test]
     fn a_script_error_keeps_its_own_message() {
         let error = run_until(
             "Test",
@@ -140,5 +182,31 @@ mod tests {
         let text = format!("{error:#}");
         assert!(text.contains("Test automation failed"), "{text}");
         assert!(!text.contains("did not answer"), "{text}");
+    }
+}
+
+// Substitute only the external automation boundary; close dispatch remains production code.
+#[cfg(test)]
+pub(in crate::native) mod testing {
+    use super::*;
+    type Runner = Box<dyn FnMut(Option<Instant>) -> Result<String>>;
+    thread_local! {
+        static RUNNER: std::cell::RefCell<Option<Runner>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn run(deadline: Option<Instant>) -> Option<Result<String>> {
+        RUNNER.with(|runner| runner.borrow_mut().as_mut().map(|run| run(deadline)))
+    }
+    pub(in crate::native) fn with_runner<T>(
+        runner: impl FnMut(Option<Instant>) -> Result<String> + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset(Option<Runner>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                RUNNER.with(|runner| *runner.borrow_mut() = self.0.take());
+            }
+        }
+        let _reset = Reset(RUNNER.with(|slot| slot.replace(Some(Box::new(runner)))));
+        run()
     }
 }

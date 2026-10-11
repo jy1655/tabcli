@@ -1,8 +1,48 @@
 //! Explicit close, interrupted-close convergence, and dead-owner repair.
-use crate::native::terminal::ownership::{
-    close_dead_owner_surface, owner_blocks_prune, repair_owner_is_live,
-};
+use crate::native::terminal::ownership::{owner_blocks_prune, repair_owner_is_live};
 use crate::native::*;
+
+// The close is synchronous. Scope its record I/O and diagnostics as well as its
+// terminal calls; ordinary callers of these shared primitives remain unchanged.
+// This is thread-local, never inherited by another command/thread, and restored on
+// every return or unwind. Nested repair may shorten but cannot renew the budget.
+pub(in crate::native) mod budget {
+    use super::*;
+    thread_local! {
+        static DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    }
+    pub(in crate::native) struct Scope {
+        previous: Option<Instant>,
+        _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+    impl Scope {
+        pub(in crate::native) fn enter(deadline: Instant) -> Self {
+            let previous = DEADLINE.with(|slot| {
+                let previous = slot.get();
+                slot.set(Some(previous.map_or(deadline, |outer| outer.min(deadline))));
+                previous
+            });
+            Self {
+                previous,
+                _same_thread: std::marker::PhantomData,
+            }
+        }
+    }
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            DEADLINE.with(|slot| slot.set(self.previous));
+        }
+    }
+    pub(in crate::native) fn deadline() -> Option<Instant> {
+        DEADLINE.with(std::cell::Cell::get)
+    }
+    pub(in crate::native) fn check() -> Result<()> {
+        deadline()
+            .map(crate::native::close_remaining)
+            .transpose()
+            .map(|_| ())
+    }
+}
 
 #[cfg(target_os = "macos")]
 #[derive(Deserialize, Serialize)]
@@ -207,15 +247,31 @@ impl Reader {
 
 // Repairs a dead native owner first, then closes. A repair failure is the recorded close
 // error; otherwise `reason` (if any) is kept in the closed status.
-pub(in crate::native) fn close<F>(
+pub(in crate::native) fn close(
     store: &Store,
     reason: Option<String>,
-    close_terminal: F,
-) -> Result<terminal::CloseOutcome>
-where
-    F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
-{
-    close_with_repair(store, reason, || repair_dead_owner(store), close_terminal)
+    deadline: Instant,
+    close_terminal: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
+) -> Result<terminal::CloseOutcome> {
+    close_with_repair(
+        store,
+        reason,
+        || repair_dead_owner_until(store, deadline),
+        close_terminal,
+        deadline,
+    )
+    .map_err(|error| match crate::native::close_remaining(deadline) {
+        Ok(_) => error,
+        // The expiry itself already says so; add it only to an error that does not.
+        Err(expired)
+            if error
+                .chain()
+                .any(|cause| cause.to_string() == expired.to_string()) =>
+        {
+            error
+        }
+        Err(expired) => error.context(expired.to_string()),
+    })
 }
 
 fn close_with_repair(
@@ -223,16 +279,30 @@ fn close_with_repair(
     reason: Option<String>,
     repair: impl FnOnce() -> Result<bool>,
     mut close_terminal: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
+    deadline: std::time::Instant,
 ) -> Result<terminal::CloseOutcome> {
+    let _budget = budget::Scope::enter(deadline);
+    crate::native::close_remaining(deadline)?;
     let repair_error = repair()
         .err()
         .map(|error| format!("pre-close session repair failed: {error:#}"));
+    if let Err(expired) = budget::check() {
+        return Err(match repair_error {
+            Some(error) => anyhow::anyhow!(error).context(expired),
+            None => expired,
+        });
+    }
     let mut outcome = terminal::CloseOutcome::Missing;
-    close_session_state_with_error(store, repair_error.or(reason), |surface| {
-        let result = close_terminal(surface)?;
-        outcome = result.outcome;
-        Ok(result)
-    })?;
+    close_session_state_with_error(
+        store,
+        repair_error.or(reason),
+        |surface| {
+            let result = close_terminal(surface)?;
+            outcome = result.outcome;
+            Ok(result)
+        },
+        deadline,
+    )?;
     Ok(outcome)
 }
 
@@ -240,10 +310,13 @@ fn close_session_state_with_error<F>(
     store: &Store,
     mut close_error: Option<String>,
     mut close_terminal: F,
+    deadline: std::time::Instant,
 ) -> Result<()>
 where
     F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
 {
+    let _budget = budget::Scope::enter(deadline);
+    crate::native::close_remaining(deadline)?;
     let claim_path = store.record(CoreRecord::TurnClaim).path().to_owned();
     let _turn_lock = store.lock()?;
     let status: SessionStatus = store.status()?;
@@ -322,7 +395,12 @@ where
                 return Err(error);
             }
         };
-    let result = match close_terminal(&terminal) {
+    let result = match crate::native::close_remaining(deadline)
+        .and_then(|_| close_terminal(&terminal))
+        .and_then(|result| {
+            crate::native::close_remaining(deadline)?;
+            Ok(result)
+        }) {
         Ok(result) => result,
         Err(error) => {
             restore_terminal_handle(&closing_path, &terminal_path)?;
@@ -407,6 +485,9 @@ fn consume_terminal_handle(
     if tombstone_result.is_ok() {
         interruption::at(interruption::Point::ConsumptionMarkerWritten);
     }
+    // A consumption marker is durable authority for the next close. After it is
+    // written, expiry leaves the claim in place; this is never a handle rollback.
+    budget::check()?;
     let active_result = RecordStore::at(store.record(CoreRecord::Terminal).path()).remove();
     let closing_result = RecordStore::at(store.record(CoreRecord::TerminalClosing).path()).remove();
     #[cfg(all(test, target_os = "macos"))]
@@ -614,11 +695,16 @@ fn mark_session_closed_with_residual_locked(
 }
 
 pub(in crate::native) fn repair_dead_owner(store: &Store) -> Result<bool> {
+    repair_dead_owner_until(store, crate::native::close_deadline())
+}
+
+pub(in crate::native) fn repair_dead_owner_until(store: &Store, deadline: Instant) -> Result<bool> {
     repair_dead_owner_with(
         store,
         repair_owner_is_live,
         terminal::surface_outlives_owner,
-        close_dead_owner_surface,
+        |surface| terminal::ownership::close_dead_owner_surface_until(surface, deadline),
+        deadline,
     )
 }
 
@@ -627,13 +713,14 @@ fn repair_dead_owner_with<F>(
     owner_is_live: impl FnOnce(&NativeSessionOwner) -> Result<bool>,
     retain_surface: impl Fn(&terminal::TerminalSession) -> bool,
     mut close_terminal: F,
+    deadline: std::time::Instant,
 ) -> Result<bool>
 where
     F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
 {
     let directory = store.directory();
     #[cfg(not(windows))]
-    let _ = &mut close_terminal;
+    let _ = (&mut close_terminal, deadline);
     #[cfg(not(target_os = "macos"))]
     let _ = &retain_surface;
     // Completion recovery runs first so a live owner's finished turn is published before
@@ -644,6 +731,10 @@ where
     // and the damage is reported in the close error. Under a live owner, or when the
     // owner cannot be shown dead, the damage is the result.
     let recovery_damage = recover_pending_completion(directory).err();
+    // A bounded wait is not journal damage and grants no repair authority.
+    if let Err(expired) = budget::check() {
+        return Err(recovery_damage.unwrap_or(expired));
+    }
     let untouched = |damage: Option<anyhow::Error>| match damage {
         Some(error) => Err(error),
         None => Ok(false),
@@ -677,7 +768,8 @@ where
             return Err(error).with_context(|| format!("failed to read {}", owner_path.display()));
         }
     };
-    if owner_is_live(&owner)? {
+    let owner_live = owner_is_live(&owner)?;
+    if owner_live {
         return untouched(recovery_damage);
     }
     let mut repair_error = status
@@ -691,15 +783,19 @@ where
     #[cfg(windows)]
     {
         if matches!(status.state, SessionState::Exited | SessionState::Failed) {
+            crate::native::close_remaining(deadline)?;
             mark_session_closed(store, repair_error)?;
             return Ok(true);
         }
         // The visible console root can outlive a failed native-session owner. Reuse the same
         // atomic terminal-handle claim as explicit close so concurrent repair callers cannot
         // perform the external close side effect twice.
-        close_session_state_with_error(store, repair_error, |surface| {
-            close_terminal(surface).map(Into::into)
-        })
+        close_session_state_with_error(
+            store,
+            repair_error,
+            |surface| close_terminal(surface).map(Into::into),
+            deadline,
+        )
         .context("failed to close a Windows console whose native owner exited")?;
         Ok(true)
     }
@@ -759,9 +855,11 @@ pub(in crate::native) mod compatibility {
                     owner_live,
                     terminal::surface_outlives_owner,
                     |_| panic!("macOS repair must not close a surface"),
+                    crate::native::close_deadline(),
                 )
             },
             closer,
+            crate::native::close_deadline(),
         )
     }
     #[cfg(target_os = "macos")]
@@ -771,11 +869,16 @@ pub(in crate::native) mod compatibility {
         mut closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
     ) -> Result<terminal::CloseOutcome> {
         let mut outcome = terminal::CloseOutcome::Missing;
-        super::close_session_state_with_error(store, reason, |surface| {
-            let result = closer(surface)?;
-            outcome = result.outcome;
-            Ok(result)
-        })?;
+        super::close_session_state_with_error(
+            store,
+            reason,
+            |surface| {
+                let result = closer(surface)?;
+                outcome = result.outcome;
+                Ok(result)
+            },
+            crate::native::close_deadline(),
+        )?;
         Ok(outcome)
     }
     pub(in crate::native) fn mark_session_closed(
@@ -788,26 +891,36 @@ pub(in crate::native) mod compatibility {
         directory: &Path,
         mut closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
     ) -> Result<()> {
-        super::close_session_state_with_error(&Store::open_unchecked(directory), None, |surface| {
-            closer(surface).map(Into::into)
-        })
+        super::close_session_state_with_error(
+            &Store::open_unchecked(directory),
+            None,
+            |surface| closer(surface).map(Into::into),
+            crate::native::close_deadline(),
+        )
     }
     pub(in crate::native) fn close_session_state_with_error(
         directory: &Path,
         error: Option<String>,
         mut closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
+        deadline: std::time::Instant,
     ) -> Result<()> {
-        super::close_session_state_with_error(&Store::open_unchecked(directory), error, |surface| {
-            closer(surface).map(Into::into)
-        })
+        super::close_session_state_with_error(
+            &Store::open_unchecked(directory),
+            error,
+            |surface| closer(surface).map(Into::into),
+            deadline,
+        )
     }
     pub(in crate::native) fn close_repaired_session_state(
         directory: &Path,
         mut closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
     ) -> Result<()> {
-        super::close(&Store::open_unchecked(directory), None, |surface| {
-            closer(surface).map(Into::into)
-        })
+        super::close(
+            &Store::open_unchecked(directory),
+            None,
+            crate::native::close_deadline(),
+            |surface| closer(surface).map(Into::into),
+        )
         .map(|_| ())
     }
     pub(in crate::native) fn repair_dead_native_owner(directory: &Path) -> Result<bool> {
@@ -821,7 +934,10 @@ pub(in crate::native) mod compatibility {
             &Store::open_unchecked(directory),
             repair_owner_is_live,
             terminal::surface_outlives_owner,
-            |session| close_dead_owner_surface_with(session, &mut closer),
+            |session| {
+                close_dead_owner_surface_with(session, &mut closer, crate::native::close_deadline())
+            },
+            crate::native::close_deadline(),
         )
     }
     #[cfg(target_os = "macos")]
@@ -864,7 +980,7 @@ mod tests;
 // handler runs. File locks unwind; only the selected thread's one checkpoint fires.
 #[cfg(all(test, target_os = "macos"))]
 pub(in crate::native) mod interruption {
-    use std::cell::Cell;
+    use std::{cell::Cell, time::Instant};
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(in crate::native) enum Point {
         IntentPublished,
@@ -874,13 +990,32 @@ pub(in crate::native) mod interruption {
         ClosedTombstoneWritten,
     }
     thread_local! {
+        static EXPIRE: Cell<Option<(Point, Instant)>> = const { Cell::new(None) };
         static STOP: Cell<Option<Point>> = const { Cell::new(None) };
     }
     pub(in crate::native) fn at(point: Point) {
+        EXPIRE.with(|slot| {
+            if let Some((at, deadline)) = slot.get()
+                && at == point
+            {
+                crate::native::CLOSE_TEST_TIME.with(|time| time.set(Some(deadline)));
+            }
+        });
         if STOP.with(|stop| stop.get() == Some(point)) {
             STOP.with(|stop| stop.set(None));
             std::panic::panic_any(point);
         }
+    }
+    pub(super) fn expiring<T>(point: Point, deadline: Instant, run: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                EXPIRE.with(|slot| slot.set(None));
+            }
+        }
+        let _reset = Reset;
+        EXPIRE.with(|slot| slot.set(Some((point, deadline))));
+        run()
     }
     pub(in crate::native) fn during<T>(
         point: Point,

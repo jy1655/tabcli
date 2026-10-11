@@ -246,7 +246,10 @@ fn delivery_settlement_after_close_preserves_the_tombstone() {
                 closed.generation += 1;
                 store.write_closed(&closed).unwrap();
             } else {
-                session::close::close(&store, None, |_| panic!("no bound surface")).unwrap();
+                session::close::close(&store, None, crate::native::close_deadline(), |_| {
+                    panic!("no bound surface")
+                })
+                .unwrap();
             }
             let tombstone = store.record(CoreRecord::Closed).bytes().unwrap().unwrap();
             let error = anyhow::anyhow!("late delivery report");
@@ -305,7 +308,10 @@ fn delivery_begin_refuses_closed_and_replaced_claims() {
             .complete("completed", None, None)
             .unwrap();
         let newer = if closed {
-            session::close::close(&store, None, |_| panic!("no surface")).unwrap();
+            session::close::close(&store, None, crate::native::close_deadline(), |_| {
+                panic!("no surface")
+            })
+            .unwrap();
             None
         } else {
             Some(claim_ready(&store, "session-test", &[]).unwrap().0)

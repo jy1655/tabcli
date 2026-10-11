@@ -675,8 +675,11 @@ pub(super) fn guarded_dialog_input(
     }
 }
 
-pub(super) fn close_session(session: &TerminalSession) -> Result<CloseOutcome> {
-    match run_console_helper("close", session, None) {
+pub(super) fn close_session_until(
+    session: &TerminalSession,
+    deadline: Instant,
+) -> Result<CloseOutcome> {
+    match run_console_helper("close", session, None, deadline) {
         Ok(()) => Ok(CloseOutcome::Closed),
         Err(error) if super::windows_console_helper_reports_missing(&error.to_string()) => {
             Ok(CloseOutcome::Missing)
@@ -722,11 +725,19 @@ fn run_console_send_helper(
     }
 }
 
-fn run_console_helper(action: &str, session: &TerminalSession, input: Option<&str>) -> Result<()> {
+fn run_console_helper(
+    action: &str,
+    session: &TerminalSession,
+    input: Option<&str>,
+    deadline: Instant,
+) -> Result<()> {
     let mut command = console_helper_command(action, session, input)?;
-    let output = command
-        .output()
-        .context("failed to start Windows console control helper")?;
+    run_console_helper_command(&mut command, deadline)
+}
+
+fn run_console_helper_command(command: &mut Command, deadline: Instant) -> Result<()> {
+    let output =
+        super::super::command_output_until(command, deadline, "Windows console control helper")?;
     if output.status.success() {
         return Ok(());
     }
@@ -1229,6 +1240,8 @@ fn terminate_console_processes(
             return Err(error)
                 .with_context(|| format!("failed to terminate console process {}", process.pid));
         }
+        #[cfg(test)]
+        tests::after_console_termination(process.pid, exit_code)?;
     }
     Ok(())
 }

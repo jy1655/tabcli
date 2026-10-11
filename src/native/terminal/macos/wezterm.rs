@@ -53,7 +53,6 @@ use super::super::WezTermMux;
 use super::{CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession};
 use crate::native::{CommandOutputFailure, shell_quote};
 
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(100);
 // How long the GUI may take to paint a new tab and record its pane as focused. A window in
@@ -69,6 +68,9 @@ const EXIT_GRACE: Duration = if cfg!(test) {
 
 // What the adapter needs from the machine. Tests replace it; nothing else does.
 pub(super) trait Host {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
     // Verified local GUI incarnations; never a remote mux or a caller's socket hint.
     fn discover_guis(&self) -> Result<Vec<WezTermMux>> {
         Ok(Vec::new())
@@ -457,14 +459,68 @@ fn call(
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn panes(host: &dyn Host, mux: &WezTermMux, deadline: Instant) -> Result<Vec<Pane>> {
-    let listing = call(host, mux, &["list", "--format", "json"], None, deadline)
-        .map_err(CommandOutputFailure::into_error)?;
-    serde_json::from_str(&listing).context("WezTerm returned an unreadable pane list")
+// Kept typed through discovery: only a started list that times out proves busy.
+// Capability failures can use the private-GUI fallback, but are never list evidence.
+#[derive(Debug)]
+enum LookupFailure {
+    Busy(anyhow::Error),
+    Exhausted,
+    Unusable(anyhow::Error),
+    Capability(anyhow::Error),
+}
+
+impl std::fmt::Display for LookupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy(error) => {
+                write!(f, "WezTerm pane listing did not answer in time: {error:#}")
+            }
+            Self::Exhausted => write!(f, "WezTerm deadline expired"),
+            Self::Unusable(error) => write!(f, "{error:#}"),
+            Self::Capability(error) => {
+                write!(f, "WezTerm spawn capability check failed: {error:#}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LookupFailure {}
+
+impl From<anyhow::Error> for LookupFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Unusable(error)
+    }
+}
+
+fn panes(
+    host: &dyn Host,
+    mux: &WezTermMux,
+    deadline: Instant,
+) -> std::result::Result<Vec<Pane>, LookupFailure> {
+    if host.now() >= deadline {
+        return Err(LookupFailure::Exhausted);
+    }
+    let listing =
+        call(host, mux, &["list", "--format", "json"], None, deadline).map_err(|failure| {
+            if failure.timed_out() {
+                LookupFailure::Busy(failure.into_error())
+            } else if !failure.process_started() && host.now() >= deadline {
+                LookupFailure::Exhausted
+            } else {
+                LookupFailure::Unusable(failure.into_error())
+            }
+        })?;
+    serde_json::from_str(&listing)
+        .context("WezTerm returned an unreadable pane list")
+        .map_err(LookupFailure::Unusable)
 }
 
 // The panes of the session's process, `None` when the process is gone.
-fn listed(host: &dyn Host, mux: &WezTermMux, deadline: Instant) -> Result<Option<Vec<Pane>>> {
+fn listed(
+    host: &dyn Host,
+    mux: &WezTermMux,
+    deadline: Instant,
+) -> std::result::Result<Option<Vec<Pane>>, LookupFailure> {
     if !serving(host, mux)? {
         return Ok(None);
     }
@@ -608,7 +664,10 @@ fn startup_pane(host: &dyn Host, mux: &WezTermMux, deadline: Instant) -> Result<
                         more.len()
                     ),
                 },
-                Err(error) => waiting_for = error,
+                // A deadline before the next read adds no observation. Keep the
+                // last startup evidence (for example, an answered empty list).
+                Err(LookupFailure::Exhausted) => return Err(waiting_for),
+                Err(error) => waiting_for = error.into(),
             },
             Some(pid) => bail!(
                 "{} is served by process {pid}, not by the WezTerm process {} that was started",
@@ -655,6 +714,9 @@ fn create_private_gui(
     program: &[String],
     deadline: Instant,
 ) -> Result<TerminalSession> {
+    if host.now() >= deadline {
+        return Err(LookupFailure::Exhausted.into());
+    }
     let mux = host.start_gui(program)?;
     match startup_pane(host, &mux, deadline) {
         Ok(pane) => Ok(TerminalSession {
@@ -680,32 +742,59 @@ fn create_private_gui(
 
 // Only a single verified local window is an unambiguous target. Multiple panes/tabs
 // of that window are fine: none is used as the source pane or receives any input.
-fn existing_window(host: &dyn Host, deadline: Instant) -> Result<(WezTermMux, Vec<Pane>, u64)> {
+fn existing_window(
+    host: &dyn Host,
+    deadline: Instant,
+) -> std::result::Result<(WezTermMux, Vec<Pane>, u64), LookupFailure> {
+    if host.now() >= deadline {
+        return Err(LookupFailure::Exhausted);
+    }
     let guis = host.discover_guis()?;
     let mut targets = Vec::new();
+    let mut unusable = None;
     for mut mux in guis {
         mux.owns_gui = false;
-        let snapshot = listed(host, &mux, deadline)?.context("discovered GUI ended")?;
+        let snapshot = match listed(host, &mux, deadline) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                unusable.get_or_insert_with(|| anyhow!("discovered GUI ended"));
+                continue;
+            }
+            Err(LookupFailure::Unusable(error)) => {
+                unusable.get_or_insert(error);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let mut ids = BTreeSet::new();
         if snapshot.iter().any(|pane| !ids.insert(pane.pane_id)) {
-            bail!("existing GUI returned duplicate pane identities");
+            unusable
+                .get_or_insert_with(|| anyhow!("existing GUI returned duplicate pane identities"));
+            continue;
         }
         let windows: BTreeSet<_> = snapshot.iter().map(|pane| pane.window_id).collect();
         for window in windows {
             targets.push((mux.clone(), snapshot.clone(), window));
         }
     }
+    // Inspect every discovered GUI before choosing fallback: an unusable listing
+    // must not hide a later GUI's timeout.
+    if let Some(error) = unusable {
+        return Err(LookupFailure::Unusable(error));
+    }
     if targets.len() != 1 {
-        bail!(
+        return Err(LookupFailure::Unusable(anyhow!(
             "{} verified local WezTerm windows; no unique tab target",
             targets.len()
-        );
+        )));
     }
     let target = targets.pop().unwrap();
     let help = call(host, &target.0, &["spawn", "--help"], None, deadline)
-        .map_err(CommandOutputFailure::into_error)?;
+        .map_err(|failure| LookupFailure::Capability(failure.into_error()))?;
     if !help.contains("--window-id") || !help.contains("--domain-name") {
-        bail!("installed WezTerm CLI does not support an explicitly addressed local tab spawn");
+        return Err(LookupFailure::Unusable(anyhow!(
+            "installed WezTerm CLI does not support an explicitly addressed local tab spawn"
+        )));
     }
     require_serving(host, &target.0)?;
     Ok(target)
@@ -764,7 +853,16 @@ fn create(
     }
     let (mux, snapshot, window) = match existing_window(host, deadline) {
         Ok(target) => target,
+        Err(reason @ LookupFailure::Busy(_)) => {
+            return Err(anyhow::Error::from(reason))
+                .context("the running WezTerm did not answer in time; no new window was opened; close the sessions you have finished with and retry when WezTerm responds");
+        }
+        Err(LookupFailure::Exhausted) => return Err(LookupFailure::Exhausted.into()),
         Err(reason) => {
+            if host.now() >= deadline {
+                return Err(anyhow::Error::from(LookupFailure::Exhausted))
+                    .with_context(|| format!("WezTerm new-window fallback after: {reason:#}"));
+            }
             eprintln!("WezTerm tab-first: {reason:#}; opening a new private GUI window");
             return create_private_gui(host, program, deadline)
                 .with_context(|| format!("WezTerm new-window fallback after: {reason:#}"));
@@ -1035,10 +1133,6 @@ pub(super) fn read_screen(
     .map_err(CommandOutputFailure::into_error)
 }
 
-pub(super) fn close_session(host: &dyn Host, session: &TerminalSession) -> Result<CloseOutcome> {
-    close_session_until(host, session, super::timeout_deadline(CLOSE_TIMEOUT)?)
-}
-
 // Every step reads the state again, so a close that failed part of the way is finished by
 // the next one: a pane that is gone is not killed again, and a process that was left
 // without panes is ended.
@@ -1047,12 +1141,14 @@ pub(super) fn close_session_until(
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
+    crate::native::close_remaining(deadline)?;
     let (mux, pane) = target(session)?;
     let mut outcome = CloseOutcome::Missing;
     let mut kill: Option<Result<()>> = None;
     let mut without_panes_since: Option<Instant> = None;
     let mut asked_to_end = false;
     loop {
+        crate::native::close_remaining(deadline)?;
         let waiting_for = match listed(host, mux, deadline) {
             Ok(None) => {
                 forget_socket(host, mux);
@@ -1070,6 +1166,7 @@ pub(super) fn close_session_until(
                 }
                 match kill.take() {
                     None => {
+                        crate::native::close_remaining(deadline)?;
                         outcome = CloseOutcome::Closed;
                         kill = Some(
                             call(
@@ -1102,6 +1199,7 @@ pub(super) fn close_session_until(
                 let since = *without_panes_since.get_or_insert_with(Instant::now);
                 if !asked_to_end && since.elapsed() >= EXIT_GRACE {
                     asked_to_end = true;
+                    crate::native::close_remaining(deadline)?;
                     host.terminate(mux.pid)?;
                 }
                 anyhow!(
@@ -1110,12 +1208,15 @@ pub(super) fn close_session_until(
                 )
             }
             // The process can be ending: its socket closes before it is gone.
-            Err(error) => error,
+            Err(error) => error.into(),
         };
         if Instant::now() >= deadline {
             return Err(waiting_for);
         }
-        thread::sleep(POLL);
+        thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
+        if Instant::now() >= deadline {
+            return Err(waiting_for);
+        }
     }
 }
 
@@ -1218,6 +1319,13 @@ mod tests {
         existing_gui: bool,
         discovery_error: bool,
         discovery_duplicates: bool,
+        second_gui: bool,
+        list_count: usize,
+        list_timeout_at: Option<usize>,
+        first_listing: Option<String>,
+        timed_out: Vec<&'static str>,
+        expire_command: Option<&'static str>,
+        now: Option<Instant>,
         spawn_count: usize,
         spawn_reply: Option<String>,
         after_spawn_listing: Option<String>,
@@ -1301,6 +1409,9 @@ mod tests {
     }
 
     impl Host for Fake {
+        fn now(&self) -> Instant {
+            self.0.borrow().now.unwrap_or_else(Instant::now)
+        }
         fn discover_guis(&self) -> Result<Vec<WezTermMux>> {
             let mux = self.0.borrow();
             if mux.discovery_error {
@@ -1319,6 +1430,12 @@ mod tests {
             };
             if mux.discovery_duplicates {
                 found.extend(found.clone());
+            }
+            if mux.second_gui {
+                let mut second = found[0].clone();
+                second.pid += 1;
+                second.socket.push_str("-second");
+                found.push(second);
             }
             Ok(found)
         }
@@ -1342,12 +1459,13 @@ mod tests {
 
         fn socket_server(&self, socket: &str) -> Result<Option<u32>> {
             let mut mux = self.0.borrow_mut();
-            assert_eq!(socket, SOCKET);
+            assert!(socket == SOCKET || (mux.second_gui && socket == format!("{SOCKET}-second")));
             if mux.polls_before_listening > 0 {
                 mux.polls_before_listening -= 1;
                 return Ok(None);
             }
-            Ok(mux.foreign_server.or(mux.birth.map(|_| PID)))
+            let pid = if socket == SOCKET { PID } else { PID + 1 };
+            Ok(mux.foreign_server.or(mux.birth.map(|_| pid)))
         }
 
         fn process_start(&self, pid: u32) -> Result<Option<(u64, u64)>> {
@@ -1355,7 +1473,9 @@ mod tests {
             if mux.unreadable_process {
                 bail!("failed to inspect process {pid}");
             }
-            Ok(mux.birth.filter(|_| pid == PID))
+            Ok(mux
+                .birth
+                .filter(|_| pid == PID || (mux.second_gui && pid == PID + 1)))
         }
 
         fn terminate(&self, pid: u32) -> Result<()> {
@@ -1377,10 +1497,10 @@ mod tests {
             socket: &str,
             arguments: &[&str],
             input: Option<&[u8]>,
-            _deadline: Instant,
+            deadline: Instant,
         ) -> std::result::Result<Output, CommandOutputFailure> {
             let mut mux = self.0.borrow_mut();
-            assert_eq!(socket, SOCKET);
+            assert!(socket == SOCKET || (mux.second_gui && socket == format!("{SOCKET}-second")));
             assert!(
                 mux.foreign_server.is_none(),
                 "a socket that another process serves got a call"
@@ -1394,6 +1514,30 @@ mod tests {
                 input.map(<[u8]>::to_vec),
             ));
             let command = arguments[0];
+            if mux.expire_command == Some(command) {
+                mux.now = Some(deadline);
+                return Err(CommandOutputFailure::not_started(anyhow!(
+                    "budget used before subprocess start"
+                )));
+            }
+            if command == "list" {
+                mux.list_count += 1;
+                if mux.list_timeout_at == Some(mux.list_count) {
+                    return Err(
+                        CommandOutputFailure::started(anyhow!("opaque runner failure"))
+                            .ended_at_deadline(),
+                    );
+                }
+                if let Some(listing) = mux.first_listing.take() {
+                    return Ok(output(0, &listing, ""));
+                }
+            }
+            if take(&mut mux.timed_out, command) {
+                return Err(
+                    CommandOutputFailure::started(anyhow!("opaque runner failure"))
+                        .ended_at_deadline(),
+                );
+            }
             if take(&mut mux.not_started, command) {
                 return Err(CommandOutputFailure::not_started(anyhow!(
                     "failed to start WezTerm CLI"
@@ -1734,6 +1878,141 @@ mod tests {
             assert!(mux.terminated.is_empty());
             assert!(mux.removed.is_empty());
         }
+    }
+
+    #[test]
+    fn busy_listing_never_starts_a_private_gui() {
+        let host = existing();
+        host.0.borrow_mut().list_timeout_at = Some(1);
+        let error = create_tab(&host, soon()).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("running WezTerm did not answer in time"),
+            "{text}"
+        );
+        assert!(text.contains("no new window was opened"), "{text}");
+        assert!(
+            text.contains("close the sessions you have finished with and retry"),
+            "{text}"
+        );
+        assert_eq!(host.0.borrow().started, 0);
+        assert_eq!(commands(&host), ["list"]);
+    }
+
+    #[test]
+    fn one_busy_listing_among_several_guis_prevents_fallback() {
+        for first in [None, Some("not json".to_owned()), Some("[]".to_owned())] {
+            let host = existing();
+            {
+                let mut mux = host.0.borrow_mut();
+                mux.second_gui = true;
+                mux.first_listing = first;
+                mux.list_timeout_at = Some(2);
+            }
+            let error = create_tab(&host, soon()).unwrap_err();
+            assert!(format!("{error:#}").contains("running WezTerm did not answer in time"));
+            assert_eq!(host.0.borrow().started, 0);
+            assert_eq!(commands(&host), ["list", "list"]);
+        }
+    }
+
+    #[test]
+    fn exhausted_launch_budget_starts_neither_list_nor_gui() {
+        for force_new_window in [false, true] {
+            let host = existing();
+            let error = create(&host, force_new_window, &program(), Instant::now()).unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains("deadline"), "{text}");
+            assert!(!text.contains("running WezTerm did not answer in time"));
+            assert_eq!(host.0.borrow().started, 0);
+            assert!(commands(&host).is_empty());
+        }
+    }
+
+    #[test]
+    fn expired_private_gui_budget_never_calls_start_gui() {
+        let host = fake();
+        assert!(create_private_gui(&host, &program(), Instant::now()).is_err());
+        assert_eq!(host.0.borrow().started, 0);
+        assert!(commands(&host).is_empty());
+    }
+
+    #[test]
+    fn capability_check_failure_is_not_a_busy_listing() {
+        for timed_out in [false, true] {
+            let host = existing();
+            if timed_out {
+                host.0.borrow_mut().timed_out.push("spawn");
+            } else {
+                host.0.borrow_mut().refused.push("spawn");
+            }
+            let error = existing_window(&host, soon()).unwrap_err();
+            let text = format!("{error:#}");
+            assert!(text.contains("capability check failed"), "{text}");
+            assert!(!text.contains("running WezTerm did not answer in time"));
+        }
+    }
+
+    #[test]
+    fn budget_exhausted_before_list_subprocess_starts_is_not_busy() {
+        let host = existing();
+        host.0.borrow_mut().expire_command = Some("list");
+        let error = create_tab(&host, soon()).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("deadline"), "{text}");
+        assert!(!text.contains("running WezTerm did not answer in time"));
+        assert_eq!(host.0.borrow().started, 0);
+    }
+
+    #[test]
+    fn capability_failure_falls_back_only_with_budget_remaining() {
+        for expired in [false, true] {
+            let host = existing();
+            if expired {
+                host.0.borrow_mut().expire_command = Some("spawn");
+                let error = create_tab(&host, soon()).unwrap_err();
+                let text = format!("{error:#}");
+                assert!(text.contains("capability check failed"), "{text}");
+                assert!(!text.contains("running WezTerm did not answer in time"));
+                assert_eq!(host.0.borrow().started, 0);
+            } else {
+                host.0.borrow_mut().refused.push("spawn");
+                let handle = create_tab(&host, soon()).unwrap();
+                assert!(handle.wezterm_mux.unwrap().owns_gui);
+                assert_eq!(host.0.borrow().started, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn unusable_listings_keep_private_gui_fallback() {
+        type Arrange = fn(&mut Mux);
+        let cases: [Arrange; 6] = [
+            |m| m.panes = vec![7, 7],
+            |m| m.first_listing = Some("not json".to_owned()),
+            |m| m.birth = None,
+            |m| m.refused.push("list"),
+            |m| m.not_started.push("list"),
+            |m| m.second_gui = true,
+        ];
+        for arrange in cases {
+            let host = existing();
+            arrange(&mut host.0.borrow_mut());
+            let handle = create_tab(&host, soon()).unwrap();
+            assert!(handle.wezterm_mux.unwrap().owns_gui);
+            assert_eq!(host.0.borrow().started, 1);
+            assert_eq!(host.0.borrow().spawn_count, 0);
+        }
+    }
+
+    #[test]
+    fn explicit_new_window_does_not_probe_existing_guis() {
+        let host = existing();
+        host.0.borrow_mut().discovery_error = true;
+        let handle = create(&host, true, &program(), soon()).unwrap();
+        assert!(handle.wezterm_mux.unwrap().owns_gui);
+        assert_eq!(host.0.borrow().started, 1);
+        assert_eq!(commands(&host), ["list"]); // Only the new GUI's startup listing.
     }
 
     #[test]
