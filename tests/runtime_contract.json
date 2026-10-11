@@ -4,10 +4,12 @@
     "provider-process.json": 2,
     "reopen.refusal.json": 1
   },
+  "src/native/delivery.rs": {
+    ".prefix(\"pending-prompt-\")": 1
+  },
   "src/native.rs": {
     "AGENT_BRIDGE_NATIVE_SESSION_ID": 1,
     "AGENT_BRIDGE_EXECUTABLE": 1,
-    ".prefix(\"pending-prompt-\")": 2,
     "const NATIVE_DELEGATION_HEADER: &str = \"[Agent Bridge native delegation]\";": 1,
     "name: \"native-session\"": 1,
     "name: \"native-hook\"": 1,
@@ -331,7 +333,7 @@
   },
   "src/native/terminal/mod.rs": {
     "console process is no longer available": 2,
-    "Windows console submission delays do not fit inside the remaining turn timeout": 2
+    "Windows console submission delays do not fit inside the remaining turn timeout": 3
   },
   "src/native/terminal/ownership.rs": {
     "native-session": 19,

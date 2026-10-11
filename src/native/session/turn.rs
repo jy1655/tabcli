@@ -496,6 +496,21 @@ impl Claim {
             .context("failed to remove the delivered initial prompt")
     }
 
+    // Sent already retained the claim; failure to remove its prompt is a diagnostic,
+    // not a second delivery outcome. Use the same token-fenced write as uncertainty.
+    pub(in crate::native) fn record_delivery_diagnostic(
+        &self,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        let directory = self
+            .path
+            .parent()
+            .context("turn claim has no session directory")?;
+        let error = terminal_safe_text(&format!("{error:#}"), true);
+        update_status_for_turn(directory, &self.token, SessionState::Working, Some(error))?;
+        Ok(())
+    }
+
     pub(in crate::native) fn rollback_on_drop(&mut self) {
         self.retained = false;
     }

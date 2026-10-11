@@ -1,7 +1,9 @@
 use super::{
-    CompletionMonitor, CrossSessionMessageContext, CrossSessionMessageFailure,
-    CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
-    LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
+    CompletionMonitor, LaunchContext, LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan,
+    ResumedSessionContext,
+};
+use crate::native::delivery::{
+    self, Outcome, Prepared, Readiness, SurfaceInput, Transport, TransportFacts, TurnContext,
 };
 #[cfg(test)]
 use crate::native::session::SessionState;
@@ -83,7 +85,117 @@ struct HookFailureSignal {
 // refusal when Pi exposes a live-session registry or a held session lock.
 const PI_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Pi exposes no verifiable ownership evidence for a session (no lock, pid, or registry under ~/.pi identifies a live writer)";
 
+fn send_initial_prompt(
+    session: &terminal::TerminalSession,
+    prompt_path: &Path,
+    deadline: Instant,
+) -> terminal::TerminalSendResult {
+    #[cfg(windows)]
+    {
+        let directory = session
+            .managed_session_id
+            .as_deref()
+            .context("Pi initial input has no managed session identity")
+            .and_then(Reader::session_directory)
+            .map_err(terminal::TerminalSendFailure::not_sent)?;
+        send_initial_prompt_after_startup(&directory, deadline, || {
+            terminal::send_file(session, prompt_path, deadline)
+        })
+    }
+    #[cfg(not(windows))]
+    terminal::send_file(session, prompt_path, deadline)
+}
+
+fn terminal_initial_prompt(directory: &Path, prompt: &str) -> Result<String> {
+    let pending =
+        read_pending_turn(directory)?.context("Pi initial turn correlation state is missing")?;
+    terminal_correlated_prompt(prompt, &pending, cfg!(windows))
+}
+
+fn send_terminal_follow_up(
+    session: &terminal::TerminalSession,
+    prompt_path: &Path,
+    deadline: Instant,
+) -> terminal::TerminalSendResult {
+    terminal::send_file(session, prompt_path, deadline)
+}
+
+fn prepare_terminal_follow_up(directory: &Path, prompt: &str, claim_token: &str) -> Result<String> {
+    let pending = install_pending_turn(directory, claim_token)?;
+    terminal_correlated_prompt(prompt, &pending, cfg!(windows))
+}
+
+struct PiInitialPaste;
+impl Transport for PiInitialPaste {
+    fn facts(&self) -> TransportFacts {
+        TransportFacts {
+            name: "terminal-paste-fallback",
+            readiness: Readiness::AfterLaunch {
+                ready_delay: Duration::from_secs(2),
+            },
+            surface: Some(SurfaceInput { submit_count: 1 }),
+        }
+    }
+    fn prepare(&self, turn: &TurnContext<'_>) -> Result<Prepared> {
+        Ok(Prepared {
+            prompt: terminal_initial_prompt(turn.directory, turn.prompt)?,
+            correlation_id: None,
+        })
+    }
+    fn send(&self, turn: &TurnContext<'_>, _: &Prepared, file: Option<&Path>) -> Outcome {
+        send_initial_prompt(
+            turn.surface,
+            file.expect("surface transport has a prompt file"),
+            turn.deadline,
+        )
+        .into()
+    }
+    fn discard_prepared(&self, _: &TurnContext<'_>, _: Option<&Prepared>) {}
+}
+
+// Replace this paste fallback when Pi exposes addressed interactive input.
+struct PiPaste;
+impl Transport for PiPaste {
+    fn facts(&self) -> TransportFacts {
+        TransportFacts {
+            name: "terminal-paste-fallback",
+            readiness: Readiness::AfterLaunch {
+                ready_delay: Duration::ZERO,
+            },
+            surface: Some(SurfaceInput { submit_count: 1 }),
+        }
+    }
+    fn prepare(&self, turn: &TurnContext<'_>) -> Result<Prepared> {
+        Ok(Prepared {
+            prompt: prepare_terminal_follow_up(turn.directory, turn.prompt, turn.claim_token)?,
+            correlation_id: None,
+        })
+    }
+    fn send(&self, turn: &TurnContext<'_>, _: &Prepared, file: Option<&Path>) -> Outcome {
+        send_terminal_follow_up(
+            turn.surface,
+            file.expect("surface transport has a prompt file"),
+            turn.deadline,
+        )
+        .into()
+    }
+    fn discard_prepared(&self, turn: &TurnContext<'_>, _: Option<&Prepared>) {
+        let _ = cancel_pending_turn(turn.directory, turn.claim_token);
+    }
+}
+
 impl NativeProviderAdapter for PiAdapter {
+    fn initial_transport(&self) -> Box<dyn Transport> {
+        if cfg!(windows) {
+            Box::new(PiInitialPaste)
+        } else {
+            Box::new(delivery::LAUNCH_ARGUMENT)
+        }
+    }
+    fn follow_up_transport(&self) -> Box<dyn Transport> {
+        Box::new(PiPaste)
+    }
+
     fn cancel_support(&self, directory: &Path) -> Result<super::CancelSupport> {
         let reader = Reader::open_unchecked(directory);
         let ready = reader
@@ -213,70 +325,6 @@ impl NativeProviderAdapter for PiAdapter {
         bail!("{PI_REOPEN_UNSUPPORTED}")
     }
 
-    fn initial_prompt_transport(&self) -> InitialPromptTransport {
-        if cfg!(windows) {
-            InitialPromptTransport::TerminalPasteAfterLaunch
-        } else {
-            InitialPromptTransport::ProviderArgument
-        }
-    }
-
-    fn initial_prompt_ready_delay(&self) -> Duration {
-        Duration::from_secs(2)
-    }
-
-    fn send_initial_prompt(
-        &self,
-        session: &terminal::TerminalSession,
-        prompt_path: &Path,
-        deadline: Instant,
-    ) -> terminal::TerminalSendResult {
-        #[cfg(windows)]
-        {
-            let directory = session
-                .managed_session_id
-                .as_deref()
-                .context("Pi initial input has no managed session identity")
-                .and_then(Reader::session_directory)
-                .map_err(terminal::TerminalSendFailure::not_sent)?;
-            send_initial_prompt_after_startup(&directory, deadline, || {
-                terminal::send_file(session, prompt_path, deadline)
-            })
-        }
-        #[cfg(not(windows))]
-        terminal::send_file(session, prompt_path, deadline)
-    }
-
-    fn terminal_initial_prompt(&self, directory: &Path, prompt: &str) -> Result<String> {
-        let pending = read_pending_turn(directory)?
-            .context("Pi initial turn correlation state is missing")?;
-        terminal_correlated_prompt(prompt, &pending, cfg!(windows))
-    }
-
-    #[cfg(any(windows, test))]
-    fn terminal_submit_count(&self) -> usize {
-        1
-    }
-
-    fn follow_up_transport(&self) -> FollowUpTransport {
-        // Replace this fallback when Pi exposes a verified first-party input
-        // path into an already-running interactive session.
-        FollowUpTransport::TerminalPasteFallback
-    }
-
-    fn new_cross_session_turn_id(&self) -> Result<String> {
-        bail!("Pi does not support provider cross-session turns")
-    }
-
-    fn send_cross_session_message(
-        &self,
-        _context: CrossSessionMessageContext<'_>,
-    ) -> CrossSessionMessageResult {
-        Err(CrossSessionMessageFailure::not_sent(anyhow::anyhow!(
-            "Pi does not support provider cross-session messages"
-        )))
-    }
-
     fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()> {
         let Some(pending) = read_pending_turn(directory)? else {
             return Ok(());
@@ -336,29 +384,6 @@ impl NativeProviderAdapter for PiAdapter {
 
     fn run_control(&self, _arguments: &[String]) -> Result<()> {
         bail!("Pi does not expose Agent Bridge provider controls")
-    }
-
-    fn send_terminal_follow_up(
-        &self,
-        session: &terminal::TerminalSession,
-        prompt_path: &Path,
-        deadline: Instant,
-    ) -> terminal::TerminalSendResult {
-        terminal::send_file(session, prompt_path, deadline)
-    }
-
-    fn prepare_terminal_follow_up(
-        &self,
-        directory: &Path,
-        prompt: &str,
-        claim_token: &str,
-    ) -> Result<String> {
-        let pending = install_pending_turn(directory, claim_token)?;
-        terminal_correlated_prompt(prompt, &pending, cfg!(windows))
-    }
-
-    fn cancel_terminal_follow_up(&self, directory: &Path, claim_token: &str) -> Result<()> {
-        cancel_pending_turn(directory, claim_token)
     }
 }
 
@@ -1072,6 +1097,45 @@ export default function (pi) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn declared_transports_preserve_framing_and_pending_cleanup() {
+        use crate::native::delivery::TurnKind;
+        let directory = tempfile::tempdir().unwrap();
+        let surface = serde_json::from_value(
+            serde_json::json!({"terminal":"windows-console", "session_id":"surface"}),
+        )
+        .unwrap();
+        let initial =
+            super::super::transport_test_context(directory.path(), &surface, TurnKind::Initial);
+        install_pending_turn(directory.path(), initial.claim_token).unwrap();
+        let before = std::fs::read(directory.path().join(PENDING_TURN_FILE)).unwrap();
+        let prepared = PiInitialPaste.prepare(&initial).unwrap();
+        assert_eq!(
+            prepared.prompt,
+            terminal_initial_prompt(directory.path(), initial.prompt).unwrap()
+        );
+        assert!(prepared.correlation_id.is_none());
+        PiInitialPaste.discard_prepared(&initial, Some(&prepared));
+        assert_eq!(
+            std::fs::read(directory.path().join(PENDING_TURN_FILE)).unwrap(),
+            before
+        );
+        let follow =
+            super::super::transport_test_context(directory.path(), &surface, TurnKind::FollowUp);
+        let prepared = PiPaste.prepare(&follow).unwrap();
+        let pending = read_pending_turn(directory.path()).unwrap().unwrap();
+        assert_eq!(
+            prepared.prompt,
+            terminal_correlated_prompt(follow.prompt, &pending, cfg!(windows)).unwrap()
+        );
+        assert!(prepared.correlation_id.is_none());
+        PiPaste.discard_prepared(&follow, Some(&prepared));
+        assert!(!directory.path().join(PENDING_TURN_FILE).exists());
+        PiPaste.prepare(&follow).unwrap();
+        PiPaste.discard_prepared(&follow, None);
+        assert!(!directory.path().join(PENDING_TURN_FILE).exists());
+    }
+
     fn auth_output(text: &str, exit: i32) -> Result<std::process::Output> {
         #[cfg(unix)]
         let status = {

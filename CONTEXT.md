@@ -76,6 +76,11 @@ The act of putting a prompt in front of the provider. Its outcome is sent, not s
 uncertain; an uncertain delivery is never retried blindly.
 _Avoid_: send, submit, paste (these name transports, not the act)
 
+**Transport**:
+The provider-chosen way to deliver an initial prompt or follow-up, including the evidence
+needed before input and whether a failed attempt is known not sent or uncertain.
+_Avoid_: delivery (the act), channel, shared fallback
+
 **Initial prompt**:
 The first turn's prompt, delivered as part of launching the session.
 
