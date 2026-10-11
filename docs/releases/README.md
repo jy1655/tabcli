@@ -6,6 +6,8 @@ Older notes retain their own requirements and limitations; use the
 [providers](../providers.md) and [terminals](../terminals.md) pages for current behavior.
 Each note separates live checks from automated tests.
 
+- [0.4.3](0.4.3.md) (2026-10-11): Passes the session directory to the terminal adapters; adapters
+  declare their input facts; refuses close where no terminal transport exists; one command registry.
 - [0.4.2](0.4.2.md) (2026-10-11): Closes a session whose terminal application went away while its
   processes kept running; gives `close-session` one `--timeout-secs` budget; reports a busy WezTerm.
 - [0.4.1](0.4.1.md) (2026-10-11): Keeps Claude Code session markers and Bridge's per-session
