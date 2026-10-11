@@ -1,6 +1,9 @@
 use super as terminal;
 #[cfg(target_os = "macos")]
+use super::CloseOutcome;
+#[cfg(target_os = "macos")]
 use super::PreClosePolicy;
+use super::TerminalSession;
 #[cfg(target_os = "macos")]
 use super::macos::apple_terminal::{
     record_legacy_terminal_app, require_unique_terminal_app, terminal_app_alive_with,
@@ -18,7 +21,6 @@ use super::macos::process::{
 };
 #[cfg(windows)]
 pub(in crate::native) use super::windows::ownership::verified_windows_native_owner;
-use super::{CloseOutcome, TerminalSession};
 #[cfg(any(target_os = "macos", windows))]
 use crate::native::SessionStatus;
 #[cfg(target_os = "macos")]
@@ -332,6 +334,10 @@ pub(in crate::native) fn verify_terminal_close_authority(
 #[derive(Debug, Eq, PartialEq)]
 pub(in crate::native) enum TerminalCloseAuthority {
     LiveOwner,
+    #[cfg(target_os = "macos")]
+    OwnerTeardown,
+    #[cfg(target_os = "macos")]
+    TeardownComplete(String),
     #[cfg(any(target_os = "macos", windows))]
     SurfaceOnly,
     Absent,
@@ -402,6 +408,13 @@ pub(in crate::native) fn verify_terminal_close_authority_with_observations(
                     terminal::surface_outlives_owner(session),
                 )
             },
+            #[cfg(target_os = "macos")]
+            attest_owner: &|| {
+                verified_macos_terminal_owner(directory, expected_session_id, session, None)
+                    .map(|_| ())
+            },
+            #[cfg(target_os = "macos")]
+            group_gone: &owner_group_gone,
             ownership_proof: &|| {
                 verify_terminal_surface_ownership(directory, expected_session_id, session)
             },
@@ -421,6 +434,10 @@ struct CloseObservers<'a> {
     #[cfg(target_os = "macos")]
     resumable: &'a dyn Fn() -> Result<bool>,
     ownership_proof: &'a dyn Fn() -> Result<()>,
+    #[cfg(target_os = "macos")]
+    attest_owner: &'a dyn Fn() -> Result<()>,
+    #[cfg(target_os = "macos")]
+    group_gone: &'a dyn Fn(u32) -> Result<bool>,
 }
 
 fn verify_terminal_close_authority_with_observers(
@@ -442,6 +459,13 @@ fn verify_terminal_close_authority_with_observers(
     );
     #[cfg(any(target_os = "macos", windows))]
     {
+        #[cfg(target_os = "macos")]
+        let teardown_intent =
+            session::close::terminal_teardown_intent(&Reader::open_unchecked(directory), session)?;
+        #[cfg(target_os = "macos")]
+        let has_teardown_intent = teardown_intent.is_some();
+        #[cfg(windows)]
+        let has_teardown_intent = false;
         if Reader::open_unchecked(directory)
             .record(CoreRecord::Owner)
             .text()?
@@ -453,6 +477,7 @@ fn verify_terminal_close_authority_with_observers(
             // Terminal.app, Warp and WezTerm gain none here: a failed launch is no close
             // intent, and the dead-owner rules below apply to them.
             if let Some(launch) = launch::read(&Reader::open_unchecked(directory))?
+                && !has_teardown_intent
                 && launch.phase != launch::Phase::Spawned
                 && terminal::close_policy(session.kind).failed_start_identity
             {
@@ -472,7 +497,7 @@ fn verify_terminal_close_authority_with_observers(
             // again, and only once the owner it verified no longer exists. A live owner,
             // or a PID that is alive again, keeps the rules below.
             #[cfg(target_os = "macos")]
-            if (observers.resumable)()? {
+            if !has_teardown_intent && (observers.resumable)()? {
                 session.verify_managed_session(expected_session_id)?;
                 if terminal::close_policy(session.kind).requires_app_incarnation {
                     let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
@@ -523,6 +548,14 @@ fn verify_terminal_close_authority_with_observers(
                             "dead native-session owner identity is incomplete, foreign, or its PID is reused; no terminal observation or close was sent"
                         );
                     }
+                    if let Some(intent) = teardown_intent {
+                        if !(observers.group_gone)(intent.process_group)? {
+                            bail!(
+                                "the teardown owner's process group is not proven gone; no signal was sent and the handle is retained"
+                            );
+                        }
+                        return Ok(TerminalCloseAuthority::TeardownComplete(intent.reason));
+                    }
                     let absent = if terminal::close_policy(session.kind).requires_app_incarnation {
                         terminal_surface_absent(
                             owner.terminal_app.as_ref(),
@@ -541,21 +574,50 @@ fn verify_terminal_close_authority_with_observers(
                         "the recorded native-session owner is no longer live; visible terminal cleanup is unverified and no close was sent"
                     );
                 }
-                // A live owner of 0.0.10 or earlier names no app incarnation: the close
-                // derives it from that owner's own ancestry before it records its intent.
-                if terminal::close_policy(session.kind).requires_app_incarnation
+                // Keep the existing app-incarnation guard as part of the live proof.
+                // Only its ended-incarnation refusal moves to the absent-surface row.
+                let ended = if terminal::close_policy(session.kind).requires_app_incarnation
                     && let Some(app) = &owner.terminal_app
                 {
-                    if !terminal_app_alive_with(app, &process_birth)? {
-                        bail!(
-                            "Terminal.app ended while its native owner remained; no close was sent"
-                        );
+                    let alive = terminal_app_alive_with(app, &process_birth)?;
+                    if alive {
+                        require_unique_terminal_app(app, &terminal_instances()?)?;
                     }
-                    require_unique_terminal_app(app, &terminal_instances()?)?;
+                    !alive
+                } else {
+                    false
+                };
+                let proof = if ended {
+                    Err(anyhow::anyhow!(
+                        "Terminal.app ended while its native owner remained; no close was sent"
+                    ))
+                } else {
+                    (observers.ownership_proof)()
+                };
+                if let Err(error) = proof {
+                    let absent = if terminal::close_policy(session.kind).requires_app_incarnation {
+                        terminal_surface_absent(
+                            owner.terminal_app.as_ref(),
+                            &process_birth,
+                            &terminal_instances,
+                            surface_present,
+                        )
+                    } else {
+                        surface_present().map(|present| !present)
+                    };
+                    if !matches!(absent, Ok(true)) {
+                        return Err(error);
+                    }
+                    (observers.attest_owner)()?;
+                    return Ok(TerminalCloseAuthority::OwnerTeardown);
                 }
+                return Ok(TerminalCloseAuthority::LiveOwner);
             }
-            (observers.ownership_proof)()?;
-            return Ok(TerminalCloseAuthority::LiveOwner);
+            #[cfg(windows)]
+            {
+                (observers.ownership_proof)()?;
+                return Ok(TerminalCloseAuthority::LiveOwner);
+            }
         }
         let status: SessionStatus = Reader::open_unchecked(directory).status()?;
         if !matches!(status.state, SessionState::Launching | SessionState::Failed) {
@@ -691,24 +753,120 @@ pub(in crate::native) fn close_owned_surface(
     directory: &Path,
     id: &str,
     session: &TerminalSession,
-) -> Result<CloseOutcome> {
-    let authority = verify_terminal_close_authority(directory, id, session)?;
-    if authority == TerminalCloseAuthority::Absent {
-        return Ok(terminal::CloseOutcome::Missing);
-    }
-    let has_native_owner = authority == TerminalCloseAuthority::LiveOwner;
+) -> Result<terminal::CloseResult> {
     #[cfg(target_os = "macos")]
     {
-        if has_native_owner {
-            prepare_owned_surface_close(directory, id, session)?;
-        }
-        terminal::macos::close_owned_session(directory, session)
+        close_owned_surface_with(
+            || verify_terminal_close_authority(directory, id, session),
+            || {
+                teardown_absent_owner_with(
+                    &Store::open_unchecked(directory),
+                    id,
+                    session,
+                    || verified_macos_terminal_owner(directory, id, session, None),
+                    |group| {
+                        terminate_owned_foreground_group(group).context(
+                            "could not confirm disappearance of the absent surface owner's group",
+                        )
+                    },
+                )
+            },
+            |has_native_owner| {
+                if has_native_owner {
+                    prepare_owned_surface_close(directory, id, session)?;
+                }
+                terminal::macos::close_owned_session(directory, session)
+            },
+        )
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = has_native_owner;
-        terminal::close_session(session)
+        let authority = verify_terminal_close_authority(directory, id, session)?;
+        if authority == TerminalCloseAuthority::Absent {
+            return Ok(terminal::CloseOutcome::Missing.into());
+        }
+        terminal::close_session(session).map(Into::into)
     }
+}
+
+// Production and interruption tests share the authority-to-action dispatch.
+// Only observations and external actions are replaceable; result mapping is not.
+#[cfg(target_os = "macos")]
+fn close_owned_surface_with(
+    authority: impl FnOnce() -> Result<TerminalCloseAuthority>,
+    teardown: impl FnOnce() -> Result<terminal::CloseResult>,
+    close_surface: impl FnOnce(bool) -> Result<CloseOutcome>,
+) -> Result<terminal::CloseResult> {
+    match authority()? {
+        TerminalCloseAuthority::OwnerTeardown => teardown(),
+        TerminalCloseAuthority::TeardownComplete(reason) => Ok(terminal::CloseResult {
+            outcome: CloseOutcome::Missing,
+            reason: Some(reason),
+        }),
+        TerminalCloseAuthority::Absent => Ok(CloseOutcome::Missing.into()),
+        authority => close_surface(authority == TerminalCloseAuthority::LiveOwner).map(Into::into),
+    }
+}
+
+#[cfg(target_os = "macos")]
+const OWNER_TEARDOWN_REASON: &str =
+    "the surface was proven absent while its owner was live; the owner was ended";
+
+#[cfg(target_os = "macos")]
+fn owner_group_gone(group: u32) -> Result<bool> {
+    owner_group_gone_with(group, signal_process_group)
+}
+
+#[cfg(target_os = "macos")]
+fn owner_group_gone_with(
+    group: u32,
+    mut signal: impl FnMut(libc::pid_t, libc::c_int) -> std::io::Result<()>,
+) -> Result<bool> {
+    let target = process_group_signal_target(group)?;
+    match signal(target, 0) {
+        Ok(()) => Ok(false),
+        Err(error) => match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(true),
+            Some(libc::EPERM) => Ok(false),
+            _ => Err(error).context("could not observe the teardown owner's process group"),
+        },
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn teardown_absent_owner_with(
+    store: &Store,
+    id: &str,
+    surface: &TerminalSession,
+    mut attest: impl FnMut() -> Result<(NativeSessionOwner, NativeProcessIdentity)>,
+    stop: impl FnOnce(u32) -> Result<()>,
+) -> Result<terminal::CloseResult> {
+    let (owner, live) = attest()?;
+    let group = verified_terminal_owner_process_group(&owner, &live)?;
+    session::close::record_terminal_teardown_intent(
+        store,
+        id,
+        surface,
+        &owner,
+        group,
+        OWNER_TEARDOWN_REASON,
+    )?;
+    #[cfg(test)]
+    session::close::interruption::at(session::close::interruption::Point::IntentPublished);
+    // The second full attestation reads the owner, tty and parent shell again.
+    // A replacement record, even if it attests successfully, is not this intent.
+    let (again, current) = attest()?;
+    if serde_json::to_value(&owner)? != serde_json::to_value(&again)?
+        || !native_owner_identity_matches(&owner, &current)
+        || verified_terminal_owner_process_group(&again, &current)? != group
+    {
+        bail!("the teardown owner changed after intent publication; no signal was sent");
+    }
+    stop(group)?;
+    Ok(terminal::CloseResult {
+        outcome: CloseOutcome::Missing,
+        reason: Some(OWNER_TEARDOWN_REASON.to_owned()),
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -869,20 +1027,39 @@ pub(in crate::native) fn terminate_owned_foreground_group(group: u32) -> Result<
 fn terminate_owned_foreground_group_with(
     group: u32,
     timeout: Duration,
+    observe: impl FnMut(Option<i32>),
+) -> Result<()> {
+    terminate_owned_foreground_group_with_io(group, timeout, signal_process_group, observe)
+}
+
+#[cfg(target_os = "macos")]
+fn signal_process_group(target: libc::pid_t, signal: libc::c_int) -> std::io::Result<()> {
+    if unsafe { libc::kill(target, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_owned_foreground_group_with_io(
+    group: u32,
+    timeout: Duration,
+    mut signal: impl FnMut(libc::pid_t, libc::c_int) -> std::io::Result<()>,
     mut observe: impl FnMut(Option<i32>),
 ) -> Result<()> {
     let target = process_group_signal_target(group)?;
-    if unsafe { libc::kill(target, libc::SIGTERM) } != 0 {
-        let error = std::io::Error::last_os_error();
+    if let Err(error) = signal(target, libc::SIGTERM) {
         if error.raw_os_error() == Some(libc::ESRCH) {
             return Ok(());
         }
         return Err(error).context("could not stop the attested Warp foreground group");
     }
+    #[cfg(test)]
+    session::close::interruption::at(session::close::interruption::Point::SignalSent);
     let deadline = Instant::now() + timeout;
     loop {
-        if unsafe { libc::kill(target, 0) } != 0 {
-            let error = std::io::Error::last_os_error();
+        if let Err(error) = signal(target, 0) {
             observe(error.raw_os_error());
             if error.raw_os_error() == Some(libc::ESRCH) {
                 return Ok(());
@@ -1140,6 +1317,8 @@ mod close_authority_tests {
                             !self.pid_alive
                         }))
                     },
+                    attest_owner: &|| observe("attest"),
+                    group_gone: &|_| panic!("ordinary table row has no teardown intent"),
                     ownership_proof: &|| {
                         record("proof");
                         if self.proof_error {
@@ -1172,6 +1351,95 @@ mod close_authority_tests {
     }
 
     #[test]
+    fn r3_live_owner_absent_surface_requires_teardown() {
+        for kind in [Iterm2, Ghostty, Warp, WezTerm, AppleTerminal] {
+            let mut row = Row::new(kind);
+            row.live = true;
+            row.proof_error = true;
+            let mut calls = vec!["resumable", "mac-live"];
+            if kind == AppleTerminal {
+                calls.extend(["birth", "instances"]);
+            }
+            calls.push("proof");
+            if kind == AppleTerminal {
+                calls.extend(["birth", "instances"]);
+            }
+            calls.push("presence");
+            if kind == AppleTerminal {
+                calls.extend(["birth", "instances"]);
+            }
+            calls.push("attest");
+            row.check(Ok(TerminalCloseAuthority::OwnerTeardown), &calls);
+        }
+    }
+
+    #[test]
+    fn r3_ended_terminal_incarnation_requires_teardown() {
+        let mut row = Row::new(AppleTerminal);
+        row.live = true;
+        row.birth = None;
+        row.check(
+            Ok(TerminalCloseAuthority::OwnerTeardown),
+            &["resumable", "mac-live", "birth", "birth", "attest"],
+        );
+    }
+
+    #[test]
+    fn r3_presence_present_unknown_or_error_preserves_original_proof_error() {
+        for kind in [Iterm2, Ghostty, Warp, WezTerm, AppleTerminal] {
+            for presence in ["present", "unknown", "error"] {
+                let mut row = Row::new(kind);
+                row.live = true;
+                row.proof_error = true;
+                row.present = true;
+                if presence != "present" {
+                    row.observation_error = Some(("presence", 1));
+                }
+                let mut calls = vec!["resumable", "mac-live"];
+                if kind == AppleTerminal {
+                    calls.extend(["birth", "instances"]);
+                }
+                calls.push("proof");
+                if kind == AppleTerminal {
+                    calls.extend(["birth", "instances"]);
+                }
+                calls.push("presence");
+                if kind == AppleTerminal && presence == "present" {
+                    calls.extend(["birth", "instances"]);
+                }
+                row.check_error_chain(&["injected full ownership proof failure"], &calls);
+            }
+        }
+    }
+
+    #[test]
+    fn r3_absence_then_failed_attestation_writes_nothing() {
+        for kind in [Iterm2, Ghostty, Warp, WezTerm, AppleTerminal] {
+            let mut row = Row::new(kind);
+            row.live = true;
+            row.proof_error = true;
+            row.observation_error = Some(("attest", 1));
+            let mut calls = vec!["resumable", "mac-live"];
+            if kind == AppleTerminal {
+                calls.extend(["birth", "instances"]);
+            }
+            calls.push("proof");
+            if kind == AppleTerminal {
+                calls.extend(["birth", "instances"]);
+            }
+            calls.push("presence");
+            if kind == AppleTerminal {
+                calls.extend(["birth", "instances"]);
+            }
+            calls.push("attest");
+            row.check_error_chain(
+                &["injected attest failure", "injected attest cause"],
+                &calls,
+            );
+        }
+    }
+
+    #[test]
     fn failed_start_native_identity_dead_or_mismatched_owner_surface_only() {
         for kind in [Iterm2, Ghostty] {
             for (alive, matches) in [(Some(false), None), (Some(true), Some(false))] {
@@ -1196,9 +1464,10 @@ mod close_authority_tests {
                 row.observed_matches = matches;
                 row.live = true;
                 row.proof_error = true;
+                row.present = true;
                 row.check(
                     Err("injected full ownership proof failure"),
-                    &["owner-record", "resumable", "mac-live", "proof"],
+                    &["owner-record", "resumable", "mac-live", "proof", "presence"],
                 );
             }
         }
@@ -1373,11 +1642,21 @@ mod close_authority_tests {
                 let mut row = Row::new(kind);
                 row.live = true;
                 row.proof_error = proof_error;
+                row.present = true;
                 let mut calls = vec!["resumable", "mac-live"];
                 if kind == AppleTerminal {
                     calls.extend(["birth", "instances"]);
                 }
                 calls.push("proof");
+                if proof_error {
+                    if kind == AppleTerminal {
+                        calls.extend(["birth", "instances"]);
+                    }
+                    calls.push("presence");
+                    if kind == AppleTerminal {
+                        calls.extend(["birth", "instances"]);
+                    }
+                }
                 row.check(
                     if proof_error {
                         Err("injected full ownership proof failure")
@@ -1391,13 +1670,13 @@ mod close_authority_tests {
     }
 
     #[test]
-    fn live_terminal_owner_ended_incarnation_refused_before_proof() {
+    fn live_terminal_owner_ended_incarnation_teardown() {
         let mut row = Row::new(AppleTerminal);
         row.live = true;
         row.birth = None;
         row.check(
-            Err("Terminal.app ended while its native owner remained"),
-            &["resumable", "mac-live", "birth"],
+            Ok(TerminalCloseAuthority::OwnerTeardown),
+            &["resumable", "mac-live", "birth", "birth", "attest"],
         );
     }
 
@@ -1814,6 +2093,18 @@ mod process_close_tests {
     use std::{os::unix::process::CommandExt, process::Command};
 
     #[test]
+    fn r3_replay_group_probe_does_not_accept_zombie_only_group() {
+        let child = ForegroundGroupChild::spawn();
+        let group = child.0.id();
+        assert!(!owner_group_gone(group).unwrap());
+        assert_eq!(unsafe { libc::kill(-(group as i32), libc::SIGTERM) }, 0);
+        child.wait_for_zombie();
+        assert!(!owner_group_gone(group).unwrap());
+        drop(child);
+        assert!(owner_group_gone(group).unwrap());
+    }
+
+    #[test]
     fn terminal_app_close_signal_targets_and_plan() {
         assert_eq!(process_group_signal_target(4242).unwrap(), -4242);
         assert!(process_group_signal_target(0).is_err());
@@ -2022,6 +2313,15 @@ mod process_close_tests {
         let result = terminate_owned_foreground_group(group);
         let status = waiter.join().unwrap();
         assert!(result.is_ok(), "{result:?}");
-        assert!(!status.success());
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "ownership_teardown_tests.rs"]
+mod teardown_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "ownership_close_interruption_tests.rs"]
+mod close_interruption_tests;

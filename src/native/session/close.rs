@@ -10,6 +10,31 @@ struct TerminalCloseIntent {
     managed_session_id: String,
     terminal: terminal::TerminalSession,
     owner: NativeSessionOwner,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_teardown_intent"
+    )]
+    teardown: Option<TerminalTeardownIntent>,
+}
+
+// Absence is the legacy format. A present field must deserialize as a complete
+// payload: Option's usual null -> None behavior would grant legacy replay authority.
+#[cfg(target_os = "macos")]
+fn deserialize_teardown_intent<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<TerminalTeardownIntent>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    TerminalTeardownIntent::deserialize(deserializer).map(Some)
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Deserialize, Serialize)]
+pub(in crate::native) struct TerminalTeardownIntent {
+    pub process_group: u32,
+    pub reason: String,
 }
 
 #[cfg(target_os = "macos")]
@@ -25,7 +50,71 @@ pub(in crate::native) fn record_terminal_close_intent(
             managed_session_id: expected_session_id.to_owned(),
             terminal: session.clone(),
             owner: owner.clone(),
+            teardown: None,
         })
+}
+
+#[cfg(target_os = "macos")]
+pub(in crate::native) fn record_terminal_teardown_intent(
+    store: &Store,
+    id: &str,
+    surface: &terminal::TerminalSession,
+    owner: &NativeSessionOwner,
+    process_group: u32,
+    reason: &str,
+) -> Result<()> {
+    store
+        .record(CoreRecord::TerminalCloseIntent)
+        .write_json(&TerminalCloseIntent {
+            managed_session_id: id.to_owned(),
+            terminal: surface.clone(),
+            owner: owner.clone(),
+            teardown: Some(TerminalTeardownIntent {
+                process_group,
+                reason: reason.to_owned(),
+            }),
+        })
+}
+
+// Teardown is independent of surface retention policy, including iTerm2. A record
+// claiming this intent kind must validate; it may never fall through to dead-owner
+// absence based on the surface alone.
+#[cfg(target_os = "macos")]
+pub(in crate::native) fn terminal_teardown_intent(
+    reader: &Reader,
+    surface: &terminal::TerminalSession,
+) -> Result<Option<TerminalTeardownIntent>> {
+    let Some(text) = reader.record(CoreRecord::TerminalCloseIntent).text()? else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(_) => bail!("unreadable terminal close intent; the handle is retained"),
+    };
+    if value.get("teardown").is_none() {
+        return Ok(None);
+    }
+    let intent: TerminalCloseIntent = serde_json::from_value(value)?;
+    let owner: NativeSessionOwner = reader.owner()?;
+    let teardown = intent.teardown.context("missing teardown intent")?;
+    if intent.terminal != *surface
+        || surface.managed_session_id.as_deref() != Some(&intent.managed_session_id)
+        || owner.managed_session_id.as_deref() != Some(&intent.managed_session_id)
+        || serde_json::to_value(&owner)? != serde_json::to_value(&intent.owner)?
+        || owner.process_group != Some(teardown.process_group)
+        || owner.pid != teardown.process_group
+        || teardown.process_group == 0
+        || teardown.process_group > i32::MAX as u32
+        || teardown.reason.is_empty()
+        || owner.terminal_tty.as_deref().is_none_or(str::is_empty)
+        || owner.terminal_tty_device.is_none()
+        || owner.process_start_seconds.is_none()
+        || owner.process_start_microseconds.is_none()
+        || owner.terminal_process_group != Some(teardown.process_group)
+    {
+        bail!("terminal teardown intent does not match the attested owner and exact handle");
+    }
+    Ok(Some(teardown))
 }
 
 // An explicit close can end the owner before the window is gone, so a
@@ -69,7 +158,7 @@ pub(in crate::native) fn terminal_close_intent_owner(
         && owner.managed_session_id.as_deref() == Some(intent.managed_session_id.as_str());
     let exact = intent.terminal == *session
         && serde_json::to_value(&intent.owner)? == serde_json::to_value(&owner)?;
-    Ok((attested && bound && exact).then_some(owner))
+    Ok((attested && bound && exact && intent.teardown.is_none()).then_some(owner))
 }
 
 #[cfg(target_os = "macos")]
@@ -121,35 +210,45 @@ impl Reader {
 pub(in crate::native) fn close<F>(
     store: &Store,
     reason: Option<String>,
-    mut close_terminal: F,
+    close_terminal: F,
 ) -> Result<terminal::CloseOutcome>
 where
-    F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
+    F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
 {
-    let repair_error = repair_dead_owner(store)
+    close_with_repair(store, reason, || repair_dead_owner(store), close_terminal)
+}
+
+fn close_with_repair(
+    store: &Store,
+    reason: Option<String>,
+    repair: impl FnOnce() -> Result<bool>,
+    mut close_terminal: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
+) -> Result<terminal::CloseOutcome> {
+    let repair_error = repair()
         .err()
         .map(|error| format!("pre-close session repair failed: {error:#}"));
     let mut outcome = terminal::CloseOutcome::Missing;
     close_session_state_with_error(store, repair_error.or(reason), |surface| {
-        outcome = close_terminal(surface)?;
-        Ok(outcome)
+        let result = close_terminal(surface)?;
+        outcome = result.outcome;
+        Ok(result)
     })?;
     Ok(outcome)
 }
 
 fn close_session_state_with_error<F>(
     store: &Store,
-    close_error: Option<String>,
+    mut close_error: Option<String>,
     mut close_terminal: F,
 ) -> Result<()>
 where
-    F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
+    F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
 {
     let claim_path = store.record(CoreRecord::TurnClaim).path().to_owned();
     let _turn_lock = store.lock()?;
     let status: SessionStatus = store.status()?;
     if status.state == SessionState::Closed {
-        let consume_result = consume_terminal_handle(store, None);
+        let consume_result = consume_terminal_handle(store, None, close_error.as_deref());
         let close_result =
             mark_session_closed_locked(store, &claim_path, close_error.or(status.error));
         consume_result?;
@@ -164,7 +263,8 @@ where
         .to_owned()
         .exists()
     {
-        let consume_result = consume_terminal_handle(store, None);
+        close_error = merge_close_reason(close_error, terminal_consumption_reason(store)?);
+        let consume_result = consume_terminal_handle(store, None, close_error.as_deref());
         let close_result = mark_session_closed_locked(store, &claim_path, close_error);
         consume_result?;
         return close_result;
@@ -222,12 +322,22 @@ where
                 return Err(error);
             }
         };
-    if let Err(error) = close_terminal(&terminal) {
-        restore_terminal_handle(&closing_path, &terminal_path)?;
-        return Err(error);
+    let result = match close_terminal(&terminal) {
+        Ok(result) => result,
+        Err(error) => {
+            restore_terminal_handle(&closing_path, &terminal_path)?;
+            return Err(error);
+        }
+    };
+    if result.reason.is_some() {
+        close_error = merge_close_reason(
+            merge_close_reason(close_error, status.error.clone()),
+            result.reason,
+        );
     }
 
-    let consume_result = consume_terminal_handle(store, Some(terminal.kind.as_str()));
+    let consume_result =
+        consume_terminal_handle(store, Some(terminal.kind.as_str()), close_error.as_deref());
     // Only this path has the adapter's positive close/absence result. No-handle
     // close, repair, and replay of a consumed handle cannot clear the observation.
     let cleared = status
@@ -250,13 +360,59 @@ fn restore_terminal_handle(closing_path: &Path, terminal_path: &Path) -> Result<
         })
 }
 
-fn consume_terminal_handle(store: &Store, terminal_kind: Option<&str>) -> Result<()> {
-    let tombstone_result = store.write_terminal_closed(&serde_json::json!({
+fn terminal_consumption_reason(store: &Store) -> Result<Option<String>> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(store
+            .record(CoreRecord::TerminalClosed)
+            .text()?
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|value| {
+                value
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = store;
+        Ok(None)
+    }
+}
+
+fn merge_close_reason(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) if first != second => Some(format!("{first}; {second}")),
+        (first, second) => first.or(second),
+    }
+}
+
+fn consume_terminal_handle(
+    store: &Store,
+    terminal_kind: Option<&str>,
+    reason: Option<&str>,
+) -> Result<()> {
+    let mut marker = serde_json::json!({
         "consumed": true,
         "terminal": terminal_kind,
-    }));
+    });
+    if cfg!(target_os = "macos")
+        && let Some(reason) = reason
+    {
+        marker["reason"] = reason.into();
+    }
+    let tombstone_result = store.write_terminal_closed(&marker);
+    #[cfg(all(test, target_os = "macos"))]
+    if tombstone_result.is_ok() {
+        interruption::at(interruption::Point::ConsumptionMarkerWritten);
+    }
     let active_result = RecordStore::at(store.record(CoreRecord::Terminal).path()).remove();
     let closing_result = RecordStore::at(store.record(CoreRecord::TerminalClosing).path()).remove();
+    #[cfg(all(test, target_os = "macos"))]
+    if active_result.is_ok() && closing_result.is_ok() {
+        interruption::at(interruption::Point::HandleRemoved);
+    }
     #[cfg(target_os = "macos")]
     let intent_result =
         RecordStore::at(store.record(CoreRecord::TerminalCloseIntent).path()).remove();
@@ -402,6 +558,9 @@ fn mark_session_closed_with_residual_locked(
     residual_surface: Option<launch::ResidualSurface>,
 ) -> Result<()> {
     let directory = store.directory();
+    // Repair can reach this after consumption but before the closed tombstone.
+    // The consumption marker carries the callback's reason across that boundary.
+    let error = merge_close_reason(error, terminal_consumption_reason(store)?);
     let consume_result = if store
         .record(CoreRecord::Terminal)
         .path()
@@ -413,7 +572,7 @@ fn mark_session_closed_with_residual_locked(
             .to_owned()
             .exists()
     {
-        consume_terminal_handle(store, None)
+        consume_terminal_handle(store, None, error.as_deref())
     } else {
         Ok(())
     };
@@ -467,14 +626,14 @@ fn repair_dead_owner_with<F>(
     store: &Store,
     owner_is_live: impl FnOnce(&NativeSessionOwner) -> Result<bool>,
     retain_surface: impl Fn(&terminal::TerminalSession) -> bool,
-    close_terminal: F,
+    mut close_terminal: F,
 ) -> Result<bool>
 where
     F: FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
 {
     let directory = store.directory();
     #[cfg(not(windows))]
-    let _ = &close_terminal;
+    let _ = &mut close_terminal;
     #[cfg(not(target_os = "macos"))]
     let _ = &retain_surface;
     // Completion recovery runs first so a live owner's finished turn is published before
@@ -538,8 +697,10 @@ where
         // The visible console root can outlive a failed native-session owner. Reuse the same
         // atomic terminal-handle claim as explicit close so concurrent repair callers cannot
         // perform the external close side effect twice.
-        close_session_state_with_error(store, repair_error, close_terminal)
-            .context("failed to close a Windows console whose native owner exited")?;
+        close_session_state_with_error(store, repair_error, |surface| {
+            close_terminal(surface).map(Into::into)
+        })
+        .context("failed to close a Windows console whose native owner exited")?;
         Ok(true)
     }
     #[cfg(not(windows))]
@@ -582,6 +743,41 @@ where
 pub(in crate::native) mod compatibility {
     use super::*;
     use crate::native::terminal::ownership::close_dead_owner_surface_with;
+    #[cfg(target_os = "macos")]
+    pub(in crate::native) fn close_with_owner_observation(
+        store: &Store,
+        reason: Option<String>,
+        owner_live: impl FnOnce(&NativeSessionOwner) -> Result<bool>,
+        closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
+    ) -> Result<terminal::CloseOutcome> {
+        super::close_with_repair(
+            store,
+            reason,
+            || {
+                super::repair_dead_owner_with(
+                    store,
+                    owner_live,
+                    terminal::surface_outlives_owner,
+                    |_| panic!("macOS repair must not close a surface"),
+                )
+            },
+            closer,
+        )
+    }
+    #[cfg(target_os = "macos")]
+    pub(in crate::native) fn close_with_result(
+        store: &Store,
+        reason: Option<String>,
+        mut closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
+    ) -> Result<terminal::CloseOutcome> {
+        let mut outcome = terminal::CloseOutcome::Missing;
+        super::close_session_state_with_error(store, reason, |surface| {
+            let result = closer(surface)?;
+            outcome = result.outcome;
+            Ok(result)
+        })?;
+        Ok(outcome)
+    }
     pub(in crate::native) fn mark_session_closed(
         directory: &Path,
         error: Option<String>,
@@ -590,22 +786,29 @@ pub(in crate::native) mod compatibility {
     }
     pub(in crate::native) fn close_session_state(
         directory: &Path,
-        closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
+        mut closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
     ) -> Result<()> {
-        super::close_session_state_with_error(&Store::open_unchecked(directory), None, closer)
+        super::close_session_state_with_error(&Store::open_unchecked(directory), None, |surface| {
+            closer(surface).map(Into::into)
+        })
     }
     pub(in crate::native) fn close_session_state_with_error(
         directory: &Path,
         error: Option<String>,
-        closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
+        mut closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
     ) -> Result<()> {
-        super::close_session_state_with_error(&Store::open_unchecked(directory), error, closer)
+        super::close_session_state_with_error(&Store::open_unchecked(directory), error, |surface| {
+            closer(surface).map(Into::into)
+        })
     }
     pub(in crate::native) fn close_repaired_session_state(
         directory: &Path,
-        closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
+        mut closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
     ) -> Result<()> {
-        super::close(&Store::open_unchecked(directory), None, closer).map(|_| ())
+        super::close(&Store::open_unchecked(directory), None, |surface| {
+            closer(surface).map(Into::into)
+        })
+        .map(|_| ())
     }
     pub(in crate::native) fn repair_dead_native_owner(directory: &Path) -> Result<bool> {
         repair_dead_owner(&Store::open_unchecked(directory))
@@ -656,3 +859,40 @@ pub(in crate::native) mod compatibility {
 
 #[cfg(test)]
 mod tests;
+
+// A panic models interruption, not an operation error: no caller's restore/settle
+// handler runs. File locks unwind; only the selected thread's one checkpoint fires.
+#[cfg(all(test, target_os = "macos"))]
+pub(in crate::native) mod interruption {
+    use std::cell::Cell;
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(in crate::native) enum Point {
+        IntentPublished,
+        SignalSent,
+        ConsumptionMarkerWritten,
+        HandleRemoved,
+        ClosedTombstoneWritten,
+    }
+    thread_local! {
+        static STOP: Cell<Option<Point>> = const { Cell::new(None) };
+    }
+    pub(in crate::native) fn at(point: Point) {
+        if STOP.with(|stop| stop.get() == Some(point)) {
+            STOP.with(|stop| stop.set(None));
+            std::panic::panic_any(point);
+        }
+    }
+    pub(in crate::native) fn during<T>(
+        point: Point,
+        run: impl FnOnce() -> T,
+    ) -> std::thread::Result<T> {
+        struct Reset(Option<Point>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                STOP.with(|stop| stop.set(self.0));
+            }
+        }
+        let _reset = Reset(STOP.with(|stop| stop.replace(Some(point))));
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+    }
+}

@@ -226,6 +226,21 @@ pub(super) enum CloseOutcome {
 }
 
 #[derive(Debug)]
+pub(in crate::native) struct CloseResult {
+    pub outcome: CloseOutcome,
+    pub reason: Option<String>,
+}
+
+impl From<CloseOutcome> for CloseResult {
+    fn from(outcome: CloseOutcome) -> Self {
+        Self {
+            outcome,
+            reason: None,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(super) struct TerminalSendFailure {
     error: anyhow::Error,
     delivery_may_have_occurred: bool,

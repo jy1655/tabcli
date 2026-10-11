@@ -118,7 +118,7 @@ fn residual_surface_clears_only_after_the_adapter_confirms_close_or_absence() {
                 store.status().unwrap().residual_surface(),
                 Some(launch::ResidualSurface::Unverified)
             );
-            close(&store, None, |_| Ok(outcome)).unwrap();
+            close(&store, None, |_| Ok(outcome.into())).unwrap();
             let closed = store.status().unwrap();
             assert_eq!(
                 closed.residual_surface,
@@ -246,7 +246,7 @@ fn explicit_close_consumes_the_handle_and_repeated_close_skips_the_adapter() {
                 assert_eq!(session.kind, terminal::TerminalKind::Iterm2);
                 assert_eq!(session.id, "missing-iterm-session");
                 close_calls += 1;
-                Ok(terminal::CloseOutcome::Missing)
+                Ok(terminal::CloseOutcome::Missing.into())
             })
         });
         assert_eq!(outcome.unwrap(), terminal::CloseOutcome::Missing);
@@ -299,7 +299,7 @@ fn interrupted_terminal_close_resumes_from_the_claimed_handle() {
     close(&Store::open_unchecked(directory.path()), None, |session| {
         calls += 1;
         assert_eq!(session.id, "interrupted-close");
-        Ok(terminal::CloseOutcome::Closed)
+        Ok(terminal::CloseOutcome::Closed.into())
     })
     .unwrap();
 

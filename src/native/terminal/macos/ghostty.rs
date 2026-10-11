@@ -1648,7 +1648,7 @@ mod tests {
                     id,
                     surface,
                 )?;
-                close_with_runner(&mut f, surface, soon())
+                close_with_runner(&mut f, surface, soon()).map(Into::into)
             })
             .is_err()
         );
@@ -1661,7 +1661,7 @@ mod tests {
                 id,
                 surface,
             )?;
-            close_with_runner(&mut f, surface, soon())
+            close_with_runner(&mut f, surface, soon()).map(Into::into)
         })
         .unwrap();
         assert_eq!(store.status().unwrap().state, SessionState::Closed);
@@ -1723,7 +1723,7 @@ mod tests {
                 id,
                 surface,
             )?;
-            close_with_runner(&mut f, surface, soon())
+            close_with_runner(&mut f, surface, soon()).map(Into::into)
         })
         .unwrap();
         assert_eq!(store.status().unwrap().state, SessionState::Closed);

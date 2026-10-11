@@ -167,8 +167,8 @@ additional TUI input have separate verification limits (#57, #65). Consult
 ## Ownership and close
 
 `close-session` targets the surface Bridge created for that session, not whichever tab you have
-selected. It preserves your other tabs. If Bridge cannot prove that it still controls the recorded
-surface, it refuses the close instead of choosing another one.
+selected. It preserves your other tabs. If Bridge cannot prove ownership or absence of the recorded
+surface, it refuses the close and keeps the handle.
 
 The owner is the Bridge process that launched the session. Before signalling it, Bridge checks that
 the recorded owner is still the same process. On macOS it compares the PID, process birth,
@@ -183,10 +183,28 @@ for the earlier one. Bridge checks the recorded surface and attested process gro
 them.
 
 Those checks determine whether Bridge can act with the live owner, act on the recorded surface
-alone, or leave it alone because it is proven absent. That decision is close authority. A newly
+alone, end a live attested owner whose surface is proven absent, or leave it alone because it
+is proven absent. That decision is close authority. A newly
 selected tab or a window that appeared during launch provides no such authority. If none of the
-three outcomes is proven, Bridge refuses and keeps the handle. The
+four outcomes is proven, Bridge refuses and keeps the handle. The
 [architecture reference](architecture.md) explains the records behind this decision.
+
+If a macOS terminal application has gone but the session's processes survive, as observed
+after iTerm2 was killed, explicit close first tries the ownership proof. If that fails, only
+proven absence permits owner teardown. Terminal.app uses the recorded app incarnation and its
+absence checks; a present surface or an observation error keeps the original proof error.
+A restored iTerm2 session with a different unique id does not replace the recorded handle.
+
+Bridge attests the owner without the surface's tty reply, records a teardown intent naming
+the session, handle, owner, process group and reason, then attests it again before signalling.
+It sends SIGTERM only to the group the owner leads and waits up to three seconds for ESRCH.
+It sends no SIGKILL and no shell signal. Once the group is gone, close consumes the handle and
+records `closed`, outcome `Missing`, and the reason. A failure to confirm disappearance
+keeps the intent and handle. A later close obtains authority again if the owner is live.
+If the owner is dead, it sends nothing and completes only after that group is proven gone;
+EPERM and a zombie-only group do not establish absence. Check the reported error and the
+session's processes before retrying. Observation and signal are not one atomic operation.
+The group's disappearance does not prove that processes which left the group have ended.
 
 If Ghostty initialization fails after Bridge proves the created terminal, tab, and window ids,
 Bridge attempts the existing scoped cleanup once. If cleanup cannot confirm closure, the adapter
