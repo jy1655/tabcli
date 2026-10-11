@@ -263,6 +263,9 @@ repair settles the records without resending a prompt or guessing ownership of a
 - For a new terminal, start with `src/native/terminal/mod.rs` and its surface and delivery types.
   Read `src/native/terminal/ownership.rs` before implementing close. Add application-native
   operations under the platform module and tests that prove the target belongs to the session.
+  Each adapter declares its close facts, pre-close policy, paste envelope, and guarded-dialog
+  capability in its `facts.rs` module. The shared accessor dispatches exhaustively by terminal
+  kind on every build target; platform operation refusals remain separate.
   A creation preference in settings cannot substitute for recorded close authority.
 - For a new platform, start with the dispatch in `src/native/terminal/mod.rs` and the refusal
   paths in `src/native/terminal/linux/mod.rs`. Then read the process-identity code under the

@@ -1,19 +1,22 @@
-#[cfg(any(target_os = "macos", windows))]
-mod close_policy;
+pub(super) mod facts;
 #[cfg(target_os = "macos")]
-use close_policy::PreClosePolicy;
+use facts::PreClosePolicy;
 
-#[cfg(any(target_os = "macos", windows))]
-fn close_policy(kind: TerminalKind) -> close_policy::ClosePolicy {
-    #[cfg(target_os = "macos")]
-    return macos::close_policy(kind);
-    #[cfg(windows)]
-    return windows::close_policy(kind);
+pub(super) const fn facts(kind: TerminalKind) -> facts::SurfaceFacts {
+    use facts::{apple_terminal, ghostty, iterm2, warp, wezterm, windows};
+    match kind {
+        TerminalKind::Iterm2 => iterm2::FACTS,
+        TerminalKind::AppleTerminal => apple_terminal::FACTS,
+        TerminalKind::Ghostty => ghostty::FACTS,
+        TerminalKind::Warp => warp::FACTS,
+        TerminalKind::WezTerm => wezterm::FACTS,
+        TerminalKind::WindowsConsole => windows::FACTS,
+    }
 }
 
 pub(super) fn surface_outlives_owner(session: &TerminalSession) -> bool {
     #[cfg(target_os = "macos")]
-    return close_policy(session.kind).outlives_owner;
+    return facts(session.kind).outlives_owner;
     #[cfg(not(target_os = "macos"))]
     {
         let _ = session;
@@ -425,6 +428,7 @@ pub(super) fn send_file(
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
+        // Unsupported-platform stubs never send, so not_sent is accurate.
         platform::send_file(session, prompt_path, deadline).map_err(TerminalSendFailure::not_sent)
     }
 }
@@ -456,10 +460,7 @@ pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Resul
 }
 
 pub(super) const fn guards_dialog_input(kind: TerminalKind) -> bool {
-    matches!(
-        kind,
-        TerminalKind::Iterm2 | TerminalKind::AppleTerminal | TerminalKind::WindowsConsole
-    )
+    facts(kind).guards_dialog_input
 }
 
 pub(super) fn guarded_dialog_input(

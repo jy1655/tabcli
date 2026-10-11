@@ -286,7 +286,7 @@ fn run_native_adapter_smoke(provider: &str) {
     assert!(
         matches!(
             response["terminal"].as_str(),
-            Some("ghostty" | "iterm2" | "apple-terminal" | "windows-console")
+            Some("ghostty" | "iterm2" | "apple-terminal" | "windows-console" | "warp" | "wezterm")
         ),
         "native response is missing a supported terminal kind: {}",
         String::from_utf8_lossy(&output.stdout)
