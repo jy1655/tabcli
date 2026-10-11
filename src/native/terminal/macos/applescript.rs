@@ -47,7 +47,7 @@ pub(super) fn run_until(
         // that says what to check.
         // Half a second: the launcher keeps two seconds for cleanup after a timeout,
         // and the IOKit query answers in well under that.
-        let lock = match super::screen_locked(Instant::now() + Duration::from_millis(500)) {
+        let lock = match timeout_screen_lock(super::screen_locked) {
             Some(true) => "; the screen is locked",
             _ => "",
         };
@@ -56,6 +56,18 @@ pub(super) fn run_until(
         ))
     })?;
     parse_output(application, output)
+}
+
+fn timeout_screen_lock(probe: impl FnOnce(Instant) -> Option<bool>) -> Option<bool> {
+    let diagnostic_deadline = Instant::now() + Duration::from_millis(500);
+    let deadline = match crate::native::session::close::budget::deadline() {
+        Some(close) => {
+            crate::native::close_remaining(close).ok()?;
+            diagnostic_deadline.min(close)
+        }
+        None => diagnostic_deadline,
+    };
+    probe(deadline)
 }
 
 pub(super) fn run_send_until(
@@ -134,6 +146,28 @@ mod tests {
         );
         assert!(text.contains("docs/macos-permissions.md"), "{text}");
         assert!(text.contains("Test automation timed out"), "{text}");
+    }
+
+    #[test]
+    fn close_deadline_timeout_skips_diagnostic_probe_only_inside_close() {
+        let now = Instant::now();
+        let _clock = crate::native::TestCloseClock::new(now);
+        {
+            let _budget = crate::native::session::close::budget::Scope::enter(now);
+            assert_eq!(
+                timeout_screen_lock(|_| panic!("expired close must not start a probe")),
+                None
+            );
+        }
+        let mut probed = false;
+        assert_eq!(
+            timeout_screen_lock(|_| {
+                probed = true;
+                Some(true)
+            }),
+            Some(true)
+        );
+        assert!(probed, "ordinary automation keeps its diagnostic");
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub(in crate::native) fn read_regular_status_if_present(
 }
 
 pub(in crate::native) fn remove_file_if_present(path: &Path) -> Result<()> {
+    close::budget::check()?;
     fault_point("removing a record file")?;
     match fs::remove_file(path) {
         Ok(()) => {
@@ -437,6 +438,7 @@ pub(in crate::native) fn sync_file(file: &File, path: &Path) -> Result<()> {
 }
 
 pub(in crate::native) fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    close::budget::check()?;
     let parent = path.parent().context("JSON path has no parent")?;
     fault_point("creating a temporary record file")?;
     let temporary = tempfile::Builder::new()
@@ -477,22 +479,32 @@ pub(in crate::native) fn persist_record(
     temporary: tempfile::NamedTempFile,
     path: &Path,
 ) -> std::io::Result<File> {
+    close::budget::check()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::TimedOut, error))?;
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
-        let deadline = Instant::now() + RECORD_REPLACE_WAIT;
+        let deadline = crate::native::close_now() + RECORD_REPLACE_WAIT;
+        let deadline = close::budget::deadline().map_or(deadline, |close| deadline.min(close));
         let mut temporary = temporary;
         loop {
+            close::budget::check()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::TimedOut, error))?;
             match temporary.persist(path) {
                 Ok(file) => return Ok(file),
                 Err(error)
-                    if Instant::now() < deadline
+                    if crate::native::close_now() < deadline
                         && error.error.raw_os_error().is_some_and(|code| {
                             [ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION].contains(&(code as u32))
                         }) =>
                 {
                     temporary = error.file;
-                    thread::sleep(Duration::from_millis(5));
+                    #[cfg(test)]
+                    close_io_test::at(close_io_test::Point::RecordReplaceRetry);
+                    thread::sleep(
+                        Duration::from_millis(5)
+                            .min(deadline.saturating_duration_since(crate::native::close_now())),
+                    );
                 }
                 Err(error) => return Err(error.error),
             }
@@ -586,6 +598,80 @@ pub(in crate::native) fn sync_directory_entries(_directory: &Path) -> Result<()>
     Ok(())
 }
 
+// Observe the actual I/O boundary, not time spent reaching it. Test callbacks
+// may synchronize a worker or advance its thread-local close clock.
+#[cfg(test)]
+pub(in crate::native::session) mod close_io_test {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::native::session) enum Point {
+        BeforeLock(&'static str),
+        BlockingLock,
+        WouldBlock(&'static str),
+        #[cfg(windows)]
+        RecordReplaceRetry,
+    }
+    type Hook = Box<dyn FnMut(Point)>;
+    thread_local! {
+        static HOOK: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(in crate::native::session) fn at(point: Point) {
+        HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook(point);
+            }
+        });
+    }
+    pub(in crate::native::session) fn during<T>(
+        hook: impl FnMut(Point) + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset(Option<Hook>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                HOOK.with(|slot| *slot.borrow_mut() = self.0.take());
+            }
+        }
+        let _reset = Reset(HOOK.with(|slot| slot.replace(Some(Box::new(hook)))));
+        run()
+    }
+}
+
+fn lock_for_close_or_block(file: &File, name: &'static str) -> Result<()> {
+    #[cfg(test)]
+    close_io_test::at(close_io_test::Point::BeforeLock(name));
+    let Some(deadline) = close::budget::deadline() else {
+        #[cfg(test)]
+        close_io_test::at(close_io_test::Point::BlockingLock);
+        return file
+            .lock()
+            .with_context(|| format!("failed to lock native {name}"));
+    };
+    let mut contended = false;
+    loop {
+        let remaining = crate::native::close_remaining(deadline).map_err(|error| {
+            if contended {
+                error.context(format!(
+                    "another close or turn holds the session's {name} lock; nothing was changed while waiting for this lock; earlier close work is not rolled back"
+                ))
+            } else {
+                error
+            }
+        })?;
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                contended = true;
+                #[cfg(test)]
+                close_io_test::at(close_io_test::Point::WouldBlock(name));
+                thread::sleep(remaining.min(Duration::from_millis(5)));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("failed to lock native {name}"));
+            }
+        }
+    }
+}
+
 pub(in crate::native) struct StatusLock {
     _file: File,
 }
@@ -600,8 +686,7 @@ pub(in crate::native) fn lock_status(directory: &Path) -> Result<StatusLock> {
         .open(&path)
         .with_context(|| format!("failed to open {}", path.display()))?;
     set_private_file_permissions(&file)?;
-    file.lock()
-        .with_context(|| "failed to lock native session status")?;
+    lock_for_close_or_block(&file, "status")?;
     Ok(StatusLock { _file: file })
 }
 
@@ -629,8 +714,7 @@ pub(in crate::native) fn lock_turn_claim(path: &Path) -> Result<TurnClaimLock> {
         .open(&lock_path)
         .with_context(|| format!("failed to open {}", lock_path.display()))?;
     set_private_file_permissions(&file)?;
-    file.lock()
-        .with_context(|| "failed to lock native turn claim lifecycle")?;
+    lock_for_close_or_block(&file, "turn claim lifecycle")?;
     Ok(TurnClaimLock { _file: file })
 }
 

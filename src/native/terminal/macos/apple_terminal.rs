@@ -1567,6 +1567,58 @@ end mockClose
         }
     }
 
+    #[test]
+    fn close_deadline_lost_reply_leaves_zero_tab_window_unconfirmed_on_retry() {
+        use crate::native::session::{CoreRecord, SessionState, Store, close};
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_unchecked(directory.path());
+        store
+            .update_status(SessionState::Ready, None, None, None)
+            .unwrap();
+        store.write_terminal(&session()).unwrap();
+        let handle = store.record(CoreRecord::Terminal).bytes().unwrap();
+        let mut terminal = running(&[KILLED]);
+        let mut closes = Vec::new();
+        let first = close::close(&store, None, crate::native::close_deadline(), |surface| {
+            super::close_session_with(surface, |script, arguments| {
+                let (reply, events) = replay(script, &terminal, arguments);
+                if !events.is_empty() {
+                    terminal = running(&[HIDDEN_EMPTY]);
+                    closes.extend(events);
+                    anyhow::bail!("automation deadline expired after close, reply lost");
+                }
+                reply.map_err(anyhow::Error::msg)
+            })
+            .map(Into::into)
+        });
+        assert!(first.unwrap_err().to_string().contains("reply lost"));
+        assert_eq!(closes, ["closed 8341"]);
+        assert_eq!(store.record(CoreRecord::Terminal).bytes().unwrap(), handle);
+        assert!(store.closed_if_present().unwrap().is_none());
+        let (presence, events) = replay(VERIFY_TAB_SCRIPT, &terminal, &[TTY, WINDOW]);
+        assert!(presence.unwrap_err().contains("no longer matches a tab"));
+        assert!(events.is_empty());
+        let retry = close::close(&store, None, crate::native::close_deadline(), |surface| {
+            super::close_session_with(surface, |script, arguments| {
+                let (reply, events) = replay(script, &terminal, arguments);
+                assert!(
+                    events.is_empty(),
+                    "a new close has no reply-based authority"
+                );
+                reply.map_err(anyhow::Error::msg)
+            })
+            .map(Into::into)
+        });
+        assert!(
+            retry
+                .unwrap_err()
+                .to_string()
+                .contains("no longer holds its tab")
+        );
+        assert_eq!(store.record(CoreRecord::Terminal).bytes().unwrap(), handle);
+        assert!(store.closed_if_present().unwrap().is_none());
+    }
+
     // What is not a closed window after the close keeps the close failing, and with it
     // the handle: an empty window on the screen, a tab that both closes left in place,
     // and a window list that can no longer be read.

@@ -822,21 +822,21 @@ fn close_remaining(deadline: Instant) -> Result<Duration> {
 
 // Close tests can advance this clock at an action boundary without scheduler races.
 fn close_now() -> Instant {
-    #[cfg(all(test, target_os = "macos"))]
+    #[cfg(test)]
     if let Some(now) = CLOSE_TEST_TIME.with(std::cell::Cell::get) {
         return now;
     }
     Instant::now()
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 thread_local! {
     static CLOSE_TEST_TIME: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 struct TestCloseClock(Option<Instant>);
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 impl TestCloseClock {
     fn new(now: Instant) -> Self {
         Self(CLOSE_TEST_TIME.with(|time| time.replace(Some(now))))
@@ -845,7 +845,7 @@ impl TestCloseClock {
         CLOSE_TEST_TIME.with(|time| time.set(Some(now)));
     }
 }
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(test)]
 impl Drop for TestCloseClock {
     fn drop(&mut self) {
         CLOSE_TEST_TIME.with(|time| time.set(self.0));

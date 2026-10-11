@@ -1240,6 +1240,8 @@ fn terminate_console_processes(
             return Err(error)
                 .with_context(|| format!("failed to terminate console process {}", process.pid));
         }
+        #[cfg(test)]
+        tests::after_console_termination(process.pid, exit_code)?;
     }
     Ok(())
 }

@@ -493,3 +493,419 @@ fn close_deadline_preclose_repair_does_not_get_another_budget() {
     assert!(result.unwrap_err().to_string().contains("deadline"));
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
 }
+
+fn deadline_fixture() -> (tempfile::TempDir, Store) {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_unchecked(directory.path());
+    update_status(directory.path(), SessionState::Ready, None, None).unwrap();
+    store
+        .write_terminal(&terminal::TerminalSession {
+            kind: terminal::TerminalKind::Iterm2,
+            id: "deadline-fixture".into(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: None,
+            wezterm_mux: None,
+            windows_process_identity: None,
+        })
+        .unwrap();
+    (directory, store)
+}
+
+// Freeze time while recovery and syncs run; expire only after the lock actually
+// refuses a non-blocking attempt. The parent keeps the lock until this reports.
+fn expire_at_contended_lock<T>(name: &'static str, run: impl FnOnce(Instant) -> T) -> T {
+    use super::super::primitives::close_io_test::{self, Point};
+    let now = Instant::now();
+    let clock = crate::native::TestCloseClock::new(now);
+    let deadline = now + Duration::from_secs(1);
+    let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let seen = observed.clone();
+    let result = close_io_test::during(
+        move |point| {
+            if let Point::WouldBlock(actual) = point {
+                assert_eq!(actual, name);
+                seen.set(true);
+                clock.set(deadline);
+            }
+        },
+        || run(deadline),
+    );
+    assert!(observed.get(), "the test must reach the contended lock");
+    result
+}
+
+#[test]
+fn close_deadline_bounds_both_lifecycle_lock_acquisitions_without_changes() {
+    for recovery in [true, false] {
+        let (_directory, store) = deadline_fixture();
+        let held = store.lock().unwrap();
+        let before = store.record(CoreRecord::Status).bytes().unwrap();
+        let terminal = store.record(CoreRecord::Terminal).bytes().unwrap();
+        let directory = store.directory().to_owned();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let store = Store::open_unchecked(directory);
+            let result = expire_at_contended_lock("turn claim lifecycle", |deadline| {
+                if recovery {
+                    close(&store, None, deadline, |_| {
+                        panic!("locked close must not act")
+                    })
+                    .map(|_| ())
+                } else {
+                    close_session_state_with_error(
+                        &store,
+                        None,
+                        |_| panic!("locked close must not act"),
+                        deadline,
+                    )
+                }
+            });
+            send.send(result.map_err(|e| format!("{e:#}"))).unwrap();
+        });
+        // Keep the lock until the worker reports. The watchdog only prevents a broken
+        // implementation from hanging the suite; it does not release the lock on time.
+        let result = receive.recv_timeout(Duration::from_secs(10));
+        assert_eq!(store.record(CoreRecord::Status).bytes().unwrap(), before);
+        assert_eq!(
+            store.record(CoreRecord::Terminal).bytes().unwrap(),
+            terminal
+        );
+        assert!(!store.record(CoreRecord::TerminalClosing).path().exists());
+        drop(held);
+        worker.join().unwrap();
+        let error = result
+            .expect("close waited past its deadline for the lifecycle lock")
+            .unwrap_err();
+        assert!(error.contains("another close or turn"), "{error}");
+        assert!(error.contains("nothing was changed"), "{error}");
+        close(&store, None, crate::native::close_deadline(), |_| {
+            Ok(terminal::CloseOutcome::Closed.into())
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn close_deadline_status_lock_retains_consumption_for_next_close() {
+    let (_directory, store) = deadline_fixture();
+    let held = store.lock_status().unwrap();
+    let before = store.record(CoreRecord::Status).bytes().unwrap();
+    let directory = store.directory().to_owned();
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let store = Store::open_unchecked(directory);
+        let result = expire_at_contended_lock("status", |deadline| {
+            close(&store, None, deadline, |_| {
+                Ok(terminal::CloseOutcome::Closed.into())
+            })
+        });
+        send.send(result.map_err(|e| format!("{e:#}"))).unwrap();
+    });
+    let result = receive.recv_timeout(Duration::from_secs(10));
+    assert_eq!(store.record(CoreRecord::Status).bytes().unwrap(), before);
+    assert!(store.record(CoreRecord::TerminalClosed).path().exists());
+    drop(held);
+    worker.join().unwrap();
+    let error = result
+        .expect("settlement waited past its deadline for the status lock")
+        .unwrap_err();
+    assert!(error.contains("another close or turn"), "{error}");
+    assert!(store.closed_if_present().unwrap().is_none());
+    close(&store, None, crate::native::close_deadline(), |_| {
+        panic!("consumed handle must not act again")
+    })
+    .unwrap();
+    assert_eq!(store.status().unwrap().state, SessionState::Closed);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn close_deadline_expiry_after_durable_markers_never_rolls_back() {
+    for point in [
+        interruption::Point::ConsumptionMarkerWritten,
+        interruption::Point::ClosedTombstoneWritten,
+    ] {
+        let (_directory, store) = deadline_fixture();
+        store
+            .record(CoreRecord::TurnClaim)
+            .write_private(b"1-2-3\n")
+            .unwrap();
+        let now = Instant::now();
+        let clock = crate::native::TestCloseClock::new(now);
+        let deadline = now + Duration::from_secs(1);
+        let result = interruption::expiring(point, deadline, || {
+            close(&store, None, deadline, |_| {
+                Ok(terminal::CloseOutcome::Closed.into())
+            })
+        });
+        assert!(
+            result.is_err(),
+            "expiry after {point:?} must report incomplete settlement"
+        );
+        assert!(store.record(CoreRecord::TerminalClosed).path().exists());
+        assert!(
+            !store.record(CoreRecord::Terminal).path().exists(),
+            "consumed handle cannot be restored"
+        );
+        assert!(store.record(CoreRecord::TurnClaim).path().exists());
+        let tombstone = store.record(CoreRecord::Closed).bytes().unwrap();
+        assert_eq!(
+            tombstone.is_some(),
+            point == interruption::Point::ClosedTombstoneWritten
+        );
+        clock.set(now);
+        close(&store, None, deadline, |_| {
+            panic!("committed close must not call the adapter")
+        })
+        .unwrap();
+        assert_eq!(store.status().unwrap().state, SessionState::Closed);
+        assert!(!store.has_active_session_capability());
+        if let Some(tombstone) = tombstone {
+            assert_eq!(
+                store.record(CoreRecord::Closed).bytes().unwrap().unwrap(),
+                tombstone
+            );
+        }
+        store.converge().unwrap();
+    }
+}
+
+#[test]
+fn close_deadline_contender_does_not_disturb_the_closer_holding_the_lock() {
+    let (_directory, store) = deadline_fixture();
+    let path = store.directory().to_owned();
+    let (entered, entry) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        close(
+            &Store::open_unchecked(path),
+            None,
+            crate::native::close_deadline(),
+            |_| {
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(10)).unwrap();
+                Ok(terminal::CloseOutcome::Closed.into())
+            },
+        )
+    });
+    entry.recv_timeout(Duration::from_secs(10)).unwrap();
+    let status = store.record(CoreRecord::Status).bytes().unwrap();
+    let claimed = store.record(CoreRecord::TerminalClosing).bytes().unwrap();
+    let result = expire_at_contended_lock("turn claim lifecycle", |deadline| {
+        close(&store, None, deadline, |_| panic!("contender cannot close"))
+    });
+    assert_eq!(store.record(CoreRecord::Status).bytes().unwrap(), status);
+    assert_eq!(
+        store.record(CoreRecord::TerminalClosing).bytes().unwrap(),
+        claimed
+    );
+    release.send(()).unwrap();
+    assert!(format!("{:#}", result.unwrap_err()).contains("another close or turn"));
+    holder.join().unwrap().unwrap();
+    assert!(status.is_some() && claimed.is_some());
+    assert_eq!(store.status().unwrap().state, SessionState::Closed);
+}
+
+#[cfg(windows)]
+#[test]
+fn close_deadline_windows_record_replacement_stops_at_close_budget() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("record.json");
+    write_json_atomic(&path, &"before").unwrap();
+    // Deliberately deny delete sharing, making replacement fail until we drop this.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&path)
+        .unwrap();
+    use super::super::primitives::close_io_test::{self, Point};
+    let now = Instant::now();
+    let clock = crate::native::TestCloseClock::new(now);
+    let deadline = now + Duration::from_millis(40);
+    let retries = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = retries.clone();
+    let result = {
+        let _budget = budget::Scope::enter(deadline);
+        close_io_test::during(
+            move |point| {
+                if point == Point::RecordReplaceRetry {
+                    seen.set(seen.get() + 1);
+                    // Prove that a failed replacement was retried, then exhaust the
+                    // close budget while its ordinary one-second budget remains.
+                    assert!(seen.get() <= 2, "replacement retried after close expiry");
+                    if seen.get() == 2 {
+                        clock.set(deadline);
+                    }
+                }
+            },
+            || write_json_atomic(&path, &"after"),
+        )
+    };
+    assert_eq!(retries.get(), 2);
+    let error = result.unwrap_err();
+    assert!(
+        format!("{error:#}").contains("close deadline expired"),
+        "{error:#}"
+    );
+    assert_eq!(read_json::<String>(&path).unwrap(), "before");
+    drop(held);
+    write_json_atomic(&path, &"after").unwrap();
+    assert_eq!(read_json::<String>(&path).unwrap(), "after");
+}
+
+#[cfg(windows)]
+#[test]
+fn close_deadline_public_repair_of_exited_or_failed_windows_session_needs_no_helper() {
+    for state in [SessionState::Exited, SessionState::Failed] {
+        let (_directory, store) = deadline_fixture();
+        // These are the durable records after a helper ended some console processes.
+        update_status(store.directory(), state, None, None).unwrap();
+        store
+            .write_owner(&NativeSessionOwner {
+                pid: 0,
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .record(CoreRecord::Terminal)
+            .rename_to(&store.record(CoreRecord::TerminalClosing))
+            .unwrap();
+        store
+            .record(CoreRecord::TurnClaim)
+            .write_private(b"1-2-3\n")
+            .unwrap();
+        // Iterm2 is intentionally unsupported on Windows: any helper dispatch fails.
+        // Public convergence must settle these states from records alone.
+        store.converge().unwrap();
+        assert_eq!(store.status().unwrap().state, SessionState::Closed);
+        assert!(!store.has_active_session_capability());
+        assert!(store.record(CoreRecord::TerminalClosed).path().exists());
+        store.converge().unwrap();
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn close_deadline_before_confirmation_keeps_handle_and_intent() {
+    let (_directory, store) = deadline_fixture();
+    let now = Instant::now();
+    let clock = crate::native::TestCloseClock::new(now);
+    let deadline = now + Duration::from_secs(1);
+    let handle = store.record(CoreRecord::Terminal).bytes().unwrap();
+    let error = close(&store, None, deadline, |_| {
+        store
+            .record(CoreRecord::TerminalCloseIntent)
+            .write_json(&serde_json::json!({"intent": "retained"}))?;
+        clock.set(deadline);
+        Ok(terminal::CloseOutcome::Closed.into())
+    })
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("closing was not confirmed"));
+    assert_eq!(store.record(CoreRecord::Terminal).bytes().unwrap(), handle);
+    assert!(
+        store
+            .record(CoreRecord::TerminalCloseIntent)
+            .path()
+            .exists()
+    );
+    assert!(!store.record(CoreRecord::TerminalClosed).path().exists());
+    assert!(store.closed_if_present().unwrap().is_none());
+    clock.set(now);
+    let retry = close(&store, None, deadline, |_| {
+        anyhow::bail!("fresh authority refused")
+    });
+    assert!(
+        retry
+            .unwrap_err()
+            .to_string()
+            .contains("fresh authority refused")
+    );
+    assert_eq!(store.record(CoreRecord::Terminal).bytes().unwrap(), handle);
+    assert!(
+        store
+            .record(CoreRecord::TerminalCloseIntent)
+            .path()
+            .exists()
+    );
+}
+
+#[test]
+fn close_deadline_scope_is_restored_and_other_threads_keep_blocking_locks() {
+    let (_directory, store) = deadline_fixture();
+    let held = store.lock().unwrap();
+    let path = store.directory().to_owned();
+    use super::super::primitives::close_io_test::{self, Point};
+    let (send, receive) = std::sync::mpsc::channel();
+    let (entered, entry) = std::sync::mpsc::channel();
+    let (resume, resumed) = std::sync::mpsc::channel();
+    {
+        let expired = Instant::now();
+        let _scope = budget::Scope::enter(expired);
+        {
+            let _nested = budget::Scope::enter(expired + Duration::from_secs(60));
+            assert_eq!(budget::deadline(), Some(expired));
+        }
+        assert_eq!(budget::deadline(), Some(expired));
+        let worker = std::thread::spawn(move || {
+            assert!(budget::deadline().is_none());
+            close_io_test::during(
+                move |point| {
+                    if point == Point::BlockingLock {
+                        entered.send(()).unwrap();
+                        resumed.recv_timeout(Duration::from_secs(10)).unwrap();
+                    }
+                },
+                || {
+                    let _lock = Store::open_unchecked(path).lock().unwrap();
+                },
+            );
+            send.send(()).unwrap();
+        });
+        entry.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(matches!(
+            receive.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(held);
+        resume.send(()).unwrap();
+        receive.recv_timeout(Duration::from_secs(10)).unwrap();
+        worker.join().unwrap();
+    }
+    assert!(budget::deadline().is_none());
+    let _lock = store.lock().unwrap();
+}
+
+#[test]
+fn close_deadline_uncontended_settlement_reports_only_expiry() {
+    use super::super::primitives::close_io_test::{self, Point};
+    let (_directory, store) = deadline_fixture();
+    let now = Instant::now();
+    let clock = crate::native::TestCloseClock::new(now);
+    let deadline = now + Duration::from_secs(1);
+    let result = close_io_test::during(
+        move |point| {
+            if point == Point::BeforeLock("status") {
+                crate::native::CLOSE_TEST_TIME.with(|time| time.set(Some(deadline)));
+            }
+            assert!(!matches!(point, Point::WouldBlock(_)), "no lock is held");
+        },
+        || {
+            close(&store, None, deadline, |_| {
+                Ok(terminal::CloseOutcome::Closed.into())
+            })
+        },
+    );
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(error.contains("close deadline expired"), "{error}");
+    assert!(!error.contains("another close or turn"), "{error}");
+    assert!(store.record(CoreRecord::TerminalClosed).path().exists());
+    assert!(store.closed_if_present().unwrap().is_none());
+    clock.set(now);
+    close(&store, None, deadline, |_| {
+        panic!("consumed handle must not close again")
+    })
+    .unwrap();
+}

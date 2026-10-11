@@ -363,3 +363,129 @@ fn close_deadline_console_helper_is_bounded() {
             .unwrap_err();
     assert_eq!(error.to_string(), "own close timeout");
 }
+
+struct PrivateConsoleChild(std::process::Child);
+impl std::ops::Deref for PrivateConsoleChild {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for PrivateConsoleChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for PrivateConsoleChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+fn private_console_process() -> (PrivateConsoleChild, super::ConsoleProcess) {
+    let (child, process) = console_process();
+    (PrivateConsoleChild(child), process)
+}
+
+type TerminationLog = (usize, Vec<(u32, u32)>);
+thread_local! {
+    static TERMINATIONS: std::cell::RefCell<Option<TerminationLog>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn after_console_termination(pid: u32, code: u32) -> anyhow::Result<()> {
+    TERMINATIONS.with(|slot| {
+        if let Some((limit, seen)) = slot.borrow_mut().as_mut() {
+            seen.push((pid, code));
+            if seen.len() == *limit {
+                anyhow::bail!("helper interrupted after process termination");
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn close_deadline_partial_helper_keeps_descendants_before_root_and_host_last_zero() {
+    for root_already_gone in [false, true] {
+        let (mut other, other_process) = private_console_process();
+        let (mut root, root_process) = private_console_process();
+        let (mut host, host_process) = private_console_process();
+        let (mut remaining, remaining_process) = private_console_process();
+        let (root_pid, host_pid) = (root.id(), host.id());
+        let expected = vec![
+            (other.id(), 1),
+            (remaining.id(), 1),
+            (root_pid, 1),
+            (host_pid, 0),
+        ];
+        let processes = [host_process, root_process, other_process, remaining_process];
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TERMINATIONS.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
+        let limit = if root_already_gone { 3 } else { 1 };
+        TERMINATIONS.with(|slot| *slot.borrow_mut() = Some((limit, Vec::new())));
+        let failure =
+            super::terminate_console_processes(&processes, root_pid, Some(host_pid)).unwrap_err();
+        assert!(failure.to_string().contains("helper interrupted"));
+        other.wait().unwrap();
+        if root_already_gone {
+            remaining.wait().unwrap();
+            root.wait().unwrap();
+        } else {
+            assert!(root.try_wait().unwrap().is_none());
+        }
+        assert!(host.try_wait().unwrap().is_none());
+        // Settle terminated handles before retry, exactly the partial state a new
+        // helper observes. The production sort and termination loop run both times.
+        super::terminate_console_processes(&processes, root_pid, Some(host_pid)).unwrap();
+        assert_eq!(other.wait().unwrap().code(), Some(1));
+        assert_eq!(remaining.wait().unwrap().code(), Some(1));
+        assert_eq!(root.wait().unwrap().code(), Some(1));
+        assert_eq!(host.wait().unwrap().code(), Some(0));
+        TERMINATIONS.with(|slot| assert_eq!(slot.borrow().as_ref().unwrap().1, expected));
+    }
+}
+
+#[test]
+fn close_deadline_new_helper_observes_gone_root_and_ends_recorded_live_host() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut root, root_process) = private_console_process();
+    let (mut host, _host_process) = private_console_process();
+    let identity = query_process_identity(root.id()).unwrap();
+    crate::native::session::RecordStore::at(&directory.path().join("console-host-process.json"))
+        .write_json(&serde_json::json!({ "schema": 1, "pid": host.id(), "identity": query_process_identity(host.id()).unwrap() })).unwrap();
+    let session = super::TerminalSession {
+        kind: super::TerminalKind::WindowsConsole,
+        id: root.id().to_string(),
+        tab_id: None,
+        window_id: None,
+        managed_session_id: None,
+        wezterm_mux: None,
+        windows_process_identity: Some(identity),
+    };
+    super::terminate_console_processes(&[root_process], root.id(), Some(host.id())).unwrap();
+    root.wait().unwrap();
+    assert!(host.try_wait().unwrap().is_none());
+    // This returns before FreeConsole/AttachConsole: it cannot touch the test runner's console.
+    let error = super::console_control(
+        "close",
+        &session,
+        None,
+        0,
+        None,
+        &super::super::WindowsSessionRecords {
+            directory: directory.path(),
+            root_never_ran: false,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        super::super::windows_console_helper_reports_missing(&error.to_string()),
+        "{error:#}"
+    );
+    assert_eq!(host.wait().unwrap().code(), Some(0));
+}
