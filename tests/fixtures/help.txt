@@ -1,4 +1,4 @@
-tabcli 0.4.3 — Terminal Agent Bridge: visible terminal sessions for coding agent CLIs
+tabcli 0.4.4 — Terminal Agent Bridge: visible terminal sessions for coding agent CLIs
 
 Usage:
   tabcli ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]
