@@ -166,6 +166,12 @@ additional TUI input have separate verification limits (#57, #65). Consult
 
 ## Ownership and close
 
+Open sessions, including finished sessions that were not closed, load the terminal. For bulk
+delegation, cap the number of open sessions and close a session before opening the next.
+On a slow terminal, give `close-session` a longer `--timeout-secs` budget. When a running
+WezTerm GUI does not answer its pane listing in time, Bridge reports it as busy instead of
+opening another window.
+
 `close-session` targets the surface Bridge created for that session, not whichever tab you have
 selected. It preserves your other tabs. If Bridge cannot prove ownership or absence of the recorded
 surface, it refuses the close and keeps the handle.

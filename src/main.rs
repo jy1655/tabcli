@@ -87,13 +87,17 @@ Self-test:
   It never resends an uncertain prompt. It follows ask's workspace-consent rules:
   verified consent for the exact workspace is reused through the provider's own
   approval, and without it self-test approves no workspace trust itself.
-  --timeout-secs is a per-command budget (default 120); cleanup uses the normal
-  explicit-close contract. Closed records remain in the registry for inspection.
+  --timeout-secs is a per-command budget (default 120); cleanup calls close-session
+  with --timeout-secs 10 and a 15-second outer budget.
+  Closed records remain in the registry for inspection.
   --isolated keeps the run apart from your sessions in a private directory of its
   own; your state root's settings and consent records do not apply, and the
   private directory stays until you remove it. Only a fully verified round trip
   and cleanup exit successfully. Model, effort, and --yolo follow the new-session
   policy below.
+
+Close:
+  close-session --timeout-secs is the maximum time the close may take (default 60 seconds).
 
 Session policy:
   --model and --effort apply only to the new child session. For Codex, a non-empty

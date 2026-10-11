@@ -134,7 +134,8 @@ become ready while the screen was locked (2026-10-11, Ghostty 1.3.1, measured wi
 scripts: the created tab answered its ids within half a second and then reported that its terminal
 surface model was not available for the whole poll), which is the same symptom as the 2026-10-07
 observation above. Before retrying, record the lock state, whether the terminal application was
-already running, whether a macOS Automation prompt is on screen, the output of
+already running, how many sessions the terminal holds (including finished sessions that were
+not closed), whether a macOS Automation prompt is on screen, the output of
 `osascript -e 'tell application "<terminal>" to count windows'`, and
 `tabcli inspect SESSION --timeline --json`. A first launch of iTerm2 that failed within a second
 with an AppleScript syntax error was a different defect: the scripts addressed the application by
