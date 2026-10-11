@@ -1,3 +1,4 @@
+use super::applescript::{Automation, Osascript};
 use super::{DialogKey, GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
 use crate::native::session::Reader;
 #[cfg(test)]
@@ -308,14 +309,15 @@ on run argv
 end run
 "#;
 
-pub(super) fn create_tab(
+fn create_tab(
+    automation: &dyn Automation,
     mode: crate::native::settings::MacosOpenMode,
     command: &str,
     directory: &Path,
     deadline: Instant,
 ) -> Result<TerminalSession> {
     let bootstrap = launch_bootstrap(command, directory)?;
-    let id = applescript::run_until(
+    let id = automation.run_until(
         "iTerm2",
         OPEN_TAB_SCRIPT,
         &[mode.as_str(), &bootstrap],
@@ -420,7 +422,8 @@ fn wait_for_binding(directory: &Path, id: &str, iterm_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn send_file(
+fn send_file(
+    automation: &dyn Automation,
     session: &TerminalSession,
     prompt_path: &Path,
     deadline: Instant,
@@ -429,7 +432,7 @@ pub(super) fn send_file(
         .to_str()
         .context("prompt path is not valid UTF-8")
         .map_err(TerminalSendFailure::not_sent)?;
-    let response = applescript::run_send_until(
+    let response = automation.run_send_until(
         "iTerm2",
         SEND_FILE_SCRIPT,
         &[&session.id, prompt_path],
@@ -443,18 +446,19 @@ pub(super) fn send_file(
     Ok(())
 }
 
-pub(super) fn verify_session(
+fn verify_session(
+    automation: &dyn Automation,
     session: &TerminalSession,
     timeout: Option<Duration>,
 ) -> Result<String> {
     let tty = match timeout {
-        Some(timeout) => applescript::run_until(
+        Some(timeout) => automation.run_until(
             "iTerm2",
             VERIFY_SESSION_SCRIPT,
             &[&session.id],
             super::timeout_deadline(timeout)?,
         ),
-        None => applescript::run("iTerm2", VERIFY_SESSION_SCRIPT, &[&session.id]),
+        None => automation.run("iTerm2", VERIFY_SESSION_SCRIPT, &[&session.id]),
     }?;
     if tty.is_empty() {
         bail!("iTerm2 ownership proof returned an empty tty");
@@ -462,17 +466,26 @@ pub(super) fn verify_session(
     Ok(tty)
 }
 
-pub(super) fn close_session_until(
+fn close_session_until(
+    automation: &dyn Automation,
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
     let response =
-        applescript::run_until("iTerm2", CLOSE_SESSION_SCRIPT, &[&session.id], deadline)?;
+        automation.run_until("iTerm2", CLOSE_SESSION_SCRIPT, &[&session.id], deadline)?;
     close_response(TerminalKind::Iterm2, &response)
 }
 
-pub(super) struct Adapter;
-pub(super) static ADAPTER: Adapter = Adapter;
+pub(super) struct Adapter<R: Automation> {
+    automation: R,
+}
+pub(super) static ADAPTER: Adapter<Osascript> = Adapter {
+    automation: Osascript,
+};
+#[cfg(test)]
+pub(super) fn with_automation<R: Automation>(automation: R) -> Adapter<R> {
+    Adapter { automation }
+}
 // Stable creation-time handle only. A compare-and-send is one automation call;
 // an intervening repaint or changed selection sends no keys. Never targets front tab.
 pub(in crate::native) const SCREEN_SCRIPT: &str = r#"
@@ -518,7 +531,7 @@ on guardedAnswer(targetSession, expectedScreen, keyName)
     return "sent"
 end guardedAnswer
 "#;
-impl MacTerminalAdapter for Adapter {
+impl<R: Automation> MacTerminalAdapter for Adapter<R> {
     fn open_bound_tab(
         &self,
         mode: MacosOpenMode,
@@ -530,11 +543,15 @@ impl MacTerminalAdapter for Adapter {
     ) -> Result<TerminalSession> {
         super::open_with(
             deadline,
-            |startup_deadline| create_tab(mode, command, directory, startup_deadline),
+            |startup_deadline| {
+                create_tab(&self.automation, mode, command, directory, startup_deadline)
+            },
             // The creation command waits for the atomic binding above before it
             // starts the wrapper. No shell command is typed into the new tab.
             |_, _| Ok(()),
-            |session, deadline| close_session_until(session, deadline).map(|_| ()),
+            |session, deadline| {
+                close_session_until(&self.automation, session, deadline).map(|_| ())
+            },
             bind,
             unbind,
         )
@@ -545,7 +562,7 @@ impl MacTerminalAdapter for Adapter {
         prompt_path: &Path,
         deadline: Instant,
     ) -> TerminalSendResult {
-        send_file(session, prompt_path, deadline)
+        send_file(&self.automation, session, prompt_path, deadline)
     }
     fn verify_surface(
         &self,
@@ -553,7 +570,7 @@ impl MacTerminalAdapter for Adapter {
         session: &TerminalSession,
         timeout: Option<Duration>,
     ) -> Result<Option<String>> {
-        verify_session(session, timeout).map(Some)
+        verify_session(&self.automation, session, timeout).map(Some)
     }
     fn surface_present(
         &self,
@@ -561,7 +578,7 @@ impl MacTerminalAdapter for Adapter {
         session: &TerminalSession,
         timeout: Duration,
     ) -> Result<bool> {
-        let response = applescript::run_until(
+        let response = self.automation.run_until(
             "iTerm2",
             PRESENCE_SCRIPT,
             &[session.id.as_str()],
@@ -575,8 +592,12 @@ impl MacTerminalAdapter for Adapter {
     }
     fn read_screen(&self, session: &TerminalSession, deadline: Instant) -> Result<String> {
         let args = vec![session.id.as_str()];
-        let text =
-            applescript::run_until(session.kind.display_name(), SCREEN_SCRIPT, &args, deadline)?;
+        let text = self.automation.run_until(
+            session.kind.display_name(),
+            SCREEN_SCRIPT,
+            &args,
+            deadline,
+        )?;
         applescript::screen_text(&text)
     }
     fn guarded_dialog_input(
@@ -593,8 +614,12 @@ impl MacTerminalAdapter for Adapter {
                 DialogKey::DownEnter => "down-enter",
             },
         ]);
-        let answer =
-            applescript::run_until(session.kind.display_name(), SCREEN_SCRIPT, &args, deadline)?;
+        let answer = self.automation.run_until(
+            session.kind.display_name(),
+            SCREEN_SCRIPT,
+            &args,
+            deadline,
+        )?;
         applescript::guarded_answer(&answer)
     }
     fn close_session_until(
@@ -603,7 +628,7 @@ impl MacTerminalAdapter for Adapter {
         session: &TerminalSession,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
-        close_session_until(session, deadline)
+        close_session_until(&self.automation, session, deadline)
     }
     fn close_owned_session(
         &self,
@@ -611,11 +636,307 @@ impl MacTerminalAdapter for Adapter {
         session: &TerminalSession,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
-        close_session_until(session, deadline)
+        close_session_until(&self.automation, session, deadline)
     }
 }
 #[cfg(test)]
 mod tests {
+    use super::applescript::testing::{Call, Method, Replay, Reply, ScriptId};
+    fn automation_session() -> TerminalSession {
+        serde_json::from_value(serde_json::json!({
+            "iterm_session_id": "native-id", "managed_session_id": "managed-id"
+        }))
+        .unwrap()
+    }
+    fn call(
+        method: Method,
+        script: ScriptId,
+        arguments: &[&str],
+        deadline: Option<Instant>,
+    ) -> Call {
+        Call::new("iTerm2", method, script, arguments, deadline)
+    }
+    #[test]
+    fn automation_close_addresses_native_id_and_preserves_outcomes() {
+        let directory = Path::new("unused");
+        let session = automation_session();
+        for owned in [false, true] {
+            for response in ["closed", "missing", "unexpected", "error"] {
+                // Expiry is checked by Osascript, not by the adapter. A trait call
+                // with this exact expired deadline still occurs; no OS process is used.
+                let deadline = Instant::now();
+                let replay = Replay::new([Reply::Normal(if response == "error" {
+                    Err(anyhow::anyhow!("injected close error"))
+                } else {
+                    Ok(response.into())
+                })]);
+                let adapter = with_automation(replay.clone());
+                let result = if owned {
+                    adapter.close_owned_session(directory, &session, deadline)
+                } else {
+                    adapter.close_session_until(directory, &session, deadline)
+                };
+                match response {
+                    "closed" => assert_eq!(result.unwrap(), CloseOutcome::Closed),
+                    "missing" => assert_eq!(result.unwrap(), CloseOutcome::Missing),
+                    "unexpected" => assert_eq!(
+                        result.unwrap_err().to_string(),
+                        "unexpected iTerm2 close response: \"unexpected\""
+                    ),
+                    _ => assert_eq!(result.unwrap_err().to_string(), "injected close error"),
+                }
+                assert_eq!(
+                    replay.calls(),
+                    [call(
+                        Method::RunUntil,
+                        ScriptId::ItermClose,
+                        &["native-id"],
+                        Some(deadline)
+                    )]
+                );
+                replay.assert_finished();
+            }
+        }
+    }
+    #[test]
+    fn automation_verify_selects_method_and_rejects_empty_tty() {
+        let session = automation_session();
+        let timeout = Duration::from_secs(3);
+        for bounded in [false, true] {
+            for tty in ["/dev/ttys014", ""] {
+                let replay = Replay::normal(&[tty]);
+                let adapter = with_automation(replay.clone());
+                let before = Instant::now();
+                let result = adapter.verify_surface(
+                    Path::new("unused"),
+                    &session,
+                    bounded.then_some(timeout),
+                );
+                let after = Instant::now();
+                if tty.is_empty() {
+                    assert_eq!(
+                        result.unwrap_err().to_string(),
+                        "iTerm2 ownership proof returned an empty tty"
+                    );
+                } else {
+                    assert_eq!(result.unwrap(), Some(tty.into()));
+                }
+                let calls = replay.calls();
+                let deadline = calls[0].deadline;
+                if bounded {
+                    assert!((before + timeout..=after + timeout).contains(&deadline.unwrap()));
+                } else {
+                    assert_eq!(deadline, None);
+                }
+                assert_eq!(
+                    calls,
+                    [call(
+                        if bounded {
+                            Method::RunUntil
+                        } else {
+                            Method::Run
+                        },
+                        ScriptId::ItermVerify,
+                        &["native-id"],
+                        deadline
+                    )]
+                );
+                replay.assert_finished();
+            }
+        }
+    }
+    #[test]
+    fn automation_create_binds_after_creation_and_cleans_up_before_unbind() {
+        use std::cell::Cell;
+        for mode in [MacosOpenMode::TabFirst, MacosOpenMode::NewWindow] {
+            for fail_bind in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let replies: &[&str] = if fail_bind {
+                    &["native-id", "closed"]
+                } else {
+                    &["native-id"]
+                };
+                let replay = Replay::normal(replies);
+                let adapter = with_automation(replay.clone());
+                let bound = Cell::new(false);
+                let unbound = Cell::new(false);
+                let bootstrap = launch_bootstrap("echo card10", directory.path()).unwrap();
+                let args = iterm2_arguments(&bootstrap);
+                assert!(args[4].contains(&format!(
+                    "native-iterm2-host {}",
+                    crate::native::terminal::shell_quote(directory.path().as_os_str())
+                )));
+                assert!(args[4].ends_with("echo card10"));
+                let create_call = call(
+                    Method::RunUntil,
+                    ScriptId::ItermOpen,
+                    &[mode.as_str(), &bootstrap],
+                    Some(deadline - Duration::from_secs(2)),
+                );
+                let close_call = call(
+                    Method::RunUntil,
+                    ScriptId::ItermClose,
+                    &["native-id"],
+                    Some(deadline),
+                );
+                let result = adapter.open_bound_tab(
+                    mode,
+                    "echo card10",
+                    directory.path(),
+                    deadline,
+                    Box::new(|session| {
+                        assert_eq!(replay.calls(), std::slice::from_ref(&create_call));
+                        assert_eq!(session.id, "native-id");
+                        assert!(session.managed_session_id.is_none());
+                        session.managed_session_id = Some("managed-id".into());
+                        bound.set(true);
+                        if fail_bind {
+                            bail!("binding failed");
+                        }
+                        Ok(())
+                    }),
+                    Box::new(|| {
+                        assert!(bound.get());
+                        assert_eq!(replay.calls(), [create_call.clone(), close_call.clone()]);
+                        unbound.set(true);
+                        Ok(())
+                    }),
+                );
+                assert!(bound.get());
+                assert_eq!(unbound.get(), fail_bind);
+                if fail_bind {
+                    assert_eq!(result.unwrap_err().to_string(), "binding failed");
+                    assert_eq!(replay.calls(), [create_call, close_call]);
+                } else {
+                    let session = result.unwrap();
+                    assert_eq!(session.id, "native-id");
+                    assert_eq!(session.managed_session_id.as_deref(), Some("managed-id"));
+                    assert_eq!(replay.calls(), [create_call]);
+                }
+                replay.assert_finished();
+            }
+        }
+    }
+    #[test]
+    fn automation_presence_screen_guarded_and_send_preserve_call_order() {
+        let session = automation_session();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let timeout = Duration::from_secs(3);
+        let replay = Replay::normal(&[
+            "present",
+            "missing",
+            "AB_SCREEN_BEGIN  screen\nAB_SCREEN_END",
+            "sent",
+            "changed",
+            "sent",
+            "changed",
+        ]);
+        let adapter = with_automation(replay.clone());
+        let mut expected = Vec::new();
+        for present in [true, false] {
+            let before = Instant::now();
+            assert_eq!(
+                adapter
+                    .surface_present(Path::new("unused"), &session, timeout)
+                    .unwrap(),
+                present
+            );
+            let after = Instant::now();
+            let observed = replay.calls().last().unwrap().deadline.unwrap();
+            assert!((before + timeout..=after + timeout).contains(&observed));
+            expected.push(call(
+                Method::RunUntil,
+                ScriptId::ItermPresence,
+                &["native-id"],
+                Some(observed),
+            ));
+        }
+        assert_eq!(
+            adapter.read_screen(&session, deadline).unwrap(),
+            "  screen\n"
+        );
+        expected.push(call(
+            Method::RunUntil,
+            ScriptId::ItermScreen,
+            &["native-id"],
+            Some(deadline),
+        ));
+        for (key, name) in [
+            (DialogKey::Enter, "enter"),
+            (DialogKey::DownEnter, "down-enter"),
+        ] {
+            for sent in [true, false] {
+                assert_eq!(
+                    adapter
+                        .guarded_dialog_input(
+                            &session,
+                            &GuardedDialogInput {
+                                screen: "  screen\n".into(),
+                                key
+                            },
+                            deadline
+                        )
+                        .unwrap(),
+                    sent
+                );
+                expected.push(call(
+                    Method::RunUntil,
+                    ScriptId::ItermScreen,
+                    &["native-id", "  screen\n", name],
+                    Some(deadline),
+                ));
+            }
+        }
+        assert_eq!(replay.calls(), expected);
+        replay.assert_finished();
+        for response in ["sent", "bad", "not-sent", "uncertain"] {
+            let reply = match response {
+                "not-sent" => Err(TerminalSendFailure::not_sent(anyhow::anyhow!("not-sent"))),
+                "uncertain" => Err(TerminalSendFailure::delivery_uncertain(anyhow::anyhow!(
+                    "uncertain"
+                ))),
+                _ => Ok(response.into()),
+            };
+            let replay = Replay::new([Reply::Send(reply)]);
+            let result = with_automation(replay.clone()).send_file(
+                &session,
+                Path::new("/tmp/prompt"),
+                deadline,
+            );
+            match response {
+                "sent" => result.unwrap(),
+                "not-sent" => {
+                    let failure = result.unwrap_err();
+                    assert!(!failure.delivery_may_have_occurred());
+                    assert_eq!(failure.error().to_string(), "not-sent");
+                }
+                _ => {
+                    let failure = result.unwrap_err();
+                    assert!(failure.delivery_may_have_occurred());
+                    assert_eq!(
+                        failure.error().to_string(),
+                        if response == "bad" {
+                            "unexpected iTerm2 send response: \"bad\""
+                        } else {
+                            "uncertain"
+                        }
+                    );
+                }
+            }
+            assert_eq!(
+                replay.calls(),
+                [call(
+                    Method::RunSendUntil,
+                    ScriptId::ItermSend,
+                    &["native-id", "/tmp/prompt"],
+                    Some(deadline)
+                )]
+            );
+            replay.assert_finished();
+        }
+    }
+
     #[test]
     fn launch_context_does_not_depend_on_terminal_environment() {
         if !crate::native::process_env::tests::without_bridge_environment(

@@ -8,32 +8,54 @@ use anyhow::{Context, Result, bail};
 use super::super::TerminalSendFailure;
 use super::{CloseOutcome, TerminalKind};
 
-pub(super) fn run(application: &str, script: &str, arguments: &[&str]) -> Result<String> {
-    #[cfg(test)]
-    if let Some(result) = testing::run(None) {
-        return result;
-    }
-    let output = command(script, arguments)
-        .output()
-        .context("failed to execute /usr/bin/osascript")?;
-    parse_output(application, output)
+pub(super) trait Automation {
+    fn run(&self, application: &str, script: &str, arguments: &[&str]) -> Result<String>;
+    fn run_until(
+        &self,
+        application: &str,
+        script: &str,
+        arguments: &[&str],
+        deadline: Instant,
+    ) -> Result<String>;
+    fn run_send_until(
+        &self,
+        application: &str,
+        script: &str,
+        arguments: &[&str],
+        deadline: Instant,
+    ) -> std::result::Result<String, TerminalSendFailure>;
 }
 
-pub(super) fn run_until(
-    application: &str,
-    script: &str,
-    arguments: &[&str],
-    deadline: Instant,
-) -> Result<String> {
-    #[cfg(test)]
-    if let Some(result) = testing::run(Some(deadline)) {
-        return result;
+pub(super) struct Osascript;
+
+impl Automation for Osascript {
+    fn run(&self, application: &str, script: &str, arguments: &[&str]) -> Result<String> {
+        #[cfg(test)]
+        if let Some(result) = testing::run(None) {
+            return result;
+        }
+        let output = command(script, arguments)
+            .output()
+            .context("failed to execute /usr/bin/osascript")?;
+        parse_output(application, output)
     }
-    if Instant::now() >= deadline {
-        bail!("{application} automation timed out before it started");
-    }
-    let mut command = command(script, arguments);
-    let output = crate::native::command_output_until_classified(
+
+    fn run_until(
+        &self,
+        application: &str,
+        script: &str,
+        arguments: &[&str],
+        deadline: Instant,
+    ) -> Result<String> {
+        #[cfg(test)]
+        if let Some(result) = testing::run(Some(deadline)) {
+            return result;
+        }
+        if Instant::now() >= deadline {
+            bail!("{application} automation timed out before it started");
+        }
+        let mut command = command(script, arguments);
+        let output = crate::native::command_output_until_classified(
         &mut command,
         deadline,
         &format!("{application} automation"),
@@ -56,7 +78,53 @@ pub(super) fn run_until(
             "{application} did not answer before the deadline{lock}; see docs/macos-permissions.md, \"Automation timeouts\", for what to check and record before retrying"
         ))
     })?;
-    parse_output(application, output)
+        parse_output(application, output)
+    }
+
+    fn run_send_until(
+        &self,
+        application: &str,
+        script: &str,
+        arguments: &[&str],
+        deadline: Instant,
+    ) -> std::result::Result<String, TerminalSendFailure> {
+        if Instant::now() >= deadline {
+            return Err(TerminalSendFailure::not_sent(anyhow::anyhow!(
+                "{application} automation timed out before it started"
+            )));
+        }
+        let mut command = command(script, arguments);
+        let output = crate::native::command_output_until_classified(
+            &mut command,
+            deadline,
+            &format!("{application} automation"),
+        )
+        .map_err(|failure| {
+            if failure.process_started() {
+                TerminalSendFailure::delivery_uncertain(failure.into_error())
+            } else {
+                TerminalSendFailure::not_sent(failure.into_error())
+            }
+        })?;
+        parse_output(application, output).map_err(TerminalSendFailure::delivery_uncertain)
+    }
+}
+
+pub(super) fn run_until(
+    application: &str,
+    script: &str,
+    arguments: &[&str],
+    deadline: Instant,
+) -> Result<String> {
+    Osascript.run_until(application, script, arguments, deadline)
+}
+pub(super) fn run_send_until(
+    application: &str,
+    script: &str,
+    arguments: &[&str],
+    deadline: Instant,
+) -> std::result::Result<String, TerminalSendFailure> {
+    Osascript.run_send_until(application, script, arguments, deadline)
 }
 
 fn timeout_screen_lock(probe: impl FnOnce(Instant) -> Option<bool>) -> Option<bool> {
@@ -69,33 +137,6 @@ fn timeout_screen_lock(probe: impl FnOnce(Instant) -> Option<bool>) -> Option<bo
         None => diagnostic_deadline,
     };
     probe(deadline)
-}
-
-pub(super) fn run_send_until(
-    application: &str,
-    script: &str,
-    arguments: &[&str],
-    deadline: Instant,
-) -> std::result::Result<String, TerminalSendFailure> {
-    if Instant::now() >= deadline {
-        return Err(TerminalSendFailure::not_sent(anyhow::anyhow!(
-            "{application} automation timed out before it started"
-        )));
-    }
-    let mut command = command(script, arguments);
-    let output = crate::native::command_output_until_classified(
-        &mut command,
-        deadline,
-        &format!("{application} automation"),
-    )
-    .map_err(|failure| {
-        if failure.process_started() {
-            TerminalSendFailure::delivery_uncertain(failure.into_error())
-        } else {
-            TerminalSendFailure::not_sent(failure.into_error())
-        }
-    })?;
-    parse_output(application, output).map_err(TerminalSendFailure::delivery_uncertain)
 }
 
 fn command(script: &str, arguments: &[&str]) -> Command {
@@ -147,6 +188,150 @@ pub(super) fn guarded_answer(answer: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recording_replay_identifies_each_adapter_script_uniquely() {
+        use super::super::{apple_terminal as terminal, iterm2};
+        use super::testing::ScriptId::{self, *};
+        for (application, script, expected) in [
+            ("iTerm2", iterm2::OPEN_TAB_SCRIPT, ItermOpen),
+            ("iTerm2", iterm2::SEND_FILE_SCRIPT, ItermSend),
+            ("iTerm2", iterm2::VERIFY_SESSION_SCRIPT, ItermVerify),
+            ("iTerm2", iterm2::PRESENCE_SCRIPT, ItermPresence),
+            ("iTerm2", iterm2::CLOSE_SESSION_SCRIPT, ItermClose),
+            ("iTerm2", iterm2::SCREEN_SCRIPT, ItermScreen),
+            ("Terminal.app", terminal::OPEN_TAB_SCRIPT, TerminalOpen),
+            ("Terminal.app", terminal::SEND_FILE_SCRIPT, TerminalSend),
+            ("Terminal.app", terminal::VERIFY_TAB_SCRIPT, TerminalVerify),
+            ("Terminal.app", terminal::CLOSE_TAB_SCRIPT, TerminalClose),
+            (
+                "Terminal.app",
+                terminal::WAIT_FOR_CLOSE_SCRIPT,
+                TerminalWait,
+            ),
+            ("Terminal.app", terminal::SCREEN_SCRIPT, TerminalScreen),
+        ] {
+            assert_eq!(ScriptId::identify(application, script), expected);
+        }
+    }
+    #[test]
+    fn recording_replay_rejects_unknown_ambiguous_exhausted_mismatched_and_leftover_replies() {
+        use super::super::iterm2;
+        use super::testing::{Call, Method, Replay, Reply, ScriptId};
+        let deadline = Instant::now();
+        for case in [
+            "unknown",
+            "ambiguous",
+            "exhausted",
+            "normal-for-send",
+            "send-for-run",
+            "send-for-until",
+            "leftover",
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| {
+                    match case {
+                        "unknown" => {
+                            ScriptId::identify("iTerm2", "return 1");
+                        }
+                        "ambiguous" => {
+                            ScriptId::identify(
+                                "iTerm2",
+                                &format!(
+                                    "{}{}",
+                                    iterm2::CLOSE_SESSION_SCRIPT,
+                                    iterm2::SCREEN_SCRIPT
+                                ),
+                            );
+                        }
+                        "exhausted" => {
+                            let _ = Replay::normal(&[]).run(
+                                "iTerm2",
+                                iterm2::CLOSE_SESSION_SCRIPT,
+                                &[],
+                            );
+                        }
+                        "normal-for-send" => {
+                            let _ = Replay::normal(&["sent"]).run_send_until(
+                                "iTerm2",
+                                iterm2::SEND_FILE_SCRIPT,
+                                &[],
+                                deadline,
+                            );
+                        }
+                        "send-for-run" => {
+                            let _ = Replay::new([Reply::Send(Ok("sent".into()))]).run(
+                                "iTerm2",
+                                iterm2::CLOSE_SESSION_SCRIPT,
+                                &[],
+                            );
+                        }
+                        "send-for-until" => {
+                            let _ = Replay::new([Reply::Send(Ok("sent".into()))]).run_until(
+                                "iTerm2",
+                                iterm2::CLOSE_SESSION_SCRIPT,
+                                &[],
+                                deadline,
+                            );
+                        }
+                        _ => Replay::normal(&["leftover"]).assert_finished(),
+                    }
+                })
+                .is_err(),
+                "{case}"
+            );
+        }
+        let replay = Replay::new([
+            Reply::Normal(Ok("first".into())),
+            Reply::Send(Ok("second".into())),
+            Reply::Normal(Err(anyhow::anyhow!("third"))),
+        ]);
+        assert_eq!(
+            replay
+                .run("iTerm2", iterm2::VERIFY_SESSION_SCRIPT, &["id"])
+                .unwrap(),
+            "first"
+        );
+        assert_eq!(
+            replay
+                .run_send_until(
+                    "iTerm2",
+                    iterm2::SEND_FILE_SCRIPT,
+                    &["id", "file"],
+                    deadline
+                )
+                .unwrap(),
+            "second"
+        );
+        assert_eq!(
+            replay
+                .run_until("iTerm2", iterm2::CLOSE_SESSION_SCRIPT, &["id"], deadline)
+                .unwrap_err()
+                .to_string(),
+            "third"
+        );
+        assert_eq!(
+            replay.calls(),
+            [
+                Call::new("iTerm2", Method::Run, ScriptId::ItermVerify, &["id"], None),
+                Call::new(
+                    "iTerm2",
+                    Method::RunSendUntil,
+                    ScriptId::ItermSend,
+                    &["id", "file"],
+                    Some(deadline)
+                ),
+                Call::new(
+                    "iTerm2",
+                    Method::RunUntil,
+                    ScriptId::ItermClose,
+                    &["id"],
+                    Some(deadline)
+                ),
+            ]
+        );
+        replay.assert_finished();
+    }
+
     #[test]
     fn automation_drops_caller_session_environment() {
         crate::native::process_env::tests::assert_helper_environment(
@@ -216,6 +401,211 @@ mod tests {
 #[cfg(test)]
 pub(in crate::native) mod testing {
     use super::*;
+    use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::native::terminal::macos) enum ScriptId {
+        ItermOpen,
+        ItermSend,
+        ItermVerify,
+        ItermPresence,
+        ItermClose,
+        ItermScreen,
+        TerminalOpen,
+        TerminalSend,
+        TerminalVerify,
+        TerminalClose,
+        TerminalWait,
+        TerminalScreen,
+    }
+    impl ScriptId {
+        pub(in crate::native::terminal::macos) fn identify(
+            application: &str,
+            script: &str,
+        ) -> Self {
+            use ScriptId::*;
+            let matches: Vec<_> = [
+                ("iTerm2", "on itermCreateWindow(bridgeCommand)", ItermOpen),
+                ("iTerm2", "write targetSession contents of file", ItermSend),
+                (
+                    "iTerm2",
+                    "set matchedTty to tty of targetSession",
+                    ItermVerify,
+                ),
+                (
+                    "iTerm2",
+                    "if unique ID of targetSession is wantedId then return \"present\"",
+                    ItermPresence,
+                ),
+                ("iTerm2", "close targetSession", ItermClose),
+                ("iTerm2", "on screenOf(targetSession)", ItermScreen),
+                ("Terminal.app", "on soleNewWindowWithTty(", TerminalOpen),
+                (
+                    "Terminal.app",
+                    "do script promptText in targetTab",
+                    TerminalSend,
+                ),
+                (
+                    "Terminal.app",
+                    "if matchCount is 1 then return wantedTty",
+                    TerminalVerify,
+                ),
+                ("Terminal.app", "on isOwnedTty(", TerminalClose),
+                (
+                    "Terminal.app",
+                    "set attemptCount to item 2 of argv as integer",
+                    TerminalWait,
+                ),
+                ("Terminal.app", "on screenOf(w, wantedTty)", TerminalScreen),
+            ]
+            .into_iter()
+            .filter(|(app, needle, _)| *app == application && script.contains(needle))
+            .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "unknown or ambiguous {application} script"
+            );
+            matches[0].2
+        }
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(in crate::native::terminal::macos) enum Method {
+        Run,
+        RunUntil,
+        RunSendUntil,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(in crate::native::terminal::macos) struct Call {
+        pub application: String,
+        pub method: Method,
+        pub script: ScriptId,
+        pub arguments: Vec<String>,
+        pub deadline: Option<Instant>,
+    }
+    impl Call {
+        pub(in crate::native::terminal::macos) fn new(
+            application: &str,
+            method: Method,
+            script: ScriptId,
+            arguments: &[&str],
+            deadline: Option<Instant>,
+        ) -> Self {
+            Self {
+                application: application.into(),
+                method,
+                script,
+                arguments: arguments.iter().map(|s| (*s).into()).collect(),
+                deadline,
+            }
+        }
+    }
+    pub(in crate::native::terminal::macos) enum Reply {
+        Normal(Result<String>),
+        Send(std::result::Result<String, TerminalSendFailure>),
+    }
+    struct Recording {
+        calls: Vec<Call>,
+        replies: VecDeque<Reply>,
+    }
+    impl Drop for Recording {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                assert!(self.replies.is_empty(), "unconsumed automation replies");
+            }
+        }
+    }
+    #[derive(Clone)]
+    pub(in crate::native::terminal::macos) struct Replay(Rc<RefCell<Recording>>);
+    impl Replay {
+        pub(in crate::native::terminal::macos) fn new(
+            replies: impl IntoIterator<Item = Reply>,
+        ) -> Self {
+            Self(Rc::new(RefCell::new(Recording {
+                calls: Vec::new(),
+                replies: replies.into_iter().collect(),
+            })))
+        }
+        pub(in crate::native::terminal::macos) fn normal(replies: &[&str]) -> Self {
+            Self::new(replies.iter().map(|s| Reply::Normal(Ok((*s).into()))))
+        }
+        pub(in crate::native::terminal::macos) fn calls(&self) -> Vec<Call> {
+            self.0.borrow().calls.clone()
+        }
+        pub(in crate::native::terminal::macos) fn assert_finished(&self) {
+            assert!(
+                self.0.borrow().replies.is_empty(),
+                "unconsumed automation replies"
+            );
+        }
+        fn reply(
+            &self,
+            application: &str,
+            method: Method,
+            script: &str,
+            arguments: &[&str],
+            deadline: Option<Instant>,
+        ) -> Reply {
+            let call = Call::new(
+                application,
+                method,
+                ScriptId::identify(application, script),
+                arguments,
+                deadline,
+            );
+            let mut recording = self.0.borrow_mut();
+            recording.calls.push(call);
+            recording
+                .replies
+                .pop_front()
+                .expect("automation reply queue exhausted")
+        }
+    }
+    impl Automation for Replay {
+        fn run(&self, application: &str, script: &str, arguments: &[&str]) -> Result<String> {
+            match self.reply(application, Method::Run, script, arguments, None) {
+                Reply::Normal(result) => result,
+                Reply::Send(_) => panic!("send reply for normal automation method"),
+            }
+        }
+        fn run_until(
+            &self,
+            application: &str,
+            script: &str,
+            arguments: &[&str],
+            deadline: Instant,
+        ) -> Result<String> {
+            match self.reply(
+                application,
+                Method::RunUntil,
+                script,
+                arguments,
+                Some(deadline),
+            ) {
+                Reply::Normal(result) => result,
+                Reply::Send(_) => panic!("send reply for normal automation method"),
+            }
+        }
+        fn run_send_until(
+            &self,
+            application: &str,
+            script: &str,
+            arguments: &[&str],
+            deadline: Instant,
+        ) -> std::result::Result<String, TerminalSendFailure> {
+            match self.reply(
+                application,
+                Method::RunSendUntil,
+                script,
+                arguments,
+                Some(deadline),
+            ) {
+                Reply::Send(result) => result,
+                Reply::Normal(_) => panic!("normal reply for send automation method"),
+            }
+        }
+    }
+
     type Runner = Box<dyn FnMut(Option<Instant>) -> Result<String>>;
     thread_local! {
         static RUNNER: std::cell::RefCell<Option<Runner>> = const { std::cell::RefCell::new(None) };

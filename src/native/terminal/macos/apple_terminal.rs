@@ -1,3 +1,4 @@
+use super::applescript::{Automation, Osascript};
 use super::{DialogKey, GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
 pub(in crate::native) mod close_evidence;
 
@@ -284,13 +285,14 @@ end run
 
 const BOOTSTRAP_FILE: &str = "terminal-start.sh";
 
-pub(super) fn create_tab(
+fn create_tab(
+    automation: &dyn Automation,
     command: &str,
     directory: &Path,
     deadline: Instant,
 ) -> Result<TerminalSession> {
     let start = launch_bootstrap(command, directory)?;
-    let response = applescript::run_until("Terminal.app", OPEN_TAB_SCRIPT, &[&start], deadline)?;
+    let response = automation.run_until("Terminal.app", OPEN_TAB_SCRIPT, &[&start], deadline)?;
     let mut ids = response.lines();
     let id = ids.next().filter(|value| !value.is_empty());
     let window_id = ids.next().filter(|value| !value.is_empty());
@@ -398,7 +400,8 @@ fn wait_for_binding(directory: &Path, id: &str, tty: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn send_file(
+fn send_file(
+    automation: &dyn Automation,
     session: &TerminalSession,
     prompt_path: &Path,
     deadline: Instant,
@@ -408,7 +411,7 @@ pub(super) fn send_file(
         .to_str()
         .context("prompt path is not valid UTF-8")
         .map_err(TerminalSendFailure::not_sent)?;
-    let response = applescript::run_send_until(
+    let response = automation.run_send_until(
         "Terminal.app",
         SEND_FILE_SCRIPT,
         &[&session.id, window_id, prompt_path],
@@ -422,29 +425,45 @@ pub(super) fn send_file(
     Ok(())
 }
 
-pub(super) fn verify_tab(session: &TerminalSession, timeout: Option<Duration>) -> Result<String> {
-    verify_tab_with_deadline(session, timeout.map(super::timeout_deadline).transpose()?)
+fn verify_tab(
+    automation: &dyn Automation,
+    session: &TerminalSession,
+    timeout: Option<Duration>,
+) -> Result<String> {
+    verify_tab_with_deadline(
+        automation,
+        session,
+        timeout.map(super::timeout_deadline).transpose()?,
+    )
 }
 
 fn verify_tab_with_deadline(
+    automation: &dyn Automation,
     session: &TerminalSession,
     deadline: Option<Instant>,
 ) -> Result<String> {
     let window_id = ownership_proof(session)?;
-    let response = run_terminal_automation(VERIFY_TAB_SCRIPT, &[&session.id, window_id], deadline)?;
+    let response = run_terminal_automation(
+        automation,
+        VERIFY_TAB_SCRIPT,
+        &[&session.id, window_id],
+        deadline,
+    )?;
     if response != session.id {
         bail!("Agent Bridge Terminal.app owned tab is missing");
     }
     Ok(response)
 }
 
-pub(super) fn close_owned_session(
+fn close_owned_session(
+    automation: &dyn Automation,
     directory: &Path,
     session: &TerminalSession,
     deadline: std::time::Instant,
 ) -> Result<CloseOutcome> {
     let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
     close_attested_session(
+        automation,
         session,
         owner
             .terminal_app
@@ -454,23 +473,26 @@ pub(super) fn close_owned_session(
     )
 }
 
-pub(super) fn close_session_until(
+fn close_session_until(
+    automation: &dyn Automation,
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
-    close_session_with_deadline(session, Some(deadline))
+    close_session_with(session, automation, Some(deadline))
 }
 
-fn close_session_with_deadline(
+fn close_session_with(
     session: &TerminalSession,
+    automation: &dyn Automation,
     deadline: Option<Instant>,
 ) -> Result<CloseOutcome> {
-    close_session_with(session, |script, arguments| {
-        run_terminal_automation(script, arguments, deadline)
+    close_transactions(session, |script, arguments| {
+        run_terminal_automation(automation, script, arguments, deadline)
     })
 }
 
-pub(in crate::native) fn close_attested_session(
+fn close_attested_session(
+    automation: &dyn Automation,
     session: &TerminalSession,
     app: &ownership::MacTerminalAppIdentity,
     deadline: std::time::Instant,
@@ -480,7 +502,7 @@ pub(in crate::native) fn close_attested_session(
         app,
         process::macos_process_start,
         terminal_app_instances,
-        |script, arguments| run_terminal_automation(script, arguments, Some(deadline)),
+        automation,
         deadline,
     )
 }
@@ -490,19 +512,19 @@ fn close_attested_session_with(
     app: &ownership::MacTerminalAppIdentity,
     mut process_birth: impl FnMut(u32) -> Result<Option<(u64, u64)>>,
     mut instances: impl FnMut() -> Result<Vec<ownership::MacTerminalAppIdentity>>,
-    mut run: impl FnMut(&str, &[&str]) -> Result<String>,
+    automation: &dyn Automation,
     deadline: std::time::Instant,
 ) -> Result<CloseOutcome> {
     // Recheck before every transaction, including retries; a restarted app must
     // never inherit the old window/tty's close authority.
-    close_session_with(session, |script, arguments| {
+    close_transactions(session, |script, arguments| {
         crate::native::session::close::budget::close_remaining(deadline)?;
         if !terminal_app_alive_with(app, &mut process_birth)? {
             return Ok("missing".into());
         }
         require_unique_terminal_app(app, &instances()?)?;
         crate::native::session::close::budget::close_remaining(deadline)?;
-        let reply = run(script, arguments)?;
+        let reply = automation.run_until("Terminal.app", script, arguments, deadline)?;
         crate::native::session::close::budget::close_remaining(deadline)?;
         if !terminal_app_alive_with(app, &mut process_birth)? {
             return Ok("missing".into());
@@ -513,7 +535,7 @@ fn close_attested_session_with(
     })
 }
 
-fn close_session_with(
+fn close_transactions(
     session: &TerminalSession,
     mut run: impl FnMut(&str, &[&str]) -> Result<String>,
 ) -> Result<CloseOutcome> {
@@ -546,13 +568,14 @@ fn close_session_with(
 }
 
 fn run_terminal_automation(
+    automation: &dyn Automation,
     script: &str,
     arguments: &[&str],
     deadline: Option<Instant>,
 ) -> Result<String> {
     match deadline {
-        Some(deadline) => applescript::run_until("Terminal.app", script, arguments, deadline),
-        None => applescript::run("Terminal.app", script, arguments),
+        Some(deadline) => automation.run_until("Terminal.app", script, arguments, deadline),
+        None => automation.run("Terminal.app", script, arguments),
     }
 }
 
@@ -572,7 +595,7 @@ pub(in crate::native) fn verified_close_tty(
         bail!("Terminal.app ownership proof received a different terminal kind")
     }
     crate::native::session::close::budget::close_remaining(deadline)?;
-    verify_tab_with_deadline(session, Some(deadline))
+    ADAPTER.verify_tab_with_deadline(session, Some(deadline))
 }
 
 // A record of 0.0.10 or earlier names no app incarnation. While its owner is live and
@@ -839,23 +862,33 @@ pub(in crate::native) fn apple_terminal_startup_absent_with(
 
 type Start = fn(&TerminalSession, Instant) -> Result<()>;
 type Absence = fn(&Path, &TerminalSession, Instant) -> Result<bool>;
-pub(super) struct Adapter<S, A> {
+pub(super) struct Adapter<S, A, R: Automation> {
+    automation: R,
     pub(super) start: S,
     absent: A,
 }
-pub(super) static ADAPTER: Adapter<Start, Absence> = Adapter {
+pub(super) static ADAPTER: Adapter<Start, Absence, Osascript> = Adapter {
+    automation: Osascript,
     // Terminal.app typed its start when it created the tab, and the start
     // waits for the same binding. Nothing is typed after the creation.
     start: |_, _| Ok(()),
     absent: apple_terminal_startup_absent,
 };
 #[cfg(test)]
-pub(super) fn with_observations<'a, S, A>(start: &'a S, absent: &'a A) -> Adapter<&'a S, &'a A>
+pub(super) fn with_observations<'a, S, A, R: Automation>(
+    start: &'a S,
+    absent: &'a A,
+    automation: R,
+) -> Adapter<&'a S, &'a A, R>
 where
     S: Fn(&TerminalSession, Instant) -> Result<()>,
     A: Fn(&Path, &TerminalSession, Instant) -> Result<bool>,
 {
-    Adapter { start, absent }
+    Adapter {
+        start,
+        absent,
+        automation,
+    }
 }
 // Stable creation-time handle only. A compare-and-send is one automation call;
 // an intervening repaint or changed selection sends no keys. Never targets front tab.
@@ -908,7 +941,16 @@ on guardedAnswer(w, wantedTty, targetTab, expectedScreen, keyName)
     return "sent"
 end guardedAnswer
 "#;
-impl<S, A> MacTerminalAdapter for Adapter<S, A>
+impl<S, A, R: Automation> Adapter<S, A, R> {
+    fn verify_tab_with_deadline(
+        &self,
+        session: &TerminalSession,
+        deadline: Option<Instant>,
+    ) -> Result<String> {
+        verify_tab_with_deadline(&self.automation, session, deadline)
+    }
+}
+impl<S, A, R: Automation> MacTerminalAdapter for Adapter<S, A, R>
 where
     S: Fn(&TerminalSession, Instant) -> Result<()>,
     A: Fn(&Path, &TerminalSession, Instant) -> Result<bool>,
@@ -933,7 +975,7 @@ where
                         "Terminal.app tab-first: its native scripting interface has no new-tab creation command; opening a new owned window"
                     );
                 }
-                create_tab(command, directory, startup_deadline)
+                create_tab(&self.automation, command, directory, startup_deadline)
             },
             |session, deadline| (self.start)(session, deadline),
             |session, deadline| {
@@ -954,7 +996,7 @@ where
         prompt_path: &Path,
         deadline: Instant,
     ) -> TerminalSendResult {
-        send_file(session, prompt_path, deadline)
+        send_file(&self.automation, session, prompt_path, deadline)
     }
     fn verify_surface(
         &self,
@@ -962,7 +1004,7 @@ where
         session: &TerminalSession,
         timeout: Option<Duration>,
     ) -> Result<Option<String>> {
-        verify_tab(session, timeout).map(Some)
+        verify_tab(&self.automation, session, timeout).map(Some)
     }
     fn surface_present(
         &self,
@@ -970,7 +1012,7 @@ where
         session: &TerminalSession,
         timeout: Duration,
     ) -> Result<bool> {
-        let response = applescript::run_until(
+        let response = self.automation.run_until(
             "Terminal.app",
             VERIFY_TAB_SCRIPT,
             &[
@@ -997,8 +1039,12 @@ where
                 .as_deref()
                 .context("Terminal window identity missing")?,
         ];
-        let text =
-            applescript::run_until(session.kind.display_name(), SCREEN_SCRIPT, &args, deadline)?;
+        let text = self.automation.run_until(
+            session.kind.display_name(),
+            SCREEN_SCRIPT,
+            &args,
+            deadline,
+        )?;
         applescript::screen_text(&text)
     }
     fn guarded_dialog_input(
@@ -1021,8 +1067,12 @@ where
                 DialogKey::DownEnter => "down-enter",
             },
         ]);
-        let answer =
-            applescript::run_until(session.kind.display_name(), SCREEN_SCRIPT, &args, deadline)?;
+        let answer = self.automation.run_until(
+            session.kind.display_name(),
+            SCREEN_SCRIPT,
+            &args,
+            deadline,
+        )?;
         applescript::guarded_answer(&answer)
     }
     fn close_session_until(
@@ -1031,7 +1081,7 @@ where
         session: &TerminalSession,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
-        close_session_until(session, deadline)
+        close_session_until(&self.automation, session, deadline)
     }
     fn close_owned_session(
         &self,
@@ -1039,7 +1089,7 @@ where
         session: &TerminalSession,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
-        close_owned_session(directory, session, deadline)
+        close_owned_session(&self.automation, directory, session, deadline)
     }
 }
 // The shipped scripts, executed with Terminal replaced by records: only the reads and
@@ -1047,6 +1097,303 @@ where
 // `osascript`, and nothing talks to Terminal.
 #[cfg(test)]
 mod tests {
+    use super::MacTerminalAdapter;
+    use super::applescript::testing::{Call, Method, Replay, Reply, ScriptId};
+    fn automation_call(
+        method: Method,
+        script: ScriptId,
+        arguments: &[&str],
+        deadline: Option<Instant>,
+    ) -> Call {
+        Call::new("Terminal.app", method, script, arguments, deadline)
+    }
+    #[test]
+    fn automation_open_verify_presence_screen_and_send_preserve_arguments() {
+        use super::{DialogKey, GuardedDialogInput, MacosOpenMode, TerminalSendFailure};
+        use std::path::Path;
+        let directory = tempfile::tempdir().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let timeout = Duration::from_secs(2);
+        let replay = Replay::normal(&[
+            &format!("{TTY}\n{WINDOW}"),
+            TTY,
+            TTY,
+            "present",
+            "missing",
+            TTY,
+            "AB_SCREEN_BEGIN  screen\nAB_SCREEN_END",
+            "sent",
+            "changed",
+            "sent",
+            "changed",
+        ]);
+        let absent = |_: &Path, _: &TerminalSession, _: Instant| -> anyhow::Result<bool> {
+            panic!("successful open must not clean up")
+        };
+        let adapter = super::with_observations(&super::ADAPTER.start, &absent, replay.clone());
+        let start = super::launch_bootstrap("echo card10", directory.path()).unwrap();
+        let bootstrap =
+            std::fs::read_to_string(directory.path().join(super::BOOTSTRAP_FILE)).unwrap();
+        assert!(bootstrap.contains(&format!(
+            "native-terminal-host {}",
+            crate::native::terminal::shell_quote(directory.path().as_os_str())
+        )));
+        assert!(bootstrap.ends_with("echo card10\n"));
+        let open = automation_call(
+            Method::RunUntil,
+            ScriptId::TerminalOpen,
+            &[&start],
+            Some(deadline - Duration::from_secs(2)),
+        );
+        let session = adapter
+            .open_bound_tab(
+                MacosOpenMode::NewWindow,
+                "echo card10",
+                directory.path(),
+                deadline,
+                Box::new(|session| {
+                    assert_eq!(replay.calls(), std::slice::from_ref(&open));
+                    assert_eq!(session.id, TTY);
+                    assert_eq!(session.window_id.as_deref(), Some(WINDOW));
+                    session.managed_session_id = Some("managed-id".into());
+                    Ok(())
+                }),
+                Box::new(|| panic!("successful open must retain binding")),
+            )
+            .unwrap();
+        assert_eq!(session.managed_session_id.as_deref(), Some("managed-id"));
+        let mut expected = vec![open];
+        assert_eq!(
+            adapter
+                .verify_surface(directory.path(), &session, None)
+                .unwrap(),
+            Some(TTY.into())
+        );
+        expected.push(automation_call(
+            Method::Run,
+            ScriptId::TerminalVerify,
+            &[TTY, WINDOW],
+            None,
+        ));
+        let before = Instant::now();
+        assert_eq!(
+            adapter
+                .verify_surface(directory.path(), &session, Some(timeout))
+                .unwrap(),
+            Some(TTY.into())
+        );
+        let after = Instant::now();
+        let observed = replay.calls().last().unwrap().deadline.unwrap();
+        assert!((before + timeout..=after + timeout).contains(&observed));
+        expected.push(automation_call(
+            Method::RunUntil,
+            ScriptId::TerminalVerify,
+            &[TTY, WINDOW],
+            Some(observed),
+        ));
+        for present in [true, false, true] {
+            let before = Instant::now();
+            assert_eq!(
+                adapter
+                    .surface_present(directory.path(), &session, timeout)
+                    .unwrap(),
+                present
+            );
+            let after = Instant::now();
+            let observed = replay.calls().last().unwrap().deadline.unwrap();
+            assert!((before + timeout..=after + timeout).contains(&observed));
+            expected.push(automation_call(
+                Method::RunUntil,
+                ScriptId::TerminalVerify,
+                &[TTY, WINDOW],
+                Some(observed),
+            ));
+        }
+        assert_eq!(
+            adapter.read_screen(&session, deadline).unwrap(),
+            "  screen\n"
+        );
+        expected.push(automation_call(
+            Method::RunUntil,
+            ScriptId::TerminalScreen,
+            &[TTY, WINDOW],
+            Some(deadline),
+        ));
+        for (key, name) in [
+            (DialogKey::Enter, "enter"),
+            (DialogKey::DownEnter, "down-enter"),
+        ] {
+            for sent in [true, false] {
+                assert_eq!(
+                    adapter
+                        .guarded_dialog_input(
+                            &session,
+                            &GuardedDialogInput {
+                                screen: "  screen\n".into(),
+                                key
+                            },
+                            deadline
+                        )
+                        .unwrap(),
+                    sent
+                );
+                expected.push(automation_call(
+                    Method::RunUntil,
+                    ScriptId::TerminalScreen,
+                    &[TTY, WINDOW, "  screen\n", name],
+                    Some(deadline),
+                ));
+            }
+        }
+        assert_eq!(replay.calls(), expected);
+        replay.assert_finished();
+        for response in ["sent", "bad", "not-sent", "uncertain"] {
+            let reply = match response {
+                "not-sent" => Err(TerminalSendFailure::not_sent(anyhow::anyhow!("not-sent"))),
+                "uncertain" => Err(TerminalSendFailure::delivery_uncertain(anyhow::anyhow!(
+                    "uncertain"
+                ))),
+                _ => Ok(response.into()),
+            };
+            let replay = Replay::new([Reply::Send(reply)]);
+            let adapter = super::with_observations(&super::ADAPTER.start, &absent, replay.clone());
+            let result = adapter.send_file(&session, Path::new("/tmp/prompt"), deadline);
+            match response {
+                "sent" => result.unwrap(),
+                "not-sent" => {
+                    let failure = result.unwrap_err();
+                    assert!(!failure.delivery_may_have_occurred());
+                    assert_eq!(failure.error().to_string(), "not-sent");
+                }
+                _ => {
+                    let failure = result.unwrap_err();
+                    assert!(failure.delivery_may_have_occurred());
+                    assert_eq!(
+                        failure.error().to_string(),
+                        if response == "bad" {
+                            "unexpected Terminal.app send response: \"bad\""
+                        } else {
+                            "uncertain"
+                        }
+                    );
+                }
+            }
+            assert_eq!(
+                replay.calls(),
+                [automation_call(
+                    Method::RunSendUntil,
+                    ScriptId::TerminalSend,
+                    &[TTY, WINDOW, "/tmp/prompt"],
+                    Some(deadline)
+                )]
+            );
+            replay.assert_finished();
+        }
+    }
+
+    use super::Automation;
+    use std::cell::RefCell;
+    // Runs the shipped close scripts against the existing Terminal model. It has
+    // no transaction decisions: those remain in close_transactions.
+    struct ScriptAutomation<F>(RefCell<F>);
+    impl<F: FnMut(&str, &[&str]) -> anyhow::Result<String>> ScriptAutomation<F> {
+        fn new(run: F) -> Self {
+            Self(RefCell::new(run))
+        }
+    }
+    impl<F: FnMut(&str, &[&str]) -> anyhow::Result<String>> Automation for ScriptAutomation<F> {
+        fn run(
+            &self,
+            application: &str,
+            script: &str,
+            arguments: &[&str],
+        ) -> anyhow::Result<String> {
+            assert_eq!(application, "Terminal.app");
+            (self.0.borrow_mut())(script, arguments)
+        }
+        fn run_until(&self, _: &str, _: &str, _: &[&str], _: Instant) -> anyhow::Result<String> {
+            panic!("script replay uses unbounded close")
+        }
+        fn run_send_until(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[&str],
+            _: Instant,
+        ) -> Result<String, super::TerminalSendFailure> {
+            panic!("close test must not send input")
+        }
+    }
+    struct AttestedAutomation<F>(RefCell<F>);
+    impl<F: FnMut(&str, &[&str]) -> anyhow::Result<String>> AttestedAutomation<F> {
+        fn new(run: F) -> Self {
+            Self(RefCell::new(run))
+        }
+    }
+    impl<F: FnMut(&str, &[&str]) -> anyhow::Result<String>> Automation for AttestedAutomation<F> {
+        fn run(&self, _: &str, _: &str, _: &[&str]) -> anyhow::Result<String> {
+            panic!("attested close must carry its deadline")
+        }
+        fn run_until(
+            &self,
+            application: &str,
+            script: &str,
+            arguments: &[&str],
+            _: Instant,
+        ) -> anyhow::Result<String> {
+            assert_eq!(application, "Terminal.app");
+            (self.0.borrow_mut())(script, arguments)
+        }
+        fn run_send_until(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[&str],
+            _: Instant,
+        ) -> Result<String, super::TerminalSendFailure> {
+            panic!("close test must not send input")
+        }
+    }
+    struct ClockAutomation<'a> {
+        clock: &'a crate::native::session::close::budget::TestCloseClock,
+        calls: &'a std::cell::Cell<usize>,
+        expire_at: usize,
+        deadline: Instant,
+    }
+    impl Automation for ClockAutomation<'_> {
+        fn run(&self, _: &str, _: &str, _: &[&str]) -> anyhow::Result<String> {
+            panic!("attested close must carry its deadline")
+        }
+        fn run_until(
+            &self,
+            application: &str,
+            _: &str,
+            _: &[&str],
+            deadline: Instant,
+        ) -> anyhow::Result<String> {
+            assert_eq!(application, "Terminal.app");
+            assert_eq!(deadline, self.deadline);
+            self.calls.set(self.calls.get() + 1);
+            if self.calls.get() == self.expire_at {
+                self.clock.set(deadline);
+            }
+            Ok(if self.calls.get() == 1 {
+                "closed"
+            } else {
+                "missing"
+            }
+            .into())
+        }
+        fn run_send_until(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[&str],
+            _: Instant,
+        ) -> Result<String, super::TerminalSendFailure> {
+            panic!("close test must not send input")
+        }
+    }
     #[test]
     fn launch_context_does_not_depend_on_terminal_environment() {
         use super::{BOOTSTRAP_FILE, launch_bootstrap};
@@ -1152,17 +1499,11 @@ mod tests {
                     }
                     Ok(vec![app.clone()])
                 },
-                |_, _| {
-                    calls.set(calls.get() + 1);
-                    if calls.get() == expire_at {
-                        clock.set(deadline);
-                    }
-                    Ok(if calls.get() == 1 {
-                        "closed"
-                    } else {
-                        "missing"
-                    }
-                    .into())
+                &ClockAutomation {
+                    clock: &clock,
+                    calls: &calls,
+                    expire_at,
+                    deadline,
                 },
                 deadline,
             );
@@ -1217,7 +1558,7 @@ mod tests {
                     }
                     Ok(found)
                 },
-                |_, _| {
+                &AttestedAutomation::new(|_, _| {
                     calls += 1;
                     Ok(match calls {
                         1 | 3 => "closed",
@@ -1225,7 +1566,7 @@ mod tests {
                         _ => "missing",
                     }
                     .into())
-                },
+                }),
                 crate::native::session::close::budget::close_deadline(),
             );
             assert_eq!(
@@ -1740,18 +2081,22 @@ end mockClose
     ) -> (anyhow::Result<super::CloseOutcome>, Vec<String>) {
         let mut terminal = running(&[KILLED]);
         let mut closes = Vec::new();
-        let outcome = super::close_session_with(&session(), |script, arguments| {
-            let mut arguments = arguments.to_vec();
-            if script == WAIT_FOR_CLOSE_SCRIPT {
-                arguments[1] = "2";
-            }
-            let (reply, events) = replay(script, &terminal, &arguments);
-            if !events.is_empty() {
-                terminal = after_close;
-                closes.extend(events);
-            }
-            reply.map_err(anyhow::Error::msg)
-        });
+        let outcome = super::close_session_with(
+            &session(),
+            &ScriptAutomation::new(|script, arguments| {
+                let mut arguments = arguments.to_vec();
+                if script == WAIT_FOR_CLOSE_SCRIPT {
+                    arguments[1] = "2";
+                }
+                let (reply, events) = replay(script, &terminal, &arguments);
+                if !events.is_empty() {
+                    terminal = after_close;
+                    closes.extend(events);
+                }
+                reply.map_err(anyhow::Error::msg)
+            }),
+            None,
+        );
         (outcome, closes)
     }
 
@@ -1760,6 +2105,69 @@ end mockClose
     // tabs and not visible, and the second close found no tab in it.
     #[test]
     fn terminal_app_close_finishes_when_terminal_still_lists_the_window_it_closed() {
+        for (replies, outcome) in [
+            (vec!["missing"], super::CloseOutcome::Missing),
+            (vec!["closed", "missing"], super::CloseOutcome::Closed),
+            (vec!["closed", "closed"], super::CloseOutcome::Closed),
+            (
+                vec!["closed", "present", "missing"],
+                super::CloseOutcome::Closed,
+            ),
+            (
+                vec!["closed", "present", "closed", "missing"],
+                super::CloseOutcome::Closed,
+            ),
+            (
+                vec!["closed", "present", "closed", "closed"],
+                super::CloseOutcome::Closed,
+            ),
+        ] {
+            for deadline in [None, Some(Instant::now() + Duration::from_secs(10))] {
+                let replay = Replay::normal(&replies);
+                assert_eq!(
+                    super::close_session_with(&session(), &replay, deadline).unwrap(),
+                    outcome
+                );
+                let method = if deadline.is_some() {
+                    Method::RunUntil
+                } else {
+                    Method::Run
+                };
+                let mut expected = vec![automation_call(
+                    method,
+                    ScriptId::TerminalClose,
+                    &[TTY, WINDOW],
+                    deadline,
+                )];
+                if replies.len() >= 2 {
+                    expected.push(automation_call(
+                        method,
+                        ScriptId::TerminalWait,
+                        &[WINDOW, "20", replies[0]],
+                        deadline,
+                    ));
+                }
+                if replies.len() >= 3 {
+                    expected.push(automation_call(
+                        method,
+                        ScriptId::TerminalClose,
+                        &[TTY, WINDOW],
+                        deadline,
+                    ));
+                }
+                if replies.len() >= 4 {
+                    expected.push(automation_call(
+                        method,
+                        ScriptId::TerminalWait,
+                        &[WINDOW, "100", replies[2]],
+                        deadline,
+                    ));
+                }
+                assert_eq!(replay.calls(), expected);
+                replay.assert_finished();
+            }
+        }
+
         for (case, after_close) in [
             ("closed window still listed", running(&[HIDDEN_EMPTY])),
             ("window left the list", running(&[])),
@@ -1791,15 +2199,19 @@ end mockClose
             None,
             crate::native::session::close::budget::close_deadline(),
             |surface| {
-                super::close_session_with(surface, |script, arguments| {
-                    let (reply, events) = replay(script, &terminal, arguments);
-                    if !events.is_empty() {
-                        terminal = running(&[HIDDEN_EMPTY]);
-                        closes.extend(events);
-                        anyhow::bail!("automation deadline expired after close, reply lost");
-                    }
-                    reply.map_err(anyhow::Error::msg)
-                })
+                super::close_session_with(
+                    surface,
+                    &ScriptAutomation::new(|script, arguments| {
+                        let (reply, events) = replay(script, &terminal, arguments);
+                        if !events.is_empty() {
+                            terminal = running(&[HIDDEN_EMPTY]);
+                            closes.extend(events);
+                            anyhow::bail!("automation deadline expired after close, reply lost");
+                        }
+                        reply.map_err(anyhow::Error::msg)
+                    }),
+                    None,
+                )
                 .map(Into::into)
             },
         );
@@ -1815,14 +2227,18 @@ end mockClose
             None,
             crate::native::session::close::budget::close_deadline(),
             |surface| {
-                super::close_session_with(surface, |script, arguments| {
-                    let (reply, events) = replay(script, &terminal, arguments);
-                    assert!(
-                        events.is_empty(),
-                        "a new close has no reply-based authority"
-                    );
-                    reply.map_err(anyhow::Error::msg)
-                })
+                super::close_session_with(
+                    surface,
+                    &ScriptAutomation::new(|script, arguments| {
+                        let (reply, events) = replay(script, &terminal, arguments);
+                        assert!(
+                            events.is_empty(),
+                            "a new close has no reply-based authority"
+                        );
+                        reply.map_err(anyhow::Error::msg)
+                    }),
+                    None,
+                )
                 .map(Into::into)
             },
         );

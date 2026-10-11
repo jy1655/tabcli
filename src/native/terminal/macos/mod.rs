@@ -323,7 +323,7 @@ mod startup_tests {
         let directory = tempfile::tempdir().unwrap();
         let bound = Cell::new(false);
         let calls = std::rc::Rc::new(Cell::new(0));
-        let runner_calls = calls.clone();
+        let replay = automation_testing::Replay::normal(&["/dev/ttys999\n1001"]);
         let absent_calls = Cell::new(0);
         let start = |_: &TerminalSession, _: Instant| {
             bail!("injected startup command failure before app owner record")
@@ -332,36 +332,30 @@ mod startup_tests {
             absent_calls.set(absent_calls.get() + 1);
             bail!("no app identity was recorded")
         };
-        let local = apple_terminal::with_observations(&start, &absent);
+        let local = apple_terminal::with_observations(&start, &absent, replay.clone());
         let adapter: &dyn MacTerminalAdapter = &local;
-        let result = automation_testing::with_runner(
-            move |_| {
-                let calls = &runner_calls;
-                calls.set(calls.get() + 1);
-                assert_eq!(
-                    calls.get(),
-                    1,
-                    "unproved startup rollback reached a close adapter"
-                );
-                Ok("/dev/ttys999\n1001".into())
-            },
-            || {
-                adapter.open_bound_tab(
-                    MacosOpenMode::NewWindow,
-                    "true",
-                    directory.path(),
-                    Instant::now() + Duration::from_secs(10),
-                    Box::new(|_| {
-                        bound.set(true);
-                        Ok(())
-                    }),
-                    Box::new(|| {
-                        bound.set(false);
-                        Ok(())
-                    }),
-                )
-            },
+        let result = adapter.open_bound_tab(
+            MacosOpenMode::NewWindow,
+            "true",
+            directory.path(),
+            Instant::now() + Duration::from_secs(10),
+            Box::new(|_| {
+                bound.set(true);
+                Ok(())
+            }),
+            Box::new(|| {
+                bound.set(false);
+                Ok(())
+            }),
         );
+
+        calls.set(replay.calls().len());
+        assert_eq!(
+            calls.get(),
+            1,
+            "unproved startup rollback reached a close adapter"
+        );
+        replay.assert_finished();
         let error = result.unwrap_err().to_string();
         assert!(error.contains("injected startup command failure before app owner record"));
         assert!(error.contains("no app identity was recorded"));
@@ -378,35 +372,33 @@ mod startup_tests {
     fn terminal_startup_success_never_uses_failed_start_cleanup() {
         let directory = tempfile::tempdir().unwrap();
         let calls = std::rc::Rc::new(Cell::new(0));
-        let runner_calls = calls.clone();
+        let replay = automation_testing::Replay::normal(&["/dev/ttys999\n1001"]);
         let absent = |_: &Path, _: &TerminalSession, _: Instant| -> Result<bool> {
             panic!("successful startup must not need failure cleanup")
         };
         // Keep the installed adapter's real no-op start, borrowing only cleanup observation.
-        let local = apple_terminal::with_observations(&apple_terminal::ADAPTER.start, &absent);
+        let local = apple_terminal::with_observations(
+            &apple_terminal::ADAPTER.start,
+            &absent,
+            replay.clone(),
+        );
         let adapter: &dyn MacTerminalAdapter = &local;
-        let session = automation_testing::with_runner(
-            move |_| {
-                let calls = &runner_calls;
-                calls.set(calls.get() + 1);
-                assert_eq!(calls.get(), 1, "successful startup must not close");
-                Ok("/dev/ttys999\n1001".into())
-            },
-            || {
-                adapter.open_bound_tab(
-                    MacosOpenMode::NewWindow,
-                    "true",
-                    directory.path(),
-                    Instant::now() + Duration::from_secs(10),
-                    Box::new(|session| {
-                        session.managed_session_id = Some("bound".into());
-                        Ok(())
-                    }),
-                    Box::new(|| panic!("successful binding must remain")),
-                )
-            },
-        )
-        .unwrap();
+        let session = adapter
+            .open_bound_tab(
+                MacosOpenMode::NewWindow,
+                "true",
+                directory.path(),
+                Instant::now() + Duration::from_secs(10),
+                Box::new(|session| {
+                    session.managed_session_id = Some("bound".into());
+                    Ok(())
+                }),
+                Box::new(|| panic!("successful binding must remain")),
+            )
+            .unwrap();
+        calls.set(replay.calls().len());
+        assert_eq!(calls.get(), 1, "successful startup must not close");
+        replay.assert_finished();
         assert_eq!(session.managed_session_id.as_deref(), Some("bound"));
     }
 }
@@ -432,6 +424,27 @@ mod screen_lock_tests {
 
 #[cfg(test)]
 mod adapter_tests {
+    fn with_replay(
+        kind: TerminalKind,
+        replies: &[&str],
+        run: impl FnOnce(&dyn MacTerminalAdapter),
+    ) {
+        let replay = automation_testing::Replay::normal(replies);
+        let absent = |_: &Path, _: &TerminalSession, _: Instant| -> Result<bool> {
+            panic!("operation test must not clean up startup")
+        };
+        match kind {
+            TerminalKind::Iterm2 => run(&iterm2::with_automation(replay.clone())),
+            TerminalKind::AppleTerminal => run(&apple_terminal::with_observations(
+                &apple_terminal::ADAPTER.start,
+                &absent,
+                replay.clone(),
+            )),
+            _ => panic!("unexpected replay adapter"),
+        }
+        replay.assert_finished();
+    }
+
     use super::*;
 
     fn handle(kind: TerminalKind) -> TerminalSession {
@@ -546,72 +559,63 @@ mod adapter_tests {
         for kind in [TerminalKind::Iterm2, TerminalKind::AppleTerminal] {
             let mut session = handle(kind);
             session.window_id = Some("window".into());
-            let adapter = adapter(kind).unwrap();
             let deadline = Instant::now() + Duration::from_secs(2);
             for (response, expected) in [("missing", false), ("present", true)] {
-                automation_testing::with_runner(
-                    move |_| Ok(response.into()),
-                    || {
-                        assert_eq!(
-                            adapter
-                                .surface_present(directory.path(), &session, Duration::from_secs(2))
-                                .unwrap(),
-                            expected
-                        );
-                    },
-                );
-            }
-            automation_testing::with_runner(
-                |_| Ok("surface".into()),
-                || {
-                    let result =
-                        adapter.surface_present(directory.path(), &session, Duration::from_secs(2));
-                    if kind == TerminalKind::AppleTerminal {
-                        assert!(result.unwrap());
-                    } else {
-                        assert_eq!(
-                            result.unwrap_err().to_string(),
-                            "unexpected terminal presence response: \"surface\""
-                        );
-                    }
-                },
-            );
-            automation_testing::with_runner(
-                |_| Ok("bad".into()),
-                || {
-                    assert_eq!(
-                        adapter
-                            .read_screen(&session, deadline)
-                            .unwrap_err()
-                            .to_string(),
-                        "invalid managed screen response"
-                    );
-                    assert_eq!(
-                        adapter
-                            .guarded_dialog_input(
-                                &session,
-                                &GuardedDialogInput {
-                                    screen: "".into(),
-                                    key: DialogKey::Enter
-                                },
-                                deadline
-                            )
-                            .unwrap_err()
-                            .to_string(),
-                        "unexpected guarded dialog input response"
-                    );
+                with_replay(kind, &[response], |adapter| {
                     assert_eq!(
                         adapter
                             .surface_present(directory.path(), &session, Duration::from_secs(2))
-                            .unwrap_err()
-                            .to_string(),
-                        "unexpected terminal presence response: \"bad\""
+                            .unwrap(),
+                        expected
                     );
-                },
-            );
-            automation_testing::with_runner(
-                |_| Ok("AB_SCREEN_BEGIN  screen\nAB_SCREEN_END".into()),
-                || {
+                });
+            }
+            with_replay(kind, &["surface"], |adapter| {
+                let result =
+                    adapter.surface_present(directory.path(), &session, Duration::from_secs(2));
+                if kind == TerminalKind::AppleTerminal {
+                    assert!(result.unwrap());
+                } else {
+                    assert_eq!(
+                        result.unwrap_err().to_string(),
+                        "unexpected terminal presence response: \"surface\""
+                    );
+                }
+            });
+            with_replay(kind, &["bad", "bad", "bad"], |adapter| {
+                assert_eq!(
+                    adapter
+                        .read_screen(&session, deadline)
+                        .unwrap_err()
+                        .to_string(),
+                    "invalid managed screen response"
+                );
+                assert_eq!(
+                    adapter
+                        .guarded_dialog_input(
+                            &session,
+                            &GuardedDialogInput {
+                                screen: "".into(),
+                                key: DialogKey::Enter
+                            },
+                            deadline
+                        )
+                        .unwrap_err()
+                        .to_string(),
+                    "unexpected guarded dialog input response"
+                );
+                assert_eq!(
+                    adapter
+                        .surface_present(directory.path(), &session, Duration::from_secs(2))
+                        .unwrap_err()
+                        .to_string(),
+                    "unexpected terminal presence response: \"bad\""
+                );
+            });
+            with_replay(
+                kind,
+                &["AB_SCREEN_BEGIN  screen\nAB_SCREEN_END"],
+                |adapter| {
                     assert_eq!(
                         adapter.read_screen(&session, deadline).unwrap(),
                         "  screen\n"
@@ -620,24 +624,21 @@ mod adapter_tests {
             );
             for key in [DialogKey::Enter, DialogKey::DownEnter] {
                 for (response, expected) in [("sent", true), ("changed", false)] {
-                    automation_testing::with_runner(
-                        move |_| Ok(response.into()),
-                        || {
-                            assert_eq!(
-                                adapter
-                                    .guarded_dialog_input(
-                                        &session,
-                                        &GuardedDialogInput {
-                                            screen: "".into(),
-                                            key
-                                        },
-                                        deadline
-                                    )
-                                    .unwrap(),
-                                expected
-                            );
-                        },
-                    );
+                    with_replay(kind, &[response], |adapter| {
+                        assert_eq!(
+                            adapter
+                                .guarded_dialog_input(
+                                    &session,
+                                    &GuardedDialogInput {
+                                        screen: "".into(),
+                                        key
+                                    },
+                                    deadline
+                                )
+                                .unwrap(),
+                            expected
+                        );
+                    });
                 }
             }
         }
