@@ -6,6 +6,8 @@ Older notes retain their own requirements and limitations; use the
 [providers](../providers.md) and [terminals](../terminals.md) pages for current behavior.
 Each note separates live checks from automated tests.
 
+- [0.4.1](0.4.1.md) (2026-10-11): Keeps Claude Code session markers and Bridge's per-session
+  variables out of the processes Bridge starts on macOS, including a terminal application it starts.
 - [0.4.0](0.4.0.md) (2026-10-11): Adds `cancel` for Pi sessions; starts iTerm2 when it is not
   running; says what a terminal creation failure left behind; records per terminal why a guarded
   trust response is or is not possible.
