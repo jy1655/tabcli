@@ -36,14 +36,12 @@ use terminal::macos::apple_terminal::{terminal_app_process, terminal_surface_abs
 #[cfg(all(target_os = "macos", test))]
 use terminal::macos::process::{macos_process_info, macos_process_start, macos_processes_named};
 #[cfg(all(target_os = "macos", test))]
-use terminal::macos::warp::{prepare_warp_close, terminate_owned_foreground_group};
+use terminal::ownership::MacTerminalAppIdentity;
 use terminal::ownership::NativeSessionOwner;
 #[cfg(test)]
 use terminal::ownership::verify_terminal_owner_attestation;
 #[cfg(windows)]
 use terminal::ownership::verify_terminal_surface_ownership;
-#[cfg(all(target_os = "macos", test))]
-use terminal::ownership::{MacTerminalAppIdentity, surface_outlives_owner};
 #[cfg(test)]
 use terminal::ownership::{
     MacTerminalShellIdentity, NativeProcessIdentity, native_owner_identity_matches,

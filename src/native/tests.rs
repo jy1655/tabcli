@@ -1802,19 +1802,6 @@ fn terminal_app_close_waits_for_attested_process_group_shutdown_without_key_inje
     assert!(script.contains("repeat 60 times"));
     assert!(!script.contains("character id 3"));
     assert!(!script.contains("do script controlC"));
-
-    assert_eq!(
-        terminal::macos::apple_terminal::process_group_signal_target(4242).unwrap(),
-        -4242
-    );
-    assert!(terminal::macos::apple_terminal::process_group_signal_target(0).is_err());
-    assert!(
-        terminal::macos::apple_terminal::process_group_signal_target(i32::MAX as u32 + 1).is_err()
-    );
-    assert_eq!(
-        terminal::macos::apple_terminal::close_signal_plan(4242, 4000).unwrap(),
-        [(-4242, libc::SIGTERM), (-4000, libc::SIGKILL)]
-    );
 }
 
 #[cfg(target_os = "macos")]
@@ -2954,7 +2941,7 @@ fn failed_dead_native_owner_consumes_terminal_without_adapter_calls() {
 
 // An owner that passed the live Terminal.app verification has its whole identity recorded.
 #[cfg(target_os = "macos")]
-fn write_attested_apple_terminal_state(
+pub(super) fn write_attested_apple_terminal_state(
     directory: &Path,
     state: &str,
     owner_pid: u32,
@@ -8103,84 +8090,6 @@ fn dead_owner_absence_errors_and_reused_or_incomplete_owners_retain_handle() {
 }
 
 #[cfg(target_os = "macos")]
-#[test]
-fn warp_close_records_intent_before_stopping_only_attested_group() {
-    let directory = tempfile::tempdir().unwrap();
-    let owner = write_attested_apple_terminal_state(directory.path(), "ready", 4242);
-    let mut handle: terminal::TerminalSession =
-        read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
-    handle.kind = terminal::TerminalKind::Warp;
-    let live = NativeProcessIdentity {
-        pid: 4242,
-        parent_pid: 4000,
-        terminal_tty_device: 7,
-        process_group: 4242,
-        terminal_process_group: 4242,
-        process_start_seconds: 1_790_000_000,
-        process_start_microseconds: 42,
-    };
-    let shell = NativeProcessIdentity {
-        pid: 4000,
-        parent_pid: 3000,
-        terminal_tty_device: 7,
-        process_group: 4000,
-        terminal_process_group: 4242,
-        process_start_seconds: 1,
-        process_start_microseconds: 0,
-    };
-    let result = prepare_warp_close(
-        directory.path(),
-        "session-owner123",
-        &handle,
-        &owner,
-        &live,
-        &shell,
-        |group| {
-            assert_eq!(group, 4242);
-            assert!(terminal_close_intent_owner(directory.path(), &handle)?.is_some());
-            bail!("injected still-running group: adapter must not run")
-        },
-    );
-    assert!(result.unwrap_err().to_string().contains("still-running"));
-    assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
-    fs::remove_file(directory.path().join(TERMINAL_CLOSE_INTENT_FILE)).unwrap();
-    let changed = NativeProcessIdentity {
-        process_start_microseconds: 43,
-        ..live
-    };
-    assert!(
-        prepare_warp_close(
-            directory.path(),
-            "session-owner123",
-            &handle,
-            &owner,
-            &changed,
-            &shell,
-            |_| panic!("changed owner must not be signalled")
-        )
-        .is_err()
-    );
-    assert!(!directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn owned_foreground_group_termination_waits_for_real_private_process_exit() {
-    use std::os::unix::process::CommandExt;
-    let mut child = Command::new("/bin/sleep")
-        .arg("30")
-        .process_group(0)
-        .spawn()
-        .unwrap();
-    let group = child.id();
-    let waiter = std::thread::spawn(move || child.wait().unwrap());
-    let result = terminate_owned_foreground_group(group);
-    let status = waiter.join().unwrap();
-    assert!(result.is_ok(), "{result:?}");
-    assert!(!status.success());
-}
-
-#[cfg(target_os = "macos")]
 fn terminal_instance(pid: u32, start_seconds: u64) -> MacTerminalAppIdentity {
     MacTerminalAppIdentity {
         pid,
@@ -8501,7 +8410,7 @@ fn failed_launch_keeps_the_prior_intent_retry_and_the_stable_id_recovery() {
                 write_failed_launch_with_owner(directory.path(), kind, phase, reaped_child_pid());
             let handle: terminal::TerminalSession =
                 read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
-            if surface_outlives_owner(kind) {
+            if terminal::surface_outlives_owner(&handle) {
                 record_terminal_close_intent(directory.path(), "session-owner123", &handle, &owner)
                     .unwrap();
             }

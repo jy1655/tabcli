@@ -1,3 +1,26 @@
+#[cfg(any(target_os = "macos", windows))]
+mod close_policy;
+#[cfg(target_os = "macos")]
+use close_policy::PreClosePolicy;
+
+#[cfg(any(target_os = "macos", windows))]
+fn close_policy(kind: TerminalKind) -> close_policy::ClosePolicy {
+    #[cfg(target_os = "macos")]
+    return macos::close_policy(kind);
+    #[cfg(windows)]
+    return windows::close_policy(kind);
+}
+
+pub(super) fn surface_outlives_owner(session: &TerminalSession) -> bool {
+    #[cfg(target_os = "macos")]
+    return close_policy(session.kind).outlives_owner;
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = session;
+        false
+    }
+}
+
 pub(in crate::native) mod ownership;
 
 use std::{path::Path, str::FromStr, time::Instant};
@@ -200,6 +223,21 @@ impl TerminalSession {
 pub(super) enum CloseOutcome {
     Closed,
     Missing,
+}
+
+#[derive(Debug)]
+pub(in crate::native) struct CloseResult {
+    pub outcome: CloseOutcome,
+    pub reason: Option<String>,
+}
+
+impl From<CloseOutcome> for CloseResult {
+    fn from(outcome: CloseOutcome) -> Self {
+        Self {
+            outcome,
+            reason: None,
+        }
+    }
 }
 
 #[derive(Debug)]

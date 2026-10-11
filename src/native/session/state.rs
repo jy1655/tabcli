@@ -213,6 +213,10 @@ impl Store {
         };
         if state == SessionState::Closed {
             store.record(CoreRecord::Closed).write_json(&status)?;
+            #[cfg(all(test, target_os = "macos"))]
+            super::close::interruption::at(
+                super::close::interruption::Point::ClosedTombstoneWritten,
+            );
             return store.persist_status(&status);
         }
         store.persist_status(&status)

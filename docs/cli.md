@@ -861,6 +861,21 @@ See the command and output in the [opening workflow](#command-reference).
 failed sessions. Repeating a completed close succeeds without closing another surface. Bridge
 records the close in a tombstone and keeps the result history.
 
+On macOS, a terminal application can end while the session's processes survive, as observed
+after iTerm2 was killed. If the ownership proof fails, Bridge checks whether the recorded
+surface is absent. Terminal.app requires its incarnation-aware absence proof. Proven absence
+and owner attestation let Bridge record a teardown intent, attest the owner again, and send
+SIGTERM to the process group the owner leads. It sends no SIGKILL and no signal to the shell.
+Bridge waits up to three seconds for ESRCH to prove the group is gone, then records `closed`
+with outcome `Missing`, consumes the handle, and retains the reason in `inspect`.
+
+If disappearance cannot be confirmed, close fails and keeps the intent and handle. Check the
+error and the session's processes before repeating `close-session SESSION --explicit`. A
+retry with a live attested owner obtains authority again. With a dead owner, it sends no signal
+and completes only when the recorded group is proven gone. EPERM, including for a group
+containing only zombies, is not proof of disappearance. Observation and signal are not one
+atomic operation. The group's disappearance does not prove that processes which left it ended.
+
 While a session is `launching` with no surface handle and a pending launch deadline still in the
 future, close refuses without changing the session or its claim:
 

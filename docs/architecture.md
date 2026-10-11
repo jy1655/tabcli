@@ -228,8 +228,9 @@ live process and surface: PID birth, TTY and process groups on macOS, and proces
 Windows. Terminal.app also records the app incarnation: a window identity in one run of the app
 is not authority over the same apparent identity after a restart.
 
-Close authority selects one of three outcomes: close with an attested owner, close a proven
-owned surface, or record that the surface is absent. An ambiguous identity refuses close and
+Close authority selects one of four outcomes: close with an attested owner, close a proven
+owned surface, end a live attested owner whose surface is proven absent, or record that the
+surface is absent. An ambiguous identity refuses close and
 retains the handle. `session::close` records the transition and tombstones, and converges
 interrupted close; `terminal::ownership` performs the authorized surface/process action. Dead-owner
 repair settles the records without resending a prompt or guessing ownership of an unrelated surface.
