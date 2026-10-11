@@ -1131,14 +1131,13 @@ mod tests {
             panic!("successful open must not clean up")
         };
         let adapter = super::with_observations(&super::ADAPTER.start, &absent, replay.clone());
-        let start = super::launch_bootstrap("echo card10", directory.path()).unwrap();
-        let bootstrap =
-            std::fs::read_to_string(directory.path().join(super::BOOTSTRAP_FILE)).unwrap();
-        assert!(bootstrap.contains(&format!(
-            "native-terminal-host {}",
-            crate::native::terminal::shell_quote(directory.path().as_os_str())
-        )));
-        assert!(bootstrap.ends_with("echo card10\n"));
+        // The adapter's open installs the bootstrap itself (create-new); the expected
+        // start argument is derived from the path without writing the file first.
+        let bootstrap_path = directory.path().join(super::BOOTSTRAP_FILE);
+        let start = format!(
+            ". {}",
+            crate::native::terminal::shell_quote(bootstrap_path.as_os_str())
+        );
         let open = automation_call(
             Method::RunUntil,
             ScriptId::TerminalOpen,
@@ -1162,6 +1161,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(session.managed_session_id.as_deref(), Some("managed-id"));
+        let bootstrap = std::fs::read_to_string(&bootstrap_path).unwrap();
+        assert!(bootstrap.contains(&format!(
+            "native-terminal-host {}",
+            crate::native::terminal::shell_quote(directory.path().as_os_str())
+        )));
+        assert!(bootstrap.ends_with("echo card10\n"));
         let mut expected = vec![open];
         assert_eq!(
             adapter
