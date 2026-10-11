@@ -6,6 +6,7 @@ Older notes retain their own requirements and limitations; use the
 [providers](../providers.md) and [terminals](../terminals.md) pages for current behavior.
 Each note separates live checks from automated tests.
 
+- [0.4.6](0.4.6.md) (2026-10-12): Adapters declare the launch-trust, binding and terminal facts the shared modules branched on; each macOS adapter owns its operation set; the JSON envelope has one home. No output change.
 - [0.4.5](0.4.5.md) (2026-10-12): Declares close evidence per terminal adapter, splits the Agy adapter into modules, and names the turn claim's launch phases; no behaviour change.
 - [0.4.4](0.4.4.md) (2026-10-11): Waits for the Windows console input buffer before the submission Return and
   requires the empty Codex composer after a paste; one delivery module with adapter-declared Transports;
