@@ -404,7 +404,66 @@ pub(in crate::native) fn verify_terminal_close_authority_with_observations(
     process_birth: impl Fn(u32) -> Result<Option<(u64, u64)>>,
     terminal_instances: impl Fn() -> Result<Vec<MacTerminalAppIdentity>>,
 ) -> Result<TerminalCloseAuthority> {
-    let _ = (&surface_present, &process_birth, &terminal_instances);
+    verify_terminal_close_authority_with_observers(
+        directory,
+        expected_session_id,
+        session,
+        surface_present,
+        process_birth,
+        terminal_instances,
+        CloseObservers {
+            #[cfg(any(target_os = "macos", windows))]
+            owner_record: &observe_owner_record,
+            #[cfg(target_os = "macos")]
+            pid_alive: &process_is_alive,
+            #[cfg(target_os = "macos")]
+            mac_owner_live: &mac_native_owner_is_live,
+            #[cfg(target_os = "macos")]
+            resumable: &|| {
+                session::close::terminal_close_resumable(
+                    &Reader::open_unchecked(directory),
+                    session,
+                    retained_surface_outlives_owner(session),
+                )
+            },
+            ownership_proof: &|| {
+                verify_terminal_surface_ownership(directory, expected_session_id, session)
+            },
+        },
+    )
+}
+
+// Only the decision's observations are replaceable. Record reads and their ordering
+// stay in the decision; production callbacks retain the existing, distinct proofs.
+struct CloseObservers<'a> {
+    #[cfg(any(target_os = "macos", windows))]
+    owner_record: &'a dyn Fn(&NativeSessionOwner) -> crate::native::session::OwnerObservation,
+    #[cfg(target_os = "macos")]
+    pid_alive: &'a dyn Fn(u32) -> bool,
+    #[cfg(target_os = "macos")]
+    mac_owner_live: &'a dyn Fn(&NativeSessionOwner) -> Result<bool>,
+    #[cfg(target_os = "macos")]
+    resumable: &'a dyn Fn() -> Result<bool>,
+    ownership_proof: &'a dyn Fn() -> Result<()>,
+}
+
+fn verify_terminal_close_authority_with_observers(
+    directory: &Path,
+    expected_session_id: &str,
+    session: &terminal::TerminalSession,
+    surface_present: impl FnOnce() -> Result<bool>,
+    process_birth: impl Fn(u32) -> Result<Option<(u64, u64)>>,
+    terminal_instances: impl Fn() -> Result<Vec<MacTerminalAppIdentity>>,
+    observers: CloseObservers<'_>,
+) -> Result<TerminalCloseAuthority> {
+    let _ = (
+        directory,
+        expected_session_id,
+        session,
+        &surface_present,
+        &process_birth,
+        &terminal_instances,
+    );
     #[cfg(any(target_os = "macos", windows))]
     {
         if Reader::open_unchecked(directory)
@@ -423,7 +482,7 @@ pub(in crate::native) fn verify_terminal_close_authority_with_observations(
             {
                 let status: SessionStatus = Reader::open_unchecked(directory).status()?;
                 let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
-                let observed = observe_owner_record(&owner);
+                let observed = (observers.owner_record)(&owner);
                 if status.state == SessionState::Failed
                     && owner.managed_session_id.as_deref() == Some(expected_session_id)
                     && (observed.process_alive == Some(false)
@@ -437,11 +496,7 @@ pub(in crate::native) fn verify_terminal_close_authority_with_observations(
             // again, and only once the owner it verified no longer exists. A live owner,
             // or a PID that is alive again, keeps the rules below.
             #[cfg(target_os = "macos")]
-            if session::close::terminal_close_resumable(
-                &Reader::open_unchecked(directory),
-                session,
-                retained_surface_outlives_owner(session),
-            )? {
+            if (observers.resumable)()? {
                 session.verify_managed_session(expected_session_id)?;
                 if session.kind == terminal::TerminalKind::AppleTerminal {
                     let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
@@ -470,11 +525,11 @@ pub(in crate::native) fn verify_terminal_close_authority_with_observations(
             #[cfg(target_os = "macos")]
             {
                 let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
-                if !mac_native_owner_is_live(&owner)? {
+                if !(observers.mac_owner_live)(&owner)? {
                     session.verify_managed_session(expected_session_id)?;
                     // A reused PID grants neither mutation nor absence authority. The
                     // original owner's complete binding is required even for a query.
-                    if process_is_alive(owner.pid)
+                    if (observers.pid_alive)(owner.pid)
                         || owner.managed_session_id.as_deref() != Some(expected_session_id)
                         || !matches!(
                             (
@@ -523,7 +578,7 @@ pub(in crate::native) fn verify_terminal_close_authority_with_observations(
                     require_unique_terminal_app(app, &terminal_instances()?)?;
                 }
             }
-            verify_terminal_surface_ownership(directory, expected_session_id, session)?;
+            (observers.ownership_proof)()?;
             return Ok(TerminalCloseAuthority::LiveOwner);
         }
         let status: SessionStatus = Reader::open_unchecked(directory).status()?;
@@ -571,7 +626,7 @@ pub(in crate::native) fn verify_terminal_close_authority_with_observations(
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
-        verify_terminal_surface_ownership(directory, expected_session_id, session)?;
+        (observers.ownership_proof)()?;
         Ok(TerminalCloseAuthority::LiveOwner)
     }
 }
@@ -747,4 +802,886 @@ pub(in crate::native) fn current_surface_owner(
         owner
     };
     Ok(owner)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod close_authority_tests {
+    use super::*;
+    use crate::native::session::OwnerObservation;
+    use std::cell::RefCell;
+    use terminal::TerminalKind::*;
+
+    const ID: &str = "session-close-table";
+    const DEAD_IDENTITY: &str = "identity is incomplete, foreign, or its PID is reused";
+    const DEAD_PRESENT: &str = "visible terminal cleanup is unverified";
+
+    fn app() -> MacTerminalAppIdentity {
+        MacTerminalAppIdentity {
+            pid: 456,
+            start_seconds: 100,
+            start_microseconds: 42,
+        }
+    }
+
+    struct Row {
+        kind: terminal::TerminalKind,
+        owner: Option<NativeSessionOwner>,
+        state: SessionState,
+        phase: Option<launch::Phase>,
+        intent: bool,
+        surface_binding: Option<String>,
+        observation_error: Option<(&'static str, usize)>,
+        observed_alive: Option<bool>,
+        observed_matches: Option<bool>,
+        pid_alive: bool,
+        live: bool,
+        proof_error: bool,
+        present: bool,
+        birth: Option<(u64, u64)>,
+        instances: Vec<MacTerminalAppIdentity>,
+    }
+
+    impl Row {
+        fn new(kind: terminal::TerminalKind) -> Self {
+            Self {
+                kind,
+                owner: Some(NativeSessionOwner {
+                    pid: 123,
+                    managed_session_id: Some(ID.into()),
+                    terminal_tty: Some("/dev/ttys999".into()),
+                    terminal_tty_device: Some(7),
+                    process_start_seconds: Some(90),
+                    process_start_microseconds: Some(42),
+                    process_group: Some(123),
+                    terminal_process_group: Some(123),
+                    terminal_app: (kind == AppleTerminal).then(app),
+                    ..NativeSessionOwner::default()
+                }),
+                state: SessionState::Ready,
+                phase: None,
+                intent: false,
+                surface_binding: Some(ID.into()),
+                observation_error: None,
+                observed_alive: Some(false),
+                observed_matches: None,
+                pid_alive: false,
+                live: false,
+                proof_error: false,
+                present: false,
+                birth: Some((100, 42)),
+                instances: vec![app()],
+            }
+        }
+
+        fn check(
+            self,
+            expected: std::result::Result<TerminalCloseAuthority, &str>,
+            calls: &[&str],
+        ) {
+            self.check_with_error_chain(expected, calls, None);
+        }
+
+        fn check_error_chain(self, chain: &[&str], calls: &[&str]) {
+            self.check_with_error_chain(Err(""), calls, Some(chain));
+        }
+
+        fn check_with_error_chain(
+            self,
+            expected: std::result::Result<TerminalCloseAuthority, &str>,
+            calls: &[&str],
+            error_chain: Option<&[&str]>,
+        ) {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open_unchecked(directory.path());
+            let handle = TerminalSession {
+                kind: self.kind,
+                id: "surface-id".into(),
+                tab_id: None,
+                window_id: Some("1001".into()),
+                managed_session_id: self.surface_binding,
+                windows_process_identity: None,
+                wezterm_mux: None,
+            };
+            store
+                .record(CoreRecord::Terminal)
+                .write_json(&handle)
+                .unwrap();
+            store
+                .record(CoreRecord::Status)
+                .write_json(&SessionStatus {
+                    state: self.state,
+                    generation: 0,
+                    updated_unix_ms: 1,
+                    exit_code: None,
+                    error: None,
+                    residual_surface: None,
+                })
+                .unwrap();
+            if let Some(owner) = &self.owner {
+                store.record(CoreRecord::Owner).write_json(owner).unwrap();
+                if self.intent {
+                    session::close::record_terminal_close_intent(&store, ID, &handle, owner)
+                        .unwrap();
+                }
+            }
+            if let Some(phase) = self.phase {
+                store
+                    .record(CoreRecord::Launch)
+                    .write_json(&launch::Record {
+                        schema: 1,
+                        claim_token: "claim-table".into(),
+                        deadline_unix_ms: 1,
+                        phase,
+                    })
+                    .unwrap();
+            }
+            // Every row also pins the read-only boundary, including proof failures (#101).
+            let snapshot = || {
+                let mut records: Vec<_> = std::fs::read_dir(directory.path())
+                    .unwrap()
+                    .map(|entry| {
+                        let path = entry.unwrap().path();
+                        (
+                            path.file_name().unwrap().to_owned(),
+                            std::fs::read(path).unwrap(),
+                        )
+                    })
+                    .collect();
+                records.sort();
+                records
+            };
+            let before = snapshot();
+            let trace = RefCell::new(Vec::new());
+            let record = |call| trace.borrow_mut().push(call);
+            let observe = |call| -> Result<()> {
+                record(call);
+                let occurrence = trace.borrow().iter().filter(|seen| **seen == call).count();
+                if self.observation_error == Some((call, occurrence)) {
+                    return Err(anyhow::anyhow!("injected {call} cause"))
+                        .with_context(|| format!("injected {call} failure"));
+                }
+                Ok(())
+            };
+            let handle: TerminalSession = serde_json::from_str(
+                &Reader::open_unchecked(directory.path())
+                    .record(CoreRecord::Terminal)
+                    .text()
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            let result = verify_terminal_close_authority_with_observers(
+                directory.path(),
+                ID,
+                &handle,
+                || {
+                    observe("presence")?;
+                    Ok(self.present)
+                },
+                |pid| {
+                    assert_eq!(pid, app().pid);
+                    observe("birth")?;
+                    Ok(self.birth)
+                },
+                || {
+                    observe("instances")?;
+                    Ok(self.instances.clone())
+                },
+                CloseObservers {
+                    owner_record: &|owner| {
+                        assert_eq!(owner.pid, 123);
+                        record("owner-record");
+                        OwnerObservation {
+                            process_alive: self.observed_alive,
+                            identity_matches: self.observed_matches,
+                            error: None,
+                        }
+                    },
+                    pid_alive: &|pid| {
+                        assert_eq!(pid, 123);
+                        record("pid-alive");
+                        self.pid_alive
+                    },
+                    mac_owner_live: &|owner| {
+                        assert_eq!(owner.pid, 123);
+                        observe("mac-live")?;
+                        Ok(self.live)
+                    },
+                    // Read the real intent and owner binding, substituting only its final
+                    // process observation. Do not let a test boolean invent an intent.
+                    resumable: &|| {
+                        observe("resumable")?;
+                        Ok(session::close::terminal_close_intent_owner(
+                            &Reader::open_unchecked(directory.path()),
+                            &handle,
+                            retained_surface_outlives_owner(&handle),
+                        )?
+                        .is_some_and(|owner| {
+                            assert_eq!(owner.pid, 123);
+                            record("resume-pid-alive");
+                            !self.pid_alive
+                        }))
+                    },
+                    ownership_proof: &|| {
+                        record("proof");
+                        if self.proof_error {
+                            bail!("injected full ownership proof failure")
+                        }
+                        Ok(())
+                    },
+                },
+            );
+            assert_eq!(*trace.borrow(), calls, "{:?}: {result:?}", self.kind);
+            if let Some(chain) = error_chain {
+                let error = result.as_ref().unwrap_err();
+                assert_eq!(
+                    error.chain().map(ToString::to_string).collect::<Vec<_>>(),
+                    chain,
+                    "{:?}: error chain changed",
+                    self.kind
+                );
+            }
+            match expected {
+                Ok(authority) => assert_eq!(result.unwrap(), authority, "{:?}", self.kind),
+                Err(message) => assert!(
+                    format!("{:#}", result.unwrap_err()).contains(message),
+                    "{:?}: expected {message}",
+                    self.kind
+                ),
+            }
+            assert_eq!(snapshot(), before, "the decision changed session records");
+        }
+    }
+
+    #[test]
+    fn failed_start_native_identity_dead_or_mismatched_owner_surface_only() {
+        for kind in [Iterm2, Ghostty] {
+            for (alive, matches) in [(Some(false), None), (Some(true), Some(false))] {
+                let mut row = Row::new(kind);
+                row.state = SessionState::Failed;
+                row.phase = Some(launch::Phase::Spawning);
+                row.observed_alive = alive;
+                row.observed_matches = matches;
+                row.check(Ok(TerminalCloseAuthority::SurfaceOnly), &["owner-record"]);
+            }
+        }
+    }
+
+    #[test]
+    fn failed_start_live_matching_or_unknown_owner_gains_no_shortcut() {
+        for kind in [Iterm2, Ghostty] {
+            for matches in [Some(true), None] {
+                let mut row = Row::new(kind);
+                row.state = SessionState::Failed;
+                row.phase = Some(launch::Phase::Pending);
+                row.observed_alive = Some(true);
+                row.observed_matches = matches;
+                row.live = true;
+                row.proof_error = true;
+                row.check(
+                    Err("injected full ownership proof failure"),
+                    &["owner-record", "resumable", "mac-live", "proof"],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_start_shortcut_requires_failed_bound_owner_and_unspawned_launch() {
+        for case in ["ready", "foreign", "spawned"] {
+            let mut row = Row::new(Iterm2);
+            row.phase = Some(launch::Phase::Spawning);
+            row.state = SessionState::Failed;
+            match case {
+                "ready" => row.state = SessionState::Ready,
+                "foreign" => {
+                    row.owner.as_mut().unwrap().managed_session_id = Some("foreign".into())
+                }
+                _ => row.phase = Some(launch::Phase::Spawned),
+            }
+            let mut calls = vec![];
+            if case != "spawned" {
+                calls.push("owner-record");
+            }
+            calls.extend(["resumable", "mac-live", "pid-alive"]);
+            if case == "foreign" {
+                row.check(Err(DEAD_IDENTITY), &calls);
+            } else {
+                calls.push("presence");
+                row.check(Ok(TerminalCloseAuthority::Absent), &calls);
+            }
+        }
+    }
+
+    #[test]
+    fn resumable_close_intent_native_surfaces_surface_only() {
+        for kind in [Warp, WezTerm, Ghostty] {
+            let mut row = Row::new(kind);
+            row.intent = true;
+            row.check(
+                Ok(TerminalCloseAuthority::SurfaceOnly),
+                &["resumable", "resume-pid-alive"],
+            );
+        }
+    }
+
+    #[test]
+    fn close_intent_live_pid_does_not_resume() {
+        let mut row = Row::new(Ghostty);
+        row.intent = true;
+        row.pid_alive = true;
+        row.live = true;
+        row.check(
+            Ok(TerminalCloseAuthority::LiveOwner),
+            &["resumable", "resume-pid-alive", "mac-live", "proof"],
+        );
+    }
+
+    #[test]
+    fn resumable_terminal_recorded_incarnation_surface_only_absent_or_error() {
+        for case in ["live", "ended", "reused", "ambiguous"] {
+            let mut row = Row::new(AppleTerminal);
+            row.intent = true;
+            let mut calls = vec!["resumable", "resume-pid-alive", "birth"];
+            let expected = match case {
+                "ended" => {
+                    row.birth = None;
+                    Ok(TerminalCloseAuthority::Absent)
+                }
+                "reused" => {
+                    row.birth = Some((101, 42));
+                    Err("PID was reused")
+                }
+                "ambiguous" => {
+                    row.instances.clear();
+                    calls.push("instances");
+                    Err("scripting target is ambiguous or changed")
+                }
+                _ => {
+                    calls.push("instances");
+                    Ok(TerminalCloseAuthority::SurfaceOnly)
+                }
+            };
+            row.check(expected, &calls);
+        }
+    }
+
+    #[test]
+    fn resumable_terminal_without_incarnation_absent_or_error() {
+        for present in [false, true] {
+            let mut row = Row::new(AppleTerminal);
+            row.intent = true;
+            row.owner.as_mut().unwrap().terminal_app = None;
+            row.present = present;
+            row.check(
+                if present {
+                    Err("process incarnation was not recorded")
+                } else {
+                    Ok(TerminalCloseAuthority::Absent)
+                },
+                &[
+                    "resumable",
+                    "resume-pid-alive",
+                    "instances",
+                    "presence",
+                    "instances",
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn dead_owner_incomplete_foreign_or_reused_pid_refused_before_surface() {
+        for case in [
+            "incomplete",
+            "foreign",
+            "reused",
+            "missing-tty",
+            "empty-tty",
+        ] {
+            let mut row = Row::new(Iterm2);
+            let owner = row.owner.as_mut().unwrap();
+            match case {
+                "incomplete" => owner.process_group = None,
+                "foreign" => owner.managed_session_id = Some("foreign".into()),
+                "reused" => row.pid_alive = true,
+                "missing-tty" => owner.terminal_tty = None,
+                _ => owner.terminal_tty = Some(String::new()),
+            }
+            row.check(Err(DEAD_IDENTITY), &["resumable", "mac-live", "pid-alive"]);
+        }
+    }
+
+    #[test]
+    fn dead_owner_surface_absent_or_present() {
+        for kind in [Iterm2, Ghostty, Warp, WezTerm, AppleTerminal] {
+            for present in [false, true] {
+                let mut row = Row::new(kind);
+                row.present = present;
+                let mut calls = vec!["resumable", "mac-live", "pid-alive"];
+                if kind == AppleTerminal {
+                    calls.extend(["birth", "instances"]);
+                }
+                calls.push("presence");
+                if kind == AppleTerminal {
+                    calls.extend(["birth", "instances"]);
+                }
+                row.check(
+                    if present {
+                        Err(DEAD_PRESENT)
+                    } else {
+                        Ok(TerminalCloseAuthority::Absent)
+                    },
+                    &calls,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dead_terminal_owner_ended_incarnation_absent_without_surface_query() {
+        let mut row = Row::new(AppleTerminal);
+        row.birth = None;
+        row.check(
+            Ok(TerminalCloseAuthority::Absent),
+            &["resumable", "mac-live", "pid-alive", "birth"],
+        );
+    }
+
+    #[test]
+    fn live_owner_full_proof_success_or_original_error() {
+        for kind in [Iterm2, Ghostty, Warp, WezTerm, AppleTerminal] {
+            for proof_error in [false, true] {
+                let mut row = Row::new(kind);
+                row.live = true;
+                row.proof_error = proof_error;
+                let mut calls = vec!["resumable", "mac-live"];
+                if kind == AppleTerminal {
+                    calls.extend(["birth", "instances"]);
+                }
+                calls.push("proof");
+                row.check(
+                    if proof_error {
+                        Err("injected full ownership proof failure")
+                    } else {
+                        Ok(TerminalCloseAuthority::LiveOwner)
+                    },
+                    &calls,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_terminal_owner_ended_incarnation_refused_before_proof() {
+        let mut row = Row::new(AppleTerminal);
+        row.live = true;
+        row.birth = None;
+        row.check(
+            Err("Terminal.app ended while its native owner remained"),
+            &["resumable", "mac-live", "birth"],
+        );
+    }
+
+    #[test]
+    fn ownerless_non_startup_status_refused_without_observation() {
+        for state in [
+            SessionState::Ready,
+            SessionState::Working,
+            SessionState::Closed,
+        ] {
+            let mut row = Row::new(Iterm2);
+            row.owner = None;
+            row.state = state;
+            row.check(
+                Err("terminal close requires a live native-session owner"),
+                &[],
+            );
+        }
+    }
+
+    #[test]
+    fn ownerless_terminal_startup_absent_or_present() {
+        for state in [SessionState::Launching, SessionState::Failed] {
+            for present in [false, true] {
+                let mut row = Row::new(AppleTerminal);
+                row.owner = None;
+                row.state = state.clone();
+                row.present = present;
+                row.check(
+                    if present {
+                        Err("startup has no native owner/app incarnation")
+                    } else {
+                        Ok(TerminalCloseAuthority::Absent)
+                    },
+                    &["instances", "presence", "instances"],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ownerless_warp_wezterm_startup_absent_or_present() {
+        for kind in [Warp, WezTerm] {
+            for state in [SessionState::Launching, SessionState::Failed] {
+                for present in [false, true] {
+                    let mut row = Row::new(kind);
+                    row.owner = None;
+                    row.state = state.clone();
+                    row.present = present;
+                    row.check(
+                        if present {
+                            Err("startup has no native owner or close intent")
+                        } else {
+                            Ok(TerminalCloseAuthority::Absent)
+                        },
+                        &["presence"],
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ownerless_native_close_identity_startup_surface_only() {
+        for kind in [Iterm2, Ghostty] {
+            for state in [SessionState::Launching, SessionState::Failed] {
+                let mut row = Row::new(kind);
+                row.owner = None;
+                row.state = state;
+                row.check(Ok(TerminalCloseAuthority::SurfaceOnly), &[]);
+            }
+        }
+    }
+
+    #[test]
+    fn resumability_error_stops_before_owner_liveness() {
+        let mut row = Row::new(Ghostty);
+        row.intent = true;
+        row.observation_error = Some(("resumable", 1));
+        row.check_error_chain(
+            &["injected resumable failure", "injected resumable cause"],
+            &["resumable"],
+        );
+    }
+
+    #[test]
+    fn mac_owner_liveness_error_stops_before_pid_surface_and_proof() {
+        let mut row = Row::new(AppleTerminal);
+        row.observation_error = Some(("mac-live", 1));
+        row.check_error_chain(
+            &["injected mac-live failure", "injected mac-live cause"],
+            &["resumable", "mac-live"],
+        );
+    }
+
+    #[test]
+    fn dead_owner_presence_error_never_grants_absence() {
+        for kind in [Iterm2, Ghostty, Warp, WezTerm, AppleTerminal] {
+            let mut row = Row::new(kind);
+            row.observation_error = Some(("presence", 1));
+            let mut calls = vec!["resumable", "mac-live", "pid-alive"];
+            if kind == AppleTerminal {
+                calls.extend(["birth", "instances"]);
+            }
+            calls.push("presence");
+            row.check_error_chain(
+                &[
+                    "could not prove absence of the dead owner's exact terminal surface; no close was sent",
+                    "injected presence failure",
+                    "injected presence cause",
+                ],
+                &calls,
+            );
+        }
+    }
+
+    #[test]
+    fn ownerless_startup_presence_error_never_grants_absence() {
+        for kind in [Warp, WezTerm, AppleTerminal] {
+            let mut row = Row::new(kind);
+            row.owner = None;
+            row.state = SessionState::Launching;
+            row.observation_error = Some(("presence", 1));
+            let mut chain = vec![];
+            let mut calls = vec![];
+            if kind == AppleTerminal {
+                calls.push("instances");
+            } else {
+                chain.push(
+                    "could not prove absence of the ownerless startup surface; no close was sent",
+                );
+            }
+            chain.extend(["injected presence failure", "injected presence cause"]);
+            calls.push("presence");
+            row.check_error_chain(&chain, &calls);
+        }
+    }
+
+    #[test]
+    fn terminal_process_birth_errors_preserve_chain_and_stop_at_observation() {
+        for (path, occurrence, calls) in [
+            (
+                "resumable",
+                1,
+                vec!["resumable", "resume-pid-alive", "birth"],
+            ),
+            ("live", 1, vec!["resumable", "mac-live", "birth"]),
+            (
+                "dead",
+                1,
+                vec!["resumable", "mac-live", "pid-alive", "birth"],
+            ),
+            (
+                "dead",
+                2,
+                vec![
+                    "resumable",
+                    "mac-live",
+                    "pid-alive",
+                    "birth",
+                    "instances",
+                    "presence",
+                    "birth",
+                ],
+            ),
+        ] {
+            let mut row = Row::new(AppleTerminal);
+            row.intent = path == "resumable";
+            row.live = path == "live";
+            row.observation_error = Some(("birth", occurrence));
+            let mut chain = vec![];
+            if path == "dead" {
+                chain.push("could not prove absence of the dead owner's exact terminal surface; no close was sent");
+            }
+            chain.extend(["injected birth failure", "injected birth cause"]);
+            row.check_error_chain(&chain, &calls);
+        }
+    }
+
+    #[test]
+    fn terminal_instance_errors_preserve_chain_and_stop_at_observation() {
+        for (path, recorded, occurrence, calls) in [
+            (
+                "resumable",
+                true,
+                1,
+                vec!["resumable", "resume-pid-alive", "birth", "instances"],
+            ),
+            (
+                "resumable",
+                false,
+                1,
+                vec!["resumable", "resume-pid-alive", "instances"],
+            ),
+            (
+                "resumable",
+                false,
+                2,
+                vec![
+                    "resumable",
+                    "resume-pid-alive",
+                    "instances",
+                    "presence",
+                    "instances",
+                ],
+            ),
+            (
+                "live",
+                true,
+                1,
+                vec!["resumable", "mac-live", "birth", "instances"],
+            ),
+            (
+                "dead",
+                true,
+                1,
+                vec!["resumable", "mac-live", "pid-alive", "birth", "instances"],
+            ),
+            (
+                "dead",
+                true,
+                2,
+                vec![
+                    "resumable",
+                    "mac-live",
+                    "pid-alive",
+                    "birth",
+                    "instances",
+                    "presence",
+                    "birth",
+                    "instances",
+                ],
+            ),
+            (
+                "dead",
+                false,
+                1,
+                vec!["resumable", "mac-live", "pid-alive", "instances"],
+            ),
+            (
+                "dead",
+                false,
+                2,
+                vec![
+                    "resumable",
+                    "mac-live",
+                    "pid-alive",
+                    "instances",
+                    "presence",
+                    "instances",
+                ],
+            ),
+            ("startup", false, 1, vec!["instances"]),
+            (
+                "startup",
+                false,
+                2,
+                vec!["instances", "presence", "instances"],
+            ),
+        ] {
+            let mut row = Row::new(AppleTerminal);
+            row.intent = path == "resumable";
+            row.live = path == "live";
+            if !recorded {
+                row.owner.as_mut().unwrap().terminal_app = None;
+            }
+            if path == "startup" {
+                row.owner = None;
+                row.state = SessionState::Launching;
+            }
+            row.observation_error = Some(("instances", occurrence));
+            let mut chain = vec![];
+            if path == "dead" {
+                chain.push("could not prove absence of the dead owner's exact terminal surface; no close was sent");
+            }
+            chain.extend(["injected instances failure", "injected instances cause"]);
+            row.check_error_chain(&chain, &calls);
+        }
+    }
+
+    #[test]
+    fn failed_unspawned_terminal_warp_wezterm_skip_native_identity_recovery() {
+        for kind in [AppleTerminal, Warp, WezTerm] {
+            let mut row = Row::new(kind);
+            row.state = SessionState::Failed;
+            row.phase = Some(launch::Phase::Spawning);
+            row.present = true;
+            let mut calls = vec!["resumable", "mac-live", "pid-alive"];
+            if kind == AppleTerminal {
+                calls.extend(["birth", "instances"]);
+            }
+            calls.push("presence");
+            if kind == AppleTerminal {
+                calls.extend(["birth", "instances"]);
+            }
+            row.check(Err(DEAD_PRESENT), &calls);
+        }
+    }
+
+    #[test]
+    fn iterm_recorded_close_intent_does_not_resume() {
+        let mut row = Row::new(Iterm2);
+        row.intent = true;
+        row.present = true;
+        row.check(
+            Err(DEAD_PRESENT),
+            &["resumable", "mac-live", "pid-alive", "presence"],
+        );
+    }
+
+    #[test]
+    fn live_terminal_owner_without_incarnation_proceeds_to_proof() {
+        let mut row = Row::new(AppleTerminal);
+        row.owner.as_mut().unwrap().terminal_app = None;
+        row.live = true;
+        row.check(
+            Ok(TerminalCloseAuthority::LiveOwner),
+            &["resumable", "mac-live", "proof"],
+        );
+    }
+
+    #[test]
+    fn live_terminal_owner_reused_or_ambiguous_incarnation_refuses_before_proof() {
+        for reused in [true, false] {
+            let mut row = Row::new(AppleTerminal);
+            row.live = true;
+            if reused {
+                row.birth = Some((101, 42));
+                row.check_error_chain(
+                    &["Terminal.app PID was reused; no close or absence authority was granted"],
+                    &["resumable", "mac-live", "birth"],
+                );
+            } else {
+                row.instances
+                    .push(MacTerminalAppIdentity { pid: 789, ..app() });
+                row.check_error_chain(
+                    &["Terminal.app scripting target is ambiguous or changed; the recorded app must be the only running instance and the exact surface handle is retained"],
+                    &["resumable", "mac-live", "birth", "instances"],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dead_terminal_owner_without_incarnation_requires_stable_absence() {
+        for present in [false, true] {
+            let mut row = Row::new(AppleTerminal);
+            row.owner.as_mut().unwrap().terminal_app = None;
+            row.present = present;
+            row.check(
+                if present {
+                    Err(DEAD_PRESENT)
+                } else {
+                    Ok(TerminalCloseAuthority::Absent)
+                },
+                &[
+                    "resumable",
+                    "mac-live",
+                    "pid-alive",
+                    "instances",
+                    "presence",
+                    "instances",
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_or_missing_surface_binding_refuses_before_surface_observation() {
+        for path in ["failed-start", "dead", "intent", "startup"] {
+            for binding in [Some("foreign"), None] {
+                let mut row = Row::new(Ghostty);
+                row.surface_binding = binding.map(str::to_owned);
+                let calls = match path {
+                    "failed-start" => {
+                        row.state = SessionState::Failed;
+                        row.phase = Some(launch::Phase::Spawning);
+                        vec!["owner-record"]
+                    }
+                    "startup" => {
+                        row.owner = None;
+                        row.state = SessionState::Launching;
+                        vec![]
+                    }
+                    _ => {
+                        row.intent = path == "intent";
+                        vec!["resumable", "mac-live"]
+                    }
+                };
+                row.check_error_chain(
+                    &[if binding.is_some() {
+                        "terminal handle belongs to managed session foreign, not session-close-table"
+                    } else {
+                        "terminal handle is missing its managed session binding"
+                    }],
+                    &calls,
+                );
+            }
+        }
+    }
+
+    // There is no current TerminalKind that reaches "no supported native close
+    // identity" on macOS: AppleTerminal/Warp/WezTerm return earlier and every
+    // remaining kind (including WindowsConsole) has native close identity.
 }
