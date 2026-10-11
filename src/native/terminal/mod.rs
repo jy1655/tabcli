@@ -1,3 +1,6 @@
+pub(super) mod close_evidence;
+#[cfg(target_os = "macos")]
+pub(super) use close_evidence::for_kind as close_evidence;
 use std::time::Duration;
 pub(super) mod facts;
 #[cfg(target_os = "macos")]

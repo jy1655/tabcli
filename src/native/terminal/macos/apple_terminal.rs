@@ -1,3 +1,5 @@
+pub(in crate::native) mod close_evidence;
+
 use super::process;
 use super::process::{
     macos_process_path, macos_process_records, macos_process_start, macos_processes_named,

@@ -60,8 +60,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   the session seam and terminal operations. Keep provider schemas and transport selection in
   `src/native/provider/<provider>.rs`, not in shared orchestration.
 - `src/native/terminal/` selects and implements platform-specific surfaces, input, observation,
-  and close. Its `ownership` module owns owner identity, attestation, app incarnation, close
-  authority, and the execution of an authorized close.
+  and close. Its `ownership` module owns owner identity, attestation, close authority, and
+  the execution of an authorized close; the Terminal.app adapter owns app incarnation.
 - `src/native/session/` owns durable record schemas, record access, and durability.
   `schema` defines the shared manifest, event, provider-process, and reopen-refusal records and
   their constants; `primitives` owns session environment names, identity validation, and time
