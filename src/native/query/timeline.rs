@@ -1,84 +1,14 @@
 //! A read-only projection of retained evidence, not a history of inferred transitions.
 use super::*;
-use crate::native::session::SessionState;
-use crate::native::session::schema::{
-    EVENT_READ_LIMIT, SESSION_SCHEMA, SessionEvent, SessionManifest,
-};
-use crate::native::session::{CoreRecord, Reader, turn};
+use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
+use crate::native::session::snapshot::{Records, parsed, receipt_index};
+use crate::native::session::{CoreRecord, Reader};
 use crate::native::{EventsDirectory, valid_turn_claim_token};
 use agent_bridge::PUBLIC_COMMAND;
-use std::collections::BTreeMap;
-
-type Records = BTreeMap<String, std::result::Result<Option<Vec<u8>>, String>>;
 
 // Auxiliary launch diagnostics retain at most 1 MiB; all other reads use
 // the existing 64 MiB event limit. Oversized files are evidence gaps.
 const LOG_READ_LIMIT: u64 = 1024 * 1024;
-
-fn parsed<T: for<'de> Deserialize<'de>>(records: &Records, source: &str) -> Result<Option<T>> {
-    let bytes = records
-        .get(source)
-        .context("record not selected")?
-        .as_ref()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    bytes
-        .as_ref()
-        .map(|b| {
-            let text = std::str::from_utf8(b).context("invalid UTF-8")?;
-            // Recorded u128 values must fit the integer range supported by json!.
-            fn numbers(v: &Value) -> Result<()> {
-                match v {
-                    Value::Array(vs) => {
-                        for v in vs {
-                            numbers(v)?;
-                        }
-                    }
-                    Value::Object(vs) => {
-                        for (key, v) in vs {
-                            if key.ends_with("_unix_ms") && !v.is_null() && v.as_u64().is_none() {
-                                bail!(
-                                    "record timestamp is outside the JSON unsigned integer range"
-                                );
-                            }
-                            numbers(v)?;
-                        }
-                    }
-                    _ => (),
-                }
-                Ok(())
-            }
-            numbers(&serde_json::from_str::<Value>(text)?)?;
-            serde_json::from_str(text).context("invalid JSON record")
-        })
-        .transpose()
-}
-
-fn receipt_index(records: &Records) -> requests::Index {
-    let mut index = requests::Index::default();
-    for source in records
-        .keys()
-        .filter(|s| s.starts_with("requests/") && s.ends_with(".json"))
-    {
-        let read = parsed::<requests::Receipt>(records, source).and_then(|r| {
-            let r = r.context("missing receipt")?;
-            requests::validate(&r)?;
-            if source != &format!("requests/{}.json", r.claim_token) {
-                bail!("invalid Bridge request receipt");
-            }
-            Ok(r)
-        });
-        match read {
-            Ok(r) => index.receipts.push(r),
-            Err(_) => index.unreadable += 1,
-        }
-    }
-    index.receipts.sort_by(|a, b| {
-        a.created_unix_ms
-            .cmp(&b.created_unix_ms)
-            .then_with(|| a.request_id.cmp(&b.request_id))
-    });
-    index
-}
 
 fn records(reader: &Reader, request: Option<&str>) -> Result<Records> {
     let directory = reader.directory();
@@ -171,92 +101,6 @@ fn records(reader: &Reader, request: Option<&str>) -> Result<Records> {
     Ok(records)
 }
 
-fn snapshot(records: &Records) -> Result<Snapshot> {
-    fn optional<T: for<'de> Deserialize<'de>>(
-        records: &Records,
-        source: &str,
-    ) -> Result<Option<T>> {
-        if records[source].is_err() {
-            return Ok(None);
-        }
-        parsed(records, source)
-    }
-    let index = receipt_index(records);
-    let manifest: SessionManifest =
-        parsed(records, CoreRecord::Manifest.name())?.context("session has no manifest")?;
-    if manifest.schema != SESSION_SCHEMA {
-        bail!(
-            "unsupported session schema {} for {}",
-            manifest.schema,
-            manifest.id
-        );
-    }
-    let pending: Option<PendingTurnCompletion> = optional(records, CoreRecord::Completion.name())?;
-    if let Some(p) = &pending {
-        validate_pending_completion(p)?;
-    }
-    let pending_event = pending
-        .as_ref()
-        .map(|p| -> Result<JournaledEventRead> {
-            let source = format!("events/{}", p.event_file);
-            let bytes = records
-                .get(&source)
-                .and_then(|r| r.as_ref().ok())
-                .and_then(|r| r.as_ref());
-            let state = bytes
-                .map(|b| turn::journaled_event_state_of(p, b, EVENT_READ_LIMIT))
-                .transpose()?
-                .unwrap_or(JournaledEventState::Mismatched);
-            Ok(JournaledEventRead {
-                state,
-                bytes_read: 0,
-                committed_text: None,
-            })
-        })
-        .transpose()?;
-    let launch: Option<launch::Record> = optional(records, CoreRecord::Launch.name())?;
-    if launch
-        .as_ref()
-        .is_some_and(|l| l.schema != 1 || l.claim_token.is_empty())
-    {
-        bail!("invalid launch receipt identity");
-    }
-    let claim = records[CoreRecord::TurnClaim.name()]
-        .as_ref()
-        .ok()
-        .and_then(|v| v.as_ref())
-        .map(|b| std::str::from_utf8(b).map(|s| s.trim().to_owned()))
-        .transpose()?;
-    Ok(Snapshot {
-        manifest,
-        status: if records[CoreRecord::Status.name()].is_err() {
-            SessionStatus {
-                state: SessionState::Unknown("unknown".to_owned()),
-                generation: 0,
-                updated_unix_ms: 0,
-                exit_code: None,
-                error: None,
-                residual_surface: None,
-            }
-        } else {
-            parsed(records, CoreRecord::Status.name())?.context("session has no status record")?
-        },
-        receipts: index.receipts,
-        unreadable_requests: index.unreadable,
-        request_index_error: records["requests/"].as_ref().err().cloned(),
-        paths: records
-            .keys()
-            .filter(|s| s.starts_with("events/") && s.ends_with(".json"))
-            .map(PathBuf::from)
-            .collect(),
-        claim,
-        pending,
-        launch,
-        pending_event,
-        _lock: None,
-    })
-}
-
 fn event(records: &Records, snapshot: &Snapshot, name: &str) -> Result<Option<SessionEvent>> {
     for source in [
         CoreRecord::Status.name(),
@@ -313,7 +157,7 @@ pub(in crate::native) fn timeline_value(
     let directory = reader.directory();
     let lock = reader.lock_shared_with_retry(snapshot_retry_window())?;
     let before = records(reader, request)?;
-    let mut snapshot = snapshot(&before)?;
+    let mut snapshot = Snapshot::from_records(&before)?;
     snapshot._lock = lock;
     if directory.file_name().and_then(|n| n.to_str()) != Some(snapshot.manifest.id.as_str()) {
         bail!("session manifest id does not match its directory");
