@@ -468,3 +468,39 @@ fn an_older_active_result_uses_one_additional_event_decode() {
     assert_eq!(value["active_request"]["request_state"], "completed");
     assert!(value["latest_result"].is_null());
 }
+
+#[test]
+fn enumeration_faults_keep_status_reason_identity_and_encounter_order() {
+    use session::enumerate::{TestEntry, with_entries};
+    let root = tempfile::tempdir().unwrap();
+    let entries = vec![
+        Err(std::io::Error::other("entry fault")),
+        Ok(TestEntry {
+            id: "invalid".into(),
+            directory: root.path().into(),
+            directory_kind: Err(std::io::Error::other("ignored")),
+        }),
+        Ok(TestEntry {
+            id: "session-z".into(),
+            directory: root.path().into(),
+            directory_kind: Err(std::io::Error::other("kind fault")),
+        }),
+        Ok(TestEntry {
+            id: "session-a".into(),
+            directory: root.path().join("session-a"),
+            directory_kind: Ok(true),
+        }),
+    ];
+    let value = with_entries(entries, || test_value_in(root.path()));
+    let reasons = value["incomplete_reasons"].as_array().unwrap();
+    assert_eq!(reasons.len(), 3);
+    assert_eq!(
+        reasons[0],
+        json!({"session": null, "reason": "failed to read session entry: entry fault"})
+    );
+    assert_eq!(
+        reasons[1],
+        json!({"session": "session-z", "reason": "failed to read session entry file type: kind fault"})
+    );
+    assert_eq!(reasons[2]["session"], "session-a");
+}

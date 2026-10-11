@@ -1,7 +1,6 @@
 use crate::native::session::close::budget::CLOSE_TIMEOUT;
 use crate::native::session::primitives::{
     SESSION_DIR_ENV, STATE_DIR_ENV, delegation_source, require_valid_session_id, unix_ms,
-    valid_session_id,
 };
 use crate::native::session::schema::{
     ProviderProcessRecord, SESSION_SCHEMA, SessionEvent, SessionManifest,
@@ -1723,26 +1722,19 @@ fn sessions_query(
 ) -> Result<Vec<serde_json::Value>> {
     let mut sessions = Vec::new();
     if root.is_dir() {
-        for entry in fs::read_dir(root)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let id = entry.file_name().to_string_lossy().into_owned();
-            if !valid_session_id(&id) {
-                continue;
-            }
-            let directory = entry.path();
+        for entry in
+            session::enumerate::enumerate(root, session::enumerate::CheckOrder::FileTypeFirst)?
+        {
+            let entry = entry.map_err(session::enumerate::Fault::into_io)?;
+            let directory = entry.directory;
             let Ok(manifest) = Reader::open_unchecked(&directory).manifest() else {
                 continue;
             };
-            if request
-                .workspace
-                .as_ref()
-                .is_some_and(|workspace| workspace != &manifest.workspace)
-                || request
-                    .provider
-                    .is_some_and(|provider| provider.as_str() != manifest.provider)
+            if !(session::enumerate::Scope {
+                workspace: request.workspace.as_ref(),
+                provider: request.provider,
+            })
+            .admits(&manifest)
             {
                 continue;
             }
@@ -1781,7 +1773,7 @@ fn sessions_query(
                 "model": manifest.model,
                 "effort": manifest.effort,
                 "resumed_from": read_resumed_from(&directory).ok().flatten(),
-                "results": Reader::open_unchecked(&directory).events().map(|paths| paths.len()).unwrap_or(0),
+                "results": Reader::open_unchecked(&directory).published_result_count().unwrap_or(0),
             }));
         }
     }
@@ -1840,16 +1832,11 @@ fn prune_closed_sessions(root: &Path, cutoff_unix_ms: u128) -> Result<Vec<String
         .canonicalize()
         .with_context(|| format!("failed to resolve state directory {}", root.display()))?;
     let mut removed = Vec::new();
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let id = entry.file_name().to_string_lossy().into_owned();
-        if !valid_session_id(&id) {
-            continue;
-        }
-        let directory = entry.path();
+    for entry in session::enumerate::enumerate(root, session::enumerate::CheckOrder::FileTypeFirst)?
+    {
+        let entry = entry.map_err(session::enumerate::Fault::into_io)?;
+        let id = entry.id;
+        let directory = entry.directory;
         if !RecordReader::at(
             Reader::open_unchecked(&directory)
                 .record(CoreRecord::Manifest)

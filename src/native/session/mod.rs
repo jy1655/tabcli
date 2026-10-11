@@ -20,8 +20,10 @@ use std::{
 mod adapter;
 pub(in crate::native) mod cancel;
 pub(in crate::native) mod close;
+pub(in crate::native) mod enumerate;
 pub(in crate::native) mod hold;
 mod names;
+mod published_count;
 pub(in crate::native) mod requests;
 pub(in crate::native) mod turn;
 use turn::{JournaledEventRead, JournaledEventState, PendingTurnCompletion};

@@ -480,7 +480,14 @@ fn exact_title_lookup_never_selects_other_sessions_and_is_read_only() {
     let mut manifest: Value = read_json(&root.path().join("session-owned/manifest.json")).unwrap();
     manifest["id"] = json!("session-second");
     write_json_atomic(&second.join("manifest.json"), &manifest).unwrap();
+    // Count failure and missing status must not remove an ambiguous ownership row.
+    write_private(&second.join("turn.completion.json"), b"broken").unwrap();
     assert!(installed.owned_session(workspace.path(), title).is_err());
+    assert_eq!(
+        fs::read(second.join("turn.completion.json")).unwrap(),
+        b"broken"
+    );
+    assert_eq!(fs::read_dir(&second).unwrap().count(), 2);
 }
 
 #[test]
