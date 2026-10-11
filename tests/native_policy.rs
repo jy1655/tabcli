@@ -1091,6 +1091,7 @@ fn no_source_hint_uses_the_old_public_command() {
                     "ask",
                     "tell",
                     "hold",
+                    "cancel",
                     "result",
                     "wait",
                     "inspect",

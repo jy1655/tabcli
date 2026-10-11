@@ -237,37 +237,154 @@ struct SessionSpec {
     prompt: String,
 }
 
+pub(crate) struct CommandSpec {
+    pub(crate) name: &'static str,
+    parse: fn(&str, &[String]) -> Result<NativeCommand>,
+    // Usage remains handwritten; this flag is checked by its consistency test.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) hidden: bool,
+}
+
+pub(crate) const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "ask",
+        parse: |_, args| parse_ask(args),
+        hidden: false,
+    },
+    CommandSpec {
+        name: "self-test",
+        parse: |_, args| self_test::parse(args),
+        hidden: false,
+    },
+    CommandSpec {
+        name: "tell",
+        parse: |_, args| parse_tell(args),
+        hidden: false,
+    },
+    CommandSpec {
+        name: "hold",
+        parse: |_, args| hold::parse(args),
+        hidden: false,
+    },
+    CommandSpec {
+        name: "cancel",
+        parse: |_, args| cancel::parse(args),
+        hidden: false,
+    },
+    CommandSpec {
+        name: "consent",
+        parse: |_, args| parse_consent(args),
+        hidden: false,
+    },
+    CommandSpec {
+        name: "settings",
+        parse: |_, args| parse_settings(args),
+        hidden: false,
+    },
+    CommandSpec {
+        name: "reopen",
+        parse: |_, args| parse_reopen(args),
+        hidden: false,
+    },
+    CommandSpec {
+        name: "inspect",
+        parse: |_, args| query::parse_inspect(args),
+        hidden: false,
+    },
+    CommandSpec {
+        name: "result",
+        parse: |_, args| query::parse_result(args),
+        hidden: false,
+    },
+    CommandSpec {
+        name: "wait",
+        parse: |_, args| query::wait::parse(args),
+        hidden: false,
+    },
+    CommandSpec {
+        name: "search",
+        parse: |_, args| query::parse_search(args),
+        hidden: false,
+    },
+    CommandSpec {
+        name: "doctor",
+        parse: |_, args| doctor::parse_args(args),
+        hidden: false,
+    },
+    CommandSpec {
+        name: "sessions",
+        parse: |_, args| parse_sessions(args),
+        hidden: false,
+    },
+    CommandSpec {
+        name: "status",
+        parse: |_, args| query::status::parse(args),
+        hidden: false,
+    },
+    CommandSpec {
+        name: "prune-sessions",
+        parse: |_, args| parse_prune(args),
+        hidden: false,
+    },
+    CommandSpec {
+        name: "close-session",
+        parse: |_, args| parse_close(args),
+        hidden: false,
+    },
+    CommandSpec {
+        name: "native-session",
+        parse: |_, args| parse_session(args),
+        hidden: true,
+    },
+    CommandSpec {
+        name: "native-hook",
+        parse: |_, args| parse_hook(args),
+        hidden: true,
+    },
+    CommandSpec {
+        name: "native-provider-control",
+        parse: |_, args| parse_provider_control(args),
+        hidden: true,
+    },
+    CommandSpec {
+        name: "native-console-control",
+        parse: |_, args| parse_console_control(args),
+        hidden: true,
+    },
+    CommandSpec {
+        name: "native-console-host",
+        parse: parse_directory_host,
+        hidden: true,
+    },
+    CommandSpec {
+        name: "native-iterm2-host",
+        parse: parse_directory_host,
+        hidden: true,
+    },
+    CommandSpec {
+        name: "native-terminal-host",
+        parse: parse_directory_host,
+        hidden: true,
+    },
+    CommandSpec {
+        name: "native-wezterm-host",
+        parse: parse_directory_host,
+        hidden: true,
+    },
+    CommandSpec {
+        name: "native-ghostty-host",
+        parse: |_, args| parse_ghostty_host(args),
+        hidden: true,
+    },
+    CommandSpec {
+        name: "native-warp-host",
+        parse: |_, args| parse_warp_host(args),
+        hidden: true,
+    },
+];
+
 pub(crate) fn is_command(value: &str) -> bool {
-    matches!(
-        value,
-        "ask"
-            | "self-test"
-            | "consent"
-            | "settings"
-            | "tell"
-            | "hold"
-            | "cancel"
-            | "reopen"
-            | "sessions"
-            | "status"
-            | "inspect"
-            | "result"
-            | "wait"
-            | "search"
-            | "doctor"
-            | "prune-sessions"
-            | "close-session"
-            | "native-session"
-            | "native-hook"
-            | "native-provider-control"
-            | "native-console-control"
-            | "native-console-host"
-            | "native-iterm2-host"
-            | "native-terminal-host"
-            | "native-wezterm-host"
-            | "native-ghostty-host"
-            | "native-warp-host"
-    )
+    COMMANDS.iter().any(|entry| entry.name == value)
 }
 
 pub(crate) fn parse_args<I, S>(args: I) -> Result<NativeCommand>
@@ -280,133 +397,128 @@ where
         .map(|value| value.as_ref().to_owned())
         .collect::<Vec<_>>();
     let (command, rest) = args.split_first().context("native command is required")?;
-    match command.as_str() {
-        "ask" => parse_ask(rest),
-        "self-test" => self_test::parse(rest),
-        "tell" => parse_tell(rest),
-        "hold" => hold::parse(rest),
-        "cancel" => cancel::parse(rest),
-        "consent" => Ok(NativeCommand::Consent(rest.to_vec())),
-        "settings" => Ok(NativeCommand::Settings(rest.to_vec())),
-        "reopen" => parse_reopen(rest),
-        "inspect" => query::parse_inspect(rest),
-        "result" => query::parse_result(rest),
-        "wait" => query::wait::parse(rest),
-        "search" => query::parse_search(rest),
-        "doctor" => doctor::parse_args(rest),
-        "sessions" => parse_sessions(rest),
-        "status" => query::status::parse(rest),
-        "prune-sessions" => parse_prune(rest),
-        "close-session" => parse_close(rest),
-        "native-session" => {
-            let id = one_positional(rest, "native-session requires one session id")?;
-            require_valid_session_id(id)?;
-            Ok(NativeCommand::RunSession { id: id.to_owned() })
-        }
-        "native-hook" => parse_hook(rest),
-        "native-provider-control" => {
-            let (provider, arguments) = rest
-                .split_first()
-                .context("native-provider-control requires a provider")?;
-            let provider = FirstPartyCli::from_str(provider).map_err(anyhow::Error::msg)?;
-            Ok(NativeCommand::ProviderControl {
-                provider,
-                arguments: arguments.to_vec(),
-            })
-        }
-        "native-console-control" => {
-            let [action, id, tail @ ..] = rest else {
-                bail!("native-console-control requires an action and managed session id");
-            };
-            require_valid_session_id(id)?;
-            if !matches!(
-                action.as_str(),
-                "send" | "close" | "screen" | "dialog" | "window"
-            ) {
-                bail!("unsupported native console action: {action}");
-            }
-            let timeout = |timeout_ms: &String| -> Result<u64> {
-                let timeout_ms = timeout_ms
-                    .parse::<u64>()
-                    .context("invalid native console timeout")?;
-                if timeout_ms == 0 {
-                    bail!("native console timeout must be positive");
-                }
-                Ok(timeout_ms)
-            };
-            let (input_name, timeout_ms) = match (action.as_str(), tail) {
-                ("send" | "dialog", [input, timeout_ms]) if valid_pending_prompt_name(input) => {
-                    (Some(input.clone()), Some(timeout(timeout_ms)?))
-                }
-                ("window", [timeout_ms]) => (None, Some(timeout(timeout_ms)?)),
-                ("close", []) => (None, None),
-                ("screen", []) => (None, None),
-                _ => bail!("invalid native console control arguments"),
-            };
-            Ok(NativeCommand::ConsoleControl {
-                action: action.clone(),
-                id: id.clone(),
-                input_name,
-                timeout_ms,
-            })
-        }
-        "native-console-host"
-        | "native-iterm2-host"
-        | "native-wezterm-host"
-        | "native-terminal-host" => {
-            // The tab's process does not necessarily inherit the state root, so it is
-            // given the session directory itself.
-            let directory = PathBuf::from(one_positional(
-                rest,
-                &format!("{command} requires one session directory"),
-            )?);
-            let id = directory
-                .file_name()
-                .and_then(|name| name.to_str())
-                .with_context(|| format!("{command} requires a session directory"))?;
-            require_valid_session_id(id)?;
-            if !directory.is_absolute() {
-                bail!("{command} requires an absolute session directory");
-            }
-            match command.as_str() {
-                "native-iterm2-host" => Ok(NativeCommand::Iterm2Host { directory }),
-                "native-terminal-host" => Ok(NativeCommand::AppleTerminalHost { directory }),
-                "native-wezterm-host" => Ok(NativeCommand::WezTermHost { directory }),
-                "native-console-host" => Ok(NativeCommand::ConsoleHost { directory }),
-                _ => bail!("unknown native host command: {command}"),
-            }
-        }
-        "native-ghostty-host" => {
-            // The surface is created before its session is bound to it, so this host
-            // is given nothing: its launch reaches it through its own terminal.
-            if !rest.is_empty() {
-                bail!("native-ghostty-host takes no argument");
-            }
-            Ok(NativeCommand::GhosttyHost)
-        }
-        "native-warp-host" => {
-            let [directory, attempt] = rest else {
-                bail!("native-warp-host requires a session directory and attempt token");
-            };
-            let directory = PathBuf::from(directory);
-            let id = directory
-                .file_name()
-                .and_then(|name| name.to_str())
-                .context("native-warp-host requires a session directory")?;
-            require_valid_session_id(id)?;
-            if !directory.is_absolute() {
-                bail!("native-warp-host requires an absolute session directory");
-            }
-            if attempt.len() != 32 || !attempt.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                bail!("native-warp-host requires a valid attempt token");
-            }
-            Ok(NativeCommand::WarpHost {
-                directory,
-                attempt: attempt.clone(),
-            })
-        }
-        _ => bail!("unknown native command: {command}"),
+    let entry = COMMANDS
+        .iter()
+        .find(|entry| entry.name == command)
+        .with_context(|| format!("unknown native command: {command}"))?;
+    (entry.parse)(command, rest)
+}
+
+fn parse_consent(rest: &[String]) -> Result<NativeCommand> {
+    Ok(NativeCommand::Consent(rest.to_vec()))
+}
+
+fn parse_settings(rest: &[String]) -> Result<NativeCommand> {
+    Ok(NativeCommand::Settings(rest.to_vec()))
+}
+
+fn parse_session(rest: &[String]) -> Result<NativeCommand> {
+    let id = one_positional(rest, "native-session requires one session id")?;
+    require_valid_session_id(id)?;
+    Ok(NativeCommand::RunSession { id: id.to_owned() })
+}
+
+fn parse_provider_control(rest: &[String]) -> Result<NativeCommand> {
+    let (provider, arguments) = rest
+        .split_first()
+        .context("native-provider-control requires a provider")?;
+    let provider = FirstPartyCli::from_str(provider).map_err(anyhow::Error::msg)?;
+    Ok(NativeCommand::ProviderControl {
+        provider,
+        arguments: arguments.to_vec(),
+    })
+}
+
+fn parse_console_control(rest: &[String]) -> Result<NativeCommand> {
+    let [action, id, tail @ ..] = rest else {
+        bail!("native-console-control requires an action and managed session id");
+    };
+    require_valid_session_id(id)?;
+    if !matches!(
+        action.as_str(),
+        "send" | "close" | "screen" | "dialog" | "window"
+    ) {
+        bail!("unsupported native console action: {action}");
     }
+    let timeout = |timeout_ms: &String| -> Result<u64> {
+        let timeout_ms = timeout_ms
+            .parse::<u64>()
+            .context("invalid native console timeout")?;
+        if timeout_ms == 0 {
+            bail!("native console timeout must be positive");
+        }
+        Ok(timeout_ms)
+    };
+    let (input_name, timeout_ms) = match (action.as_str(), tail) {
+        ("send" | "dialog", [input, timeout_ms]) if valid_pending_prompt_name(input) => {
+            (Some(input.clone()), Some(timeout(timeout_ms)?))
+        }
+        ("window", [timeout_ms]) => (None, Some(timeout(timeout_ms)?)),
+        ("close", []) => (None, None),
+        ("screen", []) => (None, None),
+        _ => bail!("invalid native console control arguments"),
+    };
+    Ok(NativeCommand::ConsoleControl {
+        action: action.clone(),
+        id: id.clone(),
+        input_name,
+        timeout_ms,
+    })
+}
+
+fn parse_directory_host(command: &str, rest: &[String]) -> Result<NativeCommand> {
+    // The tab's process does not necessarily inherit the state root, so it is
+    // given the session directory itself.
+    let directory = PathBuf::from(one_positional(
+        rest,
+        &format!("{command} requires one session directory"),
+    )?);
+    let id = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("{command} requires a session directory"))?;
+    require_valid_session_id(id)?;
+    if !directory.is_absolute() {
+        bail!("{command} requires an absolute session directory");
+    }
+    match command {
+        "native-iterm2-host" => Ok(NativeCommand::Iterm2Host { directory }),
+        "native-terminal-host" => Ok(NativeCommand::AppleTerminalHost { directory }),
+        "native-wezterm-host" => Ok(NativeCommand::WezTermHost { directory }),
+        "native-console-host" => Ok(NativeCommand::ConsoleHost { directory }),
+        _ => bail!("unknown native host command: {command}"),
+    }
+}
+
+fn parse_ghostty_host(rest: &[String]) -> Result<NativeCommand> {
+    // The surface is created before its session is bound to it, so this host
+    // is given nothing: its launch reaches it through its own terminal.
+    if !rest.is_empty() {
+        bail!("native-ghostty-host takes no argument");
+    }
+    Ok(NativeCommand::GhosttyHost)
+}
+
+fn parse_warp_host(rest: &[String]) -> Result<NativeCommand> {
+    let [directory, attempt] = rest else {
+        bail!("native-warp-host requires a session directory and attempt token");
+    };
+    let directory = PathBuf::from(directory);
+    let id = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("native-warp-host requires a session directory")?;
+    require_valid_session_id(id)?;
+    if !directory.is_absolute() {
+        bail!("native-warp-host requires an absolute session directory");
+    }
+    if attempt.len() != 32 || !attempt.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("native-warp-host requires a valid attempt token");
+    }
+    Ok(NativeCommand::WarpHost {
+        directory,
+        attempt: attempt.clone(),
+    })
 }
 
 fn parse_ask(args: &[String]) -> Result<NativeCommand> {
@@ -971,7 +1083,9 @@ fn run_ask(request: AskRequest) -> Result<()> {
     let mut address = None;
     let outcome = run_ask_inner(request, &mut address);
     match address {
-        Some((session, request_id)) => finish_request(outcome, json, &session, &request_id),
+        Some((session, request_id)) => {
+            finish_request_with_extra(outcome, json, &session, &request_id, serde_json::Map::new())
+        }
         None => outcome,
     }
 }
@@ -2142,10 +2256,6 @@ fn run_close(request: CloseRequest) -> Result<()> {
     Ok(())
 }
 
-fn finish_request(outcome: Result<()>, json: bool, session: &str, request_id: &str) -> Result<()> {
-    finish_request_with_extra(outcome, json, session, request_id, serde_json::Map::new())
-}
-
 fn finish_request_with_extra(
     outcome: Result<()>,
     json: bool,
@@ -2534,14 +2644,10 @@ fn run_hook(provider: FirstPartyCli, argument_payload: Option<&str>) -> Result<(
 }
 
 fn create_session(spec: SessionSpec) -> Result<CreatedSession> {
-    create_session_in(&Reader::state_root()?, spec)
+    create_session_within(&Reader::state_root()?, &Reader::home_directories(), spec)
 }
 
-fn create_session_in(root: &Path, spec: SessionSpec) -> Result<CreatedSession> {
-    create_session_within(root, &Reader::home_directories(), spec)
-}
-
-/// [`create_session_in`] with the directories whose own entries are taken as durable
+/// [`create_session`] with the directories whose own entries are taken as durable
 /// (the user's home directory in production), so the state-root ancestry walk stops
 /// there instead of at the filesystem root.
 fn create_session_within(

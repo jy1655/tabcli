@@ -9609,3 +9609,169 @@ mod launch_orchestration {
         );
     }
 }
+
+#[test]
+fn registry_routes_every_command_to_its_variant_and_fields() {
+    // Debug exposes private module request fields without widening their visibility for tests.
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-route");
+    let directory_text = directory.to_str().unwrap();
+    let workspace = std::env::current_dir().unwrap();
+    let ask = format!(
+        "AskRequest {{ provider: Codex, workspace: {workspace:?}, prompt: \"hello\", title: None, model: None, effort: None, terminal: None, yolo: false, timeout: 900s, detach: false, json: false, context_results: [] }}"
+    );
+    let self_test_ask = format!(
+        "AskRequest {{ provider: Pi, workspace: {workspace:?}, prompt: \"self-test\", title: None, model: None, effort: None, terminal: None, yolo: false, timeout: 120s, detach: false, json: true, context_results: [] }}"
+    );
+    let token = "0123456789abcdef0123456789abcdef";
+    let cases: Vec<(Vec<&str>, String)> = vec![
+        (vec!["ask", "codex", "--prompt", "hello"], format!("Ask({ask})")),
+        (vec!["self-test", "pi", "--isolated", "--json"], format!("SelfTest(Request {{ ask: {self_test_ask}, isolated: true }})")),
+        (vec!["tell", "session-route", "--prompt", "hello"], "Tell(TellRequest { id: \"session-route\", prompt: \"hello\", timeout: 900s, detach: false, json: false, context_results: [] })".into()),
+        (vec!["hold", "session-route", "--release", "--json"], "Hold(Request { id: \"session-route\", release: true, json: true })".into()),
+        (vec!["cancel", "session-route", "--json"], "Cancel(Request { id: \"session-route\", json: true })".into()),
+        (vec!["consent", "arbitrary", "--bad"], "Consent([\"arbitrary\", \"--bad\"])".into()),
+        (vec!["settings", "arbitrary", "--bad"], "Settings([\"arbitrary\", \"--bad\"])".into()),
+        (vec!["reopen", "session-route", "--prompt", "hello"], "Reopen(ReopenRequest { id: \"session-route\", prompt: \"hello\", title: None, model: None, effort: None, terminal: None, yolo: false, timeout: 900s, detach: false, json: false })".into()),
+        (vec!["inspect", "session-route", "--timeline", "--request", "request-1", "--json"], "Inspect { id: \"session-route\", json: true, timeline: true, request: Some(\"request-1\") }".into()),
+        (vec!["result", "session-route", "--request", "request-1", "--wait", "--json"], "Result(ResultRequest { id: \"session-route\", selector: Request(\"request-1\"), wait: true, timeout: 900s, json: true })".into()),
+        (vec!["wait", "session-route/request-1", "--timeout-secs", "7", "--json"], "Wait(WaitRequest { addresses: [Address { session: \"session-route\", request: \"request-1\" }], timeout: 7s, json: true })".into()),
+        (vec!["search", "needle", "--all-workspaces", "--provider", "claude", "--json"], "Search(SearchRequest { query: \"needle\", scope: AllWorkspaces, provider: Some(Claude), limit: 20, byte_budget: 67108864, json: true })".into()),
+        (vec!["doctor", "--provider", "agy", "--probe", "--json"], "Doctor(DoctorRequest { session: None, provider: Some(Agy), probe: true, json: true })".into()),
+        (vec!["sessions", "--provider", "pi", "--state", "ready", "--sort", "updated", "--json"], "Sessions(SessionsRequest { json: true, workspace: None, provider: Some(Pi), state: Some(\"ready\"), sort_updated: true })".into()),
+        (vec!["status", "--all-workspaces", "--provider", "codex", "--all", "--json"], "Status(StatusRequest { scope: AllWorkspaces, provider: Some(Codex), include_closed: true, json: true })".into()),
+        (vec!["prune-sessions", "--closed-before-days", "30", "--explicit", "--json"], "Prune(PruneRequest { closed_before_days: 30, explicit: true, json: true })".into()),
+        (vec!["close-session", "session-route", "--explicit", "--timeout-secs", "7", "--json"], "Close(CloseRequest { id: \"session-route\", explicit: true, json: true, timeout: 7s })".into()),
+        (vec!["native-session", "session-route"], "RunSession { id: \"session-route\" }".into()),
+        (vec!["native-hook", "codex", "{}"], "Hook { provider: Codex, payload: Some(\"{}\") }".into()),
+        (vec!["native-provider-control", "claude", "operation", "payload"], "ProviderControl { provider: Claude, arguments: [\"operation\", \"payload\"] }".into()),
+        (vec!["native-console-control", "send", "session-route", "pending-prompt-route.txt", "7"], "ConsoleControl { action: \"send\", id: \"session-route\", input_name: Some(\"pending-prompt-route.txt\"), timeout_ms: Some(7) }".into()),
+        (vec!["native-console-host", directory_text], format!("ConsoleHost {{ directory: {directory:?} }}")),
+        (vec!["native-iterm2-host", directory_text], format!("Iterm2Host {{ directory: {directory:?} }}")),
+        (vec!["native-terminal-host", directory_text], format!("AppleTerminalHost {{ directory: {directory:?} }}")),
+        (vec!["native-wezterm-host", directory_text], format!("WezTermHost {{ directory: {directory:?} }}")),
+        (vec!["native-ghostty-host"], "GhosttyHost".into()),
+        (vec!["native-warp-host", directory_text, token], format!("WarpHost {{ directory: {directory:?}, attempt: {token:?} }}")),
+    ];
+    let covered = cases
+        .iter()
+        .map(|(args, _)| args[0])
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(covered.len(), cases.len());
+    assert_eq!(covered, COMMANDS.iter().map(|entry| entry.name).collect());
+    for (args, expected) in cases {
+        assert_eq!(
+            format!("{:?}", parse_args(&args).unwrap()),
+            expected,
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn host_parser_errors_preserve_validation_precedence() {
+    let error = |args: &[&str]| format!("{:#}", parse_args(args).unwrap_err());
+    for (args, expected) in [
+        (
+            vec!["native-console-control", "bad"],
+            "native-console-control requires an action and managed session id",
+        ),
+        (
+            vec![
+                "native-console-control",
+                "bad",
+                "bad-id",
+                "bad-input",
+                "bad-timeout",
+            ],
+            "invalid Agent Bridge session id: \"bad-id\"",
+        ),
+        (
+            vec![
+                "native-console-control",
+                "bad",
+                "session-route",
+                "bad-input",
+                "bad-timeout",
+            ],
+            "unsupported native console action: bad",
+        ),
+        (
+            vec![
+                "native-console-control",
+                "send",
+                "session-route",
+                "bad-input",
+                "bad-timeout",
+            ],
+            "invalid native console control arguments",
+        ),
+        (
+            vec![
+                "native-console-control",
+                "send",
+                "session-route",
+                "pending-prompt-route.txt",
+                "bad-timeout",
+            ],
+            "invalid native console timeout: invalid digit found in string",
+        ),
+        (
+            vec![
+                "native-console-control",
+                "send",
+                "session-route",
+                "pending-prompt-route.txt",
+                "0",
+            ],
+            "native console timeout must be positive",
+        ),
+    ] {
+        assert_eq!(error(&args), expected, "{args:?}");
+    }
+    for name in [
+        "native-console-host",
+        "native-iterm2-host",
+        "native-terminal-host",
+        "native-wezterm-host",
+    ] {
+        assert_eq!(
+            error(&[name, "bad-id", "extra"]),
+            format!("{name} requires one session directory")
+        );
+        assert_eq!(
+            error(&[name, ""]),
+            format!("{name} requires a session directory")
+        );
+        assert_eq!(
+            error(&[name, "bad-id"]),
+            "invalid Agent Bridge session id: \"bad-id\""
+        );
+        assert_eq!(
+            error(&[name, "session-route"]),
+            format!("{name} requires an absolute session directory")
+        );
+    }
+    assert_eq!(
+        error(&["native-warp-host", "bad-id"]),
+        "native-warp-host requires a session directory and attempt token"
+    );
+    assert_eq!(
+        error(&["native-warp-host", "", "bad"]),
+        "native-warp-host requires a session directory"
+    );
+    assert_eq!(
+        error(&["native-warp-host", "bad-id", "bad"]),
+        "invalid Agent Bridge session id: \"bad-id\""
+    );
+    assert_eq!(
+        error(&["native-warp-host", "session-route", "bad"]),
+        "native-warp-host requires an absolute session directory"
+    );
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-route");
+    assert_eq!(
+        error(&["native-warp-host", directory.to_str().unwrap(), "bad"]),
+        "native-warp-host requires a valid attempt token"
+    );
+}

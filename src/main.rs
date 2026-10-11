@@ -246,17 +246,7 @@ fn parse_args_from(args: impl IntoIterator<Item = OsString>) -> Result<Launch> {
 
     if matches!(
         command.as_str(),
-        "open"
-            | "prompt"
-            | "status"
-            | "read"
-            | "wait"
-            | "list"
-            | "close"
-            | "hook"
-            | "--restore"
-            | "--yolo"
-            | "-yolo"
+        "open" | "prompt" | "read" | "list" | "close" | "hook" | "--restore" | "--yolo" | "-yolo"
     ) || !command.starts_with('-')
     {
         bail!(legacy_removal_message());
@@ -343,6 +333,163 @@ mod tests {
             let error = parse_args_from(args).unwrap_err().to_string();
             assert!(error.contains("multi-PTY TUI was removed"), "{error}");
         }
+    }
+
+    #[test]
+    fn help_output_matches_exact_bytes_including_println_newline() {
+        assert_eq!(
+            format!("{}\n", help_text()).as_bytes(),
+            include_bytes!("../tests/fixtures/help.txt")
+        );
+    }
+
+    #[test]
+    fn usage_and_registry_agree_without_hiding_unregistered_commands() {
+        use std::collections::BTreeSet;
+        let help = help_text();
+        let usage = help
+            .split_once("Usage:\n")
+            .unwrap()
+            .1
+            .split_once("\n\n")
+            .unwrap()
+            .0;
+        let prefix = format!("  {PUBLIC_COMMAND} ");
+        let advertised: BTreeSet<_> = usage
+            .lines()
+            .filter_map(|line| line.strip_prefix(&prefix))
+            .filter(|line| *line != "--help | --version")
+            .map(|line| line.split_whitespace().next().unwrap())
+            .collect();
+        let registered: BTreeSet<_> = native::COMMANDS
+            .iter()
+            .filter(|entry| !entry.hidden)
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(advertised, registered);
+        let names: BTreeSet<_> = native::COMMANDS.iter().map(|entry| entry.name).collect();
+        assert_eq!(
+            names.len(),
+            native::COMMANDS.len(),
+            "duplicate registry name"
+        );
+        assert_eq!(registered.len(), 17);
+        assert_eq!(
+            native::COMMANDS.iter().filter(|entry| entry.hidden).count(),
+            10
+        );
+        for entry in native::COMMANDS.iter().filter(|entry| entry.hidden) {
+            assert!(!advertised.contains(entry.name));
+        }
+    }
+
+    #[test]
+    fn routing_preserves_exact_errors_and_help_position() {
+        let parse = |args: &[&str]| parse_args_from(args.iter().map(OsString::from));
+        assert_eq!(
+            native::parse_args(Vec::<String>::new())
+                .unwrap_err()
+                .to_string(),
+            "native command is required"
+        );
+        assert_eq!(
+            native::parse_args(["unknown"]).unwrap_err().to_string(),
+            "unknown native command: unknown"
+        );
+        for args in [
+            vec![],
+            vec![""],
+            vec!["unknown"],
+            vec!["open"],
+            vec!["prompt"],
+            vec!["read"],
+            vec!["list"],
+            vec!["close"],
+            vec!["hook"],
+            vec!["--restore"],
+            vec!["--yolo"],
+            vec!["-yolo"],
+        ] {
+            assert_eq!(
+                parse(&args).unwrap_err().to_string(),
+                legacy_removal_message(),
+                "{args:?}"
+            );
+        }
+        assert_eq!(
+            parse(&["--unknown"]).unwrap_err().to_string(),
+            "unknown command or option: --unknown"
+        );
+        for flag in ["--help", "-h"] {
+            assert!(matches!(parse(&[flag]).unwrap(), Launch::Help));
+            assert_eq!(
+                parse(&[flag, "extra"]).unwrap_err().to_string(),
+                "--help does not accept arguments"
+            );
+            for entry in native::COMMANDS {
+                assert!(native::is_command(entry.name));
+                assert!(
+                    matches!(parse(&[entry.name, flag, "extra"]).unwrap(), Launch::Help),
+                    "{}",
+                    entry.name
+                );
+            }
+            assert_eq!(
+                parse(&["tell", "session-route", flag])
+                    .unwrap_err()
+                    .to_string(),
+                format!("unknown tell option: {flag}")
+            );
+            assert!(
+                matches!(parse(&["consent", "arbitrary", flag]).unwrap(), Launch::Native(native::NativeCommand::Consent(args)) if args == ["arbitrary", flag])
+            );
+            assert!(
+                matches!(parse(&["settings", "arbitrary", flag]).unwrap(), Launch::Native(native::NativeCommand::Settings(args)) if args == ["arbitrary", flag])
+            );
+        }
+        for flag in ["--version", "-V"] {
+            assert!(matches!(parse(&[flag]).unwrap(), Launch::Version));
+            assert_eq!(
+                parse(&[flag, "extra"]).unwrap_err().to_string(),
+                "--version does not accept arguments"
+            );
+        }
+        assert!(matches!(
+            parse(&["status", "--all-workspaces"]).unwrap(),
+            Launch::Native(native::NativeCommand::Status(_))
+        ));
+        assert!(matches!(
+            parse(&["wait", "session-route/request-1"]).unwrap(),
+            Launch::Native(native::NativeCommand::Wait(_))
+        ));
+        for (args, expected) in [
+            (vec!["status", "--bad"], "unknown status option: --bad"),
+            (
+                vec!["wait"],
+                "wait requires at least one SESSION/REQUEST address",
+            ),
+            (vec!["wait", "--bad"], "unknown wait option: --bad"),
+            (
+                vec!["wait", "broken"],
+                "invalid wait address \"broken\"; expected SESSION/REQUEST with a Bridge request id",
+            ),
+        ] {
+            assert_eq!(parse(&args).unwrap_err().to_string(), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn routing_keeps_lossy_os_string_conversion() {
+        use std::os::unix::ffi::OsStringExt;
+        let invalid = OsString::from_vec(vec![b'-', 0xff]);
+        assert_eq!(
+            parse_args_from([invalid.clone()]).unwrap_err().to_string(),
+            "unknown command or option: -\u{fffd}"
+        );
+        assert!(
+            matches!(parse_args_from([OsString::from("consent"), invalid]).unwrap(), Launch::Native(native::NativeCommand::Consent(args)) if args == ["-\u{fffd}"])
+        );
     }
 
     #[test]
