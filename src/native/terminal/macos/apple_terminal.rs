@@ -289,14 +289,7 @@ pub(super) fn create_tab(
     directory: &Path,
     deadline: Instant,
 ) -> Result<TerminalSession> {
-    let executable =
-        std::env::current_exe().context("failed to resolve Agent Bridge executable")?;
-    let host = format!(
-        "{} native-terminal-host {}",
-        crate::native::shell_quote(executable.as_os_str()),
-        crate::native::shell_quote(directory.as_os_str())
-    );
-    let start = install_bootstrap(directory, &host, command)?;
+    let start = launch_bootstrap(command, directory)?;
     let response = applescript::run_until("Terminal.app", OPEN_TAB_SCRIPT, &[&start], deadline)?;
     let mut ids = response.lines();
     let id = ids.next().filter(|value| !value.is_empty());
@@ -313,6 +306,17 @@ pub(super) fn create_tab(
         wezterm_mux: None,
         windows_process_identity: None,
     })
+}
+
+fn launch_bootstrap(command: &str, directory: &Path) -> Result<String> {
+    let executable =
+        std::env::current_exe().context("failed to resolve Agent Bridge executable")?;
+    let host = format!(
+        "{} native-terminal-host {}",
+        crate::native::shell_quote(executable.as_os_str()),
+        crate::native::shell_quote(directory.as_os_str())
+    );
+    install_bootstrap(directory, &host, command)
 }
 
 // The typed line stays short (#50) and names a private file. The tab's own shell
@@ -895,6 +899,36 @@ pub(in crate::native) fn apple_terminal_startup_absent_with(
 // `osascript`, and nothing talks to Terminal.
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launch_context_does_not_depend_on_terminal_environment() {
+        use super::{BOOTSTRAP_FILE, launch_bootstrap};
+        if !crate::native::process_env::tests::without_bridge_environment(
+            module_path!(),
+            "launch_context_does_not_depend_on_terminal_environment",
+        ) {
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-e1");
+        std::fs::create_dir(&directory).unwrap();
+        let wrapper = crate::native::process_env::tests::wrapper_for(&directory);
+        let bootstrap = launch_bootstrap(&wrapper, &directory).unwrap();
+        assert_eq!(
+            bootstrap,
+            format!(
+                ". {}",
+                crate::native::shell_quote(directory.join(BOOTSTRAP_FILE).as_os_str())
+            )
+        );
+        let script = std::fs::read_to_string(directory.join(BOOTSTRAP_FILE)).unwrap();
+        assert!(script.contains(&format!(
+            "native-terminal-host {}",
+            crate::native::shell_quote(directory.as_os_str())
+        )));
+        assert!(script.ends_with(&format!("{wrapper}\n")));
+    }
+
     #[test]
     fn host_binding_partial_transitions() {
         crate::native::launch::binding_tests::characterize("Terminal.app", |directory, id| {

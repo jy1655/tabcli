@@ -9182,3 +9182,34 @@ fn every_provider_declares_session_specific_cancel_support() {
         }
     }
 }
+
+#[test]
+fn provider_launch_and_version_builders_preserve_their_exact_environments() {
+    for provider in agent_bridge::supported_clis() {
+        let removals = provider::probe_environment_removals(*provider);
+        let executable = Path::new("unused");
+        let directory = Path::new(".");
+        let mut command =
+            process_env::provider_command(executable, directory, vec![], removals).unwrap();
+        configure_provider_launch(&mut command, directory, directory, "session-e1", executable);
+        process_env::tests::assert_provider_environment(
+            &command,
+            removals,
+            &[
+                (SESSION_DIR_ENV, Some(directory.as_os_str())),
+                (
+                    "AGENT_BRIDGE_NATIVE_SESSION_ID",
+                    Some(std::ffi::OsStr::new("session-e1")),
+                ),
+                ("AGENT_BRIDGE_EXECUTABLE", Some(executable.as_os_str())),
+                (launch::STDERR_ENV, None),
+                (launch::STDOUT_ENV, None),
+            ],
+        );
+        process_env::tests::assert_provider_environment(
+            &version_probe_command(*provider, executable).unwrap(),
+            removals,
+            &[],
+        );
+    }
+}

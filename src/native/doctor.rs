@@ -8,7 +8,7 @@ use super::{
     terminal_safe_text, thread, unix_ms,
 };
 use crate::native::session::SessionState;
-use crate::native::{FromStr, Read, Seek, provider_version_command};
+use crate::native::{FromStr, Read, Seek, process_env};
 use agent_bridge::PUBLIC_COMMAND;
 use serde_json::{Value, json};
 
@@ -884,6 +884,32 @@ fn terminal_check(evidence: &SessionEvidence, id: &str, checks: &mut Vec<Check>)
 
 // Probe only explicitly requested local CLI information. Scratch files (including Windows
 // batch forwarders) live outside the session; contain descendants and cap time/output.
+fn probe_command(
+    executable: &Path,
+    arguments: &[&str],
+    workspace: Option<&Path>,
+    scratch: &Path,
+    environment_removals: &[&str],
+) -> Result<std::process::Command> {
+    let mut command = if arguments == ["--version"] {
+        let mut command = process_env::provider_version_command(executable, environment_removals)?;
+        command.arg("--version");
+        command
+    } else {
+        process_env::provider_command(
+            executable,
+            scratch,
+            arguments.iter().map(OsString::from).collect(),
+            environment_removals,
+        )?
+    };
+    command
+        .current_dir(workspace.unwrap_or(scratch))
+        .env_remove(SESSION_DIR_ENV);
+    provider_process::configure_process_tree(&mut command);
+    Ok(command)
+}
+
 pub(super) fn probe(
     executable: &Path,
     arguments: &[&str],
@@ -895,22 +921,13 @@ pub(super) fn probe(
         bail!("diagnostic probe deadline exhausted");
     }
     let scratch = tempfile::tempdir()?;
-    let mut command = if arguments == ["--version"] {
-        let mut command = provider_version_command(executable)?;
-        command.arg("--version");
-        command
-    } else {
-        provider_process::command(
-            executable,
-            scratch.path(),
-            arguments.iter().map(OsString::from).collect(),
-        )?
-    };
-    command
-        .current_dir(workspace.unwrap_or(scratch.path()))
-        .env_remove(SESSION_DIR_ENV);
-    provider::apply_environment_removals(&mut command, environment_removals);
-    provider_process::configure_process_tree(&mut command);
+    let mut command = probe_command(
+        executable,
+        arguments,
+        workspace,
+        scratch.path(),
+        environment_removals,
+    )?;
     let mut stdout = tempfile::tempfile()?;
     let mut stderr = tempfile::tempfile()?;
     if Instant::now() >= deadline {
@@ -972,6 +989,23 @@ pub(super) fn probe(
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[test]
+    fn doctor_commands_keep_only_adapter_removals_and_the_session_directory_removal() {
+        for provider in agent_bridge::supported_clis() {
+            let removals = provider::probe_environment_removals(*provider);
+            for args in [vec!["--version"], vec!["diagnostic"]] {
+                let command =
+                    probe_command(Path::new("unused"), &args, None, Path::new("."), removals)
+                        .unwrap();
+                crate::native::process_env::tests::assert_provider_environment(
+                    &command,
+                    removals,
+                    &[(SESSION_DIR_ENV, None)],
+                );
+            }
+        }
+    }
+
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 

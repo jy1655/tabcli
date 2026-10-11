@@ -573,30 +573,29 @@ fn isolated_unreadable_ownership_still_closes_the_reported_session() {
 }
 
 #[test]
-fn installed_commands_override_the_root_only_in_isolated_mode() {
+fn installed_commands_explicitly_pass_the_ordinary_custom_root() {
+    assert_installed_root(false);
+}
+
+#[test]
+fn installed_commands_explicitly_pass_the_isolated_root() {
+    assert_installed_root(true);
+}
+
+fn assert_installed_root(isolated: bool) {
     let root = tempfile::tempdir().unwrap();
-    for isolated in [false, true] {
-        let installed = Installed {
-            executable: PathBuf::from("unused"),
-            root: root.path().join("not-created"),
-            isolated,
-        };
-        for command in ["ask", "result", "tell", "close-session", "inspect"] {
-            let command = installed.command(&arguments(&[command]));
-            let env: Vec<_> = command.get_envs().collect();
-            if isolated {
-                assert_eq!(
-                    env,
-                    [(
-                        std::ffi::OsStr::new(STATE_DIR_ENV),
-                        Some(installed.root.as_os_str())
-                    )]
-                );
-            } else {
-                assert!(env.is_empty());
-            }
-            assert!(!installed.root.exists());
-        }
+    let installed = Installed {
+        executable: PathBuf::from("unused"),
+        root: root.path().join("not-created"),
+        isolated,
+    };
+    for command in ["ask", "result", "tell", "close-session", "inspect"] {
+        let command = installed.command(&arguments(&[command]));
+        crate::native::process_env::tests::assert_helper_environment(
+            &command,
+            &[(STATE_DIR_ENV, Some(installed.root.as_os_str()))],
+        );
+        assert!(!installed.root.exists());
     }
 }
 

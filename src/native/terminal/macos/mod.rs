@@ -252,13 +252,18 @@ pub(super) fn timeout_deadline(timeout: Duration) -> Result<Instant> {
 // record (`CGSSessionScreenIsLocked` in `ioreg -n Root -d1`). None when the record could
 // not be read before the deadline.
 fn screen_locked(deadline: Instant) -> Option<bool> {
-    let mut command = std::process::Command::new("/usr/sbin/ioreg");
-    command.args(["-n", "Root", "-d", "1"]);
+    let mut command = ioreg_command();
     let output = crate::native::command_output_until(&mut command, deadline, "ioreg").ok()?;
     output
         .status
         .success()
         .then(|| screen_locked_in(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn ioreg_command() -> std::process::Command {
+    let mut command = crate::native::process_env::helper_command("/usr/sbin/ioreg");
+    command.args(["-n", "Root", "-d", "1"]);
+    command
 }
 
 fn screen_locked_in(ioreg: &str) -> bool {
@@ -339,6 +344,11 @@ mod startup_tests {
 
 #[cfg(test)]
 mod screen_lock_tests {
+    #[test]
+    fn ioreg_drops_caller_session_environment() {
+        crate::native::process_env::tests::assert_helper_environment(&super::ioreg_command(), &[]);
+    }
+
     use super::screen_locked_in;
 
     #[test]

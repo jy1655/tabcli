@@ -78,7 +78,7 @@ pub(super) fn run_send_until(
 }
 
 fn command(script: &str, arguments: &[&str]) -> Command {
-    let mut command = Command::new("/usr/bin/osascript");
+    let mut command = crate::native::process_env::helper_command("/usr/bin/osascript");
     command.arg("-e").arg(script).args(arguments);
     command
 }
@@ -100,6 +100,14 @@ fn parse_output(application: &str, output: std::process::Output) -> Result<Strin
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn automation_drops_caller_session_environment() {
+        crate::native::process_env::tests::assert_helper_environment(
+            &super::command("return 1", &[]),
+            &[],
+        );
+    }
+
     use super::*;
 
     #[test]
