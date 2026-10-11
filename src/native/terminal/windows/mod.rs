@@ -632,18 +632,31 @@ pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Resul
     Ok(serde_json::from_slice(&output.stdout)?)
 }
 
-pub(super) fn guarded_dialog_input(
+// The helper child still resolves the session by id under its own inherited root.
+// Do not publish an input file that it could resolve in a different session directory.
+fn dialog_input_file(
+    directory: &Path,
     session: &TerminalSession,
     input: &super::GuardedDialogInput,
-    deadline: Instant,
-) -> Result<bool> {
+) -> Result<tempfile::NamedTempFile> {
     use std::io::Write;
-    let directory = Reader::session_directory(
-        session
-            .managed_session_id
-            .as_deref()
-            .context("missing managed session identity")?,
+    let id = session
+        .managed_session_id
+        .as_deref()
+        .context("missing managed session identity")?;
+    if directory.file_name().and_then(|name| name.to_str()) != Some(id) {
+        bail!("managed session identity does not match the supplied session directory");
+    }
+    let supplied = Reader::session_directory_in(
+        directory
+            .parent()
+            .context("session directory has no parent")?,
+        id,
     )?;
+    let helper = Reader::session_directory(id)?;
+    if supplied.canonicalize()? != helper.canonicalize()? {
+        bail!("supplied session directory disagrees with the console helper state root");
+    }
     let mut file = tempfile::Builder::new()
         .prefix("pending-prompt-")
         .suffix(".txt")
@@ -651,6 +664,16 @@ pub(super) fn guarded_dialog_input(
     RecordStore::set_file_private(file.as_file())?;
     file.write_all(&serde_json::to_vec(input)?)?;
     file.flush()?;
+    Ok(file)
+}
+
+pub(super) fn guarded_dialog_input(
+    directory: &Path,
+    session: &TerminalSession,
+    input: &super::GuardedDialogInput,
+    deadline: Instant,
+) -> Result<bool> {
+    let file = dialog_input_file(directory, session, input)?;
     let mut command = console_helper_command(
         "dialog",
         session,
@@ -676,6 +699,7 @@ pub(super) fn guarded_dialog_input(
 }
 
 pub(super) fn close_session_until(
+    _directory: &Path,
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {

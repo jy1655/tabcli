@@ -762,7 +762,13 @@ pub(super) fn apple_terminal_startup_absent(
         process_is_alive,
         macos_process_start,
         terminal_app_instances,
-        || terminal::surface_present(surface, deadline.saturating_duration_since(Instant::now())),
+        || {
+            terminal::surface_present(
+                directory,
+                surface,
+                deadline.saturating_duration_since(Instant::now()),
+            )
+        },
     )
 }
 

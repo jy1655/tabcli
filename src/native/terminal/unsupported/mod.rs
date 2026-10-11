@@ -25,6 +25,7 @@ pub(super) fn close_session(_session: &TerminalSession) -> Result<CloseOutcome> 
 }
 
 pub(super) fn close_session_until(
+    _directory: &Path,
     session: &TerminalSession,
     _deadline: std::time::Instant,
 ) -> Result<CloseOutcome> {

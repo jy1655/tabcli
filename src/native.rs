@@ -1189,13 +1189,7 @@ fn launch_created_session(
     ) {
         Ok(session) => session,
         Err(error) => {
-            let error =
-                match launch::terminal_failed(&Store::open_unchecked(&created.directory), &error) {
-                    Ok(()) => error,
-                    Err(record_error) => {
-                        error.context(format!("terminal launch failure handoff: {record_error:#}"))
-                    }
-                };
+            let error = launch::terminal_failure(&Store::open_unchecked(&created.directory), error);
             return Err(error).with_context(|| {
                 format!(
                     "failed to open {} surface for session {}",

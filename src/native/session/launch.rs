@@ -308,6 +308,26 @@ fn fail_deciding(
     Ok(())
 }
 
+// The error returned by ask, including its JSON error rendering.
+pub(in crate::native) fn terminal_failure(store: &Store, error: anyhow::Error) -> anyhow::Error {
+    let retained = error.downcast_ref::<terminal::RetainedLaunchSurface>();
+    let unverified = retained.is_some_and(|surface| surface.unverified_cleanup);
+    let has_surface = retained.is_some();
+    let handoff = terminal_failed(store, &error);
+    let residual = unverified || (has_surface && handoff.is_err());
+    let error = match handoff {
+        Ok(()) => error,
+        Err(record_error) => {
+            error.context(format!("terminal launch failure handoff: {record_error:#}"))
+        }
+    };
+    if residual && !format!("{error:#}").contains(RESIDUAL_SURFACE_MARKER) {
+        error.context(RESIDUAL_SURFACE_MARKER)
+    } else {
+        error
+    }
+}
+
 // The launcher's terminal-creation failure handoff.
 pub(in crate::native) fn terminal_failed(store: &Store, error: &anyhow::Error) -> Result<()> {
     let reason = format!("terminal launch failed: {error:#}");
@@ -328,22 +348,38 @@ pub(in crate::native) fn terminal_failed(store: &Store, error: &anyhow::Error) -
         });
     };
     let _lock = store.lock()?;
-    let status = store.status()?;
-    let record = read(store)?;
-    let claim = turn::current_claim_token(store)?;
+    let evidence = (|| -> Result<_> {
+        Ok((
+            store.status()?,
+            read(store)?,
+            turn::current_claim_token(store)?,
+            store.closed_if_present()?,
+        ))
+    })();
+    let (status, record, claim, closed) = match evidence {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            let message = format!(
+                "{reason}; exact retained surface={:?}; {RESIDUAL_SURFACE_MARKER}; launch handoff evidence could not be read: {error:#}",
+                retained.surface
+            );
+            // Failed evidence grants no bind or lifecycle transition. Preserve the
+            // residual warning if the status/tombstone can still be read and amended.
+            store
+                .record_residual_surface(&message)
+                .with_context(|| message.clone())?;
+            bail!("{message}");
+        }
+    };
     let owns_claim = record
         .as_ref()
         .is_some_and(|record| claim.as_deref() == Some(record.claim_token.as_str()));
-    if status.state != SessionState::Launching
-        || !owns_claim
-        || store.closed_if_present()?.is_some()
-    {
-        let disposition =
-            if status.state == SessionState::Closed || store.closed_if_present()?.is_some() {
-                "the session was closed during the launch"
-            } else {
-                "the session is no longer owned by this launch"
-            };
+    if status.state != SessionState::Launching || !owns_claim || closed.is_some() {
+        let disposition = if status.state == SessionState::Closed || closed.is_some() {
+            "the session was closed during the launch"
+        } else {
+            "the session is no longer owned by this launch"
+        };
         let message = format!(
             "{disposition}; exact retained surface={:?}; {RESIDUAL_SURFACE_MARKER}; {reason}",
             retained.surface
@@ -473,7 +509,11 @@ pub(in crate::native) fn wait(
             Some("provider launch timed out before startup was confirmed")
         } else if Instant::now() >= next_probe {
             next_probe = Instant::now() + Duration::from_secs(1);
-            match terminal::surface_present(surface, remaining.min(Duration::from_secs(2))) {
+            match terminal::surface_present(
+                store.directory(),
+                surface,
+                remaining.min(Duration::from_secs(2)),
+            ) {
                 Ok(false) => {
                     Some("terminal surface disappeared before provider launch was confirmed")
                 }
@@ -774,6 +814,96 @@ mod tests {
         let error = store.status().unwrap().error.unwrap();
         assert!(error.contains("provider spawn is uncertain"), "{error}");
         assert!(!error.contains("no prompt was sent"), "{error}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn retained_handoff_marks_stored_and_returned_diagnostics_once() {
+        for case in ["normal", "lost", "closed", "write", "read"] {
+            let (directory, _) = fixture();
+            let store = Store::open_unchecked(directory.path());
+            if matches!(case, "lost" | "closed") {
+                fail(&store, "launch cancelled").unwrap();
+                if case == "closed" {
+                    session::close::close(&store, None, crate::native::close_deadline(), |_| {
+                        panic!("unbound")
+                    })
+                    .unwrap();
+                }
+            }
+            if case == "write" {
+                fs::create_dir(store.record(CoreRecord::Terminal).path()).unwrap();
+            }
+            if case == "read" {
+                fs::write(store.record(CoreRecord::Launch).path(), "broken").unwrap();
+            }
+            let surface = serde_json::from_value(serde_json::json!({
+                "terminal":"warp", "session_id":"instance-1", "tab_id":"tab-1", "window_id":"window-1"
+            })).unwrap();
+            let error =
+                terminal::RetainedLaunchSurface::new(surface, "exact cleanup failed".into())
+                    .with_unverified_cleanup()
+                    .into();
+            let before = store.status().unwrap();
+            let returned = terminal_failure(&store, error);
+            let text = format!("{returned:#}");
+            assert_eq!(
+                text.matches(RESIDUAL_SURFACE_MARKER).count(),
+                1,
+                "{case}: {text}"
+            );
+            let json = serde_json::json!({"error": text});
+            assert_eq!(
+                json["error"]
+                    .as_str()
+                    .unwrap()
+                    .matches(RESIDUAL_SURFACE_MARKER)
+                    .count(),
+                1
+            );
+            let status = store.status().unwrap();
+            if case == "read" {
+                // A malformed launch record cannot grant a status transition.
+                assert_eq!(status.state, SessionState::Launching);
+                assert_eq!(status.generation, before.generation);
+                assert_eq!(status.updated_unix_ms, before.updated_unix_ms);
+                assert_eq!(
+                    status
+                        .error
+                        .as_deref()
+                        .unwrap()
+                        .matches(RESIDUAL_SURFACE_MARKER)
+                        .count(),
+                    1
+                );
+                assert_eq!(status.residual_surface(), Some(ResidualSurface::Unverified));
+            } else {
+                assert_eq!(
+                    status
+                        .error
+                        .as_deref()
+                        .unwrap()
+                        .matches(RESIDUAL_SURFACE_MARKER)
+                        .count(),
+                    1,
+                    "{case}"
+                );
+                assert_eq!(status.residual_surface(), Some(ResidualSurface::Unverified));
+                if matches!(case, "normal" | "write") {
+                    assert_eq!(status.error.as_deref(), Some(format!("terminal launch failed: exact cleanup failed; {RESIDUAL_SURFACE_MARKER}").as_str()));
+                }
+                if matches!(case, "lost" | "closed") {
+                    assert_eq!(status.generation, before.generation);
+                    assert_eq!(status.updated_unix_ms, before.updated_unix_ms);
+                }
+                if case == "closed" {
+                    assert_eq!(
+                        store.closed_if_present().unwrap().unwrap().error,
+                        status.error
+                    );
+                }
+            }
+        }
     }
 
     #[test]

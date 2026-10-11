@@ -736,6 +736,7 @@ fn terminal_owner_second_verification_uses_close_deadline() {
         || {
             // The first authority proof answers; the second verification stalls.
             terminal::verify_macos_surface(
+                dir.path(),
                 &surface,
                 Some(crate::native::close_remaining(deadline)?),
             )?;

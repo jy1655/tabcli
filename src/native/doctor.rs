@@ -755,6 +755,23 @@ fn surface_check(
         "Inspect the launch log and exact request; this read-only probe does not release a claim or resend input."));
 }
 
+// Adapter fixtures exercise the production observation and doctor mapping together.
+#[cfg(all(test, target_os = "macos"))]
+pub(in crate::native) fn surface_check_for_test(
+    evidence: &mut SessionEvidence,
+    reader: &Reader,
+) -> Check {
+    let mut checks = Vec::new();
+    surface_check(
+        evidence,
+        reader,
+        Instant::now() + Duration::from_secs(2),
+        &mut checks,
+    );
+    assert_eq!(checks.len(), 1);
+    checks.remove(0)
+}
+
 fn owner_check(evidence: &mut SessionEvidence, id: &str, checks: &mut Vec<Check>) {
     use Availability::*;
     let owner = &evidence.owner;
