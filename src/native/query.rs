@@ -9,7 +9,8 @@ use super::{
 #[cfg(test)]
 use super::{EVENTS_DIRECTORY, File, read_event_within_budget};
 use crate::native::session::SessionState;
-use crate::native::session::primitives::{require_valid_session_id, valid_session_id};
+use crate::native::session::enumerate::{CheckOrder, Fault, Scope, enumerate};
+use crate::native::session::primitives::require_valid_session_id;
 use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
 use crate::native::session::{CoreRecord, RecordReader};
 use crate::native::{Context, FromStr};
@@ -1006,14 +1007,14 @@ fn search_session(
 ) -> Result<SessionScan, String> {
     // The manifest alone decides scope, so out-of-scope sessions are never snapshotted.
     let manifest = reader.manifest().map_err(|error| format!("{error:#}"))?;
-    if let SearchScope::Workspace(workspace) = &request.scope
-        && workspace != &manifest.workspace
-    {
-        return Ok(SessionScan::Done);
-    }
-    if request
-        .provider
-        .is_some_and(|provider| provider.as_str() != manifest.provider)
+    if !(Scope {
+        workspace: match &request.scope {
+            SearchScope::Workspace(path) => Some(path),
+            SearchScope::AllWorkspaces => None,
+        },
+        provider: request.provider,
+    })
+    .admits(&manifest)
     {
         return Ok(SessionScan::Done);
     }
@@ -1167,19 +1168,15 @@ pub(super) fn search_value_in(root: &Path, request: &SearchRequest) -> Result<Va
     // The clock starts before enumeration so slow roots count against the budget too.
     let mut scan = SearchScan::new(request.byte_budget);
     let mut ids = Vec::new();
-    match fs::read_dir(root) {
+    match enumerate(root, CheckOrder::IdFirst) {
         Ok(entries) => {
             for entry in entries {
-                let entry = entry.context("failed to read the native state root")?;
-                let id = entry.file_name().to_string_lossy().into_owned();
-                if !valid_session_id(&id) {
-                    continue;
-                }
-                match entry.file_type() {
-                    Ok(kind) if kind.is_dir() => ids.push(id),
-                    Ok(_) => (),
-                    // An unreadable entry may be a session; it is never silently dropped.
-                    Err(error) => scan.incomplete(
+                match entry {
+                    Ok(entry) => ids.push(entry.id),
+                    Err(Fault::Entry(error)) => {
+                        return Err(error).context("failed to read the native state root");
+                    }
+                    Err(Fault::FileType { id, error }) => scan.incomplete(
                         None,
                         format!("session entry {id}: failed to read its file type: {error}"),
                     ),

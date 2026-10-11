@@ -6649,6 +6649,11 @@ fn claim_free_recovery_refuses_an_equivalent_event_in_another_encoding() {
     );
     let listing = cli_sessions(root.path());
     assert_eq!(listing[0]["state"], "ready");
+    assert_eq!(listing[0]["results"], 0);
+    let reader = Reader::open_unchecked(&directory);
+    assert_eq!(reader.published_result_count().unwrap(), 0);
+    let status = query::status::test_value_in(root.path());
+    assert!(status["sessions"][0]["latest_result"].is_null());
     assert_eq!(request_state(&directory, &request_id), before);
     assert!(directory.join(TURN_COMPLETION_FILE).exists());
     assert!(event_path.exists());
@@ -6668,6 +6673,7 @@ fn claim_free_recovery_refuses_an_equivalent_event_in_another_encoding() {
     assert_eq!(kept, pending.event);
     assert!(!directory.join(TURN_COMPLETION_FILE).exists());
     assert!(!recover_pending_completion(&directory).unwrap());
+    assert_eq!(cli_sessions(root.path())[0]["results"], 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -9665,4 +9671,166 @@ fn envelope_command_output_order() {
         fs::read(fixture.directory.join("status.json")).unwrap(),
         before
     );
+}
+
+#[test]
+fn state_root_faults_preserve_repair_and_prune_interleaving() {
+    use session::enumerate::{TestEntry, with_entries};
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-repair");
+    seed_event_written_completion_with(&directory, "result", "result");
+    let entries = |directory: &Path| {
+        vec![
+            Ok(TestEntry {
+                id: directory.file_name().unwrap().to_str().unwrap().into(),
+                directory: directory.into(),
+                directory_kind: Ok(true),
+            }),
+            Err(std::io::Error::other("injected entry failure")),
+        ]
+    };
+    let NativeCommand::Sessions(request) = parse_args(["sessions", "--json"]).unwrap() else {
+        panic!()
+    };
+    let error =
+        with_entries(entries(&directory), || sessions_in(root.path(), &request)).unwrap_err();
+    assert_eq!(error.to_string(), "injected entry failure");
+    assert!(!directory.join(TURN_COMPLETION_FILE).exists());
+    let closed = write_prune_test_session(root.path(), "session-prune", "closed", Some(1));
+    let error =
+        with_entries(entries(&closed), || prune_closed_sessions(root.path(), 2)).unwrap_err();
+    assert_eq!(error.to_string(), "injected entry failure");
+    assert!(!closed.exists());
+}
+
+#[test]
+fn published_count_is_lock_free_and_keeps_rows_when_evidence_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-count");
+    seed_event_written_completion_with(&directory, "result", "result");
+    let reader = Reader::open_unchecked(&directory);
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(directory.join(TURN_CLAIM_LOCK_FILE))
+        .unwrap();
+    lock.lock().unwrap();
+    assert_eq!(reader.published_result_count().unwrap(), 1);
+    // Broken status is irrelevant to both counting and ownership discovery.
+    fs::write(directory.join(STATUS_FILE), "broken").unwrap();
+    let NativeCommand::Sessions(request) = parse_args(["sessions", "--json"]).unwrap() else {
+        panic!()
+    };
+    let rows = sessions_in_read_only(root.path(), &request).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["state"], "unknown");
+    assert_eq!(rows[0]["results"], 1);
+    let rows = session::snapshot::with_snapshot_hook(
+        |directory| {
+            fs::write(directory.join(TURN_CLAIM_FILE), "changed-claim").unwrap();
+        },
+        || sessions_in_read_only(root.path(), &request).unwrap(),
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["results"], 0);
+    assert_eq!(rows[0]["id"], "session-count");
+}
+
+#[test]
+fn published_count_uses_claim_receipts_without_decoding_ordinary_events() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-count");
+    let (_, event_path) = seed_event_written_completion_with(&directory, "result", "result");
+    fs::remove_file(directory.join(TURN_COMPLETION_FILE)).unwrap();
+    let reader = Reader::open_unchecked(&directory);
+    assert_eq!(reader.published_result_count().unwrap(), 0);
+    fs::remove_file(directory.join(TURN_CLAIM_FILE)).unwrap();
+    fs::write(event_path, "not json").unwrap();
+    assert_eq!(reader.published_result_count().unwrap(), 1);
+    fs::write(directory.join("events/event-1-legacy.json"), "legacy").unwrap();
+    fs::write(
+        directory.join("events/unpublished-event-2.json"),
+        "set aside",
+    )
+    .unwrap();
+    assert_eq!(reader.published_result_count().unwrap(), 2);
+    let error = session::snapshot::with_snapshot_hook(
+        |directory| {
+            fs::write(directory.join(TURN_COMPLETION_FILE), "changed").unwrap();
+        },
+        || reader.published_result_count(),
+    )
+    .unwrap_err();
+    assert!(error.is::<session::SnapshotBusy>());
+}
+
+#[test]
+fn enumeration_faults_keep_search_and_listing_error_policies() {
+    use session::enumerate::{TestEntry, with_entries};
+    let root = tempfile::tempdir().unwrap();
+    let NativeCommand::Search(search) =
+        parse_args(["search", "needle", "--all-workspaces", "--json"]).unwrap()
+    else {
+        panic!()
+    };
+    let NativeCommand::Sessions(listing) = parse_args(["sessions", "--json"]).unwrap() else {
+        panic!()
+    };
+    let kind = |id: &str| {
+        vec![Ok(TestEntry {
+            id: id.into(),
+            directory: root.path().join(id),
+            directory_kind: Err(std::io::Error::other("kind fault")),
+        })]
+    };
+    let value = with_entries(kind("session-z"), || {
+        query::search_value_in(root.path(), &search)
+    })
+    .unwrap();
+    assert_eq!(
+        value["incomplete_reasons"],
+        serde_json::json!([{"session": null, "reason": "session entry session-z: failed to read its file type: kind fault"}])
+    );
+    let value = with_entries(kind("invalid"), || {
+        query::search_value_in(root.path(), &search)
+    })
+    .unwrap();
+    assert_eq!(value["incomplete"], false);
+    for id in ["invalid", "session-z"] {
+        let error =
+            with_entries(kind(id), || sessions_in_read_only(root.path(), &listing)).unwrap_err();
+        assert_eq!(error.to_string(), "kind fault");
+        let error = with_entries(kind(id), || prune_closed_sessions(root.path(), 0)).unwrap_err();
+        assert_eq!(error.to_string(), "kind fault");
+    }
+    let error = with_entries(vec![Err(std::io::Error::other("entry fault"))], || {
+        query::search_value_in(root.path(), &search)
+    })
+    .unwrap_err();
+    assert_eq!(
+        format!("{error:#}"),
+        "failed to read the native state root: entry fault"
+    );
+}
+
+#[test]
+fn published_count_rejects_a_receipt_changed_during_the_read() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-count");
+    seed_event_written_completion_with(&directory, "result", "result");
+    let reader = Reader::open_unchecked(&directory);
+    let receipt = requests::list(&reader).unwrap().receipts.remove(0);
+    let error = session::snapshot::with_snapshot_hook(
+        move |directory| {
+            fs::remove_file(
+                directory
+                    .join("requests")
+                    .join(format!("{}.json", receipt.claim_token)),
+            )
+            .unwrap();
+        },
+        || reader.published_result_count(),
+    )
+    .unwrap_err();
+    assert!(error.is::<session::SnapshotBusy>());
 }

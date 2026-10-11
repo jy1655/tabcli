@@ -2,7 +2,7 @@
 use super::*;
 use crate::native::session;
 use crate::native::session::OwnerObservation;
-use crate::native::session::primitives::valid_session_id;
+use crate::native::session::enumerate::{CheckOrder, Fault, Scope, enumerate};
 use observation::{Observation, StatusObservation, SurfaceRecord};
 
 #[derive(Debug)]
@@ -240,27 +240,16 @@ fn value_in(root: &Path, request: &StatusRequest, budget: Duration) -> Result<Va
     let deadline = Instant::now() + budget;
     let mut ids = Vec::new();
     let mut reasons = Vec::new();
-    match fs::read_dir(root) {
+    match enumerate(root, CheckOrder::IdFirst) {
         Ok(entries) => {
             for entry in entries {
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(error) => {
-                        reasons.push(IncompleteReason {
-                            session: None,
-                            reason: format!("failed to read session entry: {error}"),
-                        });
-                        continue;
-                    }
-                };
-                let id = entry.file_name().to_string_lossy().into_owned();
-                if !valid_session_id(&id) {
-                    continue;
-                }
-                match entry.file_type() {
-                    Ok(kind) if kind.is_dir() => ids.push(id),
-                    Ok(_) => (),
-                    Err(error) => reasons.push(IncompleteReason {
+                match entry {
+                    Ok(entry) => ids.push(entry.id),
+                    Err(Fault::Entry(error)) => reasons.push(IncompleteReason {
+                        session: None,
+                        reason: format!("failed to read session entry: {error}"),
+                    }),
+                    Err(Fault::FileType { id, error }) => reasons.push(IncompleteReason {
                         session: Some(id),
                         reason: format!("failed to read session entry file type: {error}"),
                     }),
@@ -284,10 +273,14 @@ fn value_in(root: &Path, request: &StatusRequest, budget: Duration) -> Result<Va
             }
             let reader = Reader::open_unchecked(root.join(&id));
             let manifest = reader.manifest()?;
-            if matches!(&request.scope, SearchScope::Workspace(path) if path != &manifest.workspace)
-                || request
-                    .provider
-                    .is_some_and(|provider| provider.as_str() != manifest.provider)
+            if !(Scope {
+                workspace: match &request.scope {
+                    SearchScope::Workspace(path) => Some(path),
+                    SearchScope::AllWorkspaces => None,
+                },
+                provider: request.provider,
+            })
+            .admits(&manifest)
             {
                 return Ok(None);
             }
@@ -404,3 +397,18 @@ fn human_lines(value: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(in crate::native) fn test_value_in(root: &Path) -> Value {
+    value_in(
+        root,
+        &StatusRequest {
+            scope: SearchScope::AllWorkspaces,
+            provider: None,
+            include_closed: true,
+            json: true,
+        },
+        SEARCH_TIME_BUDGET,
+    )
+    .unwrap()
+}

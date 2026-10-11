@@ -74,6 +74,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   close-record transitions and dead-owner repair; `launch` coordinates spawn, cancellation,
   and the full macOS binding wait. Terminal adapters supply surface identity checks and declare
   binding diagnostics and wait budgets.
+  `enumerate` owns lazy state-root entry traversal and exact workspace/provider scope matching.
+  It returns root-open errors separately from typed entry and file-type faults; callers retain
+  their error policies and validation order. `sessions` repairs and `prune-sessions` deletes in
+  encounter order; `status` and `search` collect ids and sort before observation.
   `state` owns the serialized status and its writes: `Store::update_status` applies
   permitted transitions and generations, while `Store::record_residual_surface` amends
   diagnostics without changing lifecycle fields. Both preserve closed tombstones.
@@ -91,7 +95,12 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   reads, and search retains its cumulative byte budget.
   Inspect, doctor, and `status` render one Observation per session from these readers and publication rules;
   owner process observations and surface probes are added on request, while `sessions` keeps
-  its own lock-free listing after its optional repair.
+  its own lock-free listing after its optional repair. Its `results` counts event paths admitted
+  by the publication predicate used by status and result. `Reader::published_result_count`
+  reads receipts and claim/journal evidence with a before/after consistency check, without
+  locking, retrying, or decoding ordinary event bodies. The journal event comparison uses the
+  existing 64 MiB bound (plus one byte to detect growth). Receipt indexing is read twice for
+  consistency; a count read failure keeps the row with `results: 0`.
 - `src/native/envelope.rs` owns shared envelope defaults, conditional parse-error JSON emission,
   and pretty JSON output. Commands retain their fields, override order, plain-text rendering,
   and error propagation. The module performs no session reads or writes.
