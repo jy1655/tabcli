@@ -218,6 +218,10 @@ fn outcome_error(outcome: &Outcome) -> &anyhow::Error {
 const APPLIED_MARKER: &str = "codex-config-override";
 
 impl NativeProviderAdapter for CodexAdapter {
+    fn result_timeout_diagnostic(&self) -> Option<super::super::doctor::ResultTimeoutDiagnostic> {
+        None
+    }
+
     fn launch_trust(&self) -> crate::native::consent::LaunchTrust {
         crate::native::consent::LaunchTrust {
             answers_launch_dialog: false,

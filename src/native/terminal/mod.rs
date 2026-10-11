@@ -545,20 +545,20 @@ pub(super) struct WindowsSessionRecords<'a> {
 
 #[cfg(target_os = "windows")]
 pub(super) fn windows_console_control(
-    action: &str,
+    action: ConsoleControlAction,
     session: &TerminalSession,
-    input_path: Option<&Path>,
-    submit_count: usize,
-    timeout: Option<std::time::Duration>,
     records: &WindowsSessionRecords<'_>,
 ) -> Result<()> {
-    windows::console_control(action, session, input_path, submit_count, timeout, records)
+    windows::console_control(action, session, records)
 }
 
 #[cfg(target_os = "windows")]
 pub(super) fn windows_console_host(directory: &Path) -> Result<()> {
     windows::run_console_host(directory)
 }
+
+#[cfg(target_os = "windows")]
+pub(super) use windows::ConsoleControlAction;
 
 #[cfg(target_os = "windows")]
 pub(super) use windows::ownership::{windows_console_handle_path, windows_console_root_never_ran};

@@ -515,11 +515,8 @@ fn close_deadline_new_helper_observes_gone_root_and_ends_recorded_live_host() {
     assert!(host.try_wait().unwrap().is_none());
     // This returns before FreeConsole/AttachConsole: it cannot touch the test runner's console.
     let error = super::console_control(
-        "close",
+        super::ConsoleControlAction::Close,
         &session,
-        None,
-        0,
-        None,
         &super::super::WindowsSessionRecords {
             directory: directory.path(),
             root_never_ran: false,

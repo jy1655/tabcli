@@ -1,10 +1,19 @@
-//! Environment policy for Bridge children. Provider adapters own their removal lists;
-//! helpers must not pass any caller's session identity into another application.
+//! Environment policy and deadline-bounded command execution for Bridge children.
+//! Provider adapters own their removal lists; helpers must not pass any caller's
+//! session identity into another application.
 #[cfg(not(windows))]
 use crate::native::session::primitives::{SESSION_DIR_ENV, STATE_DIR_ENV};
-use std::{ffi::OsStr, ffi::OsString, path::Path, process::Command};
+use std::{
+    ffi::OsStr,
+    ffi::OsString,
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 #[cfg(any(not(windows), test))]
 use super::provider;
@@ -59,10 +68,217 @@ fn remove(command: &mut Command, removals: &[&str]) {
     }
 }
 
+#[derive(Debug)]
+pub(in crate::native) struct CommandOutputFailure {
+    error: anyhow::Error,
+    #[cfg_attr(
+        not(any(target_os = "windows", target_os = "macos", test)),
+        allow(dead_code)
+    )]
+    process_started: bool,
+    // The child ran until the deadline and was ended there. Only the macOS AppleScript
+    // runner asks; the other platforms carry the fact without reading it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    timed_out: bool,
+}
+
+impl CommandOutputFailure {
+    pub(in crate::native) fn not_started(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            process_started: false,
+            timed_out: false,
+        }
+    }
+
+    pub(in crate::native) fn started(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            process_started: true,
+            timed_out: false,
+        }
+    }
+
+    fn ended_at_deadline(mut self) -> Self {
+        self.timed_out = true;
+        self
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(in crate::native) fn timed_out(&self) -> bool {
+        self.timed_out
+    }
+
+    #[cfg_attr(
+        not(any(target_os = "windows", target_os = "macos", test)),
+        allow(dead_code)
+    )]
+    pub(in crate::native) fn process_started(&self) -> bool {
+        self.process_started
+    }
+
+    pub(in crate::native) fn into_error(self) -> anyhow::Error {
+        self.error
+    }
+}
+
+pub(in crate::native) fn command_output_until(
+    command: &mut Command,
+    deadline: Instant,
+    label: &str,
+) -> Result<Output> {
+    command_output_until_classified(command, deadline, label)
+        .map_err(CommandOutputFailure::into_error)
+}
+
+pub(in crate::native) fn command_output_until_classified(
+    command: &mut Command,
+    deadline: Instant,
+    label: &str,
+) -> std::result::Result<Output, CommandOutputFailure> {
+    command_output_with_stdin_until_classified(command, Stdio::null(), deadline, label)
+}
+
+pub(in crate::native) fn command_output_with_stdin_until_classified(
+    command: &mut Command,
+    stdin: Stdio,
+    deadline: Instant,
+    label: &str,
+) -> std::result::Result<Output, CommandOutputFailure> {
+    if Instant::now() >= deadline {
+        return Err(CommandOutputFailure::not_started(anyhow::anyhow!(
+            "{label} timed out before it started"
+        )));
+    }
+    let mut stdout = tempfile::tempfile()
+        .with_context(|| format!("failed to create bounded stdout storage for {label}"))
+        .map_err(CommandOutputFailure::not_started)?;
+    let mut stderr = tempfile::tempfile()
+        .with_context(|| format!("failed to create bounded stderr storage for {label}"))
+        .map_err(CommandOutputFailure::not_started)?;
+    let child_stdout = stdout
+        .try_clone()
+        .with_context(|| format!("failed to clone bounded stdout storage for {label}"))
+        .map_err(CommandOutputFailure::not_started)?;
+    let child_stderr = stderr
+        .try_clone()
+        .with_context(|| format!("failed to clone bounded stderr storage for {label}"))
+        .map_err(CommandOutputFailure::not_started)?;
+    if Instant::now() >= deadline {
+        return Err(CommandOutputFailure::not_started(anyhow::anyhow!(
+            "{label} timed out before it started"
+        )));
+    }
+    let mut child = command
+        .stdin(stdin)
+        .stdout(Stdio::from(child_stdout))
+        .stderr(Stdio::from(child_stderr))
+        .spawn()
+        .with_context(|| format!("failed to start {label}"))
+        .map_err(CommandOutputFailure::not_started)?;
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                thread::sleep(remaining.min(Duration::from_millis(20)));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(
+                    CommandOutputFailure::started(anyhow::anyhow!("{label} timed out"))
+                        .ended_at_deadline(),
+                );
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CommandOutputFailure::started(
+                    anyhow::Error::new(error).context(format!("failed to wait for {label}")),
+                ));
+            }
+        }
+    };
+    stdout
+        .seek(SeekFrom::Start(0))
+        .with_context(|| format!("failed to rewind bounded stdout storage for {label}"))
+        .map_err(CommandOutputFailure::started)?;
+    stderr
+        .seek(SeekFrom::Start(0))
+        .with_context(|| format!("failed to rewind bounded stderr storage for {label}"))
+        .map_err(CommandOutputFailure::started)?;
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    stdout
+        .read_to_end(&mut stdout_bytes)
+        .with_context(|| format!("failed to read bounded stdout storage for {label}"))
+        .map_err(CommandOutputFailure::started)?;
+    stderr
+        .read_to_end(&mut stderr_bytes)
+        .with_context(|| format!("failed to read bounded stderr storage for {label}"))
+        .map_err(CommandOutputFailure::started)?;
+    Ok(Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    })
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    // WezTerm's fake runner needs the same timeout classification as the real runner.
+    // Keep the production mutator private to this module.
+    #[cfg(target_os = "macos")]
+    pub(in crate::native) fn timed_out_failure(error: anyhow::Error) -> CommandOutputFailure {
+        CommandOutputFailure::started(error).ended_at_deadline()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_output_terminates_a_hung_child_at_the_deadline() {
+        let mut command = Command::new("/bin/sh");
+        // The background child inherits stdout/stderr. A pipe-reader implementation
+        // would still block after killing only the direct shell process.
+        command.args(["-c", "sleep 1 & wait"]);
+        let started = Instant::now();
+
+        let failure = command_output_until_classified(
+            &mut command,
+            started + Duration::from_millis(100),
+            "test child",
+        )
+        .unwrap_err();
+        assert!(failure.process_started());
+        assert!(failure.timed_out());
+        let error = failure.into_error();
+
+        assert!(format!("{error:#}").contains("test child timed out"));
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_output_identifies_a_pre_spawn_failure() {
+        let mut command = Command::new("/definitely/not/an/agent-bridge-executable");
+
+        let failure = command_output_until_classified(
+            &mut command,
+            Instant::now() + Duration::from_secs(1),
+            "missing test child",
+        )
+        .unwrap_err();
+
+        assert!(!failure.process_started());
+        assert!(!failure.timed_out());
+        assert!(
+            format!("{:#}", failure.into_error()).contains("failed to start missing test child")
+        );
+    }
 
     pub(crate) fn assert_provider_environment(
         command: &Command,

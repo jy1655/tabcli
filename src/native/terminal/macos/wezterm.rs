@@ -54,7 +54,7 @@ use serde::Deserialize;
 
 use super::super::WezTermMux;
 use super::{CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession};
-use crate::native::CommandOutputFailure;
+use crate::native::process_env::CommandOutputFailure;
 
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(100);
@@ -307,7 +307,7 @@ impl Host for Installed {
             .args(["cli", "--no-auto-start"])
             .args(arguments)
             .env("WEZTERM_UNIX_SOCKET", socket);
-        crate::native::command_output_with_stdin_until_classified(
+        crate::native::process_env::command_output_with_stdin_until_classified(
             &mut command,
             stdin,
             deadline,
@@ -1659,20 +1659,18 @@ mod tests {
             if command == "list" {
                 mux.list_count += 1;
                 if mux.list_timeout_at == Some(mux.list_count) {
-                    return Err(
-                        CommandOutputFailure::started(anyhow!("opaque runner failure"))
-                            .ended_at_deadline(),
-                    );
+                    return Err(crate::native::process_env::tests::timed_out_failure(
+                        anyhow!("opaque runner failure"),
+                    ));
                 }
                 if let Some(listing) = mux.first_listing.take() {
                     return Ok(output(0, &listing, ""));
                 }
             }
             if take(&mut mux.timed_out, command) {
-                return Err(
-                    CommandOutputFailure::started(anyhow!("opaque runner failure"))
-                        .ended_at_deadline(),
-                );
+                return Err(crate::native::process_env::tests::timed_out_failure(
+                    anyhow!("opaque runner failure"),
+                ));
             }
             if take(&mut mux.not_started, command) {
                 return Err(CommandOutputFailure::not_started(anyhow!(

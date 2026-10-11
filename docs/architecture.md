@@ -41,6 +41,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 
 - `src/main.rs` contains top-level dispatch and help; `src/native.rs` parses native commands,
   coordinates launch and calls the Delivery seam.
+- `src/native/process_env.rs` owns child environment policy and deadline-bounded command execution;
+  provider-specific execution remains in its adapter.
 - `src/native/delivery.rs` consumes one Claim and owns readiness, injected reopen gates,
   prompt-file framing, surface ownership verification, remaining timeout and send-budget
   checks, begin/send/settlement, and initial-prompt cleanup. Provider adapters explicitly
@@ -60,7 +62,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   the session seam and terminal operations. Keep provider schemas and transport selection in
   `src/native/provider/<provider>/` (or a single `<provider>.rs` file), not in shared orchestration.
 - `src/native/terminal/` selects and implements platform-specific surfaces, input, observation,
-  and close. Its `ownership` module owns owner identity, attestation, close authority, and
+  and close. Native command parsing builds a `ConsoleControlRequest`; after session verification,
+  the Windows adapter executes a typed `ConsoleControlAction` with resolved input and timing.
+  Its `ownership` module owns owner identity, attestation, close authority, and
   the execution of an authorized close; the Terminal.app adapter owns app incarnation.
   macOS operations use `MacTerminalAdapter` through one kind lookup. Each adapter explicitly
   supplies every operation. Shared `open_with` preserves binding and cleanup order; Warp

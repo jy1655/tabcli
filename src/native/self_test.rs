@@ -140,8 +140,9 @@ impl Installed {
 impl Operations for Installed {
     fn call(&mut self, args: &[String], budget: Duration) -> Reply {
         let label = format!("self-test {} command did not return", args[0]);
-        let output = checked_deadline_from(Instant::now(), budget)
-            .and_then(|deadline| command_output_until(&mut self.command(args), deadline, &label));
+        let output = checked_deadline_from(Instant::now(), budget).and_then(|deadline| {
+            process_env::command_output_until(&mut self.command(args), deadline, &label)
+        });
         match output {
             Ok(output) => {
                 let value: Value = serde_json::from_slice(&output.stdout).unwrap_or(Value::Null);

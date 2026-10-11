@@ -219,7 +219,8 @@ pub(super) fn timeout_deadline(timeout: Duration) -> Result<Instant> {
 // not be read before the deadline.
 fn screen_locked(deadline: Instant) -> Option<bool> {
     let mut command = ioreg_command();
-    let output = crate::native::command_output_until(&mut command, deadline, "ioreg").ok()?;
+    let output =
+        crate::native::process_env::command_output_until(&mut command, deadline, "ioreg").ok()?;
     output
         .status
         .success()

@@ -630,8 +630,11 @@ pub(super) fn send_file(
 
 pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Result<String> {
     let mut command = console_helper_command("screen", session, None)?;
-    let output =
-        super::super::command_output_until(&mut command, deadline, "managed console screen")?;
+    let output = crate::native::process_env::command_output_until(
+        &mut command,
+        deadline,
+        "managed console screen",
+    )?;
     if !output.status.success() {
         bail!("{}", console_helper_failure_message(&output));
     }
@@ -692,8 +695,11 @@ pub(super) fn guarded_dialog_input(
             .max(1)
             .to_string(),
     );
-    let output =
-        super::super::command_output_until(&mut command, deadline, "managed console dialog input")?;
+    let output = crate::native::process_env::command_output_until(
+        &mut command,
+        deadline,
+        "managed console dialog input",
+    )?;
     if !output.status.success() {
         bail!("{}", console_helper_failure_message(&output));
     }
@@ -731,7 +737,7 @@ fn run_console_send_helper(
         .context("Windows console timeout is too large")
         .map_err(super::TerminalSendFailure::not_sent)?;
     command.arg(timeout_ms.max(1).to_string());
-    let output = super::super::command_output_until_classified(
+    let output = crate::native::process_env::command_output_until_classified(
         &mut command,
         deadline,
         "Windows console control helper",
@@ -766,8 +772,11 @@ fn run_console_helper(
 }
 
 fn run_console_helper_command(command: &mut Command, deadline: Instant) -> Result<()> {
-    let output =
-        super::super::command_output_until(command, deadline, "Windows console control helper")?;
+    let output = crate::native::process_env::command_output_until(
+        command,
+        deadline,
+        "Windows console control helper",
+    )?;
     if output.status.success() {
         return Ok(());
     }
@@ -804,12 +813,25 @@ fn console_helper_failure_message(output: &std::process::Output) -> String {
     }
 }
 
+pub(in crate::native) enum ConsoleControlAction {
+    Screen,
+    Send {
+        input: PathBuf,
+        submit_count: usize,
+        timeout: Duration,
+    },
+    Dialog {
+        input: PathBuf,
+    },
+    Window {
+        timeout: Duration,
+    },
+    Close,
+}
+
 pub(super) fn console_control(
-    action: &str,
+    action: ConsoleControlAction,
     session: &TerminalSession,
-    input_path: Option<&Path>,
-    submit_count: usize,
-    timeout: Option<Duration>,
     records: &super::WindowsSessionRecords<'_>,
 ) -> Result<()> {
     let pid = session
@@ -820,7 +842,7 @@ pub(super) fn console_control(
         .windows_process_identity
         .as_ref()
         .context("Windows console handle is missing its process identity")?;
-    let close_requested = action == "close";
+    let close_requested = matches!(action, ConsoleControlAction::Close);
     // Read before anything is ended: a close that cannot tell the host of a tab from the
     // session's processes ends nothing and says why.
     let recorded_host = match close_requested {
@@ -840,9 +862,9 @@ pub(super) fn console_control(
         }
     };
     let window_deadline = match action {
-        "window" => Some(
+        ConsoleControlAction::Window { timeout } => Some(
             Instant::now()
-                .checked_add(timeout.context("window requires a console-control timeout")?)
+                .checked_add(timeout)
                 .context("Windows console window timeout is too large")?,
         ),
         _ => None,
@@ -883,14 +905,13 @@ pub(super) fn console_control(
     let mut console_processes = Vec::new();
     let mut tab_host = None;
     let result = match action {
-        "screen" => {
+        ConsoleControlAction::Screen => {
             println!("{}", serde_json::to_string(&attached_screen()?)?);
             Ok(())
         }
-        "dialog" => {
-            let path = input_path.context("dialog requires an input record")?;
+        ConsoleControlAction::Dialog { input: path } => {
             let input: super::GuardedDialogInput = serde_json::from_slice(
-                &crate::native::session::RecordReader::at(path).raw_bytes()?,
+                &crate::native::session::RecordReader::at(&path).raw_bytes()?,
             )?;
             match dialog_decision(&input.screen, &attached_screen()?) {
                 DialogDecision::Changed => println!("changed"),
@@ -901,8 +922,11 @@ pub(super) fn console_control(
             }
             Ok(())
         }
-        "send" => {
-            let timeout = timeout.context("send requires a console-control timeout")?;
+        ConsoleControlAction::Send {
+            input: path,
+            submit_count,
+            timeout,
+        } => {
             if !super::windows_console_submit_delays_fit(submit_count, timeout) {
                 bail!(
                     "Windows console submission delays do not fit inside the remaining turn timeout"
@@ -911,28 +935,24 @@ pub(super) fn console_control(
             let deadline = Instant::now()
                 .checked_add(timeout)
                 .context("Windows console input timeout is too large")?;
-            let path = input_path.context("send requires a prompt path")?;
-            let input = crate::native::session::RecordReader::at(path)
+            let input = crate::native::session::RecordReader::at(&path)
                 .raw_text()
                 .with_context(|| format!("failed to read prompt payload {}", path.display()))?;
             write_console_input(&input, submit_count, deadline)
         }
-        "window" => {
-            let deadline = window_deadline.context("window requires a console-control timeout")?;
-            loop {
-                if let Some(window) = focus::attached_console_host_window() {
-                    println!("{window}");
-                    break Ok(());
-                }
-                if Instant::now() >= deadline {
-                    break Err(anyhow::anyhow!(
-                        "the managed console has no window that hosts it"
-                    ));
-                }
-                std::thread::sleep(CONSOLE_WINDOW_POLL);
+        ConsoleControlAction::Window { .. } => loop {
+            if let Some(window) = focus::attached_console_host_window() {
+                println!("{window}");
+                break Ok(());
             }
-        }
-        "close" => {
+            if window_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                break Err(anyhow::anyhow!(
+                    "the managed console has no window that hosts it"
+                ));
+            }
+            std::thread::sleep(CONSOLE_WINDOW_POLL);
+        },
+        ConsoleControlAction::Close => {
             console_processes = attached_console_processes()?;
             tab_host = tab_host_among(&console_processes, recorded_host.as_ref());
             let window = unsafe { GetConsoleWindow() };
@@ -944,7 +964,6 @@ pub(super) fn console_control(
             }
             Ok(())
         }
-        _ => bail!("unsupported native console action: {action}"),
     };
     unsafe { FreeConsole() };
     result?;

@@ -77,9 +77,9 @@ use std::fs::File;
 use std::{
     ffi::OsString,
     fs::{self, OpenOptions},
-    io::{IsTerminal, Read, Seek, SeekFrom},
+    io::{IsTerminal, Read},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::Command,
     str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
     thread,
@@ -132,10 +132,8 @@ pub(crate) enum NativeCommand {
         arguments: Vec<String>,
     },
     ConsoleControl {
-        action: String,
+        request: ConsoleControlRequest,
         id: String,
-        input_name: Option<String>,
-        timeout_ms: Option<u64>,
     },
     ConsoleHost {
         directory: PathBuf,
@@ -432,6 +430,32 @@ fn parse_provider_control(rest: &[String]) -> Result<NativeCommand> {
     })
 }
 
+// Parsed on every target; paths and provider submission counts are resolved only
+// after the managed session and its surface have been verified.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ConsoleControlRequest {
+    Screen,
+    Send {
+        input_name: String,
+        timeout: Duration,
+    },
+    Dialog {
+        input_name: String,
+        timeout: Duration,
+    },
+    Window {
+        timeout: Duration,
+    },
+    Close,
+}
+
+impl ConsoleControlRequest {
+    #[cfg(windows)]
+    fn needs_only_bound_surface(&self) -> bool {
+        matches!(self, Self::Close | Self::Window { .. })
+    }
+}
+
 fn parse_console_control(rest: &[String]) -> Result<NativeCommand> {
     let [action, id, tail @ ..] = rest else {
         bail!("native-console-control requires an action and managed session id");
@@ -443,29 +467,38 @@ fn parse_console_control(rest: &[String]) -> Result<NativeCommand> {
     ) {
         bail!("unsupported native console action: {action}");
     }
-    let timeout = |timeout_ms: &String| -> Result<u64> {
+    let timeout = |timeout_ms: &String| -> Result<Duration> {
         let timeout_ms = timeout_ms
             .parse::<u64>()
             .context("invalid native console timeout")?;
         if timeout_ms == 0 {
             bail!("native console timeout must be positive");
         }
-        Ok(timeout_ms)
+        Ok(Duration::from_millis(timeout_ms))
     };
-    let (input_name, timeout_ms) = match (action.as_str(), tail) {
-        ("send" | "dialog", [input, timeout_ms]) if valid_pending_prompt_name(input) => {
-            (Some(input.clone()), Some(timeout(timeout_ms)?))
+    let request = match (action.as_str(), tail) {
+        ("send", [input, timeout_ms]) if valid_pending_prompt_name(input) => {
+            ConsoleControlRequest::Send {
+                input_name: input.clone(),
+                timeout: timeout(timeout_ms)?,
+            }
         }
-        ("window", [timeout_ms]) => (None, Some(timeout(timeout_ms)?)),
-        ("close", []) => (None, None),
-        ("screen", []) => (None, None),
+        ("dialog", [input, timeout_ms]) if valid_pending_prompt_name(input) => {
+            ConsoleControlRequest::Dialog {
+                input_name: input.clone(),
+                timeout: timeout(timeout_ms)?,
+            }
+        }
+        ("window", [timeout_ms]) => ConsoleControlRequest::Window {
+            timeout: timeout(timeout_ms)?,
+        },
+        ("close", []) => ConsoleControlRequest::Close,
+        ("screen", []) => ConsoleControlRequest::Screen,
         _ => bail!("invalid native console control arguments"),
     };
     Ok(NativeCommand::ConsoleControl {
-        action: action.clone(),
+        request,
         id: id.clone(),
-        input_name,
-        timeout_ms,
     })
 }
 
@@ -988,12 +1021,7 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
             provider,
             arguments,
         } => provider::run_control(provider, &arguments),
-        NativeCommand::ConsoleControl {
-            action,
-            id,
-            input_name,
-            timeout_ms,
-        } => run_windows_console_control(&action, &id, input_name.as_deref(), timeout_ms),
+        NativeCommand::ConsoleControl { request, id } => run_windows_console_control(request, &id),
         NativeCommand::ConsoleHost { directory } => run_windows_console_host(&directory),
         NativeCommand::Iterm2Host { directory } => terminal::iterm2_host(&directory),
         NativeCommand::AppleTerminalHost { directory } => terminal::apple_terminal_host(&directory),
@@ -1029,32 +1057,27 @@ fn valid_pending_prompt_name(value: &str) -> bool {
 }
 
 #[cfg(target_os = "windows")]
-fn run_windows_console_control(
-    action: &str,
-    id: &str,
-    input_name: Option<&str>,
-    timeout_ms: Option<u64>,
-) -> Result<()> {
+fn run_windows_console_control(request: ConsoleControlRequest, id: &str) -> Result<()> {
     let directory = Reader::session_directory(id)?;
     let manifest = Reader::open_unchecked(&directory).manifest()?;
     let session: terminal::TerminalSession =
-        RecordReader::at(&windows_console_handle_path(&directory, action)).json()?;
+        RecordReader::at(&windows_console_handle_path(&directory, &request)).json()?;
     if session.kind != terminal::TerminalKind::WindowsConsole {
         bail!("managed session is not owned by the Windows console transport");
     }
     // A window is looked up right after the console root was started, before the wrapper
     // has recorded itself as the owner. Like a close, it needs only the bound surface.
-    if matches!(action, "close" | "window") {
+    if request.needs_only_bound_surface() {
         session.verify_managed_session(id)?;
     } else {
         verify_terminal_surface_ownership(&directory, id, &session)?;
     }
-    let input_path = input_name.map(|name| {
+    let input_path = |name: &str| {
         Reader::open_unchecked(&directory)
             .private(name)
             .path()
             .to_owned()
-    });
+    };
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
     let submit_count = provider::initial_transport(provider)
         .facts()
@@ -1064,23 +1087,32 @@ fn run_windows_console_control(
         directory: &directory,
         root_never_ran: windows_console_root_never_ran(&directory),
     };
-    terminal::windows_console_control(
-        action,
-        &session,
-        input_path.as_deref(),
-        submit_count,
-        timeout_ms.map(Duration::from_millis),
-        &records,
-    )
+    let action = match request {
+        ConsoleControlRequest::Screen => terminal::ConsoleControlAction::Screen,
+        ConsoleControlRequest::Send {
+            input_name,
+            timeout,
+        } => terminal::ConsoleControlAction::Send {
+            input: input_path(&input_name),
+            submit_count,
+            timeout,
+        },
+        ConsoleControlRequest::Dialog {
+            input_name,
+            timeout: _,
+        } => terminal::ConsoleControlAction::Dialog {
+            input: input_path(&input_name),
+        },
+        ConsoleControlRequest::Window { timeout } => {
+            terminal::ConsoleControlAction::Window { timeout }
+        }
+        ConsoleControlRequest::Close => terminal::ConsoleControlAction::Close,
+    };
+    terminal::windows_console_control(action, &session, &records)
 }
 
 #[cfg(not(target_os = "windows"))]
-fn run_windows_console_control(
-    _action: &str,
-    _id: &str,
-    _input_name: Option<&str>,
-    _timeout_ms: Option<u64>,
-) -> Result<()> {
+fn run_windows_console_control(_request: ConsoleControlRequest, _id: &str) -> Result<()> {
     bail!("native Windows console control is only available on Windows")
 }
 
@@ -1525,160 +1557,6 @@ fn remaining_turn_timeout(deadline: Instant, requested: Duration) -> Result<Dura
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
         .with_context(|| format!("timed out after {} seconds", requested.as_secs()))
-}
-
-#[derive(Debug)]
-struct CommandOutputFailure {
-    error: anyhow::Error,
-    #[cfg_attr(
-        not(any(target_os = "windows", target_os = "macos", test)),
-        allow(dead_code)
-    )]
-    process_started: bool,
-    // The child ran until the deadline and was ended there. Only the macOS AppleScript
-    // runner asks; the other platforms carry the fact without reading it.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    timed_out: bool,
-}
-
-impl CommandOutputFailure {
-    fn not_started(error: anyhow::Error) -> Self {
-        Self {
-            error,
-            process_started: false,
-            timed_out: false,
-        }
-    }
-
-    fn started(error: anyhow::Error) -> Self {
-        Self {
-            error,
-            process_started: true,
-            timed_out: false,
-        }
-    }
-
-    fn ended_at_deadline(mut self) -> Self {
-        self.timed_out = true;
-        self
-    }
-
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    fn timed_out(&self) -> bool {
-        self.timed_out
-    }
-
-    #[cfg_attr(
-        not(any(target_os = "windows", target_os = "macos", test)),
-        allow(dead_code)
-    )]
-    fn process_started(&self) -> bool {
-        self.process_started
-    }
-
-    fn into_error(self) -> anyhow::Error {
-        self.error
-    }
-}
-
-fn command_output_until(command: &mut Command, deadline: Instant, label: &str) -> Result<Output> {
-    command_output_until_classified(command, deadline, label)
-        .map_err(CommandOutputFailure::into_error)
-}
-
-fn command_output_until_classified(
-    command: &mut Command,
-    deadline: Instant,
-    label: &str,
-) -> std::result::Result<Output, CommandOutputFailure> {
-    command_output_with_stdin_until_classified(command, Stdio::null(), deadline, label)
-}
-
-fn command_output_with_stdin_until_classified(
-    command: &mut Command,
-    stdin: Stdio,
-    deadline: Instant,
-    label: &str,
-) -> std::result::Result<Output, CommandOutputFailure> {
-    if Instant::now() >= deadline {
-        return Err(CommandOutputFailure::not_started(anyhow::anyhow!(
-            "{label} timed out before it started"
-        )));
-    }
-    let mut stdout = tempfile::tempfile()
-        .with_context(|| format!("failed to create bounded stdout storage for {label}"))
-        .map_err(CommandOutputFailure::not_started)?;
-    let mut stderr = tempfile::tempfile()
-        .with_context(|| format!("failed to create bounded stderr storage for {label}"))
-        .map_err(CommandOutputFailure::not_started)?;
-    let child_stdout = stdout
-        .try_clone()
-        .with_context(|| format!("failed to clone bounded stdout storage for {label}"))
-        .map_err(CommandOutputFailure::not_started)?;
-    let child_stderr = stderr
-        .try_clone()
-        .with_context(|| format!("failed to clone bounded stderr storage for {label}"))
-        .map_err(CommandOutputFailure::not_started)?;
-    if Instant::now() >= deadline {
-        return Err(CommandOutputFailure::not_started(anyhow::anyhow!(
-            "{label} timed out before it started"
-        )));
-    }
-    let mut child = command
-        .stdin(stdin)
-        .stdout(Stdio::from(child_stdout))
-        .stderr(Stdio::from(child_stderr))
-        .spawn()
-        .with_context(|| format!("failed to start {label}"))
-        .map_err(CommandOutputFailure::not_started)?;
-
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                thread::sleep(remaining.min(Duration::from_millis(20)));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(
-                    CommandOutputFailure::started(anyhow::anyhow!("{label} timed out"))
-                        .ended_at_deadline(),
-                );
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(CommandOutputFailure::started(
-                    anyhow::Error::new(error).context(format!("failed to wait for {label}")),
-                ));
-            }
-        }
-    };
-    stdout
-        .seek(SeekFrom::Start(0))
-        .with_context(|| format!("failed to rewind bounded stdout storage for {label}"))
-        .map_err(CommandOutputFailure::started)?;
-    stderr
-        .seek(SeekFrom::Start(0))
-        .with_context(|| format!("failed to rewind bounded stderr storage for {label}"))
-        .map_err(CommandOutputFailure::started)?;
-    let mut stdout_bytes = Vec::new();
-    let mut stderr_bytes = Vec::new();
-    stdout
-        .read_to_end(&mut stdout_bytes)
-        .with_context(|| format!("failed to read bounded stdout storage for {label}"))
-        .map_err(CommandOutputFailure::started)?;
-    stderr
-        .read_to_end(&mut stderr_bytes)
-        .with_context(|| format!("failed to read bounded stderr storage for {label}"))
-        .map_err(CommandOutputFailure::started)?;
-    Ok(Output {
-        status,
-        stdout: stdout_bytes,
-        stderr: stderr_bytes,
-    })
 }
 
 fn run_sessions(request: SessionsRequest) -> Result<()> {
@@ -2418,7 +2296,7 @@ fn check_provider_version_until(
     let mut command = version_probe_command(provider, executable)?;
     let label = format!("{} --version", executable.display());
     let output = match deadline {
-        Some(deadline) => command_output_until(&mut command, deadline, &label),
+        Some(deadline) => process_env::command_output_until(&mut command, deadline, &label),
         None => command
             .output()
             .with_context(|| format!("failed to query {label}")),
