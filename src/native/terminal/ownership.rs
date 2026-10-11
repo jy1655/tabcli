@@ -890,15 +890,11 @@ fn prepare_owned_surface_close(
         PreClosePolicy::StopForegroundGroup => {
             let (owner, live) = verified_macos_terminal_owner(directory, id, surface, None)?;
             let shell = live_native_process_identity(live.parent_pid)?;
-            prepare_warp_close(
-                directory,
-                id,
-                surface,
-                &owner,
-                &live,
-                &shell,
-                terminate_owned_foreground_group,
-            )
+            prepare_warp_close(directory, id, surface, &owner, &live, &shell, |group| {
+                terminate_owned_foreground_group(group).context(
+                    "the attested Warp foreground group was not stopped; no tab close was sent",
+                )
+            })
         }
         PreClosePolicy::StopOwnerAndShellGroups => {
             terminate_apple_terminal_owner(directory, id, surface)
@@ -1053,7 +1049,7 @@ fn terminate_owned_foreground_group_with_io(
         if error.raw_os_error() == Some(libc::ESRCH) {
             return Ok(());
         }
-        return Err(error).context("could not stop the attested Warp foreground group");
+        return Err(error).context("could not send SIGTERM to the attested process group");
     }
     #[cfg(test)]
     session::close::interruption::at(session::close::interruption::Point::SignalSent);
@@ -1067,13 +1063,14 @@ fn terminate_owned_foreground_group_with_io(
             // EPERM does not establish absence, including for a zombie-only group
             // (measured on macOS 26.6.2, 2026-10-07, issue #85); only ESRCH does.
             if error.raw_os_error() != Some(libc::EPERM) {
-                return Err(error).context("could not observe the stopped Warp foreground group");
+                return Err(error)
+                    .context("could not observe the attested process group after SIGTERM");
             }
         } else {
             observe(None);
         }
         if Instant::now() >= deadline {
-            bail!("the attested Warp foreground group has not stopped; no tab close was sent");
+            bail!("the attested process group was not confirmed gone before the deadline");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -2208,7 +2205,7 @@ mod process_close_tests {
         let elapsed = started.elapsed();
         assert_eq!(
             result.as_ref().unwrap_err().to_string(),
-            "the attested Warp foreground group has not stopped; no tab close was sent",
+            "the attested process group was not confirmed gone before the deadline",
             "{result:?}"
         );
         assert!(eperm_probes > 0, "no EPERM probe was observed");
@@ -2227,7 +2224,7 @@ mod process_close_tests {
         let error = terminate_owned_foreground_group(child.0.id()).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "could not stop the attested Warp foreground group"
+            "could not send SIGTERM to the attested process group"
         );
         assert_eq!(
             error
