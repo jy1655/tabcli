@@ -32,7 +32,7 @@ pub(in crate::native) mod ownership;
 
 use std::{path::Path, str::FromStr, time::Instant};
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(windows, target_os = "macos")))]
 use anyhow::Context;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -288,7 +288,7 @@ impl TerminalSendFailure {
 pub(super) type TerminalSendResult = std::result::Result<(), TerminalSendFailure>;
 
 #[cfg(any(windows, test))]
-pub(super) fn windows_console_helper_reports_missing(message: &str) -> bool {
+fn windows_console_helper_reports_missing(message: &str) -> bool {
     matches!(
         message.trim(),
         "console process is no longer available" | "Error: console process is no longer available"
@@ -296,7 +296,7 @@ pub(super) fn windows_console_helper_reports_missing(message: &str) -> bool {
 }
 
 #[cfg(any(windows, test))]
-pub(super) fn windows_console_helper_reports_send_not_started(message: &str) -> bool {
+fn windows_console_helper_reports_send_not_started(message: &str) -> bool {
     matches!(
         message.trim(),
         "Windows console submission delays do not fit inside the remaining turn timeout"
@@ -305,20 +305,17 @@ pub(super) fn windows_console_helper_reports_send_not_started(message: &str) -> 
 }
 
 #[cfg(any(windows, test))]
-pub(super) fn windows_console_extra_submit_delay() -> std::time::Duration {
+fn windows_console_extra_submit_delay() -> std::time::Duration {
     std::time::Duration::from_secs(2)
 }
 
 #[cfg(any(windows, test))]
-pub(super) fn windows_console_immediate_submit_count(submit_count: usize) -> usize {
+fn windows_console_immediate_submit_count(submit_count: usize) -> usize {
     usize::from(submit_count == 1)
 }
 
 #[cfg(any(windows, test))]
-pub(super) fn windows_console_submit_delays_fit(
-    submit_count: usize,
-    budget: std::time::Duration,
-) -> bool {
+fn windows_console_submit_delays_fit(submit_count: usize, budget: std::time::Duration) -> bool {
     let delayed = submit_count.saturating_sub(windows_console_immediate_submit_count(submit_count));
     u32::try_from(delayed)
         .ok()
@@ -529,16 +526,7 @@ pub(super) fn surface_present(
     }
     #[cfg(windows)]
     {
-        let _ = (directory, timeout);
-        let pid: u32 = session.id.parse().context("invalid Windows console pid")?;
-        if !agent_bridge::process_is_alive(pid) {
-            return Ok(false);
-        }
-        let identity = session
-            .windows_process_identity
-            .as_ref()
-            .context("console identity is missing")?;
-        Ok(windows_process_identity(pid)? == *identity)
+        windows::surface_present(directory, session, timeout)
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
@@ -767,6 +755,46 @@ pub(super) fn validate_terminal_send_budget_for_platform(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_console_access_denied_is_not_a_missing_surface() {
+        assert!(super::windows_console_helper_reports_missing(
+            "Error: console process is no longer available"
+        ));
+        assert!(!super::windows_console_helper_reports_missing(
+            "Error: console process is no longer available: Access is denied. (os error 5)"
+        ));
+    }
+
+    #[test]
+    fn windows_console_extra_submit_waits_for_paste_confirmation() {
+        assert_eq!(
+            super::windows_console_extra_submit_delay(),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
+    fn windows_console_separates_codex_paste_confirmation_from_the_text_batch() {
+        assert_eq!(super::windows_console_immediate_submit_count(1), 1);
+        assert_eq!(super::windows_console_immediate_submit_count(2), 0);
+    }
+
+    #[test]
+    fn windows_console_rejects_a_submit_plan_that_cannot_fit_the_remaining_budget() {
+        assert!(!super::windows_console_submit_delays_fit(
+            2,
+            Duration::from_secs(4)
+        ));
+        assert!(super::windows_console_submit_delays_fit(
+            2,
+            Duration::from_secs(5)
+        ));
+        assert!(super::windows_console_submit_delays_fit(
+            1,
+            Duration::from_millis(1)
+        ));
+    }
+
     use super::validate_terminal_send_budget_for_platform;
     use std::time::Duration;
     #[test]

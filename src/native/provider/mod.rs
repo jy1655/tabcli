@@ -123,6 +123,7 @@ trait NativeProviderAdapter: Sync {
     fn initial_transport(&self) -> Box<dyn Transport>;
     fn follow_up_transport(&self) -> Box<dyn Transport>;
     fn cancel_support(&self, directory: &Path) -> Result<CancelSupport>;
+    fn launch_trust(&self) -> super::consent::LaunchTrust;
     fn workspace_trust(
         &self,
         workspace: &Path,
@@ -164,6 +165,23 @@ fn adapter(provider: FirstPartyCli) -> &'static dyn NativeProviderAdapter {
         FirstPartyCli::Agy => &agy::ADAPTER,
         FirstPartyCli::Pi => &pi::ADAPTER,
     }
+}
+
+pub(super) fn launch_trust(provider: FirstPartyCli) -> super::consent::LaunchTrust {
+    adapter(provider).launch_trust()
+}
+
+// Native trust waits accept any adapter-declared application marker, independently
+// of the target provider; authorization remains a separate required observation.
+pub(super) fn launch_trust_markers() -> impl Iterator<Item = &'static str> {
+    [
+        FirstPartyCli::Codex,
+        FirstPartyCli::Claude,
+        FirstPartyCli::Agy,
+        FirstPartyCli::Pi,
+    ]
+    .into_iter()
+    .filter_map(|provider| launch_trust(provider).applied_marker)
 }
 
 pub(super) fn workspace_trust(
@@ -274,5 +292,30 @@ fn transport_test_context<'a>(
         bridge_executable: Path::new("bridge"),
         prompt: "provider transport framing",
         deadline: Instant::now() + std::time::Duration::from_secs(30),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adapters_declare_launch_trust_facts() {
+        for (provider, answers, bypass, marker) in [
+            (
+                FirstPartyCli::Codex,
+                false,
+                false,
+                Some("codex-config-override"),
+            ),
+            (FirstPartyCli::Claude, true, true, None),
+            (FirstPartyCli::Agy, true, false, None),
+            (FirstPartyCli::Pi, false, false, Some("pi-approve-once")),
+        ] {
+            let facts = launch_trust(provider);
+            assert_eq!(facts.answers_launch_dialog, answers, "{provider:?}");
+            assert_eq!(facts.bypass_suppresses_dialog, bypass, "{provider:?}");
+            assert_eq!(facts.applied_marker, marker, "{provider:?}");
+        }
     }
 }

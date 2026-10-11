@@ -130,14 +130,18 @@ pub(in crate::native) fn read(reader: &Reader) -> Result<Option<Record>> {
     Ok(record)
 }
 
-/// The existing macOS launch hosts have distinct diagnostics and two wait budgets.
-/// Keeping their selection here leaves adapters responsible only for surface identity.
+/// Adapters declare binding diagnostics and budget; the shared wait owns observation order.
 #[cfg(target_os = "macos")]
-#[derive(Clone, Copy)]
-pub(in crate::native) enum BindingHost {
-    Iterm2,
-    AppleTerminal,
-    WezTerm,
+pub(in crate::native) struct BindingFacts {
+    pub(in crate::native) host: &'static str,
+    pub(in crate::native) cancelled: &'static str,
+    pub(in crate::native) budget: BindingBudget,
+}
+
+#[cfg(target_os = "macos")]
+pub(in crate::native) enum BindingBudget {
+    StartTimeout,
+    RemainingReceiptCapped,
 }
 
 /// Observe a pending launch until its managed surface is bound. This is an ordered,
@@ -146,30 +150,18 @@ pub(in crate::native) enum BindingHost {
 pub(in crate::native) fn wait_for_binding(
     reader: &Reader,
     session_id: &str,
-    host: BindingHost,
+    facts: &BindingFacts,
 ) -> Result<terminal::TerminalSession> {
-    let (name, cancelled) = match host {
-        BindingHost::Iterm2 => (
-            "iTerm2",
-            "iTerm2 launch was cancelled or timed out before surface binding",
-        ),
-        BindingHost::AppleTerminal => (
-            "Terminal.app",
-            "Terminal.app launch was cancelled or timed out before its surface was bound",
-        ),
-        BindingHost::WezTerm => (
-            "WezTerm",
-            "WezTerm launch was cancelled or timed out before surface binding",
-        ),
-    };
+    let name = facts.host;
+    let cancelled = facts.cancelled;
     let initial = read(reader)?.with_context(|| format!("missing {name} launch receipt"))?;
     #[cfg(test)]
     binding_tests::checkpoint(binding_tests::Point::InitialReceipt);
     // Preserve both budgets: after wall-clock rollback or a receipt extension,
-    // Terminal.app may continue beyond the initial receipt's remaining duration.
-    let budget = match host {
-        BindingHost::AppleTerminal => START_TIMEOUT,
-        BindingHost::Iterm2 | BindingHost::WezTerm => Duration::from_millis(
+    // The start-timeout budget may continue beyond the initial receipt's remaining duration.
+    let budget = match facts.budget {
+        BindingBudget::StartTimeout => START_TIMEOUT,
+        BindingBudget::RemainingReceiptCapped => Duration::from_millis(
             initial
                 .deadline_unix_ms
                 .saturating_sub(unix_ms())

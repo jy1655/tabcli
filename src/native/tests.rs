@@ -2502,46 +2502,6 @@ fn terminal_input_framing_matches_each_adapter_contract() {
 }
 
 #[test]
-fn windows_console_access_denied_is_not_a_missing_surface() {
-    assert!(terminal::windows_console_helper_reports_missing(
-        "Error: console process is no longer available"
-    ));
-    assert!(!terminal::windows_console_helper_reports_missing(
-        "Error: console process is no longer available: Access is denied. (os error 5)"
-    ));
-}
-
-#[test]
-fn windows_console_extra_submit_waits_for_paste_confirmation() {
-    assert_eq!(
-        terminal::windows_console_extra_submit_delay(),
-        Duration::from_secs(2)
-    );
-}
-
-#[test]
-fn windows_console_separates_codex_paste_confirmation_from_the_text_batch() {
-    assert_eq!(terminal::windows_console_immediate_submit_count(1), 1);
-    assert_eq!(terminal::windows_console_immediate_submit_count(2), 0);
-}
-
-#[test]
-fn windows_console_rejects_a_submit_plan_that_cannot_fit_the_remaining_budget() {
-    assert!(!terminal::windows_console_submit_delays_fit(
-        2,
-        Duration::from_secs(4)
-    ));
-    assert!(terminal::windows_console_submit_delays_fit(
-        2,
-        Duration::from_secs(5)
-    ));
-    assert!(terminal::windows_console_submit_delays_fit(
-        1,
-        Duration::from_millis(1)
-    ));
-}
-
-#[test]
 fn claim_release_waits_for_the_lifecycle_lock_before_deleting() {
     let directory = tempfile::tempdir().unwrap();
     let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();

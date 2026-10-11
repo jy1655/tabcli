@@ -410,8 +410,9 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
 }
 
 fn wait_for_binding(directory: &Path, id: &str, iterm_id: &str) -> Result<()> {
-    use crate::native::launch::{BindingHost, wait_for_binding};
-    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BindingHost::Iterm2)?;
+    use crate::native::launch::wait_for_binding;
+    use crate::native::terminal::facts::iterm2::BINDING;
+    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, &BINDING)?;
     if surface.kind != TerminalKind::Iterm2 || surface.id != iterm_id {
         bail!("iTerm2 surface binding does not match this launch host");
     }
