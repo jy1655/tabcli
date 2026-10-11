@@ -469,7 +469,7 @@ fn close_deadline_repair_after_slow_owner_observation_does_not_settle() {
         |_| panic!("expired repair must not close"),
         deadline,
     );
-    assert!(result.unwrap_err().to_string().contains("deadline"));
+    assert!(format!("{:#}", result.unwrap_err()).contains("deadline"));
     assert!(store.closed_if_present().unwrap().is_none());
 }
 
@@ -490,7 +490,7 @@ fn close_deadline_preclose_repair_does_not_get_another_budget() {
         |_| panic!("repair spent the close deadline"),
         deadline,
     );
-    assert!(result.unwrap_err().to_string().contains("deadline"));
+    assert!(format!("{:#}", result.unwrap_err()).contains("deadline"));
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
 }
 

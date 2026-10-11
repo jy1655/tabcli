@@ -955,7 +955,7 @@ mod tests {
                 },
                 deadline,
             );
-            assert!(result.unwrap_err().to_string().contains("deadline"));
+            assert!(format!("{:#}", result.unwrap_err()).contains("deadline"));
             assert_eq!(calls.get(), expire_at);
             assert!(births.get() >= 1);
         }

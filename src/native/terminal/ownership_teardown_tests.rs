@@ -579,7 +579,7 @@ fn close_deadline_after_authority_does_not_start_mutation() {
         deadline,
     );
     assert!(observed.get(), "authority must run before expiry");
-    assert!(result.unwrap_err().to_string().contains("deadline"));
+    assert!(format!("{:#}", result.unwrap_err()).contains("deadline"));
 }
 
 #[test]
@@ -710,7 +710,7 @@ fn close_deadline_after_signal_eperm_does_not_prove_exit() {
         },
         |_| {},
     );
-    assert!(result.unwrap_err().to_string().contains("deadline"));
+    assert!(format!("{:#}", result.unwrap_err()).contains("deadline"));
     assert_eq!(signals.get(), 1);
 }
 
