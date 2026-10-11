@@ -115,7 +115,7 @@
     "Yes, I trust this folder": 2,
     "No, exit": 2,
     "❯ Yes, I trust this folder": 1,
-    "const CLAUDE_CODE_SESSION_MARKERS: &[&str] = &[\n    \"CLAUDE_CODE_CHILD_SESSION\",\n    \"CLAUDECODE\",\n    \"CLAUDE_CODE_SESSION_ID\",\n    \"CLAUDE_PID\",\n    \"CLAUDE_CODE_MESSAGING_SOCKET\",\n    \"CLAUDE_CODE_MESSAGING_TOKEN\",\n    \"CLAUDE_CODE_SESSION_ATTENDED\",\n    \"CLAUDE_CODE_ENTRYPOINT\",\n    \"CLAUDE_CODE_EXECPATH\",\n    \"CLAUDE_EFFORT\",\n];": 1
+    "const CLAUDE_CODE_SESSION_MARKERS: &[&str] = &[\n    \"AI_AGENT\",\n    \"CLAUDE_CODE_BRIDGE_SESSION_ID\",\n    \"CLAUDE_CODE_CHILD_SESSION\",\n    \"CLAUDECODE\",\n    \"CLAUDE_CODE_SESSION_ID\",\n    \"CLAUDE_PID\",\n    \"CLAUDE_CODE_MESSAGING_SOCKET\",\n    \"CLAUDE_CODE_MESSAGING_TOKEN\",\n    \"CLAUDE_CODE_SESSION_ATTENDED\",\n    \"CLAUDE_CODE_ENTRYPOINT\",\n    \"CLAUDE_CODE_EXECPATH\",\n    \"CLAUDE_EFFORT\",\n];": 1
   },
   "src/native/provider/codex.rs": {
     "const PENDING_TURN_FILE: &str = \"codex-pending-turn.json\";": 1,

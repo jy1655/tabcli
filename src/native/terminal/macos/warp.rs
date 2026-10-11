@@ -347,7 +347,7 @@ impl WarpRunner for ProcessRunner {
 }
 
 fn control_command(client: &ControlClient, args: &[String]) -> Command {
-    let mut command = Command::new(&client.executable);
+    let mut command = crate::native::process_env::helper_command(&client.executable);
     if client.inject_warpctrl {
         command.arg("--warpctrl");
     }
@@ -356,7 +356,7 @@ fn control_command(client: &ControlClient, args: &[String]) -> Command {
 }
 
 fn dispatch_command(client: &ControlClient, uri: &str) -> Command {
-    let mut command = Command::new("/usr/bin/open");
+    let mut command = crate::native::process_env::helper_command("/usr/bin/open");
     command.arg("-a").arg(&client.bundle).arg(uri);
     command
 }
@@ -1977,6 +1977,43 @@ fn terminate_owned_foreground_group_with(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launch_context_does_not_depend_on_terminal_environment() {
+        if !crate::native::process_env::tests::without_bridge_environment(
+            module_path!(),
+            "launch_context_does_not_depend_on_terminal_environment",
+        ) {
+            return;
+        }
+
+        let directory = Path::new("/custom state/session-e1");
+        let wrapper = crate::native::process_env::tests::wrapper_for(directory);
+        let (passed_directory, command) =
+            host_launch_command(directory, "attempt-e1", &wrapper).unwrap();
+        assert_eq!(passed_directory, directory.to_str().unwrap());
+        assert!(command.contains("native-warp-host '/custom state/session-e1' 'attempt-e1'"));
+        assert!(command.ends_with(&wrapper));
+    }
+
+    #[test]
+    fn control_and_dispatch_drop_caller_session_environment() {
+        let client = ControlClient {
+            bundle: "/Applications/Warp.app".into(),
+            executable: "/unused/warp".into(),
+            inject_warpctrl: true,
+            app_id: "test".into(),
+            channel: "test".into(),
+            scheme: "warp".into(),
+            config_dir: "/unused".into(),
+        };
+        for command in [
+            control_command(&client, &[]),
+            dispatch_command(&client, "warp://test"),
+        ] {
+            crate::native::process_env::tests::assert_helper_environment(&command, &[]);
+        }
+    }
+
     use std::{cell::Cell, os::unix::process::CommandExt};
 
     use super::*;

@@ -10,12 +10,14 @@ use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Stor
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+#[cfg(test)]
+use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{
     ffi::OsString,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     thread,
     time::Duration,
@@ -45,14 +47,18 @@ const PROVIDER_STOPPED_CALL_RESULT: &str =
     "Not run: the response that made this tool call was stopped by a safety classifier.";
 const PENDING_TURN_FILE: &str = "claude-pending-turn.json";
 // Session markers Claude Code exports into every process it spawns (Bash, hooks, plugin
-// scripts). An interactive `claude` that inherits CLAUDE_CODE_CHILD_SESSION treats itself
-// as a nested child: it disables transcript persistence and never registers its
+// scripts). These are values Claude Code exports about its own session, including
+// AI_AGENT and CLAUDE_CODE_BRIDGE_SESSION_ID (observed 2026-10-11 in an application
+// started from a Claude Code Bash tool). An interactive `claude` that inherits
+// CLAUDE_CODE_CHILD_SESSION treats itself as a nested child: it disables transcript persistence and never registers its
 // cross-session inbox, so ListAgents cannot discover it and SendMessage cannot reach it.
 // The managed session must be an independent top-level session, and the messenger must
 // not be classified as a child either, so both launches drop the whole marker set. User
 // configuration such as ANTHROPIC_* or CLAUDE_CONFIG_DIR is deliberately left alone.
 // Removable if Claude Code stops deriving session identity from inherited markers.
 const CLAUDE_CODE_SESSION_MARKERS: &[&str] = &[
+    "AI_AGENT",
+    "CLAUDE_CODE_BRIDGE_SESSION_ID",
     "CLAUDE_CODE_CHILD_SESSION",
     "CLAUDECODE",
     "CLAUDE_CODE_SESSION_ID",
@@ -506,6 +512,15 @@ fn claude_trust_prompt_key(screen: &str, workspace: &Path) -> Option<terminal::D
     }
 }
 
+fn git_workspace_command(workspace: &Path) -> Result<std::process::Command> {
+    let mut command = crate::native::process_env::helper_command("git");
+    command
+        .arg("-C")
+        .arg(super::super::consent::native_key(workspace)?)
+        .args(["rev-parse", "--show-toplevel"]);
+    Ok(command)
+}
+
 fn require_exact_claude_trust_scope(workspace: &Path) -> Result<()> {
     // LIVE: Claude 2.1.284 displays a repository subdirectory but saves approval
     // at the Git root. Do not expand an exact child consent to that ancestor.
@@ -521,11 +536,7 @@ fn require_exact_claude_trust_scope(workspace: &Path) -> Result<()> {
     if !has_git_ancestor {
         return Ok(());
     }
-    let mut command = Command::new("git");
-    command
-        .arg("-C")
-        .arg(super::super::consent::native_key(workspace)?)
-        .args(["rev-parse", "--show-toplevel"]);
+    let mut command = git_workspace_command(workspace)?;
     let output = super::super::command_output_until(
         &mut command,
         Instant::now() + Duration::from_secs(2),
@@ -1448,6 +1459,24 @@ fn send_cross_session_message_with_discovery_retry_policy(
     }
 }
 
+fn messenger_command(
+    executable: &Path,
+    directory: &Path,
+    arguments: Vec<OsString>,
+) -> Result<std::process::Command> {
+    let mut command = super::super::process_env::provider_command(
+        executable,
+        directory,
+        arguments,
+        CLAUDE_CODE_SESSION_MARKERS,
+    )?;
+    configure_process_tree(&mut command);
+    command
+        .current_dir(directory)
+        .env(super::super::SESSION_DIR_ENV, directory);
+    Ok(command)
+}
+
 fn send_cross_session_message_inner(
     context: CrossSessionMessageContext<'_>,
 ) -> CrossSessionMessageResult {
@@ -1461,14 +1490,8 @@ fn send_cross_session_message_inner(
         &plan.files,
     )
     .map_err(CrossSessionMessageFailure::not_sent)?;
-    let mut command = super::super::provider_process::command(
-        context.provider_path,
-        context.directory,
-        plan.arguments,
-    )
-    .map_err(CrossSessionMessageFailure::not_sent)?;
-    configure_process_tree(&mut command);
-    super::apply_environment_removals(&mut command, CLAUDE_CODE_SESSION_MARKERS);
+    let mut command = messenger_command(context.provider_path, context.directory, plan.arguments)
+        .map_err(CrossSessionMessageFailure::not_sent)?;
     let mut stdout = tempfile::tempfile()
         .context("failed to create Claude messenger stdout buffer")
         .map_err(CrossSessionMessageFailure::not_sent)?;
@@ -1484,8 +1507,6 @@ fn send_cross_session_message_inner(
         .context("failed to clone Claude messenger stderr buffer")
         .map_err(CrossSessionMessageFailure::not_sent)?;
     let mut child = command
-        .current_dir(context.directory)
-        .env(super::super::SESSION_DIR_ENV, context.directory)
         .stdin(Stdio::piped())
         .stdout(Stdio::from(stdout_sink))
         .stderr(Stdio::from(stderr_sink))
@@ -1964,6 +1985,26 @@ pub(super) fn hook_settings(executable: &Path) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn messenger_keeps_only_claude_removals_and_its_explicit_session_directory() {
+        let directory = std::path::Path::new(".");
+        let command =
+            super::messenger_command(std::path::Path::new("unused"), directory, vec![]).unwrap();
+        crate::native::process_env::tests::assert_provider_environment(
+            &command,
+            super::CLAUDE_CODE_SESSION_MARKERS,
+            &[(crate::native::SESSION_DIR_ENV, Some(directory.as_os_str()))],
+        );
+    }
+
+    #[test]
+    fn git_probe_drops_caller_session_environment() {
+        crate::native::process_env::tests::assert_helper_environment(
+            &super::git_workspace_command(std::path::Path::new("/workspace")).unwrap(),
+            &[],
+        );
+    }
+
+    #[test]
     fn workspace_trust_and_dialog_require_the_exact_workspace() {
         use super::super::super::consent::{self, Trust};
         let tmp = tempfile::tempdir().unwrap();
@@ -2328,6 +2369,9 @@ mod tests {
             probe_environment_removals(FirstPartyCli::Claude),
             CLAUDE_CODE_SESSION_MARKERS
         );
+        for marker in ["AI_AGENT", "CLAUDE_CODE_BRIDGE_SESSION_ID"] {
+            assert!(probe_environment_removals(FirstPartyCli::Claude).contains(&marker));
+        }
         for other in [FirstPartyCli::Codex, FirstPartyCli::Agy, FirstPartyCli::Pi] {
             assert!(probe_environment_removals(other).is_empty(), "{other:?}");
         }
@@ -2357,6 +2401,8 @@ mod tests {
                     .contains(&"CLAUDE_CODE_CHILD_SESSION")
             );
             for marker in [
+                "AI_AGENT",
+                "CLAUDE_CODE_BRIDGE_SESSION_ID",
                 "CLAUDECODE",
                 "CLAUDE_CODE_SESSION_ID",
                 "CLAUDE_PID",
@@ -2367,7 +2413,14 @@ mod tests {
                 assert!(plan.environment_removals.contains(&marker), "{marker}");
             }
             // User configuration is not the adapter's to strip.
-            for kept in ["ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR", "PATH", "HOME"] {
+            for kept in [
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_MODEL",
+                "CLAUDE_CONFIG_DIR",
+                "PATH",
+                "HOME",
+            ] {
                 assert!(!plan.environment_removals.contains(&kept), "{kept}");
             }
         }

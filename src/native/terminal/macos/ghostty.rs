@@ -1037,6 +1037,39 @@ pub(super) fn close_session_until(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launch_context_does_not_depend_on_terminal_environment() {
+        if !crate::native::process_env::tests::without_bridge_environment(
+            module_path!(),
+            "launch_context_does_not_depend_on_terminal_environment",
+        ) {
+            return;
+        }
+
+        let directory = launch_fixture();
+        let surface = handle(&CreatedSurface {
+            tab_id: "t2".into(),
+            window_id: "w1".into(),
+            terminal_id: "u2".into(),
+        });
+        bind_fixture(directory.path(), &surface);
+        let token = crate::native::launch::read(&Reader::open_unchecked(directory.path()))
+            .unwrap()
+            .unwrap()
+            .claim_token;
+        let wrapper = crate::native::process_env::tests::wrapper_for(directory.path());
+        launch_command(directory.path(), &wrapper, None).unwrap();
+        let frame = host_frame(directory.path(), &token).unwrap();
+        let (received_token, received_directory) = parse_frame(frame.as_bytes()).unwrap().unwrap();
+        assert_eq!(received_directory, directory.path());
+        let script = verify_launch(&received_directory, &received_token).unwrap();
+        assert_eq!(script, directory.path().join("ghostty-start.sh"));
+        assert_eq!(
+            std::fs::read_to_string(script).unwrap(),
+            format!("{wrapper}\n")
+        );
+    }
+
     use super::*;
     #[test]
     fn bound_start_preserves_invoking_path_for_env_interpreters() {

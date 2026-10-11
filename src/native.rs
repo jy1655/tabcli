@@ -7,6 +7,7 @@ mod consent;
 mod context;
 mod doctor;
 mod hold;
+mod process_env;
 mod provider;
 mod provider_process;
 mod query;
@@ -58,9 +59,8 @@ use terminal::ownership::{current_native_session_owner, verified_windows_native_
 #[cfg(windows)]
 use terminal::{windows_console_handle_path, windows_console_root_never_ran};
 
-use provider_process::{
-    command as provider_process_command, version_command as provider_version_command,
-};
+#[cfg(all(test, windows))]
+use provider_process::command as provider_process_command;
 
 use std::{
     ffi::OsString,
@@ -2452,9 +2452,12 @@ fn run_session_inner(directory: &Path) -> Result<()> {
     }
 
     let completion_monitor = completion_monitor.start(directory)?;
-    let mut provider_command =
-        provider_process_command(&manifest.provider_path, directory, arguments)?;
-    provider::apply_environment_removals(&mut provider_command, environment_removals);
+    let mut provider_command = process_env::provider_command(
+        &manifest.provider_path,
+        directory,
+        arguments,
+        environment_removals,
+    )?;
     // The reopen ownership gate ran read-only before the source was claimed; the provider
     // grants no exclusive hold on the conversation, so it runs again here, after every other
     // preparation and immediately before the process exists. A holder that appeared in
@@ -2470,12 +2473,13 @@ fn run_session_inner(directory: &Path) -> Result<()> {
             format!("{error:#}"),
         ));
     }
-    provider_command
-        .current_dir(&manifest.workspace)
-        .env(SESSION_DIR_ENV, directory)
-        .env("AGENT_BRIDGE_NATIVE_SESSION_ID", &manifest.id)
-        .env("AGENT_BRIDGE_EXECUTABLE", &executable);
-    launch::provider_stderr(&mut provider_command);
+    configure_provider_launch(
+        &mut provider_command,
+        &manifest.workspace,
+        directory,
+        &manifest.id,
+        &executable,
+    );
     // Spawn and its durable identity are fenced against cancellation by the lifecycle
     // lock. Failed identity recording ends the child but stays delivery-uncertain: an
     // argument-delivered prompt could already have been consumed before cleanup.
@@ -2671,6 +2675,30 @@ fn resolve_provider_from_path(provider: FirstPartyCli, path: &std::ffi::OsStr) -
     )
 }
 
+fn configure_provider_launch(
+    command: &mut Command,
+    workspace: &Path,
+    directory: &Path,
+    id: &str,
+    executable: &Path,
+) {
+    command
+        .current_dir(workspace)
+        .env(SESSION_DIR_ENV, directory)
+        .env("AGENT_BRIDGE_NATIVE_SESSION_ID", id)
+        .env("AGENT_BRIDGE_EXECUTABLE", executable);
+    launch::provider_stderr(command);
+}
+
+fn version_probe_command(provider: FirstPartyCli, executable: &Path) -> Result<Command> {
+    let mut command = process_env::provider_version_command(
+        executable,
+        provider::probe_environment_removals(provider),
+    )?;
+    command.arg("--version");
+    Ok(command)
+}
+
 fn check_provider_version(provider: FirstPartyCli, executable: &Path) -> Result<String> {
     check_provider_version_until(provider, executable, None)
 }
@@ -2680,12 +2708,7 @@ fn check_provider_version_until(
     executable: &Path,
     deadline: Option<Instant>,
 ) -> Result<String> {
-    let mut command = provider_version_command(executable)?;
-    command.arg("--version");
-    provider::apply_environment_removals(
-        &mut command,
-        provider::probe_environment_removals(provider),
-    );
+    let mut command = version_probe_command(provider, executable)?;
     let label = format!("{} --version", executable.display());
     let output = match deadline {
         Some(deadline) => command_output_until(&mut command, deadline, &label),

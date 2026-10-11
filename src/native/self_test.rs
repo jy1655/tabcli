@@ -127,11 +127,9 @@ impl Installed {
     }
 
     fn command(&self, args: &[String]) -> Command {
-        let mut command = Command::new(&self.executable);
+        let mut command = crate::native::process_env::helper_command(&self.executable);
         command.args(args);
-        if self.isolated {
-            command.env(STATE_DIR_ENV, &self.root);
-        }
+        command.env(STATE_DIR_ENV, &self.root);
         command
     }
 }

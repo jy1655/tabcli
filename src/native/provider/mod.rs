@@ -343,15 +343,6 @@ pub(super) fn override_claude_session_registry_for_test(registry: Option<PathBuf
     claude::override_session_registry_for_test(registry);
 }
 
-// Applies an adapter's caller-environment removals to a provider process before it
-// starts. Removal is recorded on the command itself so a test can prove the variable
-// never reaches the child without spawning it.
-pub(super) fn apply_environment_removals(command: &mut std::process::Command, removals: &[&str]) {
-    for variable in removals {
-        command.env_remove(variable);
-    }
-}
-
 pub(super) fn follow_up_transport(provider: FirstPartyCli) -> FollowUpTransport {
     adapter(provider).follow_up_transport()
 }
@@ -467,28 +458,4 @@ pub(super) fn cancel_terminal_follow_up(
     claim_token: &str,
 ) -> Result<()> {
     adapter(provider).cancel_terminal_follow_up(directory, claim_token)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn environment_removals_are_recorded_on_the_command_before_spawn() {
-        let mut command = std::process::Command::new("provider");
-        command.env("CLAUDE_CODE_CHILD_SESSION", "1");
-        apply_environment_removals(&mut command, &["CLAUDE_CODE_CHILD_SESSION", "CLAUDECODE"]);
-        let removed = command
-            .get_envs()
-            .filter(|(_, value)| value.is_none())
-            .map(|(key, _)| key.to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            removed,
-            vec![
-                std::ffi::OsString::from("CLAUDECODE"),
-                std::ffi::OsString::from("CLAUDE_CODE_CHILD_SESSION"),
-            ]
-        );
-    }
 }

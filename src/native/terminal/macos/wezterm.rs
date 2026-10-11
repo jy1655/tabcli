@@ -99,7 +99,7 @@ pub(super) struct Installed;
 // inside WezTerm inherits its socket, its pane and its configuration paths.
 fn wezterm_command(inherited: impl Iterator<Item = OsString>) -> Command {
     let bundled = Path::new("/Applications/WezTerm.app/Contents/MacOS/wezterm");
-    let mut command = Command::new(if bundled.is_file() {
+    let mut command = crate::native::process_env::helper_command(if bundled.is_file() {
         bundled
     } else {
         Path::new("wezterm")
@@ -735,18 +735,22 @@ pub(super) fn create_surface(
     directory: &Path,
     deadline: Instant,
 ) -> Result<TerminalSession> {
+    create(
+        host,
+        force_new_window,
+        &host_pane_program(command, directory)?,
+        deadline,
+    )
+}
+
+fn host_pane_program(command: &str, directory: &Path) -> Result<[String; 5]> {
     let executable = env::current_exe().context("failed to resolve Agent Bridge executable")?;
     let gate = format!(
         "{} native-wezterm-host {}",
         shell_quote(executable.as_os_str()),
         shell_quote(directory.as_os_str())
     );
-    create(
-        host,
-        force_new_window,
-        &pane_program(&gate, command),
-        deadline,
-    )
+    Ok(pane_program(&gate, command))
 }
 
 fn create(
@@ -1117,6 +1121,29 @@ pub(super) fn close_session_until(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launch_context_does_not_depend_on_terminal_environment() {
+        if !crate::native::process_env::tests::without_bridge_environment(
+            module_path!(),
+            "launch_context_does_not_depend_on_terminal_environment",
+        ) {
+            return;
+        }
+
+        let directory = Path::new("/custom state/session-e1");
+        let wrapper = crate::native::process_env::tests::wrapper_for(directory);
+        let program = host_pane_program(&wrapper, directory).unwrap();
+        assert_eq!(&program[..4], ["/bin/zsh", "-l", "-i", "-c"]);
+        assert!(program[4].contains("native-wezterm-host '/custom state/session-e1'"));
+        assert!(program[4].ends_with(&wrapper));
+        let command = gui_command(std::iter::empty(), &program);
+        crate::native::process_env::tests::assert_helper_environment(&command, &[]);
+        assert_eq!(
+            command.get_args().skip(4).collect::<Vec<_>>(),
+            program.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>()
+        );
+    }
+
     use crate::native::session::SessionState;
 
     #[test]
@@ -1925,21 +1952,14 @@ mod tests {
             gui_command(inherited.iter().map(OsString::from), &program()),
             wezterm_command(inherited.iter().map(OsString::from)),
         ] {
-            let removed: Vec<_> = command
-                .get_envs()
-                .map(|(name, value)| {
-                    assert_eq!(value, None);
-                    name.to_str().unwrap().to_owned()
-                })
-                .collect();
-            assert_eq!(
-                removed,
-                [
-                    "WEZTERM_CONFIG_FILE",
-                    "WEZTERM_EXECUTABLE",
-                    "WEZTERM_PANE",
-                    "WEZTERM_UNIX_SOCKET"
-                ]
+            crate::native::process_env::tests::assert_helper_environment(
+                &command,
+                &[
+                    ("WEZTERM_CONFIG_FILE", None),
+                    ("WEZTERM_EXECUTABLE", None),
+                    ("WEZTERM_PANE", None),
+                    ("WEZTERM_UNIX_SOCKET", None),
+                ],
             );
         }
         // Never the request to an existing process, never a mux domain of the user, and

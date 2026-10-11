@@ -150,6 +150,7 @@ on run argv
     set wantedWindowId to item 2 of argv as integer
     set promptPath to item 3 of argv
     set promptText to read (POSIX file promptPath) as «class utf8»
+    if not application "Terminal" is running then error "Agent Bridge Terminal.app send: not running"
     tell application "Terminal"
         try
             set targetWindow to first window whose id is wantedWindowId
@@ -289,14 +290,7 @@ pub(super) fn create_tab(
     directory: &Path,
     deadline: Instant,
 ) -> Result<TerminalSession> {
-    let executable =
-        std::env::current_exe().context("failed to resolve Agent Bridge executable")?;
-    let host = format!(
-        "{} native-terminal-host {}",
-        crate::native::shell_quote(executable.as_os_str()),
-        crate::native::shell_quote(directory.as_os_str())
-    );
-    let start = install_bootstrap(directory, &host, command)?;
+    let start = launch_bootstrap(command, directory)?;
     let response = applescript::run_until("Terminal.app", OPEN_TAB_SCRIPT, &[&start], deadline)?;
     let mut ids = response.lines();
     let id = ids.next().filter(|value| !value.is_empty());
@@ -313,6 +307,17 @@ pub(super) fn create_tab(
         wezterm_mux: None,
         windows_process_identity: None,
     })
+}
+
+fn launch_bootstrap(command: &str, directory: &Path) -> Result<String> {
+    let executable =
+        std::env::current_exe().context("failed to resolve Agent Bridge executable")?;
+    let host = format!(
+        "{} native-terminal-host {}",
+        crate::native::shell_quote(executable.as_os_str()),
+        crate::native::shell_quote(directory.as_os_str())
+    );
+    install_bootstrap(directory, &host, command)
 }
 
 // The typed line stays short (#50) and names a private file. The tab's own shell
@@ -896,14 +901,48 @@ pub(in crate::native) fn apple_terminal_startup_absent_with(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn launch_context_does_not_depend_on_terminal_environment() {
+        use super::{BOOTSTRAP_FILE, launch_bootstrap};
+        if !crate::native::process_env::tests::without_bridge_environment(
+            module_path!(),
+            "launch_context_does_not_depend_on_terminal_environment",
+        ) {
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("session-e1");
+        std::fs::create_dir(&directory).unwrap();
+        let wrapper = crate::native::process_env::tests::wrapper_for(&directory);
+        let bootstrap = launch_bootstrap(&wrapper, &directory).unwrap();
+        assert_eq!(
+            bootstrap,
+            format!(
+                ". {}",
+                crate::native::shell_quote(directory.join(BOOTSTRAP_FILE).as_os_str())
+            )
+        );
+        let script = std::fs::read_to_string(directory.join(BOOTSTRAP_FILE)).unwrap();
+        assert!(script.contains(&format!(
+            "native-terminal-host {}",
+            crate::native::shell_quote(directory.as_os_str())
+        )));
+        assert!(script.ends_with(&format!("{wrapper}\n")));
+    }
+
+    #[test]
     fn host_binding_partial_transitions() {
         crate::native::launch::binding_tests::characterize("Terminal.app", |directory, id| {
             super::wait_for_binding(directory, id, "host-id")
         });
     }
 
-    use super::{CLOSE_TAB_SCRIPT, VERIFY_TAB_SCRIPT, WAIT_FOR_CLOSE_SCRIPT, ownership};
+    use super::{
+        CLOSE_TAB_SCRIPT, SEND_FILE_SCRIPT, TerminalKind, TerminalSession, VERIFY_TAB_SCRIPT,
+        WAIT_FOR_CLOSE_SCRIPT, applescript, ownership, ownership_proof,
+    };
     use crate::native::session::SessionState;
+    use std::time::{Duration, Instant};
 
     const WINDOW: &str = "8341";
     const TTY: &str = "/dev/ttys014";
@@ -1046,6 +1085,16 @@ on mockWindowWithId(wantedId)
     error "Can't get window 1 whose id = " & wantedId & "." number -1728
 end mockWindowWithId
 
+on mockSend(promptText, targetTab)
+    mockEvent()
+    log "sent " & promptText & " to " & (tty of targetTab)
+end mockSend
+
+on mockScreen(w, wantedTty)
+    mockEvent()
+    return "trust this directory?"
+end mockScreen
+
 on mockClose(targetWindow)
     mockEvent()
     log "closed " & (id of targetWindow)
@@ -1088,7 +1137,50 @@ end mockClose
         terminal: &Terminal,
         arguments: &[&str],
     ) -> (Result<String, String>, Vec<String>) {
+        let script = mocked_script(script, terminal);
+        let output = std::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(script)
+            .args(arguments)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let events = stderr
+            .lines()
+            .filter(|line| {
+                line.starts_with("closed ")
+                    || line.starts_with("fronted ")
+                    || line.starts_with("sent ")
+                    || *line == "launched Terminal"
+            })
+            .map(str::to_owned)
+            .collect();
+        let response = if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        } else {
+            Err(stderr)
+        };
+        (response, events)
+    }
+
+    fn mocked_script(script: &str, terminal: &Terminal) -> String {
         let script = [
+            (
+                "do script promptText in targetTab",
+                "my mockSend(promptText, targetTab)",
+            ),
+            (
+                "do script ((ASCII character 27) & \"[B\") in targetTab",
+                "my mockSend(\"down-enter\", targetTab)",
+            ),
+            (
+                "do script \"\" in targetTab",
+                "my mockSend(\"enter\", targetTab)",
+            ),
+            (
+                "contents of (first tab of w whose tty is wantedTty)",
+                "my mockScreen(w, wantedTty)",
+            ),
             ("tell application \"Terminal\"", "tell me"),
             ("application \"Terminal\" is not running", "not mockRunning"),
             ("application \"Terminal\" is running", "mockRunning"),
@@ -1112,28 +1204,123 @@ end mockClose
             terminal.error.unwrap_or("missing value"),
             terminal.windows.join(", ")
         );
-        let output = std::process::Command::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(format!("{state}{MOCK}{script}"))
-            .args(arguments)
-            .output()
-            .unwrap();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let events = stderr
-            .lines()
-            .filter(|line| {
-                line.starts_with("closed ")
-                    || line.starts_with("fronted ")
-                    || *line == "launched Terminal"
-            })
-            .map(str::to_owned)
-            .collect();
-        let response = if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        } else {
-            Err(stderr)
+        format!("{state}{MOCK}{script}")
+    }
+
+    #[test]
+    fn terminal_send_and_screen_refuse_stopped_application_without_access() {
+        let prompt = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(prompt.path(), "hello").unwrap();
+        let path = prompt.path().to_str().unwrap();
+        for (script, args, error) in [
+            (
+                SEND_FILE_SCRIPT,
+                vec![TTY, WINDOW, path],
+                "Agent Bridge Terminal.app send: not running",
+            ),
+            (
+                super::super::screen::TERMINAL,
+                vec![TTY, WINDOW],
+                "Agent Bridge Terminal.app screen: not running",
+            ),
+            (
+                super::super::screen::TERMINAL,
+                vec![TTY, WINDOW, "trust this directory?", "enter"],
+                "Agent Bridge Terminal.app screen: not running",
+            ),
+        ] {
+            let (response, events) = replay(script, &STOPPED, &args);
+            assert!(response.unwrap_err().contains(error));
+            assert!(events.is_empty(), "{events:?}");
+        }
+        assert_eq!(
+            replay(SEND_FILE_SCRIPT, &running(&[LIVE]), &[TTY, WINDOW, path]),
+            (Ok("sent".into()), vec![format!("sent hello to {TTY}")])
+        );
+        assert_eq!(
+            replay(
+                super::super::screen::TERMINAL,
+                &running(&[LIVE]),
+                &[TTY, WINDOW]
+            ),
+            (
+                Ok("AB_SCREEN_BEGINtrust this directory?AB_SCREEN_END".into()),
+                vec![]
+            )
+        );
+        for key in ["enter", "down-enter"] {
+            for (screen, answer) in [
+                ("trust this directory?", "sent"),
+                ("trust this directory!", "changed"),
+            ] {
+                let events = if answer == "sent" {
+                    vec![format!("sent {key} to {TTY}")]
+                } else {
+                    vec![]
+                };
+                assert_eq!(
+                    replay(
+                        super::super::screen::TERMINAL,
+                        &running(&[LIVE]),
+                        &[TTY, WINDOW, screen, key]
+                    ),
+                    (Ok(answer.into()), events)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_screen_handlers_recheck_running_before_application_access() {
+        for call in [
+            "my screenOf(missing value, \"unused\")",
+            "my sendKey(missing value, \"enter\")",
+            "my sendKey(missing value, \"down-enter\")",
+        ] {
+            // Invoke the handler after the application's earlier running check.
+            let script = super::super::screen::TERMINAL
+                .replace("on run argv", "on originalRun(argv)")
+                .replacen("end run", "end originalRun", 1);
+            let script = format!("{script}\non run\nreturn {call}\nend run\n");
+            let (response, events) = replay(&script, &STOPPED, &[]);
+            let error = response.unwrap_err();
+            assert!(
+                error.contains("Agent Bridge Terminal.app screen: not running"),
+                "{error}"
+            );
+            assert!(events.is_empty(), "{events:?}");
+        }
+    }
+
+    #[test]
+    fn terminal_disappearing_after_send_ownership_proof_is_delivery_uncertain() {
+        let session = TerminalSession {
+            kind: TerminalKind::AppleTerminal,
+            id: TTY.into(),
+            window_id: Some(WINDOW.into()),
+            tab_id: None,
+            managed_session_id: None,
+            windows_process_identity: None,
+            wezterm_mux: None,
         };
-        (response, events)
+        let window = ownership_proof(&session).unwrap();
+        let prompt = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(prompt.path(), "hello").unwrap();
+        // The earlier proof passed; the application is gone when osascript runs.
+        let failure = applescript::run_send_until(
+            "Terminal.app",
+            &mocked_script(SEND_FILE_SCRIPT, &STOPPED),
+            &[&session.id, window, prompt.path().to_str().unwrap()],
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert!(failure.delivery_may_have_occurred());
+        let error = format!("{:#}", failure.error());
+        assert!(
+            error.contains("Agent Bridge Terminal.app send: not running"),
+            "{error}"
+        );
+        assert!(!error.contains("launched Terminal"), "{error}");
     }
 
     fn check(

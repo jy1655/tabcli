@@ -419,6 +419,20 @@ fn codex_launch_arguments(
     Ok(arguments)
 }
 
+fn queue_command(
+    executable: &Path,
+    directory: &Path,
+    workspace: &Path,
+    arguments: Vec<OsString>,
+) -> Result<std::process::Command> {
+    let mut command =
+        super::super::process_env::provider_command(executable, directory, arguments, &[])?;
+    command
+        .current_dir(workspace)
+        .env(super::super::SESSION_DIR_ENV, directory);
+    Ok(command)
+}
+
 fn codex_queue_arguments(
     thread_id: &str,
     prompt: &str,
@@ -509,17 +523,15 @@ fn send_native_queue_message(context: CrossSessionMessageContext<'_>) -> CrossSe
     let pending =
         PendingCodexTurn::new(context.request_id).map_err(CrossSessionMessageFailure::not_sent)?;
     let arguments = codex_queue_arguments(&thread_id, context.prompt, &pending);
-    let mut command = super::super::provider_process::command(
+    let mut command = queue_command(
         context.provider_path,
         context.directory,
+        &manifest.workspace,
         arguments,
     )
     .map_err(|error| {
         queue_unavailable(error.context("failed to prepare the Codex queue command"))
     })?;
-    command
-        .current_dir(&manifest.workspace)
-        .env(super::super::SESSION_DIR_ENV, context.directory);
     write_pending_turn(context.directory, &pending)
         .map_err(CrossSessionMessageFailure::not_sent)?;
     let result = match run_bounded_command_until(&mut command, context.deadline, "Codex queue") {
@@ -1057,6 +1069,19 @@ fn established_codex_thread(directory: &Path) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn queue_keeps_the_inherited_environment_and_its_explicit_session_directory() {
+        let directory = std::path::Path::new(".");
+        let command =
+            super::queue_command(std::path::Path::new("unused"), directory, directory, vec![])
+                .unwrap();
+        crate::native::process_env::tests::assert_provider_environment(
+            &command,
+            &[],
+            &[(crate::native::SESSION_DIR_ENV, Some(directory.as_os_str()))],
+        );
+    }
+
     #[test]
     fn recovery_hint_uses_the_public_command() {
         let hint = super::unaddressed_follow_up();

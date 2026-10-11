@@ -487,7 +487,9 @@ fn claude_doctor_reports_inherited_claude_code_session_markers_without_changing_
     let before = files(fixture.root.path());
     // The test process itself may run inside a Claude Code session, so every marker is
     // cleared first and only the two under test are reintroduced.
-    const MARKERS: [&str; 10] = [
+    const MARKERS: [&str; 12] = [
+        "AI_AGENT",
+        "CLAUDE_CODE_BRIDGE_SESSION_ID",
         "CLAUDE_CODE_CHILD_SESSION",
         "CLAUDECODE",
         "CLAUDE_CODE_SESSION_ID",

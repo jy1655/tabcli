@@ -112,6 +112,10 @@ through Claude's official cross-session messaging. Every follow-up uses that mes
 a separate, nonpersistent Claude messenger model turn calls `ListAgents` to find your session
 and `SendMessage` to deliver the prompt. Bridge removes inherited Claude session markers so a
 launch from inside Claude does not create a nested session with an undiscoverable inbox.
+On macOS, Bridge also keeps those markers and its own per-session variables out of every
+other process it starts, including a terminal application it starts. An application already
+started by an earlier version keeps them until it is restarted. Native Windows is pending
+[#111](https://github.com/jy1655/tabcli/issues/111).
 
 Messaging must be available in the running CLI's backend, features, and settings, and discovery
 must find the exact live local session. A recent version or saved inbound setting does not prove

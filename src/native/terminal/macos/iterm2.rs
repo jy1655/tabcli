@@ -313,14 +313,7 @@ pub(super) fn create_tab(
     directory: &Path,
     deadline: Instant,
 ) -> Result<TerminalSession> {
-    let executable =
-        std::env::current_exe().context("failed to resolve Agent Bridge executable")?;
-    let host = format!(
-        "{} native-iterm2-host {}",
-        crate::native::shell_quote(executable.as_os_str()),
-        crate::native::shell_quote(directory.as_os_str())
-    );
-    let bootstrap = shell_command(&host, command);
+    let bootstrap = launch_bootstrap(command, directory)?;
     let id = applescript::run_until(
         "iTerm2",
         OPEN_TAB_SCRIPT,
@@ -339,6 +332,17 @@ pub(super) fn create_tab(
         wezterm_mux: None,
         windows_process_identity: None,
     })
+}
+
+fn launch_bootstrap(command: &str, directory: &Path) -> Result<String> {
+    let executable =
+        std::env::current_exe().context("failed to resolve Agent Bridge executable")?;
+    let host = format!(
+        "{} native-iterm2-host {}",
+        crate::native::shell_quote(executable.as_os_str()),
+        crate::native::shell_quote(directory.as_os_str())
+    );
+    Ok(shell_command(&host, command))
 }
 
 // iTerm's native `command` argument runs a program instead of editing a shell
@@ -472,6 +476,24 @@ pub(super) fn close_session_until(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launch_context_does_not_depend_on_terminal_environment() {
+        if !crate::native::process_env::tests::without_bridge_environment(
+            module_path!(),
+            "launch_context_does_not_depend_on_terminal_environment",
+        ) {
+            return;
+        }
+
+        let directory = Path::new("/custom state/session-e1");
+        let wrapper = crate::native::process_env::tests::wrapper_for(directory);
+        let bootstrap = launch_bootstrap(&wrapper, directory).unwrap();
+        let args = iterm2_arguments(&bootstrap);
+        assert_eq!(&args[..4], ["/bin/zsh", "-l", "-i", "-c"]);
+        assert!(args[4].contains("native-iterm2-host '/custom state/session-e1'"));
+        assert!(args[4].ends_with(&wrapper));
+    }
+
     use crate::native::session::SessionState;
 
     #[test]

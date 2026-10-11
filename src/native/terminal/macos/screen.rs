@@ -51,6 +51,7 @@ pub(in crate::native) const TERMINAL: &str = r#"
 on run argv
     set wantedTty to item 1 of argv
     set wantedWindowId to item 2 of argv as integer
+    if not application "Terminal" is running then error "Agent Bridge Terminal.app screen: not running"
     tell application "Terminal"
         set w to first window whose id is wantedWindowId
         set matchedTab to missing value
@@ -68,6 +69,7 @@ on run argv
 end run
 
 on screenOf(w, wantedTty)
+    if not application "Terminal" is running then error "Agent Bridge Terminal.app screen: not running"
     tell application "Terminal"
         -- "contents of <variable>" dereferences an AppleScript reference; use
         -- the tab specifier to read Terminal's text property instead.
@@ -76,6 +78,7 @@ on screenOf(w, wantedTty)
 end screenOf
 
 on sendKey(targetTab, keyName)
+    if not application "Terminal" is running then error "Agent Bridge Terminal.app screen: not running"
     tell application "Terminal"
         if keyName is "down-enter" then
             do script ((ASCII character 27) & "[B") in targetTab
