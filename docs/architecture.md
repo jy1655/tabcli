@@ -58,7 +58,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 - `src/native/provider/` owns each provider's launch and resume plans, trust interpretation,
   transports, completion correlation, hooks, diagnostics, and adapter-private records. It uses
   the session seam and terminal operations. Keep provider schemas and transport selection in
-  `src/native/provider/<provider>.rs`, not in shared orchestration.
+  `src/native/provider/<provider>/` (or a single `<provider>.rs` file), not in shared orchestration.
 - `src/native/terminal/` selects and implements platform-specific surfaces, input, observation,
   and close. Its `ownership` module owns owner identity, attestation, close authority, and
   the execution of an authorized close; the Terminal.app adapter owns app incarnation.
