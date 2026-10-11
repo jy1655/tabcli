@@ -96,6 +96,10 @@ pub(super) mod tests {
             expected.insert(OsStr::new(name), *value);
         }
         assert_eq!(command.get_envs().collect::<BTreeMap<_, _>>(), expected);
+        #[cfg(not(windows))]
+        for name in ["AI_AGENT", "CLAUDE_CODE_BRIDGE_SESSION_ID"] {
+            assert_eq!(expected.get(OsStr::new(name)), Some(&None), "{name}");
+        }
         // No override/removal of user configuration: it remains inherited.
         for name in [
             "PATH",

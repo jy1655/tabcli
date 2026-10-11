@@ -47,14 +47,18 @@ const PROVIDER_STOPPED_CALL_RESULT: &str =
     "Not run: the response that made this tool call was stopped by a safety classifier.";
 const PENDING_TURN_FILE: &str = "claude-pending-turn.json";
 // Session markers Claude Code exports into every process it spawns (Bash, hooks, plugin
-// scripts). An interactive `claude` that inherits CLAUDE_CODE_CHILD_SESSION treats itself
-// as a nested child: it disables transcript persistence and never registers its
+// scripts). These are values Claude Code exports about its own session, including
+// AI_AGENT and CLAUDE_CODE_BRIDGE_SESSION_ID (observed 2026-10-11 in an application
+// started from a Claude Code Bash tool). An interactive `claude` that inherits
+// CLAUDE_CODE_CHILD_SESSION treats itself as a nested child: it disables transcript persistence and never registers its
 // cross-session inbox, so ListAgents cannot discover it and SendMessage cannot reach it.
 // The managed session must be an independent top-level session, and the messenger must
 // not be classified as a child either, so both launches drop the whole marker set. User
 // configuration such as ANTHROPIC_* or CLAUDE_CONFIG_DIR is deliberately left alone.
 // Removable if Claude Code stops deriving session identity from inherited markers.
 const CLAUDE_CODE_SESSION_MARKERS: &[&str] = &[
+    "AI_AGENT",
+    "CLAUDE_CODE_BRIDGE_SESSION_ID",
     "CLAUDE_CODE_CHILD_SESSION",
     "CLAUDECODE",
     "CLAUDE_CODE_SESSION_ID",
@@ -2365,6 +2369,9 @@ mod tests {
             probe_environment_removals(FirstPartyCli::Claude),
             CLAUDE_CODE_SESSION_MARKERS
         );
+        for marker in ["AI_AGENT", "CLAUDE_CODE_BRIDGE_SESSION_ID"] {
+            assert!(probe_environment_removals(FirstPartyCli::Claude).contains(&marker));
+        }
         for other in [FirstPartyCli::Codex, FirstPartyCli::Agy, FirstPartyCli::Pi] {
             assert!(probe_environment_removals(other).is_empty(), "{other:?}");
         }
@@ -2394,6 +2401,8 @@ mod tests {
                     .contains(&"CLAUDE_CODE_CHILD_SESSION")
             );
             for marker in [
+                "AI_AGENT",
+                "CLAUDE_CODE_BRIDGE_SESSION_ID",
                 "CLAUDECODE",
                 "CLAUDE_CODE_SESSION_ID",
                 "CLAUDE_PID",
@@ -2404,7 +2413,14 @@ mod tests {
                 assert!(plan.environment_removals.contains(&marker), "{marker}");
             }
             // User configuration is not the adapter's to strip.
-            for kept in ["ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR", "PATH", "HOME"] {
+            for kept in [
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_MODEL",
+                "CLAUDE_CONFIG_DIR",
+                "PATH",
+                "HOME",
+            ] {
                 assert!(!plan.environment_removals.contains(&kept), "{kept}");
             }
         }
