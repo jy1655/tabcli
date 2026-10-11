@@ -23,7 +23,7 @@
     "| \"native-warp-host\"": 1,
     "[Agent Bridge native delegation]": 1,
     "native-console-control": 3,
-    "native-console-host": 2,
+    "native-console-host": 3,
     "native-ghostty-host": 3,
     "native-hook": 4,
     "native-iterm2-host": 3,

@@ -340,6 +340,7 @@ pub(in crate::native) fn verify_terminal_close_authority(
 
 #[derive(Debug, Eq, PartialEq)]
 pub(in crate::native) enum TerminalCloseAuthority {
+    #[cfg(any(target_os = "macos", windows))]
     LiveOwner,
     #[cfg(target_os = "macos")]
     OwnerTeardown,
@@ -513,7 +514,7 @@ fn verify_terminal_close_authority_with_observers(
             if let Some(launch) = launch::read(&Reader::open_unchecked(directory))?
                 && !has_teardown_intent
                 && launch.phase != launch::Phase::Spawned
-                && terminal::close_policy(session.kind).failed_start_identity
+                && terminal::facts(session.kind).failed_start_identity
             {
                 let status: SessionStatus = Reader::open_unchecked(directory).status()?;
                 let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
@@ -533,7 +534,7 @@ fn verify_terminal_close_authority_with_observers(
             #[cfg(target_os = "macos")]
             if !has_teardown_intent && (observers.resumable)()? {
                 session.verify_managed_session(expected_session_id)?;
-                if terminal::close_policy(session.kind).requires_app_incarnation {
+                if terminal::facts(session.kind).requires_app_incarnation {
                     let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
                     let Some(app) = &owner.terminal_app else {
                         // An intent of 0.0.10 or earlier names no app incarnation, and
@@ -590,7 +591,7 @@ fn verify_terminal_close_authority_with_observers(
                         }
                         return Ok(TerminalCloseAuthority::TeardownComplete(intent.reason));
                     }
-                    let absent = if terminal::close_policy(session.kind).requires_app_incarnation {
+                    let absent = if terminal::facts(session.kind).requires_app_incarnation {
                         terminal_surface_absent(
                             owner.terminal_app.as_ref(),
                             &process_birth,
@@ -610,7 +611,7 @@ fn verify_terminal_close_authority_with_observers(
                 }
                 // Keep the existing app-incarnation guard as part of the live proof.
                 // Only its ended-incarnation refusal moves to the absent-surface row.
-                let ended = if terminal::close_policy(session.kind).requires_app_incarnation
+                let ended = if terminal::facts(session.kind).requires_app_incarnation
                     && let Some(app) = &owner.terminal_app
                 {
                     let alive = terminal_app_alive_with(app, &process_birth)?;
@@ -630,7 +631,7 @@ fn verify_terminal_close_authority_with_observers(
                 };
                 if let Err(error) = proof {
                     close_remaining(deadline)?;
-                    let absent = if terminal::close_policy(session.kind).requires_app_incarnation {
+                    let absent = if terminal::facts(session.kind).requires_app_incarnation {
                         terminal_surface_absent(
                             owner.terminal_app.as_ref(),
                             &process_birth,
@@ -669,7 +670,7 @@ fn verify_terminal_close_authority_with_observers(
         // that no wrapper recorded here, so nothing is closed: the handle is consumed
         // once the window is proven gone.
         #[cfg(target_os = "macos")]
-        if terminal::close_policy(session.kind).requires_app_incarnation {
+        if terminal::facts(session.kind).requires_app_incarnation {
             if terminal_surface_absent(None, &process_birth, &terminal_instances, surface_present)?
             {
                 return Ok(TerminalCloseAuthority::Absent);
@@ -679,7 +680,7 @@ fn verify_terminal_close_authority_with_observers(
             );
         }
         #[cfg(target_os = "macos")]
-        if !terminal::close_policy(session.kind).failed_start_identity {
+        if !terminal::facts(session.kind).failed_start_identity {
             if !surface_present().context(
                 "could not prove absence of the ownerless startup surface; no close was sent",
             )? {
@@ -689,7 +690,7 @@ fn verify_terminal_close_authority_with_observers(
                 "startup has no native owner or close intent and its surface is not proven gone; no close was sent and the surface handle is retained"
             );
         }
-        if !terminal::close_policy(session.kind).failed_start_identity {
+        if !terminal::facts(session.kind).failed_start_identity {
             bail!("startup surface has no supported native close identity; its handle is retained");
         }
         Ok(TerminalCloseAuthority::SurfaceOnly)
@@ -697,7 +698,9 @@ fn verify_terminal_close_authority_with_observers(
     #[cfg(not(any(target_os = "macos", windows)))]
     {
         (observers.ownership_proof)()?;
-        Ok(TerminalCloseAuthority::LiveOwner)
+        bail!(
+            "this platform has no visible terminal transport (#6); no close was sent and the surface handle is retained"
+        )
     }
 }
 
@@ -936,7 +939,7 @@ fn prepare_owned_surface_close(
     deadline: std::time::Instant,
 ) -> Result<()> {
     close_remaining(deadline)?;
-    match terminal::close_policy(surface.kind).pre_close {
+    match terminal::facts(surface.kind).pre_close {
         PreClosePolicy::None => Ok(()),
         PreClosePolicy::RecordIntent => {
             // The adapter close can end the owner even when surface cleanup fails.

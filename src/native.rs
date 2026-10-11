@@ -396,7 +396,8 @@ where
                 "native-iterm2-host" => Ok(NativeCommand::Iterm2Host { directory }),
                 "native-terminal-host" => Ok(NativeCommand::AppleTerminalHost { directory }),
                 "native-wezterm-host" => Ok(NativeCommand::WezTermHost { directory }),
-                _ => Ok(NativeCommand::ConsoleHost { directory }),
+                "native-console-host" => Ok(NativeCommand::ConsoleHost { directory }),
+                _ => bail!("unknown native host command: {command}"),
             }
         }
         "native-ghostty-host" => {
@@ -2932,16 +2933,11 @@ fn native_delegation_prompt(source: &str, prompt: &str) -> String {
 }
 
 fn terminal_input_bytes(kind: terminal::TerminalKind, prompt: &str) -> Vec<u8> {
-    if matches!(
-        kind,
-        terminal::TerminalKind::Ghostty | terminal::TerminalKind::WindowsConsole
-    ) {
-        // Ghostty's `input text` command already delivers its argument as a paste.
-        // WriteConsoleInputW emits key events rather than a terminal paste, so Windows
-        // CLIs also expose a bracketed-paste envelope as literal `[200~...` text.
-        prompt.as_bytes().to_vec()
-    } else {
-        format!("\x1b[200~{prompt}\x1b[201~").into_bytes()
+    match terminal::facts(kind).paste_envelope {
+        terminal::facts::PasteEnvelope::Raw => prompt.as_bytes().to_vec(),
+        terminal::facts::PasteEnvelope::Bracketed => {
+            format!("\x1b[200~{prompt}\x1b[201~").into_bytes()
+        }
     }
 }
 

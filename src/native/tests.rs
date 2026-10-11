@@ -2544,22 +2544,24 @@ fn windows_initial_prompt_readiness_is_provider_specific() {
 
 #[test]
 fn terminal_input_framing_matches_each_adapter_contract() {
-    assert_eq!(
-        terminal_input_bytes(terminal::TerminalKind::Ghostty, "line one\nline two"),
-        b"line one\nline two"
-    );
-    assert_eq!(
-        terminal_input_bytes(terminal::TerminalKind::WindowsConsole, "line one\nline two"),
-        b"line one\nline two"
-    );
-    for kind in [
-        terminal::TerminalKind::Iterm2,
-        terminal::TerminalKind::AppleTerminal,
+    use terminal::{TerminalKind::*, facts::PasteEnvelope};
+    for (kind, envelope, guarded) in [
+        (Iterm2, PasteEnvelope::Bracketed, true),
+        (AppleTerminal, PasteEnvelope::Bracketed, true),
+        (Ghostty, PasteEnvelope::Raw, false),
+        (Warp, PasteEnvelope::Bracketed, false),
+        (WezTerm, PasteEnvelope::Bracketed, false),
+        (WindowsConsole, PasteEnvelope::Raw, true),
     ] {
-        assert_eq!(
-            terminal_input_bytes(kind, "line one\nline two"),
-            b"\x1b[200~line one\nline two\x1b[201~"
-        );
+        let facts = terminal::facts(kind);
+        assert_eq!(facts.paste_envelope, envelope);
+        assert_eq!(facts.guards_dialog_input, guarded);
+        assert_eq!(terminal::guards_dialog_input(kind), guarded);
+        let expected: &[u8] = match envelope {
+            PasteEnvelope::Raw => b"line one\nline two",
+            PasteEnvelope::Bracketed => b"\x1b[200~line one\nline two\x1b[201~",
+        };
+        assert_eq!(terminal_input_bytes(kind, "line one\nline two"), expected);
     }
 }
 
@@ -5619,7 +5621,7 @@ fn a_non_regular_receipt_is_not_trusted() {
 fn record_rename_syncs_the_destination_directory_then_a_different_source_directory() {
     let directory = tempfile::tempdir().unwrap();
     let from = directory.path().join("terminal.json");
-    let to = directory.path().join("terminal.closing.json");
+    let to = directory.path().join(TERMINAL_CLOSING_FILE);
     fs::write(&from, "{}").unwrap();
     let (outcome, log) = with_sync_log(|| rename_session_file(&from, &to));
     outcome.unwrap();
@@ -5627,7 +5629,7 @@ fn record_rename_syncs_the_destination_directory_then_a_different_source_directo
 
     let other = directory.path().join("events");
     fs::create_dir(&other).unwrap();
-    let moved = other.join("terminal.closing.json");
+    let moved = other.join(TERMINAL_CLOSING_FILE);
     let (outcome, log) = with_sync_log(|| rename_session_file(&to, &moved));
     outcome.unwrap();
     assert_eq!(
@@ -9269,4 +9271,118 @@ fn close_deadline_cli_default_and_bounds() {
         panic!()
     };
     assert_eq!(request.timeout, Duration::from_secs(3601));
+}
+
+#[test]
+fn all_native_host_names_keep_variants_and_argument_validation() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("session-abc");
+    let directory = path.to_str().unwrap();
+    for name in [
+        "native-console-host",
+        "native-iterm2-host",
+        "native-terminal-host",
+        "native-wezterm-host",
+    ] {
+        assert!(is_command(name));
+        let parsed = parse_args([name, directory]).unwrap();
+        let actual = match parsed {
+            NativeCommand::ConsoleHost { directory } => ("native-console-host", directory),
+            NativeCommand::Iterm2Host { directory } => ("native-iterm2-host", directory),
+            NativeCommand::AppleTerminalHost { directory } => ("native-terminal-host", directory),
+            NativeCommand::WezTermHost { directory } => ("native-wezterm-host", directory),
+            other => panic!("unexpected host: {other:?}"),
+        };
+        assert_eq!(actual, (name, path.clone()));
+        for args in [
+            vec![name],
+            vec![name, "relative/session-abc"],
+            vec![name, directory, "extra"],
+        ] {
+            assert!(parse_args(args).is_err());
+        }
+        assert!(parse_args([name, root.path().join("invalid").to_str().unwrap()]).is_err());
+    }
+    assert!(is_command("native-ghostty-host"));
+    assert!(matches!(
+        parse_args(["native-ghostty-host"]).unwrap(),
+        NativeCommand::GhosttyHost
+    ));
+    assert!(parse_args(["native-ghostty-host", directory]).is_err());
+    let token = "0123456789abcdef0123456789abcdef";
+    assert!(is_command("native-warp-host"));
+    assert!(
+        matches!(parse_args(["native-warp-host", directory, token]).unwrap(), NativeCommand::WarpHost { directory: d, attempt } if d == path && attempt == token)
+    );
+    for args in [
+        vec!["native-warp-host"],
+        vec!["native-warp-host", directory],
+        vec!["native-warp-host", directory, "bad"],
+        vec!["native-warp-host", "relative/session-abc", token],
+        vec!["native-warp-host", directory, token, "extra"],
+    ] {
+        assert!(parse_args(args).is_err());
+    }
+    assert!(!is_command("native-unknown-host"));
+    assert!(
+        parse_args(["native-unknown-host", directory])
+            .unwrap_err()
+            .to_string()
+            .contains("unknown native command")
+    );
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+#[test]
+fn unsupported_platform_refuses_bound_close_and_restores_claimed_handle() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-abc");
+    fs::create_dir(&directory).unwrap();
+    update_status(&directory, SessionState::Ready, None, None).unwrap();
+    let mut surface = close_test_terminal();
+    surface.managed_session_id = Some("session-abc".into());
+    write_json_atomic(&directory.join(TERMINAL_HANDLE_FILE), &surface).unwrap();
+    let original = fs::read(directory.join(TERMINAL_HANDLE_FILE)).unwrap();
+    assert!(!directory.join(SESSION_OWNER_FILE).exists());
+    let authority = |handle: &terminal::TerminalSession| {
+        terminal::ownership::verify_terminal_close_authority(
+            &directory,
+            "session-abc",
+            handle,
+            close_deadline(),
+        )
+    };
+    assert!(
+        authority(&surface)
+            .unwrap_err()
+            .to_string()
+            .contains("no visible terminal transport")
+    );
+    let result = session::close::compatibility::close_session_state(&directory, |handle| {
+        assert!(!directory.join(TERMINAL_HANDLE_FILE).exists());
+        assert!(directory.join(TERMINAL_CLOSING_FILE).exists());
+        authority(handle)?;
+        panic!("unsupported platform must never reach close")
+    });
+    assert!(format!("{:#}", result.unwrap_err()).contains("no visible terminal transport"));
+    assert_eq!(
+        fs::read(directory.join(TERMINAL_HANDLE_FILE)).unwrap(),
+        original
+    );
+    assert!(!directory.join(TERMINAL_CLOSING_FILE).exists());
+    assert!(!directory.join(TERMINAL_TOMBSTONE_FILE).exists());
+    assert!(!directory.join("closed.json").exists());
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+#[test]
+fn unsupported_platform_send_is_not_sent() {
+    let root = tempfile::tempdir().unwrap();
+    let failure = terminal::send_file(
+        &close_test_terminal(),
+        &root.path().join("absent-prompt"),
+        close_deadline(),
+    )
+    .unwrap_err();
+    assert!(!failure.delivery_may_have_occurred());
 }
