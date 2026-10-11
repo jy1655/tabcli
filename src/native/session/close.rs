@@ -262,6 +262,14 @@ pub(in crate::native) fn close(
     )
     .map_err(|error| match crate::native::close_remaining(deadline) {
         Ok(_) => error,
+        // The expiry itself already says so; add it only to an error that does not.
+        Err(expired)
+            if error
+                .chain()
+                .any(|cause| cause.to_string() == expired.to_string()) =>
+        {
+            error
+        }
         Err(expired) => error.context(expired.to_string()),
     })
 }

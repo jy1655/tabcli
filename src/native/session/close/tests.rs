@@ -900,6 +900,11 @@ fn close_deadline_uncontended_settlement_reports_only_expiry() {
     );
     let error = format!("{:#}", result.unwrap_err());
     assert!(error.contains("close deadline expired"), "{error}");
+    assert_eq!(
+        error.matches("close deadline expired").count(),
+        1,
+        "{error}"
+    );
     assert!(!error.contains("another close or turn"), "{error}");
     assert!(store.record(CoreRecord::TerminalClosed).path().exists());
     assert!(store.closed_if_present().unwrap().is_none());
