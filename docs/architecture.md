@@ -9,7 +9,8 @@ native.rs: parse ask, check inputs, prepare the session directory
   -> session::turn + session::requests: acquire the initial claim and write its receipt
   -> provider + terminal: prepare the CLI and bind a newly created surface
   -> session::launch: record provider spawn or launch failure
-  -> provider: deliver the prompt and recognize the matching completion
+  -> delivery: use the adapter-declared Transport and settle delivery of the claimed turn
+  -> provider: recognize the matching completion
   -> session::turn: write the completion journal
   -> session::turn: publish the result, update status, release the claim, remove the journal
 
@@ -25,7 +26,11 @@ close-session
 A follow-up enters through `tell` in `native.rs` and claims the existing session before delivery.
 The admission checks read Hold without taking another lock; `claim_ready` identifies follow-up
 claims so the final `begin_delivery` hold gate excludes initial delivery.
-It uses the same completion journal and publication path. If delivery is uncertain, the claim
+After the provider-specific reopened-conversation check, it calls the same `delivery::deliver`
+entry point as initial delivery. Follow-ups skip initial readiness and launch gates. Preparation,
+optional surface checks, remaining timeout and budget precede `begin_delivery`; no lifecycle lock
+is held across the transport operation. Detached commands still await delivery settlement and
+skip only result waiting. Both paths use the same completion journal and publication path. If delivery is uncertain, the claim
 stays held; neither a query nor repair resends the prompt.
 
 A record is durable evidence of an operation, not a disposable cache. Use the terms in
@@ -35,7 +40,14 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 ## Module map and dependencies
 
 - `src/main.rs` contains top-level dispatch and help; `src/native.rs` parses native commands,
-  coordinates launch and delivery.
+  coordinates launch and calls the Delivery seam.
+- `src/native/delivery.rs` consumes one Claim and owns readiness, injected reopen gates,
+  prompt-file framing, surface ownership verification, remaining timeout and send-budget
+  checks, begin/send/settlement, and initial-prompt cleanup. Provider adapters explicitly
+  declare initial and follow-up Transport values with `facts`, `prepare`, `send`, and
+  `discard_prepared`. Only known NotSent discards preparation; Uncertain retains the Claim.
+  `LaunchArgument` settles Sent without reading the prompt or repeating wrapper work.
+  The terminal module owns the Windows submit-delay budget; Transport facts supply the count.
 - `src/native/reopen.rs` owns Reopen source reservations, provenance, launch refusals,
   and their settlement, including read-only marker diagnostics. Session owns the refusal record
   shape. Reopen creates the new Session

@@ -1,0 +1,402 @@
+//! Delivery owns the ordering and settlement of a claimed Turn. Adapters own Transport.
+use super::session::{Reader, RecordStore, SessionState, turn};
+use super::terminal;
+use agent_bridge::FirstPartyCli;
+use anyhow::{Context, Result, bail};
+use std::{
+    io::Write,
+    path::Path,
+    time::{Duration, Instant},
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TurnKind {
+    Initial,
+    FollowUp,
+}
+pub(super) enum Turn<'a> {
+    Initial {
+        gate: &'a mut dyn FnMut(Gate) -> Result<()>,
+    },
+    FollowUp {
+        prompt: &'a str,
+    },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Gate {
+    AfterLaunch,
+    BeforeDelivery,
+}
+pub(super) struct DeliveryContext<'a> {
+    pub provider: FirstPartyCli,
+    pub directory: &'a Path,
+    pub session_id: &'a str,
+    pub surface: &'a terminal::TerminalSession,
+    pub provider_path: &'a Path,
+    pub deadline: Instant,
+    pub requested: Duration,
+}
+#[derive(Debug)]
+pub(super) struct Delivered {
+    pub correlation_id: Option<String>,
+}
+pub(super) trait Transport {
+    fn facts(&self) -> TransportFacts;
+    fn prepare(&self, turn: &TurnContext<'_>) -> Result<Prepared>;
+    fn send(
+        &self,
+        turn: &TurnContext<'_>,
+        prepared: &Prepared,
+        prompt_file: Option<&Path>,
+    ) -> Outcome;
+    fn discard_prepared(&self, turn: &TurnContext<'_>, prepared: Option<&Prepared>);
+}
+pub(super) struct TransportFacts {
+    pub name: &'static str,
+    pub readiness: Readiness,
+    pub surface: Option<SurfaceInput>,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Readiness {
+    LaunchArgument,
+    AfterLaunch { ready_delay: Duration },
+}
+pub(super) struct SurfaceInput {
+    pub submit_count: usize,
+}
+pub(super) struct TurnContext<'a> {
+    pub kind: TurnKind,
+    pub directory: &'a Path,
+    pub session_id: &'a str,
+    pub claim_token: &'a str,
+    pub surface: &'a terminal::TerminalSession,
+    pub provider_path: &'a Path,
+    pub bridge_executable: &'a Path,
+    pub prompt: &'a str,
+    pub deadline: Instant,
+}
+pub(super) struct Prepared {
+    pub prompt: String,
+    pub correlation_id: Option<String>,
+}
+#[derive(Debug)]
+pub(super) enum Outcome {
+    Sent,
+    NotSent(anyhow::Error),
+    Uncertain(anyhow::Error),
+}
+pub(super) struct LaunchArgument;
+pub(super) const LAUNCH_ARGUMENT: LaunchArgument = LaunchArgument;
+impl Transport for LaunchArgument {
+    fn facts(&self) -> TransportFacts {
+        TransportFacts {
+            name: "launch-argument",
+            readiness: Readiness::LaunchArgument,
+            surface: None,
+        }
+    }
+    fn prepare(&self, _: &TurnContext<'_>) -> Result<Prepared> {
+        Ok(Prepared {
+            prompt: String::new(),
+            correlation_id: None,
+        })
+    }
+    fn send(&self, _: &TurnContext<'_>, _: &Prepared, _: Option<&Path>) -> Outcome {
+        unreachable!("launch arguments are delivered by the wrapper")
+    }
+    fn discard_prepared(&self, _: &TurnContext<'_>, _: Option<&Prepared>) {}
+}
+
+impl From<terminal::TerminalSendResult> for Outcome {
+    fn from(result: terminal::TerminalSendResult) -> Self {
+        match result {
+            Ok(()) => Self::Sent,
+            Err(failure) => {
+                let uncertain = failure.delivery_may_have_occurred();
+                let error = failure.into_error();
+                if uncertain {
+                    Self::Uncertain(error)
+                } else {
+                    Self::NotSent(error)
+                }
+            }
+        }
+    }
+}
+
+pub(super) fn deliver(
+    claim: turn::Claim,
+    turn: Turn<'_>,
+    context: DeliveryContext<'_>,
+) -> Result<Delivered> {
+    let transport = match turn {
+        Turn::Initial { .. } => super::provider::initial_transport(context.provider),
+        Turn::FollowUp { .. } => super::provider::follow_up_transport(context.provider),
+    };
+    deliver_with(claim, turn, context, transport.as_ref(), &RuntimeChecks)
+}
+struct RuntimeChecks;
+impl Checks for RuntimeChecks {
+    fn ready(&self, context: &DeliveryContext<'_>, delay: Duration) -> Result<()> {
+        turn::wait_for_status(
+            context.directory,
+            SessionState::AwaitingInitialInput,
+            context.deadline,
+            context.requested,
+        )?;
+        let delay = initial_prompt_delay_within_budget(context.deadline, delay, context.requested)?;
+        std::thread::sleep(delay);
+        Ok(())
+    }
+    fn ownership(&self, context: &DeliveryContext<'_>) -> Result<()> {
+        super::verify_terminal_surface_ownership_until(
+            context.directory,
+            context.session_id,
+            context.surface,
+            context.deadline,
+            context.requested,
+        )
+    }
+    fn remaining(&self, context: &DeliveryContext<'_>) -> Result<Duration> {
+        super::remaining_turn_timeout(context.deadline, context.requested)
+    }
+    fn budget(
+        &self,
+        context: &DeliveryContext<'_>,
+        count: usize,
+        remaining: Duration,
+    ) -> Result<()> {
+        terminal::validate_terminal_send_budget(count, context.surface.kind, remaining)
+    }
+}
+
+// Private injection points for external checks; the real Store and Claim remain in tests.
+trait Checks {
+    fn ready(&self, context: &DeliveryContext<'_>, delay: Duration) -> Result<()>;
+    fn ownership(&self, context: &DeliveryContext<'_>) -> Result<()>;
+    fn remaining(&self, context: &DeliveryContext<'_>) -> Result<Duration>;
+    fn budget(
+        &self,
+        context: &DeliveryContext<'_>,
+        count: usize,
+        remaining: Duration,
+    ) -> Result<()>;
+}
+
+impl DeliveryContext<'_> {
+    fn turn_context<'a>(
+        &'a self,
+        initial: bool,
+        token: &'a str,
+        prompt: &'a str,
+        executable: &'a Path,
+    ) -> TurnContext<'a> {
+        TurnContext {
+            kind: if initial {
+                TurnKind::Initial
+            } else {
+                TurnKind::FollowUp
+            },
+            directory: self.directory,
+            session_id: self.session_id,
+            claim_token: token,
+            surface: self.surface,
+            provider_path: self.provider_path,
+            bridge_executable: executable,
+            prompt,
+            deadline: self.deadline,
+        }
+    }
+}
+
+// Context is added only after settlement: status.error retains the provider/check cause.
+#[derive(Clone, Copy)]
+enum Stage {
+    Bare,
+    Prepare,
+    Remaining,
+    Budget,
+    Send,
+}
+fn follow_up_error(
+    error: anyhow::Error,
+    stage: Stage,
+    facts: &TransportFacts,
+    context: &TurnContext<'_>,
+    uncertain: bool,
+) -> anyhow::Error {
+    let name = facts.name;
+    match stage {
+        Stage::Prepare if facts.surface.is_some() => error.context(format!(
+            "failed to prepare input for visible {} session {}", context.surface.kind.display_name(), context.session_id))
+            .context(format!("provider follow-up transport {name} failed")),
+        Stage::Send if facts.surface.is_some() => error.context(format!(
+            "failed to type into visible {} session {}", context.surface.kind.display_name(), context.session_id))
+            .context(format!("provider follow-up transport {name} failed")),
+        Stage::Send if uncertain => error.context(format!(
+            "provider follow-up transport {name} could not confirm delivery; the turn remains claimed until the target reports completion or the session is explicitly closed")),
+        Stage::Send => error.context(format!("provider follow-up transport {name} failed")),
+        Stage::Remaining if facts.surface.is_some() => error.context(format!(
+            "provider follow-up transport {name} exhausted its total timeout before delivery")),
+        Stage::Budget => error.context(format!(
+            "provider follow-up transport {name} cannot start inside its remaining total timeout")),
+        _ => error,
+    }
+}
+
+fn deliver_with(
+    mut claim: turn::Claim,
+    mut turn: Turn<'_>,
+    context: DeliveryContext<'_>,
+    transport: &dyn Transport,
+    checks: &dyn Checks,
+) -> Result<Delivered> {
+    let facts = transport.facts();
+    let initial = matches!(turn, Turn::Initial { .. });
+    if initial && facts.readiness == Readiness::LaunchArgument {
+        claim.settle_delivery(turn::Delivery::Sent)?;
+        return Ok(Delivered {
+            correlation_id: None,
+        });
+    }
+    let token = claim.token().to_owned();
+    let mut prompt = String::new();
+    // Paste has never needed current_exe. Resolve it only for addressed transports.
+    let mut executable = std::path::PathBuf::new();
+    let mut prepared = None;
+    let mut prompt_file = None;
+    let mut stage = Stage::Bare;
+    let outcome = (|| -> Result<Outcome> {
+        if let Turn::Initial { gate } = &mut turn {
+            if let Readiness::AfterLaunch { ready_delay } = facts.readiness {
+                checks.ready(&context, ready_delay)?;
+                gate(Gate::AfterLaunch)?;
+            }
+            prompt = Reader::open_unchecked(context.directory)
+                .initial_prompt()
+                .context("failed to read the preserved initial prompt")?;
+        } else if let Turn::FollowUp { prompt: input } = turn {
+            prompt = input.to_owned();
+        }
+        stage = Stage::Prepare;
+        prepared = Some(transport.prepare(&context.turn_context(
+            initial,
+            &token,
+            &prompt,
+            &executable,
+        ))?);
+        if initial && facts.surface.is_none() {
+            executable =
+                std::env::current_exe().context("failed to locate the current executable")?;
+        }
+        if facts.surface.is_some() {
+            let mut file = tempfile::Builder::new()
+                .prefix("pending-prompt-")
+                .suffix(".txt")
+                .tempfile_in(context.directory)?;
+            RecordStore::set_file_private(file.as_file())?;
+            file.write_all(&super::terminal_input_bytes(
+                context.surface.kind,
+                &prepared.as_ref().unwrap().prompt,
+            ))?;
+            file.flush()?;
+            prompt_file = Some(file);
+            checks.ownership(&context)?;
+        }
+        stage = Stage::Remaining;
+        let remaining = checks.remaining(&context)?;
+        if let Some(surface) = &facts.surface {
+            stage = Stage::Budget;
+            checks.budget(&context, surface.submit_count, remaining)?;
+        }
+        stage = Stage::Bare;
+        if !initial && facts.surface.is_none() {
+            executable =
+                std::env::current_exe().context("failed to locate the current executable")?;
+        }
+        if let Turn::Initial { gate } = &mut turn {
+            gate(Gate::BeforeDelivery)?;
+        }
+        claim.begin_delivery()?;
+        stage = Stage::Send;
+        Ok(transport.send(
+            &context.turn_context(initial, &token, &prompt, &executable),
+            prepared.as_ref().unwrap(),
+            prompt_file.as_ref().map(|file| file.path()),
+        ))
+    })()
+    .unwrap_or_else(Outcome::NotSent);
+    // Initial failure files historically disappear before rollback/uncertainty writes;
+    // follow-up files live through settlement. Do not put a long-lived lock around send.
+    if (initial || matches!(stage, Stage::Prepare)) && !matches!(outcome, Outcome::Sent) {
+        drop(prompt_file.take());
+    }
+    match outcome {
+        Outcome::Sent => {
+            if initial {
+                if let Err(error) = claim.complete_initial_delivery() {
+                    drop(prompt_file.take());
+                    let _ = claim.record_delivery_diagnostic(&error);
+                    return Err(error);
+                }
+            } else {
+                drop(prompt_file.take());
+                claim.settle_delivery(turn::Delivery::Sent)?;
+            }
+            Ok(Delivered {
+                correlation_id: prepared.and_then(|p| p.correlation_id),
+            })
+        }
+        Outcome::NotSent(error) => {
+            transport.discard_prepared(
+                &context.turn_context(initial, &token, &prompt, &executable),
+                prepared.as_ref(),
+            );
+            let _ = claim.settle_delivery(turn::Delivery::NotSent(&error));
+            Err(if initial {
+                error
+            } else {
+                follow_up_error(
+                    error,
+                    stage,
+                    &facts,
+                    &context.turn_context(initial, &token, &prompt, &executable),
+                    false,
+                )
+            })
+        }
+        Outcome::Uncertain(error) => {
+            let _ = claim.settle_delivery(turn::Delivery::Uncertain(&error));
+            Err(if initial {
+                error
+            } else {
+                follow_up_error(
+                    error,
+                    stage,
+                    &facts,
+                    &context.turn_context(initial, &token, &prompt, &executable),
+                    true,
+                )
+            })
+        }
+    }
+}
+
+fn initial_prompt_delay_within_budget(
+    deadline: Instant,
+    delay: Duration,
+    requested: Duration,
+) -> Result<Duration> {
+    let remaining = super::remaining_turn_timeout(deadline, requested)?;
+    if delay >= remaining {
+        bail!(
+            "initial prompt readiness delay of {} seconds does not fit inside the {} second ask timeout",
+            delay.as_secs(),
+            requested.as_secs()
+        )
+    }
+    Ok(delay)
+}
+
+#[cfg(test)]
+mod tests;

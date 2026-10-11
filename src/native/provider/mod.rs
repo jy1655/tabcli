@@ -5,14 +5,9 @@ mod pi;
 
 use agent_bridge::FirstPartyCli;
 use anyhow::Result;
-use std::{
-    ffi::OsString,
-    path::Path,
-    path::PathBuf,
-    time::{Duration, Instant},
-};
+use std::{ffi::OsString, path::Path, path::PathBuf, time::Instant};
 
-use super::terminal;
+use super::{delivery::Transport, terminal};
 
 pub(super) struct LaunchContext<'a> {
     pub(super) bridge_executable: &'a Path,
@@ -76,53 +71,6 @@ pub(super) struct CrossSessionMessageContext<'a> {
 }
 
 #[derive(Debug)]
-pub(super) struct CrossSessionMessageFailure {
-    error: anyhow::Error,
-    delivery_may_have_occurred: bool,
-    retryable_discovery_failure: bool,
-}
-
-impl CrossSessionMessageFailure {
-    pub(super) fn not_sent(error: anyhow::Error) -> Self {
-        Self {
-            error,
-            delivery_may_have_occurred: false,
-            retryable_discovery_failure: false,
-        }
-    }
-
-    pub(super) fn retryable_discovery_failure(error: anyhow::Error) -> Self {
-        Self {
-            error,
-            delivery_may_have_occurred: false,
-            retryable_discovery_failure: true,
-        }
-    }
-
-    pub(super) fn delivery_uncertain(error: anyhow::Error) -> Self {
-        Self {
-            error,
-            delivery_may_have_occurred: true,
-            retryable_discovery_failure: false,
-        }
-    }
-
-    pub(super) fn delivery_may_have_occurred(&self) -> bool {
-        self.delivery_may_have_occurred
-    }
-
-    pub(super) fn should_retry_discovery(&self) -> bool {
-        self.retryable_discovery_failure
-    }
-
-    pub(super) fn into_error(self) -> anyhow::Error {
-        self.error
-    }
-}
-
-pub(super) type CrossSessionMessageResult = std::result::Result<(), CrossSessionMessageFailure>;
-
-#[derive(Debug)]
 pub(super) enum CompletionMonitor {
     Hook,
     AgyTranscript { log_path: PathBuf },
@@ -161,30 +109,6 @@ impl ActiveCompletionMonitor {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum FollowUpTransport {
-    TerminalPasteFallback,
-    ProviderCrossSessionMessage,
-    ProviderQueue,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum InitialPromptTransport {
-    ProviderArgument,
-    ProviderCrossSessionMessageAfterLaunch,
-    TerminalPasteAfterLaunch,
-}
-
-impl FollowUpTransport {
-    pub(super) const fn as_str(self) -> &'static str {
-        match self {
-            Self::TerminalPasteFallback => "terminal-paste-fallback",
-            Self::ProviderCrossSessionMessage => "provider-cross-session-message",
-            Self::ProviderQueue => "provider-native-queue",
-        }
-    }
-}
-
 pub(super) enum CancelSupport {
     #[allow(dead_code)] // Provider support is added by the session-specific integration.
     Supported,
@@ -196,6 +120,8 @@ pub(super) fn cancel_support(provider: FirstPartyCli, directory: &Path) -> Resul
 }
 
 trait NativeProviderAdapter: Sync {
+    fn initial_transport(&self) -> Box<dyn Transport>;
+    fn follow_up_transport(&self) -> Box<dyn Transport>;
     fn cancel_support(&self, directory: &Path) -> Result<CancelSupport>;
     fn workspace_trust(
         &self,
@@ -227,38 +153,8 @@ trait NativeProviderAdapter: Sync {
         &self,
         context: ResumedSessionContext<'_>,
     ) -> Result<Vec<u32>>;
-    fn initial_prompt_transport(&self) -> InitialPromptTransport;
-    fn initial_prompt_ready_delay(&self) -> Duration;
-    fn send_initial_prompt(
-        &self,
-        session: &terminal::TerminalSession,
-        prompt_path: &Path,
-        deadline: Instant,
-    ) -> terminal::TerminalSendResult;
-    fn terminal_initial_prompt(&self, directory: &Path, prompt: &str) -> Result<String>;
-    #[cfg(any(windows, test))]
-    fn terminal_submit_count(&self) -> usize;
-    fn follow_up_transport(&self) -> FollowUpTransport;
-    fn new_cross_session_turn_id(&self) -> Result<String>;
-    fn send_cross_session_message(
-        &self,
-        context: CrossSessionMessageContext<'_>,
-    ) -> CrossSessionMessageResult;
     fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()>;
     fn run_control(&self, arguments: &[String]) -> Result<()>;
-    fn send_terminal_follow_up(
-        &self,
-        session: &terminal::TerminalSession,
-        prompt_path: &Path,
-        deadline: Instant,
-    ) -> terminal::TerminalSendResult;
-    fn prepare_terminal_follow_up(
-        &self,
-        directory: &Path,
-        prompt: &str,
-        claim_token: &str,
-    ) -> Result<String>;
-    fn cancel_terminal_follow_up(&self, directory: &Path, claim_token: &str) -> Result<()>;
 }
 
 fn adapter(provider: FirstPartyCli) -> &'static dyn NativeProviderAdapter {
@@ -343,77 +239,6 @@ pub(super) fn override_claude_session_registry_for_test(registry: Option<PathBuf
     claude::override_session_registry_for_test(registry);
 }
 
-pub(super) fn follow_up_transport(provider: FirstPartyCli) -> FollowUpTransport {
-    adapter(provider).follow_up_transport()
-}
-
-pub(super) fn initial_prompt_transport(provider: FirstPartyCli) -> InitialPromptTransport {
-    adapter(provider).initial_prompt_transport()
-}
-
-pub(super) fn initial_prompt_ready_delay(provider: FirstPartyCli) -> Duration {
-    adapter(provider).initial_prompt_ready_delay()
-}
-
-#[cfg(any(windows, test))]
-pub(super) fn terminal_submit_count(provider: FirstPartyCli) -> usize {
-    adapter(provider).terminal_submit_count()
-}
-
-pub(super) fn validate_terminal_send_budget(
-    provider: FirstPartyCli,
-    terminal_kind: terminal::TerminalKind,
-    timeout: Duration,
-) -> Result<()> {
-    #[cfg(windows)]
-    {
-        validate_terminal_send_budget_for_platform(provider, terminal_kind, timeout, true)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (provider, terminal_kind, timeout);
-        Ok(())
-    }
-}
-
-#[cfg(any(windows, test))]
-pub(super) fn validate_terminal_send_budget_for_platform(
-    provider: FirstPartyCli,
-    terminal_kind: terminal::TerminalKind,
-    timeout: Duration,
-    windows: bool,
-) -> Result<()> {
-    if windows
-        && terminal_kind == terminal::TerminalKind::WindowsConsole
-        && !terminal::windows_console_submit_delays_fit(terminal_submit_count(provider), timeout)
-    {
-        anyhow::bail!(
-            "Windows console submission delays do not fit inside the remaining turn timeout"
-        )
-    }
-    Ok(())
-}
-
-pub(super) fn send_terminal_follow_up(
-    provider: FirstPartyCli,
-    session: &terminal::TerminalSession,
-    prompt_path: &Path,
-    deadline: Instant,
-) -> terminal::TerminalSendResult {
-    adapter(provider).send_terminal_follow_up(session, prompt_path, deadline)
-}
-
-pub(super) fn send_cross_session_message(
-    provider: FirstPartyCli,
-    context: CrossSessionMessageContext<'_>,
-) -> CrossSessionMessageResult {
-    adapter(provider).send_cross_session_message(context)
-}
-
-pub(super) fn new_cross_session_turn_id(provider: FirstPartyCli) -> Result<String> {
-    adapter(provider).new_cross_session_turn_id()
-}
-
 pub(super) fn handle_hook(
     provider: FirstPartyCli,
     directory: &Path,
@@ -426,36 +251,28 @@ pub(super) fn run_control(provider: FirstPartyCli, arguments: &[String]) -> Resu
     adapter(provider).run_control(arguments)
 }
 
-pub(super) fn send_initial_prompt(
-    provider: FirstPartyCli,
-    session: &terminal::TerminalSession,
-    prompt_path: &Path,
-    deadline: Instant,
-) -> terminal::TerminalSendResult {
-    adapter(provider).send_initial_prompt(session, prompt_path, deadline)
+pub(super) fn initial_transport(provider: FirstPartyCli) -> Box<dyn Transport> {
+    adapter(provider).initial_transport()
+}
+pub(super) fn follow_up_transport(provider: FirstPartyCli) -> Box<dyn Transport> {
+    adapter(provider).follow_up_transport()
 }
 
-pub(super) fn terminal_initial_prompt(
-    provider: FirstPartyCli,
-    directory: &Path,
-    prompt: &str,
-) -> Result<String> {
-    adapter(provider).terminal_initial_prompt(directory, prompt)
-}
-
-pub(super) fn prepare_terminal_follow_up(
-    provider: FirstPartyCli,
-    directory: &Path,
-    prompt: &str,
-    claim_token: &str,
-) -> Result<String> {
-    adapter(provider).prepare_terminal_follow_up(directory, prompt, claim_token)
-}
-
-pub(super) fn cancel_terminal_follow_up(
-    provider: FirstPartyCli,
-    directory: &Path,
-    claim_token: &str,
-) -> Result<()> {
-    adapter(provider).cancel_terminal_follow_up(directory, claim_token)
+#[cfg(test)]
+fn transport_test_context<'a>(
+    directory: &'a Path,
+    surface: &'a terminal::TerminalSession,
+    kind: super::delivery::TurnKind,
+) -> super::delivery::TurnContext<'a> {
+    super::delivery::TurnContext {
+        kind,
+        directory,
+        session_id: "session-transport",
+        claim_token: "1-2-3",
+        surface,
+        provider_path: Path::new("provider"),
+        bridge_executable: Path::new("bridge"),
+        prompt: "provider transport framing",
+        deadline: Instant::now() + std::time::Duration::from_secs(30),
+    }
 }

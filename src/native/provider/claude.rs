@@ -1,7 +1,9 @@
 use super::{
-    CompletionMonitor, CrossSessionMessageContext, CrossSessionMessageFailure,
-    CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
-    LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
+    CompletionMonitor, CrossSessionMessageContext, LaunchContext, LaunchPlan,
+    NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
+};
+use crate::native::delivery::{
+    self, Outcome, Prepared, Readiness, Transport, TransportFacts, TurnContext,
 };
 #[cfg(test)]
 use crate::native::session::SessionState;
@@ -204,7 +206,126 @@ enum MessageGuardDecision {
     Deny,
 }
 
+#[derive(Debug)]
+struct MessengerFailure {
+    error: anyhow::Error,
+    delivery_may_have_occurred: bool,
+    retryable_discovery_failure: bool,
+}
+
+impl MessengerFailure {
+    fn not_sent(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            delivery_may_have_occurred: false,
+            retryable_discovery_failure: false,
+        }
+    }
+
+    fn retryable_discovery_failure(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            delivery_may_have_occurred: false,
+            retryable_discovery_failure: true,
+        }
+    }
+
+    fn delivery_uncertain(error: anyhow::Error) -> Self {
+        Self {
+            error,
+            delivery_may_have_occurred: true,
+            retryable_discovery_failure: false,
+        }
+    }
+
+    fn delivery_may_have_occurred(&self) -> bool {
+        self.delivery_may_have_occurred
+    }
+
+    fn should_retry_discovery(&self) -> bool {
+        self.retryable_discovery_failure
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        self.error
+    }
+}
+
+type MessengerResult = std::result::Result<(), MessengerFailure>;
+
+fn new_cross_session_turn_id() -> Result<String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_nanos();
+    Ok(format!(
+        "claude-turn-{now}-{}-{}",
+        std::process::id(),
+        CROSS_SESSION_TURN_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+struct ClaudeMessage;
+impl Transport for ClaudeMessage {
+    fn facts(&self) -> TransportFacts {
+        TransportFacts {
+            name: "provider-cross-session-message",
+            readiness: Readiness::AfterLaunch {
+                ready_delay: Duration::from_secs(2),
+            },
+            surface: None,
+        }
+    }
+    fn prepare(&self, _: &TurnContext<'_>) -> Result<Prepared> {
+        Ok(Prepared {
+            prompt: String::new(),
+            correlation_id: Some(new_cross_session_turn_id()?),
+        })
+    }
+    fn send(&self, turn: &TurnContext<'_>, prepared: &Prepared, _: Option<&Path>) -> Outcome {
+        match send_cross_session_message(CrossSessionMessageContext {
+            bridge_executable: turn.bridge_executable,
+            directory: turn.directory,
+            provider_path: turn.provider_path,
+            request_id: prepared
+                .correlation_id
+                .as_deref()
+                .expect("Claude turn identity"),
+            prompt: turn.prompt,
+            deadline: turn.deadline,
+        }) {
+            Ok(()) => Outcome::Sent,
+            Err(failure) => {
+                let uncertain = failure.delivery_may_have_occurred();
+                let mut error = failure.into_error();
+                if turn.kind == delivery::TurnKind::Initial {
+                    error = error.context(if uncertain {
+                        "Claude initial cross-session delivery could not be confirmed; the turn remains claimed until completion or explicit close"
+                    } else { "Claude initial cross-session delivery was not sent" });
+                }
+                if uncertain {
+                    Outcome::Uncertain(error)
+                } else {
+                    Outcome::NotSent(error)
+                }
+            }
+        }
+    }
+    fn discard_prepared(&self, _: &TurnContext<'_>, _: Option<&Prepared>) {}
+}
+
 impl NativeProviderAdapter for ClaudeAdapter {
+    fn initial_transport(&self) -> Box<dyn Transport> {
+        if cfg!(windows) {
+            Box::new(ClaudeMessage)
+        } else {
+            Box::new(delivery::LAUNCH_ARGUMENT)
+        }
+    }
+    fn follow_up_transport(&self) -> Box<dyn Transport> {
+        Box::new(ClaudeMessage)
+    }
+
     fn cancel_support(&self, _directory: &Path) -> Result<super::CancelSupport> {
         Ok(super::CancelSupport::Unsupported(
             "in this release the Bridge integration for claude does not support cancel".to_owned(),
@@ -383,57 +504,6 @@ impl NativeProviderAdapter for ClaudeAdapter {
         }
     }
 
-    fn initial_prompt_transport(&self) -> InitialPromptTransport {
-        claude_initial_prompt_transport(cfg!(windows))
-    }
-
-    fn initial_prompt_ready_delay(&self) -> Duration {
-        Duration::from_secs(2)
-    }
-
-    fn send_initial_prompt(
-        &self,
-        _session: &terminal::TerminalSession,
-        _prompt_path: &Path,
-        _deadline: Instant,
-    ) -> terminal::TerminalSendResult {
-        Err(terminal::TerminalSendFailure::not_sent(anyhow::anyhow!(
-            "Claude initial prompts do not use terminal paste"
-        )))
-    }
-
-    fn terminal_initial_prompt(&self, _directory: &Path, _prompt: &str) -> Result<String> {
-        bail!("Claude initial prompts do not use terminal paste")
-    }
-
-    #[cfg(any(windows, test))]
-    fn terminal_submit_count(&self) -> usize {
-        1
-    }
-
-    fn follow_up_transport(&self) -> FollowUpTransport {
-        FollowUpTransport::ProviderCrossSessionMessage
-    }
-
-    fn new_cross_session_turn_id(&self) -> Result<String> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock is before the Unix epoch")?
-            .as_nanos();
-        Ok(format!(
-            "claude-turn-{now}-{}-{}",
-            std::process::id(),
-            CROSS_SESSION_TURN_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
-
-    fn send_cross_session_message(
-        &self,
-        context: CrossSessionMessageContext<'_>,
-    ) -> CrossSessionMessageResult {
-        send_cross_session_message(context)
-    }
-
     fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()> {
         handle_hook(directory, payload)
     }
@@ -444,30 +514,6 @@ impl NativeProviderAdapter for ClaudeAdapter {
             [action, request_id] if action == "message-receipt" => run_message_receipt(request_id),
             _ => bail!("unsupported Claude Agent Bridge provider control"),
         }
-    }
-
-    fn send_terminal_follow_up(
-        &self,
-        _session: &terminal::TerminalSession,
-        _prompt_path: &Path,
-        _deadline: Instant,
-    ) -> terminal::TerminalSendResult {
-        Err(terminal::TerminalSendFailure::not_sent(anyhow::anyhow!(
-            "Claude follow-up prompts do not use terminal paste"
-        )))
-    }
-
-    fn prepare_terminal_follow_up(
-        &self,
-        _directory: &Path,
-        _prompt: &str,
-        _claim_token: &str,
-    ) -> Result<String> {
-        bail!("Claude follow-up prompts use cross-session messaging")
-    }
-
-    fn cancel_terminal_follow_up(&self, _directory: &Path, _claim_token: &str) -> Result<()> {
-        bail!("Claude follow-up prompts use cross-session messaging")
     }
 }
 
@@ -570,14 +616,6 @@ fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Res
         completion_monitor: CompletionMonitor::Hook,
         environment_removals: CLAUDE_CODE_SESSION_MARKERS,
     })
-}
-
-fn claude_initial_prompt_transport(windows: bool) -> InitialPromptTransport {
-    if windows {
-        InitialPromptTransport::ProviderCrossSessionMessageAfterLaunch
-    } else {
-        InitialPromptTransport::ProviderArgument
-    }
 }
 
 // Official `claude --resume <uuid>` continues a conversation in a new interactive process.
@@ -1393,9 +1431,7 @@ fn record_message_receipt(
     })
 }
 
-fn send_cross_session_message(
-    context: CrossSessionMessageContext<'_>,
-) -> CrossSessionMessageResult {
+fn send_cross_session_message(context: CrossSessionMessageContext<'_>) -> MessengerResult {
     send_cross_session_message_with_retry_policy(
         context,
         CROSS_SESSION_DISCOVERY_RETRY_WINDOW,
@@ -1407,9 +1443,9 @@ fn send_cross_session_message_with_retry_policy(
     context: CrossSessionMessageContext<'_>,
     retry_window: Duration,
     retry_delay: Duration,
-) -> CrossSessionMessageResult {
+) -> MessengerResult {
     let pending = install_pending_turn(context.directory, context.request_id)
-        .map_err(CrossSessionMessageFailure::not_sent)?;
+        .map_err(MessengerFailure::not_sent)?;
     let result =
         send_cross_session_message_with_discovery_retry_policy(context, retry_window, retry_delay);
     let retain_pending = match &result {
@@ -1426,13 +1462,13 @@ fn send_cross_session_message_with_discovery_retry_policy(
     context: CrossSessionMessageContext<'_>,
     retry_window: Duration,
     retry_delay: Duration,
-) -> CrossSessionMessageResult {
+) -> MessengerResult {
     let deadline = context.deadline;
     let mut retry_deadline = None;
     loop {
         let now = Instant::now();
         if now >= deadline {
-            return Err(CrossSessionMessageFailure::not_sent(anyhow::anyhow!(
+            return Err(MessengerFailure::not_sent(anyhow::anyhow!(
                 "Claude cross-session discovery exhausted the total delivery timeout"
             )));
         }
@@ -1478,35 +1514,33 @@ fn messenger_command(
     Ok(command)
 }
 
-fn send_cross_session_message_inner(
-    context: CrossSessionMessageContext<'_>,
-) -> CrossSessionMessageResult {
+fn send_cross_session_message_inner(context: CrossSessionMessageContext<'_>) -> MessengerResult {
     let deadline = context.deadline;
     let plan = cross_session_message_plan(context.directory, context.request_id, context.prompt)
-        .map_err(CrossSessionMessageFailure::not_sent)?;
+        .map_err(MessengerFailure::not_sent)?;
     let _guard_files = install_message_guard(
         context.bridge_executable,
         context.request_id,
         &plan.guard,
         &plan.files,
     )
-    .map_err(CrossSessionMessageFailure::not_sent)?;
+    .map_err(MessengerFailure::not_sent)?;
     let mut command = messenger_command(context.provider_path, context.directory, plan.arguments)
-        .map_err(CrossSessionMessageFailure::not_sent)?;
+        .map_err(MessengerFailure::not_sent)?;
     let mut stdout = tempfile::tempfile()
         .context("failed to create Claude messenger stdout buffer")
-        .map_err(CrossSessionMessageFailure::not_sent)?;
+        .map_err(MessengerFailure::not_sent)?;
     let mut stderr = tempfile::tempfile()
         .context("failed to create Claude messenger stderr buffer")
-        .map_err(CrossSessionMessageFailure::not_sent)?;
+        .map_err(MessengerFailure::not_sent)?;
     let stdout_sink = stdout
         .try_clone()
         .context("failed to clone Claude messenger stdout buffer")
-        .map_err(CrossSessionMessageFailure::not_sent)?;
+        .map_err(MessengerFailure::not_sent)?;
     let stderr_sink = stderr
         .try_clone()
         .context("failed to clone Claude messenger stderr buffer")
-        .map_err(CrossSessionMessageFailure::not_sent)?;
+        .map_err(MessengerFailure::not_sent)?;
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::from(stdout_sink))
@@ -1518,30 +1552,30 @@ fn send_cross_session_message_inner(
                 context.provider_path.display()
             )
         })
-        .map_err(CrossSessionMessageFailure::not_sent)?;
+        .map_err(MessengerFailure::not_sent)?;
     let process_tree = match ProviderProcessTree::attach(&child) {
         Ok(process_tree) => process_tree,
         Err(error) => {
             terminate_child(&mut child);
-            return Err(CrossSessionMessageFailure::not_sent(error));
+            return Err(MessengerFailure::not_sent(error));
         }
     };
     if let Err(error) = process_tree.resume(&child) {
         terminate_child_tree(&mut child, &process_tree);
-        return Err(CrossSessionMessageFailure::not_sent(error));
+        return Err(MessengerFailure::not_sent(error));
     }
     let stdin = match child.stdin.take() {
         Some(stdin) => stdin,
         None => {
             terminate_child_tree(&mut child, &process_tree);
-            return Err(CrossSessionMessageFailure::not_sent(anyhow::anyhow!(
+            return Err(MessengerFailure::not_sent(anyhow::anyhow!(
                 "Claude messenger stdin pipe was not created"
             )));
         }
     };
     if Instant::now() >= deadline {
         terminate_child_tree(&mut child, &process_tree);
-        return Err(CrossSessionMessageFailure::not_sent(anyhow::anyhow!(
+        return Err(MessengerFailure::not_sent(anyhow::anyhow!(
             "Claude cross-session messenger timed out before input delivery"
         )));
     }
@@ -1558,7 +1592,7 @@ fn send_cross_session_message_inner(
             Err(error) => {
                 terminate_child_tree(&mut child, &process_tree);
                 let _ = stdin_writer.join();
-                return Err(CrossSessionMessageFailure::delivery_uncertain(
+                return Err(MessengerFailure::delivery_uncertain(
                     anyhow::Error::new(error).context("failed to wait for Claude messenger"),
                 ));
             }
@@ -1566,9 +1600,9 @@ fn send_cross_session_message_inner(
         if Instant::now() >= deadline {
             terminate_child_tree(&mut child, &process_tree);
             let _ = stdin_writer.join();
-            return Err(CrossSessionMessageFailure::delivery_uncertain(
-                anyhow::anyhow!("Claude cross-session messenger timed out"),
-            ));
+            return Err(MessengerFailure::delivery_uncertain(anyhow::anyhow!(
+                "Claude cross-session messenger timed out"
+            )));
         }
         thread::sleep(Duration::from_millis(50));
     };
@@ -1580,15 +1614,15 @@ fn send_cross_session_message_inner(
         .map_err(|_| anyhow::anyhow!("Claude messenger stdin writer panicked"))
         .and_then(|result| result.map_err(anyhow::Error::new))
         .context("failed to deliver Claude messenger input over stdin")
-        .map_err(CrossSessionMessageFailure::delivery_uncertain)?;
+        .map_err(MessengerFailure::delivery_uncertain)?;
     let (stdout, stdout_truncated) =
-        read_capped_file(&mut stdout).map_err(CrossSessionMessageFailure::delivery_uncertain)?;
+        read_capped_file(&mut stdout).map_err(MessengerFailure::delivery_uncertain)?;
     let (stderr, stderr_truncated) =
-        read_capped_file(&mut stderr).map_err(CrossSessionMessageFailure::delivery_uncertain)?;
+        read_capped_file(&mut stderr).map_err(MessengerFailure::delivery_uncertain)?;
     if stdout_truncated || stderr_truncated {
-        return Err(CrossSessionMessageFailure::delivery_uncertain(
-            anyhow::anyhow!("Claude cross-session messenger output exceeded the safety limit"),
-        ));
+        return Err(MessengerFailure::delivery_uncertain(anyhow::anyhow!(
+            "Claude cross-session messenger output exceeded the safety limit"
+        )));
     }
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr);
@@ -1609,10 +1643,10 @@ fn unconfirmed_delivery_failure(
     stdout: &[u8],
     files: &MessengerFiles,
     error: anyhow::Error,
-) -> CrossSessionMessageFailure {
+) -> MessengerFailure {
     match send_provably_did_not_run(stdout, files) {
-        Ok(true) => CrossSessionMessageFailure::retryable_discovery_failure(error),
-        Ok(false) | Err(_) => CrossSessionMessageFailure::delivery_uncertain(error),
+        Ok(true) => MessengerFailure::retryable_discovery_failure(error),
+        Ok(false) | Err(_) => MessengerFailure::delivery_uncertain(error),
     }
 }
 
@@ -1985,6 +2019,34 @@ pub(super) fn hook_settings(executable: &Path) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn declared_message_prepares_only_identity_and_leaves_pending_ownership_in_send() {
+        use crate::native::delivery::TurnKind;
+        let directory = tempfile::tempdir().unwrap();
+        let surface = serde_json::from_value(
+            serde_json::json!({"terminal":"windows-console", "session_id":"surface"}),
+        )
+        .unwrap();
+        for kind in [TurnKind::Initial, TurnKind::FollowUp] {
+            let context = super::super::transport_test_context(directory.path(), &surface, kind);
+            let prepared = ClaudeMessage.prepare(&context).unwrap();
+            assert!(
+                prepared.prompt.is_empty(),
+                "messenger must never receive raw Prepared.prompt"
+            );
+            assert!(
+                prepared
+                    .correlation_id
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("claude-turn-")
+            );
+            assert!(!directory.path().join(PENDING_TURN_FILE).exists());
+            ClaudeMessage.discard_prepared(&context, Some(&prepared));
+            assert!(!directory.path().join(PENDING_TURN_FILE).exists());
+        }
+    }
+
     #[test]
     fn messenger_keeps_only_claude_removals_and_its_explicit_session_directory() {
         let directory = std::path::Path::new(".");
@@ -2452,16 +2514,18 @@ mod tests {
     #[test]
     fn every_platform_uses_the_official_cross_session_path_without_resume_fallback() {
         assert_eq!(
-            ADAPTER.follow_up_transport(),
-            FollowUpTransport::ProviderCrossSessionMessage
+            ADAPTER.follow_up_transport().facts().name,
+            "provider-cross-session-message"
         );
         assert_eq!(
-            claude_initial_prompt_transport(false),
-            InitialPromptTransport::ProviderArgument
+            delivery::LAUNCH_ARGUMENT.facts().readiness,
+            Readiness::LaunchArgument
         );
         assert_eq!(
-            claude_initial_prompt_transport(true),
-            InitialPromptTransport::ProviderCrossSessionMessageAfterLaunch
+            ClaudeMessage.facts().readiness,
+            Readiness::AfterLaunch {
+                ready_delay: Duration::from_secs(2)
+            }
         );
     }
 

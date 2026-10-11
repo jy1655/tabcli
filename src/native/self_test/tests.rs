@@ -1152,3 +1152,36 @@ fn close_deadline_child_report_and_outer_timeout_continue_cleanup() {
         assert!(fake.replies.is_empty());
     }
 }
+#[test]
+fn delivery_wording_preserves_self_test_failure_classification() {
+    for (reason, expected) in [
+        (
+            "provider follow-up transport provider-cross-session-message could not confirm delivery; the turn remains claimed until the target reports completion or the session is explicitly closed: cause",
+            Outcome::NotVerified,
+        ),
+        (
+            "provider follow-up transport provider-native-queue could not confirm delivery; the turn remains claimed until the target reports completion or the session is explicitly closed: cause",
+            Outcome::NotVerified,
+        ),
+        (
+            "provider follow-up transport terminal-paste-fallback failed: failed to type into visible Windows Console session session-test: cause",
+            Outcome::Failed,
+        ),
+        (
+            "provider follow-up transport terminal-paste-fallback exhausted its total timeout before delivery: timed out after 30 seconds",
+            Outcome::TimedOut,
+        ),
+        (
+            "Claude initial cross-session delivery could not be confirmed; the turn remains claimed until completion or explicit close: cause",
+            Outcome::Failed,
+        ),
+        (
+            "Claude initial cross-session delivery was not sent: cause",
+            Outcome::Failed,
+        ),
+    ] {
+        let (actual, retained) = failure(&error(reason));
+        assert_eq!(actual, expected);
+        assert_eq!(retained, reason);
+    }
+}

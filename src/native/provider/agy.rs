@@ -1,7 +1,9 @@
 use super::{
-    CompletionMonitor, CrossSessionMessageContext, CrossSessionMessageFailure,
-    CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
-    LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
+    CompletionMonitor, LaunchContext, LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan,
+    ResumedSessionContext,
+};
+use crate::native::delivery::{
+    self, Outcome, Prepared, Readiness, SurfaceInput, Transport, TransportFacts, TurnContext,
 };
 use crate::native::session::SessionState;
 use crate::native::session::turn;
@@ -109,7 +111,134 @@ impl PendingAgyTurn {
 // held lock and a resumable transcript marker.
 const AGY_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Agy exposes no verifiable ownership evidence for a conversation (presence locks are not held by the running process) and its transcript monitor binds only to a newly created conversation";
 
+fn send_initial_prompt(
+    session: &terminal::TerminalSession,
+    prompt_path: &Path,
+    deadline: Instant,
+) -> terminal::TerminalSendResult {
+    if cfg!(windows) {
+        deliver_terminal_turn(
+            session,
+            prompt_path,
+            deadline,
+            Some(WINDOWS_STARTUP_READINESS_TIMING),
+        )
+    } else {
+        // Unreachable while the initial Transport is `LAUNCH_ARGUMENT` off
+        // Windows; kept as the plain paste so the transport decision stays in one
+        // place.
+        terminal::send_file(session, prompt_path, deadline)
+    }
+}
+
+fn terminal_initial_prompt(directory: &Path, prompt: &str) -> Result<String> {
+    let pending =
+        read_pending_turn(directory)?.context("Agy initial turn correlation state is missing")?;
+    terminal_correlated_prompt(prompt, &pending, cfg!(windows))
+}
+
+fn send_terminal_follow_up(
+    session: &terminal::TerminalSession,
+    prompt_path: &Path,
+    deadline: Instant,
+) -> terminal::TerminalSendResult {
+    if cfg!(windows) {
+        // The Windows initial paste already waited for startup readiness, so a
+        // follow-up only takes its receipt offset and pastes.
+        deliver_terminal_turn(session, prompt_path, deadline, None)
+    } else {
+        // On macOS the initial prompt was a launch argument, so the first
+        // follow-up is the first paste. Agy runs that argument behind its
+        // workspace-trust dialog, which covers the composer until the workspace
+        // is approved, and a paste onto the dialog is lost while its Enter
+        // approves the folder (issue #48, see `wait_for_workspace_trust_with`).
+        // Every follow-up therefore waits for the trust evidence, then for the
+        // macOS readiness rule, and requires the receipt.
+        deliver_terminal_turn(
+            session,
+            prompt_path,
+            deadline,
+            Some(MACOS_FOLLOW_UP_READINESS_TIMING),
+        )
+    }
+}
+
+fn prepare_terminal_follow_up(directory: &Path, prompt: &str, claim_token: &str) -> Result<String> {
+    let pending = install_pending_turn(directory, claim_token)?;
+    terminal_correlated_prompt(prompt, &pending, cfg!(windows))
+}
+
+struct AgyInitialPaste;
+impl Transport for AgyInitialPaste {
+    fn facts(&self) -> TransportFacts {
+        TransportFacts {
+            name: "terminal-paste-fallback",
+            readiness: Readiness::AfterLaunch {
+                ready_delay: Duration::from_secs(0),
+            },
+            surface: Some(SurfaceInput { submit_count: 1 }),
+        }
+    }
+    fn prepare(&self, turn: &TurnContext<'_>) -> Result<Prepared> {
+        Ok(Prepared {
+            prompt: terminal_initial_prompt(turn.directory, turn.prompt)?,
+            correlation_id: None,
+        })
+    }
+    fn send(&self, turn: &TurnContext<'_>, _: &Prepared, file: Option<&Path>) -> Outcome {
+        send_initial_prompt(
+            turn.surface,
+            file.expect("surface transport has a prompt file"),
+            turn.deadline,
+        )
+        .into()
+    }
+    fn discard_prepared(&self, _: &TurnContext<'_>, _: Option<&Prepared>) {}
+}
+
+// Replace this paste fallback when Agy exposes addressed interactive input.
+struct AgyPaste;
+impl Transport for AgyPaste {
+    fn facts(&self) -> TransportFacts {
+        TransportFacts {
+            name: "terminal-paste-fallback",
+            readiness: Readiness::AfterLaunch {
+                ready_delay: Duration::ZERO,
+            },
+            surface: Some(SurfaceInput { submit_count: 1 }),
+        }
+    }
+    fn prepare(&self, turn: &TurnContext<'_>) -> Result<Prepared> {
+        Ok(Prepared {
+            prompt: prepare_terminal_follow_up(turn.directory, turn.prompt, turn.claim_token)?,
+            correlation_id: None,
+        })
+    }
+    fn send(&self, turn: &TurnContext<'_>, _: &Prepared, file: Option<&Path>) -> Outcome {
+        send_terminal_follow_up(
+            turn.surface,
+            file.expect("surface transport has a prompt file"),
+            turn.deadline,
+        )
+        .into()
+    }
+    fn discard_prepared(&self, turn: &TurnContext<'_>, _: Option<&Prepared>) {
+        let _ = cancel_pending_turn(turn.directory, turn.claim_token);
+    }
+}
+
 impl NativeProviderAdapter for AgyAdapter {
+    fn initial_transport(&self) -> Box<dyn Transport> {
+        if cfg!(windows) {
+            Box::new(AgyInitialPaste)
+        } else {
+            Box::new(delivery::LAUNCH_ARGUMENT)
+        }
+    }
+    fn follow_up_transport(&self) -> Box<dyn Transport> {
+        Box::new(AgyPaste)
+    }
+
     fn cancel_support(&self, _directory: &Path) -> Result<super::CancelSupport> {
         Ok(super::CancelSupport::Unsupported(
             "in this release the Bridge integration for agy does not support cancel".to_owned(),
@@ -226,123 +355,12 @@ impl NativeProviderAdapter for AgyAdapter {
         bail!("{AGY_REOPEN_UNSUPPORTED}")
     }
 
-    fn initial_prompt_transport(&self) -> InitialPromptTransport {
-        if cfg!(windows) {
-            InitialPromptTransport::TerminalPasteAfterLaunch
-        } else {
-            InitialPromptTransport::ProviderArgument
-        }
-    }
-
-    fn initial_prompt_ready_delay(&self) -> Duration {
-        // The Windows console paste waits on Agy's trust evidence and startup log
-        // instead of a fixed delay (see `wait_for_startup_readiness_with`): the
-        // former 12 second delay pasted onto the workspace-trust dialog of an
-        // untrusted workspace, which discards the paste (issue #43). A paste that
-        // still gets no receipt ends as delivery-uncertain, never as a second
-        // paste. Non-Windows delivers the initial prompt as an argument and never
-        // waits; its first paste is the first follow-up, which gates itself.
-        Duration::ZERO
-    }
-
-    fn send_initial_prompt(
-        &self,
-        session: &terminal::TerminalSession,
-        prompt_path: &Path,
-        deadline: Instant,
-    ) -> terminal::TerminalSendResult {
-        if cfg!(windows) {
-            deliver_terminal_turn(
-                session,
-                prompt_path,
-                deadline,
-                Some(WINDOWS_STARTUP_READINESS_TIMING),
-            )
-        } else {
-            // Unreachable while `initial_prompt_transport` is `ProviderArgument` off
-            // Windows; kept as the plain paste so the transport decision stays in one
-            // place.
-            terminal::send_file(session, prompt_path, deadline)
-        }
-    }
-
-    fn terminal_initial_prompt(&self, directory: &Path, prompt: &str) -> Result<String> {
-        let pending = read_pending_turn(directory)?
-            .context("Agy initial turn correlation state is missing")?;
-        terminal_correlated_prompt(prompt, &pending, cfg!(windows))
-    }
-
-    #[cfg(any(windows, test))]
-    fn terminal_submit_count(&self) -> usize {
-        1
-    }
-
-    fn follow_up_transport(&self) -> FollowUpTransport {
-        // Replace this fallback when Agy exposes a verified first-party input
-        // path into an already-running interactive session.
-        FollowUpTransport::TerminalPasteFallback
-    }
-
-    fn new_cross_session_turn_id(&self) -> Result<String> {
-        bail!("Agy does not support provider cross-session turns")
-    }
-
-    fn send_cross_session_message(
-        &self,
-        _context: CrossSessionMessageContext<'_>,
-    ) -> CrossSessionMessageResult {
-        Err(CrossSessionMessageFailure::not_sent(anyhow::anyhow!(
-            "Agy does not support provider cross-session messages"
-        )))
-    }
-
     fn handle_hook(&self, _directory: &Path, _payload: &serde_json::Value) -> Result<()> {
         bail!("Agy does not use native result hooks")
     }
 
     fn run_control(&self, _arguments: &[String]) -> Result<()> {
         bail!("Agy does not expose Agent Bridge provider controls")
-    }
-
-    fn send_terminal_follow_up(
-        &self,
-        session: &terminal::TerminalSession,
-        prompt_path: &Path,
-        deadline: Instant,
-    ) -> terminal::TerminalSendResult {
-        if cfg!(windows) {
-            // The Windows initial paste already waited for startup readiness, so a
-            // follow-up only takes its receipt offset and pastes.
-            deliver_terminal_turn(session, prompt_path, deadline, None)
-        } else {
-            // On macOS the initial prompt was a launch argument, so the first
-            // follow-up is the first paste. Agy runs that argument behind its
-            // workspace-trust dialog, which covers the composer until the workspace
-            // is approved, and a paste onto the dialog is lost while its Enter
-            // approves the folder (issue #48, see `wait_for_workspace_trust_with`).
-            // Every follow-up therefore waits for the trust evidence, then for the
-            // macOS readiness rule, and requires the receipt.
-            deliver_terminal_turn(
-                session,
-                prompt_path,
-                deadline,
-                Some(MACOS_FOLLOW_UP_READINESS_TIMING),
-            )
-        }
-    }
-
-    fn prepare_terminal_follow_up(
-        &self,
-        directory: &Path,
-        prompt: &str,
-        claim_token: &str,
-    ) -> Result<String> {
-        let pending = install_pending_turn(directory, claim_token)?;
-        terminal_correlated_prompt(prompt, &pending, cfg!(windows))
-    }
-
-    fn cancel_terminal_follow_up(&self, directory: &Path, claim_token: &str) -> Result<()> {
-        cancel_pending_turn(directory, claim_token)
     }
 }
 
@@ -552,7 +570,7 @@ fn correlated_response<'a>(message: &'a str, pending: &PendingAgyTurn) -> Result
 // (session-QMFk6F, 21:42:19). It carries the macOS framing header instead of the
 // Windows one, and `receipt_matches` accepts either adapter-owned framing.
 //
-// Delete this section, `initial_prompt_ready_delay`, and the trust and receipt
+// Delete this section, the initial readiness fact, and the trust and receipt
 // branches of `send_initial_prompt`/`send_terminal_follow_up` when Agy provides
 // such a signal or an input API; the transcript result monitor is unaffected.
 const AGY_LOG_FILE: &str = "agy.log";
@@ -2475,6 +2493,45 @@ fn parse_transcript_line(line: &str) -> Option<(u64, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn declared_transports_preserve_framing_and_pending_cleanup() {
+        use crate::native::delivery::TurnKind;
+        let directory = tempfile::tempdir().unwrap();
+        let surface = serde_json::from_value(
+            serde_json::json!({"terminal":"windows-console", "session_id":"surface"}),
+        )
+        .unwrap();
+        let initial =
+            super::super::transport_test_context(directory.path(), &surface, TurnKind::Initial);
+        install_pending_turn(directory.path(), initial.claim_token).unwrap();
+        let before = std::fs::read(directory.path().join(PENDING_TURN_FILE)).unwrap();
+        let prepared = AgyInitialPaste.prepare(&initial).unwrap();
+        assert_eq!(
+            prepared.prompt,
+            terminal_initial_prompt(directory.path(), initial.prompt).unwrap()
+        );
+        assert!(prepared.correlation_id.is_none());
+        AgyInitialPaste.discard_prepared(&initial, Some(&prepared));
+        assert_eq!(
+            std::fs::read(directory.path().join(PENDING_TURN_FILE)).unwrap(),
+            before
+        );
+        let follow =
+            super::super::transport_test_context(directory.path(), &surface, TurnKind::FollowUp);
+        let prepared = AgyPaste.prepare(&follow).unwrap();
+        let pending = read_pending_turn(directory.path()).unwrap().unwrap();
+        assert_eq!(
+            prepared.prompt,
+            terminal_correlated_prompt(follow.prompt, &pending, cfg!(windows)).unwrap()
+        );
+        assert!(prepared.correlation_id.is_none());
+        AgyPaste.discard_prepared(&follow, Some(&prepared));
+        assert!(!directory.path().join(PENDING_TURN_FILE).exists());
+        AgyPaste.prepare(&follow).unwrap();
+        AgyPaste.discard_prepared(&follow, None);
+        assert!(!directory.path().join(PENDING_TURN_FILE).exists());
+    }
+
     #[test]
     fn paste_preparation_requires_trust_correlation_and_readiness_in_order() {
         let tmp = tempfile::tempdir().unwrap();

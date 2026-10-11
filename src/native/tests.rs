@@ -379,29 +379,6 @@ fn bounded_command_output_identifies_a_pre_spawn_failure() {
 }
 
 #[test]
-fn initial_prompt_delay_must_fit_inside_the_original_ask_budget() {
-    let deadline = Instant::now() + Duration::from_millis(20);
-    let error = initial_prompt_delay_within_budget(
-        deadline,
-        Duration::from_secs(12),
-        Duration::from_secs(1),
-    )
-    .unwrap_err();
-    assert!(format!("{error:#}").contains("initial prompt readiness delay"));
-
-    let deadline = Instant::now() + Duration::from_secs(1);
-    assert_eq!(
-        initial_prompt_delay_within_budget(
-            deadline,
-            Duration::from_millis(10),
-            Duration::from_secs(1),
-        )
-        .unwrap(),
-        Duration::from_millis(10)
-    );
-}
-
-#[test]
 fn effort_uses_each_provider_native_session_option() {
     assert_eq!(
         provider_effort_args(FirstPartyCli::Codex, "xhigh").unwrap(),
@@ -2480,73 +2457,41 @@ fn follow_up_prompts_only_enter_a_completed_live_cli_turn() {
 }
 
 #[test]
-fn every_provider_declares_its_current_follow_up_transport() {
-    assert_eq!(
-        provider::follow_up_transport(FirstPartyCli::Codex).as_str(),
-        "provider-native-queue"
-    );
-    for provider in [FirstPartyCli::Agy, FirstPartyCli::Pi] {
-        assert_eq!(
-            provider::follow_up_transport(provider),
-            provider::FollowUpTransport::TerminalPasteFallback
-        );
-    }
-    assert_eq!(
-        provider::follow_up_transport(FirstPartyCli::Claude).as_str(),
-        "provider-cross-session-message"
-    );
-}
-
-#[test]
-fn every_provider_declares_its_initial_prompt_transport() {
-    for provider in [
-        FirstPartyCli::Codex,
-        FirstPartyCli::Claude,
-        FirstPartyCli::Agy,
-        FirstPartyCli::Pi,
+fn every_provider_declares_initial_and_follow_up_transports() {
+    use delivery::{Readiness, Transport};
+    for (provider, name, count, delay, surface) in [
+        (FirstPartyCli::Codex, "provider-native-queue", 2, 12, false),
+        (
+            FirstPartyCli::Claude,
+            "provider-cross-session-message",
+            1,
+            2,
+            false,
+        ),
+        (FirstPartyCli::Agy, "terminal-paste-fallback", 1, 0, true),
+        (FirstPartyCli::Pi, "terminal-paste-fallback", 1, 2, true),
     ] {
-        #[cfg(windows)]
-        assert_eq!(
-            provider::initial_prompt_transport(provider),
-            if provider == FirstPartyCli::Claude {
-                provider::InitialPromptTransport::ProviderCrossSessionMessageAfterLaunch
-            } else {
-                provider::InitialPromptTransport::TerminalPasteAfterLaunch
-            }
-        );
-        #[cfg(not(windows))]
-        assert_eq!(
-            provider::initial_prompt_transport(provider),
-            provider::InitialPromptTransport::ProviderArgument
-        );
-    }
-}
-
-#[test]
-fn every_provider_declares_its_terminal_submission_count() {
-    assert_eq!(provider::terminal_submit_count(FirstPartyCli::Codex), 2);
-    for provider in [FirstPartyCli::Claude, FirstPartyCli::Agy, FirstPartyCli::Pi] {
-        assert_eq!(provider::terminal_submit_count(provider), 1);
-    }
-}
-
-#[test]
-fn windows_initial_prompt_readiness_is_provider_specific() {
-    assert_eq!(
-        provider::initial_prompt_ready_delay(FirstPartyCli::Codex),
-        Duration::from_secs(12)
-    );
-    // Agy gates its Windows console paste on its own startup log inside the adapter
-    // (issue #43); the shared launcher no longer sleeps for it.
-    assert_eq!(
-        provider::initial_prompt_ready_delay(FirstPartyCli::Agy),
-        Duration::ZERO
-    );
-    for provider in [FirstPartyCli::Claude, FirstPartyCli::Pi] {
-        assert_eq!(
-            provider::initial_prompt_ready_delay(provider),
-            Duration::from_secs(2)
-        );
+        let follow = provider::follow_up_transport(provider).facts();
+        assert_eq!(follow.name, name);
+        assert_eq!(follow.surface.is_some(), surface);
+        if let Some(input) = follow.surface {
+            assert_eq!(input.submit_count, count);
+        }
+        let initial = provider::initial_transport(provider).facts();
+        if cfg!(windows) {
+            assert_eq!(
+                initial.readiness,
+                Readiness::AfterLaunch {
+                    ready_delay: Duration::from_secs(delay)
+                }
+            );
+            assert_eq!(initial.surface.is_some(), provider != FirstPartyCli::Claude);
+            assert_eq!(initial.surface.map_or(1, |input| input.submit_count), count);
+        } else {
+            assert_eq!(initial.name, delivery::LAUNCH_ARGUMENT.facts().name);
+            assert_eq!(initial.readiness, Readiness::LaunchArgument);
+            assert!(initial.surface.is_none());
+        }
     }
 }
 
@@ -2611,46 +2556,6 @@ fn windows_console_rejects_a_submit_plan_that_cannot_fit_the_remaining_budget() 
         1,
         Duration::from_millis(1)
     ));
-}
-
-#[test]
-fn terminal_delivery_preflight_rejects_only_the_unstarted_windows_submit_plan() {
-    assert!(
-        provider::validate_terminal_send_budget_for_platform(
-            FirstPartyCli::Codex,
-            terminal::TerminalKind::WindowsConsole,
-            Duration::from_secs(4),
-            true,
-        )
-        .is_err()
-    );
-    assert!(
-        provider::validate_terminal_send_budget_for_platform(
-            FirstPartyCli::Codex,
-            terminal::TerminalKind::WindowsConsole,
-            Duration::from_secs(5),
-            true,
-        )
-        .is_ok()
-    );
-    assert!(
-        provider::validate_terminal_send_budget_for_platform(
-            FirstPartyCli::Agy,
-            terminal::TerminalKind::WindowsConsole,
-            Duration::from_millis(1),
-            true,
-        )
-        .is_ok()
-    );
-    assert!(
-        provider::validate_terminal_send_budget_for_platform(
-            FirstPartyCli::Codex,
-            terminal::TerminalKind::Iterm2,
-            Duration::from_millis(1),
-            false,
-        )
-        .is_ok()
-    );
 }
 
 #[test]

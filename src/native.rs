@@ -17,6 +17,7 @@ mod tests;
 mod cancel;
 mod consent;
 mod context;
+mod delivery;
 mod doctor;
 mod hold;
 mod process_env;
@@ -74,7 +75,7 @@ use provider_process::command as provider_process_command;
 use std::{
     ffi::OsString,
     fs::{self, File, OpenOptions},
-    io::{IsTerminal, Read, Seek, SeekFrom, Write},
+    io::{IsTerminal, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     str::FromStr,
@@ -1053,7 +1054,10 @@ fn run_windows_console_control(
             .to_owned()
     });
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
-    let submit_count = provider::terminal_submit_count(provider);
+    let submit_count = provider::initial_transport(provider)
+        .facts()
+        .surface
+        .map_or(1, |surface| surface.submit_count);
     let records = terminal::WindowsSessionRecords {
         directory: &directory,
         root_never_ran: windows_console_root_never_ran(&directory),
@@ -1247,83 +1251,34 @@ fn launch_created_session(
     consent::complete_launch(&created.directory, provider, &terminal_session, deadline)?;
     // The existing delivery paths own rollback/uncertainty after confirmed startup.
     initial_claim.rollback_on_drop();
-    let initial_prompt_transport = provider::initial_prompt_transport(provider);
-    let mut expected_turn_id = None;
-    if initial_prompt_transport == provider::InitialPromptTransport::TerminalPasteAfterLaunch {
-        let mut delivery_may_have_occurred = false;
-        let delivery = (|| -> Result<()> {
-            wait_for_status(
-                &created.directory,
-                SessionState::AwaitingInitialInput,
-                deadline,
-                timeout,
-            )?;
-            let readiness_delay = initial_prompt_delay_within_budget(
-                deadline,
-                provider::initial_prompt_ready_delay(provider),
-                timeout,
-            )?;
-            thread::sleep(readiness_delay);
-            verify_reopened_conversation_exclusive(
-                provider,
-                &created.directory,
-                resumed_from.as_ref(),
-                deadline,
-                ResumedHolderCheck::AfterLaunch,
-            )?;
-            let initial_prompt = Reader::open_unchecked(&created.directory)
-                .initial_prompt()
-                .context("failed to read the preserved initial prompt")?;
-            let initial_prompt =
-                provider::terminal_initial_prompt(provider, &created.directory, &initial_prompt)?;
-            let mut prompt_file = tempfile::Builder::new()
-                .prefix("pending-prompt-")
-                .suffix(".txt")
-                .tempfile_in(&created.directory)?;
-            RecordStore::set_file_private(prompt_file.as_file())?;
-            prompt_file.write_all(&terminal_input_bytes(
-                terminal_session.kind,
-                &initial_prompt,
-            ))?;
-            prompt_file.flush()?;
-            verify_terminal_surface_ownership_until(
-                &created.directory,
-                &created.id,
-                &terminal_session,
-                deadline,
-                timeout,
-            )?;
-            let send_timeout = remaining_turn_timeout(deadline, timeout)?;
-            provider::validate_terminal_send_budget(provider, terminal_session.kind, send_timeout)?;
-            verify_reopened_conversation_exclusive(
-                provider,
-                &created.directory,
-                resumed_from.as_ref(),
-                deadline,
-                ResumedHolderCheck::BeforeInitialDelivery,
-            )?;
-            initial_claim.begin_delivery()?;
-            match provider::send_initial_prompt(
-                provider,
-                &terminal_session,
-                prompt_file.path(),
-                deadline,
-            ) {
-                Ok(()) => delivery_may_have_occurred = true,
-                Err(failure) => {
-                    delivery_may_have_occurred = failure.delivery_may_have_occurred();
-                    return Err(failure.into_error());
-                }
-            }
-            initial_claim.complete_initial_delivery()?;
-            Ok(())
-        })();
-        if let Err(error) = delivery {
-            let _ = initial_claim.settle_delivery(if delivery_may_have_occurred {
-                turn::Delivery::Uncertain(&error)
-            } else {
-                turn::Delivery::NotSent(&error)
-            });
+    let mut gate = |gate| {
+        verify_reopened_conversation_exclusive(
+            provider,
+            &created.directory,
+            resumed_from.as_ref(),
+            deadline,
+            match gate {
+                delivery::Gate::AfterLaunch => ResumedHolderCheck::AfterLaunch,
+                delivery::Gate::BeforeDelivery => ResumedHolderCheck::BeforeInitialDelivery,
+            },
+        )
+    };
+    let delivered = delivery::deliver(
+        initial_claim,
+        delivery::Turn::Initial { gate: &mut gate },
+        delivery::DeliveryContext {
+            provider,
+            directory: &created.directory,
+            session_id: &created.id,
+            surface: &terminal_session,
+            provider_path: &created.manifest.provider_path,
+            deadline,
+            requested: timeout,
+        },
+    );
+    let expected_turn_id = match delivered {
+        Ok(delivered) => delivered.correlation_id,
+        Err(error) => {
             let error = close_surface_after_reopen_verification_failure(
                 &created.directory,
                 &created.id,
@@ -1338,100 +1293,7 @@ fn launch_created_session(
                 )
             });
         }
-    } else if initial_prompt_transport
-        == provider::InitialPromptTransport::ProviderCrossSessionMessageAfterLaunch
-    {
-        let mut delivery_may_have_occurred = false;
-        let delivery = (|| -> Result<String> {
-            wait_for_status(
-                &created.directory,
-                SessionState::AwaitingInitialInput,
-                deadline,
-                timeout,
-            )?;
-            let readiness_delay = initial_prompt_delay_within_budget(
-                deadline,
-                provider::initial_prompt_ready_delay(provider),
-                timeout,
-            )?;
-            thread::sleep(readiness_delay);
-            verify_reopened_conversation_exclusive(
-                provider,
-                &created.directory,
-                resumed_from.as_ref(),
-                deadline,
-                ResumedHolderCheck::AfterLaunch,
-            )?;
-            let request_id = provider::new_cross_session_turn_id(provider)?;
-            let prompt = Reader::open_unchecked(&created.directory)
-                .initial_prompt()
-                .context("failed to read the preserved initial prompt")?;
-            let bridge_executable =
-                std::env::current_exe().context("failed to locate the current executable")?;
-            remaining_turn_timeout(deadline, timeout)?;
-            verify_reopened_conversation_exclusive(
-                provider,
-                &created.directory,
-                resumed_from.as_ref(),
-                deadline,
-                ResumedHolderCheck::BeforeInitialDelivery,
-            )?;
-            initial_claim.begin_delivery()?;
-            match provider::send_cross_session_message(
-                provider,
-                provider::CrossSessionMessageContext {
-                    bridge_executable: &bridge_executable,
-                    directory: &created.directory,
-                    provider_path: &created.manifest.provider_path,
-                    request_id: &request_id,
-                    prompt: &prompt,
-                    deadline,
-                },
-            ) {
-                Ok(()) => {
-                    delivery_may_have_occurred = true;
-                    initial_claim.complete_initial_delivery()?;
-                    Ok(request_id)
-                }
-                Err(failure) if failure.delivery_may_have_occurred() => {
-                    delivery_may_have_occurred = true;
-                    let error = failure.into_error();
-                    Err(error).context(
-                        "Claude initial cross-session delivery could not be confirmed; the turn remains claimed until completion or explicit close",
-                    )
-                }
-                Err(failure) => {
-                    let error = failure.into_error();
-                    Err(error).context("Claude initial cross-session delivery was not sent")
-                }
-            }
-        })();
-        match delivery {
-            Ok(request_id) => expected_turn_id = Some(request_id),
-            Err(error) => {
-                let _ = initial_claim.settle_delivery(if delivery_may_have_occurred {
-                    turn::Delivery::Uncertain(&error)
-                } else {
-                    turn::Delivery::NotSent(&error)
-                });
-                let error = close_surface_after_reopen_verification_failure(
-                    &created.directory,
-                    &created.id,
-                    error,
-                    deadline,
-                );
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to deliver the initial prompt to {} session {}",
-                        provider.as_str(),
-                        created.id
-                    )
-                });
-            }
-        }
-    } else {
-        initial_claim.settle_delivery(turn::Delivery::Sent)?;
-    }
+    };
 
     if detach {
         return emit_session_result_with(
@@ -1592,7 +1454,6 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
         &delegation_source(),
         &attached.prompt_with_attachments(&request.prompt),
     );
-    let follow_up_transport = provider::follow_up_transport(provider);
     let resumed_from = read_resumed_from(&directory)?;
     let (mut claim, baseline) = turn::claim_ready(
         &Store::open_unchecked(&directory),
@@ -1611,82 +1472,20 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
         &mut claim,
         &previous_state,
     )?;
-    let mut expected_turn_id = None;
-    match follow_up_transport {
-        provider::FollowUpTransport::TerminalPasteFallback => {
-            deliver_terminal_follow_up(
-                provider,
-                follow_up_transport,
-                &directory,
-                &request.id,
-                &terminal_session,
-                &prompt,
-                &claim_token,
-                &mut claim,
-                deadline,
-                request.timeout,
-            )?;
-        }
-        provider::FollowUpTransport::ProviderCrossSessionMessage
-        | provider::FollowUpTransport::ProviderQueue => {
-            let prepared = (|| -> Result<_> {
-                remaining_turn_timeout(deadline, request.timeout)?;
-                let provider_turn_id = if follow_up_transport
-                    == provider::FollowUpTransport::ProviderCrossSessionMessage
-                {
-                    Some(provider::new_cross_session_turn_id(provider)?)
-                } else {
-                    None
-                };
-                let bridge_executable =
-                    std::env::current_exe().context("failed to locate the current executable")?;
-                claim.begin_delivery()?;
-                Ok((provider_turn_id, bridge_executable))
-            })();
-            let (provider_turn_id, bridge_executable) = match prepared {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    let _ = claim.settle_delivery(turn::Delivery::NotSent(&error));
-                    return Err(error);
-                }
-            };
-            let correlation_id = provider_turn_id.as_deref().unwrap_or(&claim_token);
-            match provider::send_cross_session_message(
-                provider,
-                provider::CrossSessionMessageContext {
-                    bridge_executable: &bridge_executable,
-                    directory: &directory,
-                    provider_path: &manifest.provider_path,
-                    request_id: correlation_id,
-                    prompt: &prompt,
-                    deadline,
-                },
-            ) {
-                Ok(()) => expected_turn_id = provider_turn_id,
-                Err(failure) if failure.delivery_may_have_occurred() => {
-                    let error = failure.into_error();
-                    let _ = claim.settle_delivery(turn::Delivery::Uncertain(&error));
-                    return Err(error).with_context(|| {
-                        format!(
-                            "provider follow-up transport {} could not confirm delivery; the turn remains claimed until the target reports completion or the session is explicitly closed",
-                            follow_up_transport.as_str()
-                        )
-                    });
-                }
-                Err(failure) => {
-                    let error = failure.into_error();
-                    let _ = claim.settle_delivery(turn::Delivery::NotSent(&error));
-                    return Err(error).with_context(|| {
-                        format!(
-                            "provider follow-up transport {} failed",
-                            follow_up_transport.as_str()
-                        )
-                    });
-                }
-            }
-        }
-    }
-    claim.settle_delivery(turn::Delivery::Sent)?;
+    let expected_turn_id = delivery::deliver(
+        claim,
+        delivery::Turn::FollowUp { prompt: &prompt },
+        delivery::DeliveryContext {
+            provider,
+            directory: &directory,
+            session_id: &request.id,
+            surface: &terminal_session,
+            provider_path: &manifest.provider_path,
+            deadline,
+            requested: request.timeout,
+        },
+    )?
+    .correlation_id;
 
     if request.detach {
         return emit_session_result(
@@ -1722,120 +1521,6 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
         &receipt,
         Some(&event),
     )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn deliver_terminal_follow_up(
-    provider: FirstPartyCli,
-    follow_up_transport: provider::FollowUpTransport,
-    directory: &Path,
-    session_id: &str,
-    terminal_session: &terminal::TerminalSession,
-    prompt: &str,
-    claim_token: &str,
-    claim: &mut turn::Claim,
-    deadline: Instant,
-    requested_timeout: Duration,
-) -> Result<()> {
-    let prepared_prompt = (|| -> Result<tempfile::NamedTempFile> {
-        let correlated_prompt =
-            provider::prepare_terminal_follow_up(provider, directory, prompt, claim_token)?;
-        let mut prompt_file = tempfile::Builder::new()
-            .prefix("pending-prompt-")
-            .suffix(".txt")
-            .tempfile_in(directory)?;
-        RecordStore::set_file_private(prompt_file.as_file())?;
-        prompt_file.write_all(&terminal_input_bytes(
-            terminal_session.kind,
-            &correlated_prompt,
-        ))?;
-        prompt_file.flush()?;
-        verify_terminal_surface_ownership_until(
-            directory,
-            session_id,
-            terminal_session,
-            deadline,
-            requested_timeout,
-        )?;
-        Ok(prompt_file)
-    })();
-    let prompt_file = match prepared_prompt {
-        Ok(prompt_file) => prompt_file,
-        Err(error) => {
-            let _ = provider::cancel_terminal_follow_up(provider, directory, claim_token);
-            let _ = claim.settle_delivery(turn::Delivery::NotSent(&error));
-            return Err(error)
-                .with_context(|| {
-                    format!(
-                        "failed to prepare input for visible {} session {session_id}",
-                        terminal_session.kind.display_name()
-                    )
-                })
-                .with_context(|| {
-                    format!(
-                        "provider follow-up transport {} failed",
-                        follow_up_transport.as_str()
-                    )
-                });
-        }
-    };
-    if let Err(error) = claim.begin_delivery() {
-        let _ = provider::cancel_terminal_follow_up(provider, directory, claim_token);
-        let _ = claim.settle_delivery(turn::Delivery::NotSent(&error));
-        return Err(error);
-    }
-    let send_timeout = match remaining_turn_timeout(deadline, requested_timeout) {
-        Ok(timeout) => timeout,
-        Err(error) => {
-            let _ = provider::cancel_terminal_follow_up(provider, directory, claim_token);
-            let _ = claim.settle_delivery(turn::Delivery::NotSent(&error));
-            return Err(error).with_context(|| {
-                format!(
-                    "provider follow-up transport {} exhausted its total timeout before delivery",
-                    follow_up_transport.as_str()
-                )
-            });
-        }
-    };
-    if let Err(error) =
-        provider::validate_terminal_send_budget(provider, terminal_session.kind, send_timeout)
-    {
-        let _ = provider::cancel_terminal_follow_up(provider, directory, claim_token);
-        let _ = claim.settle_delivery(turn::Delivery::NotSent(&error));
-        return Err(error).with_context(|| {
-            format!(
-                "provider follow-up transport {} cannot start inside its remaining total timeout",
-                follow_up_transport.as_str()
-            )
-        });
-    }
-    if let Err(failure) =
-        provider::send_terminal_follow_up(provider, terminal_session, prompt_file.path(), deadline)
-    {
-        if !failure.delivery_may_have_occurred() {
-            let _ = provider::cancel_terminal_follow_up(provider, directory, claim_token);
-        }
-        let _ = claim.settle_delivery(if failure.delivery_may_have_occurred() {
-            turn::Delivery::Uncertain(failure.error())
-        } else {
-            turn::Delivery::NotSent(failure.error())
-        });
-        let error = failure.into_error();
-        return Err(error)
-            .with_context(|| {
-                format!(
-                    "failed to type into visible {} session {session_id}",
-                    terminal_session.kind.display_name()
-                )
-            })
-            .with_context(|| {
-                format!(
-                    "provider follow-up transport {} failed",
-                    follow_up_transport.as_str()
-                )
-            });
-    }
-    Ok(())
 }
 
 fn remaining_turn_timeout(deadline: Instant, requested: Duration) -> Result<Duration> {
@@ -1997,22 +1682,6 @@ fn command_output_with_stdin_until_classified(
         stdout: stdout_bytes,
         stderr: stderr_bytes,
     })
-}
-
-fn initial_prompt_delay_within_budget(
-    deadline: Instant,
-    delay: Duration,
-    requested: Duration,
-) -> Result<Duration> {
-    let remaining = remaining_turn_timeout(deadline, requested)?;
-    if delay >= remaining {
-        bail!(
-            "initial prompt readiness delay of {} seconds does not fit inside the {} second ask timeout",
-            delay.as_secs(),
-            requested.as_secs()
-        )
-    }
-    Ok(delay)
 }
 
 fn run_sessions(request: SessionsRequest) -> Result<()> {
@@ -2457,7 +2126,7 @@ fn run_session_inner(directory: &Path) -> Result<()> {
     let prompt = Reader::open_unchecked(directory)
         .initial_prompt()
         .context("failed to read initial prompt")?;
-    let initial_prompt_transport = provider::initial_prompt_transport(provider);
+    let initial_readiness = provider::initial_transport(provider).facts().readiness;
 
     let executable = std::env::current_exe().context("failed to locate the current executable")?;
     let mut policy_arguments = provider_launch_args(provider, manifest.yolo)
@@ -2525,9 +2194,7 @@ fn run_session_inner(directory: &Path) -> Result<()> {
         };
     let mut arguments = policy_arguments.clone();
     arguments.extend(provider_arguments);
-    if initial_prompt_transport == provider::InitialPromptTransport::ProviderArgument
-        && prompt_is_positional
-    {
+    if initial_readiness == delivery::Readiness::LaunchArgument && prompt_is_positional {
         arguments.push(OsString::from(prompt.clone()));
     }
 
@@ -2568,15 +2235,14 @@ fn run_session_inner(directory: &Path) -> Result<()> {
         &mut provider_command,
         |child| {
             record_provider_process(directory, &manifest.id, child)?;
-            match initial_prompt_transport {
-                provider::InitialPromptTransport::ProviderArgument => {
+            match initial_readiness {
+                delivery::Readiness::LaunchArgument => {
                     session::RecordStore::at(&prompt_path)
                         .remove_raw()
                         .context("failed to remove the accepted initial prompt")?;
                     update_status(directory, SessionState::Running, None, None)?;
                 }
-                provider::InitialPromptTransport::ProviderCrossSessionMessageAfterLaunch
-                | provider::InitialPromptTransport::TerminalPasteAfterLaunch => {
+                delivery::Readiness::AfterLaunch { .. } => {
                     update_status(directory, SessionState::AwaitingInitialInput, None, None)?;
                 }
             }

@@ -1,3 +1,4 @@
+use std::time::Duration;
 pub(super) mod facts;
 #[cfg(target_os = "macos")]
 use facts::PreClosePolicy;
@@ -727,8 +728,84 @@ pub(in crate::native) fn shell_quote(value: &std::ffi::OsStr) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+pub(super) fn validate_terminal_send_budget(
+    submit_count: usize,
+    terminal_kind: TerminalKind,
+    timeout: Duration,
+) -> Result<()> {
+    #[cfg(windows)]
+    {
+        validate_terminal_send_budget_for_platform(submit_count, terminal_kind, timeout, true)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (submit_count, terminal_kind, timeout);
+        Ok(())
+    }
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn validate_terminal_send_budget_for_platform(
+    submit_count: usize,
+    terminal_kind: TerminalKind,
+    timeout: Duration,
+    windows: bool,
+) -> Result<()> {
+    if windows
+        && terminal_kind == TerminalKind::WindowsConsole
+        && !windows_console_submit_delays_fit(submit_count, timeout)
+    {
+        anyhow::bail!(
+            "Windows console submission delays do not fit inside the remaining turn timeout"
+        )
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    use super::validate_terminal_send_budget_for_platform;
+    use std::time::Duration;
+    #[test]
+    fn terminal_delivery_preflight_rejects_only_the_unstarted_windows_submit_plan() {
+        assert!(
+            validate_terminal_send_budget_for_platform(
+                2,
+                TerminalKind::WindowsConsole,
+                Duration::from_secs(4),
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_terminal_send_budget_for_platform(
+                2,
+                TerminalKind::WindowsConsole,
+                Duration::from_secs(5),
+                true,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_terminal_send_budget_for_platform(
+                1,
+                TerminalKind::WindowsConsole,
+                Duration::from_millis(1),
+                true,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_terminal_send_budget_for_platform(
+                2,
+                TerminalKind::Iterm2,
+                Duration::from_millis(1),
+                false,
+            )
+            .is_ok()
+        );
+    }
+
     use std::str::FromStr;
 
     #[cfg(target_os = "macos")]

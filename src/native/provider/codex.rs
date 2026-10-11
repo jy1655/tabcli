@@ -1,7 +1,9 @@
 use super::{
-    CompletionMonitor, CrossSessionMessageContext, CrossSessionMessageFailure,
-    CrossSessionMessageResult, FollowUpTransport, InitialPromptTransport, LaunchContext,
-    LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
+    CompletionMonitor, CrossSessionMessageContext, LaunchContext, LaunchPlan,
+    NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
+};
+use crate::native::delivery::{
+    self, Outcome, Prepared, Readiness, SurfaceInput, Transport, TransportFacts, TurnContext,
 };
 #[cfg(test)]
 use crate::native::session::SessionState;
@@ -93,7 +95,138 @@ impl PendingCodexTurn {
 // the reopened TUI. The resume-while-held behavior also needs a live check first.
 const CODEX_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Codex reopen is not implemented in this slice; it requires the thread writer-lock and queued_items gates and a live check of resume-while-held behavior";
 
+fn send_initial_prompt(
+    session: &terminal::TerminalSession,
+    prompt_path: &Path,
+    deadline: Instant,
+) -> terminal::TerminalSendResult {
+    if cfg!(windows) {
+        let directory = session
+            .managed_session_id
+            .as_deref()
+            .context("Codex terminal has no managed session binding")
+            .and_then(Reader::session_directory)
+            .map_err(terminal::TerminalSendFailure::not_sent)?;
+        // A screen read costs a helper process and the wait polls ten times a second,
+        // so the screen is read once per `COMPOSER_POLL`.
+        let mut last_read: Option<Instant> = None;
+        super::super::consent::wait_for_native_trust(
+            &directory,
+            FirstPartyCli::Codex,
+            deadline,
+            &mut || {
+                if last_read.is_some_and(|read| read.elapsed() < COMPOSER_POLL) {
+                    return false;
+                }
+                last_read = Some(Instant::now());
+                terminal::read_screen(session, deadline)
+                    .is_ok_and(|screen| composer_is_ready(&screen))
+            },
+        )
+        .map_err(terminal::TerminalSendFailure::not_sent)?;
+    }
+    terminal::send_file(session, prompt_path, deadline)?;
+    if cfg!(windows) {
+        // Temporary measure for issue #124
+        let submission_deadline = deadline.min(Instant::now() + Duration::from_secs(10));
+        wait_for_submission_with(
+            || terminal::read_screen(session, submission_deadline),
+            submission_deadline,
+            COMPOSER_POLL,
+            Instant::now,
+        )?;
+    }
+    Ok(())
+}
+
+fn terminal_initial_prompt(directory: &Path, prompt: &str) -> Result<String> {
+    let pending =
+        read_pending_turn(directory)?.context("Codex initial turn correlation state is missing")?;
+    Ok(correlated_prompt(prompt, &pending))
+}
+
+struct CodexInitialPaste;
+impl Transport for CodexInitialPaste {
+    fn facts(&self) -> TransportFacts {
+        TransportFacts {
+            name: "terminal-paste-fallback",
+            readiness: Readiness::AfterLaunch {
+                // Cold-start MCP/extension redraws can ignore early Returns even
+                // after the composer appears; keep the existing readiness delay.
+                ready_delay: Duration::from_secs(12),
+            },
+            surface: Some(SurfaceInput { submit_count: 2 }),
+        }
+    }
+    fn prepare(&self, turn: &TurnContext<'_>) -> Result<Prepared> {
+        Ok(Prepared {
+            prompt: terminal_initial_prompt(turn.directory, turn.prompt)?,
+            correlation_id: None,
+        })
+    }
+    fn send(&self, turn: &TurnContext<'_>, _: &Prepared, file: Option<&Path>) -> Outcome {
+        send_initial_prompt(
+            turn.surface,
+            file.expect("surface transport has a prompt file"),
+            turn.deadline,
+        )
+        .into()
+    }
+    fn discard_prepared(&self, _: &TurnContext<'_>, _: Option<&Prepared>) {}
+}
+
+// The queue addresses the established thread; it never selects the active TUI thread.
+struct CodexQueue;
+impl Transport for CodexQueue {
+    fn facts(&self) -> TransportFacts {
+        TransportFacts {
+            name: "provider-native-queue",
+            readiness: Readiness::AfterLaunch {
+                ready_delay: Duration::ZERO,
+            },
+            surface: None,
+        }
+    }
+    fn prepare(&self, _: &TurnContext<'_>) -> Result<Prepared> {
+        Ok(Prepared {
+            prompt: String::new(),
+            correlation_id: None,
+        })
+    }
+    fn send(&self, turn: &TurnContext<'_>, _: &Prepared, _: Option<&Path>) -> Outcome {
+        send_native_queue_message(CrossSessionMessageContext {
+            bridge_executable: turn.bridge_executable,
+            directory: turn.directory,
+            provider_path: turn.provider_path,
+            request_id: turn.claim_token,
+            prompt: turn.prompt,
+            deadline: turn.deadline,
+        })
+        .map_or_else(|outcome| outcome, |()| Outcome::Sent)
+    }
+    fn discard_prepared(&self, _: &TurnContext<'_>, _: Option<&Prepared>) {}
+}
+
+#[cfg(test)]
+fn outcome_error(outcome: &Outcome) -> &anyhow::Error {
+    match outcome {
+        Outcome::NotSent(error) | Outcome::Uncertain(error) => error,
+        Outcome::Sent => panic!("expected failure"),
+    }
+}
+
 impl NativeProviderAdapter for CodexAdapter {
+    fn initial_transport(&self) -> Box<dyn Transport> {
+        if cfg!(windows) {
+            Box::new(CodexInitialPaste)
+        } else {
+            Box::new(delivery::LAUNCH_ARGUMENT)
+        }
+    }
+    fn follow_up_transport(&self) -> Box<dyn Transport> {
+        Box::new(CodexQueue)
+    }
+
     fn cancel_support(&self, _directory: &Path) -> Result<super::CancelSupport> {
         Ok(super::CancelSupport::Unsupported(
             "in this release the Bridge integration for codex does not support cancel".to_owned(),
@@ -209,94 +342,6 @@ impl NativeProviderAdapter for CodexAdapter {
         bail!("{CODEX_REOPEN_UNSUPPORTED}")
     }
 
-    fn initial_prompt_transport(&self) -> InitialPromptTransport {
-        if cfg!(windows) {
-            InitialPromptTransport::TerminalPasteAfterLaunch
-        } else {
-            InitialPromptTransport::ProviderArgument
-        }
-    }
-
-    fn initial_prompt_ready_delay(&self) -> Duration {
-        // Codex can render its composer before cold-start MCP and extension
-        // initialization settles. Returns delivered during that redraw window
-        // can be ignored while leaving the pasted prompt in the composer.
-        Duration::from_secs(12)
-    }
-
-    fn send_initial_prompt(
-        &self,
-        session: &terminal::TerminalSession,
-        prompt_path: &Path,
-        deadline: Instant,
-    ) -> terminal::TerminalSendResult {
-        if cfg!(windows) {
-            let directory = session
-                .managed_session_id
-                .as_deref()
-                .context("Codex terminal has no managed session binding")
-                .and_then(Reader::session_directory)
-                .map_err(terminal::TerminalSendFailure::not_sent)?;
-            // A screen read costs a helper process and the wait polls ten times a second,
-            // so the screen is read once per `COMPOSER_POLL`.
-            let mut last_read: Option<Instant> = None;
-            super::super::consent::wait_for_native_trust(
-                &directory,
-                FirstPartyCli::Codex,
-                deadline,
-                &mut || {
-                    if last_read.is_some_and(|read| read.elapsed() < COMPOSER_POLL) {
-                        return false;
-                    }
-                    last_read = Some(Instant::now());
-                    terminal::read_screen(session, deadline)
-                        .is_ok_and(|screen| composer_is_ready(&screen))
-                },
-            )
-            .map_err(terminal::TerminalSendFailure::not_sent)?;
-        }
-        terminal::send_file(session, prompt_path, deadline)?;
-        if cfg!(windows) {
-            // Temporary measure for issue #124
-            let submission_deadline = deadline.min(Instant::now() + Duration::from_secs(10));
-            wait_for_submission_with(
-                || terminal::read_screen(session, submission_deadline),
-                submission_deadline,
-                COMPOSER_POLL,
-                Instant::now,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn terminal_initial_prompt(&self, directory: &Path, prompt: &str) -> Result<String> {
-        let pending = read_pending_turn(directory)?
-            .context("Codex initial turn correlation state is missing")?;
-        Ok(correlated_prompt(prompt, &pending))
-    }
-
-    #[cfg(any(windows, test))]
-    fn terminal_submit_count(&self) -> usize {
-        2
-    }
-
-    fn follow_up_transport(&self) -> FollowUpTransport {
-        // The queue addresses the established thread and correlates by the claim.
-        // It never falls back to input in the TUI's currently selected conversation.
-        FollowUpTransport::ProviderQueue
-    }
-
-    fn new_cross_session_turn_id(&self) -> Result<String> {
-        bail!("Codex does not support provider cross-session turns")
-    }
-
-    fn send_cross_session_message(
-        &self,
-        context: CrossSessionMessageContext<'_>,
-    ) -> CrossSessionMessageResult {
-        send_native_queue_message(context)
-    }
-
     fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()> {
         let raw_message = codex_string(payload, "last-assistant-message")
             .map(|message| message.trim())
@@ -329,30 +374,6 @@ impl NativeProviderAdapter for CodexAdapter {
 
     fn run_control(&self, _arguments: &[String]) -> Result<()> {
         bail!("Codex does not expose Agent Bridge provider controls")
-    }
-
-    fn send_terminal_follow_up(
-        &self,
-        _session: &terminal::TerminalSession,
-        _prompt_path: &Path,
-        _deadline: Instant,
-    ) -> terminal::TerminalSendResult {
-        Err(terminal::TerminalSendFailure::not_sent(anyhow::anyhow!(
-            unaddressed_follow_up()
-        )))
-    }
-
-    fn prepare_terminal_follow_up(
-        &self,
-        _directory: &Path,
-        _prompt: &str,
-        _claim_token: &str,
-    ) -> Result<String> {
-        bail!(unaddressed_follow_up())
-    }
-
-    fn cancel_terminal_follow_up(&self, directory: &Path, claim_token: &str) -> Result<()> {
-        cancel_pending_turn(directory, claim_token)
     }
 }
 
@@ -529,14 +550,16 @@ impl CodexCommandFailure {
     }
 }
 
-fn queue_unavailable(error: anyhow::Error) -> CrossSessionMessageFailure {
-    CrossSessionMessageFailure::not_sent(error.context(unaddressed_follow_up()))
+fn queue_unavailable(error: anyhow::Error) -> Outcome {
+    Outcome::NotSent(error.context(unaddressed_follow_up()))
 }
 
-fn send_native_queue_message(context: CrossSessionMessageContext<'_>) -> CrossSessionMessageResult {
+fn send_native_queue_message(
+    context: CrossSessionMessageContext<'_>,
+) -> std::result::Result<(), Outcome> {
     let manifest = Reader::open_unchecked(context.directory)
         .manifest()
-        .map_err(CrossSessionMessageFailure::not_sent)?;
+        .map_err(Outcome::NotSent)?;
     match codex_version_supports_native_queue(&manifest.provider_version) {
         Ok(true) => {}
         Ok(false) => {
@@ -545,10 +568,10 @@ fn send_native_queue_message(context: CrossSessionMessageContext<'_>) -> CrossSe
                 manifest.provider_version
             )));
         }
-        Err(error) => return Err(CrossSessionMessageFailure::not_sent(error)),
+        Err(error) => return Err(Outcome::NotSent(error)),
     }
     let thread_id = established_codex_thread(context.directory)
-        .map_err(CrossSessionMessageFailure::not_sent)?
+        .map_err(Outcome::NotSent)?
         .ok_or_else(|| {
             queue_unavailable(anyhow::anyhow!(
                 "Codex session has no established provider thread id"
@@ -565,8 +588,7 @@ fn send_native_queue_message(context: CrossSessionMessageContext<'_>) -> CrossSe
     // rust-v0.149.0 and rust-v0.160.0. Requiring a daemon here blocked the embedded path.
     // Queue acceptance is not completion; the target's correlated notify still proves it.
 
-    let pending =
-        PendingCodexTurn::new(context.request_id).map_err(CrossSessionMessageFailure::not_sent)?;
+    let pending = PendingCodexTurn::new(context.request_id).map_err(Outcome::NotSent)?;
     let arguments = codex_queue_arguments(&thread_id, context.prompt, &pending);
     let mut command = queue_command(
         context.provider_path,
@@ -577,8 +599,7 @@ fn send_native_queue_message(context: CrossSessionMessageContext<'_>) -> CrossSe
     .map_err(|error| {
         queue_unavailable(error.context("failed to prepare the Codex queue command"))
     })?;
-    write_pending_turn(context.directory, &pending)
-        .map_err(CrossSessionMessageFailure::not_sent)?;
+    write_pending_turn(context.directory, &pending).map_err(Outcome::NotSent)?;
     let result = match run_bounded_command_until(&mut command, context.deadline, "Codex queue") {
         Ok(output) => classify_codex_queue_output(
             output.status.success(),
@@ -588,13 +609,11 @@ fn send_native_queue_message(context: CrossSessionMessageContext<'_>) -> CrossSe
             &thread_id,
         ),
         Err(failure) if !failure.delivery_may_have_started => Err(queue_unavailable(failure.error)),
-        Err(failure) => Err(CrossSessionMessageFailure::delivery_uncertain(
-            failure.error,
-        )),
+        Err(failure) => Err(Outcome::Uncertain(failure.error)),
     };
     if result
         .as_ref()
-        .is_err_and(|failure| !failure.delivery_may_have_occurred())
+        .is_err_and(|failure| matches!(failure, Outcome::NotSent(_)))
     {
         let _ = cancel_pending_turn(context.directory, context.request_id);
     }
@@ -906,11 +925,11 @@ fn classify_codex_queue_output(
     stderr: &[u8],
     output_truncated: bool,
     thread_id: &str,
-) -> CrossSessionMessageResult {
+) -> std::result::Result<(), Outcome> {
     if output_truncated {
-        return Err(CrossSessionMessageFailure::delivery_uncertain(
-            anyhow::anyhow!("Codex queue output exceeded the safety limit"),
-        ));
+        return Err(Outcome::Uncertain(anyhow::anyhow!(
+            "Codex queue output exceeded the safety limit"
+        )));
     }
 
     let stdout = String::from_utf8_lossy(stdout);
@@ -924,11 +943,9 @@ fn classify_codex_queue_output(
         if submission_id.is_some_and(|id| !id.is_empty() && !id.chars().any(char::is_whitespace)) {
             return Ok(());
         }
-        return Err(CrossSessionMessageFailure::delivery_uncertain(
-            anyhow::anyhow!(
-                "Codex queue reported success without the expected thread confirmation"
-            ),
-        ));
+        return Err(Outcome::Uncertain(anyhow::anyhow!(
+            "Codex queue reported success without the expected thread confirmation"
+        )));
     }
 
     let stderr = String::from_utf8_lossy(stderr);
@@ -945,7 +962,7 @@ fn classify_codex_queue_output(
     if target_missing || native_queue_unavailable || rejected_before_enqueue {
         Err(queue_unavailable(error))
     } else {
-        Err(CrossSessionMessageFailure::delivery_uncertain(error))
+        Err(Outcome::Uncertain(error))
     }
 }
 
@@ -1114,6 +1131,41 @@ fn established_codex_thread(directory: &Path) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn declared_transports_preserve_framing_and_pending_cleanup() {
+        use crate::native::delivery::TurnKind;
+        let directory = tempfile::tempdir().unwrap();
+        let surface = serde_json::from_value(
+            serde_json::json!({"terminal":"windows-console", "session_id":"surface"}),
+        )
+        .unwrap();
+        let initial =
+            super::super::transport_test_context(directory.path(), &surface, TurnKind::Initial);
+        install_pending_turn(directory.path(), initial.claim_token).unwrap();
+        let before = std::fs::read(directory.path().join(PENDING_TURN_FILE)).unwrap();
+        let prepared = CodexInitialPaste.prepare(&initial).unwrap();
+        assert_eq!(
+            prepared.prompt,
+            terminal_initial_prompt(directory.path(), initial.prompt).unwrap()
+        );
+        assert!(prepared.correlation_id.is_none());
+        CodexInitialPaste.discard_prepared(&initial, Some(&prepared));
+        assert_eq!(
+            std::fs::read(directory.path().join(PENDING_TURN_FILE)).unwrap(),
+            before
+        );
+        let follow =
+            super::super::transport_test_context(directory.path(), &surface, TurnKind::FollowUp);
+        let prepared = CodexQueue.prepare(&follow).unwrap();
+        assert!(prepared.prompt.is_empty());
+        assert!(prepared.correlation_id.is_none());
+        CodexQueue.discard_prepared(&follow, Some(&prepared));
+        assert_eq!(
+            std::fs::read(directory.path().join(PENDING_TURN_FILE)).unwrap(),
+            before
+        );
+    }
+
     #[test]
     fn queue_keeps_the_inherited_environment_and_its_explicit_session_directory() {
         let directory = std::path::Path::new(".");
@@ -1568,25 +1620,24 @@ exit 1
         let (claim, _) =
             acquire_ready_turn_claim_with_context(directory, "session-codexqueue", &[]).unwrap();
         update_status(directory, SessionState::Working, None, None).unwrap();
-        let failure = ADAPTER
-            .send_cross_session_message(CrossSessionMessageContext {
-                bridge_executable: Path::new("/unused/agent-bridge"),
-                directory,
-                provider_path: &provider,
-                request_id: claim.token(),
-                prompt: "request addressed only to A",
-                deadline: Instant::now() + Duration::from_secs(2),
-            })
-            .unwrap_err();
+        let failure = send_native_queue_message(CrossSessionMessageContext {
+            bridge_executable: Path::new("/unused/agent-bridge"),
+            directory,
+            provider_path: &provider,
+            request_id: claim.token(),
+            prompt: "request addressed only to A",
+            deadline: Instant::now() + Duration::from_secs(2),
+        })
+        .unwrap_err();
 
         assert_eq!(
-            ADAPTER.follow_up_transport(),
-            FollowUpTransport::ProviderQueue,
+            ADAPTER.follow_up_transport().facts().name,
+            "provider-native-queue",
             "a queue rejection must not select a paste into an unverified active thread"
         );
-        assert!(!failure.delivery_may_have_occurred());
+        assert!(matches!(failure, Outcome::NotSent(_)));
         assert!(!directory.join(PENDING_TURN_FILE).exists());
-        let reason = format!("{:#}", failure.into_error());
+        let reason = format!("{:#}", outcome_error(&failure));
         assert!(reason.contains("the active thread cannot be verified"));
         assert!(reason.contains("user message queue is unavailable"));
         let receipt = super::super::super::requests::for_claim(
@@ -1625,9 +1676,8 @@ exit 1
     #[test]
     fn terminal_follow_up_refuses_before_installing_pending_turn_metadata() {
         let directory = tempfile::tempdir().unwrap();
-        let result = ADAPTER.prepare_terminal_follow_up(directory.path(), "only for A", "1-2-0");
         assert!(
-            result.is_err(),
+            ADAPTER.follow_up_transport().facts().surface.is_none(),
             "terminal ownership does not identify the active Codex thread"
         );
         assert!(!directory.path().join(PENDING_TURN_FILE).exists());
@@ -1772,7 +1822,7 @@ exit 1
         ] {
             let failure =
                 classify_codex_queue_output(true, stdout, b"", truncated, thread_id).unwrap_err();
-            assert!(failure.delivery_may_have_occurred());
+            assert!(matches!(failure, Outcome::Uncertain(_)));
         }
     }
 
@@ -1800,8 +1850,8 @@ exit 1
             let failure =
                 classify_codex_queue_output(false, b"", stderr.as_bytes(), false, thread_id)
                     .unwrap_err();
-            assert!(failure.error.to_string().contains(&unaddressed_follow_up()), "{stderr}");
-            assert!(!failure.delivery_may_have_occurred(), "{stderr}");
+            assert!(outcome_error(&failure).to_string().contains(&unaddressed_follow_up()), "{stderr}");
+            assert!(matches!(failure, Outcome::NotSent(_)), "{stderr}");
         }
 
         let failure = classify_codex_queue_output(
@@ -1812,7 +1862,7 @@ exit 1
             thread_id,
         )
         .unwrap_err();
-        assert!(failure.delivery_may_have_occurred());
+        assert!(matches!(failure, Outcome::Uncertain(_)));
     }
 
     #[cfg(unix)]
@@ -1832,16 +1882,15 @@ exit 1
         // The prompt as `tell` hands it to the adapter: already framed.
         let prompt = native_delegation_prompt("external", "follow up");
 
-        ADAPTER
-            .send_cross_session_message(CrossSessionMessageContext {
-                bridge_executable: Path::new("/unused/agent-bridge"),
-                directory: &directory,
-                provider_path: &provider,
-                request_id: &claim_token,
-                prompt: &prompt,
-                deadline: Instant::now() + Duration::from_secs(2),
-            })
-            .unwrap();
+        send_native_queue_message(CrossSessionMessageContext {
+            bridge_executable: Path::new("/unused/agent-bridge"),
+            directory: &directory,
+            provider_path: &provider,
+            request_id: &claim_token,
+            prompt: &prompt,
+            deadline: Instant::now() + Duration::from_secs(2),
+        })
+        .unwrap();
 
         let arguments = std::fs::read(directory.join("queue-argv.bin")).unwrap();
         let arguments = arguments
@@ -1901,16 +1950,15 @@ exit 1
         let claim_token = claim.token().to_owned();
         claim.retain();
 
-        ADAPTER
-            .send_cross_session_message(CrossSessionMessageContext {
-                bridge_executable: Path::new("/unused/agent-bridge"),
-                directory: &directory,
-                provider_path: &provider,
-                request_id: &claim_token,
-                prompt: "follow up",
-                deadline: Instant::now() + Duration::from_secs(2),
-            })
-            .unwrap();
+        send_native_queue_message(CrossSessionMessageContext {
+            bridge_executable: Path::new("/unused/agent-bridge"),
+            directory: &directory,
+            provider_path: &provider,
+            request_id: &claim_token,
+            prompt: "follow up",
+            deadline: Instant::now() + Duration::from_secs(2),
+        })
+        .unwrap();
 
         let expected = format!("{}\n", workspace.canonicalize().unwrap().display());
         assert!(!directory.join("daemon-cwd.txt").exists());
@@ -1937,18 +1985,17 @@ exit 1
             let claim_token = claim.token().to_owned();
             claim.retain();
 
-            let failure = ADAPTER
-                .send_cross_session_message(CrossSessionMessageContext {
-                    bridge_executable: Path::new("/unused/agent-bridge"),
-                    directory: &directory,
-                    provider_path: &provider,
-                    request_id: &claim_token,
-                    prompt: "follow up",
-                    deadline: Instant::now() + Duration::from_secs(1),
-                })
-                .unwrap_err();
+            let failure = send_native_queue_message(CrossSessionMessageContext {
+                bridge_executable: Path::new("/unused/agent-bridge"),
+                directory: &directory,
+                provider_path: &provider,
+                request_id: &claim_token,
+                prompt: "follow up",
+                deadline: Instant::now() + Duration::from_secs(1),
+            })
+            .unwrap_err();
 
-            assert!(!failure.delivery_may_have_occurred(), "{version}");
+            assert!(matches!(failure, Outcome::NotSent(_)), "{version}");
             assert!(!directory.join(PENDING_TURN_FILE).exists(), "{version}");
         }
     }
@@ -1977,18 +2024,17 @@ exit 91
         let claim_token = claim.token().to_owned();
         claim.retain();
 
-        let failure = ADAPTER
-            .send_cross_session_message(CrossSessionMessageContext {
-                bridge_executable: Path::new("/unused/agent-bridge"),
-                directory: &directory,
-                provider_path: &provider,
-                request_id: &claim_token,
-                prompt: "follow up",
-                deadline: Instant::now() + Duration::from_secs(1),
-            })
-            .unwrap_err();
+        let failure = send_native_queue_message(CrossSessionMessageContext {
+            bridge_executable: Path::new("/unused/agent-bridge"),
+            directory: &directory,
+            provider_path: &provider,
+            request_id: &claim_token,
+            prompt: "follow up",
+            deadline: Instant::now() + Duration::from_secs(1),
+        })
+        .unwrap_err();
 
-        assert!(!failure.delivery_may_have_occurred());
+        assert!(matches!(failure, Outcome::NotSent(_)));
         assert!(
             !directory.join("provider-ran").exists(),
             "native queue attempted to resolve a non-UUID target as an exact session name"
@@ -2049,16 +2095,15 @@ exit 91
         let claim_token = claim.token().to_owned();
         claim.retain();
 
-        ADAPTER
-            .send_cross_session_message(CrossSessionMessageContext {
-                bridge_executable: Path::new("/unused/agent-bridge"),
-                directory: &directory,
-                provider_path: &provider,
-                request_id: &claim_token,
-                prompt: "follow up",
-                deadline: Instant::now() + Duration::from_secs(10),
-            })
-            .unwrap();
+        send_native_queue_message(CrossSessionMessageContext {
+            bridge_executable: Path::new("/unused/agent-bridge"),
+            directory: &directory,
+            provider_path: &provider,
+            request_id: &claim_token,
+            prompt: "follow up",
+            deadline: Instant::now() + Duration::from_secs(10),
+        })
+        .unwrap();
 
         assert!(!directory.join("daemon-probed").exists());
         assert!(directory.join("queue-ran").exists());
@@ -2208,19 +2253,18 @@ exit 91
             );
         });
         let _fixture = QueueTimeoutFixture { pipe: pipe.clone() };
-        let failure = ADAPTER
-            .send_cross_session_message(CrossSessionMessageContext {
-                bridge_executable: Path::new("/unused/agent-bridge"),
-                directory: &directory,
-                provider_path: &provider,
-                request_id: &claim_token,
-                prompt: "follow up",
-                deadline: Instant::now() + Duration::from_secs(5),
-            })
-            .unwrap_err();
+        let failure = send_native_queue_message(CrossSessionMessageContext {
+            bridge_executable: Path::new("/unused/agent-bridge"),
+            directory: &directory,
+            provider_path: &provider,
+            request_id: &claim_token,
+            prompt: "follow up",
+            deadline: Instant::now() + Duration::from_secs(5),
+        })
+        .unwrap_err();
 
-        let delivery_uncertain = failure.delivery_may_have_occurred();
-        let reason = format!("{:#}", failure.into_error());
+        let delivery_uncertain = matches!(failure, Outcome::Uncertain(_));
+        let reason = format!("{:#}", outcome_error(&failure));
         assert!(reason.contains("Codex queue timed out"), "{reason}");
         QUEUE_TIMEOUT_READY.with(|path| {
             assert!(
