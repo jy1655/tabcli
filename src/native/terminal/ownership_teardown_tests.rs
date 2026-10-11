@@ -191,9 +191,14 @@ fn decision(
         "session-owner123",
         surface,
         || Ok(false),
-        |_| Ok(None),
-        || Ok(vec![]),
         CloseObservers {
+            evidence: terminal::close_evidence::with_apple(
+                surface.kind,
+                &terminal::macos::apple_terminal::close_evidence::with_observations(
+                    |_| Ok(None),
+                    || Ok(vec![]),
+                ),
+            ),
             owner_record: &|_| panic!("spawn recovery must not run"),
             pid_alive: &|_| pid_alive,
             mac_owner_live: &|_| Ok(live),
@@ -260,30 +265,36 @@ fn r3_terminal_incarnation_changes_or_old_window_in_new_app_refuse() {
             "session-owner123",
             &surface,
             || Ok(case == "old-id-in-new-app"),
-            |_| {
-                births.set(births.get() + 1);
-                Ok(Some((
-                    app.start_seconds,
-                    app.start_microseconds
-                        + u64::from(
-                            case == "reused" || (case == "restart-during" && births.get() == 3),
-                        ),
-                )))
-            },
-            || {
-                Ok(if case == "multiple" {
-                    vec![
-                        app.clone(),
-                        MacTerminalAppIdentity {
-                            pid: app.pid + 1,
-                            ..app.clone()
-                        },
-                    ]
-                } else {
-                    vec![app.clone()]
-                })
-            },
             CloseObservers {
+                evidence: terminal::close_evidence::with_apple(
+                    surface.kind,
+                    &terminal::macos::apple_terminal::close_evidence::with_observations(
+                        |_| {
+                            births.set(births.get() + 1);
+                            Ok(Some((
+                                app.start_seconds,
+                                app.start_microseconds
+                                    + u64::from(
+                                        case == "reused"
+                                            || (case == "restart-during" && births.get() == 3),
+                                    ),
+                            )))
+                        },
+                        || {
+                            Ok(if case == "multiple" {
+                                vec![
+                                    app.clone(),
+                                    MacTerminalAppIdentity {
+                                        pid: app.pid + 1,
+                                        ..app.clone()
+                                    },
+                                ]
+                            } else {
+                                vec![app.clone()]
+                            })
+                        },
+                    ),
+                ),
                 owner_record: &|_| panic!("not startup"),
                 pid_alive: &|_| true,
                 mac_owner_live: &|_| Ok(true),
@@ -334,9 +345,14 @@ fn r3_owner_dying_during_live_intent_retry_cannot_bypass_group_check() {
         "session-owner123",
         &surface,
         || Ok(false),
-        |_| panic!("not Terminal.app"),
-        || panic!("not Terminal.app"),
         CloseObservers {
+            evidence: terminal::close_evidence::with_apple(
+                surface.kind,
+                &terminal::macos::apple_terminal::close_evidence::with_observations(
+                    |_| panic!("not Terminal.app"),
+                    || panic!("not Terminal.app"),
+                ),
+            ),
             owner_record: &|_| panic!("not startup"),
             pid_alive: &|_| false,
             mac_owner_live: &|_| {
@@ -429,9 +445,14 @@ fn damaged_teardown_refuses(path: &str) {
             "session-owner123",
             &surface,
             || Ok(false),
-            |_| panic!("not Terminal.app"),
-            || panic!("not Terminal.app"),
             CloseObservers {
+                evidence: terminal::close_evidence::with_apple(
+                    surface.kind,
+                    &terminal::macos::apple_terminal::close_evidence::with_observations(
+                        |_| panic!("not Terminal.app"),
+                        || panic!("not Terminal.app"),
+                    ),
+                ),
                 owner_record: &|_| session::OwnerObservation {
                     process_alive: Some(false),
                     identity_matches: Some(false),
@@ -609,9 +630,14 @@ fn close_deadline_shared_observations_policy_adapter_and_retry() {
                     expire("presence");
                     Ok(false)
                 },
-                |_| Ok(None),
-                || Ok(vec![]),
                 CloseObservers {
+                    evidence: terminal::close_evidence::with_apple(
+                        surface.kind,
+                        &terminal::macos::apple_terminal::close_evidence::with_observations(
+                            |_| Ok(None),
+                            || Ok(vec![]),
+                        ),
+                    ),
                     owner_record: &|_| panic!("not startup"),
                     pid_alive: &|_| true,
                     mac_owner_live: &|_| Ok(true),

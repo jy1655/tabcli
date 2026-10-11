@@ -4,6 +4,8 @@ use super::teardown_tests::{fixture, kinds};
 use super::*;
 use session::close::interruption::{self, Point};
 use std::cell::Cell;
+use terminal::close_evidence::with_apple;
+use terminal::macos::apple_terminal::close_evidence::with_observations as apple_evidence;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Group {
@@ -80,9 +82,11 @@ impl Processes {
                             "session-owner123",
                             surface,
                             || Ok(false),
-                            |_| Ok(None),
-                            || Ok(vec![]),
                             CloseObservers {
+                                evidence: with_apple(
+                                    surface.kind,
+                                    &apple_evidence(|_| Ok(None), || Ok(vec![])),
+                                ),
                                 owner_record: &|_| panic!("not a failed startup"),
                                 pid_alive: &|_| self.owner_live.get(),
                                 mac_owner_live: &|_| Ok(self.owner_live.get()),

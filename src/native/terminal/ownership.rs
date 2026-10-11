@@ -5,16 +5,9 @@ use super::CloseOutcome;
 use super::PreClosePolicy;
 use super::TerminalSession;
 #[cfg(target_os = "macos")]
-use super::macos::apple_terminal::{
-    record_legacy_terminal_app, require_unique_terminal_app, terminal_app_alive_with,
-    terminal_app_instances, terminal_app_process, terminal_surface_absent, verified_close_tty,
-};
-#[cfg(target_os = "macos")]
 pub(in crate::native) use super::macos::ownership::mac_native_owner_is_live;
 #[cfg(target_os = "macos")]
 use super::macos::ownership::verified_macos_terminal_owner;
-#[cfg(target_os = "macos")]
-use super::macos::process::macos_process_start;
 #[cfg(target_os = "macos")]
 use super::macos::process::{
     current_terminal_tty, live_native_process_identity, terminal_tty_device,
@@ -358,43 +351,23 @@ fn verify_terminal_close_authority_with_presence(
     surface_present: impl FnOnce() -> Result<bool>,
     deadline: std::time::Instant,
 ) -> Result<TerminalCloseAuthority> {
-    verify_terminal_close_authority_with_observations(
+    verify_terminal_close_authority_with_evidence(
         directory,
         expected_session_id,
         session,
         surface_present,
-        |pid| {
-            #[cfg(target_os = "macos")]
-            {
-                macos_process_start(pid)
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = pid;
-                bail!("macOS app observation is unavailable on this platform")
-            }
-        },
-        || {
-            #[cfg(target_os = "macos")]
-            {
-                terminal_app_instances()
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                bail!("macOS app observation is unavailable on this platform")
-            }
-        },
+        #[cfg(target_os = "macos")]
+        terminal::close_evidence(session.kind),
         deadline,
     )
 }
 
-pub(in crate::native) fn verify_terminal_close_authority_with_observations(
+pub(in crate::native) fn verify_terminal_close_authority_with_evidence(
     directory: &Path,
     expected_session_id: &str,
     session: &terminal::TerminalSession,
     surface_present: impl FnOnce() -> Result<bool>,
-    process_birth: impl Fn(u32) -> Result<Option<(u64, u64)>>,
-    terminal_instances: impl Fn() -> Result<Vec<MacTerminalAppIdentity>>,
+    #[cfg(target_os = "macos")] evidence: &dyn terminal::close_evidence::CloseEvidence,
     deadline: std::time::Instant,
 ) -> Result<TerminalCloseAuthority> {
     verify_terminal_close_authority_with_observers(
@@ -402,9 +375,9 @@ pub(in crate::native) fn verify_terminal_close_authority_with_observations(
         expected_session_id,
         session,
         surface_present,
-        process_birth,
-        terminal_instances,
         CloseObservers {
+            #[cfg(target_os = "macos")]
+            evidence,
             #[cfg(any(target_os = "macos", windows))]
             owner_record: &observe_owner_record,
             #[cfg(target_os = "macos")]
@@ -442,6 +415,8 @@ pub(in crate::native) fn verify_terminal_close_authority_with_observations(
 // Only the decision's observations are replaceable. Record reads and their ordering
 // stay in the decision; production callbacks retain the existing, distinct proofs.
 struct CloseObservers<'a> {
+    #[cfg(target_os = "macos")]
+    evidence: &'a dyn terminal::close_evidence::CloseEvidence,
     #[cfg(any(target_os = "macos", windows))]
     owner_record: &'a dyn Fn(&NativeSessionOwner) -> crate::native::session::OwnerObservation,
     #[cfg(target_os = "macos")]
@@ -457,14 +432,11 @@ struct CloseObservers<'a> {
     group_gone: &'a dyn Fn(u32) -> Result<bool>,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn verify_terminal_close_authority_with_observers(
     directory: &Path,
     expected_session_id: &str,
     session: &terminal::TerminalSession,
     surface_present: impl FnOnce() -> Result<bool>,
-    process_birth: impl Fn(u32) -> Result<Option<(u64, u64)>>,
-    terminal_instances: impl Fn() -> Result<Vec<MacTerminalAppIdentity>>,
     observers: CloseObservers<'_>,
     deadline: std::time::Instant,
 ) -> Result<TerminalCloseAuthority> {
@@ -484,14 +456,7 @@ fn verify_terminal_close_authority_with_observers(
     };
     let mut observers = observers;
     observers.ownership_proof = &ownership_proof;
-    let _ = (
-        directory,
-        expected_session_id,
-        session,
-        &surface_present,
-        &process_birth,
-        &terminal_instances,
-    );
+    let _ = (directory, expected_session_id, session, &surface_present);
     #[cfg(any(target_os = "macos", windows))]
     {
         #[cfg(target_os = "macos")]
@@ -534,29 +499,19 @@ fn verify_terminal_close_authority_with_observers(
             #[cfg(target_os = "macos")]
             if !has_teardown_intent && (observers.resumable)()? {
                 session.verify_managed_session(expected_session_id)?;
-                if terminal::facts(session.kind).requires_app_incarnation {
-                    let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
-                    let Some(app) = &owner.terminal_app else {
-                        // An intent of 0.0.10 or earlier names no app incarnation, and
-                        // its owner is gone: nothing can tie the window to an app now.
-                        if terminal_surface_absent(
-                            None,
-                            &process_birth,
-                            &terminal_instances,
-                            surface_present,
-                        )? {
-                            return Ok(TerminalCloseAuthority::Absent);
+                return Ok(
+                    match observers.evidence.resumable_authority(
+                        &|| Reader::open_unchecked(directory).owner(),
+                        Box::new(surface_present),
+                    )? {
+                        terminal::close_evidence::ResumableAuthority::Absent => {
+                            TerminalCloseAuthority::Absent
                         }
-                        bail!(
-                            "Terminal.app process incarnation was not recorded and its window is not proven gone; no close was sent and the exact surface handle is retained"
-                        );
-                    };
-                    if !terminal_app_alive_with(app, &process_birth)? {
-                        return Ok(TerminalCloseAuthority::Absent);
-                    }
-                    require_unique_terminal_app(app, &terminal_instances()?)?;
-                }
-                return Ok(TerminalCloseAuthority::SurfaceOnly);
+                        terminal::close_evidence::ResumableAuthority::SurfaceOnly => {
+                            TerminalCloseAuthority::SurfaceOnly
+                        }
+                    },
+                );
             }
             #[cfg(target_os = "macos")]
             {
@@ -591,16 +546,7 @@ fn verify_terminal_close_authority_with_observers(
                         }
                         return Ok(TerminalCloseAuthority::TeardownComplete(intent.reason));
                     }
-                    let absent = if terminal::facts(session.kind).requires_app_incarnation {
-                        terminal_surface_absent(
-                            owner.terminal_app.as_ref(),
-                            &process_birth,
-                            &terminal_instances,
-                            surface_present,
-                        )
-                    } else {
-                        surface_present().map(|present| !present)
-                    }
+                    let absent = observers.evidence.surface_absent(Some(&owner), Box::new(surface_present))
                     .context("could not prove absence of the dead owner's exact terminal surface; no close was sent")?;
                     if absent {
                         return Ok(TerminalCloseAuthority::Absent);
@@ -611,17 +557,7 @@ fn verify_terminal_close_authority_with_observers(
                 }
                 // Keep the existing app-incarnation guard as part of the live proof.
                 // Only its ended-incarnation refusal moves to the absent-surface row.
-                let ended = if terminal::facts(session.kind).requires_app_incarnation
-                    && let Some(app) = &owner.terminal_app
-                {
-                    let alive = terminal_app_alive_with(app, &process_birth)?;
-                    if alive {
-                        require_unique_terminal_app(app, &terminal_instances()?)?;
-                    }
-                    !alive
-                } else {
-                    false
-                };
+                let ended = observers.evidence.incarnation_ended(&owner)?;
                 let proof = if ended {
                     Err(anyhow::anyhow!(
                         "Terminal.app ended while its native owner remained; no close was sent"
@@ -631,16 +567,9 @@ fn verify_terminal_close_authority_with_observers(
                 };
                 if let Err(error) = proof {
                     close_remaining(deadline)?;
-                    let absent = if terminal::facts(session.kind).requires_app_incarnation {
-                        terminal_surface_absent(
-                            owner.terminal_app.as_ref(),
-                            &process_birth,
-                            &terminal_instances,
-                            surface_present,
-                        )
-                    } else {
-                        surface_present().map(|present| !present)
-                    };
+                    let absent = observers
+                        .evidence
+                        .surface_absent(Some(&owner), Box::new(surface_present));
                     if !matches!(absent, Ok(true)) {
                         return Err(error);
                     }
@@ -670,25 +599,14 @@ fn verify_terminal_close_authority_with_observers(
         // that no wrapper recorded here, so nothing is closed: the handle is consumed
         // once the window is proven gone.
         #[cfg(target_os = "macos")]
-        if terminal::facts(session.kind).requires_app_incarnation {
-            if terminal_surface_absent(None, &process_birth, &terminal_instances, surface_present)?
+        if !terminal::facts(session.kind).failed_start_identity {
+            if observers
+                .evidence
+                .surface_absent(None, Box::new(surface_present))?
             {
                 return Ok(TerminalCloseAuthority::Absent);
             }
-            bail!(
-                "Terminal.app startup has no native owner/app incarnation and its window is not proven gone; no close was sent and the surface handle is retained"
-            );
-        }
-        #[cfg(target_os = "macos")]
-        if !terminal::facts(session.kind).failed_start_identity {
-            if !surface_present().context(
-                "could not prove absence of the ownerless startup surface; no close was sent",
-            )? {
-                return Ok(TerminalCloseAuthority::Absent);
-            }
-            bail!(
-                "startup has no native owner or close intent and its surface is not proven gone; no close was sent and the surface handle is retained"
-            );
+            bail!(observers.evidence.startup_retained_reason());
         }
         if !terminal::facts(session.kind).failed_start_identity {
             bail!("startup surface has no supported native close identity; its handle is retained");
@@ -1009,7 +927,7 @@ fn close_signal_plan(
 }
 
 #[cfg(target_os = "macos")]
-fn terminate_process_groups(
+pub(in crate::native::terminal) fn terminate_process_groups(
     managed_process_group: u32,
     shell_process_group: u32,
     deadline: std::time::Instant,
@@ -1041,29 +959,12 @@ pub(in crate::native) fn terminate_apple_terminal_owner(
     session: &terminal::TerminalSession,
     deadline: std::time::Instant,
 ) -> Result<()> {
-    close_remaining(deadline)?;
-    let surface_tty = verified_close_tty(session, deadline)?;
-    let (mut owner, live) =
-        verified_macos_terminal_owner(directory, expected_session_id, session, Some(&surface_tty))?;
-    let process_group = verified_terminal_owner_process_group(&owner, &live)?;
-    let live_shell = live_native_process_identity(live.parent_pid)?;
-    let shell_process_group = verified_terminal_shell_process_group(&owner, &live, &live_shell)?;
-    record_legacy_terminal_app(directory, &mut owner, terminal_app_process)?;
-    require_unique_terminal_app(
-        owner
-            .terminal_app
-            .as_ref()
-            .context("Terminal.app identity was not recorded")?,
-        &terminal_app_instances()?,
-    )?;
-    close_remaining(deadline)?;
-    session::close::record_terminal_close_intent(
-        &Store::open_unchecked(directory),
+    terminal::macos::apple_terminal::close_evidence::terminate_owner(
+        directory,
         expected_session_id,
         session,
-        &owner,
-    )?;
-    terminate_process_groups(process_group, shell_process_group, deadline)
+        deadline,
+    )
 }
 
 // Warp preserves normal close warnings. Stop only the fully attested foreground
@@ -1197,9 +1098,8 @@ pub(in crate::native) fn current_surface_owner(
         let mut owner = owner;
         let surface: terminal::TerminalSession = Reader::open_unchecked(directory).terminal()?;
         surface.verify_managed_session(id)?;
-        if surface.kind == terminal::TerminalKind::AppleTerminal {
-            owner.terminal_app = Some(terminal_app_process(&owner)?);
-        }
+        owner.terminal_app =
+            terminal::close_evidence(surface.kind).derive_app_incarnation(&owner)?;
         owner
     };
     Ok(owner)
@@ -1379,16 +1279,21 @@ mod close_authority_tests {
                     observe("presence")?;
                     Ok(self.present)
                 },
-                |pid| {
-                    assert_eq!(pid, app().pid);
-                    observe("birth")?;
-                    Ok(self.birth)
-                },
-                || {
-                    observe("instances")?;
-                    Ok(self.instances.clone())
-                },
                 CloseObservers {
+                    evidence: terminal::close_evidence::with_apple(
+                        handle.kind,
+                        &terminal::macos::apple_terminal::close_evidence::with_observations(
+                            |pid| {
+                                assert_eq!(pid, app().pid);
+                                observe("birth")?;
+                                Ok(self.birth)
+                            },
+                            || {
+                                observe("instances")?;
+                                Ok(self.instances.clone())
+                            },
+                        ),
+                    ),
                     owner_record: &|owner| {
                         assert_eq!(owner.pid, 123);
                         record("owner-record");
