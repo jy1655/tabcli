@@ -228,6 +228,14 @@ impl Transport for AgyPaste {
 }
 
 impl NativeProviderAdapter for AgyAdapter {
+    fn launch_trust(&self) -> crate::native::consent::LaunchTrust {
+        crate::native::consent::LaunchTrust {
+            answers_launch_dialog: true,
+            bypass_suppresses_dialog: false,
+            applied_marker: None,
+        }
+    }
+
     fn initial_transport(&self) -> Box<dyn Transport> {
         if cfg!(windows) {
             Box::new(AgyInitialPaste)

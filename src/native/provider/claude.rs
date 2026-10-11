@@ -315,6 +315,14 @@ impl Transport for ClaudeMessage {
 }
 
 impl NativeProviderAdapter for ClaudeAdapter {
+    fn launch_trust(&self) -> crate::native::consent::LaunchTrust {
+        crate::native::consent::LaunchTrust {
+            answers_launch_dialog: true,
+            bypass_suppresses_dialog: true,
+            applied_marker: None,
+        }
+    }
+
     fn initial_transport(&self) -> Box<dyn Transport> {
         if cfg!(windows) {
             Box::new(ClaudeMessage)

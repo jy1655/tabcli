@@ -68,7 +68,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   helpers. `close::budget` owns the close deadline and test clock. `requests` binds public requests to
   claims and events; `turn` owns delivery settlement, completion and recovery; `close` owns
   close-record transitions and dead-owner repair; `launch` coordinates spawn, cancellation,
-  and the full macOS binding wait, with surface identity checks supplied by terminal adapters.
+  and the full macOS binding wait. Terminal adapters supply surface identity checks and declare
+  binding diagnostics and wait budgets.
   `state` owns the serialized status and its writes: `Store::update_status` applies
   permitted transitions and generations, while `Store::record_residual_surface` amends
   diagnostics without changing lifecycle fields. Both preserve closed tombstones.
@@ -95,8 +96,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   initial and follow-up results, and closes only its own sessions. It uses the ordinary state
   root unless isolation is requested; it is not called implicitly by another command.
 - `src/native/consent.rs` reads exact-workspace trust evidence, maintains Bridge consent, and
-  coordinates its application through provider and terminal adapters. Provider stores are read
-  directly but never written directly by Bridge.
+  coordinates its application through provider and terminal adapters, consuming their declared
+  `LaunchTrust` facts for launch trust policy. Provider stores are read directly but never written
+  directly by Bridge.
 - `src/native/settings.rs` owns user preferences for surface creation. A preference cannot grant
   close authority over an existing surface.
 
@@ -280,8 +282,9 @@ repair settles the records without resending a prompt or guessing ownership of a
   Read `src/native/terminal/ownership.rs` before implementing close. Add application-native
   operations under the platform module and tests that prove the target belongs to the session.
   Each adapter declares its close facts, pre-close policy, paste envelope, and guarded-dialog
-  capability in its `facts.rs` module. The shared accessor dispatches exhaustively by terminal
-  kind on every build target; platform operation refusals remain separate.
+  capability as `SurfaceFacts` in its `facts.rs` module. The shared accessor dispatches these
+  exhaustively by terminal kind on every build target; platform operation refusals remain separate.
+  The three macOS adapters also declare macOS-only `BINDING` diagnostics and budgets there.
   A creation preference in settings cannot substitute for recorded close authority.
 - For a new platform, start with the dispatch in `src/native/terminal/mod.rs` and the refusal
   paths in `src/native/terminal/linux/mod.rs`. Then read the process-identity code under the

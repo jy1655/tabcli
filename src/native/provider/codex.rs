@@ -215,7 +215,17 @@ fn outcome_error(outcome: &Outcome) -> &anyhow::Error {
     }
 }
 
+const APPLIED_MARKER: &str = "codex-config-override";
+
 impl NativeProviderAdapter for CodexAdapter {
+    fn launch_trust(&self) -> crate::native::consent::LaunchTrust {
+        crate::native::consent::LaunchTrust {
+            answers_launch_dialog: false,
+            bypass_suppresses_dialog: false,
+            applied_marker: Some(APPLIED_MARKER),
+        }
+    }
+
     fn initial_transport(&self) -> Box<dyn Transport> {
         if cfg!(windows) {
             Box::new(CodexInitialPaste)
@@ -317,7 +327,7 @@ impl NativeProviderAdapter for CodexAdapter {
                     OsString::from(workspace_trust_override(context.workspace)?),
                 ],
             );
-            super::super::consent::applied(context.directory, "codex-config-override")?;
+            super::super::consent::applied(context.directory, APPLIED_MARKER)?;
         }
         Ok(LaunchPlan {
             arguments,

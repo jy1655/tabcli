@@ -385,12 +385,9 @@ fn release_start(directory: &Path, id: &str) -> Result<String> {
 }
 
 fn wait_for_binding(directory: &Path, id: &str, tty: &str) -> Result<()> {
-    use crate::native::launch::{BindingHost, wait_for_binding};
-    let surface = wait_for_binding(
-        &Reader::open_unchecked(directory),
-        id,
-        BindingHost::AppleTerminal,
-    )?;
+    use crate::native::launch::wait_for_binding;
+    use crate::native::terminal::facts::apple_terminal::BINDING;
+    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, &BINDING)?;
     if surface.kind != TerminalKind::AppleTerminal
         || surface.id != tty
         || surface.window_id.as_deref().is_none_or(str::is_empty)

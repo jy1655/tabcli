@@ -184,7 +184,17 @@ impl Transport for PiPaste {
     }
 }
 
+const APPLIED_MARKER: &str = "pi-approve-once";
+
 impl NativeProviderAdapter for PiAdapter {
+    fn launch_trust(&self) -> crate::native::consent::LaunchTrust {
+        crate::native::consent::LaunchTrust {
+            answers_launch_dialog: false,
+            bypass_suppresses_dialog: false,
+            applied_marker: Some(APPLIED_MARKER),
+        }
+    }
+
     fn initial_transport(&self) -> Box<dyn Transport> {
         if cfg!(windows) {
             Box::new(PiInitialPaste)
@@ -295,7 +305,7 @@ impl NativeProviderAdapter for PiAdapter {
             // Pi documents --approve as a one-run project-trust override. It is
             // not a tool permission flag and does not persist to trust.json.
             arguments.push(OsString::from("--approve"));
-            super::super::consent::applied(context.directory, "pi-approve-once")?;
+            super::super::consent::applied(context.directory, APPLIED_MARKER)?;
         }
         if !cfg!(windows) {
             arguments.push(OsString::from(correlated_prompt(context.prompt, &pending)));

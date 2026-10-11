@@ -7,3 +7,13 @@ pub(in crate::native::terminal) const FACTS: SurfaceFacts = SurfaceFacts {
     paste_envelope: PasteEnvelope::Bracketed,
     guards_dialog_input: true,
 };
+
+#[cfg(target_os = "macos")]
+use crate::native::launch::{BindingBudget, BindingFacts};
+
+#[cfg(target_os = "macos")]
+pub(in crate::native::terminal) const BINDING: BindingFacts = BindingFacts {
+    host: "Terminal.app",
+    cancelled: "Terminal.app launch was cancelled or timed out before its surface was bound",
+    budget: BindingBudget::StartTimeout,
+};

@@ -27,6 +27,13 @@ pub(super) enum Trust {
     Declined,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(in crate::native) struct LaunchTrust {
+    pub(in crate::native) answers_launch_dialog: bool,
+    pub(in crate::native) bypass_suppresses_dialog: bool,
+    pub(in crate::native) applied_marker: Option<&'static str>,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Homes {
     pub(super) codex: PathBuf,
@@ -397,15 +404,37 @@ pub(super) fn complete_launch(
     session: &terminal::TerminalSession,
     deadline: Instant,
 ) -> Result<()> {
-    if !matches!(target, FirstPartyCli::Claude | FirstPartyCli::Agy)
-        || !authorized(directory, target)?
-    {
+    complete_launch_with(
+        provider::launch_trust(target),
+        || authorized(directory, target),
+        || Reader::open_unchecked(directory).manifest(),
+        |manifest| complete_launch_dialog(directory, target, session, deadline, manifest),
+    )
+}
+
+fn complete_launch_with(
+    facts: LaunchTrust,
+    authorized: impl FnOnce() -> Result<bool>,
+    manifest: impl FnOnce() -> Result<SessionManifest>,
+    dialog: impl FnOnce(SessionManifest) -> Result<()>,
+) -> Result<()> {
+    if !facts.answers_launch_dialog || !authorized()? {
         return Ok(());
     }
-    let manifest = Reader::open_unchecked(directory).manifest()?;
-    if target == FirstPartyCli::Claude && manifest.yolo {
+    let manifest = manifest()?;
+    if facts.bypass_suppresses_dialog && manifest.yolo {
         return Ok(());
     }
+    dialog(manifest)
+}
+
+fn complete_launch_dialog(
+    directory: &Path,
+    target: FirstPartyCli,
+    session: &terminal::TerminalSession,
+    deadline: Instant,
+    manifest: SessionManifest,
+) -> Result<()> {
     let homes = Homes::current()?;
     if matches!(
         provider::workspace_trust(target, &manifest.workspace, &homes)?,
@@ -480,6 +509,19 @@ fn wait_for_native_trust_with(
     homes: &Homes,
     ready: &mut dyn FnMut() -> bool,
 ) -> Result<()> {
+    wait_for_native_trust_authorized_with(directory, target, deadline, homes, ready, &mut || {
+        authorized(directory, target)
+    })
+}
+
+fn wait_for_native_trust_authorized_with(
+    directory: &Path,
+    target: FirstPartyCli,
+    deadline: Instant,
+    homes: &Homes,
+    ready: &mut dyn FnMut() -> bool,
+    authorized: &mut dyn FnMut() -> Result<bool>,
+) -> Result<()> {
     let manifest = Reader::open_unchecked(directory).manifest()?;
     loop {
         // A session that has ended has no terminal left to send to, whatever becomes
@@ -497,11 +539,13 @@ fn wait_for_native_trust_with(
             );
         }
         let assessment = observe(directory);
-        let applied_here = matches!(
-            assessment.get("applied").and_then(|s| s.as_str()),
-            Some("codex-config-override" | "pi-approve-once")
-        );
-        if (applied_here && authorized(directory, target)?)
+        let applied_here = assessment
+            .get("applied")
+            .and_then(|s| s.as_str())
+            .is_some_and(|marker| {
+                provider::launch_trust_markers().any(|registered| registered == marker)
+            });
+        if (applied_here && authorized()?)
             || matches!(
                 provider::workspace_trust(target, &manifest.workspace, homes),
                 Ok(Trust::Trusted(_))
@@ -1039,6 +1083,305 @@ mod tests {
         )
         .unwrap();
         (root, directory)
+    }
+
+    #[test]
+    fn complete_launch_without_a_dialog_reads_nothing() {
+        complete_launch_with(
+            LaunchTrust {
+                answers_launch_dialog: false,
+                bypass_suppresses_dialog: false,
+                applied_marker: None,
+            },
+            || panic!("authorization"),
+            || panic!("manifest"),
+            |_| panic!("trust or surface"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn complete_launch_bypass_reads_authorization_then_manifest_only() {
+        let (_temp, workspace, _homes) = setup();
+        let (_root, directory) = session(&workspace, "launching");
+        let order = std::cell::RefCell::new(Vec::new());
+        complete_launch_with(
+            LaunchTrust {
+                answers_launch_dialog: true,
+                bypass_suppresses_dialog: true,
+                applied_marker: None,
+            },
+            || {
+                order.borrow_mut().push("authorization");
+                Ok(true)
+            },
+            || {
+                order.borrow_mut().push("manifest");
+                let mut manifest = Reader::open_unchecked(&directory).manifest()?;
+                manifest.yolo = true;
+                Ok(manifest)
+            },
+            |_| panic!("trust or surface"),
+        )
+        .unwrap();
+        assert_eq!(*order.borrow(), ["authorization", "manifest"]);
+    }
+
+    #[test]
+    fn complete_launch_propagates_authorization_errors_before_bypass() {
+        let error = complete_launch_with(
+            provider::launch_trust(FirstPartyCli::Claude),
+            || bail!("authorization error"),
+            || panic!("manifest"),
+            |_| panic!("trust or surface"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "authorization error");
+    }
+
+    #[test]
+    fn complete_launch_agy_yolo_still_checks_the_dialog() {
+        let (_temp, workspace, _homes) = setup();
+        let (_root, directory) = session(&workspace, "launching");
+        let order = std::cell::RefCell::new(Vec::new());
+        complete_launch_with(
+            provider::launch_trust(FirstPartyCli::Agy),
+            || {
+                order.borrow_mut().push("authorization");
+                Ok(true)
+            },
+            || {
+                order.borrow_mut().push("manifest");
+                let mut manifest = Reader::open_unchecked(&directory).manifest()?;
+                manifest.yolo = true;
+                Ok(manifest)
+            },
+            |_| {
+                order.borrow_mut().push("dialog");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*order.borrow(), ["authorization", "manifest", "dialog"]);
+    }
+
+    #[test]
+    fn native_trust_rejects_absent_and_unregistered_markers() {
+        let (_temp, workspace, homes) = setup();
+        let (_root, directory) = session(&workspace, "awaiting-initial-input");
+        for applied in [
+            serde_json::Value::Null,
+            serde_json::json!("unregistered"),
+            serde_json::json!(42),
+        ] {
+            write_json_atomic(
+                &directory.join(SESSION_FILE),
+                &serde_json::json!({"applied": applied}),
+            )
+            .unwrap();
+            for target in [
+                FirstPartyCli::Codex,
+                FirstPartyCli::Claude,
+                FirstPartyCli::Agy,
+                FirstPartyCli::Pi,
+            ] {
+                let mut asked = false;
+                let error = wait_for_native_trust_authorized_with(
+                    &directory,
+                    target,
+                    Instant::now(),
+                    &homes,
+                    &mut || {
+                        asked = true;
+                        false
+                    },
+                    &mut || panic!("unregistered marker cannot authorize"),
+                )
+                .unwrap_err();
+                assert!(asked);
+                assert!(
+                    error
+                        .to_string()
+                        .starts_with("workspace trust is not verified")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_trust_cross_accepts_registered_markers_only_with_authorization() {
+        let (_temp, workspace, homes) = setup();
+        let (_root, directory) = session(&workspace, "awaiting-initial-input");
+        for marker in ["codex-config-override", "pi-approve-once"] {
+            write_json_atomic(
+                &directory.join(SESSION_FILE),
+                &serde_json::json!({"applied": marker}),
+            )
+            .unwrap();
+            for target in [
+                FirstPartyCli::Codex,
+                FirstPartyCli::Claude,
+                FirstPartyCli::Agy,
+                FirstPartyCli::Pi,
+            ] {
+                let mut authorizations = 0;
+                wait_for_native_trust_authorized_with(
+                    &directory,
+                    target,
+                    Instant::now(),
+                    &homes,
+                    &mut || panic!("authorized marker short circuits"),
+                    &mut || {
+                        authorizations += 1;
+                        Ok(true)
+                    },
+                )
+                .unwrap();
+                assert_eq!(authorizations, 1);
+                let mut asked = false;
+                let error = wait_for_native_trust_authorized_with(
+                    &directory,
+                    target,
+                    Instant::now(),
+                    &homes,
+                    &mut || {
+                        asked = true;
+                        false
+                    },
+                    &mut || Ok(false),
+                )
+                .unwrap_err();
+                assert!(asked);
+                assert!(
+                    error
+                        .to_string()
+                        .starts_with("workspace trust is not verified")
+                );
+                // False authorization still permits the adapter's independent readiness evidence.
+                wait_for_native_trust_authorized_with(
+                    &directory,
+                    target,
+                    Instant::now(),
+                    &homes,
+                    &mut || true,
+                    &mut || Ok(false),
+                )
+                .unwrap();
+                let error = wait_for_native_trust_authorized_with(
+                    &directory,
+                    target,
+                    Instant::now(),
+                    &homes,
+                    &mut || panic!("authorization error precedes ready"),
+                    &mut || bail!("authorization error"),
+                )
+                .unwrap_err();
+                assert_eq!(error.to_string(), "authorization error");
+            }
+        }
+    }
+
+    #[test]
+    fn native_trust_ended_status_precedes_marker_store_and_ready() {
+        let (_temp, workspace, homes) = setup();
+        trust_pi(&homes, &workspace);
+        for state in ["closed", "failed", "exited"] {
+            let (_root, directory) = session(&workspace, state);
+            write_json_atomic(
+                &directory.join(SESSION_FILE),
+                &serde_json::json!({"applied": "pi-approve-once"}),
+            )
+            .unwrap();
+            let error = wait_for_native_trust_authorized_with(
+                &directory,
+                FirstPartyCli::Pi,
+                Instant::now(),
+                &homes,
+                &mut || panic!("ready after ended"),
+                &mut || panic!("authorization after ended"),
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("the session is {state}"))
+            );
+        }
+    }
+
+    #[test]
+    fn native_trust_checks_store_then_ready_before_expired_deadline() {
+        let (_temp, workspace, homes) = setup();
+        let (_root, directory) = session(&workspace, "awaiting-initial-input");
+        let mut ready_calls = 0;
+        wait_for_native_trust_authorized_with(
+            &directory,
+            FirstPartyCli::Pi,
+            Instant::now(),
+            &homes,
+            &mut || {
+                ready_calls += 1;
+                true
+            },
+            &mut || panic!("no marker"),
+        )
+        .unwrap();
+        assert_eq!(ready_calls, 1);
+        trust_pi(&homes, &workspace);
+        wait_for_native_trust_authorized_with(
+            &directory,
+            FirstPartyCli::Pi,
+            Instant::now(),
+            &homes,
+            &mut || panic!("trusted store precedes ready and deadline"),
+            &mut || panic!("no marker"),
+        )
+        .unwrap();
+        // A registered marker still requires authorization before the already trusted store.
+        write_json_atomic(
+            &directory.join(SESSION_FILE),
+            &serde_json::json!({"applied": "codex-config-override"}),
+        )
+        .unwrap();
+        let error = wait_for_native_trust_authorized_with(
+            &directory,
+            FirstPartyCli::Pi,
+            Instant::now(),
+            &homes,
+            &mut || panic!("authorization error precedes ready"),
+            &mut || bail!("authorization before trusted store"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "authorization before trusted store");
+        wait_for_native_trust_authorized_with(
+            &directory,
+            FirstPartyCli::Pi,
+            Instant::now(),
+            &homes,
+            &mut || panic!("trusted store precedes ready"),
+            &mut || Ok(false),
+        )
+        .unwrap();
+        write_json_atomic(&directory.join(SESSION_FILE), &serde_json::json!({})).unwrap();
+        write_json_atomic(&homes.pi, &serde_json::json!({})).unwrap();
+        let error = wait_for_native_trust_authorized_with(
+            &directory,
+            FirstPartyCli::Pi,
+            Instant::now(),
+            &homes,
+            &mut || {
+                ready_calls += 1;
+                false
+            },
+            &mut || panic!("no marker"),
+        )
+        .unwrap_err();
+        assert_eq!(ready_calls, 2);
+        assert!(
+            error
+                .to_string()
+                .starts_with("workspace trust is not verified")
+        );
     }
 
     // Issue #60. The store never lists a workspace whose trust the provider takes from

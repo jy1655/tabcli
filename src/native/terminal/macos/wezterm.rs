@@ -1035,8 +1035,9 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
 }
 
 fn wait_for_binding(directory: &Path, id: &str, pane: &str, socket: &Path) -> Result<()> {
-    use crate::native::launch::{BindingHost, wait_for_binding};
-    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BindingHost::WezTerm)?;
+    use crate::native::launch::wait_for_binding;
+    use crate::native::terminal::facts::wezterm::BINDING;
+    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, &BINDING)?;
     if surface.kind != TerminalKind::WezTerm
         || surface.id != pane
         || surface
