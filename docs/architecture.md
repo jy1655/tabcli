@@ -66,6 +66,11 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   supplies every operation. Shared `open_with` preserves binding and cleanup order; Warp
   owns its open flow. `applescript` owns execution and common response vocabulary, while
   each adapter owns its screen and presence scripts.
+  iTerm2 and Terminal.app carry an internal Automation dependency. Osascript owns execution,
+  deadlines and delivery-failure classification; scripts, arguments, ordering and close
+  authority remain adapter-owned. Tests inject recording or script-executing Automation
+  implementations; a test-only thread-local hook remains for installed dispatch and teardown
+  coverage, including Ghostty.
 - `src/native/session/` owns durable record schemas, record access, and durability.
   `schema` defines the shared manifest, event, provider-process, and reopen-refusal records and
   their constants; `primitives` owns session environment names, identity validation, and time
