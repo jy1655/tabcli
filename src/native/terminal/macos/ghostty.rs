@@ -1,3 +1,4 @@
+use super::{GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
 use crate::native::session::SessionState;
 use crate::native::session::primitives::unix_ms;
 use crate::native::session::{CoreRecord, Reader, RecordStore};
@@ -1046,6 +1047,81 @@ pub(super) fn close_session_until(
     close_with_runner(&mut Installed, session, deadline)
 }
 
+pub(super) struct Adapter;
+pub(super) static ADAPTER: Adapter = Adapter;
+impl MacTerminalAdapter for Adapter {
+    fn open_bound_tab(
+        &self,
+        mode: MacosOpenMode,
+        command: &str,
+        directory: &Path,
+        deadline: Instant,
+        bind: super::BindSurface<'_>,
+        unbind: Box<dyn FnOnce() -> Result<()> + '_>,
+    ) -> Result<TerminalSession> {
+        super::open_with(
+            deadline,
+            |startup_deadline| {
+                create_tab_with_mode(mode == MacosOpenMode::NewWindow, startup_deadline)
+            },
+            |session, deadline| start_session(session, command, directory, deadline),
+            |session, deadline| close_session_until(session, deadline).map(|_| ()),
+            bind,
+            unbind,
+        )
+    }
+    fn send_file(
+        &self,
+        session: &TerminalSession,
+        prompt_path: &Path,
+        deadline: Instant,
+    ) -> TerminalSendResult {
+        send_file(session, prompt_path, deadline)
+    }
+    fn verify_surface(
+        &self,
+        _directory: &Path,
+        session: &TerminalSession,
+        timeout: Option<Duration>,
+    ) -> Result<Option<String>> {
+        verify_surface(session, timeout).map(|()| None)
+    }
+    fn surface_present(
+        &self,
+        _directory: &Path,
+        session: &TerminalSession,
+        timeout: Duration,
+    ) -> Result<bool> {
+        surface_present(session, timeout)
+    }
+    fn read_screen(&self, _session: &TerminalSession, _deadline: Instant) -> Result<String> {
+        bail!("managed dialog input unsupported for this terminal")
+    }
+    fn guarded_dialog_input(
+        &self,
+        _session: &TerminalSession,
+        _input: &GuardedDialogInput,
+        _deadline: Instant,
+    ) -> Result<bool> {
+        bail!("managed dialog input unsupported for this terminal")
+    }
+    fn close_session_until(
+        &self,
+        _directory: &Path,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<CloseOutcome> {
+        close_session_until(session, deadline)
+    }
+    fn close_owned_session(
+        &self,
+        _directory: &Path,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<CloseOutcome> {
+        close_session_until(session, deadline)
+    }
+}
 #[cfg(test)]
 mod tests {
     #[test]

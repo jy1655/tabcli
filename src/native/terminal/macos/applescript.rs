@@ -6,6 +6,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 use super::super::TerminalSendFailure;
+use super::{CloseOutcome, TerminalKind};
 
 pub(super) fn run(application: &str, script: &str, arguments: &[&str]) -> Result<String> {
     #[cfg(test)]
@@ -118,6 +119,32 @@ fn parse_output(application: &str, output: std::process::Output) -> Result<Strin
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+pub(super) fn close_response(terminal: TerminalKind, response: &str) -> Result<CloseOutcome> {
+    match response {
+        "closed" => Ok(CloseOutcome::Closed),
+        "missing" => Ok(CloseOutcome::Missing),
+        _ => bail!(
+            "unexpected {} close response: {response:?}",
+            terminal.display_name()
+        ),
+    }
+}
+
+pub(super) fn screen_text(text: &str) -> Result<String> {
+    Ok(text
+        .strip_prefix("AB_SCREEN_BEGIN")
+        .and_then(|s| s.strip_suffix("AB_SCREEN_END"))
+        .context("invalid managed screen response")?
+        .to_owned())
+}
+pub(super) fn guarded_answer(answer: &str) -> Result<bool> {
+    match answer {
+        "sent" => Ok(true),
+        "changed" => Ok(false),
+        _ => bail!("unexpected guarded dialog input response"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -208,5 +235,89 @@ pub(in crate::native) mod testing {
         }
         let _reset = Reset(RUNNER.with(|slot| slot.replace(Some(Box::new(runner)))));
         run()
+    }
+}
+
+#[cfg(test)]
+pub(super) mod replay {
+    fn osascript(script: &str) -> String {
+        let output = std::process::Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    // Replay the shipped decision handler; only its screen and key handlers are
+    // models. No application dictionary or live terminal is used by this script.
+    fn replay(
+        script: &str,
+        screen: &str,
+        key: &str,
+        read_parameters: &str,
+        read_arguments: &str,
+        target_arguments: &str,
+    ) -> String {
+        let (_, flow) = script.split_once("-- The flow.").unwrap();
+        assert!(!flow.contains("application"));
+        osascript(&format!(
+            r#"
+property calls : ""
+on screenOf({read_parameters})
+    set calls to calls & "read=" & ({read_arguments}) & ";"
+    return "{screen}"
+end screenOf
+on sendKey(target, keyName)
+    set calls to calls & "send=" & target & ":" & keyName & ";"
+end sendKey
+{flow}
+on run
+    set answer to my guardedAnswer({target_arguments}, "trust this directory?", "{key}")
+    return answer & ";" & calls
+end run
+"#
+        ))
+    }
+
+    pub(in crate::native::terminal::macos) fn assert_guarded_replay(
+        script: &str,
+        read_parameters: &str,
+        read_arguments: &str,
+        target_arguments: &str,
+        read_target: &str,
+        send_target: &str,
+    ) {
+        for key in ["enter", "down-enter"] {
+            assert_eq!(
+                replay(
+                    script,
+                    "trust this directory?",
+                    key,
+                    read_parameters,
+                    read_arguments,
+                    target_arguments
+                ),
+                format!("sent;read={read_target};send={send_target}:{key};")
+            );
+            // A one-character repaint between capture and comparison must send
+            // nothing, for either key sequence.
+            assert_eq!(
+                replay(
+                    script,
+                    "trust this directory!",
+                    key,
+                    read_parameters,
+                    read_arguments,
+                    target_arguments
+                ),
+                format!("changed;read={read_target};")
+            );
+        }
     }
 }

@@ -1,4 +1,5 @@
 use super::process;
+use super::{GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
 use crate::native::session::{Reader, RecordReader, RecordStore};
 #[cfg(test)]
 use crate::native::terminal::ownership;
@@ -1917,6 +1918,83 @@ fn write_new_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     )
 }
 
+pub(super) struct Adapter;
+pub(super) static ADAPTER: Adapter = Adapter;
+impl MacTerminalAdapter for Adapter {
+    fn open_bound_tab(
+        &self,
+        mode: MacosOpenMode,
+        command: &str,
+        directory: &Path,
+        deadline: Instant,
+        bind: super::BindSurface<'_>,
+        unbind: Box<dyn FnOnce() -> Result<()> + '_>,
+    ) -> Result<TerminalSession> {
+        open_bound_tab_with_mode(
+            command,
+            directory,
+            deadline,
+            mode == MacosOpenMode::NewWindow,
+            bind,
+            unbind,
+        )
+    }
+    fn send_file(
+        &self,
+        session: &TerminalSession,
+        prompt_path: &Path,
+        deadline: Instant,
+    ) -> TerminalSendResult {
+        send_file(session, prompt_path, deadline)
+    }
+    fn verify_surface(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        timeout: Option<Duration>,
+    ) -> Result<Option<String>> {
+        verify_surface(directory, session, timeout).map(Some)
+    }
+    fn surface_present(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        timeout: Duration,
+    ) -> Result<bool> {
+        surface_present(directory, session, timeout)
+    }
+    fn read_screen(&self, _session: &TerminalSession, _deadline: Instant) -> Result<String> {
+        bail!(
+            "managed Warp screen reads and guarded input are unsupported; Warp Control input.insert/input.replace do not submit"
+        )
+    }
+    fn guarded_dialog_input(
+        &self,
+        _session: &TerminalSession,
+        _input: &GuardedDialogInput,
+        _deadline: Instant,
+    ) -> Result<bool> {
+        bail!(
+            "managed Warp screen reads and guarded input are unsupported; Warp Control input.insert/input.replace do not submit"
+        )
+    }
+    fn close_session_until(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<CloseOutcome> {
+        close_session_until(directory, session, deadline)
+    }
+    fn close_owned_session(
+        &self,
+        directory: &Path,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<CloseOutcome> {
+        close_session_until(directory, session, deadline)
+    }
+}
 #[cfg(test)]
 mod tests {
     #[test]

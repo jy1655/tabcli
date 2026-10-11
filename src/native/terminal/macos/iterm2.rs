@@ -1,3 +1,4 @@
+use super::{DialogKey, GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
 use crate::native::session::Reader;
 #[cfg(test)]
 use crate::native::terminal::ownership;
@@ -11,7 +12,7 @@ use anyhow::{Context, Result, bail};
 
 use super::{
     CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession,
-    applescript, close_response,
+    applescript, applescript::close_response,
 };
 
 // iTerm2 3.7.3 selects every surface it creates, and a new window also makes
@@ -470,6 +471,149 @@ pub(super) fn close_session_until(
     close_response(TerminalKind::Iterm2, &response)
 }
 
+pub(super) struct Adapter;
+pub(super) static ADAPTER: Adapter = Adapter;
+// Stable creation-time handle only. A compare-and-send is one automation call;
+// an intervening repaint or changed selection sends no keys. Never targets front tab.
+pub(in crate::native) const SCREEN_SCRIPT: &str = r#"
+on run argv
+    if application id "com.googlecode.iterm2" is not running then error "managed iTerm2 screen is missing"
+    set wantedId to item 1 of argv
+    tell application id "com.googlecode.iterm2"
+        repeat with w in windows
+            repeat with t in tabs of w
+                repeat with s in sessions of t
+                    if unique ID of s is wantedId then
+                        if (count of argv) is 1 then return "AB_SCREEN_BEGIN" & my screenOf(s) & "AB_SCREEN_END"
+                        return my guardedAnswer(s, item 2 of argv, item 3 of argv)
+                    end if
+                end repeat
+            end repeat
+        end repeat
+    end tell
+    error "managed iTerm2 screen is missing"
+end run
+
+on screenOf(targetSession)
+    tell application id "com.googlecode.iterm2"
+        return contents of targetSession
+    end tell
+end screenOf
+
+on sendKey(targetSession, keyName)
+    tell application id "com.googlecode.iterm2"
+        if keyName is "down-enter" then
+            write targetSession text ((ASCII character 27) & "[B" & return) newline false
+        else
+            write targetSession text return newline false
+        end if
+    end tell
+end sendKey
+
+-- The flow.
+on guardedAnswer(targetSession, expectedScreen, keyName)
+    set screenText to my screenOf(targetSession)
+    if screenText is not expectedScreen then return "changed"
+    my sendKey(targetSession, keyName)
+    return "sent"
+end guardedAnswer
+"#;
+impl MacTerminalAdapter for Adapter {
+    fn open_bound_tab(
+        &self,
+        mode: MacosOpenMode,
+        command: &str,
+        directory: &Path,
+        deadline: Instant,
+        bind: super::BindSurface<'_>,
+        unbind: Box<dyn FnOnce() -> Result<()> + '_>,
+    ) -> Result<TerminalSession> {
+        super::open_with(
+            deadline,
+            |startup_deadline| create_tab(mode, command, directory, startup_deadline),
+            // The creation command waits for the atomic binding above before it
+            // starts the wrapper. No shell command is typed into the new tab.
+            |_, _| Ok(()),
+            |session, deadline| close_session_until(session, deadline).map(|_| ()),
+            bind,
+            unbind,
+        )
+    }
+    fn send_file(
+        &self,
+        session: &TerminalSession,
+        prompt_path: &Path,
+        deadline: Instant,
+    ) -> TerminalSendResult {
+        send_file(session, prompt_path, deadline)
+    }
+    fn verify_surface(
+        &self,
+        _directory: &Path,
+        session: &TerminalSession,
+        timeout: Option<Duration>,
+    ) -> Result<Option<String>> {
+        verify_session(session, timeout).map(Some)
+    }
+    fn surface_present(
+        &self,
+        _directory: &Path,
+        session: &TerminalSession,
+        timeout: Duration,
+    ) -> Result<bool> {
+        let response = applescript::run_until(
+            "iTerm2",
+            PRESENCE_SCRIPT,
+            &[session.id.as_str()],
+            super::timeout_deadline(timeout)?,
+        )?;
+        match response.as_str() {
+            "missing" => Ok(false),
+            "present" => Ok(true),
+            _ => bail!("unexpected terminal presence response: {response:?}"),
+        }
+    }
+    fn read_screen(&self, session: &TerminalSession, deadline: Instant) -> Result<String> {
+        let args = vec![session.id.as_str()];
+        let text =
+            applescript::run_until(session.kind.display_name(), SCREEN_SCRIPT, &args, deadline)?;
+        applescript::screen_text(&text)
+    }
+    fn guarded_dialog_input(
+        &self,
+        session: &TerminalSession,
+        input: &GuardedDialogInput,
+        deadline: Instant,
+    ) -> Result<bool> {
+        let mut args = vec![session.id.as_str()];
+        args.extend([
+            input.screen.as_str(),
+            match input.key {
+                DialogKey::Enter => "enter",
+                DialogKey::DownEnter => "down-enter",
+            },
+        ]);
+        let answer =
+            applescript::run_until(session.kind.display_name(), SCREEN_SCRIPT, &args, deadline)?;
+        applescript::guarded_answer(&answer)
+    }
+    fn close_session_until(
+        &self,
+        _directory: &Path,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<CloseOutcome> {
+        close_session_until(session, deadline)
+    }
+    fn close_owned_session(
+        &self,
+        _directory: &Path,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<CloseOutcome> {
+        close_session_until(session, deadline)
+    }
+}
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1714,5 +1858,20 @@ end run
                 "startup keys reached wrapper: {value}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod screen_replay_tests {
+    #[test]
+    fn iterm_guarded_answer_replays_matching_and_changed_screens() {
+        super::applescript::replay::assert_guarded_replay(
+            super::SCREEN_SCRIPT,
+            "targetSession",
+            "targetSession",
+            "\"session-id\"",
+            "session-id",
+            "session-id",
+        );
     }
 }

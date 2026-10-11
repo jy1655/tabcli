@@ -1,4 +1,5 @@
 use super::process;
+use super::{GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
 use crate::native::session::{Reader, Store};
 #[cfg(test)]
 use crate::native::terminal::ownership;
@@ -1223,6 +1224,98 @@ pub(super) fn close_session_until(
     }
 }
 
+pub(super) struct Adapter<H: Host> {
+    host: H,
+}
+pub(super) static ADAPTER: Adapter<Installed> = Adapter { host: Installed };
+#[cfg(test)]
+impl<H: Host> Adapter<H> {
+    fn with_host(host: H) -> Self {
+        Self { host }
+    }
+}
+impl<H: Host> MacTerminalAdapter for Adapter<H> {
+    fn open_bound_tab(
+        &self,
+        mode: MacosOpenMode,
+        command: &str,
+        directory: &Path,
+        deadline: Instant,
+        bind: super::BindSurface<'_>,
+        unbind: Box<dyn FnOnce() -> Result<()> + '_>,
+    ) -> Result<TerminalSession> {
+        super::open_with(
+            deadline,
+            |startup_deadline| {
+                create_surface(
+                    &self.host,
+                    mode == MacosOpenMode::NewWindow,
+                    command,
+                    directory,
+                    startup_deadline,
+                )
+            },
+            // The program of the pane waits for the binding above; nothing is typed.
+            |_, _| Ok(()),
+            |session, deadline| close_session_until(&self.host, session, deadline).map(|_| ()),
+            bind,
+            unbind,
+        )
+    }
+    fn send_file(
+        &self,
+        session: &TerminalSession,
+        prompt_path: &Path,
+        deadline: Instant,
+    ) -> TerminalSendResult {
+        send_file(&self.host, session, prompt_path, deadline)
+    }
+    fn verify_surface(
+        &self,
+        _directory: &Path,
+        session: &TerminalSession,
+        timeout: Option<Duration>,
+    ) -> Result<Option<String>> {
+        verify_session(&self.host, session, timeout).map(Some)
+    }
+    fn surface_present(
+        &self,
+        _directory: &Path,
+        session: &TerminalSession,
+        timeout: Duration,
+    ) -> Result<bool> {
+        surface_present(&self.host, session, timeout)
+    }
+    fn read_screen(&self, session: &TerminalSession, deadline: Instant) -> Result<String> {
+        read_screen(&self.host, session, deadline)
+    }
+    fn guarded_dialog_input(
+        &self,
+        _session: &TerminalSession,
+        _input: &GuardedDialogInput,
+        _deadline: Instant,
+    ) -> Result<bool> {
+        bail!(
+            "WezTerm cannot compare the screen and send a key in one call; answer the dialog in its pane"
+        )
+    }
+    fn close_session_until(
+        &self,
+        _directory: &Path,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<CloseOutcome> {
+        close_session_until(&self.host, session, deadline)
+    }
+    fn close_owned_session(
+        &self,
+        _directory: &Path,
+        session: &TerminalSession,
+        deadline: Instant,
+    ) -> Result<CloseOutcome> {
+        close_session_until(&self.host, session, deadline)
+    }
+}
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1385,6 +1478,46 @@ mod tests {
     }
 
     struct Fake(RefCell<Mux>);
+
+    #[test]
+    fn adapter_owns_the_non_sync_host_for_operations() {
+        let local = Adapter::with_host(fake());
+        let directory = tempfile::tempdir().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let adapter: &dyn MacTerminalAdapter = &local;
+        let session = adapter
+            .open_bound_tab(
+                MacosOpenMode::NewWindow,
+                "true",
+                directory.path(),
+                deadline,
+                Box::new(|_| Ok(())),
+                Box::new(|| panic!("successful open stays bound")),
+            )
+            .unwrap();
+        assert!(!local.host.0.borrow().calls.is_empty());
+        assert!(
+            adapter
+                .surface_present(directory.path(), &session, Duration::from_secs(2))
+                .unwrap()
+        );
+        assert_eq!(
+            adapter
+                .verify_surface(directory.path(), &session, Some(Duration::from_secs(2)))
+                .unwrap(),
+            Some(verify_session(&local.host, &session, Some(Duration::from_secs(2))).unwrap())
+        );
+        assert_eq!(
+            adapter.read_screen(&session, deadline).unwrap(),
+            read_screen(&local.host, &session, deadline).unwrap()
+        );
+        assert_eq!(
+            adapter
+                .close_owned_session(directory.path(), &session, deadline)
+                .unwrap(),
+            CloseOutcome::Closed
+        );
+    }
 
     fn fake() -> Fake {
         Fake(RefCell::new(Mux {
