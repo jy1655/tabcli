@@ -1,4 +1,16 @@
+use crate::native::session::close::budget::CLOSE_TIMEOUT;
+use crate::native::session::primitives::{
+    SESSION_DIR_ENV, STATE_DIR_ENV, delegation_source, require_valid_session_id, unix_ms,
+    valid_session_id,
+};
+use crate::native::session::schema::{
+    ProviderProcessRecord, SESSION_SCHEMA, SessionEvent, SessionManifest,
+};
+#[cfg(unix)]
+use crate::native::terminal::shell_quote;
 use agent_bridge::PUBLIC_COMMAND;
+#[cfg(test)]
+use terminal::ownership::NativeSessionOwner;
 #[cfg(test)]
 mod tests;
 
@@ -13,7 +25,7 @@ mod provider_process;
 mod query;
 mod reopen;
 use reopen::{
-    REOPEN_LAUNCH_GATE, RecordedReopenRefusal, ResumedFrom, ResumedHolderCheck,
+    REOPEN_LAUNCH_GATE, ResumedFrom, ResumedHolderCheck,
     close_surface_after_reopen_verification_failure, read_resumed_from, record_reopen_refusal,
     refuse_follow_up_to_shared_conversation, reopen_refusal_gate, run_reopen,
     verify_reopened_conversation_exclusive,
@@ -37,7 +49,6 @@ use terminal::macos::apple_terminal::{terminal_app_process, terminal_surface_abs
 use terminal::macos::process::{macos_process_info, macos_process_start, macos_processes_named};
 #[cfg(all(target_os = "macos", test))]
 use terminal::ownership::MacTerminalAppIdentity;
-use terminal::ownership::NativeSessionOwner;
 #[cfg(test)]
 use terminal::ownership::verify_terminal_owner_attestation;
 #[cfg(windows)]
@@ -80,11 +91,7 @@ use agent_bridge::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-const STATE_DIR_ENV: &str = "AGENT_BRIDGE_NATIVE_STATE_DIR";
-const SESSION_DIR_ENV: &str = "AGENT_BRIDGE_NATIVE_SESSION_DIR";
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
-const SESSION_SCHEMA: u32 = 1;
-static TURN_CLAIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 pub(crate) enum NativeCommand {
@@ -210,37 +217,6 @@ pub(crate) struct PruneRequest {
     closed_before_days: u64,
     explicit: bool,
     json: bool,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct SessionManifest {
-    schema: u32,
-    id: String,
-    provider: String,
-    provider_path: PathBuf,
-    provider_version: String,
-    workspace: PathBuf,
-    title: String,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    effort: Option<String>,
-    yolo: bool,
-    created_unix_ms: u128,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-struct SessionEvent {
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    cancelled: bool,
-    provider: String,
-    message: String,
-    #[serde(default)]
-    error: Option<String>,
-    provider_session_id: Option<String>,
-    turn_id: Option<String>,
-    #[serde(default)]
-    created_unix_ms: Option<u128>,
 }
 
 struct CreatedSession {
@@ -812,47 +788,6 @@ fn parse_close(args: &[String]) -> Result<NativeCommand> {
     }))
 }
 
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(60);
-fn close_deadline() -> Instant {
-    Instant::now() + CLOSE_TIMEOUT
-}
-fn close_remaining(deadline: Instant) -> Result<Duration> {
-    deadline.checked_duration_since(close_now()).filter(|remaining| !remaining.is_zero())
-        .context("close deadline expired; closing was not confirmed and terminal-side work may have occurred; use --timeout-secs for a longer budget")
-}
-
-// Close tests can advance this clock at an action boundary without scheduler races.
-fn close_now() -> Instant {
-    #[cfg(test)]
-    if let Some(now) = CLOSE_TEST_TIME.with(std::cell::Cell::get) {
-        return now;
-    }
-    Instant::now()
-}
-
-#[cfg(test)]
-thread_local! {
-    static CLOSE_TEST_TIME: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-struct TestCloseClock(Option<Instant>);
-#[cfg(test)]
-impl TestCloseClock {
-    fn new(now: Instant) -> Self {
-        Self(CLOSE_TEST_TIME.with(|time| time.replace(Some(now))))
-    }
-    fn set(&self, now: Instant) {
-        CLOSE_TEST_TIME.with(|time| time.set(Some(now)));
-    }
-}
-#[cfg(test)]
-impl Drop for TestCloseClock {
-    fn drop(&mut self) {
-        CLOSE_TEST_TIME.with(|time| time.set(self.0));
-    }
-}
-
 fn parse_hook(args: &[String]) -> Result<NativeCommand> {
     let (provider, payload) = args
         .split_first()
@@ -906,21 +841,6 @@ fn parse_timeout(value: &str) -> Result<Duration> {
     let timeout = Duration::from_secs(seconds);
     checked_deadline_from(Instant::now(), timeout)?;
     Ok(timeout)
-}
-
-pub(crate) fn valid_session_id(value: &str) -> bool {
-    value.starts_with("session-")
-        && value.len() <= 96
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-}
-
-fn require_valid_session_id(value: &str) -> Result<()> {
-    if !valid_session_id(value) {
-        bail!("invalid Agent Bridge session id: {value:?}");
-    }
-    Ok(())
 }
 
 pub(crate) fn run(command: NativeCommand) -> Result<()> {
@@ -1436,17 +1356,6 @@ fn launch_created_session(
         Some(&event),
         &result_extra,
     )
-}
-
-// The provider process a launch wrapper spawned for its session (`PROVIDER_PROCESS_FILE`).
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct ProviderProcessRecord {
-    schema: u32,
-    managed_session_id: String,
-    pid: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    windows_process_identity: Option<terminal::WindowsProcessIdentity>,
-    spawned_unix_ms: u128,
 }
 
 // Records the spawned provider process before the session leaves its launch state. The
@@ -2673,29 +2582,6 @@ fn valid_status_transition(current: &SessionState, next: &SessionState) -> bool 
     current.clone().transition_allowed(next.clone())
 }
 
-/// Largest event the publication predicate compares with its journal. It bounds only that
-/// comparison: a larger journaled event is never read for a verdict and never published,
-/// and the size policy at journal creation keeps new completions under it. It is the byte
-/// budget of a whole `search`, so a search can afford at most one such comparison. It
-/// does not bound the read of an ordinary, non-journaled event by `result`, `inspect`, or
-/// `--context-result`; only a search bounds those reads, with its byte budget.
-const EVENT_READ_LIMIT: u64 = 64 * 1024 * 1024;
-
-// macOS repair deliberately retains a surface that may outlive its owner. That
-// cleanup obligation must not turn a known process exit into a request timeout.
-// This only diagnoses a dead PID: a reused/live PID or an unknown identity is not
-// proof of death, and nothing here consumes the surface or the pending claim.
-fn unix_ms() -> u128 {
-    #[cfg(test)]
-    if let Some(now) = session::tests::FIXED_UNIX_MS.get() {
-        return now;
-    }
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-}
-
 fn resolve_provider(provider: FirstPartyCli) -> Result<PathBuf> {
     let path = std::env::var_os("PATH").context("PATH is not set")?;
     resolve_provider_from_path(provider, &path)
@@ -2812,12 +2698,6 @@ fn is_executable(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn shell_quote(value: &std::ffi::OsStr) -> String {
-    let value = value.to_string_lossy();
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-#[cfg(unix)]
 fn bridge_shell_command(
     workspace: &Path,
     state_root: &Path,
@@ -2897,10 +2777,6 @@ fn validate_shell_command_component(value: &std::ffi::OsStr, field: &str) -> Res
         );
     }
     Ok(())
-}
-
-fn delegation_source() -> String {
-    std::env::var("AGENT_BRIDGE_NATIVE_SESSION_ID").unwrap_or_else(|_| "external".to_owned())
 }
 
 // The first line of every prompt that Bridge sends to a provider. It is framing, not an

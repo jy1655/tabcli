@@ -197,7 +197,7 @@ fn close_fixtures_keep_independent_publication_expectations() {
                     &fixture.directory,
                     Some("closed by the maintainer".to_owned()),
                     |_| Ok(terminal::CloseOutcome::Closed),
-                    crate::native::close_deadline(),
+                    crate::native::session::close::budget::close_deadline(),
                 )
             });
             let finished = outcome.is_ok();

@@ -247,7 +247,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native::SessionStatus;
+    use crate::native::session::SessionStatus;
 
     #[test]
     fn refused_status_writes_preserve_the_record_bytes() {

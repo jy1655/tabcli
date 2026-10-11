@@ -3,8 +3,9 @@ use super::*;
 use crate::native::reopen::ResumedFrom;
 use crate::native::session;
 use crate::native::session::OwnerObservation;
+use crate::native::session::primitives::unix_ms;
+use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
 use crate::native::terminal::ownership::NativeSessionOwner;
-use crate::native::unix_ms;
 
 /// Hold, Owner and Surface records are separate observations from the four lifecycle records.
 /// They remain readable when the lifecycle records cannot form a consistent Observation.

@@ -1,4 +1,7 @@
 use super::*;
+use crate::native::session::names::*;
+use crate::native::session::primitives::{SyncRecord, read_json, write_json_atomic};
+use crate::native::session::schema::SessionEvent;
 
 fn damaged_completion_fixture() -> (tempfile::TempDir, Store) {
     let directory = tempfile::tempdir().unwrap();
@@ -102,10 +105,15 @@ fn residual_surface_clears_only_after_the_adapter_confirms_close_or_absence() {
                     windows_process_identity: None,
                 })
                 .unwrap();
-            let refusal = close(&store, None, crate::native::close_deadline(), |surface| {
-                assert_eq!(surface.id, "exact-retained-surface");
-                bail!("close authority not established")
-            });
+            let refusal = close(
+                &store,
+                None,
+                crate::native::session::close::budget::close_deadline(),
+                |surface| {
+                    assert_eq!(surface.id, "exact-retained-surface");
+                    bail!("close authority not established")
+                },
+            );
             assert!(refusal.is_err());
             assert_eq!(
                 store.status().unwrap().residual_surface(),
@@ -118,9 +126,12 @@ fn residual_surface_clears_only_after_the_adapter_confirms_close_or_absence() {
                 store.status().unwrap().residual_surface(),
                 Some(launch::ResidualSurface::Unverified)
             );
-            close(&store, None, crate::native::close_deadline(), |_| {
-                Ok(outcome.into())
-            })
+            close(
+                &store,
+                None,
+                crate::native::session::close::budget::close_deadline(),
+                |_| Ok(outcome.into()),
+            )
             .unwrap();
             let closed = store.status().unwrap();
             assert_eq!(
@@ -129,9 +140,12 @@ fn residual_surface_clears_only_after_the_adapter_confirms_close_or_absence() {
             );
             assert_eq!(closed.residual_surface(), None);
             store.converge().unwrap();
-            close(&store, None, crate::native::close_deadline(), |_| {
-                panic!("consumed handle must not close again")
-            })
+            close(
+                &store,
+                None,
+                crate::native::session::close::budget::close_deadline(),
+                |_| panic!("consumed handle must not close again"),
+            )
             .unwrap();
             assert_eq!(
                 serde_json::to_value(store.status().unwrap()).unwrap(),
@@ -245,12 +259,17 @@ fn explicit_close_consumes_the_handle_and_repeated_close_skips_the_adapter() {
 
     for attempt in 0..2 {
         let (outcome, syncs) = with_sync_log(|| {
-            close(&store, None, crate::native::close_deadline(), |session| {
-                assert_eq!(session.kind, terminal::TerminalKind::Iterm2);
-                assert_eq!(session.id, "missing-iterm-session");
-                close_calls += 1;
-                Ok(terminal::CloseOutcome::Missing.into())
-            })
+            close(
+                &store,
+                None,
+                crate::native::session::close::budget::close_deadline(),
+                |session| {
+                    assert_eq!(session.kind, terminal::TerminalKind::Iterm2);
+                    assert_eq!(session.id, "missing-iterm-session");
+                    close_calls += 1;
+                    Ok(terminal::CloseOutcome::Missing.into())
+                },
+            )
         });
         assert_eq!(outcome.unwrap(), terminal::CloseOutcome::Missing);
         let closed = store.record(CoreRecord::Closed);
@@ -302,7 +321,7 @@ fn interrupted_terminal_close_resumes_from_the_claimed_handle() {
     close(
         &Store::open_unchecked(directory.path()),
         None,
-        crate::native::close_deadline(),
+        crate::native::session::close::budget::close_deadline(),
         |session| {
             calls += 1;
             assert_eq!(session.id, "interrupted-close");
@@ -517,7 +536,7 @@ fn deadline_fixture() -> (tempfile::TempDir, Store) {
 fn expire_at_contended_lock<T>(name: &'static str, run: impl FnOnce(Instant) -> T) -> T {
     use super::super::primitives::close_io_test::{self, Point};
     let now = Instant::now();
-    let clock = crate::native::TestCloseClock::new(now);
+    let clock = crate::native::session::close::budget::TestCloseClock::new(now);
     let deadline = now + Duration::from_secs(1);
     let observed = std::rc::Rc::new(std::cell::Cell::new(false));
     let seen = observed.clone();
@@ -579,9 +598,12 @@ fn close_deadline_bounds_both_lifecycle_lock_acquisitions_without_changes() {
             .unwrap_err();
         assert!(error.contains("another close or turn"), "{error}");
         assert!(error.contains("nothing was changed"), "{error}");
-        close(&store, None, crate::native::close_deadline(), |_| {
-            Ok(terminal::CloseOutcome::Closed.into())
-        })
+        close(
+            &store,
+            None,
+            crate::native::session::close::budget::close_deadline(),
+            |_| Ok(terminal::CloseOutcome::Closed.into()),
+        )
         .unwrap();
     }
 }
@@ -612,9 +634,12 @@ fn close_deadline_status_lock_retains_consumption_for_next_close() {
         .unwrap_err();
     assert!(error.contains("another close or turn"), "{error}");
     assert!(store.closed_if_present().unwrap().is_none());
-    close(&store, None, crate::native::close_deadline(), |_| {
-        panic!("consumed handle must not act again")
-    })
+    close(
+        &store,
+        None,
+        crate::native::session::close::budget::close_deadline(),
+        |_| panic!("consumed handle must not act again"),
+    )
     .unwrap();
     assert_eq!(store.status().unwrap().state, SessionState::Closed);
 }
@@ -632,7 +657,7 @@ fn close_deadline_expiry_after_durable_markers_never_rolls_back() {
             .write_private(b"1-2-3\n")
             .unwrap();
         let now = Instant::now();
-        let clock = crate::native::TestCloseClock::new(now);
+        let clock = crate::native::session::close::budget::TestCloseClock::new(now);
         let deadline = now + Duration::from_secs(1);
         let result = interruption::expiring(point, deadline, || {
             close(&store, None, deadline, |_| {
@@ -681,7 +706,7 @@ fn close_deadline_contender_does_not_disturb_the_closer_holding_the_lock() {
         close(
             &Store::open_unchecked(path),
             None,
-            crate::native::close_deadline(),
+            crate::native::session::close::budget::close_deadline(),
             |_| {
                 entered.send(()).unwrap();
                 released.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -723,7 +748,7 @@ fn close_deadline_windows_record_replacement_stops_at_close_budget() {
         .unwrap();
     use super::super::primitives::close_io_test::{self, Point};
     let now = Instant::now();
-    let clock = crate::native::TestCloseClock::new(now);
+    let clock = crate::native::session::close::budget::TestCloseClock::new(now);
     let deadline = now + Duration::from_millis(40);
     let retries = std::rc::Rc::new(std::cell::Cell::new(0));
     let seen = retries.clone();
@@ -792,7 +817,7 @@ fn close_deadline_public_repair_of_exited_or_failed_windows_session_needs_no_hel
 fn close_deadline_before_confirmation_keeps_handle_and_intent() {
     let (_directory, store) = deadline_fixture();
     let now = Instant::now();
-    let clock = crate::native::TestCloseClock::new(now);
+    let clock = crate::native::session::close::budget::TestCloseClock::new(now);
     let deadline = now + Duration::from_secs(1);
     let handle = store.record(CoreRecord::Terminal).bytes().unwrap();
     let error = close(&store, None, deadline, |_| {
@@ -883,12 +908,13 @@ fn close_deadline_uncontended_settlement_reports_only_expiry() {
     use super::super::primitives::close_io_test::{self, Point};
     let (_directory, store) = deadline_fixture();
     let now = Instant::now();
-    let clock = crate::native::TestCloseClock::new(now);
+    let clock = crate::native::session::close::budget::TestCloseClock::new(now);
     let deadline = now + Duration::from_secs(1);
     let result = close_io_test::during(
         move |point| {
             if point == Point::BeforeLock("status") {
-                crate::native::CLOSE_TEST_TIME.with(|time| time.set(Some(deadline)));
+                crate::native::session::close::budget::CLOSE_TEST_TIME
+                    .with(|time| time.set(Some(deadline)));
             }
             assert!(!matches!(point, Point::WouldBlock(_)), "no lock is held");
         },

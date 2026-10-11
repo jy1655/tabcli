@@ -23,7 +23,7 @@ use super::macos::process::{
 pub(in crate::native) use super::windows::ownership::verified_windows_native_owner;
 #[cfg(any(target_os = "macos", windows))]
 use crate::native::SessionStatus;
-use crate::native::close_remaining;
+use crate::native::session::close::budget::close_remaining;
 #[cfg(target_os = "macos")]
 use crate::native::session::{self, Store};
 #[cfg(any(target_os = "macos", windows))]
@@ -1176,13 +1176,12 @@ fn terminate_owned_foreground_group_until_with_io(
         } else {
             observe(None);
         }
-        if crate::native::close_now() >= deadline {
+        if crate::native::session::close::budget::close_now() >= deadline {
             bail!("the attested process group was not confirmed gone before the deadline");
         }
-        std::thread::sleep(
-            Duration::from_millis(20)
-                .min(deadline.saturating_duration_since(crate::native::close_now())),
-        );
+        std::thread::sleep(Duration::from_millis(20).min(
+            deadline.saturating_duration_since(crate::native::session::close::budget::close_now()),
+        ));
     }
 }
 
@@ -1434,7 +1433,7 @@ mod close_authority_tests {
                         Ok(())
                     },
                 },
-                crate::native::close_deadline(),
+                crate::native::session::close::budget::close_deadline(),
             );
             assert_eq!(*trace.borrow(), calls, "{:?}: {result:?}", self.kind);
             if let Some(chain) = error_chain {
@@ -2384,7 +2383,7 @@ mod process_close_tests {
                 assert!(terminal_close_intent_owner(directory.path(), &handle)?.is_some());
                 bail!("injected still-running group: adapter must not run")
             },
-            crate::native::close_deadline(),
+            crate::native::session::close::budget::close_deadline(),
         );
         assert!(result.unwrap_err().to_string().contains("still-running"));
         assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
@@ -2402,7 +2401,7 @@ mod process_close_tests {
                 &changed,
                 &shell,
                 |_| panic!("changed owner must not be signalled"),
-                crate::native::close_deadline()
+                crate::native::session::close::budget::close_deadline()
             )
             .is_err()
         );

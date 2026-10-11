@@ -1,5 +1,6 @@
 //! Query waits: one consistent read per session per pass, without lifecycle changes.
 use super::*;
+use crate::native::session::primitives::valid_session_id;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Address {

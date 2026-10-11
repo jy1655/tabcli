@@ -339,8 +339,8 @@ fn launch_bootstrap(command: &str, directory: &Path) -> Result<String> {
         std::env::current_exe().context("failed to resolve Agent Bridge executable")?;
     let host = format!(
         "{} native-iterm2-host {}",
-        crate::native::shell_quote(executable.as_os_str()),
-        crate::native::shell_quote(directory.as_os_str())
+        crate::native::terminal::shell_quote(executable.as_os_str()),
+        crate::native::terminal::shell_quote(directory.as_os_str())
     );
     Ok(shell_command(&host, command))
 }
@@ -392,7 +392,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .context("invalid iTerm2 launch directory")?;
-    crate::native::require_valid_session_id(id)?;
+    crate::native::session::primitives::require_valid_session_id(id)?;
     let iterm_id =
         std::env::var("ITERM_SESSION_ID").context("iTerm2 did not supply its session identity")?;
     let iterm_id = iterm_id
@@ -1326,7 +1326,7 @@ end run
     // not as a shell does: the script must reach zsh as it was written.
     #[test]
     fn the_bootstrap_reaches_zsh_as_written_through_iterm2_s_own_parser() {
-        let quote = |value: &str| crate::native::shell_quote(std::ffi::OsStr::new(value));
+        let quote = |value: &str| crate::native::terminal::shell_quote(std::ffi::OsStr::new(value));
         for root in [
             "/Users/tester/.agent-bridge/native-sessions".to_owned(),
             format!("/Users/tester/{ODD_NAME}"),
@@ -1382,11 +1382,14 @@ end run
             &script,
             format!(
                 "printf started > {}; exit\n",
-                crate::native::shell_quote(marker.as_os_str())
+                crate::native::terminal::shell_quote(marker.as_os_str())
             ),
         )
         .unwrap();
-        let bridge_command = format!(". {}", crate::native::shell_quote(script.as_os_str()));
+        let bridge_command = format!(
+            ". {}",
+            crate::native::terminal::shell_quote(script.as_os_str())
+        );
         let mut master = -1;
         let mut slave = -1;
         assert_eq!(
@@ -1588,8 +1591,8 @@ end run
         let executable = std::env::current_exe().unwrap();
         let probe = format!(
             "AB_ITERM_PROBE_DIR={} {} --exact native::terminal::macos::iterm2::tests::iterm_owned_process_probe --nocapture --test-threads=1",
-            crate::native::shell_quote(directory.path().as_os_str()),
-            crate::native::shell_quote(executable.as_os_str())
+            crate::native::terminal::shell_quote(directory.path().as_os_str()),
+            crate::native::terminal::shell_quote(executable.as_os_str())
         );
         let bootstrap = shell_command(
             &format!("AB_ITERM_PROBE_MODE=host {probe}"),

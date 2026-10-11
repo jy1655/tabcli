@@ -372,7 +372,7 @@ pub(super) fn offer(
             .context("PowerShell 7 executable path is not UTF-8")?
             .to_owned(),
         command_line: command_line.to_owned(),
-        deadline_unix_ms: super::super::super::unix_ms() + budget.as_millis(),
+        deadline_unix_ms: crate::native::session::primitives::unix_ms() + budget.as_millis(),
         accepted: false,
     };
     cancel(directory);
@@ -632,7 +632,7 @@ fn host_root(
     if inherited_attempt != Some(request.attempt.as_str()) {
         bail!("the tab did not inherit the environment of the launch that asked for it");
     }
-    let expired = || super::super::super::unix_ms() >= request.deadline_unix_ms;
+    let expired = || crate::native::session::primitives::unix_ms() >= request.deadline_unix_ms;
     if expired() {
         return Ok(None);
     }
@@ -798,7 +798,11 @@ fn environment_block(attempt: Option<&str>) -> Vec<u16> {
 }
 
 fn new_attempt() -> String {
-    format!("{}-{}", std::process::id(), super::super::super::unix_ms())
+    format!(
+        "{}-{}",
+        std::process::id(),
+        crate::native::session::primitives::unix_ms()
+    )
 }
 
 // The session directory is private, and neither record has to survive a crash: the
@@ -866,7 +870,7 @@ mod tests {
                 shell.to_str().unwrap(),
                 marker.display()
             ),
-            deadline_unix_ms: super::super::super::super::unix_ms() + 20_000,
+            deadline_unix_ms: crate::native::session::primitives::unix_ms() + 20_000,
             accepted: false,
         };
         write_record(&directory.join(REQUEST_FILE), &request).unwrap();

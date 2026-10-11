@@ -427,9 +427,10 @@ fn queue_command(
 ) -> Result<std::process::Command> {
     let mut command =
         super::super::process_env::provider_command(executable, directory, arguments, &[])?;
-    command
-        .current_dir(workspace)
-        .env(super::super::SESSION_DIR_ENV, directory);
+    command.current_dir(workspace).env(
+        crate::native::session::primitives::SESSION_DIR_ENV,
+        directory,
+    );
     Ok(command)
 }
 
@@ -1057,7 +1058,7 @@ fn codex_input_correlates(payload: &serde_json::Value, pending: &PendingCodexTur
 
 fn established_codex_thread(directory: &Path) -> Result<Option<String>> {
     for path in Reader::open_unchecked(directory).events()? {
-        let event: super::super::SessionEvent = RecordReader::at(&path).json()?;
+        let event: crate::native::session::schema::SessionEvent = RecordReader::at(&path).json()?;
         if event.provider == FirstPartyCli::Codex.as_str()
             && let Some(thread_id) = event.provider_session_id
         {
@@ -1078,7 +1079,10 @@ mod tests {
         crate::native::process_env::tests::assert_provider_environment(
             &command,
             &[],
-            &[(crate::native::SESSION_DIR_ENV, Some(directory.as_os_str()))],
+            &[(
+                crate::native::session::primitives::SESSION_DIR_ENV,
+                Some(directory.as_os_str()),
+            )],
         );
     }
 
@@ -1300,12 +1304,15 @@ mod tests {
         }
     }
 
-    use super::super::super::{SESSION_SCHEMA, SessionManifest, write_json_atomic};
+    use super::super::super::write_json_atomic;
     use super::super::super::{
-        SessionEvent, SessionStatus, TURN_CLAIM_FILE, acquire_turn_claim, event_paths,
-        native_delegation_prompt, read_json, update_status,
+        SessionStatus, TURN_CLAIM_FILE, acquire_turn_claim, event_paths, native_delegation_prompt,
+        read_json, update_status,
     };
     use super::*;
+    use crate::native::session::schema::SESSION_SCHEMA;
+    use crate::native::session::schema::SessionEvent;
+    use crate::native::session::schema::SessionManifest;
 
     #[cfg(unix)]
     fn write_successful_queue_provider(directory: &Path) -> std::path::PathBuf {

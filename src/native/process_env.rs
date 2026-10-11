@@ -1,5 +1,7 @@
 //! Environment policy for Bridge children. Provider adapters own their removal lists;
 //! helpers must not pass any caller's session identity into another application.
+#[cfg(not(windows))]
+use crate::native::session::primitives::{SESSION_DIR_ENV, STATE_DIR_ENV};
 use std::{ffi::OsStr, ffi::OsString, path::Path, process::Command};
 
 use anyhow::Result;
@@ -7,9 +9,6 @@ use anyhow::Result;
 #[cfg(any(not(windows), test))]
 use super::provider;
 use super::provider_process;
-#[cfg(not(windows))]
-use super::{SESSION_DIR_ENV, STATE_DIR_ENV};
-
 #[cfg(not(windows))]
 const BRIDGE_SESSION_VARIABLES: [&str; 4] = [
     STATE_DIR_ENV,
@@ -153,11 +152,11 @@ pub(super) mod tests {
         .unwrap();
         assert!(command.contains(&format!(
             "{STATE_DIR_ENV}={}",
-            crate::native::shell_quote(root.as_os_str())
+            crate::native::terminal::shell_quote(root.as_os_str())
         )));
         assert!(command.contains(&format!(
             "native-session {}",
-            crate::native::shell_quote(OsStr::new(id))
+            crate::native::terminal::shell_quote(OsStr::new(id))
         )));
         command
     }

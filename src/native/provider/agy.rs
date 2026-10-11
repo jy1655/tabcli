@@ -906,16 +906,19 @@ where
         .private(&format!("agy-input-{}.json", pending.claim_token));
     let mut trace = serde_json::json!({
         "schema":1, "claim_token":pending.claim_token, "terminal":terminal,
-        "pre_paste_offset":pre_paste_len, "prepared_unix_ms":super::super::unix_ms(),
+        "pre_paste_offset":pre_paste_len, "prepared_unix_ms":crate::native::session::primitives::unix_ms(),
         "outcome":"prepared", "paste_started_unix_ms":null,
         "paste_returned_unix_ms":null, "receipt_finished_unix_ms":null, "error":null,
     });
     let _ = record.write_json(&trace);
-    trace["paste_started_unix_ms"] = serde_json::json!(super::super::unix_ms());
+    trace["paste_started_unix_ms"] =
+        serde_json::json!(crate::native::session::primitives::unix_ms());
     let result = send();
-    trace["paste_returned_unix_ms"] = serde_json::json!(super::super::unix_ms());
+    trace["paste_returned_unix_ms"] =
+        serde_json::json!(crate::native::session::primitives::unix_ms());
     let result = result.and_then(|()| confirm());
-    trace["receipt_finished_unix_ms"] = serde_json::json!(super::super::unix_ms());
+    trace["receipt_finished_unix_ms"] =
+        serde_json::json!(crate::native::session::primitives::unix_ms());
     trace["outcome"] = serde_json::json!(match &result {
         Ok(()) => "confirmed",
         Err(error) if error.delivery_may_have_occurred() => "delivery-uncertain",
@@ -2716,9 +2719,10 @@ mod tests {
     }
 
     use super::super::super::{
-        SessionEvent, SessionStatus, acquire_turn_claim, event_paths, read_json, update_status,
+        SessionStatus, acquire_turn_claim, event_paths, read_json, update_status,
     };
     use super::*;
+    use crate::native::session::schema::SessionEvent;
     use std::cell::Cell;
     use std::io::Write;
     use std::rc::Rc;
@@ -6981,7 +6985,7 @@ I1001 16:29:08.529657     958 manager.go:1314] Slash commands unchanged, skippin
         fs::create_dir(directory.join("events")).unwrap();
         let store = Store::open_unchecked(&directory);
         store
-            .write_manifest(&super::super::super::SessionManifest {
+            .write_manifest(&crate::native::session::schema::SessionManifest {
                 schema: 1,
                 id: "session-approval".to_owned(),
                 provider: "agy".to_owned(),

@@ -1,3 +1,4 @@
+use crate::native::session::close::budget::close_remaining;
 // Included inside ownership so all injected capabilities remain private.
 use super::*;
 use crate::native::tests::write_attested_apple_terminal_state;
@@ -76,7 +77,7 @@ fn r3_teardown_records_intent_before_signal_and_settles_every_kind() {
                     assert_eq!(intent.reason, OWNER_TEARDOWN_REASON);
                     Ok(())
                 },
-                crate::native::close_deadline(),
+                crate::native::session::close::budget::close_deadline(),
             )
         })
         .unwrap();
@@ -120,7 +121,7 @@ fn r3_attestation_changes_and_timeout_keep_handle_and_intent() {
                     signals.set(signals.get() + 1);
                     bail!("group disappearance unconfirmed: {failure}")
                 },
-                crate::native::close_deadline(),
+                crate::native::session::close::budget::close_deadline(),
             )
         });
         assert!(result.is_err());
@@ -158,7 +159,7 @@ fn r3_teardown_helper_retries_after_reattest_error() {
                 Ok((owner.clone(), live))
             },
             |_| panic!("no signal"),
-            crate::native::close_deadline()
+            crate::native::session::close::budget::close_deadline()
         )
         .is_err()
     );
@@ -172,7 +173,7 @@ fn r3_teardown_helper_retries_after_reattest_error() {
             signals.set(signals.get() + 1);
             Ok(())
         },
-        crate::native::close_deadline(),
+        crate::native::session::close::budget::close_deadline(),
     )
     .unwrap();
     assert_eq!(signals.get(), 1);
@@ -207,7 +208,7 @@ fn decision(
             attest_owner: &|| Ok(()),
             group_gone: &group_gone,
         },
-        crate::native::close_deadline(),
+        crate::native::session::close::budget::close_deadline(),
     )
 }
 
@@ -291,7 +292,7 @@ fn r3_terminal_incarnation_changes_or_old_window_in_new_app_refuse() {
                 attest_owner: &|| panic!("unproven absence must not attest or signal"),
                 group_gone: &|_| panic!("not a replay"),
             },
-            crate::native::close_deadline(),
+            crate::native::session::close::budget::close_deadline(),
         );
         let error = result.unwrap_err().to_string();
         assert!(
@@ -347,7 +348,7 @@ fn r3_owner_dying_during_live_intent_retry_cannot_bypass_group_check() {
             attest_owner: &|| bail!("owner is now dead"),
             group_gone: &|_| Ok(false),
         },
-        crate::native::close_deadline(),
+        crate::native::session::close::budget::close_deadline(),
     );
     assert!(
         result.is_err(),
@@ -450,7 +451,7 @@ fn damaged_teardown_refuses(path: &str) {
                 attest_owner: &|| panic!("dead owner"),
                 group_gone: &|_| Ok(false),
             },
-            crate::native::close_deadline(),
+            crate::native::session::close::budget::close_deadline(),
         );
         assert!(result.is_err(), "{path}, {payload}: granted {result:?}");
         assert_eq!(record.bytes().unwrap(), before);
@@ -565,7 +566,7 @@ fn close_deadline_between_attestations_keeps_handle_and_intent() {
 #[test]
 fn close_deadline_after_authority_does_not_start_mutation() {
     let now = Instant::now();
-    let clock = crate::native::TestCloseClock::new(now);
+    let clock = crate::native::session::close::budget::TestCloseClock::new(now);
     let deadline = now + Duration::from_secs(1);
     let observed = Cell::new(false);
     let result = close_owned_surface_with(
@@ -680,10 +681,15 @@ fn close_deadline_shared_observations_policy_adapter_and_retry() {
         assert_ne!(store.status().unwrap().state, SessionState::Closed);
         let before = proof_calls.get();
         // The next attempt observes again and may safely refuse; it promises no success.
-        let retry = session::close::close(&store, None, crate::native::close_deadline(), |_| {
-            let _ = decide(crate::native::close_deadline())?;
-            bail!("fresh authority still refuses cleanup")
-        });
+        let retry = session::close::close(
+            &store,
+            None,
+            crate::native::session::close::budget::close_deadline(),
+            |_| {
+                let _ = decide(crate::native::session::close::budget::close_deadline())?;
+                bail!("fresh authority still refuses cleanup")
+            },
+        );
         assert!(retry.is_err());
         assert_eq!(proof_calls.get(), before + 1);
         assert!(store.record(CoreRecord::Terminal).path().exists());
@@ -738,7 +744,9 @@ fn terminal_owner_second_verification_uses_close_deadline() {
             terminal::verify_macos_surface(
                 dir.path(),
                 &surface,
-                Some(crate::native::close_remaining(deadline)?),
+                Some(crate::native::session::close::budget::close_remaining(
+                    deadline,
+                )?),
             )?;
             terminate_apple_terminal_owner(dir.path(), "session-owner123", &surface, deadline)
         },

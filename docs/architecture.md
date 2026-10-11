@@ -35,9 +35,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 ## Module map and dependencies
 
 - `src/main.rs` contains top-level dispatch and help; `src/native.rs` parses native commands,
-  coordinates launch and delivery, and defines the shared manifest and event types.
+  coordinates launch and delivery.
 - `src/native/reopen.rs` owns Reopen source reservations, provenance, launch refusals,
-  and their settlement, including read-only marker diagnostics. It creates the new Session
+  and their settlement, including read-only marker diagnostics. Session owns the refusal record
+  shape. Reopen creates the new Session
   and records its provenance before finalizing the source marker. Launch and delivery keep
   their existing holder-check timing; provider adapters supply the holder evidence.
 - `src/providers/` defines the CLI identities, minimum versions, and model, effort, and bypass
@@ -49,7 +50,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 - `src/native/terminal/` selects and implements platform-specific surfaces, input, observation,
   and close. Its `ownership` module owns owner identity, attestation, app incarnation, close
   authority, and the execution of an authorized close.
-- `src/native/session/` owns record access and durability. `requests` binds public requests to
+- `src/native/session/` owns durable record schemas, record access, and durability.
+  `schema` defines the shared manifest, event, provider-process, and reopen-refusal records and
+  their constants; `primitives` owns session environment names, identity validation, and time
+  helpers. `close::budget` owns the close deadline and test clock. `requests` binds public requests to
   claims and events; `turn` owns delivery settlement, completion and recovery; `close` owns
   close-record transitions and dead-owner repair; `launch` coordinates spawn, cancellation,
   and the full macOS binding wait, with surface identity checks supplied by terminal adapters.

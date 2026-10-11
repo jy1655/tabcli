@@ -508,7 +508,7 @@ pub(super) fn close_session_until(
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
-    crate::native::close_remaining(deadline)?;
+    crate::native::session::close::budget::close_remaining(deadline)?;
     platform::close_session_until(directory, session, deadline)
 }
 
@@ -719,6 +719,12 @@ pub(super) fn select_macos_terminal(
         None => TerminalKind::AppleTerminal,
         Some(kind) => kind,
     }
+}
+
+#[cfg(unix)]
+pub(in crate::native) fn shell_quote(value: &std::ffi::OsStr) -> String {
+    let value = value.to_string_lossy();
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 #[cfg(test)]

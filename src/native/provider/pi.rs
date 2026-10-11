@@ -1206,7 +1206,8 @@ mod tests {
 
     #[test]
     fn credential_doctor_requires_session_model_probe_and_pi_resolution() {
-        use super::super::super::{SessionManifest, doctor};
+        use super::super::super::doctor;
+        use crate::native::session::schema::SessionManifest;
         let mut manifest = SessionManifest {
             schema: 1,
             id: "test".into(),
@@ -1427,10 +1428,11 @@ mod tests {
     use std::fs;
 
     use super::super::super::{
-        SessionEvent, SessionStatus, TURN_CLAIM_FILE, acquire_turn_claim, event_paths, read_json,
-        update_status, wait_for_event, write_json_atomic,
+        SessionStatus, TURN_CLAIM_FILE, acquire_turn_claim, event_paths, read_json, update_status,
+        wait_for_event, write_json_atomic,
     };
     use super::*;
+    use crate::native::session::schema::SessionEvent;
 
     fn claim_pending_turn(directory: &Path) -> PendingPiTurn {
         let claim = acquire_turn_claim(directory).unwrap();

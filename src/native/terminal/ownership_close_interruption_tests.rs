@@ -101,7 +101,7 @@ impl Processes {
                                     })
                                 },
                             },
-                            crate::native::close_deadline(),
+                            crate::native::session::close::budget::close_deadline(),
                         )
                     },
                     || {
@@ -112,7 +112,8 @@ impl Processes {
                             || self.attest(store, live),
                             |group| {
                                 let now = Instant::now();
-                                let clock = crate::native::TestCloseClock::new(now);
+                                let clock =
+                                    crate::native::session::close::budget::TestCloseClock::new(now);
                                 let deadline = now + Duration::from_secs(3);
                                 terminate_owned_foreground_group_until_with_io(
                                     group,
@@ -127,11 +128,11 @@ impl Processes {
                                     |_| {},
                                 )
                             },
-                            crate::native::close_deadline(),
+                            crate::native::session::close::budget::close_deadline(),
                         )
                     },
                     |_| panic!("absence/teardown must not call a surface adapter"),
-                    crate::native::close_deadline(),
+                    crate::native::session::close::budget::close_deadline(),
                 )
             },
         )

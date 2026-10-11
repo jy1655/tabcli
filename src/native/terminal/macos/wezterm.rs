@@ -2,6 +2,8 @@ use super::process;
 use crate::native::session::{Reader, Store};
 #[cfg(test)]
 use crate::native::terminal::ownership;
+#[cfg(unix)]
+use crate::native::terminal::shell_quote;
 // WezTerm through its official CLI (pinned source: 20240203-110809-5046fc22).
 // Default: discover protected gui-sock-<pid> sockets in the macOS runtime directory,
 // verify the socket peer, installed GUI executable and process birth, then use a
@@ -51,7 +53,7 @@ use serde::Deserialize;
 
 use super::super::WezTermMux;
 use super::{CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession};
-use crate::native::{CommandOutputFailure, shell_quote};
+use crate::native::CommandOutputFailure;
 
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(100);
@@ -1007,7 +1009,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
         .file_name()
         .and_then(|name| name.to_str())
         .context("invalid WezTerm launch directory")?;
-    crate::native::require_valid_session_id(id)?;
+    crate::native::session::primitives::require_valid_session_id(id)?;
     let started = (|| -> Result<()> {
         let pane =
             env::var("WEZTERM_PANE").context("WezTerm did not name the pane of this host")?;
@@ -1141,14 +1143,14 @@ pub(super) fn close_session_until(
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
-    crate::native::close_remaining(deadline)?;
+    crate::native::session::close::budget::close_remaining(deadline)?;
     let (mux, pane) = target(session)?;
     let mut outcome = CloseOutcome::Missing;
     let mut kill: Option<Result<()>> = None;
     let mut without_panes_since: Option<Instant> = None;
     let mut asked_to_end = false;
     loop {
-        crate::native::close_remaining(deadline)?;
+        crate::native::session::close::budget::close_remaining(deadline)?;
         let waiting_for = match listed(host, mux, deadline) {
             Ok(None) => {
                 forget_socket(host, mux);
@@ -1166,7 +1168,7 @@ pub(super) fn close_session_until(
                 }
                 match kill.take() {
                     None => {
-                        crate::native::close_remaining(deadline)?;
+                        crate::native::session::close::budget::close_remaining(deadline)?;
                         outcome = CloseOutcome::Closed;
                         kill = Some(
                             call(
@@ -1199,7 +1201,7 @@ pub(super) fn close_session_until(
                 let since = *without_panes_since.get_or_insert_with(Instant::now);
                 if !asked_to_end && since.elapsed() >= EXIT_GRACE {
                     asked_to_end = true;
-                    crate::native::close_remaining(deadline)?;
+                    crate::native::session::close::budget::close_remaining(deadline)?;
                     host.terminate(mux.pid)?;
                 }
                 anyhow!(
