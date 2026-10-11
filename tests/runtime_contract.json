@@ -51,41 +51,64 @@
     "provider-process.json": 1,
     "status.json": 1
   },
-  "src/native/provider/agy.rs": {
+  "src/native/provider/agy/mod.rs": {
     "const PENDING_TURN_FILE: &str = \"agy-pending-turn.json\";": 1,
     "const AGY_MODEL_LABEL_PREFIXES: [&str; 3] = [\"Gemini \", \"Claude \", \"GPT-\"];": 1,
     "const AGY_LOG_FILE: &str = \"agy.log\";": 1,
-    "const WINDOWS_PROTOCOL_PREFIX: &str = \"[Agent Bridge Agy Windows console turn protocol]\";": 1,
     "struct PendingAgyTurn {\n    schema: u32,\n    claim_token: String,\n    marker: String,\n}": 1,
     "marker: format!(\"<!-- agent-bridge-agy-turn:{claim_token} -->\"),": 1,
     "impl PendingAgyTurn {\n    fn new(claim_token: &str) -> Result<Self> {\n        validate_claim_token(claim_token)?;\n        Ok(Self {\n            schema: 1,\n            claim_token: claim_token.to_owned(),\n            marker: format!(\"<!-- agent-bridge-agy-turn:{claim_token} -->\"),\n        })\n    }\n}": 1,
-    "[Agent Bridge Agy Windows console turn protocol]": 2,
-    "[Agent Bridge Agy turn protocol]": 2,
-    "agent-bridge-agy-turn": 2,
-    "agy-input-{}.json": 1,
+    "[Agent Bridge Agy Windows console turn protocol]": 1,
+    "[Agent Bridge Agy turn protocol]": 1,
+    "agent-bridge-agy-turn": 1,
     "agy-pending-turn.json": 1,
-    "agy.log": 27,
+    "agy.log": 1,
     "transcript.jsonl": 1,
     "transcript_full.jsonl": 1,
-    "const STARTUP_COMPLETED_MARKER: &str = \"CLI startup completed\";": 1,
-    "const SLASH_RELOAD_MARKER: &str = \"Reloading system slash commands\";": 1,
-    "const SKILLS_RELOAD_MARKER: &str = \"Reloading system slash commands and skills\";": 1,
     "const HOOKS_LOADED_SOURCE: &str = \"hooks_manager.go\";": 1,
-    "const FULL_REDRAW_MARKER: &str = \"Full redraw completed\";": 1,
-    "const CONVERSATION_START_MARKER: &str = \"Starting new conversation\";": 1,
-    "const INPUT_RECEIPT_MARKER: &str = \"HandleUserInput called with text: \\\"\";": 1,
-    "const TURN_PROTOCOL_HEADER: &str = \"[Agent Bridge Agy turn protocol]\";": 1,
-    "const TURN_START_MARKER: &str = \"Forwarding user message to conversation \";": 1,
-    "const TURN_FAILURE_MARKER: &str = \"agent executor error: \";": 1,
     "Accessing workspace:": 1,
     "Do you trust the contents of this project?": 1,
     "Antigravity CLI requires permission to read, edit, and execute files here.": 1,
     "> Yes, I trust this folder": 1,
     "No, exit": 1,
-    "↑/↓ Navigate · enter Confirm": 1,
-    "\"type\"": 2,
+    "↑/↓ Navigate · enter Confirm": 1
+  },
+  "src/native/provider/agy/delivery.rs": {
+    "agy-input-{}.json": 1,
+    "agy.log": 2
+  },
+  "src/native/provider/agy/trust.rs": {
+    "agy.log": 1
+  },
+  "src/native/provider/agy/readiness.rs": {
+    "agy.log": 8,
+    "const STARTUP_COMPLETED_MARKER: &str = \"CLI startup completed\";": 1,
+    "const SLASH_RELOAD_MARKER: &str = \"Reloading system slash commands\";": 1,
+    "const SKILLS_RELOAD_MARKER: &str = \"Reloading system slash commands and skills\";": 1,
+    "const FULL_REDRAW_MARKER: &str = \"Full redraw completed\";": 1,
+    "const CONVERSATION_START_MARKER: &str = \"Starting new conversation\";": 1
+  },
+  "src/native/provider/agy/receipt.rs": {
+    "const WINDOWS_PROTOCOL_PREFIX: &str = \"[Agent Bridge Agy Windows console turn protocol]\";": 1,
+    "[Agent Bridge Agy Windows console turn protocol]": 1,
+    "[Agent Bridge Agy turn protocol]": 1,
+    "agent-bridge-agy-turn": 1,
+    "agy.log": 4,
+    "const INPUT_RECEIPT_MARKER: &str = \"HandleUserInput called with text: \\\"\";": 1,
+    "const TURN_PROTOCOL_HEADER: &str = \"[Agent Bridge Agy turn protocol]\";": 1
+  },
+  "src/native/provider/agy/diagnostics.rs": {
+    "agy.log": 10,
+    "\"type\"": 1,
     "\"USER_INPUT\"": 1,
-    "\"content\"": 2
+    "\"content\"": 1
+  },
+  "src/native/provider/agy/monitor.rs": {
+    "agy.log": 1,
+    "const TURN_START_MARKER: &str = \"Forwarding user message to conversation \";": 1,
+    "const TURN_FAILURE_MARKER: &str = \"agent executor error: \";": 1,
+    "\"type\"": 1,
+    "\"content\"": 1
   },
   "src/native/provider/claude.rs": {
     "const CROSS_SESSION_REFERENCE_PREFIX: &str = \"agent-bridge-payload:\";": 1,

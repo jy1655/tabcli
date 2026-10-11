@@ -15,7 +15,7 @@ launch, observe, continue, and close without replacing the capabilities those CL
   work, not duplication to eliminate.
 - Keep shared orchestration limited to provider-neutral session state and lifecycle
   contracts. Provider payload schemas and transport selection belong in
-  `src/native/provider/<provider>.rs`.
+  `src/native/provider/<provider>/` (or a single `<provider>.rs` file).
 - Every provider adapter must explicitly own its launch configuration, follow-up
   transport, completion identity, and any unsupported-platform fallback. Do not add a
   default adapter implementation that silently assigns the same behavior to all CLIs.
