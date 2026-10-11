@@ -6,6 +6,7 @@ Older notes retain their own requirements and limitations; use the
 [providers](../providers.md) and [terminals](../terminals.md) pages for current behavior.
 Each note separates live checks from automated tests.
 
+- [0.4.5](0.4.5.md) (2026-10-12): Declares close evidence per terminal adapter, splits the Agy adapter into modules, and names the turn claim's launch phases; no behaviour change.
 - [0.4.4](0.4.4.md) (2026-10-11): Waits for the Windows console input buffer before the submission Return and
   requires the empty Codex composer after a paste; one delivery module with adapter-declared Transports;
   the consistent session read behind the session seam.
