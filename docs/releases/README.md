@@ -6,7 +6,7 @@ Older notes retain their own requirements and limitations; use the
 [providers](../providers.md) and [terminals](../terminals.md) pages for current behavior.
 Each note separates live checks from automated tests.
 
-- [0.4.4](0.4.4.md) (2026-10-12): Waits for the Windows console input buffer before the submission Return and
+- [0.4.4](0.4.4.md) (2026-10-11): Waits for the Windows console input buffer before the submission Return and
   requires the empty Codex composer after a paste; one delivery module with adapter-declared Transports;
   the consistent session read behind the session seam.
 - [0.4.3](0.4.3.md) (2026-10-11): Passes the session directory to the terminal adapters; adapters
