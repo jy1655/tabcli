@@ -114,7 +114,11 @@ where
     if kind != TerminalKind::WindowsConsole {
         bail!("{} is not available on Windows", kind.display_name());
     }
-    let powershell = powershell_executable()?;
+    // Both surfaces pass this path as CreateProcessW's application name, which
+    // PowerShell uses for PSHOME independently of the command line.
+    let powershell = PathBuf::from(crate::native::provider_process::windows_command_path(
+        &powershell_executable()?,
+    ));
     let command_line = console_launch_command_line(&powershell, command)?;
     // The window is the user's setting. One that cannot be read is no reason to open the
     // tab in a window they work in, which only an explicit choice does.
@@ -524,6 +528,8 @@ pub(super) fn console_launch_command_line(powershell: &Path, command: &str) -> R
     if command.contains('"') {
         bail!("Windows console launch command contains an unsupported double quote");
     }
+    // PowerShell derives PSHOME and its module search path from the launch path.
+    let powershell = crate::native::provider_process::windows_command_path(powershell);
     let powershell_text = powershell.to_string_lossy();
     if powershell_text.contains('"') {
         bail!("PowerShell 7 executable path contains an unsupported double quote");

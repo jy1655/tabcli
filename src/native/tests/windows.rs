@@ -49,6 +49,36 @@ fn windows_state_root_falls_back_to_userprofile_without_home() {
 
 #[cfg(windows)]
 #[test]
+fn windows_console_launch_uses_non_verbatim_powershell_paths() {
+    // The normalized value must reach both the tab request and console-window
+    // constructor, not just argv[0]: CreateProcessW has a separate application name.
+    let source = include_str!("../terminal/windows/mod.rs").replace("\r\n", "\n");
+    assert!(source.contains(
+        "let powershell = PathBuf::from(crate::native::provider_process::windows_command_path(\n        &powershell_executable()?,\n    ));"
+    ));
+    assert!(source.contains("tab::offer(\n        &powershell,\n        &command_line,"));
+    assert!(source.contains("ConsoleWindow::create(&powershell, &command_line, deadline)"));
+    for (path, expected) in [
+        (
+            r"\\?\C:\Program Files (x86)\PowerShell\7\pwsh.exe",
+            r"C:\Program Files (x86)\PowerShell\7\pwsh.exe",
+        ),
+        (
+            r"\\?\UNC\server\share\PowerShell\7\pwsh.exe",
+            r"\\server\share\PowerShell\7\pwsh.exe",
+        ),
+    ] {
+        let application = PathBuf::from(provider_process::windows_command_path(Path::new(path)));
+        assert_eq!(application, Path::new(expected));
+        let command_line =
+            terminal::windows_console_launch_command_line(Path::new(path), "exit 0").unwrap();
+        assert!(command_line.starts_with(&format!("\"{expected}\" ")));
+        assert!(!command_line.contains(r"\\?\"));
+    }
+}
+
+#[cfg(windows)]
+#[test]
 fn windows_batch_providers_are_launched_through_a_fixed_powershell_forwarder() {
     let directory = tempfile::tempdir().unwrap();
     let command = provider_process_command(
@@ -58,6 +88,7 @@ fn windows_batch_providers_are_launched_through_a_fixed_powershell_forwarder() {
     )
     .unwrap();
     assert!(Path::new(command.get_program()).is_absolute());
+    assert!(!command.get_program().to_string_lossy().contains(r"\\?\"));
     assert_eq!(
         Path::new(command.get_program()).file_name().unwrap(),
         "pwsh.exe"
@@ -359,8 +390,9 @@ fn windows_environment_boundary_replaces_caller_context_through_bootstrap_and_ho
         let bootstrap = bridge_shell_command(&root, &root, &stub, ID).unwrap();
         let powershell = terminal::windows_powershell_executable().unwrap();
         let line = terminal::windows_console_launch_command_line(&powershell, &bootstrap).unwrap();
+        let powershell = provider_process::windows_command_path(&powershell);
         let arguments = line
-            .strip_prefix(&format!("\"{}\" ", powershell.display()))
+            .strip_prefix(&format!("\"{}\" ", powershell.to_string_lossy()))
             .unwrap();
         let mut command = process_env::helper_command(&powershell);
         command.raw_arg(arguments).env(STAGE, "wrapper");
