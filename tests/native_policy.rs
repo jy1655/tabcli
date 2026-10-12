@@ -1070,9 +1070,9 @@ fn check_readme_install_section(file_name: &str, heading: &str) {
                     continue;
                 }
                 let version = &tail[..end];
-                // Only these minimum-toolchain phrases are exempt, not every 1.97.1.
+                // Only these minimum-toolchain phrases are exempt, not every MSRV occurrence.
                 if before.ends_with("Rust ")
-                    && version == "1.97.1"
+                    && version == env!("CARGO_PKG_RUST_VERSION")
                     && (tail[end..].starts_with(" or newer") || tail[end..].starts_with(" 이상"))
                 {
                     continue;
@@ -1102,11 +1102,14 @@ fn check_readme_install_section(file_name: &str, heading: &str) {
 #[test]
 fn public_identity_in_version_and_help() {
     assert_eq!(agent_bridge::PUBLIC_COMMAND, "tabcli");
+    let version = env!("CARGO_PKG_VERSION");
     for (flag, expected) in [
-        ("--version", "tabcli 0.4.8"),
+        ("--version", format!("tabcli {version}")),
         (
             "--help",
-            "tabcli 0.4.8 — Terminal Agent Bridge: visible terminal sessions for coding agent CLIs",
+            format!(
+                "tabcli {version} — Terminal Agent Bridge: visible terminal sessions for coding agent CLIs"
+            ),
         ),
     ] {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_tabcli"))
@@ -1116,7 +1119,7 @@ fn public_identity_in_version_and_help() {
         assert!(output.status.success());
         assert!(output.stderr.is_empty());
         let text = String::from_utf8(output.stdout).unwrap();
-        assert_eq!(text.lines().next(), Some(expected));
+        assert_eq!(text.lines().next(), Some(expected.as_str()));
         if flag == "--help" {
             assert!(text.contains("tabcli hold <session> [--release] [--json]"));
             assert!(text.contains("tabcli cancel <session> [--json]"));

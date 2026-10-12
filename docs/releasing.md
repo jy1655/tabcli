@@ -18,6 +18,7 @@ cannot read the setting either.
    `docs/releases/<version>.md` must agree. The
    `readme_install_section_names_the_cargo_version` test in `tests/native_policy.rs` checks
    both README Install sections against the Cargo version.
+   `tests/fixtures/help.txt` uses a version token and needs no per-release version edit.
    Validate changes with `cargo test --all-targets --all-features -- --test-threads=1`,
    Clippy, fmt, and `git diff --check`. If you changed the Release workflow or packaging,
    first pass a rehearsal with `gh workflow run release.yml --ref <branch> -f tag=<existing-tag>`.

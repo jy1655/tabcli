@@ -108,6 +108,7 @@ fn run_fake(fake: &mut Fake) -> Report {
     );
     assert!(fake.replies.is_empty());
     assert_eq!(report.steps.len(), 5);
+    let timeout = CLEANUP_BUDGET.as_secs().to_string();
     assert!(
         fake.calls
             .iter()
@@ -118,7 +119,7 @@ fn run_fake(fake: &mut Fake) -> Report {
                     "session-owned",
                     "--explicit",
                     "--timeout-secs",
-                    "10",
+                    &timeout,
                     "--json"
                 ]))
     );
@@ -1094,10 +1095,13 @@ fn close_deadline_cleanup_budgets() {
     run_fake(&mut fake);
     for (args, budget) in fake.calls.iter().zip(&fake.budgets) {
         if args[0] == "close-session" {
-            assert_eq!(*budget, Duration::from_secs(15));
-            assert!(args.windows(2).any(|pair| pair == ["--timeout-secs", "10"]));
+            assert_eq!(*budget, CLEANUP_BUDGET + COMMAND_MARGIN);
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--timeout-secs", &CLEANUP_BUDGET.as_secs().to_string()])
+            );
         } else if args[0] == "inspect" {
-            assert_eq!(*budget, Duration::from_secs(10));
+            assert_eq!(*budget, CLEANUP_BUDGET);
         }
     }
 }
