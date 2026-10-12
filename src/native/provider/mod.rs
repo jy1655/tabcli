@@ -110,7 +110,6 @@ impl ActiveCompletionMonitor {
 }
 
 pub(super) enum CancelSupport {
-    #[allow(dead_code)] // Provider support is added by the session-specific integration.
     Supported,
     Unsupported(String),
 }

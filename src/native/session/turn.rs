@@ -1146,7 +1146,6 @@ impl<'a> Report<'a> {
     ) -> Result<()> {
         self.failure(error, provider_session_id, turn_id, false)
     }
-    #[allow(dead_code)] // Provider interruption reports are connected in the next integration.
     pub(in crate::native) fn cancelled(
         &self,
         detail: &str,

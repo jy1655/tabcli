@@ -390,22 +390,6 @@ enum CreationRoute {
     Window,
 }
 
-// Compatibility entry point; routing can pass its one creation-time choice below.
-#[allow(dead_code)]
-pub(super) fn open_bound_tab<F, U>(
-    command: &str,
-    directory: &Path,
-    deadline: Instant,
-    bind: F,
-    unbind: U,
-) -> Result<TerminalSession>
-where
-    F: FnOnce(&mut TerminalSession) -> Result<()>,
-    U: FnOnce() -> Result<()>,
-{
-    open_bound_tab_with_mode(command, directory, deadline, false, bind, unbind)
-}
-
 pub(super) fn open_bound_tab_with_mode<F, U>(
     command: &str,
     directory: &Path,
