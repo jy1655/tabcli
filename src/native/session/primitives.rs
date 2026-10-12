@@ -506,12 +506,8 @@ pub(in crate::native) fn write_json_atomic<T: Serialize>(path: &Path, value: &T)
 #[cfg(windows)]
 const RECORD_REPLACE_WAIT: Duration = Duration::from_secs(1);
 
-/// Renames a temporary record over its final path. Windows refuses to replace a file
-/// while any other handle to it is open, whatever that handle shares, and a caller that
-/// polls a record holds one for a moment on every read (2026-10-01: a launcher's read of
-/// `launch.json` failed the wrapper's replacement of it with access denied). The rename
-/// is therefore repeated for a bounded time on those two errors; a record that stays
-/// open, or cannot be replaced for another reason, still fails.
+/// Retry record replacement for bounded Windows sharing/access errors: polling readers can block rename.
+/// Other errors still fail; see AGENTS.md, Current Windows Surface Boundary.
 pub(in crate::native) fn persist_record(
     temporary: tempfile::NamedTempFile,
     path: &Path,

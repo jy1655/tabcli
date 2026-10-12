@@ -1,4 +1,4 @@
-# Terminal.app cleanup failure and retry — 2026-10-02
+# Terminal.app cleanup failure and retry: 2026-10-02
 
 Issue: [#64](https://github.com/jy1655/agent-bridge/issues/64).
 

@@ -52,21 +52,12 @@ const CROSS_SESSION_REFERENCE_PREFIX: &str = "agent-bridge-payload:";
 const MAX_CROSS_SESSION_OUTPUT_BYTES: usize = 1024 * 1024;
 const MESSAGE_GUARD_DENIAL_REASON: &str =
     "Agent Bridge rejected a changed or unverifiable SendMessage reference";
-// Claude Code 2.1.278 reports this result for a tool call in a response that the provider
-// stopped before the call ran.
+// Claude reports this result when the provider stops a tool call before execution.
 const PROVIDER_STOPPED_CALL_RESULT: &str =
     "Not run: the response that made this tool call was stopped by a safety classifier.";
 const PENDING_TURN_FILE: &str = "claude-pending-turn.json";
-// Session markers Claude Code exports into every process it spawns (Bash, hooks, plugin
-// scripts). These are values Claude Code exports about its own session, including
-// AI_AGENT and CLAUDE_CODE_BRIDGE_SESSION_ID (observed 2026-10-11 in an application
-// started from a Claude Code Bash tool). An interactive `claude` that inherits
-// CLAUDE_CODE_CHILD_SESSION treats itself as a nested child: it disables transcript persistence and never registers its
-// cross-session inbox, so ListAgents cannot discover it and SendMessage cannot reach it.
-// The managed session must be an independent top-level session, and the messenger must
-// not be classified as a child either, so both launches drop the whole marker set. User
-// configuration such as ANTHROPIC_* or CLAUDE_CONFIG_DIR is deliberately left alone.
-// Removable if Claude Code stops deriving session identity from inherited markers.
+// Drop caller-session markers from managed and messenger launches, preserving user configuration; nested children have no inbox.
+// Remove when Claude stops deriving identity from inherited markers; see docs/verification/2026-10-11-macos-0.4.1.md.
 const CLAUDE_CODE_SESSION_MARKERS: &[&str] = &[
     "AI_AGENT",
     "CLAUDE_CODE_BRIDGE_SESSION_ID",
@@ -589,10 +580,8 @@ fn git_workspace_command(workspace: &Path) -> Result<std::process::Command> {
 }
 
 fn require_exact_claude_trust_scope(workspace: &Path) -> Result<()> {
-    // LIVE: Claude 2.1.284 displays a repository subdirectory but saves approval
-    // at the Git root. Do not expand an exact child consent to that ancestor.
-    // Git resolves nested repositories and worktree .git files itself. A failed
-    // lookup leaves Claude's own dialog untouched rather than guessing its scope.
+    // Claude saves Git-subdirectory approval at the root; exact child consent cannot authorize it.
+    // Let Git resolve worktrees/nested roots; failed lookup leaves Claude's dialog untouched.
     let mut has_git_ancestor = false;
     for parent in workspace.ancestors().skip(1) {
         if parent.join(".git").try_exists()? {
@@ -639,40 +628,8 @@ fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Res
     })
 }
 
-// Official `claude --resume <uuid>` continues a conversation in a new interactive process.
-// The plan registers the new session's own private settings and cross-session name, so the
-// reopened process reports only into its own directory, exactly like a fresh launch. Policy
-// arguments (yolo, model, effort) are not part of the plan: the shared wrapper derives them
-// from the new manifest, which records only what the reopen request stated. That is the
-// whole of what Bridge controls: the flags it forwards. The effective policy of the
-// reopened process is Claude's own, decided from the resumed session, Claude's settings
-// files (re-read at launch), and its environment, none of which Bridge reads or overrides
-// (https://code.claude.com/docs/en/sessions#what-a-resumed-session-restores):
-// - Model: Bridge forwards `--model` only when the reopen request states it. Claude
-//   documents that a resumed session continues on its previous model unless a `--model`
-//   flag or an `ANTHROPIC_MODEL`-family environment variable picks one at launch, the model
-//   is retired or not in `availableModels`, or the provider uses deployment ids; the
-//   resolution order is Claude's model configuration, not the Bridge source manifest.
-// - Permission mode: Bridge forwards its bypass flag only when the reopen request passes
-//   `--yolo`. Claude documents that a terminal `--resume <session-id>` restores the saved
-//   mode except that a session which ended in bypassPermissions starts in the mode a new
-//   session would start in, and that a `permissions.defaultMode` from user, `--settings`,
-//   or managed settings takes effect there. Omitting `--yolo` therefore does not by itself
-//   establish that bypass is off: a configured bypass default still applies.
-// - Effort: the documentation lists no restored effort; only an explicit `--effort` is
-//   forwarded, and any effort default in Claude's own configuration applies otherwise.
-//
-// Claude offers no exclusive hold on a conversation: resuming one session in two terminals
-// is permitted and interleaves both into one transcript
-// (https://code.claude.com/docs/en/sessions#branch-a-session). The registry gate is
-// therefore best-effort detection, never exclusion. It runs read-only before the source is
-// claimed, again immediately before the process is spawned, after launch once the new
-// process has registered under its managed `--name`, again immediately before the initial
-// prompt is sent, and again immediately before every `tell` to the resumed session. At each
-// of those points every other live holder of the same conversation is a detected conflict
-// that refuses the delivery. A foreign `claude --resume` can still register between two
-// checks and interleave into the transcript until the next boundary catches it; only a
-// provider-owned exclusive hold would close that window, and Claude does not offer one.
+// Forward only explicitly requested policy flags; Claude owns restored policy and defaults.
+// Holder scans detect conflicts only at boundaries; see docs/verification/2026-10-12-reopen-source-notes.md.
 fn prepare_resume_for_platform(context: ResumeContext<'_>, windows: bool) -> Result<ResumePlan> {
     verify_reopen_available_for_platform(context.provider_session_id, windows)?;
     let settings_path = context.directory.join("claude-settings.json");
@@ -737,10 +694,8 @@ fn synchronized_messenger_deadline(deadline: Instant) -> Result<Instant> {
     Ok(Instant::now())
 }
 
-// Doctor's view of a reopened session: every other live Claude Code process registered for
-// the conversation the session resumed. This is the same best-effort registry scan the
-// delivery boundaries run, taken at doctor time only; it proves nothing about the interval
-// between two scans. `None` for a session that did not resume a conversation.
+// Doctor scans other live holders now, with the delivery gate's best-effort check.
+// It proves nothing between scans; non-resumed sessions return None.
 fn resumed_conversation_holders_check(directory: &Path) -> Option<super::super::doctor::Check> {
     use super::super::doctor::{Availability::*, Check};
     let manifest = RecordReader::at(

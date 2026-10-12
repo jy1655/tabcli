@@ -16,22 +16,8 @@ use super::{
     applescript, applescript::close_response,
 };
 
-// iTerm2 3.7.3 selects every surface it creates, and a new window also makes
-// iTerm2 activate itself (issue #58). The script gives back what its creation
-// took and nothing else:
-// - a new tab: the tab that was selected in that window, while the window still
-//   shows the new session. `create tab` never activates iTerm2, so no
-//   application is touched.
-// - a new window: the earlier window, then the application that had the
-//   foreground, once iTerm2 itself says that it is active. iTerm2 activates
-//   itself asynchronously and makes the new window key again when it is active,
-//   so anything given back earlier is taken again.
-// An application, window or tab that the user chose meanwhile keeps the keyboard.
-// None of this is authority over the surface or a reason to fail the launch. An
-// application is kept as its NSRunningApplication object, never as a pid to look
-// up. Native `command` creation and the bound launch host below keep the keys of
-// this exposure from editing the launch line or answering the provider's first
-// dialog. Remove the return when iTerm2 can create without selecting.
+// Restore a new tab's prior selection, or a new window's foreground after asynchronous activation.
+// Never override user selection; see docs/verification/2026-10-03-v0.1.0-focus.md.
 pub(in crate::native) const OPEN_TAB_SCRIPT: &str = r#"
 use framework "AppKit"
 
@@ -348,10 +334,8 @@ fn launch_bootstrap(command: &str, directory: &Path) -> Result<String> {
     Ok(shell_command(&host, command))
 }
 
-// iTerm's native `command` argument runs a program instead of editing a shell
-// line. Use a login, interactive zsh so startup files/PATH and distinct foreground
-// jobs are retained. The gate and wrapper are separate jobs in the original shell.
-// Unlike the profile's arbitrary command, this bootstrap is always a POSIX shell.
+// Native command creation prevents launch-line editing; login/interactive zsh retains PATH and
+// foreground jobs. The bootstrap is POSIX regardless of the profile's configured command.
 fn shell_command(host: &str, command: &str) -> String {
     format!(
         "/bin/zsh -l -i -c {}",
@@ -359,14 +343,8 @@ fn shell_command(host: &str, command: &str) -> String {
     )
 }
 
-// One argument of an iTerm2 `command`. iTerm2 3.7.3 hands that string to no
-// shell. It replaces `$$…$$` variables, asking the user for one that it does not
-// know (`$$$$` is a literal `$$`), and splits the rest with a parser of its own,
-// in which a backslash escapes even inside single quotes (PTYSession.m
-// `computeArgvForCommand:`; NSStringITerm.m `doubleDollarVariables`,
-// `componentsInShellCommand`). Double quotes with `\\` and `\"` are what
-// iTerm2 itself writes for that parser (ITAddressBookMgr.m
-// `standardLoginCommand`).
+// iTerm parses commands itself: escape dollar variables and use its double-quote/backslash rules.
+// See docs/verification/2026-10-03-v0.1.0-focus.md for the upstream parser.
 fn iterm_argument(value: &str) -> String {
     format!(
         "\"{}\"",
@@ -377,10 +355,8 @@ fn iterm_argument(value: &str) -> String {
     )
 }
 
-// Creation necessarily precedes knowing iTerm's returned UUID. Reuse the existing
-// launch receipt and atomic terminal binding as the gate: no extra persisted
-// protocol and no provider before the launcher has restored selection and bound
-// this exact surface. Failure/timeout never falls back to typed shell input.
+// Wait for restored selection and the exact returned UUID in the receipt and surface binding.
+// Failure or timeout never falls back to typed shell input.
 pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
     let metadata = std::fs::symlink_metadata(directory)?;
     if !directory.is_absolute()

@@ -31,10 +31,8 @@ pub(super) struct CodexAdapter;
 
 const PENDING_TURN_FILE: &str = "codex-pending-turn.json";
 const MAX_NATIVE_QUEUE_OUTPUT_BYTES: usize = 1024 * 1024;
-// A managed terminal can display a different thread or the /agent picker. Codex
-// has no integrated, atomic active-thread check plus addressed terminal input.
-// Replace this refusal only with a provider-owned input path that binds delivery
-// to the recorded thread; a title, old notify, or live process is not that proof.
+// Refuse terminal follow-up without an atomic, provider-owned active-thread input path.
+// A title, old notify or live process cannot prove which thread receives input.
 fn unaddressed_follow_up() -> String {
     format!(
         "Codex terminal follow-up is unavailable: the active thread cannot be verified; no terminal input was sent. Use the thread-addressed native queue with Codex 0.149+; inspect the queue error and `{PUBLIC_COMMAND} doctor <session> --probe` for the unavailable prerequisite"
@@ -89,10 +87,8 @@ impl PendingCodexTurn {
     }
 }
 
-// Codex `resume <thread>` is official, but reopen needs two file-level gates this slice
-// does not implement: the exclusive thread writer lock under ~/.codex/thread-writer-locks
-// and rows for the thread in the queue store, whose accepted inputs would execute inside
-// the reopened TUI. The resume-while-held behavior also needs a live check first.
+// Reopen needs the thread-writer lock and queued-input gates plus a live resume-while-held check.
+// See docs/verification/2026-10-12-reopen-source-notes.md.
 const CODEX_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Codex reopen is not implemented in this slice; it requires the thread writer-lock and queued_items gates and a live check of resume-while-held behavior";
 
 fn send_initial_prompt(
@@ -155,11 +151,8 @@ impl Transport for CodexInitialPaste {
                 // after the composer appears; keep the existing readiness delay.
                 ready_delay: Duration::from_secs(12),
             },
-            // Codex 0.162.1's default keymap inserts LF for Shift+Return in an
-            // editable composer, both inside and outside a paste burst. Custom
-            // bindings, Vim normal mode, history search and disabled input are
-            // outside this fallback's contract. Remove it when Codex supplies a
-            // newline-preserving input API or paste event on Windows console.
+            // Shift+Return preserves LF only in the default editable composer; replace with a native input API.
+            // Custom bindings/modes are outside this fallback; see docs/verification/2026-10-12-windows-0.4.8.md.
             surface: Some(SurfaceInput {
                 submit_count: 2,
                 newline: terminal::ConsoleNewline::ShiftReturn,
@@ -407,29 +400,12 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 }
 
-// The empty composer of the chat view: the prompt glyph and Codex's placeholder
-// (`PLACEHOLDER` in codex-rs/tui/src/chatwidget.rs, rust-v0.159.3).
+// Empty chat composer: prompt glyph plus Codex's placeholder; see docs/verification/2026-10-02-windows.md.
 const COMPOSER_ROW: &str = "› Ask Codex to do anything";
 const COMPOSER_POLL: Duration = Duration::from_secs(1);
 
-// Positive evidence that an initial paste lands in the composer and not on the trust
-// dialog. Codex draws the composer only when no onboarding screen and no view of the
-// bottom pane is active, so its empty row on the screen means that the trust dialog is
-// over. An exact project entry is not the only way there (issue #60): Codex takes the
-// trust of a workspace without one from its repository root, which covers a
-// subdirectory and a linked worktree, shows no dialog then and saves no exact entry;
-// and "Trust and continue", answered by the user in the managed terminal, saves the
-// repository root as well. Measured 2026-10-02 with Codex CLI 0.159.3 on native
-// Windows: no dialog in a linked worktree of a trusted repository; the dialog in a
-// directory that nothing trusts, with and without `--yolo`, and in a plain directory
-// below a trusted one.
-//
-// Nothing is inferred from Codex's configuration or from Git: an inference that is
-// wrong would paste onto the dialog. An empty screen, a screen that is still loading
-// and a layout this does not know are no evidence, and neither is a composer beside
-// the words of the dialog. This is not workspace consent, which stays exact and is the
-// only trust that is shared with another provider. Delete it when Codex has an input
-// path that needs no paste.
+// Require a known empty composer with no dialog; blank/loading screens prove nothing.
+// This is input readiness, not shared consent; see docs/verification/2026-10-02-windows.md.
 fn composer_is_ready(screen: &str) -> bool {
     let mut composer = false;
     for line in screen.lines() {
@@ -612,11 +588,8 @@ fn send_native_queue_message(
             "Codex session provider identity is not a thread UUID"
         )));
     }
-    // Codex owns backend selection: its queue command uses an available shared daemon or
-    // an embedded server, and both write the provider's durable, thread-addressed queue.
-    // See codex-rs/tui/src/session_queue_commands.rs and ext/queue/src/service.rs in
-    // rust-v0.149.0 and rust-v0.160.0. Requiring a daemon here blocked the embedded path.
-    // Queue acceptance is not completion; the target's correlated notify still proves it.
+    // Codex chooses daemon or embedded queue; acceptance is not completion, which needs notify.
+    // See docs/verification/2026-10-04-codex-queue.md for the provider source.
 
     let pending = PendingCodexTurn::new(context.request_id).map_err(Outcome::NotSent)?;
     let arguments = codex_queue_arguments(&thread_id, context.prompt, &pending);
@@ -1096,16 +1069,12 @@ fn codex_owned_string(payload: &serde_json::Value, key: &str) -> Option<String> 
     codex_string(payload, key).map(str::to_owned)
 }
 
-// The first line and the request heading of the IDE context that the TUI puts in front
-// of the user's message while `/ide` is on (`render_prompt_context` and
-// `PROMPT_REQUEST_BEGIN` in codex-rs/tui/src/ide_context/prompt.rs, rust-v0.159.3).
+// Exact IDE wrapper from Codex's prompt renderer; source evidence is in AGENTS.md, Current Codex Boundary.
 const IDE_CONTEXT_HEADING: &str = "# Context from my IDE setup:";
 const IDE_REQUEST_HEADING: &str = "## My request for Codex:";
 
-// Whether a message that Codex reports as the input of a turn is the prompt Bridge
-// sent: it begins with the delegation header, directly or behind Codex's IDE context.
-// The context can quote a file that holds the request heading, and so can the prompt,
-// so every heading is tried.
+// Require the delegation header, directly or after the exact IDE wrapper.
+// Try every request heading because context and prompt can themselves quote it.
 fn begins_with_bridge_prompt(message: &str) -> bool {
     let header = super::super::NATIVE_DELEGATION_HEADER;
     let message = message.trim_start();
@@ -1120,15 +1089,8 @@ fn begins_with_bridge_prompt(message: &str) -> bool {
                 }))
 }
 
-// The input of the turn that Bridge started is the prompt Bridge sent: it begins with the
-// delegation header and ends with the turn marker. The marker alone does not identify
-// it. Codex CLI 0.159.3 answers the first message of a TUI with a second turn, on a
-// thread of its own, that makes the task title; its input is Codex's instruction
-// followed by the user's whole message, marker included, and its notify can arrive
-// first (issue #61, 2026-10-02: `{"title":"READY"}` recorded as the result of two
-// initial requests out of six, with the title thread as the session's thread). This
-// tells Bridge's framing from that of a turn Codex starts; it is not an identity of
-// the turn, which Codex does not give before the first notify.
+// Require header and trailing marker: Codex's title turn can quote the marker on another thread.
+// Framing is not turn identity; see docs/verification/2026-10-02-windows.md.
 fn codex_input_correlates(payload: &serde_json::Value, pending: &PendingCodexTurn) -> bool {
     if codex_string(payload, "type") != Some("agent-turn-complete") {
         return false;

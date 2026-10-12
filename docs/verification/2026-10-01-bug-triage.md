@@ -1,4 +1,4 @@
-# Bug triage — 2026-10-01
+# Bug triage: 2026-10-01
 
 Source baseline: `9d2cd61c12a9bb62e7f98da409362f074969ffa3`, the unpublished
 0.0.9 candidate. Work branch: `fix/codex-follow-up-target-20261001`.
@@ -28,7 +28,7 @@ during the work. The table states the outcome for each.
 | #58 new managed sessions take the keyboard focus (opened during round 2) | Investigated only: the launch scripts call `activate`, and no supported terminal can create a surface without selecting it. No change here; the later change is recorded in [`2026-10-01-focus.md`](2026-10-01-focus.md). | Open. |
 | #6, #28, #53, #54, #55 | Feature work, outside this patch. | Unchanged. |
 
-## #48 — the follow-up paste landed on Agy's workspace-trust dialog
+## #48: the follow-up paste landed on Agy's workspace-trust dialog
 
 Agy keeps its workspace-trust dialog over the composer until the exact
 workspace is in its trust store. It still runs an initial prompt that was
@@ -304,7 +304,7 @@ One behaviour was not changed: when a dialog is not recognised, launch still
 waits until the request deadline before it reports the failure. That behaviour
 belongs to #28.
 
-## #57 — reject unaddressed Codex follow-up
+## #57: reject unaddressed Codex follow-up
 
 Round 1 is unchanged. The Codex adapter converts known native queue
 unavailability into a pre-send refusal, and its terminal preparation and send
@@ -332,7 +332,7 @@ The controlled case used a task-local executable shim that answers only
 `app-server daemon version` with `{"status":"stopped"}` and forwards everything
 else to the real CLI. The real shared daemon was not stopped or changed.
 
-## #56 — `codex_apps` failed with 401 `token_revoked`
+## #56: `codex_apps` failed with 401 `token_revoked`
 
 The provider's own logs record the failure and when it ended. Times are KST.
 
@@ -444,3 +444,121 @@ run Windows or Linux tests.
 - Agy turn failures other than the quota error. No other `agent executor
   error:` line exists in the logs of this Mac.
 - None of the three issues is closed by this record.
+
+## Source notes: 2026-10-12
+
+These notes preserve details moved from source comments at `cc9df15` during issue #157.
+They are prior source evidence, not new runtime verification.
+
+### `src/native/provider/agy/delivery.rs:14` (before the sweep)
+
+Delivery classification after a paste (issue #43 review):
+
+- delivered: such a receipt line exists after the pre-paste offset. Nothing
+  logged after the receipt revokes it. Agy 1.2.10 logs `Reloading system slash
+  commands and skills` a few milliseconds after `HandleUserInput` and the
+  conversation-start lines (`Starting new conversation`, `Created conversation`):
+  session-udT6uY logged it 15 ms after the receipt (2026-09-24 16:42:50.228), and
+  both delivered live asks of round 7 showed the same. That is the reload the new
+  conversation triggers, not the trust reload, so it is never evidence that the
+  paste was lost. `observe_input_receipt` looks only for the receipt, and
+  `confirm_input_receipt_with` returns on the first read that yields `Delivered`,
+  so a later reload cannot flip a delivered classification;
+- delivery-uncertain: everything else. Non-delivery would have to be proven by a
+  line Agy logs after draining its console input without a receipt, and the real
+  logs contain no such marker (session-fMqSQc, 2026-09-24: after the discarded
+  paste Agy logged only the trust reload and then nothing for a minute), so a
+  missing receipt at the end of the window, a deadline-capped window, an
+  unreadable or missing log, a log shorter than the pre-paste offset (rotated or
+  truncated), and a partial trailing line all stay uncertain and never `not_sent`.
+  The paste is never repeated. A lost paste therefore ends as delivery-uncertain:
+  the launcher keeps the turn claim, leaves the session `working`, and writes the
+  receipt error to `status.error` (`Claim::settle_delivery` for both
+  the initial prompt and `tell`).
+  The caller must inspect that error (or `doctor <session>`) and then close the
+  session with `close-session --explicit` or launch a new one; the bridge never
+  re-pastes or cleans up on its own.
+
+macOS follow-up delivery (iTerm2/Terminal.app paste): the initial prompt is a
+`--prompt-interactive` argument, so the first paste is the first `tell`. Three
+differences from the Windows console:
+
+- The trust evidence is checked at the follow-up, not at launch: the argument
+  prompt completes behind the dialog, so an `ask` in a workspace no provider has
+  approved returns its result while the dialog is still up. Issue #48 was that
+  state: the former 60 s window ended, the paste landed on the dialog, and the
+  receipt check saw only the 356 bytes of the trust reload.
+- There is no deferred-reload window (`MACOS_FOLLOW_UP_READINESS_TIMING`): once the
+  trust evidence holds nothing is pending, and a follow-up in a workspace trusted
+  before launch no longer waits 60 s for a reload that never comes.
+- Agy on macOS logs no `Full redraw completed` line at all (session-QMFk6F and
+  session-7IgCnx, this machine), so the macOS rule does not require the redraw
+  marker. The argument prompt starts a conversation a few seconds after startup,
+  and the `Reloading system slash commands and skills` line a few milliseconds
+  after `Starting new conversation` (7 ms in session-QMFk6F at +2.9 s, 26 ms in
+  session-7IgCnx at +2.7 s) is the conversation reload: an activity line for the
+  quiet period, and never the trust reload on either platform
+  (`CONVERSATION_RELOAD_MAX_LATENCY`).
+
+The receipt is the same Go-quoted `HandleUserInput` line: a multi-line paste
+through iTerm2 is logged as one record with `\n` escapes and the complete marker
+(session-QMFk6F, 21:42:19). It carries the macOS framing header instead of the
+Windows one, and `receipt_matches` accepts either adapter-owned framing.
+
+### `src/native/provider/agy/mod.rs:481` (before the sweep)
+
+Agy logs `HandleUserInput` when it processes the pasted line, not when the console
+receives it, and that processing is slow under load: session-M8QFPp (2026-09-24
+20:37) logged the receipt 18.0 s after the paste, outside the former 15 s window,
+so the adapter reported delivery-uncertain although the paste had landed;
+session-8WjG3m logged it about 10 s after its paste. The receipt is still capped
+by the deadline, and a lost paste still ends as delivery-uncertain, only 45 s
+later than before.
+
+### `src/native/provider/agy/readiness.rs:16` (before the sweep)
+
+A skills reload stamped at most this long after the newest `Starting new
+conversation` line is the reload the new conversation triggers (7 ms and 26 ms
+after it on macOS; 15 ms after the receipt on Windows, session-udT6uY), never the
+trust reload, which follows the Enter that approves the workspace-trust dialog.
+
+### `src/native/provider/agy/readiness.rs:22` (before the sweep)
+
+Trust reload latency after `CLI startup completed`, Agy 1.2.10 on the Windows
+machine, 2026-09-24 KST (the fixtures in the tests):
+
+| session        | latency | window at the time | paste                       |
+|----------------|---------|--------------------|-----------------------------|
+| session-IEKjtC |  9.8 s  | none (fixed 12 s)  | +9.5 s, lost                |
+| session-fMqSQc | 13.0 s  | none (fixed 12 s)  | +12 s, lost                 |
+| session-ql5TVc | 21.4 s  | 20 s               | +20.1 s, lost               |
+| session-Cf1FBY | 36.4 s  | 35 s               | +35 s, lost (heavy CPU load)|
+| session-uqraap | 36.4 s  | 35 s               | +35 s, lost (CPU idle)      |
+| session-IQHEwf | never   | -                  | none (round-1 gate)         |
+
+Nine more logs put it at 12.9 to 13.2 s, about a second after the fixed 12 s
+paste. The reload always trails the paste, whatever the window was: the paste's
+Enter approved the workspace-trust dialog and Agy logged the trust reload, so each
+longer window only moved the loss later, and session-IQHEwf, which pasted nothing,
+never logged it. No window was ever a measured startup latency, and none is left
+(see the note at the head of this section).
+
+A `Reloading system slash commands and skills` line stamped less than this long
+after `CLI startup completed` is the startup reload, not the trust reload. Agy
+logs its startup reload on either side of `CLI startup completed`: 3.5 ms before
+it in session-fMqSQc, 0.5 ms after it in session-udT6uY and 1.6 ms after it in
+session-M8QFPp (2026-09-24 20:37), where the former rule took it for the later
+reload and settled the condition at once. The trust reload follows an Enter on
+the dialog; the earliest one recorded on the Windows console came 9.8 s after
+startup.
+
+## Source notes: 2026-10-12 (Round 2)
+
+These notes preserve prior source evidence omitted in the issue #157 round-1 sweep.
+They are not new runtime verification.
+
+The workspace customization call chain is
+`AddWorkspaceDir -> reloadWorkspaceCustomizations -> ReloadHooks`. It runs after trust
+is established, at startup for an already trusted workspace or after approval in that
+process, and produces the non-main-goroutine hooks-load evidence. Preserved from
+`src/native/provider/agy/trust.rs:12-24` at `cc9df15`.

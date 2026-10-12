@@ -4,18 +4,8 @@ use crate::native::session::primitives::unix_ms;
 use crate::native::session::{CoreRecord, Reader, RecordStore};
 #[cfg(test)]
 use crate::native::terminal::ownership;
-// Native Ghostty scripting (installed dictionary; pinned upstream v1.3.1).
-// Creation runs only the launch host in a clean shell, never Bridge/provider input and
-// never a typed shell line: a key typed into the new surface must not edit the launch.
-// The shell sources the launch command once the host has read its own launch from the
-// bound terminal (`run_host`). An official returned
-// tab plus exclusion from the pre-snapshot and an exact post-snapshot prove ownership.
-// Surface UUID metadata alone is insufficient: empty input must reach a live model
-// before binding. Keep the new selected tab until then; guarded restoration never
-// overrides another selection. No activate/focus command is sent to Ghostty: it takes
-// the foreground by itself for every surface it creates, and FOREGROUND_SCRIPT gives it
-// back to the application that had it, best effort. Real keyboard routing and the model
-// remain a manual runtime gate, not a version promise (upstream #12730).
+// Prove returned-tab ownership and a live input model before binding; keep creation input out of shells.
+// Restore focus only on matching selection; see docs/verification/2026-10-03-v0.1.0-focus.md.
 use super::{
     CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession,
     applescript,
@@ -135,23 +125,8 @@ on run argv
  end tell
 end run
 "#;
-// Ghostty activates itself for every tab and window it creates (v1.3.1,
-// TerminalController.newTab and .newWindow) and its dictionary offers no creation in the
-// background, so the application that was in front gets the foreground back afterwards.
-// The script asks AppKit and sends that application no Apple Event: an Automation consent
-// for every application the user may work in is not acceptable.
-// Without arguments: pid, bundle identifier and start time of the application in front,
-// "-" when that is Ghostty or has no bundle identifier. With the window and tab that
-// Ghostty must show and such an identity: activates that application only while Ghostty is
-// in front with exactly that selection and the pid is still that process. Option 2 is
-// NSApplicationActivateIgnoringOtherApps, which macOS 14 and later ignore.
-// The process is named by its pid and the kernel's start time (`ps`, one second), not by
-// AppKit's launch date: a process started without LaunchServices, as a private WezTerm
-// GUI is, has none. The start time is read while the application object is held, and
-// the pid is resolved once more afterwards: an equal object proves that the pid was this
-// process's the whole time. The object that is activated is the one that was checked,
-// so a pid that changes hands later cannot receive the foreground.
-// Delete this when Ghostty can create a tab or window without activating itself.
+// Restore via the verified AppKit object only while Ghostty owns the expected selection.
+// No per-app Apple Events; remove when background creation exists. See docs/verification/2026-10-03-v0.1.0-focus.md.
 pub(in crate::native) const FOREGROUND_SCRIPT: &str = r#"
 use framework "AppKit"
 use scripting additions
@@ -565,12 +540,8 @@ fn restore(
         );
     }
 }
-// The creation command. Ghostty runs it through `bash -c "exec -l <command>"`
-// (Exec.zig, v1.3.1): it is a program with arguments, not a line that a key can edit.
-// `-f` reads no startup file, as before. `-i` keeps job control, so the wrapper is a
-// foreground job of this shell exactly as when the launch line was typed there. The
-// host prints the script to source only after it has proven its terminal and launch;
-// when it fails the shell ends and nothing was run.
+// Use native command creation and an interactive clean shell for foreground jobs.
+// Source only the host-proven launch; see docs/verification/2026-10-03-v0.1.0-focus.md.
 fn bootstrap(executable: &OsStr) -> Result<String> {
     crate::native::validate_shell_command_component(executable, "Agent Bridge executable")?;
     Ok(format!(
@@ -742,15 +713,8 @@ fn start_bound(
         deadline,
     )
 }
-// The process of the creation command (`native-ghostty-host`). Ghostty gives a child no
-// identity of its terminal: Exec.zig (v1.3.1) sets TERM, COLORTERM, TERMINFO,
-// TERM_PROGRAM, TERM_PROGRAM_VERSION, GHOSTTY_RESOURCES_DIR, GHOSTTY_BIN_DIR and the
-// variables of the creator's own configuration, and none names the surface. The proof
-// is the PTY itself: the launcher addresses the bound terminal by its id, and only the
-// process on that terminal reads the frame. A host on any other terminal gets none and
-// ends. Everything else that was typed is discarded, so no key reaches the launch
-// command or the provider's first dialog. Replace the frame by an identity from the
-// environment when Ghostty provides one.
+// Ghostty supplies no surface identity: prove the bound PTY by its frame and discard other input.
+// Replace with a native identity when available; see docs/verification/2026-10-03-v0.1.0-focus.md.
 pub(in crate::native) fn run_host() -> Result<()> {
     let start = {
         let _raw = RawInput::enter()?;
@@ -925,10 +889,7 @@ fn launch_command(
     command: &str,
     path: Option<&std::ffi::OsStr>,
 ) -> Result<String> {
-    // The clean shell does not load the user's startup files. Carry only the
-    // invoking PATH so /usr/bin/env interpreters of resolved provider executables
-    // remain available. The host hands this private script to its shell, which sources
-    // it; the returned line is what that shell then runs.
+    // Carry PATH for provider shebangs through the clean shell; source only the host's private script.
     let script = directory.join("ghostty-start.sh");
     crate::native::validate_shell_command_component(script.as_os_str(), "Ghostty startup path")?;
     let input = format!(

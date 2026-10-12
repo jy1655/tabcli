@@ -84,7 +84,6 @@ pub(super) trait Host {
     fn socket_server(&self, socket: &str) -> Result<Option<u32>>;
     // The birth of a process, `None` when there is no such process.
     fn process_start(&self, pid: u32) -> Result<Option<(u64, u64)>>;
-    // Asks a process to end.
     fn terminate(&self, pid: u32) -> Result<()>;
     // Removes the socket file of a process that has ended.
     fn remove_socket(&self, socket: &str);
@@ -532,11 +531,8 @@ fn listed(
     Ok(Some(panes))
 }
 
-// A GUI process that ends with its last window leaves its socket file behind. Once the
-// session's process is gone and nothing serves the file, it is removed, as WezTerm's own
-// discovery does (wezterm-client/src/discovery.rs, `discover_gui_socks`). A later process
-// with the same pid may already have bound the same path before it listens; any
-// live process at that pid leaves the socket alone.
+// Remove a dead GUI's socket only when no listener and no live process at its PID remain.
+// A reused PID may have bound the path before listening; see docs/verification/2026-10-03-v0.1.0-focus.md.
 fn forget_socket(host: &dyn Host, mux: &WezTermMux) {
     if mux.owns_gui
         && matches!(host.process_start(mux.pid), Ok(None))
@@ -554,10 +550,8 @@ struct Client {
     focused_pane_id: Option<u64>,
 }
 
-// The pane that the GUI reports as focused, `None` unless exactly its own client says so.
-// The GUI records a pane when it paints it while its window has the keyboard
-// (wezterm-gui/src/termwindow/render/paint.rs). The record of a window in the background
-// is old: it follows neither a new tab nor a tab that another CLI call selected.
+// Only the GUI's painted focus record proves focus; a background window's record is stale.
+// It tracks neither new tabs nor CLI selection in the background; see docs/verification/2026-10-03-v0.1.0-focus.md.
 fn keyboard_pane(host: &dyn Host, mux: &WezTermMux, deadline: Instant) -> Option<u64> {
     let clients = call(
         host,
@@ -575,15 +569,8 @@ fn keyboard_pane(host: &dyn Host, mux: &WezTermMux, deadline: Instant) -> Option
     }
 }
 
-// A new tab is the active tab of its window (mux/src/lib.rs, `spawn_tab_or_window`), and
-// the CLI cannot create one unselected, so in a focused window the keys of the user go to
-// the session's pane (issue #58). The pane that had the keyboard right before the spawn is
-// selected again, on the GUI's own word only: it must report the new pane as focused, which
-// it does only for a window that has the keyboard. Everything else is no authority: a
-// record that stayed (a window in the background, whose selected tab the CLI cannot
-// tell), a pane the user chose meanwhile, a pane that the listing after the spawn no
-// longer shows in its tab and window, a failed read. The selection follows the GUI's
-// answer with no call in between, and nothing here fails the launch.
+// Restore only if the prior pane still occupies its recorded tab/window and the GUI reports the new pane focused.
+// Restore immediately after that observation, with no intervening call; see docs/verification/2026-10-03-v0.1.0-focus.md.
 fn give_keyboard_back(
     host: &dyn Host,
     mux: &WezTermMux,
@@ -803,12 +790,8 @@ fn existing_window(
     Ok(target)
 }
 
-// The program of the session's pane. WezTerm executes these arguments itself (`cli spawn
-// -- PROG`, `start -- PROG`), so no line that the user can type into carries the launch
-// command: a key typed in front of the typed command made it `a. '/…/launch.sh'`, and the
-// provider never started (issue #58, human test of 2026-10-03). A login, interactive zsh
-// keeps the user's PATH and runs the gate and the wrapper as foreground jobs of the shell
-// that sources the launch script, which the owner record of the wrapper requires.
+// Execute the launch as the pane program so typed keys cannot edit it; use login/interactive zsh
+// for PATH and foreground jobs. See docs/verification/2026-10-03-v0.1.0-focus.md.
 fn pane_program(gate: &str, command: &str) -> [String; 5] {
     [
         "/bin/zsh",
@@ -989,13 +972,8 @@ fn require_shared_pane(
     Ok(())
 }
 
-// The first command of the session's pane (`pane_program`). The pane exists before the
-// launcher knows its id, so the wrapper may start only once the launcher has bound exactly
-// this pane: the handle must name the pane and the GUI socket that the mux itself gave this
-// process (`WEZTERM_PANE`, `WEZTERM_UNIX_SOCKET`; mux/src/domain.rs, `build_command`, set
-// after the user's configured environment). It waits on the receipt, the claim and the
-// status that every launch has and keeps no record of its own. A launch that failed or
-// timed out never falls back to typed input.
+// Wait for the receipt/claim/status to bind the pane and socket supplied by the mux itself.
+// Failure or timeout never falls back to typed input; see docs/verification/2026-10-03-v0.1.0-focus.md.
 pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(directory)
         .with_context(|| format!("no WezTerm launch directory {}", directory.display()))?;

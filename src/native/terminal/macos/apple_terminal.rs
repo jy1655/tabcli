@@ -26,46 +26,8 @@ use super::{
     applescript, applescript::close_response,
 };
 
-// Ownership of the new window is proven by the tty of the tab that `do script`
-// returned: exactly one window must hold a tab with that tty. Only windows that did
-// not exist before the run are candidates, because a tty name alone is not unique
-// over time. A window whose shell ended while a close confirmation was pending keeps
-// reporting its old tty name after Terminal has released it, and the next tab
-// receives the same name (2026-10-01, session-y5Wpkl: the proof matched the new
-// window and that stale one, the launch failed, and the new window stayed open
-// without an owner). A window list that could not be read before the run excludes
-// nothing, which is the former rule.
-//
-// Terminal keeps a window that it has closed in its window list, without tabs and off
-// the screen, until it releases the object, and making a window frontmost shows it
-// (Terminal 2.15: `setScriptFrontmost:` sends `makeKeyAndOrderFront:`). With no other
-// window, the window of the session closed before is `window 1`, and giving the
-// keyboard back to it put it on the screen again, empty (2026-10-03: window 12678 read
-// not visible before this script ran and visible after it; the user had seen window
-// 12064 return that day after each of the next two launches, issue #64). The keyboard
-// therefore goes back only to a window that is visible.
-//
-// Terminal starts a command in a tab only by typing it (Terminal 2.15, read from the
-// binary on 2026-10-03). `do script X in tab` writes X and a carriage return to the
-// tab's PTY. `do script X` without a target puts X and a line feed into the write
-// buffer of the tab it creates, before the window is shown. A key typed into the new
-// window is queued behind that text until Terminal knows the shell's process, and is
-// written in front of it from then until Terminal writes the buffer, on the first
-// output it decodes while the shell is in the foreground. An empty creation and a
-// start command typed after the binding left an editable line in between: a key that
-// reached the new window while it had the keyboard became the start of the command
-// (2026-10-03, session-t9E3YV: `a. '<...>/launch.sh'`, `zsh: command not found: a.`,
-// issue #58).
-//
-// The creation text is therefore the whole start: one short line that sources the
-// session's bootstrap, with the tty's line kill (U+0015) in front. The PTY of a new
-// tab is canonical with the kernel's control characters (lflag 0x5cb, kill ^U) until
-// a shell changes that, so the kernel discards a key that Terminal wrote in front,
-// and the default line editors of zsh and bash discard ordinary text in insertion
-// mode. A prefix or quote key just before it (Escape or Ctrl-V), or a remapped line
-// kill, can defeat this and leave the start unexecuted. Text already followed by
-// Enter is a command line of its own; nothing typed can take it back. Replace the
-// typed start when Terminal can create a tab that runs a command.
+// Bind only one new window with the returned tty; restore only visible windows.
+// Start with line-kill plus the whole bootstrap; see docs/verification/2026-10-03-v0.1.0-focus.md.
 pub(in crate::native) const OPEN_TAB_SCRIPT: &str = r#"
 on soleNewWindowWithTty(windowTtys, priorWindowIds, wantedTty)
     set matchedWindowId to missing value
@@ -194,13 +156,8 @@ on run argv
 end run
 "#;
 
-// Bridge kills the shell before it closes the window, and a tab whose shell was killed
-// can report its tty followed by U+0001 (2026-10-01, Terminal.app 2.15, windows 8341
-// and 8345 in docs/verification/2026-10-01-terminal-proof.md). An exact comparison
-// takes that tab for a missing one and reports the close as done without closing it.
-// The window is missing only when Terminal is not running or its own window list, read
-// without error, lacks it; a window that holds no tab of this tty has changed, it is not
-// absent. The running check launches nothing, unlike an event sent to a stopped Terminal.
+// A killed shell can leave U+0001 after its tty; only a successful window-list read proves absence.
+// See docs/verification/2026-10-01-terminal-proof.md.
 pub(in crate::native) const CLOSE_TAB_SCRIPT: &str = r#"
 on isOwnedTty(reportedTty, wantedTty)
     return reportedTty is wantedTty or reportedTty is (wantedTty & (character id 1))
@@ -244,18 +201,8 @@ on run argv
 end run
 "#;
 
-// Without a successful close in this transaction, only Terminal's window list can
-// prove the window missing. The tty changes when the shell ends even if the window
-// stays on the screen, so it cannot prove absence.
-//
-// Terminal can keep listing a window that it has closed: closing removes the window's
-// tabs and takes it off the screen, and the object stays in the list until Terminal
-// releases it (2026-10-03: windows 12064, 12674, 12678 and 12679 read listed, without
-// tabs and not visible after their close, 12064 for minutes; the second close then
-// failed with `no longer holds its tab`). The close that has just closed the recorded
-// window passes the close script's reply as the third argument, and only then is such
-// a window answered as `closed`. A window on the screen or with a tab is present, and
-// so is every window that this transaction did not close.
+// Only this transaction's successful close can accept an invisible, tabless listed window.
+// Otherwise require absence from the list; see docs/verification/2026-10-03-v0.1.0-focus.md.
 pub(in crate::native) const WAIT_FOR_CLOSE_SCRIPT: &str = r#"
 on run argv
     set wantedWindowId to item 1 of argv as integer
@@ -321,11 +268,8 @@ fn launch_bootstrap(command: &str, directory: &Path) -> Result<String> {
     install_bootstrap(directory, &host, command)
 }
 
-// The typed line stays short (#50) and names a private file. The tab's own shell
-// sources it, so the gate and the wrapper are two jobs of that shell and the wrapper
-// keeps the shell as its parent and a foreground group of its own. A refused gate
-// stops the bootstrap before the wrapper. A zsh with running or suspended jobs can
-// refuse exit and return to its prompt; the failed launch keeps its close proof.
+// Source a short private bootstrap so gate and wrapper keep distinct foreground jobs.
+// A zsh that refuses exit can leave a prompt; retain the failed launch's close proof.
 fn install_bootstrap(directory: &Path, host: &str, command: &str) -> Result<String> {
     let path = Reader::open_unchecked(directory)
         .private(BOOTSTRAP_FILE)
@@ -338,11 +282,8 @@ fn install_bootstrap(directory: &Path, host: &str, command: &str) -> Result<Stri
     ))
 }
 
-// The start is typed when the tab is created, before the launcher knows the tty that
-// Terminal gave it. The launch receipt and the atomic surface binding that already
-// exist are the gate: the wrapper starts only after the launcher has given the
-// keyboard back and bound this exact tty, and a launch that failed, was closed or
-// timed out starts nothing.
+// The typed start precedes tty discovery; wait for restored focus and the exact tty binding.
+// A failed, closed or timed-out launch must start nothing.
 pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
     let metadata = std::fs::symlink_metadata(directory)
         .with_context(|| format!("failed to inspect {}", directory.display()))?;
@@ -598,9 +539,8 @@ pub(in crate::native) fn verified_close_tty(
     ADAPTER.verify_tab_with_deadline(session, Some(deadline))
 }
 
-// A record of 0.0.10 or earlier names no app incarnation. While its owner is live and
-// verified, the incarnation is the one that owner runs in. It is recorded before the
-// close intent, so that the intent and every retry carry it.
+// Without a recorded app incarnation, attest the live owner and persist its incarnation
+// before close intent so every retry carries it.
 #[cfg(target_os = "macos")]
 pub(in crate::native) fn record_legacy_terminal_app(
     directory: &Path,
@@ -728,14 +668,8 @@ pub(in crate::native) fn terminal_app_alive_with(
     }
 }
 
-// Whether the recorded Terminal.app window is proven gone, by reading only. With the app
-// incarnation that created it: that process ended, or its window list lacks the window.
-// A record without one (a start that failed before the wrapper recorded it, or an owner
-// record of 0.0.10 and earlier) cannot tie a reply to an incarnation, so the reply
-// counts only when no second instance can have given it: at most one Terminal process
-// runs, the same before and after. A window list that lacks the id then proves the
-// window gone whichever incarnation created it. A listed id proves nothing: a restarted
-// Terminal can reuse it. Nothing here closes or signals.
+// Without an incarnation, require at most one unchanged Terminal process and an absent id.
+// A listed id can be reused; see docs/verification/2026-10-03-v0.1.0-focus.md.
 #[cfg(target_os = "macos")]
 pub(in crate::native) fn terminal_surface_absent(
     app: Option<&MacTerminalAppIdentity>,

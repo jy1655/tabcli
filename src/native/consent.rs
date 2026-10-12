@@ -485,14 +485,8 @@ fn complete_launch_dialog(
     )
 }
 
-// Native Windows paste must not select a workspace-trust button. A provider
-// adapter calls this only where its official input API/startup event is absent.
-//
-// The store's exact entry is not the only way a provider gets past its trust dialog:
-// Codex takes the trust of a subdirectory or a linked worktree from the repository
-// root, shows no dialog there and saves no exact entry, so a wait for that entry never
-// ended (issue #60). `ready` is the adapter's own evidence that the provider now takes
-// input. It never widens workspace consent, which stays exact.
+// A provider's positive input-readiness evidence may open the paste gate without exact stored trust.
+// It never widens shared consent; see AGENTS.md, Trust Store Boundary.
 pub(super) fn wait_for_native_trust(
     directory: &Path,
     target: FirstPartyCli,

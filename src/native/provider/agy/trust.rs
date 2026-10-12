@@ -9,24 +9,8 @@ use anyhow::{Result, bail};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-// The trust evidence a paste needs (issue #48): Agy's trust store lists the exact
-// workspace, and this session's own log shows that this Agy process loaded the
-// workspace customizations. The store alone is shared by every Agy process: a
-// dialog approved in one session leaves the dialog of another session of the same
-// workspace open (session-UuYk87, 2026-10-01: store entry present, dialog still on
-// screen for five seconds until it was approved there too). Agy loads the
-// customizations only once it trusts the workspace, at startup when the store
-// already lists it or when the dialog is approved in that process (`AddWorkspaceDir`
-// -> `reloadWorkspaceCustomizations` -> `ReloadHooks`), and either way a goroutine
-// other than the main one logs a `hooks_manager.go` line; the main goroutine logs
-// the only other one while the store manager is built. In 112 logs of Agy 1.2.6 to
-// 1.2.14 on macOS and in the Windows fixtures of the tests, every delivered paste
-// follows such a line and no session with its dialog still open has one.
-//
-// A log without the line withholds the paste but does not prove an open dialog: the
-// log can be missing, or cut before the line, in a session that has none. The
-// reports therefore state what was read, and the recovery is conditional on what the
-// managed terminal shows.
+// Require exact stored trust and this process's non-main hooks load; shared trust alone is insufficient.
+// A missing line does not prove a dialog; see docs/verification/2026-10-01-bug-triage.md.
 
 const TRUST_SESSION_UNVERIFIED: &str = "Agy's trust store lists the workspace, but this session's agy.log does not show that this session loaded the workspace customizations (no `hooks_manager.go` line outside the main goroutine), so its own trust dialog may still be open";
 
@@ -45,13 +29,8 @@ pub(super) fn workspace_customizations_loaded(log: &[u8]) -> bool {
     })
 }
 
-// Waits until `missing` reports nothing missing. An absent entry, a session whose
-// log lacks the load, an unreadable store or log, and a lookup error all keep
-// waiting, since none proves the dialog is gone: a human approves it in the managed
-// terminal, or shared consent answered it at launch. The deadline ends the wait as
-// `not_sent`, before any terminal input, and so does a session that has ended
-// (`ended` names its state): it has no terminal left to paste into, and the launcher
-// of a closed session went on waiting until its deadline (issue #60).
+// Missing or unreadable trust evidence keeps waiting; timeout or session end returns not_sent.
+// Never paste into an ended session or infer consent from a failed lookup.
 fn wait_for_workspace_trust_with<T, C>(
     missing: &mut T,
     ended: &mut dyn FnMut() -> Option<String>,
