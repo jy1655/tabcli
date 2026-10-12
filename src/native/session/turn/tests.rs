@@ -964,14 +964,14 @@ fn close_during_turn_claim_cannot_resurrect_the_session() {
             || {},
             || {
                 claimed_tx.send(()).unwrap();
-                continue_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                continue_rx.recv().unwrap();
                 Ok(())
             },
             || {},
             &[],
         )
     });
-    claimed_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    claimed_rx.recv().unwrap();
 
     mark_session_closed(directory.path(), None).unwrap();
     continue_tx.send(()).unwrap();
@@ -1002,12 +1002,12 @@ fn close_cannot_interleave_between_ready_validation_and_claimed_publication() {
             || Ok(()),
             || {
                 publish_tx.send(()).unwrap();
-                continue_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+                continue_rx.recv().unwrap();
             },
             &[],
         )
     });
-    publish_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    publish_rx.recv().unwrap();
     let close_directory = directory.path().to_owned();
     let close = thread::spawn(move || mark_session_closed(&close_directory, None));
 
