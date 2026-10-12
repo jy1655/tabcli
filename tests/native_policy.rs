@@ -1014,6 +1014,77 @@ esac
 }
 
 #[test]
+fn readme_install_section_names_the_cargo_version() {
+    let readme =
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+            .unwrap();
+    let mut lines = readme.lines().enumerate();
+    assert!(lines.any(|(_, line)| line == "## Install"));
+    let mut archives = 0;
+    let mut tags = 0;
+    for (line_index, line) in lines.take_while(|(_, line)| !line.starts_with("## ")) {
+        // Scan three numeric components at word boundaries, allowing a tag's leading `v`.
+        for (start, character) in line.char_indices() {
+            if !character.is_ascii_digit() {
+                continue;
+            }
+            let before = &line[..start];
+            let is_tag = before.ends_with("--tag v");
+            if !is_tag
+                && before
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            let tail = &line[start..];
+            let mut end = 0;
+            for component in 0..3 {
+                if component > 0 {
+                    if tail.as_bytes().get(end) != Some(&b'.') {
+                        break;
+                    }
+                    end += 1;
+                }
+                let digits = tail[end..].bytes().take_while(u8::is_ascii_digit).count();
+                if digits == 0 {
+                    break;
+                }
+                end += digits;
+                if component != 2
+                    || tail[end..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                let version = &tail[..end];
+                // Only this minimum-toolchain phrase is exempt, not every 1.97.1.
+                if before.ends_with("Rust ")
+                    && version == "1.97.1"
+                    && tail[end..].starts_with(" or newer")
+                {
+                    continue;
+                }
+                assert_eq!(
+                    version,
+                    env!("CARGO_PKG_VERSION"),
+                    "README.md:{}: Install version {version} differs from Cargo",
+                    line_index + 1
+                );
+                archives +=
+                    usize::from(before.ends_with("tabcli-") && tail[end..].starts_with('-'));
+                tags += usize::from(is_tag);
+            }
+        }
+    }
+    assert!(archives > 0, "README Install must name a versioned archive");
+    assert!(tags > 0, "README Install must name a versioned --tag");
+}
+
+#[test]
 fn public_identity_in_version_and_help() {
     assert_eq!(agent_bridge::PUBLIC_COMMAND, "tabcli");
     for (flag, expected) in [
