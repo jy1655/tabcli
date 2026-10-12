@@ -231,7 +231,7 @@ fn process_identity_rejects_reused_pid_creation_time() {
 
 #[test]
 fn verified_control_handle_retains_the_exact_process_object_after_exit() {
-    let mut child = std::process::Command::new("powershell.exe")
+    let mut child = std::process::Command::new(super::powershell_executable().unwrap())
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -380,8 +380,7 @@ fn private_acl_is_one_protected_current_user_entry() {
 
 #[test]
 fn close_deadline_console_helper_is_bounded() {
-    let powershell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let powershell = super::powershell_executable().unwrap();
     let mut command = std::process::Command::new(&powershell);
     command.args([
         "-NoProfile",

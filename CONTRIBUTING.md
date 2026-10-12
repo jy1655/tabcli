@@ -30,6 +30,11 @@ for the full rules and use the names in [CONTEXT.md](CONTEXT.md) when describing
 You need Rust 1.97.1 or newer, Cargo, Clippy, and rustfmt. [Cargo.toml](Cargo.toml) declares
 1.97.1 as the minimum supported Rust version; CI also checks stable Rust.
 
+The ordinary unit tests also require Node.js (`node` on `PATH`) to run the real Pi extension
+through its test harness. Without Node.js, that test fails with an explicit prerequisite error.
+On native Windows, the unit tests require PowerShell 7 (`pwsh.exe`) on an absolute `PATH`
+entry, as managed sessions do.
+
 Use macOS or native Windows to develop and exercise managed sessions. Linux can run the
 platform-independent checks; Linux managed sessions are not supported.
 For live work, install and authenticate the provider CLI and install the terminal application
