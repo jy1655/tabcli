@@ -5,6 +5,11 @@ a provider in a visible terminal surface. Report the two separately.
 
 ## Automated checks
 
+The ordinary unit tests require Node.js (`node` on `PATH`) to run the real Pi extension
+through its test harness. Without Node.js, that test fails with an explicit prerequisite error.
+On native Windows, the unit tests also require PowerShell 7 (`pwsh.exe`) on an absolute `PATH`
+entry, as managed sessions do.
+
 Run the required local checks from the repository root:
 
 ```sh
