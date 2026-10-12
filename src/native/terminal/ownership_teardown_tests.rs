@@ -724,7 +724,9 @@ fn close_deadline_shared_observations_policy_adapter_and_retry() {
 
 #[test]
 fn close_deadline_after_signal_eperm_does_not_prove_exit() {
-    let deadline = Instant::now() + Duration::from_millis(10);
+    let now = Instant::now();
+    let clock = crate::native::session::close::budget::TestCloseClock::new(now);
+    let deadline = now + Duration::from_secs(1);
     let signals = Cell::new(0);
     let result = terminate_owned_foreground_group_until_with_io(
         4242,
@@ -732,9 +734,8 @@ fn close_deadline_after_signal_eperm_does_not_prove_exit() {
         |_, signal| {
             if signal == libc::SIGTERM {
                 signals.set(signals.get() + 1);
-                std::thread::sleep(
-                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
-                );
+                // Expire only after SIGTERM, independent of host scheduling.
+                clock.set(deadline);
                 Ok(())
             } else {
                 Err(std::io::Error::from_raw_os_error(libc::EPERM))
