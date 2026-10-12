@@ -775,9 +775,21 @@ fn terminal_command_line(
 // The environment of this process, as a block for `CreateProcessW`, with the attempt
 // marker set to `attempt` or absent. The names are sorted without regard to case, as the
 // system expects of a block.
-fn environment_block(attempt: Option<&str>) -> Vec<u16> {
-    let mut variables = std::env::vars_os()
-        .filter(|(name, _)| !name.eq_ignore_ascii_case(ATTEMPT_ENV))
+pub(super) fn environment_block(attempt: Option<&str>) -> Vec<u16> {
+    environment_block_from(std::env::vars_os(), attempt)
+}
+
+fn environment_block_from(
+    variables: impl IntoIterator<Item = (OsString, OsString)>,
+    attempt: Option<&str>,
+) -> Vec<u16> {
+    let mut variables = variables
+        .into_iter()
+        .filter(|(name, _)| {
+            !name.eq_ignore_ascii_case(ATTEMPT_ENV)
+                && !crate::native::process_env::non_provider_removals()
+                    .any(|removal| name.eq_ignore_ascii_case(removal))
+        })
         .map(|(name, value)| (name.to_string_lossy().to_uppercase(), (name, value)))
         .collect::<BTreeMap<_, _>>();
     if let Some(attempt) = attempt {
@@ -791,6 +803,9 @@ fn environment_block(attempt: Option<&str>) -> Vec<u16> {
         block.extend(name.encode_wide());
         block.push(u16::from(b'='));
         block.extend(value.encode_wide());
+        block.push(0);
+    }
+    if block.is_empty() {
         block.push(0);
     }
     block.push(0);
@@ -1510,15 +1525,58 @@ mod tests {
         assert_eq!(locate_windows_terminal(&missing), None);
     }
 
+    fn names(block: &[u16]) -> Vec<String> {
+        block
+            .split(|unit| *unit == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(String::from_utf16_lossy)
+            .collect()
+    }
+
+    #[test]
+    fn environment_block_removes_caller_context_and_preserves_other_values() {
+        let mut variables: Vec<_> = crate::native::process_env::non_provider_removals()
+            .flat_map(|name| [name.to_owned(), name.to_ascii_lowercase()])
+            .map(|name| (OsString::from(name), OsString::from("caller-sentinel")))
+            .collect();
+        for (name, value) in [
+            ("Agent_Bridge_Console_Host_Attempt", "old-attempt"),
+            ("PATH", "C:\\tools"),
+            ("CODEX_HOME", "C:\\codex"),
+            ("CLAUDE_CODE_EFFORT_LEVEL", "high"),
+            ("CLAUDE_PLUGIN_DATA", "plugin-data"),
+            ("AGENT_BRIDGE_BATCH_ARG_0", "argument"),
+        ] {
+            variables.push((name.into(), value.into()));
+        }
+        let expected = vec![
+            "AGENT_BRIDGE_BATCH_ARG_0=argument",
+            "CLAUDE_CODE_EFFORT_LEVEL=high",
+            "CLAUDE_PLUGIN_DATA=plugin-data",
+            "CODEX_HOME=C:\\codex",
+            "PATH=C:\\tools",
+        ];
+        assert_eq!(
+            names(&environment_block_from(variables.clone(), None)),
+            expected
+        );
+        let marked = names(&environment_block_from(variables, Some("new-attempt")));
+        let mut expected_marked = expected;
+        expected_marked.insert(1, "AGENT_BRIDGE_CONSOLE_HOST_ATTEMPT=new-attempt");
+        assert_eq!(marked, expected_marked);
+    }
+
+    #[test]
+    fn empty_environment_blocks_are_double_nul_terminated() {
+        assert_eq!(environment_block_from([], None), [0, 0]);
+        let removed = crate::native::process_env::non_provider_removals()
+            .chain([ATTEMPT_ENV])
+            .map(|name| (name.into(), "caller-sentinel".into()));
+        assert_eq!(environment_block_from(removed, None), [0, 0]);
+    }
+
     #[test]
     fn the_attempt_marker_reaches_only_windows_terminal() {
-        fn names(block: &[u16]) -> Vec<String> {
-            block
-                .split(|unit| *unit == 0)
-                .filter(|entry| !entry.is_empty())
-                .map(String::from_utf16_lossy)
-                .collect()
-        }
         let marked = names(&environment_block(Some("attempt-6")));
         assert!(marked.contains(&format!("{ATTEMPT_ENV}=attempt-6")));
         let plain = names(&environment_block(None));

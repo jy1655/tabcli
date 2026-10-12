@@ -168,6 +168,16 @@ avoids relying on the currently displayed agent thread, but manual agent-picker 
 additional TUI input have separate verification limits (#57, #65). Consult
 [provider documentation](providers.md) before mixing manual input with Bridge requests.
 
+Windows launches remove adapter-owned caller-session markers and Bridge's inherited state
+root, session directory, session id and executable from `wt.exe`, its tab host, both
+PowerShell roots and helpers. The tab host receives only the new attempt marker from this
+context. The bootstrap sets the selected state root for the wrapper; the wrapper supplies
+its new session directory, id and executable to the provider and its hooks. Console control
+helpers explicitly receive the selected state root. These Bridge variables in a managed
+provider are expected; their values must describe the new session. This does not remove
+all Claude configuration or plugin context, or retroactively clean an existing terminal
+application's environment. Restart an already contaminated terminal application.
+
 ## Ownership and close
 
 Open sessions, including finished sessions that were not closed, load the terminal. For bulk

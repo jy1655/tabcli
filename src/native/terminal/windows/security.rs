@@ -2,7 +2,6 @@ use std::{
     ffi::OsStr,
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use anyhow::{Context, Result, bail};
@@ -23,7 +22,7 @@ pub(in crate::native::terminal) fn set_private_permissions(
 ) -> Result<()> {
     let system_directory = system_directory()?;
     let whoami = system_directory.join("whoami.exe");
-    let whoami_output = Command::new(&whoami)
+    let whoami_output = crate::native::process_env::helper_command(&whoami)
         .args(["/user", "/fo", "csv", "/nh"])
         .output()
         .with_context(|| {
