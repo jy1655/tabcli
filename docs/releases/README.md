@@ -6,6 +6,7 @@ Older notes retain their own requirements and limitations; use the
 [providers](../providers.md) and [terminals](../terminals.md) pages for current behavior.
 Each note separates live checks from automated tests.
 
+- [0.4.8](0.4.8.md) (2026-10-12): A Codex Windows console paste keeps its line feeds; non-provider children on native Windows drop the caller's session markers; the README Install section is pinned to the Cargo version; the hand-off tests wait for the other thread.
 - [0.4.7](0.4.7.md) (2026-10-12): `sessions` counts published Results; one state-root enumeration; the AppleScript adapters get an observable automation seam; the bounded command runner, the result-timeout diagnostic and the Windows console-control action are typed and placed. Closes architecture review 5.
 - [0.4.6](0.4.6.md) (2026-10-12): Adapters declare the launch-trust, binding and terminal facts the shared modules branched on; each macOS adapter owns its operation set; the JSON envelope has one home. No output change.
 - [0.4.5](0.4.5.md) (2026-10-12): Declares close evidence per terminal adapter, splits the Agy adapter into modules, and names the turn claim's launch phases; no behaviour change.
