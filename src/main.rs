@@ -337,9 +337,21 @@ mod tests {
 
     #[test]
     fn help_output_matches_exact_bytes_including_println_newline() {
+        let help = help_text();
+        let prefix = format!("tabcli {}", env!("CARGO_PKG_VERSION"));
+        assert!(help.lines().next().unwrap().starts_with(&prefix));
+        // The fixture uses <version> so releases never need to edit it.
+        let normalize = |text: &str| {
+            let (first, rest) = text.split_once('\n').unwrap();
+            let first = first.strip_prefix(&prefix).map_or_else(
+                || first.to_owned(),
+                |suffix| format!("tabcli <version>{suffix}"),
+            );
+            format!("{first}\n{rest}")
+        };
         assert_eq!(
-            format!("{}\n", help_text()).as_bytes(),
-            include_bytes!("../tests/fixtures/help.txt")
+            normalize(&format!("{help}\n")).as_bytes(),
+            normalize(include_str!("../tests/fixtures/help.txt")).as_bytes()
         );
     }
 
