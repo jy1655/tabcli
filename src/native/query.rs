@@ -19,6 +19,8 @@ use serde_json::{Value, json};
 
 pub(super) mod observation;
 pub(super) mod status;
+#[cfg(test)]
+mod test_support;
 mod timeline;
 pub(super) mod wait;
 #[cfg(test)]

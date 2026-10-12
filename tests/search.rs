@@ -1,3 +1,6 @@
+mod support;
+use support::{entries, manifest, status, success, write};
+
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -33,19 +36,16 @@ impl Fixture {
         fs::create_dir(directory.join("events")).unwrap();
         write(
             &directory.join("manifest.json"),
-            &json!({
-                "schema": 1, "id": id, "provider": provider, "provider_path": provider,
-                "provider_version": "1.0.0", "workspace": workspace, "title": format!("{id} title"),
-                "model": null, "effort": null, "yolo": false, "created_unix_ms": 1
-            }),
+            &manifest(
+                id,
+                provider,
+                provider.as_ref(),
+                "1.0.0",
+                workspace,
+                &format!("{id} title"),
+            ),
         );
-        write(
-            &directory.join("status.json"),
-            &json!({
-                "state": "ready", "generation": 2, "updated_unix_ms": 2,
-                "exit_code": null, "error": null
-            }),
-        );
+        write(&directory.join("status.json"), &status("ready", 2, None));
         directory
     }
 
@@ -85,8 +85,14 @@ impl Fixture {
 }
 
 fn event(directory: &Path, name: &str, text: &str, created_unix_ms: u64) -> Value {
-    let event = json!({ "provider": "claude", "message": text, "error": null,
-        "provider_session_id": "native-session", "turn_id": name, "created_unix_ms": created_unix_ms });
+    let event = support::event(
+        "claude",
+        "native-session",
+        name,
+        text,
+        None,
+        created_unix_ms,
+    );
     write(&directory.join("events").join(name), &event);
     event
 }
@@ -96,38 +102,8 @@ fn receipt(directory: &Path, claim: &str, id: &str, event: &str) {
     fs::create_dir_all(&requests).unwrap();
     write(
         &requests.join(format!("{claim}.json")),
-        &json!({
-            "schema": 1, "request_id": id, "claim_token": claim,
-            "event_file": event, "created_unix_ms": 3
-        }),
+        &support::receipt(id, claim, event),
     );
-}
-
-fn write(path: &Path, value: &Value) {
-    fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
-}
-
-fn success(output: Output) -> Value {
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
-}
-
-fn files(directory: &Path) -> Vec<(PathBuf, Vec<u8>)> {
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(directory).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_dir() {
-            entries.extend(files(&entry.path()));
-        } else {
-            entries.push((entry.path(), fs::read(entry.path()).unwrap()));
-        }
-    }
-    entries.sort();
-    entries
 }
 
 fn sessions(value: &Value) -> Vec<&str> {
@@ -288,7 +264,7 @@ fn pending_claimed_and_failed_events_are_not_results() {
         }),
     );
     event(&a, "event-4.json", "published text", 6);
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
 
     let found = fixture.search(&["text"]);
     let hits = found["hits"].as_array().unwrap();
@@ -321,7 +297,7 @@ fn pending_claimed_and_failed_events_are_not_results() {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -356,7 +332,7 @@ fn corrupt_records_make_the_search_incomplete_without_hiding_valid_hits() {
         4,
     );
     fs::write(broken.join("manifest.json"), "broken manifest").unwrap();
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
 
     let found = fixture.search(&["needle"]);
     assert_eq!(found["ok"], true);
@@ -371,7 +347,7 @@ fn corrupt_records_make_the_search_incomplete_without_hiding_valid_hits() {
             .iter()
             .any(|reason| reason["session"] == "session-broken")
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
 
     // Zero hits in an incomplete scan is never presented as "no results".
     let text = fixture.run(&["search", "absent"]);
@@ -387,7 +363,7 @@ fn busy_session_is_reported_as_incomplete_not_empty() {
     let fixture = Fixture::new();
     let a = fixture.session("session-a", "claude", &fixture.workspace_a);
     event(&a, "event-1.json", "locked needle", 3);
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
     let lock_path = a.join("turn.claim.lock");
     let lock = fs::File::create(&lock_path).unwrap();
     lock.lock().unwrap();
@@ -406,7 +382,7 @@ fn busy_session_is_reported_as_incomplete_not_empty() {
     // Windows locks are mandatory, so release the fixture's own lock before comparing.
     drop(lock);
     fs::remove_file(&lock_path).unwrap();
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -609,7 +585,7 @@ fn corrupt_receipts_make_the_index_incomplete_and_suppress_legacy_hits() {
     // A fully readable index still reports legacy events.
     let legacy = fixture.session("session-legacy", "claude", &fixture.workspace_a);
     event(&legacy, "event-1.json", "needle legacy", 6);
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
 
     let found = fixture.search(&["needle"]);
     assert_eq!(found["incomplete"], true, "{found}");
@@ -635,7 +611,7 @@ fn corrupt_receipts_make_the_index_incomplete_and_suppress_legacy_hits() {
     assert!(reasons_for(&found, Some("session-legacy")).is_empty());
     // Skipped events are not counted as examined.
     assert_eq!(found["scanned"]["events"], 2);
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -644,7 +620,7 @@ fn unreadable_request_directory_is_reported_not_treated_as_legacy() {
     let a = fixture.session("session-a", "claude", &fixture.workspace_a);
     event(&a, "event-1.json", "needle without an index", 3);
     fs::write(a.join("requests"), "not a directory").unwrap();
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
 
     let found = fixture.search(&["needle"]);
     assert_eq!(found["incomplete"], true, "{found}");
@@ -659,7 +635,7 @@ fn unreadable_request_directory_is_reported_not_treated_as_legacy() {
         reasons[0]
     );
     assert!(reasons[0].ends_with("1 event(s) without a readable receipt skipped"));
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -676,7 +652,7 @@ fn byte_budget_is_checked_before_an_event_is_read() {
     );
     let big_len = serde_json::to_vec_pretty(&big).unwrap().len();
     assert!(big_len > small_len * 2);
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
 
     // Alone, an event larger than the whole budget is never read and stops the scan even
     // though it is the last event.
@@ -712,7 +688,7 @@ fn byte_budget_is_checked_before_an_event_is_read() {
     let found = fixture.search(&["needle", "--max-bytes", &exact]);
     assert_eq!(found["incomplete"], false, "{found}");
     assert_eq!(found["hits"].as_array().unwrap().len(), 2);
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
 
     let text = fixture.run(&["search", "needle", "--max-bytes", &budget]);
     assert!(text.status.success());
@@ -748,7 +724,7 @@ fn damaged_session_directories_are_incomplete_not_empty() {
     fs::create_dir(manifest_dir.join("manifest.json")).unwrap();
     let healthy = fixture.session("session-ok", "claude", &fixture.workspace_a);
     event(&healthy, "event-1.json", "needle healthy", 5);
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
 
     let found = fixture.search(&["needle"]);
     assert_eq!(found["ok"], true);
@@ -774,7 +750,7 @@ fn damaged_session_directories_are_incomplete_not_empty() {
     assert_eq!(manifest.len(), 1, "{found}");
     assert!(manifest[0].contains("manifest.json"), "{}", manifest[0]);
     assert!(reasons_for(&found, Some("session-ok")).is_empty());
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
 
     let text = fixture.run(&["search", "absent"]);
     assert!(text.status.success());
@@ -876,8 +852,8 @@ fn linked_manifest_and_requests_directory_are_refused_not_followed() {
     );
     symlink(&external_requests, c.join("requests")).unwrap();
 
-    let before_b = files(&b);
-    let before_c = files(&c.join("events"));
+    let before_b = entries(&b);
+    let before_c = entries(&c.join("events"));
     let found = fixture.search(&["needle"]);
     assert_eq!(sessions(&found), ["session-a"], "{found}");
     assert!(
@@ -897,8 +873,8 @@ fn linked_manifest_and_requests_directory_are_refused_not_followed() {
             && c_reasons.contains("1 event(s) without a readable receipt skipped"),
         "{c_reasons}"
     );
-    assert_eq!(files(&b), before_b);
-    assert_eq!(files(&c.join("events")), before_c);
+    assert_eq!(entries(&b), before_b);
+    assert_eq!(entries(&c.join("events")), before_c);
     assert!(
         fs::symlink_metadata(c.join("requests"))
             .unwrap()

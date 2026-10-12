@@ -2174,29 +2174,11 @@ mod tests {
     // A session directory as the launcher leaves it before it opens the surface:
     // launching, claimed, with a pending launch receipt.
     fn launch_fixture() -> tempfile::TempDir {
-        use crate::native::{launch, update_status};
-        use std::os::unix::fs::PermissionsExt;
-        let directory = tempfile::Builder::new()
-            .prefix("session-ghostty-")
-            .tempdir()
-            .unwrap();
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), SessionState::Launching, None, None).unwrap();
-        let claim = crate::native::session::turn::claim(
-            &crate::native::session::Store::open_unchecked(directory.path()),
-            &[],
+        super::super::test_support::launch_fixture(
+            "session-ghostty-",
+            std::time::Duration::from_secs(8),
+            &std::env::temp_dir(),
         )
-        .unwrap();
-        let token = claim.token().to_owned();
-        claim.retain();
-        launch::begin(
-            &crate::native::session::Store::open_unchecked(directory.path()),
-            &token,
-            Instant::now() + Duration::from_secs(8),
-        )
-        .unwrap();
-        directory
     }
     // The launcher's atomic binding of the surface that the creation returned.
     fn bind_fixture(directory: &Path, handle: &TerminalSession) {

@@ -1,20 +1,7 @@
 use super::*;
+use crate::native::query::test_support::entries;
 use crate::native::session::{Reader, Store, turn};
 use crate::native::{doctor, session, tests::seed_close_fixture};
-
-fn bytes(directory: &Path) -> Vec<(PathBuf, Vec<u8>)> {
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(directory).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_dir() {
-            entries.extend(bytes(&entry.path()));
-        } else {
-            entries.push((entry.path(), fs::read(entry.path()).unwrap()));
-        }
-    }
-    entries.sort();
-    entries
-}
 
 fn doctor_records(reader: &Reader) -> (Value, Value) {
     let mut checks = Vec::new();
@@ -77,7 +64,7 @@ fn damage_keeps_inspect_and_doctor_failure_scopes() {
             }
             crate::native::write_private(&path, b"{").unwrap();
         }
-        let before = bytes(directory);
+        let before = entries(directory);
         let (observation, observation_reads) = with_event_read_count(|| Observation::read(&reader));
         let inspect = super::super::inspect_value(&reader, "session-fault");
         let ((checks, observed), doctor_reads) = with_event_read_count(|| doctor_records(&reader));
@@ -141,7 +128,7 @@ fn damage_keeps_inspect_and_doctor_failure_scopes() {
                 _ => unreachable!(),
             }
         }
-        assert_eq!(bytes(directory), before, "{part}");
+        assert_eq!(entries(directory), before, "{part}");
     }
 }
 
@@ -154,7 +141,17 @@ fn observation_is_read_only_and_releases_its_lock() {
         &json!({"pid":0, "managed_session_id":"session-fault"}),
     )
     .unwrap();
-    let before = bytes(&fixture.directory);
+    // The crate-internal snapshot must also retain empty directories.
+    let original = entries(&fixture.directory);
+    let empty = fixture.directory.join("empty");
+    fs::create_dir(&empty).unwrap();
+    let with_empty = entries(&fixture.directory);
+    assert_ne!(with_empty, original);
+    assert!(with_empty.contains(&(empty.clone(), None)));
+    fs::remove_dir(&empty).unwrap();
+    assert_ne!(entries(&fixture.directory), with_empty);
+    assert_eq!(entries(&fixture.directory), original);
+    let before = entries(&fixture.directory);
     for owner in [false, true] {
         let mut observation = Observation::read(&reader).unwrap();
         assert!(observation.evidence.owner_observation.is_none());
@@ -175,15 +172,15 @@ fn observation_is_read_only_and_releases_its_lock() {
         assert!(observation.evidence.observed_unix_ms > 0);
         // Compare bytes before taking the writer lock: Windows refuses to read a file
         // another handle holds exclusively, and the lock file is part of the directory.
-        assert_eq!(bytes(&fixture.directory), before);
+        assert_eq!(entries(&fixture.directory), before);
         let writer = File::open(fixture.directory.join("turn.claim.lock")).unwrap();
         writer.try_lock().unwrap();
         drop(writer);
     }
     fs::remove_file(fixture.directory.join("turn.claim.lock")).unwrap();
-    let before = bytes(&fixture.directory);
+    let before = entries(&fixture.directory);
     Observation::read(&reader).unwrap();
-    assert_eq!(bytes(&fixture.directory), before);
+    assert_eq!(entries(&fixture.directory), before);
 }
 
 #[test]
@@ -208,7 +205,7 @@ fn close_fixtures_keep_independent_publication_expectations() {
                 assert!(crate::native::injected_fault(&error));
             }
             let reader = Reader::open_unchecked(&fixture.directory);
-            let before = bytes(&fixture.directory);
+            let before = entries(&fixture.directory);
             let observation = Observation::read(&reader).unwrap();
             let inspect = super::super::inspect_value(&reader, "session-fault").unwrap();
             let (checks, doctor) = doctor_records(&reader);
@@ -247,7 +244,7 @@ fn close_fixtures_keep_independent_publication_expectations() {
                     "unavailable"
                 }
             );
-            assert_eq!(bytes(&fixture.directory), before);
+            assert_eq!(entries(&fixture.directory), before);
             if finished {
                 break;
             }

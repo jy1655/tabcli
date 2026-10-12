@@ -1,10 +1,13 @@
 //! `--context-result` resolves attached results read-only, before any claim, receipt,
 //! launch, or delivery. Live provider flows (Codex -> Claude -> Codex) are not exercised
 //! here; these fixtures are hand-written session records under a private state root.
+mod support;
+use support::{entries, manifest, status, success, write};
+
 use serde_json::{Value, json};
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Output},
 };
 
@@ -34,32 +37,29 @@ impl Fixture {
         fs::create_dir_all(directory.join("events")).unwrap();
         write(
             &directory.join("manifest.json"),
-            &json!({
-                "schema": 1, "id": id, "provider": provider, "provider_path": provider,
-                "provider_version": "0.0.0", "workspace": self.root.path().canonicalize().unwrap(),
-                "title": "context fixture", "model": null, "effort": null, "yolo": false,
-                "created_unix_ms": 1
-            }),
+            &manifest(
+                id,
+                provider,
+                provider.as_ref(),
+                "0.0.0",
+                &self.root.path().canonicalize().unwrap(),
+                "context fixture",
+            ),
         );
-        write(
-            &directory.join("status.json"),
-            &json!({"state": state, "generation": 2, "updated_unix_ms": 2, "exit_code": null, "error": null}),
-        );
+        write(&directory.join("status.json"), &status(state, 2, None));
     }
 
     fn event(&self, id: &str, name: &str, message: &str, error: Option<&str>) {
         write(
             &self.directory(id).join("events").join(name),
-            &json!({"provider": "codex", "message": message, "error": error,
-                "provider_session_id": "thread", "turn_id": name, "created_unix_ms": 3}),
+            &support::event("codex", "thread", name, message, error, 3),
         );
     }
 
     fn receipt(&self, id: &str, claim: &str, request: &str, event: &str, sources: Value) {
         let directory = self.directory(id).join("requests");
         fs::create_dir_all(&directory).unwrap();
-        let mut receipt = json!({"schema": 1, "request_id": request, "claim_token": claim,
-            "event_file": event, "created_unix_ms": 3});
+        let mut receipt = support::receipt(request, claim, event);
         if !sources.is_null() {
             receipt["context_sources"] = sources;
         }
@@ -76,8 +76,8 @@ impl Fixture {
             .unwrap()
     }
 
-    fn files(&self) -> Vec<Entry> {
-        files(self.root.path())
+    fn files(&self) -> Vec<support::Entry> {
+        entries(self.root.path())
     }
 
     fn ask_with(&self, address: &str) -> Output {
@@ -93,38 +93,6 @@ impl Fixture {
             "--json",
         ])
     }
-}
-
-fn write(path: &Path, value: &Value) {
-    fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
-}
-
-/// Every path under the state root: directories carry no content, files carry their bytes,
-/// so an added directory is as visible as an added file.
-type Entry = (PathBuf, Option<Vec<u8>>);
-
-fn files(directory: &Path) -> Vec<Entry> {
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(directory).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_dir() {
-            entries.push((entry.path(), None));
-            entries.extend(files(&entry.path()));
-        } else {
-            entries.push((entry.path(), Some(fs::read(entry.path()).unwrap())));
-        }
-    }
-    entries.sort();
-    entries
-}
-
-fn success(output: Output) -> Value {
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 fn stderr(output: &Output) -> String {
