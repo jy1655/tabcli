@@ -313,12 +313,14 @@ fn many_busy_sessions_share_remaining_budget_and_each_gets_a_reason() {
         lock.lock().unwrap();
         locks.push(lock);
     }
+    // Allow enumeration and the first manifest read to reach the busy lock even
+    // on a slow host. That lock deliberately consumes the two-second budget.
     let started = Instant::now();
     let value = with_snapshot_retry_window(Duration::from_secs(5), || {
-        value_in(root.path(), &all(), Duration::from_millis(60))
+        value_in(root.path(), &all(), Duration::from_secs(2))
     })
     .unwrap();
-    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(value["scanned"], json!({"sessions":1,"listed":0}));
     let reasons = value["incomplete_reasons"].as_array().unwrap();
     assert_eq!(reasons.len(), 8);

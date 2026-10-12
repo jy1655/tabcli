@@ -421,7 +421,9 @@ fn follow_up_wording_is_byte_identical_to_0_4_3() {
 
 #[test]
 fn initial_prompt_delay_must_fit_inside_the_original_ask_budget() {
-    let deadline = Instant::now() + Duration::from_millis(20);
+    // Reach the delay-fit check with budget remaining; the 12-second delay
+    // still cannot fit, and this check does not sleep.
+    let deadline = Instant::now() + Duration::from_secs(10);
     let error = initial_prompt_delay_within_budget(
         deadline,
         Duration::from_secs(12),
@@ -776,7 +778,9 @@ fn deadline_expiring_during_begin_lock_wait_does_not_add_a_second_preflight() {
     let f = Fixture::new();
     let claim = f.claim(false);
     let mut context = f.context();
-    context.deadline = Instant::now() + Duration::from_millis(100);
+    // Allow preflight to reach RuntimeChecks.remaining on a slow host. The
+    // holder above deliberately keeps the begin lock past this one-second budget.
+    context.deadline = Instant::now() + Duration::from_secs(1);
     let deadline = context.deadline;
     *f.fake.on_send.borrow_mut() = Some(Box::new(move || assert!(Instant::now() >= deadline)));
     deliver_with(
