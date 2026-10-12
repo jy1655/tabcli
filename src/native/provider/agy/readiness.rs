@@ -10,7 +10,6 @@ pub(super) const SKILLS_RELOAD_MARKER: &str = "Reloading system slash commands a
 const FULL_REDRAW_MARKER: &str = "Full redraw completed";
 const REDRAW_AFTER_STARTUP_DESCRIPTION: &str =
     "`Full redraw completed` after `CLI startup completed`";
-const DEFERRED_RELOAD_DESCRIPTION: &str = "deferred skills reload or the deferred reload window (no `Reloading system slash commands and skills` line stamped at least 1 s after `CLI startup completed` and outside 1 s after a `Starting new conversation` line, and the window since `CLI startup completed` was observed has not elapsed)";
 const QUIET_PERIOD_DESCRIPTION: &str = "quiet period not reached (no `Reloading system slash commands`, `Full redraw completed`, or `hooks_manager.go` line for the quiet period after the newest one)";
 const CONVERSATION_START_MARKER: &str = "Starting new conversation";
 
@@ -54,7 +53,7 @@ pub(super) struct StartupObservation {
     // Line index of the first `CLI startup completed` line.
     startup_line: Option<usize>,
     // The glog stamp of that line; `None` when it carries none, in which case no
-    // skills reload can be proven deferred and only the window settles the condition.
+    // skills reload can be proven deferred.
     startup_stamp: Option<Duration>,
     // Line index of the first `Full redraw completed` line after the startup line.
     // Agy redraws the composer once the TUI is up; the redraw before startup, when
@@ -83,10 +82,7 @@ pub(super) struct StartupObservation {
     settle_line: Option<usize>,
     // Activity lines seen so far (diagnostics only).
     pub(super) activity_lines: usize,
-    // The newest glog stamp in the log: how long Agy itself says it has been running
-    // since `CLI startup completed`. A follow-up gated long after startup settles the
-    // deferred-reload window from this, not from the gate's own clock, so it does not
-    // wait a whole window for a reload that would already have been logged.
+    // The newest glog stamp observed in the log.
     newest_stamp: Option<Duration>,
 }
 
@@ -192,7 +188,6 @@ enum ReadinessState {
     AwaitingLog,
     AwaitingStartup,
     AwaitingRedraw,
-    AwaitingDeferredReload,
     Settling,
 }
 
@@ -205,9 +200,6 @@ impl ReadinessState {
             Self::AwaitingRedraw => {
                 "agy.log has no `Full redraw completed` line after `CLI startup completed`"
             }
-            Self::AwaitingDeferredReload => {
-                "agy.log has no `Reloading system slash commands and skills` line stamped at least 1 s after `CLI startup completed` and the deferred reload window since `CLI startup completed` has not elapsed"
-            }
             Self::Settling => {
                 "agy.log logged a reload, redraw, or hooks line within the quiet period"
             }
@@ -218,9 +210,6 @@ impl ReadinessState {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct ReadinessTiming {
     pub(super) quiet_period: Duration,
-    // How long the former rules waited for the trust reload after startup. Zero in
-    // every rule of this file; the tests set it to replay those rules.
-    pub(super) deferred_reload_window: Duration,
     // Whether a `Full redraw completed` line after startup is required. Agy logs it
     // on the Windows console and never on macOS.
     pub(super) redraw_required: bool,
@@ -234,7 +223,7 @@ pub(super) struct ReadinessTiming {
 // is fresh. The gate therefore keeps the byte length and a digest of every byte of
 // the newest read, the way the receipt check keeps the pre-paste offset, and on a
 // discontinuity discards every settlement instant and starts over from the new
-// content: the quiet period and the deferred reload window are timed from the new
+// content: the quiet period is timed from the new
 // observation. Any number of discontinuities is tolerated within the deadline; each
 // one restarts the evidence, and the deadline report counts them. A read is a
 // continuation only when it is at least as long as the observed content and its
@@ -310,10 +299,6 @@ struct ReadinessGate {
     settle_line: Option<usize>,
     settled_at: Instant,
     quiet_reached: bool,
-    // When the gate first saw `CLI startup completed`; the deferred reload window
-    // counts from here, on the gate's clock, like the quiet period.
-    startup_seen_at: Option<Instant>,
-    deferred_reload_settled: bool,
     last_observation: Option<StartupObservation>,
     // The newest observed log content; `None` until a log has been read and after
     // it disappears.
@@ -330,8 +315,6 @@ impl ReadinessGate {
             settle_line: None,
             settled_at: now,
             quiet_reached: false,
-            startup_seen_at: None,
-            deferred_reload_settled: false,
             last_observation: None,
             continuity: None,
             discontinuities: Vec::new(),
@@ -339,8 +322,7 @@ impl ReadinessGate {
     }
 
     // Discards every settlement instant: the next observation starts over as if the
-    // gate had just been created, with the quiet period and the deferred reload
-    // window timed from `now`.
+    // gate had just been created, with the quiet period timed from `now`.
     fn restart_after(&mut self, discontinuity: LogDiscontinuity, now: Instant) {
         self.discontinuities.push((
             now.saturating_duration_since(self.started_at),
@@ -349,8 +331,6 @@ impl ReadinessGate {
         self.settle_line = None;
         self.settled_at = now;
         self.quiet_reached = false;
-        self.startup_seen_at = None;
-        self.deferred_reload_settled = false;
         self.last_observation = None;
         self.continuity = None;
     }
@@ -388,32 +368,10 @@ impl ReadinessGate {
         }
         self.quiet_reached =
             now.saturating_duration_since(self.settled_at) >= self.timing.quiet_period;
-        if observation.startup_completed() && self.startup_seen_at.is_none() {
-            self.startup_seen_at = Some(now);
-        }
-        // The window is measured on the gate's clock from the first read that showed
-        // startup, and also on Agy's own clock from the startup stamp to the newest
-        // stamp: a session that has already logged a window's worth of runtime cannot
-        // still be inside its startup burst (session-bbNK3d, macOS, 2026-09-24 22:03,
-        // never logged the deferred reload and waited the whole window on each of two
-        // follow-ups minutes after startup).
-        let logged_window_elapsed = match (observation.startup_stamp, observation.newest_stamp) {
-            (Some(startup), Some(newest)) => {
-                newest.saturating_sub(startup) >= self.timing.deferred_reload_window
-            }
-            _ => false,
-        };
-        self.deferred_reload_settled = observation.deferred_reload_after_startup.is_some()
-            || logged_window_elapsed
-            || self.startup_seen_at.is_some_and(|seen| {
-                now.saturating_duration_since(seen) >= self.timing.deferred_reload_window
-            });
         let state = if !observation.startup_completed() {
             ReadinessState::AwaitingStartup
         } else if self.timing.redraw_required && observation.redraw_after_startup.is_none() {
             ReadinessState::AwaitingRedraw
-        } else if !self.deferred_reload_settled {
-            ReadinessState::AwaitingDeferredReload
         } else if !self.quiet_reached {
             ReadinessState::Settling
         } else {
@@ -428,12 +386,6 @@ impl ReadinessGate {
             Some(observation) => observation.missing_markers(self.timing.redraw_required),
             None => StartupObservation::default().missing_markers(self.timing.redraw_required),
         };
-        // No rule of this file has a window; the report names one only for a rule
-        // that does.
-        let windowed = !self.timing.deferred_reload_window.is_zero();
-        if windowed && !self.deferred_reload_settled {
-            missing.push(DEFERRED_RELOAD_DESCRIPTION);
-        }
         if !self.quiet_reached {
             missing.push(QUIET_PERIOD_DESCRIPTION);
         }
@@ -453,18 +405,10 @@ impl ReadinessGate {
                 self.describe_discontinuities()
             ),
         };
-        let timed = if windowed {
-            format!(
-                "the quiet period is {} ms and the deferred reload window is {} ms, timed concurrently (the window from the first read with `CLI startup completed`, the quiet period from the newest reload, redraw, or hooks line; ready when both hold)",
-                self.timing.quiet_period.as_millis(),
-                self.timing.deferred_reload_window.as_millis()
-            )
-        } else {
-            format!(
-                "the quiet period is {} ms, timed from the newest reload, redraw, or hooks line",
-                self.timing.quiet_period.as_millis()
-            )
-        };
+        let timed = format!(
+            "the quiet period is {} ms, timed from the newest reload, redraw, or hooks line",
+            self.timing.quiet_period.as_millis()
+        );
         format!(
             "Agy did not report startup readiness before the deadline: {}; missing markers: {missing}; {timed}{restarted}; the prompt was not pasted",
             state.describe(),

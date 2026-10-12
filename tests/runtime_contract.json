@@ -81,7 +81,7 @@
     "agy.log": 1
   },
   "src/native/provider/agy/readiness.rs": {
-    "agy.log": 8,
+    "agy.log": 7,
     "const STARTUP_COMPLETED_MARKER: &str = \"CLI startup completed\";": 1,
     "const SLASH_RELOAD_MARKER: &str = \"Reloading system slash commands\";": 1,
     "const SKILLS_RELOAD_MARKER: &str = \"Reloading system slash commands and skills\";": 1,
