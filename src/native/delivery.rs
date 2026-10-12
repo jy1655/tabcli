@@ -63,6 +63,8 @@ pub(super) enum Readiness {
 }
 pub(super) struct SurfaceInput {
     pub submit_count: usize,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub newline: terminal::ConsoleNewline,
 }
 pub(super) struct TurnContext<'a> {
     pub kind: TurnKind,

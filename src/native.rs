@@ -430,7 +430,7 @@ fn parse_provider_control(rest: &[String]) -> Result<NativeCommand> {
     })
 }
 
-// Parsed on every target; paths and provider submission counts are resolved only
+// Parsed on every target; paths and provider console input facts are resolved only
 // after the managed session and its surface have been verified.
 #[derive(Debug, PartialEq)]
 pub(crate) enum ConsoleControlRequest {
@@ -1079,10 +1079,12 @@ fn run_windows_console_control(request: ConsoleControlRequest, id: &str) -> Resu
             .to_owned()
     };
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
-    let submit_count = provider::initial_transport(provider)
+    let (submit_count, newline) = provider::initial_transport(provider)
         .facts()
         .surface
-        .map_or(1, |surface| surface.submit_count);
+        .map_or((1, terminal::ConsoleNewline::LineFeed), |surface| {
+            (surface.submit_count, surface.newline)
+        });
     let records = terminal::WindowsSessionRecords {
         directory: &directory,
         root_never_ran: windows_console_root_never_ran(&directory),
@@ -1095,6 +1097,7 @@ fn run_windows_console_control(request: ConsoleControlRequest, id: &str) -> Resu
         } => terminal::ConsoleControlAction::Send {
             input: input_path(&input_name),
             submit_count,
+            newline,
             timeout,
         },
         ConsoleControlRequest::Dialog {

@@ -166,7 +166,10 @@ impl Transport for AgyInitialPaste {
             readiness: Readiness::AfterLaunch {
                 ready_delay: Duration::from_secs(0),
             },
-            surface: Some(SurfaceInput { submit_count: 1 }),
+            surface: Some(SurfaceInput {
+                submit_count: 1,
+                newline: terminal::ConsoleNewline::LineFeed,
+            }),
         }
     }
     fn prepare(&self, turn: &TurnContext<'_>) -> Result<Prepared> {
@@ -195,7 +198,10 @@ impl Transport for AgyPaste {
             readiness: Readiness::AfterLaunch {
                 ready_delay: Duration::ZERO,
             },
-            surface: Some(SurfaceInput { submit_count: 1 }),
+            surface: Some(SurfaceInput {
+                submit_count: 1,
+                newline: terminal::ConsoleNewline::LineFeed,
+            }),
         }
     }
     fn prepare(&self, turn: &TurnContext<'_>) -> Result<Prepared> {

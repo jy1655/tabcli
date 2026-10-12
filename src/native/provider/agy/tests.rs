@@ -5,6 +5,11 @@ use std::path::Path;
 
 #[test]
 fn declared_transports_preserve_framing_and_pending_cleanup() {
+    for facts in [AgyInitialPaste.facts(), AgyPaste.facts()] {
+        let input = facts.surface.unwrap();
+        assert_eq!(input.submit_count, 1);
+        assert_eq!(input.newline, terminal::ConsoleNewline::LineFeed);
+    }
     use crate::native::delivery::TurnKind;
     let directory = tempfile::tempdir().unwrap();
     let surface = serde_json::from_value(
