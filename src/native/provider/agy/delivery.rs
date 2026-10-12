@@ -19,22 +19,7 @@ use std::time::{Duration, Instant};
 // ready/accepted signal, this adapter reads Agy's own trust store and `--log-file`
 // output (glog lines) as the only available evidence.
 //
-// What loses a paste (root cause, 2026-10-01): Agy keeps its workspace-trust dialog
-// over the composer until the exact workspace is in its own trust store, and it runs
-// an argument-delivered initial prompt behind the dialog. A paste onto the dialog is
-// discarded and its Enter confirms the preselected "Yes, I trust this folder"; Agy
-// then logs `Reloading system slash commands and skills` with three companion lines
-// (356 bytes; `TrustWorkspace` -> `AddWorkspaceDir` -> `reloadWorkspaceCustomizations`
-// in the 1.2.14 binary) and no `HandleUserInput`, and the session is left `working`
-// at an empty composer. Reproduced on demand with Agy 1.2.14 on macOS (session-U2yPxX:
-// dialog on screen, paste, those 356 bytes 0.5 s later, the workspace added to
-// `trustedWorkspaces`, no receipt). In more than 100 Agy logs on that Mac
-// (2026-09-10 to 2026-10-01) the reload appears only in sessions whose workspace is
-// in the trust store, and in none of the sessions whose workspace never got there.
-// The "deferred skills reload" of the 2026-09-24 notes below is this reload: it
-// followed every lost paste by at most 1.4 s because the paste's own Enter caused
-// it, and it never came in a workspace that was already trusted. It is not a startup
-// timer, so no window can stand in for the trust evidence.
+// See AGENTS.md's Current Agy Boundary for the observed trust-dialog behavior.
 //
 // - workspace trust: no paste before Agy's store lists the exact workspace and this
 //   session's own log shows the workspace customization load, the per-process
@@ -46,37 +31,14 @@ use std::time::{Duration, Instant};
 //   skills"), no `Full redraw completed` line, and no `hooks_manager.go` line
 //   arrives, measured on the gate's clock from the first read that showed the newest
 //   such line. The gate is ready on the first read at which every condition holds,
-//   and it never waits for a hooks completion after a reload; the startup reload of
-//   session-IQHEwf had none.
-//   No rule waits for the trust reload any more. The rules of 0.0.7 and 0.0.8 held
-//   the paste back for a "deferred reload window" (45 s on the Windows console after
-//   20 and 35 s had proved too short, 60 s on macOS) in which a `Reloading system
-//   slash commands and skills` line stamped at least 1 s after `CLI startup
-//   completed` ended the wait.
-//   That line is the trust reload, logged when a paste's Enter approved the dialog
-//   (the session-IEKjtC paste at +9.5 s, 2026-09-24 17:47, the session-fMqSQc paste
-//   at +12 s, 2026-09-24 16:41, the session-ql5TVc paste at +20.1 s, 2026-09-24
-//   18:48, and the session-uqraap paste at +35 s, 2026-09-24 20:44), so it never came
-//   before a paste and never comes in a workspace trusted before launch, where the
-//   window only delayed the paste (session-IQHEwf, 2026-09-24 17:20, logged its
-//   startup reload before `CLI startup completed`, never logged another, and went
-//   silent). The trust evidence is checked first instead. macOS dropped its window
-//   when the cause was found. The Windows console dropped it once native Windows was
-//   verified again (2026-10-01): session-jkxi48 (Agy 1.2.10, the 45 s rule) logged
-//   the customization load 58 ms after startup and no trust reload before its paste
-//   at +45 s, and session-C2fMs7 and session-uTpvwY (Agy 1.2.14, no window) pasted
-//   right after the quiet period, 8.8 and 7.9 s after startup, and logged their
-//   receipts 1.2 and 1.4 s later. `ReadinessTiming` still carries a window so that
-//   the tests can replay the recorded sessions against the former rules; no rule in
-//   this file sets one, and it can go together with those replays.
+//   and it never waits for a hooks completion after a reload or for a trust reload.
 //   The gate also keeps the byte length and a digest of every byte of the newest
 //   read (`LogContinuity`): a log that disappears, shrinks, or no longer reproduces
 //   that digest over the observed length was replaced or rotated, so every
 //   settlement instant is discarded and the quiet period is re-measured from the new
 //   content. Any number of such restarts is tolerated within the deadline: the gate
 //   fails the paste as `not_sent` only when the deadline passes, and the report then
-//   lists every discontinuity in order (review round 6, replacing round 5's
-//   leading-bytes check and its failure on the second discontinuity).
+//   lists every discontinuity in order.
 // - input receipt: a complete `HandleUserInput called with text: "..."` line
 //   (input_loop.go) that starts after the byte length of agy.log observed
 //   immediately before the paste and whose text carries the adapter's framing and

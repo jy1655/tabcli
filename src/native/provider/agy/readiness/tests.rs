@@ -120,39 +120,6 @@ const REAL_MACOS_DEFERRED_RELOAD_LINE: usize = 72;
 // `CLI startup completed` never logged a separate deferred reload before their
 // receipt (+9.6 to +27.6 s).
 
-// Round 3's rule, for contrast: the same quiet period without the deferred-reload
-// condition (a zero window is satisfied as soon as startup is seen).
-const ROUND_3_TIMING: ReadinessTiming = ReadinessTiming {
-    quiet_period: STARTUP_QUIET_PERIOD,
-    deferred_reload_window: Duration::ZERO,
-    redraw_required: true,
-};
-// Round 6's rule, for contrast: the same quiet period with the former 20 s
-// deferred-reload window, which session-ql5TVc's 21.4 s reload outlasted.
-const ROUND_6_TIMING: ReadinessTiming = ReadinessTiming {
-    quiet_period: STARTUP_QUIET_PERIOD,
-    deferred_reload_window: Duration::from_secs(20),
-    redraw_required: true,
-};
-// Round 8's rule, for contrast: the same quiet period with the former 35 s
-// deferred-reload window, which the 36.4 s reloads of session-uqraap and
-// session-Cf1FBY outlasted.
-const ROUND_8_TIMING: ReadinessTiming = ReadinessTiming {
-    quiet_period: STARTUP_QUIET_PERIOD,
-    deferred_reload_window: Duration::from_secs(35),
-    redraw_required: true,
-};
-// The Windows console rule of 0.0.7 and 0.0.8, for contrast: the same quiet period
-// with the 45 s deferred-reload window, which no paste ever needed. A workspace
-// trusted before launch never logs the trust reload, so its paste waited the
-// whole window (session-jkxi48, 2026-10-01), and in an untrusted one the reload
-// follows the paste, whatever the window is.
-const DEFERRED_RELOAD_WINDOW: Duration = Duration::from_secs(45);
-const ROUND_9_TIMING: ReadinessTiming = ReadinessTiming {
-    quiet_period: STARTUP_QUIET_PERIOD,
-    deferred_reload_window: DEFERRED_RELOAD_WINDOW,
-    redraw_required: true,
-};
 const REPLAY_POLL: Duration = Duration::from_millis(100);
 
 // The glog stamp of a line, on the adapter's own parser, so the replay and the
@@ -543,62 +510,6 @@ fn readiness_gate_is_ready_after_the_quiet_period_on_the_quiet_healthy_startup()
         ]
     );
 
-    // The former rules waited for that reload all the same, each for its whole
-    // window, counted from when the gate first saw startup: the 45 s rule pasted
-    // at 17:21:13.62, the 35 s one at 17:21:03.62, and the quiet period that ran
-    // concurrently had long ended. The window's end was the ready instant, not
-    // window + quiet period.
-    assert_ready_at(
-        &replay,
-        replay_readiness(&replay, ROUND_9_TIMING),
-        "17:21:13.616574",
-        "session-IQHEwf, the 45 s rule",
-    );
-    assert_ready_at(
-        &replay,
-        replay_readiness(&replay, ROUND_8_TIMING),
-        "17:21:03.616574",
-        "session-IQHEwf, round 8",
-    );
-    assert_eq!(
-        replay_readiness(&replay, ROUND_3_TIMING),
-        ready,
-        "round 3's rule is the rule again, now behind the trust evidence"
-    );
-
-    // State by state under the 45 s rule: every plain reload restarts the quiet
-    // period, and the deferred-reload window is the last condition to hold.
-    assert_eq!(
-        replay.states(
-            ROUND_9_TIMING,
-            &[
-                "17:20:28.610124",
-                "17:20:28.616574",
-                "17:20:28.663151",
-                "17:20:30.481001",
-                "17:20:33.155749",
-                "17:20:34.950075",
-                "17:20:38.450075",
-                "17:20:48.616574",
-                "17:21:03.616574",
-                "17:21:13.616573",
-                "17:21:13.616574",
-            ]
-        ),
-        vec![
-            ReadinessState::AwaitingStartup,
-            ReadinessState::AwaitingRedraw,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::Ready,
-        ]
-    );
     let mut gate = ReadinessGate::new(replay.start, WINDOWS_STARTUP_READINESS_TIMING);
     assert_eq!(
         gate.observe(None, replay.start),
@@ -609,17 +520,11 @@ fn readiness_gate_is_ready_after_the_quiet_period_on_the_quiet_healthy_startup()
 #[test]
 fn readiness_gate_starts_the_quiet_period_at_the_newest_activity_line() {
     let start = Instant::now();
-    // A rule with the former 45 s window, so that the quiet period is exercised
-    // together with the condition it once ran concurrently with.
-    let timing = ReadinessTiming {
-        quiet_period: Duration::from_millis(3500),
-        deferred_reload_window: Duration::from_secs(45),
-        redraw_required: true,
-    };
+    let timing = WINDOWS_STARTUP_READINESS_TIMING;
     let at = |millis: u64| start + Duration::from_millis(millis);
 
-    // session-fMqSQc with its deferred reload logged: markers complete and the
-    // deferred-reload condition settled; ready after one quiet period.
+    // session-fMqSQc with its trust reload logged: markers complete; ready
+    // after one quiet period.
     let mut gate = ReadinessGate::new(start, timing);
     let success = settled_startup_log();
     assert_eq!(
@@ -705,61 +610,20 @@ fn readiness_gate_starts_the_quiet_period_at_the_newest_activity_line() {
         startup_only.clone() + &glog("16:42:02.000000", 269, "manager.go:934", FULL_REDRAW);
     assert_eq!(
         no_redraw.observe(Some(redrawn.as_bytes()), at(55_100)),
-        ReadinessState::Settling,
-        "the deferred-reload window ended 10 s ago, counted from when startup was first seen"
+        ReadinessState::Settling
     );
     assert_eq!(
         no_redraw.observe(Some(redrawn.as_bytes()), at(58_600)),
         ReadinessState::Ready
     );
 
-    // Startup and redraw without a skills reload after them wait for the window
-    // even though the quiet period ends at 3.5 s; the two run concurrently, so
-    // the window's end at 45.0 s is the ready instant.
+    // A skills reload restarts the quiet period; a hooks line is not required.
     let startup_redraw =
         startup_only.clone() + &glog("16:41:07.876154", 269, "manager.go:934", FULL_REDRAW);
-    let mut windowed = ReadinessGate::new(start, timing);
-    assert_eq!(
-        windowed.observe(Some(startup_redraw.as_bytes()), at(0)),
-        ReadinessState::AwaitingDeferredReload
-    );
-    assert_eq!(
-        windowed.observe(Some(startup_redraw.as_bytes()), at(44_900)),
-        ReadinessState::AwaitingDeferredReload
-    );
-    assert_eq!(
-        windowed.observe(Some(startup_redraw.as_bytes()), at(45_000)),
-        ReadinessState::Ready
-    );
-
-    // A skills reload stamped within 1 s of startup is the startup reload: it
-    // restarts the quiet period but never settles the deferred-reload condition
-    // (session-udT6uY at +0.5 ms, session-M8QFPp at +1.6 ms).
-    let mut early = ReadinessGate::new(start, timing);
-    let startup_reload_after = startup_only.clone()
-        + &glog("16:41:07.831997", 338, "manager.go:1331", SKILLS_RELOAD)
-        + &glog("16:41:07.831997", 338, "manager.go:1308", SLASH_RELOAD)
-        + &glog("16:41:07.833248", 96, "hooks_manager.go:53", HOOKS_LOADED)
-        + &glog("16:41:07.876154", 269, "manager.go:934", FULL_REDRAW);
-    assert_eq!(
-        early.observe(Some(startup_reload_after.as_bytes()), at(0)),
-        ReadinessState::AwaitingDeferredReload
-    );
-    assert_eq!(
-        early.observe(Some(startup_reload_after.as_bytes()), at(44_900)),
-        ReadinessState::AwaitingDeferredReload
-    );
-    assert_eq!(
-        early.observe(Some(startup_reload_after.as_bytes()), at(45_000)),
-        ReadinessState::Ready
-    );
-
-    // A skills reload after startup ends the window at once; its own quiet period
-    // follows, and a hooks line after it is never required.
     let mut reloaded = ReadinessGate::new(start, timing);
     assert_eq!(
         reloaded.observe(Some(startup_redraw.as_bytes()), at(0)),
-        ReadinessState::AwaitingDeferredReload
+        ReadinessState::Settling
     );
     let with_reload = startup_redraw.clone()
         + &glog("16:41:12.000000", 410, "manager.go:1331", SKILLS_RELOAD)
@@ -774,25 +638,6 @@ fn readiness_gate_starts_the_quiet_period_at_the_newest_activity_line() {
     );
     assert_eq!(
         reloaded.observe(Some(with_reload.as_bytes()), at(7_700)),
-        ReadinessState::Ready
-    );
-
-    // A skills reload before `CLI startup completed` is the startup reload, not
-    // the deferred one.
-    let mut startup_reload = ReadinessGate::new(start, timing);
-    let reload_first = glog("16:41:07.826763", 280, "manager.go:1331", SKILLS_RELOAD)
-        + &glog("16:41:07.826763", 280, "manager.go:1308", SLASH_RELOAD)
-        + &startup_redraw;
-    assert_eq!(
-        startup_reload.observe(Some(reload_first.as_bytes()), at(0)),
-        ReadinessState::AwaitingDeferredReload
-    );
-    assert_eq!(
-        startup_reload.observe(Some(reload_first.as_bytes()), at(44_900)),
-        ReadinessState::AwaitingDeferredReload
-    );
-    assert_eq!(
-        startup_reload.observe(Some(reload_first.as_bytes()), at(45_000)),
         ReadinessState::Ready
     );
 
@@ -893,11 +738,8 @@ fn log_continuity_accepts_only_a_log_that_extends_the_observed_content() {
 #[test]
 fn readiness_gate_restarts_its_evidence_when_the_log_is_replaced() {
     let start = Instant::now();
+    let timing = WINDOWS_STARTUP_READINESS_TIMING;
     let at = |millis: u64| start + Duration::from_millis(millis);
-    // The 45 s rule, under which the window has to restart as well as the quiet
-    // period. The rule in force has no window; its quiet period restarts the
-    // same way (the last block of this test).
-    let timing = ROUND_9_TIMING;
     let startup_redraw = glog(
         "16:41:07.830345",
         1,
@@ -905,16 +747,12 @@ fn readiness_gate_restarts_its_evidence_when_the_log_is_replaced() {
         "CLI startup completed (took 1ms)",
     ) + &glog("16:41:07.876154", 269, "manager.go:934", FULL_REDRAW);
 
-    // The review scenario: startup and redraw at t=0, the log missing at t=19.9,
-    // and at t=20 a replacement with the same content at the same indices. The
-    // round-4 gate kept `startup_seen_at` from t=0 and the settle line index
-    // matched, so it was ready at once although the fresh redraw had no quiet
-    // period. The evidence now restarts at the disappearance: the replacement
-    // is a new startup, and the window and the quiet period count from t=20.
+    // Startup and redraw at t=0, the log missing at t=19.9, and at t=20 a
+    // replacement with the same content and indices: the quiet period must restart.
     let mut gate = ReadinessGate::new(start, timing);
     assert_eq!(
         gate.observe(Some(startup_redraw.as_bytes()), at(0)),
-        ReadinessState::AwaitingDeferredReload
+        ReadinessState::Settling
     );
     assert_eq!(gate.observe(None, at(19_900)), ReadinessState::AwaitingLog);
     assert_eq!(
@@ -928,19 +766,18 @@ fn readiness_gate_restarts_its_evidence_when_the_log_is_replaced() {
     );
     assert_eq!(
         gate.observe(Some(startup_redraw.as_bytes()), at(20_000)),
-        ReadinessState::AwaitingDeferredReload,
+        ReadinessState::Settling,
         "a replacement with identical indices at t=20 is not ready"
     );
-    assert_eq!(gate.startup_seen_at, Some(at(20_000)));
     assert_eq!(gate.settled_at, at(20_000));
     assert_eq!(
-        gate.observe(Some(startup_redraw.as_bytes()), at(64_900)),
-        ReadinessState::AwaitingDeferredReload
+        gate.observe(Some(startup_redraw.as_bytes()), at(23_499)),
+        ReadinessState::Settling
     );
     assert_eq!(
-        gate.observe(Some(startup_redraw.as_bytes()), at(65_000)),
+        gate.observe(Some(startup_redraw.as_bytes()), at(23_500)),
         ReadinessState::Ready,
-        "the replacement is ready when its own 45 s window ends"
+        "the replacement is ready when its own quiet period ends"
     );
     assert_eq!(
         gate.discontinuities.len(),
@@ -956,15 +793,15 @@ fn readiness_gate_restarts_its_evidence_when_the_log_is_replaced() {
     let mut gate = ReadinessGate::new(start, timing);
     assert_eq!(
         gate.observe(Some(startup_redraw.as_bytes()), at(0)),
-        ReadinessState::AwaitingDeferredReload
+        ReadinessState::Settling
     );
     assert_eq!(
         gate.observe(Some(startup_redraw.as_bytes()), at(19_900)),
-        ReadinessState::AwaitingDeferredReload
+        ReadinessState::Ready
     );
     assert_eq!(
         gate.observe(Some(restamped.as_bytes()), at(20_000)),
-        ReadinessState::AwaitingDeferredReload,
+        ReadinessState::Settling,
         "a replaced log with identical indices at t=20 is not ready"
     );
     assert_eq!(
@@ -977,16 +814,15 @@ fn readiness_gate_restarts_its_evidence_when_the_log_is_replaced() {
         )]
     );
     assert_eq!(
-        gate.observe(Some(restamped.as_bytes()), at(64_900)),
-        ReadinessState::AwaitingDeferredReload
+        gate.observe(Some(restamped.as_bytes()), at(23_499)),
+        ReadinessState::Settling
     );
     assert_eq!(
-        gate.observe(Some(restamped.as_bytes()), at(65_000)),
+        gate.observe(Some(restamped.as_bytes()), at(23_500)),
         ReadinessState::Ready
     );
 
-    // A replacement whose skills reload after startup would have satisfied the
-    // deferred-reload condition still owes a full quiet period from the
+    // A replacement with a skills reload still owes a full quiet period from the
     // observation of the new content, not from the old settle instant.
     let reloaded = startup_redraw.clone()
         + &glog("16:41:12.000000", 410, "manager.go:1331", SKILLS_RELOAD)
@@ -1045,7 +881,6 @@ fn readiness_gate_restarts_its_evidence_when_the_log_is_replaced() {
             }
         )]
     );
-    assert_eq!(gate.startup_seen_at, None);
     let rotated_startup = tail.clone()
         + &glog(
             "16:42:35.000000",
@@ -1056,15 +891,14 @@ fn readiness_gate_restarts_its_evidence_when_the_log_is_replaced() {
         + &glog("16:42:35.050000", 269, "manager.go:934", FULL_REDRAW);
     assert_eq!(
         gate.observe(Some(rotated_startup.as_bytes()), at(6_000)),
-        ReadinessState::AwaitingDeferredReload
-    );
-    assert_eq!(gate.startup_seen_at, Some(at(6_000)));
-    assert_eq!(
-        gate.observe(Some(rotated_startup.as_bytes()), at(50_900)),
-        ReadinessState::AwaitingDeferredReload
+        ReadinessState::Settling
     );
     assert_eq!(
-        gate.observe(Some(rotated_startup.as_bytes()), at(51_000)),
+        gate.observe(Some(rotated_startup.as_bytes()), at(9_499)),
+        ReadinessState::Settling
+    );
+    assert_eq!(
+        gate.observe(Some(rotated_startup.as_bytes()), at(9_500)),
         ReadinessState::Ready
     );
     assert_eq!(gate.discontinuities.len(), 1);
@@ -1075,7 +909,7 @@ fn readiness_gate_restarts_its_evidence_when_the_log_is_replaced() {
     assert_eq!(gate.observe(None, at(100)), ReadinessState::AwaitingLog);
     assert_eq!(
         gate.observe(Some(startup_redraw.as_bytes()), at(200)),
-        ReadinessState::AwaitingDeferredReload
+        ReadinessState::Settling
     );
     assert!(gate.discontinuities.is_empty());
 
@@ -1392,7 +1226,7 @@ fn log_replay_anchors_its_origin_to_the_first_timestamped_line() {
 }
 
 // The recorded lost pastes (2026-09-24, Agy 1.2.10, Windows console) under the
-// rule in force and under the rules of their time. Each paste landed on the
+// rule in force. Each paste landed on the
 // workspace-trust dialog, and the trust reload these logs show is what its Enter
 // caused. The gate cannot see the dialog: it is ready one quiet period after the
 // startup burst, before that reload in every one of them, and a window only moved
@@ -1415,37 +1249,6 @@ fn readiness_gate_is_ready_before_the_trust_reload_of_the_lost_fixture() {
     assert!(
         !workspace_customizations_loaded(late_reload_startup_log().as_bytes()),
         "the trust evidence is missing before the paste"
-    );
-
-    // The 45 s rule on the same recording: the reload falls inside its window, so
-    // it would have been ready 3.5 s after the reload's hooks line. The recording
-    // holds that reload only because an earlier rule had pasted.
-    let former = replay_readiness(&replay, ROUND_9_TIMING);
-    assert_ready_at(
-        &replay,
-        former,
-        "16:41:24.314059",
-        "session-fMqSQc, the 45 s rule",
-    );
-    assert!(former > replay.recorded("16:41:20.816140"));
-    assert_eq!(
-        replay.states(
-            ROUND_9_TIMING,
-            &[
-                "16:41:07.876154",
-                "16:41:17.237805",
-                "16:41:20.814059",
-                "16:41:24.314058",
-                "16:41:24.314059",
-            ]
-        ),
-        vec![
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::Settling,
-            ReadinessState::Settling,
-            ReadinessState::Ready,
-        ]
     );
 
     // A skills reload during the quiet period restarts the period; a hooks line
@@ -1490,48 +1293,10 @@ fn readiness_gate_is_ready_where_the_recorded_paste_met_the_trust_dialog() {
         ready < trust_reload,
         "the gate is ready before the trust reload"
     );
-
-    // The 45 s rule on the same recording waits past the reload, its hooks line,
-    // and its completion.
-    let former = replay_readiness(&replay, ROUND_9_TIMING);
-    assert_ready_at(
-        &replay,
-        former,
-        "17:47:16.968806",
-        "session-IEKjtC, the 45 s rule",
-    );
-    assert!(former > replay.recorded("17:47:13.470456"));
-    assert_eq!(
-        replay.states(
-            ROUND_9_TIMING,
-            &[
-                "17:47:03.620082",
-                "17:47:03.666570",
-                "17:47:06.421536",
-                "17:47:08.894558",
-                "17:47:09.616209",
-                "17:47:13.116209",
-                "17:47:13.468806",
-                "17:47:16.968805",
-                "17:47:16.968806",
-            ]
-        ),
-        vec![
-            ReadinessState::AwaitingRedraw,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::Settling,
-            ReadinessState::Settling,
-            ReadinessState::Ready,
-        ]
-    );
 }
 
 #[test]
-fn a_20_s_window_only_moved_the_paste_onto_the_trust_dialog_later() {
+fn readiness_gate_is_ready_after_the_quiet_period_before_the_ql5tvc_trust_reload() {
     // session-ql5TVc: the quiet period ended at 18:48:12.15, 3.5 s after the
     // 18:48:08.65 plain reload, which is when the rule in force is ready. The
     // round-6 rule's 20 s window ended at 18:48:24.12, when it pasted, and the
@@ -1539,89 +1304,10 @@ fn a_20_s_window_only_moved_the_paste_onto_the_trust_dialog_later() {
     // with no receipt. The 45 s rule on the recording is ready 3.5 s after the
     // reload's hooks line.
     let replay = LogReplay::new(REAL_LATE_DEFERRED_RELOAD_STARTUP, Instant::now());
-    let startup = replay.recorded("18:48:04.115440");
     let deferred_reload = replay.recorded("18:48:25.481988");
     let in_force = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
     assert_ready_at(&replay, in_force, "18:48:12.146591", "session-ql5TVc");
     assert!(in_force < deferred_reload);
-    assert!(
-        deferred_reload - startup > Duration::from_secs(21)
-            && deferred_reload - startup < DEFERRED_RELOAD_WINDOW,
-        "the reload arrived 21.4 s after startup, inside the 45 s window"
-    );
-    let round_6 = replay_readiness(&replay, ROUND_6_TIMING);
-    assert_ready_at(
-        &replay,
-        round_6,
-        "18:48:24.115440",
-        "session-ql5TVc, round 6",
-    );
-    assert!(
-        round_6 < deferred_reload,
-        "the 20 s window pasted before the deferred reload"
-    );
-    let ready = replay_readiness(&replay, ROUND_9_TIMING);
-    assert_ready_at(
-        &replay,
-        ready,
-        "18:48:28.982515",
-        "session-ql5TVc, the 45 s rule",
-    );
-    assert!(
-        ready > replay.recorded("18:48:25.485154"),
-        "the 45 s window waits past the deferred reload, its hooks line, and its completion"
-    );
-    assert_eq!(
-        replay.states(
-            ROUND_9_TIMING,
-            &[
-                "18:48:04.115440",
-                "18:48:04.161713",
-                "18:48:05.977318",
-                "18:48:08.646591",
-                "18:48:12.146591",
-                "18:48:24.115440",
-                "18:48:25.482515",
-                "18:48:28.982514",
-                "18:48:28.982515",
-            ]
-        ),
-        vec![
-            ReadinessState::AwaitingRedraw,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::Settling,
-            ReadinessState::Settling,
-            ReadinessState::Ready,
-        ]
-    );
-    assert_eq!(
-        replay.states(
-            ROUND_6_TIMING,
-            &[
-                "18:48:04.115440",
-                "18:48:04.161713",
-                "18:48:05.977318",
-                "18:48:08.646591",
-                "18:48:12.146591",
-                "18:48:24.115439",
-                "18:48:24.115440",
-            ]
-        ),
-        vec![
-            ReadinessState::AwaitingRedraw,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::Ready
-        ],
-        "the round-6 window ended 1.3 s before the reload"
-    );
 }
 
 // The recorded delivered pastes of 2026-09-24 (Agy 1.2.10, Windows console): the
@@ -1642,39 +1328,6 @@ fn readiness_gate_is_ready_after_the_quiet_period_where_the_recorded_pastes_were
     let replay = LogReplay::new(REAL_SUCCESS_STARTUP, Instant::now());
     let in_force = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
     assert_ready_at(&replay, in_force, "16:42:32.604592", "session-udT6uY");
-    let ready = replay_readiness(&replay, ROUND_9_TIMING);
-    assert_ready_at(
-        &replay,
-        ready,
-        "16:43:09.080467",
-        "session-udT6uY, the 45 s rule",
-    );
-    assert_eq!(
-        replay.states(
-            ROUND_9_TIMING,
-            &[
-                "16:42:24.080467",
-                "16:42:24.127839",
-                "16:42:25.848949",
-                "16:42:28.530216",
-                "16:42:29.104592",
-                "16:42:32.604592",
-                "16:43:09.080466",
-                "16:43:09.080467",
-            ]
-        ),
-        vec![
-            ReadinessState::AwaitingRedraw,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::Ready,
-        ]
-    );
-
     // session-M8QFPp: the same shape 1.6 ms after startup. The round-8 rule took
     // the startup reload for the deferred one and pasted at 20:37:49.15, 3.5 s
     // after the last plain reload; that paste was received. It is the instant of
@@ -1690,38 +1343,10 @@ fn readiness_gate_is_ready_after_the_quiet_period_where_the_recorded_pastes_were
         "20:37:49.146941",
         "session-M8QFPp (the instant of the recorded, delivered paste)",
     );
-    let ready = replay_readiness(&replay, ROUND_9_TIMING);
-    assert_ready_at(
-        &replay,
-        ready,
-        "20:38:25.653251",
-        "session-M8QFPp, the 45 s rule",
-    );
-    assert_eq!(
-        replay.states(
-            ROUND_9_TIMING,
-            &[
-                "20:37:40.653251",
-                "20:37:40.700886",
-                "20:37:45.646941",
-                "20:37:49.146941",
-                "20:38:25.653250",
-                "20:38:25.653251",
-            ]
-        ),
-        vec![
-            ReadinessState::AwaitingRedraw,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::Ready,
-        ]
-    );
 }
 
 #[test]
-fn a_35_s_window_only_moved_the_paste_onto_the_trust_dialog_later() {
+fn readiness_gate_is_ready_after_the_quiet_period_before_the_uqraap_trust_reload() {
     // session-uqraap: the quiet period ended at 20:44:09.93, 3.5 s after the
     // 20:44:06.43 plain reload, which is when the rule in force is ready. The
     // round-8 rule's 35 s window ended at 20:44:36.44, when it pasted, and the
@@ -1729,83 +1354,10 @@ fn a_35_s_window_only_moved_the_paste_onto_the_trust_dialog_later() {
     // with no receipt. The 45 s rule on the recording is ready 3.5 s after the
     // reload's hooks line.
     let replay = LogReplay::new(REAL_SECOND_CLUSTER_RELOAD_STARTUP, Instant::now());
-    let startup = replay.recorded("20:44:01.443214");
     let deferred_reload = replay.recorded("20:44:37.855815");
     let in_force = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
     assert_ready_at(&replay, in_force, "20:44:09.927564", "session-uqraap");
     assert!(in_force < deferred_reload);
-    assert!(
-        deferred_reload - startup > ROUND_8_TIMING.deferred_reload_window
-            && deferred_reload - startup < DEFERRED_RELOAD_WINDOW,
-        "the reload arrived 36.4 s after startup, past the 35 s window and inside the 45 s window"
-    );
-    let round_8 = replay_readiness(&replay, ROUND_8_TIMING);
-    assert_ready_at(
-        &replay,
-        round_8,
-        "20:44:36.443214",
-        "session-uqraap, round 8",
-    );
-    assert!(
-        round_8 < deferred_reload,
-        "the 35 s window pasted before the deferred reload"
-    );
-    let ready = replay_readiness(&replay, ROUND_9_TIMING);
-    assert_ready_at(
-        &replay,
-        ready,
-        "20:44:41.356320",
-        "session-uqraap, the 45 s rule",
-    );
-    assert!(
-        ready > replay.recorded("20:44:37.857983"),
-        "the 45 s window waits past the deferred reload, its hooks line, and its completion"
-    );
-    assert_eq!(
-        replay.states(
-            ROUND_9_TIMING,
-            &[
-                "20:44:01.443214",
-                "20:44:01.490907",
-                "20:44:04.176592",
-                "20:44:06.427564",
-                "20:44:09.927564",
-                "20:44:36.443214",
-                "20:44:37.856320",
-                "20:44:41.356319",
-                "20:44:41.356320",
-            ]
-        ),
-        vec![
-            ReadinessState::AwaitingRedraw,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::Settling,
-            ReadinessState::Settling,
-            ReadinessState::Ready,
-        ]
-    );
-    assert_eq!(
-        replay.states(
-            ROUND_8_TIMING,
-            &[
-                "20:44:01.443214",
-                "20:44:09.927564",
-                "20:44:36.443213",
-                "20:44:36.443214",
-            ]
-        ),
-        vec![
-            ReadinessState::AwaitingRedraw,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::AwaitingDeferredReload,
-            ReadinessState::Ready
-        ],
-        "the round-8 window ended 1.4 s before the reload"
-    );
 }
 
 #[test]
@@ -1828,7 +1380,12 @@ fn readiness_gate_deadline_report_names_every_missing_marker() {
     )
     .unwrap_err();
     let message = format!("{error:#}");
-    assert!(message.contains("Agy did not report startup readiness before the deadline"));
+    assert_eq!(
+        message,
+        format!(
+            "Agy did not report startup readiness before the deadline: agy.log has not been created; missing markers: `CLI startup completed`, {REDRAW_AFTER_STARTUP_DESCRIPTION}, {QUIET_PERIOD_DESCRIPTION}; the quiet period is 3500 ms, timed from the newest reload, redraw, or hooks line; the prompt was not pasted"
+        )
+    );
     assert!(message.contains("agy.log has not been created"));
     assert!(message.contains(&format!(
         "missing markers: `CLI startup completed`, {REDRAW_AFTER_STARTUP_DESCRIPTION}, {QUIET_PERIOD_DESCRIPTION}; the quiet period is 3500 ms, timed from the newest reload, redraw, or hooks line; the prompt was not pasted"
@@ -1839,25 +1396,6 @@ fn readiness_gate_deadline_report_names_every_missing_marker() {
     );
     assert!(!message.contains("hooks completion"));
     assert_eq!(clock.slept, Duration::from_secs(1));
-
-    // A rule with a window names the window as well: the former 45 s rule.
-    let mut clock = FakeClock::new(start);
-    let error = wait_for_startup_readiness_with(
-        &mut log_sequence(vec![Ok(None)]),
-        deadline,
-        ROUND_9_TIMING,
-        poll,
-        &mut clock,
-    )
-    .unwrap_err();
-    let message = format!("{error:#}");
-    assert!(message.contains(&format!(
-        "missing markers: `CLI startup completed`, {REDRAW_AFTER_STARTUP_DESCRIPTION}, {DEFERRED_RELOAD_DESCRIPTION}, {QUIET_PERIOD_DESCRIPTION}"
-    )));
-    assert!(message.contains(
-        "the quiet period is 3500 ms and the deferred reload window is 45000 ms, timed concurrently"
-    ));
-    assert!(message.contains("the prompt was not pasted"));
 
     let startup_only = glog(
         "16:41:07.830345",
@@ -1897,40 +1435,6 @@ fn readiness_gate_deadline_report_names_every_missing_marker() {
         "missing markers: `CLI startup completed`, {REDRAW_AFTER_STARTUP_DESCRIPTION}; the quiet period"
     )));
 
-    // Startup and redraw, no skills reload after them, under the former 45 s
-    // rule: the window and the quiet period are both missing at 1 s, only the
-    // window at 5 s.
-    let startup_redraw = startup_only.clone() + &redraw_only;
-    let mut clock = FakeClock::new(start);
-    let error = wait_for_startup_readiness_with(
-        &mut log_sequence(vec![some_log(&startup_redraw)]),
-        deadline,
-        ROUND_9_TIMING,
-        poll,
-        &mut clock,
-    )
-    .unwrap_err();
-    let message = format!("{error:#}");
-    assert!(message.contains(
-        "agy.log has no `Reloading system slash commands and skills` line stamped at least 1 s after `CLI startup completed` and the deferred reload window since `CLI startup completed` has not elapsed"
-    ));
-    assert!(message.contains(&format!(
-        "missing markers: {DEFERRED_RELOAD_DESCRIPTION}, {QUIET_PERIOD_DESCRIPTION}; the quiet period"
-    )));
-    let mut clock = FakeClock::new(start);
-    let error = wait_for_startup_readiness_with(
-        &mut log_sequence(vec![some_log(&startup_redraw)]),
-        start + Duration::from_secs(5),
-        ROUND_9_TIMING,
-        poll,
-        &mut clock,
-    )
-    .unwrap_err();
-    let message = format!("{error:#}");
-    assert!(message.contains(&format!(
-        "missing markers: {DEFERRED_RELOAD_DESCRIPTION}; the quiet period"
-    )));
-
     // session-fMqSQc with its trust reload logged: only the quiet period is
     // missing at 1 s.
     let mut clock = FakeClock::new(start);
@@ -1948,9 +1452,10 @@ fn readiness_gate_deadline_report_names_every_missing_marker() {
         "missing markers: {QUIET_PERIOD_DESCRIPTION}; the quiet period"
     )));
 
+    let startup_redraw = startup_only.clone() + &redraw_only;
+
     // Startup seen at once, the redraw a poll later, no skills reload: ready one
-    // quiet period after the redraw was first seen, at 3.6 s. The former 45 s
-    // rule was ready when its window ended, long after that.
+    // quiet period after the redraw was first seen, at 3.6 s.
     let mut clock = FakeClock::new(start);
     wait_for_startup_readiness_with(
         &mut log_sequence(vec![some_log(&startup_only), some_log(&startup_redraw)]),
@@ -1961,16 +1466,6 @@ fn readiness_gate_deadline_report_names_every_missing_marker() {
     )
     .unwrap();
     assert_eq!(clock.slept, poll + STARTUP_QUIET_PERIOD);
-    let mut clock = FakeClock::new(start);
-    wait_for_startup_readiness_with(
-        &mut log_sequence(vec![some_log(&startup_only), some_log(&startup_redraw)]),
-        start + Duration::from_secs(60),
-        ROUND_9_TIMING,
-        poll,
-        &mut clock,
-    )
-    .unwrap();
-    assert_eq!(clock.slept, Duration::from_secs(45));
 
     let error = wait_for_startup_readiness_with(
         &mut log_sequence(vec![Err(anyhow::anyhow!(
@@ -2027,65 +1522,6 @@ fn readiness_wait_pastes_when_the_quiet_period_ends_and_not_before() {
     assert!(message.contains(&format!(
         "missing markers: {QUIET_PERIOD_DESCRIPTION}; the quiet period is 3500 ms, timed from the newest reload, redraw, or hooks line; the prompt was not pasted"
     )));
-    let failure = terminal::TerminalSendFailure::not_sent(error);
-    assert!(
-        !failure.delivery_may_have_occurred(),
-        "a gate that never passed is not_sent, never uncertain"
-    );
-}
-
-// The former 45 s rule on the same log: the quiet period ended at 3.5 s and the
-// window at 45 s, so that rule was ready at exactly 45 s. A deadline one second
-// past the window reached the paste; a deadline one second short of it failed
-// `not_sent` naming the window as the only missing condition.
-#[test]
-fn the_former_window_rule_pasted_at_the_window_end_and_not_before() {
-    let start = Instant::now();
-    let poll = Duration::from_millis(100);
-    let startup_redraw = glog(
-        "16:41:07.830345",
-        1,
-        "analytics.go:187",
-        "CLI startup completed (took 1ms)",
-    ) + &glog("16:41:07.876154", 269, "manager.go:934", FULL_REDRAW);
-
-    let mut clock = FakeClock::new(start);
-    let offset = wait_for_startup_readiness_with(
-        &mut log_sequence(vec![some_log(&startup_redraw)]),
-        start + Duration::from_secs(46),
-        ROUND_9_TIMING,
-        poll,
-        &mut clock,
-    )
-    .unwrap();
-    assert_eq!(offset, startup_redraw.len());
-    assert_eq!(
-        clock.slept, DEFERRED_RELOAD_WINDOW,
-        "ready at startup + 45 s, not + 45 s + the quiet period"
-    );
-
-    let mut clock = FakeClock::new(start);
-    let error = wait_for_startup_readiness_with(
-        &mut log_sequence(vec![some_log(&startup_redraw)]),
-        start + Duration::from_secs(44),
-        ROUND_9_TIMING,
-        poll,
-        &mut clock,
-    )
-    .unwrap_err();
-    assert_eq!(clock.slept, Duration::from_secs(44));
-    let message = format!("{error:#}");
-    assert!(message.contains(
-        "agy.log has no `Reloading system slash commands and skills` line stamped at least 1 s after `CLI startup completed` and the deferred reload window since `CLI startup completed` has not elapsed"
-    ));
-    assert!(message.contains(&format!(
-        "missing markers: {DEFERRED_RELOAD_DESCRIPTION}; the quiet period is 3500 ms and the deferred reload window is 45000 ms, timed concurrently"
-    )));
-    assert!(
-        !message.contains(QUIET_PERIOD_DESCRIPTION),
-        "the quiet period ended at 3.5 s and is not missing"
-    );
-    assert!(message.contains("the prompt was not pasted"));
     let failure = terminal::TerminalSendFailure::not_sent(error);
     assert!(
         !failure.delivery_may_have_occurred(),
@@ -2206,14 +1642,10 @@ fn conversation_reload_rule_is_bounded_by_its_latency() {
     assert_eq!(observation.deferred_reload_after_startup, Some(2));
 }
 
-// The former 45 s rule on a Windows session that never logged the trust reload
-// (its workspace was trusted before launch): Agy's own stamps prove a window's
-// worth of runtime, so that rule settled the window from the log and pasted after
-// one quiet period instead of waiting the whole window on its own clock. A log
-// whose newest stamp is inside the window still waited on the gate's clock. The
-// rules in force have no window to settle.
+// Old and recent logs both owe one quiet period from their first observation.
+// Keep the historical test name; only the current rules are exercised.
 #[test]
-fn a_window_rule_settles_its_window_from_the_logged_runtime() {
+fn readiness_wait_requires_one_quiet_period_from_first_observation_regardless_of_log_age() {
     let quota_line = glog(
         "17:21:20.000000",
         248,
@@ -2226,34 +1658,6 @@ fn a_window_rule_settles_its_window_from_the_logged_runtime() {
     assert_eq!(observation.newest_stamp, glog_timestamp(&quota_line));
 
     let start = Instant::now();
-    let mut clock = FakeClock::new(start);
-    let pre_paste_len = wait_for_startup_readiness_with(
-        &mut log_sequence(vec![some_log(&aged)]),
-        start + Duration::from_secs(300),
-        ROUND_9_TIMING,
-        Duration::from_millis(100),
-        &mut clock,
-    )
-    .unwrap();
-    assert_eq!(pre_paste_len, aged.len());
-    assert_eq!(
-        clock.slept, STARTUP_QUIET_PERIOD,
-        "only the quiet period from the newest activity line, seen at the first read"
-    );
-
-    // The same log without the aged line is still inside the window on Agy's
-    // clock, so the 45 s rule waited on its own clock.
-    let mut clock = FakeClock::new(start);
-    wait_for_startup_readiness_with(
-        &mut log_sequence(vec![some_log(REAL_QUIET_STARTUP)]),
-        start + Duration::from_secs(300),
-        ROUND_9_TIMING,
-        Duration::from_millis(100),
-        &mut clock,
-    )
-    .unwrap();
-    assert_eq!(clock.slept, DEFERRED_RELOAD_WINDOW);
-
     // The rules in force pass both logs after one quiet period.
     for log in [aged.as_str(), REAL_QUIET_STARTUP] {
         let mut clock = FakeClock::new(start);
@@ -2324,18 +1728,16 @@ I1001 22:43:44.994160     448 manager.go:1314] Slash commands unchanged, skippin
 
 #[test]
 fn a_windows_paste_right_after_the_quiet_period_needs_no_window_in_a_trusted_workspace() {
-    for (session, log, ready_at, window_end) in [
+    for (session, log, ready_at) in [
         (
             "session-C2fMs7",
             REAL_WINDOWS_TRUSTED_STARTUP,
             "22:43:26.187836",
-            "22:44:02.426377",
         ),
         (
             "session-uTpvwY",
             REAL_WINDOWS_TRUSTED_STARTUP_AGAIN,
             "22:43:48.491892",
-            "22:44:25.808780",
         ),
     ] {
         assert!(
@@ -2353,11 +1755,5 @@ fn a_windows_paste_right_after_the_quiet_period_needs_no_window_in_a_trusted_wor
         let replay = LogReplay::new(log, Instant::now());
         let ready = replay_readiness(&replay, WINDOWS_STARTUP_READINESS_TIMING);
         assert_ready_at(&replay, ready, ready_at, session);
-        assert_ready_at(
-            &replay,
-            replay_readiness(&replay, ROUND_9_TIMING),
-            window_end,
-            &format!("{session}, the 45 s rule"),
-        );
     }
 }

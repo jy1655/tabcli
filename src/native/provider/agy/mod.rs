@@ -470,27 +470,16 @@ const HOOKS_LOADED_SOURCE: &str = "hooks_manager.go";
 // must outlast that cadence so the paste does not land between two of them.
 const STARTUP_QUIET_PERIOD: Duration = Duration::from_millis(3500);
 
-// The Windows console rule: Agy redraws the console composer once the TUI is up, so
-// the redraw after startup is required. The initial paste has already waited for the
-// trust evidence, so no trust reload is pending and there is no deferred-reload
-// window: the former 45 s one delayed every `ask` in a workspace trusted before
-// launch by that long (53 s for session-jkxi48 against 18 and 24 s without it,
-// 2026-10-01).
+// After workspace trust, require startup, a Windows console redraw, and the quiet
+// period. See AGENTS.md's Current Agy Boundary for the trust and readiness evidence.
 const WINDOWS_STARTUP_READINESS_TIMING: ReadinessTiming = ReadinessTiming {
     quiet_period: STARTUP_QUIET_PERIOD,
-    deferred_reload_window: Duration::ZERO,
     redraw_required: true,
 };
-// The macOS follow-up rule: the same quiet period, no deferred-reload window, and no
-// redraw marker, which Agy never logs on macOS. The follow-up has already waited for
-// the trust evidence, so no trust reload is pending. The former 60 s window
-// (2026-09-24: 11.2 s in session-QMFk6F, 55.4 s in session-S7qq65, both the trust
-// reload that the `tell`'s own Enter caused) delayed every first follow-up in a
-// trusted workspace by a minute and still pasted onto the dialog of an untrusted one
-// (issue #48).
+// The macOS follow-up uses the same quiet period but no redraw marker, which Agy
+// never logs on macOS. Workspace trust is checked before this gate.
 const MACOS_FOLLOW_UP_READINESS_TIMING: ReadinessTiming = ReadinessTiming {
     quiet_period: STARTUP_QUIET_PERIOD,
-    deferred_reload_window: Duration::ZERO,
     redraw_required: false,
 };
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
