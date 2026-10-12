@@ -155,10 +155,26 @@ impl Transport for CodexInitialPaste {
                 // after the composer appears; keep the existing readiness delay.
                 ready_delay: Duration::from_secs(12),
             },
-            surface: Some(SurfaceInput { submit_count: 2 }),
+            // Codex 0.162.1's default keymap inserts LF for Shift+Return in an
+            // editable composer, both inside and outside a paste burst. Custom
+            // bindings, Vim normal mode, history search and disabled input are
+            // outside this fallback's contract. Remove it when Codex supplies a
+            // newline-preserving input API or paste event on Windows console.
+            surface: Some(SurfaceInput {
+                submit_count: 2,
+                newline: terminal::ConsoleNewline::ShiftReturn,
+            }),
         }
     }
     fn prepare(&self, turn: &TurnContext<'_>) -> Result<Prepared> {
+        // No timing/UI-independent literal Tab encoding is proven for Codex's
+        // console composer. Keep this restriction out of the native queue path.
+        if turn.surface.kind == terminal::TerminalKind::WindowsConsole && turn.prompt.contains('\t')
+        {
+            bail!(
+                "Codex Windows console paste cannot preserve tabs; replace tab characters with spaces"
+            );
+        }
         Ok(Prepared {
             prompt: terminal_initial_prompt(turn.directory, turn.prompt)?,
             correlation_id: None,
@@ -1145,6 +1161,52 @@ fn established_codex_thread(directory: &Path) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn console_paste_declares_soft_newlines_and_rejects_only_console_tabs() {
+        use crate::native::delivery::TurnKind;
+        let facts = CodexInitialPaste.facts().surface.unwrap();
+        assert_eq!(facts.submit_count, 2);
+        assert_eq!(facts.newline, terminal::ConsoleNewline::ShiftReturn);
+        assert!(CodexQueue.facts().surface.is_none());
+        let directory = tempfile::tempdir().unwrap();
+        for kind in [
+            "windows-console",
+            "ghostty",
+            "iterm2",
+            "apple-terminal",
+            "wezterm",
+            "warp",
+        ] {
+            let surface = serde_json::from_value(serde_json::json!({
+                "terminal": kind, "session_id": "surface"
+            }))
+            .unwrap();
+            let mut turn =
+                super::super::transport_test_context(directory.path(), &surface, TurnKind::Initial);
+            install_pending_turn(directory.path(), turn.claim_token).unwrap();
+            turn.prompt = "first\n\tsecond";
+            let result = CodexInitialPaste.prepare(&turn);
+            if kind == "windows-console" {
+                assert_eq!(
+                    result.err().unwrap().to_string(),
+                    "Codex Windows console paste cannot preserve tabs; replace tab characters with spaces"
+                );
+            } else {
+                assert!(result.unwrap().prompt.contains(turn.prompt));
+            }
+            turn.kind = TurnKind::FollowUp;
+            assert!(CodexQueue.prepare(&turn).is_ok());
+            turn.kind = TurnKind::Initial;
+            turn.prompt = "first\nsecond";
+            assert!(
+                CodexInitialPaste
+                    .prepare(&turn)
+                    .unwrap()
+                    .prompt
+                    .contains(turn.prompt)
+            );
+        }
+    }
     #[test]
     fn declared_transports_preserve_framing_and_pending_cleanup() {
         use crate::native::delivery::TurnKind;

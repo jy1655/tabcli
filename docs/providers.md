@@ -63,6 +63,17 @@ was sent. Check the managed surface and approve the workspace if you trust it. A
 initial request, close that session and run a new `ask`; `tell` requires a ready session.
 An empty screen does not count as a ready composer.
 
+Windows console initial paste encodes each LF as Shift+Return, keeping submission Returns
+unmodified. This fallback assumes Codex's default keymap and an editable composer; custom
+bindings, Vim normal mode, history search and disabled input are outside its supported scope.
+Bridge does not interpret Codex keymaps. Tabs in this paste path are refused with
+`replace tab characters with spaces`: no literal Tab encoding is proven to preserve text
+independently of timing and UI state. Native queue follow-ups are unaffected. The existing
+input policy still rejects CR, including CRLF; Bridge does not normalize line endings.
+Replace this fallback when Codex provides a newline-preserving input API or paste event on
+Windows console. Windows live verification of newline preservation is pending; Agy and Pi
+retain their existing LF encoding and need separate provider evidence.
+
 Temporary measure for #124: after the Windows initial paste, Bridge waits up to 10 s (bounded by
 the request deadline) for the empty composer row with no `› [Pasted Content` row. If that submission
 evidence is absent or the screen cannot be read, delivery is uncertain and Bridge does not resend.

@@ -17,7 +17,10 @@ impl Transport for Fake {
             readiness: Readiness::AfterLaunch {
                 ready_delay: Duration::ZERO,
             },
-            surface: self.surface.then_some(SurfaceInput { submit_count: 2 }),
+            surface: self.surface.then_some(SurfaceInput {
+                submit_count: 2,
+                newline: terminal::ConsoleNewline::LineFeed,
+            }),
         }
     }
     fn prepare(&self, turn: &TurnContext<'_>) -> Result<Prepared> {
