@@ -1015,11 +1015,20 @@ esac
 
 #[test]
 fn readme_install_section_names_the_cargo_version() {
+    for (file_name, heading) in [("README.md", "## Install"), ("README.ko.md", "## 설치")] {
+        check_readme_install_section(file_name, heading);
+    }
+}
+
+fn check_readme_install_section(file_name: &str, heading: &str) {
     let readme =
-        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
-            .unwrap();
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file_name))
+            .unwrap_or_else(|error| panic!("{file_name}: {error}"));
     let mut lines = readme.lines().enumerate();
-    assert!(lines.any(|(_, line)| line == "## Install"));
+    assert!(
+        lines.any(|(_, line)| line == heading),
+        "{file_name}: missing {heading} section"
+    );
     let mut archives = 0;
     let mut tags = 0;
     for (line_index, line) in lines.take_while(|(_, line)| !line.starts_with("## ")) {
@@ -1061,17 +1070,17 @@ fn readme_install_section_names_the_cargo_version() {
                     continue;
                 }
                 let version = &tail[..end];
-                // Only this minimum-toolchain phrase is exempt, not every 1.97.1.
+                // Only these minimum-toolchain phrases are exempt, not every 1.97.1.
                 if before.ends_with("Rust ")
                     && version == "1.97.1"
-                    && tail[end..].starts_with(" or newer")
+                    && (tail[end..].starts_with(" or newer") || tail[end..].starts_with(" 이상"))
                 {
                     continue;
                 }
                 assert_eq!(
                     version,
                     env!("CARGO_PKG_VERSION"),
-                    "README.md:{}: Install version {version} differs from Cargo",
+                    "{file_name}:{}: Install version {version} differs from Cargo",
                     line_index + 1
                 );
                 archives +=
@@ -1080,8 +1089,14 @@ fn readme_install_section_names_the_cargo_version() {
             }
         }
     }
-    assert!(archives > 0, "README Install must name a versioned archive");
-    assert!(tags > 0, "README Install must name a versioned --tag");
+    assert!(
+        archives > 0,
+        "{file_name}: {heading} must name a versioned archive"
+    );
+    assert!(
+        tags > 0,
+        "{file_name}: {heading} must name a versioned --tag"
+    );
 }
 
 #[test]
