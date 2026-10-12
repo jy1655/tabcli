@@ -292,19 +292,8 @@ fn read_full_result(path: &Path, brain_root: &Path, step: u64) -> Result<Option<
     Ok(None)
 }
 
-// A turn Agy gives up on never reaches the transcript as a result: the conversation
-// keeps only its USER_INPUT step and agy.log gets one `agent executor error:` line
-// (2026-10-01, Agy 1.2.14: `generating and executing: RESOURCE_EXHAUSTED (code 429):
-// Individual quota reached. ... Resets in 2h22m28s.`; fifteen sessions, the only such
-// lines in more than 100 logs, each of which waited out its whole timeout). Turns are
-// sequential and each starts with a `Forwarding user message` line, so an error after
-// the newest such line ended the newest turn. That turn is the pending one when the
-// log itself says so: a pasted turn is preceded by the receipt that carries its
-// marker. The argument-delivered initial prompt has no receipt; it is the first turn
-// of the log, and Agy's full transcript must hold exactly one USER_INPUT step, the
-// one with the marker, so that a later turn whose log lines are not yet written
-// cannot inherit the first turn's error. Replace this when Agy exposes a per-turn
-// failure callback with turn identity.
+// Bind quota failure to the newest log turn via its receipt, or the sole marked initial transcript input.
+// Replace with a provider turn-failure signal; see AGENTS.md, Current Agy Boundary.
 const TURN_START_MARKER: &str = "Forwarding user message to conversation ";
 const TURN_FAILURE_MARKER: &str = "agent executor error: ";
 

@@ -79,19 +79,11 @@ const REOPEN_POST_CREATION_GATES: [&str; 3] = [
     REOPEN_VERIFICATION_FAILED_GATE,
 ];
 
-// The only phase whose refusals are persisted. The record exists so the reopen command can
-// name a gate that failed in the launch wrapper, in another process; every writer of it is
-// a launch-phase gate (the pre-spawn recheck, the post-launch holder check, and the holder
-// check immediately before the initial prompt is sent), and the reader accepts nothing
-// else. A refused later `tell` keeps its reason in the session status and its own response
-// only: it must never be mistaken for a refusal of the initial delivery, whose uncertain
-// outcome is decided from this record.
+// Only launch gates persist refusals across processes; a later tell refusal must never
+// authorize retry of an uncertain initial delivery.
 const REOPEN_REFUSAL_LAUNCH_PHASE: &str = "launch";
 
-// `cleanup` is written by a marker settlement that found the refused launch may still hold
-// the conversation (a failed close of a spawned process). It is a note for `doctor` and the
-// next reopen attempt; the release decision itself is always taken from the session's live
-// records, never from this field.
+// Cleanup is a diagnostic for doctor and the next reopen; only live records decide release.
 const REOPEN_REFUSAL_CLEANUP_PENDING: &str = "pending";
 
 // Records a launch-phase gate refusal that happened after the new session existed, then
@@ -173,10 +165,7 @@ enum ProviderProcessObservation {
     Unknown(String),
 }
 
-// Reopen-local observation of a recorded provider process. Unlike the owner observation
-// used by dead-owner repair (`query::observe_owner_record`), it keeps a confirmed identity
-// mismatch apart from a failure to inspect: the first is a pid reused by another process
-// and releases the marker, the second retains it.
+// A verified PID reuse releases the marker; an inspection failure retains it.
 fn observe_provider_process(record: &ProviderProcessRecord) -> ProviderProcessObservation {
     #[cfg(windows)]
     if let Some(identity) = &record.windows_process_identity {
@@ -212,15 +201,8 @@ fn classify_provider_process_identity(
     }
 }
 
-// Whether a launch-refused reopened session can still hold the provider conversation. The
-// source's reopen marker is released only on the two verified outcomes; `Pending` keeps it
-// consumed, because a refused launch whose provider process survived (a close that failed
-// or was never performed, a process that ignored the console close, a process that never
-// registered) is exactly the second live writer the gate exists to keep out, and the
-// registry scan of the next reopen would not see an unregistered one. Neither the launch
-// wrapper's liveness nor a closed surface is evidence on its own: Windows does not end a
-// child with its parent, dead-owner repair marks a session closed without any terminal
-// close, and a provider can outlive the console it was started in.
+// Release only when the provider is verified gone or never spawned. Wrapper death and
+// a closed surface cannot rule out an unregistered provider that still holds the conversation.
 #[derive(Debug, PartialEq)]
 enum RefusedLaunchCleanup {
     // The pre-spawn recheck refused and no provider process was recorded: the launch
@@ -279,11 +261,8 @@ impl std::fmt::Display for RefusedLaunchCleanup {
     }
 }
 
-// Read-only. Establishes, from the refused session's own records, whether the launch that
-// was refused under `gate` can still hold the conversation. A session that accepts prompts
-// or is working is never a refused launch, whatever its record says. The pre-spawn gate
-// proves nothing by itself: only the absence of a provider process record shows that no
-// process was spawned, and a record that exists is verified like any other.
+// Read-only: ready/working sessions are not refused launches. A pre-spawn refusal proves
+// no spawn only without a provider record; an existing record must be verified.
 fn refused_launch_cleanup(refused_directory: &Path, gate: &str) -> Result<RefusedLaunchCleanup> {
     let refused_session = refused_directory
         .file_name()
@@ -384,16 +363,8 @@ impl ResumedHolderCheck {
     }
 }
 
-// The holder check of a reopened session. The adapter reports every other live holder of the
-// conversation; a non-empty answer is a detected conflict and refuses under
-// `reopen-conflict`. Any failure to complete the check (unreadable registry, a live record
-// that cannot be verified, an uninspectable process, a duplicate managed name, a registration
-// that never came) refuses under `reopen-verification-failed`: an unverifiable conversation
-// is treated as shared, never as exclusive. At the launch-phase boundaries both refusals are
-// recorded in the session so the gate survives the process boundary; a follow-up refusal is
-// returned unrecorded. The recorded detail states only what was detected; whether the new
-// surface was then closed is reported by the caller once that outcome is known. A foreign
-// resume that registers between two checks is not detected until the next one.
+// Other live holders refuse as conflict; incomplete verification also refuses delivery.
+// Persist launch refusals only; foreign resumes between checks remain undetected.
 pub(super) fn verify_reopened_conversation_exclusive(
     provider: FirstPartyCli,
     directory: &Path,
@@ -451,13 +422,8 @@ pub(super) fn verify_reopened_conversation_exclusive(
     ))
 }
 
-// A failed holder check, whether a detected conflict or a verification the adapter could
-// not complete, is the launch failure that also closes the new surface: the reopened
-// process is a second live writer of the conversation (or cannot be shown not to be), and
-// leaving it open would keep the interleaving the gate exists to detect. Every other launch
-// failure keeps the existing behavior of marking only the new session failed. Only the new
-// session's own handle is ever closed; the source keeps its tombstone. The returned error
-// reports the close outcome only after it is known.
+// A failed holder check closes only the new surface and reports its close outcome.
+// Other launch failures only fail the new session; the source keeps its tombstone.
 pub(super) fn close_surface_after_reopen_verification_failure(
     directory: &Path,
     id: &str,
@@ -541,17 +507,8 @@ pub(super) fn run_reopen(request: ReopenRequest) -> Result<()> {
     }
 }
 
-// Decides, once the reopened session exists, whether the reopen was refused at a
-// post-creation gate and whether that refusal releases the source's reopen marker. The gate
-// is typed in this process (the post-launch and pre-initial-delivery holder checks) or
-// recorded by the launch wrapper in the new session (the pre-spawn recheck); either way the
-// response names it. Only a launch-phase refusal counts: the initial delivery can complete
-// while its messenger is still settling, a later `tell` can then be refused and the session
-// closed, and the initial messenger can finally report only that delivery is uncertain.
-// That `tell` refusal lives in the session status, never in the launch refusal record, so
-// the uncertain outcome finds no gate here and the marker stays consumed: a prompt may
-// have reached the conversation, and a second reopen must not be permitted on the strength
-// of a refusal that was not the launch's.
+// Only a launch-phase refusal can release the source marker. A later tell can fail while
+// the initial messenger settles; its refusal cannot prove the initial prompt was not sent.
 fn settle_reopen_outcome(
     session_directory: impl Fn(&str) -> Result<PathBuf>,
     source: &str,
@@ -695,18 +652,8 @@ fn create_reopened_session(
     Ok((created, resumed_from))
 }
 
-// A reopen refused after its session existed delivered nothing to the conversation: the
-// pre-spawn recheck started no process, and both post-launch gates refuse before the first
-// prompt and close the new surface. Bridge therefore established no conversation writer,
-// and the source's reopen marker is released so the source can be reopened again once the
-// cause is gone. The refused session keeps its `resumed_from` as provenance. Release
-// requires that the marker still names the refused session and that the refused launch
-// provably cannot hold the conversation (`refused_launch_cleanup`): a spawned provider
-// process may survive the console close and the wrapper without ever registering, so the
-// registry gate of the next reopen would not catch it. Until that process is verified
-// gone the marker stays consumed, the refusal record is annotated with `cleanup:
-// "pending"`, and the next reopen attempt reconciles the marker
-// (`verify_reopen_source_is_closed`).
+// Release only the marker naming this refused launch, once its provider is verified gone.
+// Keep resumed_from; pending cleanup retains the marker for the next reopen to reconcile.
 fn release_reopen_marker_after_refusal(
     source_directory: &Path,
     refused_directory: &Path,
@@ -760,22 +707,14 @@ fn release_reopen_marker_after_refusal(
     }
 }
 
-// Read-only gates on the closed source: it is closed with its tombstone and nothing of its
-// lifecycle is left open, every request record resolves to a recorded event, and a provider
-// event supplies the conversation identity. Each refusal names its gate. Receipts are
-// validated before the identity is read, so a corrupt newest event refuses under
-// `request-unresolved` whether or not a receipt points at it.
+// Require a tombstoned, settled source with resolved receipts and a provider identity.
+// Validate receipts first so corrupt events consistently refuse as request-unresolved.
 fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
     let manifest = Reader::open_unchecked(directory).manifest()?;
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
     verify_reopen_source_is_closed(directory, id)?;
-    // The lifecycle readers' contract for `events`: it is a real directory inside the
-    // session, or absent, before anything under it is opened. A link or a non-directory
-    // planted there would carry the reads below outside the session, and the shared
-    // listing would present it as "no events", which the identity gate would then report
-    // as a source without an identity. Neither can prove what the source delivered. An
-    // absent directory is not rejected here: it holds no event, so the receipt and identity
-    // gates below refuse for what is actually missing.
+    // Reject linked or non-directory events paths before reads can escape the session.
+    // An absent directory reaches the receipt/identity gates, which report what is missing.
     Reader::open_unchecked(directory)
         .events_directory_state()
         .map_err(|error| {
@@ -851,10 +790,8 @@ fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
     })
 }
 
-// A reopen marker that names a session whose launch was refused and whose cleanup is now
-// verified. The marker no longer excludes anything: the reopen it recorded delivered no
-// prompt and its process is provably gone, so the next claim under the source lock removes
-// it before writing its own.
+// A refused launch with verified cleanup no longer holds the conversation; the next
+// claim removes its stale marker under the source lock before installing its own.
 #[derive(Debug)]
 struct StaleReopenMarker {
     refused_session: String,
@@ -862,15 +799,8 @@ struct StaleReopenMarker {
     cleanup: RefusedLaunchCleanup,
 }
 
-// Read-only. The source is closed with its tombstone, nothing of its lifecycle is left
-// open, and any reopen marker it carries is either stale (returned, so the claim can
-// release it) or refuses under `already-reopened` naming the blocking condition. A marker
-// is stale only when the session it names carries a durable launch-phase refusal and that
-// refused launch is verified unable to hold the conversation (`refused_launch_cleanup`).
-// This is how a marker whose parent reopen crashed before settlement, or whose launch
-// wrapper recorded its refusal only after the parent timed out, is reconciled: nothing is
-// inferred from the absence of records, and a marker that names a session without a launch
-// refusal, or with a launch refusal whose process may survive, stays consumed.
+// Read-only: release eligibility requires a durable launch refusal and verified cleanup.
+// Missing records or a possibly surviving provider keep the marker consumed after a crash.
 fn verify_reopen_source_is_closed(directory: &Path, id: &str) -> Result<Option<StaleReopenMarker>> {
     let closed = Reader::open_unchecked(directory).regular_closed_if_present()?;
     let status = Reader::open_unchecked(directory).regular_status_if_present()?;
@@ -957,10 +887,8 @@ fn verify_reopen_source_is_closed(directory: &Path, id: &str) -> Result<Option<S
     }))
 }
 
-// A recorded event that cannot be read is a turn whose outcome cannot be verified, so it
-// refuses under `request-unresolved` even when no receipt points at it (legacy sessions).
-// Every recorded event is read, not only those newer than the identity that is returned: an
-// older unreadable event is as unverifiable as a newer one.
+// Read every event, including legacy and older events: any unreadable outcome refuses
+// as request-unresolved even without a receipt pointing at it.
 fn latest_provider_event_identity(
     directory: &Path,
     provider: FirstPartyCli,
@@ -1119,11 +1047,8 @@ fn claim_reopen_marker(
     })
 }
 
-// A resumed session's conversation is re-checked immediately before every follow-up
-// delivery. A refusal sends nothing: the claim is released and the reason is recorded in
-// one status write, so the session stays ready with the refusal in its status and its
-// receipt stays unresolved. This is the same best-effort detection the launch ran; a
-// foreign resume that registers after this point is caught only by the next delivery.
+// Recheck before every follow-up; refusal atomically releases the claim and records the
+// reason, leaving its receipt unresolved. A later foreign resume waits for the next check.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn refuse_follow_up_to_shared_conversation(
     provider: FirstPartyCli,
@@ -1149,10 +1074,8 @@ pub(super) fn refuse_follow_up_to_shared_conversation(
     Err(record_follow_up_refusal(id, claim, previous_state, error))
 }
 
-// The claim is released and the refusal reason is published in one write under the
-// lifecycle lock, and only while the claim is still this request's. Once another `tell`
-// owns the turn, nothing is written: that turn keeps its claim, receipt, and status, and
-// the refused request's receipt stays unresolved.
+// Release and status update share the lifecycle lock and require this request's claim.
+// A newer turn keeps its claim, receipt and status; the refused receipt stays unresolved.
 fn record_follow_up_refusal(
     id: &str,
     claim: &mut turn::Claim,
@@ -1170,11 +1093,8 @@ fn record_follow_up_refusal(
     }
 }
 
-// The reopen marker of a closed source session: which reopen consumed it and whether the
-// next reopen can proceed. Read-only, and the same judgment the reopen gate makes under the
-// source lock (`refused_launch_cleanup`, which verifies the recorded provider process, not
-// the launch wrapper or the closed surface); doctor neither releases nor annotates the
-// marker.
+// Doctor observes the same marker eligibility as the locked reopen gate, using the
+// provider identity; it never releases or annotates the marker.
 pub(super) fn marker_check(reader: &Reader, id: &str, checks: &mut Vec<Check>) {
     let directory = reader.directory();
     use Availability::*;

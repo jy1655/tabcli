@@ -20,7 +20,7 @@ enum Launch {
 
 fn help_text() -> String {
     format!(
-        "{PUBLIC_COMMAND} {} — Terminal Agent Bridge: visible terminal sessions for coding agent CLIs
+        "{PUBLIC_COMMAND} {}: Terminal Agent Bridge: visible terminal sessions for coding agent CLIs
 
 Usage:
   {PUBLIC_COMMAND} ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]

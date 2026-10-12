@@ -1,33 +1,5 @@
-//! Keeps the keyboard where it was while a managed surface is created (issue #58).
-//!
-//! Windows Terminal brings a window to the front whenever a command line is dispatched
-//! to it, and a console window handed to the default terminal is created in front. No
-//! option creates either surface behind the window the user is typing in, so the launch
-//! remembers that window and gives the foreground back, but only while the window that
-//! hosts the new surface holds it. A window the user goes to in the meantime is
-//! remembered instead and gets the keyboard back from then on, and the surface's own
-//! window keeps the keyboard when it comes to the front again later than a window does
-//! on its own. Everything here is best effort and never fails a launch.
-//!
-//! What the user did cannot be told from what a window did. The surface's window in
-//! front before the keyboard was given back, or shortly after, is taken as the launch's
-//! doing, also when the user happened to select it in that moment: leaving the keyboard
-//! in a session the user did not choose is the worse mistake.
-//!
-//! The foreground is watched by a thread of its own, because "shortly after" is only
-//! known to someone who looks all the time, and the launch itself waits on files and
-//! processes in between. The launch never waits for that thread longer than a moment:
-//! giving the foreground back goes through the input queue of the window that holds
-//! it, and a window that has stopped answering can hold such a call for good.
-//!
-//! The window that hosts the surface is never guessed: a process inside the console
-//! reads it from the console's own window (`attached_console_host_window`). In a tab that
-//! process is the tab host, which reports the window before the root is started. For a
-//! console window of its own it is a control helper that attaches to the started root's
-//! console. The console window says nothing to a process outside the console: under
-//! Windows Terminal it belongs to the terminal's console host process, not to the root
-//! (measured 2026-10-01, Windows Terminal 1.24). A terminal window that merely appeared
-//! during the launch is not attributed to it; the user may have opened it.
+//! Return focus only from the verified surface window, tracking user selections with a bounded watcher.
+//! Timing cannot distinguish every user action; see AGENTS.md, Current Windows Surface Boundary.
 use std::{
     sync::{
         Arc,

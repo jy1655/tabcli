@@ -11,95 +11,14 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
-// Terminal paste delivery verification (Agy adapter fallback, issues #43 and #48).
-//
-// Agy has no first-party input API for a running interactive session and no
-// ready/accepted signal for a turn, so the adapter pastes the framed prompt into the
-// managed terminal. Until Agy exposes either a first-party input path or a per-turn
-// ready/accepted signal, this adapter reads Agy's own trust store and `--log-file`
-// output (glog lines) as the only available evidence.
-//
-// See AGENTS.md's Current Agy Boundary for the observed trust-dialog behavior.
-//
-// - workspace trust: no paste before Agy's store lists the exact workspace and this
-//   session's own log shows the workspace customization load, the per-process
-//   evidence that its dialog is gone (`wait_for_workspace_trust_with`). The macOS
-//   follow-up and the native Windows initial paste both wait for it.
-// - readiness gate: `CLI startup completed` (analytics.go), on the Windows console
-//   at least one `Full redraw completed` (manager.go) line after it, and a quiet
-//   period in which no `Reloading system slash commands` line (with or without "and
-//   skills"), no `Full redraw completed` line, and no `hooks_manager.go` line
-//   arrives, measured on the gate's clock from the first read that showed the newest
-//   such line. The gate is ready on the first read at which every condition holds,
-//   and it never waits for a hooks completion after a reload or for a trust reload.
-//   The gate also keeps the byte length and a digest of every byte of the newest
-//   read (`LogContinuity`): a log that disappears, shrinks, or no longer reproduces
-//   that digest over the observed length was replaced or rotated, so every
-//   settlement instant is discarded and the quiet period is re-measured from the new
-//   content. Any number of such restarts is tolerated within the deadline: the gate
-//   fails the paste as `not_sent` only when the deadline passes, and the report then
-//   lists every discontinuity in order.
-// - input receipt: a complete `HandleUserInput called with text: "..."` line
-//   (input_loop.go) that starts after the byte length of agy.log observed
-//   immediately before the paste and whose text carries the adapter's framing and
-//   the complete pending turn marker.
-//
-// Delivery classification after a paste (issue #43 review):
-//
-// - delivered: such a receipt line exists after the pre-paste offset. Nothing
-//   logged after the receipt revokes it. Agy 1.2.10 logs `Reloading system slash
-//   commands and skills` a few milliseconds after `HandleUserInput` and the
-//   conversation-start lines (`Starting new conversation`, `Created conversation`):
-//   session-udT6uY logged it 15 ms after the receipt (2026-09-24 16:42:50.228), and
-//   both delivered live asks of round 7 showed the same. That is the reload the new
-//   conversation triggers, not the trust reload, so it is never evidence that the
-//   paste was lost. `observe_input_receipt` looks only for the receipt, and
-//   `confirm_input_receipt_with` returns on the first read that yields `Delivered`,
-//   so a later reload cannot flip a delivered classification;
-// - delivery-uncertain: everything else. Non-delivery would have to be proven by a
-//   line Agy logs after draining its console input without a receipt, and the real
-//   logs contain no such marker (session-fMqSQc, 2026-09-24: after the discarded
-//   paste Agy logged only the trust reload and then nothing for a minute), so a
-//   missing receipt at the end of the window, a deadline-capped window, an
-//   unreadable or missing log, a log shorter than the pre-paste offset (rotated or
-//   truncated), and a partial trailing line all stay uncertain and never `not_sent`.
-//   The paste is never repeated. A lost paste therefore ends as delivery-uncertain:
-//   the launcher keeps the turn claim, leaves the session `working`, and writes the
-//   receipt error to `status.error` (`Claim::settle_delivery` for both
-//   the initial prompt and `tell`).
-//   The caller must inspect that error (or `doctor <session>`) and then close the
-//   session with `close-session --explicit` or launch a new one; the bridge never
-//   re-pastes or cleans up on its own.
-//
-// macOS follow-up delivery (iTerm2/Terminal.app paste): the initial prompt is a
-// `--prompt-interactive` argument, so the first paste is the first `tell`. Three
-// differences from the Windows console:
-//
-// - The trust evidence is checked at the follow-up, not at launch: the argument
-//   prompt completes behind the dialog, so an `ask` in a workspace no provider has
-//   approved returns its result while the dialog is still up. Issue #48 was that
-//   state: the former 60 s window ended, the paste landed on the dialog, and the
-//   receipt check saw only the 356 bytes of the trust reload.
-// - There is no deferred-reload window (`MACOS_FOLLOW_UP_READINESS_TIMING`): once the
-//   trust evidence holds nothing is pending, and a follow-up in a workspace trusted
-//   before launch no longer waits 60 s for a reload that never comes.
-// - Agy on macOS logs no `Full redraw completed` line at all (session-QMFk6F and
-//   session-7IgCnx, this machine), so the macOS rule does not require the redraw
-//   marker. The argument prompt starts a conversation a few seconds after startup,
-//   and the `Reloading system slash commands and skills` line a few milliseconds
-//   after `Starting new conversation` (7 ms in session-QMFk6F at +2.9 s, 26 ms in
-//   session-7IgCnx at +2.7 s) is the conversation reload: an activity line for the
-//   quiet period, and never the trust reload on either platform
-//   (`CONVERSATION_RELOAD_MAX_LATENCY`).
-//
-// The receipt is the same Go-quoted `HandleUserInput` line: a multi-line paste
-// through iTerm2 is logged as one record with `\n` escapes and the complete marker
-// (session-QMFk6F, 21:42:19). It carries the macOS framing header instead of the
-// Windows one, and `receipt_matches` accepts either adapter-owned framing.
-//
-// Delete this section, the initial readiness fact, and the trust and receipt
-// branches of `send_initial_prompt`/`send_terminal_follow_up` when Agy provides
-// such a signal or an input API; the transcript result monitor is unaffected.
+// Paste only after exact trust, per-process customization load, startup and quiet log evidence.
+// Windows also requires redraw; macOS launch arguments need no paste gate.
+// Replaced logs reset readiness; the qualifying read's byte length bounds the receipt search.
+// Only a complete framed HandleUserInput marker after that offset proves delivery.
+// Later activity never revokes a receipt; missing evidence stays uncertain and is never re-pasted.
+// Keep the claim and status.error on uncertainty; cleanup belongs to an explicit caller action.
+// Replace these gates when Agy exposes input/acceptance; the transcript monitor is independent.
+// See docs/verification/2026-10-01-bug-triage.md for the investigation.
 
 const INPUT_RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 

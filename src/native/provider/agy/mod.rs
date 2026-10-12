@@ -38,18 +38,12 @@ const PENDING_TURN_FILE: &str = "agy-pending-turn.json";
 const TRANSCRIPT_FILE: &str = "transcript.jsonl";
 const FULL_TRANSCRIPT_FILE: &str = "transcript_full.jsonl";
 
-// The only line Agy draws under its trust dialog is the footer with the selected
-// model's label, and `agy models` (1.2.14) lists these families. The footer appears
-// about a second after the dialog and names the saved model, not always a Gemini
-// one: a `Gemini `-only rule left the dialog of a `Claude Opus 4.6 (Thinking)`
-// setup unanswered until the ask deadline (session-a1QguW, 2026-10-01). Any other
-// trailing line (a permission prompt, a custom status line, a new family) leaves
-// the dialog to the user.
+// Accept only the known model-family footer after the exact trust dialog; other trailing text
+// leaves it to the user. See docs/verification/2026-10-01-bug-triage.md.
 const AGY_MODEL_LABEL_PREFIXES: [&str; 3] = ["Gemini ", "Claude ", "GPT-"];
 
-// Agy 1.2.12 has no process-local workspace-trust flag. This adapter-only
-// fallback responds to its exact managed startup dialog, then verifies Agy's
-// own saved decision. Remove when Agy exposes an official trust input API.
+// Without a process-local trust API, answer only the exact managed dialog and verify the saved decision.
+// Remove this fallback when Agy provides an official trust input API.
 fn agy_trust_prompt_key(screen: &str, workspace: &Path) -> Option<terminal::DialogKey> {
     let lines: Vec<_> = screen
         .lines()
@@ -137,13 +131,8 @@ fn send_terminal_follow_up(
         // follow-up only takes its receipt offset and pastes.
         deliver_terminal_turn(session, prompt_path, deadline, None)
     } else {
-        // On macOS the initial prompt was a launch argument, so the first
-        // follow-up is the first paste. Agy runs that argument behind its
-        // workspace-trust dialog, which covers the composer until the workspace
-        // is approved, and a paste onto the dialog is lost while its Enter
-        // approves the folder (issue #48, see `wait_for_workspace_trust_with`).
-        // Every follow-up therefore waits for the trust evidence, then for the
-        // macOS readiness rule, and requires the receipt.
+        // Argument prompts run behind the trust dialog; each macOS follow-up needs trust, readiness
+        // and a receipt before it can count as delivered. See AGENTS.md, Current Agy Boundary.
         deliver_terminal_turn(
             session,
             prompt_path,
@@ -478,13 +467,8 @@ const MACOS_FOLLOW_UP_READINESS_TIMING: ReadinessTiming = ReadinessTiming {
     redraw_required: false,
 };
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
-// Agy logs `HandleUserInput` when it processes the pasted line, not when the console
-// receives it, and that processing is slow under load: session-M8QFPp (2026-09-24
-// 20:37) logged the receipt 18.0 s after the paste, outside the former 15 s window,
-// so the adapter reported delivery-uncertain although the paste had landed;
-// session-8WjG3m logged it about 10 s after its paste. The receipt is still capped
-// by the deadline, and a lost paste still ends as delivery-uncertain, only 45 s
-// later than before.
+// Agy processes pasted input late under load; cap receipt waiting by the caller's deadline.
+// Missing receipts stay uncertain; see docs/verification/2026-10-01-bug-triage.md.
 const INPUT_RECEIPT_WINDOW: Duration = Duration::from_secs(60);
 
 const TRUST_STORE_MISSING: &str = "Agy's trust store does not list the exact workspace, and Agy keeps its trust dialog over the composer until such a workspace is approved";

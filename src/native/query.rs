@@ -695,10 +695,8 @@ pub(super) fn inspect_value(reader: &Reader, id: &str) -> Result<Value> {
     observation::Observation::read_locked(reader)?.inspect_value(reader, id)
 }
 
-// ---------------------------------------------------------------------------------------
 // `search`: substring lookup over published result bodies. Read-only, budgeted, and scoped
 // to one workspace unless the caller removes the filter.
-// ---------------------------------------------------------------------------------------
 
 const SEARCH_DEFAULT_LIMIT: usize = 20;
 const SEARCH_MAX_LIMIT: usize = 200;

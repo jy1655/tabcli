@@ -13,39 +13,12 @@ const REDRAW_AFTER_STARTUP_DESCRIPTION: &str =
 const QUIET_PERIOD_DESCRIPTION: &str = "quiet period not reached (no `Reloading system slash commands`, `Full redraw completed`, or `hooks_manager.go` line for the quiet period after the newest one)";
 const CONVERSATION_START_MARKER: &str = "Starting new conversation";
 
-// A skills reload stamped at most this long after the newest `Starting new
-// conversation` line is the reload the new conversation triggers (7 ms and 26 ms
-// after it on macOS; 15 ms after the receipt on Windows, session-udT6uY), never the
-// trust reload, which follows the Enter that approves the workspace-trust dialog.
+// A reload near the newest conversation start is that conversation's reload, not trust.
+// See docs/verification/2026-10-01-bug-triage.md for timing evidence.
 const CONVERSATION_RELOAD_MAX_LATENCY: Duration = Duration::from_secs(1);
 
-// Trust reload latency after `CLI startup completed`, Agy 1.2.10 on the Windows
-// machine, 2026-09-24 KST (the fixtures in the tests):
-//
-// | session        | latency | window at the time | paste                       |
-// |----------------|---------|--------------------|-----------------------------|
-// | session-IEKjtC |  9.8 s  | none (fixed 12 s)  | +9.5 s, lost                |
-// | session-fMqSQc | 13.0 s  | none (fixed 12 s)  | +12 s, lost                 |
-// | session-ql5TVc | 21.4 s  | 20 s               | +20.1 s, lost               |
-// | session-Cf1FBY | 36.4 s  | 35 s               | +35 s, lost (heavy CPU load)|
-// | session-uqraap | 36.4 s  | 35 s               | +35 s, lost (CPU idle)      |
-// | session-IQHEwf | never   | -                  | none (round-1 gate)         |
-//
-// Nine more logs put it at 12.9 to 13.2 s, about a second after the fixed 12 s
-// paste. The reload always trails the paste, whatever the window was: the paste's
-// Enter approved the workspace-trust dialog and Agy logged the trust reload, so each
-// longer window only moved the loss later, and session-IQHEwf, which pasted nothing,
-// never logged it. No window was ever a measured startup latency, and none is left
-// (see the note at the head of this section).
-//
-// A `Reloading system slash commands and skills` line stamped less than this long
-// after `CLI startup completed` is the startup reload, not the trust reload. Agy
-// logs its startup reload on either side of `CLI startup completed`: 3.5 ms before
-// it in session-fMqSQc, 0.5 ms after it in session-udT6uY and 1.6 ms after it in
-// session-M8QFPp (2026-09-24 20:37), where the former rule took it for the later
-// reload and settled the condition at once. The trust reload follows an Enter on
-// the dialog; the earliest one recorded on the Windows console came 9.8 s after
-// startup.
+// Startup reloads can straddle CLI startup completed; the latency threshold separates them.
+// Trust reload follows dialog approval, not a timer; see docs/verification/2026-10-01-bug-triage.md.
 const DEFERRED_RELOAD_MIN_LATENCY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -59,12 +32,8 @@ pub(super) struct StartupObservation {
     // Agy redraws the composer once the TUI is up; the redraw before startup, when
     // there is one, does not count.
     pub(super) redraw_after_startup: Option<usize>,
-    // Line index of the first `Reloading system slash commands and skills` line
-    // after the startup line that is stamped at least `DEFERRED_RELOAD_MIN_LATENCY`
-    // after it: the trust reload Agy logs when its workspace-trust dialog is
-    // approved (the "deferred" reload of the 2026-09-24 notes). The startup
-    // reload, which Agy logs a few milliseconds before or after `CLI startup
-    // completed`, does not count on either side of it.
+    // First post-startup trust reload at least DEFERRED_RELOAD_MIN_LATENCY after startup;
+    // exclude the startup reload on either side of CLI startup completed.
     pub(super) deferred_reload_after_startup: Option<usize>,
     // Line index of the first skills reload after the startup line that was too
     // early to be the deferred reload (diagnostics only).
@@ -75,10 +44,7 @@ pub(super) struct StartupObservation {
     pub(super) conversation_reload_after_startup: Option<usize>,
     // The glog stamp of the newest `Starting new conversation` line so far.
     conversation_start_stamp: Option<Duration>,
-    // Line index of the newest activity line: any `Reloading system slash commands`
-    // line (with or without "and skills"), `Full redraw completed` line, or
-    // `hooks_manager.go` line, wherever it sits. The quiet period restarts whenever
-    // this changes.
+    // Newest reload, redraw or hooks activity, anywhere in the log; a change restarts quiet time.
     settle_line: Option<usize>,
     // Activity lines seen so far (diagnostics only).
     pub(super) activity_lines: usize,
@@ -215,22 +181,8 @@ pub(super) struct ReadinessTiming {
     pub(super) redraw_required: bool,
 }
 
-// The settlement instants are only evidence about the log they were measured
-// against. Agy appends to its `--log-file`, so every read must extend the previous
-// one; a log that disappears, shrinks, or no longer holds every byte observed
-// earlier was replaced or rotated, and the indices of its `CLI startup completed`
-// and activity lines can coincide with the old ones while the composer behind it
-// is fresh. The gate therefore keeps the byte length and a digest of every byte of
-// the newest read, the way the receipt check keeps the pre-paste offset, and on a
-// discontinuity discards every settlement instant and starts over from the new
-// content: the quiet period is timed from the new
-// observation. Any number of discontinuities is tolerated within the deadline; each
-// one restarts the evidence, and the deadline report counts them. A read is a
-// continuation only when it is at least as long as the observed content and its
-// first `len` bytes digest to the same value, so a rewrite anywhere inside the
-// observed content (a re-stamped prefix, a replaced later line, or a suffix rewrite
-// that keeps every line index) is a discontinuity, not just one within a leading
-// window. The log is small, so the prefix is re-digested on every read.
+// Each read must extend the entire observed prefix, verified by length and digest.
+// Any discontinuity resets settlement evidence and counts toward the unchanged deadline.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LogContinuity {
     len: usize,
@@ -426,11 +378,8 @@ impl ReadinessGate {
     }
 }
 
-// Waits until one read of the log passes the readiness rule and continues every
-// earlier read, and returns that read's byte length: the caller pastes right after
-// it, so it is the pre-paste offset for the receipt check. A read that shows a
-// discontinuity or new activity is never a baseline; the gate keeps waiting within
-// the deadline until a later read passes both.
+// Return the ready, continuous read's length as the pre-paste receipt offset.
+// New activity or discontinuity requires a later qualifying read within the deadline.
 pub(super) fn wait_for_startup_readiness_with<L, C>(
     read_log: &mut L,
     deadline: Instant,

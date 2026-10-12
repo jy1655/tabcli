@@ -1,4 +1,4 @@
-# Terminal.app ownership proof — 2026-10-01
+# Terminal.app ownership proof: 2026-10-01
 
 Source baseline: commit `13e74f8` on branch
 `fix/codex-follow-up-target-20261001`. The change recorded here fixes a

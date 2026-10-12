@@ -75,7 +75,7 @@
   },
   "src/native/provider/agy/delivery.rs": {
     "agy-input-{}.json": 1,
-    "agy.log": 2
+    "agy.log": 1
   },
   "src/native/provider/agy/trust.rs": {
     "agy.log": 1
@@ -104,7 +104,6 @@
     "\"content\"": 1
   },
   "src/native/provider/agy/monitor.rs": {
-    "agy.log": 1,
     "const TURN_START_MARKER: &str = \"Forwarding user message to conversation \";": 1,
     "const TURN_FAILURE_MARKER: &str = \"agent executor error: \";": 1,
     "\"type\"": 1,
@@ -155,7 +154,7 @@
     "agent-turn-complete": 1,
     "input-messages": 1,
     "Trust this folder?": 1,
-    "Trust and continue": 2,
+    "Trust and continue": 1,
     "last-assistant-message": 1,
     "thread-id": 1,
     "\"type\"": 1,
@@ -281,7 +280,6 @@
     ".prefix(\"session-\")": 1,
     "home.join(\".agent-bridge\").join(\"native-sessions\")": 1,
     "event-{}-{}.json": 1,
-    "launch.json": 1,
     "manifest.json": 1,
     "native-session": 1
   },
@@ -308,14 +306,13 @@
     "AB_SCREEN_BEGIN": 1,
     "AB_SCREEN_END": 1,
     "const BOOTSTRAP_FILE: &str = \"terminal-start.sh\";": 1,
-    "launch.sh": 1,
     "native-terminal-host": 1,
     "terminal-start.sh": 1
   },
   "src/native/terminal/macos/ghostty.rs": {
     "const HOST_FRAME: &str = \"agent-bridge-ghostty-host:\";": 1,
     "ghostty-start.sh": 2,
-    "native-ghostty-host": 2,
+    "native-ghostty-host": 1,
     "Terminal surface model is not available": 1,
     "\"not-ready\"": 4,
     "\"queued\"": 2,
@@ -352,11 +349,10 @@
     "let bound_title = format!(\"agent-bridge-{attempt}\");": 1
   },
   "src/native/terminal/macos/wezterm.rs": {
-    "launch.sh": 1,
     "native-wezterm-host": 1,
     "gui-sock-": 3,
     "/dev/ttys": 1,
-    "WEZTERM_": 8
+    "WEZTERM_": 6
   },
   "src/native/terminal/mod.rs": {
     "console process is no longer available": 2,

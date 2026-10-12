@@ -538,12 +538,8 @@ fn console_creation_flags() -> u32 {
     CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED
 }
 
-// Asks for a window that is shown without being activated. Windows Terminal honours it
-// for a window that `wt.exe` creates while another application is in front (measured
-// 2026-10-01, Windows Terminal 1.24). It does not when one of its own windows is in
-// front, nor for a console that Windows hands to it as the default terminal, which is
-// created in front, nor for a window that already exists, which it brings to the front;
-// those are what `focus::ForegroundGuard` answers.
+// Show-without-activation works only for a new wt window while another app is in front.
+// Use ForegroundGuard for other cases; see AGENTS.md, Current Windows Surface Boundary.
 fn console_startup_info() -> STARTUPINFOW {
     STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,

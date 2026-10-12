@@ -1108,7 +1108,7 @@ fn public_identity_in_version_and_help() {
         (
             "--help",
             format!(
-                "tabcli {version} — Terminal Agent Bridge: visible terminal sessions for coding agent CLIs"
+                "tabcli {version}: Terminal Agent Bridge: visible terminal sessions for coding agent CLIs"
             ),
         ),
     ] {
@@ -1158,7 +1158,7 @@ fn runtime_literals_survive_the_public_rename() {
             assert_eq!(
                 production.matches(&literal).count(),
                 expected_count,
-                "{path}: {literal:?}: this is a runtime contract, see CONTRIBUTING.md / issue #76"
+                "{path}: {literal:?}: this is a runtime contract, see issue #76"
             );
         }
     }
