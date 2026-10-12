@@ -2475,7 +2475,7 @@ fn claim_release_waits_for_the_lifecycle_lock_before_deleting() {
     assert!(finished_rx.recv_timeout(Duration::from_millis(50)).is_err());
 
     drop(lifecycle_lock);
-    finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    finished_rx.recv().unwrap();
     release.join().unwrap();
     assert!(!path.exists());
 }

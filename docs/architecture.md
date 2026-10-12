@@ -52,7 +52,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   declare initial and follow-up Transport values with `facts`, `prepare`, `send`, and
   `discard_prepared`. Only known NotSent discards preparation; Uncertain retains the Claim.
   `LaunchArgument` settles Sent without reading the prompt or repeating wrapper work.
-  The terminal module owns the Windows submit-delay budget; Transport facts supply the count.
+  The terminal module owns the Windows submit-delay budget; Transport facts supply the count
+  and provider-selected console newline encoding. The console helper resolves both from
+  the verified session's provider; its CLI carries the session identity and prompt file name.
 - `src/native/reopen.rs` owns Reopen source reservations, provenance, launch refusals,
   and their settlement, including read-only marker diagnostics. Session owns the refusal record
   shape. Reopen creates the new Session

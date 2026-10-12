@@ -6,6 +6,13 @@ pub(super) mod facts;
 #[cfg(target_os = "macos")]
 use facts::PreClosePolicy;
 
+/// Provider-selected encoding of LF in a native Windows console text batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::native) enum ConsoleNewline {
+    LineFeed,
+    ShiftReturn,
+}
+
 pub(super) const fn facts(kind: TerminalKind) -> facts::SurfaceFacts {
     use facts::{apple_terminal, ghostty, iterm2, warp, wezterm, windows};
     match kind {

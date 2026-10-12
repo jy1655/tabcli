@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use windows_sys::Win32::System::Console::{
     AttachConsole, FreeConsole, GetConsoleProcessList, GetConsoleWindow,
     GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0,
-    WriteConsoleInputW,
+    SHIFT_PRESSED, WriteConsoleInputW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, SW_SHOWNOACTIVATE, WM_CLOSE};
 use windows_sys::Win32::{
@@ -37,7 +37,7 @@ use windows_sys::Win32::{
 };
 
 use super::{
-    CloseOutcome, TerminalKind, TerminalSession, WindowsProcessIdentity,
+    CloseOutcome, ConsoleNewline, TerminalKind, TerminalSession, WindowsProcessIdentity,
     WindowsProcessIdentityCheck,
 };
 
@@ -822,6 +822,7 @@ pub(in crate::native) enum ConsoleControlAction {
     Send {
         input: PathBuf,
         submit_count: usize,
+        newline: ConsoleNewline,
         timeout: Duration,
     },
     Dialog {
@@ -929,6 +930,7 @@ pub(super) fn console_control(
         ConsoleControlAction::Send {
             input: path,
             submit_count,
+            newline,
             timeout,
         } => {
             if !super::windows_console_submit_delays_fit(submit_count, timeout) {
@@ -942,7 +944,7 @@ pub(super) fn console_control(
             let input = crate::native::session::RecordReader::at(&path)
                 .raw_text()
                 .with_context(|| format!("failed to read prompt payload {}", path.display()))?;
-            write_console_input(&input, submit_count, deadline)
+            write_console_input(&input, submit_count, newline, deadline)
         }
         ConsoleControlAction::Window { .. } => loop {
             if let Some(window) = focus::attached_console_host_window() {
@@ -1152,7 +1154,7 @@ fn write_dialog_key(key: super::DialogKey) -> Result<()> {
             });
         }
     }
-    records.extend(build_console_input_records("", 1));
+    records.extend(build_console_input_records("", 1, ConsoleNewline::LineFeed));
     write_input_records(handle.as_raw_handle(), &records)
 }
 
@@ -1317,7 +1319,12 @@ fn wait_for_console_process_exit(pid: u32, identity: &WindowsProcessIdentity) ->
     }
 }
 
-fn write_console_input(input: &str, submit_count: usize, deadline: Instant) -> Result<()> {
+fn write_console_input(
+    input: &str,
+    submit_count: usize,
+    newline: ConsoleNewline,
+    deadline: Instant,
+) -> Result<()> {
     let console_name = "CONIN$\0".encode_utf16().collect::<Vec<_>>();
     let handle = unsafe {
         CreateFileW(
@@ -1339,7 +1346,10 @@ fn write_console_input(input: &str, submit_count: usize, deadline: Instant) -> R
         if Instant::now() >= deadline {
             bail!("Windows console input timed out before delivery");
         }
-        write_input_records(handle, &build_console_input_records(input, first_submit))?;
+        write_input_records(
+            handle,
+            &build_console_input_records(input, first_submit, newline),
+        )?;
         for _ in first_submit..submit_count {
             // Codex detects the fast synthetic text batch as a paste. Keep both
             // its confirmation Return and later submission Return out of that
@@ -1364,7 +1374,10 @@ fn write_console_input(input: &str, submit_count: usize, deadline: Instant) -> R
                 bail!("Windows console input timed out before the next submission Return");
             }
             std::thread::sleep(delay);
-            write_input_records(handle, &build_console_input_records("", 1))?;
+            write_input_records(
+                handle,
+                &build_console_input_records("", 1, ConsoleNewline::LineFeed),
+            )?;
         }
         Ok(())
     })();
@@ -1410,9 +1423,14 @@ fn write_input_records(
     Ok(())
 }
 
-fn build_console_input_records(input: &str, submit_count: usize) -> Vec<INPUT_RECORD> {
+fn build_console_input_records(
+    input: &str,
+    submit_count: usize,
+    newline: ConsoleNewline,
+) -> Vec<INPUT_RECORD> {
     let mut records = Vec::new();
     for character in input.encode_utf16() {
+        let soft_return = character == u16::from(b'\n') && newline == ConsoleNewline::ShiftReturn;
         for key_down in [1, 0] {
             records.push(INPUT_RECORD {
                 EventType: KEY_EVENT as u16,
@@ -1420,12 +1438,16 @@ fn build_console_input_records(input: &str, submit_count: usize) -> Vec<INPUT_RE
                     KeyEvent: KEY_EVENT_RECORD {
                         bKeyDown: key_down,
                         wRepeatCount: 1,
-                        wVirtualKeyCode: 0,
-                        wVirtualScanCode: 0,
+                        wVirtualKeyCode: if soft_return { 0x0d } else { 0 },
+                        wVirtualScanCode: if soft_return { 0x1c } else { 0 },
                         uChar: KEY_EVENT_RECORD_0 {
-                            UnicodeChar: character,
+                            UnicodeChar: if soft_return {
+                                u16::from(b'\r')
+                            } else {
+                                character
+                            },
                         },
-                        dwControlKeyState: 0,
+                        dwControlKeyState: if soft_return { SHIFT_PRESSED } else { 0 },
                     },
                 },
             });

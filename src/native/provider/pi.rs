@@ -123,7 +123,10 @@ impl Transport for PiInitialPaste {
             readiness: Readiness::AfterLaunch {
                 ready_delay: Duration::from_secs(2),
             },
-            surface: Some(SurfaceInput { submit_count: 1 }),
+            surface: Some(SurfaceInput {
+                submit_count: 1,
+                newline: terminal::ConsoleNewline::LineFeed,
+            }),
         }
     }
     fn prepare(&self, turn: &TurnContext<'_>) -> Result<Prepared> {
@@ -152,7 +155,10 @@ impl Transport for PiPaste {
             readiness: Readiness::AfterLaunch {
                 ready_delay: Duration::ZERO,
             },
-            surface: Some(SurfaceInput { submit_count: 1 }),
+            surface: Some(SurfaceInput {
+                submit_count: 1,
+                newline: terminal::ConsoleNewline::LineFeed,
+            }),
         }
     }
     fn prepare(&self, turn: &TurnContext<'_>) -> Result<Prepared> {
@@ -1111,6 +1117,11 @@ export default function (pi) {
 mod tests {
     #[test]
     fn declared_transports_preserve_framing_and_pending_cleanup() {
+        for facts in [PiInitialPaste.facts(), PiPaste.facts()] {
+            let input = facts.surface.unwrap();
+            assert_eq!(input.submit_count, 1);
+            assert_eq!(input.newline, terminal::ConsoleNewline::LineFeed);
+        }
         use crate::native::delivery::TurnKind;
         let directory = tempfile::tempdir().unwrap();
         let surface = serde_json::from_value(

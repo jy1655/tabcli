@@ -322,11 +322,12 @@ fn submission_return_drain_times_out_at_the_deadline_as_uncertain() {
 #[test]
 fn codex_paste_confirmation_and_submission_are_delayed_from_the_text_batch() {
     let immediate = super::super::windows_console_immediate_submit_count(2);
-    let initial_records = build_console_input_records("prompt", immediate);
+    let initial_records =
+        build_console_input_records("prompt", immediate, super::ConsoleNewline::ShiftReturn);
     assert_eq!(return_key_down_count(&initial_records), 0);
 
     let delayed_batches = (immediate..2)
-        .map(|_| build_console_input_records("", 1))
+        .map(|_| build_console_input_records("", 1, super::ConsoleNewline::ShiftReturn))
         .collect::<Vec<_>>();
     assert_eq!(delayed_batches.len(), 2);
     assert!(
@@ -347,7 +348,7 @@ fn codex_paste_confirmation_and_submission_are_delayed_from_the_text_batch() {
 
 #[test]
 fn single_submit_provider_gets_one_return_key() {
-    let records = build_console_input_records("prompt", 1);
+    let records = build_console_input_records("prompt", 1, super::ConsoleNewline::LineFeed);
     assert_eq!(
         records
             .iter()
@@ -605,6 +606,44 @@ fn guarded_dialog_file_stays_private_in_the_supplied_helper_directory() {
     );
     assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
     assert_eq!(fs::read_dir(&other).unwrap().count(), 0);
+}
+
+#[test]
+fn console_newline_modes_preserve_text_and_plain_submission_records() {
+    use super::ConsoleNewline;
+    use windows_sys::Win32::System::Console::{KEY_EVENT, SHIFT_PRESSED};
+    // Include adjacent/edge LF, tabs in the unchanged mode, and a surrogate pair.
+    for (mode, input, submits) in [
+        (ConsoleNewline::ShiftReturn, "a\nb", 2),
+        (ConsoleNewline::ShiftReturn, "\n가😀\n\n", 0),
+        (ConsoleNewline::LineFeed, "a\n\tb😀", 1),
+    ] {
+        let records = build_console_input_records(input, submits, mode);
+        let units = input.encode_utf16().collect::<Vec<_>>();
+        assert_eq!(records.len(), (units.len() + submits) * 2);
+        for (index, pair) in records.as_chunks::<2>().0.iter().enumerate() {
+            let submit = index >= units.len();
+            let unit = if submit {
+                u16::from(b'\r')
+            } else {
+                units[index]
+            };
+            let soft = !submit && unit == u16::from(b'\n') && mode == ConsoleNewline::ShiftReturn;
+            for (record, down) in pair.iter().zip([1, 0]) {
+                assert_eq!(record.EventType, KEY_EVENT as u16);
+                let key = unsafe { record.Event.KeyEvent };
+                assert_eq!(key.bKeyDown, down);
+                assert_eq!(key.wRepeatCount, 1);
+                assert_eq!(key.wVirtualKeyCode, if submit || soft { 0x0d } else { 0 });
+                assert_eq!(key.wVirtualScanCode, if submit || soft { 0x1c } else { 0 });
+                assert_eq!(
+                    unsafe { key.uChar.UnicodeChar },
+                    if soft { u16::from(b'\r') } else { unit }
+                );
+                assert_eq!(key.dwControlKeyState, if soft { SHIFT_PRESSED } else { 0 });
+            }
+        }
+    }
 }
 
 #[test]
