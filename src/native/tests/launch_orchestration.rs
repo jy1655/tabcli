@@ -194,6 +194,7 @@ fn console_launch_carries_the_bootstrap_and_records_the_wrapper_exit_code() {
     let powershell = terminal::windows_powershell_executable().unwrap();
     let command_line =
         terminal::windows_console_launch_command_line(&powershell, &command).unwrap();
+    let powershell = provider_process::windows_command_path(&powershell);
     let arguments = command_line
         .strip_prefix(&format!("\"{}\" ", powershell.to_string_lossy()))
         .unwrap();

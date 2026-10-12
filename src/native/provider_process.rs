@@ -282,7 +282,9 @@ pub(super) fn version_command(executable: &Path) -> Result<Command> {
 
 #[cfg(windows)]
 fn powershell_file_command(script: &Path) -> Result<Command> {
-    let mut command = Command::new(terminal::windows_powershell_executable()?);
+    let mut command = Command::new(windows_command_path(
+        &terminal::windows_powershell_executable()?,
+    ));
     command.args([
         "-NoLogo",
         "-NoProfile",
@@ -302,7 +304,7 @@ fn has_extension(path: &Path, expected: &str) -> bool {
 }
 
 #[cfg(windows)]
-fn windows_command_path(path: &Path) -> OsString {
+pub(in crate::native) fn windows_command_path(path: &Path) -> OsString {
     let value = path.as_os_str().to_string_lossy();
     if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
         return OsString::from(format!(r"\\{rest}"));
