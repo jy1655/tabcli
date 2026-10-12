@@ -733,6 +733,27 @@ pub(super) fn override_session_registry_for_test(registry: Option<PathBuf>) {
     SESSION_REGISTRY_OVERRIDE.with(|slot| *slot.borrow_mut() = registry);
 }
 
+#[cfg(all(test, unix))]
+thread_local! {
+    static MESSENGER_TIMEOUT_READY: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+fn synchronized_messenger_deadline(deadline: Instant) -> Result<Instant> {
+    let Some(ready) = MESSENGER_TIMEOUT_READY.with(|path| path.borrow_mut().take()) else {
+        return Ok(deadline);
+    };
+    while !ready.is_file() {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "messenger fixture did not finish startup"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    Ok(Instant::now())
+}
+
 fn claude_sessions_registry_dir() -> Result<PathBuf> {
     #[cfg(test)]
     if let Some(registry) = SESSION_REGISTRY_OVERRIDE.with(|slot| slot.borrow().clone()) {
@@ -1596,6 +1617,18 @@ fn send_cross_session_message_inner(context: CrossSessionMessageContext<'_>) -> 
         let mut stdin = stdin;
         stdin.write_all(stdin_payload.as_bytes())
     });
+
+    // Observe the fixture's descendant before expiring its budget. Release builds
+    // and tests without the hook keep the caller's original, shared deadline.
+    #[cfg(all(test, unix))]
+    let deadline = match synchronized_messenger_deadline(deadline) {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            terminate_child_tree(&mut child, &process_tree);
+            let _ = stdin_writer.join();
+            return Err(MessengerFailure::delivery_uncertain(error));
+        }
+    };
 
     let status = loop {
         match child.try_wait() {
@@ -3329,41 +3362,112 @@ mod tests {
     }
 
     #[cfg(unix)]
+    struct MessengerTimeoutFixture {
+        pipe: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Drop for MessengerTimeoutFixture {
+        fn drop(&mut self) {
+            use std::{io::Write, os::unix::fs::OpenOptionsExt};
+
+            MESSENGER_TIMEOUT_READY.with(|path| path.borrow_mut().take());
+            // Release a surviving descendant even if an earlier assertion failed.
+            if let Ok(mut writer) = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&self.pipe)
+            {
+                let _ = writer.write_all(b"stop\n");
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn messenger_timeout_terminates_descendants_before_they_can_act_late() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::{
+            ffi::OsStrExt,
+            fs::{OpenOptionsExt, PermissionsExt},
+        };
 
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("session-safe123");
         std::fs::create_dir(&directory).unwrap();
+        let pipe = directory.join("descendant-pipe");
+        let pipe_name = std::ffi::CString::new(pipe.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(pipe_name.as_ptr(), 0o600) }, 0);
+        let _fixture = MessengerTimeoutFixture { pipe: pipe.clone() };
         let executable = root.path().join("fake-claude");
         std::fs::write(
             &executable,
             concat!(
                 "#!/bin/sh\n",
-                "(sleep 2.5; printf late > \"$PWD/late-delivery\") &\n",
+                "(\n",
+                "  exec 3<>\"$PWD/descendant-pipe\"\n",
+                "  : > \"$PWD/messenger-descendant-started\"\n",
+                "  read -r finish <&3\n",
+                "  : > \"$PWD/descendant-survived\"\n",
+                ") &\n",
                 "cat >/dev/null\n",
-                "sleep 5\n"
+                "wait\n"
             ),
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        let started = Instant::now();
+        // Setup has its own bounded budget; only possession of the FIFO triggers
+        // expiry, so a delayed shell cannot let the teardown assertion pass early.
+        MESSENGER_TIMEOUT_READY.with(|path| {
+            assert!(
+                path.borrow_mut()
+                    .replace(directory.join("messenger-descendant-started"))
+                    .is_none()
+            );
+        });
         let error = send_cross_session_message(CrossSessionMessageContext {
             bridge_executable: Path::new("/opt/agent-bridge"),
             directory: &directory,
             provider_path: &executable,
             request_id: "claude-turn-safe123",
             prompt: "follow-up secret",
-            deadline: Instant::now() + Duration::from_secs(2),
+            deadline: Instant::now() + Duration::from_secs(5),
         })
         .unwrap_err();
 
         assert!(error.delivery_may_have_occurred());
-        assert!(started.elapsed() < Duration::from_secs(3));
-        thread::sleep(Duration::from_millis(700));
-        assert!(!directory.join("late-delivery").exists());
+        MESSENGER_TIMEOUT_READY.with(|path| {
+            assert!(
+                path.borrow().is_none(),
+                "messenger timeout hook was not consumed"
+            );
+        });
+        let reason = format!("{:#}", error.into_error());
+        assert!(
+            reason.contains("Claude cross-session messenger timed out"),
+            "{reason}"
+        );
+        assert!(directory.join("messenger-descendant-started").is_file());
+        // Even a zombie has closed its FIFO. Observe teardown directly rather
+        // than guessing how long a surviving descendant would take to act.
+        let stopped = Instant::now() + Duration::from_secs(2);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&pipe)
+            {
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => break,
+                Ok(writer) => drop(writer),
+                Err(error) => panic!("failed to inspect descendant FIFO: {error}"),
+            }
+            assert!(
+                Instant::now() < stopped,
+                "timed-out descendant still holds its FIFO"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!directory.join("descendant-survived").exists());
     }
 
     #[cfg(windows)]
