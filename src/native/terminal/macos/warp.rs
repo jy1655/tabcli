@@ -3,6 +3,8 @@ use super::{GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
 use crate::native::session::{Reader, RecordReader, RecordStore};
 #[cfg(test)]
 use crate::native::terminal::ownership;
+#[cfg(unix)]
+use crate::native::terminal::shell_quote;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
@@ -1896,11 +1898,6 @@ fn host_deadlines(deadline: Instant) -> Result<(u64, u64)> {
         .checked_add(timeout_ms)
         .context("Warp host deadline overflow")?;
     Ok((deadline_unix_ms, timeout_ms))
-}
-
-fn shell_quote(value: &OsStr) -> String {
-    let value = value.to_string_lossy();
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 #[cfg(test)]
