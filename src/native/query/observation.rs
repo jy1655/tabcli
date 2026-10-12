@@ -3,7 +3,6 @@ use super::*;
 use crate::native::reopen::ResumedFrom;
 use crate::native::session;
 use crate::native::session::OwnerObservation;
-use crate::native::session::primitives::unix_ms;
 use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
 use crate::native::terminal::ownership::NativeSessionOwner;
 
@@ -14,8 +13,6 @@ pub(in crate::native) struct SessionEvidence {
     pub(in crate::native) held: Result<bool>,
     pub(in crate::native) hold_release_allowed: bool,
     pub(in crate::native) surface: SurfaceRecord,
-    #[allow(dead_code)] // Retained for callers that expose observation times.
-    pub(in crate::native) observed_unix_ms: u128,
     pub(in crate::native) owner_observation: Option<OwnerObservation>,
     pub(in crate::native) surface_presence: Option<Result<bool>>,
 }
@@ -28,7 +25,6 @@ pub(in crate::native) enum SurfaceRecord {
 
 impl SessionEvidence {
     pub(in crate::native) fn read(reader: &Reader, held: Result<bool>) -> Self {
-        let observed_unix_ms = unix_ms();
         let owner = RecordReader::at(reader.record(CoreRecord::Owner).path()).optional_json();
         let surface = match RecordReader::at(reader.record(CoreRecord::TerminalClosed).path())
             .optional_json::<Value>()
@@ -53,7 +49,6 @@ impl SessionEvidence {
             held,
             owner,
             surface,
-            observed_unix_ms,
             owner_observation: None,
             surface_presence: None,
         }
@@ -177,8 +172,6 @@ pub(in crate::native) struct Observation {
 }
 
 pub(in crate::native) struct Judgments {
-    #[allow(dead_code)] // Existing renderings do not expose the evaluation time.
-    pub(in crate::native) evaluated_unix_ms: u128,
     pub(in crate::native) active_state: Option<Result<RequestState>>,
     pub(in crate::native) launch_failure: Option<(&'static str, String)>,
 }
@@ -223,7 +216,6 @@ impl Observation {
         records: Snapshot,
         active_state: Option<Result<RequestState>>,
     ) -> Self {
-        let evaluated_unix_ms = unix_ms();
         let launch_failure = launch::diagnostic(
             records.launch.as_ref(),
             &records.status,
@@ -238,7 +230,6 @@ impl Observation {
             resumed_from: read_resumed_from(reader.directory()),
             workspace_consent: consent::observe(reader.directory()),
             judgments: Judgments {
-                evaluated_unix_ms,
                 active_state,
                 launch_failure,
             },

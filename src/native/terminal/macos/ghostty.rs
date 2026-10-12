@@ -666,10 +666,6 @@ fn create_with_runner(
     }
     Ok(handle(&surface))
 }
-#[allow(dead_code)]
-pub(super) fn create_tab(deadline: Instant) -> Result<TerminalSession> {
-    create_tab_with_mode(false, deadline)
-}
 pub(super) fn create_tab_with_mode(
     force_new_window: bool,
     deadline: Instant,
