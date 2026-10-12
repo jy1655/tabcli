@@ -9967,3 +9967,130 @@ fn published_count_rejects_a_receipt_changed_during_the_read() {
     .unwrap_err();
     assert!(error.is::<session::SnapshotBusy>());
 }
+
+// Each stage runs in a test child: never mutate the test runner's environment.
+#[cfg(windows)]
+#[test]
+fn windows_environment_boundary_replaces_caller_context_through_bootstrap_and_hook() {
+    use crate::native::session::primitives::{state_root, validate_hook_directory};
+    use std::os::windows::process::CommandExt;
+    const STAGE: &str = "ISSUE111_TEST_STAGE";
+    const ROOT: &str = "ISSUE111_TEST_ROOT";
+    const ID: &str = "session-environment";
+    let test = "native::tests::windows_environment_boundary_replaces_caller_context_through_bootstrap_and_hook";
+    let executable = std::env::current_exe().unwrap();
+    let run = |command: &mut Command| {
+        let output = process_env::command_output_until(
+            command,
+            Instant::now() + Duration::from_secs(30),
+            "environment boundary test",
+        )
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let stage = std::env::var(STAGE).unwrap_or_default();
+    if stage.is_empty() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(ID)).unwrap();
+        let mut child = Command::new(&executable);
+        child
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(STAGE, "launcher")
+            .env(ROOT, root.path());
+        for name in process_env::non_provider_removals() {
+            child.env(name, "caller-sentinel");
+        }
+        run(&mut child);
+        assert_eq!(
+            fs::read(root.path().join("hook-verified")).unwrap(),
+            b"verified"
+        );
+        return;
+    }
+    let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+    let directory = root.join(ID);
+    if stage == "launcher" {
+        for name in process_env::non_provider_removals() {
+            assert_eq!(std::env::var(name).unwrap(), "caller-sentinel");
+        }
+        let stub = root.join("bridge owner's stub.cmd");
+        fs::write(&stub, format!(
+            "@echo off\r\n\"{}\" --exact {test} --nocapture --test-threads=1\r\n@exit /b %errorlevel%\r\n",
+            executable.display(),
+        )).unwrap();
+        let bootstrap = bridge_shell_command(&root, &root, &stub, ID).unwrap();
+        let powershell = terminal::windows_powershell_executable().unwrap();
+        let line = terminal::windows_console_launch_command_line(&powershell, &bootstrap).unwrap();
+        let arguments = line
+            .strip_prefix(&format!("\"{}\" ", powershell.display()))
+            .unwrap();
+        let mut command = process_env::helper_command(&powershell);
+        command.raw_arg(arguments).env(STAGE, "wrapper");
+        run(&mut command);
+        return;
+    }
+    assert_eq!(state_root().unwrap(), root);
+    for name in process_env::non_provider_removals() {
+        if name != STATE_DIR_ENV
+            && (stage == "wrapper"
+                || ![
+                    SESSION_DIR_ENV,
+                    "AGENT_BRIDGE_NATIVE_SESSION_ID",
+                    "AGENT_BRIDGE_EXECUTABLE",
+                ]
+                .contains(&name))
+        {
+            assert!(std::env::var_os(name).is_none(), "{name}");
+        }
+    }
+    if stage == "wrapper" {
+        let mut command = process_env::provider_command(
+            &executable,
+            &directory,
+            ["--exact", test, "--nocapture", "--test-threads=1"]
+                .map(OsString::from)
+                .to_vec(),
+            provider::probe_environment_removals(FirstPartyCli::Codex),
+        )
+        .unwrap();
+        // Prove the launch configuration replaces these values, rather than relying
+        // only on their absence at the clean wrapper boundary.
+        for name in [
+            SESSION_DIR_ENV,
+            "AGENT_BRIDGE_NATIVE_SESSION_ID",
+            "AGENT_BRIDGE_EXECUTABLE",
+        ] {
+            command.env(name, "caller-sentinel");
+        }
+        configure_provider_launch(&mut command, &root, &directory, ID, &executable);
+        command.env(STAGE, "provider");
+        run(&mut command);
+    } else {
+        assert_eq!(
+            std::env::var_os(SESSION_DIR_ENV).unwrap(),
+            directory.as_os_str()
+        );
+        assert_eq!(std::env::var("AGENT_BRIDGE_NATIVE_SESSION_ID").unwrap(), ID);
+        assert_eq!(
+            std::env::var_os("AGENT_BRIDGE_EXECUTABLE").unwrap(),
+            executable.as_os_str()
+        );
+        validate_hook_directory(&directory).unwrap();
+        if stage == "provider" {
+            // A provider-owned hook inherits the new session's environment.
+            let mut command = Command::new(&executable);
+            command
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(STAGE, "hook");
+            run(&mut command);
+        } else {
+            assert_eq!(stage, "hook");
+            fs::write(root.join("hook-verified"), b"verified").unwrap();
+        }
+    }
+}

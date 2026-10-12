@@ -1,7 +1,6 @@
 //! Environment policy and deadline-bounded command execution for Bridge children.
 //! Provider adapters own their removal lists; helpers must not pass any caller's
 //! session identity into another application.
-#[cfg(not(windows))]
 use crate::native::session::primitives::{SESSION_DIR_ENV, STATE_DIR_ENV};
 use std::{
     ffi::OsStr,
@@ -15,10 +14,8 @@ use std::{
 
 use anyhow::{Context, Result};
 
-#[cfg(any(not(windows), test))]
 use super::provider;
 use super::provider_process;
-#[cfg(not(windows))]
 const BRIDGE_SESSION_VARIABLES: [&str; 4] = [
     STATE_DIR_ENV,
     SESSION_DIR_ENV,
@@ -26,22 +23,23 @@ const BRIDGE_SESSION_VARIABLES: [&str; 4] = [
     "AGENT_BRIDGE_EXECUTABLE",
 ];
 
+pub(super) fn non_provider_removals() -> impl Iterator<Item = &'static str> {
+    // Query each adapter, rather than maintaining a second copy of its markers.
+    agent_bridge::supported_clis()
+        .iter()
+        .flat_map(|provider| {
+            provider::probe_environment_removals(*provider)
+                .iter()
+                .copied()
+        })
+        .chain(BRIDGE_SESSION_VARIABLES)
+}
+
 pub(super) fn helper_command(program: impl AsRef<OsStr>) -> Command {
-    let command = Command::new(program);
-    // Native Windows helpers retain their inherited environment until issue #111.
-    #[cfg(not(windows))]
-    let command = {
-        let mut command = command;
-        // Query each adapter, rather than maintaining a second copy of its markers.
-        for provider in agent_bridge::supported_clis() {
-            remove(
-                &mut command,
-                provider::probe_environment_removals(*provider),
-            );
-        }
-        remove(&mut command, &BRIDGE_SESSION_VARIABLES);
-        command
-    };
+    let mut command = Command::new(program);
+    for variable in non_provider_removals() {
+        command.env_remove(variable);
+    }
     command
 }
 
@@ -296,22 +294,18 @@ pub(super) mod tests {
     }
     pub(crate) fn assert_helper_environment(command: &Command, extras: &[(&str, Option<&OsStr>)]) {
         let mut expected = BTreeMap::new();
-        #[cfg(not(windows))]
-        {
-            for provider in agent_bridge::supported_clis() {
-                for name in provider::probe_environment_removals(*provider) {
-                    expected.insert(OsStr::new(name), None);
-                }
-            }
-            for name in BRIDGE_SESSION_VARIABLES {
+        for provider in agent_bridge::supported_clis() {
+            for name in provider::probe_environment_removals(*provider) {
                 expected.insert(OsStr::new(name), None);
             }
+        }
+        for name in BRIDGE_SESSION_VARIABLES {
+            expected.insert(OsStr::new(name), None);
         }
         for (name, value) in extras {
             expected.insert(OsStr::new(name), *value);
         }
         assert_eq!(command.get_envs().collect::<BTreeMap<_, _>>(), expected);
-        #[cfg(not(windows))]
         for name in ["AI_AGENT", "CLAUDE_CODE_BRIDGE_SESSION_ID"] {
             assert_eq!(expected.get(OsStr::new(name)), Some(&None), "{name}");
         }
@@ -376,16 +370,9 @@ pub(super) mod tests {
         )));
         command
     }
-    #[cfg(not(windows))]
     #[test]
     fn helpers_remove_only_adapter_markers_and_bridge_session_variables() {
         assert_helper_environment(&helper_command("unused"), &[]);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_helpers_keep_the_inherited_environment_until_issue_111() {
-        assert_eq!(helper_command("unused").get_envs().count(), 0);
     }
 
     #[test]

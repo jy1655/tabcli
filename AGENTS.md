@@ -68,12 +68,15 @@ launch, observe, continue, and close without replacing the capabilities those CL
   fails (issue #42, observed 2026-09-24 with Claude Code 2.1.281). The removal list is
   adapter-owned launch configuration; the shared module only applies it. Provider
   commands (managed launches, version and doctor probes, messengers and the Codex queue)
-  keep their own adapter's removal list. Non-provider commands on macOS, including
-  terminal automation that can start an application and helpers, drop the union of the
-  adapters' caller-session markers and Bridge's state directory, session directory,
-  session id and executable variables. A child that needs one receives it explicitly.
-  Non-provider environment cleanup on native Windows is pending issue #111. An already
-  contaminated terminal application must be restarted.
+  keep their own adapter's removal list. Non-provider commands on macOS and native Windows,
+  including terminal automation that can start an application and helpers, drop the union
+  of the adapters' caller-session markers and Bridge's state directory, session directory,
+  session id and executable variables. A child that needs one receives it explicitly. On
+  Windows this includes `wt.exe`, its tab host, both PowerShell roots, console control and
+  security helpers. The console control helper explicitly receives the selected state root;
+  the bootstrap sets it for the wrapper, which supplies the new session directory, id and
+  executable to the provider and its hooks. An already contaminated terminal application
+  must be restarted; child cleanup does not change its existing environment.
 
 ## Current Agy Boundary
 

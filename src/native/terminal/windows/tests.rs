@@ -645,3 +645,57 @@ fn console_newline_modes_preserve_text_and_plain_submission_records() {
         }
     }
 }
+
+#[test]
+fn console_helpers_explicitly_forward_only_the_selected_state_root() {
+    use crate::native::session::primitives::STATE_DIR_ENV;
+    const CHILD: &str = "ISSUE111_HELPER_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let test = "native::terminal::windows::tests::console_helpers_explicitly_forward_only_the_selected_state_root";
+        for root in [Some("C:\\selected-private-root"), None] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1");
+            for name in crate::native::process_env::non_provider_removals() {
+                command.env(name, "caller-sentinel");
+            }
+            if let Some(root) = root {
+                command.env(STATE_DIR_ENV, root);
+            } else {
+                command.env_remove(STATE_DIR_ENV);
+            }
+            let output = crate::native::process_env::command_output_until(
+                &mut command,
+                Instant::now() + Duration::from_secs(30),
+                "helper environment test",
+            )
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+        return;
+    }
+    let session = super::TerminalSession {
+        managed_session_id: Some("session-environment".into()),
+        kind: super::TerminalKind::WindowsConsole,
+        id: "1".into(),
+        tab_id: None,
+        window_id: None,
+        windows_process_identity: None,
+        wezterm_mux: None,
+    };
+    let root = std::env::var_os(STATE_DIR_ENV);
+    for action in ["window", "screen", "dialog", "send", "close"] {
+        let command = super::console_helper_command(action, &session, None).unwrap();
+        crate::native::process_env::tests::assert_helper_environment(
+            &command,
+            &[(STATE_DIR_ENV, root.as_deref())],
+        );
+    }
+}

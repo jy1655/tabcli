@@ -42,7 +42,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 - `src/main.rs` contains top-level dispatch and help; `src/native.rs` parses native commands,
   coordinates launch and calls the Delivery seam.
 - `src/native/process_env.rs` owns child environment policy and deadline-bounded command execution;
-  provider-specific execution remains in its adapter.
+  provider-specific execution remains in its adapter. Non-provider children on macOS and
+  Windows remove the union of adapter caller-session markers and Bridge's four session
+  variables; helpers and the bootstrap explicitly supply the context each child needs.
+  Windows Terminal and both console roots use the same filtered environment block.
 - `src/native/delivery.rs` consumes one Claim and owns readiness, injected reopen gates,
   prompt-file framing, surface ownership verification, remaining timeout and send-budget
   checks, begin/send/settlement, and initial-prompt cleanup. Provider adapters explicitly

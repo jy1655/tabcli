@@ -323,7 +323,7 @@ impl ConsoleWindow {
             command_line,
             console_creation_flags(),
             &console_startup_info(),
-            None,
+            Some(&tab::environment_block(None)),
         )
         .context("failed to open a managed Windows console with PowerShell 7 (pwsh.exe)")?;
         match query_process_identity_from_handle(process.process.as_raw_handle()) {
@@ -793,7 +793,11 @@ fn console_helper_command(
         .managed_session_id
         .as_deref()
         .context("Windows console handle is missing its managed session binding")?;
-    let mut command = Command::new(executable);
+    let mut command = crate::native::process_env::helper_command(executable);
+    let state_dir_env = crate::native::session::primitives::STATE_DIR_ENV;
+    if let Some(root) = std::env::var_os(state_dir_env) {
+        command.env(state_dir_env, root);
+    }
     command.args(["native-console-control", action, managed_session_id]);
     if let Some(input) = input {
         let input_name = Path::new(input)

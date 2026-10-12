@@ -313,13 +313,6 @@ fn production_commands_use_the_environment_policy() {
         ("native/provider_process.rs", "version_command"),
         // #111: leave the Windows provider PowerShell constructor byte-for-byte intact.
         ("native/provider_process.rs", "powershell_file_command"),
-        // #111: Windows console control retains its current environment.
-        ("native/terminal/windows/mod.rs", "console_helper_command"),
-        // #111: Windows security helper retains its current environment.
-        (
-            "native/terminal/windows/security.rs",
-            "set_private_permissions",
-        ),
     ];
     for (file, function) in &found {
         assert!(
