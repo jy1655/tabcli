@@ -381,12 +381,7 @@ impl NativeProviderAdapter for AgyAdapter {
 }
 
 fn validate_claim_token(claim_token: &str) -> Result<()> {
-    if claim_token.is_empty()
-        || claim_token.len() > 160
-        || !claim_token
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || byte == b'-')
-    {
+    if !turn::valid_turn_claim_token(claim_token) {
         bail!("invalid Agy turn claim token")
     }
     Ok(())
