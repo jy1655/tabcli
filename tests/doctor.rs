@@ -1,7 +1,10 @@
+mod support;
+use support::{entries, manifest, status, success, write};
+
 use serde_json::{Value, json};
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Output},
 };
 
@@ -22,20 +25,17 @@ impl Fixture {
             "agy" => "1.1.12",
             _ => "0.84.1",
         };
-        write(
-            &directory.join("manifest.json"),
-            &json!({
-                "schema": 1, "id": "session-doctor", "provider": provider,
-                "provider_path": root.path().join("provider"), "provider_version": version,
-                "workspace": root.path(), "title": "doctor fixture", "model": "recorded-model",
-                "effort": null, "yolo": false, "created_unix_ms": 1
-            }),
+        let mut manifest = manifest(
+            "session-doctor",
+            provider,
+            &root.path().join("provider"),
+            version,
+            root.path(),
+            "doctor fixture",
         );
-        write(
-            &directory.join("status.json"),
-            &json!({"state":"ready", "generation":2,
-            "updated_unix_ms":2, "exit_code":null, "error":null}),
-        );
+        manifest["model"] = json!("recorded-model");
+        write(&directory.join("manifest.json"), &manifest);
+        write(&directory.join("status.json"), &status("ready", 2, None));
         Self { root, directory }
     }
 
@@ -70,29 +70,17 @@ impl Fixture {
         fs::create_dir(self.directory.join("requests")).unwrap();
         write(
             &self.directory.join("requests/123-456-0.json"),
-            &json!({
-                "schema":1, "request_id":"request-exact", "claim_token":"123-456-0",
-                "event_file":"event-1.json", "created_unix_ms":3
-            }),
+            &support::receipt("request-exact", "123-456-0", "event-1.json"),
         );
         write(
             &self.directory.join("status.json"),
-            &json!({"state":"working", "generation":3,
-            "updated_unix_ms":3, "exit_code":null, "error":error}),
+            &status("working", 3, error),
         );
     }
 }
 
-fn write(path: &Path, value: &Value) {
-    fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
-}
 fn report(output: Output) -> Value {
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let report = success(output);
     assert_eq!(report["ok"], true);
     report
 }
@@ -104,20 +92,6 @@ fn check<'a>(report: &'a Value, id: &str) -> &'a Value {
         .find(|c| c["id"] == id)
         .unwrap()
 }
-fn files(path: &Path) -> Vec<(PathBuf, Vec<u8>)> {
-    let mut result = Vec::new();
-    for entry in fs::read_dir(path).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            result.extend(files(&path));
-        } else {
-            result.push((path.clone(), fs::read(path).unwrap()));
-        }
-    }
-    result.sort();
-    result
-}
-
 #[test]
 fn diagnostics_preserve_uncertain_delivery_and_address_the_exact_request() {
     let fixture = Fixture::new("claude");
@@ -126,7 +100,7 @@ fn diagnostics_preserve_uncertain_delivery_and_address_the_exact_request() {
         &fixture.directory.join("claude-settings.json"),
         &json!({"crossSessionInbound":"accept"}),
     );
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
     let value = fixture.doctor();
     assert_eq!(check(&value, "turn")["availability"], "unknown");
     assert_eq!(check(&value, "turn")["reason_code"], "delivery_unconfirmed");
@@ -140,7 +114,7 @@ fn diagnostics_preserve_uncertain_delivery_and_address_the_exact_request() {
         "claude_inbound_configured"
     );
     assert_eq!(value["configured"]["model"], "recorded-model");
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -160,7 +134,7 @@ fn active_and_recovery_states_are_diagnosed_without_repair() {
             "status_error":null,"status_state":"ready"
         }),
     );
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
     let value = fixture.doctor();
     assert_eq!(
         check(&value, "completion")["reason_code"],
@@ -176,7 +150,7 @@ fn active_and_recovery_states_are_diagnosed_without_repair() {
             "--json"
         ])
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -189,7 +163,7 @@ fn missing_corrupt_and_locked_records_produce_unknown_without_writes() {
     );
     assert!(!fixture.root.path().join("session-absent").exists());
     let lock = fs::File::create(fixture.directory.join("turn.claim.lock")).unwrap();
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
     lock.lock().unwrap();
     let value = fixture.doctor();
     assert_eq!(check(&value, "session_records")["availability"], "unknown");
@@ -202,14 +176,14 @@ fn missing_corrupt_and_locked_records_produce_unknown_without_writes() {
     }
     // Windows locks also prevent a second handle from reading the locked bytes.
     drop(lock);
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
     fs::write(fixture.directory.join("status.json"), "not json").unwrap();
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
     assert_eq!(
         check(&fixture.doctor(), "session_records")["reason_code"],
         "records_unreadable"
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -286,7 +260,7 @@ fn only_opt_in_probe_executes_local_cli_and_keeps_session_records_identical() {
             "provider_session_id":"00000000-0000-0000-0000-000000000123","turn_id":"turn-1","created_unix_ms":3
         }),
     );
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
     let passive = fixture.doctor();
     assert_eq!(
         check(&passive, "provider_version")["availability"],
@@ -309,7 +283,7 @@ fn only_opt_in_probe_executes_local_cli_and_keeps_session_records_identical() {
         check(&value, "codex_thread")["reason_code"],
         "codex_thread_recorded"
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
 }
 
 #[cfg(unix)]
@@ -324,9 +298,9 @@ fn default_never_invokes_provider_even_when_executable_would_mutate_state() {
     )
     .unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
     fixture.doctor();
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -368,7 +342,7 @@ printf '2.1.280\n'
     .unwrap();
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
     let lock = fs::File::create(fixture.directory.join("turn.claim.lock")).unwrap();
-    let before = files(&fixture.directory);
+    let before = entries(&fixture.directory);
     let mut child = Command::new(env!("CARGO_BIN_EXE_tabcli"))
         .args(["doctor", "session-doctor", "--probe", "--json"])
         .env("AGENT_BRIDGE_NATIVE_STATE_DIR", fixture.root.path())
@@ -400,7 +374,7 @@ printf '2.1.280\n'
         check(&value, "provider_version")["reason_code"],
         "version_supported"
     );
-    assert_eq!(files(&fixture.directory), before);
+    assert_eq!(entries(&fixture.directory), before);
 }
 
 #[cfg(unix)]
@@ -415,7 +389,7 @@ fn missing_workspace_does_not_hide_the_installed_version_or_probe_another_daemon
     let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     manifest["workspace"] = json!(fixture.root.path().join("removed-worktree"));
     write(&path, &manifest);
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
     let value = report(fixture.run(&["doctor", "session-doctor", "--probe", "--json"]));
     assert_eq!(
         check(&value, "provider_version")["reason_code"],
@@ -426,7 +400,7 @@ fn missing_workspace_does_not_hide_the_installed_version_or_probe_another_daemon
         check(&value, "codex_daemon")["reason_code"],
         "workspace_unavailable"
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -438,22 +412,22 @@ fn terminal_close_markers_are_reported_without_consuming_or_resuming_them() {
             "terminal":"iterm2", "session_id":"owned-surface", "managed_session_id":"session-doctor"
         }),
     );
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
     assert_eq!(
         check(&fixture.doctor(), "terminal_record")["reason_code"],
         "terminal_close_in_progress"
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
     write(
         &fixture.directory.join("terminal.closed.json"),
         &json!({"consumed":true,"terminal":"iterm2"}),
     );
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
     assert_eq!(
         check(&fixture.doctor(), "terminal_record")["reason_code"],
         "terminal_consumed"
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
     write(
         &fixture.directory.join("native-session.json"),
         &json!({"pid":0}),
@@ -484,7 +458,7 @@ fn legacy_iterm_handle_uses_the_existing_binding_contract() {
 #[test]
 fn claude_doctor_reports_inherited_claude_code_session_markers_without_changing_files() {
     let fixture = Fixture::new("claude");
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
     // The test process itself may run inside a Claude Code session, so every marker is
     // cleared first and only the two under test are reintroduced.
     const MARKERS: [&str; 12] = [
@@ -524,7 +498,7 @@ fn claude_doctor_reports_inherited_claude_code_session_markers_without_changing_
         check(&outside, "claude_caller_markers")["reason_code"],
         "claude_caller_markers_absent"
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -554,9 +528,9 @@ fn reopen_marker_is_reported_with_its_release_condition_without_writes() {
         );
     };
     let observe = |reason: &str, availability: &str| -> Value {
-        let before = files(fixture.root.path());
+        let before = entries(fixture.root.path());
         let value = fixture.doctor();
-        assert_eq!(files(fixture.root.path()), before, "{reason}");
+        assert_eq!(entries(fixture.root.path()), before, "{reason}");
         let check = check(&value, "reopen_marker");
         assert_eq!(check["reason_code"], reason, "{check}");
         assert_eq!(check["availability"], availability, "{check}");
@@ -701,7 +675,7 @@ fn scope_reports_launch_inputs_and_reuses_consent_observation() {
         &fixture.directory.join("workspace-consent.json"),
         &json!({"state":"verified", "provider":"pi"}),
     );
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
     let value = fixture.doctor();
     assert_eq!(
         value["scope"],
@@ -757,7 +731,7 @@ fn scope_reports_launch_inputs_and_reuses_consent_observation() {
             .unwrap()
             .starts_with("scope: {")
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -774,7 +748,7 @@ fn scope_keeps_unusable_launch_paths_null_without_path_substitution() {
     ] {
         manifest["provider_path"] = json!(executable);
         write(&path, &manifest);
-        let before = files(fixture.root.path());
+        let before = entries(fixture.root.path());
         let value = report(fixture.run(&["doctor", "session-doctor", "--probe", "--json"]));
         assert_eq!(check(&value, "provider_executable")["reason_code"], reason);
         assert_eq!(
@@ -785,7 +759,7 @@ fn scope_keeps_unusable_launch_paths_null_without_path_substitution() {
         assert!(value["scope"]["executable_source"].is_null());
         assert!(value["scope"]["current_version"].is_null());
         assert_eq!(value["configured"]["provider_path"], json!(executable));
-        assert_eq!(files(fixture.root.path()), before);
+        assert_eq!(entries(fixture.root.path()), before);
     }
 }
 
@@ -801,7 +775,7 @@ fn scope_of_damaged_or_unrecognized_manifest_keeps_unknown_checks() {
         "provider_unrecognized"
     );
     fs::write(fixture.directory.join("manifest.json"), "not json").unwrap();
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
     let value = fixture.doctor();
     assert_eq!(
         value["scope"],
@@ -822,7 +796,7 @@ fn scope_of_damaged_or_unrecognized_manifest_keeps_unknown_checks() {
         "terminal_record_missing"
     );
     assert_eq!(value["observations"], json!({}));
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
 }
 
 #[cfg(unix)]
@@ -848,7 +822,7 @@ fn scope_reports_resolved_path_and_only_successful_current_version() {
         }
         report(command.output().unwrap())
     };
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
     let value = run(false);
     assert_eq!(
         value["scope"],
@@ -862,7 +836,7 @@ fn scope_reports_resolved_path_and_only_successful_current_version() {
     let value = run(true);
     assert_eq!(value["scope"]["current_version"], "1.0.0");
     assert_eq!(value["scope"]["probe"], true);
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(entries(fixture.root.path()), before);
     // The same probe target in a session comes from its launch record.
     let path = fixture.directory.join("manifest.json");
     let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -890,7 +864,7 @@ fn scope_reports_resolved_path_and_only_successful_current_version() {
 fn scope_cwd_failure_does_not_hide_missing_or_damaged_session_checks() {
     let fixture = Fixture::new("pi");
     fs::write(fixture.directory.join("manifest.json"), "not json").unwrap();
-    let before = files(fixture.root.path());
+    let before = entries(fixture.root.path());
     for (session, reason, availability) in [
         ("session-absent", "session_unavailable", "unavailable"),
         ("session-doctor", "records_unreadable", "unknown"),
@@ -935,7 +909,7 @@ fn scope_cwd_failure_does_not_hide_missing_or_damaged_session_checks() {
             );
         }
         assert_eq!(value["observations"], json!({}));
-        assert_eq!(files(fixture.root.path()), before);
+        assert_eq!(entries(fixture.root.path()), before);
         assert!(!fixture.root.path().join("session-absent").exists());
     }
 }
@@ -955,7 +929,7 @@ fn hold_check_reports_each_part_without_changing_other_checks() {
         (json!({"held":false}), "unknown", "hold_unreadable"),
     ] {
         write(&fixture.directory.join("hold.json"), &record);
-        let before = files(fixture.root.path());
+        let before = entries(fixture.root.path());
         let report = fixture.doctor();
         let hold = check(&report, "hold");
         assert_eq!(hold["availability"], availability);
@@ -982,7 +956,7 @@ fn hold_check_reports_each_part_without_changing_other_checks() {
                 .collect::<Vec<_>>()
         };
         assert_eq!(projection(&report), projection(&original));
-        assert_eq!(files(fixture.root.path()), before);
+        assert_eq!(entries(fixture.root.path()), before);
     }
     write(
         &fixture.directory.join("hold.json"),

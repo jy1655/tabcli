@@ -1,3 +1,6 @@
+mod support;
+use support::{manifest, status, success, write};
+
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -18,20 +21,16 @@ impl Fixture {
         fs::create_dir(directory.join("events")).unwrap();
         write(
             &directory.join("manifest.json"),
-            &json!({
-                "schema": 1, "id": "session-observe", "provider": "claude",
-                "provider_path": "claude", "provider_version": "2.1.280",
-                "workspace": root.path().canonicalize().unwrap(), "title": "inspect fixture", "model": null,
-                "effort": null, "yolo": false, "created_unix_ms": 1
-            }),
+            &manifest(
+                "session-observe",
+                "claude",
+                "claude".as_ref(),
+                "2.1.280",
+                &root.path().canonicalize().unwrap(),
+                "inspect fixture",
+            ),
         );
-        write(
-            &directory.join("status.json"),
-            &json!({
-                "state": "ready", "generation": 2, "updated_unix_ms": 2,
-                "exit_code": null, "error": null
-            }),
-        );
+        write(&directory.join("status.json"), &status("ready", 2, None));
         Self { root, directory }
     }
 
@@ -44,45 +43,28 @@ impl Fixture {
     }
 
     fn event(&self, name: &str, text: &str) -> Value {
-        let event = json!({ "provider": "claude", "message": text, "error": null,
-            "provider_session_id": "native-session", "turn_id": name, "created_unix_ms": 3 });
+        let event = support::event("claude", "native-session", name, text, None, 3);
         write(&self.directory.join("events").join(name), &event);
         event
     }
-}
-
-fn write(path: &Path, value: &Value) {
-    fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
-}
-
-fn success(output: Output) -> Value {
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).unwrap()
-}
-
-fn files(directory: &Path) -> Vec<(PathBuf, Vec<u8>)> {
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(directory).unwrap() {
-        let entry = entry.unwrap();
-        if entry.file_type().unwrap().is_dir() {
-            entries.extend(files(&entry.path()));
-        } else {
-            entries.push((entry.path(), fs::read(entry.path()).unwrap()));
-        }
-    }
-    entries.sort();
-    entries
 }
 
 #[test]
 fn inspect_and_legacy_result_are_read_only_and_do_not_invent_request_identity() {
     let fixture = Fixture::new();
     fixture.event("event-1.json", "old result");
-    let before = files(fixture.root.path());
+    // Prove the read-only check sees creation and deletion of an empty directory.
+    let original = support::entries(fixture.root.path());
+    let empty = fixture.directory.join("empty");
+    fs::create_dir(&empty).unwrap();
+    let with_empty = support::entries(fixture.root.path());
+    assert_ne!(with_empty, original);
+    assert!(with_empty.contains(&(empty.clone(), None)));
+    fs::remove_dir(&empty).unwrap();
+    assert_ne!(support::entries(fixture.root.path()), with_empty);
+    assert_eq!(support::entries(fixture.root.path()), original);
+
+    let before = support::entries(fixture.root.path());
     let inspected = success(fixture.run(&["inspect", "session-observe", "--json"]));
     assert_eq!(inspected["schema_version"], 1);
     let result = success(fixture.run(&[
@@ -94,7 +76,7 @@ fn inspect_and_legacy_result_are_read_only_and_do_not_invent_request_identity() 
     ]));
     assert_eq!(result["result"], "old result");
     assert_eq!(result["request_id"], Value::Null);
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -124,7 +106,7 @@ fn inspect_reports_typed_and_legacy_residual_surfaces_without_writing() {
             status["residual_surface"] = json!(typed);
         }
         write(&fixture.directory.join("status.json"), &status);
-        let before = files(fixture.root.path());
+        let before = support::entries(fixture.root.path());
         let inspected = success(fixture.run(&["inspect", "session-observe", "--json"]));
         assert_eq!(inspected["stored_state"], "closed");
         assert_eq!(inspected["error"], error);
@@ -136,7 +118,7 @@ fn inspect_reports_typed_and_legacy_residual_surfaces_without_writing() {
                 Value::Null
             }
         );
-        assert_eq!(files(fixture.root.path()), before);
+        assert_eq!(support::entries(fixture.root.path()), before);
     }
 }
 
@@ -152,7 +134,7 @@ fn result_never_publishes_a_partial_completion_journal_or_recovers_it() {
             "event": event, "status_error": null, "status_state": "ready"
         }),
     );
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     let result = fixture.run(&[
         "result",
         "session-observe",
@@ -163,7 +145,7 @@ fn result_never_publishes_a_partial_completion_journal_or_recovers_it() {
     let body: Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(body["result"], Value::Null);
     assert_ne!(body["request_state"], "completed");
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -226,7 +208,7 @@ fn timeline_preserves_identity_closed_results_and_every_session_byte() {
         &json!({"consumed": true, "terminal": "windows-console"}),
     );
     fs::write(fixture.directory.join("turn.claim.lock"), "").unwrap();
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     let all = timeline(&fixture, None);
     assert_eq!(all["requests"].as_array().unwrap().len(), 2);
     for (index, id) in ["request-first", "request-second"].iter().enumerate() {
@@ -285,7 +267,7 @@ fn timeline_preserves_identity_closed_results_and_every_session_byte() {
     assert!(human.contains("time=unknown"));
     assert!(human.contains("source=\"launch.json\""));
     assert!(human.contains("session_entries:"));
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -325,7 +307,7 @@ fn timeline_states_match_exact_result_and_never_confirm_uncertain_delivery() {
             &json!({"state": "working", "generation": 3,
             "updated_unix_ms": 4, "exit_code": null, "error": "delivery could not be confirmed; do not resend"}),
         );
-        let before = files(fixture.root.path());
+        let before = support::entries(fixture.root.path());
         let value = timeline(&fixture, Some("request-turn"));
         let exact = success(fixture.run(&[
             "result",
@@ -350,7 +332,7 @@ fn timeline_states_match_exact_result_and_never_confirm_uncertain_delivery() {
                     .any(|e| e["stage"] == "completion" && e["record_state"] == "observed")
             );
         }
-        assert_eq!(files(fixture.root.path()), before);
+        assert_eq!(support::entries(fixture.root.path()), before);
     }
 }
 
@@ -370,7 +352,7 @@ fn timeline_reports_missing_and_damaged_evidence_without_success() {
     fs::write(fixture.directory.join("requests/123-457-1.json"), "{broken").unwrap();
     fs::write(fixture.directory.join("closed.json"), "{broken").unwrap();
     fs::write(fixture.directory.join("terminal.closing.json"), "{broken").unwrap();
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     let damaged = timeline(&fixture, None);
     assert_eq!(damaged["incomplete"], true);
     assert_eq!(damaged["unreadable_requests"], 1);
@@ -383,7 +365,7 @@ fn timeline_reports_missing_and_damaged_evidence_without_success() {
             .iter()
             .any(|e| e["stage"] == "closed_status" && e["record_state"] == "unreadable")
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -418,13 +400,13 @@ fn timeline_rejects_unknown_requests_invalid_options_and_corrupt_core_records() 
     assert_eq!(value["ok"], false);
     assert!(!String::from_utf8_lossy(&output.stdout).contains("unrelated result"));
     fs::write(fixture.directory.join("launch.json"), "{broken").unwrap();
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     let output = fixture.run(&["inspect", "session-observe", "--timeline", "--json"]);
     assert!(!output.status.success());
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["ok"], false);
     assert_eq!(value["stored_state"], "unknown");
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -460,7 +442,7 @@ fn waiting_timeout_preserves_the_claim_and_receipt() {
     let fixture = Fixture::new();
     request(&fixture, "123-456-0", "request-pending", "event-1.json");
     fs::write(fixture.directory.join("turn.claim"), "123-456-0\n").unwrap();
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     let output = fixture.run(&[
         "result",
         "session-observe",
@@ -476,7 +458,7 @@ fn waiting_timeout_preserves_the_claim_and_receipt() {
     assert_eq!(result["request_id"], "request-pending");
     assert_eq!(result["timed_out"], true);
     assert_eq!(result["result"], Value::Null);
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -565,10 +547,10 @@ fn read_only_queries_preserve_closed_and_dead_owner_records() {
         &fixture.directory.join("closed.json"),
         &json!({"state": "closed", "generation": 3, "updated_unix_ms": 4, "exit_code": null, "error": null}),
     );
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     success(fixture.run(&["inspect", "session-observe", "--json"]));
     success(fixture.run(&["result", "session-observe", "--latest", "--json"]));
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -620,7 +602,7 @@ fn corrupt_receipt_is_reported_without_hiding_an_independently_addressed_result(
     request(&fixture, "123-456-0", "request-broken", "event-1.json");
     fixture.event("event-1.json", "verified provider result");
     fs::write(fixture.directory.join("requests/123-456-0.json"), "broken").unwrap();
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     let inspected = success(fixture.run(&["inspect", "session-observe", "--json"]));
     assert_eq!(inspected["unreadable_requests"], 1);
     let result = success(fixture.run(&[
@@ -645,7 +627,7 @@ fn corrupt_receipt_is_reported_without_hiding_an_independently_addressed_result(
             .status
             .success()
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -657,7 +639,7 @@ fn dead_owner_ends_wait_without_repairing_or_releasing_the_claim() {
         &fixture.directory.join("native-session.json"),
         &json!({"pid": u32::MAX}),
     );
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     let started = std::time::Instant::now();
     let output = fixture.run(&[
         "result",
@@ -674,7 +656,7 @@ fn dead_owner_ends_wait_without_repairing_or_releasing_the_claim() {
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["owner_process_alive"], false);
     assert_eq!(result["timed_out"], Value::Null);
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -692,13 +674,13 @@ fn empty_latest_is_a_structured_nonzero_result_but_inspect_still_works() {
 fn inspect_reports_unreadable_status_without_repairing_it() {
     let fixture = Fixture::new();
     fs::write(fixture.directory.join("status.json"), "broken status").unwrap();
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     let output = fixture.run(&["inspect", "session-observe", "--json"]);
     assert!(!output.status.success());
     let body: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(body["ok"], false);
     assert_eq!(body["stored_state"], "unknown");
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -1047,7 +1029,7 @@ fn status_is_read_only_including_closed_tombstones_and_dead_owners() {
         &closed.join("native-session.json"),
         &json!({"pid":0,"managed_session_id":"session-closed"}),
     );
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     let value = success(fixture.run(&["status", "--all-workspaces", "--json"]));
     assert_eq!(value["sessions"].as_array().unwrap().len(), 1);
     assert_eq!(value["sessions"][0]["attention"], json!(["owner_exited"]));
@@ -1059,7 +1041,7 @@ fn status_is_read_only_including_closed_tombstones_and_dead_owners() {
         value["sessions"][0]["result_command"],
         "tabcli result session-observe --event event-1.json --json"
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
     let value = success(fixture.run(&["status", "--all-workspaces", "--all", "--json"]));
     assert_eq!(value["scanned"], json!({"sessions":2,"listed":2}));
     let closed = value["sessions"]
@@ -1070,7 +1052,7 @@ fn status_is_read_only_including_closed_tombstones_and_dead_owners() {
         .unwrap();
     assert_eq!(closed["attention"], json!(["residual_surface_unverified"]));
     assert_eq!(closed["residual_surface"], "unverified");
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -1136,9 +1118,9 @@ fn status_sorts_attention_then_updated_then_id_and_includes_failed_by_default() 
     ] {
         status_session(&fixture, id, state, updated, "codex", fixture.root.path());
     }
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     let value = success(fixture.run(&["status", "--all-workspaces", "--json"]));
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
     let ids = value["sessions"]
         .as_array()
         .unwrap()
@@ -1167,13 +1149,13 @@ fn status_sorts_attention_then_updated_then_id_and_includes_failed_by_default() 
 fn status_omits_unreadable_required_records_with_session_reasons() {
     let fixture = Fixture::new();
     fs::write(fixture.directory.join("status.json"), "{").unwrap();
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     let value = success(fixture.run(&["status", "--all-workspaces", "--json"]));
     assert_eq!(value["sessions"], json!([]));
     assert_eq!(value["incomplete"], true);
     assert_eq!(value["incomplete_reasons"][0]["session"], "session-observe");
     assert_eq!(value["scanned"], json!({"sessions":1,"listed":0}));
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -1182,7 +1164,7 @@ fn status_returns_busy_incomplete_without_writing_or_waiting_for_the_writer() {
     let lock = fs::File::create(fixture.directory.join("turn.claim.lock")).unwrap();
     // Snapshot the bytes before locking: Windows refuses to read a file that another
     // handle holds exclusively, and the lock file is part of the directory.
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     lock.lock().unwrap();
     let started = std::time::Instant::now();
     let value = success(fixture.run(&["status", "--all-workspaces", "--json"]));
@@ -1196,7 +1178,7 @@ fn status_returns_busy_incomplete_without_writing_or_waiting_for_the_writer() {
             .contains("busy")
     );
     drop(lock);
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -1292,7 +1274,7 @@ fn wait_selects_completed_and_preserves_other_claim_and_all_records() {
     request(&fixture, "123-456-0", "request-first", "event-1.json");
     fixture.event("event-1.json", "first result");
     wait_second_session(&fixture);
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     let value = success(fixture.run(&[
         "wait",
         "session-observe/request-first",
@@ -1315,7 +1297,7 @@ fn wait_selects_completed_and_preserves_other_claim_and_all_records() {
             .unwrap()
             .ends_with("remaining: session-second/request-second\n")
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -1324,7 +1306,7 @@ fn wait_shared_timeout_preserves_both_pending_requests() {
     request(&fixture, "123-456-0", "request-first", "event-1.json");
     fs::write(fixture.directory.join("turn.claim"), "123-456-0\n").unwrap();
     wait_second_session(&fixture);
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     let output = fixture.run(&[
         "wait",
         "session-observe/request-first",
@@ -1341,7 +1323,7 @@ fn wait_shared_timeout_preserves_both_pending_requests() {
         "remaining": ["session-observe/request-first", "session-second/request-second"],
         "timed_out": true, "error": "waiting timed out; no request was cancelled or resent"})
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -1379,7 +1361,7 @@ fn wait_busy_unconfirmed_session_does_not_block_a_completed_request() {
     fixture.event("event-1.json", "completed");
     let second = wait_second_session(&fixture);
     let lock = fs::File::create(second.join("turn.claim.lock")).unwrap();
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     lock.lock().unwrap();
     // Even a missing receipt cannot be confirmed while this session is busy.
     let value = success(fixture.run(&[
@@ -1396,7 +1378,7 @@ fn wait_busy_unconfirmed_session_does_not_block_a_completed_request() {
         value["remaining"],
         json!(["session-second/request-missing"])
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -1409,7 +1391,7 @@ fn wait_rejects_invalid_addresses_before_selecting_a_completed_request() {
         request(&fixture, "123-456-0", "request-first", "event-1.json");
         fixture.event("event-1.json", "must not be returned");
         wait_second_session(&fixture);
-        let before = files(fixture.root.path());
+        let before = support::entries(fixture.root.path());
         let started = std::time::Instant::now();
         let output = fixture.run(&["wait", "session-observe/request-first", invalid, "--json"]);
         assert!(!output.status.success());
@@ -1418,7 +1400,7 @@ fn wait_rejects_invalid_addresses_before_selecting_a_completed_request() {
         assert_eq!(value["ended"], Value::Null);
         assert_eq!(value["ok"], false);
         assert!(!String::from_utf8_lossy(&output.stdout).contains("must not be returned"));
-        assert_eq!(files(fixture.root.path()), before);
+        assert_eq!(support::entries(fixture.root.path()), before);
     }
 }
 
@@ -1513,7 +1495,7 @@ fn wait_one_matches_public_result_wait_and_preserves_journal_and_dead_owner() {
                 "updated_unix_ms": 4, "exit_code": null, "error": null}),
             );
         }
-        let before = files(fixture.root.path());
+        let before = support::entries(fixture.root.path());
         let result = fixture.run(&[
             "result",
             "session-observe",
@@ -1574,7 +1556,7 @@ fn wait_one_matches_public_result_wait_and_preserves_journal_and_dead_owner() {
             assert_eq!(ended["result"], "result");
             assert!(!ended.contains_key("owner"));
         }
-        assert_eq!(files(fixture.root.path()), before);
+        assert_eq!(support::entries(fixture.root.path()), before);
     }
 }
 
@@ -1677,7 +1659,7 @@ fn held_or_unreadable_tell_refuses_before_any_record_write() {
             );
         }
         // No lifecycle lock yet: converge would create it, so compare the whole directory.
-        let before = files(fixture.root.path());
+        let before = support::entries(fixture.root.path());
         let output = fixture.run(&[
             "tell",
             "session-observe",
@@ -1696,7 +1678,7 @@ fn held_or_unreadable_tell_refuses_before_any_record_write() {
             value,
             json!({"schema_version":1,"ok":false,"session":"session-observe","error":error})
         );
-        assert_eq!(files(fixture.root.path()), before);
+        assert_eq!(support::entries(fixture.root.path()), before);
     }
 }
 
@@ -1717,7 +1699,7 @@ fn hold_observations_distinguish_absent_valid_malformed_and_nonregular() {
             _ => (),
         }
         fixture.event("event-1.json", "retained result");
-        let before = files(fixture.root.path());
+        let before = support::entries(fixture.root.path());
         let inspect = success(fixture.run(&["inspect", "session-observe", "--json"]));
         let status = success(fixture.run(&["status", "--all-workspaces", "--json"]));
         let entry = &status["sessions"][0];
@@ -1747,7 +1729,7 @@ fn hold_observations_distinguish_absent_valid_malformed_and_nonregular() {
         let timeline =
             success(fixture.run(&["inspect", "session-observe", "--timeline", "--json"]));
         assert!(timeline.get("held").is_none());
-        assert_eq!(files(fixture.root.path()), before);
+        assert_eq!(support::entries(fixture.root.path()), before);
     }
 }
 
@@ -1775,14 +1757,14 @@ fn hold_argument_and_missing_session_errors_are_json() {
         assert!(value["error"].is_string());
     }
     fs::write(fixture.directory.join("manifest.json"), b"malformed").unwrap();
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     assert!(
         !fixture
             .run(&["hold", "session-observe", "--json"])
             .status
             .success()
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -1849,7 +1831,7 @@ fn cancel_readers_render_outcomes_without_mutation() {
                 "provider_session_id":"native", "turn_id":"turn", "created_unix_ms":4
             }),
         );
-        let before = files(fixture.root.path());
+        let before = support::entries(fixture.root.path());
         let inspect = success(fixture.run(&["inspect", "session-observe", "--json"]));
         assert_eq!(
             inspect["cancel"],
@@ -1905,7 +1887,7 @@ fn cancel_readers_render_outcomes_without_mutation() {
         );
         let search = success(fixture.run(&["search", "aborted", "--all-workspaces", "--json"]));
         assert!(search["hits"].as_array().unwrap().is_empty());
-        assert_eq!(files(fixture.root.path()), before);
+        assert_eq!(support::entries(fixture.root.path()), before);
     }
 }
 
@@ -1917,16 +1899,16 @@ fn cancel_requested_unreadable_and_absent_are_auxiliary_evidence() {
         &fixture.directory.join("status.json"),
         &json!({"state":"working", "generation":3, "updated_unix_ms":3, "error":null, "exit_code":null}),
     );
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     let inspected = success(fixture.run(&["inspect", "session-observe", "--json"]));
     assert_eq!(inspected["cancel"]["state"], "requested");
     let status = success(fixture.run(&["status", "--all-workspaces", "--json"]));
     assert!(status.to_string().contains("cancel_requested"));
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
     fs::remove_file(fixture.directory.join("turn.claim")).unwrap();
     fixture.event("event-1.json", "published success");
     fs::write(fixture.directory.join("cancel.json"), b"{broken").unwrap();
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     let inspected = success(fixture.run(&["inspect", "session-observe", "--json"]));
     assert_eq!(inspected["cancel"]["state"], "unreadable");
     assert_eq!(inspected["latest_result"]["request_state"], "completed");
@@ -1949,7 +1931,7 @@ fn cancel_requested_unreadable_and_absent_are_auxiliary_evidence() {
             .iter()
             .any(|c| c["id"] == "cancel" && c["reason_code"] == "cancel_unreadable")
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
     fs::remove_file(fixture.directory.join("cancel.json")).unwrap();
     assert_eq!(
         success(fixture.run(&["inspect", "session-observe", "--json"]))["cancel"],
@@ -2005,7 +1987,7 @@ fn cancel_without_provider_capability_refuses_without_changing_claim_or_intent()
             );
             fs::write(fixture.directory.join("turn.claim"), "1-2-3\n").unwrap();
             // The command may create its lifecycle lock; all other bytes must be retained.
-            let before = files(fixture.root.path());
+            let before = support::entries(fixture.root.path());
             let output = fixture.run(&["cancel", "session-observe", "--json"]);
             assert!(!output.status.success());
             let value: Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -2021,7 +2003,7 @@ fn cancel_without_provider_capability_refuses_without_changing_claim_or_intent()
                 json!({"schema_version":1,"ok":false,"session":"session-observe",
                 "error":reason})
             );
-            let mut after = files(fixture.root.path());
+            let mut after = support::entries(fixture.root.path());
             after.retain(|(path, _)| path.file_name().unwrap() != "turn.claim.lock");
             assert_eq!(before, after);
         }
@@ -2053,7 +2035,7 @@ fn cancel_timeline_filters_retained_intent_and_rejects_non_utf8() {
             .any(|e| e["stage"] == "cancel_request")
     );
     fs::write(fixture.directory.join("cancel.json"), [0xff]).unwrap();
-    let before = files(fixture.root.path());
+    let before = support::entries(fixture.root.path());
     let value = success(fixture.run(&["inspect", "session-observe", "--timeline", "--json"]));
     assert_eq!(value["incomplete"], true);
     assert!(
@@ -2063,7 +2045,7 @@ fn cancel_timeline_filters_retained_intent_and_rejects_non_utf8() {
             .iter()
             .any(|e| e["stage"] == "cancel_request" && e["record_state"] == "unreadable")
     );
-    assert_eq!(files(fixture.root.path()), before);
+    assert_eq!(support::entries(fixture.root.path()), before);
 }
 
 #[test]
@@ -2093,7 +2075,7 @@ fn cancel_identity_mismatch_is_unreadable_in_every_reader_without_hiding_result(
                 "schema":1, "request_id":"request-cancel", "claim_token":"4-5-6", "created_unix_ms":3
             }),
         );
-        let before = files(fixture.root.path());
+        let before = support::entries(fixture.root.path());
         let inspect = success(fixture.run(&["inspect", "session-observe", "--json"]));
         assert_eq!(inspect["cancel"]["state"], "unreadable");
         let result = success(fixture.run(&[
@@ -2134,6 +2116,6 @@ fn cancel_identity_mismatch_is_unreadable_in_every_reader_without_hiding_result(
         );
         let status = success(fixture.run(&["status", "--all-workspaces", "--json"]));
         assert!(!status.to_string().contains("cancel_requested"));
-        assert_eq!(files(fixture.root.path()), before);
+        assert_eq!(support::entries(fixture.root.path()), before);
     }
 }

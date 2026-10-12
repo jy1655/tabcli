@@ -20,6 +20,8 @@ const STARTUP_CLEANUP_RESERVE: Duration = Duration::from_secs(2);
 pub(in crate::native) mod apple_terminal;
 mod applescript;
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 pub(in crate::native) use applescript::testing as automation_testing;
 pub(in crate::native) mod ghostty;
 pub(in crate::native) mod iterm2;

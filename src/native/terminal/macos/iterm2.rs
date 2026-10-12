@@ -1936,29 +1936,11 @@ end run
     }
 
     fn launch_fixture_in(parent: &Path) -> tempfile::TempDir {
-        use crate::native::*;
-        let directory = tempfile::Builder::new()
-            .prefix("session-iterm-")
-            .tempdir_in(parent)
-            .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::create_dir(directory.path().join("events")).unwrap();
-        update_status(directory.path(), SessionState::Launching, None, None).unwrap();
-        let claim = crate::native::session::turn::claim(
-            &crate::native::session::Store::open_unchecked(directory.path()),
-            &[],
+        super::super::test_support::launch_fixture(
+            "session-iterm-",
+            std::time::Duration::from_secs(5),
+            parent,
         )
-        .unwrap();
-        let token = claim.token().to_owned();
-        claim.retain();
-        launch::begin(
-            &crate::native::session::Store::open_unchecked(directory.path()),
-            &token,
-            Instant::now() + Duration::from_secs(5),
-        )
-        .unwrap();
-        directory
     }
 
     fn bind_fixture(directory: &Path, terminal_id: &str) {
