@@ -1,0 +1,1267 @@
+use super::support::*;
+use super::*;
+
+#[test]
+fn explicit_close_repairs_failed_launch_without_terminal_record() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(
+        directory.path(),
+        SessionState::Failed,
+        None,
+        Some("launch failed".to_owned()),
+    )
+    .unwrap();
+    let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
+    claim.retain();
+    let mut close_was_called = false;
+
+    close_session_state(directory.path(), |_| {
+        close_was_called = true;
+        Ok(terminal::CloseOutcome::Closed)
+    })
+    .unwrap();
+
+    assert!(!close_was_called);
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state.as_str(), "closed");
+    assert!(
+        status.error.is_none(),
+        "ordinary launch errors are not retained by handle-less close"
+    );
+}
+
+#[test]
+fn explicit_close_remains_available_with_a_corrupt_completion_journal() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), SessionState::Working, None, None).unwrap();
+    let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
+    claim.retain();
+    fs::write(directory.path().join(TURN_COMPLETION_FILE), "not-json").unwrap();
+
+    close_repaired_session_state(directory.path(), |_| {
+        panic!("a missing terminal handle must not call the adapter")
+    })
+    .unwrap();
+
+    assert!(!directory.path().join(TURN_COMPLETION_FILE).exists());
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state.as_str(), "closed");
+    assert!(
+        status
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("invalid pending native turn completion"))
+    );
+}
+
+#[test]
+fn explicit_close_restores_the_terminal_handle_after_adapter_failure() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_json_atomic(
+        &directory.path().join(TERMINAL_HANDLE_FILE),
+        &terminal::TerminalSession {
+            kind: terminal::TerminalKind::WindowsConsole,
+            id: "windows-console-process".to_owned(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: Some("session-windows-close".to_owned()),
+            wezterm_mux: None,
+            windows_process_identity: None,
+        },
+    )
+    .unwrap();
+    update_status(directory.path(), SessionState::Ready, None, None).unwrap();
+
+    let error = close_session_state(directory.path(), |_| {
+        Err(anyhow::anyhow!(
+            "failed to attach to the managed console process: Access is denied"
+        ))
+    })
+    .unwrap_err();
+
+    assert!(error.to_string().contains("Access is denied"));
+    assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
+    assert!(!directory.path().join(TERMINAL_CLOSING_FILE).exists());
+    assert!(!directory.path().join(TERMINAL_TOMBSTONE_FILE).exists());
+    assert_eq!(
+        read_json::<SessionStatus>(&directory.path().join("status.json"))
+            .unwrap()
+            .state
+            .as_str(),
+        "ready"
+    );
+}
+
+#[test]
+fn concurrent_close_requests_share_one_terminal_handle_claim() {
+    use std::sync::{Arc, Barrier, atomic::AtomicUsize};
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_json_atomic(
+        &directory.path().join(TERMINAL_HANDLE_FILE),
+        &terminal::TerminalSession {
+            kind: terminal::TerminalKind::Iterm2,
+            id: "concurrent-close".to_owned(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: None,
+            wezterm_mux: None,
+            windows_process_identity: None,
+        },
+    )
+    .unwrap();
+    update_status(directory.path(), SessionState::Running, None, None).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let first_directory = directory.path().to_owned();
+    let first_barrier = Arc::clone(&barrier);
+    let first_calls = Arc::clone(&calls);
+    let first = std::thread::spawn(move || {
+        close_session_state(&first_directory, |_| {
+            first_calls.fetch_add(1, Ordering::SeqCst);
+            first_barrier.wait();
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(terminal::CloseOutcome::Closed)
+        })
+    });
+
+    while !directory.path().join(TERMINAL_CLOSING_FILE).exists() {
+        std::thread::yield_now();
+    }
+    barrier.wait();
+    close_session_state(directory.path(), |_| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Ok(terminal::CloseOutcome::Closed)
+    })
+    .unwrap();
+    first.join().unwrap().unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        read_json::<SessionStatus>(&directory.path().join("status.json"))
+            .unwrap()
+            .state
+            .as_str(),
+        "closed"
+    );
+}
+
+#[test]
+fn tell_cannot_claim_while_explicit_close_owns_the_terminal_lifecycle() {
+    use std::sync::{Arc, Barrier};
+
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_json_atomic(
+        &directory.path().join(TERMINAL_HANDLE_FILE),
+        &terminal::TerminalSession {
+            kind: terminal::TerminalKind::Iterm2,
+            id: "closing-before-tell".to_owned(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: None,
+            wezterm_mux: None,
+            windows_process_identity: None,
+        },
+    )
+    .unwrap();
+    update_status(directory.path(), SessionState::Ready, None, None).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let close_directory = directory.path().to_owned();
+    let close_barrier = Arc::clone(&barrier);
+    let close = thread::spawn(move || {
+        close_session_state(&close_directory, |_| {
+            close_barrier.wait();
+            Ok(terminal::CloseOutcome::Closed)
+        })
+    });
+
+    barrier.wait();
+    let tell_directory = directory.path().to_owned();
+    let tell = thread::spawn(move || {
+        turn::claim_ready(
+            &Store::open_unchecked(&tell_directory),
+            "session-close123",
+            &[],
+        )
+    });
+    close.join().unwrap().unwrap();
+    let tell_error = match tell.join().unwrap() {
+        Ok(_) => panic!("tell claimed a session while close owned its lifecycle"),
+        Err(error) => error,
+    };
+
+    assert!(tell_error.to_string().contains("closed"));
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+}
+
+#[test]
+fn already_closed_session_never_reuses_a_stale_terminal_handle() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_json_atomic(
+        &directory.path().join("terminal.json"),
+        &terminal::TerminalSession {
+            kind: terminal::TerminalKind::Iterm2,
+            id: "stale-iterm-session".to_owned(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: None,
+            wezterm_mux: None,
+            windows_process_identity: None,
+        },
+    )
+    .unwrap();
+    update_status(directory.path(), SessionState::Closed, None, None).unwrap();
+    let mut close_calls = 0;
+
+    close_session_state(directory.path(), |_| {
+        close_calls += 1;
+        Ok(terminal::CloseOutcome::Closed)
+    })
+    .unwrap();
+
+    assert_eq!(close_calls, 0);
+    assert_eq!(
+        read_json::<SessionStatus>(&directory.path().join("status.json"))
+            .unwrap()
+            .state
+            .as_str(),
+        "closed"
+    );
+}
+
+#[test]
+fn explicit_close_routes_using_the_recorded_terminal_kind() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_json_atomic(
+        &directory.path().join("terminal.json"),
+        &terminal::TerminalSession {
+            kind: terminal::TerminalKind::Ghostty,
+            id: "ghostty-terminal".to_owned(),
+            tab_id: Some("ghostty-tab".to_owned()),
+            window_id: Some("ghostty-window".to_owned()),
+            managed_session_id: None,
+            wezterm_mux: None,
+            windows_process_identity: None,
+        },
+    )
+    .unwrap();
+    update_status(directory.path(), SessionState::Working, None, None).unwrap();
+
+    close_session_state(directory.path(), |session| {
+        assert_eq!(session.kind, terminal::TerminalKind::Ghostty);
+        assert_eq!(session.id, "ghostty-terminal");
+        assert_eq!(session.tab_id.as_deref(), Some("ghostty-tab"));
+        assert_eq!(session.window_id.as_deref(), Some("ghostty-window"));
+        Ok(terminal::CloseOutcome::Closed)
+    })
+    .unwrap();
+}
+
+#[test]
+fn explicit_close_is_terminal_against_late_native_wrapper_updates() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    write_json_atomic(
+        &directory.path().join("terminal.json"),
+        &terminal::TerminalSession {
+            kind: terminal::TerminalKind::Iterm2,
+            id: "closing-iterm-session".to_owned(),
+            tab_id: None,
+            window_id: None,
+            managed_session_id: None,
+            wezterm_mux: None,
+            windows_process_identity: None,
+        },
+    )
+    .unwrap();
+    update_status(directory.path(), SessionState::Running, None, None).unwrap();
+
+    close_session_state(directory.path(), |_| Ok(terminal::CloseOutcome::Closed)).unwrap();
+    update_status(directory.path(), SessionState::Exited, Some(1), None).unwrap();
+    update_status(
+        directory.path(),
+        SessionState::Failed,
+        None,
+        Some("provider exited after close".to_owned()),
+    )
+    .unwrap();
+
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state.as_str(), "closed");
+    assert_eq!(status.exit_code, None);
+    assert_eq!(status.error, None);
+}
+
+#[test]
+fn internal_session_ids_cannot_escape_the_state_root() {
+    assert!(valid_session_id("session-abCD_123-xyz"));
+    assert!(!valid_session_id("../outside"));
+    assert!(!valid_session_id("session/child"));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn assert_dead_terminal_owner_close_converges(state: &str) {
+    let directory = tempfile::tempdir().unwrap();
+    write_owned_terminal_state(directory.path(), state, reaped_child_pid());
+    let mut adapter_calls = 0;
+
+    assert!(repair_dead_native_owner(directory.path()).unwrap());
+    close_session_state(directory.path(), |_| {
+        adapter_calls += 1;
+        Ok(terminal::CloseOutcome::Closed)
+    })
+    .unwrap();
+    assert!(!repair_dead_native_owner(directory.path()).unwrap());
+    close_session_state(directory.path(), |_| {
+        adapter_calls += 1;
+        Ok(terminal::CloseOutcome::Closed)
+    })
+    .unwrap();
+
+    assert_eq!(adapter_calls, 0);
+    assert!(!directory.path().join(TERMINAL_HANDLE_FILE).exists());
+    assert!(!directory.path().join(TERMINAL_CLOSING_FILE).exists());
+    assert!(directory.path().join(TERMINAL_TOMBSTONE_FILE).exists());
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state.as_str(), "closed");
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn exited_dead_native_owner_consumes_terminal_without_adapter_calls() {
+    assert_dead_terminal_owner_close_converges("exited");
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn failed_dead_native_owner_consumes_terminal_without_adapter_calls() {
+    assert_dead_terminal_owner_close_converges("failed");
+}
+
+#[test]
+fn exited_and_failed_live_native_owners_are_not_repaired() {
+    for state in ["exited", "failed"] {
+        let directory = tempfile::tempdir().unwrap();
+        write_owned_terminal_state(directory.path(), state, std::process::id());
+
+        assert!(!repair_dead_native_owner(directory.path()).unwrap());
+        assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
+        assert!(!directory.path().join(TERMINAL_TOMBSTONE_FILE).exists());
+        assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(status.state.as_str(), state);
+    }
+}
+
+#[test]
+fn live_native_session_owner_is_not_repaired() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), SessionState::Working, None, None).unwrap();
+    let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
+    claim.retain();
+    write_json_atomic(
+        &directory.path().join(SESSION_OWNER_FILE),
+        &NativeSessionOwner {
+            pid: std::process::id(),
+            windows_process_identity: test_windows_process_identity(std::process::id()),
+            ..NativeSessionOwner::default()
+        },
+    )
+    .unwrap();
+
+    assert!(!repair_dead_native_owner(directory.path()).unwrap());
+    assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state.as_str(), "working");
+}
+
+#[test]
+fn dead_native_session_owner_releases_the_turn_and_closes_state() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), SessionState::Working, None, None).unwrap();
+    let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
+    claim.retain();
+    write_json_atomic(
+        &directory.path().join(SESSION_OWNER_FILE),
+        &NativeSessionOwner {
+            pid: reaped_child_pid(),
+            ..NativeSessionOwner::default()
+        },
+    )
+    .unwrap();
+
+    assert!(repair_dead_native_owner(directory.path()).unwrap());
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state.as_str(), "closed");
+    assert!(
+        status
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("no longer running"))
+    );
+    assert!(directory.path().join("events").is_dir());
+}
+
+#[test]
+fn terminal_close_transaction_preserves_its_terminal_reason() {
+    let directory = tempfile::tempdir().unwrap();
+    update_status(directory.path(), SessionState::Working, None, None).unwrap();
+    let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
+    claim.retain();
+
+    close_session_state_with_error(
+        directory.path(),
+        Some("native session process stopped".to_owned()),
+        |_| panic!("a missing terminal handle must not call the adapter"),
+        crate::native::session::close::budget::close_deadline(),
+    )
+    .unwrap();
+
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state.as_str(), "closed");
+    assert_eq!(
+        status.error.as_deref(),
+        Some("native session process stopped")
+    );
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+}
+
+#[test]
+fn claimed_and_awaiting_initial_input_dead_owners_respect_surface_cleanup() {
+    for state in ["claimed", "awaiting-initial-input"] {
+        let directory = tempfile::tempdir().unwrap();
+        write_owned_terminal_state(directory.path(), state, reaped_child_pid());
+
+        #[cfg(windows)]
+        assert!(
+            repair_dead_native_owner_with_terminal_close(directory.path(), |session| {
+                assert_eq!(session.kind, terminal::TerminalKind::WindowsConsole);
+                Ok(terminal::CloseOutcome::Missing)
+            })
+            .unwrap()
+        );
+        #[cfg(not(any(windows, target_os = "macos")))]
+        assert!(repair_dead_native_owner(directory.path()).unwrap());
+        #[cfg(target_os = "macos")]
+        {
+            assert!(!repair_dead_native_owner(directory.path()).unwrap());
+            assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
+            assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+            let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+            assert_eq!(status.state.as_str(), state);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+            let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+            assert_eq!(status.state.as_str(), "closed");
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn explicit_close_allows_only_bound_ownerless_launch_failures() {
+    let session = terminal::TerminalSession {
+        kind: if cfg!(windows) {
+            terminal::TerminalKind::WindowsConsole
+        } else {
+            terminal::TerminalKind::Iterm2
+        },
+        id: "launch-surface".to_owned(),
+        tab_id: None,
+        window_id: None,
+        managed_session_id: Some("session-owner123".to_owned()),
+        wezterm_mux: None,
+        windows_process_identity: None,
+    };
+
+    let directory = tempfile::tempdir().unwrap();
+    update_status(
+        directory.path(),
+        SessionState::Failed,
+        None,
+        Some("startup failed".to_owned()),
+    )
+    .unwrap();
+    assert!(
+        verify_terminal_close_authority(
+            directory.path(),
+            "session-owner123",
+            &session,
+            crate::native::session::close::budget::close_deadline()
+        )
+        .unwrap()
+            == TerminalCloseAuthority::SurfaceOnly
+    );
+
+    let ready_directory = tempfile::tempdir().unwrap();
+    update_status(ready_directory.path(), SessionState::Ready, None, None).unwrap();
+    assert!(
+        verify_terminal_close_authority(
+            ready_directory.path(),
+            "session-owner123",
+            &session,
+            crate::native::session::close::budget::close_deadline()
+        )
+        .is_err()
+    );
+
+    let launching_directory = tempfile::tempdir().unwrap();
+    update_status(
+        launching_directory.path(),
+        SessionState::Launching,
+        None,
+        None,
+    )
+    .unwrap();
+    assert!(
+        verify_terminal_close_authority(
+            launching_directory.path(),
+            "session-different456",
+            &session,
+            crate::native::session::close::budget::close_deadline()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn terminal_owner_proof_rejects_record_only_ids_and_reused_surfaces() {
+    let terminal: terminal::TerminalSession = serde_json::from_value(serde_json::json!({
+        "terminal": "apple-terminal",
+        "session_id": "/dev/ttys001",
+        "window_id": "1001",
+        "managed_session_id": "session-owner123"
+    }))
+    .unwrap();
+    let owner = NativeSessionOwner {
+        pid: 4242,
+        managed_session_id: Some("session-owner123".to_owned()),
+        terminal_tty: Some("/dev/ttys001".to_owned()),
+        terminal_tty_device: Some(7),
+        process_start_seconds: Some(100),
+        process_start_microseconds: Some(200),
+        process_group: Some(4242),
+        terminal_process_group: Some(4242),
+        terminal_shell: None,
+        terminal_app: None,
+        windows_process_identity: None,
+    };
+    let live = NativeProcessIdentity {
+        pid: 4242,
+        parent_pid: 4000,
+        terminal_tty_device: 7,
+        process_group: 4242,
+        terminal_process_group: 4242,
+        process_start_seconds: 100,
+        process_start_microseconds: 200,
+    };
+
+    verify_terminal_owner_attestation("session-owner123", &terminal, &owner, &live, 7).unwrap();
+
+    let record_only = NativeSessionOwner {
+        pid: 4242,
+        managed_session_id: Some("session-owner123".to_owned()),
+        terminal_tty: None,
+        terminal_tty_device: None,
+        process_start_seconds: None,
+        process_start_microseconds: None,
+        process_group: None,
+        terminal_process_group: None,
+        terminal_shell: None,
+        terminal_app: None,
+        windows_process_identity: None,
+    };
+    assert!(
+        verify_terminal_owner_attestation("session-owner123", &terminal, &record_only, &live, 7,)
+            .is_err()
+    );
+
+    let wrong_session = NativeSessionOwner {
+        managed_session_id: Some("session-other456".to_owned()),
+        ..owner.clone()
+    };
+    assert!(
+        verify_terminal_owner_attestation("session-owner123", &terminal, &wrong_session, &live, 7,)
+            .is_err()
+    );
+
+    let wrong_tty = NativeSessionOwner {
+        terminal_tty: Some("/dev/ttys002".to_owned()),
+        ..owner.clone()
+    };
+    assert!(
+        verify_terminal_owner_attestation("session-owner123", &terminal, &wrong_tty, &live, 7,)
+            .is_err()
+    );
+
+    let reused_process = NativeProcessIdentity {
+        process_start_microseconds: 201,
+        ..live
+    };
+    assert!(native_owner_identity_matches(&owner, &live));
+    assert!(!native_owner_identity_matches(&owner, &reused_process));
+    assert!(
+        verify_terminal_owner_attestation(
+            "session-owner123",
+            &terminal,
+            &owner,
+            &reused_process,
+            7,
+        )
+        .is_err()
+    );
+    assert!(
+        verify_terminal_owner_attestation("session-owner123", &terminal, &owner, &live, 8,)
+            .is_err()
+    );
+}
+
+#[test]
+fn terminal_owner_process_group_must_match_the_attested_foreground_group() {
+    let owner = NativeSessionOwner {
+        pid: 4242,
+        process_group: Some(4242),
+        terminal_process_group: Some(4242),
+        ..NativeSessionOwner::default()
+    };
+    let live = NativeProcessIdentity {
+        pid: 4242,
+        parent_pid: 4000,
+        terminal_tty_device: 7,
+        process_group: 4242,
+        terminal_process_group: 4242,
+        process_start_seconds: 100,
+        process_start_microseconds: 200,
+    };
+
+    assert_eq!(
+        verified_terminal_owner_process_group(&owner, &live).unwrap(),
+        4242
+    );
+
+    let changed_foreground_group = NativeProcessIdentity {
+        terminal_process_group: 7777,
+        ..live
+    };
+    assert!(verified_terminal_owner_process_group(&owner, &changed_foreground_group).is_err());
+
+    let missing_group = NativeSessionOwner {
+        process_group: None,
+        terminal_process_group: None,
+        ..owner
+    };
+    assert_eq!(
+        verified_terminal_owner_process_group(&missing_group, &live).unwrap(),
+        4242
+    );
+
+    let partial_group = NativeSessionOwner {
+        process_group: Some(4242),
+        terminal_process_group: None,
+        ..missing_group
+    };
+    assert!(verified_terminal_owner_process_group(&partial_group, &live).is_err());
+}
+
+#[test]
+fn terminal_shell_process_group_must_match_the_live_owner_parent_and_tty() {
+    let shell = MacTerminalShellIdentity {
+        pid: 4000,
+        process_group: 4000,
+        terminal_tty_device: 7,
+        process_start_seconds: 90,
+        process_start_microseconds: 100,
+    };
+    let owner = NativeSessionOwner {
+        pid: 4242,
+        terminal_shell: Some(shell.clone()),
+        ..NativeSessionOwner::default()
+    };
+    let live_owner = NativeProcessIdentity {
+        pid: 4242,
+        parent_pid: 4000,
+        terminal_tty_device: 7,
+        process_group: 4242,
+        terminal_process_group: 4242,
+        process_start_seconds: 100,
+        process_start_microseconds: 200,
+    };
+    let live_shell = NativeProcessIdentity {
+        pid: 4000,
+        parent_pid: 3999,
+        terminal_tty_device: 7,
+        process_group: 4000,
+        terminal_process_group: 4242,
+        process_start_seconds: 90,
+        process_start_microseconds: 100,
+    };
+
+    assert_eq!(
+        verified_terminal_shell_process_group(&owner, &live_owner, &live_shell).unwrap(),
+        4000
+    );
+
+    let wrong_tty = NativeProcessIdentity {
+        terminal_tty_device: 8,
+        ..live_shell
+    };
+    assert!(verified_terminal_shell_process_group(&owner, &live_owner, &wrong_tty).is_err());
+
+    let changed_shell = NativeProcessIdentity {
+        process_start_microseconds: 101,
+        ..live_shell
+    };
+    assert!(verified_terminal_shell_process_group(&owner, &live_owner, &changed_shell).is_err());
+}
+
+#[test]
+fn interrupted_close_converges_when_recovery_runs() {
+    // A close that stopped after writing the tombstone and status but before releasing the
+    // claim and the journal must converge on the next lifecycle-lock holder.
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), SessionState::Working, None, None).unwrap();
+    let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
+    let claim_token = claim.token().to_owned();
+    claim.retain();
+    let pending = sample_completion(&claim_token, "late result");
+    write_json_atomic(&directory.path().join(TURN_COMPLETION_FILE), &pending).unwrap();
+    update_status(
+        directory.path(),
+        SessionState::Closed,
+        None,
+        Some("closed by the maintainer".to_owned()),
+    )
+    .unwrap();
+    let tombstone: SessionStatus = read_json(&directory.path().join(CLOSED_STATUS_FILE)).unwrap();
+
+    assert!(recover_pending_completion(directory.path()).unwrap());
+
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+    assert!(!directory.path().join(TURN_COMPLETION_FILE).exists());
+    assert!(event_paths(directory.path()).unwrap().is_empty());
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state.as_str(), "closed");
+    assert_eq!(status.generation, tombstone.generation);
+    assert_eq!(status.error.as_deref(), Some("closed by the maintainer"));
+    let preserved: SessionStatus = read_json(&directory.path().join(CLOSED_STATUS_FILE)).unwrap();
+    assert_eq!(preserved.generation, tombstone.generation);
+    assert_eq!(preserved.updated_unix_ms, tombstone.updated_unix_ms);
+    assert!(!recover_pending_completion(directory.path()).unwrap());
+}
+
+#[test]
+fn legacy_owner_without_process_identity_is_repaired_only_when_its_pid_is_dead() {
+    for (pid, expect_repair) in [(std::process::id(), false), (reaped_child_pid(), true)] {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("events")).unwrap();
+        update_status(directory.path(), SessionState::Working, None, None).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
+        claim.retain();
+        // Pre-identity owner records carry only a PID on every platform.
+        write_json_atomic(
+            &directory.path().join(SESSION_OWNER_FILE),
+            &serde_json::json!({ "pid": pid }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            repair_dead_native_owner(directory.path()).unwrap(),
+            expect_repair
+        );
+        assert_eq!(
+            directory.path().join(TURN_CLAIM_FILE).exists(),
+            !expect_repair
+        );
+        let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+        assert_eq!(
+            status.state.as_str(),
+            if expect_repair { "closed" } else { "working" }
+        );
+    }
+}
+
+#[test]
+fn explicit_close_converges_after_a_fault_before_every_close_mutation() {
+    for journaled_event in [
+        JournaledEventState::Absent,
+        JournaledEventState::Committed,
+        JournaledEventState::Mismatched,
+    ] {
+        explicit_close_converges_after_every_fault_with(journaled_event);
+    }
+}
+
+fn explicit_close_converges_after_every_fault_with(journaled_event: JournaledEventState) {
+    let mut faulted = 0;
+    let mut tombstoned = 0;
+    let mut labels = Vec::new();
+    for budget in 0.. {
+        let fixture = seed_close_fixture(journaled_event);
+        let CloseFixture {
+            directory,
+            request_id,
+            pending,
+            event_path,
+            ..
+        } = &fixture;
+        let directory = directory.as_path();
+        let mut adapter_calls = 0;
+
+        let outcome = with_fault_budget(budget, || {
+            close_session_state_with_error(
+                directory,
+                Some("closed by the maintainer".to_owned()),
+                |_| {
+                    adapter_calls += 1;
+                    Ok(terminal::CloseOutcome::Closed)
+                },
+                crate::native::session::close::budget::close_deadline(),
+            )
+        });
+        match outcome {
+            Ok(()) => break,
+            Err(error) => {
+                assert!(injected_fault(&error), "{error:#}");
+                labels.push(format!("{error:#}"));
+            }
+        }
+        faulted += 1;
+
+        // Recovery under the lifecycle lock must finish an interrupted close whose
+        // tombstone exists and must never leave a journal behind. Without a tombstone the
+        // close never committed, so recovery treats the journal as an ordinary interrupted
+        // completion: it publishes a matching or missing event and refuses a different one.
+        let tombstoned_before_recovery = directory.join(CLOSED_STATUS_FILE).exists();
+        let recovered = recover_pending_completion(directory);
+        if tombstoned_before_recovery {
+            tombstoned += 1;
+            recovered.unwrap();
+            assert_journal_settled(directory);
+            let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+            assert_eq!(status.state.as_str(), "closed");
+            assert_eq!(status.error.as_deref(), Some("closed by the maintainer"));
+            assert!(!directory.join(TURN_CLAIM_FILE).exists());
+            assert!(!directory.join(LEGACY_RESUME_PENDING_FILE).exists());
+        } else if journaled_event == JournaledEventState::Mismatched {
+            assert!(format!("{:#}", recovered.unwrap_err()).contains("contains different data"));
+        } else {
+            recovered.unwrap();
+            assert_journal_settled(directory);
+        }
+
+        close_session_state(directory, |_| {
+            adapter_calls += 1;
+            Ok(terminal::CloseOutcome::Closed)
+        })
+        .unwrap();
+        assert!(
+            adapter_calls <= 2,
+            "the terminal adapter ran {adapter_calls} times"
+        );
+        let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+        assert_eq!(status.state.as_str(), "closed");
+        let tombstone: SessionStatus = read_json(&directory.join(CLOSED_STATUS_FILE)).unwrap();
+        assert_eq!(tombstone.generation, status.generation);
+        assert!(!directory.join(TURN_CLAIM_FILE).exists());
+        assert!(!directory.join(TURN_COMPLETION_FILE).exists());
+        assert!(!directory.join(LEGACY_RESUME_PENDING_FILE).exists());
+        assert!(!directory.join(TERMINAL_HANDLE_FILE).exists());
+        assert!(!directory.join(TERMINAL_CLOSING_FILE).exists());
+        assert!(directory.join(TERMINAL_TOMBSTONE_FILE).exists());
+        assert!(!recover_pending_completion(directory).unwrap());
+        // Once the close committed, its commit point wins: a journal whose event was never
+        // written is discarded. An event the completion already wrote is the provider's
+        // result and stays published exactly when it matches its journal. A close that
+        // never committed lets recovery publish the completion first.
+        let (request, session) = request_state(directory, request_id);
+        assert_eq!(session, "closed");
+        let published = match journaled_event {
+            JournaledEventState::Committed => true,
+            JournaledEventState::Absent => !tombstoned_before_recovery,
+            JournaledEventState::Mismatched | JournaledEventState::Oversized(_) => false,
+        };
+        assert_eq!(
+            request,
+            if published { "completed" } else { "unresolved" },
+            "{journaled_event:?} budget {budget}"
+        );
+        assert_eq!(
+            event_paths(directory).unwrap(),
+            if published {
+                vec![event_path.clone()]
+            } else {
+                Vec::new()
+            }
+        );
+        let quarantined = directory
+            .join("events")
+            .join(format!("{UNPUBLISHED_EVENT_PREFIX}{}", pending.event_file));
+        assert_eq!(
+            quarantined.exists(),
+            journaled_event == JournaledEventState::Mismatched
+        );
+    }
+    assert!(
+        faulted >= 20,
+        "only {faulted} close mutation boundaries were exercised for {journaled_event:?}"
+    );
+    assert!(
+        tombstoned >= 8,
+        "interrupted post-tombstone cleanup was not exercised for {journaled_event:?}"
+    );
+    // The terminal handle is claimed by a direct rename with its own sync; both of that
+    // pair's boundaries are fault points like every other rename's.
+    for label in [
+        "claiming the terminal handle for close",
+        "syncing the claimed terminal handle's directory",
+    ] {
+        assert!(
+            labels.iter().any(|error| error.contains(label)),
+            "no fault before {label} for {journaled_event:?}: {labels:?}"
+        );
+    }
+}
+
+#[test]
+fn result_wait_repairs_a_dead_owner_and_ends_the_wait() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), SessionState::Working, None, None).unwrap();
+    let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
+    let claim_token = claim.token().to_owned();
+    claim.retain();
+    write_json_atomic(
+        &directory.path().join(SESSION_OWNER_FILE),
+        &NativeSessionOwner {
+            pid: reaped_child_pid(),
+            ..NativeSessionOwner::default()
+        },
+    )
+    .unwrap();
+
+    let started = Instant::now();
+    let error = turn::wait(
+        &Store::open_unchecked(directory.path()),
+        0,
+        None,
+        Some(&claim_token),
+        agent_bridge::checked_deadline_from(std::time::Instant::now(), Duration::from_secs(30))
+            .unwrap(),
+        Duration::from_secs(30),
+    )
+    .unwrap_err();
+
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(
+        format!("{error:#}").contains("no longer running"),
+        "{error:#}"
+    );
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+    let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
+    assert_eq!(status.state.as_str(), "closed");
+}
+
+/// [`seed_close_fixture`] with a committed event, in `state`, owned by a process that has
+/// already exited, and then stripped of its `events/` directory: a journal that completion
+/// recovery can no longer settle on a session only repair can close.
+fn seed_dead_owner_with_unrecoverable_journal(state: &str) -> CloseFixture {
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    update_status(&fixture.directory, state.parse().unwrap(), None, None).unwrap();
+    write_dead_owner(&fixture.directory);
+    fs::remove_dir_all(fixture.directory.join("events")).unwrap();
+    fixture
+}
+
+fn write_dead_owner(directory: &Path) {
+    let pid = reaped_child_pid();
+    write_json_atomic(
+        &directory.join(SESSION_OWNER_FILE),
+        &NativeSessionOwner {
+            pid,
+            managed_session_id: Some("session-close123".to_owned()),
+            windows_process_identity: test_windows_process_identity(pid).or_else(|| {
+                cfg!(windows).then(|| terminal::WindowsProcessIdentity {
+                    creation_time: 0,
+                    executable_path: String::new(),
+                })
+            }),
+            ..NativeSessionOwner::default()
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn sessions_repairs_a_dead_owner_whose_journal_cannot_be_recovered() {
+    for state in ["working", "exited"] {
+        let fixture = seed_dead_owner_with_unrecoverable_journal(state);
+        let directory = fixture.directory.clone();
+        let label = format!("state {state}");
+        // The missing directory is damage that completion recovery refuses.
+        let error = recover_pending_completion(&directory).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("events directory is missing"),
+            "{label}: {error:#}"
+        );
+
+        // Repair does not stop at that damage: the owner is dead, so the session is
+        // closed, which settles the journal the way every close settles a journal with
+        // no event to verify, and the damage is reported in the close error.
+        if state == "working" && cfg!(windows) {
+            assert!(
+                repair_dead_native_owner_with_terminal_close(&directory, |session| {
+                    assert_eq!(session.kind, terminal::TerminalKind::WindowsConsole);
+                    Ok(terminal::CloseOutcome::Missing)
+                })
+                .unwrap(),
+                "{label}"
+            );
+        }
+        let listing = cli_sessions(fixture.root.path());
+        assert_eq!(listing.len(), 1, "{label}: {listing:?}");
+        if cfg!(target_os = "macos") {
+            // A dead owner and unreadable journal prove nothing about its window.
+            assert_eq!(listing[0]["state"], state, "{label}: {listing:?}");
+            assert!(directory.join(TERMINAL_HANDLE_FILE).exists());
+            assert!(!directory.join(TERMINAL_TOMBSTONE_FILE).exists());
+            assert!(!directory.join(CLOSED_STATUS_FILE).exists());
+            assert!(directory.join(TURN_COMPLETION_FILE).exists());
+            continue;
+        }
+        assert_eq!(listing[0]["state"], "closed", "{label}: {listing:?}");
+        let status: SessionStatus = read_json(&directory.join("status.json")).unwrap();
+        assert_eq!(status.state.as_str(), "closed", "{label}");
+        let close_error = status.error.clone().unwrap_or_default();
+        assert!(
+            close_error.contains("is no longer running")
+                && close_error.contains("events directory is missing"),
+            "{label}: {close_error}"
+        );
+        assert!(directory.join(CLOSED_STATUS_FILE).exists(), "{label}");
+        assert!(!directory.join(TURN_CLAIM_FILE).exists(), "{label}");
+        assert!(!directory.join(TURN_COMPLETION_FILE).exists(), "{label}");
+        assert!(!directory.join(TERMINAL_HANDLE_FILE).exists(), "{label}");
+        assert!(directory.join(TERMINAL_TOMBSTONE_FILE).exists(), "{label}");
+        assert!(
+            !directory.join("events").exists(),
+            "{label}: the repair created an events directory"
+        );
+        assert_eq!(
+            request_state(&directory, &fixture.request_id),
+            ("unresolved".to_owned(), "closed".to_owned()),
+            "{label}"
+        );
+
+        // Explicit close of the repaired session is idempotent: no adapter call, no
+        // replacement claim, no event recreated, the tombstone unchanged.
+        let tombstone = fs::read(directory.join(CLOSED_STATUS_FILE)).unwrap();
+        let mut adapter_calls = 0;
+        for _ in 0..2 {
+            close_repaired_session_state(&directory, |_| {
+                adapter_calls += 1;
+                Ok(terminal::CloseOutcome::Closed)
+            })
+            .unwrap();
+        }
+        assert_eq!(adapter_calls, 0, "{label}");
+        assert_eq!(
+            fs::read(directory.join(CLOSED_STATUS_FILE)).unwrap(),
+            tombstone,
+            "{label}: the tombstone changed"
+        );
+        assert!(!directory.join(TURN_CLAIM_FILE).exists(), "{label}");
+        assert!(!directory.join("events").exists(), "{label}");
+        assert!(!recover_pending_completion(&directory).unwrap(), "{label}");
+        assert!(!repair_dead_native_owner(&directory).unwrap(), "{label}");
+        assert_eq!(
+            request_state(&directory, &fixture.request_id),
+            ("unresolved".to_owned(), "closed".to_owned()),
+            "{label}"
+        );
+    }
+}
+
+#[test]
+fn a_live_owner_keeps_unrecoverable_journal_damage_as_a_repair_error() {
+    // The same damage under a live owner is not repaired away: the error is reported and
+    // the claim, the journal, and the status stay exactly as they were.
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    let pid = std::process::id();
+    write_json_atomic(
+        &fixture.directory.join(SESSION_OWNER_FILE),
+        &NativeSessionOwner {
+            pid,
+            managed_session_id: Some("session-close123".to_owned()),
+            windows_process_identity: test_windows_process_identity(pid),
+            ..NativeSessionOwner::default()
+        },
+    )
+    .unwrap();
+    fs::remove_dir_all(fixture.directory.join("events")).unwrap();
+
+    let error = repair_dead_native_owner(&fixture.directory).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("events directory is missing"),
+        "{error:#}"
+    );
+    let listing = cli_sessions(fixture.root.path());
+    assert_eq!(listing[0]["state"], "working", "{listing:?}");
+    assert!(fixture.directory.join(TURN_CLAIM_FILE).exists());
+    assert!(fixture.directory.join(TURN_COMPLETION_FILE).exists());
+    assert!(!fixture.directory.join(CLOSED_STATUS_FILE).exists());
+    assert!(fixture.directory.join(TERMINAL_HANDLE_FILE).exists());
+}
+
+// An explicit close after a failed startup whose wrapper recorded itself and ended.
+// A surface with an app-unique native id (an iTerm2 session, a Windows console) is
+// still closed by that id. A macOS surface that can outlive its owner is not: a
+// failed launch is no close intent, and an owner record without the whole identity
+// does not even allow the observation that could prove the surface gone.
+// Close authority is terminal-kind policy, so this test lives at the native boundary and
+// not in `session::launch`, which must know nothing about terminal kinds.
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn explicit_close_recovers_a_failed_startup_only_through_a_stable_native_id() {
+    // The launch fixture: a launching session whose claim the launcher retains and whose
+    // launch receipt `begin` wrote, as in `session::launch`'s own tests.
+    let directory = tempfile::Builder::new()
+        .prefix("session-")
+        .tempdir()
+        .unwrap();
+    fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), SessionState::Launching, None, None).unwrap();
+    let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
+    let token = claim.token().to_owned();
+    claim.retain();
+    launch::begin(
+        &Store::open_unchecked(directory.path()),
+        &token,
+        Instant::now() + Duration::from_secs(30),
+    )
+    .unwrap();
+    let id = directory.path().file_name().unwrap().to_str().unwrap();
+    let mut record = launch::read(&Reader::open_unchecked(directory.path()))
+        .unwrap()
+        .unwrap();
+    record.phase = launch::Phase::Spawning;
+    write_json_atomic(&directory.path().join(launch::FILE), &record).unwrap();
+    update_status(
+        directory.path(),
+        SessionState::Failed,
+        None,
+        Some("spawn uncertain".to_owned()),
+    )
+    .unwrap();
+    write_json_atomic(
+        &directory.path().join(SESSION_OWNER_FILE),
+        &NativeSessionOwner {
+            pid: u32::MAX,
+            managed_session_id: Some(id.to_owned()),
+            ..NativeSessionOwner::default()
+        },
+    )
+    .unwrap();
+    let authority = |kind, managed_session_id: &str| {
+        verify_terminal_close_authority_with_evidence(
+            directory.path(),
+            id,
+            &terminal::TerminalSession {
+                kind,
+                id: "missing-owned-surface".to_owned(),
+                managed_session_id: Some(managed_session_id.to_owned()),
+                tab_id: None,
+                window_id: None,
+                wezterm_mux: None,
+                windows_process_identity: None,
+            },
+            || panic!("an unproven owner allows no surface observation"),
+            #[cfg(target_os = "macos")]
+            terminal::close_evidence::with_apple(
+                kind,
+                &terminal::macos::apple_terminal::close_evidence::with_observations(
+                    |_| panic!("no app incarnation is recorded"),
+                    || panic!("no app incarnation is recorded"),
+                ),
+            ),
+            crate::native::session::close::budget::close_deadline(),
+        )
+    };
+    assert_eq!(
+        authority(terminal::TerminalKind::Iterm2, id).unwrap(),
+        TerminalCloseAuthority::SurfaceOnly
+    );
+    assert!(authority(terminal::TerminalKind::Iterm2, "session-foreign").is_err());
+    #[cfg(target_os = "macos")]
+    for kind in [
+        terminal::TerminalKind::AppleTerminal,
+        terminal::TerminalKind::Warp,
+        terminal::TerminalKind::WezTerm,
+    ] {
+        let error = authority(kind, id).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("no terminal observation or close was sent"),
+            "{kind:?}: {error:#}"
+        );
+    }
+    assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+#[test]
+fn unsupported_platform_refuses_bound_close_and_restores_claimed_handle() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-abc");
+    fs::create_dir(&directory).unwrap();
+    update_status(&directory, SessionState::Ready, None, None).unwrap();
+    let mut surface = close_test_terminal();
+    surface.managed_session_id = Some("session-abc".into());
+    write_json_atomic(&directory.join(TERMINAL_HANDLE_FILE), &surface).unwrap();
+    let original = fs::read(directory.join(TERMINAL_HANDLE_FILE)).unwrap();
+    assert!(!directory.join(SESSION_OWNER_FILE).exists());
+    let authority = |handle: &terminal::TerminalSession| {
+        terminal::ownership::verify_terminal_close_authority(
+            &directory,
+            "session-abc",
+            handle,
+            close_deadline(),
+        )
+    };
+    assert!(
+        authority(&surface)
+            .unwrap_err()
+            .to_string()
+            .contains("no visible terminal transport")
+    );
+    let result = session::close::compatibility::close_session_state(&directory, |handle| {
+        assert!(!directory.join(TERMINAL_HANDLE_FILE).exists());
+        assert!(directory.join(TERMINAL_CLOSING_FILE).exists());
+        authority(handle)?;
+        panic!("unsupported platform must never reach close")
+    });
+    assert!(format!("{:#}", result.unwrap_err()).contains("no visible terminal transport"));
+    assert_eq!(
+        fs::read(directory.join(TERMINAL_HANDLE_FILE)).unwrap(),
+        original
+    );
+    assert!(!directory.join(TERMINAL_CLOSING_FILE).exists());
+    assert!(!directory.join(TERMINAL_TOMBSTONE_FILE).exists());
+    assert!(!directory.join("closed.json").exists());
+}
