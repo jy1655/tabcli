@@ -960,60 +960,6 @@ where
 }
 
 #[cfg(test)]
-pub(in crate::native) mod compatibility {
-    use super::*;
-    use crate::native::terminal::ownership::close_dead_owner_surface_with;
-    pub(in crate::native) fn mark_session_closed(
-        directory: &Path,
-        error: Option<String>,
-    ) -> Result<()> {
-        super::mark_session_closed(&Store::open_unchecked(directory), error)
-    }
-    pub(in crate::native) fn close_session_state(
-        directory: &Path,
-        mut closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
-    ) -> Result<()> {
-        super::close_session_state_with_error(
-            &Store::open_unchecked(directory),
-            None,
-            |surface| closer(surface).map(Into::into),
-            crate::native::session::close::budget::close_deadline(),
-        )
-    }
-    pub(in crate::native) fn close_session_state_with_error(
-        directory: &Path,
-        error: Option<String>,
-        mut closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
-        deadline: std::time::Instant,
-    ) -> Result<()> {
-        super::close_session_state_with_error(
-            &Store::open_unchecked(directory),
-            error,
-            |surface| closer(surface).map(Into::into),
-            deadline,
-        )
-    }
-    pub(in crate::native) fn repair_dead_native_owner_with_terminal_close(
-        directory: &Path,
-        mut closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
-    ) -> Result<bool> {
-        repair_dead_owner_with(
-            &Store::open_unchecked(directory),
-            |owner| repair_owner_is_live(&attest_owner(owner)),
-            terminal::surface_outlives_owner,
-            |session| {
-                close_dead_owner_surface_with(
-                    session,
-                    &mut closer,
-                    crate::native::session::close::budget::close_deadline(),
-                )
-            },
-            crate::native::session::close::budget::close_deadline(),
-        )
-    }
-}
-
-#[cfg(test)]
 mod tests;
 
 // A panic models interruption, not an operation error: no caller's restore/settle
