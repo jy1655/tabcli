@@ -1,5 +1,6 @@
 //! Dead-owner repair through the public entry paths (issue #5). `tell` and `sessions`
 //! repair a session whose recorded native owner is no longer running; `result` never does.
+mod support;
 use serde_json::{Value, json};
 use std::{fs, path::PathBuf, process::Command};
 
@@ -17,12 +18,14 @@ impl Fixture {
         let workspace = root.path().canonicalize().unwrap();
         fs::write(
             directory.join("manifest.json"),
-            serde_json::to_vec_pretty(&json!({
-                "schema": 1, "id": "session-deadowner", "provider": "codex",
-                "provider_path": "codex", "provider_version": "0.147.0",
-                "workspace": workspace, "title": "dead owner", "model": null,
-                "effort": null, "yolo": false, "created_unix_ms": 1
-            }))
+            serde_json::to_vec_pretty(&support::manifest(
+                "session-deadowner",
+                "codex",
+                "codex".as_ref(),
+                "0.147.0",
+                &workspace,
+                "dead owner",
+            ))
             .unwrap(),
         )
         .unwrap();
@@ -121,10 +124,11 @@ fn result_wait_reports_a_dead_owner_without_repairing_it() {
     fs::create_dir_all(&requests).unwrap();
     fs::write(
         requests.join("123-456-0.json"),
-        serde_json::to_vec_pretty(&json!({
-            "schema": 1, "request_id": "request-dead", "claim_token": "123-456-0",
-            "event_file": "event-1.json", "created_unix_ms": 3
-        }))
+        serde_json::to_vec_pretty(&support::receipt(
+            "request-dead",
+            "123-456-0",
+            "event-1.json",
+        ))
         .unwrap(),
     )
     .unwrap();
