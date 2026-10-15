@@ -338,6 +338,32 @@ launch, observe, continue, and close without replacing the capabilities those CL
   explicit `--yolo` only forwards the provider's own bypass option. `--isolated`
   separates Bridge's records, not a provider's trust store. Nothing else may call it.
 
+## Current Attestation Boundary
+
+- One rule decides whether a recorded incarnation is still the live process (`process_identity`):
+  Live, Gone(Exited), Gone(Reused) or Unknown. Only the platform observer confirms absence: raw
+  `ESRCH` on macOS, `ERROR_INVALID_PARAMETER` from `OpenProcess` or a signalled handle on Windows.
+  An inspection failure of a process whose identity was recorded is Unknown. Never derive a death
+  from the liveness bool when an identity was recorded: on Windows that bool turns every open
+  failure but access denial into "dead". The bool answers only pid-only records.
+- Unknown is not conservative by itself. Prune blocks, repair fails, the wait continues and the
+  exact-intent close resume refuses. A dead owner must reach Gone through the observer, or every
+  command on that session fails: "every unverified open failure is Unknown" would have made every
+  dead Windows owner Unknown (plan defect found in review, 2026-10-15, #190).
+- A reused pid is the verified death of the recorded incarnation and grants no authority over its
+  surface. A changed control identity (controlling TTY, process groups) of a live incarnation is
+  not a death. A second observation of the same pid is checked against the attested incarnation
+  before its control fields are compared; a later snapshot with another birth is reuse (#190).
+- Attestation reads the owner value and OS evidence only and takes no session lock; launch repair
+  and close call it under their own lock. Callers (prune, repair, wait, close resume, the
+  terminal adapters, reopen, the Claude registry) map the four answers in their own vocabulary
+  and keep their messages and authority.
+- Windows: the attestation compares executable paths case-insensitively; record and surface
+  handle equality stay exact. The observer opens with `PROCESS_QUERY_LIMITED_INFORMATION |
+  SYNCHRONIZE`, so a process that grants only query access is Unknown, never absent. The
+  image-path query of an exited process fails (os error 31, GitHub runner, 2026-10-15), so an
+  exited process whose object is still retained is Gone through the signalled handle (#191).
+
 ## Change and Verification Rules
 
 - For provider behavior changes, add or update tests in that provider's adapter and prove
@@ -350,6 +376,10 @@ launch, observe, continue, and close without replacing the capabilities those CL
   local, CI, and release checks; retain concurrency created inside individual tests.
 - Tests requiring authenticated CLIs and visible terminal surfaces remain manual live
   tests; do not represent ignored live tests as runtime verification.
+- A claim about Windows behavior is not verified until its `cfg(windows)` test has run on the
+  Windows CI runner. Cross-target clippy proves compilation only, and a review's source-level
+  mock of Win32 can contradict the system (2026-10-15, #191: the mock had the identity query of
+  an exited process succeed; Windows refuses it).
 - For Release workflow or release packaging changes, run the rehearsal
   (`gh workflow run release.yml --ref <branch> -f tag=<existing tag>`) and read its
   result before relying on a tag push. Only a tag push publishes, and a published release
