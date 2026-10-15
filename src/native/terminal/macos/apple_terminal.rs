@@ -2,6 +2,7 @@ use super::OwnedSurfaceClose;
 use super::applescript::{Automation, Osascript};
 use super::{DialogKey, GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
 use crate::native::session::close::budget::close_remaining;
+use crate::native::terminal::facts::apple_terminal::HOST_COMMAND;
 pub(in crate::native) mod close_evidence;
 
 use super::process;
@@ -16,7 +17,6 @@ use crate::native::terminal::ownership::{
 };
 use agent_bridge::process_is_alive;
 use std::{
-    os::unix::fs::MetadataExt,
     path::Path,
     time::{Duration, Instant},
 };
@@ -263,7 +263,7 @@ fn launch_bootstrap(command: &str, directory: &Path) -> Result<String> {
     let executable =
         std::env::current_exe().context("failed to resolve Agent Bridge executable")?;
     let host = format!(
-        "{} native-terminal-host {}",
+        "{} {HOST_COMMAND} {}",
         crate::native::terminal::shell_quote(executable.as_os_str()),
         crate::native::terminal::shell_quote(directory.as_os_str())
     );
@@ -287,47 +287,35 @@ fn install_bootstrap(directory: &Path, host: &str, command: &str) -> Result<Stri
 // The typed start precedes tty discovery; wait for restored focus and the exact tty binding.
 // A failed, closed or timed-out launch must start nothing.
 pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(directory)
-        .with_context(|| format!("failed to inspect {}", directory.display()))?;
-    if !directory.is_absolute()
-        || !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-    {
-        bail!("Terminal.app launch directory is not private to the current user");
-    }
-    let id = directory
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("invalid Terminal.app launch directory")?;
-    crate::native::session::primitives::require_valid_session_id(id)?;
-    let released = release_start(directory, id);
-    crate::native::launch::log(
-        &Store::open_unchecked(directory),
-        &match &released {
-            Ok(tty) => format!("terminal_host_released tty={tty}"),
-            Err(error) => format!("terminal_host_refused: {error:#}"),
+    use super::bound_host::{BoundHostSpec, run_bound_host};
+    use crate::native::terminal::facts::apple_terminal::BINDING;
+    run_bound_host(
+        directory,
+        &BoundHostSpec {
+            name: BINDING.host,
+            metadata_context: Some(|directory| {
+                format!("failed to inspect {}", directory.display())
+            }),
         },
-    );
-    released.map(|_| ())
-}
-
-fn release_start(directory: &Path, id: &str) -> Result<String> {
-    // The binding names the tab by its tty, and the flush below must be this tab's:
-    // standard input has to be the controlling terminal of this process.
-    let tty = process::current_terminal_tty()?;
-    let live = process::live_native_process_identity(std::process::id())?;
-    if live.terminal_tty_device != process::terminal_tty_device(Path::new(&tty))? {
-        bail!("Terminal.app launch host is not attached to the tty of its standard input");
-    }
-    wait_for_binding(directory, id, &tty)?;
-    // Keys typed while the creation gave the new window the keyboard must not answer
-    // the provider's first dialog. Only the input queue of this tty is discarded.
-    if unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("cannot discard Terminal.app startup input");
-    }
-    Ok(tty)
+        || {
+            let tty = process::current_terminal_tty()?;
+            let live = process::live_native_process_identity(std::process::id())?;
+            if live.terminal_tty_device != process::terminal_tty_device(Path::new(&tty))? {
+                bail!("Terminal.app launch host is not attached to the tty of its standard input");
+            }
+            Ok(tty)
+        },
+        |directory, id, tty| wait_for_binding(directory, id, tty),
+        |released| {
+            crate::native::launch::log(
+                &Store::open_unchecked(directory),
+                &match released {
+                    Ok(tty) => format!("terminal_host_released tty={tty}"),
+                    Err(error) => format!("terminal_host_refused: {error:#}"),
+                },
+            );
+        },
+    )
 }
 
 fn wait_for_binding(directory: &Path, id: &str, tty: &str) -> Result<()> {
@@ -1378,6 +1366,18 @@ mod tests {
             crate::native::terminal::shell_quote(directory.as_os_str())
         )));
         assert!(script.ends_with(&format!("{wrapper}\n")));
+        let invocation = script.split_once(" || exit\n").unwrap().0;
+        let args = super::super::test_support::host_argv(invocation);
+        assert_eq!(
+            args,
+            [
+                super::HOST_COMMAND.to_owned(),
+                directory.to_str().unwrap().to_owned()
+            ]
+        );
+        assert!(
+            matches!(crate::native::parse_args(args).unwrap(), crate::native::NativeCommand::Host(crate::native::terminal::host::HostCommand::AppleTerminal { directory: actual }) if actual == directory)
+        );
     }
 
     #[test]
@@ -2890,6 +2890,18 @@ end run
         }
         let status = child.wait().unwrap();
         let log = std::fs::read_to_string(directory.join(crate::native::launch::LOG)).unwrap();
+        let expected_host_log = match outcome {
+            "bound" => format!("terminal_host_released tty={tty}\n"),
+            "closed" => "terminal_host_refused: Terminal.app launch was cancelled or timed out before its surface was bound\n".into(),
+            "another tty" => "terminal_host_refused: Terminal.app surface binding does not name the tty of this launch host\n".into(),
+            "another standard input" => "terminal_host_refused: Terminal.app launch host is not attached to the tty of its standard input\n".into(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            super::super::test_support::host_log_messages(directory, "terminal_host_"),
+            [expected_host_log]
+        );
+
         if outcome == "bound" {
             assert!(status.success(), "{}", shown(&screen));
             let probe: serde_json::Value =

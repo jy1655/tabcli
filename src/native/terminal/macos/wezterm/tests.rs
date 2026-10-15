@@ -1431,10 +1431,19 @@ fn the_gate_of_the_pane_is_a_command_that_the_executable_routes_here() {
     use crate::native::{NativeCommand, is_command, parse_args};
     let gate = gate(Path::new("/s/session-a1"));
     assert!(gate.ends_with(" native-wezterm-host '/s/session-a1'"));
+    let program = host_pane_program("wrapper", Path::new("/s/session-a1")).unwrap();
+    assert_eq!(&program[..4], ["/bin/zsh", "-l", "-i", "-c"]);
+    let invocation = program[4].split_once(" || exit; ").unwrap().0;
+    let args = super::super::test_support::host_argv(invocation);
+    assert_eq!(args, [HOST_COMMAND, "/s/session-a1"]);
+    assert!(
+        matches!(parse_args(args).unwrap(), NativeCommand::Host(crate::native::terminal::host::HostCommand::WezTerm { directory }) if directory == Path::new("/s/session-a1"))
+    );
+
     assert!(is_command("native-wezterm-host"));
     assert!(matches!(
         parse_args(["native-wezterm-host", "/s/session-a1"]).unwrap(),
-        NativeCommand::WezTermHost { directory } if directory == Path::new("/s/session-a1")
+        NativeCommand::Host(crate::native::terminal::host::HostCommand::WezTerm { directory }) if directory == Path::new("/s/session-a1")
     ));
     assert!(parse_args(["native-wezterm-host", "s/session-a1"]).is_err());
     assert!(parse_args(["native-wezterm-host", "/s/not-a-session"]).is_err());
@@ -1610,6 +1619,15 @@ fn replay_on_a_private_pty(cancelled: bool) {
     };
     let screen = String::from_utf8_lossy(&screen);
     assert!(released, "the gate never ran: {screen}");
+    assert_eq!(
+        super::super::test_support::host_log_messages(directory, "wezterm_host_"),
+        if cancelled {
+            vec!["wezterm_host_refused: WezTerm launch was cancelled or timed out before surface binding\n".to_owned()]
+        } else {
+            vec![]
+        }
+    );
+
     if cancelled {
         assert!(!owner.exists(), "a cancelled launch started its wrapper");
         assert!(!status.success());

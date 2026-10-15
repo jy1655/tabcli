@@ -370,7 +370,7 @@ fn terminal_host_command_takes_one_absolute_session_directory() {
     assert!(is_command("native-terminal-host"));
     assert!(matches!(
         parse_args(["native-terminal-host", valid]).unwrap(),
-        NativeCommand::AppleTerminalHost { directory } if directory == valid_path
+        NativeCommand::Host(terminal::host::HostCommand::AppleTerminal { directory }) if directory == valid_path
     ));
     for arguments in [
         vec!["native-terminal-host"],
@@ -389,7 +389,7 @@ fn ghostty_host_command_takes_no_argument() {
     assert!(is_command("native-ghostty-host"));
     assert!(matches!(
         parse_args(["native-ghostty-host"]).unwrap(),
-        NativeCommand::GhosttyHost
+        NativeCommand::Host(terminal::host::HostCommand::Ghostty)
     ));
     assert!(parse_args(["native-ghostty-host", "/state/session-abc"]).is_err());
 }
@@ -487,10 +487,18 @@ fn all_native_host_names_keep_variants_and_argument_validation() {
         assert!(is_command(name));
         let parsed = parse_args([name, directory]).unwrap();
         let actual = match parsed {
-            NativeCommand::ConsoleHost { directory } => ("native-console-host", directory),
-            NativeCommand::Iterm2Host { directory } => ("native-iterm2-host", directory),
-            NativeCommand::AppleTerminalHost { directory } => ("native-terminal-host", directory),
-            NativeCommand::WezTermHost { directory } => ("native-wezterm-host", directory),
+            NativeCommand::Host(terminal::host::HostCommand::Console { directory }) => {
+                ("native-console-host", directory)
+            }
+            NativeCommand::Host(terminal::host::HostCommand::Iterm2 { directory }) => {
+                ("native-iterm2-host", directory)
+            }
+            NativeCommand::Host(terminal::host::HostCommand::AppleTerminal { directory }) => {
+                ("native-terminal-host", directory)
+            }
+            NativeCommand::Host(terminal::host::HostCommand::WezTerm { directory }) => {
+                ("native-wezterm-host", directory)
+            }
             other => panic!("unexpected host: {other:?}"),
         };
         assert_eq!(actual, (name, path.clone()));
@@ -506,13 +514,13 @@ fn all_native_host_names_keep_variants_and_argument_validation() {
     assert!(is_command("native-ghostty-host"));
     assert!(matches!(
         parse_args(["native-ghostty-host"]).unwrap(),
-        NativeCommand::GhosttyHost
+        NativeCommand::Host(terminal::host::HostCommand::Ghostty)
     ));
     assert!(parse_args(["native-ghostty-host", directory]).is_err());
     let token = "0123456789abcdef0123456789abcdef";
     assert!(is_command("native-warp-host"));
     assert!(
-        matches!(parse_args(["native-warp-host", directory, token]).unwrap(), NativeCommand::WarpHost { directory: d, attempt } if d == path && attempt == token)
+        matches!(parse_args(["native-warp-host", directory, token]).unwrap(), NativeCommand::Host(terminal::host::HostCommand::Warp { directory: d, attempt }) if d == path && attempt == token)
     );
     for args in [
         vec!["native-warp-host"],
@@ -546,6 +554,22 @@ fn registry_routes_every_command_to_its_variant_and_fields() {
         "AskRequest {{ provider: Pi, workspace: {workspace:?}, prompt: \"self-test\", title: None, model: None, effort: None, terminal: None, yolo: false, timeout: 120s, detach: false, json: true, context_results: [] }}"
     );
     let token = "0123456789abcdef0123456789abcdef";
+    // Independent name literals pin the portable declarations as well as hidden routing.
+    for (expected, actual) in [
+        ("native-console-host", terminal::host::CONSOLE_HOST_COMMAND),
+        ("native-iterm2-host", terminal::host::ITERM2_HOST_COMMAND),
+        (
+            "native-terminal-host",
+            terminal::host::APPLE_TERMINAL_HOST_COMMAND,
+        ),
+        ("native-wezterm-host", terminal::host::WEZTERM_HOST_COMMAND),
+        ("native-ghostty-host", terminal::host::GHOSTTY_HOST_COMMAND),
+        ("native-warp-host", terminal::host::WARP_HOST_COMMAND),
+    ] {
+        assert_eq!(actual, expected);
+        let row = COMMANDS.iter().find(|row| row.name == actual).unwrap();
+        assert!(row.hidden, "{expected}");
+    }
     let cases: Vec<(Vec<&str>, String)> = vec![
         (vec!["ask", "codex", "--prompt", "hello"], format!("Ask({ask})")),
         (vec!["self-test", "pi", "--isolated", "--json"], format!("SelfTest(Request {{ ask: {self_test_ask}, isolated: true }})")),
@@ -568,12 +592,12 @@ fn registry_routes_every_command_to_its_variant_and_fields() {
         (vec!["native-hook", "codex", "{}"], "Hook { provider: Codex, payload: Some(\"{}\") }".into()),
         (vec!["native-provider-control", "claude", "operation", "payload"], "ProviderControl { provider: Claude, arguments: [\"operation\", \"payload\"] }".into()),
         (vec!["native-console-control", "send", "session-route", "pending-prompt-route.txt", "7"], "ConsoleControl { request: Send { input_name: \"pending-prompt-route.txt\", timeout: 7ms }, id: \"session-route\" }".into()),
-        (vec!["native-console-host", directory_text], format!("ConsoleHost {{ directory: {directory:?} }}")),
-        (vec!["native-iterm2-host", directory_text], format!("Iterm2Host {{ directory: {directory:?} }}")),
-        (vec!["native-terminal-host", directory_text], format!("AppleTerminalHost {{ directory: {directory:?} }}")),
-        (vec!["native-wezterm-host", directory_text], format!("WezTermHost {{ directory: {directory:?} }}")),
-        (vec!["native-ghostty-host"], "GhosttyHost".into()),
-        (vec!["native-warp-host", directory_text, token], format!("WarpHost {{ directory: {directory:?}, attempt: {token:?} }}")),
+        (vec!["native-console-host", directory_text], format!("Host(Console {{ directory: {directory:?} }})")),
+        (vec!["native-iterm2-host", directory_text], format!("Host(Iterm2 {{ directory: {directory:?} }})")),
+        (vec!["native-terminal-host", directory_text], format!("Host(AppleTerminal {{ directory: {directory:?} }})")),
+        (vec!["native-wezterm-host", directory_text], format!("Host(WezTerm {{ directory: {directory:?} }})")),
+        (vec!["native-ghostty-host"], "Host(Ghostty)".into()),
+        (vec!["native-warp-host", directory_text, token], format!("Host(Warp {{ directory: {directory:?}, attempt: {token:?} }})")),
     ];
     let covered = cases
         .iter()

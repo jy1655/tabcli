@@ -3,10 +3,10 @@ use super::applescript::{Automation, Osascript};
 use super::{DialogKey, GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
 use crate::native::session::Reader;
 use crate::native::session::close::budget::close_remaining;
+use crate::native::terminal::facts::iterm2::HOST_COMMAND;
 #[cfg(test)]
 use crate::native::terminal::ownership;
 use std::{
-    os::unix::fs::MetadataExt,
     path::Path,
     time::{Duration, Instant},
 };
@@ -329,7 +329,7 @@ fn launch_bootstrap(command: &str, directory: &Path) -> Result<String> {
     let executable =
         std::env::current_exe().context("failed to resolve Agent Bridge executable")?;
     let host = format!(
-        "{} native-iterm2-host {}",
+        "{} {HOST_COMMAND} {}",
         crate::native::terminal::shell_quote(executable.as_os_str()),
         crate::native::terminal::shell_quote(directory.as_os_str())
     );
@@ -360,34 +360,27 @@ fn iterm_argument(value: &str) -> String {
 // Wait for restored selection and the exact returned UUID in the receipt and surface binding.
 // Failure or timeout never falls back to typed shell input.
 pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(directory)?;
-    if !directory.is_absolute()
-        || !metadata.is_dir()
-        || metadata.file_type().is_symlink()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-    {
-        bail!("iTerm2 launch directory is not private to the current user");
-    }
-    let id = directory
-        .file_name()
-        .and_then(|n| n.to_str())
-        .context("invalid iTerm2 launch directory")?;
-    crate::native::session::primitives::require_valid_session_id(id)?;
-    let iterm_id =
-        std::env::var("ITERM_SESSION_ID").context("iTerm2 did not supply its session identity")?;
-    let iterm_id = iterm_id
-        .rsplit(':')
-        .next()
-        .filter(|id| !id.is_empty())
-        .context("empty iTerm2 session identity")?;
-    wait_for_binding(directory, id, iterm_id)?;
-    // Keys that arrived while creation temporarily selected this surface must not
-    // answer a provider's first dialog. This flush touches only this process's PTY.
-    if unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("cannot discard iTerm2 startup input");
-    }
-    Ok(())
+    use super::bound_host::{BoundHostSpec, run_bound_host};
+    use crate::native::terminal::facts::iterm2::BINDING;
+    run_bound_host(
+        directory,
+        &BoundHostSpec {
+            name: BINDING.host,
+            metadata_context: None,
+        },
+        || {
+            let iterm_id = std::env::var("ITERM_SESSION_ID")
+                .context("iTerm2 did not supply its session identity")?;
+            Ok(iterm_id
+                .rsplit(':')
+                .next()
+                .filter(|id| !id.is_empty())
+                .context("empty iTerm2 session identity")?
+                .to_owned())
+        },
+        |directory, id, iterm_id| wait_for_binding(directory, id, iterm_id),
+        |_| {},
+    )
 }
 
 fn wait_for_binding(directory: &Path, id: &str, iterm_id: &str) -> Result<()> {
@@ -965,6 +958,12 @@ mod tests {
         assert_eq!(&args[..4], ["/bin/zsh", "-l", "-i", "-c"]);
         assert!(args[4].contains("native-iterm2-host '/custom state/session-e1'"));
         assert!(args[4].ends_with(&wrapper));
+        let invocation = args[4].split_once(" || exit; ").unwrap().0;
+        let host_args = super::super::test_support::host_argv(invocation);
+        assert_eq!(host_args, [HOST_COMMAND, directory.to_str().unwrap()]);
+        assert!(
+            matches!(crate::native::parse_args(host_args).unwrap(), crate::native::NativeCommand::Host(crate::native::terminal::host::HostCommand::Iterm2 { directory: actual }) if actual == directory)
+        );
     }
 
     use crate::native::session::SessionState;
@@ -2052,6 +2051,7 @@ end run
         let odd = parent.path().join(ODD_NAME);
         std::fs::create_dir(&odd).unwrap();
         let directory = launch_fixture_in(&odd);
+        let log_before = std::fs::read(directory.path().join(crate::native::launch::LOG)).unwrap();
         let executable = std::env::current_exe().unwrap();
         let probe = format!(
             "AB_ITERM_PROBE_DIR={} {} --exact native::terminal::macos::iterm2::tests::iterm_owned_process_probe --nocapture --test-threads=1",
@@ -2156,6 +2156,10 @@ end run
             "host never reached gate: {}",
             String::from_utf8_lossy(&output)
         );
+        let log =
+            std::fs::read_to_string(directory.path().join(crate::native::launch::LOG)).unwrap();
+        assert!(log.lines().all(|line| !line.contains("host_")), "{log}");
+        assert_eq!(log.as_bytes(), log_before);
         let owner = directory.path().join("owner-probe.json");
         if cancel {
             assert!(!owner.exists(), "cancelled host launched a wrapper");

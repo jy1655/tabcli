@@ -18,6 +18,19 @@ fn launch_context_does_not_depend_on_terminal_environment() {
 }
 
 #[test]
+fn actual_host_builder_routes_directory_and_attempt() {
+    let directory = Path::new("/custom state/session-e1");
+    let attempt = "0123456789abcdef0123456789ABCDEF";
+    let (_, command) = host_launch_command(directory, attempt, "wrapper").unwrap();
+    let invocation = command.split_once(" || exit; ").unwrap().0;
+    let args = super::super::test_support::host_argv(invocation);
+    assert_eq!(args, [HOST_COMMAND, directory.to_str().unwrap(), attempt]);
+    assert!(
+        matches!(crate::native::parse_args(args).unwrap(), crate::native::NativeCommand::Host(crate::native::terminal::host::HostCommand::Warp { directory: actual, attempt: token }) if actual == directory && token == attempt)
+    );
+}
+
+#[test]
 fn control_and_dispatch_drop_caller_session_environment() {
     let client = ControlClient {
         bundle: "/Applications/Warp.app".into(),

@@ -5,6 +5,7 @@ use super::{GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
 use crate::native::session;
 use crate::native::session::close::budget::close_remaining;
 use crate::native::session::{Reader, Store};
+use crate::native::terminal::facts::wezterm::HOST_COMMAND;
 #[cfg(test)]
 use crate::native::terminal::ownership;
 #[cfg(unix)]
@@ -830,7 +831,7 @@ pub(super) fn create_surface(
 fn host_pane_program(command: &str, directory: &Path) -> Result<[String; 5]> {
     let executable = env::current_exe().context("failed to resolve Agent Bridge executable")?;
     let gate = format!(
-        "{} native-wezterm-host {}",
+        "{} {HOST_COMMAND} {}",
         shell_quote(executable.as_os_str()),
         shell_quote(directory.as_os_str())
     );
@@ -984,42 +985,34 @@ fn require_shared_pane(
 // Wait for the receipt/claim/status to bind the pane and socket supplied by the mux itself.
 // Failure or timeout never falls back to typed input; see docs/verification/2026-10-03-v0.1.0-focus.md.
 pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(directory)
-        .with_context(|| format!("no WezTerm launch directory {}", directory.display()))?;
-    if !directory.is_absolute()
-        || !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-    {
-        bail!("WezTerm launch directory is not private to the current user");
-    }
-    let id = directory
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("invalid WezTerm launch directory")?;
-    crate::native::session::primitives::require_valid_session_id(id)?;
-    let started = (|| -> Result<()> {
-        let pane =
-            env::var("WEZTERM_PANE").context("WezTerm did not name the pane of this host")?;
-        let socket = env::var_os("WEZTERM_UNIX_SOCKET")
-            .context("WezTerm did not name the GUI of this host")?;
-        wait_for_binding(directory, id, &pane, Path::new(&socket))?;
-        // Keys that arrived while the creation had selected this pane must not answer the
-        // provider's first dialog. This discards the input of this process's own pty only.
-        if unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("cannot discard WezTerm startup input");
-        }
-        Ok(())
-    })();
-    // The pane ends with this process and takes the message with it.
-    if let Err(error) = &started {
-        crate::native::launch::log(
-            &Store::open_unchecked(directory),
-            &format!("wezterm_host_refused: {error:#}"),
-        );
-    }
-    started
+    use super::bound_host::{BoundHostSpec, run_bound_host};
+    use crate::native::terminal::facts::wezterm::BINDING;
+    run_bound_host(
+        directory,
+        &BoundHostSpec {
+            name: BINDING.host,
+            metadata_context: Some(|directory| {
+                format!("no WezTerm launch directory {}", directory.display())
+            }),
+        },
+        || {
+            let pane =
+                env::var("WEZTERM_PANE").context("WezTerm did not name the pane of this host")?;
+            let socket = env::var_os("WEZTERM_UNIX_SOCKET")
+                .context("WezTerm did not name the GUI of this host")?;
+            Ok((pane, socket))
+        },
+        |directory, id, (pane, socket)| wait_for_binding(directory, id, pane, Path::new(socket)),
+        |started| {
+            // The pane ends with this process and takes the message with it.
+            if let Err(error) = started {
+                crate::native::launch::log(
+                    &Store::open_unchecked(directory),
+                    &format!("wezterm_host_refused: {error:#}"),
+                );
+            }
+        },
+    )
 }
 
 fn wait_for_binding(directory: &Path, id: &str, pane: &str, socket: &Path) -> Result<()> {

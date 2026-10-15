@@ -139,23 +139,7 @@ pub(crate) enum NativeCommand {
         request: ConsoleControlRequest,
         id: String,
     },
-    ConsoleHost {
-        directory: PathBuf,
-    },
-    Iterm2Host {
-        directory: PathBuf,
-    },
-    AppleTerminalHost {
-        directory: PathBuf,
-    },
-    WezTermHost {
-        directory: PathBuf,
-    },
-    GhosttyHost,
-    WarpHost {
-        directory: PathBuf,
-        attempt: String,
-    },
+    Host(terminal::host::HostCommand),
 }
 
 #[derive(Debug)]
@@ -357,33 +341,33 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
         hidden: true,
     },
     CommandSpec {
-        name: "native-console-host",
-        parse: parse_directory_host,
+        name: terminal::host::CONSOLE_HOST_COMMAND,
+        parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         hidden: true,
     },
     CommandSpec {
-        name: "native-iterm2-host",
-        parse: parse_directory_host,
+        name: terminal::host::ITERM2_HOST_COMMAND,
+        parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         hidden: true,
     },
     CommandSpec {
-        name: "native-terminal-host",
-        parse: parse_directory_host,
+        name: terminal::host::APPLE_TERMINAL_HOST_COMMAND,
+        parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         hidden: true,
     },
     CommandSpec {
-        name: "native-wezterm-host",
-        parse: parse_directory_host,
+        name: terminal::host::WEZTERM_HOST_COMMAND,
+        parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         hidden: true,
     },
     CommandSpec {
-        name: "native-ghostty-host",
-        parse: |_, args| parse_ghostty_host(args),
+        name: terminal::host::GHOSTTY_HOST_COMMAND,
+        parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         hidden: true,
     },
     CommandSpec {
-        name: "native-warp-host",
-        parse: |_, args| parse_warp_host(args),
+        name: terminal::host::WARP_HOST_COMMAND,
+        parse: |command, rest| terminal::host::parse(command, rest).map(NativeCommand::Host),
         hidden: true,
     },
 ];
@@ -503,61 +487,6 @@ fn parse_console_control(rest: &[String]) -> Result<NativeCommand> {
     Ok(NativeCommand::ConsoleControl {
         request,
         id: id.clone(),
-    })
-}
-
-fn parse_directory_host(command: &str, rest: &[String]) -> Result<NativeCommand> {
-    // The tab's process does not necessarily inherit the state root, so it is
-    // given the session directory itself.
-    let directory = PathBuf::from(one_positional(
-        rest,
-        &format!("{command} requires one session directory"),
-    )?);
-    let id = directory
-        .file_name()
-        .and_then(|name| name.to_str())
-        .with_context(|| format!("{command} requires a session directory"))?;
-    require_valid_session_id(id)?;
-    if !directory.is_absolute() {
-        bail!("{command} requires an absolute session directory");
-    }
-    match command {
-        "native-iterm2-host" => Ok(NativeCommand::Iterm2Host { directory }),
-        "native-terminal-host" => Ok(NativeCommand::AppleTerminalHost { directory }),
-        "native-wezterm-host" => Ok(NativeCommand::WezTermHost { directory }),
-        "native-console-host" => Ok(NativeCommand::ConsoleHost { directory }),
-        _ => bail!("unknown native host command: {command}"),
-    }
-}
-
-fn parse_ghostty_host(rest: &[String]) -> Result<NativeCommand> {
-    // The surface is created before its session is bound to it, so this host
-    // is given nothing: its launch reaches it through its own terminal.
-    if !rest.is_empty() {
-        bail!("native-ghostty-host takes no argument");
-    }
-    Ok(NativeCommand::GhosttyHost)
-}
-
-fn parse_warp_host(rest: &[String]) -> Result<NativeCommand> {
-    let [directory, attempt] = rest else {
-        bail!("native-warp-host requires a session directory and attempt token");
-    };
-    let directory = PathBuf::from(directory);
-    let id = directory
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("native-warp-host requires a session directory")?;
-    require_valid_session_id(id)?;
-    if !directory.is_absolute() {
-        bail!("native-warp-host requires an absolute session directory");
-    }
-    if attempt.len() != 32 || !attempt.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("native-warp-host requires a valid attempt token");
-    }
-    Ok(NativeCommand::WarpHost {
-        directory,
-        attempt: attempt.clone(),
     })
 }
 
@@ -1024,31 +953,8 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
             arguments,
         } => provider::run_control(provider, &arguments),
         NativeCommand::ConsoleControl { request, id } => run_windows_console_control(request, &id),
-        NativeCommand::ConsoleHost { directory } => run_windows_console_host(&directory),
-        NativeCommand::Iterm2Host { directory } => terminal::iterm2_host(&directory),
-        NativeCommand::AppleTerminalHost { directory } => terminal::apple_terminal_host(&directory),
-        NativeCommand::WezTermHost { directory } => terminal::wezterm_host(&directory),
-        NativeCommand::GhosttyHost => terminal::ghostty_host(),
-        NativeCommand::WarpHost { directory, attempt } => terminal::warp_host(&directory, &attempt),
+        NativeCommand::Host(command) => terminal::host::run(command),
     }
-}
-
-#[cfg(target_os = "windows")]
-fn run_windows_console_host(directory: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(directory)
-        .with_context(|| format!("no such session directory: {}", directory.display()))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        bail!(
-            "refusing non-directory session directory: {}",
-            directory.display()
-        );
-    }
-    terminal::windows_console_host(directory)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn run_windows_console_host(_directory: &Path) -> Result<()> {
-    bail!("the native Windows console host is only available on Windows")
 }
 
 fn valid_pending_prompt_name(value: &str) -> bool {
