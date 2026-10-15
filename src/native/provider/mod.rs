@@ -1,4 +1,5 @@
 mod agy;
+mod capped_output;
 mod claude;
 mod codex;
 mod pi;
