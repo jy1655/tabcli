@@ -506,3 +506,34 @@ fn enumeration_faults_keep_status_reason_identity_and_encounter_order() {
     );
     assert_eq!(reasons[2]["session"], "session-a");
 }
+
+#[test]
+fn r1_c6_reused_owner_attention_is_mismatch_not_unverified() {
+    let fixture = seed_close_fixture(JournaledEventState::Absent);
+    let reader = Reader::open_unchecked(&fixture.directory);
+    let observed = read(&reader);
+    let owner = crate::native::session::owner::tests::reused_observation();
+    let flags = attention(&observed, &owner, true);
+    assert!(flags.contains(&"owner_identity_mismatch"));
+    assert!(!flags.contains(&"owner_unverified"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn correction_a3_intermediate_owner_status_distinguishes_changed_unknown_and_verified() {
+    let fixture = seed_close_fixture(JournaledEventState::Absent);
+    let reader = Reader::open_unchecked(&fixture.directory);
+    let observed = read(&reader);
+    for (control, expected) in [
+        ("changed", vec!["owner_identity_mismatch"]),
+        ("unknown", vec!["owner_unverified"]),
+        ("verified", vec![]),
+    ] {
+        let owner = crate::native::session::owner::tests::intermediate_observation(control);
+        let flags: Vec<_> = attention(&observed, &owner, true)
+            .into_iter()
+            .filter(|flag| flag.starts_with("owner_"))
+            .collect();
+        assert_eq!(flags, expected, "{control}");
+    }
+}

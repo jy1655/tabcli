@@ -1091,7 +1091,7 @@ fn apple_terminal_close_retry_failure_or_interruption_keeps_the_intent_and_the_h
 // intent grants nothing, and the original live-owner rules apply.
 #[cfg(target_os = "macos")]
 #[test]
-fn apple_terminal_close_intent_grants_nothing_while_the_owner_pid_is_alive() {
+fn apple_terminal_close_intent_grants_nothing_while_the_incarnation_is_live() {
     let directory = tempfile::tempdir().unwrap();
     let owner = write_attested_apple_terminal_state(directory.path(), "ready", std::process::id());
     let handle: terminal::TerminalSession =
@@ -1102,7 +1102,21 @@ fn apple_terminal_close_intent_grants_nothing_while_the_owner_pid_is_alive() {
             .unwrap()
             .is_some()
     );
-    assert!(!terminal_close_resumable(directory.path(), &handle).unwrap());
+    assert!(
+        !session::close::terminal_close_resumable_with(
+            &Reader::open_unchecked(directory.path()),
+            &handle,
+            true,
+            |_| session::owner::OwnerAttestation {
+                process: crate::native::process_identity::ProcessObservation::Live(
+                    crate::native::process_identity::Attested::Incarnation
+                ),
+                control: session::owner::ControlAttestation::Verified,
+                pid_alive: Some(true),
+            },
+        )
+        .unwrap()
+    );
 }
 
 // Warp can close the owned tab (ending its owner) while its dedicated window remains.
@@ -1390,19 +1404,14 @@ fn internal_status_wait_reports_dead_owner_without_consuming_surface() {
 #[cfg(target_os = "macos")]
 #[test]
 fn internal_wait_does_not_call_live_or_unverified_owner_dead() {
-    for mode in ["live", "mismatched", "missing"] {
+    for mode in ["live", "missing"] {
         let directory = tempfile::tempdir().unwrap();
-        if mode == "mismatched" {
-            write_attested_apple_terminal_state(directory.path(), "working", std::process::id());
-        } else {
-            write_owned_terminal_state(directory.path(), "working", std::process::id());
-        }
+        write_owned_terminal_state(directory.path(), "working", std::process::id());
         if mode == "missing" {
             fs::remove_file(directory.path().join(SESSION_OWNER_FILE)).unwrap();
         }
-        // Headless repair may stop at identity lookup before reaching the new
-        // guard. Check directly that a live PID with a different identity is not
-        // diagnosed as dead by that guard either.
+        // PID-only compatibility and a missing owner remain non-terminal observations.
+        // Incarnation reuse and unknown inspection are covered with injected observations.
         require_running_wait_owner(directory.path()).unwrap();
         for status_wait in [false, true] {
             let error = if status_wait {

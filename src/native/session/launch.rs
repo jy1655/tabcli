@@ -444,6 +444,13 @@ fn confirmed(reader: &Reader, record: &Record, status: &SessionStatus) -> bool {
 /// Called before old dead-owner repair. A new launch with an uncertain spawn must not
 /// be silently closed/released by the legacy owner-only repair path.
 pub(in crate::native) fn repair(store: &Store) -> Result<bool> {
+    repair_with_owner(store, super::observe_owner)
+}
+
+fn repair_with_owner(
+    store: &Store,
+    observe: impl FnOnce(&Reader) -> super::OwnerObservation,
+) -> Result<bool> {
     let Some(record) = read(store)? else {
         return Ok(false);
     };
@@ -465,7 +472,7 @@ pub(in crate::native) fn repair(store: &Store) -> Result<bool> {
         return Ok(false);
     }
     if status.state == SessionState::Launching {
-        let owner = super::observe_owner(store);
+        let owner = observe(store);
         if unix_ms() >= record.deadline_unix_ms {
             fail_locked(
                 store,
@@ -727,6 +734,25 @@ mod tests {
         )
         .unwrap();
         (directory, token)
+    }
+
+    #[test]
+    fn r1_c6_mismatch_fails_launch_before_deadline() {
+        let (directory, _) = fixture();
+        let store = Store::open_unchecked(directory.path());
+        assert!(
+            repair_with_owner(&store, |_| super::super::owner::tests::reused_observation())
+                .unwrap()
+        );
+        assert_eq!(store.status().unwrap().state, SessionState::Failed);
+        assert!(
+            store
+                .status()
+                .unwrap()
+                .error
+                .unwrap()
+                .contains("wrapper exited")
+        );
     }
 
     fn child_command() -> Command {

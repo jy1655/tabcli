@@ -325,7 +325,7 @@
     "native-iterm2-host": 1
   },
   "src/native/terminal/macos/ownership.rs": {
-    "native-session": 7
+    "native-session": 6
   },
   "src/native/terminal/macos/process.rs": {
     "native-session": 7

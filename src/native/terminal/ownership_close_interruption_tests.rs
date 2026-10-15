@@ -89,7 +89,7 @@ impl Processes {
                                 ),
                                 owner_record: &|_| panic!("not a failed startup"),
                                 pid_alive: &|_| self.owner_live.get(),
-                                mac_owner_live: &|_| Ok(self.owner_live.get()),
+                                mac_owner_live: &|_| test_owner_attestation(self.owner_live.get()),
                                 resumable: &|| {
                                     session::close::terminal_close_resumable(
                                         store,

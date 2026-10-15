@@ -43,6 +43,7 @@ use super::{
 
 mod focus;
 mod process;
+pub(in crate::native) use process::{WindowsIncarnation, observe_process_identity};
 mod security;
 mod tab;
 pub(super) use process::{check_process_identity, query_process_identity, verify_process_identity};

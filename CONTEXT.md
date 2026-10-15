@@ -121,11 +121,20 @@ _Avoid_: orphan (absence of an owner does not prove this observation)
 **Attestation**:
 The proof that a recorded owner is the live process it names: its PID, birth, controlling
 TTY and process groups (on Windows its process identity) match what the system reports now.
+It answers in one of four ways: live, gone because the process exited, gone because its PID
+now belongs to another incarnation, or unknown because the live process could not be
+inspected. A reused PID proves the recorded process gone and grants no authority over its
+surface. A record that names only a PID can be observed alive or gone, but never attested.
 _Avoid_: liveness check, validation
 
+**Incarnation**:
+One run of a process, identified by its PID and birth. A PID alone names whichever process
+holds it now; only the incarnation names the process a record was written about.
+_Avoid_: process (ambiguous between the PID and the run), instance
+
 **App incarnation**:
-One run of a terminal application, identified by its PID and birth. A Terminal.app window id
-and tty are identities only inside the incarnation that created them.
+The incarnation of a terminal application. A Terminal.app window id and tty are identities
+only inside the incarnation that created them.
 _Avoid_: app instance, app process
 
 **Close**:

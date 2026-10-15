@@ -21,6 +21,7 @@ mod doctor;
 mod envelope;
 mod hold;
 mod process_env;
+mod process_identity;
 mod provider;
 mod provider_process;
 mod query;

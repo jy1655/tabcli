@@ -7,6 +7,8 @@ use crate::native::session::state::{
     SessionState, SessionStatus, update_status, update_status_with_residual,
 };
 
+use super::owner::{OwnerAttestation, attest_owner};
+use crate::native::process_identity::ProcessObservation;
 use crate::native::session::turn::{
     JournaledEventState, PendingTurnCompletion, journaled_event_state, recover_pending_completion,
     remove_turn_claim_locked, validate_pending_completion,
@@ -14,9 +16,7 @@ use crate::native::session::turn::{
 use crate::native::session::{CoreRecord, Reader, RecordStore, Store, launch};
 use crate::native::terminal;
 use crate::native::terminal::ownership::NativeSessionOwner;
-use crate::native::terminal::ownership::{owner_blocks_prune, repair_owner_is_live};
-#[cfg(target_os = "macos")]
-use agent_bridge::process_is_alive;
+
 use anyhow::{Context, Result, bail};
 #[cfg(target_os = "macos")]
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,18 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
+
+pub(in crate::native) fn prune_blocked_by(a: &OwnerAttestation) -> bool {
+    !matches!(a.process, ProcessObservation::Gone(_))
+}
+
+pub(in crate::native) fn repair_owner_is_live(a: &OwnerAttestation) -> Result<bool> {
+    match &a.process {
+        ProcessObservation::Live(_) => Ok(true),
+        ProcessObservation::Gone(_) => Ok(false),
+        ProcessObservation::Unknown(reason) => bail!("{reason}"),
+    }
+}
 
 // The close is synchronous. Scope its record I/O and diagnostics as well as its
 // terminal calls; ordinary callers of these shared primitives remain unchanged.
@@ -272,9 +284,19 @@ pub(in crate::native) fn terminal_close_resumable(
     session: &terminal::TerminalSession,
     surface_outlives_owner: bool,
 ) -> Result<bool> {
+    terminal_close_resumable_with(reader, session, surface_outlives_owner, attest_owner)
+}
+
+#[cfg(target_os = "macos")]
+pub(in crate::native) fn terminal_close_resumable_with(
+    reader: &Reader,
+    session: &terminal::TerminalSession,
+    surface_outlives_owner: bool,
+    observe: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
+) -> Result<bool> {
     Ok(
         terminal_close_intent_owner(reader, session, surface_outlives_owner)?
-            .is_some_and(|owner| !process_is_alive(owner.pid)),
+            .is_some_and(|owner| matches!(observe(&owner).process, ProcessObservation::Gone(_))),
     )
 }
 
@@ -306,7 +328,7 @@ impl Reader {
             Err(_) => return Ok(true),
         };
 
-        owner_blocks_prune(&owner)
+        Ok(prune_blocked_by(&attest_owner(&owner)))
     }
 }
 
@@ -771,7 +793,7 @@ pub(in crate::native) fn repair_dead_owner(store: &Store) -> Result<bool> {
 pub(in crate::native) fn repair_dead_owner_until(store: &Store, deadline: Instant) -> Result<bool> {
     repair_dead_owner_with(
         store,
-        repair_owner_is_live,
+        |owner| repair_owner_is_live(&attest_owner(owner)),
         terminal::surface_outlives_owner,
         |surface| {
             terminal::ownership::close_dead_owner_surface_until(
@@ -1008,7 +1030,7 @@ pub(in crate::native) mod compatibility {
     ) -> Result<bool> {
         repair_dead_owner_with(
             &Store::open_unchecked(directory),
-            repair_owner_is_live,
+            |owner| repair_owner_is_live(&attest_owner(owner)),
             terminal::surface_outlives_owner,
             |session| {
                 close_dead_owner_surface_with(

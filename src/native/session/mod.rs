@@ -566,7 +566,7 @@ impl RecordStore {
 #[cfg(test)]
 pub(super) mod tests;
 
-mod owner;
+pub(in crate::native) mod owner;
 mod state;
 pub(in crate::native) use owner::{OwnerObservation, observe_owner, observe_owner_record};
 pub(in crate::native) use state::{SessionState, SessionStatus, update_status};

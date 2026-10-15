@@ -5,7 +5,6 @@ use crate::native::terminal::ownership::{
     NativeProcessIdentity, NativeSessionOwner, native_owner_identity_matches,
     verified_terminal_owner_process_group, verified_terminal_shell_process_group,
 };
-use agent_bridge::process_is_alive;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
@@ -57,32 +56,4 @@ pub(in crate::native) fn verified_macos_terminal_owner(
     let live_shell = live_native_process_identity(live.parent_pid)?;
     verified_terminal_shell_process_group(&owner, &live, &live_shell)?;
     Ok((owner, live))
-}
-
-#[cfg(target_os = "macos")]
-pub(in crate::native) fn mac_native_owner_is_live(owner: &NativeSessionOwner) -> Result<bool> {
-    if matches!(
-        (
-            owner.terminal_tty_device,
-            owner.process_start_seconds,
-            owner.process_start_microseconds,
-            owner.process_group,
-            owner.terminal_process_group,
-        ),
-        (None, None, None, None, None)
-    ) {
-        // Pre-0.0.3 owner records had only a PID. Preserve their historical liveness
-        // behavior; every newly launched macOS session records the strong identity below.
-        return Ok(process_is_alive(owner.pid));
-    }
-    match live_native_process_identity(owner.pid) {
-        Ok(live) => Ok(native_owner_identity_matches(owner, &live)),
-        Err(error) if process_is_alive(owner.pid) => Err(error).with_context(|| {
-            format!(
-                "failed to verify the birth identity of live native-session process {}",
-                owner.pid
-            )
-        }),
-        Err(_) => Ok(false),
-    }
 }

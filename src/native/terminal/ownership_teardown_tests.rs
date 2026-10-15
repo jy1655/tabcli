@@ -201,7 +201,7 @@ fn decision(
             ),
             owner_record: &|_| panic!("spawn recovery must not run"),
             pid_alive: &|_| pid_alive,
-            mac_owner_live: &|_| Ok(live),
+            mac_owner_live: &|_| test_owner_attestation(live),
             resumable: &|| {
                 session::close::terminal_close_resumable(
                     &Reader::open_unchecked(dir),
@@ -297,7 +297,7 @@ fn r3_terminal_incarnation_changes_or_old_window_in_new_app_refuse() {
                 ),
                 owner_record: &|_| panic!("not startup"),
                 pid_alive: &|_| true,
-                mac_owner_live: &|_| Ok(true),
+                mac_owner_live: &|_| test_owner_attestation(true),
                 resumable: &|| Ok(false),
                 ownership_proof: &|| bail!("original proof mismatch"),
                 attest_owner: &|| panic!("unproven absence must not attest or signal"),
@@ -357,7 +357,7 @@ fn r3_owner_dying_during_live_intent_retry_cannot_bypass_group_check() {
             pid_alive: &|_| false,
             mac_owner_live: &|_| {
                 live_reads.set(live_reads.get() + 1);
-                Ok(live_reads.get() == 1)
+                test_owner_attestation(live_reads.get() == 1)
             },
             resumable: &|| Ok(false),
             ownership_proof: &|| bail!("owner ended during retry"),
@@ -459,7 +459,7 @@ fn damaged_teardown_refuses(path: &str) {
                     error: None,
                 },
                 pid_alive: &|_| false,
-                mac_owner_live: &|_| Ok(false),
+                mac_owner_live: &|_| test_owner_attestation(false),
                 resumable: &|| {
                     Ok(session::close::terminal_close_intent_owner(
                         &store,
@@ -640,7 +640,7 @@ fn close_deadline_shared_observations_policy_adapter_and_retry() {
                     ),
                     owner_record: &|_| panic!("not startup"),
                     pid_alive: &|_| true,
-                    mac_owner_live: &|_| Ok(true),
+                    mac_owner_live: &|_| test_owner_attestation(true),
                     resumable: &|| Ok(false),
                     ownership_proof: &|| {
                         proof_calls.set(proof_calls.get() + 1);
@@ -788,4 +788,122 @@ fn terminal_owner_second_verification_uses_close_deadline() {
             .path()
             .exists()
     );
+}
+
+#[test]
+fn owner_control_failure_or_reuse_grants_no_ordinary_surface_authority() {
+    use crate::native::process_identity::Attested;
+    use crate::native::session::owner::ControlAttestation;
+    for control in [
+        ControlAttestation::Changed("TTY".into()),
+        ControlAttestation::Unknown("no TTY".into()),
+    ] {
+        let (dir, _, surface, _) = fixture(terminal::TerminalKind::Iterm2);
+        let result = verify_terminal_close_authority_with_observers(
+            dir.path(),
+            "session-owner123",
+            &surface,
+            || panic!("control failure must not probe surface"),
+            CloseObservers {
+                evidence: terminal::close_evidence(surface.kind),
+                owner_record: &|_| panic!("not startup"),
+                pid_alive: &|_| true,
+                mac_owner_live: &|_| OwnerAttestation {
+                    process: ProcessObservation::Live(Attested::Incarnation),
+                    control: match &control {
+                        ControlAttestation::Changed(r) => ControlAttestation::Changed(r.clone()),
+                        ControlAttestation::Unknown(r) => ControlAttestation::Unknown(r.clone()),
+                        _ => unreachable!(),
+                    },
+                    pid_alive: Some(true),
+                },
+                resumable: &|| Ok(false),
+                ownership_proof: &|| panic!("failed initial control"),
+                attest_owner: &|| panic!("failed initial control"),
+                group_gone: &|_| panic!("not teardown"),
+            },
+            crate::native::session::close::budget::close_deadline(),
+        );
+        assert!(result.is_err());
+    }
+    let (dir, _, surface, _) = fixture(terminal::TerminalKind::Iterm2);
+    let result = verify_terminal_close_authority_with_observers(
+        dir.path(),
+        "session-owner123",
+        &surface,
+        || panic!("reuse grants no absence"),
+        CloseObservers {
+            evidence: terminal::close_evidence(surface.kind),
+            owner_record: &|_| panic!("not startup"),
+            pid_alive: &|_| false,
+            mac_owner_live: &|_| OwnerAttestation {
+                process: ProcessObservation::Gone(Gone::Reused("birth".into())),
+                control: ControlAttestation::NotRecorded,
+                pid_alive: Some(false),
+            },
+            resumable: &|| Ok(false),
+            ownership_proof: &|| panic!("reused"),
+            attest_owner: &|| panic!("reused"),
+            group_gone: &|_| panic!("reused"),
+        },
+        crate::native::session::close::budget::close_deadline(),
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn r1_c8_reused_birth_resumes_only_through_exact_intent_at_authority_seam() {
+    use crate::native::session::owner::{OwnerObservers, attest_owner_with};
+    for intent in [false, true] {
+        let (dir, owner, surface, _) = fixture(terminal::TerminalKind::Iterm2);
+        let store = Store::open_unchecked(dir.path());
+        if intent {
+            session::close::record_terminal_close_intent(
+                &store,
+                "session-owner123",
+                &surface,
+                &owner,
+            )
+            .unwrap();
+        }
+        let observe = |owner: &NativeSessionOwner| {
+            attest_owner_with(
+                owner,
+                OwnerObservers {
+                    pid_alive: &|_| true,
+                    birth: &|_| {
+                        Ok(Some((
+                            owner.process_start_seconds.unwrap() + 1,
+                            owner.process_start_microseconds.unwrap(),
+                        )))
+                    },
+                    control: &|_| panic!("birth reuse has no control lookup"),
+                },
+            )
+        };
+        let result = verify_terminal_close_authority_with_observers(
+            dir.path(),
+            "session-owner123",
+            &surface,
+            || panic!("no surface observation granted"),
+            CloseObservers {
+                evidence: terminal::close_evidence(surface.kind),
+                owner_record: &|_| panic!("not startup"),
+                pid_alive: &|_| true,
+                mac_owner_live: &observe,
+                resumable: &|| {
+                    session::close::terminal_close_resumable_with(&store, &surface, true, observe)
+                },
+                ownership_proof: &|| panic!("not live owner"),
+                attest_owner: &|| panic!("not live owner"),
+                group_gone: &|_| panic!("not teardown"),
+            },
+            crate::native::session::close::budget::close_deadline(),
+        );
+        if intent {
+            assert_eq!(result.unwrap(), TerminalCloseAuthority::SurfaceOnly);
+        } else {
+            assert!(result.is_err());
+        }
+    }
 }
