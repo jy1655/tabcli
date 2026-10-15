@@ -3,6 +3,7 @@
 //! (tombstone -> status -> claim release -> journal removal), for a completion that had
 //! already written its event. Every query command must report the result as `completed`
 //! before `sessions` converges the close, and again afterwards.
+mod support;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -47,8 +48,7 @@ impl Fixture {
         fs::create_dir(directory.join("requests")).unwrap();
         write(
             &directory.join("requests").join(format!("{CLAIM}.json")),
-            &json!({"schema": 1, "request_id": REQUEST, "claim_token": CLAIM,
-                "event_file": EVENT, "created_unix_ms": 3}),
+            &support::receipt(REQUEST, CLAIM, EVENT),
         );
         fs::write(directory.join("turn.claim"), CLAIM).unwrap();
         write(&directory.join("turn.completion.json"), &journal());
@@ -90,16 +90,18 @@ impl Fixture {
         fs::create_dir_all(directory.join("events")).unwrap();
         write(
             &directory.join("manifest.json"),
-            &json!({
-                "schema": 1, "id": id, "provider": provider, "provider_path": provider,
-                "provider_version": "0.0.0", "workspace": self.root.path().canonicalize().unwrap(),
-                "title": "interrupted close fixture", "model": null, "effort": null,
-                "yolo": false, "created_unix_ms": 1
-            }),
+            &support::manifest(
+                id,
+                provider,
+                provider.as_ref(),
+                "0.0.0",
+                &self.root.path().canonicalize().unwrap(),
+                "interrupted close fixture",
+            ),
         );
         write(
             &directory.join("status.json"),
-            &json!({"state": state, "generation": 2, "updated_unix_ms": 2, "exit_code": null, "error": null}),
+            &support::status(state, 2, None),
         );
     }
 

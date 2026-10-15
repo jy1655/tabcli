@@ -1,4 +1,5 @@
 //! Launch failures before an owner exists must not strand the initial request (#50).
+mod support;
 use serde_json::{Value, json};
 use std::{fs, path::PathBuf, process::Command};
 
@@ -15,16 +16,18 @@ impl Fixture {
         fs::create_dir(directory.join("events")).unwrap();
         fs::create_dir(directory.join("requests")).unwrap();
         let fixture = Self { root, directory };
-        fixture.write("manifest.json", json!({
-            "schema":1, "id":"session-launch", "provider":"codex", "provider_path":"codex",
-            "provider_version":"0.147.0", "workspace":fixture.root.path().canonicalize().unwrap(),
-            "title":"launch fixture", "model":null, "effort":null, "yolo":false, "created_unix_ms":1
-        }));
         fixture.write(
-            "status.json",
-            json!({"state":"launching", "generation":1,
-            "updated_unix_ms":1, "exit_code":null, "error":null}),
+            "manifest.json",
+            support::manifest(
+                "session-launch",
+                "codex",
+                "codex".as_ref(),
+                "0.147.0",
+                &fixture.root.path().canonicalize().unwrap(),
+                "launch fixture",
+            ),
         );
+        fixture.write("status.json", support::status("launching", 1, None));
         fixture.write(
             "launch.json",
             json!({"schema":1, "claim_token":"123-456-0",
@@ -153,8 +156,7 @@ fn interrupted_pre_spawn_failure_finishes_releasing_the_claim() {
     let fixture = Fixture::new("pending", false);
     fixture.write(
         "status.json",
-        json!({"state":"failed", "generation":2,
-        "updated_unix_ms":2, "exit_code":null, "error":"launch timed out"}),
+        support::status("failed", 2, Some("launch timed out")),
     );
     let before = fixture.status();
     fixture.sessions();

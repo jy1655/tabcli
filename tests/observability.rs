@@ -166,10 +166,7 @@ fn request(fixture: &Fixture, claim: &str, id: &str, event: &str) {
     fs::create_dir_all(&directory).unwrap();
     write(
         &directory.join(format!("{claim}.json")),
-        &json!({
-            "schema": 1, "request_id": id, "claim_token": claim,
-            "event_file": event, "created_unix_ms": 3
-        }),
+        &support::receipt(id, claim, event),
     );
 }
 
