@@ -129,11 +129,15 @@ fn assert_unattachable(fixture: &Fixture, output: Output, address: &str, state: 
         text.contains(&format!("tabcli result {session} {flag} {id} --json")),
         "{address}: {text}"
     );
-    // Rejection precedes any receipt, so there is no request address to report.
-    assert!(
-        output.stdout.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&output.stdout)
+    // Rejection precedes any receipt; tell knows only the target session.
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "ok": false, "schema_version": 1,
+            "error": text.trim().strip_prefix("Error: ").unwrap(),
+            "session": TARGET,
+        })
     );
     assert!(!fixture.directory(TARGET).join("turn.claim").exists());
     assert!(!fixture.directory(TARGET).join("turn.claim.lock").exists());
@@ -432,7 +436,14 @@ fn a_source_the_receipt_would_reject_fails_resolution_before_ask_creates_anythin
             && !text.contains("invalid Bridge request receipt"),
         "{text}"
     );
-    assert!(output.stdout.is_empty());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value,
+        json!({
+            "ok": false, "schema_version": 1,
+            "error": text.trim().strip_prefix("Error: ").unwrap(),
+        })
+    );
     assert_eq!(
         fixture.files(),
         before,

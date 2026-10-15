@@ -126,6 +126,9 @@ The remaining options use the [shared prompt and output rules](#shared-prompt-an
 Human output prints `session:`, `request:`, then the result when waiting completes. A detached JSON
 success has `request_state: "accepted"` and a null `result`; a waited success has `request_state:
 "completed"`. See the [JSON field reference](#json-field-reference).
+After arguments have been parsed successfully, with `--json`, failures before a request address exists
+print an error object containing only `ok: false`, `error`, and `schema_version`; later failures include
+the request address.
 
 Without `--detach`, exit 0 means Bridge received a successful result. With it, exit 0 means the
 launch and delivery steps succeeded; retrieve the result using the returned request id.
@@ -160,6 +163,8 @@ turn. All listed options follow the shared rules; the timeout defaults to 900 se
 effort, title, terminal, or bypass options for a follow-up.
 
 Human and JSON output, including detached `accepted` and waited `completed`, match `ask`.
+After arguments have been parsed successfully, with `--json`, failures before a request address exists
+also include the target `session` in the error object; later failures include the request address.
 
 Codex uses its addressed native queue and does not require a shared daemon. There is no Codex
 terminal-input fallback. Claude uses official cross-session messaging, including a messenger model
@@ -269,6 +274,10 @@ conversation settings, so omitting `--yolo` does not establish that bypass is of
 
 Human output adds `source_session:`. JSON adds `source_session` and `resumed_from` to the `ask`
 response; `resumed_from` contains `session`, `provider_session_id`, and `event_id`.
+After arguments have been parsed successfully, with `--json`, failures before a request address exists
+print an error object with `source_session`, `session: null`, `request_id: null`, and `gate` (null when no
+refusal gate applies).
+Later failures include the request address, `source_session`, and `gate`.
 
 Exit behaviour otherwise matches `ask`. Refusal gates include `provider-unsupported`,
 `reopen-conflict`, `reopen-verification-failed`, and `already-reopened`. Source refusals include
@@ -971,10 +980,13 @@ This is reference material, not a resume of the source conversation.
 
 Successful commands normally exit 0; parsing, execution, and I/O failures exit nonzero and print an
 error on stderr. Check the exit behaviour in each command section: a successful observation can
-report a failed request or an unavailable capability. `--json` does not guarantee a JSON error for
-every failure, especially parsing and failures before a request address exists. Human result text
-has terminal control characters escaped. The JSON examples in this reference are trimmed excerpts
-with invented values, not complete response schemas.
+report a failed request or an unavailable capability. After arguments have been parsed successfully,
+with `--json`, every failure of `ask`, `tell` and `reopen` prints one JSON error object: with the request
+address once a request exists (and the recorded request state when it can be read), and with the fields
+the command already knows before one exists (`session` for `tell`, `source_session` and `gate` for `reopen`). Argument-parsing
+failures of these three commands still report on stderr without a JSON error object.
+Human result text has terminal control characters escaped.
+The JSON examples in this reference are trimmed excerpts with invented values, not complete response schemas.
 
 Unknown options, repeated single-value options, missing values, and invalid ids fail before the
 command runs. Copy ids from command output rather than constructing them. Session ids begin with

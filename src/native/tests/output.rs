@@ -78,6 +78,66 @@ fn envelope_command_output_order() {
         )
         .unwrap();
         println!("PLAIN_SUCCESS_END");
+        // Force the first inner operation to fail before any address or side effect.
+        for (label, command, target, json) in [
+            ("PRE_ASK", "ask", "pi", true),
+            ("PRE_TELL", "tell", "session-missing", true),
+            ("PRE_REOPEN", "reopen", "session-source", true),
+            ("PRE_PLAIN", "ask", "pi", false),
+            ("PRE_PLAIN_TELL", "tell", "session-missing", false),
+            ("PRE_PLAIN_REOPEN", "reopen", "session-source", false),
+        ] {
+            let mut command = parse_args([command, target, "--prompt", "unused"]).unwrap();
+            match &mut command {
+                NativeCommand::Ask(request) => {
+                    request.timeout = Duration::MAX;
+                    request.json = json;
+                }
+                NativeCommand::Tell(request) => {
+                    request.timeout = Duration::MAX;
+                    request.json = json;
+                }
+                NativeCommand::Reopen(request) => {
+                    request.timeout = Duration::MAX;
+                    request.json = json;
+                }
+                _ => unreachable!(),
+            }
+            println!("{label}_BEGIN");
+            let error = run(command).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                checked_deadline_from(Instant::now(), Duration::MAX)
+                    .unwrap_err()
+                    .to_string()
+            );
+            println!("{label}_END");
+        }
+        for (label, before, extra) in [
+            ("PRE_ASK", serde_json::json!({}), serde_json::json!({})),
+            (
+                "PRE_TELL",
+                serde_json::json!({"session": "session-missing"}),
+                serde_json::json!({}),
+            ),
+            (
+                "PRE_REOPEN",
+                serde_json::json!({"source_session": "session-source"}),
+                serde_json::json!({"session": null, "request_id": null, "gate": null}),
+            ),
+        ] {
+            for json in [true, false] {
+                println!("REPORT_{label}_{json}_BEGIN");
+                let report = TurnReport::new(json, before.as_object().unwrap().clone());
+                let error = checked_deadline_from(Instant::now(), Duration::MAX).unwrap_err();
+                let original = error.to_string();
+                let error = report
+                    .finish(Err(error), extra.as_object().unwrap().clone())
+                    .unwrap_err();
+                assert_eq!(error.to_string(), original);
+                println!("REPORT_{label}_{json}_END");
+            }
+        }
         return;
     }
     let fixture = seed_close_fixture(JournaledEventState::Committed);
@@ -106,6 +166,42 @@ fn envelope_command_output_order() {
             .to_owned()
     };
     let value = |name: &str| serde_json::from_str::<serde_json::Value>(&section(name)).unwrap();
+    let expected_error = checked_deadline_from(Instant::now(), Duration::MAX)
+        .unwrap_err()
+        .to_string();
+    let mut pre_address_mismatches = Vec::new();
+    for (label, extra) in [
+        ("PRE_ASK", serde_json::json!({})),
+        (
+            "PRE_TELL",
+            serde_json::json!({"session": "session-missing"}),
+        ),
+        (
+            "PRE_REOPEN",
+            serde_json::json!({"source_session": "session-source", "session": null, "request_id": null, "gate": null}),
+        ),
+    ] {
+        let expected = envelope::error(
+            &anyhow::anyhow!(expected_error.clone()),
+            extra.as_object().unwrap().clone(),
+        );
+        assert_eq!(section(&format!("REPORT_{label}_false")), "");
+        assert_eq!(section(&format!("REPORT_{label}_true")), section(label));
+        let expected = format!("{}\n", serde_json::to_string_pretty(&expected).unwrap());
+        if section(label) != expected {
+            pre_address_mismatches.push(format!(
+                "{label}: actual {:?}, expected {expected:?}",
+                section(label)
+            ));
+        }
+    }
+    assert_eq!(section("PRE_PLAIN"), "");
+    assert_eq!(section("PRE_PLAIN_TELL"), "");
+    assert_eq!(section("PRE_PLAIN_REOPEN"), "");
+    assert!(
+        pre_address_mismatches.is_empty(),
+        "{pre_address_mismatches:#?}"
+    );
     let queried = value("QUERY");
     assert_eq!(queried["ok"], false);
     assert_eq!(queried["error"], "outer: inner");
