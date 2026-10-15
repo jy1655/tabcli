@@ -1,5 +1,9 @@
+use super::OwnedSurfaceClose;
+use super::ownership::verified_macos_terminal_owner;
 use super::process;
 use super::{GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
+use crate::native::session;
+use crate::native::session::close::budget::close_remaining;
 use crate::native::session::{Reader, Store};
 #[cfg(test)]
 use crate::native::terminal::ownership;
@@ -1292,10 +1296,24 @@ impl<H: Host> MacTerminalAdapter for Adapter<H> {
     }
     fn close_owned_session(
         &self,
-        _directory: &Path,
+        directory: &Path,
+        id: &str,
         session: &TerminalSession,
+        close: OwnedSurfaceClose,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
+        if close == OwnedSurfaceClose::LiveOwner {
+            close_remaining(deadline)?;
+            // The adapter close can end the owner even when surface cleanup fails.
+            let (owner, _) = verified_macos_terminal_owner(directory, id, session, None)?;
+            close_remaining(deadline)?;
+            session::close::record_terminal_close_intent(
+                &Store::open_unchecked(directory),
+                id,
+                session,
+                &owner,
+            )?;
+        }
         close_session_until(&self.host, session, deadline)
     }
 }

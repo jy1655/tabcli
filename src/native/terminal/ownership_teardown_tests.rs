@@ -668,7 +668,7 @@ fn close_deadline_shared_observations_policy_adapter_and_retry() {
                         process_start_microseconds: 0,
                         ..live
                     };
-                    prepare_warp_close(
+                    terminal::macos::warp::prepare_warp_close(
                         dir.path(),
                         "session-owner123",
                         &surface,
@@ -775,7 +775,12 @@ fn terminal_owner_second_verification_uses_close_deadline() {
                     deadline,
                 )?),
             )?;
-            terminate_apple_terminal_owner(dir.path(), "session-owner123", &surface, deadline)
+            terminal::macos::apple_terminal::close_evidence::terminate_owner(
+                dir.path(),
+                "session-owner123",
+                &surface,
+                deadline,
+            )
         },
     );
     assert!(format!("{:#}", result.unwrap_err()).contains("deadline"));

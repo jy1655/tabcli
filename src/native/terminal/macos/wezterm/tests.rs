@@ -191,7 +191,13 @@ fn adapter_owns_the_non_sync_host_for_operations() {
     );
     assert_eq!(
         adapter
-            .close_owned_session(directory.path(), &session, deadline)
+            .close_owned_session(
+                directory.path(),
+                "unused",
+                &session,
+                OwnedSurfaceClose::SurfaceOnly,
+                deadline
+            )
             .unwrap(),
         CloseOutcome::Closed
     );

@@ -3,8 +3,6 @@ pub(super) mod close_evidence;
 pub(super) use close_evidence::for_kind as close_evidence;
 use std::time::Duration;
 pub(super) mod facts;
-#[cfg(target_os = "macos")]
-use facts::PreClosePolicy;
 
 /// Provider-selected encoding of LF in a native Windows console text batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

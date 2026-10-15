@@ -331,12 +331,13 @@ repair settles the records without resending a prompt or guessing ownership of a
 - For a new terminal, start with `src/native/terminal/mod.rs` and its surface and delivery types.
   Read `src/native/terminal/ownership.rs` before implementing close. Add application-native
   operations under the platform module and tests that prove the target belongs to the session.
-  Each adapter declares its close facts, pre-close policy, paste envelope, and guarded-dialog
+  Each adapter declares its close facts, paste envelope, and guarded-dialog
   capability as `SurfaceFacts` in its `facts.rs` module. The shared accessor dispatches these
   exhaustively by terminal kind on every build target; platform operation refusals remain separate.
   The three macOS adapters also declare macOS-only `BINDING` diagnostics and budgets there.
   For macOS operations, implement every `MacTerminalAdapter` method explicitly and add the
-  adapter to its kind lookup. Reuse `open_with` for binding and cleanup unless the adapter
+  adapter to its kind lookup. What an adapter does for a live owner before ending its surface
+  lives in its `close_owned_session`. Reuse `open_with` for binding and cleanup unless the adapter
   owns a distinct open protocol, as Warp does. Keep screen and presence scripts in the adapter.
   A creation preference in settings cannot substitute for recorded close authority.
 - For a new platform, start with the dispatch in `src/native/terminal/mod.rs` and the refusal

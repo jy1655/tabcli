@@ -10,7 +10,7 @@ use crate::native::terminal::close_evidence::{CloseEvidence, ResumableAuthority}
 use crate::native::terminal::macos::ownership::verified_macos_terminal_owner;
 use crate::native::terminal::macos::process::{live_native_process_identity, macos_process_start};
 use crate::native::terminal::ownership::{
-    MacTerminalAppIdentity, NativeSessionOwner, terminate_process_groups,
+    MacTerminalAppIdentity, NativeSessionOwner, process_group_signal_target,
     verified_terminal_owner_process_group, verified_terminal_shell_process_group,
 };
 use anyhow::{Context, Result, bail};
@@ -139,9 +139,65 @@ pub(in crate::native) fn terminate_owner(
     terminate_process_groups(process_group, shell_process_group, deadline)
 }
 
+fn close_signal_plan(
+    managed_process_group: u32,
+    shell_process_group: u32,
+) -> Result<[(libc::pid_t, libc::c_int); 2]> {
+    if managed_process_group == shell_process_group {
+        bail!("Terminal.app managed and shell process groups must be distinct")
+    }
+    Ok([
+        (
+            process_group_signal_target(managed_process_group)?,
+            libc::SIGTERM,
+        ),
+        (
+            process_group_signal_target(shell_process_group)?,
+            libc::SIGKILL,
+        ),
+    ])
+}
+
+fn terminate_process_groups(
+    managed_process_group: u32,
+    shell_process_group: u32,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    for (target, signal) in close_signal_plan(managed_process_group, shell_process_group)? {
+        close_remaining(deadline)?;
+        let result = unsafe { libc::kill(target, signal) };
+        if result == 0 {
+            continue;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            continue;
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "failed to send signal {signal} to Terminal.app process group {}",
+                target.checked_neg().unwrap_or_default()
+            )
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_app_close_signal_targets_and_plan() {
+        assert_eq!(process_group_signal_target(4242).unwrap(), -4242);
+        assert!(process_group_signal_target(0).is_err());
+        assert!(process_group_signal_target(i32::MAX as u32 + 1).is_err());
+        assert_eq!(
+            close_signal_plan(4242, 4000).unwrap(),
+            [(-4242, libc::SIGTERM), (-4000, libc::SIGKILL)]
+        );
+    }
+
     use std::cell::RefCell;
 
     #[test]
