@@ -77,6 +77,7 @@ Warp는 접근이 허용된 공식 Control 연결과 탭·창 생성 기능이 �
 
 Codex 후속 요청에는 0.149.0 이상이 필요하며 공유 데몬은 필요하지 않습니다. Claude는 최소 버전을 충족하고, 사용하는 백엔드와 설정에서 세션 간 메시지 전달도 지원해야 합니다. 전달 경로와 오류 처리는 [에이전트 CLI 요구 사항](docs/providers.md)을 따릅니다.
 
+- [2026-10-15 macOS, 배포된 0.4.9](docs/verification/2026-10-15-macos-0.4.9.md): 배포 후 iTerm2에서 네 provider의 self-test를 모두 확인했습니다. Codex·Claude는 기본값, Pi는 명시한 모델, Agy는 `--yolo`를 사용했습니다. 별도 Ghostty 검사는 설치된 실행 파일과 이미 실행 중인 앱을 사용했습니다.
 - [2026-10-07 Windows, 0.2.6](docs/verification/2026-10-07-windows-0.2.6.md): 기본 권한 모드에서 Codex·Claude·Pi의 두 요청과 종료를 확인했습니다. Agy는 도구 승인 대기가 기록된 상태로 초기 결과 제한 시간을 넘겼으며 세션은 종료했습니다.
 - [2026-10-07 macOS, 0.2.5](docs/verification/2026-10-07-macos-0.2.5.md): iTerm2에서 Codex·Claude·Agy·Pi의 초기 요청·후속 요청·종료를 모두 확인했습니다.
 - [2026-10-07 macOS, 0.2.4](docs/verification/2026-10-07-macos-0.2.4.md): 네 터미널의 Codex와 WezTerm의 Claude·Agy·Pi 왕복, Pi 자격 증명 누락 타임아웃 진단을 확인했습니다.
