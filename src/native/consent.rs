@@ -1,6 +1,8 @@
 //! Workspace consent is evidence, not a provider permission mode. Provider stores are
 //! read only; their schemas and the way a managed CLI accepts trust belong to adapters.
 use super::*;
+#[cfg(unix)]
+use crate::native::private_to_user::owned_and_not_writable_by_others;
 use crate::native::session::{Reader, RecordReader, RecordStore};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -184,8 +186,7 @@ pub(super) fn read_store(path: &Path) -> Result<Option<String>> {
     let opened_meta = file.metadata()?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        if opened_meta.uid() != unsafe { libc::geteuid() } || opened_meta.mode() & 0o022 != 0 {
+        if !owned_and_not_writable_by_others(&opened_meta, unsafe { libc::geteuid() }) {
             bail!("trust store is not owned and writable only by the current user");
         }
     }
@@ -1498,6 +1499,31 @@ mod tests {
         assert_eq!(
             assess_with(temp.path(), &workspace, &homes).unwrap().state,
             "identity-changed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_store_preserves_write_only_restriction_and_refuses_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store");
+        crate::native::session::primitives::write_private(&path, b"store contents").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(read_store(&path).unwrap(), Some("store contents".into()));
+        for mode in [0o664, 0o606] {
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                read_store(&path).unwrap_err().to_string(),
+                "trust store is not owned and writable only by the current user"
+            );
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let alias = temp.path().join("store-link");
+        symlink(&path, &alias).unwrap();
+        assert_eq!(
+            read_store(&alias).unwrap_err().to_string(),
+            "trust store is not a regular file"
         );
     }
 

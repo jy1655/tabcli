@@ -2,6 +2,7 @@ use super::OwnedSurfaceClose;
 use super::ownership::verified_macos_terminal_owner;
 use super::process;
 use super::{GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
+use crate::native::private_to_user::owned_and_not_writable_by_others;
 use crate::native::session;
 use crate::native::session::close::budget::close_remaining;
 use crate::native::session::{Reader, Store};
@@ -333,8 +334,7 @@ fn safe_socket_path(path: &Path) -> Result<()> {
     let directory = fs::symlink_metadata(path.parent().context("socket has no parent")?)?;
     let socket = fs::symlink_metadata(path)?;
     if !directory.is_dir()
-        || directory.uid() != uid
-        || directory.mode() & 0o022 != 0
+        || !owned_and_not_writable_by_others(&directory, uid)
         || !socket.file_type().is_socket()
         || socket.uid() != uid
     {

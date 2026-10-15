@@ -1,4 +1,5 @@
-use std::{os::unix::fs::MetadataExt, path::Path};
+use crate::native::private_to_user::owned_and_not_accessible_by_others;
+use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
@@ -21,8 +22,7 @@ pub(in crate::native::terminal) fn run_bound_host<I>(
     };
     if !directory.is_absolute()
         || !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
+        || !owned_and_not_accessible_by_others(&metadata, unsafe { libc::geteuid() })
     {
         bail!(
             "{} launch directory is not private to the current user",

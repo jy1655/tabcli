@@ -985,6 +985,10 @@ fn discovery_only_accepts_pid_named_protected_local_sockets() {
     let _listener = UnixListener::bind(&socket).unwrap();
     assert_eq!(socket_pid(&socket), Some(42));
     assert!(safe_socket_path(&socket).is_ok());
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(safe_socket_path(&socket).is_ok());
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(safe_socket_path(&socket).is_ok());
     for name in [
         "default-WezTerm",
         "gui-sock-0",
