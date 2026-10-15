@@ -460,8 +460,8 @@ with inferred events.
 Use `result` to retrieve a recorded result or wait for one particular request to finish.
 
 ```text
-tabcli result SESSION [--latest | --list | --event EVENT | --request REQUEST]
-    [--json] [--wait --timeout-secs N]
+tabcli result SESSION [--latest | --list | --event EVENT | --request REQUEST] [--json]
+tabcli result SESSION --request REQUEST --wait [--timeout-secs N] [--json]
 ```
 
 ```sh
