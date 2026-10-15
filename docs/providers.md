@@ -68,8 +68,9 @@ unmodified. This fallback assumes Codex's default keymap and an editable compose
 bindings, Vim normal mode, history search and disabled input are outside its supported scope.
 Bridge does not interpret Codex keymaps. Tabs in this paste path are refused with
 `replace tab characters with spaces`: no literal Tab encoding is proven to preserve text
-independently of timing and UI state. Native queue follow-ups are unaffected. The existing
-input policy still rejects CR, including CRLF; Bridge does not normalize line endings.
+independently of timing and UI state. Native queue follow-ups are unaffected. Bridge normalizes
+CRLF to LF for `--prompt-file` before the input policy runs; inline `--prompt` is not normalized.
+The input policy rejects any remaining CR.
 Replace this fallback when Codex provides a newline-preserving input API or paste event on
 Windows console. Windows live verification of newline preservation is pending; Agy and Pi
 retain their existing LF encoding and need separate provider evidence.
