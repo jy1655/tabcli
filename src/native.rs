@@ -39,6 +39,10 @@ use session::turn::*;
 use session::*;
 mod settings;
 mod terminal;
+mod turn_report;
+#[cfg(test)]
+use turn_report::finish_request_with_extra;
+use turn_report::{TurnReport, emit_session_result, emit_session_result_with};
 
 #[cfg(all(target_os = "macos", test))]
 use terminal::macos::apple_terminal::{
@@ -1121,18 +1125,12 @@ fn run_windows_console_control(_request: ConsoleControlRequest, _id: &str) -> Re
 }
 
 fn run_ask(request: AskRequest) -> Result<()> {
-    let json = request.json;
-    let mut address = None;
-    let outcome = run_ask_inner(request, &mut address);
-    match address {
-        Some((session, request_id)) => {
-            finish_request_with_extra(outcome, json, &session, &request_id, serde_json::Map::new())
-        }
-        None => outcome,
-    }
+    let mut report = TurnReport::new(request.json, serde_json::Map::new());
+    let outcome = run_ask_inner(request, &mut report);
+    report.finish(outcome, serde_json::Map::new())
 }
 
-fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) -> Result<()> {
+fn run_ask_inner(request: AskRequest, report: &mut TurnReport) -> Result<()> {
     let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
     // Attached results are resolved and pinned before any session, claim, receipt, terminal,
     // or delivery exists, so a failed resolution changes nothing.
@@ -1186,7 +1184,7 @@ fn run_ask_inner(request: AskRequest, address: &mut Option<(String, String)>) ->
             result_extra: serde_json::Map::new(),
             resumed_from: None,
         },
-        address,
+        report,
     )
 }
 
@@ -1210,10 +1208,7 @@ struct SessionLaunch<'a> {
     resumed_from: Option<ResumedFrom>,
 }
 
-fn launch_created_session(
-    launch: SessionLaunch<'_>,
-    address: &mut Option<(String, String)>,
-) -> Result<()> {
+fn launch_created_session(launch: SessionLaunch<'_>, report: &mut TurnReport) -> Result<()> {
     let SessionLaunch {
         created,
         provider,
@@ -1230,7 +1225,7 @@ fn launch_created_session(
         turn::claim(&Store::open_unchecked(&created.directory), context_sources)?;
     let expected_claim_token = initial_claim.token().to_owned();
     let receipt = initial_claim.receipt().clone();
-    *address = Some((created.id.clone(), receipt.request_id.clone()));
+    report.addressed(created.id.clone(), receipt.request_id.clone());
     let launch_deadline = launch::begin(
         &Store::open_unchecked(&created.directory),
         &expected_claim_token,
@@ -1435,34 +1430,19 @@ fn verify_terminal_surface_ownership_until(
 }
 
 fn run_tell(request: TellRequest) -> Result<()> {
-    let json = request.json;
-    let session = request.id.clone();
-    let mut address = None;
-    let outcome = run_tell_inner(request, &mut address);
-    match address {
-        Some((session, request_id)) => {
-            let mut extra = serde_json::Map::new();
-            if let Some(gate) = outcome.as_ref().err().and_then(reopen_refusal_gate) {
-                extra.insert("gate".to_owned(), serde_json::json!(gate));
-            }
-            finish_request_with_extra(outcome, json, &session, &request_id, extra)
-        }
-        None => {
-            if json
-                && let Err(error) = &outcome
-                && error.is::<session::hold::Refusal>()
-            {
-                envelope::print(&envelope::error(
-                    error,
-                    serde_json::Map::from_iter([("session".into(), serde_json::json!(session))]),
-                ))?;
-            }
-            outcome
-        }
+    let mut report = TurnReport::new(
+        request.json,
+        serde_json::Map::from_iter([("session".into(), serde_json::json!(request.id))]),
+    );
+    let outcome = run_tell_inner(request, &mut report);
+    let mut extra = serde_json::Map::new();
+    if let Some(gate) = outcome.as_ref().err().and_then(reopen_refusal_gate) {
+        extra.insert("gate".to_owned(), serde_json::json!(gate));
     }
+    report.finish(outcome, extra)
 }
 
-fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) -> Result<()> {
+fn run_tell_inner(request: TellRequest, report: &mut TurnReport) -> Result<()> {
     let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
     // Attached results are resolved and pinned before the target is recovered, repaired,
     // claimed, or sent to, so a failed resolution leaves every session unchanged.
@@ -1495,7 +1475,7 @@ fn run_tell_inner(request: TellRequest, address: &mut Option<(String, String)>) 
     )?;
     let claim_token = claim.token().to_owned();
     let receipt = claim.receipt().clone();
-    *address = Some((request.id.clone(), receipt.request_id.clone()));
+    report.addressed(request.id.clone(), receipt.request_id.clone());
     refuse_follow_up_to_shared_conversation(
         provider,
         &directory,
@@ -1790,112 +1770,6 @@ fn run_close(request: CloseRequest) -> Result<()> {
         println!("closed {}", request.id);
     }
     Ok(())
-}
-
-fn finish_request_with_extra(
-    outcome: Result<()>,
-    json: bool,
-    session: &str,
-    request_id: &str,
-    extra: serde_json::Map<String, serde_json::Value>,
-) -> Result<()> {
-    if let Err(error) = outcome {
-        if json {
-            let mut value = Reader::session_directory(session)
-                .and_then(|directory| {
-                    query::request_result(&Reader::open_unchecked(&directory), request_id)
-                })
-                .unwrap_or_else(|_| {
-                    serde_json::json!({
-                        "session": session, "request_id": request_id,
-                        "request_state": "unknown", "result": null
-                    })
-                });
-            let fields = value.as_object_mut().unwrap();
-            fields.remove("ok");
-            fields.remove("error");
-            let mut value = envelope::error(&error, std::mem::take(fields));
-            for (key, field) in extra {
-                value[key] = field;
-            }
-            envelope::print(&value)?;
-        }
-        return Err(error).with_context(|| format!(
-            "session {session}, request {request_id}; inspect with `{PUBLIC_COMMAND} result {session} --request {request_id} --json`; this error alone is not proof of non-delivery; inspect the recorded outcome before deciding whether to retry"
-        ));
-    }
-    Ok(())
-}
-
-fn emit_session_result(
-    json: bool,
-    id: &str,
-    terminal_session: &terminal::TerminalSession,
-    provider: FirstPartyCli,
-    receipt: &requests::Receipt,
-    event: Option<&SessionEvent>,
-) -> Result<()> {
-    emit_session_result_with(
-        json,
-        id,
-        terminal_session,
-        provider,
-        receipt,
-        event,
-        &serde_json::Map::new(),
-    )
-}
-
-fn emit_session_result_with(
-    json: bool,
-    id: &str,
-    terminal_session: &terminal::TerminalSession,
-    provider: FirstPartyCli,
-    receipt: &requests::Receipt,
-    event: Option<&SessionEvent>,
-    extra: &serde_json::Map<String, serde_json::Value>,
-) -> Result<()> {
-    let request_id = &receipt.request_id;
-    let (elapsed, elapsed_reason) = query::observed_elapsed(Some(receipt), event);
-    let mut value = envelope::ok(
-        serde_json::json!({
-                "session": id,
-                "request_id": request_id,
-                "context_sources": receipt.context_sources,
-                "bridge_observed_elapsed_ms": elapsed,
-                "bridge_observed_elapsed_reason": elapsed_reason,
-                "request_state": if event.is_some() { "completed" } else { "accepted" },
-                "provider": provider.as_str(),
-                "terminal": terminal_session.kind.as_str(),
-                "terminal_session_id": terminal_session.id,
-                "terminal_tab_id": terminal_session.tab_id,
-                "terminal_window_id": terminal_session.window_id,
-                "iterm_session_id": (terminal_session.kind == terminal::TerminalKind::Iterm2)
-                    .then_some(terminal_session.id.as_str()),
-                "result": event.map(|value| value.message.as_str()),
-                "provider_session_id": event.and_then(|value| value.provider_session_id.as_deref()),
-                "turn_id": event.and_then(|value| value.turn_id.as_deref()),
-        })
-        .as_object()
-        .unwrap()
-        .clone(),
-    );
-    for (key, field) in extra {
-        value[key.as_str()] = field.clone();
-    }
-    envelope::emit(json, &value, || {
-        println!("session: {id}\nrequest: {request_id}");
-        for (key, field) in extra {
-            if let Some(field) = field.as_str() {
-                println!("{}: {}", key, terminal_safe_text(field, false));
-            }
-        }
-        if let Some(event) = event {
-            println!();
-            println!("{}", terminal_safe_text(&event.message, true));
-        }
-        Ok(())
-    })
 }
 
 fn run_session(id: &str) -> Result<()> {

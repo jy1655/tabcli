@@ -507,37 +507,31 @@ struct ReopenSource {
 }
 
 pub(super) fn run_reopen(request: ReopenRequest) -> Result<()> {
-    let json = request.json;
     let source = request.id.clone();
-    let mut address = None;
-    let outcome = run_reopen_inner(request, &mut address);
-    match address {
-        Some((session, request_id)) => {
+    let mut report = TurnReport::new(
+        request.json,
+        serde_json::Map::from_iter([("source_session".into(), serde_json::json!(source))]),
+    );
+    let outcome = run_reopen_inner(request, &mut report);
+    match report.address() {
+        Some((session, _)) => {
             let (outcome, gate) =
-                settle_reopen_outcome(Reader::session_directory, &source, &session, outcome);
+                settle_reopen_outcome(Reader::session_directory, &source, session, outcome);
             let mut extra = serde_json::Map::new();
             extra.insert("source_session".to_owned(), serde_json::json!(source));
             extra.insert("gate".to_owned(), serde_json::json!(gate));
-            finish_request_with_extra(outcome, json, &session, &request_id, extra)
+            report.finish(outcome, extra)
         }
         None => {
-            if let Err(error) = &outcome
-                && json
-            {
-                envelope::print(&envelope::error(
-                    error,
-                    serde_json::json!({
-                    "source_session": source,
-                    "session": null,
-                    "request_id": null,
-                    "gate": reopen_refusal_gate(error),
-                    })
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-                ))?;
-            }
-            outcome
+            let extra = serde_json::json!({
+                "session": null,
+                "request_id": null,
+                "gate": outcome.as_ref().err().and_then(reopen_refusal_gate),
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            report.finish(outcome, extra)
         }
     }
 }
@@ -578,7 +572,7 @@ fn settle_reopen_outcome(
     (outcome, gate)
 }
 
-fn run_reopen_inner(request: ReopenRequest, address: &mut Option<(String, String)>) -> Result<()> {
+fn run_reopen_inner(request: ReopenRequest, report: &mut TurnReport) -> Result<()> {
     let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
     let terminal_kind = terminal::select(request.terminal)?;
     let source_directory = Reader::session_directory(&request.id)?;
@@ -651,7 +645,7 @@ fn run_reopen_inner(request: ReopenRequest, address: &mut Option<(String, String
             result_extra,
             resumed_from: Some(resumed_from),
         },
-        address,
+        report,
     )
 }
 
