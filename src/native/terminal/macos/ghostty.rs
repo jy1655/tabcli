@@ -223,10 +223,6 @@ on run argv
 end run
 "#;
 
-// Retain the shared-test symbol while the manager updates obsolete tab-only
-// assertions. Production cleanup always requires all three composite identities.
-#[cfg(test)]
-pub(in crate::native) const CLOSE_CREATED_TAB_SCRIPT: &str = CLOSE_TAB_SCRIPT;
 pub(in crate::native) const QUEUE_COMMAND_SCRIPT: &str = r#"
 on run argv
     set wantedTerminalId to item 1 of argv
@@ -317,6 +313,12 @@ const HOST_WAIT: Duration = if cfg!(test) {
 trait Runner {
     fn capable(&mut self) -> Result<()>;
     fn run(&mut self, script: &str, args: &[&str], deadline: Instant) -> Result<String>;
+    fn run_send(
+        &mut self,
+        script: &str,
+        args: &[&str],
+        deadline: Instant,
+    ) -> std::result::Result<String, TerminalSendFailure>;
     fn pause(&mut self, deadline: Instant) -> Result<()> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining <= POLL {
@@ -348,6 +350,14 @@ impl Runner for Installed {
     }
     fn run(&mut self, script: &str, args: &[&str], deadline: Instant) -> Result<String> {
         applescript::run_until("Ghostty", script, args, deadline)
+    }
+    fn run_send(
+        &mut self,
+        script: &str,
+        args: &[&str],
+        deadline: Instant,
+    ) -> std::result::Result<String, TerminalSendFailure> {
+        applescript::run_send_until("Ghostty", script, args, deadline)
     }
 }
 #[derive(Clone, Debug, Default)]
@@ -920,13 +930,20 @@ pub(super) fn send_file(
     prompt_path: &Path,
     deadline: Instant,
 ) -> TerminalSendResult {
+    send_file_with_runner(&mut Installed, session, prompt_path, deadline)
+}
+fn send_file_with_runner(
+    runner: &mut dyn Runner,
+    session: &TerminalSession,
+    prompt_path: &Path,
+    deadline: Instant,
+) -> TerminalSendResult {
     let (tab, window) = ownership_proof(session).map_err(TerminalSendFailure::not_sent)?;
     let path = prompt_path
         .to_str()
         .context("prompt path is not valid UTF-8")
         .map_err(TerminalSendFailure::not_sent)?;
-    let response = applescript::run_send_until(
-        "Ghostty",
+    let response = runner.run_send(
         SEND_FILE_SCRIPT,
         &[&session.id, tab, window, path],
         deadline,
@@ -939,9 +956,15 @@ pub(super) fn send_file(
     Ok(())
 }
 pub(super) fn verify_surface(session: &TerminalSession, timeout: Option<Duration>) -> Result<()> {
+    verify_surface_with_runner(&mut Installed, session, timeout)
+}
+fn verify_surface_with_runner(
+    runner: &mut dyn Runner,
+    session: &TerminalSession,
+    timeout: Option<Duration>,
+) -> Result<()> {
     let (tab, window) = ownership_proof(session)?;
-    let response = applescript::run_until(
-        "Ghostty",
+    let response = runner.run(
         VERIFY_SURFACE_SCRIPT,
         &[&session.id, tab, window],
         super::timeout_deadline(timeout.unwrap_or(Duration::from_secs(10)))?,
@@ -1089,6 +1112,285 @@ impl MacTerminalAdapter for Adapter {
 }
 #[cfg(test)]
 mod tests {
+    #[derive(Default)]
+    struct ScriptProbe {
+        response: Option<Result<String>>,
+        send_response: Option<std::result::Result<String, TerminalSendFailure>>,
+        calls: Vec<(String, Vec<String>, Instant)>,
+        send_calls: Vec<(String, Vec<String>, Instant)>,
+    }
+
+    impl Runner for ScriptProbe {
+        fn capable(&mut self) -> Result<()> {
+            panic!("unexpected capability check")
+        }
+        fn pause(&mut self, _: Instant) -> Result<()> {
+            panic!("unexpected pause")
+        }
+        fn run(&mut self, script: &str, args: &[&str], deadline: Instant) -> Result<String> {
+            self.calls.push((
+                script.into(),
+                args.iter().map(|s| (*s).into()).collect(),
+                deadline,
+            ));
+            self.response.take().expect("unexpected general automation")
+        }
+        fn run_send(
+            &mut self,
+            script: &str,
+            args: &[&str],
+            deadline: Instant,
+        ) -> std::result::Result<String, TerminalSendFailure> {
+            self.send_calls.push((
+                script.into(),
+                args.iter().map(|s| (*s).into()).collect(),
+                deadline,
+            ));
+            self.send_response
+                .take()
+                .expect("unexpected send automation")
+        }
+    }
+
+    #[test]
+    fn send_preflight_rejects_without_automation() {
+        use std::os::unix::ffi::OsStrExt;
+        let surface = handle(&CreatedSurface {
+            tab_id: "t2".into(),
+            window_id: "w1".into(),
+            terminal_id: "u2".into(),
+        });
+        let invalid_path = Path::new(std::ffi::OsStr::from_bytes(b"/invalid\xff"));
+        let mut no_tab = surface.clone();
+        no_tab.tab_id = None;
+        let mut no_window = surface.clone();
+        no_window.window_id = None;
+        let mut invalid_id = surface.clone();
+        invalid_id.id = "-".into();
+        for (session, path, message) in [
+            (
+                &no_tab,
+                Path::new("/prompt"),
+                "Ghostty session record is missing its tab id",
+            ),
+            (
+                &no_window,
+                Path::new("/prompt"),
+                "Ghostty session record is missing its window id",
+            ),
+            (
+                &invalid_id,
+                Path::new("/prompt"),
+                "Ghostty composite identity is invalid",
+            ),
+            (&surface, invalid_path, "prompt path is not valid UTF-8"),
+            (
+                &no_tab,
+                invalid_path,
+                "Ghostty session record is missing its tab id",
+            ),
+            (
+                &invalid_id,
+                invalid_path,
+                "Ghostty composite identity is invalid",
+            ),
+        ] {
+            let mut probe = ScriptProbe::default();
+            let error =
+                send_file_with_runner(&mut probe, session, path, Instant::now()).unwrap_err();
+            assert_eq!(format!("{:#}", error.error()), message);
+            assert!(!error.delivery_may_have_occurred());
+            assert!(probe.calls.is_empty());
+            assert!(probe.send_calls.is_empty());
+            assert!(probe.response.is_none());
+            assert!(probe.send_response.is_none());
+        }
+    }
+
+    #[test]
+    fn send_uses_one_classified_runner_call() {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let path = Path::new("/prompt with 'quotes' \"한글\"");
+        for (tab, window) in [("t2", "w1"), ("-", "-")] {
+            let surface = handle(&CreatedSurface {
+                tab_id: tab.into(),
+                window_id: window.into(),
+                terminal_id: "u2".into(),
+            });
+            for (response, expected) in [
+                (Ok("sent".into()), None),
+                (
+                    Ok(String::new()),
+                    Some(("unexpected Ghostty send response: \"\"", true)),
+                ),
+                (
+                    Ok("missing".into()),
+                    Some(("unexpected Ghostty send response: \"missing\"", true)),
+                ),
+                (
+                    Ok("sent\n".into()),
+                    Some(("unexpected Ghostty send response: \"sent\\n\"", true)),
+                ),
+                (
+                    Err(TerminalSendFailure::not_sent(anyhow!("not started"))),
+                    Some(("not started", false)),
+                ),
+                (
+                    Err(TerminalSendFailure::delivery_uncertain(
+                        anyhow!("root failure").context("send context"),
+                    )),
+                    Some(("send context: root failure", true)),
+                ),
+            ] {
+                let mut probe = ScriptProbe {
+                    send_response: Some(response),
+                    ..Default::default()
+                };
+                let result = send_file_with_runner(&mut probe, &surface, path, deadline);
+                match expected {
+                    None => result.unwrap(),
+                    Some((message, uncertain)) => {
+                        let error = result.unwrap_err();
+                        assert_eq!(format!("{:#}", error.error()), message);
+                        assert_eq!(error.delivery_may_have_occurred(), uncertain);
+                    }
+                }
+                assert_eq!(
+                    probe.send_calls,
+                    vec![(
+                        SEND_FILE_SCRIPT.into(),
+                        vec![
+                            "u2".into(),
+                            tab.into(),
+                            window.into(),
+                            path.to_str().unwrap().into()
+                        ],
+                        deadline
+                    )]
+                );
+                assert!(probe.calls.is_empty());
+                assert!(probe.response.is_none());
+                assert!(probe.send_response.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn installed_send_keeps_prestart_and_script_failure_classification() {
+        let surface = handle(&CreatedSurface {
+            tab_id: "t2".into(),
+            window_id: "w1".into(),
+            terminal_id: "u2".into(),
+        });
+        let error = send_file(
+            &surface,
+            Path::new("/prompt"),
+            Instant::now() - Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert_eq!(
+            format!("{:#}", error.error()),
+            "Ghostty automation timed out before it started"
+        );
+        assert!(!error.delivery_may_have_occurred());
+        let error = Installed
+            .run_send(
+                "error \"injected send failure\" number 7",
+                &[],
+                Instant::now() + Duration::from_secs(10),
+            )
+            .unwrap_err();
+        assert!(error.delivery_may_have_occurred());
+        assert_eq!(
+            format!("{:#}", error.error()),
+            "Ghostty automation failed: 6:29: execution error: injected send failure (7)"
+        );
+    }
+
+    #[test]
+    fn verify_uses_runner_without_changing_validation_or_timeout() {
+        let surface = handle(&CreatedSurface {
+            tab_id: "t2".into(),
+            window_id: "w1".into(),
+            terminal_id: "u2".into(),
+        });
+        for timeout in [None, Some(Duration::from_secs(3))] {
+            for (response, expected) in [
+                (Ok("present".into()), None),
+                (
+                    Ok("missing".into()),
+                    Some("Agent Bridge Ghostty owned terminal surface is missing"),
+                ),
+                (
+                    Ok(String::new()),
+                    Some("Agent Bridge Ghostty owned terminal surface is missing"),
+                ),
+                (
+                    Ok("present\n".into()),
+                    Some("Agent Bridge Ghostty owned terminal surface is missing"),
+                ),
+                (
+                    Err(anyhow!("root failure").context("verify context")),
+                    Some("verify context: root failure"),
+                ),
+            ] {
+                let mut probe = ScriptProbe {
+                    response: Some(response),
+                    ..Default::default()
+                };
+                let before = Instant::now();
+                let result = verify_surface_with_runner(&mut probe, &surface, timeout);
+                let after = Instant::now();
+                match expected {
+                    None => result.unwrap(),
+                    Some(message) => assert_eq!(format!("{:#}", result.unwrap_err()), message),
+                }
+                assert_eq!(probe.calls.len(), 1);
+                let deadline = probe.calls[0].2;
+                let duration = timeout.unwrap_or(Duration::from_secs(10));
+                assert!(deadline >= before + duration && deadline <= after + duration);
+                assert_eq!(
+                    probe.calls,
+                    vec![(
+                        VERIFY_SURFACE_SCRIPT.into(),
+                        vec!["u2".into(), "t2".into(), "w1".into()],
+                        deadline
+                    )]
+                );
+                assert!(probe.send_calls.is_empty());
+                assert!(probe.response.is_none());
+                assert!(probe.send_response.is_none());
+            }
+        }
+        let mut invalid = surface.clone();
+        invalid.tab_id = None;
+        for (session, timeout, message) in [
+            (
+                &invalid,
+                None,
+                "Ghostty session record is missing its tab id",
+            ),
+            (
+                &surface,
+                Some(Duration::MAX),
+                "terminal automation timeout is too large",
+            ),
+            (
+                &invalid,
+                Some(Duration::MAX),
+                "Ghostty session record is missing its tab id",
+            ),
+        ] {
+            let mut probe = ScriptProbe::default();
+            let error = verify_surface_with_runner(&mut probe, session, timeout).unwrap_err();
+            assert_eq!(format!("{error:#}"), message);
+            assert!(probe.calls.is_empty());
+            assert!(probe.send_calls.is_empty());
+            assert!(probe.response.is_none());
+            assert!(probe.send_response.is_none());
+        }
+    }
+
     #[test]
     fn launch_context_does_not_depend_on_terminal_environment() {
         if !crate::native::process_env::tests::without_bridge_environment(
@@ -1180,6 +1482,14 @@ mod tests {
             deadline: Instant,
         }
         impl Runner for Slow {
+            fn run_send(
+                &mut self,
+                _: &str,
+                _: &[&str],
+                _: Instant,
+            ) -> std::result::Result<String, TerminalSendFailure> {
+                panic!("unexpected send automation")
+            }
             fn capable(&mut self) -> Result<()> {
                 Ok(())
             }
@@ -1400,6 +1710,14 @@ mod tests {
         rows.join("\n")
     }
     impl Runner for Fake {
+        fn run_send(
+            &mut self,
+            _: &str,
+            _: &[&str],
+            _: Instant,
+        ) -> std::result::Result<String, TerminalSendFailure> {
+            panic!("unexpected send automation")
+        }
         fn capable(&mut self) -> Result<()> {
             if self.capability_failure {
                 bail!("dictionary lacks native API");
