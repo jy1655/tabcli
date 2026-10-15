@@ -27,13 +27,12 @@ mod provider_process;
 mod query;
 mod reopen;
 use reopen::{
-    REOPEN_LAUNCH_GATE, ResumedFrom, ResumedHolderCheck,
-    close_surface_after_reopen_verification_failure, read_resumed_from, record_reopen_refusal,
+    REOPEN_LAUNCH_GATE, read_resumed_from, record_reopen_refusal,
     refuse_follow_up_to_shared_conversation, reopen_refusal_gate, run_reopen,
-    verify_reopened_conversation_exclusive,
 };
 mod self_test;
 mod session;
+mod session_start;
 
 use session::turn::*;
 use session::*;
@@ -42,7 +41,7 @@ mod terminal;
 mod turn_report;
 #[cfg(test)]
 use turn_report::finish_request_with_extra;
-use turn_report::{TurnReport, emit_session_result, emit_session_result_with};
+use turn_report::{TurnReport, emit_session_result};
 
 #[cfg(all(target_os = "macos", test))]
 use terminal::macos::apple_terminal::{
@@ -562,69 +561,90 @@ fn parse_warp_host(rest: &[String]) -> Result<NativeCommand> {
     })
 }
 
+#[derive(Default)]
+struct CommonStartOptions {
+    prompt: Option<String>,
+    prompt_file: Option<PathBuf>,
+    title: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+    terminal: Option<terminal::TerminalKind>,
+    yolo: bool,
+    timeout: Option<Duration>,
+    detach: bool,
+    json: bool,
+}
+
+// Consume one common option, leaving unknown tokens untouched for the command.
+fn parse_common_start_option(
+    options: &[String],
+    index: &mut usize,
+    parsed: &mut CommonStartOptions,
+) -> Result<bool> {
+    match options[*index].as_str() {
+        "--prompt" => set_once(
+            &mut parsed.prompt,
+            option_value(options, index, "--prompt")?.to_owned(),
+            "--prompt",
+        )?,
+        "--prompt-file" => set_once(
+            &mut parsed.prompt_file,
+            PathBuf::from(option_value(options, index, "--prompt-file")?),
+            "--prompt-file",
+        )?,
+        "--title" => set_once(
+            &mut parsed.title,
+            option_value(options, index, "--title")?.to_owned(),
+            "--title",
+        )?,
+        "--model" => set_once(
+            &mut parsed.model,
+            option_value(options, index, "--model")?.to_owned(),
+            "--model",
+        )?,
+        "--effort" => set_once(
+            &mut parsed.effort,
+            option_value(options, index, "--effort")?.to_owned(),
+            "--effort",
+        )?,
+        "--terminal" => set_once(
+            &mut parsed.terminal,
+            terminal::TerminalKind::from_str(option_value(options, index, "--terminal")?)
+                .map_err(anyhow::Error::msg)?,
+            "--terminal",
+        )?,
+        "--timeout-secs" => {
+            let value = option_value(options, index, "--timeout-secs")?;
+            set_once(&mut parsed.timeout, parse_timeout(value)?, "--timeout-secs")?;
+        }
+        "--yolo" => set_flag_once(&mut parsed.yolo, "--yolo")?,
+        "--detach" => set_flag_once(&mut parsed.detach, "--detach")?,
+        "--json" => set_flag_once(&mut parsed.json, "--json")?,
+        _ => return Ok(false),
+    }
+    *index += 1;
+    Ok(true)
+}
+
 fn parse_ask(args: &[String]) -> Result<NativeCommand> {
     let (provider, options) = args
         .split_first()
         .context("ask requires codex, claude, agy, or pi")?;
     let provider = FirstPartyCli::from_str(provider).map_err(anyhow::Error::msg)?;
     let mut workspace = None;
-    let mut prompt = None;
-    let mut prompt_file = None;
-    let mut title = None;
-    let mut model = None;
-    let mut effort = None;
-    let mut terminal = None;
-    let mut yolo = false;
-    let mut timeout = None;
-    let mut detach = false;
-    let mut json = false;
+    let mut parsed = CommonStartOptions::default();
     let mut context_results = Vec::new();
     let mut index = 0;
     while index < options.len() {
+        if parse_common_start_option(options, &mut index, &mut parsed)? {
+            continue;
+        }
         match options[index].as_str() {
             "--workspace" => set_once(
                 &mut workspace,
                 PathBuf::from(option_value(options, &mut index, "--workspace")?),
                 "--workspace",
             )?,
-            "--prompt" => set_once(
-                &mut prompt,
-                option_value(options, &mut index, "--prompt")?.to_owned(),
-                "--prompt",
-            )?,
-            "--prompt-file" => set_once(
-                &mut prompt_file,
-                PathBuf::from(option_value(options, &mut index, "--prompt-file")?),
-                "--prompt-file",
-            )?,
-            "--title" => set_once(
-                &mut title,
-                option_value(options, &mut index, "--title")?.to_owned(),
-                "--title",
-            )?,
-            "--model" => set_once(
-                &mut model,
-                option_value(options, &mut index, "--model")?.to_owned(),
-                "--model",
-            )?,
-            "--effort" => set_once(
-                &mut effort,
-                option_value(options, &mut index, "--effort")?.to_owned(),
-                "--effort",
-            )?,
-            "--terminal" => set_once(
-                &mut terminal,
-                terminal::TerminalKind::from_str(option_value(options, &mut index, "--terminal")?)
-                    .map_err(anyhow::Error::msg)?,
-                "--terminal",
-            )?,
-            "--timeout-secs" => {
-                let value = option_value(options, &mut index, "--timeout-secs")?;
-                set_once(&mut timeout, parse_timeout(value)?, "--timeout-secs")?;
-            }
-            "--yolo" => set_flag_once(&mut yolo, "--yolo")?,
-            "--detach" => set_flag_once(&mut detach, "--detach")?,
-            "--json" => set_flag_once(&mut json, "--json")?,
             "--context-result" => context::push_option(
                 &mut context_results,
                 option_value(options, &mut index, "--context-result")?,
@@ -633,6 +653,18 @@ fn parse_ask(args: &[String]) -> Result<NativeCommand> {
         }
         index += 1;
     }
+    let CommonStartOptions {
+        prompt,
+        prompt_file,
+        title,
+        model,
+        effort,
+        terminal,
+        yolo,
+        timeout,
+        detach,
+        json,
+    } = parsed;
     let workspace = workspace.unwrap_or(std::env::current_dir()?);
     let prompt = read_prompt_option(prompt, prompt_file, "ask")?;
     if prompt.trim().is_empty() {
@@ -717,61 +749,26 @@ fn parse_reopen(args: &[String]) -> Result<NativeCommand> {
         .split_first()
         .context("reopen requires one closed session id")?;
     require_valid_session_id(id)?;
-    let mut prompt = None;
-    let mut prompt_file = None;
-    let mut title = None;
-    let mut model = None;
-    let mut effort = None;
-    let mut terminal = None;
-    let mut yolo = false;
-    let mut timeout = None;
-    let mut detach = false;
-    let mut json = false;
+    let mut parsed = CommonStartOptions::default();
     let mut index = 0;
     while index < options.len() {
-        match options[index].as_str() {
-            "--prompt" => set_once(
-                &mut prompt,
-                option_value(options, &mut index, "--prompt")?.to_owned(),
-                "--prompt",
-            )?,
-            "--prompt-file" => set_once(
-                &mut prompt_file,
-                PathBuf::from(option_value(options, &mut index, "--prompt-file")?),
-                "--prompt-file",
-            )?,
-            "--title" => set_once(
-                &mut title,
-                option_value(options, &mut index, "--title")?.to_owned(),
-                "--title",
-            )?,
-            "--model" => set_once(
-                &mut model,
-                option_value(options, &mut index, "--model")?.to_owned(),
-                "--model",
-            )?,
-            "--effort" => set_once(
-                &mut effort,
-                option_value(options, &mut index, "--effort")?.to_owned(),
-                "--effort",
-            )?,
-            "--terminal" => set_once(
-                &mut terminal,
-                terminal::TerminalKind::from_str(option_value(options, &mut index, "--terminal")?)
-                    .map_err(anyhow::Error::msg)?,
-                "--terminal",
-            )?,
-            "--timeout-secs" => {
-                let value = option_value(options, &mut index, "--timeout-secs")?;
-                set_once(&mut timeout, parse_timeout(value)?, "--timeout-secs")?;
-            }
-            "--yolo" => set_flag_once(&mut yolo, "--yolo")?,
-            "--detach" => set_flag_once(&mut detach, "--detach")?,
-            "--json" => set_flag_once(&mut json, "--json")?,
-            option => bail!("unknown reopen option: {option}"),
+        if parse_common_start_option(options, &mut index, &mut parsed)? {
+            continue;
         }
-        index += 1;
+        bail!("unknown reopen option: {}", options[index]);
     }
+    let CommonStartOptions {
+        prompt,
+        prompt_file,
+        title,
+        model,
+        effort,
+        terminal,
+        yolo,
+        timeout,
+        detach,
+        json,
+    } = parsed;
     let prompt = read_prompt_option(prompt, prompt_file, "reopen")?;
     if prompt.trim().is_empty() {
         bail!("--prompt cannot be empty");
@@ -1131,237 +1128,12 @@ fn run_ask(request: AskRequest) -> Result<()> {
 }
 
 fn run_ask_inner(request: AskRequest, report: &mut TurnReport) -> Result<()> {
-    let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
-    // Attached results are resolved and pinned before any session, claim, receipt, terminal,
-    // or delivery exists, so a failed resolution changes nothing.
-    let attached = context::resolve(&request.context_results)?;
-    let terminal_kind = terminal::select(request.terminal)?;
-    let workspace = request.workspace.canonicalize().with_context(|| {
-        format!(
-            "workspace does not exist or cannot be resolved: {}",
-            request.workspace.display()
-        )
-    })?;
-    if !workspace.is_dir() {
-        bail!("workspace is not a directory: {}", workspace.display());
-    }
-    let provider_path = resolve_provider(request.provider)?;
-    let provider_version =
-        check_provider_version_until(request.provider, &provider_path, Some(deadline))?;
-    let requested_title = request.title.unwrap_or_else(|| {
-        let workspace_name = workspace
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("workspace");
-        format!("{} · {workspace_name}", request.provider.as_str())
-    });
-    let title = sanitize_title(&requested_title)?;
-    let created = create_session(SessionSpec {
-        provider: request.provider,
-        provider_path,
-        provider_version,
-        workspace,
-        title,
-        model: request.model,
-        effort: request.effort,
-        yolo: request.yolo,
-        prompt: native_delegation_prompt(
-            &delegation_source(),
-            &attached.prompt_with_attachments(&request.prompt),
-        ),
-    })?;
-    consent::prepare(&created.directory, &request.workspace)?;
-    launch_created_session(
-        SessionLaunch {
-            created,
-            provider: request.provider,
-            terminal_kind,
-            deadline,
-            timeout: request.timeout,
-            detach: request.detach,
-            json: request.json,
-            context_sources: &attached.sources,
-            result_extra: serde_json::Map::new(),
-            resumed_from: None,
-        },
-        report,
-    )
-}
-
-// A created session that is ready to be launched. `ask` and `reopen` share everything from
-// the initial turn claim onwards: terminal opening, launch-failure cleanup, initial prompt
-// delivery, and result waiting. `result_extra` carries command-specific fields into the
-// emitted JSON response.
-struct SessionLaunch<'a> {
-    created: CreatedSession,
-    provider: FirstPartyCli,
-    terminal_kind: terminal::TerminalKind,
-    deadline: Instant,
-    timeout: Duration,
-    detach: bool,
-    json: bool,
-    context_sources: &'a [requests::ContextSource],
-    result_extra: serde_json::Map<String, serde_json::Value>,
-    // Set for `reopen`: the provider conversation the new session continues. Its holder
-    // check runs after launch, once the process exists, and again immediately before the
-    // first prompt is sent.
-    resumed_from: Option<ResumedFrom>,
-}
-
-fn launch_created_session(launch: SessionLaunch<'_>, report: &mut TurnReport) -> Result<()> {
-    let SessionLaunch {
-        created,
-        provider,
-        terminal_kind,
-        deadline,
-        timeout,
-        detach,
-        json,
-        context_sources,
-        result_extra,
-        resumed_from,
-    } = launch;
-    let mut initial_claim =
-        turn::claim(&Store::open_unchecked(&created.directory), context_sources)?;
-    let expected_claim_token = initial_claim.token().to_owned();
-    let receipt = initial_claim.receipt().clone();
-    report.addressed(created.id.clone(), receipt.request_id.clone());
-    let launch_deadline = launch::begin(
-        &Store::open_unchecked(&created.directory),
-        &expected_claim_token,
-        deadline,
-    )?;
-    let executable = std::env::current_exe().context("failed to locate the current executable")?;
-    let bridge_command = bridge_shell_command(
-        &created.manifest.workspace,
-        created
-            .directory
-            .parent()
-            .context("session directory has no state root")?,
-        &executable,
-        &created.id,
-    )?;
-    let bridge_command =
-        launch::install_script(&Store::open_unchecked(&created.directory), &bridge_command)?;
-    initial_claim.fence_launch();
-    let terminal_session = match terminal::open_bound_tab(
-        terminal_kind,
-        &bridge_command,
-        &created.directory,
-        launch_deadline,
-        |session| {
-            session.managed_session_id = Some(created.id.clone());
-            Store::open_unchecked(&created.directory).write_terminal(session)
-        },
-        || {
-            Store::open_unchecked(&created.directory)
-                .record(CoreRecord::Terminal)
-                .remove()
-        },
-    ) {
-        Ok(session) => session,
-        Err(error) => {
-            let error = launch::terminal_failure(&Store::open_unchecked(&created.directory), error);
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to open {} surface for session {}",
-                    terminal_kind.display_name(),
-                    created.id
-                )
-            });
-        }
+    let options = session_start::StartOptions {
+        timeout: request.timeout,
+        detach: request.detach,
+        json: request.json,
     };
-    launch::wait(
-        &Store::open_unchecked(&created.directory),
-        &terminal_session,
-        launch_deadline,
-    )?;
-    // A trust response is separate from model input. Only verified consent and an
-    // adapter-recognized exact workspace dialog may produce one guarded response.
-    consent::complete_launch(&created.directory, provider, &terminal_session, deadline)?;
-    // The existing delivery paths own rollback/uncertainty after confirmed startup.
-    initial_claim.startup_confirmed();
-    let mut gate = |gate| {
-        verify_reopened_conversation_exclusive(
-            provider,
-            &created.directory,
-            resumed_from.as_ref(),
-            deadline,
-            match gate {
-                delivery::Gate::AfterLaunch => ResumedHolderCheck::AfterLaunch,
-                delivery::Gate::BeforeDelivery => ResumedHolderCheck::BeforeInitialDelivery,
-            },
-        )
-    };
-    let delivered = delivery::deliver(
-        initial_claim,
-        delivery::Turn::Initial { gate: &mut gate },
-        delivery::DeliveryContext {
-            provider,
-            directory: &created.directory,
-            session_id: &created.id,
-            surface: &terminal_session,
-            provider_path: &created.manifest.provider_path,
-            deadline,
-            requested: timeout,
-        },
-    );
-    let expected_turn_id = match delivered {
-        Ok(delivered) => delivered.correlation_id,
-        Err(error) => {
-            let error = close_surface_after_reopen_verification_failure(
-                &created.directory,
-                &created.id,
-                error,
-                deadline,
-            );
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to deliver the initial prompt to {} session {}",
-                    provider.as_str(),
-                    created.id
-                )
-            });
-        }
-    };
-
-    if detach {
-        return emit_session_result_with(
-            json,
-            &created.id,
-            &terminal_session,
-            provider,
-            &receipt,
-            None,
-            &result_extra,
-        );
-    }
-
-    let event = turn::wait(
-        &Store::open_unchecked(&created.directory),
-        0,
-        expected_turn_id.as_deref(),
-        Some(&expected_claim_token),
-        deadline,
-        timeout,
-    )
-    .with_context(|| {
-        format!(
-            "session {} in {} did not return a successful result; use `{PUBLIC_COMMAND} inspect {}` to inspect its recorded state",
-            created.id,
-            terminal_session.kind.display_name(),
-            created.id
-        )
-    })?;
-    emit_session_result_with(
-        json,
-        &created.id,
-        &terminal_session,
-        provider,
-        &receipt,
-        Some(&event),
-        &result_extra,
-    )
+    session_start::start(options, &mut session_start::FreshSource(request), report)
 }
 
 // Records the spawned provider process before the session leaves its launch state. The

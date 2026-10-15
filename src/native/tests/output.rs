@@ -1,5 +1,6 @@
 use super::support::*;
 use super::*;
+use crate::native::turn_report::emit_session_result_with;
 
 #[test]
 fn envelope_command_output_order() {

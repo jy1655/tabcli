@@ -578,81 +578,141 @@ fn settle_reopen_outcome(
 }
 
 fn run_reopen_inner(request: ReopenRequest, report: &mut TurnReport) -> Result<()> {
-    let deadline = checked_deadline_from(Instant::now(), request.timeout)?;
-    let terminal_kind = terminal::select(request.terminal)?;
-    let source_directory = Reader::session_directory(&request.id)?;
-    // Every check against the source is read-only. Pending-completion recovery and dead-owner
-    // repair are never run on it: a closed session has nothing to converge, and reopen must not
-    // alter the record it continues from.
-    let source = inspect_reopen_source(&source_directory, &request.id)?;
-    provider::reopen(source.provider)
-        .and_then(|support| support.verify_available(&source.provider_session_id))
-        .map_err(|error| reopen_refusal("provider-unsupported", format!("{error:#}")))?;
-    let workspace = source.manifest.workspace.canonicalize().with_context(|| {
-        format!(
-            "source workspace does not exist or cannot be resolved: {}",
-            source.manifest.workspace.display()
-        )
-    })?;
-    if !workspace.is_dir() {
-        bail!(
-            "source workspace is not a directory: {}",
-            workspace.display()
-        );
+    let options = session_start::StartOptions {
+        timeout: request.timeout,
+        detach: request.detach,
+        json: request.json,
+    };
+    session_start::start(options, &mut ReopenedSource::new(request), report)
+}
+
+struct ReopenedSource {
+    request: ReopenRequest,
+    resolved: Option<(PathBuf, ReopenSource)>,
+    resumed_from: Option<ResumedFrom>,
+}
+
+impl ReopenedSource {
+    fn new(request: ReopenRequest) -> Self {
+        Self {
+            request,
+            resolved: None,
+            resumed_from: None,
+        }
     }
-    let provider_path = resolve_provider(source.provider)?;
-    let provider_version =
-        check_provider_version_until(source.provider, &provider_path, Some(deadline))?;
-    let requested_title = request.title.unwrap_or_else(|| {
-        let workspace_name = workspace
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("workspace");
-        format!(
-            "{} · {workspace_name} (reopened {})",
-            source.provider.as_str(),
-            request.id
-        )
-    });
-    let title = sanitize_title(&requested_title)?;
-    let (created, resumed_from) =
-        create_reopened_session(&source_directory, &request.id, &source, || {
-            create_session(SessionSpec {
-                provider: source.provider,
-                provider_path,
-                provider_version,
-                workspace,
-                title,
-                model: request.model,
-                effort: request.effort,
-                yolo: request.yolo,
-                prompt: native_delegation_prompt(&delegation_source(), &request.prompt),
-            })
+}
+
+impl session_start::StartSource for ReopenedSource {
+    fn resolve(&mut self, deadline: Instant) -> Result<session_start::Resolved> {
+        let request = &self.request;
+        let terminal_kind = terminal::select(request.terminal)?;
+        let source_directory = Reader::session_directory(&request.id)?;
+        // Every check against the source is read-only. Pending-completion recovery and dead-owner
+        // repair are never run on it: a closed session has nothing to converge, and reopen must not
+        // alter the record it continues from.
+        let source = inspect_reopen_source(&source_directory, &request.id)?;
+        provider::reopen(source.provider)
+            .and_then(|support| support.verify_available(&source.provider_session_id))
+            .map_err(|error| reopen_refusal("provider-unsupported", format!("{error:#}")))?;
+        let workspace = source.manifest.workspace.canonicalize().with_context(|| {
+            format!(
+                "source workspace does not exist or cannot be resolved: {}",
+                source.manifest.workspace.display()
+            )
         })?;
-    let mut result_extra = serde_json::Map::new();
-    result_extra.insert(
-        "source_session".to_owned(),
-        serde_json::Value::String(request.id.clone()),
-    );
-    result_extra.insert(
-        "resumed_from".to_owned(),
-        serde_json::to_value(&resumed_from)?,
-    );
-    launch_created_session(
-        SessionLaunch {
-            created,
+        if !workspace.is_dir() {
+            bail!(
+                "source workspace is not a directory: {}",
+                workspace.display()
+            );
+        }
+        let provider_path = resolve_provider(source.provider)?;
+        let provider_version =
+            check_provider_version_until(source.provider, &provider_path, Some(deadline))?;
+        let requested_title = request.title.clone().unwrap_or_else(|| {
+            let workspace_name = workspace
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("workspace");
+            format!(
+                "{} · {workspace_name} (reopened {})",
+                source.provider.as_str(),
+                request.id
+            )
+        });
+        let title = sanitize_title(&requested_title)?;
+        let spec = SessionSpec {
             provider: source.provider,
+            provider_path,
+            provider_version,
+            workspace,
+            title,
+            model: request.model.clone(),
+            effort: request.effort.clone(),
+            yolo: request.yolo,
+            prompt: request.prompt.clone(),
+        };
+        self.resolved = Some((source_directory, source));
+        Ok(session_start::Resolved {
+            spec,
             terminal_kind,
+            context_sources: Vec::new(),
+            assess_consent: None,
+        })
+    }
+
+    fn create(&mut self, mut spec: SessionSpec) -> Result<CreatedSession> {
+        let (directory, source) = self.resolved.as_ref().expect("resolve precedes create");
+        let (created, resumed_from) =
+            create_reopened_session(directory, &self.request.id, source, || {
+                spec.prompt = native_delegation_prompt(&delegation_source(), &spec.prompt);
+                create_session(spec)
+            })?;
+        self.resumed_from = Some(resumed_from);
+        Ok(created)
+    }
+
+    fn gate(&self, directory: &Path, gate: delivery::Gate, deadline: Instant) -> Result<()> {
+        let (_, source) = self.resolved.as_ref().expect("resolve precedes gate");
+        let resumed_from = self.resumed_from.as_ref().expect("create precedes gate");
+        verify_reopened_conversation_exclusive(
+            source.provider,
+            directory,
+            Some(resumed_from),
             deadline,
-            timeout: request.timeout,
-            detach: request.detach,
-            json: request.json,
-            context_sources: &[],
-            result_extra,
-            resumed_from: Some(resumed_from),
-        },
-        report,
-    )
+            match gate {
+                delivery::Gate::AfterLaunch => ResumedHolderCheck::AfterLaunch,
+                delivery::Gate::BeforeDelivery => ResumedHolderCheck::BeforeInitialDelivery,
+            },
+        )
+    }
+
+    fn delivery_failed(
+        &self,
+        directory: &Path,
+        id: &str,
+        error: anyhow::Error,
+        deadline: Instant,
+    ) -> anyhow::Error {
+        close_surface_after_reopen_verification_failure(directory, id, error, deadline)
+    }
+
+    fn result_extra(&self) -> Result<session_start::ResultExtra> {
+        let resumed_from = self
+            .resumed_from
+            .as_ref()
+            .expect("create precedes result_extra");
+        let mut result_extra = serde_json::Map::new();
+        result_extra.insert(
+            "source_session".to_owned(),
+            serde_json::Value::String(self.request.id.clone()),
+        );
+        result_extra.insert(
+            "resumed_from".to_owned(),
+            serde_json::to_value(resumed_from)?,
+        );
+        Ok(result_extra)
+    }
 }
 
 fn create_reopened_session(
