@@ -287,7 +287,7 @@ impl Transport for ClaudeMessage {
             bridge_executable: turn.bridge_executable,
             directory: turn.directory,
             provider_path: turn.provider_path,
-            request_id: prepared
+            correlation_id: prepared
                 .correlation_id
                 .as_deref()
                 .expect("Claude turn identity"),
@@ -1140,7 +1140,7 @@ fn send_cross_session_message_with_retry_policy(
     retry_window: Duration,
     retry_delay: Duration,
 ) -> MessengerResult {
-    let pending = install_pending_turn(context.directory, context.request_id)
+    let pending = install_pending_turn(context.directory, context.correlation_id)
         .map_err(MessengerFailure::not_sent)?;
     let result =
         send_cross_session_message_with_discovery_retry_policy(context, retry_window, retry_delay);
@@ -1212,11 +1212,12 @@ fn messenger_command(
 
 fn send_cross_session_message_inner(context: CrossSessionMessageContext<'_>) -> MessengerResult {
     let deadline = context.deadline;
-    let plan = cross_session_message_plan(context.directory, context.request_id, context.prompt)
-        .map_err(MessengerFailure::not_sent)?;
+    let plan =
+        cross_session_message_plan(context.directory, context.correlation_id, context.prompt)
+            .map_err(MessengerFailure::not_sent)?;
     let _guard_files = install_message_guard(
         context.bridge_executable,
-        context.request_id,
+        context.correlation_id,
         &plan.guard,
         &plan.files,
     )

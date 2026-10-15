@@ -147,7 +147,7 @@ exit 1
         bridge_executable: Path::new("/unused/agent-bridge"),
         directory,
         provider_path: &provider,
-        request_id: claim.token(),
+        correlation_id: claim.token(),
         prompt: "request addressed only to A",
         deadline: Instant::now() + Duration::from_secs(2),
     })
@@ -299,7 +299,7 @@ fn codex_native_queue_runs_the_provider_command_with_the_claim_marker() {
         bridge_executable: Path::new("/unused/agent-bridge"),
         directory: &directory,
         provider_path: &provider,
-        request_id: &claim_token,
+        correlation_id: &claim_token,
         prompt: &prompt,
         deadline: Instant::now() + Duration::from_secs(2),
     })
@@ -367,7 +367,7 @@ fn codex_queue_runs_in_the_original_workspace() {
         bridge_executable: Path::new("/unused/agent-bridge"),
         directory: &directory,
         provider_path: &provider,
-        request_id: &claim_token,
+        correlation_id: &claim_token,
         prompt: "follow up",
         deadline: Instant::now() + Duration::from_secs(2),
     })
@@ -401,7 +401,7 @@ fn codex_queue_refuses_before_start_for_old_versions_or_missing_threads() {
             bridge_executable: Path::new("/unused/agent-bridge"),
             directory: &directory,
             provider_path: &provider,
-            request_id: &claim_token,
+            correlation_id: &claim_token,
             prompt: "follow up",
             deadline: Instant::now() + Duration::from_secs(1),
         })
@@ -440,7 +440,7 @@ exit 91
         bridge_executable: Path::new("/unused/agent-bridge"),
         directory: &directory,
         provider_path: &provider,
-        request_id: &claim_token,
+        correlation_id: &claim_token,
         prompt: "follow up",
         deadline: Instant::now() + Duration::from_secs(1),
     })
@@ -511,7 +511,7 @@ exit 91
         bridge_executable: Path::new("/unused/agent-bridge"),
         directory: &directory,
         provider_path: &provider,
-        request_id: &claim_token,
+        correlation_id: &claim_token,
         prompt: "follow up",
         deadline: Instant::now() + Duration::from_secs(10),
     })
@@ -610,7 +610,7 @@ exit 91
         bridge_executable: Path::new("/unused/agent-bridge"),
         directory: &directory,
         provider_path: &provider,
-        request_id: &claim_token,
+        correlation_id: &claim_token,
         prompt: "follow up",
         deadline: Instant::now() + Duration::from_secs(5),
     })
