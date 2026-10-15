@@ -10,7 +10,7 @@ use windows_sys::Win32::{
     },
 };
 
-use super::{WindowsProcessIdentity, WindowsProcessIdentityCheck};
+use super::WindowsProcessIdentity;
 
 pub(super) fn verify_control_process_identity(
     pid: u32,
@@ -100,66 +100,30 @@ pub(in crate::native::terminal) fn verify_process_identity(
     verify_identity_values(&live, creation_time, executable_path)
 }
 
-// Compares the live process behind `pid` with a recorded identity and keeps the two
-// negative answers apart: an `Err` is a process that could not be inspected and proves
-// nothing, while `Mismatch` is a confirmed observation that the pid now belongs to another
-// process.
-pub(in crate::native::terminal) fn check_process_identity(
-    pid: u32,
-    identity: &WindowsProcessIdentity,
-) -> Result<WindowsProcessIdentityCheck> {
-    let live = query_process_identity(pid)?;
-    Ok(check_identity_values(
-        &live,
-        identity.creation_time,
-        &identity.executable_path,
-    ))
-}
-
 fn verify_identity_values(
     live: &WindowsProcessIdentity,
     creation_time: u64,
     executable_path: &str,
 ) -> Result<()> {
-    match check_identity_values(live, creation_time, executable_path) {
-        WindowsProcessIdentityCheck::Matches => Ok(()),
-        WindowsProcessIdentityCheck::Mismatch(reason) => bail!("{reason}"),
-    }
+    check_identity_values(live, creation_time, executable_path).map_err(anyhow::Error::msg)
 }
 
-fn check_identity_values(
+pub(super) fn check_identity_values(
     live: &WindowsProcessIdentity,
     creation_time: u64,
     executable_path: &str,
-) -> WindowsProcessIdentityCheck {
+) -> std::result::Result<(), &'static str> {
     if live.creation_time != creation_time {
-        return WindowsProcessIdentityCheck::Mismatch("Windows console process id was reused");
+        return Err("Windows console process id was reused");
     }
     if !live.executable_path.eq_ignore_ascii_case(executable_path) {
-        return WindowsProcessIdentityCheck::Mismatch(
-            "Windows console process executable identity changed",
-        );
+        return Err("Windows console process executable identity changed");
     }
-    WindowsProcessIdentityCheck::Matches
+    Ok(())
 }
 
-/// A comparison used only by owner attestation; record and surface equality stay exact.
-#[derive(Debug)]
-pub(in crate::native) struct WindowsIncarnation(pub WindowsProcessIdentity);
-
-impl PartialEq for WindowsIncarnation {
-    fn eq(&self, other: &Self) -> bool {
-        same_incarnation(&self.0, &other.0)
-    }
-}
-
-fn same_incarnation(recorded: &WindowsProcessIdentity, live: &WindowsProcessIdentity) -> bool {
-    recorded.creation_time == live.creation_time
-        && recorded
-            .executable_path
-            .eq_ignore_ascii_case(&live.executable_path)
-}
-
+/// Opens with PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE to observe exit first.
+/// A process granting only QUERY access yields an inspection error, not absence.
 pub(in crate::native) fn observe_process_identity(
     pid: u32,
 ) -> Result<Option<WindowsProcessIdentity>> {
@@ -193,6 +157,29 @@ fn observe_process_identity_from_handle(
 #[cfg(test)]
 mod observation_tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn retained_exited_process_remains_queryable_but_is_observed_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        // Keep cmd alive long enough to capture its identity before ending it.
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/C", "ping -n 3 127.0.0.1 >NUL"])
+            .current_dir(dir.path())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let recorded = query_process_identity(pid);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let recorded = recorded.unwrap();
+        // Child retains the process object: the former typed check could still match.
+        assert_eq!(query_process_identity(pid).unwrap(), recorded);
+        assert!(observe_process_identity(pid).unwrap().is_none());
+        drop(child);
+        // With the last handle closed, ERROR_INVALID_PARAMETER also proves absence.
+        assert!(observe_process_identity(pid).unwrap().is_none());
+    }
+
     #[test]
     fn retained_exited_process_is_absent_and_invalid_handle_is_unknown() {
         let dir = tempfile::tempdir().unwrap();

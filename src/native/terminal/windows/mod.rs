@@ -36,21 +36,18 @@ use windows_sys::Win32::{
     },
 };
 
-use super::{
-    CloseOutcome, ConsoleNewline, TerminalKind, TerminalSession, WindowsProcessIdentity,
-    WindowsProcessIdentityCheck,
-};
+use super::{CloseOutcome, ConsoleNewline, TerminalKind, TerminalSession, WindowsProcessIdentity};
 
 mod focus;
 mod process;
-pub(in crate::native) use process::{WindowsIncarnation, observe_process_identity};
+pub(in crate::native) use process::observe_process_identity;
 mod security;
 mod tab;
-pub(super) use process::{check_process_identity, query_process_identity, verify_process_identity};
 use process::{
     open_verified_control_process, query_process_identity_from_handle,
     verify_control_process_identity,
 };
+pub(super) use process::{query_process_identity, verify_process_identity};
 pub(super) use security::set_private_permissions;
 pub(super) use tab::run_host as run_console_host;
 

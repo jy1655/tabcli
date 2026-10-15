@@ -45,6 +45,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   compatibility), Gone (Exited or Reused), or Unknown. It performs no OS or record reads;
   platform adapters own absence and identity observations. A reused incarnation grants no
   Surface authority.
+  Terminal adapters, Reopen provider observations, and the Claude registry use
+  `process_identity::classify` for incarnation comparison; messages and authority remain
+  adapter-owned.
 - `src/native/process_env.rs` owns child environment policy and deadline-bounded command execution;
   provider-specific execution remains in its adapter. Non-provider children on macOS and
   Windows remove the union of adapter caller-session markers and Bridge's four session

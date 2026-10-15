@@ -404,17 +404,22 @@ fn target(session: &TerminalSession) -> Result<(&WezTermMux, u64)> {
     Ok((mux, pane))
 }
 
-fn birth(mux: &WezTermMux) -> Option<(u64, u64)> {
-    Some((mux.start_seconds, mux.start_microseconds))
-}
-
 // Whether the session's process is there. Only a dead PID proves absence. A reused
 // identity or a socket that is not its own leaves cleanup unverified.
 fn serving(host: &dyn Host, mux: &WezTermMux) -> Result<bool> {
-    match host.process_start(mux.pid)? {
-        None => return Ok(false),
-        Some(current) if Some(current) == birth(mux) => {}
-        Some(_) => bail!("WezTerm GUI PID was reused; exact surface absence is unverified"),
+    use crate::native::process_identity::{self, Gone, ProcessObservation};
+    match process_identity::classify(
+        mux.pid,
+        Some(&(mux.start_seconds, mux.start_microseconds)),
+        || false, // A recorded incarnation never uses PID-only liveness.
+        || host.process_start(mux.pid),
+    ) {
+        ProcessObservation::Live(_) => {}
+        ProcessObservation::Gone(Gone::Exited) => return Ok(false),
+        ProcessObservation::Gone(Gone::Reused(_)) => {
+            bail!("WezTerm GUI PID was reused; exact surface absence is unverified")
+        }
+        ProcessObservation::Unknown(reason) => bail!("{reason}"),
     }
     match host.socket_server(&mux.socket)? {
         Some(pid) if pid == mux.pid => Ok(true),
@@ -634,7 +639,7 @@ fn startup_pane(host: &dyn Host, mux: &WezTermMux, deadline: Instant) -> Result<
         mux.socket
     );
     loop {
-        if host.process_start(mux.pid)? != birth(mux) {
+        if host.process_start(mux.pid)? != Some((mux.start_seconds, mux.start_microseconds)) {
             bail!("WezTerm process {} ended while it started", mux.pid);
         }
         match host.socket_server(&mux.socket)? {
@@ -679,7 +684,7 @@ fn end_unbound_process(host: &dyn Host, mux: &WezTermMux) -> Result<()> {
     let deadline = Instant::now() + EXIT_GRACE;
     let mut asked = false;
     loop {
-        if host.process_start(mux.pid)? != birth(mux) {
+        if host.process_start(mux.pid)? != Some((mux.start_seconds, mux.start_microseconds)) {
             forget_socket(host, mux);
             return Ok(());
         }
@@ -1089,7 +1094,7 @@ pub(super) fn surface_present(
     // different process, even though no command would be sent to that process.
     if host
         .process_start(mux.pid)?
-        .is_some_and(|current| Some(current) != birth(mux))
+        .is_some_and(|current| Some(current) != Some((mux.start_seconds, mux.start_microseconds)))
     {
         bail!("WezTerm GUI PID was reused; exact surface absence is unverified");
     }

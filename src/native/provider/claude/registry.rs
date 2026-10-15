@@ -192,21 +192,27 @@ fn live_conversation_holders(
         if record.session_id != provider_session_id {
             continue;
         }
-        let Some(live) = live_creation_time(record.pid).with_context(|| {
-            format!(
-                "failed to verify the Claude Code process {} registered at {}",
-                record.pid,
-                path.display()
-            )
-        })?
-        else {
-            continue;
-        };
-        if record.proc_start == live {
-            holders.push(LiveConversationHolder {
+        use crate::native::process_identity::{self, Gone, ProcessObservation};
+        match process_identity::classify(
+            record.pid,
+            Some(&record.proc_start),
+            || false, // A recorded incarnation never uses PID-only liveness.
+            || live_creation_time(record.pid),
+        ) {
+            ProcessObservation::Live(_) => holders.push(LiveConversationHolder {
                 pid: record.pid,
                 name: record.name,
-            });
+            }),
+            ProcessObservation::Gone(Gone::Exited | Gone::Reused(_)) => continue,
+            ProcessObservation::Unknown(reason) => {
+                return Err(anyhow::anyhow!(reason)).with_context(|| {
+                    format!(
+                        "failed to verify the Claude Code process {} registered at {}",
+                        record.pid,
+                        path.display()
+                    )
+                });
+            }
         }
     }
     holders.sort_by_key(|holder| holder.pid);

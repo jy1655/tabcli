@@ -1800,7 +1800,7 @@ mod close_authority_tests {
     }
 
     #[test]
-    fn terminal_process_birth_errors_preserve_chain_and_stop_at_observation() {
+    fn terminal_process_birth_errors_preserve_reason_and_stop_at_observation() {
         for (path, occurrence, calls) in [
             (
                 "resumable",
@@ -1835,7 +1835,8 @@ mod close_authority_tests {
             if path == "dead" {
                 chain.push("could not prove absence of the dead owner's exact terminal surface; no close was sent");
             }
-            chain.extend(["injected birth failure", "injected birth cause"]);
+            // Incarnation classification preserves the reason as one string.
+            chain.push("injected birth failure: injected birth cause");
             row.check_error_chain(&chain, &calls);
         }
     }

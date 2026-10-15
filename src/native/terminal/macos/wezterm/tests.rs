@@ -2082,11 +2082,27 @@ fn live_a_session_process_is_started_bound_and_ended() {
     eprintln!("LIVE process after close: {after:?}");
     used.unwrap();
     assert_eq!(closed.unwrap(), CloseOutcome::Closed);
-    assert_ne!(after.unwrap(), birth(&mux));
+    assert_ne!(
+        after.unwrap(),
+        Some((mux.start_seconds, mux.start_microseconds))
+    );
     assert!(!surface_present(&host, &session, Duration::from_secs(2)).unwrap());
     eprintln!(
         "LIVE socket file left behind: {}",
         Path::new(&mux.socket).exists()
     );
     assert!(!Path::new(&mux.socket).exists());
+}
+
+#[test]
+fn serving_inspection_error_preserves_reason() {
+    let host = fake();
+    let session = session(&host);
+    let mux = session.wezterm_mux.as_ref().unwrap();
+    host.0.borrow_mut().unreadable_process = true;
+    assert_eq!(
+        serving(&host, mux).unwrap_err().to_string(),
+        format!("failed to inspect process {}", mux.pid)
+    );
+    assert!(commands(&host).is_empty());
 }

@@ -208,17 +208,6 @@ pub(super) struct WindowsProcessIdentity {
     pub(super) executable_path: String,
 }
 
-// The answer of comparing a live Windows process with a recorded identity. `Mismatch` is a
-// confirmed observation (the pid is in use by a different process, so the recorded one is
-// gone); a process that cannot be inspected is reported as an error by the caller, never as
-// either variant.
-#[cfg(any(windows, test))]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum WindowsProcessIdentityCheck {
-    Matches,
-    Mismatch(&'static str),
-}
-
 impl TerminalSession {
     pub(super) fn verify_managed_session(&self, expected: &str) -> Result<()> {
         match self.managed_session_id.as_deref() {
@@ -648,9 +637,13 @@ pub(super) fn windows_set_private_permissions(path: &Path, directory: bool) -> R
 }
 
 #[cfg(windows)]
-pub(in crate::native) use windows::{
-    WindowsIncarnation, observe_process_identity as observe_windows_process_identity,
-};
+pub(in crate::native) use windows::observe_process_identity as observe_windows_process_identity;
+
+#[cfg(any(windows, test))]
+#[path = "windows/incarnation.rs"]
+mod windows_incarnation;
+#[cfg(any(windows, test))]
+pub(in crate::native) use windows_incarnation::WindowsIncarnation;
 
 #[cfg(windows)]
 pub(super) fn windows_process_identity(pid: u32) -> Result<WindowsProcessIdentity> {
@@ -663,16 +656,6 @@ pub(super) fn verify_windows_process_identity(
     identity: &WindowsProcessIdentity,
 ) -> Result<()> {
     windows::verify_process_identity(pid, identity.creation_time, &identity.executable_path)
-}
-
-// Distinguishes a confirmed identity mismatch from a process that cannot be inspected; see
-// `WindowsProcessIdentityCheck`.
-#[cfg(windows)]
-pub(super) fn check_windows_process_identity(
-    pid: u32,
-    identity: &WindowsProcessIdentity,
-) -> Result<WindowsProcessIdentityCheck> {
-    windows::check_process_identity(pid, identity)
 }
 
 #[cfg(any(target_os = "macos", test))]

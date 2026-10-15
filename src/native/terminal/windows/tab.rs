@@ -79,8 +79,7 @@ use windows_sys::Win32::{
 
 use super::super::super::settings::WindowsTabWindow;
 use super::{
-    CreatedProcess, WindowsProcessIdentity, WindowsProcessIdentityCheck, check_process_identity,
-    console_startup_info,
+    CreatedProcess, WindowsProcessIdentity, console_startup_info,
     focus::{ForegroundGuard, attached_console_host_window},
     query_process_identity, query_process_identity_from_handle, terminate_by_identity,
     terminate_process_until,
@@ -409,10 +408,13 @@ pub(super) fn offer(
                 let identity = offer
                     .identity
                     .context("the tab host offered no process identity")?;
-                if let WindowsProcessIdentityCheck::Mismatch(reason) =
-                    check_process_identity(offer.pid, &identity)
-                        .context("the offered managed console root could not be inspected")?
-                {
+                let live = super::query_process_identity(offer.pid)
+                    .context("the offered managed console root could not be inspected")?;
+                if let Err(reason) = super::process::check_identity_values(
+                    &live,
+                    identity.creation_time,
+                    &identity.executable_path,
+                ) {
                     bail!("the offered managed console root is gone: {reason}");
                 }
                 return Ok((offer.pid, identity, window));
@@ -968,10 +970,12 @@ mod tests {
 
         let offer = wait_for(|| read_offer(directory.path(), "attempt-1").unwrap());
         let identity = offer.identity.clone().unwrap();
-        assert_eq!(
-            check_process_identity(offer.pid, &identity).unwrap(),
-            WindowsProcessIdentityCheck::Matches
-        );
+        super::super::verify_process_identity(
+            offer.pid,
+            identity.creation_time,
+            &identity.executable_path,
+        )
+        .unwrap();
         assert_eq!(offer.window, 0x1234);
         assert!(!offer.started);
         // Suspended: the root has not run its command, and nothing is decided.
