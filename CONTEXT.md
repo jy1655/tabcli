@@ -125,6 +125,9 @@ It answers in one of four ways: live, gone because the process exited, gone beca
 now belongs to another incarnation, or unknown because the live process could not be
 inspected. A reused PID proves the recorded process gone and grants no authority over its
 surface. A record that names only a PID can be observed alive or gone, but never attested.
+Attestation has two parts: the incarnation (PID and birth) decides whether the recorded process
+is still there; the control identity (controlling TTY and process groups) is compared only for
+a live matching incarnation, and its change is not a death.
 _Avoid_: liveness check, validation
 
 **Incarnation**:
