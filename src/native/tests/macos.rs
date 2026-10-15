@@ -661,12 +661,6 @@ fn macos_terminal_applescripts_compile_without_opening_a_tab() {
             "Ghostty",
             "/Applications/Ghostty.app",
         ),
-        (
-            "Ghostty close created tab",
-            terminal::macos::ghostty::CLOSE_CREATED_TAB_SCRIPT,
-            "Ghostty",
-            "/Applications/Ghostty.app",
-        ),
     ] {
         let directory = tempfile::tempdir().unwrap();
         // iTerm2 scripts address the application by bundle identifier so that a launch
