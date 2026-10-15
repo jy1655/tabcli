@@ -2,6 +2,7 @@
 //! writes: exclusive first publication by hard link, bounded adapter reads, and a private
 //! host directory check. The adapter names its records; this module only moves bytes.
 use super::*;
+use crate::native::private_to_user::owned_and_not_accessible_by_others;
 use serde::de::DeserializeOwned;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::PermissionsExt;
@@ -82,7 +83,6 @@ impl Reader {
     /// `label` names the directory's role in diagnostics.
     pub(in crate::native) fn validate_private_session_directory(&self, label: &str) -> Result<()> {
         let directory = self.directory();
-        use std::os::unix::fs::MetadataExt;
 
         let metadata = fs::symlink_metadata(directory)
             .with_context(|| format!("no such {label} directory: {}", directory.display()))?;
@@ -94,7 +94,7 @@ impl Reader {
         }
         // The hidden host executes the plan only from a session directory that another
         // account cannot replace or populate.
-        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+        if !owned_and_not_accessible_by_others(&metadata, unsafe { libc::geteuid() }) {
             bail!("{label} directory is not private to the current user");
         }
         Ok(())

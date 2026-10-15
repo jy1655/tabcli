@@ -3,6 +3,7 @@ use super::ownership::verified_macos_terminal_owner;
 use super::process;
 use super::process::live_native_process_identity;
 use super::{GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
+use crate::native::private_to_user::owned_and_not_writable_by_others;
 use crate::native::session::close::budget::close_remaining;
 use crate::native::session::{self, Store};
 use crate::native::session::{Reader, RecordReader, RecordStore};
@@ -1550,8 +1551,7 @@ fn ensure_private_config_directory(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("failed to resolve {}", path.display()))?;
     let metadata = fs::metadata(&canonical)?;
     if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o022 != 0
+        || !owned_and_not_writable_by_others(&metadata, unsafe { libc::geteuid() })
     {
         bail!("Warp launch configuration directory is not privately writable");
     }

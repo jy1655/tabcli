@@ -20,6 +20,8 @@ mod delivery;
 mod doctor;
 mod envelope;
 mod hold;
+#[cfg(unix)]
+mod private_to_user;
 mod process_env;
 mod process_identity;
 mod provider;

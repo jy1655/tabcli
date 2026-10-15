@@ -1,5 +1,6 @@
 use super::OwnedSurfaceClose;
 use super::{GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
+use crate::native::private_to_user::owned_and_not_accessible_by_others;
 use crate::native::session::SessionState;
 use crate::native::session::close::budget::close_remaining;
 use crate::native::session::primitives::unix_ms;
@@ -18,7 +19,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     io::Write,
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -836,8 +837,7 @@ fn verify_launch(directory: &Path, token: &str) -> Result<PathBuf> {
         let metadata = std::fs::symlink_metadata(path)?;
         Ok(metadata.is_dir() == directory
             && (directory || metadata.is_file())
-            && metadata.uid() == unsafe { libc::geteuid() }
-            && metadata.mode() & 0o077 == 0)
+            && owned_and_not_accessible_by_others(&metadata, unsafe { libc::geteuid() }))
     };
     let id = directory
         .file_name()
@@ -2347,6 +2347,16 @@ mod tests {
         );
         use crate::native::{TERMINAL_HANDLE_FILE, launch, update_status, write_json_atomic};
         use std::os::unix::fs::PermissionsExt;
+        let (readable_directory, readable_token) = prepared();
+        let script = readable_directory.path().join("ghostty-start.sh");
+        assert!(std::fs::symlink_metadata(&script).unwrap().is_file());
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            verify_launch(readable_directory.path(), &readable_token)
+                .unwrap_err()
+                .to_string(),
+            "Ghostty start script is not private to the current user"
+        );
         for case in [
             "the token of another launch",
             "the receipt of another launch",

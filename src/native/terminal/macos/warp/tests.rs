@@ -2140,6 +2140,20 @@ fn preview_style_user_owned_config_symlink_resolves_to_private_target() {
         ensure_private_config_directory(&preview).unwrap(),
         target.canonicalize().unwrap()
     );
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        ensure_private_config_directory(&preview).unwrap(),
+        target.canonicalize().unwrap()
+    );
+    for mode in [0o775, 0o702] {
+        fs::set_permissions(&target, fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(
+            ensure_private_config_directory(&preview)
+                .unwrap_err()
+                .to_string(),
+            "Warp launch configuration directory is not privately writable"
+        );
+    }
 }
 
 #[test]
