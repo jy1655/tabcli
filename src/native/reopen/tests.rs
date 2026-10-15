@@ -3233,6 +3233,24 @@ fn holder_checks_select_registration_wait_or_immediate_check() {
             check,
         )
         .unwrap_err();
+        // Exercise the new source joints against the same registry and preserve every
+        // existing helper assertion below. Follow-up remains outside StartSource.
+        if check != ResumedHolderCheck::BeforeFollowUp {
+            use crate::native::session_start::StartSource;
+            let (mut adapter, _) = start_source_fixture(root.path());
+            adapter.resumed_from = Some(resumed.clone());
+            let gate = if check == ResumedHolderCheck::AfterLaunch {
+                delivery::Gate::AfterLaunch
+            } else {
+                delivery::Gate::BeforeDelivery
+            };
+            let mapped = adapter.gate(&directory, gate, deadline).unwrap_err();
+            assert_eq!(format!("{mapped:#}"), format!("{error:#}"));
+            assert_eq!(
+                reopen_refusal_gate(&mapped),
+                Some(REOPEN_VERIFICATION_FAILED_GATE)
+            );
+        }
         provider::override_claude_session_registry_for_test(None);
         let reason = if check == ResumedHolderCheck::AfterLaunch {
             format!(
@@ -3267,5 +3285,171 @@ fn holder_checks_select_registration_wait_or_immediate_check() {
             assert_eq!(record["gate"], REOPEN_VERIFICATION_FAILED_GATE);
             assert_eq!(record["detail"], detail);
         }
+    }
+}
+
+fn start_source_fixture(root: &Path) -> (ReopenedSource, SessionSpec) {
+    let id = "session-start-source";
+    let directory =
+        write_closed_reopen_source(root, id, "claude", Some(REOPEN_TEST_CONVERSATION), true);
+    let source = inspect_reopen_source(&directory, id).unwrap();
+    let request = ReopenRequest {
+        id: id.into(),
+        prompt: "new prompt".into(),
+        title: None,
+        model: None,
+        effort: None,
+        terminal: None,
+        yolo: false,
+        timeout: Duration::from_secs(30),
+        detach: false,
+        json: false,
+    };
+    let spec = SessionSpec {
+        provider: source.provider,
+        provider_path: PathBuf::from("claude"),
+        provider_version: "fixture".into(),
+        workspace: source.manifest.workspace.clone(),
+        title: "new title".into(),
+        model: None,
+        effort: None,
+        yolo: false,
+        prompt: request.prompt.clone(),
+    };
+    let mut adapter = ReopenedSource::new(request);
+    // Seed only the resolve output: real resolve requires the platform/provider capability.
+    adapter.resolved = Some((directory, source));
+    (adapter, spec)
+}
+
+#[test]
+fn reopened_source_creation_extra_and_failure_joints() {
+    use crate::native::session_start::StartSource;
+    const CHILD: &str = "TABCLI_REOPEN_START_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let root = tempfile::tempdir().unwrap();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native::reopen::tests::reopened_source_creation_extra_and_failure_joints",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env(STATE_DIR_ENV, root.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        return;
+    }
+    let root = Reader::state_root().unwrap();
+    let (mut adapter, spec) = start_source_fixture(&root);
+    let original = snapshot_directory(&adapter.resolved.as_ref().unwrap().0);
+    let created = adapter.create(spec).unwrap();
+    let provenance = adapter.resumed_from.as_ref().unwrap();
+    assert_eq!(
+        read_resumed_from(&created.directory).unwrap().as_ref(),
+        Some(provenance)
+    );
+    let extra = adapter.result_extra().unwrap();
+    assert_eq!(extra["source_session"], adapter.request.id);
+    assert_eq!(
+        extra["resumed_from"],
+        serde_json::to_value(provenance).unwrap()
+    );
+    assert_eq!(extra.len(), 2);
+    assert!(!created.directory.join("workspace-consent.json").exists());
+    assert_eq!(created.manifest.model, None);
+    assert_eq!(created.manifest.effort, None);
+    assert!(!created.manifest.yolo);
+    assert_eq!(created.manifest.title, "new title");
+    assert_eq!(
+        fs::read_to_string(created.directory.join(CoreRecord::InitialPrompt.name())).unwrap(),
+        native_delegation_prompt(&delegation_source(), "new prompt")
+    );
+    let directory = &adapter.resolved.as_ref().unwrap().0;
+    let marker: ReopenMarker = Reader::open_unchecked(directory)
+        .record(CoreRecord::ReopenMarker)
+        .json()
+        .unwrap();
+    assert_eq!(marker.reopened_by.as_deref(), Some(created.id.as_str()));
+    let mut after = snapshot_directory(directory);
+    after.remove(CoreRecord::ReopenMarker.name());
+    assert_eq!(after, original);
+
+    let before = snapshot_directory(&created.directory);
+    let ordinary = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "original delivery error");
+    let error = adapter.delivery_failed(
+        &created.directory,
+        &created.id,
+        ordinary.into(),
+        Instant::now(),
+    );
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+    let error = adapter.delivery_failed(
+        &created.directory,
+        &created.id,
+        reopen_refusal("provider-unsupported", "unsupported".into()),
+        Instant::now(),
+    );
+    assert_eq!(reopen_refusal_gate(&error), Some("provider-unsupported"));
+    assert_eq!(snapshot_directory(&created.directory), before);
+    // No terminal exists. A typed refusal still survives the close helper's error context.
+    for gate in [REOPEN_CONFLICT_GATE, REOPEN_VERIFICATION_FAILED_GATE] {
+        let missing = root.join("session-missing");
+        let error = adapter.delivery_failed(
+            &missing,
+            "session-missing",
+            reopen_refusal(gate, "original refusal".into()),
+            Instant::now(),
+        );
+        assert_eq!(reopen_refusal_gate(&error), Some(gate));
+        assert!(format!("{error:#}").contains("original refusal"));
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn reopened_source_gates_keep_provenance_and_refusal_on_unsupported_platform() {
+    use crate::native::session_start::StartSource;
+    for (gate, check) in [
+        (delivery::Gate::AfterLaunch, ResumedHolderCheck::AfterLaunch),
+        (
+            delivery::Gate::BeforeDelivery,
+            ResumedHolderCheck::BeforeInitialDelivery,
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (mut adapter, _) = start_source_fixture(root.path());
+        let resumed = ResumedFrom {
+            session: adapter.request.id.clone(),
+            provider_session_id: REOPEN_TEST_CONVERSATION.into(),
+            event_id: "event-1-1.json".into(),
+        };
+        adapter.resumed_from = Some(resumed.clone());
+        let directory = root.path().join("session-new");
+        fs::create_dir(&directory).unwrap();
+        let deadline = Instant::now();
+        let expected = verify_reopened_conversation_exclusive(
+            FirstPartyCli::Claude,
+            &directory,
+            Some(&resumed),
+            deadline,
+            check,
+        )
+        .unwrap_err();
+        let error = adapter.gate(&directory, gate, deadline).unwrap_err();
+        assert_eq!(format!("{error:#}"), format!("{expected:#}"));
+        assert_eq!(
+            reopen_refusal_gate(&error),
+            Some(REOPEN_VERIFICATION_FAILED_GATE)
+        );
+        assert_eq!(
+            read_reopen_refusal_gate(&directory).as_deref(),
+            Some(REOPEN_VERIFICATION_FAILED_GATE)
+        );
     }
 }
