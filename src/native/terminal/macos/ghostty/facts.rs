@@ -7,3 +7,5 @@ pub(in crate::native::terminal) const FACTS: SurfaceFacts = SurfaceFacts {
     paste_envelope: PasteEnvelope::Raw,
     guards_dialog_input: false,
 };
+
+pub(in crate::native) const HOST_COMMAND: &str = "native-ghostty-host";

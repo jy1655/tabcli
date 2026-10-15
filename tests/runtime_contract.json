@@ -15,23 +15,17 @@
     "name: \"native-hook\"": 1,
     "name: \"native-provider-control\"": 1,
     "name: \"native-console-control\"": 1,
-    "name: \"native-console-host\"": 1,
-    "name: \"native-iterm2-host\"": 1,
-    "name: \"native-terminal-host\"": 1,
-    "name: \"native-wezterm-host\"": 1,
-    "name: \"native-ghostty-host\"": 1,
-    "name: \"native-warp-host\"": 1,
     "[Agent Bridge native delegation]": 1,
     "native-console-control": 2,
-    "native-console-host": 2,
-    "native-ghostty-host": 2,
     "native-hook": 3,
-    "native-iterm2-host": 2,
     "native-provider-control": 2,
     "native-session": 5,
-    "native-terminal-host": 2,
-    "native-warp-host": 5,
-    "native-wezterm-host": 2
+    "name: terminal::host::CONSOLE_HOST_COMMAND": 1,
+    "name: terminal::host::ITERM2_HOST_COMMAND": 1,
+    "name: terminal::host::APPLE_TERMINAL_HOST_COMMAND": 1,
+    "name: terminal::host::WEZTERM_HOST_COMMAND": 1,
+    "name: terminal::host::GHOSTTY_HOST_COMMAND": 1,
+    "name: terminal::host::WARP_HOST_COMMAND": 1
   },
   "src/native/consent.rs": {
     "const SESSION_FILE: &str = \"workspace-consent.json\";": 1,
@@ -314,23 +308,26 @@
     "AB_SCREEN_BEGIN": 1,
     "AB_SCREEN_END": 1,
     "const BOOTSTRAP_FILE: &str = \"terminal-start.sh\";": 1,
-    "native-terminal-host": 1,
-    "terminal-start.sh": 1
+    "terminal-start.sh": 1,
+    "{HOST_COMMAND}": 1,
+    "use crate::native::terminal::facts::apple_terminal::HOST_COMMAND;": 1
   },
   "src/native/terminal/macos/ghostty.rs": {
     "const HOST_FRAME: &str = \"agent-bridge-ghostty-host:\";": 1,
     "ghostty-start.sh": 2,
-    "native-ghostty-host": 1,
     "Terminal surface model is not available": 1,
     "\"not-ready\"": 4,
     "\"queued\"": 2,
     "\"missing\"": 12,
-    "\"closed\"": 1
+    "\"closed\"": 1,
+    "{HOST_COMMAND}": 1,
+    "use crate::native::terminal::facts::ghostty::HOST_COMMAND;": 1
   },
   "src/native/terminal/macos/iterm2.rs": {
     "AB_SCREEN_BEGIN": 1,
     "AB_SCREEN_END": 1,
-    "native-iterm2-host": 1
+    "{HOST_COMMAND}": 1,
+    "use crate::native::terminal::facts::iterm2::HOST_COMMAND;": 1
   },
   "src/native/terminal/macos/ownership.rs": {
     "native-session": 6
@@ -347,20 +344,22 @@
     "const HOST_SESSION_DIRECTORY_LABEL: &str = \"Warp host session\";": 1,
     "format!(\"agent-bridge-{attempt}\")": 2,
     "format!(\"agent-bridge-offer-{attempt}\")": 1,
-    "native-warp-host": 1,
     "warp-control.json": 1,
     "warp-host-decision.json": 1,
     "warp-host-offer.json": 1,
     "warp-host-plan.json": 1,
     "let config_name = format!(\"agent-bridge-{attempt}\");": 1,
     "let offer_title = format!(\"agent-bridge-offer-{attempt}\");": 1,
-    "let bound_title = format!(\"agent-bridge-{attempt}\");": 1
+    "let bound_title = format!(\"agent-bridge-{attempt}\");": 1,
+    "{HOST_COMMAND}": 1,
+    "use crate::native::terminal::facts::warp::HOST_COMMAND;": 1
   },
   "src/native/terminal/macos/wezterm.rs": {
-    "native-wezterm-host": 1,
     "gui-sock-": 3,
     "/dev/ttys": 1,
-    "WEZTERM_": 6
+    "WEZTERM_": 6,
+    "{HOST_COMMAND}": 1,
+    "use crate::native::terminal::facts::wezterm::HOST_COMMAND;": 1
   },
   "src/native/terminal/mod.rs": {
     "console process is no longer available": 2,
@@ -393,6 +392,51 @@
     "console-host-offer.json": 2,
     "console-host-process.json": 1,
     "console-host.json": 2,
-    "native-console-host": 2
+    "native-console-host": 1,
+    "{HOST_COMMAND}": 1,
+    "use crate::native::terminal::facts::windows::HOST_COMMAND;": 1
+  },
+  "src/native/terminal/windows/facts.rs": {
+    "pub(in crate::native) const HOST_COMMAND: &str = \"native-console-host\";": 1,
+    "native-console-host": 1
+  },
+  "src/native/terminal/macos/iterm2/facts.rs": {
+    "pub(in crate::native) const HOST_COMMAND: &str = \"native-iterm2-host\";": 1,
+    "native-iterm2-host": 1
+  },
+  "src/native/terminal/macos/apple_terminal/facts.rs": {
+    "pub(in crate::native) const HOST_COMMAND: &str = \"native-terminal-host\";": 1,
+    "native-terminal-host": 1
+  },
+  "src/native/terminal/macos/wezterm/facts.rs": {
+    "pub(in crate::native) const HOST_COMMAND: &str = \"native-wezterm-host\";": 1,
+    "native-wezterm-host": 1
+  },
+  "src/native/terminal/macos/ghostty/facts.rs": {
+    "pub(in crate::native) const HOST_COMMAND: &str = \"native-ghostty-host\";": 1,
+    "native-ghostty-host": 1
+  },
+  "src/native/terminal/macos/warp/facts.rs": {
+    "pub(in crate::native) const HOST_COMMAND: &str = \"native-warp-host\";": 1,
+    "native-warp-host": 1
+  },
+  "src/native/terminal/host.rs": {
+    "use super::facts::windows::HOST_COMMAND as CONSOLE_HOST_COMMAND;": 1,
+    "CONSOLE_HOST_COMMAND =>": 1,
+    "use super::facts::iterm2::HOST_COMMAND as ITERM2_HOST_COMMAND;": 1,
+    "ITERM2_HOST_COMMAND =>": 1,
+    "use super::facts::apple_terminal::HOST_COMMAND as APPLE_TERMINAL_HOST_COMMAND;": 1,
+    "APPLE_TERMINAL_HOST_COMMAND =>": 1,
+    "use super::facts::wezterm::HOST_COMMAND as WEZTERM_HOST_COMMAND;": 1,
+    "WEZTERM_HOST_COMMAND =>": 1,
+    "use super::facts::ghostty::HOST_COMMAND as GHOSTTY_HOST_COMMAND;": 1,
+    "GHOSTTY_HOST_COMMAND =>": 1,
+    "use super::facts::warp::HOST_COMMAND as WARP_HOST_COMMAND;": 1,
+    "WARP_HOST_COMMAND =>": 1,
+    "{GHOSTTY_HOST_COMMAND} takes no argument": 1,
+    "{WARP_HOST_COMMAND} requires a session directory and attempt token": 1,
+    "{WARP_HOST_COMMAND} requires a session directory\"": 1,
+    "{WARP_HOST_COMMAND} requires an absolute session directory": 1,
+    "{WARP_HOST_COMMAND} requires a valid attempt token": 1
   }
 }

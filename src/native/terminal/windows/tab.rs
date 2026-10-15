@@ -85,8 +85,9 @@ use super::{
     terminate_process_until,
 };
 
+use crate::native::terminal::facts::windows::HOST_COMMAND;
+
 const WINDOW_NAME: &str = "agent-bridge";
-const HOST_COMMAND: &str = "native-console-host";
 const REQUEST_FILE: &str = "console-host.json";
 const OFFER_FILE: &str = "console-host-offer.json";
 const DECISION_FILE: &str = "console-host-decision";
@@ -1466,6 +1467,20 @@ mod tests {
                 r#""C:\Program Files\Agent Bridge\agent-bridge.exe" native-console-host "#,
                 r#""C:\Users\me\.agent-bridge\native-sessions\session-AbC123""#
             )
+        );
+        let invocation = command.split_once(" new-tab ").unwrap().1;
+        let invocation = invocation
+            .strip_prefix(r#""C:\Program Files\Agent Bridge\agent-bridge.exe" "#)
+            .unwrap();
+        let (name, quoted_directory) = invocation.split_once(' ').unwrap();
+        assert_eq!(name, HOST_COMMAND);
+        let directory = quoted_directory
+            .strip_prefix('"')
+            .unwrap()
+            .strip_suffix('"')
+            .unwrap();
+        assert!(
+            matches!(crate::native::parse_args([name, directory]).unwrap(), crate::native::NativeCommand::Host(crate::native::terminal::host::HostCommand::Console { directory: actual }) if actual == Path::new(directory))
         );
         // Unless the user chose it, never the window they work in, and never a new window
         // on purpose.

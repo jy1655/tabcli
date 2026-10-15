@@ -4,6 +4,7 @@ use crate::native::session::SessionState;
 use crate::native::session::close::budget::close_remaining;
 use crate::native::session::primitives::unix_ms;
 use crate::native::session::{CoreRecord, Reader, RecordStore};
+use crate::native::terminal::facts::ghostty::HOST_COMMAND;
 #[cfg(test)]
 use crate::native::terminal::ownership;
 // Prove returned-tab ownership and a live input model before binding; keep creation input out of shells.
@@ -549,7 +550,7 @@ fn bootstrap(executable: &OsStr) -> Result<String> {
     Ok(format!(
         "/bin/zsh -f -i -c {}",
         crate::native::terminal::shell_quote(OsStr::new(&format!(
-            "start=$({} native-ghostty-host) || exit; . \"$start\"",
+            "start=$({} {HOST_COMMAND}) || exit; . \"$start\"",
             crate::native::terminal::shell_quote(executable)
         )))
     ))
@@ -2257,6 +2258,20 @@ mod tests {
                 .ends_with(" native-ghostty-host) || exit; . \"$start\"'")
         );
         assert!(!f.command.contains(directory.path().to_str().unwrap()));
+        let shell_args = super::super::test_support::shell_argv(&f.command);
+        assert_eq!(&shell_args[..4], ["/bin/zsh", "-f", "-i", "-c"]);
+        let invocation = shell_args[4]
+            .strip_prefix("start=$(")
+            .unwrap()
+            .strip_suffix(") || exit; . \"$start\"")
+            .unwrap();
+        let args = super::super::test_support::host_argv(invocation);
+        assert_eq!(args, [HOST_COMMAND]);
+        assert!(matches!(
+            crate::native::parse_args(args).unwrap(),
+            crate::native::NativeCommand::Host(crate::native::terminal::host::HostCommand::Ghostty)
+        ));
+
         assert!(CREATE_SURFACE_SCRIPT.contains("set command of cfg to item 2 of argv"));
         bind_fixture(directory.path(), &handle);
         let created = f.calls.len();

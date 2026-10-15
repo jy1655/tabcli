@@ -1,4 +1,5 @@
 pub(super) mod close_evidence;
+pub(in crate::native) mod host;
 #[cfg(target_os = "macos")]
 pub(super) use close_evidence::for_kind as close_evidence;
 use std::time::Duration;
@@ -547,74 +548,10 @@ pub(super) fn windows_console_control(
 }
 
 #[cfg(target_os = "windows")]
-pub(super) fn windows_console_host(directory: &Path) -> Result<()> {
-    windows::run_console_host(directory)
-}
-
-#[cfg(target_os = "windows")]
 pub(super) use windows::ConsoleControlAction;
 
 #[cfg(target_os = "windows")]
 pub(super) use windows::ownership::{windows_console_handle_path, windows_console_root_never_ran};
-
-pub(super) fn iterm2_host(directory: &Path) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        macos::iterm2::run_host(directory)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = directory;
-        bail!("the native iTerm2 host is only available on macOS")
-    }
-}
-
-pub(super) fn wezterm_host(directory: &Path) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        macos::wezterm::run_host(directory)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = directory;
-        bail!("the native WezTerm host is only available on macOS")
-    }
-}
-
-pub(super) fn apple_terminal_host(directory: &Path) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        macos::apple_terminal::run_host(directory)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = directory;
-        bail!("the native Terminal.app host is only available on macOS")
-    }
-}
-
-pub(super) fn ghostty_host() -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        macos::ghostty::run_host()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        bail!("the native Ghostty host is only available on macOS")
-    }
-}
-
-pub(super) fn warp_host(directory: &Path, attempt: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        macos::warp::run_host(directory, attempt)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (directory, attempt);
-        bail!("the native Warp host is only available on macOS")
-    }
-}
 
 #[cfg(target_os = "windows")]
 pub(super) fn windows_powershell_executable() -> Result<std::path::PathBuf> {

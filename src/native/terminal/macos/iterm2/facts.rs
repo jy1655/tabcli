@@ -16,3 +16,5 @@ pub(in crate::native::terminal) const BINDING: BindingFacts = BindingFacts {
     cancelled: "iTerm2 launch was cancelled or timed out before surface binding",
     budget: BindingBudget::RemainingReceiptCapped,
 };
+
+pub(in crate::native) const HOST_COMMAND: &str = "native-iterm2-host";

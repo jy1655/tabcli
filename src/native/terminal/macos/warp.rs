@@ -7,6 +7,7 @@ use crate::native::session::close::budget::close_remaining;
 use crate::native::session::{self, Store};
 use crate::native::session::{Reader, RecordReader, RecordStore};
 use crate::native::terminal;
+use crate::native::terminal::facts::warp::HOST_COMMAND;
 use crate::native::terminal::ownership;
 use crate::native::terminal::ownership::{
     NativeProcessIdentity, NativeSessionOwner, native_owner_identity_matches,
@@ -1428,7 +1429,7 @@ fn host_launch_command<'a>(
         .to_str()
         .context("Warp session directory is not valid UTF-8")?;
     let host_command = format!(
-        "{} native-warp-host {} {}",
+        "{} {HOST_COMMAND} {} {}",
         shell_quote(OsStr::new(executable)),
         shell_quote(directory.as_os_str()),
         shell_quote(OsStr::new(attempt))
