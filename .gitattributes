@@ -3,3 +3,5 @@
 # (a Windows runner with autocrlf turned LF into CRLF and the comparison failed).
 src/native/session/fixtures/** -text
 tests/fixtures/** -text
+# The harness strips LF import lines; prevent Windows autocrlf conversion.
+src/native/provider/pi_extension.js -text

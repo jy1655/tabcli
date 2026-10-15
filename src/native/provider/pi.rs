@@ -866,246 +866,7 @@ fn consume_hook_failure(directory: &Path) -> Result<bool> {
 }
 
 fn bridge_extension() -> &'static str {
-    r#"import { spawnSync } from "node:child_process";
-import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-
-function assistantText(message) {
-  if (!Array.isArray(message.content)) return undefined;
-  const text = message.content
-    .filter((part) => part?.type === "text" && typeof part.text === "string")
-    .map((part) => part.text)
-    .join("\n")
-    .trim();
-  return text || undefined;
-}
-
-function lastAssistantOutcome(messages) {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message?.role !== "assistant") continue;
-    if (message.stopReason !== "stop") {
-      const detail = typeof message.errorMessage === "string" && message.errorMessage.trim()
-        ? `: ${message.errorMessage.trim()}`
-        : "";
-      return { agent_bridge_error: `Pi turn ended with ${message.stopReason ?? "an unknown state"}${detail}` };
-    }
-    const text = assistantText(message);
-    if (text) return { last_assistant_message: text };
-    return { agent_bridge_error: "Pi settled without assistant text." };
-  }
-  return { agent_bridge_error: "Pi settled without an assistant result." };
-}
-
-function wait(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-async function deliverResult(executable, payload) {
-  if (!executable) {
-    return { ok: false, detail: "Agent Bridge executable is unavailable" };
-  }
-  let detail = "native hook failed";
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const result = spawnSync(executable, ["native-hook", "pi"], {
-      input: JSON.stringify(payload),
-      encoding: "utf8",
-      stdio: ["pipe", "ignore", "pipe"],
-      timeout: 10000,
-    });
-    if (!result.error && result.status === 0) return { ok: true };
-    const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
-    detail = result.error?.message || stderr || `native hook exited with status ${result.status}`;
-    if (attempt < 2) await wait(100 * (attempt + 1));
-  }
-  return { ok: false, detail: detail.slice(0, 1024) };
-}
-
-function persistHookFailure(payload, detail) {
-  const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
-  if (!directory) return false;
-  const target = join(directory, "pi-hook-failure.json");
-  const temporary = join(
-    directory,
-    `.pi-hook-failure-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`,
-  );
-  const signal = {
-    error: `Pi result delivery failed: ${detail}`,
-    provider_session_id: payload.session_id,
-    turn_id: payload.turn_id,
-    claim_token: payload.agent_bridge_claim_token,
-  };
-  try {
-    writeFileSync(temporary, JSON.stringify(signal), { encoding: "utf8", flag: "wx", mode: 0o600 });
-    renameSync(temporary, target);
-    return true;
-  } catch {
-    try { unlinkSync(temporary); } catch {}
-    return false;
-  }
-}
-
-export default function (pi) {
-  let pending;
-  let undelivered = false;
-  let activeClaimToken;
-  let activePromptCorrelated = false;
-  let cancelTimer;
-  let runId = 0;
-  let abortClaimToken;
-
-  function stopCancelTimer() {
-    // Invalidate callbacks before clearing the timer or changing run correlation.
-    runId += 1;
-    if (cancelTimer !== undefined) clearInterval(cancelTimer);
-    cancelTimer = undefined;
-  }
-
-  function readRecord(name) {
-    const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
-    if (!directory) return undefined;
-    try { return JSON.parse(readFileSync(join(directory, name), "utf8")); }
-    catch { return undefined; }
-  }
-
-  function startCancelTimer(ctx) {
-    const thisRun = runId;
-    const claimToken = activeClaimToken;
-    if (!claimToken || !activePromptCorrelated) return;
-    // Pi v1.0.4 ctx is runtime-scoped, not a turn handle. This synchronous,
-    // non-overlapping callback must check both run lifetime and current claim.
-    cancelTimer = setInterval(() => {
-      if (thisRun !== runId || claimToken !== activeClaimToken
-          || !activePromptCorrelated || abortClaimToken === claimToken
-          || readActiveClaimToken() !== claimToken) return;
-      const cancel = readRecord("cancel.json");
-      if (cancel?.schema !== 1 || cancel.claim_token !== claimToken) return;
-      // Calling abort and publishing acceptance cannot be atomic. Never retry
-      // this claim after a thrown abort or a failed publication.
-      abortClaimToken = claimToken;
-      const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
-      const temporary = join(directory, `.pi-cancel-${process.pid}-${Date.now()}.tmp`);
-      try {
-        ctx.abort();
-        writeFileSync(temporary, JSON.stringify({ schema: 1, claim_token: claimToken }),
-          { encoding: "utf8", flag: "wx", mode: 0o600 });
-        renameSync(temporary, join(directory, "pi-cancel-accepted.json"));
-      } catch {
-        try { unlinkSync(temporary); } catch {}
-      }
-    }, 200);
-  }
-
-  function readActiveClaimToken() {
-    const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
-    if (!directory) return undefined;
-    try {
-      const token = readFileSync(join(directory, "turn.claim"), "utf8").trim();
-      return token || undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
-  // Official session_start follows project_trust resolution, including a user's decline.
-  // Never return a trust decision here or persist one in Pi's provider-owned store.
-  pi.on("session_start", (event, ctx) => {
-    stopCancelTimer();
-    if (event.reason !== "startup") return;
-    const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
-    const claimToken = readActiveClaimToken();
-    if (!directory || !claimToken) return;
-    const temporary = join(directory, `.pi-startup-${process.pid}-${Date.now()}.tmp`);
-    try {
-      writeFileSync(temporary, JSON.stringify({
-        schema: 2,
-        claim_token: claimToken,
-        session_id: ctx.sessionManager.getSessionId(),
-      }), { encoding: "utf8", flag: "wx", mode: 0o600 });
-      renameSync(temporary, join(directory, "pi-startup-ready.json"));
-    } catch {
-      try { unlinkSync(temporary); } catch {}
-      if (process.platform === "win32") {
-        ctx.ui.notify("Agent Bridge could not confirm Pi startup; the initial console input will remain withheld.", "warning");
-      }
-    }
-  });
-
-  pi.on("before_agent_start", (event) => {
-    stopCancelTimer();
-    activeClaimToken = readActiveClaimToken();
-    activePromptCorrelated = Boolean(
-      activeClaimToken
-      && event.prompt.includes(`<!-- agent-bridge-pi-turn:${activeClaimToken} -->`),
-    );
-  });
-
-  pi.on("agent_start", (_event, ctx) => {
-    stopCancelTimer();
-    if (undelivered && pending) {
-      if (!persistHookFailure(pending, "a prior result remained undelivered")) {
-        ctx.ui.notify("Agent Bridge still cannot recover the previous Pi result.", "warning");
-        return;
-      }
-      undelivered = false;
-    }
-    pending = undefined;
-    startCancelTimer(ctx);
-  });
-
-  pi.on("agent_end", (event, ctx) => {
-    stopCancelTimer();
-    if (undelivered) return;
-    if (!activePromptCorrelated || !activeClaimToken) {
-      pending = undefined;
-      return;
-    }
-    pending = {
-      ...lastAssistantOutcome(event.messages),
-      session_id: ctx.sessionManager.getSessionId(),
-      turn_id: ctx.sessionManager.getLeafId() ?? undefined,
-      agent_bridge_claim_token: activeClaimToken,
-      agent_bridge_prompt_correlated: true,
-    };
-    const assistant = event.messages.findLast((message) => message?.role === "assistant");
-    const accepted = readRecord("pi-cancel-accepted.json");
-    // Pi 1.0.4, observed 2026-10-11: abort during a tool can surface Node's
-    // AbortError message as errorMessage with stopReason "error". Match that
-    // exact message, never arbitrary errors containing "abort". agent-loop.ts
-    // forwards the stream's final assistant outcome without normalizing it.
-    const aborted = assistant?.stopReason === "aborted"
-      || (assistant?.stopReason === "error" && assistant.errorMessage === "This operation was aborted");
-    if (aborted && accepted?.schema === 1
-        && accepted.claim_token === activeClaimToken) {
-      pending.agent_bridge_cancel_claim_token = activeClaimToken;
-    }
-  });
-
-  pi.on("agent_settled", async (_event, ctx) => {
-    stopCancelTimer();
-    if (!pending) return;
-    const payload = pending;
-    const executable = process.env.AGENT_BRIDGE_EXECUTABLE;
-    const delivery = await deliverResult(executable, payload);
-    if (!delivery.ok) {
-      if (persistHookFailure(payload, delivery.detail)) {
-        pending = undefined;
-        ctx.ui.notify("Agent Bridge marked this undelivered Pi result as failed.", "warning");
-        return;
-      }
-      undelivered = true;
-      ctx.ui.notify("Agent Bridge could not record or recover this Pi result.", "warning");
-      return;
-    }
-    pending = undefined;
-  });
-  pi.on("session_shutdown", () => {
-    stopCancelTimer();
-    activeClaimToken = undefined;
-    activePromptCorrelated = false;
-  });
-}
-"#
+    include_str!("pi_extension.js")
 }
 
 #[cfg(test)]
@@ -1526,15 +1287,13 @@ mod tests {
         format!("{message}\n{}", pending.marker)
     }
 
-    #[test]
-    fn cancel_extension_executes_lifecycle_and_partial_failure_cases_in_node() {
-        let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("extension.js"), bridge_extension()).unwrap();
-        let harness = directory.path().join("test.mjs");
-        fs::write(&harness, include_str!("pi_cancel_test.mjs")).unwrap();
-        let output = std::process::Command::new("node")
-            .arg(harness)
-            .arg(directory.path())
+    fn run_extension_harness(directory: &Path, startup: bool) {
+        let mut command = std::process::Command::new("node");
+        command.arg(directory.join("test.mjs")).arg(directory);
+        if startup {
+            command.arg("startup");
+        }
+        let output = command
             .output()
             .expect("Node on PATH is required to execute the Pi extension tests");
         assert!(
@@ -1542,6 +1301,165 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn cancel_extension_executes_lifecycle_and_partial_failure_cases_in_node() {
+        use crate::native::session::schema::SessionManifest;
+        use crate::native::session::{CoreRecord, cancel};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("extension.js"), bridge_extension()).unwrap();
+        fs::write(root.join("test.mjs"), include_str!("pi_cancel_test.mjs")).unwrap();
+        let cases = [
+            "matched_duplicate",
+            "prompt_mismatch",
+            "claim_mismatch",
+            "claim_replaced",
+            "stale_callback",
+            "direct_escape",
+            "write_failure",
+            "abort_failure",
+            "agent_settled",
+            "session_shutdown",
+            "normal_completion_wins",
+            "two_claims_and_retry",
+            "settlement_without_aborted_end",
+            "retry_without_before_agent_start",
+            "partial_json_then_valid_record",
+            "tool_abort_accepted",
+            "tool_abort_direct_escape",
+            "tool_network_error",
+            "tool_abort_message_not_exact",
+            "tool_abort_wrong_accepted_claim",
+            "normal_complete",
+        ];
+        let mut inputs = serde_json::Map::new();
+        // Each case keeps its own live claim. Secondary claims supply mismatch/replacement bytes.
+        for name in cases {
+            for suffix in ["", "_second"] {
+                let key = format!("{name}{suffix}");
+                let dir = root.join(&key);
+                fs::create_dir(&dir).unwrap();
+                fs::create_dir(dir.join("events")).unwrap();
+                update_status(&dir, SessionState::Working, None, None).unwrap();
+                let store = Store::open_unchecked(&dir);
+                store
+                    .write_manifest(&SessionManifest {
+                        schema: 1,
+                        id: key.clone(),
+                        provider: "pi".into(),
+                        provider_path: "pi".into(),
+                        provider_version: "1.0.4".into(),
+                        workspace: root.to_path_buf(),
+                        title: key.clone(),
+                        model: None,
+                        effort: None,
+                        yolo: false,
+                        created_unix_ms: 1,
+                    })
+                    .unwrap();
+                let pending = claim_pending_turn(&dir);
+                let prompt = if name == "tool_abort_accepted" {
+                    terminal_correlated_prompt("prompt\nwith\ttabs", &pending, true).unwrap()
+                } else {
+                    correlated_prompt("prompt", &pending)
+                };
+                inputs.insert(key, serde_json::json!([{
+                    "token": pending.claim_token,
+                    "claim": fs::read_to_string(dir.join(CoreRecord::TurnClaim.name())).unwrap(),
+                    "prompt": prompt, "response": marked("result", &pending),
+                }]));
+            }
+        }
+        write_json_atomic(&root.join("inputs.json"), &inputs).unwrap();
+        // The extension itself writes schema-2 readiness before real cancel admission.
+        run_extension_harness(root, true);
+        for (key, records) in &mut inputs {
+            let dir = root.join(key);
+            assert!(matches!(
+                ADAPTER.cancel_support(&dir).unwrap(),
+                super::super::CancelSupport::Supported
+            ));
+            cancel::request(&Store::open_unchecked(&dir), key).unwrap();
+            records[0]["cancel"] =
+                serde_json::json!(fs::read_to_string(dir.join(CoreRecord::Cancel.name())).unwrap());
+            fs::remove_file(dir.join(CoreRecord::Cancel.name())).unwrap();
+        }
+        for name in cases {
+            let second = inputs[&format!("{name}_second")][0].clone();
+            inputs
+                .get_mut(name)
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .push(second);
+        }
+        write_json_atomic(&root.join("inputs.json"), &inputs).unwrap();
+        run_extension_harness(root, false);
+        let outputs: Vec<serde_json::Value> = read_json(&root.join("payloads.json")).unwrap();
+        for (name, cancelled, error) in [
+            ("normal_complete", false, None),
+            (
+                "matched_duplicate",
+                true,
+                Some("cancelled: Pi turn ended with aborted"),
+            ),
+            ("direct_escape", false, Some("Pi turn ended with aborted")),
+            (
+                "tool_abort_accepted",
+                true,
+                Some("cancelled: Pi turn ended with error: This operation was aborted"),
+            ),
+            ("write_failure", false, Some("Pi turn ended with aborted")),
+            ("normal_completion_wins", false, None),
+            ("prompt_mismatch", false, None),
+        ] {
+            let dir = root.join(name);
+            let payloads = outputs.iter().find(|v| v["name"] == name).unwrap()["payloads"]
+                .as_array()
+                .unwrap();
+            assert!(dir.join(CoreRecord::TurnClaim.name()).exists());
+            if name == "prompt_mismatch" {
+                assert!(payloads.is_empty());
+                assert!(event_paths(&dir).unwrap().is_empty());
+                assert_eq!(
+                    turn::current_claim_token(&Reader::open_unchecked(&dir))
+                        .unwrap()
+                        .unwrap(),
+                    inputs[name][0]["token"]
+                );
+                continue;
+            }
+            for payload in payloads {
+                ADAPTER.handle_hook(&dir, payload).unwrap();
+            }
+            let paths = event_paths(&dir).unwrap();
+            assert_eq!(paths.len(), 1, "{name}");
+            let event: SessionEvent = read_json(&paths[0]).unwrap();
+            assert_eq!(event.cancelled, cancelled, "{name}");
+            assert_eq!(event.error.as_deref(), error, "{name}");
+            assert_eq!(
+                event.message,
+                if error.is_none() { "result" } else { "" },
+                "{name}"
+            );
+            assert!(!dir.join(CoreRecord::TurnClaim.name()).exists(), "{name}");
+        }
+        // Carry the JS-written receipt to a real next claim in that same session.
+        let dir = root.join("matched_duplicate");
+        let old: StartupReady = read_json(&dir.join(STARTUP_READY_FILE)).unwrap();
+        let next = claim_pending_turn(&dir);
+        let carried: StartupReady = read_json(&dir.join(STARTUP_READY_FILE)).unwrap();
+        assert_eq!(carried.schema, old.schema);
+        assert_eq!(carried.schema, 2);
+        assert_eq!(carried.session_id, old.session_id);
+        assert_ne!(carried.claim_token, old.claim_token);
+        assert_eq!(carried.claim_token, next.claim_token);
+        assert!(matches!(
+            ADAPTER.cancel_support(&dir).unwrap(),
+            super::super::CancelSupport::Supported
+        ));
     }
 
     #[test]
@@ -1807,6 +1725,68 @@ mod tests {
         assert!(framed.contains(&pending.marker));
     }
 
+    fn assert_core_record_contract(extension: &str) {
+        use crate::native::session::CoreRecord;
+        fn allowed(record: CoreRecord) -> bool {
+            match record {
+                CoreRecord::Hold => false,
+                CoreRecord::Cancel => true,
+                CoreRecord::TurnClaim => true,
+                CoreRecord::Completion => false,
+                CoreRecord::Owner => false,
+                CoreRecord::Closed => false,
+                CoreRecord::Terminal => false,
+                CoreRecord::TerminalClosing => false,
+                CoreRecord::TerminalClosed => false,
+                #[cfg(target_os = "macos")]
+                CoreRecord::TerminalCloseIntent => false,
+                CoreRecord::LegacyResumePending => false,
+                CoreRecord::LegacyResumeRunning => false,
+                CoreRecord::ReopenMarker => false,
+                CoreRecord::ReopenRefusal => false,
+                CoreRecord::ProviderProcess => false,
+                CoreRecord::Status => false,
+                CoreRecord::Manifest => false,
+                CoreRecord::InitialPrompt => false,
+                CoreRecord::Events => false,
+                CoreRecord::Requests => false,
+                CoreRecord::Launch => false,
+            }
+        }
+        let records = [
+            CoreRecord::Hold,
+            CoreRecord::Cancel,
+            CoreRecord::TurnClaim,
+            CoreRecord::Completion,
+            CoreRecord::Owner,
+            CoreRecord::Closed,
+            CoreRecord::Terminal,
+            CoreRecord::TerminalClosing,
+            CoreRecord::TerminalClosed,
+            #[cfg(target_os = "macos")]
+            CoreRecord::TerminalCloseIntent,
+            CoreRecord::LegacyResumePending,
+            CoreRecord::LegacyResumeRunning,
+            CoreRecord::ReopenMarker,
+            CoreRecord::ReopenRefusal,
+            CoreRecord::ProviderProcess,
+            CoreRecord::Status,
+            CoreRecord::Manifest,
+            CoreRecord::InitialPrompt,
+            CoreRecord::Events,
+            CoreRecord::Requests,
+            CoreRecord::Launch,
+        ];
+        for record in records {
+            assert_eq!(
+                extension.contains(record.name()),
+                allowed(record),
+                "Pi core record contract changed for {}; update the declared contract",
+                record.name()
+            );
+        }
+    }
+
     #[test]
     fn extension_reports_only_settled_results_without_changing_tool_policy() {
         let extension = bridge_extension();
@@ -1820,7 +1800,9 @@ mod tests {
         assert!(extension.contains("agent_bridge_claim_token"));
         assert!(extension.contains("agent_bridge_prompt_correlated"));
         assert!(extension.contains("event.prompt.includes"));
-        assert!(extension.contains("turn.claim"));
+        assert_core_record_contract(extension);
+        assert!(extension.contains(CANCEL_ACCEPTED_FILE));
+        assert!(extension.contains(STARTUP_READY_FILE));
         assert!(extension.contains(HOOK_FAILURE_FILE));
         assert!(extension.contains("renameSync"));
         assert!(extension.contains("native-hook\", \"pi"));

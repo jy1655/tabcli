@@ -41,6 +41,9 @@ _Avoid_: state, repository, manager
 **Adapter-private record**:
 A record whose name and schema one provider or terminal adapter owns. It lives in the session
 directory and is written with the Store's primitives, but no other module reads it.
+A component installed inside a provider by its adapter may read that adapter's private
+records, and core records only through a contract declared in `AGENTS.md` (currently the
+Pi extension's `turn.claim` and `cancel.json`).
 _Avoid_: scratch file, side file
 
 ### Turns
