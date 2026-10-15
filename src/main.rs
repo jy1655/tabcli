@@ -41,7 +41,7 @@ Usage:
   {PUBLIC_COMMAND} status [--workspace PATH | --all-workspaces] [--provider <codex|claude|agy|pi>] [--all] [--json]
   {PUBLIC_COMMAND} inspect <session> [--timeline [--request REQUEST]] [--json]
   {PUBLIC_COMMAND} result <session> [--latest | --list | --event EVENT | --request REQUEST] [--json]
-      [--wait --timeout-secs N]
+  {PUBLIC_COMMAND} result <session> --request REQUEST --wait [--timeout-secs N] [--json]
   {PUBLIC_COMMAND} wait ADDRESS [ADDRESS ...] [--timeout-secs N] [--json]
   {PUBLIC_COMMAND} search <query> [--workspace PATH | --all-workspaces] [--provider <codex|claude|agy|pi>]
       [--limit N] [--json]
