@@ -3,8 +3,8 @@ use super::query::observation::{Observation, SessionEvidence, SurfaceRecord};
 use super::{
     Duration, FirstPartyCli, Instant, NativeCommand, OsString, Path, Reader, Result, Serialize,
     bail, cli_version_is_supported, consent, fs, is_executable, option_value, provider,
-    provider_process, query, reopen, resolve_provider, set_flag_once, set_once, terminal,
-    terminal_safe_text, thread,
+    provider_process, provider_version_text, query, reopen, resolve_provider, set_flag_once,
+    set_once, terminal, terminal_safe_text, thread,
 };
 use crate::native::session::SessionState;
 use crate::native::session::primitives::{SESSION_DIR_ENV, require_valid_session_id, unix_ms};
@@ -347,10 +347,7 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
                     deadline,
                 ) {
                     Ok(output) if output.status.success() => {
-                        let mut version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-                        if version.is_empty() {
-                            version = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-                        }
+                        let version = provider_version_text(&output.stdout, &output.stderr);
                         let (availability, reason) =
                             match cli_version_is_supported(provider, &version) {
                                 Ok(true) => (Available, "version_supported"),

@@ -1775,6 +1775,14 @@ fn configure_provider_launch(
     launch::provider_stderr(command);
 }
 
+fn provider_version_text(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut version = String::from_utf8_lossy(stdout).trim().to_owned();
+    if version.is_empty() {
+        version = String::from_utf8_lossy(stderr).trim().to_owned();
+    }
+    version
+}
+
 fn version_probe_command(provider: FirstPartyCli, executable: &Path) -> Result<Command> {
     let mut command = process_env::provider_version_command(
         executable,
@@ -1808,10 +1816,7 @@ fn check_provider_version_until(
             output.status
         );
     }
-    let mut version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if version.is_empty() {
-        version = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    }
+    let version = provider_version_text(&output.stdout, &output.stderr);
     if !cli_version_is_supported(provider, &version)? {
         bail!(
             "{} is too old: found {version:?}, require >= {}",
