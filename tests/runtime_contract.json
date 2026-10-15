@@ -176,8 +176,7 @@
     "input-messages": 1,
     "\"type\"": 1
   },
-  "src/native/provider/pi.rs": {
-    "const HOOK_FAILURE_FILE: &str = \"pi-hook-failure.json\";": 1,
+  "src/native/provider/pi/mod.rs": {
     "const PENDING_TURN_FILE: &str = \"pi-pending-turn.json\";": 1,
     "const STARTUP_READY_FILE: &str = \"pi-startup-ready.json\";": 1,
     "context.directory.join(\"pi-agent-bridge.js\")": 1,
@@ -190,10 +189,13 @@
     "[Agent Bridge Pi Windows console turn protocol]": 1,
     "[Agent Bridge Pi turn protocol]": 1,
     "agent-bridge-pi-turn": 1,
-    "pi-hook-failure.json": 1,
     "pi-pending-turn.json": 1,
     "pi-startup-ready.json": 1,
     "trust.json": 1
+  },
+  "src/native/provider/pi/monitor.rs": {
+    "const HOOK_FAILURE_FILE: &str = \"pi-hook-failure.json\";": 1,
+    "pi-hook-failure.json": 1
   },
   "src/native/provider/pi_extension.js": {
     "AGENT_BRIDGE_NATIVE_SESSION_DIR": 5,
