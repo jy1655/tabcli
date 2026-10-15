@@ -1,4 +1,3 @@
-use super::session::close::compatibility::*;
 use super::*;
 #[cfg(not(any(target_os = "macos", windows)))]
 use crate::native::session::close::budget::close_deadline;

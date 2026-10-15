@@ -290,8 +290,6 @@ pub(in crate::native) struct CloseFixture {
     pub(super) root: tempfile::TempDir,
     pub(in crate::native) directory: PathBuf,
     pub(super) request_id: String,
-    pub(super) pending: PendingTurnCompletion,
-    pub(super) event_path: PathBuf,
 }
 
 /// A working session under `session-fault` with a held claim, a journaled completion
@@ -332,8 +330,6 @@ pub(in crate::native) fn seed_close_fixture(journaled_event: JournaledEventState
         root,
         directory,
         request_id,
-        pending,
-        event_path,
     }
 }
 
