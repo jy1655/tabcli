@@ -6,8 +6,7 @@ use crate::native::delivery::{
     Outcome, Prepared, Readiness, SurfaceInput, Transport, TransportFacts, TurnContext,
 };
 use crate::native::provider::{
-    CompletionMonitor, LaunchContext, LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan,
-    ResumedSessionContext,
+    CompletionMonitor, LaunchContext, LaunchPlan, NativeProviderAdapter, ReopenSupport,
 };
 use crate::native::session::{Reader, Store, turn};
 use crate::native::terminal;
@@ -345,18 +344,7 @@ impl NativeProviderAdapter for AgyAdapter {
         })
     }
 
-    fn verify_reopen_available(&self, _provider_session_id: &str) -> Result<()> {
-        bail!("{AGY_REOPEN_UNSUPPORTED}")
-    }
-
-    fn prepare_resume(&self, _context: ResumeContext<'_>) -> Result<ResumePlan> {
-        bail!("{AGY_REOPEN_UNSUPPORTED}")
-    }
-
-    fn other_resumed_conversation_holders(
-        &self,
-        _context: ResumedSessionContext<'_>,
-    ) -> Result<Vec<u32>> {
+    fn reopen(&self) -> Result<&'static dyn ReopenSupport> {
         bail!("{AGY_REOPEN_UNSUPPORTED}")
     }
 

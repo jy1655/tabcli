@@ -1,6 +1,6 @@
 use super::{
     CompletionMonitor, CrossSessionMessageContext, LaunchContext, LaunchPlan,
-    NativeProviderAdapter, ResumeContext, ResumePlan, ResumedSessionContext,
+    NativeProviderAdapter, ReopenSupport, ResumeContext, ResumePlan, ResumedSessionContext,
 };
 use crate::native::delivery::{
     self, Outcome, Prepared, Readiness, Transport, TransportFacts, TurnContext,
@@ -473,7 +473,28 @@ impl NativeProviderAdapter for ClaudeAdapter {
         prepare_launch_for_platform(context, cfg!(windows))
     }
 
-    fn verify_reopen_available(&self, provider_session_id: &str) -> Result<()> {
+    fn reopen(&self) -> Result<&'static dyn ReopenSupport> {
+        Ok(&CLAUDE_REOPEN)
+    }
+
+    fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()> {
+        handle_hook(directory, payload)
+    }
+
+    fn run_control(&self, arguments: &[String]) -> Result<()> {
+        match arguments {
+            [action, request @ ..] if action == "message-guard" => run_message_guard(request),
+            [action, request_id] if action == "message-receipt" => run_message_receipt(request_id),
+            _ => bail!("unsupported Claude Agent Bridge provider control"),
+        }
+    }
+}
+
+struct ClaudeReopen;
+static CLAUDE_REOPEN: ClaudeReopen = ClaudeReopen;
+
+impl ReopenSupport for ClaudeReopen {
+    fn verify_available(&self, provider_session_id: &str) -> Result<()> {
         verify_reopen_available_for_platform(provider_session_id, cfg!(windows))?;
         let registry = claude_sessions_registry_dir()?;
         if let Some(pid) =
@@ -487,45 +508,37 @@ impl NativeProviderAdapter for ClaudeAdapter {
         Ok(())
     }
 
-    fn prepare_resume(&self, context: ResumeContext<'_>) -> Result<ResumePlan> {
+    fn prepare(&self, context: ResumeContext<'_>) -> Result<ResumePlan> {
         prepare_resume_for_platform(context, cfg!(windows))
     }
 
-    fn other_resumed_conversation_holders(
+    fn other_holders_after_registration(
         &self,
         context: ResumedSessionContext<'_>,
+        deadline: Instant,
     ) -> Result<Vec<u32>> {
         verify_reopen_available_for_platform(context.provider_session_id, cfg!(windows))?;
         let registry = claude_sessions_registry_dir()?;
         let managed_name = managed_session_name(context.directory)?;
-        if context.wait_for_registration {
-            wait_for_resumed_conversation_holders(
-                &registry,
-                context.provider_session_id,
-                &managed_name,
-                live_process_creation_time,
-                context.deadline,
-            )
-        } else {
-            recheck_resumed_conversation_holders(
-                &registry,
-                context.provider_session_id,
-                &managed_name,
-                live_process_creation_time,
-            )
-        }
+        wait_for_resumed_conversation_holders(
+            &registry,
+            context.provider_session_id,
+            &managed_name,
+            live_process_creation_time,
+            deadline,
+        )
     }
 
-    fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()> {
-        handle_hook(directory, payload)
-    }
-
-    fn run_control(&self, arguments: &[String]) -> Result<()> {
-        match arguments {
-            [action, request @ ..] if action == "message-guard" => run_message_guard(request),
-            [action, request_id] if action == "message-receipt" => run_message_receipt(request_id),
-            _ => bail!("unsupported Claude Agent Bridge provider control"),
-        }
+    fn other_holders_now(&self, context: ResumedSessionContext<'_>) -> Result<Vec<u32>> {
+        verify_reopen_available_for_platform(context.provider_session_id, cfg!(windows))?;
+        let registry = claude_sessions_registry_dir()?;
+        let managed_name = managed_session_name(context.directory)?;
+        recheck_resumed_conversation_holders(
+            &registry,
+            context.provider_session_id,
+            &managed_name,
+            live_process_creation_time,
+        )
     }
 }
 

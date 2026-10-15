@@ -243,6 +243,19 @@ fn doctor_reports_other_live_holders_of_a_resumed_conversation() {
         "claude_resumed_conversation_exclusive_now"
     );
 
+    let rendered = serde_json::to_value(&check).unwrap();
+    assert_eq!(
+        rendered["detail"],
+        format!(
+            "No other live Claude Code process is registered for resumed conversation {REOPEN_TEST_CONVERSATION} at this moment."
+        )
+    );
+    assert_eq!(rendered["next_action"], DOCTOR_HOLDER_NEXT_ACTION);
+    assert_eq!(
+        rendered["evidence"],
+        serde_json::json!({"provider_session_id": REOPEN_TEST_CONVERSATION, "other_holders": []})
+    );
+
     // A foreign live resume is listed by pid.
     let mut foreign = std::process::Command::new("cmd.exe")
         .args(["/c", "pause"])
@@ -270,11 +283,37 @@ fn doctor_reports_other_live_holders_of_a_resumed_conversation() {
         "{rendered}"
     );
 
+    assert_eq!(
+        rendered["detail"],
+        format!(
+            "Resumed conversation {REOPEN_TEST_CONVERSATION} is also held by live Claude Code process(es) {}; the next tell to this session will be refused with gate reopen-conflict while they stay registered.",
+            foreign.id()
+        )
+    );
+    assert_eq!(rendered["next_action"], DOCTOR_HOLDER_NEXT_ACTION);
+    assert_eq!(
+        rendered["evidence"],
+        serde_json::json!({"provider_session_id": REOPEN_TEST_CONVERSATION, "other_holders": [foreign.id()]})
+    );
+
     // A scan that cannot complete is reported as unknown, never as exclusive.
     std::fs::remove_file(registry.join(format!("{}.json", std::process::id()))).unwrap();
     let check = holders_check(&directory).unwrap();
     assert_eq!(check.availability, Availability::Unknown);
     assert_eq!(check.reason_code, "claude_resumed_conversation_unverified");
+    let rendered = serde_json::to_value(&check).unwrap();
+    assert_eq!(
+        rendered["detail"],
+        format!(
+            "The registry scan for resumed conversation {REOPEN_TEST_CONVERSATION} failed: reopened Claude session session-reopendoc1 is no longer registered for conversation {REOPEN_TEST_CONVERSATION} under {}; the next tell to this session will be refused with gate reopen-verification-failed until it succeeds.",
+            registry.display()
+        )
+    );
+    assert_eq!(rendered["next_action"], DOCTOR_HOLDER_NEXT_ACTION);
+    assert_eq!(
+        rendered["evidence"],
+        serde_json::json!({"provider_session_id": REOPEN_TEST_CONVERSATION})
+    );
     override_session_registry_for_test(None);
 }
 
@@ -1710,3 +1749,63 @@ fn resume_is_refused_off_native_windows_and_for_non_uuid_identity() {
     verify_reopen_available_for_platform(REOPEN_TEST_CONVERSATION, true).unwrap();
     verify_reopen_available_for_platform("6928CA1C-1234-4ABC-8DEF-0123456789AB", true).unwrap();
 }
+
+#[test]
+fn reopen_bundle_exists_on_every_platform() {
+    assert!(ADAPTER.reopen().is_ok());
+}
+
+#[test]
+fn doctor_empty_registry_preserves_unverified_detail_and_omission() {
+    use super::super::super::doctor::Availability;
+    let root = tempfile::tempdir().unwrap();
+    let registry = root.path().join("registry");
+    std::fs::create_dir(&registry).unwrap();
+    override_session_registry_for_test(Some(registry.clone()));
+    for name in ["session-doctorempty", "invalid"] {
+        let directory = root.path().join(name);
+        std::fs::create_dir(&directory).unwrap();
+        assert!(resumed_conversation_holders_check(&directory).is_none());
+        for manifest in [
+            serde_json::json!({}),
+            serde_json::json!({"resumed_from": {}}),
+            serde_json::json!({"resumed_from": {"provider_session_id": 1}}),
+        ] {
+            std::fs::write(directory.join("manifest.json"), manifest.to_string()).unwrap();
+            assert!(resumed_conversation_holders_check(&directory).is_none());
+        }
+        for conversation in [REOPEN_TEST_CONVERSATION, "not-a-uuid"] {
+            std::fs::write(
+                directory.join("manifest.json"),
+                serde_json::json!({"resumed_from": {"provider_session_id": conversation}})
+                    .to_string(),
+            )
+            .unwrap();
+            let check = resumed_conversation_holders_check(&directory);
+            if name == "invalid" {
+                assert!(check.is_none());
+                continue;
+            }
+            let check = check.unwrap();
+            assert_eq!(check.id, "claude_resumed_conversation_holders");
+            assert_eq!(check.availability, Availability::Unknown);
+            assert_eq!(check.reason_code, "claude_resumed_conversation_unverified");
+            let rendered = serde_json::to_value(&check).unwrap();
+            assert_eq!(
+                rendered["detail"],
+                format!(
+                    "The registry scan for resumed conversation {conversation} failed: reopened Claude session {name} is no longer registered for conversation {conversation} under {}; the next tell to this session will be refused with gate reopen-verification-failed until it succeeds.",
+                    registry.display()
+                )
+            );
+            assert_eq!(rendered["next_action"], DOCTOR_HOLDER_NEXT_ACTION);
+            assert_eq!(
+                rendered["evidence"],
+                serde_json::json!({"provider_session_id": conversation})
+            );
+        }
+    }
+    override_session_registry_for_test(None);
+}
+
+const DOCTOR_HOLDER_NEXT_ACTION: &str = "Detection is best-effort and taken only at launch, before each delivery, and now; a foreign claude --resume can still interleave between checks. Close the other holder before the next tell, or accept the shared transcript.";

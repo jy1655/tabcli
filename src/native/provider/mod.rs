@@ -45,18 +45,11 @@ pub(super) struct ResumePlan {
     pub(super) environment_removals: &'static [&'static str],
 }
 
-// A reopened session whose provider process is running. `directory` is the new session's
-// own state. With `wait_for_registration` the adapter waits until `deadline` for the
-// provider's own registration of that process (the post-launch check, before the initial
-// prompt exists in the process); without it the adapter answers from the registry as it is
-// now and treats a missing registration as a failure (the re-scan immediately before the
-// initial prompt and before every follow-up delivery).
+// A reopened session whose provider process is running; directory is its own state.
 #[derive(Clone, Copy)]
 pub(super) struct ResumedSessionContext<'a> {
     pub(super) directory: &'a Path,
     pub(super) provider_session_id: &'a str,
-    pub(super) deadline: Instant,
-    pub(super) wait_for_registration: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -118,6 +111,20 @@ pub(super) fn cancel_support(provider: FirstPartyCli, directory: &Path) -> Resul
     adapter(provider).cancel_support(directory)
 }
 
+pub(super) trait ReopenSupport: Sync {
+    fn verify_available(&self, provider_session_id: &str) -> Result<()>;
+    fn prepare(&self, context: ResumeContext<'_>) -> Result<ResumePlan>;
+    // Wait for this session's registration until the supplied deadline, then report other
+    // live holders. Registry errors are not waited out.
+    fn other_holders_after_registration(
+        &self,
+        context: ResumedSessionContext<'_>,
+        deadline: Instant,
+    ) -> Result<Vec<u32>>;
+    // Succeeds only when this session's own registration is verified now.
+    fn other_holders_now(&self, context: ResumedSessionContext<'_>) -> Result<Vec<u32>>;
+}
+
 trait NativeProviderAdapter: Sync {
     fn initial_transport(&self) -> Box<dyn Transport>;
     fn follow_up_transport(&self) -> Box<dyn Transport>;
@@ -136,24 +143,9 @@ trait NativeProviderAdapter: Sync {
     // there is no shared default.
     fn probe_environment_removals(&self) -> &'static [&'static str];
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan>;
-    // Read-only reopen gate. Each adapter states whether the recorded provider conversation
-    // can be continued in a new process on this platform and whether the provider's own
-    // ownership evidence shows the conversation is still held by a live process. There is no
-    // shared default: an adapter that cannot prove ownership must refuse with its reason.
-    fn verify_reopen_available(&self, provider_session_id: &str) -> Result<()>;
-    fn prepare_resume(&self, context: ResumeContext<'_>) -> Result<ResumePlan>;
-    // Ownership check for a reopened session, run after launch and again at every delivery
-    // boundary. Once the provider's own evidence shows the new process registered as the
-    // conversation's holder, the adapter reports every OTHER live process that holds the
-    // same conversation. A non-empty answer is a conflict the shared layer refuses the
-    // delivery for; an error is a verification failure the shared layer also refuses for,
-    // because an unverifiable conversation is treated as shared. This is best-effort
-    // detection at each call, not exclusion. An adapter that refuses reopen refuses here as
-    // well, because this call is only reachable after its resume plan ran.
-    fn other_resumed_conversation_holders(
-        &self,
-        context: ResumedSessionContext<'_>,
-    ) -> Result<Vec<u32>>;
+    // Ok means an implementation exists, not availability for this platform or conversation.
+    // Each operation verifies its own availability.
+    fn reopen(&self) -> Result<&'static dyn ReopenSupport>;
     fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()>;
     fn run_control(&self, arguments: &[String]) -> Result<()>;
 }
@@ -220,29 +212,12 @@ pub(super) fn prepare_launch(
     adapter(provider).prepare_launch(context)
 }
 
-pub(super) fn verify_reopen_available(
-    provider: FirstPartyCli,
-    provider_session_id: &str,
-) -> Result<()> {
-    adapter(provider).verify_reopen_available(provider_session_id)
+pub(super) fn reopen(provider: FirstPartyCli) -> Result<&'static dyn ReopenSupport> {
+    adapter(provider).reopen()
 }
 
 pub(super) fn probe_environment_removals(provider: FirstPartyCli) -> &'static [&'static str] {
     adapter(provider).probe_environment_removals()
-}
-
-pub(super) fn prepare_resume(
-    provider: FirstPartyCli,
-    context: ResumeContext<'_>,
-) -> Result<ResumePlan> {
-    adapter(provider).prepare_resume(context)
-}
-
-pub(super) fn other_resumed_conversation_holders(
-    provider: FirstPartyCli,
-    context: ResumedSessionContext<'_>,
-) -> Result<Vec<u32>> {
-    adapter(provider).other_resumed_conversation_holders(context)
 }
 
 // Points the Claude adapter's session-registry reads at a fixture for the calling thread,

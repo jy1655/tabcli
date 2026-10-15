@@ -417,15 +417,20 @@ pub(super) fn verify_reopened_conversation_exclusive(
             reopen_refusal(gate, detail)
         }
     };
-    let others = match provider::other_resumed_conversation_holders(
-        provider,
-        provider::ResumedSessionContext {
+    let others = match provider::reopen(provider).and_then(|support| {
+        let context = provider::ResumedSessionContext {
             directory,
             provider_session_id: &resumed_from.provider_session_id,
-            deadline,
-            wait_for_registration: check == ResumedHolderCheck::AfterLaunch,
-        },
-    ) {
+        };
+        match check {
+            ResumedHolderCheck::AfterLaunch => {
+                support.other_holders_after_registration(context, deadline)
+            }
+            ResumedHolderCheck::BeforeInitialDelivery | ResumedHolderCheck::BeforeFollowUp => {
+                support.other_holders_now(context)
+            }
+        }
+    }) {
         Ok(others) => others,
         Err(error) => {
             return Err(refuse(
@@ -580,7 +585,8 @@ fn run_reopen_inner(request: ReopenRequest, report: &mut TurnReport) -> Result<(
     // repair are never run on it: a closed session has nothing to converge, and reopen must not
     // alter the record it continues from.
     let source = inspect_reopen_source(&source_directory, &request.id)?;
-    provider::verify_reopen_available(source.provider, &source.provider_session_id)
+    provider::reopen(source.provider)
+        .and_then(|support| support.verify_available(&source.provider_session_id))
         .map_err(|error| reopen_refusal("provider-unsupported", format!("{error:#}")))?;
     let workspace = source.manifest.workspace.canonicalize().with_context(|| {
         format!(

@@ -1,7 +1,4 @@
-use super::{
-    CompletionMonitor, LaunchContext, LaunchPlan, NativeProviderAdapter, ResumeContext, ResumePlan,
-    ResumedSessionContext,
-};
+use super::{CompletionMonitor, LaunchContext, LaunchPlan, NativeProviderAdapter, ReopenSupport};
 use crate::native::delivery::{
     self, Outcome, Prepared, Readiness, SurfaceInput, Transport, TransportFacts, TurnContext,
 };
@@ -328,18 +325,7 @@ impl NativeProviderAdapter for PiAdapter {
         })
     }
 
-    fn verify_reopen_available(&self, _provider_session_id: &str) -> Result<()> {
-        bail!("{PI_REOPEN_UNSUPPORTED}")
-    }
-
-    fn prepare_resume(&self, _context: ResumeContext<'_>) -> Result<ResumePlan> {
-        bail!("{PI_REOPEN_UNSUPPORTED}")
-    }
-
-    fn other_resumed_conversation_holders(
-        &self,
-        _context: ResumedSessionContext<'_>,
-    ) -> Result<Vec<u32>> {
+    fn reopen(&self) -> Result<&'static dyn ReopenSupport> {
         bail!("{PI_REOPEN_UNSUPPORTED}")
     }
 
@@ -1951,21 +1937,15 @@ mod tests {
 
     #[test]
     fn reopen_is_refused_with_the_adapters_own_reason() {
-        let error = ADAPTER
-            .verify_reopen_available("5e58ec26-0000-4000-8000-000000000000")
-            .unwrap_err();
+        let error = ADAPTER.reopen().err().expect("unsupported provider");
+        assert_eq!(error.to_string(), PI_REOPEN_UNSUPPORTED);
         assert!(
             error.to_string().starts_with("reopen unsupported: Pi"),
             "{error}"
         );
         let directory = tempfile::tempdir().unwrap();
-        let error = ADAPTER
-            .prepare_resume(ResumeContext {
-                bridge_executable: std::path::Path::new("/opt/agent-bridge"),
-                directory: directory.path(),
-                provider_session_id: "5e58ec26-0000-4000-8000-000000000000",
-            })
-            .unwrap_err();
+        let error = ADAPTER.reopen().err().expect("unsupported provider");
+        assert_eq!(error.to_string(), PI_REOPEN_UNSUPPORTED);
         assert!(
             error.to_string().starts_with("reopen unsupported: Pi"),
             "{error}"
