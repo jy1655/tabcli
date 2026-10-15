@@ -663,6 +663,98 @@ fn version_probes_drop_the_adapters_environment_removals() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn version_probe_preserves_text_classification_and_scope() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (status, stdout, stderr, availability, reason, expected) in [
+        (
+            0,
+            "agy 1.1.12",
+            "agy 1.1.11",
+            "available",
+            "version_supported",
+            Some("agy 1.1.12"),
+        ),
+        (
+            0,
+            " \t\n",
+            "agy 1.1.12",
+            "available",
+            "version_supported",
+            Some("agy 1.1.12"),
+        ),
+        (
+            0,
+            "agy 1.1.11",
+            "agy 1.1.12",
+            "unavailable",
+            "version_unsupported",
+            Some("agy 1.1.11"),
+        ),
+        (
+            0,
+            "development build",
+            "agy 1.1.12",
+            "unknown",
+            "version_unrecognized",
+            Some("development build"),
+        ),
+        (
+            0,
+            " \t\n",
+            " \r\n",
+            "unknown",
+            "version_unrecognized",
+            Some(""),
+        ),
+        (
+            7,
+            "agy 1.1.12",
+            "failed",
+            "unknown",
+            "version_probe_failed",
+            None,
+        ),
+    ] {
+        let fixture = Fixture::new("agy");
+        let executable = fixture.root.path().join("provider");
+        fs::write(&executable, format!(
+            "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = '--version' ] || exit 99\nprintf '%s' '{stdout}'\nprintf '%s' '{stderr}' >&2\nexit {status}\n"
+        )).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let before = entries(&fixture.directory);
+        let value = report(fixture.run(&["doctor", "session-doctor", "--probe", "--json"]));
+        let version = check(&value, "provider_version");
+        assert_eq!(version["availability"], availability);
+        assert_eq!(version["reason_code"], reason);
+        assert_eq!(value["scope"]["current_version"], json!(expected));
+        if let Some(expected) = expected {
+            assert_eq!(version["evidence"]["current_version"], expected);
+            assert_eq!(
+                version["detail"],
+                "Current CLI version; required minimum 1.1.12"
+            );
+            assert_eq!(
+                version["next_action"],
+                "CLI version is only one gate; inspect the provider-specific checks."
+            );
+        } else {
+            assert_eq!(version["evidence"], Value::Null);
+            assert_eq!(
+                version["detail"],
+                "Version probe exited with exit status: 7"
+            );
+            assert_eq!(
+                version["next_action"],
+                "Inspect the provider installation; a failed probe does not prove availability."
+            );
+        }
+        assert_eq!(entries(&fixture.directory), before);
+    }
+}
+
 #[test]
 fn scope_reports_launch_inputs_and_reuses_consent_observation() {
     let fixture = Fixture::new("pi");

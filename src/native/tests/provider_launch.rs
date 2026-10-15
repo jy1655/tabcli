@@ -383,3 +383,86 @@ fn provider_launch_and_version_builders_preserve_their_exact_environments() {
         );
     }
 }
+
+#[test]
+fn provider_version_text_selects_trimmed_lossy_stdout_before_stderr() {
+    for (stdout, stderr, expected) in [
+        (
+            &b" \tcodex-cli 0.147.0\r\n"[..],
+            &b"different"[..],
+            "codex-cli 0.147.0",
+        ),
+        (b"", b" \tagy 1.1.12\r\n", "agy 1.1.12"),
+        (b" \t\r\n", b" agy 1.1.12 \n", "agy 1.1.12"),
+        ("\u{2003}\u{00a0}\n".as_bytes(), b"agy 1.1.12", "agy 1.1.12"),
+        (b" \t\n", b" \r\n", ""),
+        (b"development build", b"agy 1.1.12", "development build"),
+        (b"\xff", b"agy 1.1.12", "\u{fffd}"),
+        (b" \t\n", b" \xff \n", "\u{fffd}"),
+        (
+            b"  banner\nagy 1.1.12\nextra  \n",
+            b"ignored",
+            "banner\nagy 1.1.12\nextra",
+        ),
+    ] {
+        assert_eq!(provider_version_text(stdout, stderr), expected);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_version_check_preserves_output_selection_and_failures() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let executable = root.path().join("provider");
+    let nonzero = format!(
+        "{} --version exited with exit status: 7",
+        executable.display()
+    );
+    for (status, stdout, stderr, expected) in [
+        (0, "agy 1.1.12", "agy 1.1.11", Ok("agy 1.1.12")),
+        (0, " \t\n", "agy 1.1.12", Ok("agy 1.1.12")),
+        (
+            0,
+            "agy 1.1.11",
+            "agy 1.1.12",
+            Err("agy is too old: found \"agy 1.1.11\", require >= 1.1.12"),
+        ),
+        (
+            0,
+            "development build",
+            "agy 1.1.12",
+            Err("could not parse a semantic version from \"development build\""),
+        ),
+        (
+            0,
+            " \t\n",
+            " \r\n",
+            Err("could not parse a semantic version from \"\""),
+        ),
+        (7, "agy 1.1.12", "failed", Err(nonzero.as_str())),
+    ] {
+        fs::write(&executable, format!(
+            "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = '--version' ] || exit 99\nprintf '%s' '{stdout}'\nprintf '%s' '{stderr}' >&2\nexit {status}\n"
+        )).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        for bounded in [false, true] {
+            let actual = if bounded {
+                check_provider_version_until(
+                    FirstPartyCli::Agy,
+                    &executable,
+                    Some(Instant::now() + Duration::from_secs(5)),
+                )
+            } else {
+                check_provider_version(FirstPartyCli::Agy, &executable)
+            }
+            .map_err(|error| error.to_string());
+            assert_eq!(
+                actual.as_deref().map_err(String::as_str),
+                expected,
+                "bounded={bounded}, exit={status}, stdout={stdout:?}"
+            );
+        }
+    }
+}
