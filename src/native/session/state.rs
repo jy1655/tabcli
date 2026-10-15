@@ -56,6 +56,13 @@ impl SessionState {
         *self == Self::Ready
     }
 
+    /// Whether the recorded session lifecycle is exited, failed, or closed.
+    /// Exited and Failed may still transition to Closed. This does not prove
+    /// that the owner, provider process, or terminal surface has ended.
+    pub(in crate::native) fn ended(&self) -> bool {
+        matches!(self, Self::Exited | Self::Failed | Self::Closed)
+    }
+
     pub(in crate::native) fn as_str(&self) -> &str {
         match self {
             Self::Launching => "launching",
@@ -248,6 +255,29 @@ impl Store {
 mod tests {
     use super::*;
     use crate::native::session::SessionStatus;
+
+    #[test]
+    fn ended_checks_only_the_recorded_lifecycle_variants() {
+        for (state, expected) in [
+            (SessionState::Launching, false),
+            (SessionState::Running, false),
+            (SessionState::AwaitingInitialInput, false),
+            (SessionState::Ready, false),
+            (SessionState::Claimed, false),
+            (SessionState::Working, false),
+            (SessionState::ResumePending, false),
+            (SessionState::Exited, true),
+            (SessionState::Failed, true),
+            (SessionState::Closed, true),
+            (SessionState::Unknown("closed".to_owned()), false),
+            (SessionState::Unknown("exited".to_owned()), false),
+            (SessionState::Unknown("failed".to_owned()), false),
+            (SessionState::Unknown("unknown".to_owned()), false),
+            (SessionState::Unknown("".to_owned()), false),
+        ] {
+            assert_eq!(state.ended(), expected, "{state:?}");
+        }
+    }
 
     #[test]
     fn refused_status_writes_preserve_the_record_bytes() {
