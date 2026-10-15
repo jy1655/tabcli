@@ -340,11 +340,37 @@ pub(in crate::native) fn close(
     deadline: Instant,
     close_terminal: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
 ) -> Result<terminal::CloseOutcome> {
+    close_with_attestation(store, reason, deadline, attest_owner, close_terminal)
+}
+
+// Runs the same close procedure, with only the owner's OS observation supplied by
+// the caller. Recovery, repair policy, surface retention and close ordering stay fixed.
+pub(in crate::native) fn close_with_attestation(
+    store: &Store,
+    reason: Option<String>,
+    deadline: Instant,
+    observe: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
+    closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
+) -> Result<terminal::CloseOutcome> {
     close_with_repair(
         store,
         reason,
-        || repair_dead_owner_until(store, deadline),
-        close_terminal,
+        || {
+            repair_dead_owner_with(
+                store,
+                |owner| repair_owner_is_live(&observe(owner)),
+                terminal::surface_outlives_owner,
+                |surface| {
+                    terminal::ownership::close_dead_owner_surface_until(
+                        store.directory(),
+                        surface,
+                        deadline,
+                    )
+                },
+                deadline,
+            )
+        },
+        closer,
         deadline,
     )
     .map_err(
@@ -937,48 +963,6 @@ where
 pub(in crate::native) mod compatibility {
     use super::*;
     use crate::native::terminal::ownership::close_dead_owner_surface_with;
-    #[cfg(target_os = "macos")]
-    pub(in crate::native) fn close_with_owner_observation(
-        store: &Store,
-        reason: Option<String>,
-        owner_live: impl FnOnce(&NativeSessionOwner) -> Result<bool>,
-        closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
-    ) -> Result<terminal::CloseOutcome> {
-        super::close_with_repair(
-            store,
-            reason,
-            || {
-                super::repair_dead_owner_with(
-                    store,
-                    owner_live,
-                    terminal::surface_outlives_owner,
-                    |_| panic!("macOS repair must not close a surface"),
-                    crate::native::session::close::budget::close_deadline(),
-                )
-            },
-            closer,
-            crate::native::session::close::budget::close_deadline(),
-        )
-    }
-    #[cfg(target_os = "macos")]
-    pub(in crate::native) fn close_with_result(
-        store: &Store,
-        reason: Option<String>,
-        mut closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseResult>,
-    ) -> Result<terminal::CloseOutcome> {
-        let mut outcome = terminal::CloseOutcome::Missing;
-        super::close_session_state_with_error(
-            store,
-            reason,
-            |surface| {
-                let result = closer(surface)?;
-                outcome = result.outcome;
-                Ok(result)
-            },
-            crate::native::session::close::budget::close_deadline(),
-        )?;
-        Ok(outcome)
-    }
     pub(in crate::native) fn mark_session_closed(
         directory: &Path,
         error: Option<String>,
@@ -1009,21 +993,6 @@ pub(in crate::native) mod compatibility {
             deadline,
         )
     }
-    pub(in crate::native) fn close_repaired_session_state(
-        directory: &Path,
-        mut closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
-    ) -> Result<()> {
-        super::close(
-            &Store::open_unchecked(directory),
-            None,
-            crate::native::session::close::budget::close_deadline(),
-            |surface| closer(surface).map(Into::into),
-        )
-        .map(|_| ())
-    }
-    pub(in crate::native) fn repair_dead_native_owner(directory: &Path) -> Result<bool> {
-        repair_dead_owner(&Store::open_unchecked(directory))
-    }
     pub(in crate::native) fn repair_dead_native_owner_with_terminal_close(
         directory: &Path,
         mut closer: impl FnMut(&terminal::TerminalSession) -> Result<terminal::CloseOutcome>,
@@ -1040,37 +1009,6 @@ pub(in crate::native) mod compatibility {
                 )
             },
             crate::native::session::close::budget::close_deadline(),
-        )
-    }
-    #[cfg(target_os = "macos")]
-    pub(in crate::native) fn record_terminal_close_intent(
-        directory: &Path,
-        id: &str,
-        session: &terminal::TerminalSession,
-        owner: &NativeSessionOwner,
-    ) -> Result<()> {
-        super::record_terminal_close_intent(&Store::open_unchecked(directory), id, session, owner)
-    }
-    #[cfg(target_os = "macos")]
-    pub(in crate::native) fn terminal_close_intent_owner(
-        directory: &Path,
-        session: &terminal::TerminalSession,
-    ) -> Result<Option<NativeSessionOwner>> {
-        super::terminal_close_intent_owner(
-            &Reader::open_unchecked(directory),
-            session,
-            terminal::surface_outlives_owner(session),
-        )
-    }
-    #[cfg(target_os = "macos")]
-    pub(in crate::native) fn terminal_close_resumable(
-        directory: &Path,
-        session: &terminal::TerminalSession,
-    ) -> Result<bool> {
-        super::terminal_close_resumable(
-            &Reader::open_unchecked(directory),
-            session,
-            terminal::surface_outlives_owner(session),
         )
     }
 }

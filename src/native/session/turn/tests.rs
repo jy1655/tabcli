@@ -1,7 +1,7 @@
 use super::*;
 use crate::native::query;
 use crate::native::reopen::tests::snapshot_directory;
-use crate::native::session::close::compatibility::mark_session_closed;
+use crate::native::session::close as session_close;
 use crate::native::session::names::{TURN_CLAIM_FILE, TURN_COMPLETION_FILE};
 use crate::native::session::primitives::{
     injected_fault, injected_sync_failure, lock_turn_claim, read_json, with_fault_budget,
@@ -973,7 +973,14 @@ fn close_during_turn_claim_cannot_resurrect_the_session() {
     });
     claimed_rx.recv().unwrap();
 
-    mark_session_closed(directory.path(), None).unwrap();
+    session_close::close(
+        &Store::open_unchecked(directory.path()),
+        None,
+        session_close::budget::close_deadline(),
+        |_| panic!("no terminal handle"),
+    )
+    .map(|_| ())
+    .unwrap();
     continue_tx.send(()).unwrap();
     let error = match waiter.join().unwrap() {
         Ok(_) => panic!("closed session unexpectedly reacquired a turn"),
@@ -1009,7 +1016,15 @@ fn close_cannot_interleave_between_ready_validation_and_claimed_publication() {
     });
     publish_rx.recv().unwrap();
     let close_directory = directory.path().to_owned();
-    let close = thread::spawn(move || mark_session_closed(&close_directory, None));
+    let close = thread::spawn(move || {
+        session_close::close(
+            &Store::open_unchecked(&close_directory),
+            None,
+            session_close::budget::close_deadline(),
+            |_| panic!("no terminal handle"),
+        )
+        .map(|_| ())
+    });
 
     continue_tx.send(()).unwrap();
     let (claim, _) = tell.join().unwrap().unwrap();

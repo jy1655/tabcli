@@ -52,34 +52,40 @@ fn r3_teardown_records_intent_before_signal_and_settles_every_kind() {
         let (dir, owner, surface, live) = fixture(kind);
         let store = Store::open_unchecked(dir.path());
         let attestations = Cell::new(0);
-        let outcome = session::close::compatibility::close_with_result(&store, None, |_| {
-            assert_eq!(
-                decision(dir.path(), &surface, true, true, |_| panic!(
-                    "no replay group probe"
-                ))
-                .unwrap(),
-                TerminalCloseAuthority::OwnerTeardown
-            );
-            teardown_absent_owner_with(
-                &store,
-                "session-owner123",
-                &surface,
-                || {
-                    attestations.set(attestations.get() + 1);
-                    Ok((owner.clone(), live))
-                },
-                |group| {
-                    assert_eq!(attestations.get(), 2);
-                    assert_eq!(group, 4242);
-                    let intent =
-                        session::close::terminal_teardown_intent(&store, &surface)?.unwrap();
-                    assert_eq!(intent.process_group, group);
-                    assert_eq!(intent.reason, OWNER_TEARDOWN_REASON);
-                    Ok(())
-                },
-                crate::native::session::close::budget::close_deadline(),
-            )
-        })
+        let outcome = session::close::close_with_attestation(
+            &store,
+            None,
+            session::close::budget::close_deadline(),
+            |_| test_owner_attestation(true),
+            |_| {
+                assert_eq!(
+                    decision(dir.path(), &surface, true, true, |_| panic!(
+                        "no replay group probe"
+                    ))
+                    .unwrap(),
+                    TerminalCloseAuthority::OwnerTeardown
+                );
+                teardown_absent_owner_with(
+                    &store,
+                    "session-owner123",
+                    &surface,
+                    || {
+                        attestations.set(attestations.get() + 1);
+                        Ok((owner.clone(), live))
+                    },
+                    |group| {
+                        assert_eq!(attestations.get(), 2);
+                        assert_eq!(group, 4242);
+                        let intent =
+                            session::close::terminal_teardown_intent(&store, &surface)?.unwrap();
+                        assert_eq!(intent.process_group, group);
+                        assert_eq!(intent.reason, OWNER_TEARDOWN_REASON);
+                        Ok(())
+                    },
+                    crate::native::session::close::budget::close_deadline(),
+                )
+            },
+        )
         .unwrap();
         assert_eq!(outcome, CloseOutcome::Missing);
         assert_eq!(store.status().unwrap().state, SessionState::Closed);
@@ -99,31 +105,37 @@ fn r3_attestation_changes_and_timeout_keep_handle_and_intent() {
         let store = Store::open_unchecked(dir.path());
         let calls = Cell::new(0);
         let signals = Cell::new(0);
-        let result = session::close::compatibility::close_with_result(&store, None, |_| {
-            teardown_absent_owner_with(
-                &store,
-                "session-owner123",
-                &surface,
-                || {
-                    calls.set(calls.get() + 1);
-                    if failure == "initial" || (failure == "died" && calls.get() == 2) {
-                        bail!("owner gone");
-                    }
-                    let mut observed = owner.clone();
-                    let mut process = live;
-                    if failure == "reused" && calls.get() == 2 {
-                        observed.process_start_microseconds = Some(43);
-                        process.process_start_microseconds = 43;
-                    }
-                    Ok((observed, process))
-                },
-                |_| {
-                    signals.set(signals.get() + 1);
-                    bail!("group disappearance unconfirmed: {failure}")
-                },
-                crate::native::session::close::budget::close_deadline(),
-            )
-        });
+        let result = session::close::close_with_attestation(
+            &store,
+            None,
+            session::close::budget::close_deadline(),
+            |_| test_owner_attestation(true),
+            |_| {
+                teardown_absent_owner_with(
+                    &store,
+                    "session-owner123",
+                    &surface,
+                    || {
+                        calls.set(calls.get() + 1);
+                        if failure == "initial" || (failure == "died" && calls.get() == 2) {
+                            bail!("owner gone");
+                        }
+                        let mut observed = owner.clone();
+                        let mut process = live;
+                        if failure == "reused" && calls.get() == 2 {
+                            observed.process_start_microseconds = Some(43);
+                            process.process_start_microseconds = 43;
+                        }
+                        Ok((observed, process))
+                    },
+                    |_| {
+                        signals.set(signals.get() + 1);
+                        bail!("group disappearance unconfirmed: {failure}")
+                    },
+                    crate::native::session::close::budget::close_deadline(),
+                )
+            },
+        );
         assert!(result.is_err());
         assert_eq!(
             signals.get(),

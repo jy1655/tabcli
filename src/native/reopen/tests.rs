@@ -1,5 +1,5 @@
 use super::*;
-use crate::native::session::close::compatibility::*;
+use crate::native::session::close as session_close;
 use crate::native::session::schema::{
     ProviderProcessRecord, RecordedReopenRefusal, SESSION_SCHEMA, SessionEvent, SessionManifest,
 };
@@ -169,7 +169,13 @@ fn write_closed_reopen_source(
             )
             .unwrap();
     }
-    close_session_state(&directory, |_| Ok(terminal::CloseOutcome::Closed)).unwrap();
+    session_close::close(
+        &Store::open_unchecked(&directory),
+        None,
+        session_close::budget::close_deadline(),
+        |_| Ok(terminal::CloseOutcome::Closed.into()),
+    )
+    .unwrap();
     assert!(directory.join(CLOSED_STATUS_FILE).is_file());
     assert!(directory.join(TERMINAL_TOMBSTONE_FILE).is_file());
     directory
@@ -719,10 +725,15 @@ fn reopened_session_close_consumes_only_its_own_handle_and_leaves_the_source_tom
     let source_before = snapshot_directory(&source);
 
     let mut closed_terminals = Vec::new();
-    close_session_state(&new, |session| {
-        closed_terminals.push(session.id.clone());
-        Ok(terminal::CloseOutcome::Closed)
-    })
+    session_close::close(
+        &Store::open_unchecked(&new),
+        None,
+        session_close::budget::close_deadline(),
+        |session| {
+            closed_terminals.push(session.id.clone());
+            Ok(terminal::CloseOutcome::Closed.into())
+        },
+    )
     .unwrap();
     assert_eq!(closed_terminals, [format!("{new_id}-terminal")]);
     assert!(new.join(TERMINAL_TOMBSTONE_FILE).is_file());
@@ -743,19 +754,29 @@ fn reopened_session_close_consumes_only_its_own_handle_and_leaves_the_source_tom
     assert_eq!(status.error, None);
 
     let mut close_calls = 0;
-    close_session_state(&new, |_| {
-        close_calls += 1;
-        Ok(terminal::CloseOutcome::Closed)
-    })
+    session_close::close(
+        &Store::open_unchecked(&new),
+        None,
+        session_close::budget::close_deadline(),
+        |_| {
+            close_calls += 1;
+            Ok(terminal::CloseOutcome::Closed.into())
+        },
+    )
     .unwrap();
     assert_eq!(close_calls, 0);
     assert_eq!(snapshot_directory(&source), source_before);
 
     let mut close_calls = 0;
-    close_session_state(&source, |_| {
-        close_calls += 1;
-        Ok(terminal::CloseOutcome::Closed)
-    })
+    session_close::close(
+        &Store::open_unchecked(&source),
+        None,
+        session_close::budget::close_deadline(),
+        |_| {
+            close_calls += 1;
+            Ok(terminal::CloseOutcome::Closed.into())
+        },
+    )
     .unwrap();
     assert_eq!(close_calls, 0);
     assert_eq!(
@@ -1300,10 +1321,15 @@ fn reopen_lifecycle_interleavings_each_admit_one_outcome_and_keep_the_source_tom
                 }
                 Close => {
                     let mut close_calls = 0;
-                    close_session_state(&source, |_| {
-                        close_calls += 1;
-                        Ok(terminal::CloseOutcome::Closed)
-                    })
+                    session_close::close(
+                        &Store::open_unchecked(&source),
+                        None,
+                        session_close::budget::close_deadline(),
+                        |_| {
+                            close_calls += 1;
+                            Ok(terminal::CloseOutcome::Closed.into())
+                        },
+                    )
                     .unwrap();
                     assert_eq!(
                         close_calls, 0,
@@ -2083,15 +2109,16 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
                 if !close_succeeds {
                     anyhow::bail!("terminal adapter unavailable");
                 }
-                close_session_state_with_error(
-                    &new,
+                session_close::close(
+                    &Store::open_unchecked(&new),
                     Some(format!("{detected:#}")),
+                    crate::native::session::close::budget::close_deadline(),
                     |session| {
                         closed_terminals.push(session.id.clone());
-                        Ok(terminal::CloseOutcome::Closed)
+                        Ok(terminal::CloseOutcome::Closed.into())
                     },
-                    crate::native::session::close::budget::close_deadline(),
                 )
+                .map(|_| ())
             });
         drop(initial_claim);
         assert_eq!(
@@ -2453,22 +2480,18 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
         std::process::id()
     );
     expect_refused(&still_running);
-    // The cleanup the crashed parent never performed: an explicit close of the refused
-    // session consumes its handle. The closed surface is not evidence either while the
-    // provider process survives it.
-    let mut closed_terminals = Vec::new();
-    close_session_state_with_error(
-        &new,
+    // Finish the refused launch fixture before dead-owner repair consumes its handle.
+    // A closed surface is not evidence that the provider process has gone.
+    update_status(&new, SessionState::Failed, None, Some("refused".to_owned())).unwrap();
+    session_close::close(
+        &Store::open_unchecked(&new),
         Some("refused".to_owned()),
-        |session| {
-            closed_terminals.push(session.id.clone());
-            Ok(terminal::CloseOutcome::Closed)
-        },
-        crate::native::session::close::budget::close_deadline(),
+        session_close::budget::close_deadline(),
+        |_| panic!("failed dead-owner repair must consume the handle without an adapter"),
     )
     .unwrap();
-    assert_eq!(closed_terminals, [format!("{new_id}-terminal")]);
     assert!(new.join(TERMINAL_TOMBSTONE_FILE).is_file());
+    assert!(!new.join(TERMINAL_HANDLE_FILE).exists());
     expect_refused(&still_running);
     // Only the provider process being verified gone releases the marker; the closed
     // surface is reported alongside.
@@ -2700,14 +2723,14 @@ fn surviving_provider_process_retains_the_source_marker_until_it_is_verified_gon
     // The parent closed the surface (the console is gone) and the wrapper died with it;
     // the provider ignored the console close.
     let mut closed_terminals = Vec::new();
-    close_session_state_with_error(
-        &new,
+    session_close::close(
+        &Store::open_unchecked(&new),
         Some(format!("{refusal:#}")),
+        crate::native::session::close::budget::close_deadline(),
         |session| {
             closed_terminals.push(session.id.clone());
-            Ok(terminal::CloseOutcome::Closed)
+            Ok(terminal::CloseOutcome::Closed.into())
         },
-        crate::native::session::close::budget::close_deadline(),
     )
     .unwrap();
     assert_eq!(closed_terminals, [format!("{new_id}-terminal")]);

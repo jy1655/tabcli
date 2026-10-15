@@ -1,3 +1,4 @@
+use crate::native::session::close as session_close;
 #[test]
 fn launch_context_does_not_depend_on_terminal_environment() {
     if !crate::native::process_env::tests::without_bridge_environment(
@@ -2906,7 +2907,6 @@ fn g4_r20_creation_configs_carry_quoted_and_unicode_text_exactly() {
     }
 }
 
-use crate::native::session::close::compatibility::terminal_close_intent_owner;
 use crate::native::tests::write_attested_apple_terminal_state;
 use crate::native::{TERMINAL_CLOSE_INTENT_FILE, TERMINAL_HANDLE_FILE, read_json};
 
@@ -2945,7 +2945,14 @@ fn warp_close_records_intent_before_stopping_only_attested_group() {
         &shell,
         |group| {
             assert_eq!(group, 4242);
-            assert!(terminal_close_intent_owner(directory.path(), &handle)?.is_some());
+            assert!(
+                session_close::terminal_close_intent_owner(
+                    &Reader::open_unchecked(directory.path()),
+                    &handle,
+                    terminal::surface_outlives_owner(&handle)
+                )?
+                .is_some()
+            );
             bail!("injected still-running group: adapter must not run")
         },
         crate::native::session::close::budget::close_deadline(),

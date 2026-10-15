@@ -70,10 +70,11 @@ impl Processes {
     }
 
     fn close(&self, store: &Store, live: NativeProcessIdentity) -> Result<CloseOutcome> {
-        session::close::compatibility::close_with_owner_observation(
+        session::close::close_with_attestation(
             store,
             Some("pre-close diagnostic".into()),
-            |_| Ok(self.owner_live.get()),
+            session::close::budget::close_deadline(),
+            |_| test_owner_attestation(self.owner_live.get()),
             |surface| {
                 close_owned_surface_with(
                     || {
