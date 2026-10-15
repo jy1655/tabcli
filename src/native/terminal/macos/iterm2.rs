@@ -1,6 +1,8 @@
+use super::OwnedSurfaceClose;
 use super::applescript::{Automation, Osascript};
 use super::{DialogKey, GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
 use crate::native::session::Reader;
+use crate::native::session::close::budget::close_remaining;
 #[cfg(test)]
 use crate::native::terminal::ownership;
 use std::{
@@ -609,9 +611,14 @@ impl<R: Automation> MacTerminalAdapter for Adapter<R> {
     fn close_owned_session(
         &self,
         _directory: &Path,
+        _id: &str,
         session: &TerminalSession,
+        close: OwnedSurfaceClose,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
+        if close == OwnedSurfaceClose::LiveOwner {
+            close_remaining(deadline)?;
+        }
         close_session_until(&self.automation, session, deadline)
     }
 }
@@ -633,6 +640,29 @@ mod tests {
         Call::new("iTerm2", method, script, arguments, deadline)
     }
     #[test]
+    fn live_owner_expired_close_stops_before_automation() {
+        let deadline = Instant::now();
+        let _clock = crate::native::session::close::budget::TestCloseClock::new(deadline);
+        let replay = Replay::normal(&[]);
+        let adapter = with_automation(replay.clone());
+        let error = adapter
+            .close_owned_session(
+                Path::new("unused"),
+                "unused",
+                &automation_session(),
+                OwnedSurfaceClose::LiveOwner,
+                deadline,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "close deadline expired; closing was not confirmed and terminal-side work may have occurred; use --timeout-secs for a longer budget"
+        );
+        assert!(replay.calls().is_empty());
+        replay.assert_finished();
+    }
+
+    #[test]
     fn automation_close_addresses_native_id_and_preserves_outcomes() {
         let directory = Path::new("unused");
         let session = automation_session();
@@ -648,7 +678,13 @@ mod tests {
                 })]);
                 let adapter = with_automation(replay.clone());
                 let result = if owned {
-                    adapter.close_owned_session(directory, &session, deadline)
+                    adapter.close_owned_session(
+                        directory,
+                        "managed-id",
+                        &session,
+                        OwnedSurfaceClose::SurfaceOnly,
+                        deadline,
+                    )
                 } else {
                     adapter.close_session_until(directory, &session, deadline)
                 };

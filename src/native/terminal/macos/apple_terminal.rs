@@ -1,5 +1,7 @@
+use super::OwnedSurfaceClose;
 use super::applescript::{Automation, Osascript};
 use super::{DialogKey, GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
+use crate::native::session::close::budget::close_remaining;
 pub(in crate::native) mod close_evidence;
 
 use super::process;
@@ -1029,9 +1031,15 @@ where
     fn close_owned_session(
         &self,
         directory: &Path,
+        id: &str,
         session: &TerminalSession,
+        close: OwnedSurfaceClose,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
+        if close == OwnedSurfaceClose::LiveOwner {
+            close_remaining(deadline)?;
+            close_evidence::terminate_owner(directory, id, session, deadline)?;
+        }
         close_owned_session(&self.automation, directory, session, deadline)
     }
 }

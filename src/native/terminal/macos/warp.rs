@@ -1,8 +1,17 @@
+use super::OwnedSurfaceClose;
+use super::ownership::verified_macos_terminal_owner;
 use super::process;
+use super::process::live_native_process_identity;
 use super::{GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
+use crate::native::session::close::budget::close_remaining;
+use crate::native::session::{self, Store};
 use crate::native::session::{Reader, RecordReader, RecordStore};
-#[cfg(test)]
+use crate::native::terminal;
 use crate::native::terminal::ownership;
+use crate::native::terminal::ownership::{
+    NativeProcessIdentity, NativeSessionOwner, native_owner_identity_matches,
+    verified_terminal_owner_process_group, verified_terminal_shell_process_group,
+};
 #[cfg(unix)]
 use crate::native::terminal::shell_quote;
 use std::{
@@ -1979,11 +1988,65 @@ impl MacTerminalAdapter for Adapter {
     fn close_owned_session(
         &self,
         directory: &Path,
+        id: &str,
         session: &TerminalSession,
+        close: OwnedSurfaceClose,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
+        if close == OwnedSurfaceClose::LiveOwner {
+            close_remaining(deadline)?;
+            let (owner, live) = verified_macos_terminal_owner(directory, id, session, None)?;
+            let shell = live_native_process_identity(live.parent_pid)?;
+            prepare_warp_close(
+                directory,
+                id,
+                session,
+                &owner,
+                &live,
+                &shell,
+                |group| {
+                    ownership::terminate_owned_foreground_group_until(group, deadline).context(
+                        "the attested Warp foreground group was not stopped; no tab close was sent",
+                    )
+                },
+                deadline,
+            )?;
+        }
         close_session_until(directory, session, deadline)
     }
 }
 #[cfg(test)]
 mod tests;
+
+// Warp preserves normal close warnings. Stop only the fully attested foreground
+// job before requesting tab.close; never suppress warnings or signal by tty name.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::native) fn prepare_warp_close(
+    directory: &Path,
+    id: &str,
+    session: &terminal::TerminalSession,
+    owner: &NativeSessionOwner,
+    live: &NativeProcessIdentity,
+    shell: &NativeProcessIdentity,
+    stop: impl FnOnce(u32) -> Result<()>,
+    deadline: std::time::Instant,
+) -> Result<()> {
+    session.verify_managed_session(id)?;
+    if session.kind != terminal::TerminalKind::Warp
+        || owner.managed_session_id.as_deref() != Some(id)
+        || !native_owner_identity_matches(owner, live)
+    {
+        bail!("Warp close owner identity changed");
+    }
+    let group = verified_terminal_owner_process_group(owner, live)?;
+    verified_terminal_shell_process_group(owner, live, shell)?;
+    close_remaining(deadline)?;
+    session::close::record_terminal_close_intent(
+        &Store::open_unchecked(directory),
+        id,
+        session,
+        owner,
+    )?;
+    close_remaining(deadline)?;
+    stop(group)
+}

@@ -42,6 +42,15 @@ pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
 
 pub(super) type BindSurface<'a> = Box<dyn FnOnce(&mut TerminalSession) -> Result<()> + 'a>;
 
+/// Which authority the owned close runs under: the attested owner is live, or only the
+/// surface remains (failed start reclaim, resumable intent). An adapter does its pre-close
+/// work for a live owner only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::native) enum OwnedSurfaceClose {
+    LiveOwner,
+    SurfaceOnly,
+}
+
 pub(super) trait MacTerminalAdapter {
     fn open_bound_tab(
         &self,
@@ -86,7 +95,9 @@ pub(super) trait MacTerminalAdapter {
     fn close_owned_session(
         &self,
         directory: &Path,
+        id: &str,
         session: &TerminalSession,
+        close: OwnedSurfaceClose,
         deadline: Instant,
     ) -> Result<CloseOutcome>;
 }
@@ -204,10 +215,12 @@ pub(super) fn close_session_until(
 
 pub(super) fn close_owned_session(
     directory: &Path,
+    id: &str,
     session: &TerminalSession,
+    close: OwnedSurfaceClose,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
-    adapter(session.kind)?.close_owned_session(directory, session, deadline)
+    adapter(session.kind)?.close_owned_session(directory, id, session, close, deadline)
 }
 
 pub(super) fn timeout_deadline(timeout: Duration) -> Result<Instant> {
@@ -291,7 +304,13 @@ mod startup_tests {
                 assert!(unbound.get());
                 assert_eq!(
                     adapter
-                        .close_owned_session(directory.path(), &legacy, deadline)
+                        .close_owned_session(
+                            directory.path(),
+                            "unused",
+                            &legacy,
+                            OwnedSurfaceClose::SurfaceOnly,
+                            deadline
+                        )
                         .unwrap(),
                     CloseOutcome::Closed
                 );
@@ -316,7 +335,13 @@ mod startup_tests {
         std::fs::write(directory.path().join("native-session.json"), "broken").unwrap();
         let error = adapter(session.kind)
             .unwrap()
-            .close_owned_session(directory.path(), &session, Instant::now())
+            .close_owned_session(
+                directory.path(),
+                "unused",
+                &session,
+                OwnedSurfaceClose::SurfaceOnly,
+                Instant::now(),
+            )
             .unwrap_err();
         assert!(format!("{error:#}").contains("expected value"), "{error:#}");
     }

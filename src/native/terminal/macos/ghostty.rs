@@ -1,5 +1,7 @@
+use super::OwnedSurfaceClose;
 use super::{GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
 use crate::native::session::SessionState;
+use crate::native::session::close::budget::close_remaining;
 use crate::native::session::primitives::unix_ms;
 use crate::native::session::{CoreRecord, Reader, RecordStore};
 #[cfg(test)]
@@ -1073,9 +1075,14 @@ impl MacTerminalAdapter for Adapter {
     fn close_owned_session(
         &self,
         _directory: &Path,
+        _id: &str,
         session: &TerminalSession,
+        close: OwnedSurfaceClose,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
+        if close == OwnedSurfaceClose::LiveOwner {
+            close_remaining(deadline)?;
+        }
         close_session_until(session, deadline)
     }
 }

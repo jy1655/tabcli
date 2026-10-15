@@ -4,17 +4,8 @@
 pub(in crate::native) struct SurfaceFacts {
     pub(in crate::native) outlives_owner: bool,
     pub(in crate::native) failed_start_identity: bool,
-    pub(in crate::native) pre_close: PreClosePolicy,
     pub(in crate::native) paste_envelope: PasteEnvelope,
     pub(in crate::native) guards_dialog_input: bool,
-}
-
-#[derive(Clone, Copy)]
-pub(in crate::native) enum PreClosePolicy {
-    None,
-    RecordIntent,
-    StopForegroundGroup,
-    StopOwnerAndShellGroups,
 }
 
 #[path = "macos/apple_terminal/facts.rs"]
