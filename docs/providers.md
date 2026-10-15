@@ -71,8 +71,9 @@ Bridge does not interpret Codex keymaps. Tabs in this paste path are refused wit
 independently of timing and UI state. Native queue follow-ups are unaffected. The existing
 input policy still rejects CR, including CRLF; Bridge does not normalize line endings.
 Replace this fallback when Codex provides a newline-preserving input API or paste event on
-Windows console. Windows live verification of newline preservation is pending; Agy and Pi
-retain their existing LF encoding and need separate provider evidence.
+Windows console. The [2026-10-12 Windows check][win48] measured newline preservation with
+codex-cli 0.162.1: the recorded message retained 28 line feeds from a 23-line prompt, but lost
+an emoji (#147). Agy and Pi retain their existing LF encoding and need separate provider evidence.
 
 Temporary measure for #124: after the Windows initial paste, Bridge waits up to 10 s (bounded by
 the request deadline) for the empty composer row with no `› [Pasted Content` row. If that submission
@@ -130,8 +131,10 @@ and `SendMessage` to deliver the prompt. Bridge removes inherited Claude session
 launch from inside Claude does not create a nested session with an undiscoverable inbox.
 On macOS, Bridge also keeps those markers and its own per-session variables out of every
 other process it starts, including a terminal application it starts. An application already
-started by an earlier version keeps them until it is restarted. Native Windows is pending
-[#111](https://github.com/jy1655/tabcli/issues/111).
+started by an earlier version keeps them until it is restarted. The [2026-10-12 Windows check][win48]
+verified scrubbing in the managed Codex process on both a Windows Terminal tab and a separate
+console window. Only the Windows Terminal cold-start observation followed by a user-opened tab
+remains open in [#111](https://github.com/jy1655/tabcli/issues/111).
 
 Messaging must be available in the running CLI's backend, features, and settings, and discovery
 must find the exact live local session. A recent version or saved inbound setting does not prove
@@ -326,30 +329,39 @@ provider/terminal combinations are not verified.
 
 | Provider/platform | Live evidence | Limitations |
 | --- | --- | --- |
-| Codex/macOS | [2026-10-06][mac12] | Listed terminals only; uses `--yolo` |
-| Claude/macOS | [2026-10-06][mac12] | WezTerm; uses `--yolo`; no reopen |
-| Agy/macOS | [2026-10-04][mac11] | WezTerm; provider defaults |
-| Pi/macOS | [2026-09-24 iTerm2 run][old7] | Recent WezTerm attempt failed authentication |
-| Codex/Windows | [2026-10-02][win10] | Older authenticated evidence |
-| Claude/Windows | [2026-10-02][win10], [reopen][old7] | Reopen evidence dates to 2026-09-24 |
-| Agy/Windows | [2026-10-02][win10] | Older authenticated evidence |
-| Pi/Windows | [2026-10-02][win10] | Older authenticated evidence |
+| Codex/macOS | [2026-10-15 published 0.4.9][mac49], [2026-10-11 candidate 0.4.3][mac43] | codex-cli 0.162.1; iTerm2 and WezTerm self-tests respectively, defaults; installed 0.4.9 also completed two Ghostty 1.3.1 `ask` round trips; no Ghostty cold start (#104) |
+| Claude/macOS | [2026-10-15 published 0.4.9][mac49], [2026-10-11 candidate 0.4.3][mac43] | Claude Code 2.1.300/iTerm2 and 2.1.296/WezTerm respectively, defaults; no reopen |
+| Agy/macOS | [2026-10-15 published 0.4.9][mac49], [2026-10-11 candidate 0.4.3][mac43] | Agy 1.3.5/iTerm2 and 1.3.3/WezTerm respectively; `--yolo` |
+| Pi/macOS | [2026-10-15 published 0.4.9][mac49], [2026-10-11 candidate 0.4.3][mac43] | Pi 1.2.0/iTerm2 with `--model openai-codex/gpt-5.6-sol`; Pi 1.0.4/WezTerm with defaults |
+| Codex/Windows | [2026-10-12 candidate 0.4.9][win49], [0.4.8 checks][win48] | 0.4.9 self-test uses `--terminal windows-console --yolo`; record identifies Codex CLI 0.162 through npm; 0.4.8 record identifies 0.162.1 |
+| Claude/Windows | [2026-10-12 candidate 0.4.9][win49], [0.4.8 checks][win48], [reopen][old7] | 0.4.9 record does not give a Claude version; 0.4.8 used 2.1.296; reopen evidence dates to 2026-09-24 |
+| Agy/Windows | [2026-10-02][win10] | Older authenticated evidence; not run in the 0.4.8 or 0.4.9 records |
+| Pi/Windows | [2026-10-02][win10] | Older authenticated evidence; not run in the 0.4.8 or 0.4.9 records |
 | All/Linux | Not verified | Refusal tests only; no visible-session transport |
 
-The latest Mac record covers Codex in WezTerm, Terminal.app, iTerm2, and Ghostty, and Claude in
-WezTerm. Those runs used `--yolo`; the earlier Mac record covers Codex, Claude, and Agy with
-provider defaults. Pi's recent WezTerm attempt failed authentication and is not a round-trip pass.
-The Windows authenticated evidence predates the current release. The newer
-[daemon-absent Codex queue probe][queue] used a mock model, not an authenticated TUI.
+The latest Mac record covers all four providers on iTerm2 with the downloaded, published 0.4.9
+binary, after publication; it did not gate the release. Codex and Claude used defaults, Pi selected
+`openai-codex/gpt-5.6-sol`, and Agy used `--yolo`. The 0.4.3 candidate record covers all four in
+WezTerm, including Pi 1.0.4, with defaults for Codex, Claude and Pi and `--yolo` for Agy.
+Terminal.app, WezTerm and Warp were not verified on macOS 0.4.9; the latest record's two Ghostty
+`ask` round trips used the installed 0.4.9 with Ghostty already running, not a cold start (#104).
+The Windows 0.4.9 record covers candidate Codex and Claude self-tests, not a downloaded published
+binary. The 0.4.8 record measures Codex newline preservation (with emoji loss, #147) and environment
+scrubbing on both Windows surfaces; the Windows Terminal cold-start observation of #111 remains
+open. The [daemon-absent Codex queue probe][queue] used a mock model, not an authenticated TUI.
 
 Warp requires a reachable official Control endpoint and provable surface ownership. It cannot
 submit terminal input, so Agy and Pi follow-ups are unsupported there; choose another terminal
 for those providers. Warp has automated tests. The [0.1.1 check][mac11] returned an empty Warp
-instance list; Warp was not exercised for [0.1.2][mac12]. Linux is unsupported even where shared
-code compiles. See [terminal support](terminals.md) for surface-specific constraints.
+instance list; Warp was not exercised for [0.1.2][mac12] or the latest Mac run (#63, #87).
+Linux is unsupported even where shared code compiles. See [terminal support](terminals.md) for surface-specific constraints.
 
 [mac12]: verification/2026-10-06-macos-0.1.2.md
 [mac11]: verification/2026-10-04-macos-0.1.1.md
 [win10]: verification/2026-10-02-windows.md
 [old7]: releases/0.0.7.md
 [queue]: verification/2026-10-04-codex-queue.md
+[mac43]: verification/2026-10-11-macos-0.4.3.md
+[mac49]: verification/2026-10-15-macos-0.4.9.md
+[win48]: verification/2026-10-12-windows-0.4.8.md
+[win49]: verification/2026-10-12-windows-0.4.9.md
