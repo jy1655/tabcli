@@ -506,10 +506,7 @@ pub(in crate::native) fn wait(
     let mut next_probe = Instant::now() + Duration::from_secs(1);
     loop {
         let status: SessionStatus = store.status()?;
-        if matches!(
-            status.state,
-            SessionState::Failed | SessionState::Closed | SessionState::Exited
-        ) {
+        if status.state.ended() {
             bail!(
                 "{}",
                 status
@@ -682,10 +679,7 @@ pub(in crate::native) fn finalize(store: &Store, result: &Result<()>) -> Result<
     }
     recover_pending_completion_locked(directory, &claim_path)?;
     let status: SessionStatus = Reader::open_unchecked(directory).status()?;
-    if !matches!(
-        status.state,
-        SessionState::Closed | SessionState::Exited | SessionState::Failed
-    ) {
+    if !status.state.ended() {
         match result {
             Ok(()) => update_status(directory, SessionState::Exited, Some(0), None)?,
             Err(error) => {

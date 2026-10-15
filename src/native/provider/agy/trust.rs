@@ -4,7 +4,7 @@ use super::{
     TRUST_STORE_MISSING,
 };
 use crate::native::provider::NativeProviderAdapter;
-use crate::native::session::{Reader, SessionState};
+use crate::native::session::Reader;
 use anyhow::{Result, bail};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -98,12 +98,7 @@ pub(super) fn wait_for_workspace_trust(directory: &Path, deadline: Instant) -> R
                 .status()
                 .ok()
                 .map(|status| status.state)
-                .filter(|state| {
-                    matches!(
-                        state,
-                        SessionState::Failed | SessionState::Exited | SessionState::Closed
-                    )
-                })
+                .filter(|state| state.ended())
                 .map(|state| state.to_string())
         },
         deadline,

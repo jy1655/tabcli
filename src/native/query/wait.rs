@@ -132,10 +132,7 @@ fn observe_with_owner(
         observation.error = Some(
             "recorded native owner is no longer live; run sessions for this workspace to recover its state, then inspect the request".to_owned()
         );
-    } else if matches!(
-        snapshot.status.state,
-        SessionState::Closed | SessionState::Failed | SessionState::Exited
-    ) {
+    } else if snapshot.status.state.ended() {
         observation.state = RequestState::Unresolved;
     }
     let mut value = observation.value();

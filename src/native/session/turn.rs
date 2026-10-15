@@ -132,10 +132,7 @@ fn record_monitor_failure(directory: &Path, provider: FirstPartyCli, error: &str
     let _claim_lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
     recover_pending_completion_locked(directory, &claim_path)?;
     let status: SessionStatus = Reader::open_unchecked(directory).status()?;
-    if matches!(
-        status.state,
-        SessionState::Closed | SessionState::Exited | SessionState::Failed
-    ) {
+    if status.state.ended() {
         return Ok(());
     }
     let Some(claim_token) = read_claim_token(directory)? else {
@@ -958,10 +955,7 @@ pub(in crate::native) fn wait_for_status(
     loop {
         Store::open_unchecked(directory).converge_until(deadline)?;
         if let Ok(status) = Reader::open_unchecked(directory).status() {
-            if matches!(
-                status.state,
-                SessionState::Failed | SessionState::Exited | SessionState::Closed
-            ) {
+            if status.state.ended() {
                 let reason = status
                     .error
                     .unwrap_or_else(|| format!("session entered state {}", status.state));
@@ -1025,10 +1019,7 @@ fn wait_for_event_for_turn_until(
             }
         }
         if let Ok(status) = Reader::open_unchecked(directory).status()
-            && matches!(
-                status.state,
-                SessionState::Failed | SessionState::Exited | SessionState::Closed
-            )
+            && status.state.ended()
         {
             let reason = status
                 .error
