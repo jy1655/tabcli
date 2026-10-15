@@ -696,7 +696,7 @@ fn release_turn_claim_token_locked(path: &Path, expected_token: &str) -> Result<
         .context("failed to release native turn claim")
 }
 
-pub(in crate::native) fn remove_turn_claim_locked(path: &Path) -> Result<()> {
+pub(super) fn remove_turn_claim_locked(path: &Path) -> Result<()> {
     RecordStore::at(path)
         .remove()
         .context("failed to release native turn claim")
@@ -733,7 +733,7 @@ pub(in crate::native) fn recover_pending_completion(directory: &Path) -> Result<
 /// the claim without the journal. For the same reason both sequences sync `events/` before
 /// they discard the journal of an event that already matches it: the completion that wrote
 /// the event may have stopped between its rename and that sync.
-pub(in crate::native) fn recover_pending_completion_locked(
+pub(super) fn recover_pending_completion_locked(
     directory: &Path,
     claim_path: &Path,
 ) -> Result<bool> {

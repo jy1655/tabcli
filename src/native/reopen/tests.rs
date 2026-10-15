@@ -875,7 +875,7 @@ fn resumed_session_launch_passes_the_official_resume_plan_and_no_policy_the_requ
     claim.retain();
 
     let result = run_session_inner(&directory);
-    finalize_native_session(&directory, &result).unwrap();
+    launch::finalize(&Store::open_unchecked(&directory), &result).unwrap();
     result.unwrap();
 
     let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
@@ -1448,7 +1448,7 @@ fn resumed_session_launch_refuses_before_spawn_when_a_holder_registered_after_th
     let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
     claim.retain();
     let result = run_session_inner(&directory);
-    finalize_native_session(&directory, &result).unwrap();
+    launch::finalize(&Store::open_unchecked(&directory), &result).unwrap();
     let error = result.unwrap_err();
     assert_eq!(reopen_refusal_gate(&error), Some("provider-unsupported"));
     assert!(

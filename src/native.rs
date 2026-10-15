@@ -1901,22 +1901,7 @@ fn emit_session_result_with(
 fn run_session(id: &str) -> Result<()> {
     let directory = Reader::session_directory(id)?;
     launch::log(&Store::open_unchecked(&directory), "wrapper_started");
-    if let Some(record) = launch::read(&Reader::open_unchecked(&directory))? {
-        let status: SessionStatus = Reader::open_unchecked(&directory).status()?;
-        if record.phase != launch::Phase::Pending
-            || status.state != SessionState::Launching
-            || turn::current_claim_token(&Reader::open_unchecked(&directory))?.as_deref()
-                != Some(&record.claim_token)
-        {
-            launch::log(
-                &Store::open_unchecked(&directory),
-                "wrapper_exit_code=1; launch cancelled or already attempted",
-            );
-            bail!(
-                "provider launch cancelled or already attempted; the recorded session is unchanged"
-            );
-        }
-    }
+    launch::admit_wrapper(&Store::open_unchecked(&directory))?;
     let result = (|| {
         launch::restore_stdout()?;
         if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -1934,7 +1919,7 @@ fn run_session(id: &str) -> Result<()> {
             &format!("wrapper_exit_code=1; {error:#}"),
         ),
     }
-    if let Err(finalization_error) = finalize_native_session(&directory, &result) {
+    if let Err(finalization_error) = launch::finalize(&Store::open_unchecked(&directory), &result) {
         return match result {
             Ok(()) => Err(finalization_error),
             Err(run_error) => Err(anyhow::anyhow!(
@@ -1943,46 +1928,6 @@ fn run_session(id: &str) -> Result<()> {
         };
     }
     result
-}
-
-fn finalize_native_session(directory: &Path, result: &Result<()>) -> Result<()> {
-    let claim_path = Reader::open_unchecked(directory)
-        .record(CoreRecord::TurnClaim)
-        .path()
-        .to_owned();
-    let _claim_lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
-    if let Some(record) = launch::read(&Reader::open_unchecked(directory))?
-        && record.phase != launch::Phase::Spawned
-        && turn::current_claim_token(&Reader::open_unchecked(directory))?.as_deref()
-            != Some(&record.claim_token)
-    {
-        return Ok(());
-    }
-    recover_pending_completion_locked(directory, &claim_path)?;
-    let status: SessionStatus = Reader::open_unchecked(directory).status()?;
-    if !matches!(
-        status.state,
-        SessionState::Closed | SessionState::Exited | SessionState::Failed
-    ) {
-        match result {
-            Ok(()) => update_status(directory, SessionState::Exited, Some(0), None)?,
-            Err(error) => {
-                let reason = if launch::uncertain(&Reader::open_unchecked(directory)) {
-                    format!(
-                        "{error:#}; provider spawn is uncertain; the claim is retained, do not resend"
-                    )
-                } else {
-                    format!("{error:#}")
-                };
-                update_status(directory, SessionState::Failed, Some(1), Some(reason))?;
-            }
-        }
-    }
-    if launch::uncertain(&Reader::open_unchecked(directory)) && status.state != SessionState::Closed
-    {
-        return Ok(());
-    }
-    remove_turn_claim_locked(&claim_path)
 }
 
 fn run_session_inner(directory: &Path) -> Result<()> {

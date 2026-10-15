@@ -1740,8 +1740,8 @@ fn write_failed_launch_with_owner(
         record.phase = phase;
         write_json_atomic(&directory.join(launch::FILE), &record).unwrap();
     }
-    finalize_native_session(
-        directory,
+    launch::finalize(
+        &Store::open_unchecked(directory),
         &Err(anyhow::anyhow!("provider version check failed")),
     )
     .unwrap();

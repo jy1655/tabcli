@@ -161,7 +161,7 @@ fn native_session_executes_the_provider_with_policy_and_provenance() {
     let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
     claim.retain();
     let result = run_session_inner(&directory);
-    finalize_native_session(&directory, &result).unwrap();
+    launch::finalize(&Store::open_unchecked(&directory), &result).unwrap();
     result.unwrap();
 
     let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
@@ -230,7 +230,7 @@ fn claude_session_forwards_requested_model() {
     let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
     claim.retain();
     let result = run_session_inner(&directory);
-    finalize_native_session(&directory, &result).unwrap();
+    launch::finalize(&Store::open_unchecked(&directory), &result).unwrap();
     result.unwrap();
 
     let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
@@ -283,7 +283,7 @@ fn agy_session_uses_interactive_prompt_model_log_and_explicit_yolo() {
     let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
     claim.retain();
     let result = run_session_inner(&directory);
-    finalize_native_session(&directory, &result).unwrap();
+    launch::finalize(&Store::open_unchecked(&directory), &result).unwrap();
     result.unwrap();
 
     let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();
@@ -337,7 +337,7 @@ fn pi_session_loads_the_result_extension_and_explicit_project_approval() {
     let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
     claim.retain();
     let result = run_session_inner(&directory);
-    finalize_native_session(&directory, &result).unwrap();
+    launch::finalize(&Store::open_unchecked(&directory), &result).unwrap();
     result.unwrap();
 
     let arguments = fs::read_to_string(directory.join("argv.txt")).unwrap();

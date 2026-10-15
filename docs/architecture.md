@@ -40,7 +40,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 ## Module map and dependencies
 
 - `src/main.rs` contains top-level dispatch and help; `src/native.rs` parses native commands,
-  coordinates launch and calls the Delivery seam.
+  coordinates launch and calls the Delivery seam; wrapper admission and exit settlement live in
+  `session::launch`.
 - `src/native/process_identity.rs` classifies process evidence as Live (Incarnation or PID-only
   compatibility), Gone (Exited or Reused), or Unknown. It performs no OS or record reads;
   platform adapters own absence and identity observations. A reused incarnation grants no
