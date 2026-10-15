@@ -137,6 +137,19 @@ launch, observe, continue, and close without replacing the capabilities those CL
 
 ## Current Pi Boundary
 
+- The Pi-installed extension reads core `turn.claim` and `cancel.json` read-only as a
+  declared exception to the adapter-private record boundary. The whole UTF-8 claim,
+  trimmed, is the current Claim token and currency guard; a changed or absent token
+  ends correlation and cancel authority.
+  Cancel is a JSON object with schema 1 and a string `claim_token`; other fields are
+  ignored and parse failure supplies no intent. Claims can end through paths the adapter
+  does not observe while Pi may still run (2026-10-15 critique). A Pi-owned copy would
+  require retirement notification on every release path and a two-record publication
+  protocol to avoid retaining abort authority. Tests execute the extension with real core
+  writer output and round-trip its output through Rust readers. Replace these core reads
+  when Pi provides an addressed interruption endpoint and Bridge has an adapter claim
+  retirement boundary.
+
 - Pi v1.0.4 exposes `ctx.abort()` to an interactive extension, but no verified official
   endpoint addresses that running interactive session from outside. Cancel therefore
   reaches the official API through a Pi-owned record and polling fallback. Replace the
