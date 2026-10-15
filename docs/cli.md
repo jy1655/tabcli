@@ -524,7 +524,7 @@ consistent observation. A busy session remains unconfirmed and does not block an
 completion. An invalid address found in a pass fails the command before any successful selection;
 later record deletion or damage is an error, not a pending request.
 
-The wait ends on `completed`, `failed`, `unresolved`, or `recovery_required`, or when a recorded
+The wait ends on `completed`, `failed`, `cancelled`, `unresolved`, or `recovery_required`, or when a recorded
 owner is no longer live or a closed, failed, or exited session leaves the request unresolved.
 As with `result --wait`, only `completed` exits successfully. If more than one address ends in
 the same pass, the original input order wins, even across session groups. Sessions are observed
@@ -994,9 +994,10 @@ owner.
 Hold is orthogonal to session state and refuses only follow-ups whose delivery Bridge has not yet
 allowed to start.
 
-Request states reported by `result` are `completed`, `failed`, `pending`, `unresolved`,
+Request states reported by `result` are `completed`, `failed`, `cancelled`, `pending`, `unresolved`,
 `recovery_required`, and `unavailable`; a waiting read can report `busy` when it times out without a
-consistent observation. `accepted` is the detached command acknowledgement, not a published result.
+consistent observation. `cancelled` occurs only for a correlated provider interruption (see
+[cancel](#cancel)). `accepted` is the detached command acknowledgement, not a published result.
 Error fallback output can use `unknown`. Request and session state are different: a session can
 remain usable after a request completes, and a closed session can retain results.
 
@@ -1172,8 +1173,12 @@ The session `cancel` check has reason `cancel_absent`, `cancel_recorded`, or
 Fields: `schema_version`, `ok`, `session`, `request_id`, `session_state`, `session_error`,
 `recovery_required`, `incomplete`, `unreadable_requests`, `request_index_error`, `requests`,
 `entries`, `session_entries`, and `doctor_command`. Entries contain `session`, `request_id`,
-`event_id`, `stage`, `observed_unix_ms`, `source`, `record_state`, and `detail`. Request summaries
-derived from `result` carry `derived_from: "result"`.
+`event_id`, `stage`, `observed_unix_ms`, `source`, `record_state`, and `detail`.
+
+`requests[]` contains `result` summaries without the result body, plus `derived_from: "result"`,
+`result_command` (the command to query that request as JSON), and `delivery`. `delivery` is
+`"completion_recorded"` when a published completion is read, otherwise `"unknown"`.
+`delivery: "unknown"` does not mean that nothing was sent.
 
 ### search
 
