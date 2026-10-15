@@ -1,0 +1,498 @@
+use super::monitor::HOOK_FAILURE_FILE;
+use super::test_support::{claim_pending_turn, marked};
+use super::*;
+use crate::native::session::{SessionState, schema::SessionEvent};
+use crate::native::{TURN_CLAIM_FILE, event_paths, read_json, update_status, write_json_atomic};
+use std::fs;
+
+#[test]
+fn declared_transports_preserve_framing_and_pending_cleanup() {
+    for facts in [PiInitialPaste.facts(), PiPaste.facts()] {
+        let input = facts.surface.unwrap();
+        assert_eq!(input.submit_count, 1);
+        assert_eq!(input.newline, terminal::ConsoleNewline::LineFeed);
+    }
+    use crate::native::delivery::TurnKind;
+    let directory = tempfile::tempdir().unwrap();
+    let surface = serde_json::from_value(
+        serde_json::json!({"terminal":"windows-console", "session_id":"surface"}),
+    )
+    .unwrap();
+    let initial =
+        super::super::transport_test_context(directory.path(), &surface, TurnKind::Initial);
+    install_pending_turn(directory.path(), initial.claim_token).unwrap();
+    let before = std::fs::read(directory.path().join(PENDING_TURN_FILE)).unwrap();
+    let prepared = PiInitialPaste.prepare(&initial).unwrap();
+    assert_eq!(
+        prepared.prompt,
+        terminal_initial_prompt(directory.path(), initial.prompt).unwrap()
+    );
+    assert!(prepared.correlation_id.is_none());
+    PiInitialPaste.discard_prepared(&initial, Some(&prepared));
+    assert_eq!(
+        std::fs::read(directory.path().join(PENDING_TURN_FILE)).unwrap(),
+        before
+    );
+    let follow =
+        super::super::transport_test_context(directory.path(), &surface, TurnKind::FollowUp);
+    let prepared = PiPaste.prepare(&follow).unwrap();
+    let pending = read_pending_turn(directory.path()).unwrap().unwrap();
+    assert_eq!(
+        prepared.prompt,
+        terminal_correlated_prompt(follow.prompt, &pending, cfg!(windows)).unwrap()
+    );
+    assert!(prepared.correlation_id.is_none());
+    PiPaste.discard_prepared(&follow, Some(&prepared));
+    assert!(!directory.path().join(PENDING_TURN_FILE).exists());
+    PiPaste.prepare(&follow).unwrap();
+    PiPaste.discard_prepared(&follow, None);
+    assert!(!directory.path().join(PENDING_TURN_FILE).exists());
+}
+
+#[test]
+fn workspace_trust_requires_exact_positive_but_respects_parent_decline() {
+    use super::super::super::consent::{self, Trust};
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().canonicalize().unwrap();
+    let homes = consent::fixture_homes(tmp.path());
+    let key = consent::native_key(&workspace).unwrap();
+    super::super::super::write_json_atomic(&homes.pi, &serde_json::json!({key.clone():true}))
+        .unwrap();
+    assert!(matches!(
+        ADAPTER.workspace_trust(&workspace, &homes).unwrap(),
+        Trust::Trusted(_)
+    ));
+    assert_eq!(
+        ADAPTER
+            .workspace_trust(&workspace.join("child"), &homes)
+            .unwrap(),
+        Trust::Absent
+    );
+    super::super::super::write_json_atomic(&homes.pi, &serde_json::json!({key:false})).unwrap();
+    assert_eq!(
+        ADAPTER
+            .workspace_trust(&workspace.join("child"), &homes)
+            .unwrap(),
+        Trust::Declined
+    );
+    std::fs::write(&homes.pi, b"[]").unwrap();
+    assert!(ADAPTER.workspace_trust(&workspace, &homes).is_err());
+}
+
+#[test]
+fn diagnostics_describe_pi_owned_fallback_without_claiming_live_delivery() {
+    use super::super::super::doctor::{Availability, Context};
+    use super::NativeProviderAdapter;
+    let checks = super::ADAPTER.diagnose(Context {
+        directory: None,
+        manifest: None,
+        executable: None,
+        current_version: None,
+        workspace: std::path::Path::new("."),
+        probe: false,
+        deadline: std::time::Instant::now(),
+    });
+    assert_eq!(checks[0].reason_code, "pi_terminal_fallback");
+    assert_eq!(checks[0].availability, Availability::Unknown);
+    assert_eq!(checks[1].id, "pi_provider_credentials");
+    assert_eq!(checks[1].availability, Availability::Unknown);
+}
+
+fn run_extension_harness(directory: &Path, startup: bool) {
+    let mut command = std::process::Command::new("node");
+    command.arg(directory.join("test.mjs")).arg(directory);
+    if startup {
+        command.arg("startup");
+    }
+    let output = command
+        .output()
+        .expect("Node on PATH is required to execute the Pi extension tests");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn cancel_extension_executes_lifecycle_and_partial_failure_cases_in_node() {
+    use crate::native::session::schema::SessionManifest;
+    use crate::native::session::{CoreRecord, cancel};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    fs::write(root.join("extension.js"), bridge_extension()).unwrap();
+    fs::write(root.join("test.mjs"), include_str!("../pi_cancel_test.mjs")).unwrap();
+    let cases = [
+        "matched_duplicate",
+        "prompt_mismatch",
+        "claim_mismatch",
+        "claim_replaced",
+        "stale_callback",
+        "direct_escape",
+        "write_failure",
+        "abort_failure",
+        "agent_settled",
+        "session_shutdown",
+        "normal_completion_wins",
+        "two_claims_and_retry",
+        "settlement_without_aborted_end",
+        "retry_without_before_agent_start",
+        "partial_json_then_valid_record",
+        "tool_abort_accepted",
+        "tool_abort_direct_escape",
+        "tool_network_error",
+        "tool_abort_message_not_exact",
+        "tool_abort_wrong_accepted_claim",
+        "normal_complete",
+    ];
+    let mut inputs = serde_json::Map::new();
+    // Each case keeps its own live claim. Secondary claims supply mismatch/replacement bytes.
+    for name in cases {
+        for suffix in ["", "_second"] {
+            let key = format!("{name}{suffix}");
+            let dir = root.join(&key);
+            fs::create_dir(&dir).unwrap();
+            fs::create_dir(dir.join("events")).unwrap();
+            update_status(&dir, SessionState::Working, None, None).unwrap();
+            let store = Store::open_unchecked(&dir);
+            store
+                .write_manifest(&SessionManifest {
+                    schema: 1,
+                    id: key.clone(),
+                    provider: "pi".into(),
+                    provider_path: "pi".into(),
+                    provider_version: "1.0.4".into(),
+                    workspace: root.to_path_buf(),
+                    title: key.clone(),
+                    model: None,
+                    effort: None,
+                    yolo: false,
+                    created_unix_ms: 1,
+                })
+                .unwrap();
+            let pending = claim_pending_turn(&dir);
+            let prompt = if name == "tool_abort_accepted" {
+                terminal_correlated_prompt("prompt\nwith\ttabs", &pending, true).unwrap()
+            } else {
+                correlated_prompt("prompt", &pending)
+            };
+            inputs.insert(
+                key,
+                serde_json::json!([{
+                    "token": pending.claim_token,
+                    "claim": fs::read_to_string(dir.join(CoreRecord::TurnClaim.name())).unwrap(),
+                    "prompt": prompt, "response": marked("result", &pending),
+                }]),
+            );
+        }
+    }
+    write_json_atomic(&root.join("inputs.json"), &inputs).unwrap();
+    // The extension itself writes schema-2 readiness before real cancel admission.
+    run_extension_harness(root, true);
+    for (key, records) in &mut inputs {
+        let dir = root.join(key);
+        assert!(matches!(
+            ADAPTER.cancel_support(&dir).unwrap(),
+            super::super::CancelSupport::Supported
+        ));
+        cancel::request(&Store::open_unchecked(&dir), key).unwrap();
+        records[0]["cancel"] =
+            serde_json::json!(fs::read_to_string(dir.join(CoreRecord::Cancel.name())).unwrap());
+        fs::remove_file(dir.join(CoreRecord::Cancel.name())).unwrap();
+    }
+    for name in cases {
+        let second = inputs[&format!("{name}_second")][0].clone();
+        inputs
+            .get_mut(name)
+            .unwrap()
+            .as_array_mut()
+            .unwrap()
+            .push(second);
+    }
+    write_json_atomic(&root.join("inputs.json"), &inputs).unwrap();
+    run_extension_harness(root, false);
+    let outputs: Vec<serde_json::Value> = read_json(&root.join("payloads.json")).unwrap();
+    for (name, cancelled, error) in [
+        ("normal_complete", false, None),
+        (
+            "matched_duplicate",
+            true,
+            Some("cancelled: Pi turn ended with aborted"),
+        ),
+        ("direct_escape", false, Some("Pi turn ended with aborted")),
+        (
+            "tool_abort_accepted",
+            true,
+            Some("cancelled: Pi turn ended with error: This operation was aborted"),
+        ),
+        ("write_failure", false, Some("Pi turn ended with aborted")),
+        ("normal_completion_wins", false, None),
+        ("prompt_mismatch", false, None),
+    ] {
+        let dir = root.join(name);
+        let payloads = outputs.iter().find(|v| v["name"] == name).unwrap()["payloads"]
+            .as_array()
+            .unwrap();
+        assert!(dir.join(CoreRecord::TurnClaim.name()).exists());
+        if name == "prompt_mismatch" {
+            assert!(payloads.is_empty());
+            assert!(event_paths(&dir).unwrap().is_empty());
+            assert_eq!(
+                turn::current_claim_token(&Reader::open_unchecked(&dir))
+                    .unwrap()
+                    .unwrap(),
+                inputs[name][0]["token"]
+            );
+            continue;
+        }
+        for payload in payloads {
+            ADAPTER.handle_hook(&dir, payload).unwrap();
+        }
+        let paths = event_paths(&dir).unwrap();
+        assert_eq!(paths.len(), 1, "{name}");
+        let event: SessionEvent = read_json(&paths[0]).unwrap();
+        assert_eq!(event.cancelled, cancelled, "{name}");
+        assert_eq!(event.error.as_deref(), error, "{name}");
+        assert_eq!(
+            event.message,
+            if error.is_none() { "result" } else { "" },
+            "{name}"
+        );
+        assert!(!dir.join(CoreRecord::TurnClaim.name()).exists(), "{name}");
+    }
+    // Carry the JS-written receipt to a real next claim in that same session.
+    let dir = root.join("matched_duplicate");
+    let old: StartupReady = read_json(&dir.join(STARTUP_READY_FILE)).unwrap();
+    let next = claim_pending_turn(&dir);
+    let carried: StartupReady = read_json(&dir.join(STARTUP_READY_FILE)).unwrap();
+    assert_eq!(carried.schema, old.schema);
+    assert_eq!(carried.schema, 2);
+    assert_eq!(carried.session_id, old.session_id);
+    assert_ne!(carried.claim_token, old.claim_token);
+    assert_eq!(carried.claim_token, next.claim_token);
+    assert!(matches!(
+        ADAPTER.cancel_support(&dir).unwrap(),
+        super::super::CancelSupport::Supported
+    ));
+}
+
+#[test]
+fn cancel_support_requires_schema_two_and_current_claim() {
+    let directory = tempfile::tempdir().unwrap();
+    let pending = claim_pending_turn(directory.path());
+    for (schema, token, session, supported) in [
+        (1, pending.claim_token.as_str(), "native", false),
+        (2, "1-2-3", "native", false),
+        (2, pending.claim_token.as_str(), "", false),
+        (3, pending.claim_token.as_str(), "native", false),
+        (2, pending.claim_token.as_str(), "native", true),
+    ] {
+        write_json_atomic(
+            &directory.path().join(STARTUP_READY_FILE),
+            &StartupReady {
+                schema,
+                claim_token: token.into(),
+                session_id: session.into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            matches!(
+                ADAPTER.cancel_support(directory.path()).unwrap(),
+                super::super::CancelSupport::Supported
+            ),
+            supported
+        );
+    }
+    for contents in [None, Some("not-json")] {
+        fs::remove_file(directory.path().join(STARTUP_READY_FILE)).unwrap();
+        if let Some(contents) = contents {
+            fs::write(directory.path().join(STARTUP_READY_FILE), contents).unwrap();
+        }
+        assert!(matches!(
+            ADAPTER.cancel_support(directory.path()).unwrap(),
+            super::super::CancelSupport::Unsupported(_)
+        ));
+        // Restore for the next removal.
+        fs::write(directory.path().join(STARTUP_READY_FILE), "{}").unwrap();
+    }
+}
+
+#[test]
+fn cancel_accepted_cleanup_is_owned_by_pending_turn_lifecycle() {
+    let directory = tempfile::tempdir().unwrap();
+    let accepted = directory.path().join("pi-cancel-accepted.json");
+    install_pending_turn(directory.path(), "1-2-3").unwrap();
+    write_json_atomic(
+        &accepted,
+        &serde_json::json!({"schema":1,"claim_token":"1-2-3"}),
+    )
+    .unwrap();
+    install_pending_turn(directory.path(), "4-5-6").unwrap();
+    assert!(!accepted.exists());
+    write_json_atomic(
+        &accepted,
+        &serde_json::json!({"schema":1,"claim_token":"4-5-6"}),
+    )
+    .unwrap();
+    cancel_pending_turn(directory.path(), "1-2-3").unwrap();
+    assert!(
+        accepted.exists(),
+        "stale rollback cannot remove the new claim's record"
+    );
+    cancel_pending_turn(directory.path(), "4-5-6").unwrap();
+    assert!(!accepted.exists());
+}
+
+#[test]
+fn cancel_support_survives_follow_up_and_delivery_rollback_without_upgrading_legacy() {
+    for schema in [1, 2] {
+        let directory = tempfile::tempdir().unwrap();
+        let pending = claim_pending_turn(directory.path());
+        write_json_atomic(
+            &directory.path().join(STARTUP_READY_FILE),
+            &StartupReady {
+                schema,
+                claim_token: pending.claim_token,
+                session_id: "native".into(),
+            },
+        )
+        .unwrap();
+        for token in ["4-5-6", "7-8-9"] {
+            fs::write(directory.path().join(TURN_CLAIM_FILE), token).unwrap();
+            install_pending_turn(directory.path(), token).unwrap();
+            assert_eq!(
+                matches!(
+                    ADAPTER.cancel_support(directory.path()).unwrap(),
+                    super::super::CancelSupport::Supported
+                ),
+                schema == 2
+            );
+            cancel_pending_turn(directory.path(), token).unwrap();
+        }
+    }
+}
+
+#[test]
+fn windows_console_prompt_preserves_multiline_input_without_raw_submission_keys() {
+    let pending = PendingPiTurn::new("1-2-3").unwrap();
+    let prompt = "first line\nsecond\tcolumn";
+    let framed = terminal_correlated_prompt(prompt, &pending, true).unwrap();
+
+    assert!(
+        framed
+            .chars()
+            .all(|character| !matches!(character, '\r' | '\n' | '\t'))
+    );
+    assert!(framed.contains(&serde_json::to_string(prompt).unwrap()));
+    assert!(framed.contains(&pending.marker));
+}
+
+fn assert_core_record_contract(extension: &str) {
+    use crate::native::session::CoreRecord;
+    fn allowed(record: CoreRecord) -> bool {
+        match record {
+            CoreRecord::Hold => false,
+            CoreRecord::Cancel => true,
+            CoreRecord::TurnClaim => true,
+            CoreRecord::Completion => false,
+            CoreRecord::Owner => false,
+            CoreRecord::Closed => false,
+            CoreRecord::Terminal => false,
+            CoreRecord::TerminalClosing => false,
+            CoreRecord::TerminalClosed => false,
+            #[cfg(target_os = "macos")]
+            CoreRecord::TerminalCloseIntent => false,
+            CoreRecord::LegacyResumePending => false,
+            CoreRecord::LegacyResumeRunning => false,
+            CoreRecord::ReopenMarker => false,
+            CoreRecord::ReopenRefusal => false,
+            CoreRecord::ProviderProcess => false,
+            CoreRecord::Status => false,
+            CoreRecord::Manifest => false,
+            CoreRecord::InitialPrompt => false,
+            CoreRecord::Events => false,
+            CoreRecord::Requests => false,
+            CoreRecord::Launch => false,
+        }
+    }
+    let records = [
+        CoreRecord::Hold,
+        CoreRecord::Cancel,
+        CoreRecord::TurnClaim,
+        CoreRecord::Completion,
+        CoreRecord::Owner,
+        CoreRecord::Closed,
+        CoreRecord::Terminal,
+        CoreRecord::TerminalClosing,
+        CoreRecord::TerminalClosed,
+        #[cfg(target_os = "macos")]
+        CoreRecord::TerminalCloseIntent,
+        CoreRecord::LegacyResumePending,
+        CoreRecord::LegacyResumeRunning,
+        CoreRecord::ReopenMarker,
+        CoreRecord::ReopenRefusal,
+        CoreRecord::ProviderProcess,
+        CoreRecord::Status,
+        CoreRecord::Manifest,
+        CoreRecord::InitialPrompt,
+        CoreRecord::Events,
+        CoreRecord::Requests,
+        CoreRecord::Launch,
+    ];
+    for record in records {
+        assert_eq!(
+            extension.contains(record.name()),
+            allowed(record),
+            "Pi core record contract changed for {}; update the declared contract",
+            record.name()
+        );
+    }
+}
+
+#[test]
+fn extension_reports_only_settled_results_without_changing_tool_policy() {
+    let extension = bridge_extension();
+
+    assert!(extension.contains("agent_start"));
+    assert!(extension.contains("before_agent_start"));
+    assert!(extension.contains("agent_end"));
+    assert!(extension.contains("agent_settled"));
+    assert!(extension.contains("stopReason"));
+    assert!(extension.contains("agent_bridge_error"));
+    assert!(extension.contains("agent_bridge_claim_token"));
+    assert!(extension.contains("agent_bridge_prompt_correlated"));
+    assert!(extension.contains("event.prompt.includes"));
+    assert_core_record_contract(extension);
+    assert!(extension.contains(CANCEL_ACCEPTED_FILE));
+    assert!(extension.contains(STARTUP_READY_FILE));
+    assert!(extension.contains(HOOK_FAILURE_FILE));
+    assert!(extension.contains("renameSync"));
+    assert!(extension.contains("native-hook\", \"pi"));
+    assert!(extension.contains("timeout: 10000"));
+    assert!(!extension.contains("tool_call"));
+    assert!(!extension.contains("--approve"));
+}
+
+#[test]
+fn reopen_is_refused_with_the_adapters_own_reason() {
+    let error = ADAPTER.reopen().err().expect("unsupported provider");
+    assert_eq!(error.to_string(), PI_REOPEN_UNSUPPORTED);
+    assert!(
+        error.to_string().starts_with("reopen unsupported: Pi"),
+        "{error}"
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let error = ADAPTER.reopen().err().expect("unsupported provider");
+    assert_eq!(error.to_string(), PI_REOPEN_UNSUPPORTED);
+    assert!(
+        error.to_string().starts_with("reopen unsupported: Pi"),
+        "{error}"
+    );
+    assert!(
+        std::fs::read_dir(directory.path())
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
