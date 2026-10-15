@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use std::{
-    io::{Read, Seek, SeekFrom},
     process::{ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
@@ -159,13 +158,8 @@ fn read_capped_output(
     reader: &mut std::fs::File,
     remaining_bytes: &mut usize,
 ) -> Result<(Vec<u8>, bool)> {
-    reader.seek(SeekFrom::Start(0))?;
-    let mut output = Vec::new();
-    reader
-        .take(remaining_bytes.saturating_add(1) as u64)
-        .read_to_end(&mut output)?;
-    let truncated = output.len() > *remaining_bytes;
-    output.truncate(*remaining_bytes);
+    let (output, truncated) =
+        super::super::capped_output::read_capped_file(reader, *remaining_bytes)?;
     *remaining_bytes -= output.len();
     Ok((output, truncated))
 }

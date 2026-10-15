@@ -1809,3 +1809,34 @@ fn doctor_empty_registry_preserves_unverified_detail_and_omission() {
 }
 
 const DOCTOR_HOLDER_NEXT_ACTION: &str = "Detection is best-effort and taken only at launch, before each delivery, and now; a foreign claude --resume can still interleave between checks. Close the other holder before the next tell, or accept the shared transcript.";
+
+#[test]
+fn messenger_output_reader_keeps_a_full_budget_for_each_stream() {
+    use std::io::Write;
+
+    assert_eq!(MAX_CROSS_SESSION_OUTPUT_BYTES, 1_048_576);
+    let stdout_bytes = vec![b'a'; MAX_CROSS_SESSION_OUTPUT_BYTES];
+    let stderr_bytes = vec![b'b'; MAX_CROSS_SESSION_OUTPUT_BYTES];
+    let mut stdout = tempfile::tempfile().unwrap();
+    stdout.write_all(&stdout_bytes).unwrap();
+    let mut stderr = tempfile::tempfile().unwrap();
+    stderr.write_all(&stderr_bytes).unwrap();
+
+    let (stdout, stdout_truncated) = read_capped_file(&mut stdout).unwrap();
+    let (stderr, stderr_truncated) = read_capped_file(&mut stderr).unwrap();
+    assert_eq!(stdout, stdout_bytes);
+    assert_eq!(stderr, stderr_bytes);
+    assert!(!stdout_truncated);
+    assert!(!stderr_truncated);
+    assert_eq!(
+        stdout.len() + stderr.len(),
+        2 * MAX_CROSS_SESSION_OUTPUT_BYTES
+    );
+
+    let oversized_bytes = vec![b'c'; MAX_CROSS_SESSION_OUTPUT_BYTES + 1];
+    let mut oversized = tempfile::tempfile().unwrap();
+    oversized.write_all(&oversized_bytes).unwrap();
+    let (output, truncated) = read_capped_file(&mut oversized).unwrap();
+    assert_eq!(output, oversized_bytes[..MAX_CROSS_SESSION_OUTPUT_BYTES]);
+    assert!(truncated);
+}

@@ -17,7 +17,7 @@ use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{
     ffi::OsString,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, Stdio},
     sync::atomic::{AtomicU64, Ordering},
@@ -1442,14 +1442,7 @@ fn install_message_guard(
 }
 
 fn read_capped_file(reader: &mut std::fs::File) -> Result<(Vec<u8>, bool)> {
-    reader.seek(SeekFrom::Start(0))?;
-    let mut output = Vec::new();
-    reader
-        .take((MAX_CROSS_SESSION_OUTPUT_BYTES + 1) as u64)
-        .read_to_end(&mut output)?;
-    let truncated = output.len() > MAX_CROSS_SESSION_OUTPUT_BYTES;
-    output.truncate(MAX_CROSS_SESSION_OUTPUT_BYTES);
-    Ok((output, truncated))
+    super::capped_output::read_capped_file(reader, MAX_CROSS_SESSION_OUTPUT_BYTES)
 }
 
 fn confirm_cross_session_delivery(
