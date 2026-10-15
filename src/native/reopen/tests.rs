@@ -467,7 +467,8 @@ fn non_claude_sources_are_refused_with_each_adapters_own_reason() {
     );
     let source = inspect_reopen_source(&codex, "session-reopencodex").unwrap();
     assert_eq!(source.provider, FirstPartyCli::Codex);
-    let error = provider::verify_reopen_available(source.provider, &source.provider_session_id)
+    let error = provider::reopen(source.provider)
+        .and_then(|support| support.verify_available(&source.provider_session_id))
         .unwrap_err();
     assert!(
         format!("{error:#}").starts_with("reopen unsupported: Codex"),
@@ -478,35 +479,36 @@ fn non_claude_sources_are_refused_with_each_adapters_own_reason() {
         (FirstPartyCli::Agy, "reopen unsupported: Agy"),
         (FirstPartyCli::Pi, "reopen unsupported: Pi"),
     ] {
-        let error =
-            provider::verify_reopen_available(provider, "5e58ec26-0000-4000-8000-000000000000")
-                .unwrap_err();
+        let error = provider::reopen(provider)
+            .and_then(|support| support.verify_available("5e58ec26-0000-4000-8000-000000000000"))
+            .unwrap_err();
         assert!(format!("{error:#}").starts_with(expected), "{error:#}");
     }
     for provider in [FirstPartyCli::Codex, FirstPartyCli::Agy, FirstPartyCli::Pi] {
-        let error = provider::prepare_resume(
-            provider,
-            provider::ResumeContext {
-                bridge_executable: Path::new("/opt/agent-bridge"),
-                directory: root.path(),
-                provider_session_id: REOPEN_TEST_CONVERSATION,
-            },
-        )
-        .unwrap_err();
+        let error = provider::reopen(provider)
+            .and_then(|support| {
+                support.prepare(provider::ResumeContext {
+                    bridge_executable: Path::new("/opt/agent-bridge"),
+                    directory: root.path(),
+                    provider_session_id: REOPEN_TEST_CONVERSATION,
+                })
+            })
+            .unwrap_err();
         assert!(
             format!("{error:#}").starts_with("reopen unsupported: "),
             "{error:#}"
         );
-        let error = provider::other_resumed_conversation_holders(
-            provider,
-            provider::ResumedSessionContext {
-                directory: root.path(),
-                provider_session_id: REOPEN_TEST_CONVERSATION,
-                deadline: Instant::now() + Duration::from_secs(1),
-                wait_for_registration: true,
-            },
-        )
-        .unwrap_err();
+        let error = provider::reopen(provider)
+            .and_then(|support| {
+                support.other_holders_after_registration(
+                    provider::ResumedSessionContext {
+                        directory: root.path(),
+                        provider_session_id: REOPEN_TEST_CONVERSATION,
+                    },
+                    Instant::now() + Duration::from_secs(1),
+                )
+            })
+            .unwrap_err();
         assert!(
             format!("{error:#}").starts_with("reopen unsupported: "),
             "{error:#}"
@@ -1465,7 +1467,9 @@ fn resumed_session_launch_refuses_before_spawn_when_a_holder_registered_after_th
     )
     .unwrap();
     // The initial read-only scan sees nobody.
-    provider::verify_reopen_available(FirstPartyCli::Claude, REOPEN_TEST_CONVERSATION).unwrap();
+    provider::reopen(FirstPartyCli::Claude)
+        .and_then(|support| support.verify_available(REOPEN_TEST_CONVERSATION))
+        .unwrap();
     // A foreign resume registers between that scan and the launch boundary.
     write_live_registry_entry(&registry, std::process::id(), "foreign-resume");
 
@@ -2298,8 +2302,8 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
         inspect_reopen_source(&source, source_id).unwrap();
         // The adapter admits the conversation only on native Windows; elsewhere it refuses
         // before consulting the registry, and the marker gates below are platform-neutral.
-        let availability =
-            provider::verify_reopen_available(FirstPartyCli::Claude, REOPEN_TEST_CONVERSATION);
+        let availability = provider::reopen(FirstPartyCli::Claude)
+            .and_then(|support| support.verify_available(REOPEN_TEST_CONVERSATION));
         if cfg!(windows) {
             availability.unwrap();
         } else {
@@ -3136,4 +3140,132 @@ fn inspection_error_with_dead_provider_pid_retains_reopen_marker() {
         .unwrap_err();
     assert!(format!("{error:#}").contains("was not released"));
     assert_eq!(snapshot_directory(&source), before);
+}
+
+#[test]
+fn unsupported_reopen_getter_preserves_holder_gates_and_none_bypass() {
+    for provider in [FirstPartyCli::Codex, FirstPartyCli::Pi, FirstPartyCli::Agy] {
+        for check in [
+            ResumedHolderCheck::AfterLaunch,
+            ResumedHolderCheck::BeforeInitialDelivery,
+            ResumedHolderCheck::BeforeFollowUp,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            verify_reopened_conversation_exclusive(
+                provider,
+                directory.path(),
+                None,
+                Instant::now(),
+                check,
+            )
+            .unwrap();
+            assert!(fs::read_dir(directory.path()).unwrap().next().is_none());
+            let resumed = ResumedFrom {
+                session: "session-source".into(),
+                provider_session_id: REOPEN_TEST_CONVERSATION.into(),
+                event_id: "event-1-1.json".into(),
+            };
+            let reason = provider::reopen(provider)
+                .err()
+                .expect("unsupported provider");
+            let error = verify_reopened_conversation_exclusive(
+                provider,
+                directory.path(),
+                Some(&resumed),
+                Instant::now(),
+                check,
+            )
+            .unwrap_err();
+            assert_eq!(
+                reopen_refusal_gate(&error),
+                Some(REOPEN_VERIFICATION_FAILED_GATE)
+            );
+            let detail = format!(
+                "could not verify that the reopened {} conversation {} has no other live holder: {reason:#}; no prompt was delivered",
+                provider.as_str(),
+                REOPEN_TEST_CONVERSATION
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("reopen refused (reopen-verification-failed): {detail}")
+            );
+            if check == ResumedHolderCheck::BeforeFollowUp {
+                assert!(fs::read_dir(directory.path()).unwrap().next().is_none());
+            } else {
+                let record: serde_json::Value = serde_json::from_slice(
+                    &fs::read(directory.path().join(REOPEN_REFUSAL_FILE)).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(record["schema"], 2);
+                assert_eq!(record["phase"], "launch");
+                assert_eq!(record["gate"], REOPEN_VERIFICATION_FAILED_GATE);
+                assert_eq!(record["detail"], detail);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn holder_checks_select_registration_wait_or_immediate_check() {
+    for check in [
+        ResumedHolderCheck::AfterLaunch,
+        ResumedHolderCheck::BeforeInitialDelivery,
+        ResumedHolderCheck::BeforeFollowUp,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("registry");
+        fs::create_dir(&registry).unwrap();
+        let directory = root.path().join("session-mapping");
+        fs::create_dir(&directory).unwrap();
+        provider::override_claude_session_registry_for_test(Some(registry.clone()));
+        let resumed = ResumedFrom {
+            session: "session-source".into(),
+            provider_session_id: REOPEN_TEST_CONVERSATION.into(),
+            event_id: "event-1-1.json".into(),
+        };
+        let deadline = Instant::now();
+        let error = verify_reopened_conversation_exclusive(
+            FirstPartyCli::Claude,
+            &directory,
+            Some(&resumed),
+            deadline,
+            check,
+        )
+        .unwrap_err();
+        provider::override_claude_session_registry_for_test(None);
+        let reason = if check == ResumedHolderCheck::AfterLaunch {
+            format!(
+                "reopened Claude session session-mapping did not register conversation {REOPEN_TEST_CONVERSATION} under {} before the deadline",
+                registry.display()
+            )
+        } else {
+            format!(
+                "reopened Claude session session-mapping is no longer registered for conversation {REOPEN_TEST_CONVERSATION} under {}",
+                registry.display()
+            )
+        };
+        let detail = format!(
+            "could not verify that the reopened claude conversation {REOPEN_TEST_CONVERSATION} has no other live holder: {reason}; no prompt was delivered"
+        );
+        assert_eq!(
+            reopen_refusal_gate(&error),
+            Some(REOPEN_VERIFICATION_FAILED_GATE)
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("reopen refused (reopen-verification-failed): {detail}")
+        );
+        if check == ResumedHolderCheck::BeforeFollowUp {
+            assert!(fs::read_dir(&directory).unwrap().next().is_none());
+        } else {
+            let record: serde_json::Value =
+                serde_json::from_slice(&fs::read(directory.join(REOPEN_REFUSAL_FILE)).unwrap())
+                    .unwrap();
+            assert_eq!(record["schema"], 2);
+            assert_eq!(record["phase"], "launch");
+            assert_eq!(record["gate"], REOPEN_VERIFICATION_FAILED_GATE);
+            assert_eq!(record["detail"], detail);
+        }
+    }
 }

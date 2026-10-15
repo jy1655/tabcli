@@ -1847,14 +1847,11 @@ fn run_session_inner(directory: &Path) -> Result<()> {
                     arguments,
                     completion_monitor,
                     environment_removals,
-                } = provider::prepare_resume(
-                    provider,
-                    provider::ResumeContext {
-                        bridge_executable: &executable,
-                        directory,
-                        provider_session_id: &resumed_from.provider_session_id,
-                    },
-                )?;
+                } = provider::reopen(provider)?.prepare(provider::ResumeContext {
+                    bridge_executable: &executable,
+                    directory,
+                    provider_session_id: &resumed_from.provider_session_id,
+                })?;
                 (arguments, false, completion_monitor, environment_removals)
             }
             None => {
@@ -1899,8 +1896,8 @@ fn run_session_inner(directory: &Path) -> Result<()> {
     // preparation and immediately before the process exists. A holder that appeared in
     // between refuses under the same gate; the record carries the gate to the reopen command.
     if let Some(resumed_from) = &resumed_from
-        && let Err(error) =
-            provider::verify_reopen_available(provider, &resumed_from.provider_session_id)
+        && let Err(error) = provider::reopen(provider)
+            .and_then(|support| support.verify_available(&resumed_from.provider_session_id))
     {
         let _ = completion_monitor.stop();
         return Err(record_reopen_refusal(

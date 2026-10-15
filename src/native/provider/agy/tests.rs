@@ -1,5 +1,4 @@
 use super::*;
-use crate::native::provider::ResumeContext;
 use crate::native::terminal;
 use std::path::Path;
 
@@ -137,21 +136,15 @@ fn agy_rejects_the_native_hook_transport_it_does_not_use() {
 
 #[test]
 fn reopen_is_refused_with_the_adapters_own_reason() {
-    let error = ADAPTER
-        .verify_reopen_available("5e58ec26-0000-4000-8000-000000000000")
-        .unwrap_err();
+    let error = ADAPTER.reopen().err().expect("unsupported provider");
+    assert_eq!(error.to_string(), AGY_REOPEN_UNSUPPORTED);
     assert!(
         error.to_string().starts_with("reopen unsupported: Agy"),
         "{error}"
     );
     let directory = tempfile::tempdir().unwrap();
-    let error = ADAPTER
-        .prepare_resume(ResumeContext {
-            bridge_executable: std::path::Path::new("/opt/agent-bridge"),
-            directory: directory.path(),
-            provider_session_id: "5e58ec26-0000-4000-8000-000000000000",
-        })
-        .unwrap_err();
+    let error = ADAPTER.reopen().err().expect("unsupported provider");
+    assert_eq!(error.to_string(), AGY_REOPEN_UNSUPPORTED);
     assert!(
         error.to_string().starts_with("reopen unsupported: Agy"),
         "{error}"
