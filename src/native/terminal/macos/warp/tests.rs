@@ -2450,14 +2450,16 @@ fn warp_r2_app_birth_and_official_no_instance_semantics() {
         "reused app must never be controlled"
     );
     runner.birth_unreadable = true;
-    assert!(
-        bound_instance_present(
-            &mut runner,
-            &client,
-            &binding,
-            Instant::now() + Duration::from_secs(1)
-        )
-        .is_err()
+    assert_eq!(
+        recorded_process_present(&mut runner, &binding)
+            .unwrap_err()
+            .to_string(),
+        "injected app birth unreadable"
+    );
+    assert_eq!(
+        runner.calls.len(),
+        calls,
+        "unknown app must never be controlled"
     );
     runner.birth_unreadable = false;
     binding.process_birth = None;

@@ -2781,32 +2781,67 @@ fn surviving_provider_process_retains_the_source_marker_until_it_is_verified_gon
 // proves the recorded process gone) apart from a process that cannot be inspected (which
 // proves nothing and retains the marker), and from a pid that is simply dead.
 #[test]
-fn provider_process_identity_check_separates_reuse_from_uninspectable() {
-    let alive = std::process::id();
-    assert_eq!(
-        classify_provider_process_identity(
-            alive,
-            Ok(terminal::WindowsProcessIdentityCheck::Matches)
+fn provider_process_observation_separates_reuse_absence_and_unknown() {
+    let identity = terminal::WindowsProcessIdentity {
+        creation_time: 1,
+        executable_path: "C:/Claude.exe".into(),
+    };
+    let mut record = ProviderProcessRecord {
+        schema: 1,
+        managed_session_id: "session-test".into(),
+        pid: std::process::id(),
+        windows_process_identity: Some(identity.clone()),
+        spawned_unix_ms: 1,
+    };
+    for (live, expected) in [
+        (
+            Ok(Some(identity.clone())),
+            ProviderProcessObservation::Alive,
         ),
+        (
+            Ok(Some(terminal::WindowsProcessIdentity {
+                executable_path: "c:/CLAUDE.EXE".into(),
+                ..identity.clone()
+            })),
+            ProviderProcessObservation::Alive,
+        ),
+        (
+            Ok(None),
+            ProviderProcessObservation::Gone(ProviderProcessGone::Exited),
+        ),
+        (
+            Ok(Some(terminal::WindowsProcessIdentity {
+                creation_time: 2,
+                ..identity.clone()
+            })),
+            ProviderProcessObservation::Gone(ProviderProcessGone::IdentityMismatch(
+                "Windows console process id was reused".into(),
+            )),
+        ),
+        (
+            Ok(Some(terminal::WindowsProcessIdentity {
+                executable_path: "C:/other.exe".into(),
+                ..identity.clone()
+            })),
+            ProviderProcessObservation::Gone(ProviderProcessGone::IdentityMismatch(
+                "Windows console process executable identity changed".into(),
+            )),
+        ),
+        (
+            Err(anyhow::anyhow!("access denied").context("inspection")),
+            ProviderProcessObservation::Unknown("inspection: access denied".into()),
+        ),
+    ] {
+        assert_eq!(observe_provider_process_with(&record, |_| live), expected);
+    }
+    record.windows_process_identity = None;
+    assert_eq!(
+        observe_provider_process_with(&record, |_| panic!("PID-only must not inspect identity")),
         ProviderProcessObservation::Alive
     );
+    record.pid = 0;
     assert_eq!(
-        classify_provider_process_identity(
-            alive,
-            Ok(terminal::WindowsProcessIdentityCheck::Mismatch(
-                "Windows console process id was reused"
-            ))
-        ),
-        ProviderProcessObservation::Gone(ProviderProcessGone::IdentityMismatch(
-            "Windows console process id was reused"
-        ))
-    );
-    assert_eq!(
-        classify_provider_process_identity(alive, Err(anyhow::anyhow!("access is denied"))),
-        ProviderProcessObservation::Unknown("access is denied".to_owned())
-    );
-    assert_eq!(
-        classify_provider_process_identity(0, Err(anyhow::anyhow!("no such process"))),
+        observe_provider_process_with(&record, |_| panic!("PID-only must not inspect identity")),
         ProviderProcessObservation::Gone(ProviderProcessGone::Exited)
     );
 }
@@ -2897,7 +2932,7 @@ fn reused_provider_pid_with_a_different_identity_releases_the_marker() {
             cleanup,
             RefusedLaunchCleanup::ProviderProcessGone {
                 pid,
-                evidence: ProviderProcessGone::IdentityMismatch(reason),
+                evidence: ProviderProcessGone::IdentityMismatch(reason.into()),
                 surface_closed: false,
             },
             "{label}"
@@ -2943,14 +2978,8 @@ fn uninspectable_provider_process_retains_the_marker() {
     );
     let system_pid = 4;
     assert!(process_is_alive(system_pid));
-    let error = terminal::check_windows_process_identity(
-        system_pid,
-        &terminal::WindowsProcessIdentity {
-            creation_time: 1,
-            executable_path: "C:\\Windows\\System32\\claude.exe".to_owned(),
-        },
-    )
-    .expect_err("the System process reported an identity");
+    let error = terminal::observe_windows_process_identity(system_pid)
+        .expect_err("the System process reported an identity");
     write_json_atomic(
         &new.join(PROVIDER_PROCESS_FILE),
         &ProviderProcessRecord {
@@ -3036,4 +3065,52 @@ fn reopen_refuses_a_journal_before_examining_request_results() {
         );
         assert_eq!(snapshot_directory(&directory), before);
     }
+}
+
+#[test]
+fn inspection_error_with_dead_provider_pid_retains_reopen_marker() {
+    let root = tempfile::tempdir().unwrap();
+    let source_id = "session-reopensrcb1";
+    let source = write_closed_reopen_source(
+        root.path(),
+        source_id,
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let new_id = "session-reopennewb1";
+    let new = write_reopen_launch_session(root.path(), new_id, Path::new("/opt/claude"));
+    claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION)
+        .unwrap()
+        .finalize(new_id)
+        .unwrap();
+    let before = snapshot_directory(&source);
+    update_status(&new, SessionState::Failed, None, Some("refused".into())).unwrap();
+    let record = ProviderProcessRecord {
+        schema: 1,
+        managed_session_id: new_id.into(),
+        pid: 0,
+        windows_process_identity: Some(terminal::WindowsProcessIdentity {
+            creation_time: 1,
+            executable_path: "C:\\claude.exe".into(),
+        }),
+        spawned_unix_ms: 1,
+    };
+    assert!(!process_is_alive(record.pid));
+    write_json_atomic(&new.join(PROVIDER_PROCESS_FILE), &record).unwrap();
+    let observe = |record: &ProviderProcessRecord| {
+        observe_provider_process_with(record, |_| Err(anyhow::anyhow!("inspection failed")))
+    };
+    let cleanup =
+        refused_launch_cleanup_with(&new, REOPEN_VERIFICATION_FAILED_GATE, observe).unwrap();
+    assert!(!cleanup.releases_marker(), "{cleanup:?}");
+    assert_eq!(
+        observe(&record),
+        ProviderProcessObservation::Unknown("inspection failed".into())
+    );
+    assert!(cleanup.to_string().contains("inspection failed"));
+    let error = release_reopen_marker_after_refusal_with(&source, &new, Ok(()), || Ok(cleanup))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("was not released"));
+    assert_eq!(snapshot_directory(&source), before);
 }

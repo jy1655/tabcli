@@ -860,10 +860,19 @@ fn recorded_process_present<R: WarpRunner>(
     binding: &ControlBinding,
 ) -> Result<bool> {
     let birth = binding.process_birth.context("Warp control binding is missing the app process birth; absence and control authority are unverified")?;
-    match runner.process_birth(binding.pid)? {
-        None => Ok(false),
-        Some(live) if live == birth => Ok(true),
-        Some(_) => bail!("recorded Warp app PID was reused; control and absence are unverified"),
+    use crate::native::process_identity::{self, Gone, ProcessObservation};
+    match process_identity::classify(
+        binding.pid,
+        Some(&birth),
+        || false, // A recorded incarnation never uses PID-only liveness.
+        || runner.process_birth(binding.pid),
+    ) {
+        ProcessObservation::Live(_) => Ok(true),
+        ProcessObservation::Gone(Gone::Exited) => Ok(false),
+        ProcessObservation::Gone(Gone::Reused(_)) => {
+            bail!("recorded Warp app PID was reused; control and absence are unverified")
+        }
+        ProcessObservation::Unknown(reason) => bail!("{reason}"),
     }
 }
 

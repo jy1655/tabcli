@@ -150,7 +150,7 @@ enum ProviderProcessGone {
     Exited,
     // Its pid is alive but belongs to a different process: the pid was reused after the
     // recorded process exited (Windows creation time or executable path differ).
-    IdentityMismatch(&'static str),
+    IdentityMismatch(String),
 }
 
 // What can be observed about a recorded provider process now.
@@ -160,44 +160,71 @@ enum ProviderProcessObservation {
     Gone(ProviderProcessGone),
     // The pid is alive and, where an identity was recorded, still carries it.
     Alive,
-    // The pid is alive (or its liveness cannot be denied) but its identity could not be
-    // inspected, so neither survival nor reuse is established.
+    // Its identity could not be inspected; PID-only liveness cannot establish whether
+    // the recorded incarnation survived, exited, or was reused.
     Unknown(String),
 }
 
 // A verified PID reuse releases the marker; an inspection failure retains it.
 fn observe_provider_process(record: &ProviderProcessRecord) -> ProviderProcessObservation {
     #[cfg(windows)]
-    if let Some(identity) = &record.windows_process_identity {
-        return classify_provider_process_identity(
+    // B2: an exited provider whose object is still retained is Gone(Exited), as the former
+    // typed check also concluded through its liveness fallback; no liveness bool is consulted.
+    return observe_provider_process_with(record, terminal::observe_windows_process_identity);
+    #[cfg(not(windows))]
+    {
+        use crate::native::process_identity::{self, ProcessObservation};
+        match process_identity::classify::<()>(
             record.pid,
-            terminal::check_windows_process_identity(record.pid, identity),
-        );
-    }
-    if process_is_alive(record.pid) {
-        ProviderProcessObservation::Alive
-    } else {
-        ProviderProcessObservation::Gone(ProviderProcessGone::Exited)
+            None,
+            || process_is_alive(record.pid),
+            || Ok(None),
+        ) {
+            ProcessObservation::Live(_) => ProviderProcessObservation::Alive,
+            ProcessObservation::Gone(_) => {
+                ProviderProcessObservation::Gone(ProviderProcessGone::Exited)
+            }
+            ProcessObservation::Unknown(reason) => ProviderProcessObservation::Unknown(reason),
+        }
     }
 }
 
-// Maps the typed Windows identity check onto the observation. An inspection failure is
-// `Gone` only when the pid is not alive at all; a pid that is alive (or access-denied, which
-// liveness treats as alive) but uninspectable stays `Unknown`.
 #[cfg(any(windows, test))]
-fn classify_provider_process_identity(
-    pid: u32,
-    check: Result<terminal::WindowsProcessIdentityCheck>,
+fn observe_provider_process_with(
+    record: &ProviderProcessRecord,
+    observe: impl FnOnce(u32) -> Result<Option<terminal::WindowsProcessIdentity>>,
 ) -> ProviderProcessObservation {
-    match check {
-        Ok(terminal::WindowsProcessIdentityCheck::Matches) => ProviderProcessObservation::Alive,
-        Ok(terminal::WindowsProcessIdentityCheck::Mismatch(reason)) => {
-            ProviderProcessObservation::Gone(ProviderProcessGone::IdentityMismatch(reason))
-        }
-        Err(_) if !process_is_alive(pid) => {
+    use crate::native::process_identity::{self, Gone, ProcessObservation};
+    use terminal::WindowsIncarnation;
+    let recorded = record
+        .windows_process_identity
+        .clone()
+        .map(WindowsIncarnation);
+    // Keep the published Windows mismatch vocabulary while classify owns the decision.
+    let mut mismatch = "Windows console process executable identity changed";
+    let observation = process_identity::classify(
+        record.pid,
+        recorded.as_ref(),
+        || process_is_alive(record.pid),
+        || {
+            let live = observe(record.pid)?;
+            if let (Some(recorded), Some(live)) = (&recorded, &live)
+                && recorded.0.creation_time != live.creation_time
+            {
+                mismatch = "Windows console process id was reused";
+            }
+            Ok(live.map(WindowsIncarnation))
+        },
+    );
+    match observation {
+        ProcessObservation::Live(_) => ProviderProcessObservation::Alive,
+        ProcessObservation::Gone(Gone::Exited) => {
             ProviderProcessObservation::Gone(ProviderProcessGone::Exited)
         }
-        Err(error) => ProviderProcessObservation::Unknown(format!("{error:#}")),
+        ProcessObservation::Gone(Gone::Reused(_)) => {
+            ProviderProcessObservation::Gone(ProviderProcessGone::IdentityMismatch(mismatch.into()))
+        }
+        ProcessObservation::Unknown(reason) => ProviderProcessObservation::Unknown(reason),
     }
 }
 
@@ -264,6 +291,14 @@ impl std::fmt::Display for RefusedLaunchCleanup {
 // Read-only: ready/working sessions are not refused launches. A pre-spawn refusal proves
 // no spawn only without a provider record; an existing record must be verified.
 fn refused_launch_cleanup(refused_directory: &Path, gate: &str) -> Result<RefusedLaunchCleanup> {
+    refused_launch_cleanup_with(refused_directory, gate, observe_provider_process)
+}
+
+fn refused_launch_cleanup_with(
+    refused_directory: &Path,
+    gate: &str,
+    observe: impl FnOnce(&ProviderProcessRecord) -> ProviderProcessObservation,
+) -> Result<RefusedLaunchCleanup> {
     let refused_session = refused_directory
         .file_name()
         .and_then(|name| name.to_str())
@@ -304,7 +339,7 @@ fn refused_launch_cleanup(refused_directory: &Path, gate: &str) -> Result<Refuse
             record.managed_session_id, record.schema
         )));
     }
-    let evidence = match observe_provider_process(&record) {
+    let evidence = match observe(&record) {
         ProviderProcessObservation::Gone(evidence) => evidence,
         ProviderProcessObservation::Alive => {
             return Ok(RefusedLaunchCleanup::Pending(format!(
@@ -660,12 +695,23 @@ fn release_reopen_marker_after_refusal(
     gate: &str,
     outcome: Result<()>,
 ) -> Result<()> {
+    release_reopen_marker_after_refusal_with(source_directory, refused_directory, outcome, || {
+        refused_launch_cleanup(refused_directory, gate)
+    })
+}
+
+fn release_reopen_marker_after_refusal_with(
+    source_directory: &Path,
+    refused_directory: &Path,
+    outcome: Result<()>,
+    cleanup: impl FnOnce() -> Result<RefusedLaunchCleanup>,
+) -> Result<()> {
     let refused_session = refused_directory
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
     let released = (|| -> Result<()> {
-        let cleanup = refused_launch_cleanup(refused_directory, gate)?;
+        let cleanup = cleanup()?;
         if let RefusedLaunchCleanup::Pending(reason) = &cleanup {
             let note = record_reopen_refusal_cleanup_pending(refused_directory, reason)
                 .err()

@@ -64,6 +64,13 @@ fn registry_entry_with_live_pid_and_matching_start_is_the_writer_and_stale_entri
     .unwrap_err();
     assert!(format!("{error:#}").contains("4242"), "{error:#}");
     assert!(format!("{error:#}").contains("access denied"), "{error:#}");
+    assert_eq!(
+        format!("{error:#}"),
+        format!(
+            "failed to verify the Claude Code process 4242 registered at {}: access denied",
+            registry.join("4242.json").display()
+        )
+    );
     // No registry means no writer.
     assert_eq!(
         live_conversation_writer(&registry.join("missing"), REOPEN_TEST_CONVERSATION, |_| {

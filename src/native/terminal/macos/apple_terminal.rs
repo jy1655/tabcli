@@ -661,10 +661,19 @@ pub(in crate::native) fn terminal_app_alive_with(
             "Terminal.app process incarnation is incomplete; the exact surface handle is retained"
         );
     }
-    match process_birth(app.pid)? {
-        None => Ok(false),
-        Some(birth) if birth == (app.start_seconds, app.start_microseconds) => Ok(true),
-        Some(_) => bail!("Terminal.app PID was reused; no close or absence authority was granted"),
+    use crate::native::process_identity::{self, Gone, ProcessObservation};
+    match process_identity::classify(
+        app.pid,
+        Some(&(app.start_seconds, app.start_microseconds)),
+        || false, // A recorded incarnation never uses PID-only liveness.
+        || process_birth(app.pid),
+    ) {
+        ProcessObservation::Live(_) => Ok(true),
+        ProcessObservation::Gone(Gone::Exited) => Ok(false),
+        ProcessObservation::Gone(Gone::Reused(_)) => {
+            bail!("Terminal.app PID was reused; no close or absence authority was granted")
+        }
+        ProcessObservation::Unknown(reason) => bail!("{reason}"),
     }
 }
 
@@ -2908,5 +2917,24 @@ mod screen_replay_tests {
             "window-id:tty-id",
             "tab-id",
         );
+    }
+}
+
+#[cfg(test)]
+mod incarnation_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_app_inspection_error_preserves_reason() {
+        let app = MacTerminalAppIdentity {
+            pid: 42,
+            start_seconds: 100,
+            start_microseconds: 123,
+        };
+        let error = terminal_app_alive_with(&app, |_| {
+            Err(anyhow::anyhow!("birth unreadable").context("inspection"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "inspection: birth unreadable");
     }
 }
