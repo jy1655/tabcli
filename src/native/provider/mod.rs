@@ -58,7 +58,9 @@ pub(super) struct CrossSessionMessageContext<'a> {
     pub(super) bridge_executable: &'a Path,
     pub(super) directory: &'a Path,
     pub(super) provider_path: &'a Path,
-    pub(super) request_id: &'a str,
+    // Adapter-selected turn correlation value, not a Bridge Request id:
+    // Codex uses the Claim token; Claude uses its adapter-generated claude-turn id.
+    pub(super) correlation_id: &'a str,
     pub(super) prompt: &'a str,
     pub(super) deadline: Instant,
 }

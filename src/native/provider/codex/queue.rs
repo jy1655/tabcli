@@ -82,7 +82,7 @@ pub(super) fn send_native_queue_message(
     // Codex chooses daemon or embedded queue; acceptance is not completion, which needs notify.
     // See docs/verification/2026-10-04-codex-queue.md for the provider source.
 
-    let pending = PendingCodexTurn::new(context.request_id).map_err(Outcome::NotSent)?;
+    let pending = PendingCodexTurn::new(context.correlation_id).map_err(Outcome::NotSent)?;
     let arguments = codex_queue_arguments(&thread_id, context.prompt, &pending);
     let mut command = queue_command(
         context.provider_path,
@@ -109,7 +109,7 @@ pub(super) fn send_native_queue_message(
         .as_ref()
         .is_err_and(|failure| matches!(failure, Outcome::NotSent(_)))
     {
-        let _ = cancel_pending_turn(context.directory, context.request_id);
+        let _ = cancel_pending_turn(context.directory, context.correlation_id);
     }
     result
 }

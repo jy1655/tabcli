@@ -147,7 +147,7 @@ impl Transport for CodexQueue {
             bridge_executable: turn.bridge_executable,
             directory: turn.directory,
             provider_path: turn.provider_path,
-            request_id: turn.claim_token,
+            correlation_id: turn.claim_token,
             prompt: turn.prompt,
             deadline: turn.deadline,
         })
