@@ -41,6 +41,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 
 - `src/main.rs` contains top-level dispatch and help; `src/native.rs` parses native commands,
   coordinates launch and calls the Delivery seam.
+- `src/native/process_identity.rs` classifies process evidence as Live (Incarnation or PID-only
+  compatibility), Gone (Exited or Reused), or Unknown. It performs no OS or record reads;
+  platform adapters own absence and identity observations. A reused incarnation grants no
+  Surface authority.
 - `src/native/process_env.rs` owns child environment policy and deadline-bounded command execution;
   provider-specific execution remains in its adapter. Non-provider children on macOS and
   Windows remove the union of adapter caller-session markers and Bridge's four session
@@ -69,8 +73,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 - `src/native/terminal/` selects and implements platform-specific surfaces, input, observation,
   and close. Native command parsing builds a `ConsoleControlRequest`; after session verification,
   the Windows adapter executes a typed `ConsoleControlAction` with resolved input and timing.
-  Its `ownership` module owns owner identity, attestation, close authority, and
-  the execution of an authorized close; the Terminal.app adapter owns app incarnation.
+  Its `ownership` module retains the owner record types, control proof, close authority,
+  and the execution of an authorized close; `session::owner` owns process observation and
+  attestation. The Terminal.app adapter owns app incarnation. Process reuse alone never
+  supplies control proof or ordinary dead-owner Surface authority.
   macOS operations use `MacTerminalAdapter` through one kind lookup. Each adapter explicitly
   supplies every operation. Shared `open_with` preserves binding and cleanup order; Warp
   owns its open flow. `applescript` owns execution and common response vocabulary, while
@@ -97,7 +103,12 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   diagnostics without changing lifecycle fields. Both preserve closed tombstones.
 - Within `src/native/session/`, start with `reads.rs` for decoding and read budgets,
   `primitives.rs` for filesystem durability and private-record permissions, and `owner.rs` for
-  read-only observations of the recorded owner.
+  read-only attestation of the recorded owner. Owner attestation separates incarnation birth
+  from recorded TTY/process-group control, preserves inspection errors, and projects the
+  public OwnerObservation. It takes only an owner value and OS observations, never a Store
+  or session lock. Caller policy for prune, repair, wait and exact close-intent resumption
+  remains in session; control proof and the close authority table remain in terminal.
+  R1 removes duplicated execution lookups, not the type dependency on terminal::ownership.
 - `src/native/query.rs` and `query/timeline.rs` own command-specific observations and fields for
   read-only inspection, result, search, and timeline output using the session readers and common
   publication rules. Queries get a `Reader`,

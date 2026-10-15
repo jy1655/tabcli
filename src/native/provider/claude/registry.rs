@@ -313,10 +313,8 @@ fn proc_start_filetime(value: &serde_json::Value) -> Option<u64> {
 
 #[cfg(windows)]
 pub(super) fn live_process_creation_time(pid: u32) -> Result<Option<u64>> {
-    if !agent_bridge::process_is_alive(pid) {
-        return Ok(None);
-    }
-    terminal::windows_process_identity(pid).map(|identity| Some(identity.creation_time))
+    terminal::observe_windows_process_identity(pid)
+        .map(|identity| identity.map(|identity| identity.creation_time))
 }
 
 #[cfg(not(windows))]

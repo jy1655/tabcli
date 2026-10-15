@@ -5,8 +5,6 @@ use super::CloseOutcome;
 use super::PreClosePolicy;
 use super::TerminalSession;
 #[cfg(target_os = "macos")]
-pub(in crate::native) use super::macos::ownership::mac_native_owner_is_live;
-#[cfg(target_os = "macos")]
 use super::macos::ownership::verified_macos_terminal_owner;
 #[cfg(target_os = "macos")]
 use super::macos::process::{
@@ -16,11 +14,16 @@ use super::macos::process::{
 pub(in crate::native) use super::windows::ownership::verified_windows_native_owner;
 #[cfg(any(target_os = "macos", windows))]
 use crate::native::SessionStatus;
+#[cfg(target_os = "macos")]
+use crate::native::process_identity::{Gone, ProcessObservation};
 use crate::native::session::close::budget::close_remaining;
+#[cfg(target_os = "macos")]
+use crate::native::session::owner::{OwnerAttestation, attest_owner};
 #[cfg(target_os = "macos")]
 use crate::native::session::{self, Store};
 #[cfg(any(target_os = "macos", windows))]
 use crate::native::session::{CoreRecord, Reader, SessionState, launch, observe_owner_record};
+#[cfg(target_os = "macos")]
 use agent_bridge::process_is_alive;
 #[cfg(any(target_os = "macos", test))]
 use anyhow::Context;
@@ -383,7 +386,7 @@ pub(in crate::native) fn verify_terminal_close_authority_with_evidence(
             #[cfg(target_os = "macos")]
             pid_alive: &process_is_alive,
             #[cfg(target_os = "macos")]
-            mac_owner_live: &mac_native_owner_is_live,
+            mac_owner_live: &attest_owner,
             #[cfg(target_os = "macos")]
             resumable: &|| {
                 session::close::terminal_close_resumable(
@@ -422,7 +425,7 @@ struct CloseObservers<'a> {
     #[cfg(target_os = "macos")]
     pid_alive: &'a dyn Fn(u32) -> bool,
     #[cfg(target_os = "macos")]
-    mac_owner_live: &'a dyn Fn(&NativeSessionOwner) -> Result<bool>,
+    mac_owner_live: &'a dyn Fn(&NativeSessionOwner) -> OwnerAttestation,
     #[cfg(target_os = "macos")]
     resumable: &'a dyn Fn() -> Result<bool>,
     ownership_proof: &'a dyn Fn() -> Result<()>,
@@ -494,8 +497,9 @@ fn verify_terminal_close_authority_with_observers(
                 }
             }
             // The close that recorded the intent may finish without signalling anything
-            // again, and only once the owner it verified no longer exists. A live owner,
-            // or a PID that is alive again, keeps the rules below.
+            // again, and only once the incarnation it verified no longer exists. A live
+            // or uninspectable incarnation keeps the rules below; a reused PID alone
+            // grants nothing outside this exact-intent route.
             #[cfg(target_os = "macos")]
             if !has_teardown_intent && (observers.resumable)()? {
                 session.verify_managed_session(expected_session_id)?;
@@ -516,11 +520,25 @@ fn verify_terminal_close_authority_with_observers(
             #[cfg(target_os = "macos")]
             {
                 let owner: NativeSessionOwner = Reader::open_unchecked(directory).owner()?;
-                if !(observers.mac_owner_live)(&owner)? {
+                let attestation = (observers.mac_owner_live)(&owner);
+                if let ProcessObservation::Unknown(reason) = &attestation.process {
+                    bail!("{reason}");
+                }
+                match &attestation.control {
+                    crate::native::session::owner::ControlAttestation::Changed(reason)
+                    | crate::native::session::owner::ControlAttestation::Unknown(reason) => {
+                        bail!("{reason}")
+                    }
+                    _ => {}
+                }
+                if matches!(attestation.process, ProcessObservation::Gone(_)) {
                     session.verify_managed_session(expected_session_id)?;
                     // A reused PID grants neither mutation nor absence authority. The
                     // original owner's complete binding is required even for a query.
-                    if (observers.pid_alive)(owner.pid)
+                    if matches!(
+                        attestation.process,
+                        ProcessObservation::Gone(Gone::Reused(_))
+                    ) || (observers.pid_alive)(owner.pid)
                         || owner.managed_session_id.as_deref() != Some(expected_session_id)
                         || !matches!(
                             (
@@ -620,72 +638,6 @@ fn verify_terminal_close_authority_with_observers(
             "this platform has no visible terminal transport (#6); no close was sent and the surface handle is retained"
         )
     }
-}
-
-// Platform identity checks remain outside the session records layer.
-pub(in crate::native) fn owner_blocks_prune(owner: &NativeSessionOwner) -> Result<bool> {
-    #[cfg(windows)]
-    {
-        let Some(identity) = &owner.windows_process_identity else {
-            return Ok(true);
-        };
-        if !process_is_alive(owner.pid) {
-            return Ok(false);
-        }
-        match terminal::windows_process_identity(owner.pid) {
-            Ok(live) => Ok(&live == identity),
-            Err(_) => Ok(true),
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if !process_is_alive(owner.pid) {
-            return Ok(false);
-        }
-        let (Some(seconds), Some(microseconds)) = (
-            owner.process_start_seconds,
-            owner.process_start_microseconds,
-        ) else {
-            return Ok(true);
-        };
-        match live_native_process_identity(owner.pid) {
-            Ok(live) => Ok(live.process_start_seconds == seconds
-                && live.process_start_microseconds == microseconds),
-            Err(_) => Ok(true),
-        }
-    }
-    #[cfg(not(any(target_os = "macos", windows)))]
-    {
-        Ok(process_is_alive(owner.pid))
-    }
-}
-
-pub(in crate::native) fn repair_owner_is_live(owner: &NativeSessionOwner) -> Result<bool> {
-    #[cfg(windows)]
-    match &owner.windows_process_identity {
-        Some(identity) => {
-            if terminal::verify_windows_process_identity(owner.pid, identity).is_ok() {
-                return Ok(true);
-            }
-        }
-        // Pre-identity (v0.0.2) Windows owner records carry only a PID. Their identity is
-        // unknown, not dead: while the PID is alive the session is left alone and inspect
-        // reports `identity_matches: null`; only a dead PID lets repair proceed.
-        None => {
-            if process_is_alive(owner.pid) {
-                return Ok(true);
-            }
-        }
-    }
-    #[cfg(target_os = "macos")]
-    if mac_native_owner_is_live(owner)? {
-        return Ok(true);
-    }
-    #[cfg(all(not(windows), not(target_os = "macos")))]
-    if process_is_alive(owner.pid) {
-        return Ok(true);
-    }
-    Ok(false)
 }
 
 pub(in crate::native) fn close_dead_owner_surface_until(
@@ -1310,8 +1262,15 @@ mod close_authority_tests {
                     },
                     mac_owner_live: &|owner| {
                         assert_eq!(owner.pid, 123);
-                        observe("mac-live")?;
-                        Ok(self.live)
+                        match observe("mac-live") {
+                            Ok(()) => test_owner_attestation(self.live),
+                            Err(error) => OwnerAttestation {
+                                process: ProcessObservation::Unknown(format!("{error:#}")),
+                                control:
+                                    crate::native::session::owner::ControlAttestation::NotRecorded,
+                                pid_alive: Some(self.pid_alive),
+                            },
+                        }
                     },
                     // Read the real intent and owner binding, substituting only its final
                     // process observation. Do not let a test boolean invent an intent.
@@ -1448,6 +1407,19 @@ mod close_authority_tests {
                 &["injected attest failure", "injected attest cause"],
                 &calls,
             );
+        }
+    }
+
+    #[test]
+    fn r1_c6_reused_projection_qualifies_only_failed_bound_startup_surface() {
+        let observed = crate::native::session::owner::tests::reused_observation();
+        for kind in [Iterm2, Ghostty] {
+            let mut row = Row::new(kind);
+            row.state = SessionState::Failed;
+            row.phase = Some(launch::Phase::Spawning);
+            row.observed_alive = observed.process_alive;
+            row.observed_matches = observed.identity_matches;
+            row.check(Ok(TerminalCloseAuthority::SurfaceOnly), &["owner-record"]);
         }
     }
 
@@ -1779,7 +1751,7 @@ mod close_authority_tests {
         let mut row = Row::new(AppleTerminal);
         row.observation_error = Some(("mac-live", 1));
         row.check_error_chain(
-            &["injected mac-live failure", "injected mac-live cause"],
+            &["injected mac-live failure: injected mac-live cause"],
             &["resumable", "mac-live"],
         );
     }
@@ -2339,3 +2311,73 @@ mod teardown_tests;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "ownership_close_interruption_tests.rs"]
 mod close_interruption_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+fn test_owner_attestation(live: bool) -> OwnerAttestation {
+    OwnerAttestation {
+        process: if live {
+            ProcessObservation::Live(crate::native::process_identity::Attested::Incarnation)
+        } else {
+            ProcessObservation::Gone(Gone::Exited)
+        },
+        control: crate::native::session::owner::ControlAttestation::NotRecorded,
+        pid_alive: Some(live),
+    }
+}
+
+#[cfg(all(test, any(windows, target_os = "macos")))]
+mod projected_authority_tests {
+    use super::*;
+    #[test]
+    fn r1_c6_windows_surface_failed_start_consumes_mismatch_projection() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::native::session::Store::open_unchecked(root.path());
+        store
+            .write_owner(&NativeSessionOwner {
+                pid: 4242,
+                managed_session_id: Some("session-test".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        crate::native::session::update_status(root.path(), SessionState::Failed, None, None)
+            .unwrap();
+        store
+            .record(CoreRecord::Launch)
+            .write_json(&launch::Record {
+                schema: 1,
+                claim_token: "claim-test".into(),
+                deadline_unix_ms: 1,
+                phase: launch::Phase::Spawning,
+            })
+            .unwrap();
+        let surface: TerminalSession = serde_json::from_value(serde_json::json!({
+            "terminal":"windows-console", "session_id":"4242", "managed_session_id":"session-test"
+        }))
+        .unwrap();
+        let authority = verify_terminal_close_authority_with_observers(
+            root.path(),
+            "session-test",
+            &surface,
+            || panic!("projection does not inspect surface"),
+            CloseObservers {
+                owner_record: &|_| crate::native::session::owner::tests::reused_observation(),
+                ownership_proof: &|| panic!("failed-start route"),
+                #[cfg(target_os = "macos")]
+                evidence: terminal::close_evidence(surface.kind),
+                #[cfg(target_os = "macos")]
+                pid_alive: &|_| panic!("failed-start route"),
+                #[cfg(target_os = "macos")]
+                mac_owner_live: &|_| panic!("failed-start route"),
+                #[cfg(target_os = "macos")]
+                resumable: &|| panic!("failed-start route"),
+                #[cfg(target_os = "macos")]
+                attest_owner: &|| panic!("failed-start route"),
+                #[cfg(target_os = "macos")]
+                group_gone: &|_| panic!("failed-start route"),
+            },
+            crate::native::session::close::budget::close_deadline(),
+        )
+        .unwrap();
+        assert_eq!(authority, TerminalCloseAuthority::SurfaceOnly);
+    }
+}

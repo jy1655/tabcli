@@ -1115,6 +1115,19 @@ and `provider_version_at_launch`. Request references include `request_id`, `crea
 `source`, `event_id`, `context_sources`, `active`, and the two elapsed-time fields described under
 `result`.
 
+Owner inspection separates a known identity mismatch from an inspection failure. For any
+owner record, `owner.identity_matches: true` means every recorded identity field matched;
+`false` means a verified mismatch of a recorded field, with `owner.error: null`. This also
+applies to intermediate macOS records containing birth and TTY but no process groups; it
+does not assert that unrecorded fields were verified. PID-only or otherwise unattested
+records keep the match null; an unreadable identity also keeps it null and reports an error.
+Launch repair fails an unconfirmed launch on a mismatch; a pending public wait ends as
+unresolved, and status and doctor report `owner_identity_mismatch`. A verified intermediate
+record can therefore report an available owner in doctor; an inspection failure remains
+unverified. These effects apply to macOS intermediate records as well as Windows records.
+Completed Results still take precedence. These observations alone grant no general Surface
+close authority.
+
 `held` is true, false, or null with `hold_error`, using the same rules as `status`.
 `cancel` is null when absent, otherwise `{request_id, requested_unix_ms, state}`; `state`
 is `requested`, `applied`, `not_applied`, or `unreadable`. Unreadable evidence includes `error`

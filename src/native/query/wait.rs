@@ -113,11 +113,20 @@ impl RequestState {
 
 /// Completed observations precede owner checks and therefore have no owner fields.
 fn observe(snapshot: &Snapshot, reader: &Reader, selector: &Selector) -> Result<(Value, bool)> {
+    observe_with_owner(snapshot, reader, selector, observe_owner)
+}
+
+fn observe_with_owner(
+    snapshot: &Snapshot,
+    reader: &Reader,
+    selector: &Selector,
+    observe: impl FnOnce(&Reader) -> crate::native::session::OwnerObservation,
+) -> Result<(Value, bool)> {
     let mut observation = snapshot.observe_result(reader, selector)?;
     if observation.state.ends_wait() {
         return Ok((observation.value(), true));
     }
-    let owner = observe_owner(reader);
+    let owner = observe(reader);
     if owner.process_alive == Some(false) || owner.identity_matches == Some(false) {
         observation.state = RequestState::Unresolved;
         observation.error = Some(
@@ -306,6 +315,45 @@ pub(in crate::native) fn run(request: WaitRequest) -> Result<()> {
 mod tests {
     use super::*;
     use crate::native::{tests::seed_close_fixture, write_json_atomic};
+
+    #[test]
+    fn r1_c6_mismatch_ends_pending_wait_without_writes() {
+        let fixture = seed_close_fixture(JournaledEventState::Absent);
+        let reader = Reader::open_unchecked(&fixture.directory);
+        fs::remove_file(fixture.directory.join("turn.completion.json")).unwrap();
+        let snapshot = reader.snapshot().unwrap();
+        let id = snapshot.receipts[0].request_id.clone();
+        let before = fs::read(fixture.directory.join("status.json")).unwrap();
+        let (value, ended) = observe_with_owner(&snapshot, &reader, &Selector::Request(id), |_| {
+            crate::native::session::owner::tests::reused_observation()
+        })
+        .unwrap();
+        assert!(ended);
+        assert_eq!(value["request_state"], "unresolved");
+        assert_eq!(
+            fs::read(fixture.directory.join("status.json")).unwrap(),
+            before
+        );
+        assert!(fixture.directory.join("turn.claim").exists());
+    }
+
+    #[test]
+    fn published_result_precedes_even_a_reused_owner_observation() {
+        let fixture = seed_close_fixture(JournaledEventState::Committed);
+        let reader = Reader::open_unchecked(&fixture.directory);
+        crate::native::session::turn::recover_pending_completion(&fixture.directory).unwrap();
+        let snapshot = reader.snapshot().unwrap();
+        let (value, ended) = observe_with_owner(
+            &snapshot,
+            &reader,
+            &Selector::Request(snapshot.receipts[0].request_id.clone()),
+            |_| panic!("published Result precedes owner inspection"),
+        )
+        .unwrap();
+        assert!(ended);
+        assert_eq!(value["request_state"], "completed");
+        assert!(value.get("owner").is_none());
+    }
 
     #[test]
     fn only_recorded_wait_end_states_end_a_wait() {

@@ -796,11 +796,20 @@ pub(in crate::native) fn surface_check_for_test(
 }
 
 fn owner_check(evidence: &mut SessionEvidence, id: &str, checks: &mut Vec<Check>) {
+    owner_check_with(evidence, id, checks, |e| e.observe_owner().clone())
+}
+
+fn owner_check_with(
+    evidence: &mut SessionEvidence,
+    id: &str,
+    checks: &mut Vec<Check>,
+    observe: impl FnOnce(&mut SessionEvidence) -> crate::native::session::OwnerObservation,
+) {
     use Availability::*;
     let owner = &evidence.owner;
     let (availability, reason, detail, evidence) = match owner {
         Ok(Some(owner)) if owner.managed_session_id.as_deref() == Some(id) => {
-            let observed = evidence.observe_owner();
+            let observed = observe(evidence);
             let (availability, reason) = match (observed.process_alive, observed.identity_matches) {
                 (Some(false), _) => (Unavailable, "owner_exited"),
                 (_, Some(false)) => (Unavailable, "owner_identity_mismatch"),
@@ -821,7 +830,7 @@ fn owner_check(evidence: &mut SessionEvidence, id: &str, checks: &mut Vec<Check>
             "Owner record belongs to another managed session.".to_owned(),
             Value::Null,
         ),
-        Ok(Some(_)) => (Unknown, "owner_unbound_legacy", "A legacy owner record has no managed-session binding; process observation is not proof of control authority.".to_owned(), json!(evidence.observe_owner())),
+        Ok(Some(_)) => (Unknown, "owner_unbound_legacy", "A legacy owner record has no managed-session binding; process observation is not proof of control authority.".to_owned(), json!(observe(evidence))),
         Ok(None) => (
             Unknown,
             "owner_unverified",
@@ -1187,5 +1196,61 @@ mod timeout_tests {
                 None
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod attestation_tests {
+    use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn correction_a3_intermediate_owner_doctor_distinguishes_changed_unknown_and_verified() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::native::session::Store::open_unchecked(dir.path());
+        store
+            .write_owner(&crate::native::terminal::ownership::NativeSessionOwner {
+                pid: 4242,
+                managed_session_id: Some("session-test".into()),
+                terminal_tty_device: Some(9),
+                process_start_seconds: Some(10),
+                process_start_microseconds: Some(20),
+                ..Default::default()
+            })
+            .unwrap();
+        for (control, availability, reason) in [
+            ("changed", "unavailable", "owner_identity_mismatch"),
+            ("unknown", "unknown", "owner_unverified"),
+            ("verified", "available", "owner_identity_observed"),
+        ] {
+            let mut evidence = SessionEvidence::read(&store, Ok(false));
+            let mut checks = vec![];
+            owner_check_with(&mut evidence, "session-test", &mut checks, |_| {
+                crate::native::session::owner::tests::intermediate_observation(control)
+            });
+            let value = serde_json::to_value(checks).unwrap();
+            assert_eq!(value[0]["availability"], availability, "{control}");
+            assert_eq!(value[0]["reason_code"], reason, "{control}");
+        }
+    }
+
+    #[test]
+    fn r1_c6_reused_owner_is_unavailable_with_mismatch_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::native::session::Store::open_unchecked(dir.path());
+        store
+            .write_owner(&crate::native::terminal::ownership::NativeSessionOwner {
+                pid: 4242,
+                managed_session_id: Some("session-test".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut evidence = SessionEvidence::read(&store, Ok(false));
+        let mut checks = vec![];
+        owner_check_with(&mut evidence, "session-test", &mut checks, |_| {
+            crate::native::session::owner::tests::reused_observation()
+        });
+        let value = serde_json::to_value(&checks).unwrap();
+        assert_eq!(value[0]["reason_code"], "owner_identity_mismatch");
+        assert_eq!(value[0]["availability"], "unavailable");
     }
 }

@@ -8,7 +8,9 @@ use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Stor
 use crate::native::terminal::ownership::NativeSessionOwner;
 
 #[cfg(target_os = "macos")]
-use agent_bridge::process_is_alive;
+use crate::native::process_identity::{Gone, ProcessObservation};
+#[cfg(target_os = "macos")]
+use crate::native::session::owner::{OwnerAttestation, attest_owner};
 use agent_bridge::{FirstPartyCli, terminal_safe_text};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -919,17 +921,29 @@ fn write_completion_event(directory: &Path, pending: &PendingTurnCompletion) -> 
 
 #[cfg(target_os = "macos")]
 fn running_wait_owner(directory: &Path) -> Result<()> {
+    running_wait_owner_with(directory, attest_owner)
+}
+
+#[cfg(target_os = "macos")]
+pub(in crate::native) fn running_wait_owner_with(
+    directory: &Path,
+    observe: impl FnOnce(&NativeSessionOwner) -> OwnerAttestation,
+) -> Result<()> {
     if let Some(text) = Reader::open_unchecked(directory)
         .record(CoreRecord::Owner)
         .text()?
     {
         let owner: NativeSessionOwner =
             serde_json::from_str(&text).context("invalid native-session owner record")?;
-        if !process_is_alive(owner.pid) {
-            bail!(
+        match observe(&owner).process {
+            ProcessObservation::Gone(Gone::Exited) => bail!(
                 "native session process {} is no longer running; terminal cleanup remains unverified",
                 owner.pid
-            );
+            ),
+            ProcessObservation::Gone(Gone::Reused(reason)) => {
+                bail!("native session process {} was reused; {reason}", owner.pid)
+            }
+            ProcessObservation::Live(_) | ProcessObservation::Unknown(_) => {}
         }
     }
     Ok(())

@@ -267,3 +267,44 @@ pub(in crate::native) fn macos_processes_named(
     processes.sort_by_key(|process| process.pid);
     Ok(processes)
 }
+
+/// Only a preserved ESRCH proves absence; a missing TTY or unreadable identity does not.
+pub(in crate::native) fn live_native_process_identity_if_present(
+    pid: u32,
+) -> Result<Option<NativeProcessIdentity>> {
+    identity_if_present(live_native_process_identity(pid))
+}
+
+fn identity_if_present(
+    observed: Result<NativeProcessIdentity>,
+) -> Result<Option<NativeProcessIdentity>> {
+    match observed {
+        Ok(identity) => Ok(Some(identity)),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.raw_os_error() == Some(libc::ESRCH)) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+    #[test]
+    fn only_raw_esrch_is_confirmed_absence() {
+        let absent = Err(std::io::Error::from_raw_os_error(libc::ESRCH)).context("inspect owner");
+        assert!(identity_if_present(absent).unwrap().is_none());
+        for error in [
+            anyhow::Error::from(std::io::Error::from_raw_os_error(libc::EACCES)),
+            anyhow::anyhow!("no such process"),
+            anyhow::anyhow!("no controlling TTY"),
+            anyhow::anyhow!("incomplete identity"),
+        ] {
+            assert!(identity_if_present(Err(error)).is_err());
+        }
+    }
+}

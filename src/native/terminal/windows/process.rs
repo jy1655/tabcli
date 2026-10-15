@@ -2,7 +2,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 use anyhow::{Context, Result, bail};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
     Storage::FileSystem::SYNCHRONIZE,
     System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -141,4 +141,81 @@ fn check_identity_values(
         );
     }
     WindowsProcessIdentityCheck::Matches
+}
+
+/// A comparison used only by owner attestation; record and surface equality stay exact.
+#[derive(Debug)]
+pub(in crate::native) struct WindowsIncarnation(pub WindowsProcessIdentity);
+
+impl PartialEq for WindowsIncarnation {
+    fn eq(&self, other: &Self) -> bool {
+        same_incarnation(&self.0, &other.0)
+    }
+}
+
+fn same_incarnation(recorded: &WindowsProcessIdentity, live: &WindowsProcessIdentity) -> bool {
+    recorded.creation_time == live.creation_time
+        && recorded
+            .executable_path
+            .eq_ignore_ascii_case(&live.executable_path)
+}
+
+pub(in crate::native) fn observe_process_identity(
+    pid: u32,
+) -> Result<Option<WindowsProcessIdentity>> {
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        let error = std::io::Error::last_os_error();
+        // Win32 reports ERROR_INVALID_PARAMETER for a nonexistent PID. Access denial
+        // and every other open failure prove no absence and remain inspection errors.
+        if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            return Ok(None);
+        }
+        return Err(error).with_context(|| format!("failed to open Windows process {pid}"));
+    }
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    observe_process_identity_from_handle(handle.as_raw_handle())
+}
+
+fn observe_process_identity_from_handle(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<Option<WindowsProcessIdentity>> {
+    match unsafe { WaitForSingleObject(handle, 0) } {
+        WAIT_OBJECT_0 => Ok(None),
+        WAIT_TIMEOUT => query_process_identity_from_handle(handle).map(Some),
+        WAIT_FAILED => {
+            Err(std::io::Error::last_os_error()).context("failed to observe Windows process exit")
+        }
+        other => bail!("unexpected Windows process wait result {other}"),
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+    #[test]
+    fn retained_exited_process_is_absent_and_invalid_handle_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/C", "exit", "0"])
+            .current_dir(dir.path())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(
+            observe_process_identity_from_handle(child.as_raw_handle())
+                .unwrap()
+                .is_none()
+        );
+        drop(child);
+        assert!(observe_process_identity(pid).unwrap().is_none());
+        assert!(observe_process_identity_from_handle(std::ptr::null_mut()).is_err());
+        assert!(observe_process_identity(u32::MAX).unwrap().is_none());
+        assert!(
+            observe_process_identity(std::process::id())
+                .unwrap()
+                .is_some()
+        );
+    }
 }

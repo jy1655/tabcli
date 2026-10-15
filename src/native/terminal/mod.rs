@@ -648,6 +648,11 @@ pub(super) fn windows_set_private_permissions(path: &Path, directory: bool) -> R
 }
 
 #[cfg(windows)]
+pub(in crate::native) use windows::{
+    WindowsIncarnation, observe_process_identity as observe_windows_process_identity,
+};
+
+#[cfg(windows)]
 pub(super) fn windows_process_identity(pid: u32) -> Result<WindowsProcessIdentity> {
     windows::query_process_identity(pid)
 }

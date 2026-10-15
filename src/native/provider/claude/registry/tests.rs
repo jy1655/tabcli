@@ -499,3 +499,32 @@ fn windows_creation_time_check_distinguishes_the_live_process_from_a_stale_entry
         None
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn c9_windows_absence_is_stale_but_inspection_error_is_not() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join(format!("{}.json", u32::MAX)),
+        serde_json::json!({
+            "pid": u32::MAX, "sessionId": REOPEN_TEST_CONVERSATION, "procStart": "123"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(
+        live_conversation_writer(
+            root.path(),
+            REOPEN_TEST_CONVERSATION,
+            live_process_creation_time
+        )
+        .unwrap(),
+        None
+    );
+    assert!(
+        live_conversation_writer(root.path(), REOPEN_TEST_CONVERSATION, |_| anyhow::bail!(
+            "access denied"
+        ))
+        .is_err()
+    );
+}

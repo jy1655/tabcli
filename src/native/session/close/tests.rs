@@ -443,8 +443,8 @@ fn reader_reports_capabilities_and_owner_evidence_without_writes() {
             ..Default::default()
         })
         .unwrap();
-    // Windows requires attested identity even for a dead PID, exactly as before.
-    assert_eq!(reader.native_owner_blocks_prune().unwrap(), cfg!(windows));
+    // A legacy dead PID blocks pruning on no platform.
+    assert!(!reader.native_owner_blocks_prune().unwrap());
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
 }
 
@@ -940,4 +940,72 @@ fn close_deadline_uncontended_settlement_reports_only_expiry() {
         panic!("consumed handle must not close again")
     })
     .unwrap();
+}
+
+#[test]
+fn attestation_unknown_preserves_completion_damage_and_claim_without_closing() {
+    let (_directory, store) = damaged_completion_fixture();
+    store
+        .write_owner(&NativeSessionOwner {
+            pid: 4242,
+            ..Default::default()
+        })
+        .unwrap();
+    let before = store.record(CoreRecord::Status).bytes().unwrap();
+    let observed = std::cell::Cell::new(false);
+    let error = repair_dead_owner_with(
+        &store,
+        |_| {
+            observed.set(true);
+            // Recovery has already tried publication and retained the damaged journal.
+            assert!(store.record(CoreRecord::Completion).path().exists());
+            repair_owner_is_live(&OwnerAttestation {
+                process: ProcessObservation::Unknown("inspection denied".into()),
+                control: super::super::owner::ControlAttestation::NotRecorded,
+                pid_alive: Some(true),
+            })
+        },
+        |_| false,
+        |_| panic!("unknown grants no close authority"),
+        budget::close_deadline(),
+    )
+    .unwrap_err();
+    assert!(observed.get());
+    assert!(error.to_string().contains("inspection denied"));
+    assert_eq!(store.record(CoreRecord::Status).bytes().unwrap(), before);
+    assert!(store.record(CoreRecord::Completion).path().exists());
+    assert!(store.record(CoreRecord::TurnClaim).path().exists());
+    assert!(store.closed_if_present().unwrap().is_none());
+}
+
+#[test]
+fn attestation_policy_matrix_keeps_live_and_unknown_owners() {
+    use crate::native::process_identity::{Attested, Gone};
+    for (process, blocked, live) in [
+        (
+            ProcessObservation::Live(Attested::Incarnation),
+            true,
+            Some(true),
+        ),
+        (
+            ProcessObservation::Live(Attested::PidOnly),
+            true,
+            Some(true),
+        ),
+        (ProcessObservation::Gone(Gone::Exited), false, Some(false)),
+        (
+            ProcessObservation::Gone(Gone::Reused("birth".into())),
+            false,
+            Some(false),
+        ),
+        (ProcessObservation::Unknown("denied".into()), true, None),
+    ] {
+        let a = OwnerAttestation {
+            process,
+            control: super::super::owner::ControlAttestation::NotRecorded,
+            pid_alive: None,
+        };
+        assert_eq!(prune_blocked_by(&a), blocked);
+        assert_eq!(repair_owner_is_live(&a).ok(), live);
+    }
 }
