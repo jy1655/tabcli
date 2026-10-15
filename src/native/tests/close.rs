@@ -1,5 +1,6 @@
 use super::support::*;
 use super::*;
+use crate::native::session::close as session_close;
 
 #[test]
 fn explicit_close_repairs_failed_launch_without_terminal_record() {
@@ -16,10 +17,15 @@ fn explicit_close_repairs_failed_launch_without_terminal_record() {
     claim.retain();
     let mut close_was_called = false;
 
-    close_session_state(directory.path(), |_| {
-        close_was_called = true;
-        Ok(terminal::CloseOutcome::Closed)
-    })
+    session_close::close(
+        &Store::open_unchecked(directory.path()),
+        None,
+        session_close::budget::close_deadline(),
+        |_| {
+            close_was_called = true;
+            Ok(terminal::CloseOutcome::Closed.into())
+        },
+    )
     .unwrap();
 
     assert!(!close_was_called);
@@ -41,9 +47,18 @@ fn explicit_close_remains_available_with_a_corrupt_completion_journal() {
     claim.retain();
     fs::write(directory.path().join(TURN_COMPLETION_FILE), "not-json").unwrap();
 
-    close_repaired_session_state(directory.path(), |_| {
-        panic!("a missing terminal handle must not call the adapter")
-    })
+    {
+        let closer = &mut |_: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
+            panic!("a missing terminal handle must not call the adapter")
+        };
+        session_close::close(
+            &Store::open_unchecked(directory.path()),
+            None,
+            session_close::budget::close_deadline(),
+            |surface| closer(surface).map(Into::into),
+        )
+    }
+    .map(|_| ())
     .unwrap();
 
     assert!(!directory.path().join(TURN_COMPLETION_FILE).exists());
@@ -221,10 +236,15 @@ fn already_closed_session_never_reuses_a_stale_terminal_handle() {
     update_status(directory.path(), SessionState::Closed, None, None).unwrap();
     let mut close_calls = 0;
 
-    close_session_state(directory.path(), |_| {
-        close_calls += 1;
-        Ok(terminal::CloseOutcome::Closed)
-    })
+    session_close::close(
+        &Store::open_unchecked(directory.path()),
+        None,
+        session_close::budget::close_deadline(),
+        |_| {
+            close_calls += 1;
+            Ok(terminal::CloseOutcome::Closed.into())
+        },
+    )
     .unwrap();
 
     assert_eq!(close_calls, 0);
@@ -256,13 +276,18 @@ fn explicit_close_routes_using_the_recorded_terminal_kind() {
     .unwrap();
     update_status(directory.path(), SessionState::Working, None, None).unwrap();
 
-    close_session_state(directory.path(), |session| {
-        assert_eq!(session.kind, terminal::TerminalKind::Ghostty);
-        assert_eq!(session.id, "ghostty-terminal");
-        assert_eq!(session.tab_id.as_deref(), Some("ghostty-tab"));
-        assert_eq!(session.window_id.as_deref(), Some("ghostty-window"));
-        Ok(terminal::CloseOutcome::Closed)
-    })
+    session_close::close(
+        &Store::open_unchecked(directory.path()),
+        None,
+        session_close::budget::close_deadline(),
+        |session| {
+            assert_eq!(session.kind, terminal::TerminalKind::Ghostty);
+            assert_eq!(session.id, "ghostty-terminal");
+            assert_eq!(session.tab_id.as_deref(), Some("ghostty-tab"));
+            assert_eq!(session.window_id.as_deref(), Some("ghostty-window"));
+            Ok(terminal::CloseOutcome::Closed.into())
+        },
+    )
     .unwrap();
 }
 
@@ -285,7 +310,13 @@ fn explicit_close_is_terminal_against_late_native_wrapper_updates() {
     .unwrap();
     update_status(directory.path(), SessionState::Running, None, None).unwrap();
 
-    close_session_state(directory.path(), |_| Ok(terminal::CloseOutcome::Closed)).unwrap();
+    session_close::close(
+        &Store::open_unchecked(directory.path()),
+        None,
+        session_close::budget::close_deadline(),
+        |_| Ok(terminal::CloseOutcome::Closed.into()),
+    )
+    .unwrap();
     update_status(directory.path(), SessionState::Exited, Some(1), None).unwrap();
     update_status(
         directory.path(),
@@ -314,17 +345,27 @@ fn assert_dead_terminal_owner_close_converges(state: &str) {
     write_owned_terminal_state(directory.path(), state, reaped_child_pid());
     let mut adapter_calls = 0;
 
-    assert!(repair_dead_native_owner(directory.path()).unwrap());
-    close_session_state(directory.path(), |_| {
-        adapter_calls += 1;
-        Ok(terminal::CloseOutcome::Closed)
-    })
+    assert!(session_close::repair_dead_owner(&Store::open_unchecked(directory.path())).unwrap());
+    session_close::close(
+        &Store::open_unchecked(directory.path()),
+        None,
+        session_close::budget::close_deadline(),
+        |_| {
+            adapter_calls += 1;
+            Ok(terminal::CloseOutcome::Closed.into())
+        },
+    )
     .unwrap();
-    assert!(!repair_dead_native_owner(directory.path()).unwrap());
-    close_session_state(directory.path(), |_| {
-        adapter_calls += 1;
-        Ok(terminal::CloseOutcome::Closed)
-    })
+    assert!(!session_close::repair_dead_owner(&Store::open_unchecked(directory.path())).unwrap());
+    session_close::close(
+        &Store::open_unchecked(directory.path()),
+        None,
+        session_close::budget::close_deadline(),
+        |_| {
+            adapter_calls += 1;
+            Ok(terminal::CloseOutcome::Closed.into())
+        },
+    )
     .unwrap();
 
     assert_eq!(adapter_calls, 0);
@@ -354,7 +395,9 @@ fn exited_and_failed_live_native_owners_are_not_repaired() {
         let directory = tempfile::tempdir().unwrap();
         write_owned_terminal_state(directory.path(), state, std::process::id());
 
-        assert!(!repair_dead_native_owner(directory.path()).unwrap());
+        assert!(
+            !session_close::repair_dead_owner(&Store::open_unchecked(directory.path())).unwrap()
+        );
         assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
         assert!(!directory.path().join(TERMINAL_TOMBSTONE_FILE).exists());
         assert!(directory.path().join(TURN_CLAIM_FILE).exists());
@@ -380,7 +423,7 @@ fn live_native_session_owner_is_not_repaired() {
     )
     .unwrap();
 
-    assert!(!repair_dead_native_owner(directory.path()).unwrap());
+    assert!(!session_close::repair_dead_owner(&Store::open_unchecked(directory.path())).unwrap());
     assert!(directory.path().join(TURN_CLAIM_FILE).exists());
     let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
     assert_eq!(status.state.as_str(), "working");
@@ -402,7 +445,7 @@ fn dead_native_session_owner_releases_the_turn_and_closes_state() {
     )
     .unwrap();
 
-    assert!(repair_dead_native_owner(directory.path()).unwrap());
+    assert!(session_close::repair_dead_owner(&Store::open_unchecked(directory.path())).unwrap());
     assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
     let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
     assert_eq!(status.state.as_str(), "closed");
@@ -422,11 +465,11 @@ fn terminal_close_transaction_preserves_its_terminal_reason() {
     let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
     claim.retain();
 
-    close_session_state_with_error(
-        directory.path(),
+    session_close::close(
+        &Store::open_unchecked(directory.path()),
         Some("native session process stopped".to_owned()),
-        |_| panic!("a missing terminal handle must not call the adapter"),
         crate::native::session::close::budget::close_deadline(),
+        |_| panic!("a missing terminal handle must not call the adapter"),
     )
     .unwrap();
 
@@ -454,10 +497,15 @@ fn claimed_and_awaiting_initial_input_dead_owners_respect_surface_cleanup() {
             .unwrap()
         );
         #[cfg(not(any(windows, target_os = "macos")))]
-        assert!(repair_dead_native_owner(directory.path()).unwrap());
+        assert!(
+            session_close::repair_dead_owner(&Store::open_unchecked(directory.path())).unwrap()
+        );
         #[cfg(target_os = "macos")]
         {
-            assert!(!repair_dead_native_owner(directory.path()).unwrap());
+            assert!(
+                !session_close::repair_dead_owner(&Store::open_unchecked(directory.path()))
+                    .unwrap()
+            );
             assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
             assert!(directory.path().join(TURN_CLAIM_FILE).exists());
             let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
@@ -781,7 +829,7 @@ fn legacy_owner_without_process_identity_is_repaired_only_when_its_pid_is_dead()
         .unwrap();
 
         assert_eq!(
-            repair_dead_native_owner(directory.path()).unwrap(),
+            session_close::repair_dead_owner(&Store::open_unchecked(directory.path())).unwrap(),
             expect_repair
         );
         assert_eq!(
@@ -1073,10 +1121,20 @@ fn sessions_repairs_a_dead_owner_whose_journal_cannot_be_recovered() {
         let tombstone = fs::read(directory.join(CLOSED_STATUS_FILE)).unwrap();
         let mut adapter_calls = 0;
         for _ in 0..2 {
-            close_repaired_session_state(&directory, |_| {
-                adapter_calls += 1;
-                Ok(terminal::CloseOutcome::Closed)
-            })
+            {
+                let closer =
+                    &mut |_: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
+                        adapter_calls += 1;
+                        Ok(terminal::CloseOutcome::Closed)
+                    };
+                session_close::close(
+                    &Store::open_unchecked(&directory),
+                    None,
+                    session_close::budget::close_deadline(),
+                    |surface| closer(surface).map(Into::into),
+                )
+            }
+            .map(|_| ())
             .unwrap();
         }
         assert_eq!(adapter_calls, 0, "{label}");
@@ -1088,7 +1146,10 @@ fn sessions_repairs_a_dead_owner_whose_journal_cannot_be_recovered() {
         assert!(!directory.join(TURN_CLAIM_FILE).exists(), "{label}");
         assert!(!directory.join("events").exists(), "{label}");
         assert!(!recover_pending_completion(&directory).unwrap(), "{label}");
-        assert!(!repair_dead_native_owner(&directory).unwrap(), "{label}");
+        assert!(
+            !session_close::repair_dead_owner(&Store::open_unchecked(&directory)).unwrap(),
+            "{label}"
+        );
         assert_eq!(
             request_state(&directory, &fixture.request_id),
             ("unresolved".to_owned(), "closed".to_owned()),
@@ -1115,7 +1176,8 @@ fn a_live_owner_keeps_unrecoverable_journal_damage_as_a_repair_error() {
     .unwrap();
     fs::remove_dir_all(fixture.directory.join("events")).unwrap();
 
-    let error = repair_dead_native_owner(&fixture.directory).unwrap_err();
+    let error =
+        session_close::repair_dead_owner(&Store::open_unchecked(&fixture.directory)).unwrap_err();
     assert!(
         format!("{error:#}").contains("events directory is missing"),
         "{error:#}"

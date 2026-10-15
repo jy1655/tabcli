@@ -1,5 +1,6 @@
 use super::support::*;
 use super::*;
+use crate::native::session::close as session_close;
 
 fn write_resume_wait_owner(directory: &Path, state: &str, pid: u32) {
     update_status(directory, state.parse().unwrap(), None, None).unwrap();
@@ -69,7 +70,7 @@ fn resume_pending_dead_owner_is_repaired_instead_of_stalling() {
     )
     .unwrap();
 
-    assert!(repair_dead_native_owner(directory.path()).unwrap());
+    assert!(session_close::repair_dead_owner(&Store::open_unchecked(directory.path())).unwrap());
     assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
     let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
     assert_eq!(status.state.as_str(), "closed");

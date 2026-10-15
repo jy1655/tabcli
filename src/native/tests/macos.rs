@@ -1,5 +1,6 @@
 use super::support::*;
 use super::*;
+use crate::native::session::close as session_close;
 
 #[cfg(target_os = "macos")]
 #[test]
@@ -704,7 +705,12 @@ fn fail_apple_terminal_close_after_teardown(directory: &Path, owner: &NativeSess
         directory,
         None,
         |session| {
-            record_terminal_close_intent(directory, "session-owner123", session, owner)?;
+            session_close::record_terminal_close_intent(
+                &Store::open_unchecked(directory),
+                "session-owner123",
+                session,
+                owner,
+            )?;
             Err(anyhow::anyhow!(
                 "Terminal.app automation failed: AppleEvent timed out."
             ))
@@ -748,12 +754,21 @@ fn apple_terminal_close_retry_after_teardown_reaches_the_adapter() {
         assert!(directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
 
         // A later command's repair does not report the surface closed.
-        assert!(!repair_dead_native_owner(directory.path()).unwrap());
+        assert!(
+            !session_close::repair_dead_owner(&Store::open_unchecked(directory.path())).unwrap()
+        );
         let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
         assert_eq!(status.state.as_str(), "ready");
         // The close that recorded the intent may finish without signalling anything. The
         // first assertion keeps a regression from reaching the Terminal.app probe.
-        assert!(terminal_close_resumable(directory.path(), &handle).unwrap());
+        assert!(
+            session_close::terminal_close_resumable(
+                &Reader::open_unchecked(directory.path()),
+                &handle,
+                terminal::surface_outlives_owner(&handle)
+            )
+            .unwrap()
+        );
         assert!(
             verify_terminal_close_authority_with_evidence(
                 directory.path(),
@@ -778,11 +793,21 @@ fn apple_terminal_close_retry_after_teardown_reaches_the_adapter() {
         );
 
         let mut adapter_calls = 0;
-        close_repaired_session_state(directory.path(), |session| {
-            adapter_calls += 1;
-            assert_eq!(session, &handle);
-            Ok(outcome)
-        })
+        {
+            let closer =
+                &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
+                    adapter_calls += 1;
+                    assert_eq!(session, &handle);
+                    Ok(outcome)
+                };
+            session_close::close(
+                &Store::open_unchecked(directory.path()),
+                None,
+                session_close::budget::close_deadline(),
+                |surface| closer(surface).map(Into::into),
+            )
+        }
+        .map(|_| ())
         .unwrap();
         assert_eq!(adapter_calls, 1, "the retried close must reach the adapter");
         assert_closed_without_terminal_records(directory.path());
@@ -804,30 +829,47 @@ fn apple_terminal_close_retry_without_app_incarnation_never_reaches_the_adapter(
         let path = directory.path().join(TERMINAL_HANDLE_FILE);
         fail_apple_terminal_close_after_teardown(directory.path(), &owner);
         let handle: terminal::TerminalSession = read_json(&path).unwrap();
-        assert!(terminal_close_resumable(directory.path(), &handle).unwrap());
-        let result = close_repaired_session_state(directory.path(), |session| {
-            let authority = verify_terminal_close_authority_with_evidence(
-                directory.path(),
-                "session-owner123",
-                session,
-                || Ok(present),
-                #[cfg(target_os = "macos")]
-                terminal::close_evidence::with_apple(
-                    session.kind,
-                    &terminal::macos::apple_terminal::close_evidence::with_observations(
-                        |_| panic!("no app incarnation is recorded"),
-                        || Ok(Vec::new()),
-                    ),
-                ),
-                crate::native::session::close::budget::close_deadline(),
-            )?;
-            assert_eq!(
-                authority,
-                TerminalCloseAuthority::Absent,
-                "a legacy retry reached an adapter without app-incarnation proof"
-            );
-            Ok(terminal::CloseOutcome::Missing)
-        });
+        assert!(
+            session_close::terminal_close_resumable(
+                &Reader::open_unchecked(directory.path()),
+                &handle,
+                terminal::surface_outlives_owner(&handle)
+            )
+            .unwrap()
+        );
+        let result = {
+            let closer =
+                &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
+                    let authority = verify_terminal_close_authority_with_evidence(
+                        directory.path(),
+                        "session-owner123",
+                        session,
+                        || Ok(present),
+                        #[cfg(target_os = "macos")]
+                        terminal::close_evidence::with_apple(
+                            session.kind,
+                            &terminal::macos::apple_terminal::close_evidence::with_observations(
+                                |_| panic!("no app incarnation is recorded"),
+                                || Ok(Vec::new()),
+                            ),
+                        ),
+                        crate::native::session::close::budget::close_deadline(),
+                    )?;
+                    assert_eq!(
+                        authority,
+                        TerminalCloseAuthority::Absent,
+                        "a legacy retry reached an adapter without app-incarnation proof"
+                    );
+                    Ok(terminal::CloseOutcome::Missing)
+                };
+            session_close::close(
+                &Store::open_unchecked(directory.path()),
+                None,
+                session_close::budget::close_deadline(),
+                |surface| closer(surface).map(Into::into),
+            )
+        }
+        .map(|_| ());
         assert_eq!(result.is_ok(), !present, "{result:?}");
         if present {
             assert!(path.exists());
@@ -864,49 +906,61 @@ fn apple_terminal_incarnation_gates_retry_and_read_only_absence() {
                 fail_apple_terminal_close_after_teardown(directory.path(), &owner);
             }
             let observations = std::cell::Cell::new(0);
-            let result = close_repaired_session_state(directory.path(), |session| {
-                let authority = verify_terminal_close_authority_with_evidence(
-                    directory.path(),
-                    "session-owner123",
-                    session,
-                    || {
-                        observations.set(observations.get() + 1);
-                        Ok(mode == "same-present")
-                    },
-                    #[cfg(target_os = "macos")]
-                    terminal::close_evidence::with_apple(
-                        session.kind,
-                        &terminal::macos::apple_terminal::close_evidence::with_observations(
-                            |pid| {
-                                assert_eq!(pid, 1234);
-                                match mode {
-                                    "dead" => Ok(None),
-                                    "reused" => Ok(Some((101, 42))),
-                                    "unreadable" => bail!("injected OS observation error"),
-                                    "missing" => panic!("missing app identity must not query"),
-                                    _ => Ok(Some(birth)),
-                                }
-                            }, // A record without an incarnation is not settled by a reply that a
-                            // second Terminal process could have given.
+            let result = {
+                let closer =
+                    &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
+                        let authority = verify_terminal_close_authority_with_evidence(
+                            directory.path(),
+                            "session-owner123",
+                            session,
                             || {
-                                let mut instances = vec![terminal_instance(1234, 100)];
-                                if mode == "missing" {
-                                    instances.push(terminal_instance(5678, 200));
-                                }
-                                Ok(instances)
+                                observations.set(observations.get() + 1);
+                                Ok(mode == "same-present")
                             },
-                        ),
-                    ),
-                    crate::native::session::close::budget::close_deadline(),
-                )?;
-                if authority == TerminalCloseAuthority::Absent {
-                    Ok(terminal::CloseOutcome::Missing)
-                } else {
-                    assert!(prior_intent);
-                    assert_eq!(authority, TerminalCloseAuthority::SurfaceOnly);
-                    bail!("injected adapter failure retains retry")
-                }
-            });
+                            #[cfg(target_os = "macos")]
+                            terminal::close_evidence::with_apple(
+                                session.kind,
+                                &terminal::macos::apple_terminal::close_evidence::with_observations(
+                                    |pid| {
+                                        assert_eq!(pid, 1234);
+                                        match mode {
+                                            "dead" => Ok(None),
+                                            "reused" => Ok(Some((101, 42))),
+                                            "unreadable" => bail!("injected OS observation error"),
+                                            "missing" => {
+                                                panic!("missing app identity must not query")
+                                            }
+                                            _ => Ok(Some(birth)),
+                                        }
+                                    }, // A record without an incarnation is not settled by a reply that a
+                                    // second Terminal process could have given.
+                                    || {
+                                        let mut instances = vec![terminal_instance(1234, 100)];
+                                        if mode == "missing" {
+                                            instances.push(terminal_instance(5678, 200));
+                                        }
+                                        Ok(instances)
+                                    },
+                                ),
+                            ),
+                            crate::native::session::close::budget::close_deadline(),
+                        )?;
+                        if authority == TerminalCloseAuthority::Absent {
+                            Ok(terminal::CloseOutcome::Missing)
+                        } else {
+                            assert!(prior_intent);
+                            assert_eq!(authority, TerminalCloseAuthority::SurfaceOnly);
+                            bail!("injected adapter failure retains retry")
+                        }
+                    };
+                session_close::close(
+                    &Store::open_unchecked(directory.path()),
+                    None,
+                    session_close::budget::close_deadline(),
+                    |surface| closer(surface).map(Into::into),
+                )
+            }
+            .map(|_| ());
             let absent = mode == "dead" || (!prior_intent && mode == "same-absent");
             assert_eq!(result.is_ok(), absent, "{prior_intent}/{mode}: {result:?}");
             if absent {
@@ -1057,11 +1111,20 @@ fn apple_terminal_close_retry_failure_or_interruption_keeps_the_intent_and_the_h
     let owner = write_attested_apple_terminal_state(directory.path(), "ready", reaped_child_pid());
     fail_apple_terminal_close_after_teardown(directory.path(), &owner);
 
-    close_repaired_session_state(directory.path(), |_| {
-        Err(anyhow::anyhow!(
-            "Agent Bridge Terminal.app window no longer holds its tab"
-        ))
-    })
+    {
+        let closer = &mut |_: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
+            Err(anyhow::anyhow!(
+                "Agent Bridge Terminal.app window no longer holds its tab"
+            ))
+        };
+        session_close::close(
+            &Store::open_unchecked(directory.path()),
+            None,
+            session_close::budget::close_deadline(),
+            |surface| closer(surface).map(Into::into),
+        )
+    }
+    .map(|_| ())
     .unwrap_err();
     assert!(directory.path().join(TERMINAL_HANDLE_FILE).exists());
     assert!(directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
@@ -1075,13 +1138,22 @@ fn apple_terminal_close_retry_failure_or_interruption_keeps_the_intent_and_the_h
         directory.path().join(TERMINAL_CLOSING_FILE),
     )
     .unwrap();
-    assert!(!repair_dead_native_owner(directory.path()).unwrap());
+    assert!(!session_close::repair_dead_owner(&Store::open_unchecked(directory.path())).unwrap());
     assert!(directory.path().join(TERMINAL_CLOSING_FILE).exists());
     let mut adapter_calls = 0;
-    close_repaired_session_state(directory.path(), |_| {
-        adapter_calls += 1;
-        Ok(terminal::CloseOutcome::Closed)
-    })
+    {
+        let closer = &mut |_: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
+            adapter_calls += 1;
+            Ok(terminal::CloseOutcome::Closed)
+        };
+        session_close::close(
+            &Store::open_unchecked(directory.path()),
+            None,
+            session_close::budget::close_deadline(),
+            |surface| closer(surface).map(Into::into),
+        )
+    }
+    .map(|_| ())
     .unwrap();
     assert_eq!(adapter_calls, 1);
     assert_closed_without_terminal_records(directory.path());
@@ -1096,11 +1168,21 @@ fn apple_terminal_close_intent_grants_nothing_while_the_incarnation_is_live() {
     let owner = write_attested_apple_terminal_state(directory.path(), "ready", std::process::id());
     let handle: terminal::TerminalSession =
         read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
-    record_terminal_close_intent(directory.path(), "session-owner123", &handle, &owner).unwrap();
+    session_close::record_terminal_close_intent(
+        &Store::open_unchecked(directory.path()),
+        "session-owner123",
+        &handle,
+        &owner,
+    )
+    .unwrap();
     assert!(
-        terminal_close_intent_owner(directory.path(), &handle)
-            .unwrap()
-            .is_some()
+        session_close::terminal_close_intent_owner(
+            &Reader::open_unchecked(directory.path()),
+            &handle,
+            terminal::surface_outlives_owner(&handle)
+        )
+        .unwrap()
+        .is_some()
     );
     assert!(
         !session::close::terminal_close_resumable_with(
@@ -1138,16 +1220,28 @@ fn warp_close_retry_preserves_authority_after_partial_surface_cleanup() {
         directory.path(),
         None,
         |session| {
-            record_terminal_close_intent(directory.path(), "session-owner123", session, &owner)?;
+            session_close::record_terminal_close_intent(
+                &Store::open_unchecked(directory.path()),
+                "session-owner123",
+                session,
+                &owner,
+            )?;
             bail!("managed Warp tab is closed but its dedicated empty window remains")
         },
         crate::native::session::close::budget::close_deadline(),
     )
     .unwrap_err();
 
-    assert!(!repair_dead_native_owner(directory.path()).unwrap());
+    assert!(!session_close::repair_dead_owner(&Store::open_unchecked(directory.path())).unwrap());
     // Guard the production authority call so a regression never probes a real app.
-    assert!(terminal_close_resumable(directory.path(), &handle).unwrap());
+    assert!(
+        session_close::terminal_close_resumable(
+            &Reader::open_unchecked(directory.path()),
+            &handle,
+            terminal::surface_outlives_owner(&handle)
+        )
+        .unwrap()
+    );
     assert!(
         verify_terminal_close_authority(
             directory.path(),
@@ -1159,11 +1253,20 @@ fn warp_close_retry_preserves_authority_after_partial_surface_cleanup() {
             == TerminalCloseAuthority::SurfaceOnly
     );
     let mut calls = 0;
-    close_repaired_session_state(directory.path(), |session| {
-        assert_eq!(session, &handle);
-        calls += 1;
-        Ok(terminal::CloseOutcome::Missing)
-    })
+    {
+        let closer = &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
+            assert_eq!(session, &handle);
+            calls += 1;
+            Ok(terminal::CloseOutcome::Missing)
+        };
+        session_close::close(
+            &Store::open_unchecked(directory.path()),
+            None,
+            session_close::budget::close_deadline(),
+            |surface| closer(surface).map(Into::into),
+        )
+    }
+    .map(|_| ())
     .unwrap();
     assert_eq!(calls, 1);
     assert_closed_without_terminal_records(directory.path());
@@ -1195,16 +1298,28 @@ fn wezterm_close_retry_preserves_authority_after_partial_surface_cleanup() {
         directory.path(),
         None,
         |session| {
-            record_terminal_close_intent(directory.path(), "session-owner123", session, &owner)?;
+            session_close::record_terminal_close_intent(
+                &Store::open_unchecked(directory.path()),
+                "session-owner123",
+                session,
+                &owner,
+            )?;
             bail!("managed WezTerm pane is closed but its process remains")
         },
         crate::native::session::close::budget::close_deadline(),
     )
     .unwrap_err();
 
-    assert!(!repair_dead_native_owner(directory.path()).unwrap());
+    assert!(!session_close::repair_dead_owner(&Store::open_unchecked(directory.path())).unwrap());
     // Guard the production authority call so a regression never probes a real app.
-    assert!(terminal_close_resumable(directory.path(), &handle).unwrap());
+    assert!(
+        session_close::terminal_close_resumable(
+            &Reader::open_unchecked(directory.path()),
+            &handle,
+            terminal::surface_outlives_owner(&handle)
+        )
+        .unwrap()
+    );
     assert!(
         verify_terminal_close_authority(
             directory.path(),
@@ -1216,11 +1331,20 @@ fn wezterm_close_retry_preserves_authority_after_partial_surface_cleanup() {
             == TerminalCloseAuthority::SurfaceOnly
     );
     let mut calls = 0;
-    close_repaired_session_state(directory.path(), |session| {
-        assert_eq!(session, &handle);
-        calls += 1;
-        Ok(terminal::CloseOutcome::Missing)
-    })
+    {
+        let closer = &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
+            assert_eq!(session, &handle);
+            calls += 1;
+            Ok(terminal::CloseOutcome::Missing)
+        };
+        session_close::close(
+            &Store::open_unchecked(directory.path()),
+            None,
+            session_close::budget::close_deadline(),
+            |surface| closer(surface).map(Into::into),
+        )
+    }
+    .map(|_| ())
     .unwrap();
     assert_eq!(calls, 1);
     assert_closed_without_terminal_records(directory.path());
@@ -1235,7 +1359,13 @@ type CloseIntentMutation = fn(&Path, &terminal::TerminalSession, &NativeSessionO
 #[test]
 fn apple_terminal_close_intent_grants_nothing_unless_it_names_this_handle_and_owner() {
     let record = |directory: &Path, id: &str, handle, owner| {
-        record_terminal_close_intent(directory, id, handle, owner).unwrap()
+        session_close::record_terminal_close_intent(
+            &Store::open_unchecked(directory),
+            id,
+            handle,
+            owner,
+        )
+        .unwrap()
     };
     let cases: [(&str, CloseIntentMutation); 6] = [
         ("no intent", |_, _, _| {}),
@@ -1245,17 +1375,35 @@ fn apple_terminal_close_intent_grants_nothing_unless_it_names_this_handle_and_ow
         ("another session", |directory, handle, owner| {
             let mut handle = handle.clone();
             handle.managed_session_id = Some("session-other456".to_owned());
-            record_terminal_close_intent(directory, "session-other456", &handle, owner).unwrap()
+            session_close::record_terminal_close_intent(
+                &Store::open_unchecked(directory),
+                "session-other456",
+                &handle,
+                owner,
+            )
+            .unwrap()
         }),
         ("another handle", |directory, handle, owner| {
             let mut handle = handle.clone();
             handle.window_id = Some("1002".to_owned());
-            record_terminal_close_intent(directory, "session-owner123", &handle, owner).unwrap()
+            session_close::record_terminal_close_intent(
+                &Store::open_unchecked(directory),
+                "session-owner123",
+                &handle,
+                owner,
+            )
+            .unwrap()
         }),
         ("another owner", |directory, handle, owner| {
             let mut owner = owner.clone();
             owner.process_start_microseconds = Some(43);
-            record_terminal_close_intent(directory, "session-owner123", handle, &owner).unwrap()
+            session_close::record_terminal_close_intent(
+                &Store::open_unchecked(directory),
+                "session-owner123",
+                handle,
+                &owner,
+            )
+            .unwrap()
         }),
         ("owner without its identity", |directory, handle, owner| {
             let owner = NativeSessionOwner {
@@ -1265,7 +1413,13 @@ fn apple_terminal_close_intent_grants_nothing_unless_it_names_this_handle_and_ow
                 ..NativeSessionOwner::default()
             };
             write_json_atomic(&directory.join(SESSION_OWNER_FILE), &owner).unwrap();
-            record_terminal_close_intent(directory, "session-owner123", handle, &owner).unwrap()
+            session_close::record_terminal_close_intent(
+                &Store::open_unchecked(directory),
+                "session-owner123",
+                handle,
+                &owner,
+            )
+            .unwrap()
         }),
     ];
     for (case, mutate) in cases {
@@ -1276,7 +1430,12 @@ fn apple_terminal_close_intent_grants_nothing_unless_it_names_this_handle_and_ow
             read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
         mutate(directory.path(), &handle, &owner);
         assert!(
-            !terminal_close_resumable(directory.path(), &handle).unwrap(),
+            !session_close::terminal_close_resumable(
+                &Reader::open_unchecked(directory.path()),
+                &handle,
+                terminal::surface_outlives_owner(&handle)
+            )
+            .unwrap(),
             "{case}"
         );
         assert!(
@@ -1302,7 +1461,14 @@ fn apple_terminal_close_intent_grants_nothing_unless_it_names_this_handle_and_ow
         read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
     handle.kind = terminal::TerminalKind::Iterm2;
     record(directory.path(), "session-owner123", &handle, &owner);
-    assert!(!terminal_close_resumable(directory.path(), &handle).unwrap());
+    assert!(
+        !session_close::terminal_close_resumable(
+            &Reader::open_unchecked(directory.path()),
+            &handle,
+            terminal::surface_outlives_owner(&handle)
+        )
+        .unwrap()
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -1328,8 +1494,13 @@ fn assert_internal_wait_reports_dead_owner(status_wait: bool) {
             if retained == TERMINAL_CLOSING_FILE {
                 fs::rename(&handle_path, directory.path().join(retained)).unwrap();
             } else if retained == TERMINAL_CLOSE_INTENT_FILE {
-                record_terminal_close_intent(directory.path(), "session-owner123", &handle, &owner)
-                    .unwrap();
+                session_close::record_terminal_close_intent(
+                    &Store::open_unchecked(directory.path()),
+                    "session-owner123",
+                    &handle,
+                    &owner,
+                )
+                .unwrap();
             }
             let records = ["status.json", SESSION_OWNER_FILE, TURN_CLAIM_FILE, retained];
             let before: Vec<_> = records
@@ -1495,27 +1666,37 @@ fn assert_dead_owner_preserves_unverified_surface(kind: terminal::TerminalKind) 
                 .unwrap();
             }
             assert!(!directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
-            let result = close_repaired_session_state(directory.path(), |session| {
-                verify_terminal_close_authority_with_evidence(
-                    directory.path(),
-                    "session-owner123",
-                    session,
-                    || Ok(true),
-                    #[cfg(target_os = "macos")]
-                    terminal::close_evidence::with_apple(
-                        session.kind,
-                        &terminal::macos::apple_terminal::close_evidence::with_observations(
-                            |_| {
-                                let app = owner.terminal_app.as_ref().unwrap();
-                                Ok(Some((app.start_seconds, app.start_microseconds)))
-                            },
-                            || Ok(vec![owner.terminal_app.clone().unwrap()]),
-                        ),
-                    ),
-                    crate::native::session::close::budget::close_deadline(),
-                )?;
-                panic!("a dead owner without intent must grant no adapter authority")
-            });
+            let result = {
+                let closer =
+                    &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
+                        verify_terminal_close_authority_with_evidence(
+                            directory.path(),
+                            "session-owner123",
+                            session,
+                            || Ok(true),
+                            #[cfg(target_os = "macos")]
+                            terminal::close_evidence::with_apple(
+                                session.kind,
+                                &terminal::macos::apple_terminal::close_evidence::with_observations(
+                                    |_| {
+                                        let app = owner.terminal_app.as_ref().unwrap();
+                                        Ok(Some((app.start_seconds, app.start_microseconds)))
+                                    },
+                                    || Ok(vec![owner.terminal_app.clone().unwrap()]),
+                                ),
+                            ),
+                            crate::native::session::close::budget::close_deadline(),
+                        )?;
+                        panic!("a dead owner without intent must grant no adapter authority")
+                    };
+                session_close::close(
+                    &Store::open_unchecked(directory.path()),
+                    None,
+                    session_close::budget::close_deadline(),
+                    |surface| closer(surface).map(Into::into),
+                )
+            }
+            .map(|_| ());
             assert!(
                 result.is_err(),
                 "{kind:?}/{state}/{claimed}: no adapter proof, but close reported success"
@@ -1572,31 +1753,41 @@ fn dead_owner_exact_absence_can_finish_without_adapter_or_signal() {
         handle.kind = kind;
         write_json_atomic(&directory.path().join(TERMINAL_HANDLE_FILE), &handle).unwrap();
         let mut observations = 0;
-        close_repaired_session_state(directory.path(), |session| {
-            let authority = verify_terminal_close_authority_with_evidence(
-                directory.path(),
-                "session-owner123",
-                session,
-                || {
-                    observations += 1;
-                    Ok(false)
-                },
-                #[cfg(target_os = "macos")]
-                terminal::close_evidence::with_apple(
-                    session.kind,
-                    &terminal::macos::apple_terminal::close_evidence::with_observations(
-                        |_| {
-                            let app = owner.terminal_app.as_ref().unwrap();
-                            Ok(Some((app.start_seconds, app.start_microseconds)))
+        {
+            let closer =
+                &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
+                    let authority = verify_terminal_close_authority_with_evidence(
+                        directory.path(),
+                        "session-owner123",
+                        session,
+                        || {
+                            observations += 1;
+                            Ok(false)
                         },
-                        || Ok(vec![owner.terminal_app.clone().unwrap()]),
-                    ),
-                ),
-                crate::native::session::close::budget::close_deadline(),
-            )?;
-            assert_eq!(authority, TerminalCloseAuthority::Absent);
-            Ok(terminal::CloseOutcome::Missing)
-        })
+                        #[cfg(target_os = "macos")]
+                        terminal::close_evidence::with_apple(
+                            session.kind,
+                            &terminal::macos::apple_terminal::close_evidence::with_observations(
+                                |_| {
+                                    let app = owner.terminal_app.as_ref().unwrap();
+                                    Ok(Some((app.start_seconds, app.start_microseconds)))
+                                },
+                                || Ok(vec![owner.terminal_app.clone().unwrap()]),
+                            ),
+                        ),
+                        crate::native::session::close::budget::close_deadline(),
+                    )?;
+                    assert_eq!(authority, TerminalCloseAuthority::Absent);
+                    Ok(terminal::CloseOutcome::Missing)
+                };
+            session_close::close(
+                &Store::open_unchecked(directory.path()),
+                None,
+                session_close::budget::close_deadline(),
+                |surface| closer(surface).map(Into::into),
+            )
+        }
+        .map(|_| ())
         .unwrap();
         assert_eq!(observations, 1);
         assert_closed_without_terminal_records(directory.path());
@@ -1621,34 +1812,44 @@ fn dead_owner_absence_errors_and_reused_or_incomplete_owners_retain_handle() {
         }
         write_json_atomic(&directory.path().join(SESSION_OWNER_FILE), &owner).unwrap();
         let mut observed = 0;
-        let result = close_repaired_session_state(directory.path(), |session| {
-            verify_terminal_close_authority_with_evidence(
-                directory.path(),
-                "session-owner123",
-                session,
-                || {
-                    observed += 1;
-                    match mode {
-                        "read-error" => bail!("injected unreadable target"),
-                        "present" => Ok(true),
-                        _ => panic!("unproven owner must not inspect a surface"),
-                    }
-                },
-                #[cfg(target_os = "macos")]
-                terminal::close_evidence::with_apple(
-                    session.kind,
-                    &terminal::macos::apple_terminal::close_evidence::with_observations(
-                        |_| {
-                            let app = owner.terminal_app.as_ref().unwrap();
-                            Ok(Some((app.start_seconds, app.start_microseconds)))
+        let result = {
+            let closer =
+                &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
+                    verify_terminal_close_authority_with_evidence(
+                        directory.path(),
+                        "session-owner123",
+                        session,
+                        || {
+                            observed += 1;
+                            match mode {
+                                "read-error" => bail!("injected unreadable target"),
+                                "present" => Ok(true),
+                                _ => panic!("unproven owner must not inspect a surface"),
+                            }
                         },
-                        || Ok(vec![owner.terminal_app.clone().unwrap()]),
-                    ),
-                ),
-                crate::native::session::close::budget::close_deadline(),
-            )?;
-            panic!("unproven absence must never close or signal")
-        });
+                        #[cfg(target_os = "macos")]
+                        terminal::close_evidence::with_apple(
+                            session.kind,
+                            &terminal::macos::apple_terminal::close_evidence::with_observations(
+                                |_| {
+                                    let app = owner.terminal_app.as_ref().unwrap();
+                                    Ok(Some((app.start_seconds, app.start_microseconds)))
+                                },
+                                || Ok(vec![owner.terminal_app.clone().unwrap()]),
+                            ),
+                        ),
+                        crate::native::session::close::budget::close_deadline(),
+                    )?;
+                    panic!("unproven absence must never close or signal")
+                };
+            session_close::close(
+                &Store::open_unchecked(directory.path()),
+                None,
+                session_close::budget::close_deadline(),
+                |surface| closer(surface).map(Into::into),
+            )
+        }
+        .map(|_| ());
         assert!(result.is_err(), "{mode}");
         assert_eq!(
             observed,
@@ -1797,8 +1998,8 @@ fn failed_launch_with_a_recorded_owner_gets_no_close_without_a_prior_intent() {
                 assert!(!directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
 
                 let (mut observations, mut adapter_calls) = (0, 0);
-                let result = close_repaired_session_state(directory.path(), |session| {
-                    let authority = verify_terminal_close_authority_with_evidence(
+                let result = { let closer = &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
+                            let authority = verify_terminal_close_authority_with_evidence(
                         directory.path(),
                         "session-owner123",
                         session,
@@ -1823,13 +2024,14 @@ fn failed_launch_with_a_recorded_owner_gets_no_close_without_a_prior_intent() {
                         ),
                         crate::native::session::close::budget::close_deadline(),
                     )?;
-                    if authority == TerminalCloseAuthority::Absent {
-                        return Ok(terminal::CloseOutcome::Missing);
-                    }
-                    // Where `close_session_surface` signals the owner or calls the adapter.
-                    adapter_calls += 1;
-                    Ok(terminal::CloseOutcome::Closed)
-                });
+                            if authority == TerminalCloseAuthority::Absent {
+                                return Ok(terminal::CloseOutcome::Missing);
+                            }
+                            // Where `close_session_surface` signals the owner or calls the adapter.
+                            adapter_calls += 1;
+                            Ok(terminal::CloseOutcome::Closed)
+                        }; session_close::close(&Store::open_unchecked(directory.path()), None, session_close::budget::close_deadline(), |surface| closer(surface).map(Into::into)) }
+                .map(|_| ());
 
                 if adapter_calls != 0 {
                     failures.push(format!("{case}: {adapter_calls} close/signal step reached"));
@@ -1895,8 +2097,8 @@ fn ownerless_warp_and_wezterm_failures_only_consume_proven_absence() {
                 let claim =
                     turn::current_claim_token(&Reader::open_unchecked(directory.path())).unwrap();
                 let (mut observations, mut mutations) = (0, 0);
-                let result = close_repaired_session_state(directory.path(), |session| {
-                    let authority = verify_terminal_close_authority_with_evidence(
+                let result = { let closer = &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
+                            let authority = verify_terminal_close_authority_with_evidence(
                         directory.path(),
                         if mode == "foreign" {
                             "session-foreign"
@@ -1922,12 +2124,13 @@ fn ownerless_warp_and_wezterm_failures_only_consume_proven_absence() {
                         ),
                         crate::native::session::close::budget::close_deadline(),
                     )?;
-                    if authority == TerminalCloseAuthority::Absent {
-                        return Ok(terminal::CloseOutcome::Missing);
-                    }
-                    mutations += 1;
-                    Ok(terminal::CloseOutcome::Closed)
-                });
+                            if authority == TerminalCloseAuthority::Absent {
+                                return Ok(terminal::CloseOutcome::Missing);
+                            }
+                            mutations += 1;
+                            Ok(terminal::CloseOutcome::Closed)
+                        }; session_close::close(&Store::open_unchecked(directory.path()), None, session_close::budget::close_deadline(), |surface| closer(surface).map(Into::into)) }
+                .map(|_| ());
                 assert_eq!(
                     mutations, 0,
                     "{kind:?}/{phase:?}/{mode}: mutation without owner or intent"
@@ -2018,35 +2221,50 @@ fn failed_launch_keeps_the_prior_intent_retry_and_the_stable_id_recovery() {
             let handle: terminal::TerminalSession =
                 read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
             if terminal::surface_outlives_owner(&handle) {
-                record_terminal_close_intent(directory.path(), "session-owner123", &handle, &owner)
-                    .unwrap();
+                session_close::record_terminal_close_intent(
+                    &Store::open_unchecked(directory.path()),
+                    "session-owner123",
+                    &handle,
+                    &owner,
+                )
+                .unwrap();
             }
             let app = owner.terminal_app.clone().unwrap();
             let mut adapter_calls = 0;
-            close_repaired_session_state(directory.path(), |session| {
-                let authority = verify_terminal_close_authority_with_evidence(
-                    directory.path(),
-                    "session-owner123",
-                    session,
-                    || panic!("{kind:?}/{phase:?}: no surface observation is needed"),
-                    #[cfg(target_os = "macos")]
-                    terminal::close_evidence::with_apple(
-                        session.kind,
-                        &terminal::macos::apple_terminal::close_evidence::with_observations(
-                            |_| Ok(Some((app.start_seconds, app.start_microseconds))),
-                            || Ok(vec![app.clone()]),
-                        ),
-                    ),
-                    crate::native::session::close::budget::close_deadline(),
-                )?;
-                assert_eq!(
-                    authority,
-                    TerminalCloseAuthority::SurfaceOnly,
-                    "{kind:?}/{phase:?}"
-                );
-                adapter_calls += 1;
-                Ok(terminal::CloseOutcome::Closed)
-            })
+            {
+                let closer =
+                    &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
+                        let authority = verify_terminal_close_authority_with_evidence(
+                            directory.path(),
+                            "session-owner123",
+                            session,
+                            || panic!("{kind:?}/{phase:?}: no surface observation is needed"),
+                            #[cfg(target_os = "macos")]
+                            terminal::close_evidence::with_apple(
+                                session.kind,
+                                &terminal::macos::apple_terminal::close_evidence::with_observations(
+                                    |_| Ok(Some((app.start_seconds, app.start_microseconds))),
+                                    || Ok(vec![app.clone()]),
+                                ),
+                            ),
+                            crate::native::session::close::budget::close_deadline(),
+                        )?;
+                        assert_eq!(
+                            authority,
+                            TerminalCloseAuthority::SurfaceOnly,
+                            "{kind:?}/{phase:?}"
+                        );
+                        adapter_calls += 1;
+                        Ok(terminal::CloseOutcome::Closed)
+                    };
+                session_close::close(
+                    &Store::open_unchecked(directory.path()),
+                    None,
+                    session_close::budget::close_deadline(),
+                    |surface| closer(surface).map(Into::into),
+                )
+            }
+            .map(|_| ())
             .unwrap();
             assert_eq!(adapter_calls, 1, "{kind:?}/{phase:?}");
             assert_closed_without_terminal_records(directory.path());
@@ -2215,49 +2433,65 @@ fn terminal_record_without_app_incarnation_is_consumed_only_by_proven_absence() 
             let before: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
             let listings = std::cell::Cell::new(0);
             let (mut observations, mut adapter_calls) = (0, 0);
-            let result = close_repaired_session_state(directory.path(), |session| {
-                let authority = verify_terminal_close_authority_with_evidence(
-                    directory.path(),
-                    "session-owner123",
-                    session,
-                    || {
-                        observations += 1;
-                        match mode {
-                            "presence-error" => bail!("injected unreadable window list"),
-                            "one-stable-listed" | "none-running-but-listed" => Ok(true),
-                            _ => Ok(false),
-                        }
-                    },
-                    #[cfg(target_os = "macos")]
-                    terminal::close_evidence::with_apple(
-                        session.kind,
-                        &terminal::macos::apple_terminal::close_evidence::with_observations(
-                            |_| panic!("{case}: no app incarnation is recorded"),
+            let result = {
+                let closer =
+                    &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
+                        let authority = verify_terminal_close_authority_with_evidence(
+                            directory.path(),
+                            "session-owner123",
+                            session,
                             || {
-                                listings.set(listings.get() + 1);
-                                let first = listings.get() == 1;
+                                observations += 1;
                                 match mode {
-                                    "listing-error" => bail!("injected process table error"),
-                                    "none-running" | "none-running-but-listed" => Ok(Vec::new()),
-                                    "two-instances" => Ok(vec![
-                                        terminal_instance(1234, 100),
-                                        terminal_instance(5678, 200),
-                                    ]),
-                                    "restarted" if !first => Ok(vec![terminal_instance(1234, 101)]),
-                                    "started-meanwhile" if first => Ok(Vec::new()),
-                                    _ => Ok(vec![terminal_instance(1234, 100)]),
+                                    "presence-error" => bail!("injected unreadable window list"),
+                                    "one-stable-listed" | "none-running-but-listed" => Ok(true),
+                                    _ => Ok(false),
                                 }
                             },
-                        ),
-                    ),
-                    crate::native::session::close::budget::close_deadline(),
-                )?;
-                if authority == TerminalCloseAuthority::Absent {
-                    return Ok(terminal::CloseOutcome::Missing);
-                }
-                adapter_calls += 1;
-                Ok(terminal::CloseOutcome::Closed)
-            });
+                            #[cfg(target_os = "macos")]
+                            terminal::close_evidence::with_apple(
+                                session.kind,
+                                &terminal::macos::apple_terminal::close_evidence::with_observations(
+                                    |_| panic!("{case}: no app incarnation is recorded"),
+                                    || {
+                                        listings.set(listings.get() + 1);
+                                        let first = listings.get() == 1;
+                                        match mode {
+                                            "listing-error" => {
+                                                bail!("injected process table error")
+                                            }
+                                            "none-running" | "none-running-but-listed" => {
+                                                Ok(Vec::new())
+                                            }
+                                            "two-instances" => Ok(vec![
+                                                terminal_instance(1234, 100),
+                                                terminal_instance(5678, 200),
+                                            ]),
+                                            "restarted" if !first => {
+                                                Ok(vec![terminal_instance(1234, 101)])
+                                            }
+                                            "started-meanwhile" if first => Ok(Vec::new()),
+                                            _ => Ok(vec![terminal_instance(1234, 100)]),
+                                        }
+                                    },
+                                ),
+                            ),
+                            crate::native::session::close::budget::close_deadline(),
+                        )?;
+                        if authority == TerminalCloseAuthority::Absent {
+                            return Ok(terminal::CloseOutcome::Missing);
+                        }
+                        adapter_calls += 1;
+                        Ok(terminal::CloseOutcome::Closed)
+                    };
+                session_close::close(
+                    &Store::open_unchecked(directory.path()),
+                    None,
+                    session_close::budget::close_deadline(),
+                    |surface| closer(surface).map(Into::into),
+                )
+            }
+            .map(|_| ());
 
             let absent = matches!(mode, "none-running" | "one-stable");
             let wanted_observations =
@@ -2385,11 +2619,21 @@ fn legacy_terminal_owner_records_its_app_incarnation_before_the_close_intent() {
     })
     .unwrap();
     assert_eq!(stored_app(), Some(app.clone()));
-    record_terminal_close_intent(directory.path(), "session-owner123", &handle, &owner).unwrap();
+    session_close::record_terminal_close_intent(
+        &Store::open_unchecked(directory.path()),
+        "session-owner123",
+        &handle,
+        &owner,
+    )
+    .unwrap();
     assert_eq!(
-        terminal_close_intent_owner(directory.path(), &handle)
-            .unwrap()
-            .and_then(|owner| owner.terminal_app),
+        session_close::terminal_close_intent_owner(
+            &Reader::open_unchecked(directory.path()),
+            &handle,
+            terminal::surface_outlives_owner(&handle)
+        )
+        .unwrap()
+        .and_then(|owner| owner.terminal_app),
         Some(app.clone())
     );
 
@@ -2433,8 +2677,8 @@ fn close_uses_the_stored_creation_scope_of_a_wezterm_session() {
             None,
             |session| {
                 assert_eq!(session, &handle);
-                record_terminal_close_intent(
-                    directory.path(),
+                session_close::record_terminal_close_intent(
+                    &Store::open_unchecked(directory.path()),
                     "session-owner123",
                     session,
                     &owner,
@@ -2448,37 +2692,55 @@ fn close_uses_the_stored_creation_scope_of_a_wezterm_session() {
         let mut other_scope = handle.clone();
         other_scope.wezterm_mux.as_mut().unwrap().owns_gui = !owns_gui;
         assert!(
-            terminal_close_intent_owner(directory.path(), &other_scope)
-                .unwrap()
-                .is_none()
+            session_close::terminal_close_intent_owner(
+                &Reader::open_unchecked(directory.path()),
+                &other_scope,
+                terminal::surface_outlives_owner(&other_scope)
+            )
+            .unwrap()
+            .is_none()
         );
         assert!(
-            terminal_close_intent_owner(directory.path(), &handle)
-                .unwrap()
-                .is_some()
+            session_close::terminal_close_intent_owner(
+                &Reader::open_unchecked(directory.path()),
+                &handle,
+                terminal::surface_outlives_owner(&handle)
+            )
+            .unwrap()
+            .is_some()
         );
 
         let mut closed = None;
-        close_repaired_session_state(directory.path(), |session| {
-            let authority = verify_terminal_close_authority_with_evidence(
-                directory.path(),
-                "session-owner123",
-                session,
-                || panic!("the recorded intent needs no surface observation"),
-                #[cfg(target_os = "macos")]
-                terminal::close_evidence::with_apple(
-                    session.kind,
-                    &terminal::macos::apple_terminal::close_evidence::with_observations(
-                        |_| panic!("a WezTerm handle names no Terminal.app incarnation"),
-                        || panic!("a WezTerm handle lists no Terminal.app instances"),
-                    ),
-                ),
-                crate::native::session::close::budget::close_deadline(),
-            )?;
-            assert_eq!(authority, TerminalCloseAuthority::SurfaceOnly);
-            closed = Some(session.clone());
-            Ok(terminal::CloseOutcome::Closed)
-        })
+        {
+            let closer =
+                &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
+                    let authority = verify_terminal_close_authority_with_evidence(
+                        directory.path(),
+                        "session-owner123",
+                        session,
+                        || panic!("the recorded intent needs no surface observation"),
+                        #[cfg(target_os = "macos")]
+                        terminal::close_evidence::with_apple(
+                            session.kind,
+                            &terminal::macos::apple_terminal::close_evidence::with_observations(
+                                |_| panic!("a WezTerm handle names no Terminal.app incarnation"),
+                                || panic!("a WezTerm handle lists no Terminal.app instances"),
+                            ),
+                        ),
+                        crate::native::session::close::budget::close_deadline(),
+                    )?;
+                    assert_eq!(authority, TerminalCloseAuthority::SurfaceOnly);
+                    closed = Some(session.clone());
+                    Ok(terminal::CloseOutcome::Closed)
+                };
+            session_close::close(
+                &Store::open_unchecked(directory.path()),
+                None,
+                session_close::budget::close_deadline(),
+                |surface| closer(surface).map(Into::into),
+            )
+        }
+        .map(|_| ())
         .unwrap();
         assert_eq!(closed, Some(handle));
         assert_closed_without_terminal_records(directory.path());
