@@ -86,7 +86,7 @@ fn claimed_session_can_finalize_when_the_provider_exits_before_delivery() {
     update_status(directory.path(), SessionState::Ready, None, None).unwrap();
     update_status(directory.path(), SessionState::Claimed, None, None).unwrap();
 
-    finalize_native_session(directory.path(), &Ok(())).unwrap();
+    launch::finalize(&Store::open_unchecked(directory.path()), &Ok(())).unwrap();
 
     let status: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
     assert_eq!(status.state.as_str(), "exited");
@@ -119,7 +119,7 @@ fn native_finalization_is_idempotent_after_a_terminal_status() {
         }
         let before: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
 
-        finalize_native_session(directory.path(), &Ok(())).unwrap();
+        launch::finalize(&Store::open_unchecked(directory.path()), &Ok(())).unwrap();
 
         let after: SessionStatus = read_json(&directory.path().join("status.json")).unwrap();
         assert_eq!(after.state.as_str(), state);
@@ -153,9 +153,9 @@ fn completion_and_process_exit_converge_in_either_serialized_order() {
         };
         if completion_first {
             complete();
-            finalize_native_session(directory.path(), &Ok(())).unwrap();
+            launch::finalize(&Store::open_unchecked(directory.path()), &Ok(())).unwrap();
         } else {
-            finalize_native_session(directory.path(), &Ok(())).unwrap();
+            launch::finalize(&Store::open_unchecked(directory.path()), &Ok(())).unwrap();
             complete();
         }
 
@@ -311,7 +311,7 @@ fn turn_lifecycle_converges_under_every_completion_exit_and_failure_order() {
                 )
                 .unwrap(),
                 TurnEvent::ProcessExit => {
-                    finalize_native_session(directory.path(), &Ok(())).unwrap()
+                    launch::finalize(&Store::open_unchecked(directory.path()), &Ok(())).unwrap()
                 }
                 TurnEvent::DelayedDeliveryFailure => {
                     let failure = delivery_uncertain_failure("paste timed out");

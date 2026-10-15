@@ -1,9 +1,11 @@
 //! Provider-neutral startup receipt and fencing. A terminal accepting a command is not
 //! evidence that its wrapper ran. The lifecycle lock serializes cancellation with spawn.
 use crate::native::session::primitives::unix_ms;
-use crate::native::session::state::{SessionState, SessionStatus, update_status_with_residual};
+use crate::native::session::state::{
+    SessionState, SessionStatus, update_status, update_status_with_residual,
+};
 
-use crate::native::session::turn::remove_turn_claim_locked;
+use crate::native::session::turn::{recover_pending_completion_locked, remove_turn_claim_locked};
 use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store, turn};
 use crate::native::terminal;
 #[cfg(unix)]
@@ -640,7 +642,71 @@ where
     Ok(child)
 }
 
-pub(in crate::native) fn uncertain(reader: &Reader) -> bool {
+/// The wrapper's admission: the launch it was started for is still the pending one.
+pub(in crate::native) fn admit_wrapper(store: &Store) -> Result<()> {
+    let directory = store.directory();
+    if let Some(record) = read(&Reader::open_unchecked(directory))? {
+        let status: SessionStatus = Reader::open_unchecked(directory).status()?;
+        if record.phase != Phase::Pending
+            || status.state != SessionState::Launching
+            || turn::current_claim_token(&Reader::open_unchecked(directory))?.as_deref()
+                != Some(&record.claim_token)
+        {
+            log(
+                &Store::open_unchecked(directory),
+                "wrapper_exit_code=1; launch cancelled or already attempted",
+            );
+            bail!(
+                "provider launch cancelled or already attempted; the recorded session is unchanged"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Settles the session after the wrapper's command returned: recovers a pending completion,
+/// records Exited/Failed, keeps the claim when the spawn is uncertain, otherwise releases it.
+pub(in crate::native) fn finalize(store: &Store, result: &Result<()>) -> Result<()> {
+    let directory = store.directory();
+    let claim_path = Reader::open_unchecked(directory)
+        .record(CoreRecord::TurnClaim)
+        .path()
+        .to_owned();
+    let _claim_lock = Store::open_unchecked((claim_path).with_file_name("")).lock()?;
+    if let Some(record) = read(&Reader::open_unchecked(directory))?
+        && record.phase != Phase::Spawned
+        && turn::current_claim_token(&Reader::open_unchecked(directory))?.as_deref()
+            != Some(&record.claim_token)
+    {
+        return Ok(());
+    }
+    recover_pending_completion_locked(directory, &claim_path)?;
+    let status: SessionStatus = Reader::open_unchecked(directory).status()?;
+    if !matches!(
+        status.state,
+        SessionState::Closed | SessionState::Exited | SessionState::Failed
+    ) {
+        match result {
+            Ok(()) => update_status(directory, SessionState::Exited, Some(0), None)?,
+            Err(error) => {
+                let reason = if uncertain(&Reader::open_unchecked(directory)) {
+                    format!(
+                        "{error:#}; provider spawn is uncertain; the claim is retained, do not resend"
+                    )
+                } else {
+                    format!("{error:#}")
+                };
+                update_status(directory, SessionState::Failed, Some(1), Some(reason))?;
+            }
+        }
+    }
+    if uncertain(&Reader::open_unchecked(directory)) && status.state != SessionState::Closed {
+        return Ok(());
+    }
+    remove_turn_claim_locked(&claim_path)
+}
+
+fn uncertain(reader: &Reader) -> bool {
     read(reader)
         .ok()
         .flatten()

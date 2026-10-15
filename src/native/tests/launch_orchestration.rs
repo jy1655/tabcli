@@ -133,7 +133,7 @@ fn failed_spawn_does_not_claim_a_process_was_started() {
             .phase,
         Phase::Pending
     );
-    finalize_native_session(directory.path(), &Err(error)).unwrap();
+    launch::finalize(&Store::open_unchecked(directory.path()), &Err(error)).unwrap();
     assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
 }
 
