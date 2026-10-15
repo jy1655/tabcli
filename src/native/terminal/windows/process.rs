@@ -159,7 +159,7 @@ mod observation_tests {
     use super::*;
     #[cfg(windows)]
     #[test]
-    fn retained_exited_process_remains_queryable_but_is_observed_absent() {
+    fn retained_exited_process_is_unqueryable_and_observed_absent() {
         let dir = tempfile::tempdir().unwrap();
         // Keep cmd alive long enough to capture its identity before ending it.
         let mut child = std::process::Command::new("cmd.exe")
@@ -171,9 +171,13 @@ mod observation_tests {
         let recorded = query_process_identity(pid);
         child.kill().unwrap();
         child.wait().unwrap();
-        let recorded = recorded.unwrap();
-        // Child retains the process object: the former typed check could still match.
-        assert_eq!(query_process_identity(pid).unwrap(), recorded);
+        recorded.unwrap();
+        // The Child still retains the process object. Windows refuses the image-path query
+        // of an exited process (observed on the GitHub runner: "A device attached to the
+        // system is not functioning", os error 31), so the former typed check reached its
+        // liveness fallback and reported the process gone; the observer reports the same
+        // absence from the signalled handle without consulting the liveness bool.
+        assert!(query_process_identity(pid).is_err());
         assert!(observe_process_identity(pid).unwrap().is_none());
         drop(child);
         // With the last handle closed, ERROR_INVALID_PARAMETER also proves absence.

@@ -168,7 +168,8 @@ enum ProviderProcessObservation {
 // A verified PID reuse releases the marker; an inspection failure retains it.
 fn observe_provider_process(record: &ProviderProcessRecord) -> ProviderProcessObservation {
     #[cfg(windows)]
-    // B2: an exited-but-retained provider is Gone(Exited), unlike the former typed check.
+    // B2: an exited provider whose object is still retained is Gone(Exited), as the former
+    // typed check also concluded through its liveness fallback; no liveness bool is consulted.
     return observe_provider_process_with(record, terminal::observe_windows_process_identity);
     #[cfg(not(windows))]
     {
