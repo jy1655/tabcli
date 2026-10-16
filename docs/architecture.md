@@ -113,6 +113,18 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   or session lock. Caller policy for prune, repair, wait and exact close-intent resumption
   remains in session; control proof and the close authority table remain in terminal.
   R1 removes duplicated execution lookups, not the type dependency on terminal::ownership.
+- `src/native/session/origin.rs` owns Origin observation. It selects a session's Origin only
+  from the receipt of the claim its launch record names (from a read Snapshot or by a bounded
+  direct read), and judges whether that one Origin, in the same state root, ended: a valid close
+  tombstone first, then a recorded `closed`, `failed` or `exited` status, then
+  `attest_owner(owner).process` for a bound owner, never the projected liveness bools. A missing
+  Origin directory is undecided, not ended. It reads through `RecordReader`'s bounded strict
+  regular-file reads within a `ReadBudget`, rechecks the tombstone and status after the verdict,
+  and opens no Store, takes no lock, repairs, recovers or writes nothing. It renders the public
+  `origin` and `origin_observation` fields once for `status`, `sessions`, `inspect` and `doctor`,
+  and owns the bounded started-from scan that `close-session` reports after a successful close.
+  The scan enumerates lazily and reads per session only the manifest, tombstone, status, launch
+  record and one receipt; it never closes or repairs another session and never fails the close.
 - `src/native/query.rs` and `query/timeline.rs` own command-specific observations and fields for
   read-only inspection, result, search, and timeline output using the session readers and common
   publication rules. Queries get a `Reader`,
@@ -124,7 +136,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   reads, and search retains its cumulative byte budget.
   Inspect, doctor, and `status` render one Observation per session from these readers and publication rules;
   owner process observations and surface probes are added on request, while `sessions` keeps
-  its own lock-free listing after its optional repair. Its `results` counts event paths admitted
+  its own lock-free listing after its optional repair. All four add the Origin fields through the
+  session origin reader; that reading stays observation-only even in the repairing `sessions`. Its `results` counts event paths admitted
   by the publication predicate used by status and result. `Reader::published_result_count`
   reads receipts and claim/journal evidence with a before/after consistency check, without
   locking, retrying, or decoding ordinary event bodies. The journal event comparison uses the

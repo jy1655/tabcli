@@ -2,7 +2,7 @@
 use crate::native::session::primitives::{delegation_source, unix_ms, valid_session_id};
 use crate::native::session::turn::valid_turn_claim_token;
 
-use crate::native::session::{CoreRecord, Reader, RecordStore, Store};
+use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -123,7 +123,7 @@ pub(in crate::native) fn create(
 /// non-directory at that path is refused: `read_dir` and the receipt reads would follow
 /// a link out of the state root, and a receipt read from there would supply request
 /// identity for the session's events.
-fn requests_directory_present(reader: &Reader) -> Result<bool> {
+pub(in crate::native) fn requests_directory_present(reader: &Reader) -> Result<bool> {
     let directory = reader.directory();
     let root = Reader::open_unchecked(directory)
         .record(CoreRecord::Requests)
@@ -148,6 +148,13 @@ fn requests_directory_present(reader: &Reader) -> Result<bool> {
     }
 }
 
+/// The receipt record of one claim. The caller validates the token and the directory.
+pub(in crate::native) fn receipt_record(reader: &Reader, claim_token: &str) -> RecordReader {
+    reader
+        .record(CoreRecord::Requests)
+        .child(&format!("{claim_token}.json"))
+}
+
 pub(in crate::native) fn for_claim(reader: &Reader, claim_token: &str) -> Result<Option<Receipt>> {
     if !valid_turn_claim_token(claim_token) {
         bail!("invalid request claim token")
@@ -155,10 +162,7 @@ pub(in crate::native) fn for_claim(reader: &Reader, claim_token: &str) -> Result
     if !requests_directory_present(reader)? {
         return Ok(None);
     }
-    let record = reader
-        .record(CoreRecord::Requests)
-        .child(&format!("{claim_token}.json"));
-    let Some(text) = record.text()? else {
+    let Some(text) = receipt_record(reader, claim_token).text()? else {
         return Ok(None);
     };
     let receipt: Receipt = serde_json::from_str(&text).context("invalid Bridge request receipt")?;

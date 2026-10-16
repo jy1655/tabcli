@@ -91,6 +91,26 @@ The first turn's prompt, delivered as part of launching the session.
 Any later turn's prompt, delivered with `tell` into the running session.
 _Avoid_: continuation, reply
 
+**Request source**:
+The id of the managed session that Bridge recorded as having issued one request, or the
+external mark when the request came from outside Bridge. Without that record, or when it
+cannot be read, the source is unknown. It is not an authenticated identity of the caller and
+not an Owner.
+_Avoid_: parent, caller process
+
+**Origin**:
+The managed session recorded as having requested a session's Initial prompt. An external
+Initial prompt has no managed Origin, and a session without readable initial evidence has an
+Origin that cannot be determined. It is independent of a Follow-up's source and of the
+conversation a Reopen resumed.
+_Avoid_: parent, launcher, owner
+
+**Origin ended**:
+The observation that a managed Origin's recorded lifecycle has ended, or that the Gone of its
+recorded Owner incarnation was confirmed. It does not mean that a surface ended, that a
+session was abandoned, or that anyone may close it.
+_Avoid_: orphan, abandoned, stranded
+
 **Hold**:
 The user's recorded request that a session take no further follow-up: a follow-up whose delivery
 Bridge has not yet allowed to start is refused until the hold is released. A hold does not stop

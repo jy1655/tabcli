@@ -161,6 +161,9 @@ fn missing_corrupt_and_locked_records_produce_unknown_without_writes() {
         check(&absent, "session_records")["reason_code"],
         "session_unavailable"
     );
+    // The origin is reported as unobserved, not omitted.
+    assert_eq!(check(&absent, "origin")["availability"], "unknown");
+    assert_eq!(check(&absent, "origin")["reason_code"], "origin_unverified");
     assert!(!fixture.root.path().join("session-absent").exists());
     let lock = fs::File::create(fixture.directory.join("turn.claim.lock")).unwrap();
     let before = entries(fixture.root.path());
@@ -316,6 +319,14 @@ fn provider_only_diagnostics_do_not_create_or_scan_a_session_store() {
     );
     assert!(value["session"].is_null());
     assert_eq!(check(&value, "claude_messaging")["availability"], "unknown");
+    // A session relation has no meaning without a session.
+    assert!(
+        !value["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == "origin")
+    );
     assert!(!missing.exists());
 }
 
@@ -788,7 +799,10 @@ fn scope_reports_launch_inputs_and_reuses_consent_observation() {
         value["observations"],
         json!({
             "stored_state":"ready", "generation":2, "updated_unix_ms":2, "session_error":null,
-            "active_request_id":null, "active_request_state":null, "recovery_required":false
+            "active_request_id":null, "active_request_state":null, "recovery_required":false,
+            "origin":null, "origin_observation":{"kind":"unknown", "request_id":null,
+                "stored_state":null, "ended":null, "reason":"initial_request_unavailable",
+                "detail":"no launch record names the initial request", "derived_from":"records"}
         })
     );
     assert_eq!(
@@ -805,6 +819,7 @@ fn scope_reports_launch_inputs_and_reuses_consent_observation() {
             "turn",
             "completion",
             "cancel",
+            "origin",
             "owner",
             "terminal_record",
             "hold",

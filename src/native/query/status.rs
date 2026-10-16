@@ -3,6 +3,7 @@ use super::*;
 use crate::native::session;
 use crate::native::session::OwnerObservation;
 use crate::native::session::enumerate::{CheckOrder, Fault, Scope, enumerate};
+use crate::native::session::origin::{ObservationCache, OriginObservation};
 use observation::{Observation, StatusObservation, SurfaceRecord};
 
 #[derive(Debug)]
@@ -88,6 +89,7 @@ fn attention(
     observed: &StatusObservation,
     owner: &OwnerObservation,
     bound: bool,
+    origin: &OriginObservation,
 ) -> Vec<&'static str> {
     let observation = &observed.observation;
     let records = &observation.records;
@@ -161,6 +163,10 @@ fn attention(
         SessionState::Exited => flags.push("session_exited"),
         _ => (),
     }
+    // Derived from the Origin's records; neither an open surface nor a close authority.
+    if records.status.state != SessionState::Closed && origin.ended == Some(true) {
+        flags.push("origin_ended");
+    }
     flags
 }
 
@@ -182,7 +188,7 @@ fn result_command(observed: &StatusObservation, id: &str) -> Option<String> {
     }
 }
 
-fn entry(mut observed: StatusObservation, id: &str) -> Value {
+fn entry(mut observed: StatusObservation, id: &str, origin: OriginObservation) -> Value {
     let bound = matches!(&observed.observation.evidence.owner,
         Ok(Some(owner)) if owner.managed_session_id.as_deref() == Some(id));
     let owner = if bound {
@@ -205,7 +211,7 @@ fn entry(mut observed: StatusObservation, id: &str) -> Value {
             ..OwnerObservation::default()
         }
     };
-    let flags = attention(&observed, &owner, bound);
+    let flags = attention(&observed, &owner, bound, &origin);
     let command = result_command(&observed, id);
     let observation = &observed.observation;
     let records = &observation.records;
@@ -233,6 +239,7 @@ fn entry(mut observed: StatusObservation, id: &str) -> Value {
     if let Some(residual) = records.status.residual_surface() {
         value["residual_surface"] = json!(residual);
     }
+    origin.add_fields(&mut value);
     value
 }
 
@@ -266,6 +273,7 @@ fn value_in(root: &Path, request: &StatusRequest, budget: Duration) -> Result<Va
     ids.sort();
     let mut sessions = Vec::new();
     let mut scanned = 0;
+    let mut origins = ObservationCache::default();
     for id in ids {
         let read = (|| -> Result<Option<Value>> {
             if Instant::now() >= deadline {
@@ -296,7 +304,8 @@ fn value_in(root: &Path, request: &StatusRequest, budget: Duration) -> Result<Va
             if Instant::now() >= deadline {
                 bail!("status time budget exhausted");
             }
-            Ok(Some(entry(observed, &id)))
+            let origin = origins.observe(root, observed.observation.origin.clone(), Some(deadline));
+            Ok(Some(entry(observed, &id, origin)))
         })();
         match read {
             Ok(Some(value)) => sessions.push(value),

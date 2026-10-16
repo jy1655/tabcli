@@ -361,6 +361,8 @@ sorts ascending by id; `updated` sorts newest first, breaking ties by id.
 publication of recorded completions, completion of interrupted closes, and repair of sessions whose
 owner died before reading their state. The state filter is applied afterward. The internal read-only
 listing is not a public flag. Use `status`, `inspect`, `result`, or `search` when records must not change.
+Each row also carries `origin` and `origin_observation`, read the same way as in `status`. That
+reading only observes: it runs after the repair above and changes no record.
 
 Human rows show id, state, provider, workspace, terminal, bypass flag, and recorded event count. An
 empty list prints `no native Agent Bridge sessions`. JSON is an array, not an `ok` envelope. The
@@ -427,6 +429,13 @@ null. Attention does not change session or request state. Owner exit, identity m
 missing observations are distinct facts; closed sessions have no owner liveness flags. A live
 owner whose identity was not observed is not flagged; a failed identity check is reported as
 `owner_unverified`.
+Each session carries `origin` and `origin_observation`: the managed session recorded as the
+source of its initial request, and whether that session's records show it ended (see
+[origin observation](#origin-observation)). A session whose recorded state is not `closed` and
+whose origin has ended gets attention `origin_ended`; failed and exited sessions are included until
+they are closed. The flag does not mean that a surface is open or that anyone abandoned the
+session, and it grants no close authority. An origin that could not be observed adds no flag and
+fails nothing; the reason is in the object. One status response reads each origin once.
 `scanned.sessions` counts session reads attempted after the workspace and provider filters,
 including failed reads and sessions excluded by the closed filter. `scanned.listed` counts
 returned entries.
@@ -478,7 +487,8 @@ result id, and request ids. In JSON, check `turn_claimed` for an active request 
 reference](#json-field-reference).
 
 The default inspection also reports `held` as true, false, or null with `hold_error` when unreadable.
-Timeline does not include hold history.
+Timeline does not include hold history. The default inspection adds `origin` and
+`origin_observation` as in `status`; the timeline has no origin entry.
 
 Timeline output groups request summaries and recorded evidence. Derived request summaries carry
 `derived_from: "result"`; session diagnostics remain separate from request entries.
@@ -687,6 +697,16 @@ Session reports append a `hold` check after the other record checks: `available`
 `unavailable` / `session_held`, or `unknown` / `hold_unreadable`. A held session's next action
 names `hold SESSION --release` only when it is known not to be closed; a closed session retains
 its hold as a record and cannot release it.
+
+Session reports add an `origin` check, and `observations` gains `origin` and
+`origin_observation` (see [origin observation](#origin-observation)). The check is `available` /
+`origin_external` for an initial request from outside Bridge, `available` / `origin_live` when the
+origin's attested owner is live, `unavailable` / `origin_ended` when the origin ended and this
+session is not closed, `available` / `origin_ended_session_closed` when both have ended, and
+`unknown` / `origin_unverified` otherwise, including when the session's own records could not be
+read consistently. Only `origin_ended` suggests a command: an explicit `close-session` of this
+session, if you no longer need it. The origin observation grants no close authority.
+`doctor --provider` has no origin check.
 
 For Pi, `checks` includes `pi_provider_credentials`. With a session's explicit
 `provider/model` and `--probe`, Pi's local, non-refreshing auth check reports
@@ -972,7 +992,23 @@ for this failure is not implemented (#87); an explicit close refuses and preserv
 when absence cannot be proved. Check the named tab in Warp. This failure has not been observed
 live, and Warp remains not live-verified (#63).
 
-Human output is `closed SESSION`. JSON has `ok`, `session`, and `closed`.
+After a successful close, and only then, Bridge looks once for sessions whose initial request
+names the closed session as its origin and that are not closed in their records. The scan reads
+records only: per session the manifest, the close tombstone and status, and for a session that is
+not closed its launch record and the one receipt of its initial request. It reads no request index,
+event, owner process or surface, and it closes and repairs nothing. It uses what is left of the
+close deadline, at most two seconds, and stops at 4,096 sessions, 64 KiB per record, 16 MiB in
+all, or 256 sessions found. The deadline is checked between reads; a slow filesystem call can
+outlast it. A scan that stops early or cannot classify a session is reported as incomplete; it
+never fails the close. The answer describes the records at the time of the scan: sessions can be
+created, closed or changed during and after it, and a session launched from this one but not yet
+recorded is not found.
+
+Human output is `closed SESSION`. When sessions were found it adds
+`N session(s) started from SESSION remain unclosed in the observed records: ID ...` and
+`Close a session you no longer need with 'tabcli close-session ID --explicit'.`; an incomplete
+scan adds `Started-from scan incomplete; the list may omit sessions.`. JSON has `ok`, `session`,
+`closed`, and `started_from` (see the [JSON field reference](#close-session-1)).
 
 Exit 0 means Bridge completed the close. If the id is missing, check it with `sessions`; if the
 command asks for acknowledgement, add `--explicit` only when you intend to close that session. For
@@ -1061,7 +1097,8 @@ Error fallback output can use `unknown`. Request and session state are different
 remain usable after a request completes, and a closed session can retain results.
 
 `status`, `inspect`, timeline, `result`, `wait`, `search`, and `doctor` only observe. They never repair, recover,
-resend, close, or write records. The public `sessions` command performs repair as documented above.
+resend, close, or write records. The public `sessions` command performs repair as documented above;
+its origin fields and the started-from report of `close-session` only observe.
 No query treats a missing result as an instruction to deliver the prompt again.
 
 ## Environment and internal interfaces
@@ -1139,8 +1176,9 @@ Fields: `settings_file`, `windows_tab_window` (`dedicated` or `current`), `macos
 
 Each array entry contains `id`, `provider`, `workspace`, `title`, `yolo`, `state`, `terminal`,
 `terminal_session_id`, `terminal_tab_id`, `terminal_window_id`, `iterm_session_id`,
-`created_unix_ms`, `updated_unix_ms`, `error`, `model`, `effort`, `resumed_from`, and `results`. The
-event count is not a count of successful published results.
+`created_unix_ms`, `updated_unix_ms`, `error`, `model`, `effort`, `resumed_from`, `results`,
+`origin`, and `origin_observation`. The event count is not a count of successful published
+results. The origin fields are described under [origin observation](#origin-observation).
 
 ### status
 
@@ -1153,7 +1191,8 @@ The envelope contains `schema_version`, `ok`, `filters`, `sessions`, `incomplete
 Each session contains `id`, `provider`, `workspace`, `title`, `model`, `effort`, `yolo`,
 `created_unix_ms`, `state`, `generation`, `updated_unix_ms`, `error`, `turn_claimed`,
 `recovery_required`, `unreadable_requests`, `request_index_error`, `active_request`,
-`latest_result`, `owner`, `attention`, `derived_from`, and `result_command`.
+`latest_result`, `owner`, `attention`, `derived_from`, `result_command`, `origin`, and
+`origin_observation`.
 `held` is true for a valid hold, false for an absent record (including legacy sessions), or null
 with `hold_error` when the record cannot be read. A true value adds attention `held`; null adds
 `records_partially_unreadable`. `residual_surface` follows inspect's optional-field rule below.
@@ -1168,8 +1207,72 @@ with `hold_error` when the record cannot be read. A true value adds attention `h
 Attention flags are `cancel_requested`, `held`, `delivery_unconfirmed`, `launch_timeout`, `launch_failed`,
 `launch_uncertain`, `claim_without_receipt`, `recovery_required`, `owner_exited`,
 `owner_identity_mismatch`, `owner_unverified`, `records_partially_unreadable`,
-`request_index_incomplete`, `residual_surface_unverified`, `session_failed`, and
-`session_exited`. No flag supplies repair or close authority.
+`request_index_incomplete`, `residual_surface_unverified`, `session_failed`, `session_exited`,
+and `origin_ended`. No flag supplies repair or close authority.
+
+### Origin observation
+
+`status` sessions, `sessions` rows, `inspect` and `doctor` `observations` carry the same two
+fields. `origin` is the id of the managed origin session, or null. `origin_observation` is:
+
+```json
+{
+  "kind": "managed",
+  "request_id": "request-example",
+  "stored_state": "closed",
+  "ended": true,
+  "reason": "recorded_closed",
+  "detail": null,
+  "derived_from": "records"
+}
+```
+
+`kind` is `managed`, `external`, or `unknown`. `request_id` is the initial request whose receipt
+named the origin, or null. `stored_state` is the origin's recorded state, or null when it was not
+read. `ended` is true, false, or null when it could not be decided. `detail` is a nullable
+explanation. `derived_from` is always `records`.
+
+The origin is taken only from the receipt of the claim that the session's launch record names.
+No other receipt replaces it: a follow-up from another session, an older timestamp, or a
+`resumed_from` source never becomes the origin. A reopened session's origin is the caller of
+`reopen`. The recorded source is the caller's environment at the time of the request, not an
+authenticated identity.
+
+| `reason` | `kind` | `ended` | Meaning |
+| --- | --- | --- | --- |
+| `recorded_closed` | managed | true | The origin's close tombstone or status records `closed`. A status that has not caught up with the tombstone is named in `detail`. |
+| `recorded_failed`, `recorded_exited` | managed | true | The origin's status records that state. |
+| `owner_exited` | managed | true | The origin's bound owner process is attested gone. |
+| `owner_reused` | managed | true | The owner's process id now belongs to another process, which grants no authority. |
+| `owner_live` | managed | false | The owner is attested live; `detail` notes a process-id-only record. |
+| `owner_unverified` | managed | null | No owner record, an unbound or foreign one, or an attestation that could not decide. |
+| `origin_missing` | managed | null | No session directory with that id in this state root; a pruned, deleted or foreign session looks the same. |
+| `origin_unreadable` | managed | null | A linked or damaged directory, manifest, status or tombstone. |
+| `origin_unverified` | managed | null | A recorded state this version does not know. |
+| `origin_busy` | managed | null | The origin's records changed while they were read. |
+| `origin_budget_exhausted` | any | null | The read budget ran out. |
+| `origin_external` | external | null | The initial request came from outside Bridge. |
+| `initial_request_unavailable` | unknown | null | No launch record, an invalid one, or no receipt for its claim, as for sessions launched before 0.0.7. |
+| `initial_receipt_unreadable` | unknown | null | The initial request's receipt could not be read. |
+| `source_unavailable` | unknown | null | The initial receipt records no source. |
+| `invalid_source` | unknown | null | The recorded source is not a session id or names the session itself. |
+
+Only the origin itself is read, in the same state root, through bounded regular-file reads: at
+most 100 ms, 64 KiB per record and 512 KiB per origin. No lock is taken and no record is written;
+origins of origins are not followed.
+
+### close-session
+
+Success fields: `ok`, `session`, `closed`, and `started_from`. There is no `schema_version`.
+`started_from` contains `open`, the sorted ids of sessions found (at most 256);
+`incomplete`; `incomplete_reasons`, at most 64 objects `{session, reason}` where `session` is null
+for a root-level reason; `additional_incomplete_reasons`, the count of reasons beyond 64; and
+`scanned` with `sessions` (sessions examined, excluding the closed one) and `listed` (the length of
+`open`). A reason starts with a code and may add context after a colon: one of the
+[origin observation](#origin-observation) reasons for initial evidence,
+`records_unreadable`, `close_in_progress`, `session_changed`, `time_budget_exhausted`,
+`entry_limit`, `byte_limit`, `open_limit`, `root_unreadable`, or `entry_unreadable`. `incomplete:
+false` does not mean that no session will be launched from the closed one later.
 
 ### inspect
 
@@ -1177,7 +1280,7 @@ Fields: `schema_version`, `ok`, `session`, `provider`, `workspace`, `title`, `st
 `generation`, `created_unix_ms`, `updated_unix_ms`, `error`, `exit_code`, `configured`,
 `resumed_from`, `workspace_consent`, `owner_process_alive`, `owner_identity_verified`, `owner`,
 `recovery_required`, `turn_claimed`, `unreadable_requests`, `request_index_error`,
-`recorded_events`, `latest_result`, and `requests`. `configured` contains `model`, `effort`, `yolo`,
+`recorded_events`, `latest_result`, `requests`, `origin`, and `origin_observation`. `configured` contains `model`, `effort`, `yolo`,
 and `provider_version_at_launch`. Request references include `request_id`, `created_unix_ms`,
 `source`, `event_id`, `context_sources`, `active`, and the two elapsed-time fields described under
 `result`.
@@ -1247,6 +1350,11 @@ No command stdout, stderr, or arbitrary error text is copied into that evidence.
 
 The session `cancel` check has reason `cancel_absent`, `cancel_recorded`, or
 `cancel_unreadable`; recorded intent does not confirm interruption.
+
+The session `origin` check has reason `origin_external`, `origin_live`, `origin_ended`,
+`origin_ended_session_closed`, or `origin_unverified`. Its `evidence` holds `origin` and
+`origin_observation`; only `origin_ended` has a `next_command`, the explicit close of the
+diagnosed session.
 
 ### inspect --timeline
 

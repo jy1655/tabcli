@@ -624,3 +624,66 @@ fn published_count_rejects_a_receipt_changed_during_the_read() {
     .unwrap_err();
     assert!(error.is::<session::SnapshotBusy>());
 }
+
+#[test]
+fn ownership_listing_observes_origins_without_changing_any_record() {
+    fn tree(path: &Path, out: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+        if path.is_dir() {
+            out.push((path.to_owned(), None));
+            let mut children: Vec<_> = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            children.sort();
+            for child in children {
+                tree(&child, out);
+            }
+        } else {
+            out.push((path.to_owned(), fs::read(path).ok()));
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    // The origin carries what repair and recovery act on: a pending completion and a
+    // bound owner whose pid is not running.
+    let origin = root.path().join("session-origin");
+    seed_event_written_completion_with(&origin, "result", "result");
+    write_json_atomic(
+        &origin.join(SESSION_OWNER_FILE),
+        &serde_json::json!({"pid": u32::MAX - 1, "managed_session_id": "session-origin"}),
+    )
+    .unwrap();
+    let child = root.path().join("session-child");
+    seed_event_written_completion_with(&child, "result", "result");
+    let token = fs::read_to_string(child.join(TURN_CLAIM_FILE)).unwrap();
+    write_json_atomic(
+        &child.join(LAUNCH_FILE),
+        &serde_json::json!({"schema": 1, "claim_token": token.trim(),
+            "deadline_unix_ms": 1, "phase": "spawned"}),
+    )
+    .unwrap();
+    let receipt_path = child
+        .join(REQUESTS_DIRECTORY)
+        .join(format!("{}.json", token.trim()));
+    let mut receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    receipt["source"] = serde_json::json!("session-origin");
+    write_json_atomic(&receipt_path, &receipt).unwrap();
+    // A writer holds the origin's lifecycle lock throughout.
+    let _lock = Store::open_unchecked(&origin).lock().unwrap();
+    let mut before = Vec::new();
+    tree(root.path(), &mut before);
+    let NativeCommand::Sessions(request) = parse_args(["sessions", "--json"]).unwrap() else {
+        panic!()
+    };
+    let rows = sessions_in_read_only(root.path(), &request).unwrap();
+    let child_row = rows
+        .iter()
+        .find(|row| row["id"] == "session-child")
+        .unwrap();
+    assert_eq!(child_row["origin"], "session-origin");
+    assert_eq!(child_row["origin_observation"]["kind"], "managed");
+    assert_eq!(child_row["origin_observation"]["derived_from"], "records");
+    let mut after = Vec::new();
+    tree(root.path(), &mut after);
+    assert_eq!(after, before);
+}
