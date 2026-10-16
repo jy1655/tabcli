@@ -1,8 +1,12 @@
 use super::*;
 #[cfg(windows)]
+use crate::native::session::launch::launcher::bridge_shell_command;
+#[cfg(windows)]
 use crate::native::session::launch::wrapper::{
     check_provider_version, configure_provider_launch, resolve_provider_from_path,
 };
+#[cfg(windows)]
+use crate::native::session::primitives::STATE_DIR_ENV;
 
 #[cfg(windows)]
 #[test]

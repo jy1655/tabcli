@@ -1,10 +1,8 @@
 use crate::native::session::close::budget::CLOSE_TIMEOUT;
 use crate::native::session::primitives::{
-    SESSION_DIR_ENV, STATE_DIR_ENV, delegation_source, require_valid_session_id, unix_ms,
+    SESSION_DIR_ENV, delegation_source, require_valid_session_id, unix_ms,
 };
 use crate::native::session::schema::{SESSION_SCHEMA, SessionEvent, SessionManifest};
-#[cfg(unix)]
-use crate::native::terminal::shell_quote;
 use agent_bridge::PUBLIC_COMMAND;
 #[cfg(test)]
 use terminal::ownership::NativeSessionOwner;
@@ -1525,88 +1523,6 @@ fn create_session_within(
 #[cfg(test)]
 fn valid_status_transition(current: &SessionState, next: &SessionState) -> bool {
     current.clone().transition_allowed(next.clone())
-}
-
-#[cfg(unix)]
-fn bridge_shell_command(
-    workspace: &Path,
-    state_root: &Path,
-    executable: &Path,
-    id: &str,
-) -> Result<String> {
-    for (value, field) in [
-        (workspace.as_os_str(), "workspace"),
-        (state_root.as_os_str(), "state root"),
-        (executable.as_os_str(), "Agent Bridge executable"),
-        (std::ffi::OsStr::new(id), "session id"),
-    ] {
-        validate_shell_command_component(value, field)?;
-    }
-    let log = shell_quote(state_root.join(id).join(launch::LOG).as_os_str());
-    let location = format!("cd {} &&", shell_quote(workspace.as_os_str()));
-    let invocation = format!(
-        "{STATE_DIR_ENV}={} {} native-session {}",
-        shell_quote(state_root.as_os_str()),
-        shell_quote(executable.as_os_str()),
-        shell_quote(OsString::from(id).as_os_str())
-    );
-    let start = format!("{location} {invocation}");
-    let logged_start = format!(
-        "{location} {}=3 {}=4 {invocation}",
-        launch::STDERR_ENV,
-        launch::STDOUT_ENV
-    );
-    Ok(format!(
-        "if (umask 077; : >> {log}) 2>/dev/null; then {{ {logged_start}; bridge_status=$?; printf 'wrapper_exit_code=%s\\n' \"$bridge_status\" >> {log}; }} 3>&2 4>&1 >> {log} 2>&1; else {start}; bridge_status=$?; fi; exit \"$bridge_status\""
-    ))
-}
-
-#[cfg(windows)]
-fn powershell_quote(value: &std::ffi::OsStr) -> String {
-    format!("'{}'", value.to_string_lossy().replace('\'', "''"))
-}
-
-#[cfg(windows)]
-fn bridge_shell_command(
-    workspace: &Path,
-    state_root: &Path,
-    executable: &Path,
-    id: &str,
-) -> Result<String> {
-    for (value, field) in [
-        (workspace.as_os_str(), "workspace"),
-        (state_root.as_os_str(), "state root"),
-        (executable.as_os_str(), "Agent Bridge executable"),
-        (std::ffi::OsStr::new(id), "session id"),
-    ] {
-        validate_shell_command_component(value, field)?;
-    }
-    let log = powershell_quote(state_root.join(id).join(launch::LOG).as_os_str());
-    // The console launch passes this to PowerShell as one double-quoted `-Command`
-    // argument and refuses a command that holds a double quote, so every string here is
-    // single-quoted.
-    Ok(format!(
-        "$bridgeStatus = 1; try {{ Set-Location -LiteralPath {} -ErrorAction Stop; $env:{} = {}; & {} native-session {}; $bridgeStatus = $LASTEXITCODE }} catch {{ try {{ Add-Content -LiteralPath {log} -Value $_ -ErrorAction Stop }} catch {{}} }}; try {{ Add-Content -LiteralPath {log} -Value ('wrapper_exit_code=' + $bridgeStatus) -ErrorAction Stop }} catch {{}}; exit $bridgeStatus",
-        powershell_quote(workspace.as_os_str()),
-        STATE_DIR_ENV,
-        powershell_quote(state_root.as_os_str()),
-        powershell_quote(executable.as_os_str()),
-        powershell_quote(std::ffi::OsStr::new(id)),
-    ))
-}
-
-fn validate_shell_command_component(value: &std::ffi::OsStr, field: &str) -> Result<()> {
-    if let Some(character) = value
-        .to_string_lossy()
-        .chars()
-        .find(|value| value.is_control())
-    {
-        bail!(
-            "{field} contains terminal control U+{:04X}",
-            u32::from(character)
-        );
-    }
-    Ok(())
 }
 
 // The first line of every prompt that Bridge sends to a provider. It is framing, not an

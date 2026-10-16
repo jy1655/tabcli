@@ -1,4 +1,5 @@
 use super::*;
+use crate::native::session::launch::launcher::bridge_shell_command;
 use crate::native::session::launch::wrapper::{
     STDERR_ENV, STDOUT_ENV, configure_provider_launch, provider_version_text, version_probe_command,
 };

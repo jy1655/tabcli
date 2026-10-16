@@ -25,11 +25,11 @@ use std::{
 #[cfg(all(test, any(target_os = "macos", windows)))]
 pub(in crate::native) use super::LAUNCH_FILE as FILE;
 pub(in crate::native) const LOG: &str = "launch.log";
+pub(in crate::native) mod launcher;
 pub(in crate::native) mod wrapper;
-// The Unix bootstrap in native.rs names the fd handoff through this module until the
-// launcher side moves in.
-#[cfg(unix)]
-pub(in crate::native) use wrapper::{STDERR_ENV, STDOUT_ENV};
+// Written at the end of the launch log by whoever sees the wrapper end: the bootstrap for a
+// wrapper that could not write, the wrapper itself, and the admission refusal.
+pub(in crate::native) const WRAPPER_EXIT_CODE_MARKER: &str = "wrapper_exit_code=";
 // Retained for older readers and for reading records written before residual_surface.
 pub(in crate::native) const RESIDUAL_SURFACE_MARKER: &str =
     "the surface may remain and is not closed by Bridge";
@@ -646,7 +646,7 @@ pub(in crate::native) fn admit_wrapper(store: &Store) -> Result<()> {
         {
             log(
                 &Store::open_unchecked(directory),
-                "wrapper_exit_code=1; launch cancelled or already attempted",
+                &format!("{WRAPPER_EXIT_CODE_MARKER}1; launch cancelled or already attempted"),
             );
             bail!(
                 "provider launch cancelled or already attempted; the recorded session is unchanged"

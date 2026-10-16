@@ -17,7 +17,7 @@
     "native-console-control": 2,
     "native-hook": 3,
     "native-provider-control": 2,
-    "native-session": 4,
+    "native-session": 2,
     "name: terminal::host::CONSOLE_HOST_COMMAND": 1,
     "name: terminal::host::ITERM2_HOST_COMMAND": 1,
     "name: terminal::host::APPLE_TERMINAL_HOST_COMMAND": 1,
@@ -233,6 +233,9 @@
   "src/native/session/launch/mod.rs": {
     "launch.log": 1,
     "launch.sh": 1
+  },
+  "src/native/session/launch/launcher.rs": {
+    "native-session": 2
   },
   "src/native/session/launch/wrapper.rs": {
     "AGENT_BRIDGE_NATIVE_SESSION_ID": 1,

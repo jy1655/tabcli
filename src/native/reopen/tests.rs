@@ -3,6 +3,7 @@ use crate::native::session::close as session_close;
 #[cfg(windows)]
 use crate::native::session::launch::wrapper::provision;
 use crate::native::session::launch::wrapper::record_provider_process;
+use crate::native::session::primitives::STATE_DIR_ENV;
 use crate::native::session::schema::{
     ProviderProcessRecord, RecordedReopenRefusal, SESSION_SCHEMA, SessionEvent, SessionManifest,
 };

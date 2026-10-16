@@ -1,6 +1,7 @@
 //! The wrapper operation of the launch protocol: the native session command as the bootstrap
 //! runs it in the surface. Admission, the fd handoff, the owner record, the version gate,
 //! the provider plan, the spawn with its durable identity and the exit settlement.
+use super::WRAPPER_EXIT_CODE_MARKER;
 use crate::native::reopen::{REOPEN_LAUNCH_GATE, read_resumed_from, record_reopen_refusal};
 use crate::native::session::primitives::{SESSION_DIR_ENV, unix_ms};
 use crate::native::session::schema::ProviderProcessRecord;
@@ -71,10 +72,13 @@ pub(in crate::native) fn run(id: &str) -> Result<()> {
         provision(&directory)
     })();
     match &result {
-        Ok(()) => super::log(&Store::open_unchecked(&directory), "wrapper_exit_code=0"),
+        Ok(()) => super::log(
+            &Store::open_unchecked(&directory),
+            &format!("{WRAPPER_EXIT_CODE_MARKER}0"),
+        ),
         Err(error) => super::log(
             &Store::open_unchecked(&directory),
-            &format!("wrapper_exit_code=1; {error:#}"),
+            &format!("{WRAPPER_EXIT_CODE_MARKER}1; {error:#}"),
         ),
     }
     if let Err(finalization_error) = super::finalize(&Store::open_unchecked(&directory), &result) {
