@@ -1113,3 +1113,107 @@ fn hold_check_reports_each_part_without_changing_other_checks() {
         );
     }
 }
+
+// The Agy workspace-trust row, through the public command and a controlled caller
+// environment: Bridge locates Agy's store under HOME, otherwise USERPROFILE, and reports
+// what it observed without answering the dialog. Every row keeps the same fields.
+#[test]
+fn agy_workspace_trust_rows_are_observed_from_the_callers_home() {
+    const OBSERVATION: &str =
+        "Observation only: doctor never answers the dialog or edits Agy's settings.";
+    const WITHHELD: &str = "The Windows initial paste and every macOS follow-up are withheld meanwhile, because a paste onto the dialog is lost and its Enter would approve the folder; an argument-delivered initial prompt still runs behind the dialog.";
+    const RECOVERY: &str = "If the managed terminal shows the trust dialog, approve it there and send the prompt again; if it shows the composer or the prompt is still withheld afterwards, close this session and start a new one";
+    let fixture = Fixture::new("agy");
+    let home = tempfile::tempdir().unwrap();
+    fs::create_dir_all(home.path().join(".gemini/antigravity-cli")).unwrap();
+    // Spelled as the Agy adapter spells it: one literal under the home, so the
+    // evidence row compares equal on Windows, where a second join would use `\`.
+    let store = home.path().join(".gemini/antigravity-cli/settings.json");
+    let log = fixture.directory.join("agy.log");
+    // The recorded workspace, as the manifest spells it.
+    let workspace = fixture.root.path().to_str().unwrap().to_owned();
+    let home_str = home.path().to_str().unwrap();
+    let doctor = |env: &[(&str, Option<&str>)]| {
+        let report = report(fixture.run_with_env(&["doctor", "session-doctor", "--json"], env));
+        check(&report, "agy_workspace_trust").clone()
+    };
+    let recovering_next_action = format!(
+        "{OBSERVATION} {RECOVERY}. A workspace another provider already trusts is answered from shared consent on a later ask."
+    );
+    let evidence = json!({"workspace": workspace, "store": store, "log": log});
+    let with_home = [("HOME", Some(home_str)), ("USERPROFILE", None)];
+
+    // Neither HOME nor USERPROFILE: the store cannot be located, and the command goes on.
+    let row = doctor(&[("HOME", None), ("USERPROFILE", None)]);
+    assert_eq!(row["availability"], "unknown");
+    assert_eq!(row["reason_code"], "agy_trust_store_unlocated");
+    assert_eq!(row["detail"], "no user home for workspace trust lookup");
+    assert_eq!(
+        row["next_action"],
+        "Inspect the managed terminal; doctor never answers the dialog."
+    );
+    assert!(row["evidence"].is_null(), "{row}");
+
+    // No store under the home: the workspace is untrusted.
+    let row = doctor(&with_home);
+    assert_eq!(row["availability"], "unavailable");
+    assert_eq!(row["reason_code"], "agy_workspace_untrusted");
+    assert_eq!(
+        row["detail"],
+        format!(
+            "Agy's own trust store does not list this exact workspace, and Agy keeps its workspace-trust dialog over the composer until such a workspace is approved. {WITHHELD}"
+        )
+    );
+    assert_eq!(row["next_action"], recovering_next_action);
+    assert_eq!(row["evidence"], evidence);
+    // USERPROFILE locates the same store when HOME is unset.
+    let row = doctor(&[("HOME", None), ("USERPROFILE", Some(home_str))]);
+    assert_eq!(row["reason_code"], "agy_workspace_untrusted");
+    assert_eq!(row["evidence"], evidence);
+
+    // The store lists the workspace, but this session's log does not show the load.
+    fs::write(
+        &store,
+        json!({"trustedWorkspaces": [workspace]}).to_string(),
+    )
+    .unwrap();
+    let row = doctor(&with_home);
+    assert_eq!(row["availability"], "unknown");
+    assert_eq!(row["reason_code"], "agy_session_trust_unverified");
+    assert_eq!(
+        row["detail"],
+        format!(
+            "Agy's own trust store lists this exact workspace, but this session's agy.log does not show that this session loaded the workspace customizations. Either this session still shows its own workspace-trust dialog, as it does after the workspace was approved in another session, or the log is missing or no longer holds that line. {WITHHELD}"
+        )
+    );
+    assert_eq!(row["next_action"], recovering_next_action);
+    assert_eq!(row["evidence"], evidence);
+
+    // The log shows the load from a goroutine other than the main one: trusted.
+    fs::write(
+        &log,
+        "I0924 16:41:07.819578       1 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)\nI0924 16:41:20.814059     406 hooks_manager.go:53] loaded 0 named hooks from 0 hooks.json file(s)\n",
+    )
+    .unwrap();
+    let row = doctor(&with_home);
+    assert_eq!(row["availability"], "available");
+    assert_eq!(row["reason_code"], "agy_workspace_trusted");
+    assert_eq!(
+        row["detail"],
+        "Agy's own trust store lists this exact workspace and this session's agy.log shows that it loaded the workspace customizations, so no workspace-trust dialog covers the composer."
+    );
+    assert_eq!(row["next_action"], OBSERVATION);
+    assert_eq!(row["evidence"], evidence);
+
+    // A store that is not Agy's shape is reported as unreadable, with the same evidence.
+    fs::write(&store, "{\"trustedWorkspaces\":true}").unwrap();
+    let row = doctor(&with_home);
+    assert_eq!(row["availability"], "unknown");
+    assert_eq!(row["reason_code"], "agy_trust_evidence_unreadable");
+    assert_eq!(
+        row["detail"],
+        "Agy's trust store or this session's agy.log could not be read, so the dialog state is unobserved: Agy trustedWorkspaces is not an array"
+    );
+    assert_eq!(row["next_action"], recovering_next_action);
+    assert_eq!(row["evidence"], evidence);
+}

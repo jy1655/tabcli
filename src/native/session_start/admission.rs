@@ -8,38 +8,38 @@
 //! adapter; this module applies the setting to it. It is an admission policy for an
 //! observed path, not a sandbox: it does not stop a launch from another directory.
 use super::super::*;
-use crate::native::consent::Homes;
+use crate::native::consent::Environment;
 use crate::native::settings::CodexMemoryWorkspace;
 use agent_bridge::PUBLIC_COMMAND;
 
 /// Applies the setting of the state root to a canonical workspace. An `allow` setting
 /// admits without reading the caller's Codex home.
 pub(in crate::native) fn check(root: &Path, canonical_workspace: &Path) -> Result<()> {
-    check_from(root, canonical_workspace, Homes::current)
+    check_from(root, canonical_workspace, Environment::current)
 }
 
 /// The self-test's isolated mode reads no settings: it uses the default, refuse.
 pub(in crate::native) fn check_isolated(canonical_workspace: &Path) -> Result<()> {
-    check_isolated_from(canonical_workspace, Homes::current)
+    check_isolated_from(canonical_workspace, Environment::current)
 }
 
 fn check_from(
     root: &Path,
     canonical_workspace: &Path,
-    homes: impl FnOnce() -> Result<Homes>,
+    env: impl FnOnce() -> Environment,
 ) -> Result<()> {
     let policy = settings::codex_memory_workspace(root)?;
     if policy == CodexMemoryWorkspace::Allow {
         return Ok(());
     }
-    check_with(policy, canonical_workspace, &memory_workspace(homes)?)
+    check_with(policy, canonical_workspace, &memory_workspace(env)?)
 }
 
 fn check_isolated_from(
     canonical_workspace: &Path,
-    homes: impl FnOnce() -> Result<Homes>,
+    env: impl FnOnce() -> Environment,
 ) -> Result<()> {
-    match refusal(canonical_workspace, &memory_workspace(homes)?)? {
+    match refusal(canonical_workspace, &memory_workspace(env)?)? {
         Some(refusal) => bail!(
             "{refusal} Isolated self-test uses default settings; use ordinary self-test with the allow setting to permit this workspace."
         ),
@@ -61,10 +61,11 @@ fn check_with(
     }
 }
 
-// The caller's Codex home, resolved exactly as workspace trust resolves it.
-fn memory_workspace(homes: impl FnOnce() -> Result<Homes>) -> Result<PathBuf> {
-    let homes = homes().context("cannot locate the Codex memory workspace")?;
-    provider::codex_memory_workspace(&homes)
+// The memory workspace of the caller's Codex home, which the Codex adapter resolves
+// exactly as workspace trust resolves it; the snapshot is taken only here, after the
+// setting was read.
+fn memory_workspace(env: impl FnOnce() -> Environment) -> Result<PathBuf> {
+    provider::codex_memory_workspace(&env()).context("cannot locate the Codex memory workspace")
 }
 
 // The refusal detail, or None when the workspace lies outside the memory workspace. Only a

@@ -27,6 +27,7 @@ fn diagnostics_describe_agy_owned_fallback_without_claiming_live_delivery() {
         workspace: std::path::Path::new("."),
         probe: false,
         deadline: std::time::Instant::now(),
+        environment: &crate::native::consent::Environment::default(),
     });
     assert_eq!(checks[0].reason_code, "agy_terminal_fallback");
     assert_eq!(checks[0].availability, Availability::Unknown);

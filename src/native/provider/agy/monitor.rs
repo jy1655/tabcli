@@ -25,7 +25,7 @@ impl AgyMonitor {
     pub(in crate::native::provider) fn start(directory: &Path, log_path: &Path) -> Result<Self> {
         let directory = directory.to_owned();
         let log_path = log_path.to_owned();
-        let brain_root = brain_root()?;
+        let brain_root = brain_root(&crate::native::consent::Environment::current())?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
         let error_directory = directory.clone();
@@ -420,11 +420,9 @@ fn monitor_session(
     }
 }
 
-pub(super) fn brain_root() -> Result<PathBuf> {
-    default_brain_root(
-        std::env::var_os("HOME").as_deref(),
-        std::env::var_os("USERPROFILE").as_deref(),
-    )
+// The brain root of the caller's environment, resolved fresh at each invocation.
+pub(super) fn brain_root(env: &crate::native::consent::Environment) -> Result<PathBuf> {
+    default_brain_root(env.home.as_deref(), env.userprofile.as_deref())
 }
 
 fn default_brain_root(

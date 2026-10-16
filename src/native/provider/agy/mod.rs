@@ -33,6 +33,22 @@ mod test_support;
 
 pub(super) static ADAPTER: AgyAdapter = AgyAdapter;
 
+// Agy's home: its settings, which hold the trust store, under the user home. The brain
+// root beside them is resolved by the monitor with its own requirement.
+#[derive(Debug)]
+struct Home {
+    settings: PathBuf,
+}
+
+impl Home {
+    fn resolve(env: &super::super::consent::Environment) -> Result<Self> {
+        let home = super::super::consent::user_home(env)?;
+        Ok(Self {
+            settings: PathBuf::from(home).join(".gemini/antigravity-cli/settings.json"),
+        })
+    }
+}
+
 pub(super) struct AgyAdapter;
 
 const AGY_TOOL_CONFIRMATION_OBSERVED: &str = "agy_tool_confirmation_observed";
@@ -255,10 +271,15 @@ impl NativeProviderAdapter for AgyAdapter {
     fn workspace_trust(
         &self,
         workspace: &Path,
-        homes: &super::super::consent::Homes,
+        env: &super::super::consent::Environment,
+        store: Option<&Path>,
     ) -> Result<super::super::consent::Trust> {
         use super::super::consent::{self, Evidence, Trust};
-        let Some(text) = consent::read_store(&homes.agy)? else {
+        let store = match store {
+            Some(store) => store.to_path_buf(),
+            None => Home::resolve(env)?.settings,
+        };
+        let Some(text) = consent::read_store(&store)? else {
             return Ok(Trust::Absent);
         };
         let config: serde_json::Value = serde_json::from_str(&text)?;
@@ -279,7 +300,7 @@ impl NativeProviderAdapter for AgyAdapter {
         Ok(if entries.contains(&key.as_str()) {
             Trust::Trusted(Evidence {
                 provider: "agy".into(),
-                store: homes.agy.clone(),
+                store,
                 key,
             })
         } else {
@@ -310,8 +331,12 @@ impl NativeProviderAdapter for AgyAdapter {
         // Session-scoped: only a launched session has a managed terminal that can
         // still show the trust dialog.
         if let Some(directory) = context.directory {
-            checks.push(workspace_trust_check(context.workspace, directory));
-            checks.push(tool_confirmation_check(directory));
+            checks.push(workspace_trust_check(
+                context.workspace,
+                context.environment,
+                directory,
+            ));
+            checks.push(tool_confirmation_check(directory, context.environment));
         }
         checks
     }

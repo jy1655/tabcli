@@ -99,7 +99,9 @@ fn workspace_trust_reads_exact_toml_key_and_no_permission_override() {
     use super::super::super::consent::{self, Trust};
     let tmp = tempfile::tempdir().unwrap();
     let workspace = tmp.path().canonicalize().unwrap();
-    let homes = consent::fixture_homes(tmp.path());
+    let env = consent::Environment::at_home(tmp.path());
+    std::fs::create_dir(tmp.path().join(".codex")).unwrap();
+    let store = tmp.path().join(".codex").join("config.toml");
     let mut key = consent::native_key(&workspace).unwrap();
     if cfg!(windows) {
         key = key.to_lowercase();
@@ -110,28 +112,36 @@ fn workspace_trust_reads_exact_toml_key_and_no_permission_override() {
     );
     // Created as Codex creates it in a user profile: nobody else can change it. A
     // plain file in the temporary directory inherits whatever that directory allows.
-    super::super::super::write_private(&homes.codex, config.as_bytes()).unwrap();
-    assert!(matches!(
-        ADAPTER.workspace_trust(&workspace, &homes).unwrap(),
-        Trust::Trusted(_)
-    ));
+    super::super::super::write_private(&store, config.as_bytes()).unwrap();
+    // The evidence names the store the adapter read, spelled as its home resolves it.
+    let Trust::Trusted(evidence) = ADAPTER.workspace_trust(&workspace, &env, None).unwrap() else {
+        panic!("trusted");
+    };
+    assert_eq!(evidence.provider, "codex");
+    assert_eq!(evidence.key, key);
+    assert_eq!(evidence.store, store);
+    let serialized = serde_json::to_value(&evidence).unwrap()["store"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    if cfg!(windows) {
+        assert!(serialized.ends_with(r"\.codex\config.toml"), "{serialized}");
+    } else {
+        assert!(serialized.ends_with("/.codex/config.toml"), "{serialized}");
+    }
     assert_eq!(
         ADAPTER
-            .workspace_trust(&workspace.join("child"), &homes)
+            .workspace_trust(&workspace.join("child"), &env, None)
             .unwrap(),
         Trust::Absent
     );
-    std::fs::write(
-        &homes.codex,
-        config.replace("trusted", "untrusted").as_bytes(),
-    )
-    .unwrap();
+    std::fs::write(&store, config.replace("trusted", "untrusted").as_bytes()).unwrap();
     assert_eq!(
-        ADAPTER.workspace_trust(&workspace, &homes).unwrap(),
+        ADAPTER.workspace_trust(&workspace, &env, None).unwrap(),
         Trust::Declined
     );
-    std::fs::write(&homes.codex, b"[bad").unwrap();
-    assert!(ADAPTER.workspace_trust(&workspace, &homes).is_err());
+    std::fs::write(&store, b"[bad").unwrap();
+    assert!(ADAPTER.workspace_trust(&workspace, &env, None).is_err());
 }
 
 #[test]
@@ -178,40 +188,140 @@ fn reopen_is_refused_with_the_adapters_own_reason() {
     );
 }
 
-fn homes_with_codex_config(codex: &str) -> crate::native::consent::Homes {
-    crate::native::consent::Homes {
-        codex: std::path::PathBuf::from(codex),
-        claude: "unused-claude".into(),
-        agy: "unused-agy".into(),
-        pi: "unused-pi".into(),
+fn codex_environment(
+    home: Option<&str>,
+    codex_home: Option<&str>,
+) -> crate::native::consent::Environment {
+    crate::native::consent::Environment {
+        home: home.map(Into::into),
+        codex_home: codex_home.map(Into::into),
+        ..Default::default()
     }
 }
 
 #[test]
-fn the_memory_workspace_is_beside_the_config_that_homes_names() {
-    // Only the Codex config path decides; the other providers' homes are never read.
+fn the_codex_home_is_config_toml_under_codex_home_or_the_user_home() {
     let home = tempfile::tempdir().unwrap();
-    let config = home.path().join("custom-codex").join("config.toml");
+    let home_str = home.path().to_str().unwrap();
+    // Without `CODEX_HOME`, `.codex` under the user home.
     assert_eq!(
-        memory_workspace(&homes_with_codex_config(config.to_str().unwrap())).unwrap(),
-        home.path().join("custom-codex").join("memories")
+        Home::resolve(&codex_environment(Some(home_str), None))
+            .unwrap()
+            .config,
+        home.path().join(".codex").join("config.toml")
+    );
+    // `CODEX_HOME` replaces that directory and is kept as spelled: a relative value stays
+    // relative, and an empty one names the caller's working directory.
+    let custom = home.path().join("custom-codex");
+    assert_eq!(
+        Home::resolve(&codex_environment(Some(home_str), custom.to_str()))
+            .unwrap()
+            .config,
+        custom.join("config.toml")
+    );
+    assert_eq!(
+        Home::resolve(&codex_environment(Some(home_str), Some("relative")))
+            .unwrap()
+            .config,
+        std::path::Path::new("relative").join("config.toml")
+    );
+    assert_eq!(
+        Home::resolve(&codex_environment(Some(home_str), Some("")))
+            .unwrap()
+            .config,
+        std::path::PathBuf::from("config.toml")
+    );
+    // The user home is required even when `CODEX_HOME` names the home.
+    let error = Home::resolve(&codex_environment(None, custom.to_str())).unwrap_err();
+    assert_eq!(error.to_string(), "no user home for workspace trust lookup");
+    // An explicitly empty `HOME` still wins over `USERPROFILE`.
+    let env = crate::native::consent::Environment {
+        home: Some("".into()),
+        userprofile: Some(home_str.into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        Home::resolve(&env).unwrap().config,
+        std::path::PathBuf::from("")
+            .join(".codex")
+            .join("config.toml")
+    );
+    assert_eq!(
+        Home::resolve(&codex_environment(None, None))
+            .unwrap_err()
+            .to_string(),
+        "no user home for workspace trust lookup"
+    );
+}
+
+#[test]
+fn the_memory_workspace_is_beside_the_config_of_the_codex_home() {
+    // Only the Codex home decides; the other providers' variables are never read.
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap();
+    assert_eq!(
+        memory_workspace(&codex_environment(Some(home_str), None)).unwrap(),
+        home.path().join(".codex").join("memories")
+    );
+    let custom = home.path().join("custom-codex");
+    assert_eq!(
+        memory_workspace(&codex_environment(Some(home_str), custom.to_str())).unwrap(),
+        custom.join("memories")
     );
     // A relative config path stays relative: the caller's working directory resolves it.
     assert_eq!(
-        memory_workspace(&homes_with_codex_config("relative/config.toml")).unwrap(),
+        memory_workspace(&codex_environment(Some(home_str), Some("relative"))).unwrap(),
         std::path::Path::new("relative").join("memories")
     );
     assert_eq!(
-        memory_workspace(&homes_with_codex_config("config.toml")).unwrap(),
+        memory_workspace(&codex_environment(Some(home_str), Some(""))).unwrap(),
         std::path::Path::new("memories")
     );
-    let error = memory_workspace(&homes_with_codex_config("")).unwrap_err();
-    assert_eq!(error.to_string(), "Codex config path has no parent");
+    let error = memory_workspace(&codex_environment(None, Some("custom"))).unwrap_err();
+    assert_eq!(error.to_string(), "no user home for workspace trust lookup");
     assert_eq!(
-        super::super::codex_memory_workspace(&homes_with_codex_config(config.to_str().unwrap()))
+        super::super::codex_memory_workspace(&codex_environment(Some(home_str), custom.to_str()))
             .unwrap(),
-        memory_workspace(&homes_with_codex_config(config.to_str().unwrap())).unwrap()
+        memory_workspace(&codex_environment(Some(home_str), custom.to_str())).unwrap()
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_trust_keys_are_lowercased_and_the_store_path_is_not() {
+    use super::super::super::consent::{self, Trust};
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().canonicalize().unwrap();
+    let mixed = tmp.path().join("Codex-Home");
+    std::fs::create_dir(&mixed).unwrap();
+    let env = consent::Environment {
+        home: Some(tmp.path().as_os_str().to_owned()),
+        codex_home: Some(mixed.as_os_str().to_owned()),
+        ..Default::default()
+    };
+    let store = mixed.join("config.toml");
+    let native = consent::native_key(&workspace).unwrap();
+    let lowercase = native.to_lowercase();
+    assert_ne!(
+        native, lowercase,
+        "the fixture needs a mixed-case workspace path"
+    );
+    // An exact lowercase entry is found first; a mixed-case entry is found as a fallback;
+    // the evidence key is lowercase either way and the store path keeps its case.
+    for entry in [&lowercase, &native] {
+        let config = format!(
+            "[projects.{}]\ntrust_level = \"trusted\"\n",
+            serde_json::to_string(entry).unwrap()
+        );
+        super::super::super::write_private(&store, config.as_bytes()).unwrap();
+        let Trust::Trusted(evidence) = ADAPTER.workspace_trust(&workspace, &env, None).unwrap()
+        else {
+            panic!("trusted through {entry}");
+        };
+        assert_eq!(evidence.key, lowercase);
+        assert_eq!(evidence.store, store);
+        std::fs::remove_file(&store).unwrap();
+    }
 }
 
 // A session directory with a seeded Claim, as the launcher leaves it before the wrapper

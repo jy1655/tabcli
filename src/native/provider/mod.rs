@@ -159,10 +159,14 @@ trait NativeProviderAdapter: Sync {
     fn follow_up_transport(&self) -> Box<dyn Transport>;
     fn cancel_support(&self, directory: &Path) -> Result<CancelSupport>;
     fn launch_trust(&self) -> super::consent::LaunchTrust;
+    // Exact-workspace trust from the provider's own store. The adapter resolves the store
+    // from its home in `env`; `store` is consent's recorded source store, which the recheck
+    // reads in its place. The returned evidence names the store that was read.
     fn workspace_trust(
         &self,
         workspace: &Path,
-        homes: &super::consent::Homes,
+        env: &super::consent::Environment,
+        store: Option<&Path>,
     ) -> Result<super::consent::Trust>;
     fn workspace_trust_key(&self, screen: &str, workspace: &Path) -> Option<terminal::DialogKey>;
     fn result_timeout_diagnostic(&self) -> Option<super::doctor::ResultTimeoutDiagnostic>;
@@ -203,15 +207,16 @@ pub(super) fn launch_trust_markers() -> impl Iterator<Item = &'static str> {
 pub(super) fn workspace_trust(
     provider: FirstPartyCli,
     workspace: &Path,
-    homes: &super::consent::Homes,
+    env: &super::consent::Environment,
+    store: Option<&Path>,
 ) -> Result<super::consent::Trust> {
-    adapter(provider).workspace_trust(workspace, homes)
+    adapter(provider).workspace_trust(workspace, env, store)
 }
 
 // The Codex memory workspace that the launch admission protects. Only the Codex adapter
 // declares it; the admission applies the user's setting to it for every target provider.
-pub(super) fn codex_memory_workspace(homes: &super::consent::Homes) -> Result<PathBuf> {
-    codex::memory_workspace(homes)
+pub(super) fn codex_memory_workspace(env: &super::consent::Environment) -> Result<PathBuf> {
+    codex::memory_workspace(env)
 }
 
 pub(super) fn workspace_trust_key(

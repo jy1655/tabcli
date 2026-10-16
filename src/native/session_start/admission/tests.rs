@@ -3,7 +3,7 @@ use super::*;
 struct Fixture {
     _directory: tempfile::TempDir,
     base: PathBuf,
-    // The Codex home whose `config.toml` the injected Homes names.
+    // The Codex home that the injected Environment names through `CODEX_HOME`.
     codex_home: PathBuf,
 }
 
@@ -24,8 +24,8 @@ impl Fixture {
         self.codex_home.join("memories")
     }
 
-    fn homes(&self) -> Homes {
-        homes_at(&self.codex_home)
+    fn environment(&self) -> Environment {
+        environment_at(&self.codex_home)
     }
 
     fn directory(&self, path: &Path) -> PathBuf {
@@ -43,12 +43,13 @@ fn write_setting(root: &Path, value: &str) {
     .unwrap();
 }
 
-fn homes_at(codex_home: &Path) -> Homes {
-    Homes {
-        codex: codex_home.join("config.toml"),
-        claude: PathBuf::from("unused-claude"),
-        agy: PathBuf::from("unused-agy"),
-        pi: PathBuf::from("unused-pi"),
+// A caller whose `CODEX_HOME` is the given directory; its user home is the directory's
+// parent, which the trust lookup requires but the Codex home does not use.
+fn environment_at(codex_home: &Path) -> Environment {
+    Environment {
+        home: Some(codex_home.parent().unwrap().as_os_str().to_owned()),
+        codex_home: Some(codex_home.as_os_str().to_owned()),
+        ..Default::default()
     }
 }
 
@@ -109,12 +110,12 @@ fn the_state_root_setting_decides_and_a_damaged_setting_is_an_error() {
     let memory = fixture.directory(&fixture.memories());
     // A missing state root and a missing record mean the default, refuse.
     let root = fixture.base.join("state");
-    let error = check_from(&root, &memory, || Ok(fixture.homes())).unwrap_err();
+    let error = check_from(&root, &memory, || fixture.environment()).unwrap_err();
     assert_eq!(error.to_string(), expected_refusal(&memory, &memory));
     assert!(!root.exists(), "admission must not create the state root");
 
     write_setting(&root, "refuse");
-    assert!(check_from(&root, &memory, || Ok(fixture.homes())).is_err());
+    assert!(check_from(&root, &memory, || fixture.environment()).is_err());
 
     write_setting(&root, "sometimes");
     let error = check_from(&root, &memory, || panic!("settings are read first")).unwrap_err();
@@ -129,12 +130,14 @@ fn a_missing_memory_workspace_protects_nothing_and_a_missing_home_is_an_error() 
     let fixture = Fixture::new();
     let workspace = fixture.directory(&fixture.base.join("project"));
     check_from(&fixture.base.join("state"), &workspace, || {
-        Ok(fixture.homes())
+        fixture.environment()
     })
     .unwrap();
-    check_isolated_from(&workspace, || Ok(homes_at(&fixture.base.join("absent")))).unwrap();
-    let error = check_isolated_from(&workspace, || {
-        bail!("no user home for workspace trust lookup")
+    check_isolated_from(&workspace, || environment_at(&fixture.base.join("absent"))).unwrap();
+    // Without HOME and USERPROFILE the Codex home cannot be resolved, even with CODEX_HOME.
+    let error = check_isolated_from(&workspace, || Environment {
+        codex_home: Some(fixture.codex_home.as_os_str().to_owned()),
+        ..Default::default()
     })
     .unwrap_err();
     assert_eq!(
@@ -164,7 +167,7 @@ fn a_protected_path_that_is_not_a_directory_is_an_error() {
 fn the_isolated_check_refuses_by_default_and_says_how_to_permit_the_workspace() {
     let fixture = Fixture::new();
     let memory = fixture.directory(&fixture.memories());
-    let error = check_isolated_from(&memory, || Ok(fixture.homes())).unwrap_err();
+    let error = check_isolated_from(&memory, || fixture.environment()).unwrap_err();
     assert_eq!(
         error.to_string(),
         format!(
@@ -190,7 +193,7 @@ fn aliases_resolve_before_comparison_and_an_escaping_link_is_admitted() {
     // A Codex home reached through a link names the same memory workspace.
     let linked_home = fixture.base.join("linked-home");
     symlink(&fixture.codex_home, &linked_home).unwrap();
-    let error = check_isolated_from(&inside, || Ok(homes_at(&linked_home))).unwrap_err();
+    let error = check_isolated_from(&inside, || environment_at(&linked_home)).unwrap_err();
     assert!(
         error
             .to_string()

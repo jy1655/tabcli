@@ -54,29 +54,101 @@ fn workspace_trust_requires_exact_positive_but_respects_parent_decline() {
     use super::super::super::consent::{self, Trust};
     let tmp = tempfile::tempdir().unwrap();
     let workspace = tmp.path().canonicalize().unwrap();
-    let homes = consent::fixture_homes(tmp.path());
+    let env = consent::Environment::at_home(tmp.path());
+    std::fs::create_dir_all(tmp.path().join(".pi/agent")).unwrap();
+    let store = tmp.path().join(".pi/agent").join("trust.json");
     let key = consent::native_key(&workspace).unwrap();
-    super::super::super::write_json_atomic(&homes.pi, &serde_json::json!({key.clone():true}))
-        .unwrap();
-    assert!(matches!(
-        ADAPTER.workspace_trust(&workspace, &homes).unwrap(),
-        Trust::Trusted(_)
-    ));
+    super::super::super::write_json_atomic(&store, &serde_json::json!({key.clone():true})).unwrap();
+    // The evidence names the store the adapter read, spelled as its home resolves it:
+    // the `.pi/agent` component keeps its slash on every platform.
+    let Trust::Trusted(evidence) = ADAPTER.workspace_trust(&workspace, &env, None).unwrap() else {
+        panic!("trusted");
+    };
+    assert_eq!(evidence.provider, "pi");
+    assert_eq!(evidence.key, key);
+    assert_eq!(evidence.store, store);
+    let serialized = serde_json::to_value(&evidence).unwrap()["store"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    if cfg!(windows) {
+        assert!(
+            serialized.ends_with(r"\.pi/agent\trust.json"),
+            "{serialized}"
+        );
+    } else {
+        assert!(
+            serialized.ends_with("/.pi/agent/trust.json"),
+            "{serialized}"
+        );
+    }
     assert_eq!(
         ADAPTER
-            .workspace_trust(&workspace.join("child"), &homes)
+            .workspace_trust(&workspace.join("child"), &env, None)
             .unwrap(),
         Trust::Absent
     );
-    super::super::super::write_json_atomic(&homes.pi, &serde_json::json!({key:false})).unwrap();
+    super::super::super::write_json_atomic(&store, &serde_json::json!({key:false})).unwrap();
     assert_eq!(
         ADAPTER
-            .workspace_trust(&workspace.join("child"), &homes)
+            .workspace_trust(&workspace.join("child"), &env, None)
             .unwrap(),
         Trust::Declined
     );
-    std::fs::write(&homes.pi, b"[]").unwrap();
-    assert!(ADAPTER.workspace_trust(&workspace, &homes).is_err());
+    std::fs::write(&store, b"[]").unwrap();
+    assert!(ADAPTER.workspace_trust(&workspace, &env, None).is_err());
+}
+
+#[test]
+fn the_pi_home_is_trust_json_under_the_agent_dir_or_the_user_home() {
+    use crate::native::consent::Environment;
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap();
+    let environment = |agent_dir: Option<&str>| Environment {
+        home: Some(home_str.into()),
+        pi_coding_agent_dir: agent_dir.map(Into::into),
+        ..Default::default()
+    };
+    assert_eq!(
+        Home::resolve(&environment(None)).unwrap().trust_store,
+        home.path().join(".pi/agent").join("trust.json")
+    );
+    let custom = home.path().join("custom-pi");
+    assert_eq!(
+        Home::resolve(&environment(custom.to_str()))
+            .unwrap()
+            .trust_store,
+        custom.join("trust.json")
+    );
+    // The override is kept as spelled: relative stays relative, empty names the caller's
+    // working directory.
+    assert_eq!(
+        Home::resolve(&environment(Some("relative")))
+            .unwrap()
+            .trust_store,
+        Path::new("relative").join("trust.json")
+    );
+    assert_eq!(
+        Home::resolve(&environment(Some(""))).unwrap().trust_store,
+        std::path::PathBuf::from("trust.json")
+    );
+    // The user home is required even with the override.
+    let override_only = Environment {
+        pi_coding_agent_dir: Some(custom.as_os_str().to_owned()),
+        ..Default::default()
+    };
+    assert_eq!(
+        Home::resolve(&override_only).unwrap_err().to_string(),
+        "no user home for workspace trust lookup"
+    );
+    let profile_only = Environment {
+        userprofile: Some(home_str.into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        Home::resolve(&profile_only).unwrap().trust_store,
+        home.path().join(".pi/agent").join("trust.json")
+    );
 }
 
 #[test]
@@ -91,6 +163,7 @@ fn diagnostics_describe_pi_owned_fallback_without_claiming_live_delivery() {
         workspace: std::path::Path::new("."),
         probe: false,
         deadline: std::time::Instant::now(),
+        environment: &crate::native::consent::Environment::default(),
     });
     assert_eq!(checks[0].reason_code, "pi_terminal_fallback");
     assert_eq!(checks[0].availability, Availability::Unknown);

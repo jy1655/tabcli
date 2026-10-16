@@ -5,6 +5,7 @@ use crate::native::delivery::verify_terminal_surface_ownership_until;
 #[cfg(unix)]
 use crate::native::private_to_user::owned_and_not_writable_by_others;
 use crate::native::session::{Reader, RecordReader, RecordStore};
+use std::ffi::OsStr;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct Identity {
@@ -36,35 +37,50 @@ pub(in crate::native) struct LaunchTrust {
     pub(in crate::native) applied_marker: Option<&'static str>,
 }
 
-#[derive(Clone, Debug)]
-pub(super) struct Homes {
-    pub(super) codex: PathBuf,
-    pub(super) claude: PathBuf,
-    pub(super) agy: PathBuf,
-    pub(super) pi: PathBuf,
+// A raw snapshot of the caller's environment variables that locate a provider's home.
+// It holds no path and validates nothing: each provider adapter resolves its own home
+// from it with its own spelling, and each boundary applies its own requirement (the
+// trust and admission boundaries need a user home, see `user_home`; the Claude session
+// registry and the Agy brain root keep their own rules).
+#[derive(Clone, Debug, Default)]
+pub(in crate::native) struct Environment {
+    pub(in crate::native) home: Option<OsString>,
+    pub(in crate::native) userprofile: Option<OsString>,
+    pub(in crate::native) codex_home: Option<OsString>,
+    pub(in crate::native) claude_config_dir: Option<OsString>,
+    pub(in crate::native) pi_coding_agent_dir: Option<OsString>,
 }
 
-impl Homes {
-    pub(super) fn current() -> Result<Self> {
-        let home = std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .map(PathBuf::from)
-            .context("no user home for workspace trust lookup")?;
-        Ok(Self {
-            codex: std::env::var_os("CODEX_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".codex"))
-                .join("config.toml"),
-            claude: std::env::var_os("CLAUDE_CONFIG_DIR")
-                .map(PathBuf::from)
-                .map_or_else(|| home.join(".claude.json"), |p| p.join(".claude.json")),
-            agy: home.join(".gemini/antigravity-cli/settings.json"),
-            pi: std::env::var_os("PI_CODING_AGENT_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(".pi/agent"))
-                .join("trust.json"),
-        })
+impl Environment {
+    pub(in crate::native) fn current() -> Self {
+        Self {
+            home: std::env::var_os("HOME"),
+            userprofile: std::env::var_os("USERPROFILE"),
+            codex_home: std::env::var_os("CODEX_HOME"),
+            claude_config_dir: std::env::var_os("CLAUDE_CONFIG_DIR"),
+            pi_coding_agent_dir: std::env::var_os("PI_CODING_AGENT_DIR"),
+        }
     }
+
+    // A caller whose only variable is `HOME`, as the tests point the provider homes at a
+    // temporary directory.
+    #[cfg(test)]
+    pub(in crate::native) fn at_home(home: &Path) -> Self {
+        Self {
+            home: Some(home.as_os_str().to_owned()),
+            ..Self::default()
+        }
+    }
+}
+
+// The user home that workspace trust and the launch admission require: `HOME` when set,
+// even empty, otherwise `USERPROFILE`. A provider override or a recorded source store
+// does not replace it (tests/launch_admission.rs pins this for an empty `CODEX_HOME`).
+pub(in crate::native) fn user_home(env: &Environment) -> Result<&OsStr> {
+    env.home
+        .as_deref()
+        .or(env.userprofile.as_deref())
+        .context("no user home for workspace trust lookup")
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -252,7 +268,7 @@ fn with_record<T>(
     f(&path, record)
 }
 
-fn assess_with(root: &Path, requested: &Path, homes: &Homes) -> Result<Assessment> {
+fn assess_with(root: &Path, requested: &Path, env: &Environment) -> Result<Assessment> {
     let identity = identity(requested)?;
     let mut assessment = Assessment {
         schema: 1,
@@ -288,14 +304,9 @@ fn assess_with(root: &Path, requested: &Path, homes: &Homes) -> Result<Assessmen
                 "Shared workspace consent is revoked; provider-owned trust is unchanged.".into();
         } else if let Some(source) = &record.source {
             let cli = FirstPartyCli::from_str(&source.provider).map_err(anyhow::Error::msg)?;
-            let mut source_homes = homes.clone();
-            match cli {
-                FirstPartyCli::Codex => source_homes.codex = source.store.clone(),
-                FirstPartyCli::Claude => source_homes.claude = source.store.clone(),
-                FirstPartyCli::Agy => source_homes.agy = source.store.clone(),
-                FirstPartyCli::Pi => source_homes.pi = source.store.clone(),
-            }
-            match provider::workspace_trust(cli, &identity.path, &source_homes) {
+            // The one provider the record names rechecks the store it was read from, never
+            // the store its home resolves to now.
+            match provider::workspace_trust(cli, &identity.path, env, Some(&source.store)) {
                 Ok(Trust::Trusted(now)) if now == *source => {
                     assessment.source = Some(now);
                 }
@@ -312,7 +323,7 @@ fn assess_with(root: &Path, requested: &Path, homes: &Homes) -> Result<Assessmen
                 FirstPartyCli::Pi,
             ] {
                 if let Ok(Trust::Trusted(source)) =
-                    provider::workspace_trust(cli, &identity.path, homes)
+                    provider::workspace_trust(cli, &identity.path, env, None)
                 {
                     assessment.source = Some(source.clone());
                     record.source = Some(source);
@@ -330,11 +341,10 @@ fn assess_with(root: &Path, requested: &Path, homes: &Homes) -> Result<Assessmen
 }
 
 pub(super) fn prepare(directory: &Path, requested: &Path) -> Result<()> {
-    let assessment = assess_with(
-        directory.parent().context("session has no state root")?,
-        requested,
-        &Homes::current()?,
-    )?;
+    let root = directory.parent().context("session has no state root")?;
+    let env = Environment::current();
+    user_home(&env)?;
+    let assessment = assess_with(root, requested, &env)?;
     Store::open_unchecked(directory)
         .private(SESSION_FILE)
         .write_json(&assessment)
@@ -354,9 +364,10 @@ pub(super) fn authorized(directory: &Path, target: FirstPartyCli) -> Result<bool
     {
         return Ok(false);
     }
-    let homes = Homes::current()?;
+    let env = Environment::current();
+    user_home(&env)?;
     if matches!(
-        provider::workspace_trust(target, &assessment.identity.path, &homes),
+        provider::workspace_trust(target, &assessment.identity.path, &env, None),
         Err(_) | Ok(Trust::Declined)
     ) {
         return Ok(false);
@@ -366,7 +377,7 @@ pub(super) fn authorized(directory: &Path, target: FirstPartyCli) -> Result<bool
     let now = assess_with(
         directory.parent().context("session has no state root")?,
         &assessment.identity.path,
-        &homes,
+        &env,
     )?;
     Ok(now.state == "verified"
         && now.identity == assessment.identity
@@ -436,9 +447,10 @@ fn complete_launch_dialog(
     deadline: Instant,
     manifest: SessionManifest,
 ) -> Result<()> {
-    let homes = Homes::current()?;
+    let env = Environment::current();
+    user_home(&env)?;
     if matches!(
-        provider::workspace_trust(target, &manifest.workspace, &homes)?,
+        provider::workspace_trust(target, &manifest.workspace, &env, None)?,
         Trust::Trusted(_)
     ) {
         return Ok(());
@@ -446,7 +458,7 @@ fn complete_launch_dialog(
     let mut responded = false;
     while Instant::now() < deadline {
         if matches!(
-            provider::workspace_trust(target, &manifest.workspace, &homes)?,
+            provider::workspace_trust(target, &manifest.workspace, &env, None)?,
             Trust::Trusted(_)
         ) {
             if responded {
@@ -486,75 +498,197 @@ fn complete_launch_dialog(
     )
 }
 
+// The clock a trust wait and Agy's paste gates poll with. Production reads the system
+// clock; tests inject a simulated one so that no simulated wait becomes a wall-clock sleep.
+pub(in crate::native) trait Clock {
+    fn now(&mut self) -> Instant;
+    fn sleep(&mut self, duration: Duration);
+}
+
+pub(in crate::native) struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&mut self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
+
+// A simulated clock: `sleep` advances it and adds up what was slept, and `shared`
+// hands its instant to a log reader that grows the log with the clock.
+#[cfg(test)]
+pub(in crate::native) struct FakeClock {
+    now: std::rc::Rc<std::cell::Cell<Instant>>,
+    pub(in crate::native) slept: Duration,
+}
+
+#[cfg(test)]
+impl FakeClock {
+    pub(in crate::native) fn new(now: Instant) -> Self {
+        Self {
+            now: std::rc::Rc::new(std::cell::Cell::new(now)),
+            slept: Duration::ZERO,
+        }
+    }
+
+    pub(in crate::native) fn shared(&self) -> std::rc::Rc<std::cell::Cell<Instant>> {
+        std::rc::Rc::clone(&self.now)
+    }
+}
+
+#[cfg(test)]
+impl Clock for FakeClock {
+    fn now(&mut self) -> Instant {
+        self.now.get()
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        self.now.set(self.now.get() + duration);
+        self.slept += duration;
+    }
+}
+
+// What one poll of a trust wait's readiness callback found. A fatal error is the
+// callback's `Err` and ends the wait at once; a retryable observation is `Pending`
+// with the reason the timeout message reports when it is the last one.
+pub(in crate::native) enum TrustReadiness<R> {
+    Ready,
+    Pending(R),
+}
+
+// How the wait bounds its sleep by the deadline: from the instant it compared with
+// the deadline, or from the clock sampled again after the comparison.
+#[derive(Clone, Copy)]
+pub(in crate::native) enum SleepBound {
+    CapturedNow,
+    Resampled,
+}
+
+// A caller's poll cadence: how long one sleep is at most, and which instant bounds it.
+#[derive(Clone, Copy)]
+pub(in crate::native) struct TrustPoll {
+    pub(in crate::native) interval: Duration,
+    pub(in crate::native) sleep_bound: SleepBound,
+}
+
+// The one trust wait of the paste gates (AGENTS.md, Trust Store Boundary). Every poll
+// looks at the session before it looks at the evidence: a session that has ended has
+// no terminal left to send to, whatever becomes of its workspace's trust, and without
+// this the launcher of a closed session went on waiting until its deadline (#60). A
+// failed status read is ignored. Then the caller's readiness: `Ready` ends the wait,
+// and positive evidence wins over an already-expired deadline; a fatal error
+// propagates; `Pending` keeps waiting until the deadline, whose message formats the
+// current poll's reason. The caller reads the manifest once, outside this loop.
+pub(in crate::native) fn wait_until_trusted<R, C: Clock>(
+    directory: &Path,
+    deadline: Instant,
+    poll: TrustPoll,
+    clock: &mut C,
+    ended_message: &dyn Fn(&str) -> String,
+    ready: &mut dyn FnMut() -> Result<TrustReadiness<R>>,
+    timeout_message: &dyn Fn(R) -> String,
+) -> Result<()> {
+    loop {
+        if let Ok(status) = Reader::open_unchecked(directory).status()
+            && status.state.ended()
+        {
+            bail!("{}", ended_message(&status.state.to_string()));
+        }
+        let reason = match ready()? {
+            TrustReadiness::Ready => return Ok(()),
+            TrustReadiness::Pending(reason) => reason,
+        };
+        let now = clock.now();
+        if now >= deadline {
+            bail!("{}", timeout_message(reason));
+        }
+        let remaining = match poll.sleep_bound {
+            SleepBound::CapturedNow => deadline.saturating_duration_since(now),
+            SleepBound::Resampled => deadline.saturating_duration_since(clock.now()),
+        };
+        clock.sleep(remaining.min(poll.interval));
+    }
+}
+
+const NATIVE_TRUST_TIMEOUT: &str = "workspace trust is not verified; no initial console input was sent. Approve the exact workspace in the managed provider and start a new request after a timeout";
+
 // A provider's positive input-readiness evidence may open the paste gate without exact stored trust.
 // It never widens shared consent; see AGENTS.md, Trust Store Boundary.
 pub(super) fn wait_for_native_trust(
     directory: &Path,
     target: FirstPartyCli,
     deadline: Instant,
+    env: &Environment,
     ready: &mut dyn FnMut() -> bool,
 ) -> Result<()> {
-    wait_for_native_trust_with(directory, target, deadline, &Homes::current()?, ready)
+    user_home(env)?;
+    wait_for_native_trust_with(directory, target, deadline, env, ready)
 }
 
 fn wait_for_native_trust_with(
     directory: &Path,
     target: FirstPartyCli,
     deadline: Instant,
-    homes: &Homes,
+    env: &Environment,
     ready: &mut dyn FnMut() -> bool,
 ) -> Result<()> {
-    wait_for_native_trust_authorized_with(directory, target, deadline, homes, ready, &mut || {
+    wait_for_native_trust_authorized_with(directory, target, deadline, env, ready, &mut || {
         authorized(directory, target)
     })
 }
 
+// Codex's readiness, in order and short-circuiting: a registered applied marker with
+// authorization (an authorization error is fatal), then the adapter's exact stored
+// trust (a lookup error is not trust), then the adapter's own readiness evidence.
 fn wait_for_native_trust_authorized_with(
     directory: &Path,
     target: FirstPartyCli,
     deadline: Instant,
-    homes: &Homes,
+    env: &Environment,
     ready: &mut dyn FnMut() -> bool,
     authorized: &mut dyn FnMut() -> Result<bool>,
 ) -> Result<()> {
     let manifest = Reader::open_unchecked(directory).manifest()?;
-    loop {
-        // A session that has ended has no terminal left to send to, whatever becomes
-        // of its workspace's trust, so this comes before the evidence. Without it the
-        // launcher of a closed session went on waiting until its deadline.
-        if let Ok(status) = Reader::open_unchecked(directory).status()
-            && status.state.ended()
-        {
-            bail!(
-                "the session is {} and no longer waits for workspace trust; no initial console input was sent",
-                status.state
-            );
-        }
-        let assessment = observe(directory);
-        let applied_here = assessment
-            .get("applied")
-            .and_then(|s| s.as_str())
-            .is_some_and(|marker| {
-                provider::launch_trust_markers().any(|registered| registered == marker)
-            });
-        if (applied_here && authorized()?)
-            || matches!(
-                provider::workspace_trust(target, &manifest.workspace, homes),
-                Ok(Trust::Trusted(_))
+    wait_until_trusted(
+        directory,
+        deadline,
+        TrustPoll {
+            interval: Duration::from_millis(100),
+            sleep_bound: SleepBound::Resampled,
+        },
+        &mut SystemClock,
+        &|state| {
+            format!(
+                "the session is {state} and no longer waits for workspace trust; no initial console input was sent"
             )
-            || ready()
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "workspace trust is not verified; no initial console input was sent. Approve the exact workspace in the managed provider and start a new request after a timeout"
-            );
-        }
-        thread::sleep(
-            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
-        );
-    }
+        },
+        &mut || {
+            let assessment = observe(directory);
+            let applied_here = assessment
+                .get("applied")
+                .and_then(|s| s.as_str())
+                .is_some_and(|marker| {
+                    provider::launch_trust_markers().any(|registered| registered == marker)
+                });
+            Ok(
+                if (applied_here && authorized()?)
+                    || matches!(
+                        provider::workspace_trust(target, &manifest.workspace, env, None),
+                        Ok(Trust::Trusted(_))
+                    )
+                    || ready()
+                {
+                    TrustReadiness::Ready
+                } else {
+                    TrustReadiness::Pending(())
+                },
+            )
+        },
+        &|()| NATIVE_TRUST_TIMEOUT.to_owned(),
+    )
 }
 
 pub(super) fn observe(directory: &Path) -> serde_json::Value {
@@ -804,33 +938,45 @@ fn windows_sid(sid: windows_sys::Win32::Security::PSID) -> Result<String> {
 }
 
 #[cfg(test)]
-pub(super) fn fixture_homes(root: &Path) -> Homes {
-    Homes {
-        codex: root.join("codex.toml"),
-        claude: root.join("claude.json"),
-        agy: root.join("agy.json"),
-        pi: root.join("pi.json"),
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn setup() -> (tempfile::TempDir, PathBuf, Homes) {
+    // A caller whose `HOME` is the temporary root, and the four stores the adapters
+    // resolve under it.
+    pub(super) struct Fixture {
+        pub(super) env: Environment,
+        pub(super) codex: PathBuf,
+        pub(super) claude: PathBuf,
+        pub(super) agy: PathBuf,
+        pub(super) pi: PathBuf,
+    }
+
+    pub(super) fn fixture(root: &Path) -> Fixture {
+        for parent in [".codex", ".gemini/antigravity-cli", ".pi/agent"] {
+            fs::create_dir_all(root.join(parent)).unwrap();
+        }
+        Fixture {
+            env: Environment::at_home(root),
+            codex: root.join(".codex").join("config.toml"),
+            claude: root.join(".claude.json"),
+            agy: root.join(".gemini/antigravity-cli/settings.json"),
+            pi: root.join(".pi/agent").join("trust.json"),
+        }
+    }
+
+    fn setup() -> (tempfile::TempDir, PathBuf, Fixture) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let workspace = root.join("workspace");
         fs::create_dir(&workspace).unwrap();
-        let homes = fixture_homes(&root);
-        (temp, workspace, homes)
+        (temp, workspace, fixture(&root))
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn unsupported_dialog_response_preserves_consent_without_pending_input() {
-        let (temp, workspace, homes) = setup();
-        let assessment = assess_with(temp.path(), &workspace, &homes).unwrap();
+        let (temp, workspace, fixture) = setup();
+        let assessment = assess_with(temp.path(), &workspace, &fixture.env).unwrap();
         let path = temp.path().join(SESSION_FILE);
         write_json_atomic(&path, &assessment).unwrap();
         let before = fs::read(&path).unwrap();
@@ -862,9 +1008,12 @@ mod tests {
         }
     }
 
-    fn trust_pi(homes: &Homes, workspace: &Path) {
+    fn trust_pi(fixture: &Fixture, workspace: &Path) {
+        if fixture.pi.exists() {
+            fs::remove_file(&fixture.pi).unwrap();
+        }
         write_private(
-            &homes.pi,
+            &fixture.pi,
             serde_json::to_string(&serde_json::json!({native_key(workspace).unwrap(): true}))
                 .unwrap()
                 .as_bytes(),
@@ -927,16 +1076,16 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_store_written_by_this_user_is_read_whoever_windows_made_its_owner() {
-        let (_temp, workspace, homes) = setup();
-        trust_pi(&homes, &workspace);
+        let (_temp, workspace, fixture) = setup();
+        trust_pi(&fixture, &workspace);
 
         let owners = windows_current_owners().unwrap();
         assert!((1..=2).contains(&owners.len()), "{owners:?}");
         assert!(
-            owners.contains(&windows_owner(&homes.pi).unwrap()),
+            owners.contains(&windows_owner(&fixture.pi).unwrap()),
             "{owners:?}"
         );
-        assert!(read_store(&homes.pi).unwrap().is_some());
+        assert!(read_store(&fixture.pi).unwrap().is_some());
     }
 
     // The owner alone does not say who can change a store: outside the user profile a
@@ -944,12 +1093,12 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_store_that_another_account_can_change_is_refused() {
-        let (_temp, workspace, homes) = setup();
-        trust_pi(&homes, &workspace);
+        let (_temp, workspace, fixture) = setup();
+        trust_pi(&fixture, &workspace);
         let user = windows_current_owners().unwrap().remove(0);
         let refusal = |sddl: String| {
-            set_access_list(&homes.pi, &sddl);
-            read_store(&homes.pi).unwrap_err().to_string()
+            set_access_list(&fixture.pi, &sddl);
+            read_store(&fixture.pi).unwrap_err().to_string()
         };
 
         // Everyone may write the content.
@@ -989,8 +1138,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_store_that_others_can_only_read_stays_this_users_own() {
-        let (_temp, workspace, homes) = setup();
-        trust_pi(&homes, &workspace);
+        let (_temp, workspace, fixture) = setup();
+        trust_pi(&fixture, &workspace);
         let user = windows_current_owners().unwrap().remove(0);
 
         for sddl in [
@@ -1001,8 +1150,8 @@ mod tests {
             // A rule that only takes write access away from an account.
             format!("D:P(D;;0x6;;;AN)(A;;FA;;;{user})"),
         ] {
-            set_access_list(&homes.pi, &sddl);
-            assert!(read_store(&homes.pi).unwrap().is_some(), "{sddl}");
+            set_access_list(&fixture.pi, &sddl);
+            assert!(read_store(&fixture.pi).unwrap().is_some(), "{sddl}");
         }
     }
 
@@ -1094,7 +1243,7 @@ mod tests {
 
     #[test]
     fn complete_launch_bypass_reads_authorization_then_manifest_only() {
-        let (_temp, workspace, _homes) = setup();
+        let (_temp, workspace, _fixture) = setup();
         let (_root, directory) = session(&workspace, "launching");
         let order = std::cell::RefCell::new(Vec::new());
         complete_launch_with(
@@ -1133,7 +1282,7 @@ mod tests {
 
     #[test]
     fn complete_launch_agy_yolo_still_checks_the_dialog() {
-        let (_temp, workspace, _homes) = setup();
+        let (_temp, workspace, _fixture) = setup();
         let (_root, directory) = session(&workspace, "launching");
         let order = std::cell::RefCell::new(Vec::new());
         complete_launch_with(
@@ -1159,7 +1308,7 @@ mod tests {
 
     #[test]
     fn native_trust_rejects_absent_and_unregistered_markers() {
-        let (_temp, workspace, homes) = setup();
+        let (_temp, workspace, fixture) = setup();
         let (_root, directory) = session(&workspace, "awaiting-initial-input");
         for applied in [
             serde_json::Value::Null,
@@ -1182,7 +1331,7 @@ mod tests {
                     &directory,
                     target,
                     Instant::now(),
-                    &homes,
+                    &fixture.env,
                     &mut || {
                         asked = true;
                         false
@@ -1191,18 +1340,14 @@ mod tests {
                 )
                 .unwrap_err();
                 assert!(asked);
-                assert!(
-                    error
-                        .to_string()
-                        .starts_with("workspace trust is not verified")
-                );
+                assert_eq!(error.to_string(), NATIVE_TRUST_TIMEOUT);
             }
         }
     }
 
     #[test]
     fn native_trust_cross_accepts_registered_markers_only_with_authorization() {
-        let (_temp, workspace, homes) = setup();
+        let (_temp, workspace, fixture) = setup();
         let (_root, directory) = session(&workspace, "awaiting-initial-input");
         for marker in ["codex-config-override", "pi-approve-once"] {
             write_json_atomic(
@@ -1221,7 +1366,7 @@ mod tests {
                     &directory,
                     target,
                     Instant::now(),
-                    &homes,
+                    &fixture.env,
                     &mut || panic!("authorized marker short circuits"),
                     &mut || {
                         authorizations += 1;
@@ -1235,7 +1380,7 @@ mod tests {
                     &directory,
                     target,
                     Instant::now(),
-                    &homes,
+                    &fixture.env,
                     &mut || {
                         asked = true;
                         false
@@ -1244,17 +1389,13 @@ mod tests {
                 )
                 .unwrap_err();
                 assert!(asked);
-                assert!(
-                    error
-                        .to_string()
-                        .starts_with("workspace trust is not verified")
-                );
+                assert_eq!(error.to_string(), NATIVE_TRUST_TIMEOUT);
                 // False authorization still permits the adapter's independent readiness evidence.
                 wait_for_native_trust_authorized_with(
                     &directory,
                     target,
                     Instant::now(),
-                    &homes,
+                    &fixture.env,
                     &mut || true,
                     &mut || Ok(false),
                 )
@@ -1263,7 +1404,7 @@ mod tests {
                     &directory,
                     target,
                     Instant::now(),
-                    &homes,
+                    &fixture.env,
                     &mut || panic!("authorization error precedes ready"),
                     &mut || bail!("authorization error"),
                 )
@@ -1275,8 +1416,8 @@ mod tests {
 
     #[test]
     fn native_trust_ended_status_precedes_marker_store_and_ready() {
-        let (_temp, workspace, homes) = setup();
-        trust_pi(&homes, &workspace);
+        let (_temp, workspace, fixture) = setup();
+        trust_pi(&fixture, &workspace);
         for state in ["closed", "failed", "exited"] {
             let (_root, directory) = session(&workspace, state);
             write_json_atomic(
@@ -1288,29 +1429,30 @@ mod tests {
                 &directory,
                 FirstPartyCli::Pi,
                 Instant::now(),
-                &homes,
+                &fixture.env,
                 &mut || panic!("ready after ended"),
                 &mut || panic!("authorization after ended"),
             )
             .unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .starts_with(&format!("the session is {state}"))
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "the session is {state} and no longer waits for workspace trust; no initial console input was sent"
+                )
             );
         }
     }
 
     #[test]
     fn native_trust_checks_store_then_ready_before_expired_deadline() {
-        let (_temp, workspace, homes) = setup();
+        let (_temp, workspace, fixture) = setup();
         let (_root, directory) = session(&workspace, "awaiting-initial-input");
         let mut ready_calls = 0;
         wait_for_native_trust_authorized_with(
             &directory,
             FirstPartyCli::Pi,
             Instant::now(),
-            &homes,
+            &fixture.env,
             &mut || {
                 ready_calls += 1;
                 true
@@ -1319,12 +1461,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ready_calls, 1);
-        trust_pi(&homes, &workspace);
+        trust_pi(&fixture, &workspace);
         wait_for_native_trust_authorized_with(
             &directory,
             FirstPartyCli::Pi,
             Instant::now(),
-            &homes,
+            &fixture.env,
             &mut || panic!("trusted store precedes ready and deadline"),
             &mut || panic!("no marker"),
         )
@@ -1339,7 +1481,7 @@ mod tests {
             &directory,
             FirstPartyCli::Pi,
             Instant::now(),
-            &homes,
+            &fixture.env,
             &mut || panic!("authorization error precedes ready"),
             &mut || bail!("authorization before trusted store"),
         )
@@ -1349,18 +1491,18 @@ mod tests {
             &directory,
             FirstPartyCli::Pi,
             Instant::now(),
-            &homes,
+            &fixture.env,
             &mut || panic!("trusted store precedes ready"),
             &mut || Ok(false),
         )
         .unwrap();
         write_json_atomic(&directory.join(SESSION_FILE), &serde_json::json!({})).unwrap();
-        write_json_atomic(&homes.pi, &serde_json::json!({})).unwrap();
+        write_json_atomic(&fixture.pi, &serde_json::json!({})).unwrap();
         let error = wait_for_native_trust_authorized_with(
             &directory,
             FirstPartyCli::Pi,
             Instant::now(),
-            &homes,
+            &fixture.env,
             &mut || {
                 ready_calls += 1;
                 false
@@ -1369,22 +1511,24 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(ready_calls, 2);
-        assert!(
-            error
-                .to_string()
-                .starts_with("workspace trust is not verified")
-        );
+        assert_eq!(error.to_string(), NATIVE_TRUST_TIMEOUT);
     }
 
     // Issue #60. The store never lists a workspace whose trust the provider takes from
     // elsewhere, and a launcher went on waiting for a session that had been closed.
     #[test]
     fn the_wait_for_native_trust_ends_with_the_adapters_evidence_or_with_the_session() {
-        let (_temp, workspace, homes) = setup();
+        let (_temp, workspace, fixture) = setup();
         let far = || Instant::now() + Duration::from_secs(600);
         let wait = |directory: &Path, deadline: Instant, ready: &mut dyn FnMut() -> bool| {
-            wait_for_native_trust_with(directory, FirstPartyCli::Codex, deadline, &homes, ready)
-                .map_err(|error| error.to_string())
+            wait_for_native_trust_with(
+                directory,
+                FirstPartyCli::Codex,
+                deadline,
+                &fixture.env,
+                ready,
+            )
+            .map_err(|error| error.to_string())
         };
 
         // The adapter is asked on every poll, and the wait ends with its first yes.
@@ -1442,26 +1586,301 @@ mod tests {
             &mut || false,
         )
         .unwrap_err();
-        assert!(
-            error.starts_with("workspace trust is not verified; no initial console input was sent"),
-            "{error}"
+        assert_eq!(error, NATIVE_TRUST_TIMEOUT);
+    }
+
+    // The shared loop looks at the session before it asks either caller's readiness,
+    // with each caller's own message, and sleeps nothing for an ended session.
+    #[test]
+    fn the_shared_trust_wait_checks_the_session_before_any_readiness_for_both_callers() {
+        let (_temp, workspace, _fixture) = setup();
+        let start = Instant::now();
+        let poll = TrustPoll {
+            interval: Duration::from_millis(100),
+            sleep_bound: SleepBound::CapturedNow,
+        };
+        fn codex_ended(state: &str) -> String {
+            format!(
+                "the session is {state} and no longer waits for workspace trust; no initial console input was sent"
+            )
+        }
+        fn agy_ended(state: &str) -> String {
+            format!(
+                "the session is {state} and no longer waits for Agy workspace trust, so the prompt was not pasted"
+            )
+        }
+        type EndedMessage = fn(&str) -> String;
+        let messages: [(&str, EndedMessage); 2] = [("codex", codex_ended), ("agy", agy_ended)];
+        for state in ["closed", "failed", "exited"] {
+            let (_root, ended) = session(&workspace, state);
+            for (caller, ended_message) in messages {
+                let mut clock = FakeClock::new(start);
+                let error = wait_until_trusted(
+                    &ended,
+                    start + Duration::from_secs(60),
+                    poll,
+                    &mut clock,
+                    &ended_message,
+                    &mut || -> Result<TrustReadiness<()>> { panic!("{caller}: ready after ended") },
+                    &|()| panic!("{caller}: timeout after ended"),
+                )
+                .unwrap_err();
+                assert_eq!(error.to_string(), ended_message(state), "{caller}");
+                assert_eq!(clock.slept, Duration::ZERO, "{caller}");
+            }
+        }
+
+        // A session that is still waiting is asked, a fatal error ends the wait at
+        // once, and the deadline formats the reason of its own poll.
+        let (_root, waiting) = session(&workspace, "awaiting-initial-input");
+        let mut clock = FakeClock::new(start);
+        let error = wait_until_trusted(
+            &waiting,
+            start + Duration::from_secs(60),
+            poll,
+            &mut clock,
+            &|_| panic!("not ended"),
+            &mut || -> Result<TrustReadiness<()>> { bail!("fatal") },
+            &|()| panic!("fatal precedes the deadline"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "fatal");
+        assert_eq!(clock.slept, Duration::ZERO);
+        let mut reasons = ["first", "second", "third", "fourth"].into_iter();
+        let mut clock = FakeClock::new(start);
+        let error = wait_until_trusted(
+            &waiting,
+            start + Duration::from_millis(250),
+            TrustPoll {
+                interval: Duration::from_millis(100),
+                sleep_bound: SleepBound::Resampled,
+            },
+            &mut clock,
+            &|_| panic!("not ended"),
+            &mut || Ok(TrustReadiness::Pending(reasons.next().unwrap())),
+            &|reason| format!("timed out: {reason}"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "timed out: fourth");
+        assert_eq!(clock.slept, Duration::from_millis(250));
+    }
+
+    // Writes the exact workspace as trusted into one provider's store, as that provider
+    // writes it.
+    fn trust(fixture: &Fixture, provider: FirstPartyCli, workspace: &Path) {
+        let key = native_key(workspace).unwrap();
+        match provider {
+            FirstPartyCli::Codex => {
+                let key = if cfg!(windows) {
+                    key.to_lowercase()
+                } else {
+                    key
+                };
+                if fixture.codex.exists() {
+                    fs::remove_file(&fixture.codex).unwrap();
+                }
+                write_private(
+                    &fixture.codex,
+                    format!(
+                        "[projects.{}]\ntrust_level = \"trusted\"\n",
+                        serde_json::to_string(&key).unwrap()
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            }
+            FirstPartyCli::Claude => {
+                let key = if cfg!(windows) {
+                    key.replace('\\', "/")
+                } else {
+                    key
+                };
+                write_json_atomic(
+                    &fixture.claude,
+                    &serde_json::json!({"projects":{key:{"hasTrustDialogAccepted":true}}}),
+                )
+                .unwrap();
+            }
+            FirstPartyCli::Agy => write_json_atomic(
+                &fixture.agy,
+                &serde_json::json!({"trustedWorkspaces":[key]}),
+            )
+            .unwrap(),
+            FirstPartyCli::Pi => trust_pi(fixture, workspace),
+        }
+    }
+
+    fn store_of(fixture: &Fixture, provider: FirstPartyCli) -> &Path {
+        match provider {
+            FirstPartyCli::Codex => &fixture.codex,
+            FirstPartyCli::Claude => &fixture.claude,
+            FirstPartyCli::Agy => &fixture.agy,
+            FirstPartyCli::Pi => &fixture.pi,
+        }
+    }
+
+    const PROVIDERS: [FirstPartyCli; 4] = [
+        FirstPartyCli::Codex,
+        FirstPartyCli::Claude,
+        FirstPartyCli::Agy,
+        FirstPartyCli::Pi,
+    ];
+
+    #[test]
+    fn the_user_home_is_home_even_empty_then_userprofile() {
+        let env = Environment {
+            home: Some("".into()),
+            userprofile: Some("profile".into()),
+            ..Default::default()
+        };
+        assert_eq!(user_home(&env).unwrap(), OsStr::new(""));
+        let env = Environment {
+            userprofile: Some("profile".into()),
+            codex_home: Some("codex".into()),
+            ..Default::default()
+        };
+        assert_eq!(user_home(&env).unwrap(), OsStr::new("profile"));
+        // A provider override is no user home.
+        let env = Environment {
+            codex_home: Some("codex".into()),
+            claude_config_dir: Some("claude".into()),
+            pi_coding_agent_dir: Some("pi".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            user_home(&env).unwrap_err().to_string(),
+            "no user home for workspace trust lookup"
         );
+    }
+
+    // The recorded source is rechecked in the store it was read from, whatever the
+    // caller's environment resolves to now (the former clone of `Homes` with that one
+    // field swapped), and no other provider is substituted when it no longer holds.
+    #[test]
+    fn a_recorded_source_is_rechecked_in_its_own_store_for_every_provider() {
+        for provider in PROVIDERS {
+            let (temp, workspace, fixture) = setup();
+            trust(&fixture, provider, &workspace);
+            let first = assess_with(temp.path(), &workspace, &fixture.env).unwrap();
+            assert_eq!(first.state, "verified", "{provider:?}");
+            let source = first.source.clone().unwrap();
+            assert_eq!(source.provider, provider.as_str());
+            assert_eq!(source.store, store_of(&fixture, provider));
+
+            // The environment moves to a home without stores: the original store is
+            // still the one rechecked.
+            let other = tempfile::tempdir().unwrap();
+            let other_root = other.path().canonicalize().unwrap();
+            let moved = self::fixture(&other_root);
+            let again = assess_with(temp.path(), &workspace, &moved.env).unwrap();
+            assert_eq!(again.state, "verified", "{provider:?}");
+            assert_eq!(again.source, Some(source.clone()));
+
+            // A store at the new home that trusts the workspace is not the source, and
+            // is not substituted once the original store is gone.
+            trust(&moved, provider, &workspace);
+            assert_eq!(
+                assess_with(temp.path(), &workspace, &moved.env)
+                    .unwrap()
+                    .source,
+                Some(source.clone()),
+                "{provider:?}"
+            );
+            fs::remove_file(store_of(&fixture, provider)).unwrap();
+            let reset = assess_with(temp.path(), &workspace, &moved.env).unwrap();
+            assert_eq!(reset.state, "source-reset", "{provider:?}");
+            assert!(reset.source.is_none());
+            // The record keeps the source: a later store that lists the workspace again
+            // verifies it again.
+            trust(&fixture, provider, &workspace);
+            assert_eq!(
+                assess_with(temp.path(), &workspace, &moved.env)
+                    .unwrap()
+                    .state,
+                "verified",
+                "{provider:?}"
+            );
+
+            // Unreadable, declined or absent in the original store: source-reset.
+            fs::write(store_of(&fixture, provider), b"= =\n").unwrap();
+            assert_eq!(
+                assess_with(temp.path(), &workspace, &fixture.env)
+                    .unwrap()
+                    .state,
+                "source-reset",
+                "{provider:?}: unreadable"
+            );
+            let declined: &[u8] = match provider {
+                FirstPartyCli::Codex => b"[projects]\n",
+                FirstPartyCli::Claude => b"{\"projects\":{}}",
+                FirstPartyCli::Agy => b"{\"trustedWorkspaces\":[]}",
+                FirstPartyCli::Pi => b"{}",
+            };
+            fs::write(store_of(&fixture, provider), declined).unwrap();
+            assert_eq!(
+                assess_with(temp.path(), &workspace, &fixture.env)
+                    .unwrap()
+                    .state,
+                "source-reset",
+                "{provider:?}: absent"
+            );
+
+            // A recorded key that the store no longer yields: source-reset.
+            trust(&fixture, provider, &workspace);
+            with_record(temp.path(), &workspace, |path, record| {
+                let mut record = record.unwrap();
+                record.source.as_mut().unwrap().key = "another key".into();
+                write_json_atomic(path, &record)
+            })
+            .unwrap();
+            assert_eq!(
+                assess_with(temp.path(), &workspace, &fixture.env)
+                    .unwrap()
+                    .state,
+                "source-reset",
+                "{provider:?}: key"
+            );
+        }
+    }
+
+    // Without a record the providers are asked in the order Codex, Claude, Agy, Pi, and
+    // the first that trusts the workspace is the source; one provider's error does not
+    // stop the next from being asked.
+    #[test]
+    fn the_first_trusting_provider_in_order_is_the_source_and_an_error_is_skipped() {
+        for (index, provider) in PROVIDERS.into_iter().enumerate() {
+            let (temp, workspace, fixture) = setup();
+            for later in &PROVIDERS[index..] {
+                trust(&fixture, *later, &workspace);
+            }
+            for earlier in &PROVIDERS[..index] {
+                fs::write(store_of(&fixture, *earlier), b"= =\n").unwrap();
+                assert!(
+                    provider::workspace_trust(*earlier, &workspace, &fixture.env, None).is_err()
+                );
+            }
+            let assessment = assess_with(temp.path(), &workspace, &fixture.env).unwrap();
+            assert_eq!(assessment.state, "verified", "{provider:?}");
+            let source = assessment.source.unwrap();
+            assert_eq!(source.provider, provider.as_str());
+            assert_eq!(source.store, store_of(&fixture, provider));
+        }
     }
 
     #[test]
     fn unknown_workspace_is_not_approved_and_exact_native_trust_can_be_imported() {
-        let (temp, workspace, homes) = setup();
-        let first = assess_with(temp.path(), &workspace, &homes).unwrap();
+        let (temp, workspace, fixture) = setup();
+        let first = assess_with(temp.path(), &workspace, &fixture.env).unwrap();
         assert_eq!(first.state, "unverified");
         assert!(first.source.is_none());
-        trust_pi(&homes, &workspace);
-        let next = assess_with(temp.path(), &workspace, &homes).unwrap();
+        trust_pi(&fixture, &workspace);
+        let next = assess_with(temp.path(), &workspace, &fixture.env).unwrap();
         assert_eq!(next.state, "verified");
         assert_eq!(next.source.unwrap().provider, "pi");
         let child = workspace.join("child");
         fs::create_dir(&child).unwrap();
         assert!(
-            assess_with(temp.path(), &child, &homes)
+            assess_with(temp.path(), &child, &fixture.env)
                 .unwrap()
                 .source
                 .is_none()
@@ -1469,7 +1888,7 @@ mod tests {
         let sibling = temp.path().join("workspace2");
         fs::create_dir(&sibling).unwrap();
         assert!(
-            assess_with(temp.path(), &sibling, &homes)
+            assess_with(temp.path(), &sibling, &fixture.env)
                 .unwrap()
                 .source
                 .is_none()
@@ -1478,16 +1897,20 @@ mod tests {
 
     #[test]
     fn replaced_directory_or_owner_does_not_reimport_old_path_trust() {
-        let (temp, workspace, homes) = setup();
-        trust_pi(&homes, &workspace);
+        let (temp, workspace, fixture) = setup();
+        trust_pi(&fixture, &workspace);
         assert_eq!(
-            assess_with(temp.path(), &workspace, &homes).unwrap().state,
+            assess_with(temp.path(), &workspace, &fixture.env)
+                .unwrap()
+                .state,
             "verified"
         );
         fs::rename(&workspace, temp.path().join("old-workspace")).unwrap();
         fs::create_dir(&workspace).unwrap();
         assert_eq!(
-            assess_with(temp.path(), &workspace, &homes).unwrap().state,
+            assess_with(temp.path(), &workspace, &fixture.env)
+                .unwrap()
+                .state,
             "identity-changed"
         );
         with_record(temp.path(), &workspace, |path, record| {
@@ -1498,7 +1921,9 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            assess_with(temp.path(), &workspace, &homes).unwrap().state,
+            assess_with(temp.path(), &workspace, &fixture.env)
+                .unwrap()
+                .state,
             "identity-changed"
         );
     }
@@ -1532,18 +1957,22 @@ mod tests {
     #[test]
     fn symlink_alias_and_unsafe_store_do_not_supply_consent() {
         use std::os::unix::fs::{PermissionsExt, symlink};
-        let (temp, workspace, homes) = setup();
-        trust_pi(&homes, &workspace);
+        let (temp, workspace, fixture) = setup();
+        trust_pi(&fixture, &workspace);
         let alias = temp.path().join("alias");
         symlink(&workspace, &alias).unwrap();
         assert_eq!(
-            assess_with(temp.path(), &alias, &homes).unwrap().state,
+            assess_with(temp.path(), &alias, &fixture.env)
+                .unwrap()
+                .state,
             "alias"
         );
-        fs::set_permissions(&homes.pi, fs::Permissions::from_mode(0o666)).unwrap();
-        assert!(provider::workspace_trust(FirstPartyCli::Pi, &workspace, &homes).is_err());
+        fs::set_permissions(&fixture.pi, fs::Permissions::from_mode(0o666)).unwrap();
         assert!(
-            assess_with(temp.path(), &workspace, &homes)
+            provider::workspace_trust(FirstPartyCli::Pi, &workspace, &fixture.env, None).is_err()
+        );
+        assert!(
+            assess_with(temp.path(), &workspace, &fixture.env)
                 .unwrap()
                 .source
                 .is_none()
@@ -1552,36 +1981,36 @@ mod tests {
 
     #[test]
     fn source_reset_does_not_reimport_an_automatically_trusted_target() {
-        let (temp, workspace, homes) = setup();
-        trust_pi(&homes, &workspace);
-        assess_with(temp.path(), &workspace, &homes).unwrap();
+        let (temp, workspace, fixture) = setup();
+        trust_pi(&fixture, &workspace);
+        assess_with(temp.path(), &workspace, &fixture.env).unwrap();
         write_json_atomic(
-            &homes.agy,
+            &fixture.agy,
             &serde_json::json!({"trustedWorkspaces":[native_key(&workspace).unwrap()]}),
         )
         .unwrap();
-        fs::remove_file(&homes.pi).unwrap();
-        let assessment = assess_with(temp.path(), &workspace, &homes).unwrap();
+        fs::remove_file(&fixture.pi).unwrap();
+        let assessment = assess_with(temp.path(), &workspace, &fixture.env).unwrap();
         assert_eq!(assessment.state, "source-reset");
         assert!(assessment.source.is_none());
     }
 
     #[test]
     fn revocation_is_serialized_with_import_and_reset_requires_fresh_evidence() {
-        let (temp, workspace, homes) = setup();
-        trust_pi(&homes, &workspace);
-        assess_with(temp.path(), &workspace, &homes).unwrap();
+        let (temp, workspace, fixture) = setup();
+        trust_pi(&fixture, &workspace);
+        assess_with(temp.path(), &workspace, &fixture.env).unwrap();
         // Deterministic lock contention: the importer must see the revoke written
         // while it waits, rather than replace it using a pre-lock snapshot.
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let root = temp.path().to_owned();
         let child_workspace = workspace.clone();
-        let child_homes = homes.clone();
+        let child_env = fixture.env.clone();
         let child_barrier = barrier.clone();
         let worker = with_record(temp.path(), &workspace, |path, record| {
             let worker = thread::spawn(move || {
                 child_barrier.wait();
-                assess_with(&root, &child_workspace, &child_homes).unwrap()
+                assess_with(&root, &child_workspace, &child_env).unwrap()
             });
             barrier.wait();
             let mut record = record.unwrap();
@@ -1598,14 +2027,18 @@ mod tests {
             write_json_atomic(path, &record)
         })
         .unwrap();
-        fs::remove_file(&homes.pi).unwrap();
+        fs::remove_file(&fixture.pi).unwrap();
         assert_eq!(
-            assess_with(temp.path(), &workspace, &homes).unwrap().state,
+            assess_with(temp.path(), &workspace, &fixture.env)
+                .unwrap()
+                .state,
             "unverified"
         );
-        trust_pi(&homes, &workspace);
+        trust_pi(&fixture, &workspace);
         assert_eq!(
-            assess_with(temp.path(), &workspace, &homes).unwrap().state,
+            assess_with(temp.path(), &workspace, &fixture.env)
+                .unwrap()
+                .state,
             "verified"
         );
     }

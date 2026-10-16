@@ -36,16 +36,22 @@ pub(in crate::native) fn override_session_registry_for_test(registry: Option<Pat
     SESSION_REGISTRY_OVERRIDE.with(|slot| *slot.borrow_mut() = registry);
 }
 
-pub(super) fn claude_sessions_registry_dir() -> Result<PathBuf> {
+// The registry of the caller's environment: `<override>/sessions` with a non-empty
+// `CLAUDE_CONFIG_DIR`, which needs no user home, otherwise `<home>/.claude/sessions`.
+pub(super) fn claude_sessions_registry_dir(
+    env: &crate::native::consent::Environment,
+) -> Result<PathBuf> {
     #[cfg(test)]
     if let Some(registry) = SESSION_REGISTRY_OVERRIDE.with(|slot| slot.borrow().clone()) {
         return Ok(registry);
     }
-    let config_dir = match std::env::var_os("CLAUDE_CONFIG_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => {
-            let home = std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
+    let config_dir = match super::config_dir_override(env) {
+        Some(dir) => dir,
+        None => {
+            let home = env
+                .home
+                .as_deref()
+                .or(env.userprofile.as_deref())
                 .context("neither HOME nor USERPROFILE is set")?;
             PathBuf::from(home).join(".claude")
         }

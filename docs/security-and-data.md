@@ -71,7 +71,10 @@ If consent is missing or unreadable, check the store Bridge reads. In these path
 `HOME` when set, otherwise `USERPROFILE`:
 
 - Codex: `config.toml` under `CODEX_HOME`, or `<home>/.codex/config.toml` when unset.
-- Claude: `.claude.json` under `CLAUDE_CONFIG_DIR`, or `<home>/.claude.json` when unset.
+- Claude: `.claude.json` under `CLAUDE_CONFIG_DIR`, or `<home>/.claude.json` when it is unset or
+  empty (an empty value is unset, as it always was for the session registry; through 0.4.12 the
+  trust store read it as the relative `.claude.json`). The session registry that `reopen` reads is
+  `sessions/` under the same directory, or `<home>/.claude/sessions` when it is unset or empty.
 - Agy: `<home>/.gemini/antigravity-cli/settings.json`.
 - Pi: `trust.json` under `PI_CODING_AGENT_DIR`, or `<home>/.pi/agent/trust.json` when unset.
 

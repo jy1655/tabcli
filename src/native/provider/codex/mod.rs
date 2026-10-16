@@ -192,10 +192,15 @@ impl NativeProviderAdapter for CodexAdapter {
     fn workspace_trust(
         &self,
         workspace: &Path,
-        homes: &super::super::consent::Homes,
+        env: &super::super::consent::Environment,
+        store: Option<&Path>,
     ) -> Result<super::super::consent::Trust> {
         use super::super::consent::{self, Evidence, Trust};
-        let Some(text) = consent::read_store(&homes.codex)? else {
+        let store = match store {
+            Some(store) => store.to_path_buf(),
+            None => Home::resolve(env)?.config,
+        };
+        let Some(text) = consent::read_store(&store)? else {
             return Ok(Trust::Absent);
         };
         let config: toml::Value = text.parse().context("invalid Codex trust config")?;
@@ -229,7 +234,7 @@ impl NativeProviderAdapter for CodexAdapter {
             None => Ok(Trust::Absent),
             Some(v) if v.as_str() == Some("trusted") => Ok(Trust::Trusted(Evidence {
                 provider: "codex".into(),
-                store: homes.codex.clone(),
+                store,
                 key,
             })),
             Some(v) if v.as_str() == Some("untrusted") => Ok(Trust::Declined),
@@ -292,17 +297,45 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 }
 
-// The directory in which Codex keeps its memories and runs its background memory
-// consolidation, beside its `config.toml`. Bridge's launch admission refuses that
-// workspace by default (issue #216); the location is Codex's, so it is declared here.
+// Codex's home: `config.toml` under `CODEX_HOME`, or under `.codex` in the user home. An
+// empty `CODEX_HOME` keeps the relative spelling, `config.toml` in the caller's working
+// directory, and the user home is required even when `CODEX_HOME` is set.
+#[derive(Debug)]
+struct Home {
+    config: std::path::PathBuf,
+}
+
+impl Home {
+    fn resolve(env: &crate::native::consent::Environment) -> Result<Self> {
+        let home = crate::native::consent::user_home(env)?;
+        Ok(Self {
+            config: env
+                .codex_home
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from(home).join(".codex"))
+                .join("config.toml"),
+        })
+    }
+
+    // The directory in which Codex keeps its memories and runs its background memory
+    // consolidation, beside its `config.toml`.
+    fn memory_workspace(&self) -> Result<std::path::PathBuf> {
+        Ok(self
+            .config
+            .parent()
+            .context("Codex config path has no parent")?
+            .join("memories"))
+    }
+}
+
+// The Codex memory workspace of the caller's environment. Bridge's launch admission
+// refuses that workspace by default (issue #216); the location is Codex's, so it is
+// declared here.
 pub(super) fn memory_workspace(
-    homes: &crate::native::consent::Homes,
+    env: &crate::native::consent::Environment,
 ) -> Result<std::path::PathBuf> {
-    Ok(homes
-        .codex
-        .parent()
-        .context("Codex config path has no parent")?
-        .join("memories"))
+    Home::resolve(env)?.memory_workspace()
 }
 
 fn validate_claim_token(claim_token: &str) -> Result<()> {

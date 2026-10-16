@@ -365,8 +365,12 @@ fn monitor_records_a_turn_agy_gave_up_on_as_a_failed_request() {
 #[cfg(windows)]
 #[test]
 fn windows_brain_root_falls_back_to_userprofile_without_home() {
+    let env = crate::native::consent::Environment {
+        userprofile: Some(r"C:\Users\agy-user".into()),
+        ..Default::default()
+    };
     assert_eq!(
-        default_brain_root(None, Some(std::ffi::OsStr::new(r"C:\Users\agy-user"))).unwrap(),
+        brain_root(&env).unwrap(),
         PathBuf::from(r"C:\Users\agy-user\.gemini\antigravity-cli\brain")
     );
 }

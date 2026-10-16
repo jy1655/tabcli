@@ -8,7 +8,6 @@ use crate::native::session::{Reader, RecordReader, Store};
 use crate::native::terminal;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::thread;
 use std::time::{Duration, Instant};
 
 // Paste only after exact trust, per-process customization load, startup and quiet log evidence.
@@ -22,22 +21,9 @@ use std::time::{Duration, Instant};
 
 const INPUT_RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-pub(super) trait Clock {
-    fn now(&mut self) -> Instant;
-    fn sleep(&mut self, duration: Duration);
-}
-
-pub(super) struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now(&mut self) -> Instant {
-        Instant::now()
-    }
-
-    fn sleep(&mut self, duration: Duration) {
-        thread::sleep(duration);
-    }
-}
+// The clock is consent's, shared with the trust wait; the readiness and receipt gates
+// take it so that tests run them on simulated time.
+pub(super) use crate::native::consent::{Clock, SystemClock};
 
 pub(super) fn read_log_bytes(log_path: &Path) -> Result<Option<Vec<u8>>> {
     RecordReader::at(log_path).bytes()
@@ -103,7 +89,11 @@ pub(super) fn deliver_terminal_turn(
         &directory,
         || {
             if readiness.is_some() {
-                wait_for_workspace_trust(&directory, deadline)?;
+                wait_for_workspace_trust(
+                    &directory,
+                    deadline,
+                    &crate::native::consent::Environment::current(),
+                )?;
             }
             Ok(())
         },
