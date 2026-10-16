@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 
 use super::{
     CloseOutcome, DialogKey, GuardedDialogInput, TerminalKind, TerminalSendFailure,
-    TerminalSendResult, TerminalSession, select_macos_terminal,
+    TerminalSendResult, TerminalSession, macos_selection::select_macos_terminal,
 };
 
 const STARTUP_CLEANUP_RESERVE: Duration = Duration::from_secs(2);
@@ -24,6 +24,8 @@ mod applescript;
 mod test_support;
 #[cfg(test)]
 pub(in crate::native) use applescript::testing as automation_testing;
+#[cfg(test)]
+use test_support::Unused as UnusedAdapter;
 pub(in crate::native) mod ghostty;
 pub(in crate::native) mod iterm2;
 pub(in crate::native) mod warp;
@@ -80,13 +82,28 @@ pub(super) trait MacTerminalAdapter {
         session: &TerminalSession,
         timeout: Duration,
     ) -> Result<bool>;
-    fn read_screen(&self, session: &TerminalSession, deadline: Instant) -> Result<String>;
+    // A kind that declares a refusal for one of these in its registration is refused
+    // by the shared dispatch before its adapter is reached, so the defaults are an
+    // invariant failure and never an ordinary answer.
+    fn read_screen(&self, session: &TerminalSession, deadline: Instant) -> Result<String> {
+        let _ = deadline;
+        bail!(
+            "{} declares managed screen reads unsupported; the shared dispatch must refuse before its adapter",
+            session.kind.display_name()
+        )
+    }
     fn guarded_dialog_input(
         &self,
         session: &TerminalSession,
         input: &GuardedDialogInput,
         deadline: Instant,
-    ) -> Result<bool>;
+    ) -> Result<bool> {
+        let _ = (input, deadline);
+        bail!(
+            "{} declares managed dialog input unsupported; the shared dispatch must refuse before its adapter",
+            session.kind.display_name()
+        )
+    }
     fn close_session_until(
         &self,
         directory: &Path,
@@ -103,18 +120,92 @@ pub(super) trait MacTerminalAdapter {
     ) -> Result<CloseOutcome>;
 }
 
-pub(super) fn adapter(kind: TerminalKind) -> Result<&'static dyn MacTerminalAdapter> {
-    match kind {
-        TerminalKind::Iterm2 => Ok(&iterm2::ADAPTER),
-        TerminalKind::AppleTerminal => Ok(&apple_terminal::ADAPTER),
-        TerminalKind::Ghostty => Ok(&ghostty::ADAPTER),
-        TerminalKind::WezTerm => Ok(&wezterm::ADAPTER),
-        TerminalKind::Warp => Ok(&warp::ADAPTER),
-        TerminalKind::WindowsConsole => bail!("Windows Console is only available on Windows"),
+/// The adapter of a kind. Every shared operation resolves its adapter here and nowhere
+/// else; production passes `&INSTALLED`, a test a `Dispatch` over its own adapters.
+pub(super) trait Adapters {
+    fn adapter(&self, kind: TerminalKind) -> Result<&dyn MacTerminalAdapter>;
+}
+
+/// The five macOS adapters, each over the dependency its own constructor took.
+/// Generic so that a test adapter needs neither `Sync` nor `'static`: the recording
+/// automation is reference counted, the WezTerm test host is deliberately not `Sync`,
+/// and Terminal.app's observation constructor borrows local callbacks.
+pub(super) struct Dispatch<I, T, G, Z, W> {
+    iterm2: I,
+    apple_terminal: T,
+    ghostty: G,
+    wezterm: Z,
+    warp: W,
+}
+
+impl<I, T, G, Z, W> Dispatch<I, T, G, Z, W> {
+    pub(super) const fn new(iterm2: I, apple_terminal: T, ghostty: G, wezterm: Z, warp: W) -> Self {
+        Self {
+            iterm2,
+            apple_terminal,
+            ghostty,
+            wezterm,
+            warp,
+        }
     }
 }
 
+impl<I, T, G, Z, W> Adapters for Dispatch<I, T, G, Z, W>
+where
+    I: MacTerminalAdapter,
+    T: MacTerminalAdapter,
+    G: MacTerminalAdapter,
+    Z: MacTerminalAdapter,
+    W: MacTerminalAdapter,
+{
+    fn adapter(&self, kind: TerminalKind) -> Result<&dyn MacTerminalAdapter> {
+        match kind {
+            TerminalKind::Iterm2 => Ok(&self.iterm2),
+            TerminalKind::AppleTerminal => Ok(&self.apple_terminal),
+            TerminalKind::Ghostty => Ok(&self.ghostty),
+            TerminalKind::WezTerm => Ok(&self.wezterm),
+            TerminalKind::Warp => Ok(&self.warp),
+            TerminalKind::WindowsConsole => bail!("Windows Console is only available on Windows"),
+        }
+    }
+}
+
+type InstalledDispatch = Dispatch<
+    iterm2::InstalledAdapter,
+    apple_terminal::InstalledAdapter,
+    ghostty::InstalledAdapter,
+    wezterm::InstalledAdapter,
+    warp::InstalledAdapter,
+>;
+
+static INSTALLED_DISPATCH: InstalledDispatch = Dispatch::new(
+    iterm2::Adapter::installed(),
+    apple_terminal::Adapter::installed(),
+    ghostty::Adapter::installed(),
+    wezterm::Adapter::installed(),
+    warp::Adapter::installed(),
+);
+
+/// The adapters over the installed terminals: `osascript` for iTerm2 and Terminal.app,
+/// Ghostty's scripting dictionary and `osascript`, the installed `wezterm`, and the
+/// installed Warp Control clients. Production passes this to every shared operation.
+pub(super) static INSTALLED: &(dyn Adapters + Sync) = &INSTALLED_DISPATCH;
+
+/// A dispatch for a test of Terminal.app alone, over the given automation; the other
+/// kinds' adapters fail the test when reached.
+#[cfg(test)]
+pub(super) fn apple_terminal_dispatch(automation: automation_testing::Replay) -> impl Adapters {
+    Dispatch::new(
+        UnusedAdapter("iTerm2"),
+        apple_terminal::with_automation(automation),
+        UnusedAdapter("Ghostty"),
+        UnusedAdapter("WezTerm"),
+        UnusedAdapter("Warp"),
+    )
+}
+
 pub(super) fn open_bound_tab<F, U>(
+    adapters: &dyn Adapters,
     kind: TerminalKind,
     command: &str,
     directory: &Path,
@@ -133,7 +224,7 @@ where
             .parent()
             .context("session directory has no state root")?,
     )?;
-    adapter(kind)?.open_bound_tab(
+    adapters.adapter(kind)?.open_bound_tab(
         mode,
         command,
         directory,
@@ -169,59 +260,89 @@ pub(super) fn open_with(
 }
 
 pub(super) fn send_file(
+    adapters: &dyn Adapters,
     session: &TerminalSession,
     prompt_path: &Path,
     deadline: Instant,
 ) -> TerminalSendResult {
-    adapter(session.kind)
+    adapters
+        .adapter(session.kind)
         .map_err(TerminalSendFailure::not_sent)?
         .send_file(session, prompt_path, deadline)
 }
 
 pub(super) fn verify_surface(
+    adapters: &dyn Adapters,
     directory: &Path,
     session: &TerminalSession,
     timeout: Option<Duration>,
 ) -> Result<Option<String>> {
-    adapter(session.kind)?.verify_surface(directory, session, timeout)
+    adapters
+        .adapter(session.kind)?
+        .verify_surface(directory, session, timeout)
 }
 
 pub(super) fn surface_present(
+    adapters: &dyn Adapters,
     directory: &Path,
     session: &TerminalSession,
     timeout: Duration,
 ) -> Result<bool> {
-    adapter(session.kind)?.surface_present(directory, session, timeout)
+    adapters
+        .adapter(session.kind)?
+        .surface_present(directory, session, timeout)
 }
 
-pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Result<String> {
-    adapter(session.kind)?.read_screen(session, deadline)
+// The declared refusals answer before any adapter is reached.
+pub(super) fn read_screen(
+    adapters: &dyn Adapters,
+    session: &TerminalSession,
+    deadline: Instant,
+) -> Result<String> {
+    if let Some(refusal) = session.kind.registration().screen_read_refusal {
+        return Err(anyhow::anyhow!(refusal));
+    }
+    adapters
+        .adapter(session.kind)?
+        .read_screen(session, deadline)
 }
 
 pub(super) fn guarded_dialog_input(
+    adapters: &dyn Adapters,
     session: &TerminalSession,
     input: &GuardedDialogInput,
     deadline: Instant,
 ) -> Result<bool> {
-    adapter(session.kind)?.guarded_dialog_input(session, input, deadline)
+    if let Some(refusal) = session.kind.registration().guarded_input_refusal {
+        return Err(anyhow::anyhow!(refusal));
+    }
+    adapters
+        .adapter(session.kind)?
+        .guarded_dialog_input(session, input, deadline)
 }
 
 pub(super) fn close_session_until(
+    adapters: &dyn Adapters,
     directory: &Path,
     session: &TerminalSession,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
-    adapter(session.kind)?.close_session_until(directory, session, deadline)
+    adapters
+        .adapter(session.kind)?
+        .close_session_until(directory, session, deadline)
 }
 
 pub(super) fn close_owned_session(
+    adapters: &dyn Adapters,
     directory: &Path,
     id: &str,
     session: &TerminalSession,
     close: OwnedSurfaceClose,
     deadline: Instant,
 ) -> Result<CloseOutcome> {
-    adapter(session.kind)?.close_owned_session(directory, id, session, close, deadline)
+    adapters
+        .adapter(session.kind)?
+        .close_owned_session(directory, id, session, close, deadline)
 }
 
 pub(super) fn timeout_deadline(timeout: Duration) -> Result<Instant> {
@@ -267,57 +388,45 @@ mod startup_tests {
         .unwrap();
         assert!(legacy.managed_session_id.is_none());
         let deadline = Instant::now() + Duration::from_secs(10);
-        let calls = std::rc::Rc::new(Cell::new(0));
-        let runner_calls = calls.clone();
         let unbound = Cell::new(false);
-        let adapter = adapter(TerminalKind::Iterm2).unwrap();
-        automation_testing::with_runner(
-            move |_| {
-                let calls = &runner_calls;
-                calls.set(calls.get() + 1);
-                Ok(if calls.get() == 1 {
-                    "native-session-id"
-                } else {
-                    "closed"
-                }
-                .into())
-            },
-            || {
-                let error = adapter
-                    .open_bound_tab(
-                        MacosOpenMode::TabFirst,
-                        "true",
-                        directory.path(),
-                        deadline,
-                        Box::new(|session| {
-                            assert!(session.managed_session_id.is_none());
-                            assert_eq!(session.id, legacy.id);
-                            bail!("injected binding failure")
-                        }),
-                        Box::new(|| {
-                            unbound.set(true);
-                            Ok(())
-                        }),
-                    )
-                    .unwrap_err();
-                assert_eq!(error.to_string(), "injected binding failure");
-                assert_eq!(calls.get(), 2, "create then exact cleanup");
-                assert!(unbound.get());
-                assert_eq!(
-                    adapter
-                        .close_owned_session(
-                            directory.path(),
-                            "unused",
-                            &legacy,
-                            OwnedSurfaceClose::SurfaceOnly,
-                            deadline
-                        )
-                        .unwrap(),
-                    CloseOutcome::Closed
-                );
-            },
-        );
+        // Creation, the exact cleanup of the failed binding, then the legacy close.
+        let replay = automation_testing::Replay::normal(&["native-session-id", "closed", "closed"]);
+        let adapter = iterm2::with_automation(replay.clone());
         let error = adapter
+            .open_bound_tab(
+                MacosOpenMode::TabFirst,
+                "true",
+                directory.path(),
+                deadline,
+                Box::new(|session| {
+                    assert!(session.managed_session_id.is_none());
+                    assert_eq!(session.id, legacy.id);
+                    bail!("injected binding failure")
+                }),
+                Box::new(|| {
+                    unbound.set(true);
+                    Ok(())
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "injected binding failure");
+        assert_eq!(replay.calls().len(), 2, "create then exact cleanup");
+        assert!(unbound.get());
+        assert_eq!(
+            adapter
+                .close_owned_session(
+                    directory.path(),
+                    "unused",
+                    &legacy,
+                    OwnedSurfaceClose::SurfaceOnly,
+                    deadline
+                )
+                .unwrap(),
+            CloseOutcome::Closed
+        );
+        replay.assert_finished();
+        // Expiry is the installed automation's own check, made before anything runs.
+        let error = iterm2::Adapter::installed()
             .close_session_until(directory.path(), &legacy, Instant::now())
             .unwrap_err();
         assert_eq!(
@@ -334,7 +443,8 @@ mod startup_tests {
         }))
         .unwrap();
         std::fs::write(directory.path().join("native-session.json"), "broken").unwrap();
-        let error = adapter(session.kind)
+        let error = INSTALLED
+            .adapter(session.kind)
             .unwrap()
             .close_owned_session(
                 directory.path(),
@@ -407,7 +517,7 @@ mod startup_tests {
         };
         // Keep the installed adapter's real no-op start, borrowing only cleanup observation.
         let local = apple_terminal::with_observations(
-            &apple_terminal::ADAPTER.start,
+            &apple_terminal::started_at_creation,
             &absent,
             replay.clone(),
         );
@@ -465,7 +575,7 @@ mod adapter_tests {
         match kind {
             TerminalKind::Iterm2 => run(&iterm2::with_automation(replay.clone())),
             TerminalKind::AppleTerminal => run(&apple_terminal::with_observations(
-                &apple_terminal::ADAPTER.start,
+                &apple_terminal::started_at_creation,
                 &absent,
                 replay.clone(),
             )),
@@ -488,15 +598,61 @@ mod adapter_tests {
         }
     }
 
+    // Capability against behaviour: an operation a kind declares unsupported is
+    // answered by the shared dispatch with the declared message and never reaches
+    // the adapter, whose own answer would be the invariant failure. The expected
+    // literals are independent of the registrations.
     #[test]
-    fn lookup_selects_each_operation_set_and_rejects_windows() {
+    fn declared_refusals_answer_before_adapters_and_windows_is_rejected() {
         let deadline = Instant::now() + Duration::from_secs(2);
+        let input = GuardedDialogInput {
+            screen: "screen".into(),
+            key: DialogKey::Enter,
+        };
+        // Only iTerm2's read reaches an automation; Terminal.app's and WezTerm's
+        // refuse the malformed handle first, and the other kinds never reach their
+        // adapter's dependency.
+        let iterm2 = automation_testing::Replay::normal(&["AB_SCREEN_BEGINscreenAB_SCREEN_END"]);
+        let apple_terminal = automation_testing::Replay::normal(&[]);
+        let dispatch = Dispatch::new(
+            iterm2::with_automation(iterm2.clone()),
+            apple_terminal::with_automation(apple_terminal.clone()),
+            ghostty::Adapter::installed(),
+            wezterm::Adapter::installed(),
+            warp::Adapter::installed(),
+        );
+        let read = |kind: TerminalKind| {
+            read_screen(&dispatch, &handle(kind), deadline)
+                .unwrap_or_else(|error| error.to_string())
+        };
+        let guard = |kind: TerminalKind| {
+            guarded_dialog_input(&dispatch, &handle(kind), &input, Instant::now())
+                .unwrap_err()
+                .to_string()
+        };
+        // Supported on both: the adapter answers (iTerm2 through the automation,
+        // Terminal.app from its missing window identity).
+        assert_eq!(read(TerminalKind::Iterm2), "screen");
+        assert_eq!(
+            read(TerminalKind::AppleTerminal),
+            "Terminal window identity missing"
+        );
+        assert_eq!(
+            guard(TerminalKind::AppleTerminal),
+            "Terminal window identity missing"
+        );
+        // Screen reads supported, guarded input declared unsupported: the read reaches
+        // the adapter (which refuses this malformed handle itself); the guard does not.
+        assert_eq!(
+            read(TerminalKind::WezTerm),
+            "WezTerm handle does not name the process that owns its pane"
+        );
+        assert_eq!(
+            guard(TerminalKind::WezTerm),
+            "WezTerm cannot compare the screen and send a key in one call; answer the dialog in its pane"
+        );
+        // Both declared unsupported.
         for (kind, expected) in [
-            (TerminalKind::Iterm2, "screen"),
-            (
-                TerminalKind::AppleTerminal,
-                "Terminal window identity missing",
-            ),
             (
                 TerminalKind::Ghostty,
                 "managed dialog input unsupported for this terminal",
@@ -505,60 +661,54 @@ mod adapter_tests {
                 TerminalKind::Warp,
                 "managed Warp screen reads and guarded input are unsupported; Warp Control input.insert/input.replace do not submit",
             ),
-            (
-                TerminalKind::WezTerm,
-                "WezTerm handle does not name the process that owns its pane",
-            ),
         ] {
-            let session = handle(kind);
-            let actual = automation_testing::with_runner(
-                |_| Ok("AB_SCREEN_BEGINscreenAB_SCREEN_END".into()),
-                || adapter(kind).unwrap().read_screen(&session, deadline),
-            );
-            let actual = actual.unwrap_or_else(|error| error.to_string());
-            assert_eq!(actual, expected, "{kind:?}");
+            assert_eq!(read(kind), expected, "{kind:?}");
+            assert_eq!(guard(kind), expected, "{kind:?}");
         }
+        // The adapters of the refusing kinds give only the invariant failure, so the
+        // declared messages above can only have come from the shared dispatch.
+        for (kind, name) in [
+            (TerminalKind::Ghostty, "Ghostty"),
+            (TerminalKind::Warp, "Warp"),
+            (TerminalKind::WezTerm, "WezTerm"),
+        ] {
+            let adapter = dispatch.adapter(kind).unwrap();
+            assert_eq!(
+                adapter
+                    .guarded_dialog_input(&handle(kind), &input, deadline)
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "{name} declares managed dialog input unsupported; the shared dispatch must refuse before its adapter"
+                )
+            );
+            if kind != TerminalKind::WezTerm {
+                assert_eq!(
+                    adapter
+                        .read_screen(&handle(kind), deadline)
+                        .unwrap_err()
+                        .to_string(),
+                    format!(
+                        "{name} declares managed screen reads unsupported; the shared dispatch must refuse before its adapter"
+                    )
+                );
+            }
+        }
+        // Windows Console has no adapter on macOS.
         assert_eq!(
-            adapter(TerminalKind::WindowsConsole)
+            dispatch
+                .adapter(TerminalKind::WindowsConsole)
                 .err()
                 .expect("unsupported kind")
                 .to_string(),
             "Windows Console is only available on Windows"
         );
-    }
-
-    #[test]
-    fn unsupported_guarded_input_and_windows_send_keep_their_classification() {
-        let input = GuardedDialogInput {
-            screen: "screen".into(),
-            key: DialogKey::Enter,
-        };
-        for (kind, expected) in [
-            (
-                TerminalKind::AppleTerminal,
-                "Terminal window identity missing",
-            ),
-            (
-                TerminalKind::Ghostty,
-                "managed dialog input unsupported for this terminal",
-            ),
-            (
-                TerminalKind::Warp,
-                "managed Warp screen reads and guarded input are unsupported; Warp Control input.insert/input.replace do not submit",
-            ),
-            (
-                TerminalKind::WezTerm,
-                "WezTerm cannot compare the screen and send a key in one call; answer the dialog in its pane",
-            ),
-        ] {
-            assert_eq!(
-                guarded_dialog_input(&handle(kind), &input, Instant::now())
-                    .unwrap_err()
-                    .to_string(),
-                expected
-            );
-        }
+        assert_eq!(
+            read(TerminalKind::WindowsConsole),
+            "Windows Console is only available on Windows"
+        );
         let failure = send_file(
+            &dispatch,
             &handle(TerminalKind::WindowsConsole),
             Path::new("unused"),
             Instant::now(),
@@ -569,12 +719,16 @@ mod adapter_tests {
             failure.error().to_string(),
             "Windows Console is only available on Windows"
         );
+        // Warp's send refusal is the adapter's own and separate from its declared ones.
         let failure = send_file(
+            &dispatch,
             &handle(TerminalKind::Warp),
             Path::new("unused"),
             Instant::now(),
         )
         .unwrap_err();
+        iterm2.assert_finished();
+        apple_terminal.assert_finished();
         assert!(!failure.delivery_may_have_occurred());
         assert_eq!(
             failure.error().to_string(),
@@ -671,51 +825,62 @@ mod adapter_tests {
                 }
             }
         }
-        assert_eq!(
-            surface_present(
-                directory.path(),
-                &handle(TerminalKind::AppleTerminal),
-                Duration::from_secs(2)
-            )
-            .unwrap_err()
-            .to_string(),
-            "Terminal.app window id is missing"
+        // Malformed handles are refused by the adapters before any dependency is
+        // reached; Ghostty takes its snapshot first, so its injected failure answers.
+        struct FailingSnapshot;
+        impl ghostty::Runner for FailingSnapshot {
+            fn capable(&mut self) -> Result<()> {
+                panic!("presence needs no capability check")
+            }
+            fn run(&mut self, _: &str, _: &[&str], _: Instant) -> Result<String> {
+                bail!("injected Ghostty presence failure")
+            }
+            fn run_send(
+                &mut self,
+                _: &str,
+                _: &[&str],
+                _: Instant,
+            ) -> std::result::Result<String, TerminalSendFailure> {
+                panic!("presence sends nothing")
+            }
+        }
+        let apple_terminal = automation_testing::Replay::normal(&[]);
+        let dispatch = Dispatch::new(
+            UnusedAdapter("iTerm2"),
+            apple_terminal::with_automation(apple_terminal.clone()),
+            ghostty::with_runner(FailingSnapshot),
+            wezterm::Adapter::installed(),
+            warp::Adapter::installed(),
         );
-        assert_eq!(
-            surface_present(
-                directory.path(),
-                &handle(TerminalKind::Warp),
-                Duration::from_secs(2)
-            )
-            .unwrap_err()
-            .to_string(),
-            "Warp terminal handle is missing its managed session binding"
-        );
-        assert_eq!(
-            surface_present(
-                directory.path(),
-                &handle(TerminalKind::WezTerm),
-                Duration::from_secs(2)
-            )
-            .unwrap_err()
-            .to_string(),
-            "WezTerm handle does not name the process that owns its pane"
-        );
-        automation_testing::with_runner(
-            |_| bail!("injected Ghostty presence failure"),
-            || {
-                assert_eq!(
-                    surface_present(
-                        directory.path(),
-                        &handle(TerminalKind::Ghostty),
-                        Duration::from_secs(2)
-                    )
-                    .unwrap_err()
-                    .to_string(),
-                    "injected Ghostty presence failure"
-                );
-            },
-        );
+        for (kind, expected) in [
+            (
+                TerminalKind::AppleTerminal,
+                "Terminal.app window id is missing",
+            ),
+            (
+                TerminalKind::Warp,
+                "Warp terminal handle is missing its managed session binding",
+            ),
+            (
+                TerminalKind::WezTerm,
+                "WezTerm handle does not name the process that owns its pane",
+            ),
+            (TerminalKind::Ghostty, "injected Ghostty presence failure"),
+        ] {
+            assert_eq!(
+                surface_present(
+                    &dispatch,
+                    directory.path(),
+                    &handle(kind),
+                    Duration::from_secs(2)
+                )
+                .unwrap_err()
+                .to_string(),
+                expected,
+                "{kind:?}"
+            );
+        }
+        apple_terminal.assert_finished();
     }
 
     #[test]

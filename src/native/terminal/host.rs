@@ -1,13 +1,28 @@
+use super::TerminalKind;
 use crate::native::{one_positional, require_valid_session_id};
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 
-pub(in crate::native) use super::facts::apple_terminal::HOST_COMMAND as APPLE_TERMINAL_HOST_COMMAND;
-pub(in crate::native) use super::facts::ghostty::HOST_COMMAND as GHOSTTY_HOST_COMMAND;
-pub(in crate::native) use super::facts::iterm2::HOST_COMMAND as ITERM2_HOST_COMMAND;
-pub(in crate::native) use super::facts::warp::HOST_COMMAND as WARP_HOST_COMMAND;
-pub(in crate::native) use super::facts::wezterm::HOST_COMMAND as WEZTERM_HOST_COMMAND;
-pub(in crate::native) use super::facts::windows::HOST_COMMAND as CONSOLE_HOST_COMMAND;
+// The host command names, read from each kind's registration.
+pub(in crate::native) const APPLE_TERMINAL_HOST_COMMAND: &str =
+    TerminalKind::AppleTerminal.registration().host_command;
+pub(in crate::native) const GHOSTTY_HOST_COMMAND: &str =
+    TerminalKind::Ghostty.registration().host_command;
+pub(in crate::native) const ITERM2_HOST_COMMAND: &str =
+    TerminalKind::Iterm2.registration().host_command;
+pub(in crate::native) const WARP_HOST_COMMAND: &str =
+    TerminalKind::Warp.registration().host_command;
+pub(in crate::native) const WEZTERM_HOST_COMMAND: &str =
+    TerminalKind::WezTerm.registration().host_command;
+pub(in crate::native) const CONSOLE_HOST_COMMAND: &str =
+    TerminalKind::WindowsConsole.registration().host_command;
+
+// The kind whose registered host command is the name.
+fn kind_of(command: &str) -> Option<TerminalKind> {
+    TerminalKind::ALL
+        .into_iter()
+        .find(|kind| kind.registration().host_command == command)
+}
 
 #[derive(Debug)]
 pub(crate) enum HostCommand {
@@ -20,14 +35,18 @@ pub(crate) enum HostCommand {
 }
 
 pub(in crate::native) fn parse(command: &str, rest: &[String]) -> Result<HostCommand> {
-    match command {
-        GHOSTTY_HOST_COMMAND => parse_ghostty_host(rest),
-        WARP_HOST_COMMAND => parse_warp_host(rest),
-        _ => parse_directory_host(command, rest),
+    match kind_of(command) {
+        Some(TerminalKind::Ghostty) => parse_ghostty_host(rest),
+        Some(TerminalKind::Warp) => parse_warp_host(rest),
+        kind => parse_directory_host(command, kind, rest),
     }
 }
 
-fn parse_directory_host(command: &str, rest: &[String]) -> Result<HostCommand> {
+fn parse_directory_host(
+    command: &str,
+    kind: Option<TerminalKind>,
+    rest: &[String],
+) -> Result<HostCommand> {
     // The tab's process does not necessarily inherit the state root, so it is
     // given the session directory itself.
     let directory = PathBuf::from(one_positional(
@@ -42,12 +61,14 @@ fn parse_directory_host(command: &str, rest: &[String]) -> Result<HostCommand> {
     if !directory.is_absolute() {
         bail!("{command} requires an absolute session directory");
     }
-    match command {
-        ITERM2_HOST_COMMAND => Ok(HostCommand::Iterm2 { directory }),
-        APPLE_TERMINAL_HOST_COMMAND => Ok(HostCommand::AppleTerminal { directory }),
-        WEZTERM_HOST_COMMAND => Ok(HostCommand::WezTerm { directory }),
-        CONSOLE_HOST_COMMAND => Ok(HostCommand::Console { directory }),
-        _ => bail!("unknown native host command: {command}"),
+    match kind {
+        Some(TerminalKind::Iterm2) => Ok(HostCommand::Iterm2 { directory }),
+        Some(TerminalKind::AppleTerminal) => Ok(HostCommand::AppleTerminal { directory }),
+        Some(TerminalKind::WezTerm) => Ok(HostCommand::WezTerm { directory }),
+        Some(TerminalKind::WindowsConsole) => Ok(HostCommand::Console { directory }),
+        Some(TerminalKind::Ghostty | TerminalKind::Warp) | None => {
+            bail!("unknown native host command: {command}")
+        }
     }
 }
 

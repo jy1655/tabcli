@@ -114,15 +114,23 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   `session::owner` owns process observation and
   attestation. The Terminal.app adapter owns app incarnation. Process reuse alone never
   supplies control proof or ordinary dead-owner Surface authority.
-  macOS operations use `MacTerminalAdapter` through one kind lookup. Each adapter explicitly
-  supplies every operation. Shared `open_with` preserves binding and cleanup order; Warp
-  owns its open flow. `applescript` owns execution and common response vocabulary, while
-  each adapter owns its screen and presence scripts.
+  Each terminal kind is registered once: its portable `facts.rs` declares its surface facts,
+  host command, close-evidence choice, refusal messages for screen reads and guarded dialog
+  input and, on macOS, its binding facts, and the shared lookups (`facts`, `close_evidence`,
+  `host`, the command table) read that registration. The installed macOS dispatch is a value
+  built from each adapter's injectable dependency (the AppleScript automation, the Ghostty and
+  Warp runners, the WezTerm host); a test builds one with a recording automation or a fake
+  runner. The shared macOS operations refuse an operation the kind declares unsupported from
+  its facts before any adapter is reached, so an adapter implements only what its kind
+  supports. Shared `open_with` preserves binding and cleanup order; Warp owns its open flow.
+  `applescript` owns execution and common response vocabulary, while each adapter owns its
+  screen and presence scripts.
   iTerm2 and Terminal.app carry an internal Automation dependency. Osascript owns execution,
   deadlines and delivery-failure classification; scripts, arguments, ordering and close
   authority remain adapter-owned. Tests inject recording or script-executing Automation
-  implementations; a test-only thread-local hook remains for installed dispatch and teardown
-  coverage, including Ghostty.
+  implementations through the dispatch they build. The Windows submit budget and the macOS
+  terminal selection live in portable children of their platform modules (`windows/budget.rs`,
+  `macos/selection.rs`), compiled and tested on every target.
 - `src/native/session/` owns durable record schemas, record access, and durability.
   `schema` defines the shared manifest, event, provider-process, and reopen-refusal records and
   their constants; `primitives` owns session environment names, identity validation, and time
@@ -409,12 +417,16 @@ repair settles the records without resending a prompt or guessing ownership of a
   the seam, `close_evidence.rs` for selecting the kind's evidence, and `ownership.rs` for the
   owner-teardown action. Add application-native
   operations under the platform module and tests that prove the target belongs to the session.
-  Each adapter declares its close facts, paste envelope, and guarded-dialog
-  capability as `SurfaceFacts` in its `facts.rs` module. The shared accessor dispatches these
-  exhaustively by terminal kind on every build target; platform operation refusals remain separate.
-  The three macOS adapters also declare macOS-only `BINDING` diagnostics and budgets there.
-  For macOS operations, implement every `MacTerminalAdapter` method explicitly and add the
-  adapter to its kind lookup. What an adapter does for a live owner before ending its surface
+  Register the kind once: its `facts.rs` declares one `Registration` with the close facts,
+  paste envelope and guarded-dialog capability (`SurfaceFacts`), the host command, the
+  close-evidence choice, the refusal message for each operation the kind does not support and,
+  on macOS, its `BindingFacts` diagnostics and budgets. `TerminalKind::registration` is the one
+  exhaustive lookup on every build target; the shared lookups and the shared macOS refusals read
+  it, so nothing else needs a per-kind match. For macOS operations, implement the
+  `MacTerminalAdapter` methods for the operations the kind supports, behind an injectable
+  dependency, and add the adapter to the `Dispatch` in `macos/mod.rs`; an operation the
+  registration declares unsupported is refused before the adapter is called. What an adapter
+  does for a live owner before ending its surface
   lives in its `close_owned_session`. Reuse `open_with` for binding and cleanup unless the adapter
   owns a distinct open protocol, as Warp does. Keep screen and presence scripts in the adapter.
   A creation preference in settings cannot substitute for recorded close authority.

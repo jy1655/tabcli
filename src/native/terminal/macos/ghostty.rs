@@ -1,12 +1,11 @@
 use super::OwnedSurfaceClose;
-use super::{GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
+use super::{MacTerminalAdapter, MacosOpenMode};
 use crate::native::private_to_user::owned_and_not_accessible_by_others;
 use crate::native::session::SessionState;
 use crate::native::session::close::budget::close_remaining;
 use crate::native::session::launch::launcher::validate_shell_command_component;
 use crate::native::session::primitives::unix_ms;
 use crate::native::session::{CoreRecord, Reader, RecordStore};
-use crate::native::terminal::facts::ghostty::HOST_COMMAND;
 #[cfg(test)]
 use crate::native::terminal::ownership;
 // Prove returned-tab ownership and a live input model before binding; keep creation input out of shells.
@@ -25,6 +24,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+const HOST_COMMAND: &str = TerminalKind::Ghostty.registration().host_command;
 #[cfg(test)]
 pub(in crate::native) const VERSION_SCRIPT: &str = r#"on run
  tell application "Ghostty" to return version
@@ -311,7 +312,7 @@ const HOST_WAIT: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(30)
 };
-trait Runner {
+pub(super) trait Runner {
     fn capable(&mut self) -> Result<()>;
     fn run(&mut self, script: &str, args: &[&str], deadline: Instant) -> Result<String>;
     fn run_send(
@@ -329,7 +330,7 @@ trait Runner {
         Ok(())
     }
 }
-struct Installed;
+pub(super) struct Installed;
 impl Runner for Installed {
     fn capable(&mut self) -> Result<()> {
         let dictionary =
@@ -652,12 +653,6 @@ fn create_with_runner(
     }
     Ok(handle(&surface))
 }
-pub(super) fn create_tab_with_mode(
-    force_new_window: bool,
-    deadline: Instant,
-) -> Result<TerminalSession> {
-    create_with_runner(&mut Installed, force_new_window, deadline)
-}
 fn ownership_proof(session: &TerminalSession) -> Result<(&str, &str)> {
     let tab = session
         .tab_id
@@ -890,14 +885,6 @@ fn verify_launch(directory: &Path, token: &str) -> Result<PathBuf> {
     }
     Ok(start)
 }
-pub(super) fn start_session(
-    session: &TerminalSession,
-    command: &str,
-    directory: &Path,
-    deadline: Instant,
-) -> Result<()> {
-    start_bound(&mut Installed, session, command, directory, deadline)
-}
 fn launch_command(
     directory: &Path,
     command: &str,
@@ -926,13 +913,6 @@ fn launch_command(
     RecordStore::at(&script).write_private(format!("{export}{command}\n").as_bytes())?;
     Ok(input)
 }
-pub(super) fn send_file(
-    session: &TerminalSession,
-    prompt_path: &Path,
-    deadline: Instant,
-) -> TerminalSendResult {
-    send_file_with_runner(&mut Installed, session, prompt_path, deadline)
-}
 fn send_file_with_runner(
     runner: &mut dyn Runner,
     session: &TerminalSession,
@@ -955,9 +935,6 @@ fn send_file_with_runner(
         )));
     }
     Ok(())
-}
-pub(super) fn verify_surface(session: &TerminalSession, timeout: Option<Duration>) -> Result<()> {
-    verify_surface_with_runner(&mut Installed, session, timeout)
 }
 fn verify_surface_with_runner(
     runner: &mut dyn Runner,
@@ -989,9 +966,14 @@ fn present(state: &Snapshot, session: &TerminalSession) -> Result<bool> {
     }
     Ok(true)
 }
-pub(super) fn surface_present(session: &TerminalSession, timeout: Duration) -> Result<bool> {
+// The snapshot is taken before the handle is validated against it.
+fn surface_present_with_runner(
+    runner: &mut dyn Runner,
+    session: &TerminalSession,
+    timeout: Duration,
+) -> Result<bool> {
     present(
-        &snapshot(&mut Installed, super::timeout_deadline(timeout)?)?,
+        &snapshot(runner, super::timeout_deadline(timeout)?)?,
         session,
     )
 }
@@ -1024,16 +1006,35 @@ fn close_with_runner(
     bail!("Ghostty owned surface remains; handle retained; close response={answer:?}")
 }
 
-pub(super) fn close_session_until(
-    session: &TerminalSession,
-    deadline: Instant,
-) -> Result<CloseOutcome> {
-    close_with_runner(&mut Installed, session, deadline)
+// The runner uses `&mut self` and the adapter `&self`. The lock is taken for one
+// operation at a time: `open_with` runs its create, start and cleanup callbacks one
+// after another, so no callback holds the runner while another needs it.
+pub(super) struct Adapter<R: Runner> {
+    runner: std::sync::Mutex<R>,
 }
-
-pub(super) struct Adapter;
-pub(super) static ADAPTER: Adapter = Adapter;
-impl MacTerminalAdapter for Adapter {
+pub(super) type InstalledAdapter = Adapter<Installed>;
+impl Adapter<Installed> {
+    /// The adapter over Ghostty's installed scripting dictionary and `osascript`.
+    pub(super) const fn installed() -> Self {
+        Self {
+            runner: std::sync::Mutex::new(Installed),
+        }
+    }
+}
+#[cfg(test)]
+pub(super) fn with_runner<R: Runner>(runner: R) -> Adapter<R> {
+    Adapter {
+        runner: std::sync::Mutex::new(runner),
+    }
+}
+impl<R: Runner> Adapter<R> {
+    fn runner(&self) -> std::sync::MutexGuard<'_, R> {
+        self.runner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+impl<R: Runner> MacTerminalAdapter for Adapter<R> {
     fn open_bound_tab(
         &self,
         mode: MacosOpenMode,
@@ -1046,10 +1047,18 @@ impl MacTerminalAdapter for Adapter {
         super::open_with(
             deadline,
             |startup_deadline| {
-                create_tab_with_mode(mode == MacosOpenMode::NewWindow, startup_deadline)
+                create_with_runner(
+                    &mut *self.runner(),
+                    mode == MacosOpenMode::NewWindow,
+                    startup_deadline,
+                )
             },
-            |session, deadline| start_session(session, command, directory, deadline),
-            |session, deadline| close_session_until(session, deadline).map(|_| ()),
+            |session, deadline| {
+                start_bound(&mut *self.runner(), session, command, directory, deadline)
+            },
+            |session, deadline| {
+                close_with_runner(&mut *self.runner(), session, deadline).map(|_| ())
+            },
             bind,
             unbind,
         )
@@ -1060,7 +1069,7 @@ impl MacTerminalAdapter for Adapter {
         prompt_path: &Path,
         deadline: Instant,
     ) -> TerminalSendResult {
-        send_file(session, prompt_path, deadline)
+        send_file_with_runner(&mut *self.runner(), session, prompt_path, deadline)
     }
     fn verify_surface(
         &self,
@@ -1068,7 +1077,7 @@ impl MacTerminalAdapter for Adapter {
         session: &TerminalSession,
         timeout: Option<Duration>,
     ) -> Result<Option<String>> {
-        verify_surface(session, timeout).map(|()| None)
+        verify_surface_with_runner(&mut *self.runner(), session, timeout).map(|()| None)
     }
     fn surface_present(
         &self,
@@ -1076,26 +1085,16 @@ impl MacTerminalAdapter for Adapter {
         session: &TerminalSession,
         timeout: Duration,
     ) -> Result<bool> {
-        surface_present(session, timeout)
+        surface_present_with_runner(&mut *self.runner(), session, timeout)
     }
-    fn read_screen(&self, _session: &TerminalSession, _deadline: Instant) -> Result<String> {
-        bail!("managed dialog input unsupported for this terminal")
-    }
-    fn guarded_dialog_input(
-        &self,
-        _session: &TerminalSession,
-        _input: &GuardedDialogInput,
-        _deadline: Instant,
-    ) -> Result<bool> {
-        bail!("managed dialog input unsupported for this terminal")
-    }
+    // Screen reads and guarded dialog input are declared unsupported in the registration.
     fn close_session_until(
         &self,
         _directory: &Path,
         session: &TerminalSession,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
-        close_session_until(session, deadline)
+        close_with_runner(&mut *self.runner(), session, deadline)
     }
     fn close_owned_session(
         &self,
@@ -1108,7 +1107,7 @@ impl MacTerminalAdapter for Adapter {
         if close == OwnedSurfaceClose::LiveOwner {
             close_remaining(deadline)?;
         }
-        close_session_until(session, deadline)
+        close_with_runner(&mut *self.runner(), session, deadline)
     }
 }
 #[cfg(test)]
@@ -1283,7 +1282,8 @@ mod tests {
             window_id: "w1".into(),
             terminal_id: "u2".into(),
         });
-        let error = send_file(
+        let error = send_file_with_runner(
+            &mut Installed,
             &surface,
             Path::new("/prompt"),
             Instant::now() - Duration::from_secs(1),

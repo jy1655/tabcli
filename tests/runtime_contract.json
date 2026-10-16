@@ -324,7 +324,7 @@
     "const BOOTSTRAP_FILE: &str = \"terminal-start.sh\";": 1,
     "terminal-start.sh": 1,
     "{HOST_COMMAND}": 1,
-    "use crate::native::terminal::facts::apple_terminal::HOST_COMMAND;": 1
+    "const HOST_COMMAND: &str = TerminalKind::AppleTerminal.registration().host_command;": 1
   },
   "src/native/terminal/macos/ghostty.rs": {
     "const HOST_FRAME: &str = \"agent-bridge-ghostty-host:\";": 1,
@@ -335,13 +335,13 @@
     "\"missing\"": 12,
     "\"closed\"": 1,
     "{HOST_COMMAND}": 1,
-    "use crate::native::terminal::facts::ghostty::HOST_COMMAND;": 1
+    "const HOST_COMMAND: &str = TerminalKind::Ghostty.registration().host_command;": 1
   },
   "src/native/terminal/macos/iterm2.rs": {
     "AB_SCREEN_BEGIN": 1,
     "AB_SCREEN_END": 1,
     "{HOST_COMMAND}": 1,
-    "use crate::native::terminal::facts::iterm2::HOST_COMMAND;": 1
+    "const HOST_COMMAND: &str = TerminalKind::Iterm2.registration().host_command;": 1
   },
   "src/native/terminal/macos/ownership.rs": {
     "native-session": 6
@@ -366,16 +366,16 @@
     "let offer_title = format!(\"agent-bridge-offer-{attempt}\");": 1,
     "let bound_title = format!(\"agent-bridge-{attempt}\");": 1,
     "{HOST_COMMAND}": 1,
-    "use crate::native::terminal::facts::warp::HOST_COMMAND;": 1
+    "const HOST_COMMAND: &str = TerminalKind::Warp.registration().host_command;": 1
   },
   "src/native/terminal/macos/wezterm.rs": {
     "gui-sock-": 3,
     "/dev/ttys": 1,
     "WEZTERM_": 6,
     "{HOST_COMMAND}": 1,
-    "use crate::native::terminal::facts::wezterm::HOST_COMMAND;": 1
+    "const HOST_COMMAND: &str = TerminalKind::WezTerm.registration().host_command;": 1
   },
-  "src/native/terminal/mod.rs": {
+  "src/native/terminal/windows/budget.rs": {
     "console process is no longer available": 2,
     "Windows console submission delays do not fit inside the remaining turn timeout": 3
   },
@@ -411,45 +411,45 @@
     "console-host.json": 2,
     "native-console-host": 1,
     "{HOST_COMMAND}": 1,
-    "use crate::native::terminal::facts::windows::HOST_COMMAND;": 1
+    "const HOST_COMMAND: &str = TerminalKind::WindowsConsole.registration().host_command;": 1
   },
   "src/native/terminal/windows/facts.rs": {
-    "pub(in crate::native) const HOST_COMMAND: &str = \"native-console-host\";": 1,
+    "host_command: \"native-console-host\",": 1,
     "native-console-host": 1
   },
   "src/native/terminal/macos/iterm2/facts.rs": {
-    "pub(in crate::native) const HOST_COMMAND: &str = \"native-iterm2-host\";": 1,
+    "host_command: \"native-iterm2-host\",": 1,
     "native-iterm2-host": 1
   },
   "src/native/terminal/macos/apple_terminal/facts.rs": {
-    "pub(in crate::native) const HOST_COMMAND: &str = \"native-terminal-host\";": 1,
+    "host_command: \"native-terminal-host\",": 1,
     "native-terminal-host": 1
   },
   "src/native/terminal/macos/wezterm/facts.rs": {
-    "pub(in crate::native) const HOST_COMMAND: &str = \"native-wezterm-host\";": 1,
+    "host_command: \"native-wezterm-host\",": 1,
     "native-wezterm-host": 1
   },
   "src/native/terminal/macos/ghostty/facts.rs": {
-    "pub(in crate::native) const HOST_COMMAND: &str = \"native-ghostty-host\";": 1,
+    "host_command: \"native-ghostty-host\",": 1,
     "native-ghostty-host": 1
   },
   "src/native/terminal/macos/warp/facts.rs": {
-    "pub(in crate::native) const HOST_COMMAND: &str = \"native-warp-host\";": 1,
+    "host_command: \"native-warp-host\",": 1,
     "native-warp-host": 1
   },
   "src/native/terminal/host.rs": {
-    "use super::facts::windows::HOST_COMMAND as CONSOLE_HOST_COMMAND;": 1,
-    "CONSOLE_HOST_COMMAND =>": 1,
-    "use super::facts::iterm2::HOST_COMMAND as ITERM2_HOST_COMMAND;": 1,
-    "ITERM2_HOST_COMMAND =>": 1,
-    "use super::facts::apple_terminal::HOST_COMMAND as APPLE_TERMINAL_HOST_COMMAND;": 1,
-    "APPLE_TERMINAL_HOST_COMMAND =>": 1,
-    "use super::facts::wezterm::HOST_COMMAND as WEZTERM_HOST_COMMAND;": 1,
-    "WEZTERM_HOST_COMMAND =>": 1,
-    "use super::facts::ghostty::HOST_COMMAND as GHOSTTY_HOST_COMMAND;": 1,
-    "GHOSTTY_HOST_COMMAND =>": 1,
-    "use super::facts::warp::HOST_COMMAND as WARP_HOST_COMMAND;": 1,
-    "WARP_HOST_COMMAND =>": 1,
+    "pub(in crate::native) const CONSOLE_HOST_COMMAND: &str =": 1,
+    "TerminalKind::WindowsConsole.registration().host_command;": 1,
+    "pub(in crate::native) const ITERM2_HOST_COMMAND: &str =": 1,
+    "TerminalKind::Iterm2.registration().host_command;": 1,
+    "pub(in crate::native) const APPLE_TERMINAL_HOST_COMMAND: &str =": 1,
+    "TerminalKind::AppleTerminal.registration().host_command;": 1,
+    "pub(in crate::native) const WEZTERM_HOST_COMMAND: &str =": 1,
+    "TerminalKind::WezTerm.registration().host_command;": 1,
+    "pub(in crate::native) const GHOSTTY_HOST_COMMAND: &str =": 1,
+    "TerminalKind::Ghostty.registration().host_command;": 1,
+    "pub(in crate::native) const WARP_HOST_COMMAND: &str =": 1,
+    "TerminalKind::Warp.registration().host_command;": 1,
     "{GHOSTTY_HOST_COMMAND} takes no argument": 1,
     "{WARP_HOST_COMMAND} requires a session directory and attempt token": 1,
     "{WARP_HOST_COMMAND} requires a session directory\"": 1,

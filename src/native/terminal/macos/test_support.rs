@@ -1,12 +1,72 @@
+use super::{MacTerminalAdapter, OwnedSurfaceClose};
+use crate::native::settings::MacosOpenMode;
+use crate::native::terminal::{CloseOutcome, TerminalSendResult, TerminalSession};
 use crate::native::{
     launch,
     session::{SessionState, Store, turn},
     set_private_directory_permissions, update_status,
 };
+use anyhow::Result;
 use std::{
     path::Path,
     time::{Duration, Instant},
 };
+
+/// The adapter of a kind a dispatch test does not exercise: reaching it is the
+/// test's failure, named by the kind.
+pub(in crate::native::terminal) struct Unused(pub(in crate::native::terminal) &'static str);
+
+impl Unused {
+    fn reached(&self, operation: &str) -> ! {
+        panic!("{} adapter is not under test: {operation}", self.0)
+    }
+}
+
+impl MacTerminalAdapter for Unused {
+    fn open_bound_tab(
+        &self,
+        _: MacosOpenMode,
+        _: &str,
+        _: &Path,
+        _: Instant,
+        _: super::BindSurface<'_>,
+        _: Box<dyn FnOnce() -> Result<()> + '_>,
+    ) -> Result<TerminalSession> {
+        self.reached("open_bound_tab")
+    }
+    fn send_file(&self, _: &TerminalSession, _: &Path, _: Instant) -> TerminalSendResult {
+        self.reached("send_file")
+    }
+    fn verify_surface(
+        &self,
+        _: &Path,
+        _: &TerminalSession,
+        _: Option<Duration>,
+    ) -> Result<Option<String>> {
+        self.reached("verify_surface")
+    }
+    fn surface_present(&self, _: &Path, _: &TerminalSession, _: Duration) -> Result<bool> {
+        self.reached("surface_present")
+    }
+    fn close_session_until(
+        &self,
+        _: &Path,
+        _: &TerminalSession,
+        _: Instant,
+    ) -> Result<CloseOutcome> {
+        self.reached("close_session_until")
+    }
+    fn close_owned_session(
+        &self,
+        _: &Path,
+        _: &str,
+        _: &TerminalSession,
+        _: OwnedSurfaceClose,
+        _: Instant,
+    ) -> Result<CloseOutcome> {
+        self.reached("close_owned_session")
+    }
+}
 
 pub(super) fn launch_fixture(prefix: &str, timeout: Duration, parent: &Path) -> tempfile::TempDir {
     let directory = tempfile::Builder::new()

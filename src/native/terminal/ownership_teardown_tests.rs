@@ -717,42 +717,47 @@ fn close_deadline_after_signal_eperm_does_not_prove_exit() {
 
 #[test]
 fn terminal_owner_second_verification_uses_close_deadline() {
-    use std::rc::Rc;
+    use crate::native::terminal::macos::automation_testing::{Method, Replay, Reply};
     let (dir, _, surface, _) = fixture(terminal::TerminalKind::AppleTerminal);
-    let calls = Rc::new(Cell::new(0));
-    let observed_calls = Rc::clone(&calls);
     let deadline = Instant::now() + Duration::from_secs(60);
-    let tty = surface.id.clone();
-    let result = terminal::macos::automation_testing::with_runner(
-        move |until| {
-            let until = until.expect("every close verification must use bounded automation");
-            observed_calls.set(observed_calls.get() + 1);
-            if observed_calls.get() == 1 {
-                Ok(tty.clone())
-            } else {
-                assert_eq!(until, deadline);
-                bail!("Terminal.app did not answer before the deadline")
-            }
-        },
-        || {
-            // The first authority proof answers; the second verification stalls.
-            terminal::verify_macos_surface(
-                dir.path(),
-                &surface,
-                Some(crate::native::session::close::budget::close_remaining(
-                    deadline,
-                )?),
-            )?;
-            terminal::macos::apple_terminal::close_evidence::terminate_owner(
-                dir.path(),
-                "session-owner123",
-                &surface,
+    // The first authority proof answers; the second verification stalls. Both run
+    // through the one automation of the closing adapter.
+    let automation = Replay::new([
+        Reply::Normal(Ok(surface.id.clone())),
+        Reply::Normal(Err(anyhow::anyhow!(
+            "Terminal.app did not answer before the deadline"
+        ))),
+    ]);
+    let dispatch = terminal::macos::apple_terminal_dispatch(automation.clone());
+    let result = (|| {
+        terminal::macos::verify_surface(
+            &dispatch,
+            dir.path(),
+            &surface,
+            Some(crate::native::session::close::budget::close_remaining(
                 deadline,
-            )
-        },
-    );
+            )?),
+        )?;
+        terminal::macos::apple_terminal::close_evidence::terminate_owner(
+            &automation,
+            dir.path(),
+            "session-owner123",
+            &surface,
+            deadline,
+        )
+    })();
     assert!(format!("{:#}", result.unwrap_err()).contains("deadline"));
-    assert_eq!(calls.get(), 2);
+    let calls = automation.calls();
+    assert_eq!(calls.len(), 2);
+    for call in &calls {
+        assert_eq!(
+            call.method,
+            Method::RunUntil,
+            "every close verification must use bounded automation"
+        );
+    }
+    assert_eq!(calls[1].deadline, Some(deadline));
+    automation.assert_finished();
     let store = Store::open_unchecked(dir.path());
     assert!(store.record(CoreRecord::Terminal).path().exists());
     assert!(

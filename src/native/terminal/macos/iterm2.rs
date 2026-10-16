@@ -3,7 +3,6 @@ use super::applescript::{Automation, Osascript};
 use super::{DialogKey, GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
 use crate::native::session::Reader;
 use crate::native::session::close::budget::close_remaining;
-use crate::native::terminal::facts::iterm2::HOST_COMMAND;
 #[cfg(test)]
 use crate::native::terminal::ownership;
 use std::{
@@ -17,6 +16,11 @@ use super::{
     CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession,
     applescript, applescript::close_response,
 };
+
+use crate::native::launch::BindingFacts;
+
+const HOST_COMMAND: &str = TerminalKind::Iterm2.registration().host_command;
+const BINDING: &BindingFacts = TerminalKind::Iterm2.registration().binding();
 
 // Restore a new tab's prior selection, or a new window's foreground after asynchronous activation.
 // Never override user selection; see docs/verification/2026-10-03-v0.1.0-focus.md.
@@ -361,7 +365,6 @@ fn iterm_argument(value: &str) -> String {
 // Failure or timeout never falls back to typed shell input.
 pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
     use super::bound_host::{BoundHostSpec, run_bound_host};
-    use crate::native::terminal::facts::iterm2::BINDING;
     run_bound_host(
         directory,
         &BoundHostSpec {
@@ -385,8 +388,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
 
 fn wait_for_binding(directory: &Path, id: &str, iterm_id: &str) -> Result<()> {
     use crate::native::launch::wait_for_binding;
-    use crate::native::terminal::facts::iterm2::BINDING;
-    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, &BINDING)?;
+    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING)?;
     if surface.kind != TerminalKind::Iterm2 || surface.id != iterm_id {
         bail!("iTerm2 surface binding does not match this launch host");
     }
@@ -450,9 +452,15 @@ fn close_session_until(
 pub(super) struct Adapter<R: Automation> {
     automation: R,
 }
-pub(super) static ADAPTER: Adapter<Osascript> = Adapter {
-    automation: Osascript,
-};
+pub(super) type InstalledAdapter = Adapter<Osascript>;
+impl Adapter<Osascript> {
+    /// The adapter over the installed `osascript`.
+    pub(super) const fn installed() -> Self {
+        Self {
+            automation: Osascript,
+        }
+    }
+}
 #[cfg(test)]
 pub(super) fn with_automation<R: Automation>(automation: R) -> Adapter<R> {
     Adapter { automation }

@@ -2,7 +2,6 @@ use super::OwnedSurfaceClose;
 use super::applescript::{Automation, Osascript};
 use super::{DialogKey, GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
 use crate::native::session::close::budget::close_remaining;
-use crate::native::terminal::facts::apple_terminal::HOST_COMMAND;
 pub(in crate::native) mod close_evidence;
 
 use super::process;
@@ -27,6 +26,11 @@ use super::{
     CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession,
     applescript, applescript::close_response,
 };
+
+use crate::native::launch::BindingFacts;
+
+const HOST_COMMAND: &str = TerminalKind::AppleTerminal.registration().host_command;
+const BINDING: &BindingFacts = TerminalKind::AppleTerminal.registration().binding();
 
 // Bind only one new window with the returned tty; restore only visible windows.
 // Start with line-kill plus the whole bootstrap; see docs/verification/2026-10-03-v0.1.0-focus.md.
@@ -288,7 +292,6 @@ fn install_bootstrap(directory: &Path, host: &str, command: &str) -> Result<Stri
 // A failed, closed or timed-out launch must start nothing.
 pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
     use super::bound_host::{BoundHostSpec, run_bound_host};
-    use crate::native::terminal::facts::apple_terminal::BINDING;
     run_bound_host(
         directory,
         &BoundHostSpec {
@@ -320,8 +323,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
 
 fn wait_for_binding(directory: &Path, id: &str, tty: &str) -> Result<()> {
     use crate::native::launch::wait_for_binding;
-    use crate::native::terminal::facts::apple_terminal::BINDING;
-    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, &BINDING)?;
+    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING)?;
     if surface.kind != TerminalKind::AppleTerminal
         || surface.id != tty
         || surface.window_id.as_deref().is_none_or(str::is_empty)
@@ -517,8 +519,11 @@ fn ownership_proof(session: &TerminalSession) -> Result<&str> {
         .context("Terminal.app session record is missing its window id")
 }
 
+// The second verification of a close, through the automation of the adapter that
+// closes, so a test's recording automation sees every call of the close.
 #[cfg(target_os = "macos")]
-pub(in crate::native) fn verified_close_tty(
+pub(in crate::native::terminal) fn verified_close_tty(
+    automation: &dyn Automation,
     session: &terminal::TerminalSession,
     deadline: Instant,
 ) -> Result<String> {
@@ -526,7 +531,7 @@ pub(in crate::native) fn verified_close_tty(
         bail!("Terminal.app ownership proof received a different terminal kind")
     }
     crate::native::session::close::budget::close_remaining(deadline)?;
-    ADAPTER.verify_tab_with_deadline(session, Some(deadline))
+    verify_tab_with_deadline(automation, session, Some(deadline))
 }
 
 // Without a recorded app incarnation, attest the live owner and persist its incarnation
@@ -797,16 +802,36 @@ type Start = fn(&TerminalSession, Instant) -> Result<()>;
 type Absence = fn(&Path, &TerminalSession, Instant) -> Result<bool>;
 pub(super) struct Adapter<S, A, R: Automation> {
     automation: R,
-    pub(super) start: S,
+    start: S,
     absent: A,
 }
-pub(super) static ADAPTER: Adapter<Start, Absence, Osascript> = Adapter {
-    automation: Osascript,
-    // Terminal.app typed its start when it created the tab, and the start
-    // waits for the same binding. Nothing is typed after the creation.
-    start: |_, _| Ok(()),
-    absent: apple_terminal_startup_absent,
-};
+// Terminal.app typed its start when it created the tab, and the start waits for the
+// same binding. Nothing is typed after the creation.
+pub(super) fn started_at_creation(_: &TerminalSession, _: Instant) -> Result<()> {
+    Ok(())
+}
+pub(super) type InstalledAdapter = Adapter<Start, Absence, Osascript>;
+impl Adapter<Start, Absence, Osascript> {
+    /// The adapter over the installed `osascript` with the production start and
+    /// startup-absence observations.
+    pub(super) const fn installed() -> Self {
+        Self {
+            automation: Osascript,
+            start: started_at_creation,
+            absent: apple_terminal_startup_absent,
+        }
+    }
+}
+// The production observations over a test automation: for operations on an existing
+// surface, which never start or clean up.
+#[cfg(test)]
+pub(super) fn with_automation<R: Automation>(automation: R) -> Adapter<Start, Absence, R> {
+    Adapter {
+        automation,
+        start: started_at_creation,
+        absent: apple_terminal_startup_absent,
+    }
+}
 #[cfg(test)]
 pub(super) fn with_observations<'a, S, A, R: Automation>(
     start: &'a S,
@@ -874,15 +899,6 @@ on guardedAnswer(w, wantedTty, targetTab, expectedScreen, keyName)
     return "sent"
 end guardedAnswer
 "#;
-impl<S, A, R: Automation> Adapter<S, A, R> {
-    fn verify_tab_with_deadline(
-        &self,
-        session: &TerminalSession,
-        deadline: Option<Instant>,
-    ) -> Result<String> {
-        verify_tab_with_deadline(&self.automation, session, deadline)
-    }
-}
 impl<S, A, R: Automation> MacTerminalAdapter for Adapter<S, A, R>
 where
     S: Fn(&TerminalSession, Instant) -> Result<()>,
@@ -1026,7 +1042,7 @@ where
     ) -> Result<CloseOutcome> {
         if close == OwnedSurfaceClose::LiveOwner {
             close_remaining(deadline)?;
-            close_evidence::terminate_owner(directory, id, session, deadline)?;
+            close_evidence::terminate_owner(&self.automation, directory, id, session, deadline)?;
         }
         close_owned_session(&self.automation, directory, session, deadline)
     }
@@ -1069,7 +1085,8 @@ mod tests {
         let absent = |_: &Path, _: &TerminalSession, _: Instant| -> anyhow::Result<bool> {
             panic!("successful open must not clean up")
         };
-        let adapter = super::with_observations(&super::ADAPTER.start, &absent, replay.clone());
+        let adapter =
+            super::with_observations(&super::started_at_creation, &absent, replay.clone());
         // The adapter's open installs the bootstrap itself (create-new); the expected
         // start argument is derived from the path without writing the file first.
         let bootstrap_path = directory.path().join(super::BOOTSTRAP_FILE);
@@ -1200,7 +1217,8 @@ mod tests {
                 _ => Ok(response.into()),
             };
             let replay = Replay::new([Reply::Send(reply)]);
-            let adapter = super::with_observations(&super::ADAPTER.start, &absent, replay.clone());
+            let adapter =
+                super::with_observations(&super::started_at_creation, &absent, replay.clone());
             let result = adapter.send_file(&session, Path::new("/tmp/prompt"), deadline);
             match response {
                 "sent" => result.unwrap(),

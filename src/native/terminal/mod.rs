@@ -13,15 +13,7 @@ pub(in crate::native) enum ConsoleNewline {
 }
 
 pub(super) const fn facts(kind: TerminalKind) -> facts::SurfaceFacts {
-    use facts::{apple_terminal, ghostty, iterm2, warp, wezterm, windows};
-    match kind {
-        TerminalKind::Iterm2 => iterm2::FACTS,
-        TerminalKind::AppleTerminal => apple_terminal::FACTS,
-        TerminalKind::Ghostty => ghostty::FACTS,
-        TerminalKind::Warp => warp::FACTS,
-        TerminalKind::WezTerm => wezterm::FACTS,
-        TerminalKind::WindowsConsole => windows::FACTS,
-    }
+    kind.registration().facts
 }
 
 pub(super) fn surface_outlives_owner(session: &TerminalSession) -> bool {
@@ -53,6 +45,15 @@ mod unsupported;
 #[cfg(target_os = "windows")]
 mod windows;
 
+// Platform-only pure decisions live beside their platform module and compile on every
+// target, so that their tests run on every target; the platform modules remain gated.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+#[path = "macos/selection.rs"]
+mod macos_selection;
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[path = "windows/budget.rs"]
+mod windows_budget;
+
 #[cfg(target_os = "linux")]
 use linux as platform;
 #[cfg(target_os = "macos")]
@@ -75,6 +76,16 @@ pub(crate) enum TerminalKind {
 }
 
 impl TerminalKind {
+    /// Every kind, in declaration order.
+    pub(in crate::native) const ALL: [Self; 6] = [
+        Self::Iterm2,
+        Self::AppleTerminal,
+        Self::Ghostty,
+        Self::Warp,
+        Self::WezTerm,
+        Self::WindowsConsole,
+    ];
+
     pub(super) const fn supported_on_this_platform(self) -> bool {
         match self {
             Self::Iterm2 | Self::AppleTerminal | Self::Ghostty | Self::Warp | Self::WezTerm => {
@@ -283,42 +294,6 @@ impl TerminalSendFailure {
 
 pub(super) type TerminalSendResult = std::result::Result<(), TerminalSendFailure>;
 
-#[cfg(any(windows, test))]
-fn windows_console_helper_reports_missing(message: &str) -> bool {
-    matches!(
-        message.trim(),
-        "console process is no longer available" | "Error: console process is no longer available"
-    )
-}
-
-#[cfg(any(windows, test))]
-fn windows_console_helper_reports_send_not_started(message: &str) -> bool {
-    matches!(
-        message.trim(),
-        "Windows console submission delays do not fit inside the remaining turn timeout"
-            | "Error: Windows console submission delays do not fit inside the remaining turn timeout"
-    )
-}
-
-#[cfg(any(windows, test))]
-fn windows_console_extra_submit_delay() -> std::time::Duration {
-    std::time::Duration::from_secs(2)
-}
-
-#[cfg(any(windows, test))]
-fn windows_console_immediate_submit_count(submit_count: usize) -> usize {
-    usize::from(submit_count == 1)
-}
-
-#[cfg(any(windows, test))]
-fn windows_console_submit_delays_fit(submit_count: usize, budget: std::time::Duration) -> bool {
-    let delayed = submit_count.saturating_sub(windows_console_immediate_submit_count(submit_count));
-    u32::try_from(delayed)
-        .ok()
-        .and_then(|count| windows_console_extra_submit_delay().checked_mul(count))
-        .is_some_and(|required| required < budget)
-}
-
 pub(super) fn select(preferred: Option<TerminalKind>) -> Result<TerminalKind> {
     platform::select(preferred)
 }
@@ -343,7 +318,15 @@ where
     }
     #[cfg(target_os = "macos")]
     {
-        macos::open_bound_tab(kind, command, directory, deadline, bind, unbind)
+        macos::open_bound_tab(
+            macos::INSTALLED,
+            kind,
+            command,
+            directory,
+            deadline,
+            bind,
+            unbind,
+        )
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
@@ -421,7 +404,7 @@ pub(super) fn send_file(
     }
     #[cfg(target_os = "macos")]
     {
-        macos::send_file(session, prompt_path, deadline)
+        macos::send_file(macos::INSTALLED, session, prompt_path, deadline)
     }
     #[cfg(not(any(windows, target_os = "macos")))]
     {
@@ -446,7 +429,7 @@ pub(super) struct GuardedDialogInput {
 
 pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Result<String> {
     #[cfg(target_os = "macos")]
-    return macos::read_screen(session, deadline);
+    return macos::read_screen(macos::INSTALLED, session, deadline);
     #[cfg(windows)]
     return windows::read_screen(session, deadline);
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -469,7 +452,7 @@ pub(super) fn guarded_dialog_input(
     #[cfg(target_os = "macos")]
     {
         let _ = directory;
-        macos::guarded_dialog_input(session, input, deadline)
+        macos::guarded_dialog_input(macos::INSTALLED, session, input, deadline)
     }
     #[cfg(windows)]
     return windows::guarded_dialog_input(directory, session, input, deadline);
@@ -480,24 +463,13 @@ pub(super) fn guarded_dialog_input(
     }
 }
 
-#[cfg(any(windows, test))]
-pub(super) fn remaining_send_budget_at(
-    deadline: Instant,
-    now: Instant,
-) -> Result<std::time::Duration> {
-    match deadline.checked_duration_since(now) {
-        Some(remaining) if !remaining.is_zero() => Ok(remaining),
-        _ => bail!("terminal send deadline is exhausted"),
-    }
-}
-
 #[cfg(target_os = "macos")]
 pub(super) fn verify_macos_surface(
     directory: &Path,
     session: &TerminalSession,
     timeout: Option<std::time::Duration>,
 ) -> Result<Option<String>> {
-    macos::verify_surface(directory, session, timeout)
+    macos::verify_surface(macos::INSTALLED, directory, session, timeout)
 }
 
 pub(super) fn close_session_until(
@@ -506,7 +478,14 @@ pub(super) fn close_session_until(
     deadline: Instant,
 ) -> Result<CloseOutcome> {
     crate::native::session::close::budget::close_remaining(deadline)?;
-    platform::close_session_until(directory, session, deadline)
+    #[cfg(target_os = "macos")]
+    {
+        macos::close_session_until(macos::INSTALLED, directory, session, deadline)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        platform::close_session_until(directory, session, deadline)
+    }
 }
 
 /// Read-only presence check. Unlike control authorization, absence and an inspection
@@ -518,7 +497,7 @@ pub(super) fn surface_present(
 ) -> Result<bool> {
     #[cfg(target_os = "macos")]
     {
-        macos::surface_present(directory, session, timeout)
+        macos::surface_present(macos::INSTALLED, directory, session, timeout)
     }
     #[cfg(windows)]
     {
@@ -594,56 +573,6 @@ pub(super) fn verify_windows_process_identity(
     windows::verify_process_identity(pid, identity.creation_time, &identity.executable_path)
 }
 
-#[cfg(any(target_os = "macos", test))]
-pub(super) fn classify_macos_terminal(
-    term_program: Option<&str>,
-    term: Option<&str>,
-    has_iterm_session_id: bool,
-    has_term_session_id: bool,
-) -> Option<TerminalKind> {
-    if let Some(value) = term_program {
-        return match value.to_ascii_lowercase().as_str() {
-            "ghostty" => Some(TerminalKind::Ghostty),
-            "warpterminal" | "warp" => Some(TerminalKind::Warp),
-            // WezTerm sets TERM_PROGRAM=WezTerm for every program it starts
-            // (config/src/config.rs, `apply_cmd_defaults`).
-            "wezterm" => Some(TerminalKind::WezTerm),
-            "iterm" | "iterm.app" | "iterm2" => Some(TerminalKind::Iterm2),
-            "apple_terminal" | "terminal" | "terminal.app" => Some(TerminalKind::AppleTerminal),
-            _ => None,
-        };
-    }
-    if term.is_some_and(|value| value.eq_ignore_ascii_case("xterm-ghostty")) {
-        return Some(TerminalKind::Ghostty);
-    }
-    if has_iterm_session_id {
-        return Some(TerminalKind::Iterm2);
-    }
-    has_term_session_id.then_some(TerminalKind::AppleTerminal)
-}
-
-#[cfg(any(target_os = "macos", test))]
-pub(super) fn select_macos_terminal(
-    preferred: Option<TerminalKind>,
-    term_program: Option<&str>,
-    term: Option<&str>,
-    has_iterm_session_id: bool,
-    has_term_session_id: bool,
-) -> TerminalKind {
-    if let Some(preferred) = preferred {
-        return preferred;
-    }
-    match classify_macos_terminal(
-        term_program,
-        term,
-        has_iterm_session_id,
-        has_term_session_id,
-    ) {
-        None => TerminalKind::AppleTerminal,
-        Some(kind) => kind,
-    }
-}
-
 #[cfg(unix)]
 pub(in crate::native) fn shell_quote(value: &std::ffi::OsStr) -> String {
     let value = value.to_string_lossy();
@@ -657,7 +586,12 @@ pub(super) fn validate_terminal_send_budget(
 ) -> Result<()> {
     #[cfg(windows)]
     {
-        validate_terminal_send_budget_for_platform(submit_count, terminal_kind, timeout, true)
+        windows_budget::validate_terminal_send_budget_for_platform(
+            submit_count,
+            terminal_kind,
+            timeout,
+            true,
+        )
     }
     #[cfg(not(windows))]
     {
@@ -666,117 +600,13 @@ pub(super) fn validate_terminal_send_budget(
     }
 }
 
-#[cfg(any(windows, test))]
-pub(super) fn validate_terminal_send_budget_for_platform(
-    submit_count: usize,
-    terminal_kind: TerminalKind,
-    timeout: Duration,
-    windows: bool,
-) -> Result<()> {
-    if windows
-        && terminal_kind == TerminalKind::WindowsConsole
-        && !windows_console_submit_delays_fit(submit_count, timeout)
-    {
-        anyhow::bail!(
-            "Windows console submission delays do not fit inside the remaining turn timeout"
-        )
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn windows_console_access_denied_is_not_a_missing_surface() {
-        assert!(super::windows_console_helper_reports_missing(
-            "Error: console process is no longer available"
-        ));
-        assert!(!super::windows_console_helper_reports_missing(
-            "Error: console process is no longer available: Access is denied. (os error 5)"
-        ));
-    }
-
-    #[test]
-    fn windows_console_extra_submit_waits_for_paste_confirmation() {
-        assert_eq!(
-            super::windows_console_extra_submit_delay(),
-            Duration::from_secs(2)
-        );
-    }
-
-    #[test]
-    fn windows_console_separates_codex_paste_confirmation_from_the_text_batch() {
-        assert_eq!(super::windows_console_immediate_submit_count(1), 1);
-        assert_eq!(super::windows_console_immediate_submit_count(2), 0);
-    }
-
-    #[test]
-    fn windows_console_rejects_a_submit_plan_that_cannot_fit_the_remaining_budget() {
-        assert!(!super::windows_console_submit_delays_fit(
-            2,
-            Duration::from_secs(4)
-        ));
-        assert!(super::windows_console_submit_delays_fit(
-            2,
-            Duration::from_secs(5)
-        ));
-        assert!(super::windows_console_submit_delays_fit(
-            1,
-            Duration::from_millis(1)
-        ));
-    }
-
-    use super::validate_terminal_send_budget_for_platform;
-    use std::time::Duration;
-    #[test]
-    fn terminal_delivery_preflight_rejects_only_the_unstarted_windows_submit_plan() {
-        assert!(
-            validate_terminal_send_budget_for_platform(
-                2,
-                TerminalKind::WindowsConsole,
-                Duration::from_secs(4),
-                true,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_terminal_send_budget_for_platform(
-                2,
-                TerminalKind::WindowsConsole,
-                Duration::from_secs(5),
-                true,
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_terminal_send_budget_for_platform(
-                1,
-                TerminalKind::WindowsConsole,
-                Duration::from_millis(1),
-                true,
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_terminal_send_budget_for_platform(
-                2,
-                TerminalKind::Iterm2,
-                Duration::from_millis(1),
-                false,
-            )
-            .is_ok()
-        );
-    }
-
     use std::str::FromStr;
 
     #[cfg(target_os = "macos")]
     use super::macos;
-    use super::{
-        TerminalKind, TerminalSendFailure, TerminalSession, bind_surface_before_start,
-        classify_macos_terminal, select_macos_terminal,
-        windows_console_helper_reports_send_not_started,
-    };
+    use super::{TerminalKind, TerminalSendFailure, TerminalSession, bind_surface_before_start};
     use anyhow::bail;
 
     #[test]
@@ -832,188 +662,6 @@ mod tests {
             managed_session_id: None,
             wezterm_mux: None,
             windows_process_identity: None,
-        }
-    }
-
-    #[test]
-    fn windows_helper_budget_rejection_proves_send_never_started() {
-        assert!(windows_console_helper_reports_send_not_started(
-            "Error: Windows console submission delays do not fit inside the remaining turn timeout"
-        ));
-        assert!(!windows_console_helper_reports_send_not_started(
-            "Error: Windows console control helper timed out"
-        ));
-    }
-
-    #[test]
-    fn macos_terminal_detection_recognizes_each_supported_host() {
-        assert_eq!(
-            classify_macos_terminal(Some("ghostty"), Some("xterm-ghostty"), false, true),
-            Some(TerminalKind::Ghostty)
-        );
-        assert_eq!(
-            classify_macos_terminal(Some("iTerm.app"), Some("xterm-256color"), true, true),
-            Some(TerminalKind::Iterm2)
-        );
-        assert_eq!(
-            classify_macos_terminal(Some("Apple_Terminal"), Some("xterm-256color"), false, true),
-            Some(TerminalKind::AppleTerminal)
-        );
-        assert_eq!(
-            classify_macos_terminal(Some("WarpTerminal"), Some("xterm-256color"), false, true),
-            Some(TerminalKind::Warp)
-        );
-        assert_eq!(
-            classify_macos_terminal(Some("WezTerm"), Some("xterm-256color"), false, false),
-            Some(TerminalKind::WezTerm)
-        );
-        assert_eq!(
-            classify_macos_terminal(Some("vscode"), Some("xterm-256color"), false, false),
-            None
-        );
-        assert_eq!(
-            classify_macos_terminal(Some("vscode"), Some("xterm-ghostty"), false, true),
-            None
-        );
-    }
-
-    #[test]
-    fn macos_terminal_selection_honors_explicit_choice_and_falls_back_safely() {
-        assert_eq!(
-            select_macos_terminal(
-                Some(TerminalKind::Ghostty),
-                Some("Apple_Terminal"),
-                Some("xterm-256color"),
-                false,
-                true,
-            ),
-            TerminalKind::Ghostty
-        );
-        assert_eq!(
-            select_macos_terminal(None, Some("vscode"), Some("xterm-256color"), false, false,),
-            TerminalKind::AppleTerminal
-        );
-        assert_eq!(
-            select_macos_terminal(None, None, None, false, false),
-            TerminalKind::AppleTerminal
-        );
-        assert_eq!(
-            select_macos_terminal(None, Some("ghostty"), Some("xterm-ghostty"), false, false,),
-            TerminalKind::Ghostty
-        );
-        assert_eq!(
-            select_macos_terminal(
-                None,
-                Some("WarpTerminal"),
-                Some("xterm-256color"),
-                false,
-                false,
-            ),
-            TerminalKind::Warp
-        );
-    }
-
-    #[test]
-    fn ghostty_host_routes_to_its_native_adapter_without_terminal_fallback() {
-        assert_eq!(
-            select_macos_terminal(None, Some("ghostty"), Some("xterm-ghostty"), false, false),
-            TerminalKind::Ghostty
-        );
-        assert_eq!(
-            TerminalKind::Ghostty.supported_on_this_platform(),
-            cfg!(target_os = "macos")
-        );
-    }
-
-    #[test]
-    fn explicit_warp_target_is_independent_of_the_invoking_host() {
-        for (host, program, term, iterm, terminal) in [
-            (
-                "Warp",
-                Some("WarpTerminal"),
-                Some("xterm-256color"),
-                false,
-                false,
-            ),
-            (
-                "iTerm2",
-                Some("iTerm.app"),
-                Some("xterm-256color"),
-                true,
-                true,
-            ),
-            (
-                "Terminal.app",
-                Some("Apple_Terminal"),
-                Some("xterm-256color"),
-                false,
-                true,
-            ),
-            (
-                "WezTerm",
-                Some("WezTerm"),
-                Some("xterm-256color"),
-                false,
-                false,
-            ),
-            ("empty", None, None, false, false),
-            (
-                "conflicting",
-                Some("Apple_Terminal"),
-                Some("xterm-ghostty"),
-                true,
-                true,
-            ),
-        ] {
-            assert_eq!(
-                select_macos_terminal(Some(TerminalKind::Warp), program, term, iterm, terminal),
-                TerminalKind::Warp,
-                "explicit Warp target was changed by the {host} invoking environment"
-            );
-        }
-    }
-
-    #[test]
-    fn an_explicit_wezterm_target_wins_in_every_invoking_terminal() {
-        // TERM_PROGRAM, TERM, whether ITERM_SESSION_ID and TERM_SESSION_ID are set, and
-        // what the invoking terminal selects when nothing is asked for.
-        let xterm = Some("xterm-256color");
-        let hosts = [
-            (Some("WezTerm"), xterm, false, false, TerminalKind::WezTerm),
-            (Some("iTerm.app"), xterm, true, true, TerminalKind::Iterm2),
-            (
-                Some("Apple_Terminal"),
-                xterm,
-                false,
-                true,
-                TerminalKind::AppleTerminal,
-            ),
-            (
-                Some("vscode"),
-                xterm,
-                false,
-                false,
-                TerminalKind::AppleTerminal,
-            ),
-            (None, None, false, false, TerminalKind::AppleTerminal),
-            // A multiplexer started in iTerm2 and attached from WezTerm keeps both.
-            (Some("WezTerm"), xterm, true, true, TerminalKind::WezTerm),
-        ];
-        for (term_program, term, iterm, apple, detected) in hosts {
-            let select =
-                |preferred| select_macos_terminal(preferred, term_program, term, iterm, apple);
-            assert_eq!(select(None), detected, "{term_program:?}");
-            assert_eq!(
-                select(Some(TerminalKind::WezTerm)),
-                TerminalKind::WezTerm,
-                "{term_program:?}"
-            );
-            // And the other way: a terminal asked for from inside WezTerm is that one.
-            assert_eq!(
-                select(Some(TerminalKind::Iterm2)),
-                TerminalKind::Iterm2,
-                "{term_program:?}"
-            );
         }
     }
 

@@ -2,13 +2,12 @@ use super::OwnedSurfaceClose;
 use super::ownership::verified_macos_terminal_owner;
 use super::process;
 use super::process::live_native_process_identity;
-use super::{GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
+use super::{MacTerminalAdapter, MacosOpenMode};
 use crate::native::private_to_user::owned_and_not_writable_by_others;
 use crate::native::session::close::budget::close_remaining;
 use crate::native::session::{self, Store};
 use crate::native::session::{Reader, RecordReader, RecordStore};
 use crate::native::terminal;
-use crate::native::terminal::facts::warp::HOST_COMMAND;
 use crate::native::terminal::ownership;
 use crate::native::terminal::ownership::{
     NativeProcessIdentity, NativeSessionOwner, native_owner_identity_matches,
@@ -36,6 +35,8 @@ use serde_json::json;
 use serde_json::Value;
 
 use super::{CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession};
+
+const HOST_COMMAND: &str = TerminalKind::Warp.registration().host_command;
 
 const CONTROL_FILE: &str = "warp-control.json";
 const HOST_PLAN_FILE: &str = "warp-host-plan.json";
@@ -123,7 +124,7 @@ const BUNDLE_SPECS: &[BundleSpec] = &[
 ];
 
 #[derive(Clone, Debug)]
-struct ControlClient {
+pub(super) struct ControlClient {
     bundle: PathBuf,
     executable: PathBuf,
     inject_warpctrl: bool,
@@ -289,13 +290,18 @@ impl std::fmt::Display for ControlFailure {
 
 impl std::error::Error for ControlFailure {}
 
-struct CommandOutput {
+pub(super) struct CommandOutput {
     success: bool,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
 
-trait WarpRunner {
+pub(super) trait WarpRunner {
+    // What an open prepares before its first control call, in this order: the
+    // installed Warp Control clients, then the attempt token of this launch.
+    fn control_clients(&mut self) -> Result<Vec<ControlClient>>;
+    fn attempt_token(&mut self) -> Result<String>;
+
     fn control(
         &mut self,
         client: &ControlClient,
@@ -319,9 +325,17 @@ trait WarpRunner {
     }
 }
 
-struct ProcessRunner;
+pub(super) struct ProcessRunner;
 
 impl WarpRunner for ProcessRunner {
+    fn control_clients(&mut self) -> Result<Vec<ControlClient>> {
+        installed_control_clients()
+    }
+
+    fn attempt_token(&mut self) -> Result<String> {
+        random_token()
+    }
+
     fn process_birth(&mut self, pid: u32) -> Result<Option<(u64, u64)>> {
         process::macos_process_start(pid)
     }
@@ -403,7 +417,8 @@ enum CreationRoute {
     Window,
 }
 
-pub(super) fn open_bound_tab_with_mode<F, U>(
+fn open_bound_tab_with_mode<R, F, U>(
+    runner: &mut R,
     command: &str,
     directory: &Path,
     deadline: Instant,
@@ -412,17 +427,18 @@ pub(super) fn open_bound_tab_with_mode<F, U>(
     unbind: U,
 ) -> Result<TerminalSession>
 where
+    R: WarpRunner,
     F: FnOnce(&mut TerminalSession) -> Result<()>,
     U: FnOnce() -> Result<()>,
 {
-    let clients = installed_control_clients()?;
-    let attempt = random_token()?;
+    let clients = runner.control_clients()?;
+    let attempt = runner.attempt_token()?;
     let startup_deadline = deadline
         .checked_sub(STARTUP_CLEANUP_RESERVE)
         .filter(|candidate| *candidate > Instant::now())
         .context("Warp startup timeout leaves no room for exact surface cleanup")?;
     open_bound_tab_with(
-        &mut ProcessRunner,
+        runner,
         OpenRequest {
             force_new_window,
             clients: &clients,
@@ -811,7 +827,8 @@ pub(super) fn send_file(
     )))
 }
 
-pub(super) fn verify_surface(
+fn verify_surface<R: WarpRunner>(
+    runner: &mut R,
     directory: &Path,
     session: &TerminalSession,
     timeout: Option<Duration>,
@@ -826,32 +843,32 @@ pub(super) fn verify_surface(
     .read_adapter_record("Warp host offer", MAX_CONTROL_OUTPUT as u64)?;
     validate_offer(&offer, &binding.attempt, directory)?;
     let deadline = deadline_from_timeout(timeout.unwrap_or(CONTROL_TIMEOUT))?;
-    let mut runner = ProcessRunner;
-    let Some(client) = binding_client_if_present(&mut runner, &binding, deadline)? else {
+    let Some(client) = binding_client_if_present(runner, &binding, deadline)? else {
         bail!("managed Warp tab is missing");
     };
-    if !tab_present_with(&mut runner, &client, session, deadline)? {
+    if !tab_present_with(runner, &client, session, deadline)? {
         bail!("managed Warp tab is missing");
     }
     Ok(offer.tty)
 }
 
-pub(super) fn surface_present(
+fn surface_present<R: WarpRunner>(
+    runner: &mut R,
     directory: &Path,
     session: &TerminalSession,
     timeout: Duration,
 ) -> Result<bool> {
     validate_session_directory(directory, session)?;
     let binding = load_binding(directory, session)?;
-    let mut runner = ProcessRunner;
     let deadline = deadline_from_timeout(timeout)?;
-    let Some(client) = binding_client_if_present(&mut runner, &binding, deadline)? else {
+    let Some(client) = binding_client_if_present(runner, &binding, deadline)? else {
         return Ok(false);
     };
-    tab_present_with(&mut runner, &client, session, deadline)
+    tab_present_with(runner, &client, session, deadline)
 }
 
-pub(super) fn close_session_until(
+fn close_session_until<R: WarpRunner>(
+    runner: &mut R,
     directory: &Path,
     session: &TerminalSession,
     deadline: Instant,
@@ -859,11 +876,10 @@ pub(super) fn close_session_until(
     crate::native::session::close::budget::close_remaining(deadline)?;
     validate_session_directory(directory, session)?;
     let binding = load_binding(directory, session)?;
-    let mut runner = ProcessRunner;
-    let Some(client) = binding_client_if_present(&mut runner, &binding, deadline)? else {
+    let Some(client) = binding_client_if_present(runner, &binding, deadline)? else {
         return Ok(CloseOutcome::Missing);
     };
-    close_exact(&mut runner, &client, session, deadline)
+    close_exact(runner, &client, session, deadline)
 }
 
 fn recorded_process_present<R: WarpRunner>(
@@ -1918,9 +1934,35 @@ fn write_new_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     )
 }
 
-pub(super) struct Adapter;
-pub(super) static ADAPTER: Adapter = Adapter;
-impl MacTerminalAdapter for Adapter {
+// The runner uses `&mut self` and the adapter `&self`. The lock is taken for one
+// operation at a time; an open holds it for its whole protocol, whose bind and unbind
+// callbacks need no runner.
+pub(super) struct Adapter<R: WarpRunner> {
+    runner: std::sync::Mutex<R>,
+}
+pub(super) type InstalledAdapter = Adapter<ProcessRunner>;
+impl Adapter<ProcessRunner> {
+    /// The adapter over the installed Warp Control clients and this machine's processes.
+    pub(super) const fn installed() -> Self {
+        Self {
+            runner: std::sync::Mutex::new(ProcessRunner),
+        }
+    }
+}
+impl<R: WarpRunner> Adapter<R> {
+    #[cfg(test)]
+    fn with_runner(runner: R) -> Self {
+        Self {
+            runner: std::sync::Mutex::new(runner),
+        }
+    }
+    fn runner(&self) -> std::sync::MutexGuard<'_, R> {
+        self.runner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+impl<R: WarpRunner> MacTerminalAdapter for Adapter<R> {
     fn open_bound_tab(
         &self,
         mode: MacosOpenMode,
@@ -1931,6 +1973,7 @@ impl MacTerminalAdapter for Adapter {
         unbind: Box<dyn FnOnce() -> Result<()> + '_>,
     ) -> Result<TerminalSession> {
         open_bound_tab_with_mode(
+            &mut *self.runner(),
             command,
             directory,
             deadline,
@@ -1953,7 +1996,7 @@ impl MacTerminalAdapter for Adapter {
         session: &TerminalSession,
         timeout: Option<Duration>,
     ) -> Result<Option<String>> {
-        verify_surface(directory, session, timeout).map(Some)
+        verify_surface(&mut *self.runner(), directory, session, timeout).map(Some)
     }
     fn surface_present(
         &self,
@@ -1961,30 +2004,16 @@ impl MacTerminalAdapter for Adapter {
         session: &TerminalSession,
         timeout: Duration,
     ) -> Result<bool> {
-        surface_present(directory, session, timeout)
+        surface_present(&mut *self.runner(), directory, session, timeout)
     }
-    fn read_screen(&self, _session: &TerminalSession, _deadline: Instant) -> Result<String> {
-        bail!(
-            "managed Warp screen reads and guarded input are unsupported; Warp Control input.insert/input.replace do not submit"
-        )
-    }
-    fn guarded_dialog_input(
-        &self,
-        _session: &TerminalSession,
-        _input: &GuardedDialogInput,
-        _deadline: Instant,
-    ) -> Result<bool> {
-        bail!(
-            "managed Warp screen reads and guarded input are unsupported; Warp Control input.insert/input.replace do not submit"
-        )
-    }
+    // Screen reads and guarded dialog input are declared unsupported in the registration.
     fn close_session_until(
         &self,
         directory: &Path,
         session: &TerminalSession,
         deadline: Instant,
     ) -> Result<CloseOutcome> {
-        close_session_until(directory, session, deadline)
+        close_session_until(&mut *self.runner(), directory, session, deadline)
     }
     fn close_owned_session(
         &self,
@@ -2013,7 +2042,7 @@ impl MacTerminalAdapter for Adapter {
                 deadline,
             )?;
         }
-        close_session_until(directory, session, deadline)
+        close_session_until(&mut *self.runner(), directory, session, deadline)
     }
 }
 #[cfg(test)]
