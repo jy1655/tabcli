@@ -12,7 +12,8 @@ native.rs: parse ask, check inputs, prepare the session directory
      wait for the confirmed startup
   -> session::launch::wrapper (inside the surface): admit the wrapper, record the owner, take the
      adapter's complete provider command, spawn it, finalize the launch record
-  -> delivery: use the adapter-declared Transport and settle delivery of the claimed turn
+  -> turn_run -> delivery: the Turn run uses the adapter-declared Transport and settles delivery
+     of the claimed turn
   -> provider: recognize the matching completion
   -> session::turn: write the completion journal
   -> session::turn: publish the result, update status, release the claim, remove the journal
@@ -30,12 +31,15 @@ close-session
 A follow-up enters through `tell` in `native.rs` and claims the existing session before delivery.
 The admission checks read Hold without taking another lock; `claim_ready` identifies follow-up
 claims so the final `begin_delivery` hold gate excludes initial delivery.
-After the provider-specific reopened-conversation check, it calls the same `delivery::deliver`
-entry point as initial delivery. Follow-ups skip initial readiness and launch gates. Preparation,
-optional surface checks, remaining timeout and budget precede `begin_delivery`; no lifecycle lock
-is held across the transport operation. Detached commands still await delivery settlement and
-skip only result waiting. Both paths use the same completion journal and publication path. If delivery is uncertain, the claim
-stays held; neither a query nor repair resends the prompt.
+After its admission checks and the provider-specific reopened-conversation refusal, `tell` hands
+the claimed follow-up to `turn_run`; session-start hands it a launched, consent-completed initial
+turn. Both callers keep their early report addressing. `turn_run` composes delivery settlement,
+the optional Claim-addressed wait and success rendering. Follow-ups skip initial readiness and
+launch gates. Preparation, optional surface checks, remaining timeout and budget precede
+`begin_delivery`; no lifecycle lock is held across the transport operation. Detached commands
+still await delivery settlement and skip only result waiting. Both paths use the same completion
+journal and publication path. If delivery is uncertain, the claim stays held; neither a query nor
+repair resends the prompt.
 
 A record is durable evidence of an operation, not a disposable cache. Use the terms in
 [CONTEXT.md](../CONTEXT.md) when reading the lifecycle code. The rules for changes live in
@@ -44,7 +48,7 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 ## Module map and dependencies
 
 - `src/main.rs` contains top-level dispatch and help; `src/native.rs` parses native commands and
-  dispatches them. The launch protocol is two operations in `session::launch`: `launcher.rs`
+  dispatches them; after its pre-checks it hands the claimed turn to `turn_run`. The launch protocol is two operations in `session::launch`: `launcher.rs`
   holds the start-in-surface operation and both bootstrap builders; `wrapper.rs` holds the
   native-session wrapper with its admission and provision steps, the fd handoff consumer,
   provider resolution and the version gate; `mod.rs` keeps the launch records and their rules
@@ -70,6 +74,17 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   The terminal module owns the Windows submit-delay budget; Transport facts supply the count
   and provider-selected console newline encoding. The console helper resolves both from
   the verified session's provider; its CLI carries the session identity and prompt file name.
+  The surface-ownership timeout, remaining-timeout and paste-framing helpers
+  (`verify_terminal_surface_ownership_until`, `remaining_turn_timeout`, `terminal_input_bytes`)
+  live here now; `tell`'s pre-check imports the first two.
+- `src/native/turn_run.rs` runs one Turn from a held Claim to its Result for `ask`, `tell` and
+  `reopen`: it repeats the report address idempotently, composes delivery settlement through
+  `delivery::deliver_with`, the optional Claim-addressed `turn::wait`, and success rendering.
+  `emit_session_result_with` lives there. The caller's delivery-error hook is called exactly once for
+  a Delivery failure; wait and emission errors never reach it. `run_with` takes the Transport and
+  the `Checks` so the tail is tested at its own interface with the shared fake Transport.
+- `src/native/turn_report.rs` keeps `TurnReport`: address-aware failure finishing. Callers call
+  `TurnReport::finish` outside the Turn run, with their own extra fields.
 - `src/native/reopen.rs` owns Reopen source reservations, provenance, launch refusals,
   and their settlement, including read-only marker diagnostics. Session owns the refusal record
   shape. Reopen creates the new Session
