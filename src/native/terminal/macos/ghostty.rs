@@ -3,6 +3,7 @@ use super::{GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
 use crate::native::private_to_user::owned_and_not_accessible_by_others;
 use crate::native::session::SessionState;
 use crate::native::session::close::budget::close_remaining;
+use crate::native::session::launch::launcher::validate_shell_command_component;
 use crate::native::session::primitives::unix_ms;
 use crate::native::session::{CoreRecord, Reader, RecordStore};
 use crate::native::terminal::facts::ghostty::HOST_COMMAND;
@@ -557,7 +558,7 @@ fn restore(
 // Use native command creation and an interactive clean shell for foreground jobs.
 // Source only the host-proven launch; see docs/verification/2026-10-03-v0.1.0-focus.md.
 fn bootstrap(executable: &OsStr) -> Result<String> {
-    crate::native::validate_shell_command_component(executable, "Agent Bridge executable")?;
+    validate_shell_command_component(executable, "Agent Bridge executable")?;
     Ok(format!(
         "/bin/zsh -f -i -c {}",
         crate::native::terminal::shell_quote(OsStr::new(&format!(
@@ -904,7 +905,7 @@ fn launch_command(
 ) -> Result<String> {
     // Carry PATH for provider shebangs through the clean shell; source only the host's private script.
     let script = directory.join("ghostty-start.sh");
-    crate::native::validate_shell_command_component(script.as_os_str(), "Ghostty startup path")?;
+    validate_shell_command_component(script.as_os_str(), "Ghostty startup path")?;
     let input = format!(
         ". {}",
         crate::native::terminal::shell_quote(script.as_os_str())
@@ -914,7 +915,7 @@ fn launch_command(
     }
     let export = match path {
         Some(path) => {
-            crate::native::validate_shell_command_component(path, "Ghostty launch PATH")?;
+            validate_shell_command_component(path, "Ghostty launch PATH")?;
             format!(
                 "export PATH={}\n",
                 crate::native::terminal::shell_quote(path)

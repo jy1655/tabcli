@@ -353,7 +353,7 @@ pub(super) mod tests {
     pub(crate) fn wrapper_for(directory: &Path) -> String {
         let root = directory.parent().unwrap();
         let id = directory.file_name().unwrap().to_str().unwrap();
-        let command = crate::native::bridge_shell_command(
+        let command = crate::native::session::launch::launcher::bridge_shell_command(
             Path::new("/workspace"),
             root,
             Path::new("/unused/bridge"),

@@ -1,6 +1,7 @@
 //! One start operation; each source owns resolution, creation and provider-specific gates.
 use super::turn_report::emit_session_result_with;
 use super::*;
+use crate::native::session::launch::wrapper::{check_provider_version_until, resolve_provider};
 
 pub(super) mod admission;
 
@@ -134,55 +135,12 @@ pub(super) fn start(
     let expected_claim_token = initial_claim.token().to_owned();
     let receipt = initial_claim.receipt().clone();
     report.addressed(created.id.clone(), receipt.request_id.clone());
-    let launch_deadline = launch::begin(
-        &Store::open_unchecked(&created.directory),
+    let terminal_session = launch::launcher::start(
+        &created,
+        terminal_kind,
+        &mut initial_claim,
         &expected_claim_token,
         deadline,
-    )?;
-    let executable = std::env::current_exe().context("failed to locate the current executable")?;
-    let bridge_command = bridge_shell_command(
-        &created.manifest.workspace,
-        created
-            .directory
-            .parent()
-            .context("session directory has no state root")?,
-        &executable,
-        &created.id,
-    )?;
-    let bridge_command =
-        launch::install_script(&Store::open_unchecked(&created.directory), &bridge_command)?;
-    initial_claim.fence_launch();
-    let terminal_session = match terminal::open_bound_tab(
-        terminal_kind,
-        &bridge_command,
-        &created.directory,
-        launch_deadline,
-        |session| {
-            session.managed_session_id = Some(created.id.clone());
-            Store::open_unchecked(&created.directory).write_terminal(session)
-        },
-        || {
-            Store::open_unchecked(&created.directory)
-                .record(CoreRecord::Terminal)
-                .remove()
-        },
-    ) {
-        Ok(session) => session,
-        Err(error) => {
-            let error = launch::terminal_failure(&Store::open_unchecked(&created.directory), error);
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to open {} surface for session {}",
-                    terminal_kind.display_name(),
-                    created.id
-                )
-            });
-        }
-    };
-    launch::wait(
-        &Store::open_unchecked(&created.directory),
-        &terminal_session,
-        launch_deadline,
     )?;
     // A trust response is separate from model input. Only verified consent and an
     // adapter-recognized exact workspace dialog may produce one guarded response.

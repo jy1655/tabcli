@@ -1,4 +1,6 @@
 use super::*;
+use crate::native::session::launch::launcher::bridge_shell_command;
+use crate::native::session::launch::wrapper::record_provider_process;
 use crate::native::session::launch::*;
 use std::{
     process::{Child, Stdio},

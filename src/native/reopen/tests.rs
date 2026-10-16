@@ -1,5 +1,9 @@
 use super::*;
 use crate::native::session::close as session_close;
+#[cfg(windows)]
+use crate::native::session::launch::wrapper::provision;
+use crate::native::session::launch::wrapper::record_provider_process;
+use crate::native::session::primitives::STATE_DIR_ENV;
 use crate::native::session::schema::{
     ProviderProcessRecord, RecordedReopenRefusal, SESSION_SCHEMA, SessionEvent, SessionManifest,
 };
@@ -897,7 +901,7 @@ fn resumed_session_launch_passes_the_official_resume_plan_and_no_policy_the_requ
     let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
     claim.retain();
 
-    let result = run_session_inner(&directory);
+    let result = provision(&directory);
     launch::finalize(&Store::open_unchecked(&directory), &result).unwrap();
     result.unwrap();
 
@@ -1477,7 +1481,7 @@ fn resumed_session_launch_refuses_before_spawn_when_a_holder_registered_after_th
     let directory = write_reopen_launch_session(root.path(), id, &provider_path);
     let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
     claim.retain();
-    let result = run_session_inner(&directory);
+    let result = provision(&directory);
     launch::finalize(&Store::open_unchecked(&directory), &result).unwrap();
     let error = result.unwrap_err();
     assert_eq!(reopen_refusal_gate(&error), Some("provider-unsupported"));
