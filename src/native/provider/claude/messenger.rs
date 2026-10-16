@@ -25,7 +25,7 @@ use super::{
     CLAUDE_CODE_SESSION_MARKERS, PendingCrossSessionTurn, claude_owned_string, claude_string,
     install_pending_turn, managed_session_name, new_cross_session_turn_id,
 };
-use crate::native::consent::{Clock, SystemClock};
+use crate::native::clock::{Clock, SystemClock};
 use crate::native::delivery::{
     self, Outcome, Prepared, Readiness, Transport, TransportFacts, TurnContext,
 };

@@ -61,6 +61,7 @@ use super::super::WezTermMux;
 use super::{CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession};
 use crate::native::process_env::CommandOutputFailure;
 
+use crate::native::clock::{Clock, SystemClock};
 use crate::native::session::launch::BindingFacts;
 
 const HOST_COMMAND: &str = TerminalKind::WezTerm.registration().host_command;
@@ -1005,7 +1006,9 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
                 .context("WezTerm did not name the GUI of this host")?;
             Ok((pane, socket))
         },
-        |directory, id, (pane, socket)| wait_for_binding(directory, id, pane, Path::new(socket)),
+        |directory, id, (pane, socket)| {
+            wait_for_binding(directory, id, pane, Path::new(socket), &mut SystemClock)
+        },
         |started| {
             // The pane ends with this process and takes the message with it.
             if let Err(error) = started {
@@ -1018,9 +1021,15 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
     )
 }
 
-fn wait_for_binding(directory: &Path, id: &str, pane: &str, socket: &Path) -> Result<()> {
+fn wait_for_binding(
+    directory: &Path,
+    id: &str,
+    pane: &str,
+    socket: &Path,
+    clock: &mut dyn Clock,
+) -> Result<()> {
     use crate::native::session::launch::wait_for_binding;
-    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING)?;
+    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING, clock)?;
     if surface.kind != TerminalKind::WezTerm
         || surface.id != pane
         || surface

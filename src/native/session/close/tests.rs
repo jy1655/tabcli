@@ -3405,12 +3405,14 @@ fn close_fixtures_keep_independent_publication_expectations() {
 fn doctor_records(reader: &Reader) -> (Value, Value) {
     let mut checks = Vec::new();
     let mut observations = json!({});
+    let mut clock = crate::native::clock::SystemClock;
     doctor::record_checks(
         reader,
         "session-fault",
         std::time::Instant::now() + std::time::Duration::from_secs(5),
         &mut checks,
         &mut observations,
+        &mut crate::native::session::origin::OriginEnvironment::production(&mut clock),
     );
     (serde_json::to_value(checks).unwrap(), observations)
 }

@@ -1,5 +1,6 @@
 //! Workspace consent is evidence, not a provider permission mode. Provider stores are
 //! read only; their schemas and the way a managed CLI accepts trust belong to adapters.
+use crate::native::clock::{Clock, SystemClock};
 use crate::native::delivery::verify_terminal_surface_ownership_until;
 #[cfg(unix)]
 use crate::native::private_to_user::owned_and_not_writable_by_others;
@@ -513,59 +514,6 @@ fn complete_launch_dialog(
     )
 }
 
-// The clock a trust wait and Agy's paste gates poll with. Production reads the system
-// clock; tests inject a simulated one so that no simulated wait becomes a wall-clock sleep.
-pub(in crate::native) trait Clock {
-    fn now(&mut self) -> Instant;
-    fn sleep(&mut self, duration: Duration);
-}
-
-pub(in crate::native) struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now(&mut self) -> Instant {
-        Instant::now()
-    }
-
-    fn sleep(&mut self, duration: Duration) {
-        thread::sleep(duration);
-    }
-}
-
-// A simulated clock: `sleep` advances it and adds up what was slept, and `shared`
-// hands its instant to a log reader that grows the log with the clock.
-#[cfg(test)]
-pub(in crate::native) struct FakeClock {
-    now: std::rc::Rc<std::cell::Cell<Instant>>,
-    pub(in crate::native) slept: Duration,
-}
-
-#[cfg(test)]
-impl FakeClock {
-    pub(in crate::native) fn new(now: Instant) -> Self {
-        Self {
-            now: std::rc::Rc::new(std::cell::Cell::new(now)),
-            slept: Duration::ZERO,
-        }
-    }
-
-    pub(in crate::native) fn shared(&self) -> std::rc::Rc<std::cell::Cell<Instant>> {
-        std::rc::Rc::clone(&self.now)
-    }
-}
-
-#[cfg(test)]
-impl Clock for FakeClock {
-    fn now(&mut self) -> Instant {
-        self.now.get()
-    }
-
-    fn sleep(&mut self, duration: Duration) {
-        self.now.set(self.now.get() + duration);
-        self.slept += duration;
-    }
-}
-
 // What one poll of a trust wait's readiness callback found. A fatal error is the
 // callback's `Err` and ends the wait at once; a retryable observation is `Pending`
 // with the reason the timeout message reports when it is the last one.
@@ -955,6 +903,7 @@ fn windows_sid(sid: windows_sys::Win32::Security::PSID) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::clock::FakeClock;
     use crate::native::session::primitives::{write_json_atomic, write_private};
     use crate::native::session::schema::SESSION_SCHEMA;
 

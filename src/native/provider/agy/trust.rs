@@ -3,7 +3,8 @@ use super::{
     ADAPTER, AGY_LOG_FILE, HOOKS_LOADED_SOURCE, STARTUP_POLL_INTERVAL, TRUST_RECOVERY,
     TRUST_STORE_MISSING,
 };
-use crate::native::consent::{self, Clock, SystemClock, TrustReadiness};
+use crate::native::clock::{Clock, SystemClock};
+use crate::native::consent::{self, TrustReadiness};
 use crate::native::provider::NativeProviderAdapter;
 use crate::native::session::Reader;
 use anyhow::Result;

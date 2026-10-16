@@ -1,4 +1,5 @@
 use super::*;
+use crate::native::clock::FakeClock;
 use crate::native::session::Store;
 use crate::native::session::owner::{ControlAttestation, OwnerAttestation};
 use std::cell::{Cell, RefCell};
@@ -21,8 +22,6 @@ type AttestHook = Box<dyn Fn(&NativeSessionOwner) -> OwnerAttestation>;
 thread_local! {
     static RECEIPT_READS: Cell<usize> = const { Cell::new(0) };
     static CHECKPOINT: RefCell<Option<CheckpointHook>> = const { RefCell::new(None) };
-    static ATTEST: RefCell<Option<AttestHook>> = const { RefCell::new(None) };
-    static CLOCK: Cell<Duration> = const { Cell::new(Duration::ZERO) };
 }
 
 pub(super) fn count_receipt_read() {
@@ -37,19 +36,7 @@ pub(super) fn checkpoint(point: Checkpoint, directory: &Path) {
     });
 }
 
-pub(super) fn attested(owner: &NativeSessionOwner) -> Option<ProcessObservation> {
-    ATTEST.with(|cell| cell.borrow().as_ref().map(|hook| hook(owner).process))
-}
-
-pub(super) fn clock_offset() -> Duration {
-    CLOCK.with(Cell::get)
-}
-
-fn advance_clock(by: Duration) {
-    CLOCK.with(|clock| clock.set(clock.get() + by));
-}
-
-/// Resets every hook of this thread when a test ends, also on panic.
+/// Resets every observation hook of this thread when a test ends, also on panic.
 struct Hooks;
 impl Hooks {
     fn new() -> Self {
@@ -59,14 +46,9 @@ impl Hooks {
     fn reset() {
         RECEIPT_READS.with(|count| count.set(0));
         CHECKPOINT.with(|cell| *cell.borrow_mut() = None);
-        ATTEST.with(|cell| *cell.borrow_mut() = None);
-        CLOCK.with(|clock| clock.set(Duration::ZERO));
     }
     fn checkpoint(&self, hook: impl FnMut(Checkpoint, &Path) + 'static) {
         CHECKPOINT.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
-    }
-    fn attest(&self, hook: impl Fn(&NativeSessionOwner) -> OwnerAttestation + 'static) {
-        ATTEST.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
     }
     fn receipt_reads(&self) -> usize {
         RECEIPT_READS.with(Cell::get)
@@ -75,6 +57,41 @@ impl Hooks {
 impl Drop for Hooks {
     fn drop(&mut self) {
         Self::reset();
+    }
+}
+
+/// A test's Origin environment: an attester the test sets (the platform observer until
+/// it does), and a fake clock seeded from one instant that every deadline derives from.
+struct Environment {
+    attest: Rc<RefCell<Option<AttestHook>>>,
+    attester: Box<dyn Fn(&NativeSessionOwner) -> ProcessObservation>,
+    clock: FakeClock,
+}
+
+impl Environment {
+    fn new() -> Self {
+        let attest: Rc<RefCell<Option<AttestHook>>> = Rc::new(RefCell::new(None));
+        let slot = Rc::clone(&attest);
+        Self {
+            attest,
+            attester: Box::new(move |owner| match slot.borrow().as_ref() {
+                Some(hook) => hook(owner).process,
+                None => attest_through_platform_observer(owner),
+            }),
+            clock: FakeClock::new(Instant::now()),
+        }
+    }
+    fn attest(&self, hook: impl Fn(&NativeSessionOwner) -> OwnerAttestation + 'static) {
+        *self.attest.borrow_mut() = Some(Box::new(hook));
+    }
+    fn now(&mut self) -> Instant {
+        self.clock.now()
+    }
+    fn origin(&mut self) -> OriginEnvironment<'_> {
+        OriginEnvironment {
+            attest: &*self.attester,
+            clock: &mut self.clock,
+        }
     }
 }
 
@@ -159,18 +176,16 @@ impl Session {
     }
 }
 
-fn budget() -> ReadBudget {
-    ReadBudget::for_query(None)
+fn read(environment: &mut Environment, session: &Session) -> OriginReference {
+    let mut budget = ReadBudget::for_query(None, &mut environment.clock);
+    read_reference(&session.reader(), &mut budget, &mut environment.clock)
 }
 
-fn read(session: &Session) -> OriginReference {
-    read_reference(&session.reader(), &mut budget())
-}
-
-fn observed(root: &Path, session: &Session) -> OriginObservation {
-    let mut budget = budget();
-    let reference = read_reference(&session.reader(), &mut budget);
-    observe(root, reference, &mut budget)
+fn observed(environment: &mut Environment, root: &Path, session: &Session) -> OriginObservation {
+    let mut environment = environment.origin();
+    let mut budget = ReadBudget::for_query(None, environment.clock);
+    let reference = read_reference(&session.reader(), &mut budget, environment.clock);
+    observe(root, reference, &mut budget, &mut environment)
 }
 
 fn attestation(process: ProcessObservation, control: ControlAttestation) -> OwnerAttestation {
@@ -184,6 +199,7 @@ fn attestation(process: ProcessObservation, control: ControlAttestation) -> Owne
 #[test]
 fn the_launch_claim_names_the_initial_request_whatever_the_timestamps_say() {
     let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     let session = Session::new(root.path(), "session-child", "ready");
     session.launch("200-1");
@@ -191,7 +207,7 @@ fn the_launch_claim_names_the_initial_request_whatever_the_timestamps_say() {
     // Follow-ups from elsewhere, older and equal in wall-clock time.
     session.receipt("100-1", 10, Some("session-other"));
     session.receipt("300-1", 500, Some("external"));
-    let reference = read(&session);
+    let reference = read(&mut environment, &session);
     assert_eq!(reference.kind, SourceKind::Managed);
     assert_eq!(reference.id.as_deref(), Some("session-origin"));
     assert_eq!(reference.request_id.as_deref(), Some("request-200-1"));
@@ -203,11 +219,12 @@ fn the_launch_claim_names_the_initial_request_whatever_the_timestamps_say() {
 #[test]
 fn a_missing_or_damaged_initial_receipt_never_promotes_a_follow_up() {
     let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     let session = Session::new(root.path(), "session-child", "ready");
     session.launch("200-1");
     session.receipt("300-1", 1, Some("session-other"));
-    let missing = read(&session);
+    let missing = read(&mut environment, &session);
     assert_eq!(missing.kind, SourceKind::Unknown);
     assert_eq!(missing.id, None);
     assert_eq!(missing.reason, "initial_request_unavailable");
@@ -217,7 +234,7 @@ fn a_missing_or_damaged_initial_receipt_never_promotes_a_follow_up() {
     );
 
     session.damaged_receipt("200-1");
-    let damaged = read(&session);
+    let damaged = read(&mut environment, &session);
     assert_eq!(damaged.kind, SourceKind::Unknown);
     assert_eq!(damaged.reason, "initial_receipt_unreadable");
     let snapshot = super::reference(&session.reader().snapshot().unwrap());
@@ -228,10 +245,14 @@ fn a_missing_or_damaged_initial_receipt_never_promotes_a_follow_up() {
 #[test]
 fn an_unrelated_unreadable_receipt_does_not_hide_a_readable_initial_one() {
     let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     let session = Session::started_from(root.path(), "session-child", "ready", "session-origin");
     session.damaged_receipt("300-1");
-    assert_eq!(read(&session).id.as_deref(), Some("session-origin"));
+    assert_eq!(
+        read(&mut environment, &session).id.as_deref(),
+        Some("session-origin")
+    );
     let snapshot = session.reader().snapshot().unwrap();
     assert_eq!(snapshot.unreadable_requests, 1);
     assert_eq!(
@@ -243,10 +264,11 @@ fn an_unrelated_unreadable_receipt_does_not_hide_a_readable_initial_one() {
 #[test]
 fn legacy_external_and_sourceless_initial_requests_are_distinct_evidence() {
     let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     // Before 0.0.7: no launch record and no receipts.
     let legacy = Session::new(root.path(), "session-legacy", "ready");
-    let reference = read(&legacy);
+    let reference = read(&mut environment, &legacy);
     assert_eq!(
         (reference.kind, reference.reason.as_str()),
         (SourceKind::Unknown, "initial_request_unavailable")
@@ -255,14 +277,14 @@ fn legacy_external_and_sourceless_initial_requests_are_distinct_evidence() {
     let sourceless = Session::new(root.path(), "session-sourceless", "ready");
     sourceless.launch("1-1");
     sourceless.receipt("1-1", 1, None);
-    let reference = read(&sourceless);
+    let reference = read(&mut environment, &sourceless);
     assert_eq!(
         (reference.kind, reference.reason.as_str()),
         (SourceKind::Unknown, "source_unavailable")
     );
     assert_eq!(reference.request_id.as_deref(), Some("request-1-1"));
     let external = Session::started_from(root.path(), "session-external", "ready", "external");
-    let observation = observed(root.path(), &external);
+    let observation = observed(&mut environment, root.path(), &external);
     assert_eq!(observation.reference.kind, SourceKind::External);
     assert_eq!(observation.reference.id, None);
     assert_eq!(observation.ended, None);
@@ -275,12 +297,16 @@ fn legacy_external_and_sourceless_initial_requests_are_distinct_evidence() {
     // A receipt written before its launch record is not yet evidence.
     let launching = Session::new(root.path(), "session-launching", "launching");
     launching.receipt("100-1", 1, Some("session-origin"));
-    assert_eq!(read(&launching).reason, "initial_request_unavailable");
+    assert_eq!(
+        read(&mut environment, &launching).reason,
+        "initial_request_unavailable"
+    );
 }
 
 #[test]
 fn invalid_and_self_sources_are_unknown_and_never_joined_to_a_path() {
     let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     for (id, source) in [
         ("session-a", "../session-escape"),
@@ -289,7 +315,7 @@ fn invalid_and_self_sources_are_unknown_and_never_joined_to_a_path() {
         ("session-d", "request-1"),
     ] {
         let session = Session::started_from(root.path(), id, "ready", source);
-        let observation = observed(root.path(), &session);
+        let observation = observed(&mut environment, root.path(), &session);
         assert_eq!(observation.reference.kind, SourceKind::Unknown, "{source}");
         assert_eq!(observation.reference.id, None);
         assert_eq!(observation.reason, "invalid_source");
@@ -300,14 +326,15 @@ fn invalid_and_self_sources_are_unknown_and_never_joined_to_a_path() {
 #[test]
 fn a_cycle_reads_one_origin_and_a_foreign_or_linked_origin_is_not_followed() {
     let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     let a = Session::started_from(root.path(), "session-a", "ready", "session-b");
     let b = Session::started_from(root.path(), "session-b", "closed", "session-a");
     b.tombstone();
-    let observation = observed(root.path(), &a);
+    let observation = observed(&mut environment, root.path(), &a);
     assert_eq!(observation.reason, "recorded_closed");
     assert_eq!(observation.ended, Some(true));
-    let observation = observed(root.path(), &b);
+    let observation = observed(&mut environment, root.path(), &b);
     assert_eq!(observation.reference.id.as_deref(), Some("session-a"));
     assert_eq!(observation.reason, "owner_unverified");
 
@@ -315,7 +342,7 @@ fn a_cycle_reads_one_origin_and_a_foreign_or_linked_origin_is_not_followed() {
     let other = tempfile::tempdir().unwrap();
     Session::new(other.path(), "session-elsewhere", "closed").tombstone();
     let c = Session::started_from(root.path(), "session-c", "ready", "session-elsewhere");
-    let observation = observed(root.path(), &c);
+    let observation = observed(&mut environment, root.path(), &c);
     assert_eq!(
         (observation.ended, observation.reason.as_str()),
         (None, "origin_missing")
@@ -333,7 +360,7 @@ fn a_cycle_reads_one_origin_and_a_foreign_or_linked_origin_is_not_followed() {
             root.path().join("session-elsewhere"),
         )
         .unwrap();
-        let observation = observed(root.path(), &c);
+        let observation = observed(&mut environment, root.path(), &c);
         assert_eq!(
             (observation.ended, observation.reason.as_str()),
             (None, "origin_unreadable")
@@ -350,7 +377,7 @@ fn a_cycle_reads_one_origin_and_a_foreign_or_linked_origin_is_not_followed() {
             d.record(CoreRecord::Status),
         )
         .unwrap();
-        let observation = observed(root.path(), &c);
+        let observation = observed(&mut environment, root.path(), &c);
         assert_eq!(observation.reason, "origin_unreadable");
         // A linked requests directory supplies no initial receipt.
         let e = Session::new(root.path(), "session-e", "ready");
@@ -362,13 +389,17 @@ fn a_cycle_reads_one_origin_and_a_foreign_or_linked_origin_is_not_followed() {
                 "event_file": "event-x.json", "source": "session-a"}),
         );
         symlink(outside.path(), e.record(CoreRecord::Requests)).unwrap();
-        assert_eq!(read(&e).reason, "initial_receipt_unreadable");
+        assert_eq!(
+            read(&mut environment, &e).reason,
+            "initial_receipt_unreadable"
+        );
     }
 }
 
 #[test]
 fn a_reopened_session_has_its_reopen_caller_as_origin_not_its_conversation_source() {
     let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     let source = Session::started_from(root.path(), "session-source", "closed", "session-old");
     source.tombstone();
@@ -378,7 +409,7 @@ fn a_reopened_session_has_its_reopen_caller_as_origin_not_its_conversation_sourc
     manifest["resumed_from"] = json!({"session": "session-source",
         "provider_session_id": "thread", "event_id": "event-1.json"});
     write(&reopened.record(CoreRecord::Manifest), &manifest);
-    let observation = observed(root.path(), &reopened);
+    let observation = observed(&mut environment, root.path(), &reopened);
     assert_eq!(observation.reference.kind, SourceKind::External);
     assert_eq!(observation.ended, None);
 }
@@ -386,6 +417,7 @@ fn a_reopened_session_has_its_reopen_caller_as_origin_not_its_conversation_sourc
 #[test]
 fn recorded_lifecycle_ends_and_the_attested_owner_decide_ended() {
     let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
     let origin = Session::new(root.path(), "session-origin", "ready");
@@ -395,20 +427,20 @@ fn recorded_lifecycle_ends_and_the_attested_owner_decide_ended() {
         ("exited", "recorded_exited"),
     ] {
         origin.status(state, 4);
-        let observation = observed(root.path(), &child);
+        let observation = observed(&mut environment, root.path(), &child);
         assert_eq!(observation.ended, Some(true), "{state}");
         assert_eq!(observation.reason, reason);
         assert_eq!(observation.stored_state.as_deref(), Some(state));
     }
     origin.status("future-state", 4);
-    let observation = observed(root.path(), &child);
+    let observation = observed(&mut environment, root.path(), &child);
     assert_eq!(
         (observation.ended, observation.reason.as_str()),
         (None, "origin_unverified")
     );
     assert_eq!(observation.stored_state.as_deref(), Some("future-state"));
 
-    let hooks = Hooks::new();
+    let _hooks = Hooks::new();
     type Case = (
         &'static str,
         fn() -> OwnerAttestation,
@@ -505,28 +537,31 @@ fn recorded_lifecycle_ends_and_the_attested_owner_decide_ended() {
     ] {
         origin.status(state, 5);
         for (name, attestation, ended, reason) in cases {
-            hooks.attest(move |_| attestation());
-            let observation = observed(root.path(), &child);
+            environment.attest(move |_| attestation());
+            let observation = observed(&mut environment, root.path(), &child);
             assert_eq!(observation.ended, ended, "{state} {name}");
             assert_eq!(observation.reason, reason, "{state} {name}");
             assert_eq!(observation.stored_state.as_deref(), Some(state));
         }
     }
     // An owner that is not bound to the Origin is never attested.
-    hooks.attest(|_| panic!("an unbound owner must not be attested"));
+    environment.attest(|_| panic!("an unbound owner must not be attested"));
     origin.status("ready", 6);
     for managed in [None, Some("session-other")] {
         origin.owner(managed, 7);
-        let observation = observed(root.path(), &child);
+        let observation = observed(&mut environment, root.path(), &child);
         assert_eq!(
             (observation.ended, observation.reason.as_str()),
             (None, "owner_unverified")
         );
     }
     fs::remove_file(origin.record(CoreRecord::Owner)).unwrap();
-    assert_eq!(observed(root.path(), &child).reason, "owner_unverified");
+    assert_eq!(
+        observed(&mut environment, root.path(), &child).reason,
+        "owner_unverified"
+    );
     fs::remove_dir_all(&origin.directory).unwrap();
-    let observation = observed(root.path(), &child);
+    let observation = observed(&mut environment, root.path(), &child);
     assert_eq!(
         (observation.ended, observation.reason.as_str()),
         (None, "origin_missing")
@@ -537,11 +572,12 @@ fn recorded_lifecycle_ends_and_the_attested_owner_decide_ended() {
 #[test]
 fn a_live_pid_only_owner_is_live_through_the_platform_observer() {
     let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
     let origin = Session::new(root.path(), "session-origin", "ready");
     origin.owner(Some("session-origin"), std::process::id());
-    let observation = observed(root.path(), &child);
+    let observation = observed(&mut environment, root.path(), &child);
     assert_eq!(
         (observation.ended, observation.reason.as_str()),
         (Some(false), "owner_live")
@@ -552,26 +588,27 @@ fn a_live_pid_only_owner_is_live_through_the_platform_observer() {
 #[test]
 fn a_tombstone_ahead_of_its_status_is_a_recorded_close() {
     let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
     let origin = Session::new(root.path(), "session-origin", "ready");
     // The close wrote its tombstone and stopped before status.json caught up.
     origin.tombstone();
-    let observation = observed(root.path(), &child);
+    let observation = observed(&mut environment, root.path(), &child);
     assert_eq!(observation.ended, Some(true));
     assert_eq!(observation.reason, "recorded_closed");
     assert_eq!(observation.stored_state.as_deref(), Some("ready"));
     assert!(observation.detail.unwrap().contains("still says ready"));
     // A tombstone with an unreadable status keeps its end and reports the gap.
     fs::write(origin.record(CoreRecord::Status), b"{").unwrap();
-    let observation = observed(root.path(), &child);
+    let observation = observed(&mut environment, root.path(), &child);
     assert_eq!(
         (observation.ended, observation.stored_state.clone()),
         (Some(true), None)
     );
     // A malformed tombstone is not evidence of anything.
     fs::write(origin.record(CoreRecord::Closed), b"{").unwrap();
-    let observation = observed(root.path(), &child);
+    let observation = observed(&mut environment, root.path(), &child);
     assert_eq!(
         (observation.ended, observation.reason.as_str()),
         (None, "origin_unreadable")
@@ -581,11 +618,12 @@ fn a_tombstone_ahead_of_its_status_is_a_recorded_close() {
 #[test]
 fn a_change_between_the_reads_is_busy_not_a_verdict() {
     let hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
     let origin = Session::new(root.path(), "session-origin", "ready");
     origin.owner(Some("session-origin"), 7);
-    hooks.attest(|_| {
+    environment.attest(|_| {
         attestation(
             ProcessObservation::Gone(Gone::Exited),
             ControlAttestation::NotRecorded,
@@ -602,7 +640,7 @@ fn a_change_between_the_reads_is_busy_not_a_verdict() {
             );
         }
     });
-    let observation = observed(root.path(), &child);
+    let observation = observed(&mut environment, root.path(), &child);
     assert_eq!(
         (observation.ended, observation.reason.as_str()),
         (None, "origin_busy")
@@ -619,31 +657,38 @@ fn a_change_between_the_reads_is_busy_not_a_verdict() {
             );
         }
     });
-    let observation = observed(root.path(), &child);
+    let observation = observed(&mut environment, root.path(), &child);
     assert_eq!(observation.reason, "origin_busy");
     // The next query sees the commit.
-    assert_eq!(observed(root.path(), &child).reason, "recorded_closed");
+    assert_eq!(
+        observed(&mut environment, root.path(), &child).reason,
+        "recorded_closed"
+    );
 }
 
 #[test]
 fn budgets_and_damaged_records_leave_the_end_unknown() {
     let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
     let origin = Session::new(root.path(), "session-origin", "closed");
-    let reference = read(&child);
+    let reference = read(&mut environment, &child);
     // No time left: nothing is read.
+    let now = environment.now();
     let observation = observe(
         root.path(),
         reference.clone(),
-        &mut ReadBudget::new(Instant::now(), OBSERVATION_BYTES),
+        &mut ReadBudget::new(now, OBSERVATION_BYTES),
+        &mut environment.origin(),
     );
     assert_eq!(observation.reason, "origin_budget_exhausted");
     // Too few bytes left for the manifest.
     let observation = observe(
         root.path(),
         reference.clone(),
-        &mut ReadBudget::new(Instant::now() + Duration::from_secs(5), 10),
+        &mut ReadBudget::new(now + Duration::from_secs(5), 10),
+        &mut environment.origin(),
     );
     assert_eq!(observation.reason, "origin_budget_exhausted");
     // An oversized or non-UTF-8 record is damaged.
@@ -652,15 +697,24 @@ fn budgets_and_damaged_records_leave_the_end_unknown() {
         vec![b' '; RECORD_LIMIT as usize + 1],
     )
     .unwrap();
-    assert_eq!(observed(root.path(), &child).reason, "origin_unreadable");
-    fs::write(origin.record(CoreRecord::Status), b"\xff\xfe").unwrap();
-    assert_eq!(observed(root.path(), &child).reason, "origin_unreadable");
-    fs::remove_file(origin.record(CoreRecord::Manifest)).unwrap();
-    assert_eq!(observed(root.path(), &child).reason, "origin_unreadable");
-    // The reference's own budget is bounded too.
-    let mut empty = ReadBudget::new(Instant::now(), OBSERVATION_BYTES);
     assert_eq!(
-        read_reference(&child.reader(), &mut empty).reason,
+        observed(&mut environment, root.path(), &child).reason,
+        "origin_unreadable"
+    );
+    fs::write(origin.record(CoreRecord::Status), b"\xff\xfe").unwrap();
+    assert_eq!(
+        observed(&mut environment, root.path(), &child).reason,
+        "origin_unreadable"
+    );
+    fs::remove_file(origin.record(CoreRecord::Manifest)).unwrap();
+    assert_eq!(
+        observed(&mut environment, root.path(), &child).reason,
+        "origin_unreadable"
+    );
+    // The reference's own budget is bounded too.
+    let mut empty = ReadBudget::new(environment.now(), OBSERVATION_BYTES);
+    assert_eq!(
+        read_reference(&child.reader(), &mut empty, &mut environment.clock).reason,
         "origin_budget_exhausted"
     );
 }
@@ -668,11 +722,12 @@ fn budgets_and_damaged_records_leave_the_end_unknown() {
 #[test]
 fn the_rendered_fields_match_the_public_shape() {
     let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
     Session::new(root.path(), "session-origin", "closed").tombstone();
     let mut value = json!({});
-    observed(root.path(), &child).add_fields(&mut value);
+    observed(&mut environment, root.path(), &child).add_fields(&mut value);
     assert_eq!(
         value,
         json!({"origin": "session-origin", "origin_observation": {"kind": "managed",
@@ -681,7 +736,7 @@ fn the_rendered_fields_match_the_public_shape() {
     );
     let legacy = Session::new(root.path(), "session-legacy", "ready");
     let mut value = json!({});
-    observed(root.path(), &legacy).add_fields(&mut value);
+    observed(&mut environment, root.path(), &legacy).add_fields(&mut value);
     assert_eq!(
         value,
         json!({"origin": null, "origin_observation": {"kind": "unknown", "request_id": null,
@@ -692,7 +747,8 @@ fn the_rendered_fields_match_the_public_shape() {
 
 #[test]
 fn the_query_cache_reads_an_origin_once_per_response() {
-    let hooks = Hooks::new();
+    let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     let a = Session::started_from(root.path(), "session-a", "ready", "session-origin");
     let b = Session::started_from(root.path(), "session-b", "ready", "session-origin");
@@ -700,7 +756,7 @@ fn the_query_cache_reads_an_origin_once_per_response() {
     origin.owner(Some("session-origin"), 7);
     let attests = std::rc::Rc::new(Cell::new(0));
     let counted = attests.clone();
-    hooks.attest(move |_| {
+    environment.attest(move |_| {
         counted.set(counted.get() + 1);
         attestation(
             ProcessObservation::Gone(Gone::Exited),
@@ -709,7 +765,8 @@ fn the_query_cache_reads_an_origin_once_per_response() {
     });
     let mut cache = ObservationCache::default();
     for session in [&a, &b] {
-        let observation = cache.observe(root.path(), read(session), None);
+        let reference = read(&mut environment, session);
+        let observation = cache.observe(root.path(), reference, None, &mut environment.origin());
         assert_eq!(observation.reason, "owner_exited");
         assert_eq!(
             observation.reference.request_id.as_deref(),
@@ -748,7 +805,8 @@ fn tree(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>, u32)> {
 
 #[test]
 fn the_reader_and_the_scan_change_no_record_and_wait_on_no_lock() {
-    let hooks = Hooks::new();
+    let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     let child = Session::started_from(root.path(), "session-child", "working", "session-origin");
     let origin = Session::new(root.path(), "session-origin", "ready");
@@ -759,7 +817,7 @@ fn the_reader_and_the_scan_change_no_record_and_wait_on_no_lock() {
         &json!({"schema": 1, "claim_token": "100-1", "event_file": "event-1.json"}),
     );
     fs::write(origin.record(CoreRecord::TurnClaim), "100-1\n").unwrap();
-    hooks.attest(|_| {
+    environment.attest(|_| {
         attestation(
             ProcessObservation::Gone(Gone::Exited),
             ControlAttestation::NotRecorded,
@@ -769,20 +827,28 @@ fn the_reader_and_the_scan_change_no_record_and_wait_on_no_lock() {
     let _origin_lock = Store::open_unchecked(&origin.directory).lock().unwrap();
     let _child_lock = Store::open_unchecked(&child.directory).lock().unwrap();
     let before = tree(root.path());
-    let observation = observed(root.path(), &child);
+    let observation = observed(&mut environment, root.path(), &child);
     assert_eq!(observation.reason, "owner_exited");
-    let scan = scan_started_from(root.path(), "session-origin", Instant::now() + SCAN_TIME);
+    let deadline = environment.now() + SCAN_TIME;
+    let scan = scan_started_from(
+        root.path(),
+        "session-origin",
+        deadline,
+        &mut environment.clock,
+    );
     assert_eq!(scan.open, vec!["session-child".to_owned()]);
     assert_eq!(tree(root.path()), before);
 }
 
-fn open_children(root: &Path, origin: &str) -> StartedFrom {
-    scan_started_from(root, origin, Instant::now() + Duration::from_secs(60))
+fn open_children(environment: &mut Environment, root: &Path, origin: &str) -> StartedFrom {
+    let deadline = environment.now() + Duration::from_secs(60);
+    scan_started_from(root, origin, deadline, &mut environment.clock)
 }
 
 #[test]
 fn the_scan_reports_unclosed_sessions_started_from_the_closed_one() {
     let hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     Session::new(root.path(), "session-origin", "closed").tombstone();
     Session::started_from(root.path(), "session-z", "ready", "session-origin");
@@ -794,7 +860,7 @@ fn the_scan_reports_unclosed_sessions_started_from_the_closed_one() {
     // A session that started from the origin but whose follow-up came from elsewhere.
     let followed = Session::started_from(root.path(), "session-y", "ready", "session-origin");
     followed.receipt("200-1", 1, Some("session-else"));
-    let scan = open_children(root.path(), "session-origin");
+    let scan = open_children(&mut environment, root.path(), "session-origin");
     assert_eq!(scan.open, vec!["session-b", "session-y", "session-z"]);
     assert!(!scan.incomplete, "{:?}", scan.incomplete_reasons);
     assert_eq!(scan.scanned.sessions, 6);
@@ -812,6 +878,7 @@ fn the_scan_reports_unclosed_sessions_started_from_the_closed_one() {
 #[test]
 fn the_scan_never_counts_missing_evidence_as_unrelated() {
     let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     Session::new(root.path(), "session-legacy", "ready");
     Session::new(root.path(), "session-legacy-closed", "closed");
@@ -823,7 +890,7 @@ fn the_scan_never_counts_missing_evidence_as_unrelated() {
     closing.tombstone();
     Session::started_from(root.path(), "session-bad", "ready", "../x");
     fs::create_dir(root.path().join("session-empty")).unwrap();
-    let scan = open_children(root.path(), "session-origin");
+    let scan = open_children(&mut environment, root.path(), "session-origin");
     assert!(scan.open.is_empty());
     assert!(scan.incomplete);
     let mut reasons: Vec<_> = scan
@@ -859,6 +926,7 @@ fn the_scan_never_counts_missing_evidence_as_unrelated() {
 #[test]
 fn a_match_that_closes_or_changes_before_it_is_reported_is_not_open() {
     let hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     let closes = Session::started_from(root.path(), "session-a", "ready", "session-origin");
     let changes = Session::started_from(root.path(), "session-b", "ready", "session-origin");
@@ -888,7 +956,7 @@ fn a_match_that_closes_or_changes_before_it_is_reported_is_not_open() {
             fs::remove_file(&status).unwrap();
         }
     });
-    let scan = open_children(root.path(), "session-origin");
+    let scan = open_children(&mut environment, root.path(), "session-origin");
     assert!(scan.open.is_empty());
     let mut reasons: Vec<_> = scan
         .incomplete_reasons
@@ -908,6 +976,7 @@ fn a_match_that_closes_or_changes_before_it_is_reported_is_not_open() {
 #[test]
 fn an_exhausted_budget_stops_the_scan_without_io_or_midway() {
     let hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     for index in 0..5 {
         Session::started_from(
@@ -918,25 +987,28 @@ fn an_exhausted_budget_stops_the_scan_without_io_or_midway() {
         );
     }
     // No time left: nothing is read, not even the root.
+    let deadline = environment.now();
     let scan = scan_started_from(
         &root.path().join("missing"),
         "session-origin",
-        Instant::now(),
+        deadline,
+        &mut environment.clock,
     );
     assert_eq!(scan.incomplete_reasons[0].reason, "time_budget_exhausted");
     assert_eq!(scan.scanned.sessions, 0);
     // The clock passes the deadline while the third entry is examined.
     let entries = Rc::new(Cell::new(0));
     let seen = entries.clone();
+    let clock = environment.clock.shared();
     hooks.checkpoint(move |point, _| {
         if point == Checkpoint::Entry {
             seen.set(seen.get() + 1);
             if seen.get() == 3 {
-                advance_clock(Duration::from_secs(120));
+                clock.set(clock.get() + Duration::from_secs(120));
             }
         }
     });
-    let scan = open_children(root.path(), "session-origin");
+    let scan = open_children(&mut environment, root.path(), "session-origin");
     assert_eq!(scan.open.len(), 2);
     assert!(scan.incomplete);
     assert_eq!(scan.incomplete_reasons.len(), 1);
@@ -947,6 +1019,7 @@ fn an_exhausted_budget_stops_the_scan_without_io_or_midway() {
 #[test]
 fn the_scan_refuses_damaged_records_and_reports_root_and_entry_errors() {
     let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     let oversized = Session::started_from(root.path(), "session-big", "ready", "session-origin");
     fs::write(
@@ -966,7 +1039,7 @@ fn the_scan_refuses_damaged_records_and_reports_root_and_entry_errors() {
         )
         .unwrap();
     }
-    let scan = open_children(root.path(), "session-origin");
+    let scan = open_children(&mut environment, root.path(), "session-origin");
     assert!(scan.open.is_empty());
     let reasons: std::collections::BTreeMap<_, _> = scan
         .incomplete_reasons
@@ -978,7 +1051,11 @@ fn the_scan_refuses_damaged_records_and_reports_root_and_entry_errors() {
     #[cfg(unix)]
     assert!(reasons["session-link"].starts_with("records_unreadable"));
 
-    let scan = open_children(&root.path().join("missing"), "session-origin");
+    let scan = open_children(
+        &mut environment,
+        &root.path().join("missing"),
+        "session-origin",
+    );
     assert!(
         scan.incomplete_reasons[0]
             .reason
@@ -995,7 +1072,7 @@ fn the_scan_refuses_damaged_records_and_reports_root_and_entry_errors() {
                 directory_kind: Err(std::io::Error::other("kind")),
             }),
         ],
-        || open_children(root.path(), "session-origin"),
+        || open_children(&mut environment, root.path(), "session-origin"),
     );
     let reasons: Vec<_> = scan
         .incomplete_reasons
@@ -1017,6 +1094,7 @@ fn the_scan_refuses_damaged_records_and_reports_root_and_entry_errors() {
 #[test]
 fn every_scan_cap_is_reported_and_the_reasons_are_capped() {
     let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     // Entries without records: each is examined and each is a reason.
     let entries = (0..SCAN_ENTRIES + 3)
@@ -1029,7 +1107,7 @@ fn every_scan_cap_is_reported_and_the_reasons_are_capped() {
         })
         .collect();
     let scan = crate::native::session::enumerate::with_entries(entries, || {
-        open_children(root.path(), "session-origin")
+        open_children(&mut environment, root.path(), "session-origin")
     });
     assert_eq!(scan.scanned.sessions, SCAN_ENTRIES);
     assert_eq!(scan.incomplete_reasons.len(), SCAN_REASONS);
@@ -1047,7 +1125,7 @@ fn every_scan_cap_is_reported_and_the_reasons_are_capped() {
             "session-origin",
         );
     }
-    let scan = open_children(root.path(), "session-origin");
+    let scan = open_children(&mut environment, root.path(), "session-origin");
     assert_eq!(scan.open.len(), SCAN_OPEN);
     let mut sorted = scan.open.clone();
     sorted.sort();
@@ -1059,6 +1137,7 @@ fn every_scan_cap_is_reported_and_the_reasons_are_capped() {
 #[test]
 fn the_byte_limit_stops_the_scan() {
     let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     // 300 manifests of 60 KiB each exceed the 16 MiB total.
     for index in 0..300 {
@@ -1071,7 +1150,7 @@ fn the_byte_limit_stops_the_scan() {
                 "title": "x".repeat(60 * 1024), "yolo": false, "created_unix_ms": 1}),
         );
     }
-    let scan = open_children(root.path(), "session-origin");
+    let scan = open_children(&mut environment, root.path(), "session-origin");
     assert!(scan.incomplete);
     assert_eq!(scan.incomplete_reasons.last().unwrap().reason, "byte_limit");
     assert!(scan.scanned.sessions < 300);
@@ -1109,6 +1188,7 @@ fn a_synthetic_root_of_thousands_of_sessions_is_scanned_within_the_bounds() {
         root.path(),
         "session-origin",
         started + Duration::from_secs(60),
+        &mut SystemClock,
     );
     let elapsed = started.elapsed();
     eprintln!("synthetic started-from scan of 3,277 entries: {elapsed:?}");
@@ -1122,10 +1202,11 @@ fn a_synthetic_root_of_thousands_of_sessions_is_scanned_within_the_bounds() {
 #[test]
 fn an_owner_record_that_changes_or_disappears_before_the_recheck_is_busy() {
     let hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
     let origin = Session::new(root.path(), "session-origin", "ready");
-    hooks.attest(|_| {
+    environment.attest(|_| {
         attestation(
             ProcessObservation::Gone(Gone::Exited),
             ControlAttestation::NotRecorded,
@@ -1133,7 +1214,10 @@ fn an_owner_record_that_changes_or_disappears_before_the_recheck_is_busy() {
     });
     // Unchanged, the attested owner decides.
     origin.owner(Some("session-origin"), 7);
-    assert_eq!(observed(root.path(), &child).reason, "owner_exited");
+    assert_eq!(
+        observed(&mut environment, root.path(), &child).reason,
+        "owner_exited"
+    );
     // A new owner is recorded between the attestation and the recheck.
     let owner = origin.record(CoreRecord::Owner);
     let replaced = owner.clone();
@@ -1145,7 +1229,7 @@ fn an_owner_record_that_changes_or_disappears_before_the_recheck_is_busy() {
             );
         }
     });
-    let observation = observed(root.path(), &child);
+    let observation = observed(&mut environment, root.path(), &child);
     assert_eq!(
         (observation.ended, observation.reason.as_str()),
         (None, "origin_busy")
@@ -1158,7 +1242,7 @@ fn an_owner_record_that_changes_or_disappears_before_the_recheck_is_busy() {
             fs::remove_file(&removed).unwrap();
         }
     });
-    let observation = observed(root.path(), &child);
+    let observation = observed(&mut environment, root.path(), &child);
     assert_eq!(
         (observation.ended, observation.reason.as_str()),
         (None, "origin_busy")
@@ -1173,7 +1257,7 @@ fn an_owner_record_that_changes_or_disappears_before_the_recheck_is_busy() {
             );
         }
     });
-    let observation = observed(root.path(), &child);
+    let observation = observed(&mut environment, root.path(), &child);
     assert_eq!(
         (observation.ended, observation.reason.as_str()),
         (None, "origin_busy")
@@ -1193,19 +1277,33 @@ fn malformed_manifest(session: &Session) {
 #[test]
 fn failed_reads_are_charged_against_the_cumulative_allowance() {
     let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     // The observation allowance holds eight full records; each failed read reserves one.
     let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
     let origin = Session::new(root.path(), "session-origin", "ready");
     malformed_manifest(&origin);
-    let reference = read(&child);
-    let mut budget = ReadBudget::new(Instant::now() + Duration::from_secs(60), OBSERVATION_BYTES);
+    let reference = read(&mut environment, &child);
+    let mut budget = ReadBudget::new(
+        environment.now() + Duration::from_secs(60),
+        OBSERVATION_BYTES,
+    );
     let allowance = OBSERVATION_BYTES / RECORD_LIMIT;
     for _ in 0..allowance {
-        let observation = observe(root.path(), reference.clone(), &mut budget);
+        let observation = observe(
+            root.path(),
+            reference.clone(),
+            &mut budget,
+            &mut environment.origin(),
+        );
         assert_eq!(observation.reason, "origin_unreadable");
     }
-    let observation = observe(root.path(), reference, &mut budget);
+    let observation = observe(
+        root.path(),
+        reference,
+        &mut budget,
+        &mut environment.origin(),
+    );
     assert_eq!(
         (observation.ended, observation.reason.as_str()),
         (None, "origin_budget_exhausted")
@@ -1218,7 +1316,7 @@ fn failed_reads_are_charged_against_the_cumulative_allowance() {
         let session = Session::new(scan_root.path(), &format!("session-{index:04}"), "ready");
         malformed_manifest(&session);
     }
-    let scan = open_children(scan_root.path(), "session-origin");
+    let scan = open_children(&mut environment, scan_root.path(), "session-origin");
     // Each of the first `records` sessions is a reason, then the byte limit stops the
     // scan at the next one; the reasons past the cap are only counted.
     assert!(scan.incomplete);
@@ -1233,10 +1331,12 @@ fn failed_reads_are_charged_against_the_cumulative_allowance() {
         let session = Session::new(small_root.path(), &format!("session-{index}"), "ready");
         malformed_manifest(&session);
     }
+    let deadline = environment.now() + Duration::from_secs(60);
     let scan = scan_started_from(
         small_root.path(),
         "session-origin",
-        Instant::now() + Duration::from_secs(60),
+        deadline,
+        &mut environment.clock,
     );
     assert!(
         !scan
@@ -1249,14 +1349,21 @@ fn failed_reads_are_charged_against_the_cumulative_allowance() {
 #[test]
 fn a_short_invalid_utf8_record_is_charged_the_whole_attempt() {
     let _hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     let origin = Session::new(root.path(), "session-origin", "ready");
     let status = origin.reader().record(CoreRecord::Status);
-    let mut budget = ReadBudget::new(Instant::now() + Duration::from_secs(60), OBSERVATION_BYTES);
+    let mut budget = ReadBudget::new(
+        environment.now() + Duration::from_secs(60),
+        OBSERVATION_BYTES,
+    );
     // Two bytes that are not UTF-8: the reader refuses them, and the whole attempt is
     // reserved, as for a record that fills the per-record limit.
     fs::write(status.path(), b"\xff\xfe").unwrap();
-    let fault = budget.decoded(&status, record::status).err().unwrap();
+    let fault = budget
+        .decoded(&status, &mut environment.clock, record::status)
+        .err()
+        .unwrap();
     assert!(
         matches!(&fault, ReadFault::Unreadable(error) if error.contains("invalid UTF-8")),
         "{fault:?}"
@@ -1264,7 +1371,10 @@ fn a_short_invalid_utf8_record_is_charged_the_whole_attempt() {
     assert_eq!(budget.remaining, OBSERVATION_BYTES - RECORD_LIMIT);
     // Two bytes the reader accepts and the decoder refuses cost only what was read.
     fs::write(status.path(), b"{}").unwrap();
-    let fault = budget.decoded(&status, record::status).err().unwrap();
+    let fault = budget
+        .decoded(&status, &mut environment.clock, record::status)
+        .err()
+        .unwrap();
     assert!(
         matches!(&fault, ReadFault::Unreadable(error) if error.starts_with("invalid JSON in ")),
         "{fault:?}"
@@ -1273,7 +1383,7 @@ fn a_short_invalid_utf8_record_is_charged_the_whole_attempt() {
     // Through the observation the fault is the record's, not the budget's.
     fs::write(status.path(), b"\xff\xfe").unwrap();
     let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
-    let observation = observed(root.path(), &child);
+    let observation = observed(&mut environment, root.path(), &child);
     assert_eq!(observation.reason, "origin_unreadable");
     assert!(
         observation
@@ -1287,6 +1397,7 @@ fn a_short_invalid_utf8_record_is_charged_the_whole_attempt() {
 #[test]
 fn reaching_a_scan_cap_exactly_stops_and_marks_the_scan_incomplete() {
     let hooks = Hooks::new();
+    let mut environment = Environment::new();
     let root = tempfile::tempdir().unwrap();
     // Exactly `SCAN_ENTRIES` entries: each is examined, then the limit is recorded.
     let entries = (0..SCAN_ENTRIES)
@@ -1299,7 +1410,7 @@ fn reaching_a_scan_cap_exactly_stops_and_marks_the_scan_incomplete() {
         })
         .collect();
     let scan = crate::native::session::enumerate::with_entries(entries, || {
-        open_children(root.path(), "session-origin")
+        open_children(&mut environment, root.path(), "session-origin")
     });
     assert!(scan.incomplete);
     assert_eq!(scan.scanned.sessions, SCAN_ENTRIES);
@@ -1324,7 +1435,7 @@ fn reaching_a_scan_cap_exactly_stops_and_marks_the_scan_incomplete() {
             counted.set(counted.get() + 1);
         }
     });
-    let scan = open_children(root.path(), "session-origin");
+    let scan = open_children(&mut environment, root.path(), "session-origin");
     assert!(scan.incomplete);
     assert_eq!(scan.open.len(), SCAN_OPEN);
     assert_eq!(scan.scanned.listed, SCAN_OPEN as u64);
@@ -1335,7 +1446,7 @@ fn reaching_a_scan_cap_exactly_stops_and_marks_the_scan_incomplete() {
     // One more match: the scan still stops at the cap and reads no further entry.
     Session::started_from(root.path(), "session-0256", "ready", "session-origin");
     examined.set(0);
-    let scan = open_children(root.path(), "session-origin");
+    let scan = open_children(&mut environment, root.path(), "session-origin");
     assert_eq!(scan.open.len(), SCAN_OPEN);
     assert_eq!(scan.scanned.sessions, SCAN_OPEN as u64);
     assert_eq!(examined.get(), SCAN_OPEN as u64);

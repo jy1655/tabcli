@@ -29,6 +29,7 @@ use super::{
     applescript, applescript::close_response,
 };
 
+use crate::native::clock::{Clock, SystemClock};
 use crate::native::session::launch::BindingFacts;
 
 const HOST_COMMAND: &str = TerminalKind::AppleTerminal.registration().host_command;
@@ -310,7 +311,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
             }
             Ok(tty)
         },
-        |directory, id, tty| wait_for_binding(directory, id, tty),
+        |directory, id, tty| wait_for_binding(directory, id, tty, &mut SystemClock),
         |released| {
             crate::native::session::launch::log(
                 &Store::open_unchecked(directory),
@@ -323,9 +324,9 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
     )
 }
 
-fn wait_for_binding(directory: &Path, id: &str, tty: &str) -> Result<()> {
+fn wait_for_binding(directory: &Path, id: &str, tty: &str, clock: &mut dyn Clock) -> Result<()> {
     use crate::native::session::launch::wait_for_binding;
-    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING)?;
+    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING, clock)?;
     if surface.kind != TerminalKind::AppleTerminal
         || surface.id != tty
         || surface.window_id.as_deref().is_none_or(str::is_empty)
@@ -1404,7 +1405,7 @@ mod tests {
     fn host_binding_partial_transitions() {
         crate::native::session::launch::binding_tests::characterize(
             "Terminal.app",
-            |directory, id| super::wait_for_binding(directory, id, "host-id"),
+            |directory, id, clock| super::wait_for_binding(directory, id, "host-id", clock),
         );
     }
 
@@ -2680,7 +2681,8 @@ end run
                 _ => {}
             }
             assert_eq!(
-                super::wait_for_binding(directory, id, TTY).is_ok(),
+                super::wait_for_binding(directory, id, TTY, &mut crate::native::clock::SystemClock)
+                    .is_ok(),
                 case == "bound",
                 "{case}"
             );

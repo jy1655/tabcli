@@ -23,7 +23,7 @@ const INPUT_RECEIPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 // The clock is consent's, shared with the trust wait; the readiness and receipt gates
 // take it so that tests run them on simulated time.
-pub(super) use crate::native::consent::{Clock, SystemClock};
+pub(super) use crate::native::clock::{Clock, SystemClock};
 
 pub(super) fn read_log_bytes(log_path: &Path) -> Result<Option<Vec<u8>>> {
     RecordReader::at(log_path).bytes()

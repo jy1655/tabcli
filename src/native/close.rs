@@ -1,5 +1,6 @@
 //! Explicit close of a managed session's visible surface.
 use super::args::{parse_timeout, set_flag_once, set_once};
+use crate::native::clock::SystemClock;
 use crate::native::session::close::budget::CLOSE_TIMEOUT;
 use crate::native::session::primitives::require_valid_session_id;
 use crate::native::session::{Reader, Store};
@@ -68,6 +69,7 @@ pub(super) fn run(request: CloseRequest) -> Result<()> {
         directory.parent().unwrap_or(Path::new("")),
         &request.id,
         deadline.min(Instant::now() + session::origin::SCAN_TIME),
+        &mut SystemClock,
     );
     if request.json {
         println!(

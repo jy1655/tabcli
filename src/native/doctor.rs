@@ -6,11 +6,12 @@ use super::query::observation::judgment::{
 };
 use super::query::observation::{Observation, SessionEvidence};
 use super::{NativeCommand, consent, provider, provider_process, query, reopen, terminal};
+use crate::native::clock::SystemClock;
 use crate::native::process_env;
 use crate::native::session::launch::wrapper::{
     is_executable, provider_version_text, resolve_provider,
 };
-use crate::native::session::origin::{OriginObservation, SourceKind};
+use crate::native::session::origin::{OriginEnvironment, OriginObservation, SourceKind};
 use crate::native::session::primitives::{SESSION_DIR_ENV, require_valid_session_id, unix_ms};
 use crate::native::session::schema::SessionManifest;
 use crate::native::session::{Reader, SessionState};
@@ -290,12 +291,14 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
         });
     }
     let manifest = directory.as_ref().and_then(|directory| {
+        let mut clock = SystemClock;
         let (manifest, evidence) = record_checks(
             &Reader::open_unchecked(directory),
             request.session.as_deref().unwrap(),
             deadline,
             &mut checks,
             &mut observations,
+            &mut OriginEnvironment::production(&mut clock),
         );
         if request.probe {
             surface_check(
@@ -544,12 +547,13 @@ pub(super) fn record_checks(
     deadline: Instant,
     checks: &mut Vec<Check>,
     observations: &mut Value,
+    environment: &mut OriginEnvironment<'_>,
 ) -> (Option<SessionManifest>, SessionEvidence) {
     let (manifest, evidence, surface, hold) = match Observation::read(reader) {
         Ok(observation) => {
             session_checks(&observation, checks, observations);
             cancel_check(&observation.judgments.cancel, id, checks);
-            let origin = observation.observe_origin(reader, Some(deadline));
+            let origin = observation.observe_origin(reader, Some(deadline), environment);
             origin.add_fields(observations);
             origin_check(
                 &origin,

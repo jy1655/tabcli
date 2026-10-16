@@ -17,6 +17,7 @@ use super::{
     applescript, applescript::close_response,
 };
 
+use crate::native::clock::{Clock, SystemClock};
 use crate::native::session::launch::BindingFacts;
 
 const HOST_COMMAND: &str = TerminalKind::Iterm2.registration().host_command;
@@ -381,14 +382,19 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
                 .context("empty iTerm2 session identity")?
                 .to_owned())
         },
-        |directory, id, iterm_id| wait_for_binding(directory, id, iterm_id),
+        |directory, id, iterm_id| wait_for_binding(directory, id, iterm_id, &mut SystemClock),
         |_| {},
     )
 }
 
-fn wait_for_binding(directory: &Path, id: &str, iterm_id: &str) -> Result<()> {
+fn wait_for_binding(
+    directory: &Path,
+    id: &str,
+    iterm_id: &str,
+    clock: &mut dyn Clock,
+) -> Result<()> {
     use crate::native::session::launch::wait_for_binding;
-    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING)?;
+    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING, clock)?;
     if surface.kind != TerminalKind::Iterm2 || surface.id != iterm_id {
         bail!("iTerm2 surface binding does not match this launch host");
     }
@@ -978,9 +984,10 @@ mod tests {
 
     #[test]
     fn host_binding_partial_transitions() {
-        crate::native::session::launch::binding_tests::characterize("iTerm2", |directory, id| {
-            wait_for_binding(directory, id, "host-id")
-        });
+        crate::native::session::launch::binding_tests::characterize(
+            "iTerm2",
+            |directory, id, clock| wait_for_binding(directory, id, "host-id", clock),
+        );
     }
 
     use super::*;
@@ -2007,7 +2014,7 @@ end run
                 _ => {}
             }
             assert!(
-                wait_for_binding(directory, id, "owned-id").is_err(),
+                wait_for_binding(directory, id, "owned-id", &mut SystemClock).is_err(),
                 "{mode}"
             );
         }
