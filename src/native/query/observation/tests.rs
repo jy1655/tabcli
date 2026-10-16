@@ -159,21 +159,13 @@ fn observation_is_read_only_and_releases_its_lock() {
     assert_eq!(entries(&fixture.directory), original);
     let before = entries(&fixture.directory);
     for owner in [false, true] {
-        let mut observation = Observation::read(&reader).unwrap();
-        assert!(observation.evidence.owner_observation.is_none());
+        let observation = Observation::read(&reader).unwrap();
+        assert!(observation.evidence.owner_judgment.get().is_none());
         if owner {
-            observation.evidence.observe_owner();
-            assert_eq!(
-                observation
-                    .evidence
-                    .owner_observation
-                    .as_ref()
-                    .unwrap()
-                    .process_alive,
-                Some(false)
-            );
+            observation.evidence.judge_owner("session-fault");
+            assert!(observation.evidence.owner_judgment.get().unwrap().gone());
         }
-        assert!(observation.evidence.surface_presence.is_none());
+        assert!(observation.evidence.surface_presence.get().is_none());
         // Compare bytes before taking the writer lock: Windows refuses to read a file
         // another handle holds exclusively, and the lock file is part of the directory.
         assert_eq!(entries(&fixture.directory), before);
@@ -258,13 +250,13 @@ fn inspect_rejects_provenance_before_reading_latest_event() {
 }
 
 #[test]
-fn unreadable_active_result_is_unknown_to_doctor() {
+fn an_active_result_damaged_after_publication_is_an_unreadable_active_state() {
     let fixture = seed_close_fixture(JournaledEventState::Committed);
     let reader = Reader::open_unchecked(&fixture.directory);
     let event_path = reader.events().unwrap().remove(0);
-    let original = fs::read(&event_path).unwrap();
     // Damage the active event after its publication comparison, while retaining the
-    // claim and valid journal. This isolates the active Request's decode error.
+    // claim and valid journal. This isolates the active Request's decode error from the
+    // turn judgment, which still sees the claim.
     let damaged = event_path.clone();
     with_snapshot_hook(
         move |_| fs::write(&damaged, b"{").unwrap(),
@@ -279,14 +271,180 @@ fn unreadable_active_result_is_unknown_to_doctor() {
                     .unwrap()
                     .is_err()
             );
-            fs::write(&event_path, &original).unwrap();
-            let (checks, observed) = doctor_records(&reader);
-            assert_eq!(reason(&checks, "session_records"), "records_read");
-            assert_eq!(observed["active_request_state"], "unknown");
-            assert!(observed["active_request_id"].is_string());
-            assert_eq!(reason(&checks, "turn"), "turn_in_progress");
+            assert_eq!(observation.judgments.turn, judgment::Turn::TurnInProgress);
+            assert!(!observation.judgments.claim_without_receipt);
         },
     );
+}
+
+#[test]
+fn each_damaged_auxiliary_record_is_its_unreadable_part() {
+    use judgment::UnreadablePart;
+    for (part, expected) in [
+        ("owner", UnreadablePart::Owner),
+        ("surface", UnreadablePart::SurfaceRecord),
+        ("tombstone", UnreadablePart::UnconsumedCloseTombstone),
+        ("hold", UnreadablePart::Hold),
+        ("resumed_from", UnreadablePart::ResumedFrom),
+        ("receipt", UnreadablePart::RequestIndex),
+        ("request_index", UnreadablePart::RequestIndex),
+    ] {
+        let fixture = seed_close_fixture(JournaledEventState::Committed);
+        let directory = &fixture.directory;
+        session::turn::recover_pending_completion(directory).unwrap();
+        session::update_status(directory, SessionState::Claimed, None, None).unwrap();
+        session::update_status(directory, SessionState::Working, None, None).unwrap();
+        let reader = Reader::open_unchecked(directory);
+        let observation = Observation::read(&reader).unwrap();
+        assert!(observation.judgments.unreadable.is_empty(), "{part}");
+        let receipt = &observation.records.receipts[0];
+        let path = match part {
+            "owner" => directory.join("native-session.json"),
+            "surface" => directory.join("terminal.json"),
+            "tombstone" => directory.join("terminal.closed.json"),
+            "hold" => directory.join("hold.json"),
+            "resumed_from" => directory.join("manifest.json"),
+            "receipt" => directory
+                .join("requests")
+                .join(format!("{}.json", receipt.claim_token)),
+            "request_index" => directory.join("requests"),
+            _ => unreachable!(),
+        };
+        match part {
+            "resumed_from" => {
+                let mut manifest: Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                manifest["resumed_from"] = json!({"session": 42});
+                crate::native::write_json_atomic(&path, &manifest).unwrap();
+            }
+            "tombstone" => {
+                crate::native::write_json_atomic(&path, &json!({"terminal": "iterm"})).unwrap()
+            }
+            _ => {
+                if path.is_dir() {
+                    fs::remove_dir_all(&path).unwrap();
+                } else if path.exists() {
+                    fs::remove_file(&path).unwrap();
+                }
+                crate::native::write_private(&path, b"{").unwrap();
+            }
+        }
+        let observation = Observation::read(&reader).unwrap();
+        assert_eq!(observation.judgments.unreadable, vec![expected], "{part}");
+        assert_eq!(observation.records.status.state, SessionState::Working);
+        if part == "tombstone" {
+            assert_eq!(
+                observation.judgments.surface,
+                judgment::Surface::Closed { consumed: false }
+            );
+        }
+    }
+}
+
+#[test]
+fn surface_presence_is_judged_once_per_observation() {
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    crate::native::write_json_atomic(
+        &fixture.directory.join("terminal.json"),
+        &json!({"terminal": "warp", "session_id": "surface-1", "managed_session_id": "session-fault"}),
+    )
+    .unwrap();
+    let reader = Reader::open_unchecked(&fixture.directory);
+    let observation = Observation::read(&reader).unwrap();
+    assert!(observation.evidence.surface_presence.get().is_none());
+    let calls = std::cell::Cell::new(0);
+    let probe = |directory: &Path, handle: &terminal::TerminalSession, budget: Duration| {
+        calls.set(calls.get() + 1);
+        assert_eq!(directory, fixture.directory.as_path());
+        assert_eq!(handle.id, "surface-1");
+        assert!(budget <= Duration::from_secs(2));
+        Ok(false)
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for _ in 0..3 {
+        let presence = observation
+            .evidence
+            .judge_surface_presence_with(&reader, deadline, &probe);
+        assert_eq!(*presence, judgment::SurfacePresence::Missing);
+    }
+    assert_eq!(calls.get(), 1);
+    // The memoized judgment is the one every renderer of this Observation reads.
+    assert_eq!(
+        *observation
+            .evidence
+            .judge_surface_presence(&reader, deadline),
+        judgment::SurfacePresence::Missing
+    );
+    assert_eq!(calls.get(), 1);
+    // Without a bound active handle the probe is never asked (D18: the current read).
+    let unbound = Observation::read(&reader).unwrap();
+    fs::remove_file(fixture.directory.join("terminal.json")).unwrap();
+    let presence = unbound
+        .evidence
+        .judge_surface_presence_with(&reader, deadline, &|_, _, _| panic!("no handle to probe"));
+    assert_eq!(
+        *presence,
+        judgment::SurfacePresence::Unverified("no active terminal handle is recorded".into())
+    );
+    let expired = Observation::read(&reader).unwrap();
+    crate::native::write_json_atomic(
+        &fixture.directory.join("terminal.json"),
+        &json!({"terminal": "warp", "session_id": "surface-1", "managed_session_id": "session-fault"}),
+    )
+    .unwrap();
+    let presence =
+        expired
+            .evidence
+            .judge_surface_presence_with(&reader, Instant::now(), &|_, _, _| {
+                panic!("no budget to probe")
+            });
+    assert_eq!(
+        *presence,
+        judgment::SurfacePresence::Unverified("diagnostic probe deadline exhausted".into())
+    );
+}
+
+#[test]
+fn inspect_holds_the_lifecycle_lock_through_its_historical_elapsed_reads() {
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    let directory = &fixture.directory;
+    // A second, historical request beside the active one.
+    crate::native::write_json_atomic(
+        &directory.join("events/event-000.json"),
+        &json!({"provider":"codex","message":"earlier result","error":null,
+            "provider_session_id":null,"turn_id":null,"created_unix_ms":1}),
+    )
+    .unwrap();
+    crate::native::write_json_atomic(
+        &directory.join("requests/1-1-1.json"),
+        &json!({"schema":1,"request_id":"request-earlier","claim_token":"1-1-1",
+            "event_file":"event-000.json","created_unix_ms":0}),
+    )
+    .unwrap();
+    let reader = Reader::open_unchecked(directory);
+    let receipts = observe_snapshot(&reader).unwrap().receipts.len();
+    assert_eq!(receipts, 2);
+    let lock_path = directory.join("turn.claim.lock");
+    let held = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = held.clone();
+    let inspect = with_event_read_hook(
+        move |_| {
+            let writer = File::open(&lock_path).unwrap();
+            seen.lock().unwrap().push(matches!(
+                writer.try_lock(),
+                Err(std::fs::TryLockError::WouldBlock)
+            ));
+        },
+        || super::super::inspect_value(&reader, "session-fault").unwrap(),
+    );
+    // The active Request's state, the latest Result and one historical elapsed read per
+    // receipt, every decode under the lock.
+    assert_eq!(*held.lock().unwrap(), vec![true; receipts + 2]);
+    assert_eq!(inspect["requests"].as_array().unwrap().len(), receipts);
+    File::open(directory.join("turn.claim.lock"))
+        .unwrap()
+        .try_lock()
+        .unwrap();
 }
 
 #[test]
@@ -357,4 +515,48 @@ fn doctor_reads_the_origin_within_its_own_deadline() {
         "origin_budget_exhausted"
     );
     assert!(observations["origin_observation"]["ended"].is_null());
+}
+
+#[test]
+fn owner_judgment_is_made_once_per_observation() {
+    use crate::native::process_identity::{Attested, ProcessObservation};
+    use crate::native::session::owner::ControlAttestation;
+    use judgment::tests::attestation;
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    crate::native::write_json_atomic(
+        &fixture.directory.join("native-session.json"),
+        &json!({"pid": 4242, "managed_session_id": "session-fault"}),
+    )
+    .unwrap();
+    let observation = Observation::read(&Reader::open_unchecked(&fixture.directory)).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let observers = judgment::Observers {
+        attest: &|owner| {
+            calls.set(calls.get() + 1);
+            assert_eq!(owner.pid, 4242);
+            attestation(
+                ProcessObservation::Live(Attested::PidOnly),
+                ControlAttestation::NotRecorded,
+                Some(true),
+            )
+        },
+        pid_alive: &|_| panic!("a bound record is attested"),
+    };
+    for _ in 0..3 {
+        let owner = observation
+            .evidence
+            .judge_owner_with("session-fault", &observers);
+        assert_eq!(owner.observation().process_alive, Some(true));
+    }
+    assert_eq!(calls.get(), 1);
+    // The memoized judgment is the one every renderer of this Observation reads.
+    assert_eq!(
+        observation
+            .evidence
+            .judge_owner("session-fault")
+            .observation()
+            .process_alive,
+        Some(true)
+    );
+    assert_eq!(calls.get(), 1);
 }

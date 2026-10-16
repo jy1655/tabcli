@@ -136,7 +136,11 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   reads, and search retains its cumulative byte budget.
   Inspect, doctor, and `status` render one Observation per session from these readers and publication rules;
   owner process observations and surface probes are added on request, while `sessions` keeps
-  its own lock-free listing after its optional repair. All four add the Origin fields through the
+  its own lock-free listing after its optional repair. The Observation's judgments live in
+  `query/observation/judgment.rs` as pure functions over the Records, with the owner attestation
+  and the surface probe made on request and memoized per Observation; `wait` makes a fresh owner
+  judgment per poll, `inspect`'s renderer is `query/inspect.rs`, and no renderer (status, doctor,
+  inspect, wait) derives a rule of its own. All four add the Origin fields through the
   session origin reader; that reading stays observation-only even in the repairing `sessions`. Its `results` counts event paths admitted
   by the publication predicate used by status and result. `Reader::published_result_count`
   reads receipts and claim/journal evidence with a before/after consistency check, without

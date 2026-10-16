@@ -69,6 +69,30 @@ thread_local! {
 }
 
 #[cfg(test)]
+type EventReadHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs on every published event decode with the event's path, so a test can observe
+    /// what the reader holds while it decodes.
+    static ON_EVENT_READ: std::cell::RefCell<Option<EventReadHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs `hook` for the published event decodes `run` performs on this thread and
+/// removes it afterwards.
+#[cfg(test)]
+pub(in crate::native) fn with_event_read_hook<T>(
+    hook: impl FnMut(&Path) + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    ON_EVENT_READ.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+    let outcome = run();
+    ON_EVENT_READ.with(|cell| *cell.borrow_mut() = None);
+    outcome
+}
+
+#[cfg(test)]
 pub(in crate::native) fn with_event_read_count<T>(run: impl FnOnce() -> T) -> (T, usize) {
     let previous = EVENT_READ_COUNT.with(|count| count.replace(Some(0)));
     let outcome = run();
@@ -234,7 +258,14 @@ impl Snapshot {
         }
         #[cfg(test)]
         EVENT_READ_COUNT.with(|count| count.set(count.get().map(|reads| reads + 1)));
-        RecordReader::at(reader.event(name).path()).optional_json()
+        let record = reader.event(name);
+        #[cfg(test)]
+        ON_EVENT_READ.with(|cell| {
+            if let Some(hook) = cell.borrow_mut().as_mut() {
+                hook(record.path());
+            }
+        });
+        RecordReader::at(record.path()).optional_json()
     }
 
     pub(in crate::native) fn active_receipt(&self) -> Option<&requests::Receipt> {

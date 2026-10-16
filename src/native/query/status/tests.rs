@@ -1,5 +1,10 @@
 use super::*;
+use crate::native::process_identity::{Attested, Gone, ProcessObservation};
+use crate::native::session::owner::ControlAttestation::{self, *};
+use crate::native::session::owner::tests::reused_attestation;
 use crate::native::{session, tests::seed_close_fixture, write_json_atomic, write_private};
+use observation::judgment::tests::{CLAIM, SESSION, attestation, evidence, receipt, snapshot};
+use observation::judgment::{IndexIncomplete, Judgments, Surface, SurfaceSource, UnreadablePart};
 
 fn read(reader: &Reader) -> StatusObservation {
     Observation::read_for_status(reader, Instant::now() + SEARCH_TIME_BUDGET, true)
@@ -25,220 +30,333 @@ fn origin(ended: Option<bool>) -> OriginObservation {
 }
 
 fn flag(observed: &StatusObservation, expected: &str) -> bool {
-    attention(observed, &OwnerObservation::default(), false, &origin(None)).contains(&expected)
+    attention(observed, &OwnerJudgment::Absent, &origin(None)).contains(&expected)
 }
 
-#[test]
-fn attention_uses_recorded_delivery_launch_claim_and_state_facts() {
-    let fixture = seed_close_fixture(JournaledEventState::Absent);
-    let reader = Reader::open_unchecked(&fixture.directory);
-    let mut observed = read(&reader);
-    assert!(flag(&observed, "recovery_required"));
-    assert!(!flag(&observed, "delivery_unconfirmed"));
-    observed.observation.records.pending = None;
-    observed.observation.records.status.error = Some("delivery uncertain".to_owned());
-    assert!(flag(&observed, "delivery_unconfirmed"));
-    assert!(!flag(&observed, "claim_without_receipt"));
-    observed.observation.records.receipts.clear();
-    assert!(flag(&observed, "claim_without_receipt"));
-    for (state, phase, reason) in [
-        (
-            SessionState::Launching,
-            launch::Phase::Pending,
-            "launch_timeout",
-        ),
-        (
-            SessionState::Failed,
-            launch::Phase::Pending,
-            "launch_failed",
-        ),
-        (
-            SessionState::Failed,
-            launch::Phase::Spawning,
-            "launch_uncertain",
-        ),
-    ] {
-        let records = &mut observed.observation.records;
-        records.status.state = state;
-        records.launch = Some(launch::Record {
-            schema: 1,
-            claim_token: records.claim.clone().unwrap(),
-            deadline_unix_ms: 1,
-            phase,
-        });
-        observed.observation.judgments.launch_failure = launch::diagnostic(
-            records.launch.as_ref(),
-            &records.status,
-            records.claim.as_deref(),
-        );
-        assert!(flag(&observed, reason));
+/// A StatusObservation assembled in memory from `records`, with every auxiliary record
+/// readable and absent and both status reads successful.
+fn in_memory(records: Snapshot) -> StatusObservation {
+    let evidence = evidence();
+    let judgments = Judgments::of(&records, &evidence, None, &Ok(None), None, None, SESSION);
+    StatusObservation {
+        observation: Observation {
+            origin: session::origin::reference(&records),
+            cancel: None,
+            records,
+            evidence,
+            resumed_from: Ok(None),
+            workspace_consent: Value::Null,
+            judgments,
+        },
+        active: None,
+        latest: Ok(Value::Null),
     }
-    assert!(flag(&observed, "session_failed"));
-    observed.observation.records.status.state = SessionState::Exited;
-    assert!(flag(&observed, "session_exited"));
-    observed.observation.records.status.residual_surface =
-        Some(launch::ResidualSurface::Unverified);
-    assert!(flag(&observed, "residual_surface_unverified"));
-    observed.observation.records.status.residual_surface = Some(launch::ResidualSurface::Cleared);
-    assert!(!flag(&observed, "residual_surface_unverified"));
+}
+
+fn live(control: ControlAttestation) -> OwnerJudgment {
+    OwnerJudgment::Bound(attestation(
+        ProcessObservation::Live(Attested::Incarnation),
+        control,
+        Some(true),
+    ))
 }
 
 #[test]
-fn owner_attention_distinguishes_negative_and_missing_facts_including_linux() {
-    let fixture = seed_close_fixture(JournaledEventState::Absent);
-    let reader = Reader::open_unchecked(&fixture.directory);
-    let mut observed = read(&reader);
-    for (alive, identity, bound, expected) in [
-        (Some(false), None, true, vec!["owner_exited"]),
+fn status_maps_each_judgment_to_its_documented_output() {
+    let mut observed = in_memory(snapshot(SessionState::Working));
+    // A verified owner adds no flag, so every other row is read alone.
+    let flags = |observed: &StatusObservation, ended: Option<bool>| {
+        attention(observed, &live(Verified), &origin(ended))
+    };
+    assert!(flags(&observed, None).is_empty());
+
+    for (cancel, expected) in [
         (
-            Some(true),
-            Some(false),
-            true,
-            vec!["owner_identity_mismatch"],
+            Cancel::Recorded(Some(CancelState::RequestedActive)),
+            vec!["cancel_requested"],
         ),
-        (None, None, true, vec!["owner_unverified"]),
-        (Some(true), None, true, vec![]),
-        (Some(true), Some(true), true, vec![]),
-        (None, None, false, vec!["owner_unverified"]),
+        (Cancel::Recorded(Some(CancelState::RequestedStale)), vec![]),
+        (Cancel::Recorded(Some(CancelState::Applied)), vec![]),
+        (Cancel::Recorded(Some(CancelState::NotApplied)), vec![]),
+        (Cancel::Recorded(None), vec![]),
+        (Cancel::Unreadable("x".into()), vec![]),
+        (Cancel::Absent, vec![]),
     ] {
-        let owner = OwnerObservation {
-            process_alive: alive,
-            identity_matches: identity,
-            error: None,
-        };
-        let actual = attention(&observed, &owner, bound, &origin(None))
-            .into_iter()
-            .filter(|flag| flag.starts_with("owner_"))
-            .collect::<Vec<_>>();
-        assert_eq!(actual, expected);
+        observed.observation.judgments.cancel = cancel.clone();
+        assert_eq!(flags(&observed, None), expected, "{cancel:?}");
     }
-    observed.observation.records.status.state = SessionState::Closed;
-    assert!(!flag(&observed, "owner_unverified"));
-    let owner = OwnerObservation {
-        process_alive: Some(false),
-        identity_matches: Some(false),
-        error: None,
-    };
-    assert!(
-        !attention(&observed, &owner, true, &origin(None))
-            .iter()
-            .any(|f| f.starts_with("owner_"))
-    );
-}
-
-#[test]
-fn a_live_owner_identity_check_error_requires_attention() {
-    let fixture = seed_close_fixture(JournaledEventState::Absent);
-    let reader = Reader::open_unchecked(&fixture.directory);
-    let observed = read(&reader);
-    let owner = OwnerObservation {
-        process_alive: Some(true),
-        identity_matches: None,
-        error: Some("identity check failed".to_owned()),
-    };
-    let flags = attention(&observed, &owner, true, &origin(None))
-        .into_iter()
-        .filter(|flag| flag.starts_with("owner_"))
-        .collect::<Vec<_>>();
-    assert_eq!(flags, ["owner_unverified"]);
-}
-
-#[test]
-fn each_auxiliary_failure_keeps_the_session_with_attention() {
+    for (hold, expected) in [
+        (
+            Hold::Held {
+                release_allowed: true,
+            },
+            vec!["held"],
+        ),
+        (
+            Hold::Held {
+                release_allowed: false,
+            },
+            vec!["held"],
+        ),
+        (Hold::Unreadable("x".into()), vec![]),
+        (Hold::NotHeld, vec![]),
+    ] {
+        observed.observation.judgments.hold = hold.clone();
+        assert_eq!(flags(&observed, None), expected, "{hold:?}");
+    }
+    for (turn, expected) in [
+        (Turn::DeliveryUnconfirmed, vec!["delivery_unconfirmed"]),
+        (
+            Turn::LaunchFailed {
+                reason: "launch_timeout",
+                detail: "deadline expired".into(),
+            },
+            vec!["launch_timeout"],
+        ),
+        (
+            Turn::LaunchFailed {
+                reason: "launch_uncertain",
+                detail: "spawning".into(),
+            },
+            vec!["launch_uncertain"],
+        ),
+        (Turn::TurnInProgress, vec![]),
+        (Turn::NoActiveTurn, vec![]),
+    ] {
+        observed.observation.judgments.turn = turn.clone();
+        assert_eq!(flags(&observed, None), expected, "{turn:?}");
+    }
+    observed.observation.judgments.claim_without_receipt = true;
+    assert_eq!(flags(&observed, None), ["claim_without_receipt"]);
+    observed.observation.judgments.claim_without_receipt = false;
+    observed.observation.judgments.recovery_required = true;
+    assert_eq!(flags(&observed, None), ["recovery_required"]);
+    observed.observation.judgments.recovery_required = false;
     for part in [
-        "owner",
-        "surface",
-        "resumed_from",
-        "event",
-        "receipt",
-        "request_index",
+        UnreadablePart::Hold,
+        UnreadablePart::Owner,
+        UnreadablePart::SurfaceRecord,
+        UnreadablePart::UnconsumedCloseTombstone,
+        UnreadablePart::ResumedFrom,
+        UnreadablePart::RequestIndex,
     ] {
-        let fixture = seed_close_fixture(JournaledEventState::Committed);
-        let directory = &fixture.directory;
-        session::turn::recover_pending_completion(directory).unwrap();
-        // Keep the original observation fixture: a published result while the provider works.
-        session::update_status(directory, SessionState::Claimed, None, None).unwrap();
-        session::update_status(directory, SessionState::Working, None, None).unwrap();
-        let reader = Reader::open_unchecked(directory);
-        let observed = read(&reader);
-        let receipt = &observed.observation.records.receipts[0];
-        let path = match part {
-            "owner" => directory.join("native-session.json"),
-            "surface" => directory.join("terminal.json"),
-            "resumed_from" => directory.join("manifest.json"),
-            "event" => directory.join("events").join(&receipt.event_file),
-            "receipt" => directory
-                .join("requests")
-                .join(format!("{}.json", receipt.claim_token)),
-            "request_index" => directory.join("requests"),
-            _ => unreachable!(),
-        };
-        if part == "resumed_from" {
-            let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            manifest["resumed_from"] = json!({"session": 42});
-            write_json_atomic(&path, &manifest).unwrap();
-        } else {
-            if path.is_dir() {
-                fs::remove_dir_all(&path).unwrap();
-            } else if path.exists() {
-                fs::remove_file(&path).unwrap();
-            }
-            write_private(&path, b"{").unwrap();
-        }
-        let observed = read(&reader);
-        assert!(flag(&observed, "records_partially_unreadable"), "{part}");
-        let value = entry(observed, "session-fault", origin(None));
-        assert_eq!(value["state"], "working");
-        if part == "event" {
-            assert!(value["latest_result"].is_null());
-        }
-        if matches!(part, "receipt" | "request_index") {
-            assert!(
-                value["attention"]
-                    .as_array()
-                    .unwrap()
-                    .contains(&json!("request_index_incomplete"))
-            );
-        }
+        observed.observation.judgments.unreadable = vec![part];
+        assert_eq!(
+            flags(&observed, None),
+            ["records_partially_unreadable"],
+            "{part:?}"
+        );
     }
-}
-
-#[test]
-fn result_commands_use_active_then_claim_then_exact_event_then_null() {
-    let fixture = seed_close_fixture(JournaledEventState::Committed);
-    let reader = Reader::open_unchecked(&fixture.directory);
-    let mut observed = read(&reader);
-    let request = observed
-        .observation
-        .active_request()
-        .unwrap()
-        .request_id
-        .clone();
-    assert_eq!(
-        result_command(&observed, "session-fault"),
-        Some(format!(
-            "{PUBLIC_COMMAND} result session-fault --request {request} --json"
-        ))
-    );
-    observed.observation.records.receipts.clear();
-    assert_eq!(
-        result_command(&observed, "session-fault"),
-        Some(format!(
-            "{PUBLIC_COMMAND} result session-fault --list --json"
-        ))
-    );
-    observed.observation.records.claim = None;
-    let event = observed.latest.as_ref().unwrap()["event_id"]
-        .as_str()
-        .unwrap();
-    assert_eq!(
-        result_command(&observed, "session-fault"),
-        Some(format!(
-            "{PUBLIC_COMMAND} result session-fault --event {event} --json"
-        ))
-    );
+    observed.observation.judgments.unreadable = vec![];
+    observed.observation.judgments.request_index = Some(IndexIncomplete {
+        unreadable: 1,
+        error: None,
+    });
+    assert_eq!(flags(&observed, None), ["request_index_incomplete"]);
+    observed.observation.judgments.request_index = None;
+    observed.observation.judgments.residual_surface = Some(launch::ResidualSurface::Unverified);
+    assert_eq!(flags(&observed, None), ["residual_surface_unverified"]);
+    observed.observation.judgments.residual_surface = None;
+    for (ended, expected) in [
+        (Ended::Failed, vec!["session_failed"]),
+        (Ended::Exited, vec!["session_exited"]),
+        (Ended::Neither, vec![]),
+    ] {
+        observed.observation.judgments.ended = ended;
+        assert_eq!(flags(&observed, None), expected, "{ended:?}");
+    }
+    // Status's own two reads join the unreadable parts (D12).
+    observed.latest = Err(anyhow::anyhow!("latest"));
+    assert_eq!(flags(&observed, None), ["records_partially_unreadable"]);
     observed.latest = Ok(Value::Null);
-    assert_eq!(result_command(&observed, "session-fault"), None);
+    observed.active = Some(Err(anyhow::anyhow!("active")));
+    assert_eq!(flags(&observed, None), ["records_partially_unreadable"]);
+    observed.active = Some(Ok(json!({"request_state": "pending"})));
+    assert!(flags(&observed, None).is_empty());
+    observed.active = None;
+    assert_eq!(flags(&observed, Some(true)), ["origin_ended"]);
+    assert!(flags(&observed, Some(false)).is_empty());
+
+    // Owner rows: a live owner whose identity was not compared is not flagged, and an
+    // Unknown attestation is unverified, never exited (B3).
+    let owner_rows: Vec<(OwnerJudgment, Vec<&str>, Value)> = vec![
+        (
+            OwnerJudgment::Bound(attestation(
+                ProcessObservation::Gone(Gone::Exited),
+                NotRecorded,
+                Some(false),
+            )),
+            vec!["owner_exited"],
+            json!([false, null, null]),
+        ),
+        (
+            OwnerJudgment::Bound(reused_attestation()),
+            vec!["owner_identity_mismatch"],
+            json!([true, false, null]),
+        ),
+        (
+            live(Changed("owner TTY changed".into())),
+            vec!["owner_identity_mismatch"],
+            json!([true, false, null]),
+        ),
+        (live(Verified), vec![], json!([true, true, null])),
+        (live(NotRecorded), vec![], json!([true, null, null])),
+        (
+            OwnerJudgment::Bound(attestation(
+                ProcessObservation::Live(Attested::PidOnly),
+                NotRecorded,
+                Some(true),
+            )),
+            vec![],
+            json!([true, null, null]),
+        ),
+        (
+            live(Unknown("identity check failed".into())),
+            vec!["owner_unverified"],
+            json!([true, null, "identity check failed"]),
+        ),
+        (
+            OwnerJudgment::Bound(attestation(
+                ProcessObservation::Unknown("denied".into()),
+                NotRecorded,
+                Some(false),
+            )),
+            vec!["owner_unverified"],
+            json!([false, null, "denied"]),
+        ),
+        (
+            OwnerJudgment::UnboundLegacy { alive: Some(false) },
+            vec!["owner_unverified"],
+            json!([null, null, "owner record is unbound"]),
+        ),
+        (
+            OwnerJudgment::Foreign,
+            vec!["owner_unverified"],
+            json!([null, null, FOREIGN_OWNER]),
+        ),
+        (
+            OwnerJudgment::Absent,
+            vec!["owner_unverified"],
+            json!([null, null, "no owner record"]),
+        ),
+        (
+            OwnerJudgment::Unreadable("invalid JSON".into()),
+            vec!["owner_unverified"],
+            json!([null, null, "invalid JSON"]),
+        ),
+    ];
+    for (owner, expected, value) in &owner_rows {
+        assert_eq!(
+            &attention(&observed, owner, &origin(None)),
+            expected,
+            "{owner:?}"
+        );
+        let o = owner_value(owner);
+        assert_eq!(
+            &json!([o.process_alive, o.identity_matches, o.error]),
+            value,
+            "{owner:?}"
+        );
+    }
+    // A closed session has neither owner nor origin attention.
+    observed.observation.records.status.state = SessionState::Closed;
+    for (owner, _, _) in &owner_rows {
+        assert!(
+            attention(&observed, owner, &origin(Some(true))).is_empty(),
+            "{owner:?}"
+        );
+    }
+    observed.observation.records.status.state = SessionState::Working;
+
+    // Every flag at once, in the documented order.
+    let judgments = &mut observed.observation.judgments;
+    judgments.cancel = Cancel::Recorded(Some(CancelState::RequestedActive));
+    judgments.hold = Hold::Held {
+        release_allowed: false,
+    };
+    judgments.turn = Turn::DeliveryUnconfirmed;
+    judgments.claim_without_receipt = true;
+    judgments.recovery_required = true;
+    judgments.unreadable = vec![UnreadablePart::RequestIndex];
+    judgments.request_index = Some(IndexIncomplete {
+        unreadable: 1,
+        error: None,
+    });
+    judgments.residual_surface = Some(launch::ResidualSurface::Unverified);
+    judgments.ended = Ended::Failed;
+    assert_eq!(
+        attention(&observed, &owner_rows[0].0, &origin(Some(true))),
+        [
+            "cancel_requested",
+            "held",
+            "delivery_unconfirmed",
+            "claim_without_receipt",
+            "recovery_required",
+            "owner_exited",
+            "records_partially_unreadable",
+            "request_index_incomplete",
+            "residual_surface_unverified",
+            "session_failed",
+            "origin_ended",
+        ]
+    );
+
+    for (candidate, expected) in [
+        (
+            ResultCandidate::ActiveRequest("request-test".into()),
+            Some(format!(
+                "{PUBLIC_COMMAND} result {SESSION} --request request-test --json"
+            )),
+        ),
+        (
+            ResultCandidate::ClaimOnly,
+            Some(format!("{PUBLIC_COMMAND} result {SESSION} --list --json")),
+        ),
+        (
+            ResultCandidate::LatestDecoded("event-9.json".into()),
+            Some(format!(
+                "{PUBLIC_COMMAND} result {SESSION} --event event-9.json --json"
+            )),
+        ),
+        (ResultCandidate::None, None),
+    ] {
+        assert_eq!(
+            result_command(candidate.clone(), SESSION),
+            expected,
+            "{candidate:?}"
+        );
+    }
+
+    // The entry carries the judgments and hands status's decoded latest to the candidate.
+    let mut records = snapshot(SessionState::Working);
+    records.claim = Some(CLAIM.to_owned());
+    records.receipts.push(receipt(CLAIM));
+    let mut observed = in_memory(records);
+    observed.observation.judgments.recovery_required = true;
+    observed.observation.judgments.residual_surface = Some(launch::ResidualSurface::Unverified);
+    observed.observation.judgments.surface = Surface::Unreadable {
+        source: SurfaceSource::ActiveHandle,
+        reason: "x".into(),
+    };
+    observed.latest = Ok(json!({"event_id": "event-9.json"}));
+    let value = entry(observed, SESSION, origin(None));
+    assert_eq!(value["recovery_required"], true);
+    assert_eq!(value["residual_surface"], "unverified");
+    assert_eq!(value["held"], false);
+    assert_eq!(
+        value["result_command"],
+        format!("{PUBLIC_COMMAND} result {SESSION} --request request-test --json")
+    );
+    assert_eq!(value["derived_from"], "observation");
+    let mut observed = in_memory(snapshot(SessionState::Ready));
+    observed.latest = Ok(json!({"event_id": "event-9.json"}));
+    let value = entry(observed, SESSION, origin(None));
+    assert_eq!(value["recovery_required"], false);
+    assert!(value.get("residual_surface").is_none());
+    assert_eq!(
+        value["result_command"],
+        format!("{PUBLIC_COMMAND} result {SESSION} --event event-9.json --json")
+    );
 }
 
 #[test]
@@ -400,29 +518,6 @@ fn closed_filter_precedes_event_decode_and_tombstone_shape_stays_distinct() {
 }
 
 #[test]
-fn owner_binding_is_required_before_attestation_and_record_failures_stay_null() {
-    let fixture = seed_close_fixture(JournaledEventState::Absent);
-    let reader = Reader::open_unchecked(&fixture.directory);
-    for owner in [
-        json!({"pid":0}),
-        json!({"pid":0,"managed_session_id":"session-other"}),
-        json!(42),
-    ] {
-        write_json_atomic(&fixture.directory.join("native-session.json"), &owner).unwrap();
-        let value = entry(read(&reader), "session-fault", origin(None));
-        assert!(value["owner"]["process_alive"].is_null());
-        assert!(value["owner"]["identity_matches"].is_null());
-        let flags = value["attention"].as_array().unwrap();
-        assert!(flags.contains(&json!("owner_unverified")));
-        assert!(!flags.contains(&json!("owner_exited")));
-        assert_eq!(
-            flags.contains(&json!("records_partially_unreadable")),
-            owner == json!(42)
-        );
-    }
-}
-
-#[test]
 fn owner_observation_runs_after_releasing_the_lifecycle_lock() {
     let fixture = seed_close_fixture(JournaledEventState::Committed);
     let reader = Reader::open_unchecked(&fixture.directory);
@@ -522,35 +617,4 @@ fn enumeration_faults_keep_status_reason_identity_and_encounter_order() {
         json!({"session": "session-z", "reason": "failed to read session entry file type: kind fault"})
     );
     assert_eq!(reasons[2]["session"], "session-a");
-}
-
-#[test]
-fn r1_c6_reused_owner_attention_is_mismatch_not_unverified() {
-    let fixture = seed_close_fixture(JournaledEventState::Absent);
-    let reader = Reader::open_unchecked(&fixture.directory);
-    let observed = read(&reader);
-    let owner = crate::native::session::owner::tests::reused_observation();
-    let flags = attention(&observed, &owner, true, &origin(None));
-    assert!(flags.contains(&"owner_identity_mismatch"));
-    assert!(!flags.contains(&"owner_unverified"));
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn correction_a3_intermediate_owner_status_distinguishes_changed_unknown_and_verified() {
-    let fixture = seed_close_fixture(JournaledEventState::Absent);
-    let reader = Reader::open_unchecked(&fixture.directory);
-    let observed = read(&reader);
-    for (control, expected) in [
-        ("changed", vec!["owner_identity_mismatch"]),
-        ("unknown", vec!["owner_unverified"]),
-        ("verified", vec![]),
-    ] {
-        let owner = crate::native::session::owner::tests::intermediate_observation(control);
-        let flags: Vec<_> = attention(&observed, &owner, true, &origin(None))
-            .into_iter()
-            .filter(|flag| flag.starts_with("owner_"))
-            .collect();
-        assert_eq!(flags, expected, "{control}");
-    }
 }

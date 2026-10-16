@@ -1,5 +1,9 @@
 //! Observations and advice only. No recovery, delivery, terminal control, or settings writes.
-use super::query::observation::{Observation, SessionEvidence, SurfaceRecord};
+use super::query::observation::judgment::{
+    self, ActiveHandle, BoundOwner, Cancel, Hold, OwnerJudgment, ResultCandidate, Surface,
+    SurfacePresence, SurfaceSource, Turn,
+};
+use super::query::observation::{Observation, SessionEvidence};
 use super::{
     Duration, FirstPartyCli, Instant, NativeCommand, OsString, Path, Reader, Result, Serialize,
     bail, cli_version_is_supported, consent, fs, is_executable, option_value, provider,
@@ -221,11 +225,14 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
                     "Check the explicit session id and state directory.",
                 ));
                 unknown_session_checks(id, "session_unavailable", &mut checks);
-                cancel_check(Some("unreadable"), id, &mut checks);
+                cancel_check(
+                    &Cancel::Unreadable("session unavailable".to_owned()),
+                    id,
+                    &mut checks,
+                );
                 unobserved_origin_check(id, &mut checks);
                 hold_check(
-                    &Err(anyhow::anyhow!("session unavailable")),
-                    false,
+                    &Hold::Unreadable("session unavailable".to_owned()),
                     id,
                     &mut checks,
                 );
@@ -273,7 +280,7 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
         });
     }
     let manifest = directory.as_ref().and_then(|directory| {
-        let (manifest, mut evidence) = record_checks(
+        let (manifest, evidence) = record_checks(
             &Reader::open_unchecked(directory),
             request.session.as_deref().unwrap(),
             deadline,
@@ -282,7 +289,7 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
         );
         if request.probe {
             surface_check(
-                &mut evidence,
+                &evidence,
                 &Reader::open_unchecked(directory),
                 deadline,
                 &mut checks,
@@ -526,11 +533,10 @@ pub(super) fn record_checks(
     checks: &mut Vec<Check>,
     observations: &mut Value,
 ) -> (Option<SessionManifest>, SessionEvidence) {
-    let mut evidence = None;
-    let manifest = match Observation::read(reader) {
+    let (manifest, evidence, surface, hold) = match Observation::read(reader) {
         Ok(observation) => {
             session_checks(&observation, checks, observations);
-            cancel_check(observation.cancel.as_ref().map(|c| c.state), id, checks);
+            cancel_check(&observation.judgments.cancel, id, checks);
             let origin = observation.observe_origin(reader, Some(deadline));
             origin.add_fields(observations);
             origin_check(
@@ -539,8 +545,18 @@ pub(super) fn record_checks(
                 id,
                 checks,
             );
-            evidence = Some(observation.evidence);
-            Some(observation.records.manifest)
+            let Observation {
+                records,
+                evidence,
+                judgments,
+                ..
+            } = observation;
+            (
+                Some(records.manifest),
+                evidence,
+                judgments.surface,
+                judgments.hold,
+            )
         }
         Err(error) => {
             let reason = if error.is::<query::SnapshotBusy>() {
@@ -553,53 +569,40 @@ pub(super) fn record_checks(
             let cancel = reader
                 .lock_shared()
                 .and_then(|lock| super::session::cancel::observe(reader, lock.is_some()));
-            cancel_check(
-                Some(match cancel {
-                    Ok(None) => "absent",
-                    Ok(Some(_)) => "requested",
-                    Err(_) => "unreadable",
-                }),
-                id,
-                checks,
-            );
+            cancel_check(&judgment::cancel_record(&cancel), id, checks);
             unobserved_origin_check(id, checks);
-            reader.manifest().ok()
+            // No Snapshot: the evidence-only judgments, with the stored state unknown.
+            let evidence = match reader.lock_shared() {
+                Ok(lock) => SessionEvidence::read(
+                    reader,
+                    super::session::hold::observe(reader, lock.is_some()),
+                ),
+                Err(error) => SessionEvidence::read(reader, Err(error)),
+            };
+            let surface = judgment::surface(&evidence.surface, id);
+            let hold = judgment::hold(&evidence.held, evidence.close_tombstone.as_ref(), None);
+            (reader.manifest().ok(), evidence, surface, hold)
         }
     };
-    let mut evidence = evidence.unwrap_or_else(|| match reader.lock_shared() {
-        Ok(lock) => SessionEvidence::read(
-            reader,
-            super::session::hold::observe(reader, lock.is_some()),
-        ),
-        Err(error) => SessionEvidence::read(reader, Err(error)),
-    });
-    owner_check(&mut evidence, id, checks);
-    terminal_check(&evidence, id, checks);
-    hold_check(
-        &evidence.held,
-        evidence.hold_release_allowed
-            && observations["stored_state"]
-                .as_str()
-                .is_some_and(|state| state != "closed"),
-        id,
-        checks,
-    );
+    owner_check(evidence.judge_owner(id), checks);
+    terminal_check(&surface, checks);
+    hold_check(&hold, id, checks);
     (manifest, evidence)
 }
 
-fn cancel_check(state: Option<&str>, id: &str, checks: &mut Vec<Check>) {
-    let (availability, reason, detail) = match state {
-        None | Some("absent") => (
+fn cancel_check(cancel: &Cancel, id: &str, checks: &mut Vec<Check>) {
+    let (availability, reason, detail) = match cancel {
+        Cancel::Absent => (
             Availability::Available,
             "cancel_absent",
             "No cancel request is recorded.",
         ),
-        Some("unreadable") => (
+        Cancel::Unreadable(_) => (
             Availability::Unknown,
             "cancel_unreadable",
             "The cancel request cannot be read reliably; published results remain independent.",
         ),
-        _ => (
+        Cancel::Recorded(_) => (
             Availability::Available,
             "cancel_recorded",
             "A cancel request is recorded; only a correlated provider result confirms interruption.",
@@ -674,31 +677,31 @@ fn origin_check(
     checks.push(check.evidence(evidence));
 }
 
-fn hold_check(held: &Result<bool>, release_allowed: bool, id: &str, checks: &mut Vec<Check>) {
-    let check = match held {
-        Ok(false) => Check::new(
+fn hold_check(hold: &Hold, id: &str, checks: &mut Vec<Check>) {
+    let check = match hold {
+        Hold::NotHeld => Check::new(
             "hold",
             Availability::Available,
             "not_held",
             "No follow-up hold is recorded.",
             "No hold release is needed.",
         ),
-        Ok(true) => Check::new(
+        Hold::Held { release_allowed } => Check::new(
             "hold",
             Availability::Unavailable,
             "session_held",
             "The user's hold refuses follow-ups whose delivery has not begun.",
-            if release_allowed {
+            if *release_allowed {
                 format!("{PUBLIC_COMMAND} hold {id} --release")
             } else {
                 "Preserve the hold record; inspect the session's recorded lifecycle before taking action.".to_owned()
             },
         ),
-        Err(error) => Check::new(
+        Hold::Unreadable(reason) => Check::new(
             "hold",
             Availability::Unknown,
             "hold_unreadable",
-            format!("{error:#}"),
+            reason.clone(),
             format!("{PUBLIC_COMMAND} inspect {id} --json"),
         ),
     };
@@ -727,22 +730,22 @@ fn unknown_session_checks(id: &str, reason: &'static str, checks: &mut Vec<Check
 fn session_checks(observation: &Observation, checks: &mut Vec<Check>, observations: &mut Value) {
     use Availability::*;
     let snapshot = &observation.records;
+    let judgments = &observation.judgments;
     let active = observation.active_request();
-    let result_action = active.map_or_else(
-        || {
+    // Doctor decodes no latest event: every candidate but the active Request is the list.
+    let result_action = match judgment::result_candidate(snapshot, None) {
+        ResultCandidate::ActiveRequest(request) => format!(
+            "{PUBLIC_COMMAND} result {} --request {request} --json",
+            snapshot.manifest.id
+        ),
+        ResultCandidate::ClaimOnly | ResultCandidate::LatestDecoded(_) | ResultCandidate::None => {
             format!(
                 "{PUBLIC_COMMAND} result {} --list --json",
                 snapshot.manifest.id
             )
-        },
-        |r| {
-            format!(
-                "{PUBLIC_COMMAND} result {} --request {} --json",
-                snapshot.manifest.id, r.request_id
-            )
-        },
-    );
-    let request_state = observation.judgments.active_state.as_ref().map(|state| {
+        }
+    };
+    let request_state = judgments.active_state.as_ref().map(|state| {
         state
             .as_ref()
             .map(|state| state.as_str())
@@ -751,8 +754,8 @@ fn session_checks(observation: &Observation, checks: &mut Vec<Check>, observatio
     *observations = json!({"stored_state": snapshot.status.state, "generation": snapshot.status.generation,
         "updated_unix_ms": snapshot.status.updated_unix_ms, "session_error": snapshot.status.error,
         "active_request_id": active.map(|r| &r.request_id), "active_request_state": request_state,
-        "recovery_required": snapshot.pending.is_some()});
-    if snapshot.claim.is_some() && active.is_none() {
+        "recovery_required": judgments.recovery_required});
+    if judgments.claim_without_receipt {
         checks.push(Check::new("active_request", Unknown, "active_request_unknown", "The active claim has no readable request receipt; its public request identity is unknown.", &result_action));
     }
     checks.push(Check::new(
@@ -773,32 +776,23 @@ fn session_checks(observation: &Observation, checks: &mut Vec<Check>, observatio
         format!("Stored state: {}", snapshot.status.state),
         &result_action,
     ));
-    let (availability, reason, detail) = match (&snapshot.claim, &snapshot.status.error) {
-        (Some(_), Some(_))
-            if snapshot.status.state == SessionState::Working && snapshot.pending.is_none() =>
-        {
-            (
-                Unknown,
-                "delivery_unconfirmed",
-                "A turn remains claimed with an error. Delivery may have occurred; do not resend.",
-            )
-        }
-        (Some(_), _) => (
+    let (availability, reason, detail) = match &judgments.turn {
+        Turn::LaunchFailed { reason, detail } => (Unavailable, *reason, detail.as_str()),
+        Turn::DeliveryUnconfirmed => (
+            Unknown,
+            "delivery_unconfirmed",
+            "A turn remains claimed with an error. Delivery may have occurred; do not resend.",
+        ),
+        Turn::TurnInProgress => (
             Unavailable,
             "turn_in_progress",
             "A turn is claimed; wait for the same request result instead of sending another turn.",
         ),
-        (None, _) => (
+        Turn::NoActiveTurn => (
             Available,
             "no_active_turn",
             "No active turn claim was observed.",
         ),
-    };
-    let launch_failure = &observation.judgments.launch_failure;
-    let (availability, reason, detail) = if let Some((reason, detail)) = launch_failure {
-        (Unavailable, *reason, detail.as_str())
-    } else {
-        (availability, reason, detail)
     };
     checks.push(Check::new(
         "turn",
@@ -809,24 +803,24 @@ fn session_checks(observation: &Observation, checks: &mut Vec<Check>, observatio
     ));
     let mut completion = Check::new(
         "completion",
-        if snapshot.pending.is_some() {
+        if judgments.recovery_required {
             Unavailable
         } else {
             Available
         },
-        if snapshot.pending.is_some() {
+        if judgments.recovery_required {
             "recovery_required"
         } else {
             "no_pending_completion"
         },
         "Completion journal observation; doctor never publishes or repairs a result.",
-        if snapshot.pending.is_some() {
+        if judgments.recovery_required {
             "The suggested sessions command changes state: it recovers completion and can close dead-owner sessions in that workspace. Run it explicitly, then query the same request."
         } else {
             "Retrieve recorded results with result."
         },
     );
-    if snapshot.pending.is_some() {
+    if judgments.recovery_required {
         completion = completion.command(vec![
             PUBLIC_COMMAND.to_owned(),
             "sessions".to_owned(),
@@ -836,180 +830,169 @@ fn session_checks(observation: &Observation, checks: &mut Vec<Check>, observatio
         ]);
     }
     checks.push(completion);
-    if snapshot.unreadable_requests > 0 || snapshot.request_index_error.is_some() {
+    if let Some(index) = &judgments.request_index {
         checks.push(Check::new("request_index", Unknown, "request_index_incomplete", "Some request references could not be read; absence is not proof that no request exists.", "Use an exact event id when known; preserve damaged request records.")
-            .evidence(json!({"unreadable_requests": snapshot.unreadable_requests, "error": snapshot.request_index_error})));
+            .evidence(json!({"unreadable_requests": index.unreadable, "error": index.error})));
     }
 }
 
 fn surface_check(
-    evidence: &mut SessionEvidence,
+    evidence: &SessionEvidence,
     reader: &Reader,
     deadline: Instant,
     checks: &mut Vec<Check>,
 ) {
+    checks.push(surface_presence_check(
+        evidence.judge_surface_presence(reader, deadline),
+    ));
+}
+
+/// The doctor mapping of the on-request surface presence judgment.
+pub(in crate::native) fn surface_presence_check(presence: &SurfacePresence) -> Check {
     use Availability::*;
-    let result = evidence.observe_surface(reader, deadline);
-    let (availability, reason, detail) = match result {
-        Ok(true) => (Available, "terminal_surface_present", "Recorded terminal surface is present; this does not prove provider readiness or delivery.".to_owned()),
-        Ok(false) => (Unavailable, "terminal_surface_missing", "Recorded terminal surface is absent; a provider process may still survive it.".to_owned()),
-        Err(error) => (Unknown, "terminal_surface_unverified", format!("Surface presence could not be verified: {error:#}")),
+    let (availability, reason, detail) = match presence {
+        SurfacePresence::Present => (Available, "terminal_surface_present", "Recorded terminal surface is present; this does not prove provider readiness or delivery.".to_owned()),
+        SurfacePresence::Missing => (Unavailable, "terminal_surface_missing", "Recorded terminal surface is absent; a provider process may still survive it.".to_owned()),
+        SurfacePresence::Unverified(reason) => (Unknown, "terminal_surface_unverified", format!("Surface presence could not be verified: {reason}")),
     };
-    checks.push(Check::new("terminal_surface", availability, reason, detail,
-        "Inspect the launch log and exact request; this read-only probe does not release a claim or resend input."));
+    Check::new(
+        "terminal_surface",
+        availability,
+        reason,
+        detail,
+        "Inspect the launch log and exact request; this read-only probe does not release a claim or resend input.",
+    )
 }
 
-// Adapter fixtures exercise the production observation and doctor mapping together.
-#[cfg(all(test, target_os = "macos"))]
-pub(in crate::native) fn surface_check_for_test(
-    evidence: &mut SessionEvidence,
-    reader: &Reader,
-) -> Check {
-    let mut checks = Vec::new();
-    surface_check(
-        evidence,
-        reader,
-        Instant::now() + Duration::from_secs(2),
-        &mut checks,
-    );
-    assert_eq!(checks.len(), 1);
-    checks.remove(0)
-}
-
-fn owner_check(evidence: &mut SessionEvidence, id: &str, checks: &mut Vec<Check>) {
-    owner_check_with(evidence, id, checks, |e| e.observe_owner().clone())
-}
-
-fn owner_check_with(
-    evidence: &mut SessionEvidence,
-    id: &str,
-    checks: &mut Vec<Check>,
-    observe: impl FnOnce(&mut SessionEvidence) -> crate::native::session::OwnerObservation,
-) {
+fn owner_check(owner: &OwnerJudgment, checks: &mut Vec<Check>) {
     use Availability::*;
-    let owner = &evidence.owner;
     let (availability, reason, detail, evidence) = match owner {
-        Ok(Some(owner)) if owner.managed_session_id.as_deref() == Some(id) => {
-            let observed = observe(evidence);
-            let (availability, reason) = match (observed.process_alive, observed.identity_matches) {
-                (Some(false), _) => (Unavailable, "owner_exited"),
-                (_, Some(false)) => (Unavailable, "owner_identity_mismatch"),
-                (Some(true), Some(true)) => (Available, "owner_identity_observed"),
-                _ => (Unknown, "owner_unverified"),
+        OwnerJudgment::Bound(attestation) => {
+            // An Unknown attestation is unverified whatever its PID hint (B3).
+            let (availability, reason) = match BoundOwner::of(attestation) {
+                BoundOwner::Exited => (Unavailable, "owner_exited"),
+                BoundOwner::Reused | BoundOwner::ControlChanged => {
+                    (Unavailable, "owner_identity_mismatch")
+                }
+                BoundOwner::Verified => (Available, "owner_identity_observed"),
+                BoundOwner::Uncompared | BoundOwner::Unknown => (Unknown, "owner_unverified"),
             };
             (
                 availability,
                 reason,
                 "Owner observation is separate from terminal surface or provider readiness."
                     .to_owned(),
-                json!(observed),
+                json!(owner.observation()),
             )
         }
-        Ok(Some(owner)) if owner.managed_session_id.is_some() => (
+        OwnerJudgment::Foreign => (
             Unavailable,
             "owner_session_mismatch",
             "Owner record belongs to another managed session.".to_owned(),
             Value::Null,
         ),
-        Ok(Some(_)) => (Unknown, "owner_unbound_legacy", "A legacy owner record has no managed-session binding; process observation is not proof of control authority.".to_owned(), json!(observe(evidence))),
-        Ok(None) => (
+        OwnerJudgment::UnboundLegacy { .. } => (Unknown, "owner_unbound_legacy", "A legacy owner record has no managed-session binding; process observation is not proof of control authority.".to_owned(), json!(owner.observation())),
+        OwnerJudgment::Absent => (
             Unknown,
             "owner_unverified",
             "No owner record bound to this managed session was observed.".to_owned(),
             Value::Null,
         ),
-        Err(error) => (
+        OwnerJudgment::Unreadable(error) => (
             Unknown,
             "owner_unreadable",
-            format!("{error:#}"),
+            error.clone(),
             Value::Null,
         ),
     };
     checks.push(Check::new("owner", availability, reason, detail, "Inspect the exact request result; do not infer delivery or resend from owner liveness.").evidence(evidence));
 }
 
-fn terminal_check(evidence: &SessionEvidence, id: &str, checks: &mut Vec<Check>) {
+fn terminal_check(surface: &Surface, checks: &mut Vec<Check>) {
     use Availability::*;
-    match &evidence.surface {
-        SurfaceRecord::Closed(record) => match record {
-            Ok(value) => {
-                let consumed = value.get("consumed").and_then(Value::as_bool) == Some(true);
-                checks.push(Check::new(
-                    "terminal_record",
-                    if consumed { Unavailable } else { Unknown },
-                    if consumed {
-                        "terminal_consumed"
-                    } else {
-                        "terminal_tombstone_unreadable"
-                    },
-                    "A terminal tombstone is recorded; a consumed handle cannot be reused.",
-                    "Inspect retained results; doctor does not reopen or delete terminal records.",
-                ));
-            }
-            Err(error) => {
-                checks.push(Check::new(
-                    "terminal_record",
-                    Unknown,
-                    "terminal_tombstone_unreadable",
-                    format!("{error:#}"),
-                    "Preserve the terminal records and inspect the close attempt.",
-                ));
-            }
-        },
-        SurfaceRecord::Closing(record) => match record {
-            Ok(terminal) => {
-                let bound = terminal.verify_managed_session(id).is_ok();
-                checks.push(Check::new("terminal_record", if bound { Unavailable } else { Unknown },
-                if bound { "terminal_close_in_progress" } else { "terminal_binding_unverified" },
-                "A claimed close handle remains; the close may still be running or require explicit recovery.",
-                "Inspect the prior close attempt. Finishing it requires an explicit close request and ownership verification."));
-            }
-            Err(error) => {
-                checks.push(Check::new(
-                    "terminal_record",
-                    Unknown,
-                    "terminal_record_unreadable",
-                    format!("{error:#}"),
-                    "Preserve and inspect the close handle.",
-                ));
-            }
-        },
-        SurfaceRecord::Active(record) => {
-            let (availability, reason, detail, evidence) = match record {
-                Ok(Some(terminal)) => {
-                    let supported = terminal.kind.supported_on_this_platform();
-                    let (availability, reason) = if !supported {
-                        (Unavailable, "terminal_unsupported")
-                    } else if terminal.verify_managed_session(id).is_err() || terminal.id.is_empty()
-                    {
-                        (Unknown, "terminal_binding_unverified")
-                    } else {
-                        (Available, "terminal_record_found")
-                    };
-                    (
-                        availability,
-                        reason,
-                        "Stored terminal metadata only; no live surface control was attempted."
-                            .to_owned(),
-                        json!({"terminal": terminal.kind}),
-                    )
-                }
-                Ok(None) => (
-                    Unavailable,
-                    "terminal_record_missing",
-                    "No active terminal handle is recorded.".to_owned(),
-                    Value::Null,
-                ),
-                Err(error) => (
-                    Unknown,
-                    "terminal_record_unreadable",
-                    format!("{error:#}"),
-                    Value::Null,
-                ),
+    const ACTIVE_NEXT: &str = "Only tell/close revalidate their target surface; this observation grants no control authority.";
+    let check = match surface {
+        Surface::Closed { consumed } => Check::new(
+            "terminal_record",
+            if *consumed { Unavailable } else { Unknown },
+            if *consumed {
+                "terminal_consumed"
+            } else {
+                "terminal_tombstone_unreadable"
+            },
+            "A terminal tombstone is recorded; a consumed handle cannot be reused.",
+            "Inspect retained results; doctor does not reopen or delete terminal records.",
+        ),
+        Surface::Unreadable {
+            source: SurfaceSource::ClosedTombstone,
+            reason,
+        } => Check::new(
+            "terminal_record",
+            Unknown,
+            "terminal_tombstone_unreadable",
+            reason.clone(),
+            "Preserve the terminal records and inspect the close attempt.",
+        ),
+        Surface::Closing { bound } => Check::new(
+            "terminal_record",
+            if *bound { Unavailable } else { Unknown },
+            if *bound {
+                "terminal_close_in_progress"
+            } else {
+                "terminal_binding_unverified"
+            },
+            "A claimed close handle remains; the close may still be running or require explicit recovery.",
+            "Inspect the prior close attempt. Finishing it requires an explicit close request and ownership verification.",
+        ),
+        Surface::Unreadable {
+            source: SurfaceSource::ClosingHandle,
+            reason,
+        } => Check::new(
+            "terminal_record",
+            Unknown,
+            "terminal_record_unreadable",
+            reason.clone(),
+            "Preserve and inspect the close handle.",
+        ),
+        Surface::Active {
+            kind,
+            supported,
+            bound,
+            empty_id,
+        } => {
+            let (availability, reason) = match ActiveHandle::of(*supported, *bound, *empty_id) {
+                ActiveHandle::Unsupported => (Unavailable, "terminal_unsupported"),
+                ActiveHandle::BindingUnverified => (Unknown, "terminal_binding_unverified"),
+                ActiveHandle::Bound => (Available, "terminal_record_found"),
             };
-            checks.push(Check::new("terminal_record", availability, reason, detail, "Only tell/close revalidate their target surface; this observation grants no control authority.").evidence(evidence));
+            Check::new(
+                "terminal_record",
+                availability,
+                reason,
+                "Stored terminal metadata only; no live surface control was attempted.",
+                ACTIVE_NEXT,
+            )
+            .evidence(json!({"terminal": kind}))
         }
-    }
+        Surface::Missing => Check::new(
+            "terminal_record",
+            Unavailable,
+            "terminal_record_missing",
+            "No active terminal handle is recorded.",
+            ACTIVE_NEXT,
+        ),
+        Surface::Unreadable {
+            source: SurfaceSource::ActiveHandle,
+            reason,
+        } => Check::new(
+            "terminal_record",
+            Unknown,
+            "terminal_record_unreadable",
+            reason.clone(),
+            ACTIVE_NEXT,
+        ),
+    };
+    checks.push(check);
 }
 
 // Probe only explicitly requested local CLI information. Scratch files (including Windows
@@ -1283,11 +1266,31 @@ mod timeout_tests {
 #[cfg(test)]
 mod attestation_tests {
     use super::*;
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn correction_a3_intermediate_owner_doctor_distinguishes_changed_unknown_and_verified() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = crate::native::session::Store::open_unchecked(dir.path());
+    use crate::native::process_identity::{Attested, Gone, ProcessObservation};
+    use crate::native::query::observation::judgment::{self, tests::attestation};
+    use crate::native::session::owner::ControlAttestation;
+    use crate::native::session::owner::tests::reused_attestation;
+
+    /// The owner check as [availability, reason, evidence facts], the facts as an array.
+    fn owner_row(owner: &OwnerJudgment) -> Value {
+        let mut checks = vec![];
+        owner_check(owner, &mut checks);
+        assert_eq!(checks.len(), 1);
+        let check = serde_json::to_value(&checks[0]).unwrap();
+        let evidence = &check["evidence"];
+        let facts = if evidence.is_null() {
+            Value::Null
+        } else {
+            json!([
+                evidence["process_alive"],
+                evidence["identity_matches"],
+                evidence["error"]
+            ])
+        };
+        json!([check["availability"], check["reason_code"], facts])
+    }
+
+    fn bound_evidence(store: &crate::native::session::Store) -> SessionEvidence {
         store
             .write_owner(&crate::native::terminal::ownership::NativeSessionOwner {
                 pid: 4242,
@@ -1298,19 +1301,433 @@ mod attestation_tests {
                 ..Default::default()
             })
             .unwrap();
+        SessionEvidence::read(store, Ok(false))
+    }
+
+    fn observation(records: crate::native::query::Snapshot) -> Observation {
+        use crate::native::query::observation::judgment::tests::{SESSION, evidence};
+        let evidence = evidence();
+        let judgments =
+            judgment::Judgments::of(&records, &evidence, None, &Ok(None), None, None, SESSION);
+        Observation {
+            origin: crate::native::session::origin::reference(&records),
+            cancel: None,
+            records,
+            evidence,
+            resumed_from: Ok(None),
+            workspace_consent: Value::Null,
+            judgments,
+        }
+    }
+
+    fn find<'a>(checks: &'a [Check], id: &str) -> Option<&'a Check> {
+        checks.iter().find(|check| check.id == id)
+    }
+
+    /// A check as [availability, reason].
+    fn row(check: &Check) -> Value {
+        json!([
+            serde_json::to_value(check.availability).unwrap(),
+            check.reason_code
+        ])
+    }
+
+    #[test]
+    fn doctor_maps_each_judgment_to_its_documented_check() {
+        use crate::native::query::RequestState;
+        use crate::native::query::observation::judgment::tests::{
+            CLAIM, SESSION, receipt, snapshot,
+        };
+        use crate::native::query::observation::judgment::{
+            CancelState, Ended, IndexIncomplete, SurfacePresence,
+        };
+        use crate::native::terminal::TerminalKind;
+        use ControlAttestation::*;
+
+        // session_checks: the turn, the completion, the index, the claim and the actions.
+        let mut records = snapshot(SessionState::Working);
+        records.claim = Some(CLAIM.to_owned());
+        records.receipts.push(receipt(CLAIM));
+        let mut observation = observation(records);
+        let session = |observation: &Observation| {
+            let mut checks = Vec::new();
+            let mut observations = json!({});
+            session_checks(observation, &mut checks, &mut observations);
+            (checks, observations)
+        };
+        for (turn, expected, detail) in [
+            (
+                Turn::LaunchFailed {
+                    reason: "launch_uncertain",
+                    detail: "spawn interrupted".into(),
+                },
+                json!(["unavailable", "launch_uncertain"]),
+                "spawn interrupted",
+            ),
+            (
+                Turn::DeliveryUnconfirmed,
+                json!(["unknown", "delivery_unconfirmed"]),
+                "A turn remains claimed with an error. Delivery may have occurred; do not resend.",
+            ),
+            (
+                Turn::TurnInProgress,
+                json!(["unavailable", "turn_in_progress"]),
+                "A turn is claimed; wait for the same request result instead of sending another turn.",
+            ),
+            (
+                Turn::NoActiveTurn,
+                json!(["available", "no_active_turn"]),
+                "No active turn claim was observed.",
+            ),
+        ] {
+            observation.judgments.turn = turn.clone();
+            let (checks, _) = session(&observation);
+            let turn_check = find(&checks, "turn").unwrap();
+            assert_eq!(row(turn_check), expected, "{turn:?}");
+            assert_eq!(turn_check.detail, detail, "{turn:?}");
+            assert!(
+                turn_check
+                    .next_action
+                    .ends_with(&format!("result {SESSION} --request request-test --json"))
+            );
+        }
+        for (recovery, expected, command) in [
+            (true, json!(["unavailable", "recovery_required"]), true),
+            (false, json!(["available", "no_pending_completion"]), false),
+        ] {
+            observation.judgments.recovery_required = recovery;
+            let (checks, observations) = session(&observation);
+            let completion = find(&checks, "completion").unwrap();
+            assert_eq!(row(completion), expected, "{recovery}");
+            assert_eq!(completion.next_command.is_some(), command);
+            assert_eq!(observations["recovery_required"], recovery);
+        }
+        observation.judgments.request_index = Some(IndexIncomplete {
+            unreadable: 2,
+            error: Some("requests: not a directory".into()),
+        });
+        let (checks, _) = session(&observation);
+        let index = find(&checks, "request_index").unwrap();
+        assert_eq!(row(index), json!(["unknown", "request_index_incomplete"]));
+        assert_eq!(
+            index.evidence,
+            json!({"unreadable_requests": 2, "error": "requests: not a directory"})
+        );
+        observation.judgments.request_index = None;
+        assert!(find(&session(&observation).0, "request_index").is_none());
+        for (state, expected) in [
+            (None, Value::Null),
+            (Some(Ok(RequestState::Completed)), json!("completed")),
+            (
+                Some(Err(anyhow::anyhow!("event: invalid"))),
+                json!("unknown"),
+            ),
+        ] {
+            observation.judgments.active_state = state;
+            let (_, observations) = session(&observation);
+            assert_eq!(observations["active_request_state"], expected);
+            assert_eq!(observations["active_request_id"], "request-test");
+        }
+        assert!(find(&session(&observation).0, "active_request").is_none());
+        observation.judgments.claim_without_receipt = true;
+        observation.records.receipts.clear();
+        let (checks, observations) = session(&observation);
+        let active = find(&checks, "active_request").unwrap();
+        assert_eq!(row(active), json!(["unknown", "active_request_unknown"]));
+        assert!(
+            active
+                .next_action
+                .ends_with(&format!("result {SESSION} --list --json"))
+        );
+        assert_eq!(observations["active_request_id"], Value::Null);
+        assert_eq!(
+            row(find(&checks, "session_state").unwrap()),
+            json!(["unavailable", "stored_state"])
+        );
+        observation.records.status.state = SessionState::Ready;
+        assert_eq!(
+            row(find(&session(&observation).0, "session_state").unwrap()),
+            json!(["available", "stored_state"])
+        );
+
+        // cancel_check
+        for (cancel, expected) in [
+            (Cancel::Absent, json!(["available", "cancel_absent"])),
+            (
+                Cancel::Recorded(Some(CancelState::RequestedActive)),
+                json!(["available", "cancel_recorded"]),
+            ),
+            (
+                Cancel::Recorded(Some(CancelState::NotApplied)),
+                json!(["available", "cancel_recorded"]),
+            ),
+            (
+                Cancel::Recorded(None),
+                json!(["available", "cancel_recorded"]),
+            ),
+            (
+                Cancel::Unreadable("x".into()),
+                json!(["unknown", "cancel_unreadable"]),
+            ),
+        ] {
+            let mut checks = Vec::new();
+            cancel_check(&cancel, SESSION, &mut checks);
+            assert_eq!(row(&checks[0]), expected, "{cancel:?}");
+            assert_eq!(
+                checks[0].next_action,
+                format!("{PUBLIC_COMMAND} inspect {SESSION} --json")
+            );
+        }
+
+        // hold_check: the release command only when the judgment allows it.
+        for (hold, expected, release) in [
+            (Hold::NotHeld, json!(["available", "not_held"]), false),
+            (
+                Hold::Held {
+                    release_allowed: true,
+                },
+                json!(["unavailable", "session_held"]),
+                true,
+            ),
+            (
+                Hold::Held {
+                    release_allowed: false,
+                },
+                json!(["unavailable", "session_held"]),
+                false,
+            ),
+            (
+                Hold::Unreadable("hold.json: invalid".into()),
+                json!(["unknown", "hold_unreadable"]),
+                false,
+            ),
+        ] {
+            let mut checks = Vec::new();
+            hold_check(&hold, SESSION, &mut checks);
+            assert_eq!(row(&checks[0]), expected, "{hold:?}");
+            assert_eq!(
+                checks[0].next_action == format!("{PUBLIC_COMMAND} hold {SESSION} --release"),
+                release,
+                "{hold:?}"
+            );
+            if let Hold::Unreadable(reason) = &hold {
+                assert_eq!(&checks[0].detail, reason);
+            }
+        }
+
+        // terminal_check: the eight reasons from the surface judgment alone.
+        let kind = TerminalKind::Warp;
+        let active = |supported, bound, empty_id| Surface::Active {
+            kind,
+            supported,
+            bound,
+            empty_id,
+        };
+        let unreadable = |source| Surface::Unreadable {
+            source,
+            reason: "record: invalid".into(),
+        };
+        for (surface, expected, evidence) in [
+            (
+                Surface::Closed { consumed: true },
+                json!(["unavailable", "terminal_consumed"]),
+                Value::Null,
+            ),
+            (
+                Surface::Closed { consumed: false },
+                json!(["unknown", "terminal_tombstone_unreadable"]),
+                Value::Null,
+            ),
+            (
+                unreadable(SurfaceSource::ClosedTombstone),
+                json!(["unknown", "terminal_tombstone_unreadable"]),
+                Value::Null,
+            ),
+            (
+                Surface::Closing { bound: true },
+                json!(["unavailable", "terminal_close_in_progress"]),
+                Value::Null,
+            ),
+            (
+                Surface::Closing { bound: false },
+                json!(["unknown", "terminal_binding_unverified"]),
+                Value::Null,
+            ),
+            (
+                unreadable(SurfaceSource::ClosingHandle),
+                json!(["unknown", "terminal_record_unreadable"]),
+                Value::Null,
+            ),
+            (
+                active(false, false, false),
+                json!(["unavailable", "terminal_unsupported"]),
+                json!({"terminal": "warp"}),
+            ),
+            (
+                active(true, false, false),
+                json!(["unknown", "terminal_binding_unverified"]),
+                json!({"terminal": "warp"}),
+            ),
+            (
+                active(true, true, true),
+                json!(["unknown", "terminal_binding_unverified"]),
+                json!({"terminal": "warp"}),
+            ),
+            (
+                active(true, true, false),
+                json!(["available", "terminal_record_found"]),
+                json!({"terminal": "warp"}),
+            ),
+            (
+                Surface::Missing,
+                json!(["unavailable", "terminal_record_missing"]),
+                Value::Null,
+            ),
+            (
+                unreadable(SurfaceSource::ActiveHandle),
+                json!(["unknown", "terminal_record_unreadable"]),
+                Value::Null,
+            ),
+        ] {
+            let mut checks = Vec::new();
+            terminal_check(&surface, &mut checks);
+            assert_eq!(checks[0].id, "terminal_record");
+            assert_eq!(row(&checks[0]), expected, "{surface:?}");
+            assert_eq!(checks[0].evidence, evidence, "{surface:?}");
+            if let Surface::Unreadable { reason, .. } = &surface {
+                assert_eq!(&checks[0].detail, reason);
+            }
+        }
+
+        // surface_presence_check
+        for (presence, expected) in [
+            (
+                SurfacePresence::Present,
+                json!(["available", "terminal_surface_present"]),
+            ),
+            (
+                SurfacePresence::Missing,
+                json!(["unavailable", "terminal_surface_missing"]),
+            ),
+            (
+                SurfacePresence::Unverified("probe deadline exhausted".into()),
+                json!(["unknown", "terminal_surface_unverified"]),
+            ),
+        ] {
+            let check = surface_presence_check(&presence);
+            assert_eq!(check.id, "terminal_surface");
+            assert_eq!(row(&check), expected, "{presence:?}");
+            if let SurfacePresence::Unverified(reason) = &presence {
+                assert!(check.detail.ends_with(reason));
+            }
+        }
+
+        // owner_check: an Unknown attestation is unverified whatever its PID hint (B3).
+        let live = |control| {
+            OwnerJudgment::Bound(attestation(
+                ProcessObservation::Live(Attested::Incarnation),
+                control,
+                Some(true),
+            ))
+        };
+        let rows = [
+            (
+                OwnerJudgment::Bound(attestation(
+                    ProcessObservation::Gone(Gone::Exited),
+                    NotRecorded,
+                    Some(false),
+                )),
+                json!(["unavailable", "owner_exited", [false, null, null]]),
+            ),
+            (
+                OwnerJudgment::Bound(reused_attestation()),
+                json!([
+                    "unavailable",
+                    "owner_identity_mismatch",
+                    [true, false, null]
+                ]),
+            ),
+            (
+                live(Changed("owner TTY changed".into())),
+                json!([
+                    "unavailable",
+                    "owner_identity_mismatch",
+                    [true, false, null]
+                ]),
+            ),
+            (
+                live(Verified),
+                json!(["available", "owner_identity_observed", [true, true, null]]),
+            ),
+            (
+                live(NotRecorded),
+                json!(["unknown", "owner_unverified", [true, null, null]]),
+            ),
+            (
+                OwnerJudgment::Bound(attestation(
+                    ProcessObservation::Live(Attested::PidOnly),
+                    NotRecorded,
+                    Some(true),
+                )),
+                json!(["unknown", "owner_unverified", [true, null, null]]),
+            ),
+            (
+                live(Unknown("no TTY".into())),
+                json!(["unknown", "owner_unverified", [true, null, "no TTY"]]),
+            ),
+            (
+                OwnerJudgment::Bound(attestation(
+                    ProcessObservation::Unknown("denied".into()),
+                    NotRecorded,
+                    Some(false),
+                )),
+                json!(["unknown", "owner_unverified", [false, null, "denied"]]),
+            ),
+            (
+                OwnerJudgment::UnboundLegacy { alive: Some(false) },
+                json!(["unknown", "owner_unbound_legacy", [false, null, null]]),
+            ),
+            (
+                OwnerJudgment::Foreign,
+                json!(["unavailable", "owner_session_mismatch", null]),
+            ),
+            (
+                OwnerJudgment::Absent,
+                json!(["unknown", "owner_unverified", null]),
+            ),
+            (
+                OwnerJudgment::Unreadable("invalid JSON".into()),
+                json!(["unknown", "owner_unreadable", null]),
+            ),
+        ];
+        for (owner, expected) in rows {
+            assert_eq!(owner_row(&owner), expected, "{owner:?}");
+        }
+        assert_eq!(observation.judgments.ended, Ended::Neither);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn correction_a3_intermediate_owner_doctor_distinguishes_changed_unknown_and_verified() {
+        use crate::native::session::owner::tests::intermediate_attestation;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::native::session::Store::open_unchecked(dir.path());
         for (control, availability, reason) in [
             ("changed", "unavailable", "owner_identity_mismatch"),
             ("unknown", "unknown", "owner_unverified"),
             ("verified", "available", "owner_identity_observed"),
         ] {
-            let mut evidence = SessionEvidence::read(&store, Ok(false));
-            let mut checks = vec![];
-            owner_check_with(&mut evidence, "session-test", &mut checks, |_| {
-                crate::native::session::owner::tests::intermediate_observation(control)
-            });
-            let value = serde_json::to_value(checks).unwrap();
-            assert_eq!(value[0]["availability"], availability, "{control}");
-            assert_eq!(value[0]["reason_code"], reason, "{control}");
+            let evidence = bound_evidence(&store);
+            let owner = evidence.judge_owner_with(
+                "session-test",
+                &judgment::Observers {
+                    attest: &|_| intermediate_attestation(control),
+                    pid_alive: &|_| panic!("a bound record is attested"),
+                },
+            );
+            let row = owner_row(owner);
+            assert_eq!(row[0], availability, "{control}");
+            assert_eq!(row[1], reason, "{control}");
         }
     }
 
@@ -1318,20 +1735,16 @@ mod attestation_tests {
     fn r1_c6_reused_owner_is_unavailable_with_mismatch_reason() {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::native::session::Store::open_unchecked(dir.path());
-        store
-            .write_owner(&crate::native::terminal::ownership::NativeSessionOwner {
-                pid: 4242,
-                managed_session_id: Some("session-test".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        let mut evidence = SessionEvidence::read(&store, Ok(false));
-        let mut checks = vec![];
-        owner_check_with(&mut evidence, "session-test", &mut checks, |_| {
-            crate::native::session::owner::tests::reused_observation()
-        });
-        let value = serde_json::to_value(&checks).unwrap();
-        assert_eq!(value[0]["reason_code"], "owner_identity_mismatch");
-        assert_eq!(value[0]["availability"], "unavailable");
+        let evidence = bound_evidence(&store);
+        let owner = evidence.judge_owner_with(
+            "session-test",
+            &judgment::Observers {
+                attest: &|_| reused_attestation(),
+                pid_alive: &|_| panic!("a bound record is attested"),
+            },
+        );
+        let row = owner_row(owner);
+        assert_eq!(row[0], "unavailable");
+        assert_eq!(row[1], "owner_identity_mismatch");
     }
 }

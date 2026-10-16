@@ -657,6 +657,124 @@ fn dead_owner_ends_wait_without_repairing_or_releasing_the_claim() {
 }
 
 #[test]
+fn wait_ends_on_a_bound_dead_owner_but_not_on_a_foreign_record() {
+    let fixture = Fixture::new();
+    request(&fixture, "123-456-0", "request-dead", "event-1.json");
+    fs::write(fixture.directory.join("turn.claim"), "123-456-0\n").unwrap();
+    let wait = || {
+        let output = fixture.run(&[
+            "wait",
+            "session-observe/request-dead",
+            "--timeout-secs",
+            "1",
+            "--json",
+        ]);
+        assert!(!output.status.success());
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    write(
+        &fixture.directory.join("native-session.json"),
+        &json!({"pid": u32::MAX, "managed_session_id": "session-observe"}),
+    );
+    let before = support::entries(fixture.root.path());
+    let value = wait();
+    assert_eq!(value["timed_out"], false);
+    assert_eq!(value["ended"]["request_state"], "unresolved");
+    assert_eq!(value["ended"]["owner_process_alive"], false);
+    assert_eq!(support::entries(fixture.root.path()), before);
+    // B2: a record naming another session is not observed, so its dead PID ends nothing.
+    write(
+        &fixture.directory.join("native-session.json"),
+        &json!({"pid": u32::MAX, "managed_session_id": "session-other"}),
+    );
+    let before = support::entries(fixture.root.path());
+    let value = wait();
+    assert_eq!(value["timed_out"], true);
+    assert_eq!(value["remaining"], json!(["session-observe/request-dead"]));
+    assert_eq!(support::entries(fixture.root.path()), before);
+}
+
+/// An owner record whose recorded birth cannot be inspected: macOS refuses a PID beyond
+/// its range, so the attestation is Unknown and the PID hint is false.
+#[cfg(target_os = "macos")]
+fn unknown_owner(session: &str) -> Value {
+    json!({"pid": u32::MAX, "managed_session_id": session,
+        "process_start_seconds": 10, "process_start_microseconds": 20})
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn an_unknown_attestation_is_unverified_and_keeps_a_wait() {
+    let fixture = Fixture::new();
+    request(&fixture, "123-456-0", "request-unknown", "event-1.json");
+    fs::write(fixture.directory.join("turn.claim"), "123-456-0\n").unwrap();
+    write(
+        &fixture.directory.join("native-session.json"),
+        &unknown_owner("session-observe"),
+    );
+    let before = support::entries(fixture.root.path());
+    // B3: status reports owner_unverified only, never owner_exited.
+    let value = success(fixture.run(&["status", "--all-workspaces", "--json"]));
+    assert_eq!(
+        value["sessions"][0]["attention"],
+        json!(["owner_unverified"])
+    );
+    assert_eq!(value["sessions"][0]["owner"]["process_alive"], false);
+    assert!(
+        value["sessions"][0]["owner"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("PID is out of range")
+    );
+    // B2: the wait continues until its timeout.
+    let output = fixture.run(&[
+        "wait",
+        "session-observe/request-unknown",
+        "--timeout-secs",
+        "1",
+        "--json",
+    ]);
+    assert!(!output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["timed_out"], true);
+    assert_eq!(support::entries(fixture.root.path()), before);
+}
+
+#[test]
+fn inspect_does_not_attest_an_owner_record_of_another_session() {
+    let fixture = Fixture::new();
+    // B1: a live PID would be observed alive if the record were attested.
+    write(
+        &fixture.directory.join("native-session.json"),
+        &json!({"pid": std::process::id(), "managed_session_id": "session-other"}),
+    );
+    fixture.event("event-1.json", "result");
+    let before = support::entries(fixture.root.path());
+    let value = success(fixture.run(&["inspect", "session-observe", "--json"]));
+    assert_eq!(
+        value["owner"],
+        json!({"process_alive": null, "identity_matches": null,
+            "error": "owner record belongs to another session"})
+    );
+    assert_eq!(value["owner_process_alive"], Value::Null);
+    assert_eq!(value["owner_identity_verified"], false);
+    assert_eq!(support::entries(fixture.root.path()), before);
+    // An unbound legacy record keeps its observed liveness and no identity.
+    write(
+        &fixture.directory.join("native-session.json"),
+        &json!({"pid": std::process::id()}),
+    );
+    let before = support::entries(fixture.root.path());
+    let value = success(fixture.run(&["inspect", "session-observe", "--json"]));
+    assert_eq!(
+        value["owner"],
+        json!({"process_alive": true, "identity_matches": null, "error": null})
+    );
+    assert_eq!(value["owner_process_alive"], true);
+    assert_eq!(support::entries(fixture.root.path()), before);
+}
+
+#[test]
 fn empty_latest_is_a_structured_nonzero_result_but_inspect_still_works() {
     let fixture = Fixture::new();
     let output = fixture.run(&["result", "session-observe", "--latest", "--json"]);

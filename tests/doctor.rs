@@ -213,6 +213,33 @@ fn owner_missing_dead_or_bound_elsewhere_is_not_reported_as_live() {
     assert_eq!(check(&fixture.doctor(), "owner")["availability"], "unknown");
 }
 
+/// B3: macOS refuses to inspect a PID beyond its range, so a bound record with a recorded
+/// birth has an Unknown attestation beside a false PID hint. It is unverified, not exited.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_unknown_owner_attestation_is_unverified_whatever_its_pid_hint() {
+    let fixture = Fixture::new("pi");
+    write(
+        &fixture.directory.join("native-session.json"),
+        &json!({"pid": u32::MAX, "managed_session_id": "session-doctor",
+            "process_start_seconds": 10, "process_start_microseconds": 20}),
+    );
+    let before = entries(fixture.root.path());
+    let value = fixture.doctor();
+    let owner = check(&value, "owner");
+    assert_eq!(owner["availability"], "unknown");
+    assert_eq!(owner["reason_code"], "owner_unverified");
+    assert_eq!(owner["evidence"]["process_alive"], false);
+    assert!(owner["evidence"]["identity_matches"].is_null());
+    assert!(
+        owner["evidence"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("PID is out of range")
+    );
+    assert_eq!(entries(fixture.root.path()), before);
+}
+
 #[test]
 fn provider_fallbacks_and_unreadable_request_index_remain_explicit() {
     for provider in ["agy", "pi"] {

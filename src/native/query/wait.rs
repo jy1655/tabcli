@@ -1,6 +1,7 @@
 //! Query waits: one consistent read per session per pass, without lifecycle changes.
 use super::*;
 use crate::native::session::primitives::valid_session_id;
+use observation::{SessionEvidence, judgment};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Address {
@@ -112,22 +113,37 @@ impl RequestState {
 }
 
 /// Completed observations precede owner checks and therefore have no owner fields.
-fn observe(snapshot: &Snapshot, reader: &Reader, selector: &Selector) -> Result<(Value, bool)> {
-    observe_with_owner(snapshot, reader, selector, observe_owner)
+fn observe(
+    snapshot: &Snapshot,
+    reader: &Reader,
+    selector: &Selector,
+    session: &str,
+) -> Result<(Value, bool)> {
+    observe_with_owner(
+        snapshot,
+        reader,
+        selector,
+        session,
+        &judgment::Observers::SYSTEM,
+    )
 }
 
+/// Each poll judges the Owner record afresh. Only a verified-gone owner ends the wait:
+/// a changed control identity, an Unknown attestation and a foreign record keep it (B2).
 fn observe_with_owner(
     snapshot: &Snapshot,
     reader: &Reader,
     selector: &Selector,
-    observe: impl FnOnce(&Reader) -> crate::native::session::OwnerObservation,
+    session: &str,
+    observers: &judgment::Observers<'_>,
 ) -> Result<(Value, bool)> {
     let mut observation = snapshot.observe_result(reader, selector)?;
     if observation.state.ends_wait() {
         return Ok((observation.value(), true));
     }
-    let owner = observe(reader);
-    if owner.process_alive == Some(false) || owner.identity_matches == Some(false) {
+    let judgment = judgment::owner(&SessionEvidence::read_owner(reader), session, observers);
+    let owner = judgment.observation();
+    if judgment.gone() {
         observation.state = RequestState::Unresolved;
         observation.error = Some(
             "recorded native owner is no longer live; run sessions for this workspace to recover its state, then inspect the request".to_owned()
@@ -191,7 +207,12 @@ fn poll(root: &Path, addresses: &[Address], timeout: Duration) -> Result<Outcome
                 Err(error) => return Err(error),
             };
             for &index in &group.indices {
-                let (value, ended) = observe(&snapshot, &reader, &selectors[index])?;
+                let (value, ended) = observe(
+                    &snapshot,
+                    &reader,
+                    &selectors[index],
+                    &addresses[index].session,
+                )?;
                 outcome.last[index] = value;
                 if ended {
                     outcome.selected = Some(
@@ -313,25 +334,143 @@ mod tests {
     use super::*;
     use crate::native::{tests::seed_close_fixture, write_json_atomic};
 
-    #[test]
-    fn r1_c6_mismatch_ends_pending_wait_without_writes() {
+    use crate::native::process_identity::{Attested, ProcessObservation};
+    use crate::native::session::owner::tests::reused_attestation;
+    use crate::native::session::owner::{ControlAttestation, OwnerAttestation};
+    use observation::judgment::tests::attestation;
+
+    const UNOBSERVED: judgment::Observers<'static> = judgment::Observers {
+        attest: &|_| panic!("this record is not attested"),
+        pid_alive: &|_| panic!("this record is not PID-observed"),
+    };
+
+    /// Observes a pending request of `session-fault` with the given Owner record.
+    fn pending_with_owner(owner: Value, observers: &judgment::Observers<'_>) -> (Value, bool) {
         let fixture = seed_close_fixture(JournaledEventState::Absent);
-        let reader = Reader::open_unchecked(&fixture.directory);
-        fs::remove_file(fixture.directory.join("turn.completion.json")).unwrap();
+        let directory = &fixture.directory;
+        let reader = Reader::open_unchecked(directory);
+        fs::remove_file(directory.join("turn.completion.json")).unwrap();
+        write_json_atomic(&directory.join("native-session.json"), &owner).unwrap();
         let snapshot = reader.snapshot().unwrap();
         let id = snapshot.receipts[0].request_id.clone();
-        let before = fs::read(fixture.directory.join("status.json")).unwrap();
-        let (value, ended) = observe_with_owner(&snapshot, &reader, &Selector::Request(id), |_| {
-            crate::native::session::owner::tests::reused_observation()
-        })
+        let before = fs::read(directory.join("status.json")).unwrap();
+        let (value, ended) = observe_with_owner(
+            &snapshot,
+            &reader,
+            &Selector::Request(id),
+            "session-fault",
+            observers,
+        )
         .unwrap();
+        assert_eq!(fs::read(directory.join("status.json")).unwrap(), before);
+        assert!(directory.join("turn.claim").exists());
+        (value, ended)
+    }
+
+    #[test]
+    fn r1_c6_mismatch_ends_pending_wait_without_writes() {
+        let (value, ended) = pending_with_owner(
+            json!({"pid": 4242, "managed_session_id": "session-fault"}),
+            &judgment::Observers {
+                attest: &|_| reused_attestation(),
+                pid_alive: &|_| panic!("a bound record is attested"),
+            },
+        );
         assert!(ended);
         assert_eq!(value["request_state"], "unresolved");
-        assert_eq!(
-            fs::read(fixture.directory.join("status.json")).unwrap(),
-            before
+        assert_eq!(value["owner"]["identity_matches"], false);
+    }
+
+    #[test]
+    fn only_a_verified_gone_owner_ends_a_pending_wait() {
+        let bound = json!({"pid": 4242, "managed_session_id": "session-fault"});
+        fn live(control: ControlAttestation) -> OwnerAttestation {
+            attestation(
+                ProcessObservation::Live(Attested::Incarnation),
+                control,
+                Some(true),
+            )
+        }
+        fn unknown(pid_alive: bool) -> OwnerAttestation {
+            attestation(
+                ProcessObservation::Unknown("denied".into()),
+                ControlAttestation::NotRecorded,
+                Some(pid_alive),
+            )
+        }
+        type Attest = fn() -> OwnerAttestation;
+        let bound_rows: [(&str, Attest, Value); 3] = [
+            // A changed control identity of a live incarnation is not a death.
+            (
+                "live changed",
+                || live(ControlAttestation::Changed("owner TTY changed".into())),
+                json!({"process_alive": true, "identity_matches": false, "error": null}),
+            ),
+            (
+                "unknown, live hint",
+                || unknown(true),
+                json!({"process_alive": true, "identity_matches": null, "error": "denied"}),
+            ),
+            // An Unknown attestation never reads as a death, whatever its PID hint.
+            (
+                "unknown, dead hint",
+                || unknown(false),
+                json!({"process_alive": false, "identity_matches": null, "error": "denied"}),
+            ),
+        ];
+        for (name, make, owner) in bound_rows {
+            let (value, ended) = pending_with_owner(
+                bound.clone(),
+                &judgment::Observers {
+                    attest: &|_| make(),
+                    pid_alive: &|_| panic!("a bound record is attested"),
+                },
+            );
+            assert!(!ended, "{name}");
+            assert_eq!(value["request_state"], "pending", "{name}");
+            assert_eq!(value["owner"], owner, "{name}");
+            assert_eq!(
+                value["owner_process_alive"], owner["process_alive"],
+                "{name}"
+            );
+        }
+        // A record naming another session is not observed and does not end the wait.
+        let (value, ended) = pending_with_owner(
+            json!({"pid": 4242, "managed_session_id": "session-other"}),
+            &UNOBSERVED,
         );
-        assert!(fixture.directory.join("turn.claim").exists());
+        assert!(!ended);
+        assert_eq!(value["request_state"], "pending");
+        assert_eq!(
+            value["owner"],
+            json!({"process_alive": null, "identity_matches": null,
+                "error": "owner record belongs to another session"})
+        );
+        // An unbound legacy PID observed gone ends it; observed alive keeps it.
+        for (alive, ends) in [(Some(false), true), (Some(true), false), (None, false)] {
+            let (value, ended) = pending_with_owner(
+                json!({"pid": 4242}),
+                &judgment::Observers {
+                    attest: &|_| panic!("an unbound record is not attested"),
+                    pid_alive: &|pid| {
+                        assert_eq!(pid, 4242);
+                        alive
+                    },
+                },
+            );
+            assert_eq!(ended, ends, "{alive:?}");
+            assert_eq!(
+                value["request_state"],
+                if ends { "unresolved" } else { "pending" }
+            );
+            assert_eq!(value["owner_process_alive"], json!(alive));
+            if ends {
+                assert_eq!(
+                    value["error"],
+                    "recorded native owner is no longer live; run sessions for this workspace to recover its state, then inspect the request"
+                );
+            }
+        }
     }
 
     #[test]
@@ -339,12 +478,21 @@ mod tests {
         let fixture = seed_close_fixture(JournaledEventState::Committed);
         let reader = Reader::open_unchecked(&fixture.directory);
         crate::native::session::turn::recover_pending_completion(&fixture.directory).unwrap();
+        write_json_atomic(
+            &fixture.directory.join("native-session.json"),
+            &json!({"pid": 4242, "managed_session_id": "session-fault"}),
+        )
+        .unwrap();
         let snapshot = reader.snapshot().unwrap();
         let (value, ended) = observe_with_owner(
             &snapshot,
             &reader,
             &Selector::Request(snapshot.receipts[0].request_id.clone()),
-            |_| panic!("published Result precedes owner inspection"),
+            "session-fault",
+            &judgment::Observers {
+                attest: &|_| panic!("published Result precedes owner inspection"),
+                pid_alive: &|_| panic!("published Result precedes owner inspection"),
+            },
         )
         .unwrap();
         assert!(ended);

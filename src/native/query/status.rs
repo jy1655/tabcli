@@ -4,7 +4,11 @@ use crate::native::session;
 use crate::native::session::OwnerObservation;
 use crate::native::session::enumerate::{CheckOrder, Fault, Scope, enumerate};
 use crate::native::session::origin::{ObservationCache, OriginObservation};
-use observation::{Observation, StatusObservation, SurfaceRecord};
+use observation::judgment::{
+    self, BoundOwner, Cancel, CancelState, Ended, FOREIGN_OWNER, Hold, OwnerJudgment,
+    ResultCandidate, Turn,
+};
+use observation::{Observation, StatusObservation};
 
 #[derive(Debug)]
 pub(crate) struct StatusRequest {
@@ -85,136 +89,114 @@ fn parse_options(args: &[String]) -> Result<StatusRequest> {
     })
 }
 
+/// Status's owner attention: a live owner whose identity was not compared is not flagged,
+/// and an Unknown attestation is unverified, never exited (B3).
+fn owner_flag(owner: &OwnerJudgment) -> Option<&'static str> {
+    match owner.bound() {
+        Some(BoundOwner::Exited) => Some("owner_exited"),
+        Some(BoundOwner::Reused | BoundOwner::ControlChanged) => Some("owner_identity_mismatch"),
+        Some(BoundOwner::Verified | BoundOwner::Uncompared) => None,
+        Some(BoundOwner::Unknown) | None => Some("owner_unverified"),
+    }
+}
+
+/// Status's `owner` object: the attestation's projection for a bound record, otherwise
+/// null facts with the reason no attestation was made.
+fn owner_value(owner: &OwnerJudgment) -> OwnerObservation {
+    let reason = match owner {
+        OwnerJudgment::Bound(_) => return owner.observation(),
+        OwnerJudgment::UnboundLegacy { .. } => "owner record is unbound",
+        OwnerJudgment::Foreign => FOREIGN_OWNER,
+        OwnerJudgment::Absent => "no owner record",
+        OwnerJudgment::Unreadable(reason) => reason,
+    };
+    OwnerObservation {
+        error: Some(reason.to_owned()),
+        ..OwnerObservation::default()
+    }
+}
+
 fn attention(
     observed: &StatusObservation,
-    owner: &OwnerObservation,
-    bound: bool,
+    owner: &OwnerJudgment,
     origin: &OriginObservation,
 ) -> Vec<&'static str> {
     let observation = &observed.observation;
-    let records = &observation.records;
+    let judgments = &observation.judgments;
+    let closed = observation.records.status.state == SessionState::Closed;
     let mut flags = Vec::new();
-    if observation
-        .cancel
-        .as_ref()
-        .is_some_and(|c| c.state == "requested" && c.active)
-    {
+    if judgments.cancel == Cancel::Recorded(Some(CancelState::RequestedActive)) {
         flags.push("cancel_requested");
     }
-    if matches!(observation.evidence.held, Ok(true)) {
+    if matches!(judgments.hold, Hold::Held { .. }) {
         flags.push("held");
     }
-    if records.status.state == SessionState::Working
-        && records.claim.is_some()
-        && records.status.error.is_some()
-        && records.pending.is_none()
-    {
-        flags.push("delivery_unconfirmed");
+    match &judgments.turn {
+        Turn::DeliveryUnconfirmed => flags.push("delivery_unconfirmed"),
+        Turn::LaunchFailed { reason, .. } => flags.push(reason),
+        Turn::TurnInProgress | Turn::NoActiveTurn => (),
     }
-    if let Some((reason, _)) = &observation.judgments.launch_failure {
-        flags.push(reason);
-    }
-    if records.claim.is_some() && observation.active_request().is_none() {
+    if judgments.claim_without_receipt {
         flags.push("claim_without_receipt");
     }
-    if records.pending.is_some() {
+    if judgments.recovery_required {
         flags.push("recovery_required");
     }
-    if records.status.state != SessionState::Closed {
-        if owner.process_alive == Some(false) {
-            flags.push("owner_exited");
-        }
-        if owner.identity_matches == Some(false) {
-            flags.push("owner_identity_mismatch");
-        }
-        if !bound
-            || owner.error.is_some()
-            || (owner.process_alive.is_none() && owner.identity_matches.is_none())
-        {
-            flags.push("owner_unverified");
-        }
+    if !closed {
+        flags.extend(owner_flag(owner));
     }
-    let index_incomplete = records.unreadable_requests > 0 || records.request_index_error.is_some();
-    if observation.evidence.held.is_err()
-        || observation.evidence.owner.is_err()
-        || matches!(
-            &observation.evidence.surface,
-            SurfaceRecord::Closed(Err(_))
-                | SurfaceRecord::Closing(Err(_))
-                | SurfaceRecord::Active(Err(_))
-        )
-        || matches!(&observation.evidence.surface,
-            SurfaceRecord::Closed(Ok(value)) if value.get("consumed").and_then(Value::as_bool) != Some(true))
-        || observation.resumed_from.is_err()
+    // Status unions its own two reads with the Observation's unreadable parts (D12).
+    if !judgments.unreadable.is_empty()
         || observed.latest.is_err()
         || observed.active.as_ref().is_some_and(Result::is_err)
-        || index_incomplete
     {
         flags.push("records_partially_unreadable");
     }
-    if index_incomplete {
+    if judgments.request_index.is_some() {
         flags.push("request_index_incomplete");
     }
-    if records.status.residual_surface().is_some() {
+    if judgments.residual_surface.is_some() {
         flags.push("residual_surface_unverified");
     }
-    match records.status.state {
-        SessionState::Failed => flags.push("session_failed"),
-        SessionState::Exited => flags.push("session_exited"),
-        _ => (),
+    match judgments.ended {
+        Ended::Failed => flags.push("session_failed"),
+        Ended::Exited => flags.push("session_exited"),
+        Ended::Neither => (),
     }
     // Derived from the Origin's records; neither an open surface nor a close authority.
-    if records.status.state != SessionState::Closed && origin.ended == Some(true) {
+    if !closed && origin.ended == Some(true) {
         flags.push("origin_ended");
     }
     flags
 }
 
-fn result_command(observed: &StatusObservation, id: &str) -> Option<String> {
-    if let Some(receipt) = observed.observation.active_request() {
-        Some(format!(
-            "{PUBLIC_COMMAND} result {id} --request {} --json",
-            receipt.request_id
-        ))
-    } else if observed.observation.records.claim.is_some() {
-        Some(format!("{PUBLIC_COMMAND} result {id} --list --json"))
-    } else {
-        observed
-            .latest
-            .as_ref()
-            .ok()
-            .and_then(|latest| latest["event_id"].as_str())
-            .map(|event| format!("{PUBLIC_COMMAND} result {id} --event {event} --json"))
+fn result_command(candidate: ResultCandidate, id: &str) -> Option<String> {
+    match candidate {
+        ResultCandidate::ActiveRequest(request) => Some(format!(
+            "{PUBLIC_COMMAND} result {id} --request {request} --json"
+        )),
+        ResultCandidate::ClaimOnly => Some(format!("{PUBLIC_COMMAND} result {id} --list --json")),
+        ResultCandidate::LatestDecoded(event) => Some(format!(
+            "{PUBLIC_COMMAND} result {id} --event {event} --json"
+        )),
+        ResultCandidate::None => None,
     }
 }
 
-fn entry(mut observed: StatusObservation, id: &str, origin: OriginObservation) -> Value {
-    let bound = matches!(&observed.observation.evidence.owner,
-        Ok(Some(owner)) if owner.managed_session_id.as_deref() == Some(id));
-    let owner = if bound {
-        let owner = observed.observation.evidence.observe_owner();
-        OwnerObservation {
-            process_alive: owner.process_alive,
-            identity_matches: owner.identity_matches,
-            error: owner.error.clone(),
-        }
-    } else {
-        OwnerObservation {
-            error: Some(match &observed.observation.evidence.owner {
-                Err(error) => format!("{error:#}"),
-                Ok(None) => "no owner record".to_owned(),
-                Ok(Some(owner)) if owner.managed_session_id.is_none() => {
-                    "owner record is unbound".to_owned()
-                }
-                Ok(Some(_)) => "owner record belongs to another session".to_owned(),
-            }),
-            ..OwnerObservation::default()
-        }
-    };
-    let flags = attention(&observed, &owner, bound, &origin);
-    let command = result_command(&observed, id);
+fn entry(observed: StatusObservation, id: &str, origin: OriginObservation) -> Value {
+    let judgment = observed.observation.evidence.judge_owner(id);
+    let owner = owner_value(judgment);
+    let flags = attention(&observed, judgment, &origin);
     let observation = &observed.observation;
     let records = &observation.records;
+    let judgments = &observation.judgments;
+    // The latest Result status has already decoded; nothing more is decoded (D16).
+    let latest_event = observed
+        .latest
+        .as_ref()
+        .ok()
+        .and_then(|latest| latest["event_id"].as_str());
+    let command = result_command(judgment::result_candidate(records, latest_event), id);
     let manifest = &records.manifest;
     let active = observation.active_request().map(|receipt| {
         let value = observed.active.as_ref().and_then(|active| active.as_ref().ok());
@@ -230,13 +212,13 @@ fn entry(mut observed: StatusObservation, id: &str, origin: OriginObservation) -
         "created_unix_ms": manifest.created_unix_ms, "state": records.status.state,
         "generation": records.status.generation, "updated_unix_ms": records.status.updated_unix_ms,
         "error": records.status.error, "turn_claimed": records.claim.is_some(),
-        "recovery_required": records.pending.is_some(), "unreadable_requests": records.unreadable_requests,
+        "recovery_required": judgments.recovery_required, "unreadable_requests": records.unreadable_requests,
         "request_index_error": records.request_index_error,
         "active_request": active, "latest_result": observed.latest.as_ref().ok(),
         "owner": owner, "attention": flags, "derived_from": "observation", "result_command": command,
     });
     session::hold::add_fields(&mut value, &observation.evidence.held);
-    if let Some(residual) = records.status.residual_surface() {
+    if let Some(residual) = judgments.residual_surface {
         value["residual_surface"] = json!(residual);
     }
     origin.add_fields(&mut value);

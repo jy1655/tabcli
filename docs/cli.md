@@ -428,7 +428,8 @@ the session in the list with attention flags. Fields whose evidence could not be
 null. Attention does not change session or request state. Owner exit, identity mismatch, and
 missing observations are distinct facts; closed sessions have no owner liveness flags. A live
 owner whose identity was not observed is not flagged; a failed identity check is reported as
-`owner_unverified`.
+`owner_unverified`. A bound owner whose attestation could not decide is `owner_unverified` only,
+never `owner_exited`, even when its process id looked absent.
 Each session carries `origin` and `origin_observation`: the managed session recorded as the
 source of its initial request, and whether that session's records show it ended (see
 [origin observation](#origin-observation)). A session whose recorded state is not `closed` and
@@ -572,6 +573,10 @@ later record deletion or damage is an error, not a pending request.
 
 The wait ends on `completed`, `failed`, `cancelled`, `unresolved`, or `recovery_required`, or when a recorded
 owner is no longer live or a closed, failed, or exited session leaves the request unresolved.
+An owner is no longer live only when a bound owner's process exited or its process id now belongs
+to another process, or an unbound legacy owner's process id is gone. A live owner with a changed
+TTY or process group, an attestation that could not decide, and an owner record of another
+session keep the wait going; `result --wait` follows the same rule.
 As with `result --wait`, only `completed` exits successfully. If more than one address ends in
 the same pass, the original input order wins, even across session groups. Sessions are observed
 sequentially: there is **no global ordering guarantee** about actual completion times.
@@ -692,6 +697,10 @@ The report starts human output with `scope`, describing the inputs used by these
   is null when that state was not observed, including provider-only mode.
 
 Scope is not proof of an effective runtime configuration or of delivery.
+
+The session `owner` check is `unavailable` / `owner_exited` or `owner_identity_mismatch` only for a
+bound owner attested gone or changed; a bound owner whose attestation could not decide is
+`unknown` / `owner_unverified`, even when its process id looked absent.
 
 Session reports append a `hold` check after the other record checks: `available` / `not_held`,
 `unavailable` / `session_held`, or `unknown` / `hold_unreadable`. A held session's next action
@@ -1291,12 +1300,16 @@ owner record, `owner.identity_matches: true` means every recorded identity field
 applies to intermediate macOS records containing birth and TTY but no process groups; it
 does not assert that unrecorded fields were verified. PID-only or otherwise unattested
 records keep the match null; an unreadable identity also keeps it null and reports an error.
-Launch repair fails an unconfirmed launch on a mismatch; a pending public wait ends as
-unresolved, and status and doctor report `owner_identity_mismatch`. A verified intermediate
+Launch repair fails an unconfirmed launch on a mismatch, and status and doctor report
+`owner_identity_mismatch`; a pending public wait ends as unresolved only when the process id was
+reused. A verified intermediate
 record can therefore report an available owner in doctor; an inspection failure remains
 unverified. These effects apply to macOS intermediate records as well as Windows records.
 Completed Results still take precedence. These observations alone grant no general Surface
 close authority.
+Only an owner record bound to the session is attested. A record of another managed session is not
+observed: `owner.error` is `owner record belongs to another session`, `owner.process_alive`,
+`owner.identity_matches` and `owner_process_alive` are null, and `owner_identity_verified` is false.
 
 `held` is true, false, or null with `hold_error`, using the same rules as `status`.
 `cancel` is null when absent, otherwise `{request_id, requested_unix_ms, state}`; `state`
