@@ -1,4 +1,7 @@
-//! Existing read policies. They deliberately preserve decoding and budget differences.
+//! Event and timeline read policies: the strict attachment read, the budgeted event read,
+//! the timeline's bounded record read and the publication predicate's event read. Core
+//! Record decoding lives in `record.rs`; these reads keep their own byte budgets and event
+//! decoding.
 use super::*;
 
 /// The attached body must be the recorded bytes, so the event is decoded strictly here

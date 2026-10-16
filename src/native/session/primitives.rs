@@ -100,8 +100,9 @@ pub(in crate::native) fn read_regular_text_if_present(path: &Path) -> Result<Opt
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-/// The raw bytes of a regular session file, so callers that must not alter a record can
-/// decode it strictly instead of through the lossy snapshot reader.
+/// The raw bytes of a regular session file: what the core Record decoders in `record.rs`
+/// take, and what a caller that must not alter an event decodes strictly instead of
+/// through the Snapshot's lossy event read.
 pub(in crate::native) fn read_regular_bytes_if_present(path: &Path) -> Result<Option<Vec<u8>>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
