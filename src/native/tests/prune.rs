@@ -1,5 +1,13 @@
 use super::support::*;
-use super::*;
+use crate::native::prune::prune_closed_sessions;
+use crate::native::session::primitives::write_json_atomic;
+use crate::native::session::test_support::{
+    CLOSED_STATUS_FILE, SESSION_OWNER_FILE, TURN_CLAIM_FILE,
+};
+#[cfg(windows)]
+use crate::native::terminal;
+use crate::native::terminal::ownership::NativeSessionOwner;
+use std::fs;
 
 #[test]
 fn pruning_removes_only_old_quiescent_closed_session_directories() {

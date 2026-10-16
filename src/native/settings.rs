@@ -1,7 +1,10 @@
 //! Settings that a user changes with `tabcli settings`. They are one private
 //! record in the state root; a missing record, or a missing key, means the default.
-use super::*;
 use crate::native::session::{Reader, RecordReader, RecordStore, Store};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::str::FromStr;
 
 const FILE: &str = "settings.json";
 const USAGE: &str = "settings takes no argument to show the settings, or macos-open-mode <tab-first|new-window>, windows-tab-window <dedicated|current> or codex-memory-workspace <refuse|allow> to change one; --json is accepted";
@@ -206,6 +209,8 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::session::primitives::read_json;
+    use std::fs;
 
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()

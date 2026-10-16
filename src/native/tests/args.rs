@@ -1,4 +1,13 @@
 use super::*;
+use crate::native::args::parse_timeout;
+use crate::native::console_control::{ConsoleControlRequest, parse as parse_console_control};
+use crate::native::tell::TellRequest;
+use crate::native::{
+    AskRequest, COMMANDS, NativeCommand, context, is_command, parse_args, terminal,
+};
+use std::fs;
+use std::path::Path;
+use std::time::Duration;
 
 #[test]
 fn ask_yolo_is_false_unless_the_child_request_contains_the_flag() {

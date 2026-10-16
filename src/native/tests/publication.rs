@@ -1,5 +1,20 @@
 use super::support::*;
 use super::*;
+use crate::native::query;
+use crate::native::session::primitives::{event_paths, read_json, write_json_atomic};
+use crate::native::session::test_support::{
+    CLOSED_STATUS_FILE, SESSION_OWNER_FILE, SyncRecord, TURN_CLAIM_FILE, TURN_COMPLETION_FILE,
+    injected_fault, with_fault_budget, with_sync_log, write_event,
+};
+use crate::native::session::turn::{
+    JournaledEventState, PendingTurnCompletion, Report, journaled_event_state,
+    recover_pending_completion,
+};
+use crate::native::session::{SessionState, SessionStatus, update_status};
+use crate::native::terminal::ownership::NativeSessionOwner;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[test]
 fn correlated_wait_ignores_other_completed_turns() {
@@ -421,14 +436,18 @@ fn a_journaled_event_over_the_read_limit_is_never_published_or_compared() {
         seed_event_written_completion_with(&directory, "late result", "late result");
     let size = fs::metadata(&event_path).unwrap().len();
     let pending: PendingTurnCompletion = read_json(&directory.join(TURN_COMPLETION_FILE)).unwrap();
-    let read = journaled_event_state_within(&directory, &pending, size).unwrap();
+    let read = Reader::open_unchecked(&directory)
+        .journaled_event_state_within(&pending, size)
+        .unwrap();
     assert_eq!(read.state, JournaledEventState::Committed);
     assert_eq!(read.bytes_read, size);
     assert_eq!(
         read.committed_text.as_deref(),
         Some(fs::read_to_string(&event_path).unwrap().as_str())
     );
-    let read = journaled_event_state_within(&directory, &pending, size - 1).unwrap();
+    let read = Reader::open_unchecked(&directory)
+        .journaled_event_state_within(&pending, size - 1)
+        .unwrap();
     assert_eq!(read.state, JournaledEventState::Oversized(size));
     assert_eq!(read.bytes_read, 0);
     assert!(read.committed_text.is_none());

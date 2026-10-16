@@ -6,16 +6,21 @@ use super::super::test_support::write_established_thread;
 use super::super::{PENDING_TURN_FILE, read_pending_turn};
 use super::*;
 #[cfg(unix)]
+use crate::native::native_delegation_prompt;
+#[cfg(unix)]
 use crate::native::provider::NativeProviderAdapter;
 #[cfg(unix)]
 use crate::native::session::SessionState;
 #[cfg(unix)]
+use crate::native::session::primitives::read_json;
+use crate::native::session::primitives::{event_paths, write_json_atomic};
+#[cfg(unix)]
 use crate::native::session::schema::SessionEvent;
 use crate::native::session::schema::{SESSION_SCHEMA, SessionManifest};
-use crate::native::session::{Store, turn};
+use crate::native::session::test_support::TURN_CLAIM_FILE;
 #[cfg(unix)]
-use crate::native::{SessionStatus, native_delegation_prompt, read_json, update_status};
-use crate::native::{TURN_CLAIM_FILE, event_paths, write_json_atomic};
+use crate::native::session::{SessionStatus, update_status};
+use crate::native::session::{Store, turn};
 #[cfg(unix)]
 use std::thread;
 use std::time::{Duration, Instant};
@@ -163,7 +168,7 @@ exit 1
     let reason = format!("{:#}", outcome_error(&failure));
     assert!(reason.contains("the active thread cannot be verified"));
     assert!(reason.contains("user message queue is unavailable"));
-    let receipt = crate::native::requests::for_claim(
+    let receipt = crate::native::session::requests::for_claim(
         &crate::native::session::Reader::open_unchecked(directory),
         claim.token(),
     )
@@ -180,7 +185,7 @@ exit 1
         Some(managed_thread)
     );
     assert_eq!(
-        crate::native::requests::for_claim(
+        crate::native::session::requests::for_claim(
             &crate::native::session::Reader::open_unchecked(directory),
             &token
         )
@@ -463,7 +468,7 @@ fn codex_queue_uses_the_provider_backend_without_a_daemon_probe() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        crate::native::write_private(
+        crate::native::session::primitives::write_private(
             &provider,
             br#"#!/bin/sh
 if [ "$1" = "app-server" ]; then
@@ -485,7 +490,7 @@ exit 91
     #[cfg(windows)]
     let provider = directory.join("fake-codex.ps1");
     #[cfg(windows)]
-    crate::native::write_private(
+    crate::native::session::primitives::write_private(
         &provider,
         br#"if ($args[0] -eq 'app-server') {
   [IO.File]::WriteAllText((Join-Path $env:AGENT_BRIDGE_NATIVE_SESSION_DIR 'daemon-probed'), '')
@@ -629,9 +634,11 @@ exit 91
     assert!(directory.join(PENDING_TURN_FILE).is_file());
     assert!(directory.join("queue-started").is_file());
     assert_eq!(
-        std::fs::read_to_string(directory.join(crate::native::TURN_CLAIM_FILE))
-            .unwrap()
-            .trim(),
+        std::fs::read_to_string(
+            directory.join(crate::native::session::test_support::TURN_CLAIM_FILE)
+        )
+        .unwrap()
+        .trim(),
         claim_token,
     );
     // A killed descendant closes the FIFO even if it remains a zombie. This

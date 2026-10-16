@@ -2,7 +2,7 @@
 // No intent, consumption marker, tombstone, or handle removal is manufactured.
 use super::teardown_tests::{fixture, kinds};
 use super::*;
-use crate::native::SessionStatus;
+use crate::native::session::SessionStatus;
 use crate::native::session::{CoreRecord, SessionState};
 use crate::native::terminal::close_authority::close_owned_surface_with;
 use crate::native::terminal::close_authority::test_support::TestObservation;

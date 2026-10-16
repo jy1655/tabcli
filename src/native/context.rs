@@ -2,11 +2,18 @@
 //! Resolution is read-only and provider-neutral: it observes source sessions through the
 //! same snapshot machinery as `result`, pins the selected event, and renders the attachment
 //! text. The combined prompt then travels through each provider's existing transport.
-use super::{AtomicU64, Ordering, Result, SystemTime, UNIX_EPOCH, bail, query, requests};
+use super::query;
+use crate::native::session::Reader;
 use crate::native::session::primitives::valid_session_id;
-use crate::native::{Context, Path, Reader, terminal_safe_text, validate_terminal_input};
+use crate::native::session::requests;
 use agent_bridge::PUBLIC_COMMAND;
+use agent_bridge::{terminal_safe_text, validate_terminal_input};
+use anyhow::Context;
+use anyhow::{Result, bail};
 use requests::ContextSource;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const MAX_CONTEXT_RESULTS: usize = 8;
 pub(crate) const MAX_ATTACHED_BYTES: usize = 256 * 1024;
@@ -260,9 +267,12 @@ pub(crate) fn resolve_in(root: &Path, references: &[ContextResultRef]) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::session::test_support::{TURN_CLAIM_FILE, TURN_CLAIM_LOCK_FILE};
     use crate::native::session::{Store, turn};
     use crate::native::*;
     use serde_json::{Value, json};
+    use std::fs;
+    use std::path::PathBuf;
 
     fn parse_all(values: &[&str]) -> Result<Vec<ContextResultRef>> {
         let mut list = Vec::new();

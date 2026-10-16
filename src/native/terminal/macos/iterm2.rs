@@ -17,7 +17,7 @@ use super::{
     applescript, applescript::close_response,
 };
 
-use crate::native::launch::BindingFacts;
+use crate::native::session::launch::BindingFacts;
 
 const HOST_COMMAND: &str = TerminalKind::Iterm2.registration().host_command;
 const BINDING: &BindingFacts = TerminalKind::Iterm2.registration().binding();
@@ -387,7 +387,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
 }
 
 fn wait_for_binding(directory: &Path, id: &str, iterm_id: &str) -> Result<()> {
-    use crate::native::launch::wait_for_binding;
+    use crate::native::session::launch::wait_for_binding;
     let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING)?;
     if surface.kind != TerminalKind::Iterm2 || surface.id != iterm_id {
         bail!("iTerm2 surface binding does not match this launch host");
@@ -978,7 +978,7 @@ mod tests {
 
     #[test]
     fn host_binding_partial_transitions() {
-        crate::native::launch::binding_tests::characterize("iTerm2", |directory, id| {
+        crate::native::session::launch::binding_tests::characterize("iTerm2", |directory, id| {
             wait_for_binding(directory, id, "host-id")
         });
     }
@@ -1963,8 +1963,8 @@ end run
     }
 
     fn bind_fixture(directory: &Path, terminal_id: &str) {
-        crate::native::write_json_atomic(
-            &directory.join(crate::native::TERMINAL_HANDLE_FILE),
+        crate::native::session::primitives::write_json_atomic(
+            &directory.join(crate::native::session::test_support::TERMINAL_HANDLE_FILE),
             &serde_json::json!({
                 "terminal": "iterm2", "session_id": terminal_id,
                 "managed_session_id": directory.file_name().unwrap().to_str().unwrap()
@@ -1995,15 +1995,15 @@ end run
                 },
             );
             match mode {
-                "wrong-owner" => crate::native::write_json_atomic(&directory.join(crate::native::TERMINAL_HANDLE_FILE), &serde_json::json!({ "terminal": "iterm2", "session_id": "owned-id", "managed_session_id": "session-other" })).unwrap(),
-                "cancelled" => crate::native::update_status(directory, SessionState::Closed, None, None).unwrap(),
+                "wrong-owner" => crate::native::session::primitives::write_json_atomic(&directory.join(crate::native::session::test_support::TERMINAL_HANDLE_FILE), &serde_json::json!({ "terminal": "iterm2", "session_id": "owned-id", "managed_session_id": "session-other" })).unwrap(),
+                "cancelled" => crate::native::session::update_status(directory, SessionState::Closed, None, None).unwrap(),
                 "expired" | "changed-claim" => {
-                    let mut receipt = crate::native::launch::read(&crate::native::session::Reader::open_unchecked(directory)).unwrap().unwrap();
+                    let mut receipt = crate::native::session::launch::read(&crate::native::session::Reader::open_unchecked(directory)).unwrap().unwrap();
                     if mode == "expired" { receipt.deadline_unix_ms = 0; }
                     else { receipt.claim_token = "unrelated".into(); }
-                    crate::native::write_json_atomic(&directory.join(crate::native::launch::FILE), &receipt).unwrap();
+                    crate::native::session::primitives::write_json_atomic(&directory.join(crate::native::session::launch::FILE), &receipt).unwrap();
                 }
-                "invalid-binding" => std::fs::write(directory.join(crate::native::TERMINAL_HANDLE_FILE), b"{").unwrap(),
+                "invalid-binding" => std::fs::write(directory.join(crate::native::session::test_support::TERMINAL_HANDLE_FILE), b"{").unwrap(),
                 _ => {}
             }
             assert!(
@@ -2031,7 +2031,7 @@ end run
             let owner = ownership::current_native_session_owner(id).unwrap();
             let mut queued: libc::c_int = -1;
             assert_eq!(unsafe { libc::ioctl(0, libc::FIONREAD, &mut queued) }, 0);
-            crate::native::write_json_atomic(&directory.join("owner-probe.json"), &serde_json::json!({ "pid": owner.pid, "group": owner.process_group, "queued_input": queued })).unwrap();
+            crate::native::session::primitives::write_json_atomic(&directory.join("owner-probe.json"), &serde_json::json!({ "pid": owner.pid, "group": owner.process_group, "queued_input": queued })).unwrap();
         }
     }
 
@@ -2059,7 +2059,8 @@ end run
         let odd = parent.path().join(ODD_NAME);
         std::fs::create_dir(&odd).unwrap();
         let directory = launch_fixture_in(&odd);
-        let log_before = std::fs::read(directory.path().join(crate::native::launch::LOG)).unwrap();
+        let log_before =
+            std::fs::read(directory.path().join(crate::native::session::launch::LOG)).unwrap();
         let executable = std::env::current_exe().unwrap();
         let probe = format!(
             "AB_ITERM_PROBE_DIR={} {} --exact native::terminal::macos::iterm2::tests::iterm_owned_process_probe --nocapture --test-threads=1",
@@ -2134,7 +2135,7 @@ end run
                     )
                 });
                 if cancel {
-                    crate::native::update_status(
+                    crate::native::session::update_status(
                         directory.path(),
                         SessionState::Closed,
                         None,
@@ -2165,7 +2166,8 @@ end run
             String::from_utf8_lossy(&output)
         );
         let log =
-            std::fs::read_to_string(directory.path().join(crate::native::launch::LOG)).unwrap();
+            std::fs::read_to_string(directory.path().join(crate::native::session::launch::LOG))
+                .unwrap();
         assert!(log.lines().all(|line| !line.contains("host_")), "{log}");
         assert_eq!(log.as_bytes(), log_before);
         let owner = directory.path().join("owner-probe.json");

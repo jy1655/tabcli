@@ -1,4 +1,7 @@
 use super::*;
+use crate::native::session::primitives::write_json_atomic;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 struct Fixture {
     _directory: tempfile::TempDir,

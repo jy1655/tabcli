@@ -8,9 +8,10 @@ use super::super::test_support::{
 };
 use super::super::{AGY_LOG_FILE, PendingAgyTurn, terminal_correlated_prompt};
 use super::*;
+use crate::native::session::primitives::{event_paths, read_json};
 use crate::native::session::schema::SessionEvent;
 use crate::native::session::{Reader, SessionState, Store, turn};
-use crate::native::{SessionStatus, event_paths, read_json, update_status};
+use crate::native::session::{SessionStatus, update_status};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
@@ -228,9 +229,9 @@ fn tool_confirmation_is_read_only_and_yields_to_results_and_failures() {
     fs::write(&transcript, "").unwrap();
     let log_path = directory.join(AGY_LOG_FILE);
     let log = approval_log(&pending);
-    super::super::super::super::write_private(&log_path, log.as_bytes()).unwrap();
+    crate::native::session::primitives::write_private(&log_path, log.as_bytes()).unwrap();
     let before = fs::read(directory.join("status.json")).unwrap();
-    let request = super::super::super::super::requests::for_claim(
+    let request = crate::native::session::requests::for_claim(
         &Reader::open_unchecked(&directory),
         &pending.claim_token,
     )

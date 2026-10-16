@@ -1,6 +1,9 @@
 //! Record the user's intent to interrupt the active request.
-use super::*;
+use super::args::{set_flag_once, set_once};
 use crate::native::session::primitives::require_valid_session_id;
+use crate::native::session::{Reader, Store};
+use crate::native::{NativeCommand, envelope, session};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 #[derive(Debug)]

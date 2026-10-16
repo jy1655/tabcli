@@ -14,8 +14,8 @@
     "name: \"native-provider-control\"": 1,
     "name: \"native-console-control\"": 1,
     "[Agent Bridge native delegation]": 1,
-    "native-console-control": 2,
-    "native-hook": 3,
+    "native-console-control": 1,
+    "native-hook": 1,
     "native-provider-control": 2,
     "native-session": 2,
     "name: terminal::host::CONSOLE_HOST_COMMAND": 1,
@@ -24,6 +24,12 @@
     "name: terminal::host::WEZTERM_HOST_COMMAND": 1,
     "name: terminal::host::GHOSTTY_HOST_COMMAND": 1,
     "name: terminal::host::WARP_HOST_COMMAND": 1
+  },
+  "src/native/hook.rs": {
+    "native-hook": 2
+  },
+  "src/native/console_control.rs": {
+    "native-console-control": 1
   },
   "src/native/consent.rs": {
     "const SESSION_FILE: &str = \"workspace-consent.json\";": 1,

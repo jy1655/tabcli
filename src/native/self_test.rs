@@ -1,10 +1,20 @@
-use super::*;
+use super::args::{option_value, set_flag_once};
+use super::session_start::parse_ask;
+use super::sessions::{parse as parse_sessions, sessions_in_read_only};
 use crate::native::session::primitives::{
     STATE_DIR_ENV, require_valid_session_id, valid_session_id,
 };
 use crate::native::session::{Reader, RecordStore, Store};
+use crate::native::{AskRequest, NativeCommand, doctor, process_env, session_start};
 use agent_bridge::PUBLIC_COMMAND;
+use agent_bridge::{checked_deadline_from, terminal_safe_text};
+use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use serde_json::Value;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 // Let each public command report its timeout before the outer deadline.
 const COMMAND_MARGIN: Duration = Duration::from_secs(5);

@@ -696,6 +696,9 @@ mod process_close_tests {
     }
 }
 
+#[cfg(test)]
+mod tests;
+
 #[cfg(all(test, target_os = "macos"))]
 #[path = "ownership_teardown_tests.rs"]
 mod teardown_tests;

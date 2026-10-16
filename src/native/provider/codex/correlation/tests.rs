@@ -1,11 +1,12 @@
 use super::super::{ADAPTER, PENDING_TURN_FILE, install_pending_turn};
 use super::*;
+use crate::native::native_delegation_prompt;
 use crate::native::provider::NativeProviderAdapter;
+use crate::native::session::primitives::{event_paths, read_json};
 use crate::native::session::schema::SessionEvent;
+use crate::native::session::test_support::TURN_CLAIM_FILE;
 use crate::native::session::{SessionState, Store, turn};
-use crate::native::{
-    SessionStatus, TURN_CLAIM_FILE, event_paths, native_delegation_prompt, read_json, update_status,
-};
+use crate::native::session::{SessionStatus, update_status};
 
 fn claim_pending_turn(directory: &Path) -> PendingCodexTurn {
     let claim = turn::claim(&Store::open_unchecked(directory), &[]).unwrap();

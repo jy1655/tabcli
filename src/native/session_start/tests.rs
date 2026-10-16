@@ -1,5 +1,13 @@
 use super::*;
+use crate::native::session::{CoreRecord, Reader, requests};
+use crate::native::turn_report::TurnReport;
+use crate::native::{CreatedSession, SessionSpec, create_session_within, delivery, terminal};
+use agent_bridge::FirstPartyCli;
+use anyhow::{Result, bail};
 use std::cell::RefCell;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 struct Fake {
     root: tempfile::TempDir,

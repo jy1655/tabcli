@@ -92,7 +92,11 @@ mod tests {
         fs::set_permissions(&invalid, fs::Permissions::from_mode(0o700)).unwrap();
         // Existing bytes also must survive preflight, including invalid-id failure.
         for path in [relative_path.as_path(), &private, &shared, &invalid] {
-            fs::write(path.join(crate::native::launch::LOG), b"existing log\n").unwrap();
+            fs::write(
+                path.join(crate::native::session::launch::LOG),
+                b"existing log\n",
+            )
+            .unwrap();
         }
         for (name, run) in hosts() {
             for missing in [
@@ -122,7 +126,7 @@ mod tests {
             );
             for path in [relative_path.as_path(), &private, &shared, &invalid] {
                 assert_eq!(
-                    fs::read(path.join(crate::native::launch::LOG)).unwrap(),
+                    fs::read(path.join(crate::native::session::launch::LOG)).unwrap(),
                     b"existing log\n"
                 );
             }
@@ -179,7 +183,7 @@ mod tests {
             std::path::PathBuf::from(std::env::var_os("AB_BOUND_HOST_DIRECTORY").unwrap());
         let is_iterm = mode.starts_with("iterm");
         let is_terminal = mode.starts_with("terminal");
-        crate::native::set_private_directory_permissions(&directory).unwrap();
+        crate::native::session::primitives::set_private_directory_permissions(&directory).unwrap();
         let name = if is_terminal {
             "Terminal.app"
         } else if is_iterm {
@@ -218,10 +222,15 @@ mod tests {
             _ => {
                 use crate::native::session::{SessionState, Store, turn};
                 let store = Store::open_unchecked(&directory);
-                crate::native::update_status(&directory, SessionState::Launching, None, None)
-                    .unwrap();
+                crate::native::session::update_status(
+                    &directory,
+                    SessionState::Launching,
+                    None,
+                    None,
+                )
+                .unwrap();
                 let claim = turn::claim(&store, &[]).unwrap();
-                crate::native::launch::begin(
+                crate::native::session::launch::begin(
                     &store,
                     claim.token(),
                     std::time::Instant::now() + std::time::Duration::from_secs(10),
@@ -236,8 +245,8 @@ mod tests {
                 if !is_iterm {
                     surface["wezterm_mux"] = serde_json::json!({"socket": "/socket", "pid": 1, "start_seconds": 1, "start_microseconds": 0, "owns_gui": false});
                 }
-                crate::native::write_json_atomic(
-                    &directory.join(crate::native::TERMINAL_HANDLE_FILE),
+                crate::native::session::primitives::write_json_atomic(
+                    &directory.join(crate::native::session::test_support::TERMINAL_HANDLE_FILE),
                     &surface,
                 )
                 .unwrap();
@@ -256,12 +265,12 @@ mod tests {
             .find(|(host, _)| *host == name)
             .unwrap()
             .1;
-        let before = fs::read(directory.join(crate::native::launch::LOG)).ok();
+        let before = fs::read(directory.join(crate::native::session::launch::LOG)).ok();
         let error = format!("{:#}", run(&directory).unwrap_err());
         assert_eq!(error, expected, "{mode}");
         if is_iterm {
             assert_eq!(
-                fs::read(directory.join(crate::native::launch::LOG)).ok(),
+                fs::read(directory.join(crate::native::session::launch::LOG)).ok(),
                 before
             );
         } else {

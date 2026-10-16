@@ -1160,7 +1160,7 @@ fn binding_record_failure_aborts_then_cleans_the_exact_claim() {
 }
 
 fn failed_binding_launch_fixture(directory: &Path) -> crate::native::session::Store {
-    use crate::native::{SessionState, launch, update_status};
+    use crate::native::session::{SessionState, launch, update_status};
     fs::create_dir(directory).unwrap();
     fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir(directory.join("events")).unwrap();
@@ -1204,7 +1204,8 @@ fn failed_binding_launch(
 
 #[test]
 fn failed_binding_cleanup_retains_only_unconfirmed_warp_surface() {
-    use crate::native::{SessionState, launch, session::close, terminal::RetainedLaunchSurface};
+    use crate::native::session::{SessionState, launch};
+    use crate::native::{session::close, terminal::RetainedLaunchSurface};
     for cancel_close in [false, true] {
         let (temp, client, attempt) = fixture();
         let directory = temp.path().join("session");
@@ -2990,8 +2991,9 @@ fn g4_r20_creation_configs_carry_quoted_and_unicode_text_exactly() {
     }
 }
 
+use crate::native::session::primitives::read_json;
+use crate::native::session::test_support::{TERMINAL_CLOSE_INTENT_FILE, TERMINAL_HANDLE_FILE};
 use crate::native::tests::write_attested_apple_terminal_state;
-use crate::native::{TERMINAL_CLOSE_INTENT_FILE, TERMINAL_HANDLE_FILE, read_json};
 
 #[cfg(target_os = "macos")]
 #[test]

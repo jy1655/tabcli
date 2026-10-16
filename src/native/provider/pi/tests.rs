@@ -1,8 +1,10 @@
 use super::monitor::HOOK_FAILURE_FILE;
 use super::test_support::{claim_pending_turn, marked};
 use super::*;
+use crate::native::session::primitives::{event_paths, read_json, write_json_atomic};
+use crate::native::session::test_support::TURN_CLAIM_FILE;
+use crate::native::session::update_status;
 use crate::native::session::{SessionState, schema::SessionEvent};
-use crate::native::{TURN_CLAIM_FILE, event_paths, read_json, update_status, write_json_atomic};
 use std::fs;
 
 #[test]
@@ -58,7 +60,11 @@ fn workspace_trust_requires_exact_positive_but_respects_parent_decline() {
     std::fs::create_dir_all(tmp.path().join(".pi/agent")).unwrap();
     let store = tmp.path().join(".pi/agent").join("trust.json");
     let key = consent::native_key(&workspace).unwrap();
-    super::super::super::write_json_atomic(&store, &serde_json::json!({key.clone():true})).unwrap();
+    crate::native::session::primitives::write_json_atomic(
+        &store,
+        &serde_json::json!({key.clone():true}),
+    )
+    .unwrap();
     // The evidence names the store the adapter read, spelled as its home resolves it:
     // the `.pi/agent` component keeps its slash on every platform.
     let Trust::Trusted(evidence) = ADAPTER.workspace_trust(&workspace, &env, None).unwrap() else {
@@ -88,7 +94,8 @@ fn workspace_trust_requires_exact_positive_but_respects_parent_decline() {
             .unwrap(),
         Trust::Absent
     );
-    super::super::super::write_json_atomic(&store, &serde_json::json!({key:false})).unwrap();
+    crate::native::session::primitives::write_json_atomic(&store, &serde_json::json!({key:false}))
+        .unwrap();
     assert_eq!(
         ADAPTER
             .workspace_trust(&workspace.join("child"), &env, None)

@@ -1,7 +1,9 @@
 use super::super::test_support::claim_pending_turn;
 use super::*;
 use crate::native::session::SessionState;
-use crate::native::{SessionStatus, TURN_CLAIM_FILE, read_json, update_status, write_json_atomic};
+use crate::native::session::primitives::{read_json, write_json_atomic};
+use crate::native::session::test_support::TURN_CLAIM_FILE;
+use crate::native::session::{SessionStatus, update_status};
 use std::fs;
 
 #[test]

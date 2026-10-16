@@ -1,4 +1,3 @@
-use super::*;
 #[cfg(not(any(target_os = "macos", windows)))]
 use crate::native::session::close::budget::close_deadline;
 use crate::native::session::primitives::{SESSION_DIR_ENV, unix_ms, valid_session_id};
@@ -14,7 +13,7 @@ use std::process::Command;
 #[cfg(target_os = "macos")]
 pub(super) use support::write_attested_apple_terminal_state;
 pub(super) use support::{
-    seed_close_fixture, spawn_surviving_process, test_windows_process_identity,
+    reaped_child_pid, seed_close_fixture, spawn_surviving_process, test_windows_process_identity,
     write_provider_process_record,
 };
 

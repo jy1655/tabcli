@@ -31,18 +31,30 @@ mod reads;
 pub(in crate::native) mod record;
 pub(in crate::native) mod schema;
 pub(in crate::native) mod snapshot;
-#[cfg(test)]
-pub(in crate::native) use names::*;
-#[cfg(not(test))]
 use names::*;
-#[cfg(test)]
-pub(in crate::native) use primitives::*;
-#[cfg(not(test))]
 use primitives::*;
-#[cfg(test)]
-pub(in crate::native) use reads::*;
-#[cfg(not(test))]
 use reads::*;
+
+/// Test-only access, for tests outside `session`, to the record names and the
+/// fault-injection primitives. Production visibility of `names`, `primitives` and `reads`
+/// is unchanged: a test compiles against the same namespace as production and reaches
+/// these names only through this facade.
+#[cfg(test)]
+pub(in crate::native) mod test_support {
+    #[cfg(target_os = "macos")]
+    pub(in crate::native) use super::names::TERMINAL_CLOSE_INTENT_FILE;
+    pub(in crate::native) use super::names::{
+        CLOSED_STATUS_FILE, EVENTS_DIRECTORY, LAUNCH_FILE, LEGACY_RESUME_PENDING_FILE,
+        PROVIDER_PROCESS_FILE, REOPEN_MARKER_FILE, REOPEN_REFUSAL_FILE, REQUESTS_DIRECTORY,
+        SESSION_OWNER_FILE, STATE_ROOT_ANCESTRY_SYNC_LIMIT, STATE_ROOT_DURABLE_FILE, STATUS_FILE,
+        TERMINAL_CLOSING_FILE, TERMINAL_HANDLE_FILE, TERMINAL_TOMBSTONE_FILE, TURN_CLAIM_FILE,
+        TURN_CLAIM_LOCK_FILE, TURN_COMPLETION_FILE,
+    };
+    pub(in crate::native) use super::primitives::{
+        SyncRecord, injected_fault, injected_sync_failure, with_fault_budget,
+        with_publication_read_log, with_sync_failure, with_sync_log, write_event,
+    };
+}
 
 /// A read-only view. Opening a view performs no recovery or record mutation.
 #[derive(Clone, Debug)]
@@ -485,7 +497,6 @@ impl RecordStore {
     }
 }
 
-#[cfg(not(test))]
 pub(in crate::native) use primitives::{EventsDirectory, StatusLock, TurnClaimLock};
 
 impl Store {

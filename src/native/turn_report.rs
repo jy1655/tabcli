@@ -1,7 +1,10 @@
 //! Lifecycle output for ask, tell and reopen: accepted, completed and failed,
 //! with or without a request address.
-use super::*;
 
+use crate::native::session::Reader;
+use crate::native::{envelope, query};
+use agent_bridge::PUBLIC_COMMAND;
+use anyhow::{Context, Result};
 /// The command's known fields and the address acquired once its receipt exists.
 pub(super) struct TurnReport {
     json: bool,

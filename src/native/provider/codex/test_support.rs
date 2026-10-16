@@ -1,5 +1,5 @@
+use crate::native::session::primitives::write_json_atomic;
 use crate::native::session::schema::SessionEvent;
-use crate::native::write_json_atomic;
 #[cfg(unix)]
 use anyhow::Result;
 use std::path::Path;

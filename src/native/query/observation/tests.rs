@@ -63,12 +63,12 @@ fn damage_keeps_inspect_and_doctor_failure_scopes() {
         if part == "resumed_from" {
             let mut manifest: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
             manifest["resumed_from"] = json!({"session": 42});
-            crate::native::write_json_atomic(&path, &manifest).unwrap();
+            crate::native::session::primitives::write_json_atomic(&path, &manifest).unwrap();
         } else {
             if path.exists() {
                 fs::remove_file(&path).unwrap();
             }
-            crate::native::write_private(&path, b"{").unwrap();
+            crate::native::session::primitives::write_private(&path, b"{").unwrap();
         }
         let before = entries(directory);
         let (observation, observation_reads) = with_event_read_count(|| Observation::read(&reader));
@@ -142,7 +142,7 @@ fn damage_keeps_inspect_and_doctor_failure_scopes() {
 fn observation_is_read_only_and_releases_its_lock() {
     let fixture = seed_close_fixture(JournaledEventState::Committed);
     let reader = Reader::open_unchecked(&fixture.directory);
-    crate::native::write_json_atomic(
+    crate::native::session::primitives::write_json_atomic(
         &fixture.directory.join("native-session.json"),
         &json!({"pid":0, "managed_session_id":"session-fault"}),
     )
@@ -234,7 +234,7 @@ fn inspect_rejects_provenance_before_reading_latest_event() {
     let manifest_path = directory.join("manifest.json");
     let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
     manifest["resumed_from"] = json!({"session": 42});
-    crate::native::write_json_atomic(&manifest_path, &manifest).unwrap();
+    crate::native::session::primitives::write_json_atomic(&manifest_path, &manifest).unwrap();
     let expected_error = format!("{:#}", read_resumed_from(directory).unwrap_err());
     let (inspect, reads) =
         with_event_read_count(|| super::super::inspect_value(&reader, "session-fault"));
@@ -242,7 +242,7 @@ fn inspect_rejects_provenance_before_reading_latest_event() {
     assert_eq!(reads, 0);
 
     manifest.as_object_mut().unwrap().remove("resumed_from");
-    crate::native::write_json_atomic(&manifest_path, &manifest).unwrap();
+    crate::native::session::primitives::write_json_atomic(&manifest_path, &manifest).unwrap();
     let (inspect, reads) =
         with_event_read_count(|| super::super::inspect_value(&reader, "session-fault"));
     assert!(inspect.is_err());
@@ -315,18 +315,20 @@ fn each_damaged_auxiliary_record_is_its_unreadable_part() {
                 let mut manifest: Value =
                     serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
                 manifest["resumed_from"] = json!({"session": 42});
-                crate::native::write_json_atomic(&path, &manifest).unwrap();
+                crate::native::session::primitives::write_json_atomic(&path, &manifest).unwrap();
             }
-            "tombstone" => {
-                crate::native::write_json_atomic(&path, &json!({"terminal": "iterm"})).unwrap()
-            }
+            "tombstone" => crate::native::session::primitives::write_json_atomic(
+                &path,
+                &json!({"terminal": "iterm"}),
+            )
+            .unwrap(),
             _ => {
                 if path.is_dir() {
                     fs::remove_dir_all(&path).unwrap();
                 } else if path.exists() {
                     fs::remove_file(&path).unwrap();
                 }
-                crate::native::write_private(&path, b"{").unwrap();
+                crate::native::session::primitives::write_private(&path, b"{").unwrap();
             }
         }
         let observation = Observation::read(&reader).unwrap();
@@ -344,7 +346,7 @@ fn each_damaged_auxiliary_record_is_its_unreadable_part() {
 #[test]
 fn surface_presence_is_judged_once_per_observation() {
     let fixture = seed_close_fixture(JournaledEventState::Committed);
-    crate::native::write_json_atomic(
+    crate::native::session::primitives::write_json_atomic(
         &fixture.directory.join("terminal.json"),
         &json!({"terminal": "warp", "session_id": "surface-1", "managed_session_id": "session-fault"}),
     )
@@ -387,7 +389,7 @@ fn surface_presence_is_judged_once_per_observation() {
         judgment::SurfacePresence::Unverified("no active terminal handle is recorded".into())
     );
     let expired = Observation::read(&reader).unwrap();
-    crate::native::write_json_atomic(
+    crate::native::session::primitives::write_json_atomic(
         &fixture.directory.join("terminal.json"),
         &json!({"terminal": "warp", "session_id": "surface-1", "managed_session_id": "session-fault"}),
     )
@@ -409,13 +411,13 @@ fn inspect_holds_the_lifecycle_lock_through_its_historical_elapsed_reads() {
     let fixture = seed_close_fixture(JournaledEventState::Committed);
     let directory = &fixture.directory;
     // A second, historical request beside the active one.
-    crate::native::write_json_atomic(
+    crate::native::session::primitives::write_json_atomic(
         &directory.join("events/event-000.json"),
         &json!({"provider":"codex","message":"earlier result","error":null,
             "provider_session_id":null,"turn_id":null,"created_unix_ms":1}),
     )
     .unwrap();
-    crate::native::write_json_atomic(
+    crate::native::session::primitives::write_json_atomic(
         &directory.join("requests/1-1-1.json"),
         &json!({"schema":1,"request_id":"request-earlier","claim_token":"1-1-1",
             "event_file":"event-000.json","created_unix_ms":0}),
@@ -469,13 +471,13 @@ fn result_reference_omits_only_the_body_key() {
 
 #[test]
 fn doctor_reads_the_origin_within_its_own_deadline() {
-    use crate::native::session::{LAUNCH_FILE, REQUESTS_DIRECTORY, TURN_CLAIM_FILE};
+    use crate::native::session::test_support::{LAUNCH_FILE, REQUESTS_DIRECTORY, TURN_CLAIM_FILE};
     let fixture = seed_close_fixture(JournaledEventState::Committed);
     let directory = &fixture.directory;
     // The initial request names a managed origin, so observing it reads its records.
     let token = fs::read_to_string(directory.join(TURN_CLAIM_FILE)).unwrap();
     let token = token.trim();
-    crate::native::write_json_atomic(
+    crate::native::session::primitives::write_json_atomic(
         &directory.join(LAUNCH_FILE),
         &json!({"schema": 1, "claim_token": token, "deadline_unix_ms": 1, "phase": "spawned"}),
     )
@@ -485,7 +487,7 @@ fn doctor_reads_the_origin_within_its_own_deadline() {
         .join(format!("{token}.json"));
     let mut receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
     receipt["source"] = json!("session-origin");
-    crate::native::write_json_atomic(&receipt_path, &receipt).unwrap();
+    crate::native::session::primitives::write_json_atomic(&receipt_path, &receipt).unwrap();
     // The origin's directory exists, so observing it reads its manifest.
     fs::create_dir(directory.parent().unwrap().join("session-origin")).unwrap();
     let reader = Reader::open_unchecked(directory);
@@ -523,7 +525,7 @@ fn owner_judgment_is_made_once_per_observation() {
     use crate::native::session::owner::ControlAttestation;
     use judgment::tests::attestation;
     let fixture = seed_close_fixture(JournaledEventState::Committed);
-    crate::native::write_json_atomic(
+    crate::native::session::primitives::write_json_atomic(
         &fixture.directory.join("native-session.json"),
         &json!({"pid": 4242, "managed_session_id": "session-fault"}),
     )

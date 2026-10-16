@@ -1,5 +1,8 @@
 use super::*;
 #[cfg(windows)]
+use crate::native::console_control::ConsoleControlRequest;
+use crate::native::provider_process::command as provider_process_command;
+#[cfg(windows)]
 use crate::native::session::launch::launcher::bridge_shell_command;
 #[cfg(windows)]
 use crate::native::session::launch::wrapper::{
@@ -7,6 +10,18 @@ use crate::native::session::launch::wrapper::{
 };
 #[cfg(windows)]
 use crate::native::session::primitives::STATE_DIR_ENV;
+use crate::native::session::primitives::{
+    default_state_root, read_json, write_json_atomic, write_private,
+};
+use crate::native::session::test_support::{TERMINAL_CLOSING_FILE, TERMINAL_HANDLE_FILE};
+#[cfg(windows)]
+use crate::native::terminal::windows_console_handle_path;
+use crate::native::{NativeCommand, parse_args, process_env, provider, provider_process, terminal};
+use std::ffi::OsString;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use std::{fs, thread};
 
 #[cfg(windows)]
 #[test]
@@ -53,36 +68,6 @@ fn windows_state_root_falls_back_to_userprofile_without_home() {
         default_state_root(None, Some(std::ffi::OsStr::new(r"C:\Users\cmd-user"))).unwrap(),
         PathBuf::from(r"C:\Users\cmd-user\.agent-bridge\native-sessions")
     );
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_console_launch_uses_non_verbatim_powershell_paths() {
-    // The normalized value must reach both the tab request and console-window
-    // constructor, not just argv[0]: CreateProcessW has a separate application name.
-    let source = include_str!("../terminal/windows/mod.rs").replace("\r\n", "\n");
-    assert!(source.contains(
-        "let powershell = PathBuf::from(crate::native::provider_process::windows_command_path(\n        &powershell_executable()?,\n    ));"
-    ));
-    assert!(source.contains("tab::offer(\n        &powershell,\n        &command_line,"));
-    assert!(source.contains("ConsoleWindow::create(&powershell, &command_line, deadline)"));
-    for (path, expected) in [
-        (
-            r"\\?\C:\Program Files (x86)\PowerShell\7\pwsh.exe",
-            r"C:\Program Files (x86)\PowerShell\7\pwsh.exe",
-        ),
-        (
-            r"\\?\UNC\server\share\PowerShell\7\pwsh.exe",
-            r"\\server\share\PowerShell\7\pwsh.exe",
-        ),
-    ] {
-        let application = PathBuf::from(provider_process::windows_command_path(Path::new(path)));
-        assert_eq!(application, Path::new(expected));
-        let command_line =
-            terminal::windows_console_launch_command_line(Path::new(path), "exit 0").unwrap();
-        assert!(command_line.starts_with(&format!("\"{expected}\" ")));
-        assert!(!command_line.contains(r"\\?\"));
-    }
 }
 
 #[cfg(windows)]
@@ -197,38 +182,6 @@ fn windows_console_helper_accepts_only_managed_session_identity() {
         arguments.extend_from_slice(invalid);
         assert!(parse_args(arguments).is_err(), "{invalid:?}");
     }
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_terminal_input_requires_the_live_native_session_owner() {
-    let directory = tempfile::tempdir().unwrap();
-    let owner = current_native_session_owner("session-owner123").unwrap();
-    write_json_atomic(&directory.path().join(SESSION_OWNER_FILE), &owner).unwrap();
-
-    verified_windows_native_owner(directory.path(), "session-owner123").unwrap();
-    assert!(
-        verified_windows_native_owner(directory.path(), "session-other123")
-            .unwrap_err()
-            .to_string()
-            .contains("not bound")
-    );
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_close_control_uses_the_claimed_terminal_handle() {
-    let directory = tempfile::tempdir().unwrap();
-    fs::write(directory.path().join(TERMINAL_HANDLE_FILE), b"active").unwrap();
-    assert_eq!(
-        windows_console_handle_path(directory.path(), &ConsoleControlRequest::Close),
-        directory.path().join(TERMINAL_HANDLE_FILE)
-    );
-    fs::write(directory.path().join(TERMINAL_CLOSING_FILE), b"closing").unwrap();
-    assert_eq!(
-        windows_console_handle_path(directory.path(), &ConsoleControlRequest::Close),
-        directory.path().join(TERMINAL_CLOSING_FILE)
-    );
 }
 
 #[cfg(windows)]

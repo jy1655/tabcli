@@ -1,5 +1,10 @@
 use super::support::*;
 use super::*;
+use crate::native::session::primitives::{event_paths, lock_turn_claim, read_json};
+use crate::native::session::test_support::{TURN_CLAIM_FILE, TURN_COMPLETION_FILE};
+use crate::native::session::{SessionState, SessionStatus, launch, update_status};
+use std::fs;
+use std::time::Duration;
 
 #[test]
 fn provider_failures_finish_the_bridge_turn_without_reporting_success() {
@@ -371,4 +376,8 @@ fn turn_lifecycle_converges_under_every_completion_exit_and_failure_order() {
             "{order:?}"
         );
     }
+}
+
+fn valid_status_transition(current: &SessionState, next: &SessionState) -> bool {
+    current.clone().transition_allowed(next.clone())
 }

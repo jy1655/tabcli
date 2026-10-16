@@ -10,8 +10,10 @@ use super::super::{
 };
 use super::*;
 use crate::native::session::Store;
+use crate::native::session::primitives::read_json;
 use crate::native::session::{SessionState, turn};
-use crate::native::{SessionStatus, read_json, terminal, update_status};
+use crate::native::session::{SessionStatus, update_status};
+use crate::native::terminal;
 use anyhow::bail;
 use std::fs;
 use std::time::{Duration, Instant};
@@ -194,7 +196,7 @@ fn follow_up_pre_paste_offset_is_the_log_length_and_never_zero_for_a_missing_log
 // the claim or the composer.
 #[test]
 fn lost_initial_paste_ends_delivery_uncertain_with_the_reason_in_status_json() {
-    use super::super::super::super::TURN_CLAIM_FILE;
+    use crate::native::session::test_support::TURN_CLAIM_FILE;
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("session-fMqSQc");
     fs::create_dir_all(directory.join("events")).unwrap();
@@ -268,7 +270,7 @@ fn lost_initial_paste_ends_delivery_uncertain_with_the_reason_in_status_json() {
 // claim retained.
 #[test]
 fn lost_macos_follow_up_paste_ends_delivery_uncertain_with_the_reason_in_status_json() {
-    use super::super::super::super::TURN_CLAIM_FILE;
+    use crate::native::session::test_support::TURN_CLAIM_FILE;
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("session-QMFk6F");
     fs::create_dir_all(directory.join("events")).unwrap();

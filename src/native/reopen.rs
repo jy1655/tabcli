@@ -1,14 +1,33 @@
 //! Reopen of a closed Session: source reservation, launch refusal, and cleanup settlement.
 //! Provider adapters retain conversation-holder evidence; terminal ownership retains Close authority.
+use super::args::{CommonStartOptions, parse_common_start_option, read_prompt_option};
+use super::close::close_session_surface;
 use super::doctor::{Availability, Check};
-use super::*;
 use crate::native::session::launch::wrapper::{check_provider_version_until, resolve_provider};
+use crate::native::session::primitives::require_valid_session_id;
 use crate::native::session::primitives::{delegation_source, unix_ms, valid_session_id};
 use crate::native::session::schema::{
     ProviderProcessRecord, RecordedReopenRefusal, SessionEvent, SessionManifest,
 };
 use crate::native::session::turn::TURN_CLAIM_SEQUENCE;
+use crate::native::session::{
+    CoreRecord, Reader, RecordReader, RecordStore, SessionState, Store, record, requests, turn,
+    update_status,
+};
+use crate::native::turn_report::TurnReport;
+use crate::native::{
+    CreatedSession, DEFAULT_TIMEOUT_SECS, NativeCommand, SessionSpec, create_session, delivery,
+    native_delegation_prompt, provider, sanitize_title, session, session_start, terminal,
+};
+use agent_bridge::{FirstPartyCli, process_is_alive, validate_terminal_input};
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // Where a reopened session's provider conversation came from: the closed Bridge session and
 // the event whose provider session id was passed to the provider's official resume.
@@ -1304,3 +1323,69 @@ pub(super) fn marker_check(reader: &Reader, id: &str, checks: &mut Vec<Check>) {
 
 #[cfg(test)]
 pub(super) mod tests;
+
+// Continues a closed session's provider conversation in a new session. Model, effort, and
+// yolo are never inherited from the source manifest; only the options stated here apply.
+#[derive(Debug)]
+pub(crate) struct ReopenRequest {
+    pub(crate) id: String,
+    pub(crate) prompt: String,
+    pub(crate) title: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+    pub(crate) terminal: Option<terminal::TerminalKind>,
+    pub(crate) yolo: bool,
+    pub(crate) timeout: Duration,
+    pub(crate) detach: bool,
+    pub(crate) json: bool,
+}
+
+pub(super) fn parse_reopen(args: &[String]) -> Result<NativeCommand> {
+    let (id, options) = args
+        .split_first()
+        .context("reopen requires one closed session id")?;
+    require_valid_session_id(id)?;
+    let mut parsed = CommonStartOptions::default();
+    let mut index = 0;
+    while index < options.len() {
+        if parse_common_start_option(options, &mut index, &mut parsed)? {
+            continue;
+        }
+        bail!("unknown reopen option: {}", options[index]);
+    }
+    let CommonStartOptions {
+        prompt,
+        prompt_file,
+        title,
+        model,
+        effort,
+        terminal,
+        yolo,
+        timeout,
+        detach,
+        json,
+    } = parsed;
+    let prompt = read_prompt_option(prompt, prompt_file, "reopen")?;
+    if prompt.trim().is_empty() {
+        bail!("--prompt cannot be empty");
+    }
+    validate_terminal_input(&prompt, "--prompt")?;
+    if model.as_ref().is_some_and(|value| value.trim().is_empty()) {
+        bail!("--model cannot be empty");
+    }
+    if effort.as_ref().is_some_and(|value| value.trim().is_empty()) {
+        bail!("--effort cannot be empty");
+    }
+    Ok(NativeCommand::Reopen(ReopenRequest {
+        id: id.to_owned(),
+        prompt,
+        title,
+        model,
+        effort,
+        terminal,
+        yolo,
+        timeout: timeout.unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
+        detach,
+        json,
+    }))
+}

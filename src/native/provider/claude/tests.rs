@@ -62,7 +62,7 @@ fn workspace_trust_and_dialog_require_the_exact_workspace() {
     } else {
         native
     };
-    super::super::super::write_json_atomic(
+    crate::native::session::primitives::write_json_atomic(
         &store,
         &serde_json::json!({"projects":{key.clone():{"hasTrustDialogAccepted":true}}}),
     )
@@ -794,7 +794,7 @@ fn correlated_response_requires_the_exact_final_turn_marker() {
 fn initial_stop_owns_the_official_claude_hook_payload_schema() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::create_dir(directory.path().join("events")).unwrap();
-    super::super::super::update_status(directory.path(), SessionState::Working, None, None)
+    crate::native::session::update_status(directory.path(), SessionState::Working, None, None)
         .unwrap();
     let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
     claim.retain();
@@ -806,9 +806,9 @@ fn initial_stop_owns_the_official_claude_hook_payload_schema() {
 
     handle_hook(directory.path(), &payload).unwrap();
 
-    let events = super::super::super::event_paths(directory.path()).unwrap();
+    let events = crate::native::session::primitives::event_paths(directory.path()).unwrap();
     let event: crate::native::session::schema::SessionEvent =
-        super::super::super::read_json(&events[0]).unwrap();
+        crate::native::session::primitives::read_json(&events[0]).unwrap();
     assert_eq!(event.message, "initial result");
     assert_eq!(
         event.provider_session_id.as_deref(),
@@ -821,7 +821,7 @@ fn initial_stop_owns_the_official_claude_hook_payload_schema() {
 fn delayed_uncorrelated_stop_cannot_complete_a_later_turn() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::create_dir(directory.path().join("events")).unwrap();
-    super::super::super::update_status(directory.path(), SessionState::Working, None, None)
+    crate::native::session::update_status(directory.path(), SessionState::Working, None, None)
         .unwrap();
     let first_claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
     first_claim.retain();
@@ -834,14 +834,14 @@ fn delayed_uncorrelated_stop_cannot_complete_a_later_turn() {
 
     let later_claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
     later_claim.retain();
-    super::super::super::update_status(directory.path(), SessionState::Claimed, None, None)
+    crate::native::session::update_status(directory.path(), SessionState::Claimed, None, None)
         .unwrap();
-    super::super::super::update_status(directory.path(), SessionState::Working, None, None)
+    crate::native::session::update_status(directory.path(), SessionState::Working, None, None)
         .unwrap();
     handle_hook(directory.path(), &payload).unwrap();
 
     assert_eq!(
-        super::super::super::event_paths(directory.path())
+        crate::native::session::primitives::event_paths(directory.path())
             .unwrap()
             .len(),
         1
@@ -849,7 +849,7 @@ fn delayed_uncorrelated_stop_cannot_complete_a_later_turn() {
     assert!(
         directory
             .path()
-            .join(super::super::super::TURN_CLAIM_FILE)
+            .join(crate::native::session::test_support::TURN_CLAIM_FILE)
             .exists()
     );
 }
@@ -858,12 +858,12 @@ fn delayed_uncorrelated_stop_cannot_complete_a_later_turn() {
 fn correlated_stop_records_only_the_expected_claude_turn() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::create_dir(directory.path().join("events")).unwrap();
-    super::super::super::update_status(directory.path(), SessionState::Working, None, None)
+    crate::native::session::update_status(directory.path(), SessionState::Working, None, None)
         .unwrap();
     let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
     claim.retain();
     let pending = PendingCrossSessionTurn::new("claude-turn-safe123").unwrap();
-    super::super::super::write_private(
+    crate::native::session::primitives::write_private(
         &directory.path().join(PENDING_TURN_FILE),
         &serde_json::to_vec_pretty(&pending).unwrap(),
     )
@@ -876,10 +876,10 @@ fn correlated_stop_records_only_the_expected_claude_turn() {
 
     handle_hook(directory.path(), &payload).unwrap();
 
-    let events = super::super::super::event_paths(directory.path()).unwrap();
+    let events = crate::native::session::primitives::event_paths(directory.path()).unwrap();
     assert_eq!(events.len(), 1);
     let event: crate::native::session::schema::SessionEvent =
-        super::super::super::read_json(&events[0]).unwrap();
+        crate::native::session::primitives::read_json(&events[0]).unwrap();
     assert_eq!(event.message, "correlated result");
     assert_eq!(
         event.provider_session_id.as_deref(),
@@ -890,7 +890,7 @@ fn correlated_stop_records_only_the_expected_claude_turn() {
     assert!(
         !directory
             .path()
-            .join(super::super::super::TURN_CLAIM_FILE)
+            .join(crate::native::session::test_support::TURN_CLAIM_FILE)
             .exists()
     );
 }
@@ -899,12 +899,12 @@ fn correlated_stop_records_only_the_expected_claude_turn() {
 fn unmarked_claude_stop_keeps_the_pending_turn_uncommitted() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::create_dir(directory.path().join("events")).unwrap();
-    super::super::super::update_status(directory.path(), SessionState::Working, None, None)
+    crate::native::session::update_status(directory.path(), SessionState::Working, None, None)
         .unwrap();
     let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
     claim.retain();
     let pending = PendingCrossSessionTurn::new("claude-turn-safe123").unwrap();
-    super::super::super::write_private(
+    crate::native::session::primitives::write_private(
         &directory.path().join(PENDING_TURN_FILE),
         &serde_json::to_vec_pretty(&pending).unwrap(),
     )
@@ -918,7 +918,7 @@ fn unmarked_claude_stop_keeps_the_pending_turn_uncommitted() {
     handle_hook(directory.path(), &payload).unwrap();
 
     assert!(
-        super::super::super::event_paths(directory.path())
+        crate::native::session::primitives::event_paths(directory.path())
             .unwrap()
             .is_empty()
     );
@@ -926,7 +926,7 @@ fn unmarked_claude_stop_keeps_the_pending_turn_uncommitted() {
     assert!(
         directory
             .path()
-            .join(super::super::super::TURN_CLAIM_FILE)
+            .join(crate::native::session::test_support::TURN_CLAIM_FILE)
             .is_file()
     );
 }
@@ -935,12 +935,12 @@ fn unmarked_claude_stop_keeps_the_pending_turn_uncommitted() {
 fn stop_failure_does_not_claim_an_uncorrelated_pending_turn() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::create_dir(directory.path().join("events")).unwrap();
-    super::super::super::update_status(directory.path(), SessionState::Working, None, None)
+    crate::native::session::update_status(directory.path(), SessionState::Working, None, None)
         .unwrap();
     let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
     claim.retain();
     let pending = PendingCrossSessionTurn::new("claude-turn-safe123").unwrap();
-    super::super::super::write_private(
+    crate::native::session::primitives::write_private(
         &directory.path().join(PENDING_TURN_FILE),
         &serde_json::to_vec_pretty(&pending).unwrap(),
     )
@@ -955,7 +955,7 @@ fn stop_failure_does_not_claim_an_uncorrelated_pending_turn() {
     handle_hook(directory.path(), &payload).unwrap();
 
     assert!(
-        super::super::super::event_paths(directory.path())
+        crate::native::session::primitives::event_paths(directory.path())
             .unwrap()
             .is_empty()
     );
@@ -963,7 +963,7 @@ fn stop_failure_does_not_claim_an_uncorrelated_pending_turn() {
     assert!(
         directory
             .path()
-            .join(super::super::super::TURN_CLAIM_FILE)
+            .join(crate::native::session::test_support::TURN_CLAIM_FILE)
             .is_file()
     );
 }

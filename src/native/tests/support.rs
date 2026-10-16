@@ -1,4 +1,20 @@
 use super::*;
+use crate::native::session::primitives::write_json_atomic;
+use crate::native::session::test_support::{
+    CLOSED_STATUS_FILE, LEGACY_RESUME_PENDING_FILE, PROVIDER_PROCESS_FILE, SESSION_OWNER_FILE,
+    TERMINAL_HANDLE_FILE, TURN_COMPLETION_FILE,
+};
+use crate::native::session::turn::{JournaledEventState, PendingTurnCompletion};
+use crate::native::session::{SessionState, SessionStatus, update_status};
+use crate::native::sessions::sessions_in;
+#[cfg(target_os = "macos")]
+use crate::native::terminal::macos::process::macos_process_start;
+#[cfg(target_os = "macos")]
+use crate::native::terminal::ownership::MacTerminalAppIdentity;
+use crate::native::terminal::ownership::NativeSessionOwner;
+use crate::native::{NativeCommand, parse_args, query, terminal};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 pub(super) fn write_prune_test_session(
     root: &Path,
@@ -52,7 +68,7 @@ pub(super) fn write_prune_test_session(
     directory
 }
 
-pub(super) fn reaped_child_pid() -> u32 {
+pub(in crate::native) fn reaped_child_pid() -> u32 {
     #[cfg(windows)]
     let mut child = Command::new("cmd")
         .args(["/C", "exit", "0"])

@@ -1,6 +1,7 @@
 use super::super::test_support::claim_pending_turn;
 use super::*;
-use crate::native::{TURN_CLAIM_FILE, write_json_atomic};
+use crate::native::session::primitives::write_json_atomic;
+use crate::native::session::test_support::TURN_CLAIM_FILE;
 use std::fs;
 
 #[test]

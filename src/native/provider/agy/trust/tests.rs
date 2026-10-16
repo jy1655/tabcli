@@ -177,7 +177,7 @@ fn a_paste_is_withheld_until_the_store_and_this_sessions_log_show_trust() {
             .iter()
             .map(|path| consent::native_key(path).unwrap())
             .collect();
-        super::super::super::super::write_json_atomic(
+        crate::native::session::primitives::write_json_atomic(
             &store,
             &serde_json::json!({ "trustedWorkspaces": keys }),
         )

@@ -1,11 +1,26 @@
 //! Workspace consent is evidence, not a provider permission mode. Provider stores are
 //! read only; their schemas and the way a managed CLI accepts trust belong to adapters.
-use super::*;
 use crate::native::delivery::verify_terminal_surface_ownership_until;
 #[cfg(unix)]
 use crate::native::private_to_user::owned_and_not_writable_by_others;
+use crate::native::session::Store;
+use crate::native::session::schema::SessionManifest;
 use crate::native::session::{Reader, RecordReader, RecordStore};
-use std::ffi::OsStr;
+use crate::native::{provider, terminal};
+use agent_bridge::FirstPartyCli;
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use std::ffi::{OsStr, OsString};
+#[cfg(windows)]
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+#[cfg(unix)]
+use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant};
+use std::{fs, thread};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct Identity {
@@ -940,6 +955,8 @@ fn windows_sid(sid: windows_sys::Win32::Security::PSID) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::session::primitives::{write_json_atomic, write_private};
+    use crate::native::session::schema::SESSION_SCHEMA;
 
     // A caller whose `HOME` is the temporary root, and the four stores the adapters
     // resolve under it.

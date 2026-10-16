@@ -61,7 +61,7 @@ use super::super::WezTermMux;
 use super::{CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession};
 use crate::native::process_env::CommandOutputFailure;
 
-use crate::native::launch::BindingFacts;
+use crate::native::session::launch::BindingFacts;
 
 const HOST_COMMAND: &str = TerminalKind::WezTerm.registration().host_command;
 const BINDING: &BindingFacts = TerminalKind::WezTerm.registration().binding();
@@ -1009,7 +1009,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
         |started| {
             // The pane ends with this process and takes the message with it.
             if let Err(error) = started {
-                crate::native::launch::log(
+                crate::native::session::launch::log(
                     &Store::open_unchecked(directory),
                     &format!("wezterm_host_refused: {error:#}"),
                 );
@@ -1019,7 +1019,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
 }
 
 fn wait_for_binding(directory: &Path, id: &str, pane: &str, socket: &Path) -> Result<()> {
-    use crate::native::launch::wait_for_binding;
+    use crate::native::session::launch::wait_for_binding;
     let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING)?;
     if surface.kind != TerminalKind::WezTerm
         || surface.id != pane

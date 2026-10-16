@@ -1,11 +1,8 @@
 use super::{MacTerminalAdapter, OwnedSurfaceClose};
+use crate::native::session::primitives::set_private_directory_permissions;
+use crate::native::session::{SessionState, Store, launch, turn, update_status};
 use crate::native::settings::MacosOpenMode;
 use crate::native::terminal::{CloseOutcome, TerminalSendResult, TerminalSession};
-use crate::native::{
-    launch,
-    session::{SessionState, Store, turn},
-    set_private_directory_permissions, update_status,
-};
 use anyhow::Result;
 use std::{
     path::Path,

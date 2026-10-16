@@ -20,10 +20,10 @@ use super::ownership::verify_terminal_surface_ownership_with_timeout;
 use super::ownership::{
     owner_group_gone, teardown_absent_owner_with, terminate_owned_foreground_group_until,
 };
-#[cfg(any(target_os = "macos", windows))]
-use crate::native::SessionStatus;
 #[cfg(target_os = "macos")]
 use crate::native::process_identity::{Gone, ProcessObservation};
+#[cfg(any(target_os = "macos", windows))]
+use crate::native::session::SessionStatus;
 use crate::native::session::close::budget::close_remaining;
 #[cfg(target_os = "macos")]
 use crate::native::session::owner::{OwnerAttestation, attest_owner};

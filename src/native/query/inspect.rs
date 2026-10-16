@@ -97,10 +97,10 @@ pub(super) fn value(observation: Observation, reader: &Reader, id: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native::launch::ResidualSurface;
     use crate::native::process_identity::{Attested, Gone, ProcessObservation};
     use crate::native::query::observation::judgment::tests::attestation;
     use crate::native::query::observation::judgment::{self, OwnerJudgment};
+    use crate::native::session::launch::ResidualSurface;
     use crate::native::session::owner::ControlAttestation::{NotRecorded, Verified};
     use crate::native::session::owner::OwnerAttestation;
     use crate::native::tests::seed_close_fixture;
@@ -109,7 +109,7 @@ mod tests {
     fn inspect_maps_its_judgments_and_the_owner() {
         let fixture = seed_close_fixture(JournaledEventState::Committed);
         let reader = Reader::open_unchecked(&fixture.directory);
-        crate::native::write_json_atomic(
+        crate::native::session::primitives::write_json_atomic(
             &fixture.directory.join("native-session.json"),
             &json!({"pid": 4242, "managed_session_id": "session-fault"}),
         )

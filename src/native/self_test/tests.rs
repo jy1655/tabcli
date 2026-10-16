@@ -1,7 +1,15 @@
 use super::*;
+use crate::native::session::launch;
 use crate::native::session::primitives::STATE_DIR_ENV;
+use crate::native::session::primitives::{read_json, write_json_atomic, write_private};
+use crate::native::{NativeCommand, parse_args};
+use agent_bridge::FirstPartyCli;
+use anyhow::{Result, bail};
 use serde_json::json;
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use std::{fs, thread};
 
 struct Fake {
     replies: VecDeque<Reply>,
