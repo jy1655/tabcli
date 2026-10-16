@@ -7,6 +7,7 @@ use super::{
     set_once, terminal, terminal_safe_text, thread,
 };
 use crate::native::session::SessionState;
+use crate::native::session::origin::{OriginObservation, SourceKind};
 use crate::native::session::primitives::{SESSION_DIR_ENV, require_valid_session_id, unix_ms};
 use crate::native::session::schema::SessionManifest;
 use crate::native::{FromStr, Read, process_env};
@@ -221,6 +222,7 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
                 ));
                 unknown_session_checks(id, "session_unavailable", &mut checks);
                 cancel_check(Some("unreadable"), id, &mut checks);
+                unobserved_origin_check(id, &mut checks);
                 hold_check(
                     &Err(anyhow::anyhow!("session unavailable")),
                     false,
@@ -274,6 +276,7 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
         let (manifest, mut evidence) = record_checks(
             &Reader::open_unchecked(directory),
             request.session.as_deref().unwrap(),
+            deadline,
             &mut checks,
             &mut observations,
         );
@@ -519,6 +522,7 @@ fn render_report(request: &DoctorRequest, started: u128, diagnosis: Diagnosis) -
 pub(super) fn record_checks(
     reader: &Reader,
     id: &str,
+    deadline: Instant,
     checks: &mut Vec<Check>,
     observations: &mut Value,
 ) -> (Option<SessionManifest>, SessionEvidence) {
@@ -527,6 +531,14 @@ pub(super) fn record_checks(
         Ok(observation) => {
             session_checks(&observation, checks, observations);
             cancel_check(observation.cancel.as_ref().map(|c| c.state), id, checks);
+            let origin = observation.observe_origin(reader, Some(deadline));
+            origin.add_fields(observations);
+            origin_check(
+                &origin,
+                observation.records.status.state == SessionState::Closed,
+                id,
+                checks,
+            );
             evidence = Some(observation.evidence);
             Some(observation.records.manifest)
         }
@@ -550,6 +562,7 @@ pub(super) fn record_checks(
                 id,
                 checks,
             );
+            unobserved_origin_check(id, checks);
             reader.manifest().ok()
         }
     };
@@ -601,6 +614,66 @@ fn cancel_check(state: Option<&str>, id: &str, checks: &mut Vec<Check>) {
     ));
 }
 
+/// The session's Origin as its records show it. Never a close authority: an ended Origin
+/// only suggests an explicit close of this session when the user no longer needs it.
+fn origin_check(
+    origin: &OriginObservation,
+    session_closed: bool,
+    id: &str,
+    checks: &mut Vec<Check>,
+) {
+    let inspect = format!("{PUBLIC_COMMAND} inspect {id} --json");
+    let check = match (origin.reference.kind, origin.ended) {
+        (SourceKind::External, _) => Check::new(
+            "origin",
+            Availability::Available,
+            "origin_external",
+            "The initial request came from outside Agent Bridge; there is no managed origin to observe.",
+            "No action is needed.",
+        ),
+        (_, Some(false)) => Check::new(
+            "origin",
+            Availability::Available,
+            "origin_live",
+            "The origin session's records and its attested owner show it has not ended.",
+            "No action is needed.",
+        ),
+        (_, Some(true)) if session_closed => Check::new(
+            "origin",
+            Availability::Available,
+            "origin_ended_session_closed",
+            "The origin session has ended, and this session is already closed.",
+            "No action is needed.",
+        ),
+        (_, Some(true)) => Check::new(
+            "origin",
+            Availability::Unavailable,
+            "origin_ended",
+            "The origin session has ended in its records; this session is not closed. This is not evidence of an open surface.",
+            "If this session is no longer needed, close it explicitly; the origin observation grants no close authority.",
+        )
+        .command(vec![
+            PUBLIC_COMMAND.to_owned(),
+            "close-session".to_owned(),
+            id.to_owned(),
+            "--explicit".to_owned(),
+        ]),
+        (_, None) => Check::new(
+            "origin",
+            Availability::Unknown,
+            "origin_unverified",
+            format!(
+                "Whether the origin has ended could not be verified ({}).",
+                origin.reason
+            ),
+            inspect,
+        ),
+    };
+    let mut evidence = json!({});
+    origin.add_fields(&mut evidence);
+    checks.push(check.evidence(evidence));
+}
+
 fn hold_check(held: &Result<bool>, release_allowed: bool, id: &str, checks: &mut Vec<Check>) {
     let check = match held {
         Ok(false) => Check::new(
@@ -630,6 +703,17 @@ fn hold_check(held: &Result<bool>, release_allowed: bool, id: &str, checks: &mut
         ),
     };
     checks.push(check);
+}
+
+/// The origin check when no consistent snapshot of this session could be read.
+fn unobserved_origin_check(id: &str, checks: &mut Vec<Check>) {
+    checks.push(Check::new(
+        "origin",
+        Availability::Unknown,
+        "origin_unverified",
+        "No consistent session snapshot was available, so the origin was not observed.",
+        format!("{PUBLIC_COMMAND} inspect {id} --json"),
+    ));
 }
 
 fn unknown_session_checks(id: &str, reason: &'static str, checks: &mut Vec<Check>) {

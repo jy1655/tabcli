@@ -7,8 +7,25 @@ fn read(reader: &Reader) -> StatusObservation {
         .unwrap()
 }
 
+fn origin(ended: Option<bool>) -> OriginObservation {
+    use crate::native::session::origin::{OriginReference, SourceKind};
+    OriginObservation {
+        reference: OriginReference {
+            id: Some("session-origin".to_owned()),
+            kind: SourceKind::Managed,
+            request_id: Some("request-origin".to_owned()),
+            reason: "recorded_source".to_owned(),
+            detail: None,
+        },
+        stored_state: None,
+        ended,
+        reason: "fixture".to_owned(),
+        detail: None,
+    }
+}
+
 fn flag(observed: &StatusObservation, expected: &str) -> bool {
-    attention(observed, &OwnerObservation::default(), false).contains(&expected)
+    attention(observed, &OwnerObservation::default(), false, &origin(None)).contains(&expected)
 }
 
 #[test]
@@ -89,7 +106,7 @@ fn owner_attention_distinguishes_negative_and_missing_facts_including_linux() {
             identity_matches: identity,
             error: None,
         };
-        let actual = attention(&observed, &owner, bound)
+        let actual = attention(&observed, &owner, bound, &origin(None))
             .into_iter()
             .filter(|flag| flag.starts_with("owner_"))
             .collect::<Vec<_>>();
@@ -103,7 +120,7 @@ fn owner_attention_distinguishes_negative_and_missing_facts_including_linux() {
         error: None,
     };
     assert!(
-        !attention(&observed, &owner, true)
+        !attention(&observed, &owner, true, &origin(None))
             .iter()
             .any(|f| f.starts_with("owner_"))
     );
@@ -119,7 +136,7 @@ fn a_live_owner_identity_check_error_requires_attention() {
         identity_matches: None,
         error: Some("identity check failed".to_owned()),
     };
-    let flags = attention(&observed, &owner, true)
+    let flags = attention(&observed, &owner, true, &origin(None))
         .into_iter()
         .filter(|flag| flag.starts_with("owner_"))
         .collect::<Vec<_>>();
@@ -170,7 +187,7 @@ fn each_auxiliary_failure_keeps_the_session_with_attention() {
         }
         let observed = read(&reader);
         assert!(flag(&observed, "records_partially_unreadable"), "{part}");
-        let value = entry(observed, "session-fault");
+        let value = entry(observed, "session-fault", origin(None));
         assert_eq!(value["state"], "working");
         if part == "event" {
             assert!(value["latest_result"].is_null());
@@ -243,7 +260,7 @@ fn status_decodes_only_latest_and_reuses_it_for_active_elapsed() {
             .is_none()
     );
     assert!(observed.latest.as_ref().unwrap().get("result").is_none());
-    let value = entry(observed, "session-fault");
+    let value = entry(observed, "session-fault", origin(None));
     assert_eq!(value["active_request"]["request_state"], "completed");
     assert_eq!(value["latest_result"]["request_state"], "completed");
     assert_eq!(
@@ -259,7 +276,7 @@ fn status_decodes_only_latest_and_reuses_it_for_active_elapsed() {
         .unwrap();
     fs::remove_file(event).unwrap();
     fs::remove_file(fixture.directory.join("events/event-000.json")).unwrap();
-    let value = entry(read(&reader), "session-fault");
+    let value = entry(read(&reader), "session-fault", origin(None));
     assert_eq!(value["active_request"]["request_state"], "pending");
     assert!(value["active_request"]["bridge_observed_elapsed_ms"].is_null());
     assert_eq!(
@@ -392,7 +409,7 @@ fn owner_binding_is_required_before_attestation_and_record_failures_stay_null() 
         json!(42),
     ] {
         write_json_atomic(&fixture.directory.join("native-session.json"), &owner).unwrap();
-        let value = entry(read(&reader), "session-fault");
+        let value = entry(read(&reader), "session-fault", origin(None));
         assert!(value["owner"]["process_alive"].is_null());
         assert!(value["owner"]["identity_matches"].is_null());
         let flags = value["attention"].as_array().unwrap();
@@ -412,7 +429,7 @@ fn owner_observation_runs_after_releasing_the_lifecycle_lock() {
     let observed = read(&reader);
     let writer = File::open(fixture.directory.join("turn.claim.lock")).unwrap();
     writer.try_lock().unwrap();
-    let value = entry(observed, "session-fault");
+    let value = entry(observed, "session-fault", origin(None));
     assert_eq!(value["state"], "working");
 }
 
@@ -444,7 +461,7 @@ fn an_older_active_result_uses_one_additional_event_decode() {
             ),
         )
         .unwrap();
-    let value = entry(observed, "session-fault");
+    let value = entry(observed, "session-fault", origin(None));
     assert!(value["active_request"]["request_id"].is_string());
     assert_eq!(value["active_request"]["request_state"], "completed");
     assert_eq!(
@@ -466,7 +483,7 @@ fn an_older_active_result_uses_one_additional_event_decode() {
     let (observed, reads) = with_event_read_count(|| read(&reader));
     assert_eq!(reads, 2);
     assert!(flag(&observed, "records_partially_unreadable"));
-    let value = entry(observed, "session-fault");
+    let value = entry(observed, "session-fault", origin(None));
     assert_eq!(value["active_request"]["request_state"], "completed");
     assert!(value["latest_result"].is_null());
 }
@@ -513,7 +530,7 @@ fn r1_c6_reused_owner_attention_is_mismatch_not_unverified() {
     let reader = Reader::open_unchecked(&fixture.directory);
     let observed = read(&reader);
     let owner = crate::native::session::owner::tests::reused_observation();
-    let flags = attention(&observed, &owner, true);
+    let flags = attention(&observed, &owner, true, &origin(None));
     assert!(flags.contains(&"owner_identity_mismatch"));
     assert!(!flags.contains(&"owner_unverified"));
 }
@@ -530,7 +547,7 @@ fn correction_a3_intermediate_owner_status_distinguishes_changed_unknown_and_ver
         ("verified", vec![]),
     ] {
         let owner = crate::native::session::owner::tests::intermediate_observation(control);
-        let flags: Vec<_> = attention(&observed, &owner, true)
+        let flags: Vec<_> = attention(&observed, &owner, true, &origin(None))
             .into_iter()
             .filter(|flag| flag.starts_with("owner_"))
             .collect();

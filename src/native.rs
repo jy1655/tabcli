@@ -1295,7 +1295,17 @@ fn sessions_query(
                 continue;
             }
             let terminal = Reader::open_unchecked(&directory).terminal().ok();
-            sessions.push(serde_json::json!({
+            // Observation only, whether or not this listing repaired above.
+            let mut origin_budget = session::origin::ReadBudget::for_query(None);
+            let origin = session::origin::observe(
+                root,
+                session::origin::read_reference(
+                    &Reader::open_unchecked(&directory),
+                    &mut origin_budget,
+                ),
+                &mut origin_budget,
+            );
+            let mut value = serde_json::json!({
                 "id": manifest.id,
                 "provider": manifest.provider,
                 "workspace": manifest.workspace,
@@ -1316,7 +1326,9 @@ fn sessions_query(
                 "effort": manifest.effort,
                 "resumed_from": read_resumed_from(&directory).ok().flatten(),
                 "results": Reader::open_unchecked(&directory).published_result_count().unwrap_or(0),
-            }));
+            });
+            origin.add_fields(&mut value);
+            sessions.push(value);
         }
     }
     sessions.sort_by(|left, right| {
@@ -1437,6 +1449,13 @@ fn run_close(request: CloseRequest) -> Result<()> {
     let directory = Reader::session_directory(&request.id)?;
     close_session_surface(&directory, &request.id, None, deadline)
         .with_context(|| format!("failed to close visible terminal session {}", request.id))?;
+    // Reported after the close succeeded, within what is left of its deadline. The scan
+    // reads records only and never fails the close.
+    let started_from = session::origin::scan_started_from(
+        directory.parent().unwrap_or(Path::new("")),
+        &request.id,
+        deadline.min(Instant::now() + session::origin::SCAN_TIME),
+    );
     if request.json {
         println!(
             "{}",
@@ -1444,12 +1463,34 @@ fn run_close(request: CloseRequest) -> Result<()> {
                 "ok": true,
                 "session": request.id,
                 "closed": true,
+                "started_from": started_from,
             }))?
         );
     } else {
         println!("closed {}", request.id);
+        for line in started_from_lines(&request.id, &started_from) {
+            println!("{}", terminal_safe_text(&line, false));
+        }
     }
     Ok(())
+}
+
+fn started_from_lines(id: &str, started_from: &session::origin::StartedFrom) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !started_from.open.is_empty() {
+        lines.push(format!(
+            "{} session(s) started from {id} remain unclosed in the observed records: {}",
+            started_from.open.len(),
+            started_from.open.join(" ")
+        ));
+        lines.push(format!(
+            "Close a session you no longer need with '{PUBLIC_COMMAND} close-session ID --explicit'."
+        ));
+    }
+    if started_from.incomplete {
+        lines.push("Started-from scan incomplete; the list may omit sessions.".to_owned());
+    }
+    lines
 }
 
 fn run_session(id: &str) -> Result<()> {

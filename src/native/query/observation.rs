@@ -3,6 +3,7 @@ use super::*;
 use crate::native::reopen::ResumedFrom;
 use crate::native::session;
 use crate::native::session::OwnerObservation;
+use crate::native::session::origin;
 use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
 use crate::native::terminal::ownership::NativeSessionOwner;
 
@@ -169,6 +170,8 @@ pub(in crate::native) struct Observation {
     pub(in crate::native) resumed_from: Result<Option<ResumedFrom>>,
     pub(in crate::native) workspace_consent: Value,
     pub(in crate::native) judgments: Judgments,
+    /// The Origin as this Snapshot's launch record and initial receipt name it.
+    pub(in crate::native) origin: origin::OriginReference,
 }
 
 pub(in crate::native) struct Judgments {
@@ -223,7 +226,9 @@ impl Observation {
         );
         let held = session::hold::observe(reader, records._lock.is_some());
         let cancel = CancelObservation::read(reader, &records);
+        let origin = origin::reference(&records);
         Self {
+            origin,
             cancel,
             records,
             evidence: SessionEvidence::read(reader, held),
@@ -305,11 +310,26 @@ impl Observation {
         }))
     }
 
+    /// The Origin's own records, read within one Origin budget that ends no later than
+    /// `outer`. Read-only; the Origin is looked up in this session's state root only.
+    pub(in crate::native) fn observe_origin(
+        &self,
+        reader: &Reader,
+        outer: Option<Instant>,
+    ) -> origin::OriginObservation {
+        origin::observe(
+            &state_root_of(reader),
+            self.origin.clone(),
+            &mut origin::ReadBudget::for_query(outer),
+        )
+    }
+
     pub(in crate::native) fn active_request(&self) -> Option<&requests::Receipt> {
         self.records.active_receipt()
     }
 
     pub(super) fn inspect_value(mut self, reader: &Reader, id: &str) -> Result<Value> {
+        let origin = self.observe_origin(reader, None);
         let owner = self.evidence.observe_owner();
         let snapshot = &self.records;
         let resumed_from = self.resumed_from?;
@@ -352,8 +372,18 @@ impl Observation {
         if let Some(residual) = residual_surface {
             value["residual_surface"] = serde_json::to_value(residual)?;
         }
+        origin.add_fields(&mut value);
         Ok(value)
     }
+}
+
+/// The state root that holds a session directory.
+pub(in crate::native) fn state_root_of(reader: &Reader) -> PathBuf {
+    reader
+        .directory()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default()
 }
 
 pub(super) struct StatusObservation {

@@ -34,8 +34,11 @@ pub(in crate::native) fn unix_ms() -> u128 {
         .as_millis()
 }
 
+/// The Request source recorded when the caller is not a managed session.
+pub(in crate::native) const EXTERNAL_SOURCE: &str = "external";
+
 pub(in crate::native) fn delegation_source() -> String {
-    std::env::var("AGENT_BRIDGE_NATIVE_SESSION_ID").unwrap_or_else(|_| "external".to_owned())
+    std::env::var("AGENT_BRIDGE_NATIVE_SESSION_ID").unwrap_or_else(|_| EXTERNAL_SOURCE.to_owned())
 }
 
 pub(in crate::native) fn is_regular_file(path: &Path) -> Result<bool> {

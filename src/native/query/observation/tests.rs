@@ -6,7 +6,13 @@ use crate::native::{doctor, session, tests::seed_close_fixture};
 fn doctor_records(reader: &Reader) -> (Value, Value) {
     let mut checks = Vec::new();
     let mut observations = json!({});
-    doctor::record_checks(reader, "session-fault", &mut checks, &mut observations);
+    doctor::record_checks(
+        reader,
+        "session-fault",
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+        &mut checks,
+        &mut observations,
+    );
     (serde_json::to_value(checks).unwrap(), observations)
 }
 
@@ -301,4 +307,54 @@ fn result_reference_omits_only_the_body_key() {
         .value();
     assert!(reference.get("result").is_none());
     assert_eq!(reference, result);
+}
+
+#[test]
+fn doctor_reads_the_origin_within_its_own_deadline() {
+    use crate::native::session::{LAUNCH_FILE, REQUESTS_DIRECTORY, TURN_CLAIM_FILE};
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    let directory = &fixture.directory;
+    // The initial request names a managed origin, so observing it reads its records.
+    let token = fs::read_to_string(directory.join(TURN_CLAIM_FILE)).unwrap();
+    let token = token.trim();
+    crate::native::write_json_atomic(
+        &directory.join(LAUNCH_FILE),
+        &json!({"schema": 1, "claim_token": token, "deadline_unix_ms": 1, "phase": "spawned"}),
+    )
+    .unwrap();
+    let receipt_path = directory
+        .join(REQUESTS_DIRECTORY)
+        .join(format!("{token}.json"));
+    let mut receipt: Value = serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    receipt["source"] = json!("session-origin");
+    crate::native::write_json_atomic(&receipt_path, &receipt).unwrap();
+    // The origin's directory exists, so observing it reads its manifest.
+    fs::create_dir(directory.parent().unwrap().join("session-origin")).unwrap();
+    let reader = Reader::open_unchecked(directory);
+    let run = |deadline| {
+        let mut checks = Vec::new();
+        let mut observations = json!({});
+        doctor::record_checks(
+            &reader,
+            "session-fault",
+            deadline,
+            &mut checks,
+            &mut observations,
+        );
+        observations
+    };
+    // With time left its records are read: it has no manifest.
+    let observations = run(std::time::Instant::now() + std::time::Duration::from_secs(5));
+    assert_eq!(observations["origin"], "session-origin");
+    assert_eq!(
+        observations["origin_observation"]["reason"],
+        "origin_unreadable"
+    );
+    // An expired doctor deadline reads nothing of the origin.
+    let observations = run(std::time::Instant::now());
+    assert_eq!(
+        observations["origin_observation"]["reason"],
+        "origin_budget_exhausted"
+    );
+    assert!(observations["origin_observation"]["ended"].is_null());
 }

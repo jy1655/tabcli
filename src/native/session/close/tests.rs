@@ -3374,7 +3374,13 @@ fn close_fixtures_keep_independent_publication_expectations() {
 fn doctor_records(reader: &Reader) -> (Value, Value) {
     let mut checks = Vec::new();
     let mut observations = json!({});
-    doctor::record_checks(reader, "session-fault", &mut checks, &mut observations);
+    doctor::record_checks(
+        reader,
+        "session-fault",
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+        &mut checks,
+        &mut observations,
+    );
     (serde_json::to_value(checks).unwrap(), observations)
 }
 
