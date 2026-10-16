@@ -5,6 +5,7 @@ use crate::native::session::names::*;
 use crate::native::session::{self, update_status};
 use crate::native::session::{Store, turn};
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::{fs, path::Path};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,26 +24,36 @@ struct Script {
     points: Vec<Point>,
 }
 
+// The wait's checkpoints receive no handle, so the checkpoint hook reads the script of
+// the calling test thread here; the scripted clock the wait is given shares the same
+// script through its `Rc`.
 thread_local! {
-    static SCRIPT: RefCell<Option<Script>> = const { RefCell::new(None) };
-}
-
-pub(super) fn now() -> Option<Instant> {
-    SCRIPT.with_borrow(|script| script.as_ref().map(|script| script.now))
+    static SCRIPT: RefCell<Option<Rc<RefCell<Script>>>> = const { RefCell::new(None) };
 }
 
 pub(in crate::native) fn checkpoint(point: Point) {
-    SCRIPT.with_borrow_mut(|script| {
+    SCRIPT.with_borrow(|script| {
         if let Some(script) = script {
+            let mut script = script.borrow_mut();
             script.points.push(point);
-            (script.hook)(point, &mut script.now);
+            let Script { now, hook, .. } = &mut *script;
+            hook(point, now);
         }
     });
 }
 
-pub(super) fn retry(delay: Duration) -> bool {
-    SCRIPT.with_borrow_mut(|script| {
-        let Some(script) = script else { return false };
+/// The clock the characterized wait reads: `now` is the script's instant and `sleep` is
+/// the scripted retry, which records the point, asserts the wait's fixed delay, advances
+/// the instant by it and then runs the script's hook.
+struct ScriptedClock(Rc<RefCell<Script>>);
+
+impl Clock for ScriptedClock {
+    fn now(&mut self) -> Instant {
+        self.0.borrow().now
+    }
+
+    fn sleep(&mut self, delay: Duration) {
+        let mut script = self.0.borrow_mut();
         script.retries += 1;
         script.points.push(Point::Retry);
         assert!(
@@ -52,9 +63,9 @@ pub(super) fn retry(delay: Duration) -> bool {
         // The real wait sleeps a full 10 ms, even with less than 10 ms remaining.
         assert_eq!(delay, Duration::from_millis(10));
         script.now += delay;
-        (script.hook)(Point::Retry, &mut script.now);
-        true
-    })
+        let Script { now, hook, .. } = &mut *script;
+        hook(Point::Retry, now);
+    }
 }
 
 struct Reset(Option<u128>);
@@ -83,7 +94,7 @@ fn corrupt_claim(directory: &Path) {
 
 pub(in crate::native) fn characterize(
     name: &'static str,
-    wait: impl Fn(&Path, &str) -> Result<()>,
+    wait: impl Fn(&Path, &str, &mut dyn Clock) -> Result<()>,
 ) {
     let cancelled = if name == "Terminal.app" {
         "Terminal.app launch was cancelled or timed out before its surface was bound".to_owned()
@@ -217,7 +228,7 @@ pub(in crate::native) fn characterize(
         let path = directory.to_owned();
         let mut initial_seen = false;
         let mut retry_seen = false;
-        SCRIPT.set(Some(Script {
+        let script = Rc::new(RefCell::new(Script {
             now: Instant::now(),
             retries: 0,
             points: Vec::new(),
@@ -323,14 +334,15 @@ pub(in crate::native) fn characterize(
                 }
             }),
         }));
-        let result = wait(directory, id);
+        SCRIPT.set(Some(Rc::clone(&script)));
+        let result = wait(directory, id, &mut ScriptedClock(Rc::clone(&script)));
         if success {
             result.unwrap_or_else(|error| panic!("{name}/{case}: {error:#}"));
         } else {
             assert_eq!(result.unwrap_err().to_string(), expected, "{name}/{case}");
         }
-        SCRIPT.with_borrow(|script| {
-            let script = script.as_ref().unwrap();
+        {
+            let script = script.borrow();
             if matches!(
                 case,
                 "missing-initial" | "invalid-initial" | "initial-identity"
@@ -345,7 +357,7 @@ pub(in crate::native) fn characterize(
                     &[Point::InitialReceipt, Point::BudgetCaptured]
                 );
             }
-        });
+        }
         if case == "late-cancellation" {
             // Binding observation is not spawn authority: it deliberately has no final
             // recheck. The existing lock-protected spawn fence still refuses this state.

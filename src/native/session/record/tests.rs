@@ -638,10 +638,14 @@ fn budgeted_observation(directory: &std::path::Path) -> origin::OriginObservatio
         reason: "recorded_source".to_owned(),
         detail: None,
     };
+    let mut clock = crate::native::clock::SystemClock;
+    let mut environment = origin::OriginEnvironment::production(&mut clock);
+    let mut budget = origin::ReadBudget::for_query(None, environment.clock);
     origin::observe(
         directory.parent().unwrap(),
         reference,
-        &mut origin::ReadBudget::for_query(None),
+        &mut budget,
+        &mut environment,
     )
 }
 

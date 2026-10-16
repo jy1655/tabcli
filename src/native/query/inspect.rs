@@ -1,6 +1,8 @@
 //! The inspect renderer: one locked Observation of a session, its records and judgments.
 use super::*;
+use crate::native::clock::SystemClock;
 use crate::native::session;
+use crate::native::session::origin::OriginEnvironment;
 use observation::{Observation, ResultReference};
 
 pub(super) fn inspect_inner(id: &str, json: bool) -> Result<()> {
@@ -41,13 +43,24 @@ pub(super) fn inspect_inner(id: &str, json: bool) -> Result<()> {
 /// Reads the Observation with its lifecycle lock and keeps the lock through the latest
 /// Result and every historical elapsed read (D18).
 pub(in crate::native) fn inspect_value(reader: &Reader, id: &str) -> Result<Value> {
-    value(Observation::read_locked(reader)?, reader, id)
+    let mut clock = SystemClock;
+    value(
+        Observation::read_locked(reader)?,
+        reader,
+        id,
+        &mut OriginEnvironment::production(&mut clock),
+    )
 }
 
 /// Renders a locked Observation. A bad `resumed_from` is rejected before the latest
 /// Result is read; the Snapshot lock is held until the value is complete.
-pub(super) fn value(observation: Observation, reader: &Reader, id: &str) -> Result<Value> {
-    let origin = observation.observe_origin(reader, None);
+pub(super) fn value(
+    observation: Observation,
+    reader: &Reader,
+    id: &str,
+    environment: &mut OriginEnvironment<'_>,
+) -> Result<Value> {
+    let origin = observation.observe_origin(reader, None, environment);
     let owner = observation.evidence.judge_owner(id).observation();
     let judgments = &observation.judgments;
     let snapshot = &observation.records;
@@ -161,7 +174,14 @@ mod tests {
                 },
             );
             assert!(matches!(owner, OwnerJudgment::Bound(_)));
-            let value = value(observation, &reader, "session-fault").unwrap();
+            let mut clock = SystemClock;
+            let value = value(
+                observation,
+                &reader,
+                "session-fault",
+                &mut OriginEnvironment::production(&mut clock),
+            )
+            .unwrap();
             assert_eq!(value["recovery_required"], recovery);
             assert_eq!(
                 value.get("residual_surface").cloned(),

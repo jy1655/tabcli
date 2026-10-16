@@ -10,6 +10,7 @@ mod tests;
 
 mod args;
 mod cancel;
+mod clock;
 mod close;
 mod consent;
 mod console_control;

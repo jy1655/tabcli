@@ -26,6 +26,32 @@ tests remains enabled.
 For a lifecycle or concurrency fix, reproduce the partial transition or race deterministically
 before changing the implementation.
 
+## Simulated time and the race hooks
+
+`src/native/clock.rs` is the one clock seam of the native module: `Clock` (`now`, `sleep`),
+the production `SystemClock`, and the test-only `FakeClock`, whose `sleep` advances the
+simulated instant and whose shared handle lets a hook or a log reader move it from outside. A
+test injects it wherever a wait is bounded: the workspace trust wait, Agy's readiness gate and
+receipt wait, the Claude messenger, the Codex queue's bounded send, the Origin observation
+environment (which also carries the process attester), the macOS launch binding wait, and the
+close scope. The close deadline stays an ambient scope by design, because record primitives and
+the AppleScript diagnostics read it without a parameter; the scope's clock is a field of that
+scope, set only by tests, and `close_now` reads it or the system clock. No production path
+branches on `cfg(test)` for time.
+
+The deterministic race hooks are the declared test adapter at the record seam that the
+reproduction rule above needs: the fault budget, the sync log and sync failures, the publication
+read log, the record replace retry hook, the close interruption points, enumeration injection,
+the snapshot checkpoints, the Origin checkpoints and receipt counter, and the Windows termination
+log. They stay thread-local test hooks beside the code they observe.
+
+An I/O context carried on `Store` and `Reader` was proposed as the next step and declined on
+2026-10-17. Its propagation cost is the reason: every `open_unchecked` call would carry it, and
+at e2b3b7d the pattern `(Reader|Store)::open_unchecked(` matches 778 call sites in `src/`
+including tests (341 `Reader`, 437 `Store`). Its benefit over the hooks above is limited to test
+hygiene, since those hooks already reproduce the transitions the rule requires. A future review
+should not re-propose it without a new reason.
+
 Also check platform-gated code with the two cross-target Clippy commands in
 [Contributing](../CONTRIBUTING.md). Installing `rust-std` for each target is enough for those
 checks. Cross-target checks do not run tests on the target platform.

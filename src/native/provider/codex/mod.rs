@@ -145,14 +145,17 @@ impl Transport for CodexQueue {
         })
     }
     fn send(&self, turn: &TurnContext<'_>, _: &Prepared, _: Option<&Path>) -> Outcome {
-        send_native_queue_message(CrossSessionMessageContext {
-            bridge_executable: turn.bridge_executable,
-            directory: turn.directory,
-            provider_path: turn.provider_path,
-            correlation_id: turn.claim_token,
-            prompt: turn.prompt,
-            deadline: turn.deadline,
-        })
+        send_native_queue_message(
+            CrossSessionMessageContext {
+                bridge_executable: turn.bridge_executable,
+                directory: turn.directory,
+                provider_path: turn.provider_path,
+                correlation_id: turn.claim_token,
+                prompt: turn.prompt,
+                deadline: turn.deadline,
+            },
+            &mut crate::native::clock::SystemClock,
+        )
         .map_or_else(|outcome| outcome, |()| Outcome::Sent)
     }
     fn discard_prepared(&self, _: &TurnContext<'_>, _: Option<&Prepared>) {}

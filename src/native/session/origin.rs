@@ -13,6 +13,7 @@ use super::requests::{self, Receipt};
 use super::snapshot::Snapshot;
 use super::turn::valid_turn_claim_token;
 use super::{CoreRecord, Reader, RecordReader, SessionState, SessionStatus, SnapshotBusy};
+use crate::native::clock::{Clock, SystemClock};
 use crate::native::process_identity::{Attested, Gone, ProcessObservation};
 use crate::native::terminal::ownership::NativeSessionOwner;
 use serde::Serialize;
@@ -76,6 +77,27 @@ enum ReadFault {
     Unreadable(String),
 }
 
+/// What an Origin observation is told about the world outside the records: how a recorded
+/// owner is attested and what time it is. One value per query; production attests through
+/// the platform observer and reads the system clock, tests supply their own.
+pub(in crate::native) struct OriginEnvironment<'a> {
+    pub(in crate::native) attest: &'a dyn Fn(&NativeSessionOwner) -> ProcessObservation,
+    pub(in crate::native) clock: &'a mut dyn Clock,
+}
+
+impl<'a> OriginEnvironment<'a> {
+    pub(in crate::native) fn production(clock: &'a mut SystemClock) -> Self {
+        Self {
+            attest: &attest_through_platform_observer,
+            clock,
+        }
+    }
+}
+
+fn attest_through_platform_observer(owner: &NativeSessionOwner) -> ProcessObservation {
+    super::owner::attest_owner(owner).process
+}
+
 /// A cooperative deadline and a byte allowance shared by a sequence of record reads. The
 /// clock is checked before and after each read; a synchronous filesystem call is not
 /// interrupted, so the deadline is not a hard wall-clock guarantee.
@@ -95,8 +117,8 @@ impl ReadBudget {
     }
 
     /// The budget of one Origin observation inside a query, never later than `outer`.
-    pub(in crate::native) fn for_query(outer: Option<Instant>) -> Self {
-        let local = now() + OBSERVATION_TIME;
+    pub(in crate::native) fn for_query(outer: Option<Instant>, clock: &mut dyn Clock) -> Self {
+        let local = clock.now() + OBSERVATION_TIME;
         Self::new(
             outer.map_or(local, |outer| outer.min(local)),
             OBSERVATION_BYTES,
@@ -108,11 +130,15 @@ impl ReadBudget {
         ReadFault::Exhausted(why)
     }
 
-    fn read(&mut self, record: &RecordReader) -> Result<Option<Vec<u8>>, ReadFault> {
+    fn read(
+        &mut self,
+        record: &RecordReader,
+        clock: &mut dyn Clock,
+    ) -> Result<Option<Vec<u8>>, ReadFault> {
         if let Some(why) = self.exhausted {
             return Err(ReadFault::Exhausted(why));
         }
-        if now() >= self.deadline {
+        if clock.now() >= self.deadline {
             return Err(self.exhaust(Exhaustion::Time));
         }
         if self.remaining == 0 {
@@ -147,7 +173,7 @@ impl ReadBudget {
             // (invalid UTF-8, growth, a busy read); reserve the whole attempt.
             self.remaining = self.remaining.saturating_sub(limit);
         }
-        if outcome.is_ok() && now() >= self.deadline {
+        if outcome.is_ok() && clock.now() >= self.deadline {
             return Err(self.exhaust(Exhaustion::Time));
         }
         outcome
@@ -160,9 +186,10 @@ impl ReadBudget {
     fn decoded<T>(
         &mut self,
         record: &RecordReader,
+        clock: &mut dyn Clock,
         decode: impl FnOnce(&[u8]) -> Result<T, DecodeError>,
     ) -> Result<Option<T>, ReadFault> {
-        self.read(record)?
+        self.read(record, clock)?
             .map(|bytes| {
                 decode(&bytes).map_err(|error| {
                     ReadFault::Unreadable(format!("{:#}", error.in_path(record.path())))
@@ -313,6 +340,7 @@ pub(in crate::native) fn reference(records: &Snapshot) -> OriginReference {
 pub(in crate::native) fn read_reference(
     reader: &Reader,
     budget: &mut ReadBudget,
+    clock: &mut dyn Clock,
 ) -> OriginReference {
     let own_id = reader
         .directory()
@@ -320,7 +348,7 @@ pub(in crate::native) fn read_reference(
         .and_then(|name| name.to_str())
         .unwrap_or_default()
         .to_owned();
-    let launch = budget.decoded(&reader.record(CoreRecord::Launch), record::launch);
+    let launch = budget.decoded(&reader.record(CoreRecord::Launch), clock, record::launch);
     select(&own_id, launch, |token| {
         if !requests::requests_directory_present(reader)
             .map_err(|error| ReadFault::Unreadable(format!("{error:#}")))?
@@ -329,7 +357,7 @@ pub(in crate::native) fn read_reference(
         }
         #[cfg(test)]
         tests::count_receipt_read();
-        budget.decoded(&requests::receipt_record(reader, token), |bytes| {
+        budget.decoded(&requests::receipt_record(reader, token), clock, |bytes| {
             record::receipt(bytes, token)
         })
     })
@@ -366,8 +394,11 @@ pub(in crate::native) fn observe(
     root: &Path,
     reference: OriginReference,
     budget: &mut ReadBudget,
+    environment: &mut OriginEnvironment<'_>,
 ) -> OriginObservation {
-    finish(reference, |id| observe_target(root, id, budget))
+    finish(reference, |id| {
+        observe_target(root, id, budget, environment)
+    })
 }
 
 fn finish(reference: OriginReference, observe: impl FnOnce(&str) -> Target) -> OriginObservation {
@@ -408,11 +439,17 @@ impl ObservationCache {
         root: &Path,
         reference: OriginReference,
         outer: Option<Instant>,
+        environment: &mut OriginEnvironment<'_>,
     ) -> OriginObservation {
         finish(reference, |id| {
             self.targets
                 .entry(id.to_owned())
-                .or_insert_with(|| observe_target(root, id, &mut ReadBudget::for_query(outer)))
+                .or_insert_with(|| {
+                    // A target read in this response constructs no budget and samples
+                    // no clock.
+                    let mut budget = ReadBudget::for_query(outer, environment.clock);
+                    observe_target(root, id, &mut budget, environment)
+                })
                 .clone()
         })
     }
@@ -435,10 +472,15 @@ fn session_directory(root: &Path, id: &str) -> Result<Option<Reader>, Target> {
     }
 }
 
-fn bound_manifest(reader: &Reader, id: &str, budget: &mut ReadBudget) -> Result<(), ReadFault> {
+fn bound_manifest(
+    reader: &Reader,
+    id: &str,
+    budget: &mut ReadBudget,
+    clock: &mut dyn Clock,
+) -> Result<(), ReadFault> {
     // The decoder's schema and id rules are Origin's one binding rule, in its own words.
     budget
-        .decoded(&reader.record(CoreRecord::Manifest), |bytes| {
+        .decoded(&reader.record(CoreRecord::Manifest), clock, |bytes| {
             record::manifest(bytes, id).map_err(|error| match error {
                 DecodeError::Rule(_) => DecodeError::Rule(anyhow::anyhow!(
                     "the session manifest does not bind this session id"
@@ -455,16 +497,23 @@ fn status_of(bytes: &[u8]) -> Result<SessionStatus, ReadFault> {
         .map_err(|error| ReadFault::Unreadable(format!("invalid status record: {error}")))
 }
 
-fn observe_target(root: &Path, id: &str, budget: &mut ReadBudget) -> Target {
+fn observe_target(
+    root: &Path,
+    id: &str,
+    budget: &mut ReadBudget,
+    environment: &mut OriginEnvironment<'_>,
+) -> Target {
     let reader = match session_directory(root, id) {
         Ok(Some(reader)) => reader,
         Ok(None) => return target(None, "origin_missing", None),
         Err(target) => return target,
     };
-    if let Err(fault) = bound_manifest(&reader, id, budget) {
+    let OriginEnvironment { attest, clock } = environment;
+    let clock: &mut dyn Clock = &mut **clock;
+    if let Err(fault) = bound_manifest(&reader, id, budget, clock) {
         return fault_target(fault, "origin_unreadable");
     }
-    match budget.read(&reader.record(CoreRecord::Closed)) {
+    match budget.read(&reader.record(CoreRecord::Closed), clock) {
         Err(fault) => return fault_target(fault, "origin_unreadable"),
         Ok(Some(bytes)) => {
             return match status_of(&bytes) {
@@ -472,7 +521,7 @@ fn observe_target(root: &Path, id: &str, budget: &mut ReadBudget) -> Target {
                     // The tombstone is the close's commit; a status that has not caught up
                     // does not undo it, and reading the tombstone repairs nothing.
                     let status = budget
-                        .read(&reader.record(CoreRecord::Status))
+                        .read(&reader.record(CoreRecord::Status), clock)
                         .and_then(|bytes| bytes.map(|bytes| status_of(&bytes)).transpose());
                     let (stored_state, detail) = match status {
                         Ok(Some(status)) if status.state == SessionState::Closed => {
@@ -511,7 +560,7 @@ fn observe_target(root: &Path, id: &str, budget: &mut ReadBudget) -> Target {
         }
         Ok(None) => (),
     }
-    let status_bytes = match budget.read(&reader.record(CoreRecord::Status)) {
+    let status_bytes = match budget.read(&reader.record(CoreRecord::Status), clock) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
             return target(
@@ -539,7 +588,7 @@ fn observe_target(root: &Path, id: &str, budget: &mut ReadBudget) -> Target {
             Some("the recorded state is not one this version knows".to_owned()),
         ),
         _ => {
-            let (owner, read) = owner_verdict(&reader, id, budget);
+            let (owner, read) = owner_verdict(&reader, id, budget, clock, &**attest);
             owner_bytes = read;
             (owner.ended, owner.reason, owner.detail)
         }
@@ -548,18 +597,18 @@ fn observe_target(root: &Path, id: &str, budget: &mut ReadBudget) -> Target {
     tests::checkpoint(tests::Checkpoint::OriginRead, reader.directory());
     // The verdict holds only if the tombstone is still absent, the status unchanged, and
     // the owner record it was derived from unchanged or still absent.
-    match budget.read(&reader.record(CoreRecord::Closed)) {
+    match budget.read(&reader.record(CoreRecord::Closed), clock) {
         Ok(None) => (),
         Ok(Some(_)) => return target(None, "origin_busy", None),
         Err(fault) => return fault_target(fault, "origin_unreadable"),
     }
-    match budget.read(&reader.record(CoreRecord::Status)) {
+    match budget.read(&reader.record(CoreRecord::Status), clock) {
         Ok(Some(bytes)) if bytes == status_bytes => (),
         Ok(_) => return target(None, "origin_busy", None),
         Err(fault) => return fault_target(fault, "origin_unreadable"),
     }
     if let Some(owner_bytes) = owner_bytes {
-        match budget.read(&reader.record(CoreRecord::Owner)) {
+        match budget.read(&reader.record(CoreRecord::Owner), clock) {
             Ok(bytes) if bytes == owner_bytes => (),
             Ok(_) => return target(None, "origin_busy", None),
             Err(fault) => return fault_target(fault, "origin_unreadable"),
@@ -579,9 +628,11 @@ fn owner_verdict(
     reader: &Reader,
     id: &str,
     budget: &mut ReadBudget,
+    clock: &mut dyn Clock,
+    attest: &dyn Fn(&NativeSessionOwner) -> ProcessObservation,
 ) -> (Target, Option<Option<Vec<u8>>>) {
     let record = reader.record(CoreRecord::Owner);
-    let bytes = match budget.read(&record) {
+    let bytes = match budget.read(&record, clock) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
             return (
@@ -592,7 +643,7 @@ fn owner_verdict(
         Err(fault) => return (fault_target(fault, "owner_unverified"), None),
     };
     let verdict = match serde_json::from_slice::<NativeSessionOwner>(&bytes) {
-        Ok(owner) => owner_attested(&owner, id),
+        Ok(owner) => owner_attested(&owner, id, attest),
         Err(error) => target(
             None,
             "owner_unverified",
@@ -605,7 +656,11 @@ fn owner_verdict(
     (verdict, Some(Some(bytes)))
 }
 
-fn owner_attested(owner: &NativeSessionOwner, id: &str) -> Target {
+fn owner_attested(
+    owner: &NativeSessionOwner,
+    id: &str,
+    attest: &dyn Fn(&NativeSessionOwner) -> ProcessObservation,
+) -> Target {
     match owner.managed_session_id.as_deref() {
         Some(bound) if bound == id => (),
         None => {
@@ -645,24 +700,6 @@ fn owner_attested(owner: &NativeSessionOwner, id: &str) -> Target {
         ),
         ProcessObservation::Unknown(reason) => target(None, "owner_unverified", Some(reason)),
     }
-}
-
-fn attest(owner: &NativeSessionOwner) -> ProcessObservation {
-    #[cfg(test)]
-    if let Some(observed) = tests::attested(owner) {
-        return observed;
-    }
-    super::owner::attest_owner(owner).process
-}
-
-#[cfg(not(test))]
-fn now() -> Instant {
-    Instant::now()
-}
-
-#[cfg(test)]
-fn now() -> Instant {
-    Instant::now() + tests::clock_offset()
 }
 
 impl OriginObservation {
@@ -748,15 +785,21 @@ fn closed_state(bytes: Option<&[u8]>) -> Option<bool> {
     bytes.map(|bytes| status_of(bytes).is_ok_and(|s| s.state == SessionState::Closed))
 }
 
-fn examine(reader: &Reader, id: &str, origin_id: &str, budget: &mut ReadBudget) -> Examined {
-    if let Err(fault) = bound_manifest(reader, id, budget) {
+fn examine(
+    reader: &Reader,
+    id: &str,
+    origin_id: &str,
+    budget: &mut ReadBudget,
+    clock: &mut dyn Clock,
+) -> Examined {
+    if let Err(fault) = bound_manifest(reader, id, budget, clock) {
         return scan_fault(fault, "records_unreadable");
     }
-    let closed = match budget.read(&reader.record(CoreRecord::Closed)) {
+    let closed = match budget.read(&reader.record(CoreRecord::Closed), clock) {
         Ok(closed) => closed,
         Err(fault) => return scan_fault(fault, "records_unreadable"),
     };
-    let status = match budget.read(&reader.record(CoreRecord::Status)) {
+    let status = match budget.read(&reader.record(CoreRecord::Status), clock) {
         Ok(status) => status,
         Err(fault) => return scan_fault(fault, "records_unreadable"),
     };
@@ -785,7 +828,7 @@ fn examine(reader: &Reader, id: &str, origin_id: &str, budget: &mut ReadBudget) 
         Ok(_) => (),
         Err(fault) => return scan_fault(fault, "records_unreadable"),
     }
-    let reference = read_reference(reader, budget);
+    let reference = read_reference(reader, budget, clock);
     if let Some(why) = budget.exhausted {
         return stop(why);
     }
@@ -802,7 +845,7 @@ fn examine(reader: &Reader, id: &str, origin_id: &str, budget: &mut ReadBudget) 
     #[cfg(test)]
     tests::checkpoint(tests::Checkpoint::Matched, reader.directory());
     // Recheck just before reporting: a session that closed since is not open.
-    let closed = match budget.read(&reader.record(CoreRecord::Closed)) {
+    let closed = match budget.read(&reader.record(CoreRecord::Closed), clock) {
         Ok(closed) => closed,
         Err(fault) => return scan_fault(fault, "session_changed"),
     };
@@ -815,7 +858,7 @@ fn examine(reader: &Reader, id: &str, origin_id: &str, budget: &mut ReadBudget) 
         }
         None => (),
     }
-    match budget.read(&reader.record(CoreRecord::Status)) {
+    match budget.read(&reader.record(CoreRecord::Status), clock) {
         Ok(Some(bytes)) if bytes == status_bytes => Examined::Open,
         Ok(Some(bytes)) if closed_state(Some(&bytes)) == Some(true) => Examined::Unrelated,
         Ok(_) => Examined::Incomplete("session_changed".to_owned()),
@@ -831,9 +874,10 @@ pub(in crate::native) fn scan_started_from(
     root: &Path,
     origin_id: &str,
     deadline: Instant,
+    clock: &mut dyn Clock,
 ) -> StartedFrom {
     let mut scan = StartedFrom::default();
-    if now() >= deadline {
+    if clock.now() >= deadline {
         scan.note(None, "time_budget_exhausted".to_owned());
         return scan;
     }
@@ -846,7 +890,7 @@ pub(in crate::native) fn scan_started_from(
         }
     };
     for entry in entries {
-        if now() >= deadline {
+        if clock.now() >= deadline {
             scan.note(None, "time_budget_exhausted".to_owned());
             break;
         }
@@ -868,7 +912,7 @@ pub(in crate::native) fn scan_started_from(
         #[cfg(test)]
         tests::checkpoint(tests::Checkpoint::Entry, &entry.directory);
         let reader = Reader::open_unchecked(&entry.directory);
-        match examine(&reader, &entry.id, origin_id, &mut budget) {
+        match examine(&reader, &entry.id, origin_id, &mut budget, clock) {
             Examined::Unrelated => (),
             Examined::Open => {
                 scan.open.push(entry.id);

@@ -1,10 +1,9 @@
 #[cfg(unix)]
 use super::super::ADAPTER;
-#[cfg(unix)]
-use super::super::test_support::QUEUE_TIMEOUT_READY;
 use super::super::test_support::write_established_thread;
 use super::super::{PENDING_TURN_FILE, read_pending_turn};
 use super::*;
+use crate::native::clock::SystemClock;
 #[cfg(unix)]
 use crate::native::native_delegation_prompt;
 #[cfg(unix)]
@@ -148,14 +147,17 @@ exit 1
     let (claim, _) =
         turn::claim_ready(&Store::open_unchecked(directory), "session-codexqueue", &[]).unwrap();
     update_status(directory, SessionState::Working, None, None).unwrap();
-    let failure = send_native_queue_message(CrossSessionMessageContext {
-        bridge_executable: Path::new("/unused/agent-bridge"),
-        directory,
-        provider_path: &provider,
-        correlation_id: claim.token(),
-        prompt: "request addressed only to A",
-        deadline: Instant::now() + Duration::from_secs(2),
-    })
+    let failure = send_native_queue_message(
+        CrossSessionMessageContext {
+            bridge_executable: Path::new("/unused/agent-bridge"),
+            directory,
+            provider_path: &provider,
+            correlation_id: claim.token(),
+            prompt: "request addressed only to A",
+            deadline: Instant::now() + Duration::from_secs(2),
+        },
+        &mut SystemClock,
+    )
     .unwrap_err();
 
     assert_eq!(
@@ -300,14 +302,17 @@ fn codex_native_queue_runs_the_provider_command_with_the_claim_marker() {
     // The prompt as `tell` hands it to the adapter: already framed.
     let prompt = native_delegation_prompt("external", "follow up");
 
-    send_native_queue_message(CrossSessionMessageContext {
-        bridge_executable: Path::new("/unused/agent-bridge"),
-        directory: &directory,
-        provider_path: &provider,
-        correlation_id: &claim_token,
-        prompt: &prompt,
-        deadline: Instant::now() + Duration::from_secs(2),
-    })
+    send_native_queue_message(
+        CrossSessionMessageContext {
+            bridge_executable: Path::new("/unused/agent-bridge"),
+            directory: &directory,
+            provider_path: &provider,
+            correlation_id: &claim_token,
+            prompt: &prompt,
+            deadline: Instant::now() + Duration::from_secs(2),
+        },
+        &mut SystemClock,
+    )
     .unwrap();
 
     let arguments = std::fs::read(directory.join("queue-argv.bin")).unwrap();
@@ -368,14 +373,17 @@ fn codex_queue_runs_in_the_original_workspace() {
     let claim_token = claim.token().to_owned();
     claim.retain();
 
-    send_native_queue_message(CrossSessionMessageContext {
-        bridge_executable: Path::new("/unused/agent-bridge"),
-        directory: &directory,
-        provider_path: &provider,
-        correlation_id: &claim_token,
-        prompt: "follow up",
-        deadline: Instant::now() + Duration::from_secs(2),
-    })
+    send_native_queue_message(
+        CrossSessionMessageContext {
+            bridge_executable: Path::new("/unused/agent-bridge"),
+            directory: &directory,
+            provider_path: &provider,
+            correlation_id: &claim_token,
+            prompt: "follow up",
+            deadline: Instant::now() + Duration::from_secs(2),
+        },
+        &mut SystemClock,
+    )
     .unwrap();
 
     let expected = format!("{}\n", workspace.canonicalize().unwrap().display());
@@ -402,14 +410,17 @@ fn codex_queue_refuses_before_start_for_old_versions_or_missing_threads() {
         let claim_token = claim.token().to_owned();
         claim.retain();
 
-        let failure = send_native_queue_message(CrossSessionMessageContext {
-            bridge_executable: Path::new("/unused/agent-bridge"),
-            directory: &directory,
-            provider_path: &provider,
-            correlation_id: &claim_token,
-            prompt: "follow up",
-            deadline: Instant::now() + Duration::from_secs(1),
-        })
+        let failure = send_native_queue_message(
+            CrossSessionMessageContext {
+                bridge_executable: Path::new("/unused/agent-bridge"),
+                directory: &directory,
+                provider_path: &provider,
+                correlation_id: &claim_token,
+                prompt: "follow up",
+                deadline: Instant::now() + Duration::from_secs(1),
+            },
+            &mut SystemClock,
+        )
         .unwrap_err();
 
         assert!(matches!(failure, Outcome::NotSent(_)), "{version}");
@@ -441,14 +452,17 @@ exit 91
     let claim_token = claim.token().to_owned();
     claim.retain();
 
-    let failure = send_native_queue_message(CrossSessionMessageContext {
-        bridge_executable: Path::new("/unused/agent-bridge"),
-        directory: &directory,
-        provider_path: &provider,
-        correlation_id: &claim_token,
-        prompt: "follow up",
-        deadline: Instant::now() + Duration::from_secs(1),
-    })
+    let failure = send_native_queue_message(
+        CrossSessionMessageContext {
+            bridge_executable: Path::new("/unused/agent-bridge"),
+            directory: &directory,
+            provider_path: &provider,
+            correlation_id: &claim_token,
+            prompt: "follow up",
+            deadline: Instant::now() + Duration::from_secs(1),
+        },
+        &mut SystemClock,
+    )
     .unwrap_err();
 
     assert!(matches!(failure, Outcome::NotSent(_)));
@@ -512,14 +526,17 @@ exit 91
     let claim_token = claim.token().to_owned();
     claim.retain();
 
-    send_native_queue_message(CrossSessionMessageContext {
-        bridge_executable: Path::new("/unused/agent-bridge"),
-        directory: &directory,
-        provider_path: &provider,
-        correlation_id: &claim_token,
-        prompt: "follow up",
-        deadline: Instant::now() + Duration::from_secs(10),
-    })
+    send_native_queue_message(
+        CrossSessionMessageContext {
+            bridge_executable: Path::new("/unused/agent-bridge"),
+            directory: &directory,
+            provider_path: &provider,
+            correlation_id: &claim_token,
+            prompt: "follow up",
+            deadline: Instant::now() + Duration::from_secs(10),
+        },
+        &mut SystemClock,
+    )
     .unwrap();
 
     assert!(!directory.join("daemon-probed").exists());
@@ -538,12 +555,35 @@ struct QueueTimeoutFixture {
     pipe: std::path::PathBuf,
 }
 
+// Real time until the fixture's ready file exists, the deadline from then on; the
+// latch records that readiness was observed and the expiry forced.
+#[cfg(unix)]
+struct ReadyClock {
+    ready: std::path::PathBuf,
+    deadline: Instant,
+    expired: bool,
+}
+
+#[cfg(unix)]
+impl crate::native::clock::Clock for ReadyClock {
+    fn now(&mut self) -> Instant {
+        if self.expired || self.ready.is_file() {
+            self.expired = true;
+            return self.deadline;
+        }
+        Instant::now()
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
+
 #[cfg(unix)]
 impl Drop for QueueTimeoutFixture {
     fn drop(&mut self) {
         use std::{io::Write, os::unix::fs::OpenOptionsExt};
 
-        QUEUE_TIMEOUT_READY.with(|path| path.borrow_mut().take());
         // A broken containment path must fail the test without leaving the
         // fake descendant blocked forever, including on an earlier assertion.
         if let Ok(mut writer) = std::fs::OpenOptions::new()
@@ -601,35 +641,35 @@ exit 91
     claim.retain();
 
     // Give setup a separate bounded budget, then trigger the real timeout path
-    // only after the descendant holds the FIFO. The thread-local hook cannot
-    // affect another test, the daemon probe, or a release build.
-    QUEUE_TIMEOUT_READY.with(|path| {
-        assert!(
-            path.borrow_mut()
-                .replace(directory.join("queue-started"))
-                .is_none()
-        );
-    });
+    // only after the descendant holds the FIFO: the runner's clock is the real
+    // time until the ready file exists and the deadline from then on.
     let _fixture = QueueTimeoutFixture { pipe: pipe.clone() };
-    let failure = send_native_queue_message(CrossSessionMessageContext {
-        bridge_executable: Path::new("/unused/agent-bridge"),
-        directory: &directory,
-        provider_path: &provider,
-        correlation_id: &claim_token,
-        prompt: "follow up",
-        deadline: Instant::now() + Duration::from_secs(5),
-    })
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut clock = ReadyClock {
+        ready: directory.join("queue-started"),
+        deadline,
+        expired: false,
+    };
+    let failure = send_native_queue_message(
+        CrossSessionMessageContext {
+            bridge_executable: Path::new("/unused/agent-bridge"),
+            directory: &directory,
+            provider_path: &provider,
+            correlation_id: &claim_token,
+            prompt: "follow up",
+            deadline,
+        },
+        &mut clock,
+    )
     .unwrap_err();
 
     let delivery_uncertain = matches!(failure, Outcome::Uncertain(_));
     let reason = format!("{:#}", outcome_error(&failure));
     assert!(reason.contains("Codex queue timed out"), "{reason}");
-    QUEUE_TIMEOUT_READY.with(|path| {
-        assert!(
-            path.borrow().is_none(),
-            "queue timeout hook was not consumed"
-        );
-    });
+    assert!(
+        clock.expired,
+        "the clock must observe the fixture's readiness and force the expiry"
+    );
     assert!(delivery_uncertain, "{reason}");
     assert!(directory.join(PENDING_TURN_FILE).is_file());
     assert!(directory.join("queue-started").is_file());

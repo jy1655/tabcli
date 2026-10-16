@@ -25,9 +25,18 @@ use crate::native::session::SessionState;
 
 #[test]
 fn host_binding_partial_transitions() {
-    crate::native::session::launch::binding_tests::characterize("WezTerm", |directory, id| {
-        wait_for_binding(directory, id, "host-id", Path::new("/tmp/binding-socket"))
-    });
+    crate::native::session::launch::binding_tests::characterize(
+        "WezTerm",
+        |directory, id, clock| {
+            wait_for_binding(
+                directory,
+                id,
+                "host-id",
+                Path::new("/tmp/binding-socket"),
+                clock,
+            )
+        },
+    );
 }
 
 use std::{cell::RefCell, os::unix::process::ExitStatusExt, path::PathBuf, process::ExitStatus};
@@ -1685,7 +1694,7 @@ fn the_launch_host_starts_only_for_the_bound_pane_of_a_pending_launch() {
         let directory = fixture.path();
         let id = directory.file_name().unwrap().to_str().unwrap();
         write_json_atomic(&directory.join(TERMINAL_HANDLE_FILE), &binding(directory)).unwrap();
-        wait_for_binding(directory, id, "8", Path::new(socket)).unwrap();
+        wait_for_binding(directory, id, "8", Path::new(socket), &mut SystemClock).unwrap();
     }
     for case in [
         "another pane",
@@ -1741,7 +1750,7 @@ fn the_launch_host_starts_only_for_the_bound_pane_of_a_pending_launch() {
             _ => {}
         }
         assert!(
-            wait_for_binding(directory, id, "8", Path::new(SOCKET)).is_err(),
+            wait_for_binding(directory, id, "8", Path::new(SOCKET), &mut SystemClock).is_err(),
             "{case}"
         );
     }

@@ -391,11 +391,14 @@ impl Observation {
         &self,
         reader: &Reader,
         outer: Option<Instant>,
+        environment: &mut origin::OriginEnvironment<'_>,
     ) -> origin::OriginObservation {
+        let mut budget = origin::ReadBudget::for_query(outer, environment.clock);
         origin::observe(
             &state_root_of(reader),
             self.origin.clone(),
-            &mut origin::ReadBudget::for_query(outer),
+            &mut budget,
+            environment,
         )
     }
 

@@ -1,10 +1,11 @@
 //! Read-only Session observations within a workspace and a shared scan budget.
 use super::*;
 use crate::native::args::{option_value, set_flag_once, set_once, workspace_scope};
+use crate::native::clock::SystemClock;
 use crate::native::session;
 use crate::native::session::OwnerObservation;
 use crate::native::session::enumerate::{CheckOrder, Fault, Scope, enumerate};
-use crate::native::session::origin::{ObservationCache, OriginObservation};
+use crate::native::session::origin::{ObservationCache, OriginEnvironment, OriginObservation};
 use observation::judgment::{
     self, BoundOwner, Cancel, CancelState, Ended, FOREIGN_OWNER, Hold, OwnerJudgment,
     ResultCandidate, Turn,
@@ -240,6 +241,8 @@ fn value_in(root: &Path, request: &StatusRequest, budget: Duration) -> Result<Va
     let mut sessions = Vec::new();
     let mut scanned = 0;
     let mut origins = ObservationCache::default();
+    let mut clock = SystemClock;
+    let mut origin_environment = OriginEnvironment::production(&mut clock);
     for id in ids {
         let read = (|| -> Result<Option<Value>> {
             if Instant::now() >= deadline {
@@ -270,7 +273,12 @@ fn value_in(root: &Path, request: &StatusRequest, budget: Duration) -> Result<Va
             if Instant::now() >= deadline {
                 bail!("status time budget exhausted");
             }
-            let origin = origins.observe(root, observed.observation.origin.clone(), Some(deadline));
+            let origin = origins.observe(
+                root,
+                observed.observation.origin.clone(),
+                Some(deadline),
+                &mut origin_environment,
+            );
             Ok(Some(entry(observed, &id, origin)))
         })();
         match read {

@@ -1,7 +1,7 @@
+use crate::native::clock::Clock;
 use anyhow::{Context, Result};
 use std::{
     process::{ExitStatus, Stdio},
-    thread,
     time::{Duration, Instant},
 };
 
@@ -44,12 +44,15 @@ impl CodexCommandFailure {
     }
 }
 
-pub(super) fn run_bounded_command_until(
+// The clock is the caller's: production reads the system clock, and the timeout test
+// reads one that reaches the deadline once its fixture is ready.
+pub(super) fn run_bounded_command_until<C: Clock>(
     command: &mut std::process::Command,
     deadline: Instant,
     label: &str,
+    clock: &mut C,
 ) -> std::result::Result<BoundedCommandOutput, CodexCommandFailure> {
-    if Instant::now() >= deadline {
+    if clock.now() >= deadline {
         return Err(CodexCommandFailure::not_started(anyhow::anyhow!(
             "{label} timed out before it started"
         )));
@@ -95,25 +98,12 @@ pub(super) fn run_bounded_command_until(
             error.context(format!("failed to resume {label}")),
         ));
     }
-    // The timeout fixture must observe its descendant before expiring the budget.
-    // Release builds always keep the caller's original, shared deadline.
-    #[cfg(all(test, unix))]
-    let deadline = match super::test_support::synchronized_queue_deadline(label, deadline) {
-        Ok(deadline) => deadline,
-        Err(error) => {
-            terminate_bounded_process(&mut child, &process_tree);
-            return Err(CodexCommandFailure::started(error));
-        }
-    };
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                thread::sleep(
-                    deadline
-                        .saturating_duration_since(Instant::now())
-                        .min(Duration::from_millis(20)),
-                );
+            Ok(None) if clock.now() < deadline => {
+                let remaining = deadline.saturating_duration_since(clock.now());
+                clock.sleep(remaining.min(Duration::from_millis(20)));
             }
             Ok(None) => {
                 terminate_bounded_process(&mut child, &process_tree);

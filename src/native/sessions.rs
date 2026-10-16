@@ -1,5 +1,6 @@
 //! The `sessions` listing over a state root.
 use super::args::{option_value, resolve_explicit_workspace, set_flag_once, set_once};
+use crate::native::clock::SystemClock;
 use crate::native::reopen::read_resumed_from;
 use crate::native::session::{Reader, Store};
 use crate::native::{NativeCommand, session, terminal};
@@ -110,6 +111,8 @@ fn sessions_query(
     repair: bool,
 ) -> Result<Vec<serde_json::Value>> {
     let mut sessions = Vec::new();
+    let mut clock = SystemClock;
+    let mut origin_environment = session::origin::OriginEnvironment::production(&mut clock);
     if root.is_dir() {
         for entry in
             session::enumerate::enumerate(root, session::enumerate::CheckOrder::FileTypeFirst)?
@@ -143,14 +146,17 @@ fn sessions_query(
             }
             let terminal = Reader::open_unchecked(&directory).terminal().ok();
             // Observation only, whether or not this listing repaired above.
-            let mut origin_budget = session::origin::ReadBudget::for_query(None);
+            let mut origin_budget =
+                session::origin::ReadBudget::for_query(None, origin_environment.clock);
             let origin = session::origin::observe(
                 root,
                 session::origin::read_reference(
                     &Reader::open_unchecked(&directory),
                     &mut origin_budget,
+                    origin_environment.clock,
                 ),
                 &mut origin_budget,
+                &mut origin_environment,
             );
             let mut value = serde_json::json!({
                 "id": manifest.id,

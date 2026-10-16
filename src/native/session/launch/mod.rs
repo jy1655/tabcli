@@ -5,6 +5,8 @@ use crate::native::session::state::{
     SessionState, SessionStatus, update_status, update_status_with_residual,
 };
 
+#[cfg(target_os = "macos")]
+use crate::native::clock::Clock;
 use crate::native::session::turn::{recover_pending_completion_locked, remove_turn_claim_locked};
 use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store, record, turn};
 use crate::native::terminal;
@@ -60,25 +62,6 @@ impl SessionStatus {
 
 #[cfg(all(test, target_os = "macos"))]
 pub(in crate::native) mod binding_tests;
-
-#[cfg(target_os = "macos")]
-fn binding_now() -> Instant {
-    #[cfg(test)]
-    if let Some(now) = binding_tests::now() {
-        return now;
-    }
-    Instant::now()
-}
-
-#[cfg(target_os = "macos")]
-fn binding_sleep() {
-    let delay = Duration::from_millis(10);
-    #[cfg(test)]
-    if binding_tests::retry(delay) {
-        return;
-    }
-    thread::sleep(delay);
-}
 
 pub(in crate::native) fn install_script(store: &Store, contents: &str) -> Result<String> {
     let directory = store.directory();
@@ -142,12 +125,14 @@ pub(in crate::native) enum BindingBudget {
 }
 
 /// Observe a pending launch until its managed surface is bound. This is an ordered,
-/// unlocked observation, not authorization to spawn; `spawn` owns that final fence.
+/// unlocked observation, not authorization to spawn; `spawn` owns that final fence. The
+/// budget and every retry read `clock`; the host passes the system clock.
 #[cfg(target_os = "macos")]
 pub(in crate::native) fn wait_for_binding(
     reader: &Reader,
     session_id: &str,
     facts: &BindingFacts,
+    clock: &mut dyn Clock,
 ) -> Result<terminal::TerminalSession> {
     let name = facts.host;
     let cancelled = facts.cancelled;
@@ -165,7 +150,7 @@ pub(in crate::native) fn wait_for_binding(
                 .min(30_000) as u64,
         ),
     };
-    let deadline = binding_now() + budget;
+    let deadline = clock.now() + budget;
     #[cfg(test)]
     binding_tests::checkpoint(binding_tests::Point::BudgetCaptured);
     loop {
@@ -173,7 +158,7 @@ pub(in crate::native) fn wait_for_binding(
         // Status is read even after expiry. Keep claim and binding reads lazy: these
         // short circuits also determine which damaged-record error the host reports.
         let status: SessionStatus = reader.status()?;
-        if binding_now() >= deadline
+        if clock.now() >= deadline
             || unix_ms() >= record.deadline_unix_ms
             || record.phase != Phase::Pending
             || record.claim_token != initial.claim_token
@@ -190,7 +175,8 @@ pub(in crate::native) fn wait_for_binding(
             surface.verify_managed_session(session_id)?;
             return Ok(surface);
         }
-        binding_sleep();
+        // The real wait sleeps a full 10 ms, even with less than 10 ms remaining.
+        clock.sleep(Duration::from_millis(10));
     }
 }
 

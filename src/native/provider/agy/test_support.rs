@@ -473,7 +473,7 @@ pub(super) fn framed_receipt_line(prompt: &str, pending: &PendingAgyTurn) -> Str
     receipt_line(&go_quoted(&framed))
 }
 
-pub(super) use crate::native::consent::FakeClock;
+pub(super) use crate::native::clock::FakeClock;
 
 pub(super) fn log_sequence(
     logs: Vec<Result<Option<Vec<u8>>>>,
