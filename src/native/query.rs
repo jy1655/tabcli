@@ -17,12 +17,15 @@ use crate::native::{Context, FromStr};
 use agent_bridge::PUBLIC_COMMAND;
 use serde_json::{Value, json};
 
+mod inspect;
 pub(super) mod observation;
 pub(super) mod status;
 #[cfg(test)]
 mod test_support;
 mod timeline;
 pub(super) mod wait;
+#[cfg(test)]
+pub(super) use inspect::inspect_value;
 #[cfg(test)]
 pub(super) use timeline::timeline_value;
 
@@ -144,7 +147,9 @@ pub(super) use super::session::SnapshotBusy;
 use super::session::snapshot::before_consistency_check;
 pub(super) use super::session::snapshot::{PublicationRead, Snapshot};
 #[cfg(test)]
-pub(super) use super::session::snapshot::{with_event_read_count, with_snapshot_hook};
+pub(super) use super::session::snapshot::{
+    with_event_read_count, with_event_read_hook, with_snapshot_hook,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -641,7 +646,7 @@ pub(super) fn run_inspect(
     let outcome = if timeline {
         timeline::run(id, json, request)
     } else {
-        inspect_inner(id, json)
+        inspect::inspect_inner(id, json)
     };
     if let Err(error) = &outcome
         && json
@@ -656,45 +661,6 @@ pub(super) fn run_inspect(
         ))?;
     }
     outcome
-}
-
-fn inspect_inner(id: &str, json: bool) -> Result<()> {
-    let directory = Reader::session_directory(id)?;
-    let value = inspect_value(&Reader::open_unchecked(&directory), id)?;
-    envelope::emit(json, &value, || {
-        println!(
-            "session: {id}\nprovider: {}\nstate (stored): {}\nworkspace: {}\nupdated: {}",
-            value["provider"].as_str().unwrap_or("?"),
-            terminal_safe_text(value["stored_state"].as_str().unwrap_or("unknown"), false),
-            terminal_safe_text(value["workspace"].as_str().unwrap_or("?"), false),
-            value["updated_unix_ms"]
-        );
-        println!(
-            "owner process alive: {}\nrecovery required: {}",
-            value["owner_process_alive"], value["recovery_required"]
-        );
-        println!("held: {}", value["held"]);
-        if let Some(error) = value["hold_error"].as_str() {
-            println!("hold error: {}", terminal_safe_text(error, true));
-        }
-        if let Some(source) = value["resumed_from"]["session"].as_str() {
-            println!("resumed from: {}", terminal_safe_text(source, false));
-        }
-        if let Some(error) = value["error"].as_str() {
-            println!("error: {}", terminal_safe_text(error, true));
-        }
-        if let Some(id) = value["latest_result"]["event_id"].as_str() {
-            println!("latest result: {id}");
-        }
-        for request in value["requests"].as_array().into_iter().flatten() {
-            println!("request: {}", request["request_id"].as_str().unwrap_or("?"));
-        }
-        Ok(())
-    })
-}
-
-pub(super) fn inspect_value(reader: &Reader, id: &str) -> Result<Value> {
-    observation::Observation::read_locked(reader)?.inspect_value(reader, id)
 }
 
 // `search`: substring lookup over published result bodies. Read-only, budgeted, and scoped

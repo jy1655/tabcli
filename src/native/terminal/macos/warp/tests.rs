@@ -749,6 +749,7 @@ fn public_seam_uses_supplied_directory_without_global_rescue() {
     }
     // Doctor must observe this Reader's directory, not the process-global root.
     // Keep a valid, present handle and binding at the global root in every case.
+    use crate::native::query::observation::judgment::SurfacePresence;
     use crate::native::{doctor, query::observation::SessionEvidence, session::Store};
     Store::open_unchecked(&global)
         .write_terminal(&session())
@@ -773,43 +774,36 @@ fn public_seam_uses_supplied_directory_without_global_rescue() {
             .unwrap();
         let before = (snapshot(temp.path()), snapshot(global.parent().unwrap()));
         let reader = Reader::open_unchecked(&directory);
-        let mut evidence = SessionEvidence::read(&reader, Ok(false));
-        let check = doctor::surface_check_for_test(&mut evidence, &reader);
+        let evidence = SessionEvidence::read(&reader, Ok(false));
+        let presence = evidence
+            .judge_surface_presence(&reader, std::time::Instant::now() + Duration::from_secs(2));
+        let check = doctor::surface_presence_check(presence);
         assert_eq!(check.id, "terminal_surface");
-        let observed = evidence
-            .surface_presence
-            .as_ref()
-            .expect("doctor must call observe_surface");
         match state {
             "present" => {
-                assert!(*observed.as_ref().unwrap());
+                assert_eq!(*presence, SurfacePresence::Present);
                 assert_eq!(check.availability, doctor::Availability::Available);
                 assert_eq!(check.reason_code, "terminal_surface_present");
             }
             "absent" => {
-                assert!(!*observed.as_ref().unwrap());
+                assert_eq!(*presence, SurfacePresence::Missing);
                 assert_eq!(check.availability, doctor::Availability::Unavailable);
                 assert_eq!(check.reason_code, "terminal_surface_missing");
             }
             _ => {
-                let error = observed.as_ref().unwrap_err();
+                let SurfacePresence::Unverified(reason) = presence else {
+                    panic!("{state}: {presence:?}")
+                };
                 assert_eq!(check.availability, doctor::Availability::Unknown);
                 assert_eq!(check.reason_code, "terminal_surface_unverified");
                 if state == "mismatched" {
                     assert!(
-                        error
-                            .to_string()
-                            .contains("belongs to managed session session-other"),
-                        "{error:#}"
+                        reason.contains("belongs to managed session session-other"),
+                        "{reason}"
                     );
                 }
                 let rendered = serde_json::to_value(&check).unwrap();
-                assert!(
-                    rendered["detail"]
-                        .as_str()
-                        .unwrap()
-                        .contains(&format!("{error:#}"))
-                );
+                assert!(rendered["detail"].as_str().unwrap().contains(reason));
             }
         }
         assert_eq!(

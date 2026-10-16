@@ -4,8 +4,11 @@ use crate::native::session;
 use crate::native::session::OwnerObservation;
 use crate::native::session::enumerate::{CheckOrder, Fault, Scope, enumerate};
 use crate::native::session::origin::{ObservationCache, OriginObservation};
-use observation::judgment::{BoundOwner, FOREIGN_OWNER, OwnerJudgment};
-use observation::{Observation, StatusObservation, SurfaceRecord};
+use observation::judgment::{
+    self, BoundOwner, Cancel, CancelState, Ended, FOREIGN_OWNER, Hold, OwnerJudgment,
+    ResultCandidate, Turn,
+};
+use observation::{Observation, StatusObservation};
 
 #[derive(Debug)]
 pub(crate) struct StatusRequest {
@@ -119,88 +122,64 @@ fn attention(
     origin: &OriginObservation,
 ) -> Vec<&'static str> {
     let observation = &observed.observation;
-    let records = &observation.records;
+    let judgments = &observation.judgments;
+    let closed = observation.records.status.state == SessionState::Closed;
     let mut flags = Vec::new();
-    if observation
-        .cancel
-        .as_ref()
-        .is_some_and(|c| c.state == "requested" && c.active)
-    {
+    if judgments.cancel == Cancel::Recorded(Some(CancelState::RequestedActive)) {
         flags.push("cancel_requested");
     }
-    if matches!(observation.evidence.held, Ok(true)) {
+    if matches!(judgments.hold, Hold::Held { .. }) {
         flags.push("held");
     }
-    if records.status.state == SessionState::Working
-        && records.claim.is_some()
-        && records.status.error.is_some()
-        && records.pending.is_none()
-    {
-        flags.push("delivery_unconfirmed");
+    match &judgments.turn {
+        Turn::DeliveryUnconfirmed => flags.push("delivery_unconfirmed"),
+        Turn::LaunchFailed { reason, .. } => flags.push(reason),
+        Turn::TurnInProgress | Turn::NoActiveTurn => (),
     }
-    if let Some((reason, _)) = &observation.judgments.launch_failure {
-        flags.push(reason);
-    }
-    if records.claim.is_some() && observation.active_request().is_none() {
+    if judgments.claim_without_receipt {
         flags.push("claim_without_receipt");
     }
-    if records.pending.is_some() {
+    if judgments.recovery_required {
         flags.push("recovery_required");
     }
-    if records.status.state != SessionState::Closed {
+    if !closed {
         flags.extend(owner_flag(owner));
     }
-    let index_incomplete = records.unreadable_requests > 0 || records.request_index_error.is_some();
-    if observation.evidence.held.is_err()
-        || observation.evidence.owner.is_err()
-        || matches!(
-            &observation.evidence.surface,
-            SurfaceRecord::Closed(Err(_))
-                | SurfaceRecord::Closing(Err(_))
-                | SurfaceRecord::Active(Err(_))
-        )
-        || matches!(&observation.evidence.surface,
-            SurfaceRecord::Closed(Ok(value)) if value.get("consumed").and_then(Value::as_bool) != Some(true))
-        || observation.resumed_from.is_err()
+    // Status unions its own two reads with the Observation's unreadable parts (D12).
+    if !judgments.unreadable.is_empty()
         || observed.latest.is_err()
         || observed.active.as_ref().is_some_and(Result::is_err)
-        || index_incomplete
     {
         flags.push("records_partially_unreadable");
     }
-    if index_incomplete {
+    if judgments.request_index.is_some() {
         flags.push("request_index_incomplete");
     }
-    if records.status.residual_surface().is_some() {
+    if judgments.residual_surface.is_some() {
         flags.push("residual_surface_unverified");
     }
-    match records.status.state {
-        SessionState::Failed => flags.push("session_failed"),
-        SessionState::Exited => flags.push("session_exited"),
-        _ => (),
+    match judgments.ended {
+        Ended::Failed => flags.push("session_failed"),
+        Ended::Exited => flags.push("session_exited"),
+        Ended::Neither => (),
     }
     // Derived from the Origin's records; neither an open surface nor a close authority.
-    if records.status.state != SessionState::Closed && origin.ended == Some(true) {
+    if !closed && origin.ended == Some(true) {
         flags.push("origin_ended");
     }
     flags
 }
 
-fn result_command(observed: &StatusObservation, id: &str) -> Option<String> {
-    if let Some(receipt) = observed.observation.active_request() {
-        Some(format!(
-            "{PUBLIC_COMMAND} result {id} --request {} --json",
-            receipt.request_id
-        ))
-    } else if observed.observation.records.claim.is_some() {
-        Some(format!("{PUBLIC_COMMAND} result {id} --list --json"))
-    } else {
-        observed
-            .latest
-            .as_ref()
-            .ok()
-            .and_then(|latest| latest["event_id"].as_str())
-            .map(|event| format!("{PUBLIC_COMMAND} result {id} --event {event} --json"))
+fn result_command(candidate: ResultCandidate, id: &str) -> Option<String> {
+    match candidate {
+        ResultCandidate::ActiveRequest(request) => Some(format!(
+            "{PUBLIC_COMMAND} result {id} --request {request} --json"
+        )),
+        ResultCandidate::ClaimOnly => Some(format!("{PUBLIC_COMMAND} result {id} --list --json")),
+        ResultCandidate::LatestDecoded(event) => Some(format!(
+            "{PUBLIC_COMMAND} result {id} --event {event} --json"
+        )),
+        ResultCandidate::None => None,
     }
 }
 
@@ -208,9 +187,16 @@ fn entry(observed: StatusObservation, id: &str, origin: OriginObservation) -> Va
     let judgment = observed.observation.evidence.judge_owner(id);
     let owner = owner_value(judgment);
     let flags = attention(&observed, judgment, &origin);
-    let command = result_command(&observed, id);
     let observation = &observed.observation;
     let records = &observation.records;
+    let judgments = &observation.judgments;
+    // The latest Result status has already decoded; nothing more is decoded (D16).
+    let latest_event = observed
+        .latest
+        .as_ref()
+        .ok()
+        .and_then(|latest| latest["event_id"].as_str());
+    let command = result_command(judgment::result_candidate(records, latest_event), id);
     let manifest = &records.manifest;
     let active = observation.active_request().map(|receipt| {
         let value = observed.active.as_ref().and_then(|active| active.as_ref().ok());
@@ -226,13 +212,13 @@ fn entry(observed: StatusObservation, id: &str, origin: OriginObservation) -> Va
         "created_unix_ms": manifest.created_unix_ms, "state": records.status.state,
         "generation": records.status.generation, "updated_unix_ms": records.status.updated_unix_ms,
         "error": records.status.error, "turn_claimed": records.claim.is_some(),
-        "recovery_required": records.pending.is_some(), "unreadable_requests": records.unreadable_requests,
+        "recovery_required": judgments.recovery_required, "unreadable_requests": records.unreadable_requests,
         "request_index_error": records.request_index_error,
         "active_request": active, "latest_result": observed.latest.as_ref().ok(),
         "owner": owner, "attention": flags, "derived_from": "observation", "result_command": command,
     });
     session::hold::add_fields(&mut value, &observation.evidence.held);
-    if let Some(residual) = records.status.residual_surface() {
+    if let Some(residual) = judgments.residual_surface {
         value["residual_surface"] = json!(residual);
     }
     origin.add_fields(&mut value);

@@ -5,7 +5,7 @@ use crate::native::session;
 use crate::native::session::origin;
 use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
 use crate::native::terminal::ownership::NativeSessionOwner;
-use judgment::OwnerJudgment;
+use judgment::{Cancel, CancelState, Judgments, OwnerJudgment, SurfacePresence};
 use std::cell::OnceCell;
 
 pub(in crate::native) mod judgment;
@@ -15,11 +15,14 @@ pub(in crate::native) mod judgment;
 pub(in crate::native) struct SessionEvidence {
     pub(in crate::native) owner: Result<Option<NativeSessionOwner>>,
     pub(in crate::native) held: Result<bool>,
-    pub(in crate::native) hold_release_allowed: bool,
+    /// The session close tombstone, read for a held session only: the hold release gate
+    /// is its one reader. None when it was not read.
+    pub(in crate::native) close_tombstone: Option<Result<Option<SessionStatus>>>,
     pub(in crate::native) surface: SurfaceRecord,
     /// Made on the first request and kept for this Observation (D21).
     pub(in crate::native) owner_judgment: OnceCell<OwnerJudgment>,
-    pub(in crate::native) surface_presence: Option<Result<bool>>,
+    /// Judged on the first request and kept for this Observation (D21).
+    pub(in crate::native) surface_presence: OnceCell<SurfacePresence>,
 }
 
 pub(in crate::native) enum SurfaceRecord {
@@ -27,6 +30,10 @@ pub(in crate::native) enum SurfaceRecord {
     Closing(Result<terminal::TerminalSession>),
     Active(Result<Option<terminal::TerminalSession>>),
 }
+
+/// The OS probe of a recorded surface. Tests replace it.
+pub(in crate::native) type SurfaceProbe<'a> =
+    &'a dyn Fn(&Path, &terminal::TerminalSession, Duration) -> Result<bool>;
 
 impl SessionEvidence {
     /// The raw Owner record read, shared with `wait`'s per-poll judgment.
@@ -52,46 +59,59 @@ impl SessionEvidence {
             },
         };
         // An interrupted close can have its tombstone before status.json catches up.
-        let hold_release_allowed =
-            matches!(held, Ok(true)) && matches!(reader.closed_if_present(), Ok(None));
+        let close_tombstone = matches!(held, Ok(true)).then(|| reader.closed_if_present());
         Self {
-            hold_release_allowed,
+            close_tombstone,
             held,
             owner,
             surface,
             owner_judgment: OnceCell::new(),
-            surface_presence: None,
+            surface_presence: OnceCell::new(),
         }
     }
 
-    pub(in crate::native) fn observe_surface(
-        &mut self,
+    /// Whether the recorded active surface is present, judged on the first request with
+    /// the caller's deadline and kept for this Observation. It reads the current active
+    /// handle of the supplied Reader's directory and probes nothing else.
+    pub(in crate::native) fn judge_surface_presence(
+        &self,
         reader: &Reader,
         deadline: Instant,
-    ) -> &Result<bool> {
-        let directory = reader.directory();
-        self.surface_presence.insert((|| -> Result<bool> {
-            let session = RecordReader::at(
-                Reader::open_unchecked(directory)
-                    .record(CoreRecord::Terminal)
-                    .path(),
-            )
-            .optional_json::<terminal::TerminalSession>()?
-            .context("no active terminal handle is recorded")?;
-            session.verify_managed_session(
-                directory
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .context("invalid session path")?,
-            )?;
-            let budget = deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_secs(2));
-            if budget.is_zero() {
-                bail!("diagnostic probe deadline exhausted")
-            }
-            terminal::surface_present(directory, &session, budget)
-        })())
+    ) -> &SurfacePresence {
+        self.judge_surface_presence_with(reader, deadline, &terminal::surface_present)
+    }
+
+    pub(in crate::native) fn judge_surface_presence_with(
+        &self,
+        reader: &Reader,
+        deadline: Instant,
+        probe: SurfaceProbe<'_>,
+    ) -> &SurfacePresence {
+        self.surface_presence.get_or_init(|| {
+            let directory = reader.directory();
+            SurfacePresence::of((|| -> Result<bool> {
+                let session = RecordReader::at(
+                    Reader::open_unchecked(directory)
+                        .record(CoreRecord::Terminal)
+                        .path(),
+                )
+                .optional_json::<terminal::TerminalSession>()?
+                .context("no active terminal handle is recorded")?;
+                session.verify_managed_session(
+                    directory
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .context("invalid session path")?,
+                )?;
+                let budget = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(2));
+                if budget.is_zero() {
+                    bail!("diagnostic probe deadline exhausted")
+                }
+                probe(directory, &session, budget)
+            })())
+        })
     }
 
     /// The owner judgment for `session`, made on the first request. One Observation
@@ -117,8 +137,9 @@ pub(in crate::native) struct CancelObservation {
     pub(in crate::native) state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// The typed judgment the state and error present.
     #[serde(skip)]
-    pub(in crate::native) active: bool,
+    pub(in crate::native) judgment: Cancel,
 }
 
 impl CancelObservation {
@@ -139,19 +160,43 @@ impl CancelObservation {
             }
             records.observe_result_with(&selector, read_event)
         })();
-        let (state, error) = match outcome {
-            Ok(result) if result.state == RequestState::Cancelled => ("applied", None),
-            Ok(result) if result.event.is_some() => ("not_applied", None),
-            Ok(_) => ("requested", None),
-            Err(error) => ("unreadable", Some(format!("{error:#}"))),
+        let (state, error, judgment) = match outcome {
+            Ok(result) if result.state == RequestState::Cancelled => (
+                "applied",
+                None,
+                Cancel::Recorded(Some(CancelState::Applied)),
+            ),
+            Ok(result) if result.event.is_some() => (
+                "not_applied",
+                None,
+                Cancel::Recorded(Some(CancelState::NotApplied)),
+            ),
+            Ok(_) => (
+                "requested",
+                None,
+                Cancel::Recorded(Some(
+                    if records.claim.as_deref() == Some(record.claim_token.as_str()) {
+                        CancelState::RequestedActive
+                    } else {
+                        CancelState::RequestedStale
+                    },
+                )),
+            ),
+            Err(error) => {
+                let reason = format!("{error:#}");
+                (
+                    "unreadable",
+                    Some(reason.clone()),
+                    Cancel::Unreadable(reason),
+                )
+            }
         };
         Self {
             request_id: Some(record.request_id.clone()),
             requested_unix_ms: Some(record.created_unix_ms),
             state,
             error,
-            active: state == "requested"
-                && records.claim.as_deref() == Some(record.claim_token.as_str()),
+            judgment,
         }
     }
 
@@ -161,13 +206,16 @@ impl CancelObservation {
             Ok(Some(record)) => Some(Self::from_record(&record, records, |name| {
                 records.event(reader, name)
             })),
-            Err(error) => Some(Self {
-                request_id: None,
-                requested_unix_ms: None,
-                state: "unreadable",
-                error: Some(format!("{error:#}")),
-                active: false,
-            }),
+            Err(error) => {
+                let reason = format!("{error:#}");
+                Some(Self {
+                    request_id: None,
+                    requested_unix_ms: None,
+                    state: "unreadable",
+                    error: Some(reason.clone()),
+                    judgment: Cancel::Unreadable(reason),
+                })
+            }
         }
     }
 }
@@ -182,14 +230,10 @@ pub(in crate::native) struct Observation {
     pub(in crate::native) evidence: SessionEvidence,
     pub(in crate::native) resumed_from: Result<Option<ResumedFrom>>,
     pub(in crate::native) workspace_consent: Value,
+    /// Decided once from the Records above; renderers map them (judgment.rs).
     pub(in crate::native) judgments: Judgments,
     /// The Origin as this Snapshot's launch record and initial receipt name it.
     pub(in crate::native) origin: origin::OriginReference,
-}
-
-pub(in crate::native) struct Judgments {
-    pub(in crate::native) active_state: Option<Result<RequestState>>,
-    pub(in crate::native) launch_failure: Option<(&'static str, String)>,
 }
 
 /// A Result reference rendered by the same builder as `result`, without its body.
@@ -208,6 +252,15 @@ impl ResultReference {
     pub(in crate::native) fn value(self) -> Value {
         self.0
     }
+}
+
+/// The session id a Reader's directory names; the surface binding is judged against it.
+fn session_id_of(reader: &Reader) -> &str {
+    reader
+        .directory()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
 }
 
 impl Observation {
@@ -232,6 +285,7 @@ impl Observation {
         records: Snapshot,
         active_state: Option<Result<RequestState>>,
     ) -> Self {
+        // The diagnostic reads the clock and is made under the retained lock (D20).
         let launch_failure = launch::diagnostic(
             records.launch.as_ref(),
             &records.status,
@@ -240,17 +294,25 @@ impl Observation {
         let held = session::hold::observe(reader, records._lock.is_some());
         let cancel = CancelObservation::read(reader, &records);
         let origin = origin::reference(&records);
+        let evidence = SessionEvidence::read(reader, held);
+        let resumed_from = read_resumed_from(reader.directory());
+        let judgments = Judgments::of(
+            &records,
+            &evidence,
+            cancel.as_ref(),
+            &resumed_from,
+            launch_failure,
+            active_state,
+            session_id_of(reader),
+        );
         Self {
             origin,
             cancel,
             records,
-            evidence: SessionEvidence::read(reader, held),
-            resumed_from: read_resumed_from(reader.directory()),
+            evidence,
+            resumed_from,
             workspace_consent: consent::observe(reader.directory()),
-            judgments: Judgments {
-                active_state,
-                launch_failure,
-            },
+            judgments,
         }
     }
 
@@ -339,54 +401,6 @@ impl Observation {
 
     pub(in crate::native) fn active_request(&self) -> Option<&requests::Receipt> {
         self.records.active_receipt()
-    }
-
-    pub(super) fn inspect_value(self, reader: &Reader, id: &str) -> Result<Value> {
-        let origin = self.observe_origin(reader, None);
-        let owner = self.evidence.judge_owner(id).observation();
-        let snapshot = &self.records;
-        let resumed_from = self.resumed_from?;
-        let latest = ResultReference::latest(snapshot, reader)?.value();
-        let request_refs = snapshot
-        .receipts
-        .iter()
-        .map(|receipt| {
-            let (elapsed, elapsed_reason) = match snapshot.event(reader, &receipt.event_file) {
-                Ok(event) => observed_elapsed(Some(receipt), event.as_ref()),
-                Err(_) => (None, Some("unreadable_result")),
-            };
-            json!({
-                "request_id": receipt.request_id, "created_unix_ms": receipt.created_unix_ms, "source": receipt.source,
-                "event_id": receipt.event_file, "context_sources": receipt.context_sources,
-                "active": snapshot.is_active(receipt),
-                "bridge_observed_elapsed_ms": elapsed,
-                "bridge_observed_elapsed_reason": elapsed_reason,
-            })
-        })
-        .collect::<Vec<_>>();
-        let residual_surface = snapshot.status.residual_surface();
-        let mut value = envelope::ok(json!({
-            "session": id, "provider": snapshot.manifest.provider,
-            "workspace": snapshot.manifest.workspace, "title": snapshot.manifest.title,
-            "stored_state": snapshot.status.state, "generation": snapshot.status.generation,
-            "created_unix_ms": snapshot.manifest.created_unix_ms, "updated_unix_ms": snapshot.status.updated_unix_ms,
-            "error": snapshot.status.error, "exit_code": snapshot.status.exit_code,
-            "configured": {"model": snapshot.manifest.model, "effort": snapshot.manifest.effort,
-                "yolo": snapshot.manifest.yolo, "provider_version_at_launch": snapshot.manifest.provider_version},
-            "resumed_from": resumed_from,
-            "workspace_consent": self.workspace_consent,
-            "cancel": self.cancel,
-            "owner_process_alive": owner.process_alive, "owner_identity_verified": owner.identity_matches == Some(true), "owner": owner,
-            "recovery_required": snapshot.pending.is_some(), "turn_claimed": snapshot.claim.is_some(),
-            "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error,
-            "recorded_events": snapshot.paths.len(), "latest_result": latest, "requests": request_refs,
-        }).as_object().unwrap().clone());
-        session::hold::add_fields(&mut value, &self.evidence.held);
-        if let Some(residual) = residual_surface {
-            value["residual_surface"] = serde_json::to_value(residual)?;
-        }
-        origin.add_fields(&mut value);
-        Ok(value)
     }
 }
 
