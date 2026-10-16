@@ -68,12 +68,12 @@ where
 
 pub(super) fn workspace_trust_missing(
     workspace: &Path,
-    homes: &super::super::super::consent::Homes,
+    env: &super::super::super::consent::Environment,
     log_path: &Path,
 ) -> Result<Option<&'static str>> {
     use super::super::super::consent::Trust;
     if !matches!(
-        ADAPTER.workspace_trust(workspace, homes)?,
+        ADAPTER.workspace_trust(workspace, env, None)?,
         Trust::Trusted(_)
     ) {
         return Ok(Some(TRUST_STORE_MISSING));
@@ -84,15 +84,21 @@ pub(super) fn workspace_trust_missing(
     Ok((!loaded).then_some(TRUST_SESSION_UNVERIFIED))
 }
 
-pub(super) fn wait_for_workspace_trust(directory: &Path, deadline: Instant) -> Result<()> {
+// The gate takes the caller's environment once per delivery; the user home is required
+// after the manifest, as before.
+pub(super) fn wait_for_workspace_trust(
+    directory: &Path,
+    deadline: Instant,
+    env: &super::super::super::consent::Environment,
+) -> Result<()> {
     let workspace = Reader::open_unchecked(directory).manifest()?.workspace;
-    let homes = super::super::super::consent::Homes::current()?;
+    super::super::super::consent::user_home(env)?;
     let log_path = Reader::open_unchecked(directory)
         .private(AGY_LOG_FILE)
         .path()
         .to_owned();
     wait_for_workspace_trust_with(
-        &mut || workspace_trust_missing(&workspace, &homes, &log_path),
+        &mut || workspace_trust_missing(&workspace, env, &log_path),
         &mut || {
             Reader::open_unchecked(directory)
                 .status()

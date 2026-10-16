@@ -26,10 +26,13 @@ pub(super) fn send_initial_prompt(
         // A screen read costs a helper process and the wait polls ten times a second,
         // so the screen is read once per `COMPOSER_POLL`.
         let mut last_read: Option<Instant> = None;
+        // The caller's environment is read once per paste gate.
+        let env = crate::native::consent::Environment::current();
         crate::native::consent::wait_for_native_trust(
             &directory,
             FirstPartyCli::Codex,
             deadline,
+            &env,
             &mut || {
                 if last_read.is_some_and(|read| read.elapsed() < COMPOSER_POLL) {
                     return false;

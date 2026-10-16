@@ -103,7 +103,11 @@ pub(super) fn deliver_terminal_turn(
         &directory,
         || {
             if readiness.is_some() {
-                wait_for_workspace_trust(&directory, deadline)?;
+                wait_for_workspace_trust(
+                    &directory,
+                    deadline,
+                    &crate::native::consent::Environment::current(),
+                )?;
             }
             Ok(())
         },

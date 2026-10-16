@@ -159,6 +159,28 @@ impl Transport for PiPaste {
 
 const APPLIED_MARKER: &str = "pi-approve-once";
 
+// Pi's home: `trust.json` under `PI_CODING_AGENT_DIR`, or under `.pi/agent` in the user
+// home. An empty override keeps the relative spelling, and the user home is required
+// even when the override is set.
+#[derive(Debug)]
+struct Home {
+    trust_store: std::path::PathBuf,
+}
+
+impl Home {
+    fn resolve(env: &super::super::consent::Environment) -> Result<Self> {
+        let home = super::super::consent::user_home(env)?;
+        Ok(Self {
+            trust_store: env
+                .pi_coding_agent_dir
+                .as_deref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from(home).join(".pi/agent"))
+                .join("trust.json"),
+        })
+    }
+}
+
 impl NativeProviderAdapter for PiAdapter {
     fn result_timeout_diagnostic(&self) -> Option<super::super::doctor::ResultTimeoutDiagnostic> {
         Some(super::super::doctor::ResultTimeoutDiagnostic {
@@ -211,10 +233,15 @@ impl NativeProviderAdapter for PiAdapter {
     fn workspace_trust(
         &self,
         workspace: &Path,
-        homes: &super::super::consent::Homes,
+        env: &super::super::consent::Environment,
+        store: Option<&Path>,
     ) -> Result<super::super::consent::Trust> {
         use super::super::consent::{self, Evidence, Trust};
-        let Some(text) = consent::read_store(&homes.pi)? else {
+        let store = match store {
+            Some(store) => store.to_path_buf(),
+            None => Home::resolve(env)?.trust_store,
+        };
+        let Some(text) = consent::read_store(&store)? else {
             return Ok(Trust::Absent);
         };
         let config: serde_json::Value = serde_json::from_str(&text)?;
@@ -225,7 +252,7 @@ impl NativeProviderAdapter for PiAdapter {
         match entries.get(&key) {
             Some(serde_json::Value::Bool(true)) => Ok(Trust::Trusted(Evidence {
                 provider: "pi".into(),
-                store: homes.pi.clone(),
+                store,
                 key,
             })),
             Some(serde_json::Value::Bool(false)) => Ok(Trust::Declined),

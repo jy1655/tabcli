@@ -1,4 +1,4 @@
-use super::super::diagnostics::workspace_trust_check_with;
+use super::super::diagnostics::workspace_trust_check;
 use super::super::readiness::STARTUP_COMPLETED_MARKER;
 use super::super::test_support::{
     FakeClock, HOOKS_LOADED, REAL_FAILURE_STARTUP, REAL_MACOS_INITIAL_TURN, REAL_QUIET_STARTUP,
@@ -143,14 +143,16 @@ fn a_paste_is_withheld_until_the_store_and_this_sessions_log_show_trust() {
     let directory = root.join("session-trust1");
     fs::create_dir(&directory).unwrap();
     let log_path = directory.join(AGY_LOG_FILE);
-    let homes = consent::fixture_homes(&root);
+    let env = consent::Environment::at_home(&root);
+    fs::create_dir_all(root.join(".gemini/antigravity-cli")).unwrap();
+    let store = root.join(".gemini/antigravity-cli/settings.json");
     let trust_store = |entries: &[&Path]| {
         let keys: Vec<String> = entries
             .iter()
             .map(|path| consent::native_key(path).unwrap())
             .collect();
         super::super::super::super::write_json_atomic(
-            &homes.agy,
+            &store,
             &serde_json::json!({ "trustedWorkspaces": keys }),
         )
         .unwrap();
@@ -160,7 +162,7 @@ fn a_paste_is_withheld_until_the_store_and_this_sessions_log_show_trust() {
     let refused = |expected: &str, availability: Availability, reason_code: &str| {
         let mut clock = FakeClock::new(start);
         let error = wait_for_workspace_trust_with(
-            &mut || workspace_trust_missing(&workspace, &homes, &log_path),
+            &mut || workspace_trust_missing(&workspace, &env, &log_path),
             &mut || None,
             start + wait,
             STARTUP_POLL_INTERVAL,
@@ -175,7 +177,7 @@ fn a_paste_is_withheld_until_the_store_and_this_sessions_log_show_trust() {
                 "Agy workspace trust was not verified before the deadline, so the prompt was not pasted: {expected}. {TRUST_RECOVERY}"
             )
         );
-        let check = workspace_trust_check_with(&workspace, &homes, &directory);
+        let check = workspace_trust_check(&workspace, &env, &directory);
         assert_eq!(check.availability, availability);
         assert_eq!(check.reason_code, reason_code);
         let next_action = serde_json::to_value(&check).unwrap()["next_action"].to_string();
@@ -198,7 +200,7 @@ fn a_paste_is_withheld_until_the_store_and_this_sessions_log_show_trust() {
     let passes = |what: &str| {
         let mut clock = FakeClock::new(start);
         wait_for_workspace_trust_with(
-            &mut || workspace_trust_missing(&workspace, &homes, &log_path),
+            &mut || workspace_trust_missing(&workspace, &env, &log_path),
             &mut || None,
             start + wait,
             STARTUP_POLL_INTERVAL,
@@ -206,7 +208,7 @@ fn a_paste_is_withheld_until_the_store_and_this_sessions_log_show_trust() {
         )
         .unwrap();
         assert_eq!(clock.slept, Duration::ZERO, "{what}");
-        let check = workspace_trust_check_with(&workspace, &homes, &directory);
+        let check = workspace_trust_check(&workspace, &env, &directory);
         assert_eq!(check.availability, Availability::Available, "{what}");
         assert_eq!(check.reason_code, "agy_workspace_trusted", "{what}");
     };
@@ -262,10 +264,10 @@ fn a_paste_is_withheld_until_the_store_and_this_sessions_log_show_trust() {
     assert_eq!(clock.slept, STARTUP_POLL_INTERVAL * 3);
 
     // An unreadable store is not an approval, and the report says why.
-    fs::write(&homes.agy, b"{\"trustedWorkspaces\":true}").unwrap();
+    fs::write(&store, b"{\"trustedWorkspaces\":true}").unwrap();
     let mut clock = FakeClock::new(start);
     let error = wait_for_workspace_trust_with(
-        &mut || workspace_trust_missing(&workspace, &homes, &log_path),
+        &mut || workspace_trust_missing(&workspace, &env, &log_path),
         &mut || None,
         start + wait,
         STARTUP_POLL_INTERVAL,
@@ -276,7 +278,7 @@ fn a_paste_is_withheld_until_the_store_and_this_sessions_log_show_trust() {
     assert!(error.contains("so the prompt was not pasted"), "{error}");
     assert!(error.contains("could not be read"), "{error}");
     assert_eq!(
-        workspace_trust_check_with(&workspace, &homes, &directory).availability,
+        workspace_trust_check(&workspace, &env, &directory).availability,
         Availability::Unknown
     );
 }

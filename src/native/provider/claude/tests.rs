@@ -54,7 +54,8 @@ fn workspace_trust_and_dialog_require_the_exact_workspace() {
     use super::super::super::consent::{self, Trust};
     let tmp = tempfile::tempdir().unwrap();
     let workspace = tmp.path().canonicalize().unwrap();
-    let homes = consent::fixture_homes(tmp.path());
+    let env = consent::Environment::at_home(tmp.path());
+    let store = tmp.path().join(".claude.json");
     let native = consent::native_key(&workspace).unwrap();
     let key = if cfg!(windows) {
         native.replace('\\', "/")
@@ -62,17 +63,29 @@ fn workspace_trust_and_dialog_require_the_exact_workspace() {
         native
     };
     super::super::super::write_json_atomic(
-        &homes.claude,
+        &store,
         &serde_json::json!({"projects":{key.clone():{"hasTrustDialogAccepted":true}}}),
     )
     .unwrap();
-    assert!(matches!(
-        ADAPTER.workspace_trust(&workspace, &homes).unwrap(),
-        Trust::Trusted(_)
-    ));
+    // The evidence names the store the adapter read, spelled as its home resolves it.
+    let Trust::Trusted(evidence) = ADAPTER.workspace_trust(&workspace, &env, None).unwrap() else {
+        panic!("trusted");
+    };
+    assert_eq!(evidence.provider, "claude");
+    assert_eq!(evidence.key, key);
+    assert_eq!(evidence.store, store);
+    let serialized = serde_json::to_value(&evidence).unwrap()["store"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    if cfg!(windows) {
+        assert!(serialized.ends_with(r"\.claude.json"), "{serialized}");
+    } else {
+        assert!(serialized.ends_with("/.claude.json"), "{serialized}");
+    }
     assert_eq!(
         ADAPTER
-            .workspace_trust(&workspace.join("child"), &homes)
+            .workspace_trust(&workspace.join("child"), &env, None)
             .unwrap(),
         Trust::Absent
     );
@@ -111,9 +124,9 @@ fn workspace_trust_and_dialog_require_the_exact_workspace() {
     };
     let child_screen = screen.replace(&key, &child_key);
     assert_eq!(claude_trust_prompt_key(&child_screen, &child), None);
-    assert!(ADAPTER.workspace_trust(&child, &homes).is_err());
+    assert!(ADAPTER.workspace_trust(&child, &env, None).is_err());
     assert!(matches!(
-        ADAPTER.workspace_trust(&workspace, &homes).unwrap(),
+        ADAPTER.workspace_trust(&workspace, &env, None).unwrap(),
         Trust::Trusted(_)
     ));
     // A nested repository owns a distinct, exact approval scope.
@@ -129,8 +142,100 @@ fn workspace_trust_and_dialog_require_the_exact_workspace() {
         claude_trust_prompt_key(&child_screen, &child),
         Some(terminal::DialogKey::DownEnter)
     );
-    std::fs::write(&homes.claude, b"{\"projects\":[]}").unwrap();
-    assert!(ADAPTER.workspace_trust(&workspace, &homes).is_err());
+    std::fs::write(&store, b"{\"projects\":[]}").unwrap();
+    assert!(ADAPTER.workspace_trust(&workspace, &env, None).is_err());
+}
+
+// B1: an empty `CLAUDE_CONFIG_DIR` is unset for the trust store as it always was
+// for the session registry; before, the trust store read it as the relative `.claude.json`.
+#[test]
+fn the_claude_home_has_two_defaults_and_one_override_for_both_paths() {
+    use crate::native::consent::Environment;
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap();
+    let environment = |config_dir: Option<&str>| Environment {
+        home: Some(home_str.into()),
+        claude_config_dir: config_dir.map(Into::into),
+        ..Default::default()
+    };
+    // Unset: two different parents.
+    assert_eq!(
+        trust_store(&environment(None)).unwrap(),
+        home.path().join(".claude.json")
+    );
+    assert_eq!(
+        claude_sessions_registry_dir(&environment(None)).unwrap(),
+        home.path().join(".claude").join("sessions")
+    );
+    // A non-empty override holds both and is kept as spelled, relative or not.
+    let custom = home.path().join("custom-claude");
+    assert_eq!(
+        trust_store(&environment(custom.to_str())).unwrap(),
+        custom.join(".claude.json")
+    );
+    assert_eq!(
+        claude_sessions_registry_dir(&environment(custom.to_str())).unwrap(),
+        custom.join("sessions")
+    );
+    assert_eq!(
+        trust_store(&environment(Some("relative"))).unwrap(),
+        Path::new("relative").join(".claude.json")
+    );
+    assert_eq!(
+        claude_sessions_registry_dir(&environment(Some("relative"))).unwrap(),
+        Path::new("relative").join("sessions")
+    );
+    // An empty override is unset for both.
+    assert_eq!(
+        trust_store(&environment(Some(""))).unwrap(),
+        home.path().join(".claude.json")
+    );
+    assert_eq!(
+        claude_sessions_registry_dir(&environment(Some(""))).unwrap(),
+        home.path().join(".claude").join("sessions")
+    );
+    // The two requirements differ: the registry succeeds on the override alone, the
+    // trust store needs the user home even then.
+    let override_only = Environment {
+        claude_config_dir: Some(custom.as_os_str().to_owned()),
+        ..Default::default()
+    };
+    assert_eq!(
+        claude_sessions_registry_dir(&override_only).unwrap(),
+        custom.join("sessions")
+    );
+    assert_eq!(
+        trust_store(&override_only).unwrap_err().to_string(),
+        "no user home for workspace trust lookup"
+    );
+    assert_eq!(
+        claude_sessions_registry_dir(&Environment::default())
+            .unwrap_err()
+            .to_string(),
+        "neither HOME nor USERPROFILE is set"
+    );
+    // `HOME`, even empty, before `USERPROFILE`.
+    let empty_home = Environment {
+        home: Some("".into()),
+        userprofile: Some(home_str.into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        trust_store(&empty_home).unwrap(),
+        PathBuf::from("").join(".claude.json")
+    );
+    assert_eq!(
+        claude_sessions_registry_dir(&empty_home).unwrap(),
+        PathBuf::from("").join(".claude").join("sessions")
+    );
+    let profile_only = Environment {
+        userprofile: Some(home_str.into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        trust_store(&profile_only).unwrap(),
+        home.path().join(".claude.json")
+    );
 }
 
 use super::*;
@@ -168,6 +273,7 @@ fn diagnostics_never_promote_configured_inbound_to_runtime_messaging() {
             workspace: directory.path(),
             probe: true,
             deadline: Instant::now(),
+            environment: &crate::native::consent::Environment::default(),
         });
         assert_eq!(
             checks
@@ -202,6 +308,7 @@ fn doctor_reports_other_live_holders_of_a_resumed_conversation() {
             workspace: directory,
             probe: false,
             deadline: Instant::now(),
+            environment: &crate::native::consent::Environment::default(),
         })
     };
     let holders_check = |directory: &Path| {

@@ -51,20 +51,41 @@ fn workspace_trust_and_dialog_are_exact_and_do_not_accept_permission_prompts() {
     use super::super::super::consent::{self, Trust};
     let tmp = tempfile::tempdir().unwrap();
     let workspace = tmp.path().canonicalize().unwrap();
-    let homes = consent::fixture_homes(tmp.path());
+    let env = consent::Environment::at_home(tmp.path());
+    std::fs::create_dir_all(tmp.path().join(".gemini/antigravity-cli")).unwrap();
+    let store = tmp.path().join(".gemini/antigravity-cli/settings.json");
     let key = consent::native_key(&workspace).unwrap();
     super::super::super::write_json_atomic(
-        &homes.agy,
+        &store,
         &serde_json::json!({"trustedWorkspaces":[key.clone()]}),
     )
     .unwrap();
-    assert!(matches!(
-        ADAPTER.workspace_trust(&workspace, &homes).unwrap(),
-        Trust::Trusted(_)
-    ));
+    // The evidence names the store the adapter read, spelled as its home resolves it:
+    // one join, whose slashes stay on every platform.
+    let Trust::Trusted(evidence) = ADAPTER.workspace_trust(&workspace, &env, None).unwrap() else {
+        panic!("trusted");
+    };
+    assert_eq!(evidence.provider, "agy");
+    assert_eq!(evidence.key, key);
+    assert_eq!(evidence.store, store);
+    let serialized = serde_json::to_value(&evidence).unwrap()["store"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    if cfg!(windows) {
+        assert!(
+            serialized.ends_with(r"\.gemini/antigravity-cli/settings.json"),
+            "{serialized}"
+        );
+    } else {
+        assert!(
+            serialized.ends_with("/.gemini/antigravity-cli/settings.json"),
+            "{serialized}"
+        );
+    }
     assert_eq!(
         ADAPTER
-            .workspace_trust(&workspace.join("child"), &homes)
+            .workspace_trust(&workspace.join("child"), &env, None)
             .unwrap(),
         Trust::Absent
     );
@@ -109,8 +130,45 @@ fn workspace_trust_and_dialog_are_exact_and_do_not_accept_permission_prompts() {
         ),
         None
     );
-    std::fs::write(&homes.agy, b"{\"trustedWorkspaces\":true}").unwrap();
-    assert!(ADAPTER.workspace_trust(&workspace, &homes).is_err());
+    std::fs::write(&store, b"{\"trustedWorkspaces\":true}").unwrap();
+    assert!(ADAPTER.workspace_trust(&workspace, &env, None).is_err());
+}
+
+#[test]
+fn the_agy_home_is_the_settings_file_under_the_user_home() {
+    use crate::native::consent::Environment;
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_str().unwrap();
+    assert_eq!(
+        Home::resolve(&Environment::at_home(home.path()))
+            .unwrap()
+            .settings,
+        home.path().join(".gemini/antigravity-cli/settings.json")
+    );
+    let profile_only = Environment {
+        userprofile: Some(home_str.into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        Home::resolve(&profile_only).unwrap().settings,
+        home.path().join(".gemini/antigravity-cli/settings.json")
+    );
+    // `HOME`, even empty, before `USERPROFILE`; no home at all is the trust lookup's error.
+    let empty_home = Environment {
+        home: Some("".into()),
+        userprofile: Some(home_str.into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        Home::resolve(&empty_home).unwrap().settings,
+        PathBuf::from("").join(".gemini/antigravity-cli/settings.json")
+    );
+    assert_eq!(
+        Home::resolve(&Environment::default())
+            .unwrap_err()
+            .to_string(),
+        "no user home for workspace trust lookup"
+    );
 }
 
 #[test]

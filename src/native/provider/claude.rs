@@ -318,6 +318,26 @@ impl Transport for ClaudeMessage {
     fn discard_prepared(&self, _: &TurnContext<'_>, _: Option<&Prepared>) {}
 }
 
+// Claude's home has two defaults. Without `CLAUDE_CONFIG_DIR` the trust store is
+// `<home>/.claude.json` and the session registry `<home>/.claude/sessions`; a non-empty
+// override holds both, `<override>/.claude.json` and `<override>/sessions`, and is kept
+// as spelled, relative or not. An empty override is unset for both (the registry always
+// read it so; the trust store read it as the relative `.claude.json` through 0.4.12).
+fn config_dir_override(env: &super::super::consent::Environment) -> Option<PathBuf> {
+    env.claude_config_dir
+        .as_deref()
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+}
+
+// The trust store requires the user home even when the override names the store.
+fn trust_store(env: &super::super::consent::Environment) -> Result<PathBuf> {
+    let home = super::super::consent::user_home(env)?;
+    Ok(config_dir_override(env)
+        .unwrap_or_else(|| PathBuf::from(home))
+        .join(".claude.json"))
+}
+
 impl NativeProviderAdapter for ClaudeAdapter {
     fn result_timeout_diagnostic(&self) -> Option<super::super::doctor::ResultTimeoutDiagnostic> {
         None
@@ -350,11 +370,16 @@ impl NativeProviderAdapter for ClaudeAdapter {
     fn workspace_trust(
         &self,
         workspace: &Path,
-        homes: &super::super::consent::Homes,
+        env: &super::super::consent::Environment,
+        store: Option<&Path>,
     ) -> Result<super::super::consent::Trust> {
         use super::super::consent::{self, Evidence, Trust};
         require_exact_claude_trust_scope(workspace)?;
-        let Some(text) = consent::read_store(&homes.claude)? else {
+        let store = match store {
+            Some(store) => store.to_path_buf(),
+            None => trust_store(env)?,
+        };
+        let Some(text) = consent::read_store(&store)? else {
             return Ok(Trust::Absent);
         };
         let config: serde_json::Value = serde_json::from_str(&text)?;
@@ -383,7 +408,7 @@ impl NativeProviderAdapter for ClaudeAdapter {
         match entry.and_then(|v| v.get("hasTrustDialogAccepted")) {
             Some(serde_json::Value::Bool(true)) => Ok(Trust::Trusted(Evidence {
                 provider: "claude".into(),
-                store: homes.claude.clone(),
+                store,
                 key,
             })),
             Some(serde_json::Value::Bool(false)) | None => Ok(Trust::Absent),
@@ -496,7 +521,8 @@ static CLAUDE_REOPEN: ClaudeReopen = ClaudeReopen;
 impl ReopenSupport for ClaudeReopen {
     fn verify_available(&self, provider_session_id: &str) -> Result<()> {
         verify_reopen_available_for_platform(provider_session_id, cfg!(windows))?;
-        let registry = claude_sessions_registry_dir()?;
+        let registry =
+            claude_sessions_registry_dir(&super::super::consent::Environment::current())?;
         if let Some(pid) =
             live_conversation_writer(&registry, provider_session_id, live_process_creation_time)?
         {
@@ -518,7 +544,8 @@ impl ReopenSupport for ClaudeReopen {
         deadline: Instant,
     ) -> Result<Vec<u32>> {
         verify_reopen_available_for_platform(context.provider_session_id, cfg!(windows))?;
-        let registry = claude_sessions_registry_dir()?;
+        let registry =
+            claude_sessions_registry_dir(&super::super::consent::Environment::current())?;
         let managed_name = managed_session_name(context.directory)?;
         wait_for_resumed_conversation_holders(
             &registry,
@@ -531,7 +558,8 @@ impl ReopenSupport for ClaudeReopen {
 
     fn other_holders_now(&self, context: ResumedSessionContext<'_>) -> Result<Vec<u32>> {
         verify_reopen_available_for_platform(context.provider_session_id, cfg!(windows))?;
-        let registry = claude_sessions_registry_dir()?;
+        let registry =
+            claude_sessions_registry_dir(&super::super::consent::Environment::current())?;
         let managed_name = managed_session_name(context.directory)?;
         recheck_resumed_conversation_holders(
             &registry,
@@ -776,14 +804,15 @@ fn resumed_conversation_holders_check(directory: &Path) -> Option<super::super::
         .as_str()?
         .to_owned();
     let managed_name = managed_session_name(directory).ok()?;
-    let scan = claude_sessions_registry_dir().and_then(|registry| {
-        recheck_resumed_conversation_holders(
-            &registry,
-            &provider_session_id,
-            &managed_name,
-            live_process_creation_time,
-        )
-    });
+    let scan = claude_sessions_registry_dir(&super::super::consent::Environment::current())
+        .and_then(|registry| {
+            recheck_resumed_conversation_holders(
+                &registry,
+                &provider_session_id,
+                &managed_name,
+                live_process_creation_time,
+            )
+        });
     let next_action = "Detection is best-effort and taken only at launch, before each delivery, and now; a foreign claude --resume can still interleave between checks. Close the other holder before the next tell, or accept the shared transcript.";
     Some(match scan {
         Ok(others) if others.is_empty() => Check::new(

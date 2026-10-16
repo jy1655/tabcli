@@ -177,6 +177,8 @@ pub(super) struct Context<'a> {
     pub(super) workspace: &'a Path,
     pub(super) probe: bool,
     pub(super) deadline: Instant,
+    // The caller's environment, from which an adapter locates its home for a row.
+    pub(super) environment: &'a consent::Environment,
 }
 
 pub(super) fn run(request: DoctorRequest) -> Result<()> {
@@ -414,6 +416,7 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
                 "Launch-time workspace consent and its provider-owned source. This is historical evidence, not a new trust grant.",
                 "Inspect workspace_consent; consent revoke disables sharing, and consent reset permits fresh provider evidence on a later ask.").evidence(consent));
         }
+        let environment = consent::Environment::current();
         checks.extend(provider::diagnose(
             provider,
             Context {
@@ -424,6 +427,7 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
                 workspace: &workspace,
                 probe: request.probe,
                 deadline,
+                environment: &environment,
             },
         ));
         scope_workspace = Some(workspace);

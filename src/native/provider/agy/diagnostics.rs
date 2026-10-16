@@ -17,27 +17,24 @@ use std::path::Path;
 
 pub(super) fn workspace_trust_check(
     workspace: &Path,
-    directory: &Path,
-) -> super::super::super::doctor::Check {
-    use super::super::super::doctor::{Availability::Unknown, Check};
-    match super::super::super::consent::Homes::current() {
-        Ok(homes) => workspace_trust_check_with(workspace, &homes, directory),
-        Err(error) => Check::new(
-            "agy_workspace_trust",
-            Unknown,
-            "agy_trust_store_unlocated",
-            format!("{error:#}"),
-            "Inspect the managed terminal; doctor never answers the dialog.",
-        ),
-    }
-}
-
-pub(super) fn workspace_trust_check_with(
-    workspace: &Path,
-    homes: &super::super::super::consent::Homes,
+    env: &super::super::super::consent::Environment,
     directory: &Path,
 ) -> super::super::super::doctor::Check {
     use super::super::super::doctor::{Availability::*, Check};
+    // A caller without a user home has no store to observe; the row says so and the
+    // doctor command goes on.
+    let home = match super::Home::resolve(env) {
+        Ok(home) => home,
+        Err(error) => {
+            return Check::new(
+                "agy_workspace_trust",
+                Unknown,
+                "agy_trust_store_unlocated",
+                format!("{error:#}"),
+                "Inspect the managed terminal; doctor never answers the dialog.",
+            );
+        }
+    };
     const OBSERVATION: &str =
         "Observation only: doctor never answers the dialog or edits Agy's settings.";
     const WITHHELD: &str = "The Windows initial paste and every macOS follow-up are withheld meanwhile, because a paste onto the dialog is lost and its Enter would approve the folder; an argument-delivered initial prompt still runs behind the dialog.";
@@ -45,7 +42,7 @@ pub(super) fn workspace_trust_check_with(
         .private(AGY_LOG_FILE)
         .path()
         .to_owned();
-    let (availability, reason, detail) = match workspace_trust_missing(workspace, homes, &log_path) {
+    let (availability, reason, detail) = match workspace_trust_missing(workspace, env, &log_path) {
         Ok(None) => (
             Available,
             "agy_workspace_trusted",
@@ -81,7 +78,9 @@ pub(super) fn workspace_trust_check_with(
         detail,
         next_action,
     )
-    .evidence(serde_json::json!({ "workspace": workspace, "store": homes.agy, "log": log_path }))
+    .evidence(
+        serde_json::json!({ "workspace": workspace, "store": home.settings, "log": log_path }),
+    )
 }
 
 pub(super) fn input_receipt_check(directory: Option<&Path>) -> super::super::super::doctor::Check {
@@ -201,9 +200,13 @@ pub(super) fn parse_tool_confirmation(line: &str) -> Option<&str> {
     .then_some(tool)
 }
 
-pub(super) fn tool_confirmation_check(directory: &Path) -> super::super::super::doctor::Check {
+pub(super) fn tool_confirmation_check(
+    directory: &Path,
+    env: &super::super::super::consent::Environment,
+) -> super::super::super::doctor::Check {
     use super::super::super::doctor::{Availability::Unknown, Check};
-    let observation = brain_root().and_then(|brain| pending_tool_confirmation(directory, &brain));
+    let observation =
+        brain_root(env).and_then(|brain| pending_tool_confirmation(directory, &brain));
     let (reason, detail, evidence) = match observation {
         Ok(Some((tool, request_id))) => (
             super::AGY_TOOL_CONFIRMATION_OBSERVED,

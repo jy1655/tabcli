@@ -21,6 +21,7 @@ fn diagnostics_keep_launch_version_and_unprobed_daemon_observations_explicit() {
             workspace: std::path::Path::new("."),
             probe: false,
             deadline: std::time::Instant::now(),
+            environment: &crate::native::consent::Environment::default(),
         });
         assert_eq!(
             checks
@@ -128,6 +129,7 @@ fn successful_model_result_does_not_mark_mcp_connected() {
         workspace: root.path(),
         probe: false,
         deadline: Instant::now(),
+        environment: &crate::native::consent::Environment::default(),
     });
     assert_eq!(
         checks

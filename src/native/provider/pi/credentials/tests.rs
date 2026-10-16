@@ -156,6 +156,7 @@ fn credential_doctor_requires_session_model_probe_and_pi_resolution() {
         workspace: Path::new("."),
         probe: true,
         deadline: Instant::now() + Duration::from_secs(5),
+        environment: &crate::native::consent::Environment::default(),
     };
     let check = credential_diagnosis(base, |_, _, _, _| panic!("provider-only must not run Pi"));
     let check = serde_json::to_value(check).unwrap();
