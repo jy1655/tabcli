@@ -5,17 +5,22 @@ mod startup;
 #[cfg(test)]
 mod test_support;
 use super::super::terminal;
-use super::{CompletionMonitor, LaunchContext, LaunchPlan, NativeProviderAdapter, ReopenSupport};
+use super::{
+    ActiveWatcher, CompletionWatcher, InitialPromptDisposition, LaunchContext, LaunchPlan,
+    NativeProviderAdapter, ReopenSupport,
+};
 use crate::native::delivery::{
     self, Outcome, Prepared, Readiness, SurfaceInput, Transport, TransportFacts, TurnContext,
 };
 use crate::native::session::turn;
 use crate::native::session::{Reader, RecordStore, Store};
-use agent_bridge::FirstPartyCli;
+use agent_bridge::{
+    FirstPartyCli, provider_effort_args, provider_launch_args, provider_model_args,
+};
 use anyhow::{Context, Result, bail};
 use credentials::credential_diagnosis;
 use hook::{pi_owned_string, pi_string, record_correlated_failure};
-pub(super) use monitor::PiFailureMonitor;
+use monitor::PiFailureMonitor;
 use serde::{Deserialize, Serialize};
 use startup::send_initial_prompt;
 use std::{
@@ -176,11 +181,7 @@ impl NativeProviderAdapter for PiAdapter {
     }
 
     fn initial_transport(&self) -> Box<dyn Transport> {
-        if cfg!(windows) {
-            Box::new(PiInitialPaste)
-        } else {
-            Box::new(delivery::LAUNCH_ARGUMENT)
-        }
+        initial_transport_for_platform(cfg!(windows))
     }
     fn follow_up_transport(&self) -> Box<dyn Transport> {
         Box::new(PiPaste)
@@ -270,34 +271,7 @@ impl NativeProviderAdapter for PiAdapter {
     }
 
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
-        let claim_token = turn::current_claim_token(&Reader::open_unchecked(context.directory))?
-            .context("Pi launch has no native turn claim")?;
-        let pending = install_pending_turn(context.directory, &claim_token)?;
-        let extension_path = context.directory.join("pi-agent-bridge.js");
-        RecordStore::at(&extension_path).write_private(bridge_extension().as_bytes())?;
-        let mut arguments = vec![
-            OsString::from("--extension"),
-            extension_path.into_os_string(),
-            OsString::from("--name"),
-            OsString::from(context.title),
-        ];
-        if super::super::consent::authorized(context.directory, FirstPartyCli::Pi)? {
-            // Pi documents --approve as a one-run project-trust override. It is
-            // not a tool permission flag and does not persist to trust.json.
-            arguments.push(OsString::from("--approve"));
-            super::super::consent::applied(context.directory, APPLIED_MARKER)?;
-        }
-        if !cfg!(windows) {
-            arguments.push(OsString::from(correlated_prompt(context.prompt, &pending)));
-        }
-        Ok(LaunchPlan {
-            arguments,
-            prompt_is_positional: false,
-            // Replace the local lifecycle extension when Pi exposes a
-            // first-party external completion callback with turn identity.
-            completion_monitor: CompletionMonitor::PiHookFailure,
-            environment_removals: &[],
-        })
+        prepare_launch_for_platform(context, cfg!(windows), super::super::consent::authorized)
     }
 
     fn reopen(&self) -> Result<&'static dyn ReopenSupport> {
@@ -371,6 +345,91 @@ fn validate_claim_token(claim_token: &str) -> Result<()> {
         bail!("invalid Pi turn claim token")
     }
     Ok(())
+}
+
+fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {
+    if windows {
+        Box::new(PiInitialPaste)
+    } else {
+        Box::new(delivery::LAUNCH_ARGUMENT)
+    }
+}
+
+// The complete launch command: the requested policy in Pi's flags (`--approve` only when
+// the bypass is requested, then thinking, then model), the result extension, the managed
+// name, one more `--approve` when consent authorizes the exact workspace, and off Windows
+// the correlated prompt as the positional argument. `authorized` is the consent gate;
+// production passes `consent::authorized`, and the applied marker is recorded right after
+// a positive answer, before the plan exists.
+fn prepare_launch_for_platform(
+    context: LaunchContext<'_>,
+    windows: bool,
+    authorized: fn(&Path, FirstPartyCli) -> Result<bool>,
+) -> Result<LaunchPlan> {
+    let claim_token = turn::current_claim_token(&Reader::open_unchecked(context.directory))?
+        .context("Pi launch has no native turn claim")?;
+    let pending = install_pending_turn(context.directory, &claim_token)?;
+    let extension_path = context.directory.join("pi-agent-bridge.js");
+    RecordStore::at(&extension_path).write_private(bridge_extension().as_bytes())?;
+    let mut arguments = provider_launch_args(FirstPartyCli::Pi, context.yolo)
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    if let Some(effort) = context.effort {
+        arguments.extend(
+            provider_effort_args(FirstPartyCli::Pi, effort)?
+                .into_iter()
+                .map(OsString::from),
+        );
+    }
+    if let Some(model) = context.model {
+        arguments.extend(
+            provider_model_args(FirstPartyCli::Pi, model)
+                .into_iter()
+                .map(OsString::from),
+        );
+    }
+    arguments.extend([
+        OsString::from("--extension"),
+        extension_path.into_os_string(),
+        OsString::from("--name"),
+        OsString::from(context.title),
+    ]);
+    if authorized(context.directory, FirstPartyCli::Pi)? {
+        // Pi documents --approve as a one-run project-trust override. It is
+        // not a tool permission flag and does not persist to trust.json.
+        arguments.push(OsString::from("--approve"));
+        super::super::consent::applied(context.directory, APPLIED_MARKER)?;
+    }
+    if !windows {
+        arguments.push(OsString::from(correlated_prompt(context.prompt, &pending)));
+    }
+    Ok(LaunchPlan {
+        arguments,
+        initial_prompt: InitialPromptDisposition::of(
+            initial_transport_for_platform(windows).as_ref(),
+        ),
+        watcher: Box::new(PiHookFailureWatcher),
+        environment_removals: &[],
+    })
+}
+
+// The unstarted hook-failure watcher a launch plan carries; no thread runs until `start`.
+// Replace the local lifecycle extension when Pi exposes a first-party external completion
+// callback with turn identity.
+#[derive(Debug)]
+struct PiHookFailureWatcher;
+
+impl CompletionWatcher for PiHookFailureWatcher {
+    fn start(self: Box<Self>, directory: &Path) -> Result<Box<dyn ActiveWatcher>> {
+        Ok(Box::new(PiFailureMonitor::start(directory)?))
+    }
+}
+
+impl ActiveWatcher for PiFailureMonitor {
+    fn stop(self: Box<Self>) -> Result<()> {
+        PiFailureMonitor::stop(*self)
+    }
 }
 
 fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingPiTurn> {

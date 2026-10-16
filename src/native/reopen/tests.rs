@@ -495,6 +495,9 @@ fn non_claude_sources_are_refused_with_each_adapters_own_reason() {
                     bridge_executable: Path::new("/opt/agent-bridge"),
                     directory: root.path(),
                     provider_session_id: REOPEN_TEST_CONVERSATION,
+                    yolo: false,
+                    model: None,
+                    effort: None,
                 })
             })
             .unwrap_err();
@@ -861,7 +864,7 @@ fn resumed_session_launch_passes_the_official_resume_plan_and_no_policy_the_requ
     let root = tempfile::tempdir().unwrap();
     let registry = root.path().join("sessions");
     fs::create_dir(&registry).unwrap();
-    provider::override_claude_session_registry_for_test(Some(registry));
+    provider::claude::override_session_registry_for_test(Some(registry));
     let provider = root.path().join("claude.cmd");
     write_private(
         &provider,
@@ -1463,7 +1466,7 @@ fn resumed_session_launch_refuses_before_spawn_when_a_holder_registered_after_th
     let root = tempfile::tempdir().unwrap();
     let registry = root.path().join("sessions");
     fs::create_dir(&registry).unwrap();
-    provider::override_claude_session_registry_for_test(Some(registry.clone()));
+    provider::claude::override_session_registry_for_test(Some(registry.clone()));
     let provider_path = root.path().join("claude.cmd");
     write_private(
         &provider_path,
@@ -1512,7 +1515,7 @@ fn resumed_session_launch_refuses_before_spawn_when_a_holder_registered_after_th
         read_reopen_refusal_gate(&directory).as_deref(),
         Some("provider-unsupported")
     );
-    provider::override_claude_session_registry_for_test(None);
+    provider::claude::override_session_registry_for_test(None);
 }
 
 // After launch the reopened process has registered under its managed name; a second live
@@ -1524,7 +1527,7 @@ fn post_launch_holder_conflict_fails_the_reopened_session_under_its_own_gate() {
     let root = tempfile::tempdir().unwrap();
     let registry = root.path().join("sessions");
     fs::create_dir(&registry).unwrap();
-    provider::override_claude_session_registry_for_test(Some(registry.clone()));
+    provider::claude::override_session_registry_for_test(Some(registry.clone()));
     let id = "session-reopenconflict";
     let directory = write_reopen_launch_session(root.path(), id, Path::new("/opt/claude"));
     let resumed_from = read_resumed_from(&directory).unwrap().unwrap();
@@ -1583,7 +1586,7 @@ fn post_launch_holder_conflict_fails_the_reopened_session_under_its_own_gate() {
     );
     let record: RecordedReopenRefusal = read_json(&directory.join(REOPEN_REFUSAL_FILE)).unwrap();
     assert!(!record.detail.contains("closed"), "{}", record.detail);
-    provider::override_claude_session_registry_for_test(None);
+    provider::claude::override_session_registry_for_test(None);
 }
 
 // Round 5 reproduction: the initial prompt was delivered and its turn completed while the
@@ -1597,7 +1600,7 @@ fn a_later_tell_refusal_never_releases_the_marker_of_a_delivered_initial_prompt(
     let root = tempfile::tempdir().unwrap();
     let registry = root.path().join("sessions");
     fs::create_dir(&registry).unwrap();
-    provider::override_claude_session_registry_for_test(Some(registry.clone()));
+    provider::claude::override_session_registry_for_test(Some(registry.clone()));
     let source_id = "session-reopensrc13";
     let source = write_closed_reopen_source(
         root.path(),
@@ -1736,7 +1739,7 @@ fn a_later_tell_refusal_never_releases_the_marker_of_a_delivered_initial_prompt(
         format!("{:#}", uncertain())
     );
     assert!(!source.join(REOPEN_MARKER_FILE).exists());
-    provider::override_claude_session_registry_for_test(None);
+    provider::claude::override_session_registry_for_test(None);
 }
 
 // A refused follow-up records its reason only while the turn is still its own. Between the
@@ -1849,7 +1852,7 @@ fn a_holder_that_registers_after_the_post_launch_scan_is_caught_before_the_initi
     let root = tempfile::tempdir().unwrap();
     let registry = root.path().join("sessions");
     fs::create_dir(&registry).unwrap();
-    provider::override_claude_session_registry_for_test(Some(registry.clone()));
+    provider::claude::override_session_registry_for_test(Some(registry.clone()));
     let id = "session-reopenlate2";
     let directory = write_reopen_launch_session(root.path(), id, Path::new("/opt/claude"));
     let resumed_from = read_resumed_from(&directory).unwrap().unwrap();
@@ -1995,7 +1998,7 @@ fn a_holder_that_registers_after_the_post_launch_scan_is_caught_before_the_initi
             .contains("reopen-verification-failed"),
         "{status:?}"
     );
-    provider::override_claude_session_registry_for_test(None);
+    provider::claude::override_session_registry_for_test(None);
 }
 
 // Every failure to complete the post-launch holder check takes the conflict path: the
@@ -2045,7 +2048,7 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
             None,
         ),
     ] {
-        provider::override_claude_session_registry_for_test(Some(registry.clone()));
+        provider::claude::override_session_registry_for_test(Some(registry.clone()));
         let new_id = "session-reopennew10";
         let new = root.path().join(new_id);
         let claim = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
@@ -2302,7 +2305,7 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
         );
         // A subsequent reopen of the same source passes its gates and claims the marker; a
         // retained marker whose process is now verified dead is released by that claim.
-        provider::override_claude_session_registry_for_test(Some(empty_registry.clone()));
+        provider::claude::override_session_registry_for_test(Some(empty_registry.clone()));
         inspect_reopen_source(&source, source_id).unwrap();
         // The adapter admits the conversation only on native Windows; elsewhere it refuses
         // before consulting the registry, and the marker gates below are platform-neutral.
@@ -2391,7 +2394,7 @@ fn post_launch_verification_failure_closes_only_the_new_surface_and_releases_the
     assert!(!source.join(REOPEN_MARKER_FILE).exists());
     // Releasing an already released marker is not an error.
     release_reopen_marker_after_refusal(&source, &new, REOPEN_LAUNCH_GATE, Ok(())).unwrap();
-    provider::override_claude_session_registry_for_test(None);
+    provider::claude::override_session_registry_for_test(None);
 }
 
 // A marker whose parent reopen never settled is reconciled by the next reopen, under the
@@ -3222,7 +3225,7 @@ fn holder_checks_select_registration_wait_or_immediate_check() {
         fs::create_dir(&registry).unwrap();
         let directory = root.path().join("session-mapping");
         fs::create_dir(&directory).unwrap();
-        provider::override_claude_session_registry_for_test(Some(registry.clone()));
+        provider::claude::override_session_registry_for_test(Some(registry.clone()));
         let resumed = ResumedFrom {
             session: "session-source".into(),
             provider_session_id: REOPEN_TEST_CONVERSATION.into(),
@@ -3255,7 +3258,7 @@ fn holder_checks_select_registration_wait_or_immediate_check() {
                 Some(REOPEN_VERIFICATION_FAILED_GATE)
             );
         }
-        provider::override_claude_session_registry_for_test(None);
+        provider::claude::override_session_registry_for_test(None);
         let reason = if check == ResumedHolderCheck::AfterLaunch {
             format!(
                 "reopened Claude session session-mapping did not register conversation {REOPEN_TEST_CONVERSATION} under {} before the deadline",
@@ -3494,7 +3497,7 @@ fn a_memory_workspace_source_is_refused_before_creation_without_touching_the_sou
     let root = Reader::state_root().unwrap();
     let registry = root.parent().unwrap().join("claude-sessions");
     fs::create_dir_all(&registry).unwrap();
-    provider::override_claude_session_registry_for_test(Some(registry));
+    provider::claude::override_session_registry_for_test(Some(registry));
     let (fixture, _) = start_source_fixture(&root);
     let (directory, _) = fixture.resolved.unwrap();
     let before = snapshot_directory(&directory);
@@ -3503,7 +3506,7 @@ fn a_memory_workspace_source_is_refused_before_creation_without_touching_the_sou
         .resolve(Instant::now() + Duration::from_secs(30))
         .err()
         .expect("reopen must be refused");
-    provider::override_claude_session_registry_for_test(None);
+    provider::claude::override_session_registry_for_test(None);
     if cfg!(windows) {
         assert_eq!(
             reopen_refusal_gate(&error),

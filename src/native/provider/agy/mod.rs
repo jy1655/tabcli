@@ -6,15 +6,19 @@ use crate::native::delivery::{
     Outcome, Prepared, Readiness, SurfaceInput, Transport, TransportFacts, TurnContext,
 };
 use crate::native::provider::{
-    CompletionMonitor, LaunchContext, LaunchPlan, NativeProviderAdapter, ReopenSupport,
+    ActiveWatcher, CompletionWatcher, InitialPromptDisposition, LaunchContext, LaunchPlan,
+    NativeProviderAdapter, ReopenSupport,
 };
 use crate::native::session::{Reader, Store, turn};
 use crate::native::terminal;
+use agent_bridge::{
+    FirstPartyCli, provider_effort_args, provider_launch_args, provider_model_args,
+};
 use anyhow::{Context, Result, bail};
-pub(super) use monitor::AgyMonitor;
+use monitor::AgyMonitor;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod delivery;
@@ -233,11 +237,7 @@ impl NativeProviderAdapter for AgyAdapter {
     }
 
     fn initial_transport(&self) -> Box<dyn Transport> {
-        if cfg!(windows) {
-            Box::new(AgyInitialPaste)
-        } else {
-            Box::new(native_delivery::LAUNCH_ARGUMENT)
-        }
+        initial_transport_for_platform(cfg!(windows))
     }
     fn follow_up_transport(&self) -> Box<dyn Transport> {
         Box::new(AgyPaste)
@@ -317,31 +317,7 @@ impl NativeProviderAdapter for AgyAdapter {
     }
 
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
-        let claim_token = turn::current_claim_token(&Reader::open_unchecked(context.directory))?
-            .context("Agy launch has no native turn claim")?;
-        let pending = install_pending_turn(context.directory, &claim_token)?;
-        let log_path = Reader::open_unchecked(context.directory)
-            .private(AGY_LOG_FILE)
-            .path()
-            .to_owned();
-        let mut arguments = vec![
-            OsString::from("--log-file"),
-            log_path.as_os_str().to_owned(),
-        ];
-        if !cfg!(windows) {
-            arguments.extend([
-                OsString::from("--prompt-interactive"),
-                OsString::from(correlated_prompt(context.prompt, &pending)),
-            ]);
-        }
-        Ok(LaunchPlan {
-            arguments,
-            prompt_is_positional: false,
-            // Replace transcript polling when Agy exposes a first-party
-            // per-turn completion callback with session and turn identity.
-            completion_monitor: CompletionMonitor::AgyTranscript { log_path },
-            environment_removals: &[],
-        })
+        prepare_launch_for_platform(context, cfg!(windows))
     }
 
     fn reopen(&self) -> Result<&'static dyn ReopenSupport> {
@@ -362,6 +338,84 @@ fn validate_claim_token(claim_token: &str) -> Result<()> {
         bail!("invalid Agy turn claim token")
     }
     Ok(())
+}
+
+fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {
+    if windows {
+        Box::new(AgyInitialPaste)
+    } else {
+        Box::new(native_delivery::LAUNCH_ARGUMENT)
+    }
+}
+
+// The complete launch command: the requested policy in Agy's flags (the bypass only when
+// requested, then effort, then model), the private log file, and off Windows the
+// correlated prompt as the interactive prompt argument.
+fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Result<LaunchPlan> {
+    let claim_token = turn::current_claim_token(&Reader::open_unchecked(context.directory))?
+        .context("Agy launch has no native turn claim")?;
+    let pending = install_pending_turn(context.directory, &claim_token)?;
+    let log_path = Reader::open_unchecked(context.directory)
+        .private(AGY_LOG_FILE)
+        .path()
+        .to_owned();
+    let mut arguments = provider_launch_args(FirstPartyCli::Agy, context.yolo)
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    if let Some(effort) = context.effort {
+        arguments.extend(
+            provider_effort_args(FirstPartyCli::Agy, effort)?
+                .into_iter()
+                .map(OsString::from),
+        );
+    }
+    if let Some(model) = context.model {
+        arguments.extend(
+            provider_model_args(FirstPartyCli::Agy, model)
+                .into_iter()
+                .map(OsString::from),
+        );
+    }
+    arguments.extend([
+        OsString::from("--log-file"),
+        log_path.as_os_str().to_owned(),
+    ]);
+    if !windows {
+        arguments.extend([
+            OsString::from("--prompt-interactive"),
+            OsString::from(correlated_prompt(context.prompt, &pending)),
+        ]);
+    }
+    Ok(LaunchPlan {
+        arguments,
+        initial_prompt: InitialPromptDisposition::of(
+            initial_transport_for_platform(windows).as_ref(),
+        ),
+        watcher: Box::new(AgyTranscriptWatcher { log_path }),
+        environment_removals: &[],
+    })
+}
+
+// The unstarted transcript watcher a launch plan carries: Agy's own log file of the
+// session, which the monitor follows to the conversation's transcript. Nothing runs and
+// no brain root is resolved until `start`. Replace transcript polling when Agy exposes a
+// first-party per-turn completion callback with session and turn identity.
+#[derive(Debug)]
+struct AgyTranscriptWatcher {
+    log_path: PathBuf,
+}
+
+impl CompletionWatcher for AgyTranscriptWatcher {
+    fn start(self: Box<Self>, directory: &Path) -> Result<Box<dyn ActiveWatcher>> {
+        Ok(Box::new(AgyMonitor::start(directory, &self.log_path)?))
+    }
+}
+
+impl ActiveWatcher for AgyMonitor {
+    fn stop(self: Box<Self>) -> Result<()> {
+        AgyMonitor::stop(*self)
+    }
 }
 
 fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingAgyTurn> {

@@ -156,3 +156,147 @@ fn reopen_is_refused_with_the_adapters_own_reason() {
             .is_none()
     );
 }
+
+// The expected policy prefix of an Agy command, in the fixed order the adapter emits it:
+// the bypass only when requested, then effort, then model.
+fn agy_policy(yolo: bool, model: Option<&str>, effort: Option<&str>) -> Vec<OsString> {
+    let mut expected = Vec::new();
+    if yolo {
+        expected.push(OsString::from("--dangerously-skip-permissions"));
+    }
+    if let Some(effort) = effort {
+        expected.extend([OsString::from("--effort"), OsString::from(effort)]);
+    }
+    if let Some(model) = model {
+        expected.extend([OsString::from("--model"), OsString::from(model)]);
+    }
+    expected
+}
+
+// The complete launch command for every policy combination and both platform branches:
+// policy, the private log file, and off Windows the correlated interactive prompt.
+#[test]
+fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
+    for windows in [false, true] {
+        for yolo in [false, true] {
+            for model in [None, Some("gemini-model")] {
+                for effort in [None, Some("high")] {
+                    let root = tempfile::tempdir().unwrap();
+                    let directory = root.path().join("session-safe123");
+                    std::fs::create_dir(&directory).unwrap();
+                    std::fs::create_dir(directory.join("events")).unwrap();
+                    turn::claim(&Store::open_unchecked(&directory), &[])
+                        .unwrap()
+                        .retain();
+                    let plan = prepare_launch_for_platform(
+                        LaunchContext {
+                            bridge_executable: Path::new("/opt/agent-bridge"),
+                            directory: &directory,
+                            workspace: root.path(),
+                            title: "Agy test",
+                            prompt: "agy prompt",
+                            yolo,
+                            model,
+                            effort,
+                        },
+                        windows,
+                    )
+                    .unwrap();
+                    let label =
+                        format!("windows={windows} yolo={yolo} model={model:?} effort={effort:?}");
+                    let pending = read_pending_turn(&directory).unwrap().unwrap();
+                    assert_eq!(
+                        pending.claim_token,
+                        turn::current_claim_token(&Reader::open_unchecked(&directory))
+                            .unwrap()
+                            .unwrap(),
+                        "{label}"
+                    );
+                    let log_path = directory.join(AGY_LOG_FILE);
+                    let mut expected = agy_policy(yolo, model, effort);
+                    expected.extend([
+                        OsString::from("--log-file"),
+                        log_path.clone().into_os_string(),
+                    ]);
+                    if !windows {
+                        let framed = correlated_prompt("agy prompt", &pending);
+                        assert!(framed.starts_with("agy prompt"), "{label}");
+                        assert!(framed.ends_with(&pending.marker), "{label}");
+                        expected.extend([
+                            OsString::from("--prompt-interactive"),
+                            OsString::from(framed),
+                        ]);
+                    }
+                    assert_eq!(plan.arguments, expected, "{label}");
+                    assert_eq!(
+                        plan.initial_prompt,
+                        if windows {
+                            InitialPromptDisposition::AwaitingDelivery
+                        } else {
+                            InitialPromptDisposition::AcceptedAtSpawn
+                        },
+                        "{label}"
+                    );
+                    assert_eq!(
+                        format!("{:?}", plan.watcher),
+                        format!("{:?}", AgyTranscriptWatcher { log_path }),
+                        "{label}"
+                    );
+                    assert!(plan.environment_removals.is_empty(), "{label}");
+                }
+            }
+        }
+    }
+}
+
+// The plan carries the transcript watcher unstarted: building it leaves the session's log
+// path untouched and runs nothing; `start` hands the directory and the owned log path to
+// the monitor, whose first read then fails on the non-regular log, and `stop` returns
+// the monitor's own error.
+#[test]
+fn launch_plan_watcher_starts_the_transcript_monitor_only_when_started() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-safe123");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::create_dir(directory.join("events")).unwrap();
+    turn::claim(&Store::open_unchecked(&directory), &[])
+        .unwrap()
+        .retain();
+    let log_path = directory.join(AGY_LOG_FILE);
+    std::fs::create_dir(&log_path).unwrap();
+    let plan = prepare_launch_for_platform(
+        LaunchContext {
+            bridge_executable: Path::new("/opt/agent-bridge"),
+            directory: &directory,
+            workspace: root.path(),
+            title: "Agy test",
+            prompt: "agy prompt",
+            yolo: false,
+            model: None,
+            effort: None,
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        format!("{:?}", plan.watcher),
+        format!(
+            "{:?}",
+            AgyTranscriptWatcher {
+                log_path: log_path.clone()
+            }
+        )
+    );
+    assert!(log_path.is_dir(), "building the plan touched the log path");
+    assert!(!directory.join("status.json").exists());
+
+    let active = plan.watcher.start(&directory).unwrap();
+    let error = active.stop().unwrap_err();
+    assert!(
+        format!("{error:#}").contains(&format!(
+            "refusing non-regular session file: {}",
+            log_path.display()
+        )),
+        "{error:#}"
+    );
+}

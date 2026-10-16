@@ -10,8 +10,8 @@ native.rs: parse ask, check inputs, prepare the session directory
   -> provider + terminal: prepare the CLI and bind a newly created surface
   -> session::launch::launcher: write the launch receipt, run the bootstrap in the bound surface,
      wait for the confirmed startup
-  -> session::launch::wrapper (inside the surface): admit the wrapper, record the owner, plan the
-     provider command, spawn it, finalize the launch record
+  -> session::launch::wrapper (inside the surface): admit the wrapper, record the owner, take the
+     adapter's complete provider command, spawn it, finalize the launch record
   -> delivery: use the adapter-declared Transport and settle delivery of the claimed turn
   -> provider: recognize the matching completion
   -> session::turn: write the completion journal
@@ -76,11 +76,17 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   and records its provenance before finalizing the source marker. Launch and delivery keep
   their existing holder-check timing; provider adapters supply the holder evidence.
 - `src/providers/` defines the CLI identities, minimum versions, and model, effort, and bypass
-  argument mappings. The library uses these mappings before the native launch path.
+  argument mappings. The native adapters call these mappings when they build their complete
+  command; shared launch code no longer does.
 - `src/native/provider/` owns each provider's launch and resume plans, trust interpretation,
-  transports, completion correlation, hooks, diagnostics, and adapter-private records. It uses
-  the session seam and terminal operations. Keep provider schemas and transport selection in
-  `src/native/provider/<provider>/` (or a single `<provider>.rs` file), not in shared orchestration.
+  transports, completion correlation, hooks, diagnostics, and adapter-private records. Each
+  adapter's launch and resume plan is the complete provider command (the policy flags in the fixed
+  order, the adapter's own arguments, the Initial prompt's place), the environment removals, the
+  initial-prompt disposition the wrapper applies after the spawn, and an unstarted completion
+  watcher the wrapper starts and stops; `provider/mod.rs` holds only provider-neutral contracts.
+  It uses the session seam and terminal operations. Keep provider schemas and transport selection
+  in `src/native/provider/<provider>/` (or a single `<provider>.rs` file), not in shared
+  orchestration.
 - `src/native/terminal/` selects and implements platform-specific surfaces, input, observation,
   and close. Native command parsing builds a `ConsoleControlRequest`; after session verification,
   the Windows adapter executes a typed `ConsoleControlAction` with resolved input and timing.

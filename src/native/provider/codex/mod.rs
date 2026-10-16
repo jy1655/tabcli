@@ -13,8 +13,8 @@ use self::diagnose::diagnose_codex;
 use self::launch::{codex_launch_arguments, send_initial_prompt, workspace_trust_override};
 use self::queue::send_native_queue_message;
 use super::{
-    CompletionMonitor, CrossSessionMessageContext, LaunchContext, LaunchPlan,
-    NativeProviderAdapter, ReopenSupport,
+    CrossSessionMessageContext, InitialPromptDisposition, LaunchContext, LaunchPlan,
+    NativeProviderAdapter, NoWatcher, ReopenSupport,
 };
 use crate::native::delivery::{
     self, Outcome, Prepared, Readiness, SurfaceInput, Transport, TransportFacts, TurnContext,
@@ -22,7 +22,9 @@ use crate::native::delivery::{
 use crate::native::session::turn;
 use crate::native::session::{Reader, Store};
 use crate::native::terminal;
-use agent_bridge::FirstPartyCli;
+use agent_bridge::{
+    FirstPartyCli, provider_effort_args, provider_launch_args, provider_model_args,
+};
 use anyhow::{Context, Result, bail};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -172,11 +174,7 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 
     fn initial_transport(&self) -> Box<dyn Transport> {
-        if cfg!(windows) {
-            Box::new(CodexInitialPaste)
-        } else {
-            Box::new(delivery::LAUNCH_ARGUMENT)
-        }
+        initial_transport_for_platform(cfg!(windows))
     }
     fn follow_up_transport(&self) -> Box<dyn Transport> {
         Box::new(CodexQueue)
@@ -252,34 +250,7 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 
     fn prepare_launch(&self, context: LaunchContext<'_>) -> Result<LaunchPlan> {
-        let claim_token = turn::current_claim_token(&Reader::open_unchecked(context.directory))?
-            .context("Codex launch has no native turn claim")?;
-        let pending = install_pending_turn(context.directory, &claim_token)?;
-        let mut arguments = codex_launch_arguments(
-            context.bridge_executable,
-            context.workspace,
-            context.prompt,
-            &pending,
-            cfg!(windows),
-        )?;
-        if super::super::consent::authorized(context.directory, FirstPartyCli::Codex)? {
-            // Official process-local TOML override; never edits config.toml or any
-            // approval/sandbox setting. Insert before the positional prompt.
-            arguments.splice(
-                0..0,
-                [
-                    OsString::from("-c"),
-                    OsString::from(workspace_trust_override(context.workspace)?),
-                ],
-            );
-            super::super::consent::applied(context.directory, APPLIED_MARKER)?;
-        }
-        Ok(LaunchPlan {
-            arguments,
-            prompt_is_positional: false,
-            completion_monitor: CompletionMonitor::Hook,
-            environment_removals: &[],
-        })
+        prepare_launch_for_platform(context, cfg!(windows), super::super::consent::authorized)
     }
 
     fn reopen(&self) -> Result<&'static dyn ReopenSupport> {
@@ -339,6 +310,75 @@ fn validate_claim_token(claim_token: &str) -> Result<()> {
         bail!("invalid Codex turn claim token")
     }
     Ok(())
+}
+
+fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {
+    if windows {
+        Box::new(CodexInitialPaste)
+    } else {
+        Box::new(delivery::LAUNCH_ARGUMENT)
+    }
+}
+
+// The complete launch command: the requested policy in Codex's flags (the bypass only when
+// requested, then effort, then model), then Codex's own arguments with the workspace trust
+// override at their start when consent authorizes it. `authorized` is the consent gate;
+// production passes `consent::authorized`, and the applied marker is recorded right after
+// a positive answer, before the plan exists.
+fn prepare_launch_for_platform(
+    context: LaunchContext<'_>,
+    windows: bool,
+    authorized: fn(&Path, FirstPartyCli) -> Result<bool>,
+) -> Result<LaunchPlan> {
+    let claim_token = turn::current_claim_token(&Reader::open_unchecked(context.directory))?
+        .context("Codex launch has no native turn claim")?;
+    let pending = install_pending_turn(context.directory, &claim_token)?;
+    let mut arguments = provider_launch_args(FirstPartyCli::Codex, context.yolo)
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    if let Some(effort) = context.effort {
+        arguments.extend(
+            provider_effort_args(FirstPartyCli::Codex, effort)?
+                .into_iter()
+                .map(OsString::from),
+        );
+    }
+    if let Some(model) = context.model {
+        arguments.extend(
+            provider_model_args(FirstPartyCli::Codex, model)
+                .into_iter()
+                .map(OsString::from),
+        );
+    }
+    let mut own = codex_launch_arguments(
+        context.bridge_executable,
+        context.workspace,
+        context.prompt,
+        &pending,
+        windows,
+    )?;
+    if authorized(context.directory, FirstPartyCli::Codex)? {
+        // Official process-local TOML override; never edits config.toml or any
+        // approval/sandbox setting. Insert before the positional prompt.
+        own.splice(
+            0..0,
+            [
+                OsString::from("-c"),
+                OsString::from(workspace_trust_override(context.workspace)?),
+            ],
+        );
+        super::super::consent::applied(context.directory, APPLIED_MARKER)?;
+    }
+    arguments.extend(own);
+    Ok(LaunchPlan {
+        arguments,
+        initial_prompt: InitialPromptDisposition::of(
+            initial_transport_for_platform(windows).as_ref(),
+        ),
+        watcher: Box::new(NoWatcher),
+        environment_removals: &[],
+    })
 }
 
 fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingCodexTurn> {

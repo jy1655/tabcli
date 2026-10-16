@@ -32,7 +32,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-pub(in crate::native::provider) fn override_session_registry_for_test(registry: Option<PathBuf>) {
+pub(in crate::native) fn override_session_registry_for_test(registry: Option<PathBuf>) {
     SESSION_REGISTRY_OVERRIDE.with(|slot| *slot.borrow_mut() = registry);
 }
 

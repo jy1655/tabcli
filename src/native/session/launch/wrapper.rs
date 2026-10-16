@@ -7,16 +7,12 @@ use crate::native::session::primitives::{SESSION_DIR_ENV, unix_ms};
 use crate::native::session::schema::ProviderProcessRecord;
 use crate::native::session::state::{SessionState, update_status};
 use crate::native::session::{self, CoreRecord, Reader, Store};
-use crate::native::{delivery, process_env, provider, terminal};
-use agent_bridge::{
-    FirstPartyCli, cli_version_is_supported, provider_effort_args, provider_launch_args,
-    provider_model_args,
-};
+use crate::native::{process_env, provider, terminal};
+use agent_bridge::{FirstPartyCli, cli_version_is_supported};
 use anyhow::{Context, Result, bail};
 #[cfg(unix)]
 use std::fs::File;
 use std::{
-    ffi::OsString,
     io::IsTerminal,
     path::{Path, PathBuf},
     process::Command,
@@ -103,76 +99,53 @@ pub(in crate::native) fn provision(directory: &Path) -> Result<()> {
     let prompt = Reader::open_unchecked(directory)
         .initial_prompt()
         .context("failed to read initial prompt")?;
-    let initial_readiness = provider::initial_transport(provider).facts().readiness;
-
     let executable = std::env::current_exe().context("failed to locate the current executable")?;
-    let mut policy_arguments = provider_launch_args(provider, manifest.yolo)
-        .into_iter()
-        .map(OsString::from)
-        .collect::<Vec<_>>();
-    if let Some(effort) = &manifest.effort {
-        policy_arguments.extend(
-            provider_effort_args(provider, effort)?
-                .into_iter()
-                .map(OsString::from),
-        );
-    }
-    if let Some(model) = &manifest.model {
-        policy_arguments.extend(
-            provider_model_args(provider, model)
-                .into_iter()
-                .map(OsString::from),
-        );
-    }
-    // A reopened session launches through the adapter's resume plan. The plan carries no
-    // prompt: the initial prompt reaches the reopened process through the same transport a
-    // fresh launch uses, so `prompt_is_positional` is false here by construction.
+    // The adapter produces the complete provider command: the policy flags of the manifest,
+    // its own arguments and the prompt's place. A reopened session launches through the
+    // adapter's resume plan with the new request's policy; the plan carries no prompt, and
+    // the reopened process receives it through the same transport a fresh launch uses.
     let resumed_from = read_resumed_from(directory)?;
-    let (provider_arguments, prompt_is_positional, completion_monitor, environment_removals) =
-        match &resumed_from {
-            Some(resumed_from) => {
-                let provider::ResumePlan {
-                    arguments,
-                    completion_monitor,
-                    environment_removals,
-                } = provider::reopen(provider)?.prepare(provider::ResumeContext {
+    let (arguments, initial_prompt, watcher, environment_removals) = match &resumed_from {
+        Some(resumed_from) => {
+            let provider::ResumePlan {
+                arguments,
+                initial_prompt,
+                watcher,
+                environment_removals,
+            } = provider::reopen(provider)?.prepare(provider::ResumeContext {
+                bridge_executable: &executable,
+                directory,
+                provider_session_id: &resumed_from.provider_session_id,
+                yolo: manifest.yolo,
+                model: manifest.model.as_deref(),
+                effort: manifest.effort.as_deref(),
+            })?;
+            (arguments, initial_prompt, watcher, environment_removals)
+        }
+        None => {
+            let provider::LaunchPlan {
+                arguments,
+                initial_prompt,
+                watcher,
+                environment_removals,
+            } = provider::prepare_launch(
+                provider,
+                provider::LaunchContext {
                     bridge_executable: &executable,
                     directory,
-                    provider_session_id: &resumed_from.provider_session_id,
-                })?;
-                (arguments, false, completion_monitor, environment_removals)
-            }
-            None => {
-                let provider::LaunchPlan {
-                    arguments,
-                    prompt_is_positional,
-                    completion_monitor,
-                    environment_removals,
-                } = provider::prepare_launch(
-                    provider,
-                    provider::LaunchContext {
-                        bridge_executable: &executable,
-                        directory,
-                        workspace: &manifest.workspace,
-                        title: &manifest.title,
-                        prompt: &prompt,
-                    },
-                )?;
-                (
-                    arguments,
-                    prompt_is_positional,
-                    completion_monitor,
-                    environment_removals,
-                )
-            }
-        };
-    let mut arguments = policy_arguments.clone();
-    arguments.extend(provider_arguments);
-    if initial_readiness == delivery::Readiness::LaunchArgument && prompt_is_positional {
-        arguments.push(OsString::from(prompt.clone()));
-    }
+                    workspace: &manifest.workspace,
+                    title: &manifest.title,
+                    prompt: &prompt,
+                    yolo: manifest.yolo,
+                    model: manifest.model.as_deref(),
+                    effort: manifest.effort.as_deref(),
+                },
+            )?;
+            (arguments, initial_prompt, watcher, environment_removals)
+        }
+    };
 
-    let completion_monitor = completion_monitor.start(directory)?;
+    let watcher = watcher.start(directory)?;
     let mut provider_command = process_env::provider_command(
         &manifest.provider_path,
         directory,
@@ -187,7 +160,7 @@ pub(in crate::native) fn provision(directory: &Path) -> Result<()> {
         && let Err(error) = provider::reopen(provider)
             .and_then(|support| support.verify_available(&resumed_from.provider_session_id))
     {
-        let _ = completion_monitor.stop();
+        let _ = watcher.stop();
         return Err(record_reopen_refusal(
             directory,
             REOPEN_LAUNCH_GATE,
@@ -209,14 +182,14 @@ pub(in crate::native) fn provision(directory: &Path) -> Result<()> {
         &mut provider_command,
         |child| {
             record_provider_process(directory, &manifest.id, child)?;
-            match initial_readiness {
-                delivery::Readiness::LaunchArgument => {
+            match initial_prompt {
+                provider::InitialPromptDisposition::AcceptedAtSpawn => {
                     session::RecordStore::at(&prompt_path)
                         .remove_raw()
                         .context("failed to remove the accepted initial prompt")?;
                     update_status(directory, SessionState::Running, None, None)?;
                 }
-                delivery::Readiness::AfterLaunch { .. } => {
+                provider::InitialPromptDisposition::AwaitingDelivery => {
                     update_status(directory, SessionState::AwaitingInitialInput, None, None)?;
                 }
             }
@@ -226,7 +199,7 @@ pub(in crate::native) fn provision(directory: &Path) -> Result<()> {
     let mut child = match child {
         Ok(child) => child,
         Err(error) => {
-            let _ = completion_monitor.stop();
+            let _ = watcher.stop();
             return Err(error).with_context(|| {
                 format!(
                     "failed to start {} at {}",
@@ -243,7 +216,7 @@ pub(in crate::native) fn provision(directory: &Path) -> Result<()> {
             &format!("provider_exit_code={:?}", status.code()),
         );
     }
-    completion_monitor.stop()?;
+    watcher.stop()?;
     let status = status.with_context(|| {
         format!(
             "failed to start {} at {}",
