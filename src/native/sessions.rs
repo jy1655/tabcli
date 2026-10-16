@@ -1,7 +1,8 @@
 //! The `sessions` listing over a state root.
 use super::args::{option_value, resolve_explicit_workspace, set_flag_once, set_once};
-use super::*;
+use crate::native::reopen::read_resumed_from;
 use crate::native::session::{Reader, Store};
+use crate::native::{NativeCommand, session, terminal};
 use agent_bridge::{FirstPartyCli, terminal_safe_text};
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};

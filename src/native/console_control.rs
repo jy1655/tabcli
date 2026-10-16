@@ -1,15 +1,21 @@
 //! Control of a managed Windows console from inside the session's own process tree.
-use super::*;
-#[cfg(windows)]
-use crate::native::session::RecordReader;
+use crate::native::NativeCommand;
 use crate::native::session::primitives::require_valid_session_id;
+#[cfg(windows)]
+use crate::native::session::{Reader, RecordReader};
+#[cfg(windows)]
+use crate::native::terminal::ownership::verify_terminal_surface_ownership;
+#[cfg(windows)]
+use crate::native::terminal::{windows_console_handle_path, windows_console_root_never_ran};
+#[cfg(windows)]
+use crate::native::{provider, terminal};
+#[cfg(windows)]
+use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
+#[cfg(windows)]
+use std::str::FromStr;
 use std::time::Duration;
-#[cfg(windows)]
-use terminal::ownership::verify_terminal_surface_ownership;
-#[cfg(windows)]
-use terminal::{windows_console_handle_path, windows_console_root_never_ran};
 
 // Parsed on every target; paths and provider console input facts are resolved only
 // after the managed session and its surface have been verified.

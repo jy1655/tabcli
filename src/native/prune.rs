@@ -1,8 +1,8 @@
 //! Removal of closed session records past their retention window.
 use super::args::{option_value, set_flag_once, set_once};
-use super::*;
 use crate::native::session::primitives::unix_ms;
 use crate::native::session::{CoreRecord, Reader, RecordReader, SessionState};
+use crate::native::{NativeCommand, session};
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::Path;

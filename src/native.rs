@@ -1,7 +1,7 @@
-use crate::native::session::primitives::{delegation_source, require_valid_session_id, unix_ms};
+use crate::native::session::primitives::{require_valid_session_id, unix_ms};
 use crate::native::session::schema::{SESSION_SCHEMA, SessionManifest};
 use crate::native::session::{CoreRecord, Reader, SessionState, Store, launch, update_status};
-use agent_bridge::{FirstPartyCli, PUBLIC_COMMAND};
+use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -28,9 +28,7 @@ mod provider_process;
 mod prune;
 mod query;
 mod reopen;
-use reopen::{
-    read_resumed_from, refuse_follow_up_to_shared_conversation, reopen_refusal_gate, run_reopen,
-};
+use reopen::run_reopen;
 mod self_test;
 mod session;
 mod session_start;
@@ -42,7 +40,6 @@ mod settings;
 mod tell;
 mod terminal;
 mod turn_report;
-use turn_report::TurnReport;
 mod turn_run;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 900;

@@ -1,7 +1,7 @@
 //! Provider hook entry: validates the session, reads the payload, and hands it to the adapter.
-use super::*;
 use crate::native::session::Reader;
 use crate::native::session::primitives::SESSION_DIR_ENV;
+use crate::native::{NativeCommand, provider};
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
 use std::io::Read;

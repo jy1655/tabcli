@@ -1,10 +1,12 @@
 //! Explicit close of a managed session's visible surface.
 use super::args::{parse_timeout, set_flag_once, set_once};
-use super::*;
 use crate::native::session::close::budget::CLOSE_TIMEOUT;
 use crate::native::session::primitives::require_valid_session_id;
 use crate::native::session::{Reader, Store};
-use agent_bridge::{checked_deadline_from, confirm_explicit_close, terminal_safe_text};
+use crate::native::{NativeCommand, session, terminal};
+use agent_bridge::{
+    PUBLIC_COMMAND, checked_deadline_from, confirm_explicit_close, terminal_safe_text,
+};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 use std::time::{Duration, Instant};

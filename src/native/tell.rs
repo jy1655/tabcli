@@ -1,8 +1,15 @@
 //! Follow-up input to a managed session.
 use super::args::{option_value, parse_timeout, read_prompt_option, set_flag_once, set_once};
-use super::*;
-use crate::native::session::primitives::require_valid_session_id;
+use crate::native::reopen::{
+    read_resumed_from, refuse_follow_up_to_shared_conversation, reopen_refusal_gate,
+};
+use crate::native::session::primitives::{delegation_source, require_valid_session_id};
 use crate::native::session::{Reader, Store, turn};
+use crate::native::turn_report::TurnReport;
+use crate::native::{
+    DEFAULT_TIMEOUT_SECS, NativeCommand, context, delivery, native_delegation_prompt, session,
+    terminal, turn_run,
+};
 use agent_bridge::{FirstPartyCli, checked_deadline_from, validate_terminal_input};
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;

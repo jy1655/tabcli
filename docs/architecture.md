@@ -5,7 +5,8 @@ The Rust CLI manages one provider conversation per session in a visible surface.
 these boundaries:
 
 ```text
-native.rs: parse ask, check inputs, prepare the session directory
+native.rs: dispatch into session_start, which parses ask, checks inputs and prepares the
+  session directory
   -> session::turn + session::requests: acquire the initial claim and write its receipt
   -> provider + terminal: prepare the CLI and bind a newly created surface
   -> session::launch::launcher: write the launch receipt, run the bootstrap in the bound surface,
@@ -28,7 +29,8 @@ close-session
   -> session::close: settle the close records and retain the tombstones
 ```
 
-A follow-up enters through `tell` in `native.rs` and claims the existing session before delivery.
+A follow-up enters through `native.rs`, which dispatches into the `tell` module; `tell` parses
+the command and claims the existing session before delivery.
 The admission checks read Hold without taking another lock; `claim_ready` identifies follow-up
 claims so the final `begin_delivery` hold gate excludes initial delivery.
 After its admission checks and the provider-specific reopened-conversation refusal, `tell` hands
@@ -47,8 +49,14 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 
 ## Module map and dependencies
 
-- `src/main.rs` contains top-level dispatch and help; `src/native.rs` parses native commands and
-  dispatches them; after its pre-checks it hands the claimed turn to `turn_run`. The launch protocol is two operations in `session::launch`: `launcher.rs`
+- `src/main.rs` contains top-level dispatch and help; `src/native.rs` holds the native command
+  table, the dispatch, session creation and the delegation prompt, and declares the native
+  modules. Each command parses and runs in its own module: `ask` in `session_start`, `reopen`
+  in `reopen`, and `tell`, `sessions`, `close`, `prune`, `hook`, `console_control`, `hold` and
+  `cancel` in the modules of those names; `args.rs` holds the shared argument helpers and the
+  explicit-workspace resolution. No test reaches another module's internals through
+  `native.rs`. After their pre-checks, `tell` and session-start hand the claimed turn to
+  `turn_run`. The launch protocol is two operations in `session::launch`: `launcher.rs`
   holds the start-in-surface operation and both bootstrap builders; `wrapper.rs` holds the
   native-session wrapper with its admission and provision steps, the fd handoff consumer,
   provider resolution and the version gate; `mod.rs` keeps the launch records and their rules
