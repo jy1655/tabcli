@@ -11,9 +11,9 @@ use agent_bridge::FirstPartyCli;
 use std::process::Command;
 
 #[cfg(target_os = "macos")]
-pub(super) use support::{reaped_child_pid, write_attested_apple_terminal_state};
+pub(super) use support::write_attested_apple_terminal_state;
 pub(super) use support::{
-    seed_close_fixture, spawn_surviving_process, test_windows_process_identity,
+    reaped_child_pid, seed_close_fixture, spawn_surviving_process, test_windows_process_identity,
     write_provider_process_record,
 };
 
