@@ -312,7 +312,7 @@ fn refused_launch_cleanup_with(
         .path()
         .to_owned();
     let state = Reader::open_unchecked(refused_directory)
-        .regular_status_if_present()?
+        .status_if_present()?
         .with_context(|| format!("failed to read {}", status_path.display()))?
         .state;
     if state.accepts_prompt() || state == SessionState::Working {
@@ -364,7 +364,7 @@ fn refused_launch_cleanup_with(
         )
         .is_regular_file()?
         && Reader::open_unchecked(refused_directory)
-            .regular_closed_if_present()?
+            .closed_if_present()?
             .is_some_and(|closed| closed.state == SessionState::Closed);
     Ok(RefusedLaunchCleanup::ProviderProcessGone {
         pid: record.pid,
@@ -915,8 +915,8 @@ struct StaleReopenMarker {
 // Read-only: release eligibility requires a durable launch refusal and verified cleanup.
 // Missing records or a possibly surviving provider keep the marker consumed after a crash.
 fn verify_reopen_source_is_closed(directory: &Path, id: &str) -> Result<Option<StaleReopenMarker>> {
-    let closed = Reader::open_unchecked(directory).regular_closed_if_present()?;
-    let status = Reader::open_unchecked(directory).regular_status_if_present()?;
+    let closed = Reader::open_unchecked(directory).closed_if_present()?;
+    let status = Reader::open_unchecked(directory).status_if_present()?;
     let state = status
         .as_ref()
         .map_or("unknown", |status| status.state.as_str());
@@ -1038,9 +1038,15 @@ fn latest_provider_event_identity(
 }
 
 pub(super) fn read_resumed_from(directory: &Path) -> Result<Option<ResumedFrom>> {
-    let provenance: ReopenProvenance = Reader::open_unchecked(directory)
+    // The manifest's provenance projection: the same regular-file, strict read as the
+    // manifest itself, judged by this projection's shape alone.
+    let path = Reader::open_unchecked(directory)
         .record(CoreRecord::Manifest)
-        .json()?;
+        .path()
+        .to_owned();
+    let provenance: ReopenProvenance =
+        record::decode(&session::primitives::read_regular_bytes(&path)?)
+            .map_err(|error| error.in_path(&path))?;
     Ok(provenance.resumed_from)
 }
 

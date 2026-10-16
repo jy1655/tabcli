@@ -1,5 +1,5 @@
 //! Minimal lock-free publication count for session listings.
-use super::{CoreRecord, Reader, SnapshotBusy, requests, schema::EVENT_READ_LIMIT, turn};
+use super::{CoreRecord, Reader, SnapshotBusy, record, requests, schema::EVENT_READ_LIMIT, turn};
 use anyhow::Result;
 
 impl Reader {
@@ -9,20 +9,22 @@ impl Reader {
     pub(in crate::native) fn published_result_count(&self) -> Result<usize> {
         let records = [CoreRecord::TurnClaim, CoreRecord::Completion];
         let before = records
-            .map(|record| self.record(record).text())
+            .map(|record| self.record(record).bytes())
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
-        let pending: Option<turn::PendingTurnCompletion> =
-            before[1].as_deref().map(serde_json::from_str).transpose()?;
+        let pending = before[1]
+            .as_deref()
+            .map(|bytes| record::journal(bytes).map_err(anyhow::Error::from))
+            .transpose()?;
         let index = requests::list(self)?;
         let pending_event = pending
             .as_ref()
-            .map(|pending| {
-                turn::validate_pending_completion(pending)?;
-                self.journaled_event_state_within(pending, EVENT_READ_LIMIT)
-            })
+            .map(|pending| self.journaled_event_state_within(pending, EVENT_READ_LIMIT))
             .transpose()?;
-        let claim = before[0].as_deref().map(str::trim);
+        let claim = before[0]
+            .as_deref()
+            .map(|bytes| String::from_utf8_lossy(bytes).trim().to_owned());
+        let claim = claim.as_deref();
         let mut receipts_by_event = std::collections::HashMap::new();
         for receipt in &index.receipts {
             // Match Snapshot::receipt_for_event's first receipt in index order.
@@ -63,7 +65,7 @@ impl Reader {
             return Err(SnapshotBusy.into());
         }
         for (index, record) in records.into_iter().enumerate() {
-            if self.record(record).text()? != before[index] {
+            if self.record(record).bytes()? != before[index] {
                 return Err(SnapshotBusy.into());
             }
         }

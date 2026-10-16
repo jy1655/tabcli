@@ -2,7 +2,7 @@
 use crate::native::session::primitives::{delegation_source, unix_ms, valid_session_id};
 use crate::native::session::turn::valid_turn_claim_token;
 
-use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store};
+use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store, record};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -162,15 +162,12 @@ pub(in crate::native) fn for_claim(reader: &Reader, claim_token: &str) -> Result
     if !requests_directory_present(reader)? {
         return Ok(None);
     }
-    let Some(text) = receipt_record(reader, claim_token).text()? else {
+    let Some(bytes) = receipt_record(reader, claim_token).bytes()? else {
         return Ok(None);
     };
-    let receipt: Receipt = serde_json::from_str(&text).context("invalid Bridge request receipt")?;
-    validate(&receipt)?;
-    if receipt.claim_token != claim_token {
-        bail!("Bridge request receipt belongs to a different claim")
-    }
-    Ok(Some(receipt))
+    record::receipt(&bytes, claim_token)
+        .map(Some)
+        .map_err(|error| error.context("invalid Bridge request receipt"))
 }
 
 #[derive(Default)]
@@ -179,41 +176,44 @@ pub(in crate::native) struct Index {
     pub(in crate::native) unreadable: usize,
 }
 
-pub(in crate::native) fn list(reader: &Reader) -> Result<Index> {
-    let directory = reader.directory();
+/// The claim tokens named under `requests/`, in directory order: `None` when the
+/// directory is absent, an error when it is refused or cannot be listed.
+pub(in crate::native) fn tokens(reader: &Reader) -> Result<Option<Vec<String>>> {
     if !requests_directory_present(reader)? {
-        return Ok(Index::default());
+        return Ok(None);
     }
-    let root = Reader::open_unchecked(directory)
-        .record(CoreRecord::Requests)
-        .path()
-        .to_owned();
+    let root = reader.record(CoreRecord::Requests).path().to_owned();
     let entries = match fs::read_dir(&root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Index::default()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("failed to read Bridge requests"),
     };
-    let mut index = Index::default();
+    let mut tokens = Vec::new();
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
         let Some(token) = name.to_str().and_then(|name| name.strip_suffix(".json")) else {
             continue;
         };
-        if !valid_turn_claim_token(token) {
-            continue;
-        }
-        match for_claim(&Reader::open_unchecked(directory), token) {
-            Ok(Some(receipt)) => index.receipts.push(receipt),
-            Ok(None) | Err(_) => index.unreadable += 1,
+        if valid_turn_claim_token(token) {
+            tokens.push(token.to_owned());
         }
     }
-    index.receipts.sort_by(|a, b| {
-        a.created_unix_ms
-            .cmp(&b.created_unix_ms)
-            .then_with(|| a.request_id.cmp(&b.request_id))
-    });
-    Ok(index)
+    Ok(Some(tokens))
+}
+
+pub(in crate::native) fn list(reader: &Reader) -> Result<Index> {
+    let Some(tokens) = tokens(reader)? else {
+        return Ok(Index::default());
+    };
+    Ok(record::receipt_index(
+        &tokens,
+        |token| match receipt_record(reader, token).bytes() {
+            Ok(Some(bytes)) => record::Read::Present(bytes),
+            Ok(None) => record::Read::Absent,
+            Err(error) => record::Read::Fault(format!("{error:#}")),
+        },
+    ))
 }
 
 #[cfg(test)]

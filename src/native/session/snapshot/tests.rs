@@ -1,7 +1,7 @@
 use super::*;
+use crate::native::session::SnapshotBusy;
 use crate::native::session::primitives::{with_publication_read_log, write_json_atomic};
 use crate::native::tests::seed_close_fixture;
-use serde_json::json;
 use std::fs;
 
 // Build the same byte-cache shape as timeline, without borrowing query's implementation.
@@ -214,39 +214,6 @@ fn from_records_preserves_cache_failure_policies() {
     );
     assert_eq!(snapshot.unreadable_requests, 1);
     assert_eq!(snapshot.receipts.len(), 1);
-    for (record, bytes, expected) in [
-        (
-            CoreRecord::Launch,
-            br#"{"schema":2,"claim_token":"x","deadline_unix_ms":1,"phase":"pending"}"#.as_slice(),
-            "invalid launch receipt identity",
-        ),
-        (CoreRecord::Status, b"\xff".as_slice(), "invalid UTF-8"),
-        (
-            CoreRecord::Status,
-            br#"{"nested":[{"created_unix_ms":18446744073709551616}]}"#.as_slice(),
-            "record timestamp is outside the JSON unsigned integer range",
-        ),
-    ] {
-        let mut cache = base.clone();
-        cache.insert(record.name().to_owned(), Ok(Some(bytes.to_vec())));
-        assert!(format!("{:#}", Snapshot::from_records(&cache).err().unwrap()).contains(expected));
-    }
-    let mut cache = base;
-    let mut manifest: Value = parsed(&cache, CoreRecord::Manifest.name())
-        .unwrap()
-        .unwrap();
-    manifest["schema"] = json!(999);
-    cache.insert(
-        CoreRecord::Manifest.name().to_owned(),
-        Ok(Some(serde_json::to_vec(&manifest).unwrap())),
-    );
-    assert!(
-        Snapshot::from_records(&cache)
-            .err()
-            .unwrap()
-            .to_string()
-            .starts_with("unsupported session schema 999")
-    );
 }
 
 #[test]

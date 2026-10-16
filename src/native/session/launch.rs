@@ -6,7 +6,7 @@ use crate::native::session::state::{
 };
 
 use crate::native::session::turn::{recover_pending_completion_locked, remove_turn_claim_locked};
-use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store, turn};
+use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store, record, turn};
 use crate::native::terminal;
 #[cfg(unix)]
 use crate::native::terminal::shell_quote;
@@ -118,18 +118,13 @@ pub(in crate::native) struct Record {
 }
 
 pub(in crate::native) fn read(reader: &Reader) -> Result<Option<Record>> {
-    let record = reader
+    reader
         .record(CoreRecord::Launch)
-        .text()?
-        .map(|text| serde_json::from_str::<Record>(&text))
+        .bytes()?
+        .map(|bytes| {
+            record::launch(&bytes).map_err(|error| error.context("invalid launch receipt"))
+        })
         .transpose()
-        .context("invalid launch receipt")?;
-    if let Some(record) = &record
-        && (record.schema != 1 || record.claim_token.is_empty())
-    {
-        bail!("invalid launch receipt identity");
-    }
-    Ok(record)
 }
 
 /// Adapters declare binding diagnostics and budget; the shared wait owns observation order.

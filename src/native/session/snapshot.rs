@@ -1,11 +1,11 @@
 //! Consistent read-only session records and their publication evidence.
+use super::record::{self, Live, Read, ReceiptNames, Source};
 use super::schema::{EVENT_READ_LIMIT, SESSION_SCHEMA, SessionEvent, SessionManifest};
 use super::turn::{
     JournaledEventRead, JournaledEventState, PendingTurnCompletion, validate_pending_completion,
 };
 use super::{
-    CoreRecord, Reader, RecordReader, SessionState, SessionStatus, SnapshotBusy, launch, requests,
-    turn,
+    CoreRecord, Reader, RecordReader, SessionState, SessionStatus, launch, requests, turn,
 };
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -140,75 +140,91 @@ impl Reader {
         &self,
         publication: PublicationRead,
     ) -> Result<Snapshot> {
-        Snapshot::read_with(self, publication)
+        let expected_id = self
+            .directory()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        Snapshot::assemble(Live::begin(self)?, expected_id, publication)
     }
 }
 
 impl Snapshot {
-    /// A consistent read deciding a journaled event's publication as `publication` says.
-    fn read_with(reader: &Reader, publication: PublicationRead) -> Result<Self> {
-        let directory = reader.directory();
-        let lock = reader.lock_shared()?;
-        let state_files = [
-            CoreRecord::Status.name(),
-            CoreRecord::TurnClaim.name(),
-            CoreRecord::Completion.name(),
-            CoreRecord::Launch.name(),
-        ];
-        let before = state_files
-            .map(|name| reader.private(name).text())
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-        let status: SessionStatus = serde_json::from_str(
-            before[0]
-                .as_deref()
-                .context("session has no status record")?,
-        )?;
-        let pending: Option<PendingTurnCompletion> =
-            before[2].as_deref().map(serde_json::from_str).transpose()?;
+    /// Builds the Snapshot from `source` in the order the Live read always used: status
+    /// and journal from the state bytes, the publication read as `publication` says, the
+    /// receipt index, the manifest bound to `expected_id`, the events, the claim, the
+    /// launch record, then the source's consistency check. A source fault fails the read;
+    /// a source that tolerates faults presents what it keeps as present or absent.
+    pub(in crate::native) fn assemble(
+        mut source: impl Source,
+        expected_id: &str,
+        publication: PublicationRead,
+    ) -> Result<Self> {
+        fn present(read: Read) -> Result<Option<Vec<u8>>> {
+            match read {
+                Read::Present(bytes) => Ok(Some(bytes)),
+                Read::Absent => Ok(None),
+                Read::Fault(error) => bail!("{error}"),
+            }
+        }
+        let status = match present(source.core(CoreRecord::Status)?)? {
+            Some(bytes) => {
+                record::status(&bytes).map_err(|error| source.locate(CoreRecord::Status, error))?
+            }
+            None => bail!("session has no status record"),
+        };
+        let pending = present(source.core(CoreRecord::Completion)?)?
+            .map(|bytes| {
+                record::journal(&bytes)
+                    .map_err(|error| source.locate(CoreRecord::Completion, error))
+            })
+            .transpose()?;
         let pending_event = match (&pending, publication) {
             (Some(pending), PublicationRead::Within(event_limit)) => {
-                validate_pending_completion(pending)?;
-                // The predicate validates `events` before it opens anything under it, so
-                // a link planted there is rejected instead of followed by this read.
-                Some(
-                    Reader::open_unchecked(directory)
-                        .journaled_event_state_within(pending, event_limit)?,
-                )
+                Some(source.publication_read(pending, event_limit)?)
             }
-            (Some(pending), PublicationRead::Deferred) => {
-                validate_pending_completion(pending)?;
-                None
-            }
-            (None, _) => None,
+            (Some(_), PublicationRead::Deferred) | (None, _) => None,
         };
-        before_consistency_check(directory);
-        let (index, request_index_error) = match requests::list(&Reader::open_unchecked(directory))
-        {
-            Ok(index) => (index, None),
-            Err(error) => (requests::Index::default(), Some(format!("{error:#}"))),
+        source.state_observed();
+        let (index, request_index_error) = match source.receipt_names() {
+            ReceiptNames::Absent => (requests::Index::default(), None),
+            ReceiptNames::Present(tokens) => (
+                record::receipt_index(&tokens, |token| source.receipt(token)),
+                None,
+            ),
+            ReceiptNames::Fault { tokens, error } => (
+                record::receipt_index(&tokens, |token| source.receipt(token)),
+                Some(error),
+            ),
         };
-        let snapshot = Self {
-            manifest: reader.manifest()?,
+        let manifest = match present(source.core(CoreRecord::Manifest)?)? {
+            Some(bytes) => record::manifest(&bytes, expected_id)
+                .map_err(|error| source.locate(CoreRecord::Manifest, error))?,
+            None => bail!("session has no manifest"),
+        };
+        let paths = source.event_paths()?;
+        // The Claim is a text token, read as the lifecycle readers read it.
+        let claim = present(source.core(CoreRecord::TurnClaim)?)?
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned());
+        let launch = present(source.core(CoreRecord::Launch)?)?
+            .map(|bytes| {
+                record::launch(&bytes).map_err(|error| source.locate(CoreRecord::Launch, error))
+            })
+            .transpose()?;
+        let lock = source.finish()?;
+        Ok(Self {
+            manifest,
             status,
             receipts: index.receipts,
             unreadable_requests: index.unreadable,
             request_index_error,
-            paths: reader.events()?,
-            claim: before[1].as_deref().map(|text| text.trim().to_owned()),
+            paths,
+            claim,
             pending,
-            launch: launch::read(reader)?,
+            launch,
             pending_event,
             _lock: lock,
-        };
-        // Status also has its own writer lock. Check for a moving snapshot even with a
-        // lifecycle reader lock, and support old records that have no lock file at all.
-        for (index, name) in state_files.iter().enumerate() {
-            if reader.private(name).text()? != before[index] {
-                return Err(SnapshotBusy.into());
-            }
-        }
-        Ok(snapshot)
+        })
     }
 
     pub(in crate::native) fn latest_event_id(&self) -> Option<&str> {
@@ -421,30 +437,18 @@ pub(in crate::native) fn parsed<T: for<'de> Deserialize<'de>>(
 }
 
 pub(in crate::native) fn receipt_index(records: &Records) -> requests::Index {
-    let mut index = requests::Index::default();
-    for source in records
+    let tokens = records
         .keys()
-        .filter(|s| s.starts_with("requests/") && s.ends_with(".json"))
-    {
-        let read = parsed::<requests::Receipt>(records, source).and_then(|r| {
-            let r = r.context("missing receipt")?;
-            requests::validate(&r)?;
-            if source != &format!("requests/{}.json", r.claim_token) {
-                bail!("invalid Bridge request receipt");
-            }
-            Ok(r)
-        });
-        match read {
-            Ok(r) => index.receipts.push(r),
-            Err(_) => index.unreadable += 1,
+        .filter_map(|source| source.strip_prefix("requests/")?.strip_suffix(".json"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    record::receipt_index(&tokens, |token| {
+        match &records[&format!("requests/{token}.json")] {
+            Ok(Some(bytes)) => Read::Present(bytes.clone()),
+            Ok(None) => Read::Absent,
+            Err(error) => Read::Fault(error.clone()),
         }
-    }
-    index.receipts.sort_by(|a, b| {
-        a.created_unix_ms
-            .cmp(&b.created_unix_ms)
-            .then_with(|| a.request_id.cmp(&b.request_id))
-    });
-    index
+    })
 }
 
 #[cfg(test)]

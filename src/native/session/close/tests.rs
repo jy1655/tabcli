@@ -8,6 +8,7 @@ use crate::native::session::primitives::event_paths;
 use crate::native::session::primitives::{SyncRecord, read_json, write_json_atomic};
 use crate::native::session::schema::SessionEvent;
 use crate::native::session::schema::{EVENT_READ_LIMIT, SESSION_SCHEMA, SessionManifest};
+use crate::native::session::turn::PendingTurnCompletion;
 use crate::native::session::{Reader, Store, turn};
 #[cfg(target_os = "macos")]
 use crate::native::terminal::close_authority::{
