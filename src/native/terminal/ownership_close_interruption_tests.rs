@@ -2,9 +2,12 @@
 // No intent, consumption marker, tombstone, or handle removal is manufactured.
 use super::teardown_tests::{fixture, kinds};
 use super::*;
+use crate::native::SessionStatus;
+use crate::native::session::{CoreRecord, SessionState};
+use crate::native::terminal::close_authority::close_owned_surface_with;
+use crate::native::terminal::close_authority::test_support::TestObservation;
 use session::close::interruption::{self, Point};
 use std::cell::Cell;
-use terminal::close_evidence::with_apple;
 use terminal::macos::apple_terminal::close_evidence::with_observations as apple_evidence;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,36 +81,33 @@ impl Processes {
             |surface| {
                 close_owned_surface_with(
                     || {
-                        verify_terminal_close_authority_with_observers(
+                        let deadline = crate::native::session::close::budget::close_deadline();
+                        let apple = apple_evidence(|_| Ok(None), || Ok(vec![]));
+                        // The intent and the owner are read from the records the
+                        // interrupted attempt left; resumability is the production read.
+                        TestObservation::on_records(
                             store.directory(),
                             "session-owner123",
                             surface,
-                            || Ok(false),
-                            CloseObservers {
-                                evidence: with_apple(
-                                    surface.kind,
-                                    &apple_evidence(|_| Ok(None), || Ok(vec![])),
-                                ),
-                                owner_record: &|_| panic!("not a failed startup"),
-                                pid_alive: &|_| self.owner_live.get(),
-                                mac_owner_live: &|_| test_owner_attestation(self.owner_live.get()),
-                                resumable: &|| {
-                                    session::close::terminal_close_resumable(
-                                        store,
-                                        surface,
-                                        terminal::surface_outlives_owner(surface),
-                                    )
-                                },
-                                ownership_proof: &|| bail!("surface proof failed"),
-                                attest_owner: &|| self.attest(store, live).map(|_| ()),
-                                group_gone: &|group| {
-                                    owner_group_gone_with(group, |target, signal| {
-                                        self.signal(target, signal)
-                                    })
-                                },
-                            },
-                            crate::native::session::close::budget::close_deadline(),
+                            deadline,
                         )
+                        .with_presence(|| Ok(false))
+                        .with_evidence(if surface.kind == terminal::TerminalKind::AppleTerminal {
+                            &apple
+                        } else {
+                            terminal::close_evidence(surface.kind)
+                        })
+                        .with_owner_record(|_| panic!("not a failed startup"))
+                        .with_pid_alive(|_| self.owner_live.get())
+                        .with_mac_owner_live(|_| test_owner_attestation(self.owner_live.get()))
+                        .with_proof(|| bail!("surface proof failed"))
+                        .with_attest(|| self.attest(store, live).map(|_| ()))
+                        .with_group_gone(|group| {
+                            owner_group_gone_with(group, |target, signal| {
+                                self.signal(target, signal)
+                            })
+                        })
+                        .decide("session-owner123", surface, deadline)
                     },
                     || {
                         teardown_absent_owner_with(

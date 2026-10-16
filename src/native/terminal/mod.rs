@@ -34,6 +34,7 @@ pub(super) fn surface_outlives_owner(session: &TerminalSession) -> bool {
     }
 }
 
+pub(in crate::native) mod close_authority;
 pub(in crate::native) mod ownership;
 
 use std::{path::Path, str::FromStr, time::Instant};

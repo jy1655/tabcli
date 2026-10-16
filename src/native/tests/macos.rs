@@ -1,6 +1,9 @@
 use super::support::*;
 use super::*;
 use crate::native::session::close as session_close;
+use crate::native::terminal::close_authority::{
+    TerminalCloseAuthority, test_support::TestObservation,
+};
 
 #[cfg(target_os = "macos")]
 #[test]
@@ -1071,24 +1074,36 @@ fn assert_dead_owner_preserves_unverified_surface(kind: terminal::TerminalKind) 
             let result = {
                 let closer =
                     &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
-                        verify_terminal_close_authority_with_evidence(
-                            directory.path(),
-                            "session-owner123",
-                            session,
-                            || Ok(true),
-                            #[cfg(target_os = "macos")]
-                            terminal::close_evidence::with_apple(
-                                session.kind,
-                                &terminal::macos::apple_terminal::close_evidence::with_observations(
+                        {
+                            let deadline = crate::native::session::close::budget::close_deadline();
+                            let apple =
+                                terminal::macos::apple_terminal::close_evidence::with_observations(
                                     |_| {
                                         let app = owner.terminal_app.as_ref().unwrap();
                                         Ok(Some((app.start_seconds, app.start_microseconds)))
                                     },
                                     || Ok(vec![owner.terminal_app.clone().unwrap()]),
-                                ),
-                            ),
-                            crate::native::session::close::budget::close_deadline(),
-                        )?;
+                                );
+                            TestObservation::on_records(
+                                directory.path(),
+                                "session-owner123",
+                                session,
+                                deadline,
+                            )
+                            .with_presence(|| Ok(true))
+                            .with_evidence(
+                                if session.kind == terminal::TerminalKind::AppleTerminal {
+                                    &apple
+                                } else {
+                                    terminal::close_evidence(session.kind)
+                                },
+                            )
+                            .decide(
+                                "session-owner123",
+                                session,
+                                deadline,
+                            )
+                        }?;
                         panic!("a dead owner without intent must grant no adapter authority")
                     };
                 session_close::close(
@@ -1158,27 +1173,33 @@ fn dead_owner_exact_absence_can_finish_without_adapter_or_signal() {
         {
             let closer =
                 &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
-                    let authority = verify_terminal_close_authority_with_evidence(
-                        directory.path(),
-                        "session-owner123",
-                        session,
-                        || {
-                            observations += 1;
-                            Ok(false)
-                        },
-                        #[cfg(target_os = "macos")]
-                        terminal::close_evidence::with_apple(
-                            session.kind,
-                            &terminal::macos::apple_terminal::close_evidence::with_observations(
+                    let authority = {
+                        let deadline = crate::native::session::close::budget::close_deadline();
+                        let apple =
+                            terminal::macos::apple_terminal::close_evidence::with_observations(
                                 |_| {
                                     let app = owner.terminal_app.as_ref().unwrap();
                                     Ok(Some((app.start_seconds, app.start_microseconds)))
                                 },
                                 || Ok(vec![owner.terminal_app.clone().unwrap()]),
-                            ),
-                        ),
-                        crate::native::session::close::budget::close_deadline(),
-                    )?;
+                            );
+                        TestObservation::on_records(
+                            directory.path(),
+                            "session-owner123",
+                            session,
+                            deadline,
+                        )
+                        .with_presence(|| {
+                            observations += 1;
+                            Ok(false)
+                        })
+                        .with_evidence(if session.kind == terminal::TerminalKind::AppleTerminal {
+                            &apple
+                        } else {
+                            terminal::close_evidence(session.kind)
+                        })
+                        .decide("session-owner123", session, deadline)
+                    }?;
                     assert_eq!(authority, TerminalCloseAuthority::Absent);
                     Ok(terminal::CloseOutcome::Missing)
                 };
@@ -1217,31 +1238,37 @@ fn dead_owner_absence_errors_and_reused_or_incomplete_owners_retain_handle() {
         let result = {
             let closer =
                 &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
-                    verify_terminal_close_authority_with_evidence(
-                        directory.path(),
-                        "session-owner123",
-                        session,
-                        || {
+                    {
+                        let deadline = crate::native::session::close::budget::close_deadline();
+                        let apple =
+                            terminal::macos::apple_terminal::close_evidence::with_observations(
+                                |_| {
+                                    let app = owner.terminal_app.as_ref().unwrap();
+                                    Ok(Some((app.start_seconds, app.start_microseconds)))
+                                },
+                                || Ok(vec![owner.terminal_app.clone().unwrap()]),
+                            );
+                        TestObservation::on_records(
+                            directory.path(),
+                            "session-owner123",
+                            session,
+                            deadline,
+                        )
+                        .with_presence(|| {
                             observed += 1;
                             match mode {
                                 "read-error" => bail!("injected unreadable target"),
                                 "present" => Ok(true),
                                 _ => panic!("unproven owner must not inspect a surface"),
                             }
-                        },
-                        #[cfg(target_os = "macos")]
-                        terminal::close_evidence::with_apple(
-                            session.kind,
-                            &terminal::macos::apple_terminal::close_evidence::with_observations(
-                                |_| {
-                                    let app = owner.terminal_app.as_ref().unwrap();
-                                    Ok(Some((app.start_seconds, app.start_microseconds)))
-                                },
-                                || Ok(vec![owner.terminal_app.clone().unwrap()]),
-                            ),
-                        ),
-                        crate::native::session::close::budget::close_deadline(),
-                    )?;
+                        })
+                        .with_evidence(if session.kind == terminal::TerminalKind::AppleTerminal {
+                            &apple
+                        } else {
+                            terminal::close_evidence(session.kind)
+                        })
+                        .decide("session-owner123", session, deadline)
+                    }?;
                     panic!("unproven absence must never close or signal")
                 };
             session_close::close(
@@ -1401,31 +1428,34 @@ fn failed_launch_with_a_recorded_owner_gets_no_close_without_a_prior_intent() {
 
                 let (mut observations, mut adapter_calls) = (0, 0);
                 let result = { let closer = &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
-                            let authority = verify_terminal_close_authority_with_evidence(
-                        directory.path(),
-                        "session-owner123",
-                        session,
-                        || {
-                            observations += 1;
-                            match mode {
-                                "absent" => Ok(false),
-                                "present" => Ok(true),
-                                _ => bail!("injected unreadable target"),
-                            }
-                        },
-                        #[cfg(target_os = "macos")]
-                        terminal::close_evidence::with_apple(
-                            session.kind,
-                            &terminal::macos::apple_terminal::close_evidence::with_observations(
+                            let deadline = crate::native::session::close::budget::close_deadline();
+                            let apple = terminal::macos::apple_terminal::close_evidence::with_observations(
                                 |pid| {
                                     assert_eq!(pid, app.pid);
                                     Ok(Some((app.start_seconds, app.start_microseconds)))
                                 },
                                 || Ok(vec![app.clone()]),
-                            ),
-                        ),
-                        crate::native::session::close::budget::close_deadline(),
-                    )?;
+                            );
+                            let authority = TestObservation::on_records(
+                                directory.path(),
+                                "session-owner123",
+                                session,
+                                deadline,
+                            )
+                            .with_presence(|| {
+                                observations += 1;
+                                match mode {
+                                    "absent" => Ok(false),
+                                    "present" => Ok(true),
+                                    _ => bail!("injected unreadable target"),
+                                }
+                            })
+                            .with_evidence(if session.kind == terminal::TerminalKind::AppleTerminal {
+                                &apple
+                            } else {
+                                terminal::close_evidence(session.kind)
+                            })
+                            .decide("session-owner123", session, deadline)?;
                             if authority == TerminalCloseAuthority::Absent {
                                 return Ok(terminal::CloseOutcome::Missing);
                             }
@@ -1500,32 +1530,28 @@ fn ownerless_warp_and_wezterm_failures_only_consume_proven_absence() {
                     turn::current_claim_token(&Reader::open_unchecked(directory.path())).unwrap();
                 let (mut observations, mut mutations) = (0, 0);
                 let result = { let closer = &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
-                            let authority = verify_terminal_close_authority_with_evidence(
-                        directory.path(),
-                        if mode == "foreign" {
-                            "session-foreign"
-                        } else {
-                            "session-owner123"
-                        },
-                        session,
-                        || {
-                            observations += 1;
-                            match mode {
-                                "absent" => Ok(false),
-                                "present" => Ok(true),
-                                _ => bail!("injected unreadable surface"),
-                            }
-                        },
-                        #[cfg(target_os = "macos")]
-                        terminal::close_evidence::with_apple(
-                            session.kind,
-                            &terminal::macos::apple_terminal::close_evidence::with_observations(
-                                |_| panic!("these adapters own their process identity checks"),
-                                || panic!("this is not a Terminal.app surface"),
-                            ),
-                        ),
-                        crate::native::session::close::budget::close_deadline(),
-                    )?;
+                            let deadline = crate::native::session::close::budget::close_deadline();
+                            let id = if mode == "foreign" {
+                                "session-foreign"
+                            } else {
+                                "session-owner123"
+                            };
+                            let authority = TestObservation::on_records(
+                                directory.path(),
+                                id,
+                                session,
+                                deadline,
+                            )
+                            .with_presence(|| {
+                                observations += 1;
+                                match mode {
+                                    "absent" => Ok(false),
+                                    "present" => Ok(true),
+                                    _ => bail!("injected unreadable surface"),
+                                }
+                            })
+                            .with_evidence(terminal::close_evidence(session.kind))
+                            .decide(id, session, deadline)?;
                             if authority == TerminalCloseAuthority::Absent {
                                 return Ok(terminal::CloseOutcome::Missing);
                             }
@@ -1563,47 +1589,6 @@ fn ownerless_warp_and_wezterm_failures_only_consume_proven_absence() {
     }
 }
 
-#[cfg(target_os = "macos")]
-#[test]
-fn ghostty_failed_start_native_id_recovery_does_not_need_a_prior_intent() {
-    for owner_recorded in [false, true] {
-        for phase in [launch::Phase::Pending, launch::Phase::Spawning] {
-            let directory = tempfile::tempdir().unwrap();
-            write_failed_launch_with_owner(
-                directory.path(),
-                terminal::TerminalKind::Ghostty,
-                phase,
-                reaped_child_pid(),
-            );
-            if !owner_recorded {
-                fs::remove_file(directory.path().join(SESSION_OWNER_FILE)).unwrap();
-            }
-            let handle: terminal::TerminalSession =
-                read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
-            assert!(!directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
-            assert_eq!(
-                verify_terminal_close_authority_with_evidence(
-                    directory.path(),
-                    "session-owner123",
-                    &handle,
-                    || panic!("the exact native-ID close adapter verifies its target"),
-                    #[cfg(target_os = "macos")]
-                    terminal::close_evidence::with_apple(
-                        handle.kind,
-                        &terminal::macos::apple_terminal::close_evidence::with_observations(
-                            |_| panic!("no Terminal.app process observation"),
-                            || panic!("no Terminal.app instance observation")
-                        )
-                    ),
-                    crate::native::session::close::budget::close_deadline(),
-                )
-                .unwrap(),
-                TerminalCloseAuthority::SurfaceOnly
-            );
-        }
-    }
-}
-
 // The close that recorded its intent while the owner was live still finishes after a
 // failed launch, and a surface with an app-unique native id keeps its startup recovery.
 #[cfg(target_os = "macos")]
@@ -1636,21 +1621,35 @@ fn failed_launch_keeps_the_prior_intent_retry_and_the_stable_id_recovery() {
             {
                 let closer =
                     &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
-                        let authority = verify_terminal_close_authority_with_evidence(
-                            directory.path(),
-                            "session-owner123",
-                            session,
-                            || panic!("{kind:?}/{phase:?}: no surface observation is needed"),
-                            #[cfg(target_os = "macos")]
-                            terminal::close_evidence::with_apple(
-                                session.kind,
-                                &terminal::macos::apple_terminal::close_evidence::with_observations(
+                        let authority = {
+                            let deadline = crate::native::session::close::budget::close_deadline();
+                            let apple =
+                                terminal::macos::apple_terminal::close_evidence::with_observations(
                                     |_| Ok(Some((app.start_seconds, app.start_microseconds))),
                                     || Ok(vec![app.clone()]),
-                                ),
-                            ),
-                            crate::native::session::close::budget::close_deadline(),
-                        )?;
+                                );
+                            TestObservation::on_records(
+                                directory.path(),
+                                "session-owner123",
+                                session,
+                                deadline,
+                            )
+                            .with_presence(|| {
+                                panic!("{kind:?}/{phase:?}: no surface observation is needed")
+                            })
+                            .with_evidence(
+                                if session.kind == terminal::TerminalKind::AppleTerminal {
+                                    &apple
+                                } else {
+                                    terminal::close_evidence(session.kind)
+                                },
+                            )
+                            .decide(
+                                "session-owner123",
+                                session,
+                                deadline,
+                            )
+                        }?;
                         assert_eq!(
                             authority,
                             TerminalCloseAuthority::SurfaceOnly,

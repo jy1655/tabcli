@@ -2027,6 +2027,19 @@ mod tests {
         assert_eq!(f.state.terminals.len(), 1);
         assert!(!f.calls.contains(&"input".into()));
     }
+    // The production close decision over the real records and the fake Ghostty runner.
+    fn production_close_authority(
+        directory: &Path,
+        id: &str,
+        surface: &TerminalSession,
+    ) -> Result<crate::native::terminal::close_authority::TerminalCloseAuthority> {
+        let deadline = crate::native::session::close::budget::close_deadline();
+        crate::native::terminal::close_authority::test_support::TestObservation::on_records(
+            directory, id, surface, deadline,
+        )
+        .decide(id, surface, deadline)
+    }
+
     #[test]
     fn failed_initialization_and_cleanup_preserve_recoverable_surface() {
         use crate::native::{
@@ -2066,12 +2079,7 @@ mod tests {
                 None,
                 crate::native::session::close::budget::close_deadline(),
                 |surface| {
-                    crate::native::terminal::ownership::verify_terminal_close_authority(
-                        directory.path(),
-                        id,
-                        surface,
-                        crate::native::session::close::budget::close_deadline(),
-                    )?;
+                    production_close_authority(directory.path(), id, surface)?;
                     close_with_runner(&mut f, surface, soon()).map(Into::into)
                 }
             )
@@ -2085,12 +2093,7 @@ mod tests {
             None,
             crate::native::session::close::budget::close_deadline(),
             |surface| {
-                crate::native::terminal::ownership::verify_terminal_close_authority(
-                    directory.path(),
-                    id,
-                    surface,
-                    crate::native::session::close::budget::close_deadline(),
-                )?;
+                production_close_authority(directory.path(), id, surface)?;
                 close_with_runner(&mut f, surface, soon()).map(Into::into)
             },
         )
@@ -2158,12 +2161,7 @@ mod tests {
             None,
             crate::native::session::close::budget::close_deadline(),
             |surface| {
-                crate::native::terminal::ownership::verify_terminal_close_authority(
-                    directory.path(),
-                    id,
-                    surface,
-                    crate::native::session::close::budget::close_deadline(),
-                )?;
+                production_close_authority(directory.path(), id, surface)?;
                 close_with_runner(&mut f, surface, soon()).map(Into::into)
             },
         )

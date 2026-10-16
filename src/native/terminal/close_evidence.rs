@@ -28,46 +28,78 @@ pub(in crate::native) trait CloseEvidence {
     ) -> Result<Option<MacTerminalAppIdentity>>;
 }
 
+// Presence alone: the adapter has no app-incarnation evidence, so an absent surface
+// is one its presence query does not find, nothing ever ends an incarnation, a
+// recorded close intent resumes as surface-only authority without rereading the owner
+// or the presence, and no incarnation is derived. Every kind but Terminal.app selects
+// it; the one declared variation is the context that Warp and WezTerm add when the
+// owner record is absent and the surface is not proven absent.
 #[cfg(target_os = "macos")]
-#[path = "macos/ghostty/close_evidence.rs"]
-mod ghostty;
+struct PresenceOnly {
+    ownerless_context: Option<&'static str>,
+}
+
 #[cfg(target_os = "macos")]
-#[path = "macos/iterm2/close_evidence.rs"]
-mod iterm2;
+static PRESENCE_ONLY: PresenceOnly = PresenceOnly {
+    ownerless_context: None,
+};
+
 #[cfg(target_os = "macos")]
-#[path = "macos/warp/close_evidence.rs"]
-mod warp;
+static PRESENCE_ONLY_WITH_OWNERLESS_CONTEXT: PresenceOnly = PresenceOnly {
+    ownerless_context: Some(
+        "could not prove absence of the ownerless startup surface; no close was sent",
+    ),
+};
+
 #[cfg(target_os = "macos")]
-#[path = "macos/wezterm/close_evidence.rs"]
-mod wezterm;
-#[cfg(target_os = "macos")]
-#[path = "windows/close_evidence.rs"]
-mod windows;
+impl CloseEvidence for PresenceOnly {
+    fn surface_absent(
+        &self,
+        owner: Option<&NativeSessionOwner>,
+        surface_present: Box<dyn FnOnce() -> Result<bool> + '_>,
+    ) -> Result<bool> {
+        use anyhow::Context as _;
+        let absent = surface_present().map(|present| !present);
+        match self.ownerless_context {
+            Some(context) if owner.is_none() => absent.context(context),
+            _ => absent,
+        }
+    }
+
+    fn incarnation_ended(&self, _owner: &NativeSessionOwner) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn resumable_authority(
+        &self,
+        _owner: &dyn Fn() -> Result<NativeSessionOwner>,
+        _surface_present: Box<dyn FnOnce() -> Result<bool> + '_>,
+    ) -> Result<ResumableAuthority> {
+        Ok(ResumableAuthority::SurfaceOnly)
+    }
+
+    fn startup_retained_reason(&self) -> &'static str {
+        "startup has no native owner or close intent and its surface is not proven gone; no close was sent and the surface handle is retained"
+    }
+
+    fn derive_app_incarnation(
+        &self,
+        _owner: &NativeSessionOwner,
+    ) -> Result<Option<MacTerminalAppIdentity>> {
+        Ok(None)
+    }
+}
 
 #[cfg(target_os = "macos")]
 pub(in crate::native) fn for_kind(kind: super::TerminalKind) -> &'static dyn CloseEvidence {
     use super::{TerminalKind, macos::apple_terminal};
     match kind {
         TerminalKind::AppleTerminal => &apple_terminal::close_evidence::EVIDENCE,
-        TerminalKind::Iterm2 => &iterm2::EVIDENCE,
-        TerminalKind::Ghostty => &ghostty::EVIDENCE,
-        TerminalKind::Warp => &warp::EVIDENCE,
-        TerminalKind::WezTerm => &wezterm::EVIDENCE,
-        TerminalKind::WindowsConsole => &windows::EVIDENCE,
-    }
-}
-
-// Inject only Terminal.app's observations; every other kind still answers through
-// its own real adapter. The borrowed evidence may capture a test's Cell/RefCell.
-#[cfg(all(test, target_os = "macos"))]
-pub(in crate::native) fn with_apple(
-    kind: super::TerminalKind,
-    apple: &dyn CloseEvidence,
-) -> &dyn CloseEvidence {
-    if kind == super::TerminalKind::AppleTerminal {
-        apple
-    } else {
-        for_kind(kind)
+        TerminalKind::Iterm2 => &PRESENCE_ONLY,
+        TerminalKind::Ghostty => &PRESENCE_ONLY,
+        TerminalKind::Warp => &PRESENCE_ONLY_WITH_OWNERLESS_CONTEXT,
+        TerminalKind::WezTerm => &PRESENCE_ONLY_WITH_OWNERLESS_CONTEXT,
+        TerminalKind::WindowsConsole => &PRESENCE_ONLY,
     }
 }
 
@@ -112,6 +144,55 @@ mod tests {
                     .unwrap()
             );
             assert!(observed);
+        }
+    }
+
+    // The one variation among the presence-only kinds: Warp and WezTerm add the
+    // ownerless-startup context to a failed presence query, and only when no owner
+    // record exists. Every other answer is the same for every presence-only kind.
+    #[test]
+    fn presence_only_ownerless_context_is_added_by_warp_and_wezterm_only() {
+        let owner = NativeSessionOwner::default();
+        for (kind, with_context) in [
+            (TerminalKind::Iterm2, false),
+            (TerminalKind::Ghostty, false),
+            (TerminalKind::WindowsConsole, false),
+            (TerminalKind::Warp, true),
+            (TerminalKind::WezTerm, true),
+        ] {
+            let evidence = for_kind(kind);
+            let chain = |owner: Option<&NativeSessionOwner>| {
+                evidence
+                    .surface_absent(owner, Box::new(|| Err(anyhow::anyhow!("presence cause"))))
+                    .unwrap_err()
+                    .chain()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            };
+            let ownerless: &[&str] = if with_context {
+                &[
+                    "could not prove absence of the ownerless startup surface; no close was sent",
+                    "presence cause",
+                ]
+            } else {
+                &["presence cause"]
+            };
+            assert_eq!(chain(None), ownerless, "{kind:?}");
+            assert_eq!(chain(Some(&owner)), ["presence cause"], "{kind:?}");
+            assert!(
+                evidence
+                    .surface_absent(None, Box::new(|| Ok(false)))
+                    .unwrap()
+            );
+            assert!(
+                !evidence
+                    .surface_absent(None, Box::new(|| Ok(true)))
+                    .unwrap()
+            );
+            assert_eq!(
+                evidence.startup_retained_reason(),
+                "startup has no native owner or close intent and its surface is not proven gone; no close was sent and the surface handle is retained"
+            );
         }
     }
 }
