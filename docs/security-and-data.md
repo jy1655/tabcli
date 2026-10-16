@@ -137,6 +137,18 @@ and other logs also live in provider-specific records. Prompts and results can c
 from your input or the provider's work; do not publish a session directory without reviewing
 it. The [contributor record map](architecture.md#session-records) lists the lifecycle records.
 
+Bridge reads its own JSON records (`manifest.json`, `status.json`, `closed.json`,
+`turn.completion.json`, `launch.json` and the receipts under `requests/`) through one decoder
+per record, in every command. The decoder takes the bytes as strict UTF-8, so a record with
+invalid UTF-8 is unreadable rather than read with replacement characters. A `*_unix_ms` value
+above the JSON unsigned integer range, anywhere in the record, also makes it unreadable, so
+that a command rendering the record cannot fail while serializing it. `status.json` and
+`closed.json` are read as regular files only, as the manifest, the journal, the launch record
+and the receipts already were: a symbolic link or a non-file at either path is refused with
+`refusing non-regular session file`, not followed. Missing records keep each command's own
+meaning (a missing `closed.json` is an open session; a missing `status.json` fails the read
+that requires it).
+
 Bridge makes private directories mode `0700` and private records mode `0600` on Unix. On Windows,
 it installs a protected access list giving the current user full control, with inheritance for
 private directories. Administrators and the operating system can still access the data.

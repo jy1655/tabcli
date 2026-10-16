@@ -109,10 +109,18 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   `state` owns the serialized status and its writes: `Store::update_status` applies
   permitted transitions and generations, while `Store::record_residual_surface` amends
   diagnostics without changing lifecycle fields. Both preserve closed tombstones.
-- Within `src/native/session/`, start with `reads.rs` for decoding and read budgets,
-  `primitives.rs` for filesystem durability and private-record permissions, and `owner.rs` for
-  read-only attestation of the recorded owner. Owner attestation separates incarnation birth
-  from recorded TTY/process-group control, preserves inspection errors, and projects the
+- Within `src/native/session/`, start with `record.rs`: one decoder per JSON core Record
+  (manifest, status and the closed tombstone, completion journal, launch record, Receipt), the
+  byte-source seam and the Snapshot assembly, with three adapters: the live source (the shared
+  lifecycle lock and the before/after check of the four state files), the timeline's cached
+  source (read once, strict, bounded, whole-map recheck) and Origin's budgeted source
+  (per-record cap, byte and time allowance, selective reads, no Snapshot). Every other reader
+  of those Records (the lifecycle paths, reopen provenance, the Claude projection) calls the
+  same decoders while keeping its own missing-record policy and error context. Then `reads.rs`
+  for event reads and read budgets, `primitives.rs` for filesystem durability and
+  private-record permissions, and `owner.rs` for read-only attestation of the recorded owner.
+  Owner attestation separates incarnation birth from recorded TTY/process-group control,
+  preserves inspection errors, and projects the
   public OwnerObservation. It takes only an owner value and OS observations, never a Store
   or session lock. Caller policy for prune, repair, wait and exact close-intent resumption
   remains in session; control proof and the close authority table remain in terminal.
@@ -310,6 +318,8 @@ Readers treat it as auxiliary evidence: malformed intent cannot hide a Result, a
 marks its interpretation as derived. Replacement removes the earlier intent from observation.
 
 `RecordReader` and `RecordStore` provide the primitives for names and schemas owned by adapters.
+Core Record decoding is not an adapter concern: it lives in `session/record.rs`, one decoder per
+Record, and every reader of a core Record calls it.
 
 The native provider contract requires explicit launch configuration, initial delivery,
 follow-up transport, completion handling, trust, diagnostics, and reopen behavior from every

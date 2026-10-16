@@ -1,22 +1,13 @@
 //! Consistent read-only session records and their publication evidence.
-use super::schema::{EVENT_READ_LIMIT, SESSION_SCHEMA, SessionEvent, SessionManifest};
-use super::turn::{
-    JournaledEventRead, JournaledEventState, PendingTurnCompletion, validate_pending_completion,
-};
-use super::{
-    CoreRecord, Reader, RecordReader, SessionState, SessionStatus, SnapshotBusy, launch, requests,
-    turn,
-};
+use super::record::{self, Live, Read, ReceiptNames, Source, Tolerance};
+use super::schema::{EVENT_READ_LIMIT, SessionEvent, SessionManifest};
+use super::turn::{JournaledEventRead, PendingTurnCompletion};
+use super::{CoreRecord, Reader, RecordReader, SessionState, SessionStatus, launch, requests};
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
-use serde_json::Value;
 use std::{
-    collections::BTreeMap,
     fs::File,
     path::{Path, PathBuf},
 };
-
-pub(in crate::native) type Records = BTreeMap<String, std::result::Result<Option<Vec<u8>>, String>>;
 
 pub(in crate::native) struct Snapshot {
     pub(in crate::native) manifest: SessionManifest,
@@ -140,75 +131,106 @@ impl Reader {
         &self,
         publication: PublicationRead,
     ) -> Result<Snapshot> {
-        Snapshot::read_with(self, publication)
+        let expected_id = self
+            .directory()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        Snapshot::assemble(Live::begin(self)?, expected_id, publication)
     }
 }
 
 impl Snapshot {
-    /// A consistent read deciding a journaled event's publication as `publication` says.
-    fn read_with(reader: &Reader, publication: PublicationRead) -> Result<Self> {
-        let directory = reader.directory();
-        let lock = reader.lock_shared()?;
-        let state_files = [
-            CoreRecord::Status.name(),
-            CoreRecord::TurnClaim.name(),
-            CoreRecord::Completion.name(),
-            CoreRecord::Launch.name(),
-        ];
-        let before = state_files
-            .map(|name| reader.private(name).text())
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-        let status: SessionStatus = serde_json::from_str(
-            before[0]
-                .as_deref()
-                .context("session has no status record")?,
-        )?;
-        let pending: Option<PendingTurnCompletion> =
-            before[2].as_deref().map(serde_json::from_str).transpose()?;
+    /// Builds the Snapshot from `source` in the order the Live read always used: status
+    /// and journal from the state bytes, the publication read as `publication` says, the
+    /// receipt index, the manifest bound to `expected_id`, the events, the claim, the
+    /// launch record, then the source's consistency check. A retained fault reaches the
+    /// Snapshot as the source's [`Tolerance`] for that record says: it fails the read,
+    /// leaves the record absent, or (status) yields the unknown status.
+    pub(in crate::native) fn assemble(
+        mut source: impl Source,
+        expected_id: &str,
+        publication: PublicationRead,
+    ) -> Result<Self> {
+        fn present(source: &mut impl Source, record: CoreRecord) -> Result<Option<Vec<u8>>> {
+            match source.core(record)? {
+                Read::Present(bytes) => Ok(Some(bytes)),
+                Read::Absent => Ok(None),
+                Read::Fault(error) => match source.tolerance(record) {
+                    Tolerance::Absent => Ok(None),
+                    Tolerance::Fail | Tolerance::UnknownStatus => bail!("{error}"),
+                },
+            }
+        }
+        let status = match source.core(CoreRecord::Status)? {
+            Read::Present(bytes) => {
+                record::status(&bytes).map_err(|error| source.locate(CoreRecord::Status, error))?
+            }
+            Read::Absent => bail!("session has no status record"),
+            Read::Fault(error) => match source.tolerance(CoreRecord::Status) {
+                Tolerance::UnknownStatus => SessionStatus {
+                    state: SessionState::Unknown("unknown".to_owned()),
+                    generation: 0,
+                    updated_unix_ms: 0,
+                    exit_code: None,
+                    error: None,
+                    residual_surface: None,
+                },
+                Tolerance::Fail | Tolerance::Absent => bail!("{error}"),
+            },
+        };
+        let pending = present(&mut source, CoreRecord::Completion)?
+            .map(|bytes| {
+                record::journal(&bytes)
+                    .map_err(|error| source.locate(CoreRecord::Completion, error))
+            })
+            .transpose()?;
         let pending_event = match (&pending, publication) {
             (Some(pending), PublicationRead::Within(event_limit)) => {
-                validate_pending_completion(pending)?;
-                // The predicate validates `events` before it opens anything under it, so
-                // a link planted there is rejected instead of followed by this read.
-                Some(
-                    Reader::open_unchecked(directory)
-                        .journaled_event_state_within(pending, event_limit)?,
-                )
+                Some(source.publication_read(pending, event_limit)?)
             }
-            (Some(pending), PublicationRead::Deferred) => {
-                validate_pending_completion(pending)?;
-                None
-            }
-            (None, _) => None,
+            (Some(_), PublicationRead::Deferred) | (None, _) => None,
         };
-        before_consistency_check(directory);
-        let (index, request_index_error) = match requests::list(&Reader::open_unchecked(directory))
-        {
-            Ok(index) => (index, None),
-            Err(error) => (requests::Index::default(), Some(format!("{error:#}"))),
+        source.state_observed();
+        let (index, request_index_error) = match source.receipt_names() {
+            ReceiptNames::Absent => (requests::Index::default(), None),
+            ReceiptNames::Present(tokens) => (
+                record::receipt_index(&tokens, |token| source.receipt(token)),
+                None,
+            ),
+            ReceiptNames::Fault { tokens, error } => (
+                record::receipt_index(&tokens, |token| source.receipt(token)),
+                Some(error),
+            ),
         };
-        let snapshot = Self {
-            manifest: reader.manifest()?,
+        let manifest = match present(&mut source, CoreRecord::Manifest)? {
+            Some(bytes) => record::manifest(&bytes, expected_id)
+                .map_err(|error| source.locate(CoreRecord::Manifest, error))?,
+            None => bail!("session has no manifest"),
+        };
+        let paths = source.event_paths()?;
+        // The Claim is a text token, read as the lifecycle readers read it.
+        let claim = present(&mut source, CoreRecord::TurnClaim)?
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned());
+        let launch = present(&mut source, CoreRecord::Launch)?
+            .map(|bytes| {
+                record::launch(&bytes).map_err(|error| source.locate(CoreRecord::Launch, error))
+            })
+            .transpose()?;
+        let lock = source.finish()?;
+        Ok(Self {
+            manifest,
             status,
             receipts: index.receipts,
             unreadable_requests: index.unreadable,
             request_index_error,
-            paths: reader.events()?,
-            claim: before[1].as_deref().map(|text| text.trim().to_owned()),
+            paths,
+            claim,
             pending,
-            launch: launch::read(reader)?,
+            launch,
             pending_event,
             _lock: lock,
-        };
-        // Status also has its own writer lock. Check for a moving snapshot even with a
-        // lifecycle reader lock, and support old records that have no lock file at all.
-        for (index, name) in state_files.iter().enumerate() {
-            if reader.private(name).text()? != before[index] {
-                return Err(SnapshotBusy.into());
-            }
-        }
-        Ok(snapshot)
+        })
     }
 
     pub(in crate::native) fn latest_event_id(&self) -> Option<&str> {
@@ -289,162 +311,6 @@ impl Snapshot {
             .context("event has no completion journal")?;
         Reader::open_unchecked(reader.directory()).journaled_event_state_within(pending, limit)
     }
-
-    pub(in crate::native) fn from_records(records: &Records) -> Result<Self> {
-        fn optional<T: for<'de> Deserialize<'de>>(
-            records: &Records,
-            source: &str,
-        ) -> Result<Option<T>> {
-            if records[source].is_err() {
-                return Ok(None);
-            }
-            parsed(records, source)
-        }
-        let index = receipt_index(records);
-        let manifest: SessionManifest =
-            parsed(records, CoreRecord::Manifest.name())?.context("session has no manifest")?;
-        if manifest.schema != SESSION_SCHEMA {
-            bail!(
-                "unsupported session schema {} for {}",
-                manifest.schema,
-                manifest.id
-            );
-        }
-        let pending: Option<PendingTurnCompletion> =
-            optional(records, CoreRecord::Completion.name())?;
-        if let Some(p) = &pending {
-            validate_pending_completion(p)?;
-        }
-        let pending_event = pending
-            .as_ref()
-            .map(|p| -> Result<JournaledEventRead> {
-                let source = format!("events/{}", p.event_file);
-                let bytes = records
-                    .get(&source)
-                    .and_then(|r| r.as_ref().ok())
-                    .and_then(|r| r.as_ref());
-                let state = bytes
-                    .map(|b| turn::journaled_event_state_of(p, b, EVENT_READ_LIMIT))
-                    .transpose()?
-                    .unwrap_or(JournaledEventState::Mismatched);
-                Ok(JournaledEventRead {
-                    state,
-                    bytes_read: 0,
-                    committed_text: None,
-                })
-            })
-            .transpose()?;
-        let launch: Option<launch::Record> = optional(records, CoreRecord::Launch.name())?;
-        if launch
-            .as_ref()
-            .is_some_and(|l| l.schema != 1 || l.claim_token.is_empty())
-        {
-            bail!("invalid launch receipt identity");
-        }
-        let claim = records[CoreRecord::TurnClaim.name()]
-            .as_ref()
-            .ok()
-            .and_then(|v| v.as_ref())
-            .map(|b| std::str::from_utf8(b).map(|s| s.trim().to_owned()))
-            .transpose()?;
-        Ok(Snapshot {
-            manifest,
-            status: if records[CoreRecord::Status.name()].is_err() {
-                SessionStatus {
-                    state: SessionState::Unknown("unknown".to_owned()),
-                    generation: 0,
-                    updated_unix_ms: 0,
-                    exit_code: None,
-                    error: None,
-                    residual_surface: None,
-                }
-            } else {
-                parsed(records, CoreRecord::Status.name())?
-                    .context("session has no status record")?
-            },
-            receipts: index.receipts,
-            unreadable_requests: index.unreadable,
-            request_index_error: records["requests/"].as_ref().err().cloned(),
-            paths: records
-                .keys()
-                .filter(|s| s.starts_with("events/") && s.ends_with(".json"))
-                .map(PathBuf::from)
-                .collect(),
-            claim,
-            pending,
-            launch,
-            pending_event,
-            _lock: None,
-        })
-    }
-}
-
-pub(in crate::native) fn parsed<T: for<'de> Deserialize<'de>>(
-    records: &Records,
-    source: &str,
-) -> Result<Option<T>> {
-    let bytes = records
-        .get(source)
-        .context("record not selected")?
-        .as_ref()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    bytes
-        .as_ref()
-        .map(|b| {
-            let text = std::str::from_utf8(b).context("invalid UTF-8")?;
-            // Recorded u128 values must fit the integer range supported by json!.
-            fn numbers(v: &Value) -> Result<()> {
-                match v {
-                    Value::Array(vs) => {
-                        for v in vs {
-                            numbers(v)?;
-                        }
-                    }
-                    Value::Object(vs) => {
-                        for (key, v) in vs {
-                            if key.ends_with("_unix_ms") && !v.is_null() && v.as_u64().is_none() {
-                                bail!(
-                                    "record timestamp is outside the JSON unsigned integer range"
-                                );
-                            }
-                            numbers(v)?;
-                        }
-                    }
-                    _ => (),
-                }
-                Ok(())
-            }
-            numbers(&serde_json::from_str::<Value>(text)?)?;
-            serde_json::from_str(text).context("invalid JSON record")
-        })
-        .transpose()
-}
-
-pub(in crate::native) fn receipt_index(records: &Records) -> requests::Index {
-    let mut index = requests::Index::default();
-    for source in records
-        .keys()
-        .filter(|s| s.starts_with("requests/") && s.ends_with(".json"))
-    {
-        let read = parsed::<requests::Receipt>(records, source).and_then(|r| {
-            let r = r.context("missing receipt")?;
-            requests::validate(&r)?;
-            if source != &format!("requests/{}.json", r.claim_token) {
-                bail!("invalid Bridge request receipt");
-            }
-            Ok(r)
-        });
-        match read {
-            Ok(r) => index.receipts.push(r),
-            Err(_) => index.unreadable += 1,
-        }
-    }
-    index.receipts.sort_by(|a, b| {
-        a.created_unix_ms
-            .cmp(&b.created_unix_ms)
-            .then_with(|| a.request_id.cmp(&b.request_id))
-    });
-    index
 }
 
 #[cfg(test)]

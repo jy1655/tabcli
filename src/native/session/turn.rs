@@ -745,12 +745,11 @@ pub(super) fn recover_pending_completion_locked(
             &tombstone,
         );
     }
-    let Some(text) = session::RecordReader::at(&completion_path).text()? else {
+    let Some(bytes) = session::RecordReader::at(&completion_path).bytes()? else {
         return Ok(false);
     };
-    let pending: PendingTurnCompletion =
-        serde_json::from_str(&text).context("invalid pending native turn completion")?;
-    validate_pending_completion(&pending)?;
+    let pending = super::record::journal(&bytes)
+        .map_err(|error| error.context("invalid pending native turn completion"))?;
 
     match session::RecordReader::at(claim_path).raw_text() {
         Ok(current) if current.trim() == pending.claim_token => {

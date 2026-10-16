@@ -8,7 +8,7 @@ use crate::native::delivery::{
 #[cfg(test)]
 use crate::native::session::SessionState;
 use crate::native::session::turn;
-use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store};
+use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store, record};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -711,14 +711,13 @@ fn synchronized_messenger_deadline(deadline: Instant) -> Result<Instant> {
 // It proves nothing between scans; non-resumed sessions return None.
 fn resumed_conversation_holders_check(directory: &Path) -> Option<super::super::doctor::Check> {
     use super::super::doctor::{Availability::*, Check};
-    let manifest = RecordReader::at(
-        Reader::open_unchecked(directory)
-            .record(CoreRecord::Manifest)
-            .path(),
-    )
-    .optional_json::<serde_json::Value>()
-    .ok()
-    .flatten()?;
+    // The manifest's optional `resumed_from` projection, read as the manifest is read.
+    let manifest = Reader::open_unchecked(directory)
+        .record(CoreRecord::Manifest)
+        .bytes()
+        .ok()
+        .flatten()
+        .and_then(|bytes| record::decode::<serde_json::Value>(&bytes).ok())?;
     let provider_session_id = manifest
         .get("resumed_from")?
         .get("provider_session_id")?

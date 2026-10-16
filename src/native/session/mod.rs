@@ -2,9 +2,7 @@
 use crate::native::terminal;
 use crate::native::terminal::ownership::NativeSessionOwner;
 use anyhow::{Context, Result, bail};
-use schema::{
-    ProviderProcessRecord, RecordedReopenRefusal, SESSION_SCHEMA, SessionEvent, SessionManifest,
-};
+use schema::{ProviderProcessRecord, RecordedReopenRefusal, SessionEvent, SessionManifest};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -30,6 +28,7 @@ pub(in crate::native) mod turn;
 use turn::{JournaledEventRead, JournaledEventState, PendingTurnCompletion};
 pub(in crate::native) mod primitives;
 mod reads;
+pub(in crate::native) mod record;
 pub(in crate::native) mod schema;
 pub(in crate::native) mod snapshot;
 #[cfg(test)]
@@ -158,7 +157,7 @@ impl Reader {
         read_manifest(&self.directory)
     }
     pub(in crate::native) fn closed_if_present(&self) -> Result<Option<SessionStatus>> {
-        read_status_if_present(&self.directory.join(CLOSED_STATUS_FILE))
+        read_regular_status_if_present(&self.directory.join(CLOSED_STATUS_FILE))
     }
     pub(in crate::native) fn event(&self, name: &str) -> RecordReader {
         self.private(EVENTS_DIRECTORY).child(name)
@@ -170,22 +169,19 @@ impl Reader {
         read_event_strictly(&self.directory, name)
     }
     pub(in crate::native) fn status_if_present(&self) -> Result<Option<SessionStatus>> {
-        read_status_if_present(&self.directory.join(STATUS_FILE))
-    }
-    pub(in crate::native) fn regular_closed_if_present(&self) -> Result<Option<SessionStatus>> {
-        read_regular_status_if_present(&self.directory.join(CLOSED_STATUS_FILE))
+        read_regular_status_if_present(&self.directory.join(STATUS_FILE))
     }
     pub(in crate::native) fn initial_prompt(&self) -> std::io::Result<String> {
         fs::read_to_string(self.directory.join(INITIAL_PROMPT_FILE))
     }
-    pub(in crate::native) fn regular_status_if_present(&self) -> Result<Option<SessionStatus>> {
-        read_regular_status_if_present(&self.directory.join(STATUS_FILE))
-    }
     pub(in crate::native) fn events(&self) -> Result<Vec<PathBuf>> {
         event_paths(&self.directory)
     }
+    /// The required status record: a regular file, decoded strictly. A missing record
+    /// is `failed to read {path}` with its I/O cause.
     pub(in crate::native) fn status(&self) -> Result<SessionStatus> {
-        self.private(STATUS_FILE).json()
+        let path = self.directory.join(STATUS_FILE);
+        record::status(&read_regular_bytes(&path)?).map_err(|error| error.in_path(&path))
     }
     // Read by the macOS and Windows ownership paths; Linux has no managed surface yet.
     #[cfg(any(target_os = "macos", windows))]

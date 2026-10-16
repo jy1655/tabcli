@@ -49,15 +49,25 @@ pub(in crate::native) fn is_regular_file(path: &Path) -> Result<bool> {
     }
 }
 
+/// `status.json` or `closed.json` when present: a regular file, decoded strictly.
 pub(in crate::native) fn read_regular_status_if_present(
     path: &Path,
 ) -> Result<Option<SessionStatus>> {
-    let Some(text) = read_regular_text_if_present(path)? else {
-        return Ok(None);
-    };
-    serde_json::from_str(&text)
-        .map(Some)
-        .with_context(|| format!("invalid JSON in {}", path.display()))
+    read_regular_bytes_if_present(path)?
+        .map(|bytes| record::status(&bytes).map_err(|error| error.in_path(path)))
+        .transpose()
+}
+
+/// The raw bytes of a required regular session file; a missing file is
+/// `failed to read {path}` with its I/O cause.
+pub(in crate::native) fn read_regular_bytes(path: &Path) -> Result<Vec<u8>> {
+    read_regular_bytes_if_present(path)?.map_or_else(
+        || {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                .with_context(|| format!("failed to read {}", path.display()))
+        },
+        Ok,
+    )
 }
 
 pub(in crate::native) fn remove_file_if_present(path: &Path) -> Result<()> {
@@ -90,8 +100,9 @@ pub(in crate::native) fn read_regular_text_if_present(path: &Path) -> Result<Opt
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-/// The raw bytes of a regular session file, so callers that must not alter a record can
-/// decode it strictly instead of through the lossy snapshot reader.
+/// The raw bytes of a regular session file: what the core Record decoders in `record.rs`
+/// take, and what a caller that must not alter an event decodes strictly instead of
+/// through the Snapshot's lossy event read.
 pub(in crate::native) fn read_regular_bytes_if_present(path: &Path) -> Result<Option<Vec<u8>>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -310,22 +321,12 @@ pub(in crate::native) fn read_manifest(directory: &Path) -> Result<SessionManife
     // would let content outside the state root steer a search or an attach, and is
     // refused rather than followed.
     let path = directory.join(crate::native::session::MANIFEST_FILE);
-    let bytes = read_regular_bytes_if_present(&path)?
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let manifest: SessionManifest = serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid JSON in {}", path.display()))?;
-    if manifest.schema != SESSION_SCHEMA {
-        bail!(
-            "unsupported session schema {} for {}",
-            manifest.schema,
-            manifest.id
-        );
-    }
-    let expected_id = directory.file_name().and_then(|name| name.to_str());
-    if expected_id != Some(manifest.id.as_str()) {
-        bail!("session manifest id does not match its directory");
-    }
-    Ok(manifest)
+    let bytes = read_regular_bytes(&path)?;
+    let expected_id = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    record::manifest(&bytes, expected_id).map_err(|error| error.in_path(&path))
 }
 
 pub(in crate::native) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
@@ -725,16 +726,6 @@ pub(in crate::native) fn lock_status(directory: &Path) -> Result<StatusLock> {
     set_private_file_permissions(&file)?;
     lock_for_close_or_block(&file, "status")?;
     Ok(StatusLock { _file: file })
-}
-
-pub(in crate::native) fn read_status_if_present(path: &Path) -> Result<Option<SessionStatus>> {
-    match fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text)
-            .map(Some)
-            .with_context(|| format!("invalid JSON in {}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
-    }
 }
 
 pub(in crate::native) struct TurnClaimLock {

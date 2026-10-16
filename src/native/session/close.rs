@@ -10,8 +10,8 @@ use crate::native::session::state::{
 use super::owner::{OwnerAttestation, attest_owner};
 use crate::native::process_identity::ProcessObservation;
 use crate::native::session::turn::{
-    JournaledEventState, PendingTurnCompletion, journaled_event_state, recover_pending_completion,
-    remove_turn_claim_locked, validate_pending_completion,
+    JournaledEventState, journaled_event_state, recover_pending_completion,
+    remove_turn_claim_locked,
 };
 use crate::native::session::{CoreRecord, Reader, RecordStore, Store, launch};
 use crate::native::terminal;
@@ -698,18 +698,16 @@ pub(in crate::native) fn converge_interrupted(
 fn set_aside_unverified_completion_event_for_close(store: &Store) -> Result<()> {
     let directory = store.directory();
     let completion_path = store.record(CoreRecord::Completion).path().to_owned();
-    let Some(text) = session::RecordReader::at(&completion_path).text()? else {
+    let Some(bytes) = session::RecordReader::at(&completion_path).bytes()? else {
         return Ok(());
     };
     if store.events_directory_state()? == EventsDirectory::Missing {
         return Ok(());
     }
-    let Ok(pending) = serde_json::from_str::<PendingTurnCompletion>(&text) else {
+    // A journal that does not decode is not evidence; the close settles without it.
+    let Ok(pending) = super::record::journal(&bytes) else {
         return Ok(());
     };
-    if validate_pending_completion(&pending).is_err() {
-        return Ok(());
-    }
     let events = store.record(CoreRecord::Events).path().to_owned();
     let set_aside = store
         .unpublished_event(&pending.event_file)

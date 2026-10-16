@@ -1401,11 +1401,11 @@ fn prune_closed_sessions(root: &Path, cutoff_unix_ms: u128) -> Result<Vec<String
         if manifest.id != id {
             continue;
         }
-        let closed = match Reader::open_unchecked(&directory).regular_closed_if_present() {
+        let closed = match Reader::open_unchecked(&directory).closed_if_present() {
             Ok(Some(closed)) => closed,
             Ok(None) | Err(_) => continue,
         };
-        let status = match Reader::open_unchecked(&directory).regular_status_if_present() {
+        let status = match Reader::open_unchecked(&directory).status_if_present() {
             Ok(Some(status)) => status,
             Ok(None) | Err(_) => continue,
         };
