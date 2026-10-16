@@ -237,17 +237,66 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                         },
                         "{label}"
                     );
-                    assert!(
-                        matches!(
-                            &plan.completion_monitor,
-                            CompletionMonitor::AgyTranscript { log_path: path } if *path == log_path
-                        ),
-                        "{label}: {:?}",
-                        plan.completion_monitor
+                    assert_eq!(
+                        format!("{:?}", plan.watcher),
+                        format!("{:?}", AgyTranscriptWatcher { log_path }),
+                        "{label}"
                     );
                     assert!(plan.environment_removals.is_empty(), "{label}");
                 }
             }
         }
     }
+}
+
+// The plan carries the transcript watcher unstarted: building it leaves the session's log
+// path untouched and runs nothing; `start` hands the directory and the owned log path to
+// the monitor, whose first read then fails on the non-regular log, and `stop` returns
+// the monitor's own error.
+#[test]
+fn launch_plan_watcher_starts_the_transcript_monitor_only_when_started() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-safe123");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::create_dir(directory.join("events")).unwrap();
+    turn::claim(&Store::open_unchecked(&directory), &[])
+        .unwrap()
+        .retain();
+    let log_path = directory.join(AGY_LOG_FILE);
+    std::fs::create_dir(&log_path).unwrap();
+    let plan = prepare_launch_for_platform(
+        LaunchContext {
+            bridge_executable: Path::new("/opt/agent-bridge"),
+            directory: &directory,
+            workspace: root.path(),
+            title: "Agy test",
+            prompt: "agy prompt",
+            yolo: false,
+            model: None,
+            effort: None,
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        format!("{:?}", plan.watcher),
+        format!(
+            "{:?}",
+            AgyTranscriptWatcher {
+                log_path: log_path.clone()
+            }
+        )
+    );
+    assert!(log_path.is_dir(), "building the plan touched the log path");
+    assert!(!directory.join("status.json").exists());
+
+    let active = plan.watcher.start(&directory).unwrap();
+    let error = active.stop().unwrap_err();
+    assert!(
+        format!("{error:#}").contains(&format!(
+            "refusing non-regular session file: {}",
+            log_path.display()
+        )),
+        "{error:#}"
+    );
 }

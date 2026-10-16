@@ -105,13 +105,12 @@ pub(in crate::native) fn provision(directory: &Path) -> Result<()> {
     // adapter's resume plan with the new request's policy; the plan carries no prompt, and
     // the reopened process receives it through the same transport a fresh launch uses.
     let resumed_from = read_resumed_from(directory)?;
-    let (arguments, initial_prompt, completion_monitor, environment_removals) = match &resumed_from
-    {
+    let (arguments, initial_prompt, watcher, environment_removals) = match &resumed_from {
         Some(resumed_from) => {
             let provider::ResumePlan {
                 arguments,
                 initial_prompt,
-                completion_monitor,
+                watcher,
                 environment_removals,
             } = provider::reopen(provider)?.prepare(provider::ResumeContext {
                 bridge_executable: &executable,
@@ -121,18 +120,13 @@ pub(in crate::native) fn provision(directory: &Path) -> Result<()> {
                 model: manifest.model.as_deref(),
                 effort: manifest.effort.as_deref(),
             })?;
-            (
-                arguments,
-                initial_prompt,
-                completion_monitor,
-                environment_removals,
-            )
+            (arguments, initial_prompt, watcher, environment_removals)
         }
         None => {
             let provider::LaunchPlan {
                 arguments,
                 initial_prompt,
-                completion_monitor,
+                watcher,
                 environment_removals,
             } = provider::prepare_launch(
                 provider,
@@ -147,16 +141,11 @@ pub(in crate::native) fn provision(directory: &Path) -> Result<()> {
                     effort: manifest.effort.as_deref(),
                 },
             )?;
-            (
-                arguments,
-                initial_prompt,
-                completion_monitor,
-                environment_removals,
-            )
+            (arguments, initial_prompt, watcher, environment_removals)
         }
     };
 
-    let completion_monitor = completion_monitor.start(directory)?;
+    let watcher = watcher.start(directory)?;
     let mut provider_command = process_env::provider_command(
         &manifest.provider_path,
         directory,
@@ -171,7 +160,7 @@ pub(in crate::native) fn provision(directory: &Path) -> Result<()> {
         && let Err(error) = provider::reopen(provider)
             .and_then(|support| support.verify_available(&resumed_from.provider_session_id))
     {
-        let _ = completion_monitor.stop();
+        let _ = watcher.stop();
         return Err(record_reopen_refusal(
             directory,
             REOPEN_LAUNCH_GATE,
@@ -210,7 +199,7 @@ pub(in crate::native) fn provision(directory: &Path) -> Result<()> {
     let mut child = match child {
         Ok(child) => child,
         Err(error) => {
-            let _ = completion_monitor.stop();
+            let _ = watcher.stop();
             return Err(error).with_context(|| {
                 format!(
                     "failed to start {} at {}",
@@ -227,7 +216,7 @@ pub(in crate::native) fn provision(directory: &Path) -> Result<()> {
             &format!("provider_exit_code={:?}", status.code()),
         );
     }
-    completion_monitor.stop()?;
+    watcher.stop()?;
     let status = status.with_context(|| {
         format!(
             "failed to start {} at {}",

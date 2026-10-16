@@ -1,12 +1,14 @@
 mod agy;
 mod capped_output;
-mod claude;
+// Named from `crate::native` so that the reopen tests can point the Claude session-registry
+// reads at a fixture through the Claude module itself (`override_session_registry_for_test`).
+pub(super) mod claude;
 mod codex;
 mod pi;
 
 use agent_bridge::FirstPartyCli;
 use anyhow::Result;
-use std::{ffi::OsString, path::Path, path::PathBuf, time::Instant};
+use std::{ffi::OsString, fmt::Debug, path::Path, path::PathBuf, time::Instant};
 
 use super::{delivery::Transport, terminal};
 
@@ -46,7 +48,9 @@ impl InitialPromptDisposition {
 pub(super) struct LaunchPlan {
     pub(super) arguments: Vec<OsString>,
     pub(super) initial_prompt: InitialPromptDisposition,
-    pub(super) completion_monitor: CompletionMonitor,
+    // The adapter's completion watcher, unstarted: the wrapper starts it right before the
+    // provider command exists and stops it after the provider process ends.
+    pub(super) watcher: Box<dyn CompletionWatcher>,
     // Caller environment variables the adapter refuses to pass to its provider process.
     // Each adapter owns this list; the shared launcher only applies it.
     pub(super) environment_removals: &'static [&'static str],
@@ -71,7 +75,7 @@ pub(super) struct ResumeContext<'a> {
 pub(super) struct ResumePlan {
     pub(super) arguments: Vec<OsString>,
     pub(super) initial_prompt: InitialPromptDisposition,
-    pub(super) completion_monitor: CompletionMonitor,
+    pub(super) watcher: Box<dyn CompletionWatcher>,
     pub(super) environment_removals: &'static [&'static str],
 }
 
@@ -95,42 +99,35 @@ pub(super) struct CrossSessionMessageContext<'a> {
     pub(super) deadline: Instant,
 }
 
+// The completion watcher a plan carries, before anything runs. Each adapter declares its
+// own: a configuration that starts no thread and resolves nothing until `start`, so that a
+// plan can be built, inspected and dropped without side effects. The shared layer knows
+// only this contract and the no-op watcher of a provider whose completion arrives through
+// its hook alone.
+pub(super) trait CompletionWatcher: Debug {
+    fn start(self: Box<Self>, directory: &Path) -> Result<Box<dyn ActiveWatcher>>;
+}
+
+// A started watcher. `stop` ends it and reports its outcome; dropping it without `stop`
+// must still end it (the adapters' handles stop and join on `Drop`).
+pub(super) trait ActiveWatcher {
+    fn stop(self: Box<Self>) -> Result<()>;
+}
+
+// The watcher of a provider whose turn completion the hook reports by itself (Codex and
+// Claude): starting and stopping it does nothing.
 #[derive(Debug)]
-pub(super) enum CompletionMonitor {
-    Hook,
-    AgyTranscript { log_path: PathBuf },
-    PiHookFailure,
-}
+pub(super) struct NoWatcher;
 
-pub(super) struct ActiveCompletionMonitor(ActiveCompletionMonitorInner);
-
-enum ActiveCompletionMonitorInner {
-    None,
-    Agy(agy::AgyMonitor),
-    Pi(pi::PiFailureMonitor),
-}
-
-impl CompletionMonitor {
-    pub(super) fn start(self, directory: &Path) -> Result<ActiveCompletionMonitor> {
-        match self {
-            Self::Hook => Ok(ActiveCompletionMonitor(ActiveCompletionMonitorInner::None)),
-            Self::AgyTranscript { log_path } => Ok(ActiveCompletionMonitor(
-                ActiveCompletionMonitorInner::Agy(agy::AgyMonitor::start(directory, &log_path)?),
-            )),
-            Self::PiHookFailure => Ok(ActiveCompletionMonitor(ActiveCompletionMonitorInner::Pi(
-                pi::PiFailureMonitor::start(directory)?,
-            ))),
-        }
+impl CompletionWatcher for NoWatcher {
+    fn start(self: Box<Self>, _directory: &Path) -> Result<Box<dyn ActiveWatcher>> {
+        Ok(self)
     }
 }
 
-impl ActiveCompletionMonitor {
-    pub(super) fn stop(self) -> Result<()> {
-        match self.0 {
-            ActiveCompletionMonitorInner::None => Ok(()),
-            ActiveCompletionMonitorInner::Agy(monitor) => monitor.stop(),
-            ActiveCompletionMonitorInner::Pi(monitor) => monitor.stop(),
-        }
+impl ActiveWatcher for NoWatcher {
+    fn stop(self: Box<Self>) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -198,14 +195,9 @@ pub(super) fn launch_trust(provider: FirstPartyCli) -> super::consent::LaunchTru
 // Native trust waits accept any adapter-declared application marker, independently
 // of the target provider; authorization remains a separate required observation.
 pub(super) fn launch_trust_markers() -> impl Iterator<Item = &'static str> {
-    [
-        FirstPartyCli::Codex,
-        FirstPartyCli::Claude,
-        FirstPartyCli::Agy,
-        FirstPartyCli::Pi,
-    ]
-    .into_iter()
-    .filter_map(|provider| launch_trust(provider).applied_marker)
+    agent_bridge::supported_clis()
+        .iter()
+        .filter_map(|provider| launch_trust(*provider).applied_marker)
 }
 
 pub(super) fn workspace_trust(
@@ -256,14 +248,6 @@ pub(super) fn reopen(provider: FirstPartyCli) -> Result<&'static dyn ReopenSuppo
 
 pub(super) fn probe_environment_removals(provider: FirstPartyCli) -> &'static [&'static str] {
     adapter(provider).probe_environment_removals()
-}
-
-// Points the Claude adapter's session-registry reads at a fixture for the calling thread,
-// so a launch-boundary test can mutate the registry between the reopen gates without
-// touching the real `~/.claude/sessions`.
-#[cfg(test)]
-pub(super) fn override_claude_session_registry_for_test(registry: Option<PathBuf>) {
-    claude::override_session_registry_for_test(registry);
 }
 
 pub(super) fn handle_hook(

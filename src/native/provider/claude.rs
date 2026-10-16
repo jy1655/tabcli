@@ -1,6 +1,6 @@
 use super::{
-    CompletionMonitor, CrossSessionMessageContext, InitialPromptDisposition, LaunchContext,
-    LaunchPlan, NativeProviderAdapter, ReopenSupport, ResumeContext, ResumePlan,
+    CrossSessionMessageContext, InitialPromptDisposition, LaunchContext, LaunchPlan,
+    NativeProviderAdapter, NoWatcher, ReopenSupport, ResumeContext, ResumePlan,
     ResumedSessionContext,
 };
 use crate::native::delivery::{
@@ -36,7 +36,7 @@ use super::super::terminal;
 mod registry;
 
 #[cfg(test)]
-pub(super) use registry::override_session_registry_for_test;
+pub(in crate::native) use registry::override_session_registry_for_test;
 use registry::{
     claude_sessions_registry_dir, live_conversation_writer, live_process_creation_time,
     recheck_resumed_conversation_holders, wait_for_resumed_conversation_holders,
@@ -681,7 +681,7 @@ fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Res
     Ok(LaunchPlan {
         arguments,
         initial_prompt,
-        completion_monitor: CompletionMonitor::Hook,
+        watcher: Box::new(NoWatcher),
         environment_removals: CLAUDE_CODE_SESSION_MARKERS,
     })
 }
@@ -708,7 +708,7 @@ fn prepare_resume_for_platform(context: ResumeContext<'_>, windows: bool) -> Res
         initial_prompt: InitialPromptDisposition::of(
             initial_transport_for_platform(windows).as_ref(),
         ),
-        completion_monitor: CompletionMonitor::Hook,
+        watcher: Box::new(NoWatcher),
         environment_removals: CLAUDE_CODE_SESSION_MARKERS,
     })
 }

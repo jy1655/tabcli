@@ -6,8 +6,8 @@ mod startup;
 mod test_support;
 use super::super::terminal;
 use super::{
-    CompletionMonitor, InitialPromptDisposition, LaunchContext, LaunchPlan, NativeProviderAdapter,
-    ReopenSupport,
+    ActiveWatcher, CompletionWatcher, InitialPromptDisposition, LaunchContext, LaunchPlan,
+    NativeProviderAdapter, ReopenSupport,
 };
 use crate::native::delivery::{
     self, Outcome, Prepared, Readiness, SurfaceInput, Transport, TransportFacts, TurnContext,
@@ -20,7 +20,7 @@ use agent_bridge::{
 use anyhow::{Context, Result, bail};
 use credentials::credential_diagnosis;
 use hook::{pi_owned_string, pi_string, record_correlated_failure};
-pub(super) use monitor::PiFailureMonitor;
+use monitor::PiFailureMonitor;
 use serde::{Deserialize, Serialize};
 use startup::send_initial_prompt;
 use std::{
@@ -409,11 +409,27 @@ fn prepare_launch_for_platform(
         initial_prompt: InitialPromptDisposition::of(
             initial_transport_for_platform(windows).as_ref(),
         ),
-        // Replace the local lifecycle extension when Pi exposes a
-        // first-party external completion callback with turn identity.
-        completion_monitor: CompletionMonitor::PiHookFailure,
+        watcher: Box::new(PiHookFailureWatcher),
         environment_removals: &[],
     })
+}
+
+// The unstarted hook-failure watcher a launch plan carries; no thread runs until `start`.
+// Replace the local lifecycle extension when Pi exposes a first-party external completion
+// callback with turn identity.
+#[derive(Debug)]
+struct PiHookFailureWatcher;
+
+impl CompletionWatcher for PiHookFailureWatcher {
+    fn start(self: Box<Self>, directory: &Path) -> Result<Box<dyn ActiveWatcher>> {
+        Ok(Box::new(PiFailureMonitor::start(directory)?))
+    }
+}
+
+impl ActiveWatcher for PiFailureMonitor {
+    fn stop(self: Box<Self>) -> Result<()> {
+        PiFailureMonitor::stop(*self)
+    }
 }
 
 fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingPiTurn> {

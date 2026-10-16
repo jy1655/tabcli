@@ -6,8 +6,8 @@ use crate::native::delivery::{
     Outcome, Prepared, Readiness, SurfaceInput, Transport, TransportFacts, TurnContext,
 };
 use crate::native::provider::{
-    CompletionMonitor, InitialPromptDisposition, LaunchContext, LaunchPlan, NativeProviderAdapter,
-    ReopenSupport,
+    ActiveWatcher, CompletionWatcher, InitialPromptDisposition, LaunchContext, LaunchPlan,
+    NativeProviderAdapter, ReopenSupport,
 };
 use crate::native::session::{Reader, Store, turn};
 use crate::native::terminal;
@@ -15,10 +15,10 @@ use agent_bridge::{
     FirstPartyCli, provider_effort_args, provider_launch_args, provider_model_args,
 };
 use anyhow::{Context, Result, bail};
-pub(super) use monitor::AgyMonitor;
+use monitor::AgyMonitor;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod delivery;
@@ -392,11 +392,30 @@ fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Res
         initial_prompt: InitialPromptDisposition::of(
             initial_transport_for_platform(windows).as_ref(),
         ),
-        // Replace transcript polling when Agy exposes a first-party
-        // per-turn completion callback with session and turn identity.
-        completion_monitor: CompletionMonitor::AgyTranscript { log_path },
+        watcher: Box::new(AgyTranscriptWatcher { log_path }),
         environment_removals: &[],
     })
+}
+
+// The unstarted transcript watcher a launch plan carries: Agy's own log file of the
+// session, which the monitor follows to the conversation's transcript. Nothing runs and
+// no brain root is resolved until `start`. Replace transcript polling when Agy exposes a
+// first-party per-turn completion callback with session and turn identity.
+#[derive(Debug)]
+struct AgyTranscriptWatcher {
+    log_path: PathBuf,
+}
+
+impl CompletionWatcher for AgyTranscriptWatcher {
+    fn start(self: Box<Self>, directory: &Path) -> Result<Box<dyn ActiveWatcher>> {
+        Ok(Box::new(AgyMonitor::start(directory, &self.log_path)?))
+    }
+}
+
+impl ActiveWatcher for AgyMonitor {
+    fn stop(self: Box<Self>) -> Result<()> {
+        AgyMonitor::stop(*self)
+    }
 }
 
 fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingAgyTurn> {

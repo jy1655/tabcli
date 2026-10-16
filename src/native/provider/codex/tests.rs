@@ -1,5 +1,17 @@
 use super::*;
 
+// The watcher of a plan whose completion arrives through the hook alone: starting it on a
+// directory that does not exist succeeds, stopping it succeeds, and the directory is left
+// as it was, so nothing ran.
+fn assert_no_op_watcher(watcher: Box<dyn crate::native::provider::CompletionWatcher>) {
+    assert_eq!(format!("{watcher:?}"), "NoWatcher");
+    let root = tempfile::tempdir().unwrap();
+    let absent = root.path().join("absent-session");
+    let active = watcher.start(&absent).unwrap();
+    active.stop().unwrap();
+    assert!(!absent.exists());
+}
+
 #[test]
 fn console_paste_declares_soft_newlines_and_rejects_only_console_tabs() {
     use crate::native::delivery::TurnKind;
@@ -320,10 +332,7 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                             },
                             "{label}"
                         );
-                        assert!(
-                            matches!(plan.completion_monitor, CompletionMonitor::Hook),
-                            "{label}"
-                        );
+                        assert_no_op_watcher(plan.watcher);
                         assert!(plan.environment_removals.is_empty(), "{label}");
                         let observed = crate::native::consent::observe(&directory);
                         if consent {

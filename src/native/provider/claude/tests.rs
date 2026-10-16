@@ -135,6 +135,18 @@ fn workspace_trust_and_dialog_require_the_exact_workspace() {
 
 use super::*;
 
+// The watcher of a plan whose completion arrives through the hook alone: starting it on a
+// directory that does not exist succeeds, stopping it succeeds, and the directory is left
+// as it was, so nothing ran.
+fn assert_no_op_watcher(watcher: Box<dyn crate::native::provider::CompletionWatcher>) {
+    assert_eq!(format!("{watcher:?}"), "NoWatcher");
+    let root = tempfile::tempdir().unwrap();
+    let absent = root.path().join("absent-session");
+    let active = watcher.start(&absent).unwrap();
+    active.stop().unwrap();
+    assert!(!absent.exists());
+}
+
 #[test]
 fn diagnostics_never_promote_configured_inbound_to_runtime_messaging() {
     use super::super::super::doctor::{Availability, Context};
@@ -1699,7 +1711,7 @@ fn resume_plan_uses_the_official_resume_with_private_settings_and_managed_name_o
             OsString::from("session-reopenplan"),
         ]
     );
-    assert!(matches!(plan.completion_monitor, CompletionMonitor::Hook));
+    assert_no_op_watcher(plan.watcher);
     assert_eq!(plan.environment_removals, CLAUDE_CODE_SESSION_MARKERS);
     for forbidden in [
         "--dangerously-skip-permissions",
@@ -1924,10 +1936,7 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                         },
                         "{label}"
                     );
-                    assert!(
-                        matches!(plan.completion_monitor, CompletionMonitor::Hook),
-                        "{label}"
-                    );
+                    assert_no_op_watcher(plan.watcher);
                     assert_eq!(plan.environment_removals, CLAUDE_CODE_SESSION_MARKERS);
                     let settings: serde_json::Value =
                         serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap())

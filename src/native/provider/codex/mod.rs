@@ -13,8 +13,8 @@ use self::diagnose::diagnose_codex;
 use self::launch::{codex_launch_arguments, send_initial_prompt, workspace_trust_override};
 use self::queue::send_native_queue_message;
 use super::{
-    CompletionMonitor, CrossSessionMessageContext, InitialPromptDisposition, LaunchContext,
-    LaunchPlan, NativeProviderAdapter, ReopenSupport,
+    CrossSessionMessageContext, InitialPromptDisposition, LaunchContext, LaunchPlan,
+    NativeProviderAdapter, NoWatcher, ReopenSupport,
 };
 use crate::native::delivery::{
     self, Outcome, Prepared, Readiness, SurfaceInput, Transport, TransportFacts, TurnContext,
@@ -376,7 +376,7 @@ fn prepare_launch_for_platform(
         initial_prompt: InitialPromptDisposition::of(
             initial_transport_for_platform(windows).as_ref(),
         ),
-        completion_monitor: CompletionMonitor::Hook,
+        watcher: Box::new(NoWatcher),
         environment_removals: &[],
     })
 }

@@ -618,8 +618,9 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                             },
                             "{label}"
                         );
-                        assert!(
-                            matches!(plan.completion_monitor, CompletionMonitor::PiHookFailure),
+                        assert_eq!(
+                            format!("{:?}", plan.watcher),
+                            format!("{:?}", PiHookFailureWatcher),
                             "{label}"
                         );
                         assert!(plan.environment_removals.is_empty(), "{label}");
@@ -636,4 +637,51 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
             }
         }
     }
+}
+
+// The plan carries the hook-failure watcher unstarted: a recovery signal written before
+// the plan is built is still there after it, and only `start` hands the directory to the
+// monitor, which consumes the signal before `stop` returns.
+#[test]
+fn launch_plan_watcher_starts_the_hook_failure_monitor_only_when_started() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-safe123");
+    fs::create_dir(&directory).unwrap();
+    fs::create_dir(directory.join("events")).unwrap();
+    turn::claim(&Store::open_unchecked(&directory), &[])
+        .unwrap()
+        .retain();
+    let signal = directory.join(HOOK_FAILURE_FILE);
+    fs::write(
+        &signal,
+        r#"{"error":"native hook exited with status 1","claim_token":"0-0-0"}"#,
+    )
+    .unwrap();
+    let plan = prepare_launch_for_platform(
+        LaunchContext {
+            bridge_executable: Path::new("/opt/agent-bridge"),
+            directory: &directory,
+            workspace: root.path(),
+            title: "Pi test",
+            prompt: "pi prompt",
+            yolo: false,
+            model: None,
+            effort: None,
+        },
+        false,
+        crate::native::consent::authorized,
+    )
+    .unwrap();
+    assert_eq!(
+        format!("{:?}", plan.watcher),
+        format!("{:?}", PiHookFailureWatcher)
+    );
+    assert!(signal.exists(), "building the plan consumed the signal");
+
+    let active = plan.watcher.start(&directory).unwrap();
+    active.stop().unwrap();
+    assert!(
+        !signal.exists(),
+        "the started monitor did not consume the signal"
+    );
 }
