@@ -1,4 +1,3 @@
-use super::support::*;
 use super::*;
 use crate::native::session::close as session_close;
 use crate::native::session::primitives::{read_json, write_json_atomic};
