@@ -133,6 +133,27 @@ the request address.
 Without `--detach`, exit 0 means Bridge received a successful result. With it, exit 0 means the
 launch and delivery steps succeeded; retrieve the result using the returned request id.
 
+Launch admission runs once the workspace is resolved and before the provider CLI is checked or any
+session record, consent record, or terminal surface exists. With the default setting
+`codex-memory-workspace refuse`, Bridge refuses a workspace that is the Codex memory workspace or lies
+inside it, whatever the target provider:
+
+```text
+launch refused: workspace <workspace> is within the Codex memory workspace <memory>; codex-memory-workspace is refuse. To allow launches here, run 'tabcli settings codex-memory-workspace allow' in the same state root.
+```
+
+The memory workspace is `memories` beside Codex's `config.toml`: `$CODEX_HOME/memories`, or
+`.codex/memories` under `HOME` (then `USERPROFILE`) when `CODEX_HOME` is unset. It is read from the
+caller's environment, exactly as workspace trust reads it: a relative `CODEX_HOME` is relative to the
+caller's working directory, not to `--workspace`; `~` is not expanded; an empty value is not
+rejected; and with neither `HOME` nor `USERPROFILE` the launch fails even when `CODEX_HOME` is set.
+Both paths are compared after resolving links, by whole path components, so a sibling such as
+`memories-other` is outside. A memory workspace that does not exist protects nothing; one that cannot
+be resolved, or that is not a directory, fails the launch. The rule exists because Codex's
+background memory consolidation started Bridge sessions there that nobody closed; it also refuses a
+launch you start there yourself. Run `tabcli settings codex-memory-workspace allow` in the same
+state root to permit it. The refusal uses the error object above; no session or request id exists.
+
 If the workspace cannot be resolved, check `--workspace` and use an existing directory. For a
 missing or too-old CLI, run `tabcli doctor --provider PROVIDER --probe`, then correct the
 installation it reports. An Automation error calls for the
@@ -280,12 +301,18 @@ refusal gate applies).
 Later failures include the request address, `source_session`, and `gate`.
 
 Exit behaviour otherwise matches `ask`. Refusal gates include `provider-unsupported`,
-`reopen-conflict`, `reopen-verification-failed`, and `already-reopened`. Source refusals include
+`workspace-refused`, `reopen-conflict`, `reopen-verification-failed`, and `already-reopened`. Source refusals include
 `source-not-closed`, `source-not-converged`, `request-unresolved`, and `source-identity-missing`.
 For `source-not-closed`, close the source first. For `source-not-converged`, repeat `close-session
 SESSION --explicit` on the source, then inspect it again. `request-unresolved` and
 `source-identity-missing` mean Bridge cannot verify the recorded results or find a conversation to
 resume; inspect the source and use a new `ask` if that evidence is unavailable.
+
+`workspace-refused` is the launch admission of [`ask`](#ask) applied to the source's workspace. It
+runs after the platform and provider check, so `provider-unsupported` still comes first, and before
+the new session exists: the source's marker is not taken and no refusal record is written. Permit
+the workspace with `tabcli settings codex-memory-workspace allow` in the same state root, or start a
+new `ask` elsewhere.
 
 For `provider-unsupported`, check the platform and provider before retrying. For `reopen-conflict`,
 stop the other resume yourself before trying another delivery. Run `doctor SESSION` for
@@ -729,6 +756,16 @@ retains closed records, and never resends uncertain input. The test uses `ask`â€
 rules, including reuse of verified existing trust. It does not grant consent for an untrusted
 workspace. `--isolated` separates Bridge records, not provider trust stores.
 
+Before it creates a private directory or runs any public command, the test resolves the workspace
+and applies [`ask`](#ask)'s launch admission. The ordinary mode uses the ordinary state root's
+`codex-memory-workspace` setting. The isolated mode copies no setting and always uses the default,
+`refuse`, so it refuses the Codex memory workspace and adds `Isolated self-test uses default
+settings; use ordinary self-test with the allow setting to permit this workspace.` to the reason. A
+refused test runs no `ask`, discovery, or cleanup. Its report has `outcome: "failed"`, null
+`session` and `session_state`, one step `{"name": "admission", "outcome": "failed", ...}` with the
+reason, and empty `cleanup_sessions`. `state_root` is the ordinary root, or null in isolated mode
+because no private directory was created; human output then prints `state root: not created`.
+
 Human output reports the mode, CLI, terminal, state root, session, each step, cleanup, and overall
 outcome. In JSON, read each failed stepâ€™s `reason` and `request_address`. See the [JSON field
 reference](#json-field-reference).
@@ -789,12 +826,14 @@ protection.
 
 ## settings
 
-Use `settings` to choose where future sessions open their terminal surfaces.
+Use `settings` to choose where future sessions open their terminal surfaces, and whether a launch in
+the Codex memory workspace is admitted.
 
 ```text
 tabcli settings [--json]
 tabcli settings windows-tab-window dedicated|current [--json]
 tabcli settings macos-open-mode tab-first|new-window [--json]
+tabcli settings codex-memory-workspace refuse|allow [--json]
 ```
 
 ```sh
@@ -805,7 +844,8 @@ tabcli settings
 {
   "settings_file": "/path/to/home/.agent-bridge/native-sessions/settings.json",
   "windows_tab_window": "dedicated",
-  "macos_open_mode": "tab-first"
+  "macos_open_mode": "tab-first",
+  "codex_memory_workspace": "refuse"
 }
 ```
 
@@ -816,11 +856,18 @@ Terminal window; the macOS setting requests a tab first or always a new window. 
 creation on its platform. Later changes do not change a surface's recorded close scope. See
 [terminals](terminals.md).
 
+`codex-memory-workspace` defaults to `refuse`: `ask`, `reopen`, and ordinary `self-test` refuse a
+workspace that is the Codex memory workspace or lies inside it, for every provider (see
+[`ask`](#ask)). `allow` admits such launches, including Codex's own background delegations; `refuse`
+restores the default. It is a launch admission preference, read at each launch, and grants or
+removes no close authority over existing sessions. Isolated `self-test` does not read it.
+
 `--json` is optional and has no format effect: output is always JSON, with `settings_file`,
-`windows_tab_window`, and `macos_open_mode`.
+`windows_tab_window`, `macos_open_mode`, and `codex_memory_workspace`.
 
 Successful reads/writes exit 0. Unknown setting names or values, duplicate `--json`, an invalid
-settings schema, and read/write failures fail. Use one setting/value pair from the synopsis. For
+settings schema, and read/write failures fail. An invalid admission value fails with
+`codex-memory-workspace is refuse or allow, not "VALUE"`. Use one setting/value pair from the synopsis. For
 record errors, inspect the `settings_file` path or the path in the error before changing it. A
 missing record uses defaults.
 
@@ -1078,7 +1125,15 @@ and `cleanup_sessions`. Steps contain `name`, `outcome`, `elapsed_ms`, `request_
 `event_address`, and `reason`; cleanup entries contain `session`, `session_state`, `outcome`, and
 `reason`. An Agy result timeout can append the same request's tool-confirmation observation
 from `doctor` to the existing step `reason`; a Pi result timeout can append the session's
-provider credential readiness. No field is added.
+provider credential readiness. No field is added. `state_root` is null only when launch admission
+refused an isolated test before its private directory existed; that report has one step,
+`admission`.
+
+### settings
+
+Fields: `settings_file`, `windows_tab_window` (`dedicated` or `current`), `macos_open_mode`
+(`tab-first` or `new-window`), and `codex_memory_workspace` (`refuse` or `allow`). There is no
+`schema_version`.
 
 ### sessions
 

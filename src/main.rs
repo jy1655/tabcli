@@ -50,6 +50,7 @@ Usage:
   {PUBLIC_COMMAND} consent <inspect|revoke|reset> PATH [--json]
   {PUBLIC_COMMAND} settings [windows-tab-window <dedicated|current>] [--json]
   {PUBLIC_COMMAND} settings macos-open-mode <tab-first|new-window> [--json]
+  {PUBLIC_COMMAND} settings codex-memory-workspace <refuse|allow> [--json]
   {PUBLIC_COMMAND} prune-sessions --closed-before-days N --explicit [--json]
   {PUBLIC_COMMAND} close-session <session> --explicit [--timeout-secs N] [--json]
   {PUBLIC_COMMAND} --help | --version
@@ -80,6 +81,13 @@ Runtime:
   Linux is not yet supported.
   Agent Bridge controls only sessions that it launched.
   Attaching to an arbitrary CLI is not supported.
+  ask, reopen, and self-test refuse a workspace that is the Codex memory
+  workspace or lies inside it, before any session record or terminal exists:
+  $CODEX_HOME/memories, or ~/.codex/memories without CODEX_HOME, read from the
+  caller's environment. Codex's background memory consolidation started sessions
+  there that nobody closed. The refusal applies to every provider and also to a
+  launch you start there yourself; settings codex-memory-workspace allow permits
+  it, and refuse restores the default.
 
 Self-test:
   self-test makes real model calls and opens a real terminal. It runs in the
@@ -92,7 +100,9 @@ Self-test:
   Closed records remain in the registry for inspection.
   --isolated keeps the run apart from your sessions in a private directory of its
   own; your state root's settings and consent records do not apply, and the
-  private directory stays until you remove it. Only a fully verified round trip
+  private directory stays until you remove it. It therefore refuses the Codex
+  memory workspace; use the ordinary mode with the allow setting to test there.
+  Only a fully verified round trip
   and cleanup exit successfully. Model, effort, and --yolo follow the new-session
   policy below.
 

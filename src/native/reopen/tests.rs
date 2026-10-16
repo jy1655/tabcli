@@ -3453,3 +3453,79 @@ fn reopened_source_gates_keep_provenance_and_refusal_on_unsupported_platform() {
         );
     }
 }
+
+// Launch admission (#216) refuses a source whose workspace is the Codex memory workspace
+// before the new session exists: no marker, no refusal record, no new session, and the
+// source's bytes unchanged. Where Claude reopen is unsupported, that earlier gate still
+// refuses first; it is not evidence that admission passed. Linux fails terminal selection
+// before either gate, with an error that names no gate, so the test runs where a surface
+// can be selected.
+#[cfg(any(target_os = "macos", windows))]
+#[test]
+fn a_memory_workspace_source_is_refused_before_creation_without_touching_the_source() {
+    use crate::native::session_start::StartSource;
+    const CHILD: &str = "TABCLI_REOPEN_ADMISSION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let base = tempfile::tempdir().unwrap();
+        let codex_home = base.path().join("codex");
+        // The state root, and so the source's recorded workspace, is the memory workspace.
+        let root = codex_home.join("memories");
+        fs::create_dir_all(&root).unwrap();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native::reopen::tests::a_memory_workspace_source_is_refused_before_creation_without_touching_the_source",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env(STATE_DIR_ENV, &root)
+            .env("HOME", base.path())
+            .env("CODEX_HOME", &codex_home)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        return;
+    }
+    let root = Reader::state_root().unwrap();
+    let registry = root.parent().unwrap().join("claude-sessions");
+    fs::create_dir_all(&registry).unwrap();
+    provider::override_claude_session_registry_for_test(Some(registry));
+    let (fixture, _) = start_source_fixture(&root);
+    let (directory, _) = fixture.resolved.unwrap();
+    let before = snapshot_directory(&directory);
+    let mut adapter = ReopenedSource::new(fixture.request);
+    let error = adapter
+        .resolve(Instant::now() + Duration::from_secs(30))
+        .err()
+        .expect("reopen must be refused");
+    provider::override_claude_session_registry_for_test(None);
+    if cfg!(windows) {
+        assert_eq!(
+            reopen_refusal_gate(&error),
+            Some(REOPEN_WORKSPACE_REFUSED_GATE)
+        );
+        let detail = format!("{error:#}");
+        assert!(
+            detail.starts_with("reopen refused (workspace-refused): launch refused: workspace "),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("codex-memory-workspace is refuse"),
+            "{detail}"
+        );
+    } else {
+        assert_eq!(reopen_refusal_gate(&error), Some(REOPEN_LAUNCH_GATE));
+    }
+    assert!(adapter.resolved.is_none());
+    assert_eq!(snapshot_directory(&directory), before);
+    assert!(!directory.join(CoreRecord::ReopenMarker.name()).exists());
+    let sessions: Vec<_> = fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        sessions,
+        vec![std::ffi::OsString::from("session-start-source")]
+    );
+}

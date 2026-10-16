@@ -4,7 +4,7 @@ use super::*;
 use crate::native::session::{Reader, RecordReader, RecordStore, Store};
 
 const FILE: &str = "settings.json";
-const USAGE: &str = "settings takes no argument to show the settings, or macos-open-mode <tab-first|new-window> or windows-tab-window <dedicated|current> to change one; --json is accepted";
+const USAGE: &str = "settings takes no argument to show the settings, or macos-open-mode <tab-first|new-window>, windows-tab-window <dedicated|current> or codex-memory-workspace <refuse|allow> to change one; --json is accepted";
 
 /// A creation preference, never cleanup authority. Each terminal handle records
 /// the surface that was actually created, even if this setting changes later.
@@ -73,6 +73,39 @@ impl FromStr for WindowsTabWindow {
     }
 }
 
+/// A launch admission preference, never close authority: whether `ask`, `reopen` and
+/// `self-test` start a session whose workspace is the Codex memory workspace or lies
+/// inside it. Codex's background memory consolidation delegated through Bridge from
+/// there and left sessions open (issue #216), so the default refuses.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum CodexMemoryWorkspace {
+    #[default]
+    Refuse,
+    Allow,
+}
+
+impl CodexMemoryWorkspace {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Refuse => "refuse",
+            Self::Allow => "allow",
+        }
+    }
+}
+
+impl FromStr for CodexMemoryWorkspace {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "refuse" => Ok(Self::Refuse),
+            "allow" => Ok(Self::Allow),
+            _ => bail!("codex-memory-workspace is refuse or allow, not {value:?}"),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct Record {
     schema: u32,
@@ -80,6 +113,8 @@ struct Record {
     windows_tab_window: Option<WindowsTabWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     macos_open_mode: Option<MacosOpenMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_memory_workspace: Option<CodexMemoryWorkspace>,
 }
 
 fn read(root: &Path) -> Result<Record> {
@@ -89,6 +124,7 @@ fn read(root: &Path) -> Result<Record> {
             schema: 1,
             windows_tab_window: None,
             macos_open_mode: None,
+            codex_memory_workspace: None,
         });
     };
     let record: Record = serde_json::from_str(&text)
@@ -109,6 +145,10 @@ pub(super) fn windows_tab_window(root: &Path) -> Result<WindowsTabWindow> {
 
 pub(super) fn macos_open_mode(root: &Path) -> Result<MacosOpenMode> {
     Ok(read(root)?.macos_open_mode.unwrap_or_default())
+}
+
+pub(super) fn codex_memory_workspace(root: &Path) -> Result<CodexMemoryWorkspace> {
+    Ok(read(root)?.codex_memory_workspace.unwrap_or_default())
 }
 
 pub(super) fn run(args: &[String]) -> Result<()> {
@@ -145,12 +185,21 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
             RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
                 .write_json(&record)?;
         }
+        ["codex-memory-workspace", value] => {
+            let value = value.parse::<CodexMemoryWorkspace>()?;
+            Store::create_state_root(root, &Reader::home_directories())?;
+            let mut record = read(root)?;
+            record.codex_memory_workspace = Some(value);
+            RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
+                .write_json(&record)?;
+        }
         _ => bail!(USAGE),
     }
     Ok(serde_json::json!({
         "settings_file": Reader::open_unchecked(root).private(FILE).path().to_owned(),
         "windows_tab_window": windows_tab_window(root)?.as_str(),
         "macos_open_mode": macos_open_mode(root)?.as_str(),
+        "codex_memory_workspace": codex_memory_workspace(root)?.as_str(),
     }))
 }
 
@@ -210,6 +259,10 @@ mod tests {
             &["windows-tab-window"][..],
             &["windows-tab-window", "new"],
             &["windows-tab-window", "current", "extra"],
+            &["codex-memory-workspace"][..],
+            &["codex-memory-workspace", "refused"],
+            &["codex-memory-workspace", "Allow"],
+            &["codex-memory-workspace", "allow", "extra"],
             &["tab-window", "current"],
             &["--json", "--json"],
         ] {
@@ -225,9 +278,15 @@ mod tests {
             r#"{"schema":2,"windows_tab_window":"current"}"#,
             r#"{"schema":1,"windows_tab_window":"somewhere"}"#,
             r#"{"schema":1,"macos_open_mode":"somewhere"}"#,
+            r#"{"schema":1,"codex_memory_workspace":"sometimes"}"#,
+            r#"{"schema":2,"codex_memory_workspace":"allow"}"#,
             "{",
         ] {
             fs::write(directory.path().join(FILE), record).unwrap();
+            assert!(
+                codex_memory_workspace(directory.path()).is_err(),
+                "{record}"
+            );
             assert!(windows_tab_window(directory.path()).is_err(), "{record}");
             assert!(macos_open_mode(directory.path()).is_err(), "{record}");
             assert!(apply(directory.path(), &[]).is_err(), "{record}");
@@ -256,5 +315,73 @@ mod tests {
         let reloaded = apply(&root, &[]).unwrap();
         assert_eq!(reloaded["macos_open_mode"], "tab-first");
         assert_eq!(reloaded["windows_tab_window"], "dedicated");
+    }
+
+    #[test]
+    fn the_codex_memory_workspace_is_refused_until_the_user_allows_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("native-sessions");
+        assert_eq!(
+            codex_memory_workspace(&root).unwrap(),
+            CodexMemoryWorkspace::Refuse
+        );
+        assert_eq!(
+            apply(&root, &[]).unwrap(),
+            serde_json::json!({
+                "settings_file": root.join(FILE),
+                "windows_tab_window": "dedicated",
+                "macos_open_mode": "tab-first",
+                "codex_memory_workspace": "refuse",
+            })
+        );
+        assert!(!root.exists(), "reading defaults must not write settings");
+        let error = apply(&root, &arguments(&["codex-memory-workspace", "always"])).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "codex-memory-workspace is refuse or allow, not \"always\""
+        );
+        assert!(!root.exists(), "an invalid value must not create the root");
+
+        apply(&root, &arguments(&["windows-tab-window", "current"])).unwrap();
+        apply(&root, &arguments(&["macos-open-mode", "new-window"])).unwrap();
+        let changed = apply(
+            &root,
+            &arguments(&["codex-memory-workspace", "allow", "--json"]),
+        )
+        .unwrap();
+        assert_eq!(changed["codex_memory_workspace"], "allow");
+        assert_eq!(
+            read_json::<serde_json::Value>(&root.join(FILE)).unwrap(),
+            serde_json::json!({
+                "schema": 1,
+                "windows_tab_window": "current",
+                "macos_open_mode": "new-window",
+                "codex_memory_workspace": "allow",
+            })
+        );
+        assert_eq!(
+            codex_memory_workspace(&root).unwrap(),
+            CodexMemoryWorkspace::Allow
+        );
+        apply(&root, &arguments(&["codex-memory-workspace", "refuse"])).unwrap();
+        assert_eq!(
+            codex_memory_workspace(&root).unwrap(),
+            CodexMemoryWorkspace::Refuse
+        );
+        assert_eq!(
+            windows_tab_window(&root).unwrap(),
+            WindowsTabWindow::Current
+        );
+        assert_eq!(macos_open_mode(&root).unwrap(), MacosOpenMode::NewWindow);
+        // A record written before this key existed keeps the default.
+        fs::write(
+            root.join(FILE),
+            r#"{"schema":1,"macos_open_mode":"tab-first"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            codex_memory_workspace(&root).unwrap(),
+            CodexMemoryWorkspace::Refuse
+        );
     }
 }

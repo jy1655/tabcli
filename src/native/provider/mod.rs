@@ -187,6 +187,12 @@ pub(super) fn workspace_trust(
     adapter(provider).workspace_trust(workspace, homes)
 }
 
+// The Codex memory workspace that the launch admission protects. Only the Codex adapter
+// declares it; the admission applies the user's setting to it for every target provider.
+pub(super) fn codex_memory_workspace(homes: &super::consent::Homes) -> Result<PathBuf> {
+    codex::memory_workspace(homes)
+}
+
 pub(super) fn workspace_trust_key(
     provider: FirstPartyCli,
     screen: &str,

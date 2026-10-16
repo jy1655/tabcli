@@ -85,6 +85,12 @@ window and uses a console window when a tab cannot be created. See
 [terminal selection and settings](docs/terminals.md#selection-and-settings), including
 `settings macos-open-mode` and `settings windows-tab-window`.
 
+By default, `ask`, `reopen`, and `self-test` refuse to launch any provider in the Codex memory
+workspace (`$CODEX_HOME/memories`, default `~/.codex/memories`) or a directory inside it, before
+any session or terminal exists. Codex's background memory consolidation started Bridge sessions
+there that nobody closed. The refusal also applies to a launch you start there yourself;
+`tabcli settings codex-memory-workspace allow` permits it. See [`ask`](docs/cli.md#ask).
+
 Warp requires an authorized official Control endpoint and the relevant creation features.
 It cannot submit terminal input, so Agy and Pi follow-ups are unsupported there. Its authenticated
 round trip and close are not verified. Choose another terminal for those providers.
