@@ -80,13 +80,28 @@ pub(super) trait MacTerminalAdapter {
         session: &TerminalSession,
         timeout: Duration,
     ) -> Result<bool>;
-    fn read_screen(&self, session: &TerminalSession, deadline: Instant) -> Result<String>;
+    // A kind that declares a refusal for one of these in its registration is refused
+    // by the shared dispatch before its adapter is reached, so the defaults are an
+    // invariant failure and never an ordinary answer.
+    fn read_screen(&self, session: &TerminalSession, deadline: Instant) -> Result<String> {
+        let _ = deadline;
+        bail!(
+            "{} declares managed screen reads unsupported; the shared dispatch must refuse before its adapter",
+            session.kind.display_name()
+        )
+    }
     fn guarded_dialog_input(
         &self,
         session: &TerminalSession,
         input: &GuardedDialogInput,
         deadline: Instant,
-    ) -> Result<bool>;
+    ) -> Result<bool> {
+        let _ = (input, deadline);
+        bail!(
+            "{} declares managed dialog input unsupported; the shared dispatch must refuse before its adapter",
+            session.kind.display_name()
+        )
+    }
     fn close_session_until(
         &self,
         directory: &Path,
@@ -194,7 +209,11 @@ pub(super) fn surface_present(
     adapter(session.kind)?.surface_present(directory, session, timeout)
 }
 
+// The declared refusals answer before any adapter is reached.
 pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Result<String> {
+    if let Some(refusal) = session.kind.registration().screen_read_refusal {
+        return Err(anyhow::anyhow!(refusal));
+    }
     adapter(session.kind)?.read_screen(session, deadline)
 }
 
@@ -203,6 +222,9 @@ pub(super) fn guarded_dialog_input(
     input: &GuardedDialogInput,
     deadline: Instant,
 ) -> Result<bool> {
+    if let Some(refusal) = session.kind.registration().guarded_input_refusal {
+        return Err(anyhow::anyhow!(refusal));
+    }
     adapter(session.kind)?.guarded_dialog_input(session, input, deadline)
 }
 
@@ -488,15 +510,52 @@ mod adapter_tests {
         }
     }
 
+    // Capability against behaviour: an operation a kind declares unsupported is
+    // answered by the shared dispatch with the declared message and never reaches
+    // the adapter, whose own answer would be the invariant failure. The expected
+    // literals are independent of the registrations.
     #[test]
-    fn lookup_selects_each_operation_set_and_rejects_windows() {
+    fn declared_refusals_answer_before_adapters_and_windows_is_rejected() {
         let deadline = Instant::now() + Duration::from_secs(2);
+        let input = GuardedDialogInput {
+            screen: "screen".into(),
+            key: DialogKey::Enter,
+        };
+        let read = |kind: TerminalKind| {
+            automation_testing::with_runner(
+                |_| Ok("AB_SCREEN_BEGINscreenAB_SCREEN_END".into()),
+                || read_screen(&handle(kind), deadline),
+            )
+            .unwrap_or_else(|error| error.to_string())
+        };
+        let guard = |kind: TerminalKind| {
+            guarded_dialog_input(&handle(kind), &input, Instant::now())
+                .unwrap_err()
+                .to_string()
+        };
+        // Supported on both: the adapter answers (iTerm2 through the automation,
+        // Terminal.app from its missing window identity).
+        assert_eq!(read(TerminalKind::Iterm2), "screen");
+        assert_eq!(
+            read(TerminalKind::AppleTerminal),
+            "Terminal window identity missing"
+        );
+        assert_eq!(
+            guard(TerminalKind::AppleTerminal),
+            "Terminal window identity missing"
+        );
+        // Screen reads supported, guarded input declared unsupported: the read reaches
+        // the adapter (which refuses this malformed handle itself); the guard does not.
+        assert_eq!(
+            read(TerminalKind::WezTerm),
+            "WezTerm handle does not name the process that owns its pane"
+        );
+        assert_eq!(
+            guard(TerminalKind::WezTerm),
+            "WezTerm cannot compare the screen and send a key in one call; answer the dialog in its pane"
+        );
+        // Both declared unsupported.
         for (kind, expected) in [
-            (TerminalKind::Iterm2, "screen"),
-            (
-                TerminalKind::AppleTerminal,
-                "Terminal window identity missing",
-            ),
             (
                 TerminalKind::Ghostty,
                 "managed dialog input unsupported for this terminal",
@@ -505,19 +564,40 @@ mod adapter_tests {
                 TerminalKind::Warp,
                 "managed Warp screen reads and guarded input are unsupported; Warp Control input.insert/input.replace do not submit",
             ),
-            (
-                TerminalKind::WezTerm,
-                "WezTerm handle does not name the process that owns its pane",
-            ),
         ] {
-            let session = handle(kind);
-            let actual = automation_testing::with_runner(
-                |_| Ok("AB_SCREEN_BEGINscreenAB_SCREEN_END".into()),
-                || adapter(kind).unwrap().read_screen(&session, deadline),
-            );
-            let actual = actual.unwrap_or_else(|error| error.to_string());
-            assert_eq!(actual, expected, "{kind:?}");
+            assert_eq!(read(kind), expected, "{kind:?}");
+            assert_eq!(guard(kind), expected, "{kind:?}");
         }
+        // The adapters of the refusing kinds give only the invariant failure, so the
+        // declared messages above can only have come from the shared dispatch.
+        for (kind, name) in [
+            (TerminalKind::Ghostty, "Ghostty"),
+            (TerminalKind::Warp, "Warp"),
+            (TerminalKind::WezTerm, "WezTerm"),
+        ] {
+            let adapter = adapter(kind).unwrap();
+            assert_eq!(
+                adapter
+                    .guarded_dialog_input(&handle(kind), &input, deadline)
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "{name} declares managed dialog input unsupported; the shared dispatch must refuse before its adapter"
+                )
+            );
+            if kind != TerminalKind::WezTerm {
+                assert_eq!(
+                    adapter
+                        .read_screen(&handle(kind), deadline)
+                        .unwrap_err()
+                        .to_string(),
+                    format!(
+                        "{name} declares managed screen reads unsupported; the shared dispatch must refuse before its adapter"
+                    )
+                );
+            }
+        }
+        // Windows Console has no adapter on macOS.
         assert_eq!(
             adapter(TerminalKind::WindowsConsole)
                 .err()
@@ -525,39 +605,10 @@ mod adapter_tests {
                 .to_string(),
             "Windows Console is only available on Windows"
         );
-    }
-
-    #[test]
-    fn unsupported_guarded_input_and_windows_send_keep_their_classification() {
-        let input = GuardedDialogInput {
-            screen: "screen".into(),
-            key: DialogKey::Enter,
-        };
-        for (kind, expected) in [
-            (
-                TerminalKind::AppleTerminal,
-                "Terminal window identity missing",
-            ),
-            (
-                TerminalKind::Ghostty,
-                "managed dialog input unsupported for this terminal",
-            ),
-            (
-                TerminalKind::Warp,
-                "managed Warp screen reads and guarded input are unsupported; Warp Control input.insert/input.replace do not submit",
-            ),
-            (
-                TerminalKind::WezTerm,
-                "WezTerm cannot compare the screen and send a key in one call; answer the dialog in its pane",
-            ),
-        ] {
-            assert_eq!(
-                guarded_dialog_input(&handle(kind), &input, Instant::now())
-                    .unwrap_err()
-                    .to_string(),
-                expected
-            );
-        }
+        assert_eq!(
+            read(TerminalKind::WindowsConsole),
+            "Windows Console is only available on Windows"
+        );
         let failure = send_file(
             &handle(TerminalKind::WindowsConsole),
             Path::new("unused"),
@@ -569,6 +620,7 @@ mod adapter_tests {
             failure.error().to_string(),
             "Windows Console is only available on Windows"
         );
+        // Warp's send refusal is the adapter's own and separate from its declared ones.
         let failure = send_file(
             &handle(TerminalKind::Warp),
             Path::new("unused"),

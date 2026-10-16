@@ -84,8 +84,9 @@ use super::{
     query_process_identity, query_process_identity_from_handle, terminate_by_identity,
     terminate_process_until,
 };
+use crate::native::terminal::TerminalKind;
 
-use crate::native::terminal::facts::windows::HOST_COMMAND;
+const HOST_COMMAND: &str = TerminalKind::WindowsConsole.registration().host_command;
 
 const WINDOW_NAME: &str = "agent-bridge";
 const REQUEST_FILE: &str = "console-host.json";

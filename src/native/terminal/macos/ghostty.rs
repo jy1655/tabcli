@@ -1,12 +1,11 @@
 use super::OwnedSurfaceClose;
-use super::{GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
+use super::{MacTerminalAdapter, MacosOpenMode};
 use crate::native::private_to_user::owned_and_not_accessible_by_others;
 use crate::native::session::SessionState;
 use crate::native::session::close::budget::close_remaining;
 use crate::native::session::launch::launcher::validate_shell_command_component;
 use crate::native::session::primitives::unix_ms;
 use crate::native::session::{CoreRecord, Reader, RecordStore};
-use crate::native::terminal::facts::ghostty::HOST_COMMAND;
 #[cfg(test)]
 use crate::native::terminal::ownership;
 // Prove returned-tab ownership and a live input model before binding; keep creation input out of shells.
@@ -25,6 +24,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+const HOST_COMMAND: &str = TerminalKind::Ghostty.registration().host_command;
 #[cfg(test)]
 pub(in crate::native) const VERSION_SCRIPT: &str = r#"on run
  tell application "Ghostty" to return version
@@ -1078,17 +1079,7 @@ impl MacTerminalAdapter for Adapter {
     ) -> Result<bool> {
         surface_present(session, timeout)
     }
-    fn read_screen(&self, _session: &TerminalSession, _deadline: Instant) -> Result<String> {
-        bail!("managed dialog input unsupported for this terminal")
-    }
-    fn guarded_dialog_input(
-        &self,
-        _session: &TerminalSession,
-        _input: &GuardedDialogInput,
-        _deadline: Instant,
-    ) -> Result<bool> {
-        bail!("managed dialog input unsupported for this terminal")
-    }
+    // Screen reads and guarded dialog input are declared unsupported in the registration.
     fn close_session_until(
         &self,
         _directory: &Path,

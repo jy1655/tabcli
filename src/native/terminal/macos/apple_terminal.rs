@@ -2,7 +2,6 @@ use super::OwnedSurfaceClose;
 use super::applescript::{Automation, Osascript};
 use super::{DialogKey, GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
 use crate::native::session::close::budget::close_remaining;
-use crate::native::terminal::facts::apple_terminal::HOST_COMMAND;
 pub(in crate::native) mod close_evidence;
 
 use super::process;
@@ -27,6 +26,11 @@ use super::{
     CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession,
     applescript, applescript::close_response,
 };
+
+use crate::native::launch::BindingFacts;
+
+const HOST_COMMAND: &str = TerminalKind::AppleTerminal.registration().host_command;
+const BINDING: &BindingFacts = TerminalKind::AppleTerminal.registration().binding();
 
 // Bind only one new window with the returned tty; restore only visible windows.
 // Start with line-kill plus the whole bootstrap; see docs/verification/2026-10-03-v0.1.0-focus.md.
@@ -288,7 +292,6 @@ fn install_bootstrap(directory: &Path, host: &str, command: &str) -> Result<Stri
 // A failed, closed or timed-out launch must start nothing.
 pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
     use super::bound_host::{BoundHostSpec, run_bound_host};
-    use crate::native::terminal::facts::apple_terminal::BINDING;
     run_bound_host(
         directory,
         &BoundHostSpec {
@@ -320,8 +323,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
 
 fn wait_for_binding(directory: &Path, id: &str, tty: &str) -> Result<()> {
     use crate::native::launch::wait_for_binding;
-    use crate::native::terminal::facts::apple_terminal::BINDING;
-    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, &BINDING)?;
+    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING)?;
     if surface.kind != TerminalKind::AppleTerminal
         || surface.id != tty
         || surface.window_id.as_deref().is_none_or(str::is_empty)

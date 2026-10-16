@@ -1,12 +1,11 @@
 use super::OwnedSurfaceClose;
 use super::ownership::verified_macos_terminal_owner;
 use super::process;
-use super::{GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
+use super::{MacTerminalAdapter, MacosOpenMode};
 use crate::native::private_to_user::owned_and_not_writable_by_others;
 use crate::native::session;
 use crate::native::session::close::budget::close_remaining;
 use crate::native::session::{Reader, Store};
-use crate::native::terminal::facts::wezterm::HOST_COMMAND;
 #[cfg(test)]
 use crate::native::terminal::ownership;
 #[cfg(unix)]
@@ -61,6 +60,11 @@ use serde::Deserialize;
 use super::super::WezTermMux;
 use super::{CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession};
 use crate::native::process_env::CommandOutputFailure;
+
+use crate::native::launch::BindingFacts;
+
+const HOST_COMMAND: &str = TerminalKind::WezTerm.registration().host_command;
+const BINDING: &BindingFacts = TerminalKind::WezTerm.registration().binding();
 
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(100);
@@ -986,7 +990,6 @@ fn require_shared_pane(
 // Failure or timeout never falls back to typed input; see docs/verification/2026-10-03-v0.1.0-focus.md.
 pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
     use super::bound_host::{BoundHostSpec, run_bound_host};
-    use crate::native::terminal::facts::wezterm::BINDING;
     run_bound_host(
         directory,
         &BoundHostSpec {
@@ -1017,8 +1020,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
 
 fn wait_for_binding(directory: &Path, id: &str, pane: &str, socket: &Path) -> Result<()> {
     use crate::native::launch::wait_for_binding;
-    use crate::native::terminal::facts::wezterm::BINDING;
-    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, &BINDING)?;
+    let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING)?;
     if surface.kind != TerminalKind::WezTerm
         || surface.id != pane
         || surface
@@ -1269,16 +1271,7 @@ impl<H: Host> MacTerminalAdapter for Adapter<H> {
     fn read_screen(&self, session: &TerminalSession, deadline: Instant) -> Result<String> {
         read_screen(&self.host, session, deadline)
     }
-    fn guarded_dialog_input(
-        &self,
-        _session: &TerminalSession,
-        _input: &GuardedDialogInput,
-        _deadline: Instant,
-    ) -> Result<bool> {
-        bail!(
-            "WezTerm cannot compare the screen and send a key in one call; answer the dialog in its pane"
-        )
-    }
+    // Guarded dialog input is declared unsupported in the registration.
     fn close_session_until(
         &self,
         _directory: &Path,

@@ -570,6 +570,32 @@ fn registry_routes_every_command_to_its_variant_and_fields() {
         let row = COMMANDS.iter().find(|row| row.name == actual).unwrap();
         assert!(row.hidden, "{expected}");
     }
+    // The host entries keep their registry order: the registrations supply the
+    // names, the table supplies the order.
+    let hosts: Vec<_> = COMMANDS
+        .iter()
+        .map(|row| row.name)
+        .filter(|name| name.starts_with("native-") && name.ends_with("-host"))
+        .collect();
+    assert_eq!(
+        hosts,
+        [
+            "native-console-host",
+            "native-iterm2-host",
+            "native-terminal-host",
+            "native-wezterm-host",
+            "native-ghostty-host",
+            "native-warp-host",
+        ]
+    );
+    assert_eq!(
+        COMMANDS.len() - hosts.len(),
+        COMMANDS
+            .iter()
+            .position(|row| row.name == hosts[0])
+            .unwrap(),
+        "the host entries end the registry"
+    );
     let cases: Vec<(Vec<&str>, String)> = vec![
         (vec!["ask", "codex", "--prompt", "hello"], format!("Ask({ask})")),
         (vec!["self-test", "pi", "--isolated", "--json"], format!("SelfTest(Request {{ ask: {self_test_ask}, isolated: true }})")),

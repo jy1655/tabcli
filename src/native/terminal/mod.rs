@@ -13,15 +13,7 @@ pub(in crate::native) enum ConsoleNewline {
 }
 
 pub(super) const fn facts(kind: TerminalKind) -> facts::SurfaceFacts {
-    use facts::{apple_terminal, ghostty, iterm2, warp, wezterm, windows};
-    match kind {
-        TerminalKind::Iterm2 => iterm2::FACTS,
-        TerminalKind::AppleTerminal => apple_terminal::FACTS,
-        TerminalKind::Ghostty => ghostty::FACTS,
-        TerminalKind::Warp => warp::FACTS,
-        TerminalKind::WezTerm => wezterm::FACTS,
-        TerminalKind::WindowsConsole => windows::FACTS,
-    }
+    kind.registration().facts
 }
 
 pub(super) fn surface_outlives_owner(session: &TerminalSession) -> bool {
@@ -75,6 +67,16 @@ pub(crate) enum TerminalKind {
 }
 
 impl TerminalKind {
+    /// Every kind, in declaration order.
+    pub(in crate::native) const ALL: [Self; 6] = [
+        Self::Iterm2,
+        Self::AppleTerminal,
+        Self::Ghostty,
+        Self::Warp,
+        Self::WezTerm,
+        Self::WindowsConsole,
+    ];
+
     pub(super) const fn supported_on_this_platform(self) -> bool {
         match self {
             Self::Iterm2 | Self::AppleTerminal | Self::Ghostty | Self::Warp | Self::WezTerm => {

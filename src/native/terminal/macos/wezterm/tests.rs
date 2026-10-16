@@ -185,6 +185,18 @@ fn adapter_owns_the_non_sync_host_for_operations() {
             .unwrap(),
         Some(verify_session(&local.host, &session, Some(Duration::from_secs(2))).unwrap())
     );
+    // The registration declares no screen-read refusal, so `get-text` is reached
+    // although the kind guards no dialog input.
+    assert!(
+        TerminalKind::WezTerm
+            .registration()
+            .screen_read_refusal
+            .is_none()
+    );
+    assert!(!crate::native::terminal::guards_dialog_input(
+        TerminalKind::WezTerm
+    ));
+    assert_eq!(adapter.read_screen(&session, deadline).unwrap(), "$ \n\n");
     assert_eq!(
         adapter.read_screen(&session, deadline).unwrap(),
         read_screen(&local.host, &session, deadline).unwrap()

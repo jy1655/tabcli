@@ -2,13 +2,12 @@ use super::OwnedSurfaceClose;
 use super::ownership::verified_macos_terminal_owner;
 use super::process;
 use super::process::live_native_process_identity;
-use super::{GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
+use super::{MacTerminalAdapter, MacosOpenMode};
 use crate::native::private_to_user::owned_and_not_writable_by_others;
 use crate::native::session::close::budget::close_remaining;
 use crate::native::session::{self, Store};
 use crate::native::session::{Reader, RecordReader, RecordStore};
 use crate::native::terminal;
-use crate::native::terminal::facts::warp::HOST_COMMAND;
 use crate::native::terminal::ownership;
 use crate::native::terminal::ownership::{
     NativeProcessIdentity, NativeSessionOwner, native_owner_identity_matches,
@@ -36,6 +35,8 @@ use serde_json::json;
 use serde_json::Value;
 
 use super::{CloseOutcome, TerminalKind, TerminalSendFailure, TerminalSendResult, TerminalSession};
+
+const HOST_COMMAND: &str = TerminalKind::Warp.registration().host_command;
 
 const CONTROL_FILE: &str = "warp-control.json";
 const HOST_PLAN_FILE: &str = "warp-host-plan.json";
@@ -1963,21 +1964,7 @@ impl MacTerminalAdapter for Adapter {
     ) -> Result<bool> {
         surface_present(directory, session, timeout)
     }
-    fn read_screen(&self, _session: &TerminalSession, _deadline: Instant) -> Result<String> {
-        bail!(
-            "managed Warp screen reads and guarded input are unsupported; Warp Control input.insert/input.replace do not submit"
-        )
-    }
-    fn guarded_dialog_input(
-        &self,
-        _session: &TerminalSession,
-        _input: &GuardedDialogInput,
-        _deadline: Instant,
-    ) -> Result<bool> {
-        bail!(
-            "managed Warp screen reads and guarded input are unsupported; Warp Control input.insert/input.replace do not submit"
-        )
-    }
+    // Screen reads and guarded dialog input are declared unsupported in the registration.
     fn close_session_until(
         &self,
         directory: &Path,

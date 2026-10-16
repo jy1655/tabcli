@@ -92,14 +92,13 @@ impl CloseEvidence for PresenceOnly {
 
 #[cfg(target_os = "macos")]
 pub(in crate::native) fn for_kind(kind: super::TerminalKind) -> &'static dyn CloseEvidence {
-    use super::{TerminalKind, macos::apple_terminal};
-    match kind {
-        TerminalKind::AppleTerminal => &apple_terminal::close_evidence::EVIDENCE,
-        TerminalKind::Iterm2 => &PRESENCE_ONLY,
-        TerminalKind::Ghostty => &PRESENCE_ONLY,
-        TerminalKind::Warp => &PRESENCE_ONLY_WITH_OWNERLESS_CONTEXT,
-        TerminalKind::WezTerm => &PRESENCE_ONLY_WITH_OWNERLESS_CONTEXT,
-        TerminalKind::WindowsConsole => &PRESENCE_ONLY,
+    use super::{facts::CloseEvidenceChoice, macos::apple_terminal};
+    match kind.registration().close_evidence {
+        CloseEvidenceChoice::AppleTerminal => &apple_terminal::close_evidence::EVIDENCE,
+        CloseEvidenceChoice::PresenceOnly => &PRESENCE_ONLY,
+        CloseEvidenceChoice::PresenceOnlyWithOwnerlessContext => {
+            &PRESENCE_ONLY_WITH_OWNERLESS_CONTEXT
+        }
     }
 }
 
