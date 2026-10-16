@@ -567,7 +567,9 @@ fn close_deadline_between_attestations_keeps_handle_and_intent() {
 #[test]
 fn close_deadline_after_authority_does_not_start_mutation() {
     let now = Instant::now();
-    let clock = crate::native::session::close::budget::TestCloseClock::new(now);
+    let fake = crate::native::clock::FakeClock::new(now);
+    let clock = fake.shared();
+    let _scope = crate::native::session::close::budget::Scope::with_clock(fake);
     let deadline = now + Duration::from_secs(1);
     let observed = Cell::new(false);
     let result = close_owned_surface_with(
@@ -693,7 +695,9 @@ fn close_deadline_shared_observations_policy_adapter_and_retry() {
 #[test]
 fn close_deadline_after_signal_eperm_does_not_prove_exit() {
     let now = Instant::now();
-    let clock = crate::native::session::close::budget::TestCloseClock::new(now);
+    let fake = crate::native::clock::FakeClock::new(now);
+    let clock = fake.shared();
+    let _scope = crate::native::session::close::budget::Scope::with_clock(fake);
     let deadline = now + Duration::from_secs(1);
     let signals = Cell::new(0);
     let result = terminate_owned_foreground_group_until_with_io(

@@ -117,8 +117,10 @@ impl Processes {
                             || self.attest(store, live),
                             |group| {
                                 let now = Instant::now();
-                                let clock =
-                                    crate::native::session::close::budget::TestCloseClock::new(now);
+                                let fake = crate::native::clock::FakeClock::new(now);
+                                let clock = fake.shared();
+                                let _scope =
+                                    crate::native::session::close::budget::Scope::with_clock(fake);
                                 let deadline = now + Duration::from_secs(3);
                                 terminate_owned_foreground_group_until_with_io(
                                     group,

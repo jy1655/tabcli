@@ -3,6 +3,7 @@ use super::runner::run_bounded_command_until;
 use super::{
     PendingCodexTurn, cancel_pending_turn, codex_version_supports_native_queue, write_pending_turn,
 };
+use crate::native::clock::Clock;
 use crate::native::delivery::Outcome;
 use crate::native::provider::CrossSessionMessageContext;
 use crate::native::session::Reader;
@@ -51,8 +52,9 @@ fn queue_unavailable(error: anyhow::Error) -> Outcome {
     Outcome::NotSent(error.context(unaddressed_follow_up()))
 }
 
-pub(super) fn send_native_queue_message(
+pub(super) fn send_native_queue_message<C: Clock>(
     context: CrossSessionMessageContext<'_>,
+    clock: &mut C,
 ) -> std::result::Result<(), Outcome> {
     let manifest = Reader::open_unchecked(context.directory)
         .manifest()
@@ -94,17 +96,20 @@ pub(super) fn send_native_queue_message(
         queue_unavailable(error.context("failed to prepare the Codex queue command"))
     })?;
     write_pending_turn(context.directory, &pending).map_err(Outcome::NotSent)?;
-    let result = match run_bounded_command_until(&mut command, context.deadline, "Codex queue") {
-        Ok(output) => classify_codex_queue_output(
-            output.status.success(),
-            &output.stdout,
-            &output.stderr,
-            output.truncated,
-            &thread_id,
-        ),
-        Err(failure) if !failure.delivery_may_have_started => Err(queue_unavailable(failure.error)),
-        Err(failure) => Err(Outcome::Uncertain(failure.error)),
-    };
+    let result =
+        match run_bounded_command_until(&mut command, context.deadline, "Codex queue", clock) {
+            Ok(output) => classify_codex_queue_output(
+                output.status.success(),
+                &output.stdout,
+                &output.stderr,
+                output.truncated,
+                &thread_id,
+            ),
+            Err(failure) if !failure.delivery_may_have_started => {
+                Err(queue_unavailable(failure.error))
+            }
+            Err(failure) => Err(Outcome::Uncertain(failure.error)),
+        };
     if result
         .as_ref()
         .is_err_and(|failure| matches!(failure, Outcome::NotSent(_)))

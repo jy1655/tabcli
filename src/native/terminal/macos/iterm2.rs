@@ -649,7 +649,9 @@ mod tests {
     #[test]
     fn live_owner_expired_close_stops_before_automation() {
         let deadline = Instant::now();
-        let _clock = crate::native::session::close::budget::TestCloseClock::new(deadline);
+        let _scope = crate::native::session::close::budget::Scope::with_clock(
+            crate::native::clock::FakeClock::new(deadline),
+        );
         let replay = Replay::normal(&[]);
         let adapter = with_automation(replay.clone());
         let error = adapter

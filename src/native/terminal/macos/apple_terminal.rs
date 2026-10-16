@@ -1320,7 +1320,7 @@ mod tests {
         }
     }
     struct ClockAutomation<'a> {
-        clock: &'a crate::native::session::close::budget::TestCloseClock,
+        clock: &'a std::rc::Rc<std::cell::Cell<Instant>>,
         calls: &'a std::cell::Cell<usize>,
         expire_at: usize,
         deadline: Instant,
@@ -1460,7 +1460,9 @@ mod tests {
                 start_microseconds: 42,
             };
             let now = Instant::now();
-            let clock = crate::native::session::close::budget::TestCloseClock::new(now);
+            let fake = crate::native::clock::FakeClock::new(now);
+            let clock = fake.shared();
+            let _scope = crate::native::session::close::budget::Scope::with_clock(fake);
             let deadline = now + Duration::from_secs(1);
             let calls = std::cell::Cell::new(0);
             let births = std::cell::Cell::new(0);

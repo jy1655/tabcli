@@ -355,7 +355,9 @@ mod tests {
     #[test]
     fn close_deadline_timeout_skips_diagnostic_probe_only_inside_close() {
         let now = Instant::now();
-        let _clock = crate::native::session::close::budget::TestCloseClock::new(now);
+        let _scope = crate::native::session::close::budget::Scope::with_clock(
+            crate::native::clock::FakeClock::new(now),
+        );
         {
             let _budget = crate::native::session::close::budget::Scope::enter(now);
             assert_eq!(

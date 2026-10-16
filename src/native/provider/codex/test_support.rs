@@ -1,13 +1,6 @@
 use crate::native::session::primitives::write_json_atomic;
 use crate::native::session::schema::SessionEvent;
-#[cfg(unix)]
-use anyhow::Result;
 use std::path::Path;
-#[cfg(unix)]
-use std::{
-    thread,
-    time::{Duration, Instant},
-};
 
 pub(super) fn write_established_thread(directory: &Path, thread_id: &str) {
     std::fs::create_dir_all(directory.join("events")).unwrap();
@@ -24,28 +17,4 @@ pub(super) fn write_established_thread(directory: &Path, thread_id: &str) {
         },
     )
     .unwrap();
-}
-
-#[cfg(unix)]
-thread_local! {
-    pub(super) static QUEUE_TIMEOUT_READY: std::cell::RefCell<Option<std::path::PathBuf>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(unix)]
-pub(super) fn synchronized_queue_deadline(label: &str, deadline: Instant) -> Result<Instant> {
-    if label != "Codex queue" {
-        return Ok(deadline);
-    }
-    let Some(ready) = QUEUE_TIMEOUT_READY.with(|path| path.borrow_mut().take()) else {
-        return Ok(deadline);
-    };
-    while !ready.is_file() {
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "queue fixture did not finish startup"
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
-    Ok(Instant::now())
 }

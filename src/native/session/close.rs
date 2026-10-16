@@ -53,46 +53,32 @@ pub(in crate::native) mod budget {
             .context("close deadline expired; closing was not confirmed and terminal-side work may have occurred; use --timeout-secs for a longer budget")
     }
 
-    // Close tests can advance this clock at an action boundary without scheduler races.
+    // The scope's clock when a test installed one, the system clock otherwise. Close
+    // tests advance the installed clock at an action boundary without scheduler races.
     pub(in crate::native) fn close_now() -> Instant {
-        #[cfg(test)]
-        if let Some(now) = CLOSE_TEST_TIME.with(std::cell::Cell::get) {
-            return now;
-        }
-        Instant::now()
+        CLOCK
+            .with(|slot| slot.borrow_mut().as_mut().map(|clock| clock.now()))
+            .unwrap_or_else(Instant::now)
     }
 
-    #[cfg(test)]
-    thread_local! {
-        pub(in crate::native) static CLOSE_TEST_TIME: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
-    }
-
-    #[cfg(test)]
-    pub(in crate::native) struct TestCloseClock(Option<Instant>);
-    #[cfg(test)]
-    impl TestCloseClock {
-        pub(in crate::native) fn new(now: Instant) -> Self {
-            Self(CLOSE_TEST_TIME.with(|time| time.replace(Some(now))))
-        }
-        pub(in crate::native) fn set(&self, now: Instant) {
-            CLOSE_TEST_TIME.with(|time| time.set(Some(now)));
-        }
-    }
-    #[cfg(test)]
-    impl Drop for TestCloseClock {
-        fn drop(&mut self) {
-            CLOSE_TEST_TIME.with(|time| time.set(self.0));
-        }
-    }
-
+    // The scope's state: the deadline and the clock inherit independently. A guard
+    // replaces one of them and restores only that one.
     thread_local! {
         static DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+        static CLOCK: std::cell::RefCell<Option<Box<dyn crate::native::clock::Clock>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    enum Replaced {
+        Deadline(Option<Instant>),
+        #[cfg(test)]
+        Clock(Option<Box<dyn crate::native::clock::Clock>>),
     }
     pub(in crate::native) struct Scope {
-        previous: Option<Instant>,
+        previous: Replaced,
         _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
     }
     impl Scope {
+        // Takes the minimum deadline and keeps the effective clock.
         pub(in crate::native) fn enter(deadline: Instant) -> Self {
             let previous = DEADLINE.with(|slot| {
                 let previous = slot.get();
@@ -100,14 +86,33 @@ pub(in crate::native) mod budget {
                 previous
             });
             Self {
-                previous,
+                previous: Replaced::Deadline(previous),
+                _same_thread: std::marker::PhantomData,
+            }
+        }
+        // Replaces only the clock and keeps any deadline already in force. Obtain a
+        // fake's shared handle before moving the clock in; the guard stays where the
+        // scope is, and clones of the handle go into hooks.
+        #[cfg(test)]
+        pub(in crate::native) fn with_clock(
+            clock: impl crate::native::clock::Clock + 'static,
+        ) -> Self {
+            let previous = CLOCK.with(|slot| slot.borrow_mut().replace(Box::new(clock)));
+            Self {
+                previous: Replaced::Clock(previous),
                 _same_thread: std::marker::PhantomData,
             }
         }
     }
     impl Drop for Scope {
         fn drop(&mut self) {
-            DEADLINE.with(|slot| slot.set(self.previous));
+            match &mut self.previous {
+                Replaced::Deadline(previous) => DEADLINE.with(|slot| slot.set(*previous)),
+                #[cfg(test)]
+                Replaced::Clock(previous) => {
+                    CLOCK.with(|slot| *slot.borrow_mut() = previous.take());
+                }
+            }
         }
     }
     pub(in crate::native) fn deadline() -> Option<Instant> {
@@ -964,7 +969,11 @@ mod tests;
 // handler runs. File locks unwind; only the selected thread's one checkpoint fires.
 #[cfg(all(test, target_os = "macos"))]
 pub(in crate::native) mod interruption {
-    use std::{cell::Cell, time::Instant};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+        time::Instant,
+    };
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(in crate::native) enum Point {
         IntentPublished,
@@ -973,17 +982,23 @@ pub(in crate::native) mod interruption {
         HandleRemoved,
         ClosedTombstoneWritten,
     }
+    // The expiry checkpoint writes the deadline into the scope's fake clock through
+    // the handle the test obtained before installing that clock.
+    struct Expiry {
+        at: Point,
+        deadline: Instant,
+        time: Rc<Cell<Instant>>,
+    }
     thread_local! {
-        static EXPIRE: Cell<Option<(Point, Instant)>> = const { Cell::new(None) };
+        static EXPIRE: RefCell<Option<Expiry>> = const { RefCell::new(None) };
         static STOP: Cell<Option<Point>> = const { Cell::new(None) };
     }
     pub(in crate::native) fn at(point: Point) {
         EXPIRE.with(|slot| {
-            if let Some((at, deadline)) = slot.get()
-                && at == point
+            if let Some(expiry) = slot.borrow().as_ref()
+                && expiry.at == point
             {
-                crate::native::session::close::budget::CLOSE_TEST_TIME
-                    .with(|time| time.set(Some(deadline)));
+                expiry.time.set(expiry.deadline);
             }
         });
         if STOP.with(|stop| stop.get() == Some(point)) {
@@ -991,15 +1006,26 @@ pub(in crate::native) mod interruption {
             std::panic::panic_any(point);
         }
     }
-    pub(super) fn expiring<T>(point: Point, deadline: Instant, run: impl FnOnce() -> T) -> T {
+    pub(super) fn expiring<T>(
+        point: Point,
+        deadline: Instant,
+        time: Rc<Cell<Instant>>,
+        run: impl FnOnce() -> T,
+    ) -> T {
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
-                EXPIRE.with(|slot| slot.set(None));
+                EXPIRE.with(|slot| *slot.borrow_mut() = None);
             }
         }
         let _reset = Reset;
-        EXPIRE.with(|slot| slot.set(Some((point, deadline))));
+        EXPIRE.with(|slot| {
+            *slot.borrow_mut() = Some(Expiry {
+                at: point,
+                deadline,
+                time,
+            })
+        });
         run()
     }
     pub(in crate::native) fn during<T>(

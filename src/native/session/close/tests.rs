@@ -559,7 +559,9 @@ fn deadline_fixture() -> (tempfile::TempDir, Store) {
 fn expire_at_contended_lock<T>(name: &'static str, run: impl FnOnce(Instant) -> T) -> T {
     use super::super::primitives::close_io_test::{self, Point};
     let now = Instant::now();
-    let clock = crate::native::session::close::budget::TestCloseClock::new(now);
+    let fake = crate::native::clock::FakeClock::new(now);
+    let clock = fake.shared();
+    let _scope = crate::native::session::close::budget::Scope::with_clock(fake);
     let deadline = now + Duration::from_secs(1);
     let observed = std::rc::Rc::new(std::cell::Cell::new(false));
     let seen = observed.clone();
@@ -680,9 +682,11 @@ fn close_deadline_expiry_after_durable_markers_never_rolls_back() {
             .write_private(b"1-2-3\n")
             .unwrap();
         let now = Instant::now();
-        let clock = crate::native::session::close::budget::TestCloseClock::new(now);
+        let fake = crate::native::clock::FakeClock::new(now);
+        let clock = fake.shared();
+        let _scope = crate::native::session::close::budget::Scope::with_clock(fake);
         let deadline = now + Duration::from_secs(1);
-        let result = interruption::expiring(point, deadline, || {
+        let result = interruption::expiring(point, deadline, clock.clone(), || {
             close(&store, None, deadline, |_| {
                 Ok(terminal::CloseOutcome::Closed.into())
             })
@@ -771,7 +775,9 @@ fn close_deadline_windows_record_replacement_stops_at_close_budget() {
         .unwrap();
     use super::super::primitives::close_io_test::{self, Point};
     let now = Instant::now();
-    let clock = crate::native::session::close::budget::TestCloseClock::new(now);
+    let fake = crate::native::clock::FakeClock::new(now);
+    let clock = fake.shared();
+    let _scope = crate::native::session::close::budget::Scope::with_clock(fake);
     let deadline = now + Duration::from_millis(40);
     let retries = std::rc::Rc::new(std::cell::Cell::new(0));
     let seen = retries.clone();
@@ -840,7 +846,9 @@ fn close_deadline_public_repair_of_exited_or_failed_windows_session_needs_no_hel
 fn close_deadline_before_confirmation_keeps_handle_and_intent() {
     let (_directory, store) = deadline_fixture();
     let now = Instant::now();
-    let clock = crate::native::session::close::budget::TestCloseClock::new(now);
+    let fake = crate::native::clock::FakeClock::new(now);
+    let clock = fake.shared();
+    let _scope = crate::native::session::close::budget::Scope::with_clock(fake);
     let deadline = now + Duration::from_secs(1);
     let handle = store.record(CoreRecord::Terminal).bytes().unwrap();
     let error = close(&store, None, deadline, |_| {
@@ -924,6 +932,76 @@ fn close_deadline_scope_is_restored_and_other_threads_keep_blocking_locks() {
     }
     assert!(budget::deadline().is_none());
     let _lock = store.lock().unwrap();
+
+    // The clock and the deadline inherit independently; each guard restores only what
+    // it replaced. A frozen time an hour ahead is distinguishable from the real clock.
+    use crate::native::clock::FakeClock;
+    let frozen = Instant::now() + Duration::from_secs(3600);
+    let later = frozen + Duration::from_secs(60);
+    {
+        let fake = FakeClock::new(frozen);
+        let clock = fake.shared();
+        let _clock_scope = budget::Scope::with_clock(fake);
+        // A clock-only scope has no deadline and reads its clock.
+        assert_eq!(budget::deadline(), None);
+        assert_eq!(budget::close_now(), frozen);
+        assert!(budget::check().is_ok());
+        {
+            // A deadline entered inside the clock scope inherits the clock.
+            let _deadline_scope = budget::Scope::enter(later);
+            assert_eq!(budget::deadline(), Some(later));
+            assert_eq!(budget::close_now(), frozen);
+            assert!(budget::check().is_ok());
+            clock.set(later);
+            assert!(budget::check().is_err());
+            clock.set(frozen);
+            {
+                // A nested clock replaces only the clock and keeps the deadline.
+                let _nested = budget::Scope::with_clock(FakeClock::new(later));
+                assert_eq!(budget::deadline(), Some(later));
+                assert_eq!(budget::close_now(), later);
+                assert!(budget::check().is_err());
+            }
+            assert_eq!(budget::deadline(), Some(later));
+            assert_eq!(budget::close_now(), frozen);
+            assert!(budget::check().is_ok());
+        }
+        // The deadline guard restored only the deadline.
+        assert_eq!(budget::deadline(), None);
+        assert_eq!(budget::close_now(), frozen);
+        // Unwinding through both guards restores what each replaced.
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _deadline_scope = budget::Scope::enter(later);
+            let _nested = budget::Scope::with_clock(FakeClock::new(later));
+            assert_eq!(budget::deadline(), Some(later));
+            assert_eq!(budget::close_now(), later);
+            std::panic::resume_unwind(Box::new(()));
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(budget::deadline(), None);
+        assert_eq!(budget::close_now(), frozen);
+        // Another thread sees neither the clock nor a deadline.
+        std::thread::spawn(move || {
+            assert!(budget::deadline().is_none());
+            assert!(budget::close_now() < frozen);
+        })
+        .join()
+        .unwrap();
+    }
+    assert!(budget::close_now() < frozen);
+    {
+        // A clock installed inside a deadline scope preserves the deadline.
+        let _deadline_scope = budget::Scope::enter(later);
+        {
+            let _clock_scope = budget::Scope::with_clock(FakeClock::new(frozen));
+            assert_eq!(budget::deadline(), Some(later));
+            assert_eq!(budget::close_now(), frozen);
+        }
+        assert_eq!(budget::deadline(), Some(later));
+        assert!(budget::close_now() < frozen);
+    }
+    assert!(budget::deadline().is_none());
+    assert!(budget::close_now() < frozen);
 }
 
 #[test]
@@ -931,13 +1009,15 @@ fn close_deadline_uncontended_settlement_reports_only_expiry() {
     use super::super::primitives::close_io_test::{self, Point};
     let (_directory, store) = deadline_fixture();
     let now = Instant::now();
-    let clock = crate::native::session::close::budget::TestCloseClock::new(now);
+    let fake = crate::native::clock::FakeClock::new(now);
+    let clock = fake.shared();
+    let _scope = crate::native::session::close::budget::Scope::with_clock(fake);
     let deadline = now + Duration::from_secs(1);
+    let time = clock.clone();
     let result = close_io_test::during(
         move |point| {
             if point == Point::BeforeLock("status") {
-                crate::native::session::close::budget::CLOSE_TEST_TIME
-                    .with(|time| time.set(Some(deadline)));
+                time.set(deadline);
             }
             assert!(!matches!(point, Point::WouldBlock(_)), "no lock is held");
         },
