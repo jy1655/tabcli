@@ -1,6 +1,10 @@
 use super::support::*;
 use super::*;
 use crate::native::session::close as session_close;
+#[cfg(any(target_os = "macos", windows))]
+use crate::native::terminal::close_authority::{
+    TerminalCloseAuthority, test_support::TestObservation,
+};
 
 #[test]
 fn explicit_close_repairs_failed_launch_without_terminal_record() {
@@ -365,12 +369,11 @@ fn explicit_close_allows_only_bound_ownerless_launch_failures() {
     )
     .unwrap();
     assert!(
-        verify_terminal_close_authority(
-            directory.path(),
-            "session-owner123",
-            &session,
-            crate::native::session::close::budget::close_deadline()
-        )
+        {
+            let deadline = crate::native::session::close::budget::close_deadline();
+            TestObservation::on_records(directory.path(), "session-owner123", &session, deadline)
+                .decide("session-owner123", &session, deadline)
+        }
         .unwrap()
             == TerminalCloseAuthority::SurfaceOnly
     );
@@ -378,12 +381,16 @@ fn explicit_close_allows_only_bound_ownerless_launch_failures() {
     let ready_directory = tempfile::tempdir().unwrap();
     update_status(ready_directory.path(), SessionState::Ready, None, None).unwrap();
     assert!(
-        verify_terminal_close_authority(
-            ready_directory.path(),
-            "session-owner123",
-            &session,
-            crate::native::session::close::budget::close_deadline()
-        )
+        {
+            let deadline = crate::native::session::close::budget::close_deadline();
+            TestObservation::on_records(
+                ready_directory.path(),
+                "session-owner123",
+                &session,
+                deadline,
+            )
+            .decide("session-owner123", &session, deadline)
+        }
         .is_err()
     );
 
@@ -396,12 +403,16 @@ fn explicit_close_allows_only_bound_ownerless_launch_failures() {
     )
     .unwrap();
     assert!(
-        verify_terminal_close_authority(
-            launching_directory.path(),
-            "session-different456",
-            &session,
-            crate::native::session::close::budget::close_deadline()
-        )
+        {
+            let deadline = crate::native::session::close::budget::close_deadline();
+            TestObservation::on_records(
+                launching_directory.path(),
+                "session-different456",
+                &session,
+                deadline,
+            )
+            .decide("session-different456", &session, deadline)
+        }
         .is_err()
     );
 }
@@ -784,29 +795,27 @@ fn explicit_close_recovers_a_failed_startup_only_through_a_stable_native_id() {
     )
     .unwrap();
     let authority = |kind, managed_session_id: &str| {
-        verify_terminal_close_authority_with_evidence(
-            directory.path(),
-            id,
-            &terminal::TerminalSession {
-                kind,
-                id: "missing-owned-surface".to_owned(),
-                managed_session_id: Some(managed_session_id.to_owned()),
-                tab_id: None,
-                window_id: None,
-                wezterm_mux: None,
-                windows_process_identity: None,
-            },
-            || panic!("an unproven owner allows no surface observation"),
-            #[cfg(target_os = "macos")]
-            terminal::close_evidence::with_apple(
-                kind,
-                &terminal::macos::apple_terminal::close_evidence::with_observations(
-                    |_| panic!("no app incarnation is recorded"),
-                    || panic!("no app incarnation is recorded"),
-                ),
-            ),
-            crate::native::session::close::budget::close_deadline(),
-        )
+        let deadline = crate::native::session::close::budget::close_deadline();
+        let surface = terminal::TerminalSession {
+            kind,
+            id: "missing-owned-surface".to_owned(),
+            managed_session_id: Some(managed_session_id.to_owned()),
+            tab_id: None,
+            window_id: None,
+            wezterm_mux: None,
+            windows_process_identity: None,
+        };
+        #[cfg(target_os = "macos")]
+        let apple = terminal::macos::apple_terminal::close_evidence::with_observations(
+            |_| panic!("no app incarnation is recorded"),
+            || panic!("no app incarnation is recorded"),
+        );
+        let observation = TestObservation::on_records(directory.path(), id, &surface, deadline)
+            .with_presence(|| panic!("an unproven owner allows no surface observation"));
+        #[cfg(target_os = "macos")]
+        let observation =
+            observation.with_evidence(terminal::close_evidence::with_apple(kind, &apple));
+        observation.decide(id, &surface, deadline)
     };
     assert_eq!(
         authority(terminal::TerminalKind::Iterm2, id).unwrap(),

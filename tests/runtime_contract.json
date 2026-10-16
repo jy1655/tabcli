@@ -373,9 +373,12 @@
     "console process is no longer available": 2,
     "Windows console submission delays do not fit inside the remaining turn timeout": 3
   },
-  "src/native/terminal/ownership.rs": {
-    "native-session": 19,
+  "src/native/terminal/close_authority.rs": {
+    "native-session": 4,
     "native-session.json": 1
+  },
+  "src/native/terminal/ownership.rs": {
+    "native-session": 15
   },
   "src/native/terminal/windows/focus.rs": {
     "const CONSOLE_HOST_CLASS: &str = \"ConsoleWindowClass\";": 1

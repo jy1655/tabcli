@@ -65,11 +65,6 @@ use terminal::ownership::{
     MacTerminalShellIdentity, NativeProcessIdentity, native_owner_identity_matches,
     verified_terminal_owner_process_group, verified_terminal_shell_process_group,
 };
-#[cfg(all(any(target_os = "macos", windows), test))]
-use terminal::ownership::{
-    TerminalCloseAuthority, verify_terminal_close_authority,
-    verify_terminal_close_authority_with_evidence,
-};
 #[cfg(all(windows, test))]
 use terminal::ownership::{current_native_session_owner, verified_windows_native_owner};
 #[cfg(windows)]
