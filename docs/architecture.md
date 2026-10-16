@@ -146,8 +146,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 - `src/native/session/` owns durable record schemas, record access, and durability.
   `schema` defines the shared manifest, event, provider-process, and reopen-refusal records and
   their constants; `primitives` owns session environment names, identity validation, and time
-  helpers. `close::budget` owns the close deadline and test clock. `requests` binds public requests to
-  claims and events; `turn` owns delivery settlement, completion and recovery; `close` owns
+  helpers. `close::budget` owns the close deadline scope and its optional test clock. `requests`
+  binds public requests to claims and events; `turn` owns delivery settlement, completion and
+  recovery; `close` owns
   close-record transitions and dead-owner repair; `launch` coordinates spawn, cancellation,
   and the full macOS binding wait, and holds the two launch operations: `launcher` starts a
   created session in a surface and `wrapper` runs the native-session command inside it.
@@ -452,4 +453,6 @@ repair settles the records without resending a prompt or guessing ownership of a
 For a lifecycle race or partial transition, first add a deterministic test that reproduces it,
 then change the implementation. Keep observation read-only and prefer the provider's own
 mechanisms over extending a fallback. Follow [AGENTS.md](../AGENTS.md) for regression requirements
-and [docs/testing.md](testing.md) to record authenticated terminal checks.
+and [docs/testing.md](testing.md) to record authenticated terminal checks; its section "Simulated
+time and the race hooks" names the one `Clock` seam, the deterministic hooks, and why an I/O
+context on `Store` and `Reader` was declined.
