@@ -2,6 +2,7 @@
 //! Provider adapters retain conversation-holder evidence; terminal ownership retains Close authority.
 use super::doctor::{Availability, Check};
 use super::*;
+use crate::native::session::launch::wrapper::{check_provider_version_until, resolve_provider};
 use crate::native::session::primitives::{delegation_source, unix_ms, valid_session_id};
 use crate::native::session::schema::{
     ProviderProcessRecord, RecordedReopenRefusal, SessionEvent, SessionManifest,

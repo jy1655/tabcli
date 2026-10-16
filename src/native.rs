@@ -2,9 +2,7 @@ use crate::native::session::close::budget::CLOSE_TIMEOUT;
 use crate::native::session::primitives::{
     SESSION_DIR_ENV, STATE_DIR_ENV, delegation_source, require_valid_session_id, unix_ms,
 };
-use crate::native::session::schema::{
-    ProviderProcessRecord, SESSION_SCHEMA, SessionEvent, SessionManifest,
-};
+use crate::native::session::schema::{SESSION_SCHEMA, SessionEvent, SessionManifest};
 #[cfg(unix)]
 use crate::native::terminal::shell_quote;
 use agent_bridge::PUBLIC_COMMAND;
@@ -29,8 +27,7 @@ mod provider_process;
 mod query;
 mod reopen;
 use reopen::{
-    REOPEN_LAUNCH_GATE, read_resumed_from, record_reopen_refusal,
-    refuse_follow_up_to_shared_conversation, reopen_refusal_gate, run_reopen,
+    read_resumed_from, refuse_follow_up_to_shared_conversation, reopen_refusal_gate, run_reopen,
 };
 mod self_test;
 mod session;
@@ -78,7 +75,7 @@ use std::fs::File;
 use std::{
     ffi::OsString,
     fs::{self, OpenOptions},
-    io::{IsTerminal, Read},
+    io::Read,
     path::{Path, PathBuf},
     process::Command,
     str::FromStr,
@@ -87,10 +84,11 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use agent_bridge::provider_effort_args;
 use agent_bridge::{
     FirstPartyCli, checked_deadline_from, cli_version_is_supported, confirm_explicit_close,
-    process_is_alive, provider_effort_args, provider_launch_args, provider_model_args,
-    terminal_safe_text, validate_terminal_input,
+    process_is_alive, terminal_safe_text, validate_terminal_input,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -943,7 +941,7 @@ pub(crate) fn run(command: NativeCommand) -> Result<()> {
         NativeCommand::Status(request) => query::status::run(request),
         NativeCommand::Prune(request) => run_prune(request),
         NativeCommand::Close(request) => run_close(request),
-        NativeCommand::RunSession { id } => run_session(&id),
+        NativeCommand::RunSession { id } => launch::wrapper::run(&id),
         NativeCommand::Hook { provider, payload } => run_hook(provider, payload.as_deref()),
         NativeCommand::ProviderControl {
             provider,
@@ -1037,36 +1035,6 @@ fn run_ask_inner(request: AskRequest, report: &mut TurnReport) -> Result<()> {
         json: request.json,
     };
     session_start::start(options, &mut session_start::FreshSource(request), report)
-}
-
-// Records the spawned provider process before the session leaves its launch state. The
-// caller still holds the child handle, so on Windows the pid cannot have been reused
-// between the spawn and the identity query. The record names the process Bridge spawned:
-// for a native executable that is the provider itself; for a `.ps1` or `.cmd` shim it is
-// the shim, which waits on the provider and whose own survival is what the record can
-// verify.
-fn record_provider_process(
-    directory: &Path,
-    managed_session_id: &str,
-    child: &std::process::Child,
-) -> Result<()> {
-    let pid = child.id();
-    #[cfg(windows)]
-    let windows_process_identity = Some(
-        terminal::windows_process_identity(pid)
-            .with_context(|| format!("failed to record the identity of provider process {pid}"))?,
-    );
-    #[cfg(not(windows))]
-    let windows_process_identity = None;
-    Store::open_unchecked(directory)
-        .write_provider_process(&ProviderProcessRecord {
-            schema: 1,
-            managed_session_id: managed_session_id.to_owned(),
-            pid,
-            windows_process_identity,
-            spawned_unix_ms: unix_ms(),
-        })
-        .context("failed to record the spawned provider process")
 }
 
 // Closes a managed session's own visible surface exactly as an explicit `close-session`
@@ -1488,203 +1456,6 @@ fn started_from_lines(id: &str, started_from: &session::origin::StartedFrom) -> 
     lines
 }
 
-fn run_session(id: &str) -> Result<()> {
-    let directory = Reader::session_directory(id)?;
-    launch::log(&Store::open_unchecked(&directory), "wrapper_started");
-    launch::admit_wrapper(&Store::open_unchecked(&directory))?;
-    let result = (|| {
-        launch::restore_stdout()?;
-        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-            bail!("native-session must run in a visible interactive terminal");
-        }
-        let owner = terminal::ownership::current_surface_owner(&directory, id)?;
-        Store::open_unchecked(&directory).write_owner(&owner)?;
-        launch::log(&Store::open_unchecked(&directory), "owner_recorded");
-        run_session_inner(&directory)
-    })();
-    match &result {
-        Ok(()) => launch::log(&Store::open_unchecked(&directory), "wrapper_exit_code=0"),
-        Err(error) => launch::log(
-            &Store::open_unchecked(&directory),
-            &format!("wrapper_exit_code=1; {error:#}"),
-        ),
-    }
-    if let Err(finalization_error) = launch::finalize(&Store::open_unchecked(&directory), &result) {
-        return match result {
-            Ok(()) => Err(finalization_error),
-            Err(run_error) => Err(anyhow::anyhow!(
-                "{run_error:#}; native session finalization also failed: {finalization_error:#}"
-            )),
-        };
-    }
-    result
-}
-
-fn run_session_inner(directory: &Path) -> Result<()> {
-    let manifest = Reader::open_unchecked(directory).manifest()?;
-    let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
-    check_provider_version(provider, &manifest.provider_path)?;
-    let prompt_path = Reader::open_unchecked(directory)
-        .record(CoreRecord::InitialPrompt)
-        .path()
-        .to_owned();
-    let prompt = Reader::open_unchecked(directory)
-        .initial_prompt()
-        .context("failed to read initial prompt")?;
-    let initial_readiness = provider::initial_transport(provider).facts().readiness;
-
-    let executable = std::env::current_exe().context("failed to locate the current executable")?;
-    let mut policy_arguments = provider_launch_args(provider, manifest.yolo)
-        .into_iter()
-        .map(OsString::from)
-        .collect::<Vec<_>>();
-    if let Some(effort) = &manifest.effort {
-        policy_arguments.extend(
-            provider_effort_args(provider, effort)?
-                .into_iter()
-                .map(OsString::from),
-        );
-    }
-    if let Some(model) = &manifest.model {
-        policy_arguments.extend(
-            provider_model_args(provider, model)
-                .into_iter()
-                .map(OsString::from),
-        );
-    }
-    // A reopened session launches through the adapter's resume plan. The plan carries no
-    // prompt: the initial prompt reaches the reopened process through the same transport a
-    // fresh launch uses, so `prompt_is_positional` is false here by construction.
-    let resumed_from = read_resumed_from(directory)?;
-    let (provider_arguments, prompt_is_positional, completion_monitor, environment_removals) =
-        match &resumed_from {
-            Some(resumed_from) => {
-                let provider::ResumePlan {
-                    arguments,
-                    completion_monitor,
-                    environment_removals,
-                } = provider::reopen(provider)?.prepare(provider::ResumeContext {
-                    bridge_executable: &executable,
-                    directory,
-                    provider_session_id: &resumed_from.provider_session_id,
-                })?;
-                (arguments, false, completion_monitor, environment_removals)
-            }
-            None => {
-                let provider::LaunchPlan {
-                    arguments,
-                    prompt_is_positional,
-                    completion_monitor,
-                    environment_removals,
-                } = provider::prepare_launch(
-                    provider,
-                    provider::LaunchContext {
-                        bridge_executable: &executable,
-                        directory,
-                        workspace: &manifest.workspace,
-                        title: &manifest.title,
-                        prompt: &prompt,
-                    },
-                )?;
-                (
-                    arguments,
-                    prompt_is_positional,
-                    completion_monitor,
-                    environment_removals,
-                )
-            }
-        };
-    let mut arguments = policy_arguments.clone();
-    arguments.extend(provider_arguments);
-    if initial_readiness == delivery::Readiness::LaunchArgument && prompt_is_positional {
-        arguments.push(OsString::from(prompt.clone()));
-    }
-
-    let completion_monitor = completion_monitor.start(directory)?;
-    let mut provider_command = process_env::provider_command(
-        &manifest.provider_path,
-        directory,
-        arguments,
-        environment_removals,
-    )?;
-    // The reopen ownership gate ran read-only before the source was claimed; the provider
-    // grants no exclusive hold on the conversation, so it runs again here, after every other
-    // preparation and immediately before the process exists. A holder that appeared in
-    // between refuses under the same gate; the record carries the gate to the reopen command.
-    if let Some(resumed_from) = &resumed_from
-        && let Err(error) = provider::reopen(provider)
-            .and_then(|support| support.verify_available(&resumed_from.provider_session_id))
-    {
-        let _ = completion_monitor.stop();
-        return Err(record_reopen_refusal(
-            directory,
-            REOPEN_LAUNCH_GATE,
-            format!("{error:#}"),
-        ));
-    }
-    configure_provider_launch(
-        &mut provider_command,
-        &manifest.workspace,
-        directory,
-        &manifest.id,
-        &executable,
-    );
-    // Spawn and its durable identity are fenced against cancellation by the lifecycle
-    // lock. Failed identity recording ends the child but stays delivery-uncertain: an
-    // argument-delivered prompt could already have been consumed before cleanup.
-    let child = launch::spawn(
-        &Store::open_unchecked(directory),
-        &mut provider_command,
-        |child| {
-            record_provider_process(directory, &manifest.id, child)?;
-            match initial_readiness {
-                delivery::Readiness::LaunchArgument => {
-                    session::RecordStore::at(&prompt_path)
-                        .remove_raw()
-                        .context("failed to remove the accepted initial prompt")?;
-                    update_status(directory, SessionState::Running, None, None)?;
-                }
-                delivery::Readiness::AfterLaunch { .. } => {
-                    update_status(directory, SessionState::AwaitingInitialInput, None, None)?;
-                }
-            }
-            Ok(())
-        },
-    );
-    let mut child = match child {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = completion_monitor.stop();
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to start {} at {}",
-                    provider.as_str(),
-                    manifest.provider_path.display()
-                )
-            });
-        }
-    };
-    let status = child.wait();
-    if let Ok(status) = &status {
-        launch::log(
-            &Store::open_unchecked(directory),
-            &format!("provider_exit_code={:?}", status.code()),
-        );
-    }
-    completion_monitor.stop()?;
-    let status = status.with_context(|| {
-        format!(
-            "failed to start {} at {}",
-            provider.as_str(),
-            manifest.provider_path.display()
-        )
-    })?;
-    if !status.success() {
-        bail!("{} exited with {status}", provider.as_str());
-    }
-    Ok(())
-}
-
 fn run_hook(provider: FirstPartyCli, argument_payload: Option<&str>) -> Result<()> {
     let directory = PathBuf::from(
         std::env::var_os(SESSION_DIR_ENV).context("native hook session directory is not set")?,
@@ -1754,126 +1525,6 @@ fn create_session_within(
 #[cfg(test)]
 fn valid_status_transition(current: &SessionState, next: &SessionState) -> bool {
     current.clone().transition_allowed(next.clone())
-}
-
-fn resolve_provider(provider: FirstPartyCli) -> Result<PathBuf> {
-    let path = std::env::var_os("PATH").context("PATH is not set")?;
-    resolve_provider_from_path(provider, &path)
-}
-
-fn resolve_provider_from_path(provider: FirstPartyCli, path: &std::ffi::OsStr) -> Result<PathBuf> {
-    for directory in std::env::split_paths(&path) {
-        if !directory.is_absolute() {
-            continue;
-        }
-        #[cfg(windows)]
-        let names = [
-            format!("{}.exe", provider.command()),
-            format!("{}.ps1", provider.command()),
-            format!("{}.cmd", provider.command()),
-            format!("{}.bat", provider.command()),
-        ];
-        #[cfg(not(windows))]
-        let names = [provider.command().to_owned()];
-        for name in names {
-            let candidate = directory.join(name);
-            if candidate.is_file() && is_executable(&candidate) {
-                let canonical = candidate.canonicalize().with_context(|| {
-                    format!(
-                        "failed to canonicalize provider path {}",
-                        candidate.display()
-                    )
-                })?;
-                if canonical.is_file() && is_executable(&canonical) {
-                    return Ok(canonical);
-                }
-            }
-        }
-    }
-    bail!(
-        "{} was not found on an absolute PATH entry",
-        provider.command()
-    )
-}
-
-fn configure_provider_launch(
-    command: &mut Command,
-    workspace: &Path,
-    directory: &Path,
-    id: &str,
-    executable: &Path,
-) {
-    command
-        .current_dir(workspace)
-        .env(SESSION_DIR_ENV, directory)
-        .env("AGENT_BRIDGE_NATIVE_SESSION_ID", id)
-        .env("AGENT_BRIDGE_EXECUTABLE", executable);
-    launch::provider_stderr(command);
-}
-
-fn provider_version_text(stdout: &[u8], stderr: &[u8]) -> String {
-    let mut version = String::from_utf8_lossy(stdout).trim().to_owned();
-    if version.is_empty() {
-        version = String::from_utf8_lossy(stderr).trim().to_owned();
-    }
-    version
-}
-
-fn version_probe_command(provider: FirstPartyCli, executable: &Path) -> Result<Command> {
-    let mut command = process_env::provider_version_command(
-        executable,
-        provider::probe_environment_removals(provider),
-    )?;
-    command.arg("--version");
-    Ok(command)
-}
-
-fn check_provider_version(provider: FirstPartyCli, executable: &Path) -> Result<String> {
-    check_provider_version_until(provider, executable, None)
-}
-
-fn check_provider_version_until(
-    provider: FirstPartyCli,
-    executable: &Path,
-    deadline: Option<Instant>,
-) -> Result<String> {
-    let mut command = version_probe_command(provider, executable)?;
-    let label = format!("{} --version", executable.display());
-    let output = match deadline {
-        Some(deadline) => process_env::command_output_until(&mut command, deadline, &label),
-        None => command
-            .output()
-            .with_context(|| format!("failed to query {label}")),
-    }?;
-    if !output.status.success() {
-        bail!(
-            "{} --version exited with {}",
-            executable.display(),
-            output.status
-        );
-    }
-    let version = provider_version_text(&output.stdout, &output.stderr);
-    if !cli_version_is_supported(provider, &version)? {
-        bail!(
-            "{} is too old: found {version:?}, require >= {}",
-            provider.as_str(),
-            provider.minimum_version()
-        );
-    }
-    Ok(version)
-}
-
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
-    path.is_file()
 }
 
 #[cfg(unix)]

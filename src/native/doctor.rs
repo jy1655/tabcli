@@ -6,11 +6,13 @@ use super::query::observation::judgment::{
 use super::query::observation::{Observation, SessionEvidence};
 use super::{
     Duration, FirstPartyCli, Instant, NativeCommand, OsString, Path, Reader, Result, Serialize,
-    bail, cli_version_is_supported, consent, fs, is_executable, option_value, provider,
-    provider_process, provider_version_text, query, reopen, resolve_provider, set_flag_once,
-    set_once, terminal, terminal_safe_text, thread,
+    bail, cli_version_is_supported, consent, fs, option_value, provider, provider_process, query,
+    reopen, set_flag_once, set_once, terminal, terminal_safe_text, thread,
 };
 use crate::native::session::SessionState;
+use crate::native::session::launch::wrapper::{
+    is_executable, provider_version_text, resolve_provider,
+};
 use crate::native::session::origin::{OriginObservation, SourceKind};
 use crate::native::session::primitives::{SESSION_DIR_ENV, require_valid_session_id, unix_ms};
 use crate::native::session::schema::SessionManifest;

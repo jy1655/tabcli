@@ -1,4 +1,11 @@
 use super::*;
+use crate::native::session::launch::wrapper::{
+    STDERR_ENV, STDOUT_ENV, configure_provider_launch, provider_version_text, version_probe_command,
+};
+#[cfg(unix)]
+use crate::native::session::launch::wrapper::{
+    check_provider_version, check_provider_version_until, provision, resolve_provider_from_path,
+};
 
 #[cfg(unix)]
 #[test]
@@ -160,7 +167,7 @@ fn native_session_executes_the_provider_with_policy_and_provenance() {
     update_status(&directory, SessionState::Launching, None, None).unwrap();
     let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
     claim.retain();
-    let result = run_session_inner(&directory);
+    let result = provision(&directory);
     launch::finalize(&Store::open_unchecked(&directory), &result).unwrap();
     result.unwrap();
 
@@ -229,7 +236,7 @@ fn claude_session_forwards_requested_model() {
     update_status(&directory, SessionState::Launching, None, None).unwrap();
     let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
     claim.retain();
-    let result = run_session_inner(&directory);
+    let result = provision(&directory);
     launch::finalize(&Store::open_unchecked(&directory), &result).unwrap();
     result.unwrap();
 
@@ -282,7 +289,7 @@ fn agy_session_uses_interactive_prompt_model_log_and_explicit_yolo() {
     update_status(&directory, SessionState::Launching, None, None).unwrap();
     let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
     claim.retain();
-    let result = run_session_inner(&directory);
+    let result = provision(&directory);
     launch::finalize(&Store::open_unchecked(&directory), &result).unwrap();
     result.unwrap();
 
@@ -336,7 +343,7 @@ fn pi_session_loads_the_result_extension_and_explicit_project_approval() {
     update_status(&directory, SessionState::Launching, None, None).unwrap();
     let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
     claim.retain();
-    let result = run_session_inner(&directory);
+    let result = provision(&directory);
     launch::finalize(&Store::open_unchecked(&directory), &result).unwrap();
     result.unwrap();
 
@@ -372,8 +379,8 @@ fn provider_launch_and_version_builders_preserve_their_exact_environments() {
                     Some(std::ffi::OsStr::new("session-e1")),
                 ),
                 ("AGENT_BRIDGE_EXECUTABLE", Some(executable.as_os_str())),
-                (launch::STDERR_ENV, None),
-                (launch::STDOUT_ENV, None),
+                (STDERR_ENV, None),
+                (STDOUT_ENV, None),
             ],
         );
         process_env::tests::assert_provider_environment(

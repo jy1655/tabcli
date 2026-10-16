@@ -1,4 +1,8 @@
 use super::*;
+#[cfg(windows)]
+use crate::native::session::launch::wrapper::{
+    check_provider_version, configure_provider_launch, resolve_provider_from_path,
+};
 
 #[cfg(windows)]
 #[test]

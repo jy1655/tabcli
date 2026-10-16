@@ -12,8 +12,6 @@ use crate::native::terminal;
 use crate::native::terminal::shell_quote;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-#[cfg(unix)]
-use std::fs::File;
 use std::process::Child;
 use std::{
     process::Command,
@@ -27,8 +25,11 @@ use std::{
 #[cfg(all(test, any(target_os = "macos", windows)))]
 pub(in crate::native) use super::LAUNCH_FILE as FILE;
 pub(in crate::native) const LOG: &str = "launch.log";
-pub(in crate::native) const STDERR_ENV: &str = "AGENT_BRIDGE_LAUNCH_STDERR_FD";
-pub(in crate::native) const STDOUT_ENV: &str = "AGENT_BRIDGE_LAUNCH_STDOUT_FD";
+pub(in crate::native) mod wrapper;
+// The Unix bootstrap in native.rs names the fd handoff through this module until the
+// launcher side moves in.
+#[cfg(unix)]
+pub(in crate::native) use wrapper::{STDERR_ENV, STDOUT_ENV};
 // Retained for older readers and for reading records written before residual_surface.
 pub(in crate::native) const RESIDUAL_SURFACE_MARKER: &str =
     "the surface may remain and is not closed by Bridge";
@@ -58,7 +59,6 @@ impl SessionStatus {
 }
 
 #[cfg(all(test, target_os = "macos"))]
-#[path = "launch/binding_tests.rs"]
 pub(in crate::native) mod binding_tests;
 
 #[cfg(target_os = "macos")]
@@ -732,35 +732,6 @@ pub(in crate::native) fn diagnostic(
         return Some(("launch_timeout", "provider launch deadline expired; run sessions for this workspace to settle startup, then inspect the same request; do not resend".to_owned()));
     }
     None
-}
-
-/// The shell redirects only Bridge's stderr. The provider keeps the original terminal
-/// stderr, so logging does not turn its interactive surface into a pipe or a file.
-pub(in crate::native) fn provider_stderr(command: &mut Command) {
-    command.env_remove(STDERR_ENV);
-    command.env_remove(STDOUT_ENV);
-    #[cfg(unix)]
-    if std::env::var(STDERR_ENV).as_deref() == Ok("3") {
-        use std::os::fd::FromRawFd;
-        // SAFETY: dup produces a new owned fd; a failed dup is not adopted.
-        let fd = unsafe { libc::fcntl(3, libc::F_DUPFD_CLOEXEC, 4) };
-        if fd >= 0 {
-            command.stderr(unsafe { File::from_raw_fd(fd) });
-        }
-    }
-}
-
-pub(in crate::native) fn restore_stdout() -> Result<()> {
-    #[cfg(unix)]
-    if std::env::var(STDOUT_ENV).as_deref() == Ok("4") {
-        // SAFETY: the launch shell supplies fd 4 as its original stdout. This runs at
-        // entry, before monitors/threads exist; provider stdout must remain the real TTY.
-        if unsafe { libc::dup2(4, libc::STDOUT_FILENO) } < 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("failed to restore launch terminal stdout");
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

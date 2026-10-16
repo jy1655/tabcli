@@ -8,8 +8,6 @@
     ".prefix(\"pending-prompt-\")": 1
   },
   "src/native.rs": {
-    "AGENT_BRIDGE_NATIVE_SESSION_ID": 1,
-    "AGENT_BRIDGE_EXECUTABLE": 1,
     "const NATIVE_DELEGATION_HEADER: &str = \"[Agent Bridge native delegation]\";": 1,
     "name: \"native-session\"": 1,
     "name: \"native-hook\"": 1,
@@ -19,7 +17,7 @@
     "native-console-control": 2,
     "native-hook": 3,
     "native-provider-control": 2,
-    "native-session": 5,
+    "native-session": 4,
     "name: terminal::host::CONSOLE_HOST_COMMAND": 1,
     "name: terminal::host::ITERM2_HOST_COMMAND": 1,
     "name: terminal::host::APPLE_TERMINAL_HOST_COMMAND": 1,
@@ -232,11 +230,16 @@
     "native-session": 1,
     "status.json": 1
   },
-  "src/native/session/launch.rs": {
-    "AGENT_BRIDGE_LAUNCH_STDERR_FD": 1,
-    "AGENT_BRIDGE_LAUNCH_STDOUT_FD": 1,
+  "src/native/session/launch/mod.rs": {
     "launch.log": 1,
     "launch.sh": 1
+  },
+  "src/native/session/launch/wrapper.rs": {
+    "AGENT_BRIDGE_NATIVE_SESSION_ID": 1,
+    "AGENT_BRIDGE_EXECUTABLE": 1,
+    "AGENT_BRIDGE_LAUNCH_STDERR_FD": 1,
+    "AGENT_BRIDGE_LAUNCH_STDOUT_FD": 1,
+    "native-session": 1
   },
   "src/native/session/names.rs": {
     "pub(in crate::native) const TURN_CLAIM_FILE: &str = \"turn.claim\";": 1,
