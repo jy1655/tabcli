@@ -1,6 +1,7 @@
 use super::{
-    CompletionMonitor, CrossSessionMessageContext, LaunchContext, LaunchPlan,
-    NativeProviderAdapter, ReopenSupport, ResumeContext, ResumePlan, ResumedSessionContext,
+    CompletionMonitor, CrossSessionMessageContext, InitialPromptDisposition, LaunchContext,
+    LaunchPlan, NativeProviderAdapter, ReopenSupport, ResumeContext, ResumePlan,
+    ResumedSessionContext,
 };
 use crate::native::delivery::{
     self, Outcome, Prepared, Readiness, Transport, TransportFacts, TurnContext,
@@ -9,6 +10,9 @@ use crate::native::delivery::{
 use crate::native::session::SessionState;
 use crate::native::session::turn;
 use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store, record};
+use agent_bridge::{
+    FirstPartyCli, provider_effort_args, provider_launch_args, provider_model_args,
+};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -328,11 +332,7 @@ impl NativeProviderAdapter for ClaudeAdapter {
     }
 
     fn initial_transport(&self) -> Box<dyn Transport> {
-        if cfg!(windows) {
-            Box::new(ClaudeMessage)
-        } else {
-            Box::new(delivery::LAUNCH_ARGUMENT)
-        }
+        initial_transport_for_platform(cfg!(windows))
     }
     fn follow_up_transport(&self) -> Box<dyn Transport> {
         Box::new(ClaudeMessage)
@@ -624,18 +624,63 @@ fn require_exact_claude_trust_scope(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
+fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {
+    if windows {
+        Box::new(ClaudeMessage)
+    } else {
+        Box::new(delivery::LAUNCH_ARGUMENT)
+    }
+}
+
+// The requested policy, in Claude's flags, ahead of every adapter argument: the bypass
+// only when requested, then effort, then model.
+fn policy_arguments(
+    yolo: bool,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Result<Vec<OsString>> {
+    let mut arguments = provider_launch_args(FirstPartyCli::Claude, yolo)
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    if let Some(effort) = effort {
+        arguments.extend(
+            provider_effort_args(FirstPartyCli::Claude, effort)?
+                .into_iter()
+                .map(OsString::from),
+        );
+    }
+    if let Some(model) = model {
+        arguments.extend(
+            provider_model_args(FirstPartyCli::Claude, model)
+                .into_iter()
+                .map(OsString::from),
+        );
+    }
+    Ok(arguments)
+}
+
+// The complete launch command. Off Windows the initial transport is the launch argument,
+// so the prompt is the last positional argument and is accepted at spawn; on Windows the
+// cross-session message delivers it after launch and argv carries no prompt.
 fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Result<LaunchPlan> {
     let settings_path = context.directory.join("claude-settings.json");
     RecordStore::at(&settings_path).write_json(&hook_settings(context.bridge_executable))?;
-    let arguments = vec![
+    let mut arguments = policy_arguments(context.yolo, context.model, context.effort)?;
+    arguments.extend([
         OsString::from("--settings"),
         settings_path.into_os_string(),
         OsString::from("--name"),
         OsString::from(managed_session_name(context.directory)?),
-    ];
+    ]);
+    let initial_prompt =
+        InitialPromptDisposition::of(initial_transport_for_platform(windows).as_ref());
+    if initial_prompt == InitialPromptDisposition::AcceptedAtSpawn {
+        arguments.push(OsString::from(context.prompt));
+    }
     Ok(LaunchPlan {
         arguments,
-        prompt_is_positional: !windows,
+        initial_prompt,
         completion_monitor: CompletionMonitor::Hook,
         environment_removals: CLAUDE_CODE_SESSION_MARKERS,
     })
@@ -643,19 +688,26 @@ fn prepare_launch_for_platform(context: LaunchContext<'_>, windows: bool) -> Res
 
 // Forward only explicitly requested policy flags; Claude owns restored policy and defaults.
 // Holder scans detect conflicts only at boundaries; see docs/verification/2026-10-12-reopen-source-notes.md.
+// The plan carries no prompt: the reopened session receives it through the initial
+// transport, exactly as a fresh launch does.
 fn prepare_resume_for_platform(context: ResumeContext<'_>, windows: bool) -> Result<ResumePlan> {
     verify_reopen_available_for_platform(context.provider_session_id, windows)?;
     let settings_path = context.directory.join("claude-settings.json");
     RecordStore::at(&settings_path).write_json(&hook_settings(context.bridge_executable))?;
+    let mut arguments = policy_arguments(context.yolo, context.model, context.effort)?;
+    arguments.extend([
+        OsString::from("--resume"),
+        OsString::from(context.provider_session_id),
+        OsString::from("--settings"),
+        settings_path.into_os_string(),
+        OsString::from("--name"),
+        OsString::from(managed_session_name(context.directory)?),
+    ]);
     Ok(ResumePlan {
-        arguments: vec![
-            OsString::from("--resume"),
-            OsString::from(context.provider_session_id),
-            OsString::from("--settings"),
-            settings_path.into_os_string(),
-            OsString::from("--name"),
-            OsString::from(managed_session_name(context.directory)?),
-        ],
+        arguments,
+        initial_prompt: InitialPromptDisposition::of(
+            initial_transport_for_platform(windows).as_ref(),
+        ),
         completion_monitor: CompletionMonitor::Hook,
         environment_removals: CLAUDE_CODE_SESSION_MARKERS,
     })

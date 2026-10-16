@@ -495,6 +495,9 @@ fn non_claude_sources_are_refused_with_each_adapters_own_reason() {
                     bridge_executable: Path::new("/opt/agent-bridge"),
                     directory: root.path(),
                     provider_session_id: REOPEN_TEST_CONVERSATION,
+                    yolo: false,
+                    model: None,
+                    effort: None,
                 })
             })
             .unwrap_err();

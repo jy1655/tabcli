@@ -10,17 +10,42 @@ use std::{ffi::OsString, path::Path, path::PathBuf, time::Instant};
 
 use super::{delivery::Transport, terminal};
 
+// The manifest's policy inputs travel with every launch context. Each adapter maps them to
+// its CLI's flags itself through the public mappings; no shared code assembles them.
 pub(super) struct LaunchContext<'a> {
     pub(super) bridge_executable: &'a Path,
     pub(super) directory: &'a Path,
     pub(super) workspace: &'a Path,
     pub(super) title: &'a str,
     pub(super) prompt: &'a str,
+    pub(super) yolo: bool,
+    pub(super) model: Option<&'a str>,
+    pub(super) effort: Option<&'a str>,
 }
 
+// How the initial prompt reaches the provider process, declared by the adapter from its own
+// initial transport. The wrapper acts on it right after the process record: an accepted
+// prompt is removed and the session runs; an awaited one stays until delivery sends it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InitialPromptDisposition {
+    AcceptedAtSpawn,
+    AwaitingDelivery,
+}
+
+impl InitialPromptDisposition {
+    pub(super) fn of(transport: &dyn Transport) -> Self {
+        match transport.facts().readiness {
+            super::delivery::Readiness::LaunchArgument => Self::AcceptedAtSpawn,
+            super::delivery::Readiness::AfterLaunch { .. } => Self::AwaitingDelivery,
+        }
+    }
+}
+
+// The complete provider command of a fresh session: every argument in its final order,
+// including the adapter's mapping of the policy inputs and the prompt's place.
 pub(super) struct LaunchPlan {
     pub(super) arguments: Vec<OsString>,
-    pub(super) prompt_is_positional: bool,
+    pub(super) initial_prompt: InitialPromptDisposition,
     pub(super) completion_monitor: CompletionMonitor,
     // Caller environment variables the adapter refuses to pass to its provider process.
     // Each adapter owns this list; the shared launcher only applies it.
@@ -34,6 +59,9 @@ pub(super) struct ResumeContext<'a> {
     pub(super) bridge_executable: &'a Path,
     pub(super) directory: &'a Path,
     pub(super) provider_session_id: &'a str,
+    pub(super) yolo: bool,
+    pub(super) model: Option<&'a str>,
+    pub(super) effort: Option<&'a str>,
 }
 
 // The provider arguments that reopen a conversation. A resume plan never carries an initial
@@ -42,6 +70,7 @@ pub(super) struct ResumeContext<'a> {
 #[derive(Debug)]
 pub(super) struct ResumePlan {
     pub(super) arguments: Vec<OsString>,
+    pub(super) initial_prompt: InitialPromptDisposition,
     pub(super) completion_monitor: CompletionMonitor,
     pub(super) environment_removals: &'static [&'static str],
 }

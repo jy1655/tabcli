@@ -496,3 +496,144 @@ fn reopen_is_refused_with_the_adapters_own_reason() {
             .is_none()
     );
 }
+
+// The expected policy prefix of a Pi command, in the fixed order the adapter emits it:
+// `--approve` only when the bypass is requested, then thinking, then model.
+fn pi_policy(yolo: bool, model: Option<&str>, effort: Option<&str>) -> Vec<OsString> {
+    let mut expected = Vec::new();
+    if yolo {
+        expected.push(OsString::from("--approve"));
+    }
+    if let Some(effort) = effort {
+        expected.extend([OsString::from("--thinking"), OsString::from(effort)]);
+    }
+    if let Some(model) = model {
+        expected.extend([OsString::from("--model"), OsString::from(model)]);
+    }
+    expected
+}
+
+// The complete launch command for every policy combination, both platform branches and
+// both consent answers: policy first, the result extension, the managed name, a second
+// `--approve` when consent authorizes the workspace (both stay when both apply), and off
+// Windows the correlated prompt last.
+#[test]
+fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
+    for consent in [false, true] {
+        for windows in [false, true] {
+            for yolo in [false, true] {
+                for (model, mapped) in [
+                    (None, None),
+                    (Some("Fable"), Some("anthropic/claude-fable-5")),
+                ] {
+                    for effort in [None, Some("minimal")] {
+                        let root = tempfile::tempdir().unwrap();
+                        let directory = root.path().join("session-safe123");
+                        fs::create_dir(&directory).unwrap();
+                        fs::create_dir(directory.join("events")).unwrap();
+                        let workspace = root.path().join("workspace");
+                        fs::create_dir(&workspace).unwrap();
+                        let workspace = workspace.canonicalize().unwrap();
+                        turn::claim(&Store::open_unchecked(&directory), &[])
+                            .unwrap()
+                            .retain();
+                        // The authorized rows use the adapter's gate seam with a
+                        // positive answer and the real applied record; the absent rows
+                        // use the production gate, which has no consent record to read.
+                        let authorized: fn(&Path, FirstPartyCli) -> Result<bool> = if consent {
+                            crate::native::consent::prepare(&directory, &workspace).unwrap();
+                            |_, _| Ok(true)
+                        } else {
+                            crate::native::consent::authorized
+                        };
+                        let plan = prepare_launch_for_platform(
+                            LaunchContext {
+                                bridge_executable: Path::new("/opt/agent-bridge"),
+                                directory: &directory,
+                                workspace: &workspace,
+                                title: "Pi test",
+                                prompt: "pi prompt",
+                                yolo,
+                                model,
+                                effort,
+                            },
+                            windows,
+                            authorized,
+                        )
+                        .unwrap();
+                        let label = format!(
+                            "consent={consent} windows={windows} yolo={yolo} model={model:?} effort={effort:?}"
+                        );
+                        let pending = read_pending_turn(&directory).unwrap().unwrap();
+                        assert_eq!(
+                            pending.claim_token,
+                            turn::current_claim_token(&Reader::open_unchecked(&directory))
+                                .unwrap()
+                                .unwrap(),
+                            "{label}"
+                        );
+                        let extension_path = directory.join("pi-agent-bridge.js");
+                        let mut expected = pi_policy(yolo, mapped, effort);
+                        expected.extend([
+                            OsString::from("--extension"),
+                            extension_path.clone().into_os_string(),
+                            OsString::from("--name"),
+                            OsString::from("Pi test"),
+                        ]);
+                        if consent {
+                            expected.push(OsString::from("--approve"));
+                        }
+                        if !windows {
+                            let framed = correlated_prompt("pi prompt", &pending);
+                            assert!(framed.starts_with("pi prompt"), "{label}");
+                            assert!(
+                                framed.contains("[Agent Bridge Pi turn protocol]"),
+                                "{label}"
+                            );
+                            assert!(framed.ends_with(&pending.marker), "{label}");
+                            expected.push(OsString::from(framed));
+                        }
+                        assert_eq!(plan.arguments, expected, "{label}");
+                        assert_eq!(
+                            plan.arguments
+                                .iter()
+                                .filter(|argument| *argument == "--approve")
+                                .count(),
+                            usize::from(yolo) + usize::from(consent),
+                            "{label}"
+                        );
+                        assert!(
+                            !plan
+                                .arguments
+                                .iter()
+                                .any(|argument| argument.to_string_lossy().contains("dangerously")),
+                            "{label}"
+                        );
+                        assert_eq!(
+                            plan.initial_prompt,
+                            if windows {
+                                InitialPromptDisposition::AwaitingDelivery
+                            } else {
+                                InitialPromptDisposition::AcceptedAtSpawn
+                            },
+                            "{label}"
+                        );
+                        assert!(
+                            matches!(plan.completion_monitor, CompletionMonitor::PiHookFailure),
+                            "{label}"
+                        );
+                        assert!(plan.environment_removals.is_empty(), "{label}");
+                        let extension = fs::read_to_string(&extension_path).unwrap();
+                        assert!(extension.contains("agent_settled"), "{label}");
+                        let observed = crate::native::consent::observe(&directory);
+                        if consent {
+                            assert_eq!(observed["applied"], APPLIED_MARKER, "{label}");
+                        } else {
+                            assert!(observed.is_null(), "{label}: {observed}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

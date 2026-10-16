@@ -201,3 +201,139 @@ fn the_memory_workspace_is_beside_the_config_that_homes_names() {
         memory_workspace(&homes_with_codex_config(config.to_str().unwrap())).unwrap()
     );
 }
+
+// A session directory with a seeded Claim, as the launcher leaves it before the wrapper
+// asks for the plan, and the workspace the session runs in.
+fn launch_fixture(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let directory = root.join("session-safe123");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::create_dir(directory.join("events")).unwrap();
+    let workspace = root.join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    turn::claim(&Store::open_unchecked(&directory), &[])
+        .unwrap()
+        .retain();
+    (directory, workspace.canonicalize().unwrap())
+}
+
+// The expected policy prefix of a Codex command, in the fixed order the adapter emits it:
+// the bypass only when requested, then effort, then model.
+fn codex_policy(yolo: bool, model: Option<&str>, effort: Option<&str>) -> Vec<OsString> {
+    let mut expected = Vec::new();
+    if yolo {
+        expected.push(OsString::from("--dangerously-bypass-approvals-and-sandbox"));
+    }
+    if let Some(effort) = effort {
+        expected.extend([
+            OsString::from("-c"),
+            OsString::from(format!("model_reasoning_effort=\"{effort}\"")),
+        ]);
+    }
+    if let Some(model) = model {
+        expected.extend([OsString::from("--model"), OsString::from(model)]);
+    }
+    expected
+}
+
+// The complete launch command for every policy combination, both platform branches and
+// both consent answers: policy first, then the trust override when consent authorizes it,
+// then the notify hook, and off Windows the workspace and the correlated framed prompt.
+#[test]
+fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
+    let bridge = Path::new("/opt/agent-bridge");
+    let notify = format!(
+        "notify={}",
+        serde_json::to_string(&[bridge.to_string_lossy().as_ref(), "native-hook", "codex"])
+            .unwrap()
+    );
+    let prompt = crate::native::native_delegation_prompt("parent", "review this");
+    for consent in [false, true] {
+        for windows in [false, true] {
+            for yolo in [false, true] {
+                for (model, mapped) in [
+                    (None, None),
+                    (Some("openai-codex/gpt-5.6-sol"), Some("gpt-5.6-sol")),
+                ] {
+                    for effort in [None, Some("xhigh")] {
+                        let root = tempfile::tempdir().unwrap();
+                        let (directory, workspace) = launch_fixture(root.path());
+                        // The authorized rows use the adapter's gate seam with a
+                        // positive answer and the real applied record; the absent rows
+                        // use the production gate, which has no consent record to read.
+                        let authorized: fn(&Path, FirstPartyCli) -> Result<bool> = if consent {
+                            crate::native::consent::prepare(&directory, &workspace).unwrap();
+                            |_, _| Ok(true)
+                        } else {
+                            crate::native::consent::authorized
+                        };
+                        let plan = prepare_launch_for_platform(
+                            LaunchContext {
+                                bridge_executable: bridge,
+                                directory: &directory,
+                                workspace: &workspace,
+                                title: "Codex test",
+                                prompt: &prompt,
+                                yolo,
+                                model,
+                                effort,
+                            },
+                            windows,
+                            authorized,
+                        )
+                        .unwrap();
+                        let label = format!(
+                            "consent={consent} windows={windows} yolo={yolo} model={model:?} effort={effort:?}"
+                        );
+                        let pending = read_pending_turn(&directory).unwrap().unwrap();
+                        assert_eq!(
+                            pending.claim_token,
+                            turn::current_claim_token(&Reader::open_unchecked(&directory))
+                                .unwrap()
+                                .unwrap(),
+                            "{label}"
+                        );
+                        let mut expected = codex_policy(yolo, mapped, effort);
+                        if consent {
+                            expected.extend([
+                                OsString::from("-c"),
+                                OsString::from(workspace_trust_override(&workspace).unwrap()),
+                            ]);
+                        }
+                        expected.extend([OsString::from("-c"), OsString::from(&notify)]);
+                        if !windows {
+                            let framed = correlated_prompt(&prompt, &pending);
+                            assert!(framed.starts_with(&prompt), "{label}");
+                            assert!(framed.ends_with(&pending.marker), "{label}");
+                            expected.extend([
+                                OsString::from("-C"),
+                                workspace.as_os_str().to_owned(),
+                                OsString::from(framed),
+                            ]);
+                        }
+                        assert_eq!(plan.arguments, expected, "{label}");
+                        assert_eq!(
+                            plan.initial_prompt,
+                            if windows {
+                                InitialPromptDisposition::AwaitingDelivery
+                            } else {
+                                InitialPromptDisposition::AcceptedAtSpawn
+                            },
+                            "{label}"
+                        );
+                        assert!(
+                            matches!(plan.completion_monitor, CompletionMonitor::Hook),
+                            "{label}"
+                        );
+                        assert!(plan.environment_removals.is_empty(), "{label}");
+                        let observed = crate::native::consent::observe(&directory);
+                        if consent {
+                            assert_eq!(observed["applied"], APPLIED_MARKER, "{label}");
+                        } else {
+                            assert!(observed.is_null(), "{label}: {observed}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

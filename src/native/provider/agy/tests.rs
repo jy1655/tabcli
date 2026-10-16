@@ -156,3 +156,98 @@ fn reopen_is_refused_with_the_adapters_own_reason() {
             .is_none()
     );
 }
+
+// The expected policy prefix of an Agy command, in the fixed order the adapter emits it:
+// the bypass only when requested, then effort, then model.
+fn agy_policy(yolo: bool, model: Option<&str>, effort: Option<&str>) -> Vec<OsString> {
+    let mut expected = Vec::new();
+    if yolo {
+        expected.push(OsString::from("--dangerously-skip-permissions"));
+    }
+    if let Some(effort) = effort {
+        expected.extend([OsString::from("--effort"), OsString::from(effort)]);
+    }
+    if let Some(model) = model {
+        expected.extend([OsString::from("--model"), OsString::from(model)]);
+    }
+    expected
+}
+
+// The complete launch command for every policy combination and both platform branches:
+// policy, the private log file, and off Windows the correlated interactive prompt.
+#[test]
+fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
+    for windows in [false, true] {
+        for yolo in [false, true] {
+            for model in [None, Some("gemini-model")] {
+                for effort in [None, Some("high")] {
+                    let root = tempfile::tempdir().unwrap();
+                    let directory = root.path().join("session-safe123");
+                    std::fs::create_dir(&directory).unwrap();
+                    std::fs::create_dir(directory.join("events")).unwrap();
+                    turn::claim(&Store::open_unchecked(&directory), &[])
+                        .unwrap()
+                        .retain();
+                    let plan = prepare_launch_for_platform(
+                        LaunchContext {
+                            bridge_executable: Path::new("/opt/agent-bridge"),
+                            directory: &directory,
+                            workspace: root.path(),
+                            title: "Agy test",
+                            prompt: "agy prompt",
+                            yolo,
+                            model,
+                            effort,
+                        },
+                        windows,
+                    )
+                    .unwrap();
+                    let label =
+                        format!("windows={windows} yolo={yolo} model={model:?} effort={effort:?}");
+                    let pending = read_pending_turn(&directory).unwrap().unwrap();
+                    assert_eq!(
+                        pending.claim_token,
+                        turn::current_claim_token(&Reader::open_unchecked(&directory))
+                            .unwrap()
+                            .unwrap(),
+                        "{label}"
+                    );
+                    let log_path = directory.join(AGY_LOG_FILE);
+                    let mut expected = agy_policy(yolo, model, effort);
+                    expected.extend([
+                        OsString::from("--log-file"),
+                        log_path.clone().into_os_string(),
+                    ]);
+                    if !windows {
+                        let framed = correlated_prompt("agy prompt", &pending);
+                        assert!(framed.starts_with("agy prompt"), "{label}");
+                        assert!(framed.ends_with(&pending.marker), "{label}");
+                        expected.extend([
+                            OsString::from("--prompt-interactive"),
+                            OsString::from(framed),
+                        ]);
+                    }
+                    assert_eq!(plan.arguments, expected, "{label}");
+                    assert_eq!(
+                        plan.initial_prompt,
+                        if windows {
+                            InitialPromptDisposition::AwaitingDelivery
+                        } else {
+                            InitialPromptDisposition::AcceptedAtSpawn
+                        },
+                        "{label}"
+                    );
+                    assert!(
+                        matches!(
+                            &plan.completion_monitor,
+                            CompletionMonitor::AgyTranscript { log_path: path } if *path == log_path
+                        ),
+                        "{label}: {:?}",
+                        plan.completion_monitor
+                    );
+                    assert!(plan.environment_removals.is_empty(), "{label}");
+                }
+            }
+        }
+    }
+}

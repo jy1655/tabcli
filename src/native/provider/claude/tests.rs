@@ -430,6 +430,9 @@ fn managed_launch_name_is_the_known_unique_session_id() {
             workspace: root.path(),
             title: "Human title",
             prompt: "review this",
+            yolo: false,
+            model: None,
+            effort: None,
         })
         .unwrap();
 
@@ -474,6 +477,9 @@ fn managed_launch_drops_inherited_claude_code_session_markers() {
                 workspace: root.path(),
                 title: "Human title",
                 prompt: "review this",
+                yolo: false,
+                model: None,
+                effort: None,
             },
             windows,
         )
@@ -560,12 +566,18 @@ fn windows_launch_keeps_large_initial_prompts_out_of_argv() {
             workspace: &directory,
             title: "large prompt",
             prompt: &prompt,
+            yolo: false,
+            model: None,
+            effort: None,
         },
         true,
     )
     .unwrap();
 
-    assert!(!plan.prompt_is_positional);
+    assert_eq!(
+        plan.initial_prompt,
+        InitialPromptDisposition::AwaitingDelivery
+    );
     assert!(
         plan.arguments
             .iter()
@@ -1668,6 +1680,9 @@ fn resume_plan_uses_the_official_resume_with_private_settings_and_managed_name_o
             bridge_executable: Path::new("/opt/agent-bridge"),
             directory: &session,
             provider_session_id: REOPEN_TEST_CONVERSATION,
+            yolo: false,
+            model: None,
+            effort: None,
         },
         true,
     )
@@ -1716,6 +1731,9 @@ fn resume_is_refused_off_native_windows_and_for_non_uuid_identity() {
             bridge_executable: Path::new("/opt/agent-bridge"),
             directory: &session,
             provider_session_id: REOPEN_TEST_CONVERSATION,
+            yolo: false,
+            model: None,
+            effort: None,
         },
         false,
     )
@@ -1839,4 +1857,133 @@ fn messenger_output_reader_keeps_a_full_budget_for_each_stream() {
     let (output, truncated) = read_capped_file(&mut oversized).unwrap();
     assert_eq!(output, oversized_bytes[..MAX_CROSS_SESSION_OUTPUT_BYTES]);
     assert!(truncated);
+}
+
+// The expected policy prefix of a Claude command, in the fixed order the adapter emits it:
+// the bypass only when requested, then effort, then model.
+fn claude_policy(yolo: bool, model: Option<&str>, effort: Option<&str>) -> Vec<OsString> {
+    let mut expected = Vec::new();
+    if yolo {
+        expected.push(OsString::from("--dangerously-skip-permissions"));
+    }
+    if let Some(effort) = effort {
+        expected.extend([OsString::from("--effort"), OsString::from(effort)]);
+    }
+    if let Some(model) = model {
+        expected.extend([OsString::from("--model"), OsString::from(model)]);
+    }
+    expected
+}
+
+// The complete launch command for every policy combination and both platform branches:
+// policy, private settings, managed name, and the prompt last off Windows only.
+#[test]
+fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-safe123");
+    std::fs::create_dir(&directory).unwrap();
+    let settings_path = directory.join("claude-settings.json");
+    for windows in [false, true] {
+        for yolo in [false, true] {
+            for (model, mapped) in [(None, None), (Some("Fable5"), Some("Fable"))] {
+                for effort in [None, Some("high")] {
+                    let _ = std::fs::remove_file(&settings_path);
+                    let plan = prepare_launch_for_platform(
+                        LaunchContext {
+                            bridge_executable: Path::new("/opt/agent-bridge"),
+                            directory: &directory,
+                            workspace: root.path(),
+                            title: "Claude test",
+                            prompt: "claude prompt",
+                            yolo,
+                            model,
+                            effort,
+                        },
+                        windows,
+                    )
+                    .unwrap();
+                    let label =
+                        format!("windows={windows} yolo={yolo} model={model:?} effort={effort:?}");
+                    let mut expected = claude_policy(yolo, mapped, effort);
+                    expected.extend([
+                        OsString::from("--settings"),
+                        settings_path.clone().into_os_string(),
+                        OsString::from("--name"),
+                        OsString::from("session-safe123"),
+                    ]);
+                    if !windows {
+                        expected.push(OsString::from("claude prompt"));
+                    }
+                    assert_eq!(plan.arguments, expected, "{label}");
+                    assert_eq!(
+                        plan.initial_prompt,
+                        if windows {
+                            InitialPromptDisposition::AwaitingDelivery
+                        } else {
+                            InitialPromptDisposition::AcceptedAtSpawn
+                        },
+                        "{label}"
+                    );
+                    assert!(
+                        matches!(plan.completion_monitor, CompletionMonitor::Hook),
+                        "{label}"
+                    );
+                    assert_eq!(plan.environment_removals, CLAUDE_CODE_SESSION_MARKERS);
+                    let settings: serde_json::Value =
+                        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap())
+                            .unwrap();
+                    assert_eq!(settings["crossSessionInbound"], "accept", "{label}");
+                    assert_eq!(
+                        settings["hooks"]["Stop"][0]["hooks"][0]["command"], "/opt/agent-bridge",
+                        "{label}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// The complete resume command carries the new request's policy ahead of the official
+// resume arguments and never a prompt; the reopened session awaits delivery.
+#[test]
+fn resume_plan_is_the_complete_command_for_every_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let session = root.path().join("session-reopenplan");
+    std::fs::create_dir(&session).unwrap();
+    let settings_path = session.join("claude-settings.json");
+    for yolo in [false, true] {
+        for (model, mapped) in [(None, None), (Some("Fable5"), Some("Fable"))] {
+            for effort in [None, Some("max")] {
+                let plan = prepare_resume_for_platform(
+                    ResumeContext {
+                        bridge_executable: Path::new("/opt/agent-bridge"),
+                        directory: &session,
+                        provider_session_id: REOPEN_TEST_CONVERSATION,
+                        yolo,
+                        model,
+                        effort,
+                    },
+                    true,
+                )
+                .unwrap();
+                let label = format!("yolo={yolo} model={model:?} effort={effort:?}");
+                let mut expected = claude_policy(yolo, mapped, effort);
+                expected.extend([
+                    OsString::from("--resume"),
+                    OsString::from(REOPEN_TEST_CONVERSATION),
+                    OsString::from("--settings"),
+                    settings_path.clone().into_os_string(),
+                    OsString::from("--name"),
+                    OsString::from("session-reopenplan"),
+                ]);
+                assert_eq!(plan.arguments, expected, "{label}");
+                assert_eq!(
+                    plan.initial_prompt,
+                    InitialPromptDisposition::AwaitingDelivery,
+                    "{label}"
+                );
+                assert_eq!(plan.environment_removals, CLAUDE_CODE_SESSION_MARKERS);
+            }
+        }
+    }
 }
