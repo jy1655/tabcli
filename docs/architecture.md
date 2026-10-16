@@ -19,7 +19,8 @@ result / inspect
 
 close-session
   -> session::close: claim the surface handle for close
-  -> terminal::ownership: decide close authority and act on the owned surface
+  -> terminal::close_authority: decide close authority over the observation seam
+  -> terminal::ownership and the platform adapters: act on the owned surface
   -> session::close: settle the close records and retain the tombstones
 ```
 
@@ -77,8 +78,11 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 - `src/native/terminal/` selects and implements platform-specific surfaces, input, observation,
   and close. Native command parsing builds a `ConsoleControlRequest`; after session verification,
   the Windows adapter executes a typed `ConsoleControlAction` with resolved input and timing.
-  Its `ownership` module retains the owner record types, control proof, close authority,
-  and the execution of an authorized close; `session::owner` owns process observation and
+  Its `close_authority` module owns the observation seam (the Records read when the decision
+  asks, and the OS and surface observations), the decision and the dispatch, with a production
+  adapter and an in-memory test adapter; `ownership` keeps the owner record types, control
+  proof and the owner-teardown action, and the platform adapters keep the surface close.
+  `session::owner` owns process observation and
   attestation. The Terminal.app adapter owns app incarnation. Process reuse alone never
   supplies control proof or ordinary dead-owner Surface authority.
   macOS operations use `MacTerminalAdapter` through one kind lookup. Each adapter explicitly
@@ -321,7 +325,10 @@ private directory. macOS guarded input uses the surface handle. Windows guarded 
 receives the directory and requires it to match the helper
 child's state-root lookup; the child still resolves the session by id under its own root.
 
-Identity and close evidence stay with each adapter. Terminal.app keeps `terminal_app` in
+Identity stays with each adapter, and each terminal kind selects its close evidence in
+`close_evidence::for_kind`: Terminal.app's evidence is its own (app incarnation), and the
+presence-only kinds share one adapter whose only declared variation is the ownerless-startup
+message context (Warp and WezTerm). Terminal.app keeps `terminal_app` in
 the owner record. Warp keeps its control binding in adapter-private `warp-control.json`.
 WezTerm keeps `wezterm_mux` in the surface handle. Windows keeps the console root's process
 identity in the handle and also uses `console-host-process.json` and owner and launch
@@ -336,7 +343,8 @@ Close authority selects one of four outcomes: close with an attested owner, clos
 owned surface, end a live attested owner whose surface is proven absent, or record that the
 surface is absent. An ambiguous identity refuses close and
 retains the handle. `session::close` records the transition and tombstones, and converges
-interrupted close; `terminal::ownership` performs the authorized surface/process action. Dead-owner
+interrupted close. `terminal::close_authority` makes the decision over its observation seam;
+`terminal::ownership` performs the authorized surface/process action. Dead-owner
 repair settles the records without resending a prompt or guessing ownership of an unrelated surface.
 
 ## Where to add things
@@ -348,7 +356,9 @@ repair settles the records without resending a prompt or guessing ownership of a
   unrelated adapters should not need changes. Document what upstream feature would let you
   remove each fallback.
 - For a new terminal, start with `src/native/terminal/mod.rs` and its surface and delivery types.
-  Read `src/native/terminal/ownership.rs` before implementing close. Add application-native
+  Before implementing close, read `src/native/terminal/close_authority.rs` for the decision and
+  the seam, `close_evidence.rs` for selecting the kind's evidence, and `ownership.rs` for the
+  owner-teardown action. Add application-native
   operations under the platform module and tests that prove the target belongs to the session.
   Each adapter declares its close facts, paste envelope, and guarded-dialog
   capability as `SurfaceFacts` in its `facts.rs` module. The shared accessor dispatches these
