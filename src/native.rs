@@ -36,9 +36,10 @@ use session::*;
 mod settings;
 mod terminal;
 mod turn_report;
+use turn_report::TurnReport;
 #[cfg(test)]
 use turn_report::finish_request_with_extra;
-use turn_report::{TurnReport, emit_session_result};
+mod turn_run;
 
 #[cfg(all(target_os = "macos", test))]
 use terminal::macos::apple_terminal::{
@@ -1054,22 +1055,6 @@ fn close_session_surface(
     .map(|_| ())
 }
 
-fn verify_terminal_surface_ownership_until(
-    directory: &Path,
-    expected_session_id: &str,
-    session: &terminal::TerminalSession,
-    deadline: Instant,
-    requested: Duration,
-) -> Result<()> {
-    let timeout = remaining_turn_timeout(deadline, requested)?;
-    terminal::ownership::verify_terminal_surface_ownership_with_timeout(
-        directory,
-        expected_session_id,
-        session,
-        Some(timeout),
-    )
-}
-
 fn run_tell(request: TellRequest) -> Result<()> {
     let mut report = TurnReport::new(
         request.json,
@@ -1095,7 +1080,7 @@ fn run_tell_inner(request: TellRequest, report: &mut TurnReport) -> Result<()> {
     let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
     let terminal_session: terminal::TerminalSession =
         Reader::open_unchecked(&directory).terminal()?;
-    verify_terminal_surface_ownership_until(
+    delivery::verify_terminal_surface_ownership_until(
         &directory,
         &request.id,
         &terminal_session,
@@ -1114,9 +1099,7 @@ fn run_tell_inner(request: TellRequest, report: &mut TurnReport) -> Result<()> {
         &request.id,
         &attached.sources,
     )?;
-    let claim_token = claim.token().to_owned();
-    let receipt = claim.receipt().clone();
-    report.addressed(request.id.clone(), receipt.request_id.clone());
+    report.addressed(request.id.clone(), claim.receipt().request_id.clone());
     refuse_follow_up_to_shared_conversation(
         provider,
         &directory,
@@ -1126,62 +1109,31 @@ fn run_tell_inner(request: TellRequest, report: &mut TurnReport) -> Result<()> {
         &mut claim,
         &previous_state,
     )?;
-    let expected_turn_id = delivery::deliver(
+    turn_run::run(
+        report,
         claim,
         delivery::Turn::FollowUp { prompt: &prompt },
-        delivery::DeliveryContext {
-            provider,
-            directory: &directory,
-            session_id: &request.id,
-            surface: &terminal_session,
-            provider_path: &manifest.provider_path,
-            deadline,
-            requested: request.timeout,
+        &turn_run::TurnRun {
+            facts: turn_run::SessionFacts {
+                id: &request.id,
+                directory: &directory,
+                provider,
+                provider_path: &manifest.provider_path,
+                surface: &terminal_session,
+            },
+            timing: turn_run::Timing {
+                deadline,
+                requested: request.timeout,
+            },
+            output: turn_run::Output {
+                detach: request.detach,
+                json: request.json,
+            },
+            extra: &serde_json::Map::new(),
+            baseline,
         },
-    )?
-    .correlation_id;
-
-    if request.detach {
-        return emit_session_result(
-            request.json,
-            &request.id,
-            &terminal_session,
-            provider,
-            &receipt,
-            None,
-        );
-    }
-    let event = turn::wait(
-        &Store::open_unchecked(&directory),
-        baseline,
-        expected_turn_id.as_deref(),
-        Some(&claim_token),
-        deadline,
-        request.timeout,
+        |error| error,
     )
-    .with_context(|| {
-        format!(
-            "session {} in {} did not return a successful result; use `{PUBLIC_COMMAND} inspect {}` to inspect its recorded state",
-            request.id,
-            terminal_session.kind.display_name(),
-            request.id
-        )
-    })?;
-    emit_session_result(
-        request.json,
-        &request.id,
-        &terminal_session,
-        provider,
-        &receipt,
-        Some(&event),
-    )
-}
-
-fn remaining_turn_timeout(deadline: Instant, requested: Duration) -> Result<Duration> {
-    deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
-        .with_context(|| format!("timed out after {} seconds", requested.as_secs()))
 }
 
 fn run_sessions(request: SessionsRequest) -> Result<()> {
@@ -1552,15 +1504,6 @@ fn native_delegation_prompt(source: &str, prompt: &str) -> String {
         source,
         prompt.trim()
     )
-}
-
-fn terminal_input_bytes(kind: terminal::TerminalKind, prompt: &str) -> Vec<u8> {
-    match terminal::facts(kind).paste_envelope {
-        terminal::facts::PasteEnvelope::Raw => prompt.as_bytes().to_vec(),
-        terminal::facts::PasteEnvelope::Bracketed => {
-            format!("\x1b[200~{prompt}\x1b[201~").into_bytes()
-        }
-    }
 }
 
 fn sanitize_title(value: &str) -> Result<String> {

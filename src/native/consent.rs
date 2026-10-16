@@ -1,6 +1,7 @@
 //! Workspace consent is evidence, not a provider permission mode. Provider stores are
 //! read only; their schemas and the way a managed CLI accepts trust belong to adapters.
 use super::*;
+use crate::native::delivery::verify_terminal_surface_ownership_until;
 #[cfg(unix)]
 use crate::native::private_to_user::owned_and_not_writable_by_others;
 use crate::native::session::{Reader, RecordReader, RecordStore};

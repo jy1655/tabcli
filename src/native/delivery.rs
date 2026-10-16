@@ -1,7 +1,6 @@
 //! Delivery owns the ordering and settlement of a claimed Turn. Adapters own Transport.
 use super::session::{Reader, RecordStore, SessionState, turn};
 use super::terminal;
-use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
 use std::{
     io::Write,
@@ -28,7 +27,6 @@ pub(super) enum Gate {
     BeforeDelivery,
 }
 pub(super) struct DeliveryContext<'a> {
-    pub provider: FirstPartyCli,
     pub directory: &'a Path,
     pub session_id: &'a str,
     pub surface: &'a terminal::TerminalSession,
@@ -126,18 +124,7 @@ impl From<terminal::TerminalSendResult> for Outcome {
     }
 }
 
-pub(super) fn deliver(
-    claim: turn::Claim,
-    turn: Turn<'_>,
-    context: DeliveryContext<'_>,
-) -> Result<Delivered> {
-    let transport = match turn {
-        Turn::Initial { .. } => super::provider::initial_transport(context.provider),
-        Turn::FollowUp { .. } => super::provider::follow_up_transport(context.provider),
-    };
-    deliver_with(claim, turn, context, transport.as_ref(), &RuntimeChecks)
-}
-struct RuntimeChecks;
+pub(in crate::native) struct RuntimeChecks;
 impl Checks for RuntimeChecks {
     fn ready(&self, context: &DeliveryContext<'_>, delay: Duration) -> Result<()> {
         turn::wait_for_status(
@@ -151,7 +138,7 @@ impl Checks for RuntimeChecks {
         Ok(())
     }
     fn ownership(&self, context: &DeliveryContext<'_>) -> Result<()> {
-        super::verify_terminal_surface_ownership_until(
+        verify_terminal_surface_ownership_until(
             context.directory,
             context.session_id,
             context.surface,
@@ -160,7 +147,7 @@ impl Checks for RuntimeChecks {
         )
     }
     fn remaining(&self, context: &DeliveryContext<'_>) -> Result<Duration> {
-        super::remaining_turn_timeout(context.deadline, context.requested)
+        remaining_turn_timeout(context.deadline, context.requested)
     }
     fn budget(
         &self,
@@ -172,8 +159,8 @@ impl Checks for RuntimeChecks {
     }
 }
 
-// Private injection points for external checks; the real Store and Claim remain in tests.
-trait Checks {
+// Injection points for external checks; the real Store and Claim remain in tests.
+pub(in crate::native) trait Checks {
     fn ready(&self, context: &DeliveryContext<'_>, delay: Duration) -> Result<()>;
     fn ownership(&self, context: &DeliveryContext<'_>) -> Result<()>;
     fn remaining(&self, context: &DeliveryContext<'_>) -> Result<Duration>;
@@ -246,7 +233,7 @@ fn follow_up_error(
     }
 }
 
-fn deliver_with(
+pub(in crate::native) fn deliver_with(
     mut claim: turn::Claim,
     mut turn: Turn<'_>,
     context: DeliveryContext<'_>,
@@ -297,7 +284,7 @@ fn deliver_with(
                 .suffix(".txt")
                 .tempfile_in(context.directory)?;
             RecordStore::set_file_private(file.as_file())?;
-            file.write_all(&super::terminal_input_bytes(
+            file.write_all(&terminal_input_bytes(
                 context.surface.kind,
                 &prepared.as_ref().unwrap().prompt,
             ))?;
@@ -389,7 +376,7 @@ fn initial_prompt_delay_within_budget(
     delay: Duration,
     requested: Duration,
 ) -> Result<Duration> {
-    let remaining = super::remaining_turn_timeout(deadline, requested)?;
+    let remaining = remaining_turn_timeout(deadline, requested)?;
     if delay >= remaining {
         bail!(
             "initial prompt readiness delay of {} seconds does not fit inside the {} second ask timeout",
@@ -400,5 +387,45 @@ fn initial_prompt_delay_within_budget(
     Ok(delay)
 }
 
+pub(in crate::native) fn verify_terminal_surface_ownership_until(
+    directory: &Path,
+    expected_session_id: &str,
+    session: &terminal::TerminalSession,
+    deadline: Instant,
+    requested: Duration,
+) -> Result<()> {
+    let timeout = remaining_turn_timeout(deadline, requested)?;
+    terminal::ownership::verify_terminal_surface_ownership_with_timeout(
+        directory,
+        expected_session_id,
+        session,
+        Some(timeout),
+    )
+}
+
+pub(in crate::native) fn remaining_turn_timeout(
+    deadline: Instant,
+    requested: Duration,
+) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .with_context(|| format!("timed out after {} seconds", requested.as_secs()))
+}
+
+pub(in crate::native) fn terminal_input_bytes(
+    kind: terminal::TerminalKind,
+    prompt: &str,
+) -> Vec<u8> {
+    match terminal::facts(kind).paste_envelope {
+        terminal::facts::PasteEnvelope::Raw => prompt.as_bytes().to_vec(),
+        terminal::facts::PasteEnvelope::Bracketed => {
+            format!("\x1b[200~{prompt}\x1b[201~").into_bytes()
+        }
+    }
+}
+
+#[cfg(test)]
+pub(in crate::native) mod test_support;
 #[cfg(test)]
 mod tests;

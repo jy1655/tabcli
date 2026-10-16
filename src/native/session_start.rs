@@ -1,5 +1,4 @@
 //! One start operation; each source owns resolution, creation and provider-specific gates.
-use super::turn_report::emit_session_result_with;
 use super::*;
 use crate::native::session::launch::wrapper::{check_provider_version_until, resolve_provider};
 
@@ -148,69 +147,34 @@ pub(super) fn start(
     // The existing delivery paths own rollback/uncertainty after confirmed startup.
     initial_claim.startup_confirmed();
     let mut gate = |gate| source.gate(&created.directory, gate, deadline);
-    let delivered = delivery::deliver(
+    turn_run::run(
+        report,
         initial_claim,
         delivery::Turn::Initial { gate: &mut gate },
-        delivery::DeliveryContext {
-            provider,
-            directory: &created.directory,
-            session_id: &created.id,
-            surface: &terminal_session,
-            provider_path: &created.manifest.provider_path,
-            deadline,
-            requested: timeout,
+        &turn_run::TurnRun {
+            facts: turn_run::SessionFacts {
+                id: &created.id,
+                directory: &created.directory,
+                provider,
+                provider_path: &created.manifest.provider_path,
+                surface: &terminal_session,
+            },
+            timing: turn_run::Timing {
+                deadline,
+                requested: timeout,
+            },
+            output: turn_run::Output { detach, json },
+            extra: &result_extra,
+            baseline: 0,
         },
-    );
-    let expected_turn_id = match delivered {
-        Ok(delivered) => delivered.correlation_id,
-        Err(error) => {
+        |error| {
             let error = source.delivery_failed(&created.directory, &created.id, error, deadline);
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to deliver the initial prompt to {} session {}",
-                    provider.as_str(),
-                    created.id
-                )
-            });
-        }
-    };
-
-    if detach {
-        return emit_session_result_with(
-            json,
-            &created.id,
-            &terminal_session,
-            provider,
-            &receipt,
-            None,
-            &result_extra,
-        );
-    }
-
-    let event = turn::wait(
-        &Store::open_unchecked(&created.directory),
-        0,
-        expected_turn_id.as_deref(),
-        Some(&expected_claim_token),
-        deadline,
-        timeout,
-    )
-    .with_context(|| {
-        format!(
-            "session {} in {} did not return a successful result; use `{PUBLIC_COMMAND} inspect {}` to inspect its recorded state",
-            created.id,
-            terminal_session.kind.display_name(),
-            created.id
-        )
-    })?;
-    emit_session_result_with(
-        json,
-        &created.id,
-        &terminal_session,
-        provider,
-        &receipt,
-        Some(&event),
-        &result_extra,
+            error.context(format!(
+                "failed to deliver the initial prompt to {} session {}",
+                provider.as_str(),
+                created.id
+            ))
+        },
     )
 }
 
