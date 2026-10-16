@@ -1125,9 +1125,10 @@ fn agy_workspace_trust_rows_are_observed_from_the_callers_home() {
     const RECOVERY: &str = "If the managed terminal shows the trust dialog, approve it there and send the prompt again; if it shows the composer or the prompt is still withheld afterwards, close this session and start a new one";
     let fixture = Fixture::new("agy");
     let home = tempfile::tempdir().unwrap();
-    let store_dir = home.path().join(".gemini/antigravity-cli");
-    fs::create_dir_all(&store_dir).unwrap();
-    let store = store_dir.join("settings.json");
+    fs::create_dir_all(home.path().join(".gemini/antigravity-cli")).unwrap();
+    // Spelled as the Agy adapter spells it: one literal under the home, so the
+    // evidence row compares equal on Windows, where a second join would use `\`.
+    let store = home.path().join(".gemini/antigravity-cli/settings.json");
     let log = fixture.directory.join("agy.log");
     // The recorded workspace, as the manifest spells it.
     let workspace = fixture.root.path().to_str().unwrap().to_owned();
