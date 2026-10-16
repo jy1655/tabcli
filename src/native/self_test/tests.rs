@@ -1196,3 +1196,60 @@ fn delivery_wording_preserves_self_test_failure_classification() {
         assert_eq!(retained, reason);
     }
 }
+
+#[test]
+fn an_admission_refusal_reports_one_failed_step_and_no_root_for_isolated_mode() {
+    let refusal = anyhow::anyhow!("launch refused: fixture");
+    for (isolated, root) in [(true, None), (false, Some(PathBuf::from("ordinary-root")))] {
+        let request = request(if isolated { &["--isolated"] } else { &[] });
+        let report = refused(
+            &request,
+            root.clone(),
+            "AB_marker".to_owned(),
+            Instant::now(),
+            &refusal,
+        );
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["outcome"], "failed");
+        assert_eq!(value["isolated"], isolated);
+        assert_eq!(value["state_root"], json!(root));
+        assert_eq!(value["marker"], "AB_marker");
+        assert!(value["session"].is_null());
+        assert!(value["session_state"].is_null());
+        assert_eq!(value["cleanup_sessions"], json!([]));
+        let steps = value["steps"].as_array().unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0]["name"], "admission");
+        assert_eq!(steps[0]["outcome"], "failed");
+        assert!(steps[0]["elapsed_ms"].is_u64());
+        assert!(steps[0]["request_address"].is_null());
+        assert!(steps[0]["event_address"].is_null());
+        assert_eq!(steps[0]["reason"], "launch refused: fixture");
+    }
+}
+
+#[test]
+fn admission_resolves_the_workspace_before_any_root_or_command() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("missing");
+    let missing_request = request(&["--workspace", missing.to_str().unwrap(), "--isolated"]);
+    let error = admit(&missing_request, None).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .starts_with("workspace does not exist or cannot be resolved"),
+        "{error:#}"
+    );
+    let file = directory.path().join("file");
+    fs::write(&file, b"").unwrap();
+    let file_request = request(&["--workspace", file.to_str().unwrap()]);
+    let root = directory.path().join("state");
+    let error = admit(&file_request, Some(&root)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .starts_with("workspace is not a directory"),
+        "{error:#}"
+    );
+    assert!(!root.exists());
+}

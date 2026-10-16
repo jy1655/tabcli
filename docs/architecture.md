@@ -148,8 +148,14 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   coordinates its application through provider and terminal adapters, consuming their declared
   `LaunchTrust` facts for launch trust policy. Provider stores are read directly but never written
   directly by Bridge.
-- `src/native/settings.rs` owns user preferences for surface creation. A preference cannot grant
-  close authority over an existing surface.
+- `src/native/settings.rs` owns user preferences for surface creation and one launch admission
+  preference, `codex-memory-workspace`. A preference cannot grant or remove close authority over
+  an existing session or surface.
+- `src/native/session_start/admission.rs` applies that admission preference to a resolved
+  workspace for `ask`, `reopen`, and `self-test`, before any session record, consent record,
+  provider check, or surface exists. It reads the caller's environment through the same `Homes`
+  resolution as workspace trust; the protected `memories` location is declared by the Codex
+  adapter, and no other adapter takes part. A refusal writes nothing.
 
 ## Session lifecycle
 

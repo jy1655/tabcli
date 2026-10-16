@@ -69,6 +69,8 @@ pub(super) fn reopen_refusal_gate(error: &anyhow::Error) -> Option<&'static str>
 pub(super) const REOPEN_LAUNCH_GATE: &str = "provider-unsupported";
 const REOPEN_CONFLICT_GATE: &str = "reopen-conflict";
 const REOPEN_VERIFICATION_FAILED_GATE: &str = "reopen-verification-failed";
+// Launch admission refused the source workspace before the new session existed.
+const REOPEN_WORKSPACE_REFUSED_GATE: &str = "workspace-refused";
 
 // The gates a reopen can fail after its session exists. Each one leaves the new session
 // failed with no prompt delivered. The source's reopen marker is released again only once
@@ -626,6 +628,11 @@ impl session_start::StartSource for ReopenedSource {
                 workspace.display()
             );
         }
+        // A pre-create gate: the source marker is claimed only by create, and no refusal
+        // record is written.
+        Reader::state_root()
+            .and_then(|root| session_start::admission::check(&root, &workspace))
+            .map_err(|error| reopen_refusal(REOPEN_WORKSPACE_REFUSED_GATE, format!("{error:#}")))?;
         let provider_path = resolve_provider(source.provider)?;
         let provider_version =
             check_provider_version_until(source.provider, &provider_path, Some(deadline))?;

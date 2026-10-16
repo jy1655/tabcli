@@ -205,6 +205,16 @@ launch, observe, continue, and close without replacing the capabilities those CL
 - When a correlation question comes up, record the raw `notify` payloads with a temporary
   build and read them; do not reason from the result alone. The two payloads of #61
   looked alike in everything but the thread, the input and the answer.
+- Codex's background memory consolidation delegated through `tabcli ask` from its memory
+  workspace and left the sessions open (issue #216: three on 2026-10-15 with tabcli 0.4.10 and
+  codex-cli 0.162.1, three on 2026-10-08 with 0.2.6), and a `LOCAL.md` instruction did not
+  stop it.
+  Launch admission therefore refuses a workspace that is `memories` beside Codex's
+  `config.toml` or lies inside it, for every target provider, unless the state root's
+  `codex-memory-workspace` setting is `allow`. This is Bridge's admission policy for an
+  observed path, not a fallback for a Codex transport; the Codex adapter only declares the
+  location. Re-examine the default when Codex's behavior is verified to stop through an
+  official control or an upstream fix; do not disable it from a version check alone.
 
 ## Current Windows Surface Boundary
 

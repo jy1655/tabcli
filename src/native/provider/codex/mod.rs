@@ -321,6 +321,19 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 }
 
+// The directory in which Codex keeps its memories and runs its background memory
+// consolidation, beside its `config.toml`. Bridge's launch admission refuses that
+// workspace by default (issue #216); the location is Codex's, so it is declared here.
+pub(super) fn memory_workspace(
+    homes: &crate::native::consent::Homes,
+) -> Result<std::path::PathBuf> {
+    Ok(homes
+        .codex
+        .parent()
+        .context("Codex config path has no parent")?
+        .join("memories"))
+}
+
 fn validate_claim_token(claim_token: &str) -> Result<()> {
     if !turn::valid_turn_claim_token(claim_token) {
         bail!("invalid Codex turn claim token")

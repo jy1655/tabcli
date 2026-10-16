@@ -173,3 +173,132 @@ fn isolated_parser_rejects_duplicates_and_unknown_options_before_creating_a_root
         assert!(!root.exists());
     }
 }
+
+// Admission (#216) runs before the self-test creates an isolated root or runs `ask`, so a
+// refusal needs no terminal on any platform.
+struct AdmissionFixture {
+    _directory: tempfile::TempDir,
+    base: std::path::PathBuf,
+    home: std::path::PathBuf,
+    memory: std::path::PathBuf,
+}
+
+impl AdmissionFixture {
+    fn new() -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let memory = home.join(".codex").join("memories");
+        std::fs::create_dir_all(&memory).unwrap();
+        let memory = memory.canonicalize().unwrap();
+        Self {
+            _directory: directory,
+            base,
+            home,
+            memory,
+        }
+    }
+
+    fn run(&self, root: &std::path::Path, extra: &[&str]) -> std::process::Output {
+        let mut args = vec!["self-test", "codex", "--workspace"];
+        args.push(self.memory.to_str().unwrap());
+        args.extend(extra);
+        Command::new(env!("CARGO_BIN_EXE_tabcli"))
+            .args(args)
+            .env("AGENT_BRIDGE_NATIVE_STATE_DIR", root)
+            .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
+            .env_remove("CODEX_HOME")
+            .env_remove("AGENT_BRIDGE_NATIVE_SESSION_ID")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    }
+
+    fn allow(&self, root: &std::path::Path) {
+        let output = Command::new(env!("CARGO_BIN_EXE_tabcli"))
+            .args(["settings", "codex-memory-workspace", "allow"])
+            .env("AGENT_BRIDGE_NATIVE_STATE_DIR", root)
+            .env("HOME", &self.home)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+}
+
+#[test]
+fn ordinary_self_test_applies_the_root_setting_before_running_ask() {
+    let fixture = AdmissionFixture::new();
+    let root = fixture.base.join("state");
+    let output = fixture.run(&root, &["--json"]);
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["outcome"], "failed");
+    assert_eq!(report["isolated"], false);
+    assert_eq!(
+        std::path::Path::new(report["state_root"].as_str().unwrap()),
+        root
+    );
+    assert_eq!(report["steps"].as_array().unwrap().len(), 1);
+    assert_eq!(report["steps"][0]["name"], "admission");
+    assert_eq!(report["steps"][0]["outcome"], "failed");
+    let reason = report["steps"][0]["reason"].as_str().unwrap();
+    assert!(
+        reason.ends_with(
+            "codex-memory-workspace is refuse. To allow launches here, run 'tabcli settings codex-memory-workspace allow' in the same state root."
+        ),
+        "{reason}"
+    );
+    assert_eq!(report["cleanup_sessions"], serde_json::json!([]));
+    assert!(!root.exists(), "a refused self-test created the state root");
+}
+
+#[test]
+fn isolated_self_test_refuses_with_default_settings_even_when_the_ordinary_root_allows() {
+    let fixture = AdmissionFixture::new();
+    let parent = fixture.base.join("state");
+    fixture.allow(&parent);
+    let before: Vec<_> = std::fs::read_dir(&parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    let output = fixture.run(&parent, &["--isolated", "--json"]);
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["isolated"], true);
+    assert!(report["state_root"].is_null());
+    assert_eq!(report["steps"][0]["name"], "admission");
+    assert!(
+        report["steps"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .ends_with("Isolated self-test uses default settings; use ordinary self-test with the allow setting to permit this workspace.")
+    );
+    let human = fixture.run(&parent, &["--isolated"]);
+    assert!(!human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(human.contains("state root: not created"), "{human}");
+    assert!(human.contains("admission: failed"), "{human}");
+    // No private root was created beside the ordinary records.
+    let after: Vec<_> = std::fs::read_dir(&parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(after, before);
+}
+
+// With the ordinary root's allow setting admission passes and `ask` runs; Apple Terminal
+// does not exist on these platforms, so `ask` reports unsupported without a terminal.
+#[cfg(any(windows, target_os = "linux"))]
+#[test]
+fn ordinary_self_test_with_the_allow_setting_runs_ask() {
+    let fixture = AdmissionFixture::new();
+    let root = fixture.base.join("state");
+    fixture.allow(&root);
+    let output = fixture.run(&root, &["--terminal", "terminal", "--json"]);
+    assert!(!output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["steps"][0]["name"], "ask");
+    assert_eq!(report["outcome"], "unsupported");
+    assert_eq!(report["steps"].as_array().unwrap().len(), 5);
+}

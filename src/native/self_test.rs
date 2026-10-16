@@ -84,7 +84,8 @@ struct Report {
     provider: String,
     provider_version: Option<String>,
     terminal: Option<String>,
-    state_root: PathBuf,
+    // Null only when admission refused an isolated self-test before its root existed.
+    state_root: Option<PathBuf>,
     isolated: bool,
     marker: String,
     session: Option<String>,
@@ -343,7 +344,7 @@ fn orchestrate(
         provider: ask.provider.as_str().to_owned(),
         provider_version: None,
         terminal: ask.terminal.map(|kind| kind.as_str().to_owned()),
-        state_root: root,
+        state_root: Some(root),
         isolated: request.isolated,
         marker,
         session: None,
@@ -615,8 +616,89 @@ fn orchestrate(
     report
 }
 
+// Launch admission for the self-test's workspace, before an isolated root, a public
+// command, discovery or cleanup exists. The ordinary mode applies the ordinary root's
+// setting; the isolated mode copies no setting and refuses as the default does.
+fn admit(request: &Request, ordinary_root: Option<&Path>) -> Result<()> {
+    let workspace = request.ask.workspace.canonicalize().with_context(|| {
+        format!(
+            "workspace does not exist or cannot be resolved: {}",
+            request.ask.workspace.display()
+        )
+    })?;
+    if !workspace.is_dir() {
+        bail!("workspace is not a directory: {}", workspace.display());
+    }
+    match ordinary_root {
+        Some(root) => session_start::admission::check(root, &workspace),
+        None => session_start::admission::check_isolated(&workspace),
+    }
+}
+
+// The report of a self-test that admission refused: no session, command or cleanup ran.
+fn refused(
+    request: &Request,
+    ordinary_root: Option<PathBuf>,
+    marker: String,
+    started: Instant,
+    error: &anyhow::Error,
+) -> Report {
+    let elapsed_ms = started.elapsed().as_millis();
+    Report {
+        schema_version: 1,
+        bridge_version: env!("CARGO_PKG_VERSION"),
+        provider: request.ask.provider.as_str().to_owned(),
+        provider_version: None,
+        terminal: request.ask.terminal.map(|kind| kind.as_str().to_owned()),
+        state_root: ordinary_root,
+        isolated: request.isolated,
+        marker,
+        session: None,
+        session_state: None,
+        outcome: Outcome::Failed,
+        elapsed_ms,
+        steps: vec![Step {
+            name: "admission",
+            outcome: Outcome::Failed,
+            elapsed_ms,
+            request_address: None,
+            event_address: None,
+            reason: Some(format!("{error:#}")),
+        }],
+        cleanup_sessions: Vec::new(),
+    }
+}
+
 pub(super) fn run(request: Request) -> Result<()> {
-    let root = if request.isolated {
+    let started = Instant::now();
+    let ordinary_root = if request.isolated {
+        None
+    } else {
+        Some(Reader::state_root()?)
+    };
+    let marker = format!(
+        "AB_{}",
+        Store::new_event_file_name()?.trim_end_matches(".json")
+    );
+    let report = match admit(&request, ordinary_root.as_deref()) {
+        Ok(()) => run_admitted(&request, ordinary_root, marker)?,
+        Err(error) => refused(&request, ordinary_root, marker, started, &error),
+    };
+    print_report(&request, &report)?;
+    if report.outcome != Outcome::Passed {
+        bail!("self-test did not pass; see the report for request outcomes and cleanup")
+    }
+    Ok(())
+}
+
+fn run_admitted(
+    request: &Request,
+    ordinary_root: Option<PathBuf>,
+    marker: String,
+) -> Result<Report> {
+    let root = if let Some(root) = ordinary_root {
+        root
+    } else {
         let mut builder = tempfile::Builder::new();
         builder.prefix("agent-bridge-self-test-");
         let directory = match std::env::var_os(STATE_DIR_ENV) {
@@ -629,21 +711,18 @@ pub(super) fn run(request: Request) -> Result<()> {
         let root = directory.keep();
         RecordStore::at(&root).set_directory_private()?;
         root
-    } else {
-        Reader::state_root()?
     };
-    let marker = format!(
-        "AB_{}",
-        Store::new_event_file_name()?.trim_end_matches(".json")
-    );
     let mut installed = Installed {
         executable: std::env::current_exe()?,
         root: root.clone(),
         isolated: request.isolated,
     };
-    let report = orchestrate(&request, &mut installed, root, marker);
+    Ok(orchestrate(request, &mut installed, root, marker))
+}
+
+fn print_report(request: &Request, report: &Report) -> Result<()> {
     if request.ask.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        println!("{}", serde_json::to_string_pretty(report)?);
     } else {
         println!(
             "{PUBLIC_COMMAND} {} self-test: {}",
@@ -661,7 +740,10 @@ pub(super) fn run(request: Request) -> Result<()> {
                 false
             ),
             report.terminal.as_deref().unwrap_or("not verified"),
-            terminal_safe_text(&report.state_root.display().to_string(), false),
+            report.state_root.as_ref().map_or_else(
+                || "not created".to_owned(),
+                |root| terminal_safe_text(&root.display().to_string(), false)
+            ),
             report.session.as_deref().unwrap_or("none"),
             report.session_state.as_deref().unwrap_or("not verified")
         );
@@ -697,9 +779,6 @@ pub(super) fn run(request: Request) -> Result<()> {
             serde_json::to_value(report.outcome)?.as_str().unwrap(),
             report.elapsed_ms
         );
-    }
-    if report.outcome != Outcome::Passed {
-        bail!("self-test did not pass; see the report for request outcomes and cleanup")
     }
     Ok(())
 }

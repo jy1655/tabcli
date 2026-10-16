@@ -2,6 +2,8 @@
 use super::turn_report::emit_session_result_with;
 use super::*;
 
+pub(super) mod admission;
+
 pub(super) type ResultExtra = serde_json::Map<String, serde_json::Value>;
 
 pub(super) struct StartOptions {
@@ -51,6 +53,7 @@ impl StartSource for FreshSource {
         if !workspace.is_dir() {
             bail!("workspace is not a directory: {}", workspace.display());
         }
+        admission::check(&Reader::state_root()?, &workspace)?;
         let provider_path = resolve_provider(request.provider)?;
         let provider_version =
             check_provider_version_until(request.provider, &provider_path, Some(deadline))?;

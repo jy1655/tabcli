@@ -165,3 +165,39 @@ fn reopen_is_refused_with_the_adapters_own_reason() {
             .is_none()
     );
 }
+
+fn homes_with_codex_config(codex: &str) -> crate::native::consent::Homes {
+    crate::native::consent::Homes {
+        codex: std::path::PathBuf::from(codex),
+        claude: "unused-claude".into(),
+        agy: "unused-agy".into(),
+        pi: "unused-pi".into(),
+    }
+}
+
+#[test]
+fn the_memory_workspace_is_beside_the_config_that_homes_names() {
+    // Only the Codex config path decides; the other providers' homes are never read.
+    let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("custom-codex").join("config.toml");
+    assert_eq!(
+        memory_workspace(&homes_with_codex_config(config.to_str().unwrap())).unwrap(),
+        home.path().join("custom-codex").join("memories")
+    );
+    // A relative config path stays relative: the caller's working directory resolves it.
+    assert_eq!(
+        memory_workspace(&homes_with_codex_config("relative/config.toml")).unwrap(),
+        std::path::Path::new("relative").join("memories")
+    );
+    assert_eq!(
+        memory_workspace(&homes_with_codex_config("config.toml")).unwrap(),
+        std::path::Path::new("memories")
+    );
+    let error = memory_workspace(&homes_with_codex_config("")).unwrap_err();
+    assert_eq!(error.to_string(), "Codex config path has no parent");
+    assert_eq!(
+        super::super::codex_memory_workspace(&homes_with_codex_config(config.to_str().unwrap()))
+            .unwrap(),
+        memory_workspace(&homes_with_codex_config(config.to_str().unwrap())).unwrap()
+    );
+}
