@@ -2,10 +2,13 @@
 use super::*;
 use crate::native::reopen::ResumedFrom;
 use crate::native::session;
-use crate::native::session::OwnerObservation;
 use crate::native::session::origin;
 use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
 use crate::native::terminal::ownership::NativeSessionOwner;
+use judgment::OwnerJudgment;
+use std::cell::OnceCell;
+
+pub(in crate::native) mod judgment;
 
 /// Hold, Owner and Surface records are separate observations from the four lifecycle records.
 /// They remain readable when the lifecycle records cannot form a consistent Observation.
@@ -14,7 +17,8 @@ pub(in crate::native) struct SessionEvidence {
     pub(in crate::native) held: Result<bool>,
     pub(in crate::native) hold_release_allowed: bool,
     pub(in crate::native) surface: SurfaceRecord,
-    pub(in crate::native) owner_observation: Option<OwnerObservation>,
+    /// Made on the first request and kept for this Observation (D21).
+    pub(in crate::native) owner_judgment: OnceCell<OwnerJudgment>,
     pub(in crate::native) surface_presence: Option<Result<bool>>,
 }
 
@@ -25,8 +29,13 @@ pub(in crate::native) enum SurfaceRecord {
 }
 
 impl SessionEvidence {
+    /// The raw Owner record read, shared with `wait`'s per-poll judgment.
+    pub(super) fn read_owner(reader: &Reader) -> Result<Option<NativeSessionOwner>> {
+        RecordReader::at(reader.record(CoreRecord::Owner).path()).optional_json()
+    }
+
     pub(in crate::native) fn read(reader: &Reader, held: Result<bool>) -> Self {
-        let owner = RecordReader::at(reader.record(CoreRecord::Owner).path()).optional_json();
+        let owner = Self::read_owner(reader);
         let surface = match RecordReader::at(reader.record(CoreRecord::TerminalClosed).path())
             .optional_json::<Value>()
         {
@@ -50,7 +59,7 @@ impl SessionEvidence {
             held,
             owner,
             surface,
-            owner_observation: None,
+            owner_judgment: OnceCell::new(),
             surface_presence: None,
         }
     }
@@ -85,15 +94,19 @@ impl SessionEvidence {
         })())
     }
 
-    pub(in crate::native) fn observe_owner(&mut self) -> &OwnerObservation {
-        self.owner_observation.insert(match &self.owner {
-            Ok(Some(owner)) => observe_owner_record(owner),
-            Ok(None) => OwnerObservation::default(),
-            Err(error) => OwnerObservation {
-                error: Some(format!("{error:#}")),
-                ..OwnerObservation::default()
-            },
-        })
+    /// The owner judgment for `session`, made on the first request. One Observation
+    /// describes one session, so later requests return the first judgment.
+    pub(in crate::native) fn judge_owner(&self, session: &str) -> &OwnerJudgment {
+        self.judge_owner_with(session, &judgment::Observers::SYSTEM)
+    }
+
+    pub(in crate::native) fn judge_owner_with(
+        &self,
+        session: &str,
+        observers: &judgment::Observers<'_>,
+    ) -> &OwnerJudgment {
+        self.owner_judgment
+            .get_or_init(|| judgment::owner(&self.owner, session, observers))
     }
 }
 
@@ -328,9 +341,9 @@ impl Observation {
         self.records.active_receipt()
     }
 
-    pub(super) fn inspect_value(mut self, reader: &Reader, id: &str) -> Result<Value> {
+    pub(super) fn inspect_value(self, reader: &Reader, id: &str) -> Result<Value> {
         let origin = self.observe_origin(reader, None);
-        let owner = self.evidence.observe_owner();
+        let owner = self.evidence.judge_owner(id).observation();
         let snapshot = &self.records;
         let resumed_from = self.resumed_from?;
         let latest = ResultReference::latest(snapshot, reader)?.value();

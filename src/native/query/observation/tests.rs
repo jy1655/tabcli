@@ -159,19 +159,11 @@ fn observation_is_read_only_and_releases_its_lock() {
     assert_eq!(entries(&fixture.directory), original);
     let before = entries(&fixture.directory);
     for owner in [false, true] {
-        let mut observation = Observation::read(&reader).unwrap();
-        assert!(observation.evidence.owner_observation.is_none());
+        let observation = Observation::read(&reader).unwrap();
+        assert!(observation.evidence.owner_judgment.get().is_none());
         if owner {
-            observation.evidence.observe_owner();
-            assert_eq!(
-                observation
-                    .evidence
-                    .owner_observation
-                    .as_ref()
-                    .unwrap()
-                    .process_alive,
-                Some(false)
-            );
+            observation.evidence.judge_owner("session-fault");
+            assert!(observation.evidence.owner_judgment.get().unwrap().gone());
         }
         assert!(observation.evidence.surface_presence.is_none());
         // Compare bytes before taking the writer lock: Windows refuses to read a file
@@ -357,4 +349,48 @@ fn doctor_reads_the_origin_within_its_own_deadline() {
         "origin_budget_exhausted"
     );
     assert!(observations["origin_observation"]["ended"].is_null());
+}
+
+#[test]
+fn owner_judgment_is_made_once_per_observation() {
+    use crate::native::process_identity::{Attested, ProcessObservation};
+    use crate::native::session::owner::ControlAttestation;
+    use judgment::tests::attestation;
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    crate::native::write_json_atomic(
+        &fixture.directory.join("native-session.json"),
+        &json!({"pid": 4242, "managed_session_id": "session-fault"}),
+    )
+    .unwrap();
+    let observation = Observation::read(&Reader::open_unchecked(&fixture.directory)).unwrap();
+    let calls = std::cell::Cell::new(0);
+    let observers = judgment::Observers {
+        attest: &|owner| {
+            calls.set(calls.get() + 1);
+            assert_eq!(owner.pid, 4242);
+            attestation(
+                ProcessObservation::Live(Attested::PidOnly),
+                ControlAttestation::NotRecorded,
+                Some(true),
+            )
+        },
+        pid_alive: &|_| panic!("a bound record is attested"),
+    };
+    for _ in 0..3 {
+        let owner = observation
+            .evidence
+            .judge_owner_with("session-fault", &observers);
+        assert_eq!(owner.observation().process_alive, Some(true));
+    }
+    assert_eq!(calls.get(), 1);
+    // The memoized judgment is the one every renderer of this Observation reads.
+    assert_eq!(
+        observation
+            .evidence
+            .judge_owner("session-fault")
+            .observation()
+            .process_alive,
+        Some(true)
+    );
+    assert_eq!(calls.get(), 1);
 }

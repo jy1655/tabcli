@@ -358,11 +358,15 @@ fn legacy_and_birth_only_observations_skip_control_and_read_pid_once() {
 }
 
 pub(in crate::native) fn reused_observation() -> OwnerObservation {
-    OwnerObservation::from(&OwnerAttestation {
+    OwnerObservation::from(&reused_attestation())
+}
+
+pub(in crate::native) fn reused_attestation() -> OwnerAttestation {
+    OwnerAttestation {
         process: ProcessObservation::Gone(Gone::Reused("different birth".into())),
         control: ControlAttestation::NotRecorded,
         pid_alive: Some(true),
-    })
+    }
 }
 
 #[cfg(windows)]
@@ -580,15 +584,17 @@ fn correction_a4_control_error_keeps_wrapper_and_underlying_context() {
     assert_eq!(OwnerObservation::from(&a).error.as_deref(), Some(expected));
 }
 
+/// The real attestation of an intermediate macOS record (birth and TTY, no process groups)
+/// whose live control is the same, changed or unreadable.
 #[cfg(target_os = "macos")]
-pub(in crate::native) fn intermediate_observation(control: &str) -> OwnerObservation {
+pub(in crate::native) fn intermediate_attestation(control: &str) -> OwnerAttestation {
     let (mut owner, mut live) = fixture();
     owner.process_group = None;
     owner.terminal_process_group = None;
     if control == "changed" {
         live.terminal_tty_device += 1;
     }
-    OwnerObservation::from(&attest_owner_with(
+    attest_owner_with(
         &owner,
         OwnerObservers {
             pid_alive: &|_| true,
@@ -601,5 +607,5 @@ pub(in crate::native) fn intermediate_observation(control: &str) -> OwnerObserva
                 }
             },
         },
-    ))
+    )
 }

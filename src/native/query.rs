@@ -493,7 +493,9 @@ fn observe_snapshot_until(
     }
 }
 
-pub(super) use super::session::{observe_owner, observe_owner_record};
+// Query observations judge the owner through `observation::judgment`; reopen tests keep this.
+#[cfg(test)]
+pub(super) use super::session::observe_owner;
 
 pub(super) fn request_result(reader: &Reader, request_id: &str) -> Result<Value> {
     observe_snapshot(reader)?.result(reader, &Selector::Request(request_id.to_owned()))

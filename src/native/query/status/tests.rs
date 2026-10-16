@@ -25,7 +25,14 @@ fn origin(ended: Option<bool>) -> OriginObservation {
 }
 
 fn flag(observed: &StatusObservation, expected: &str) -> bool {
-    attention(observed, &OwnerObservation::default(), false, &origin(None)).contains(&expected)
+    attention(observed, &OwnerJudgment::Absent, &origin(None)).contains(&expected)
+}
+
+fn owner_flags(observed: &StatusObservation, owner: &OwnerJudgment) -> Vec<&'static str> {
+    attention(observed, owner, &origin(None))
+        .into_iter()
+        .filter(|flag| flag.starts_with("owner_"))
+        .collect()
 }
 
 #[test]
@@ -85,62 +92,100 @@ fn attention_uses_recorded_delivery_launch_claim_and_state_facts() {
 
 #[test]
 fn owner_attention_distinguishes_negative_and_missing_facts_including_linux() {
+    use crate::native::process_identity::{Attested, Gone, ProcessObservation};
+    use crate::native::session::owner::ControlAttestation::*;
+    use observation::judgment::tests::attestation;
     let fixture = seed_close_fixture(JournaledEventState::Absent);
     let reader = Reader::open_unchecked(&fixture.directory);
     let mut observed = read(&reader);
-    for (alive, identity, bound, expected) in [
-        (Some(false), None, true, vec!["owner_exited"]),
-        (
+    let live = |control| {
+        OwnerJudgment::Bound(attestation(
+            ProcessObservation::Live(Attested::Incarnation),
+            control,
             Some(true),
-            Some(false),
-            true,
-            vec!["owner_identity_mismatch"],
+        ))
+    };
+    let rows: Vec<(OwnerJudgment, Vec<&str>, Value)> = vec![
+        (
+            OwnerJudgment::Bound(attestation(
+                ProcessObservation::Gone(Gone::Exited),
+                NotRecorded,
+                Some(false),
+            )),
+            vec!["owner_exited"],
+            json!([false, null, null]),
         ),
-        (None, None, true, vec!["owner_unverified"]),
-        (Some(true), None, true, vec![]),
-        (Some(true), Some(true), true, vec![]),
-        (None, None, false, vec!["owner_unverified"]),
-    ] {
-        let owner = OwnerObservation {
-            process_alive: alive,
-            identity_matches: identity,
-            error: None,
-        };
-        let actual = attention(&observed, &owner, bound, &origin(None))
-            .into_iter()
-            .filter(|flag| flag.starts_with("owner_"))
-            .collect::<Vec<_>>();
-        assert_eq!(actual, expected);
+        (
+            OwnerJudgment::Bound(crate::native::session::owner::tests::reused_attestation()),
+            vec!["owner_identity_mismatch"],
+            json!([true, false, null]),
+        ),
+        (
+            live(Changed("owner TTY changed".into())),
+            vec!["owner_identity_mismatch"],
+            json!([true, false, null]),
+        ),
+        (live(Verified), vec![], json!([true, true, null])),
+        // A live owner whose identity was not compared is not flagged.
+        (live(NotRecorded), vec![], json!([true, null, null])),
+        (
+            OwnerJudgment::Bound(attestation(
+                ProcessObservation::Live(Attested::PidOnly),
+                NotRecorded,
+                Some(true),
+            )),
+            vec![],
+            json!([true, null, null]),
+        ),
+        (
+            live(Unknown("identity check failed".into())),
+            vec!["owner_unverified"],
+            json!([true, null, "identity check failed"]),
+        ),
+        // B3: a false PID hint beside an Unknown attestation is not an exit.
+        (
+            OwnerJudgment::Bound(attestation(
+                ProcessObservation::Unknown("denied".into()),
+                NotRecorded,
+                Some(false),
+            )),
+            vec!["owner_unverified"],
+            json!([false, null, "denied"]),
+        ),
+        (
+            OwnerJudgment::UnboundLegacy { alive: Some(false) },
+            vec!["owner_unverified"],
+            json!([null, null, "owner record is unbound"]),
+        ),
+        (
+            OwnerJudgment::Foreign,
+            vec!["owner_unverified"],
+            json!([null, null, "owner record belongs to another session"]),
+        ),
+        (
+            OwnerJudgment::Absent,
+            vec!["owner_unverified"],
+            json!([null, null, "no owner record"]),
+        ),
+        (
+            OwnerJudgment::Unreadable("invalid JSON".into()),
+            vec!["owner_unverified"],
+            json!([null, null, "invalid JSON"]),
+        ),
+    ];
+    for (owner, expected, value) in &rows {
+        assert_eq!(&owner_flags(&observed, owner), expected, "{owner:?}");
+        let o = owner_value(owner);
+        assert_eq!(
+            &json!([o.process_alive, o.identity_matches, o.error]),
+            value,
+            "{owner:?}"
+        );
     }
     observed.observation.records.status.state = SessionState::Closed;
-    assert!(!flag(&observed, "owner_unverified"));
-    let owner = OwnerObservation {
-        process_alive: Some(false),
-        identity_matches: Some(false),
-        error: None,
-    };
-    assert!(
-        !attention(&observed, &owner, true, &origin(None))
-            .iter()
-            .any(|f| f.starts_with("owner_"))
-    );
-}
-
-#[test]
-fn a_live_owner_identity_check_error_requires_attention() {
-    let fixture = seed_close_fixture(JournaledEventState::Absent);
-    let reader = Reader::open_unchecked(&fixture.directory);
-    let observed = read(&reader);
-    let owner = OwnerObservation {
-        process_alive: Some(true),
-        identity_matches: None,
-        error: Some("identity check failed".to_owned()),
-    };
-    let flags = attention(&observed, &owner, true, &origin(None))
-        .into_iter()
-        .filter(|flag| flag.starts_with("owner_"))
-        .collect::<Vec<_>>();
-    assert_eq!(flags, ["owner_unverified"]);
+    for (owner, _, _) in &rows {
+        assert!(owner_flags(&observed, owner).is_empty(), "{owner:?}");
+    }
 }
 
 #[test]
@@ -529,8 +574,8 @@ fn r1_c6_reused_owner_attention_is_mismatch_not_unverified() {
     let fixture = seed_close_fixture(JournaledEventState::Absent);
     let reader = Reader::open_unchecked(&fixture.directory);
     let observed = read(&reader);
-    let owner = crate::native::session::owner::tests::reused_observation();
-    let flags = attention(&observed, &owner, true, &origin(None));
+    let owner = OwnerJudgment::Bound(crate::native::session::owner::tests::reused_attestation());
+    let flags = attention(&observed, &owner, &origin(None));
     assert!(flags.contains(&"owner_identity_mismatch"));
     assert!(!flags.contains(&"owner_unverified"));
 }
@@ -546,11 +591,9 @@ fn correction_a3_intermediate_owner_status_distinguishes_changed_unknown_and_ver
         ("unknown", vec!["owner_unverified"]),
         ("verified", vec![]),
     ] {
-        let owner = crate::native::session::owner::tests::intermediate_observation(control);
-        let flags: Vec<_> = attention(&observed, &owner, true, &origin(None))
-            .into_iter()
-            .filter(|flag| flag.starts_with("owner_"))
-            .collect();
-        assert_eq!(flags, expected, "{control}");
+        let owner = OwnerJudgment::Bound(
+            crate::native::session::owner::tests::intermediate_attestation(control),
+        );
+        assert_eq!(owner_flags(&observed, &owner), expected, "{control}");
     }
 }

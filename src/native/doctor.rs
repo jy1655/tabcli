@@ -1,4 +1,5 @@
 //! Observations and advice only. No recovery, delivery, terminal control, or settings writes.
+use super::query::observation::judgment::{BoundOwner, OwnerJudgment};
 use super::query::observation::{Observation, SessionEvidence, SurfaceRecord};
 use super::{
     Duration, FirstPartyCli, Instant, NativeCommand, OsString, Path, Reader, Result, Serialize,
@@ -566,14 +567,14 @@ pub(super) fn record_checks(
             reader.manifest().ok()
         }
     };
-    let mut evidence = evidence.unwrap_or_else(|| match reader.lock_shared() {
+    let evidence = evidence.unwrap_or_else(|| match reader.lock_shared() {
         Ok(lock) => SessionEvidence::read(
             reader,
             super::session::hold::observe(reader, lock.is_some()),
         ),
         Err(error) => SessionEvidence::read(reader, Err(error)),
     });
-    owner_check(&mut evidence, id, checks);
+    owner_check(evidence.judge_owner(id), checks);
     terminal_check(&evidence, id, checks);
     hold_check(
         &evidence.held,
@@ -876,52 +877,44 @@ pub(in crate::native) fn surface_check_for_test(
     checks.remove(0)
 }
 
-fn owner_check(evidence: &mut SessionEvidence, id: &str, checks: &mut Vec<Check>) {
-    owner_check_with(evidence, id, checks, |e| e.observe_owner().clone())
-}
-
-fn owner_check_with(
-    evidence: &mut SessionEvidence,
-    id: &str,
-    checks: &mut Vec<Check>,
-    observe: impl FnOnce(&mut SessionEvidence) -> crate::native::session::OwnerObservation,
-) {
+fn owner_check(owner: &OwnerJudgment, checks: &mut Vec<Check>) {
     use Availability::*;
-    let owner = &evidence.owner;
     let (availability, reason, detail, evidence) = match owner {
-        Ok(Some(owner)) if owner.managed_session_id.as_deref() == Some(id) => {
-            let observed = observe(evidence);
-            let (availability, reason) = match (observed.process_alive, observed.identity_matches) {
-                (Some(false), _) => (Unavailable, "owner_exited"),
-                (_, Some(false)) => (Unavailable, "owner_identity_mismatch"),
-                (Some(true), Some(true)) => (Available, "owner_identity_observed"),
-                _ => (Unknown, "owner_unverified"),
+        OwnerJudgment::Bound(attestation) => {
+            // An Unknown attestation is unverified whatever its PID hint (B3).
+            let (availability, reason) = match BoundOwner::of(attestation) {
+                BoundOwner::Exited => (Unavailable, "owner_exited"),
+                BoundOwner::Reused | BoundOwner::ControlChanged => {
+                    (Unavailable, "owner_identity_mismatch")
+                }
+                BoundOwner::Verified => (Available, "owner_identity_observed"),
+                BoundOwner::Uncompared | BoundOwner::Unknown => (Unknown, "owner_unverified"),
             };
             (
                 availability,
                 reason,
                 "Owner observation is separate from terminal surface or provider readiness."
                     .to_owned(),
-                json!(observed),
+                json!(owner.observation()),
             )
         }
-        Ok(Some(owner)) if owner.managed_session_id.is_some() => (
+        OwnerJudgment::Foreign => (
             Unavailable,
             "owner_session_mismatch",
             "Owner record belongs to another managed session.".to_owned(),
             Value::Null,
         ),
-        Ok(Some(_)) => (Unknown, "owner_unbound_legacy", "A legacy owner record has no managed-session binding; process observation is not proof of control authority.".to_owned(), json!(observe(evidence))),
-        Ok(None) => (
+        OwnerJudgment::UnboundLegacy { .. } => (Unknown, "owner_unbound_legacy", "A legacy owner record has no managed-session binding; process observation is not proof of control authority.".to_owned(), json!(owner.observation())),
+        OwnerJudgment::Absent => (
             Unknown,
             "owner_unverified",
             "No owner record bound to this managed session was observed.".to_owned(),
             Value::Null,
         ),
-        Err(error) => (
+        OwnerJudgment::Unreadable(error) => (
             Unknown,
             "owner_unreadable",
-            format!("{error:#}"),
+            error.clone(),
             Value::Null,
         ),
     };
@@ -1283,11 +1276,31 @@ mod timeout_tests {
 #[cfg(test)]
 mod attestation_tests {
     use super::*;
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn correction_a3_intermediate_owner_doctor_distinguishes_changed_unknown_and_verified() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = crate::native::session::Store::open_unchecked(dir.path());
+    use crate::native::process_identity::{Attested, Gone, ProcessObservation};
+    use crate::native::query::observation::judgment::{self, tests::attestation};
+    use crate::native::session::owner::ControlAttestation;
+    use crate::native::session::owner::tests::reused_attestation;
+
+    /// The owner check as [availability, reason, evidence facts], the facts as an array.
+    fn owner_row(owner: &OwnerJudgment) -> Value {
+        let mut checks = vec![];
+        owner_check(owner, &mut checks);
+        assert_eq!(checks.len(), 1);
+        let check = serde_json::to_value(&checks[0]).unwrap();
+        let evidence = &check["evidence"];
+        let facts = if evidence.is_null() {
+            Value::Null
+        } else {
+            json!([
+                evidence["process_alive"],
+                evidence["identity_matches"],
+                evidence["error"]
+            ])
+        };
+        json!([check["availability"], check["reason_code"], facts])
+    }
+
+    fn bound_evidence(store: &crate::native::session::Store) -> SessionEvidence {
         store
             .write_owner(&crate::native::terminal::ownership::NativeSessionOwner {
                 pid: 4242,
@@ -1298,19 +1311,117 @@ mod attestation_tests {
                 ..Default::default()
             })
             .unwrap();
+        SessionEvidence::read(store, Ok(false))
+    }
+
+    #[test]
+    fn owner_check_maps_each_owner_judgment() {
+        use ControlAttestation::*;
+        let live = |control| {
+            OwnerJudgment::Bound(attestation(
+                ProcessObservation::Live(Attested::Incarnation),
+                control,
+                Some(true),
+            ))
+        };
+        let rows = [
+            (
+                OwnerJudgment::Bound(attestation(
+                    ProcessObservation::Gone(Gone::Exited),
+                    NotRecorded,
+                    Some(false),
+                )),
+                json!(["unavailable", "owner_exited", [false, null, null]]),
+            ),
+            (
+                OwnerJudgment::Bound(reused_attestation()),
+                json!([
+                    "unavailable",
+                    "owner_identity_mismatch",
+                    [true, false, null]
+                ]),
+            ),
+            (
+                live(Changed("owner TTY changed".into())),
+                json!([
+                    "unavailable",
+                    "owner_identity_mismatch",
+                    [true, false, null]
+                ]),
+            ),
+            (
+                live(Verified),
+                json!(["available", "owner_identity_observed", [true, true, null]]),
+            ),
+            (
+                live(NotRecorded),
+                json!(["unknown", "owner_unverified", [true, null, null]]),
+            ),
+            (
+                OwnerJudgment::Bound(attestation(
+                    ProcessObservation::Live(Attested::PidOnly),
+                    NotRecorded,
+                    Some(true),
+                )),
+                json!(["unknown", "owner_unverified", [true, null, null]]),
+            ),
+            (
+                live(Unknown("no TTY".into())),
+                json!(["unknown", "owner_unverified", [true, null, "no TTY"]]),
+            ),
+            // B3: a false PID hint beside an Unknown attestation is not an exit.
+            (
+                OwnerJudgment::Bound(attestation(
+                    ProcessObservation::Unknown("denied".into()),
+                    NotRecorded,
+                    Some(false),
+                )),
+                json!(["unknown", "owner_unverified", [false, null, "denied"]]),
+            ),
+            (
+                OwnerJudgment::UnboundLegacy { alive: Some(false) },
+                json!(["unknown", "owner_unbound_legacy", [false, null, null]]),
+            ),
+            (
+                OwnerJudgment::Foreign,
+                json!(["unavailable", "owner_session_mismatch", null]),
+            ),
+            (
+                OwnerJudgment::Absent,
+                json!(["unknown", "owner_unverified", null]),
+            ),
+            (
+                OwnerJudgment::Unreadable("invalid JSON".into()),
+                json!(["unknown", "owner_unreadable", null]),
+            ),
+        ];
+        for (owner, expected) in rows {
+            assert_eq!(owner_row(&owner), expected, "{owner:?}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn correction_a3_intermediate_owner_doctor_distinguishes_changed_unknown_and_verified() {
+        use crate::native::session::owner::tests::intermediate_attestation;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::native::session::Store::open_unchecked(dir.path());
         for (control, availability, reason) in [
             ("changed", "unavailable", "owner_identity_mismatch"),
             ("unknown", "unknown", "owner_unverified"),
             ("verified", "available", "owner_identity_observed"),
         ] {
-            let mut evidence = SessionEvidence::read(&store, Ok(false));
-            let mut checks = vec![];
-            owner_check_with(&mut evidence, "session-test", &mut checks, |_| {
-                crate::native::session::owner::tests::intermediate_observation(control)
-            });
-            let value = serde_json::to_value(checks).unwrap();
-            assert_eq!(value[0]["availability"], availability, "{control}");
-            assert_eq!(value[0]["reason_code"], reason, "{control}");
+            let evidence = bound_evidence(&store);
+            let owner = evidence.judge_owner_with(
+                "session-test",
+                &judgment::Observers {
+                    attest: &|_| intermediate_attestation(control),
+                    pid_alive: &|_| panic!("a bound record is attested"),
+                },
+            );
+            let row = owner_row(owner);
+            assert_eq!(row[0], availability, "{control}");
+            assert_eq!(row[1], reason, "{control}");
         }
     }
 
@@ -1318,20 +1429,16 @@ mod attestation_tests {
     fn r1_c6_reused_owner_is_unavailable_with_mismatch_reason() {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::native::session::Store::open_unchecked(dir.path());
-        store
-            .write_owner(&crate::native::terminal::ownership::NativeSessionOwner {
-                pid: 4242,
-                managed_session_id: Some("session-test".into()),
-                ..Default::default()
-            })
-            .unwrap();
-        let mut evidence = SessionEvidence::read(&store, Ok(false));
-        let mut checks = vec![];
-        owner_check_with(&mut evidence, "session-test", &mut checks, |_| {
-            crate::native::session::owner::tests::reused_observation()
-        });
-        let value = serde_json::to_value(&checks).unwrap();
-        assert_eq!(value[0]["reason_code"], "owner_identity_mismatch");
-        assert_eq!(value[0]["availability"], "unavailable");
+        let evidence = bound_evidence(&store);
+        let owner = evidence.judge_owner_with(
+            "session-test",
+            &judgment::Observers {
+                attest: &|_| reused_attestation(),
+                pid_alive: &|_| panic!("a bound record is attested"),
+            },
+        );
+        let row = owner_row(owner);
+        assert_eq!(row[0], "unavailable");
+        assert_eq!(row[1], "owner_identity_mismatch");
     }
 }

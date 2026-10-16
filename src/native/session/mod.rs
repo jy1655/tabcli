@@ -569,7 +569,10 @@ pub(super) mod tests;
 
 pub(in crate::native) mod owner;
 mod state;
-pub(in crate::native) use owner::{OwnerObservation, observe_owner, observe_owner_record};
+pub(in crate::native) use owner::{OwnerObservation, observe_owner};
+// Terminal ownership callbacks, which exist only where a surface owner is attested.
+#[cfg(any(target_os = "macos", windows))]
+pub(in crate::native) use owner::observe_owner_record;
 pub(in crate::native) use state::{SessionState, SessionStatus, update_status};
 pub(in crate::native) mod launch;
 

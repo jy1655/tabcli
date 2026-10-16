@@ -4,6 +4,7 @@ use crate::native::session;
 use crate::native::session::OwnerObservation;
 use crate::native::session::enumerate::{CheckOrder, Fault, Scope, enumerate};
 use crate::native::session::origin::{ObservationCache, OriginObservation};
+use observation::judgment::{BoundOwner, FOREIGN_OWNER, OwnerJudgment};
 use observation::{Observation, StatusObservation, SurfaceRecord};
 
 #[derive(Debug)]
@@ -85,10 +86,36 @@ fn parse_options(args: &[String]) -> Result<StatusRequest> {
     })
 }
 
+/// Status's owner attention: a live owner whose identity was not compared is not flagged,
+/// and an Unknown attestation is unverified, never exited (B3).
+fn owner_flag(owner: &OwnerJudgment) -> Option<&'static str> {
+    match owner.bound() {
+        Some(BoundOwner::Exited) => Some("owner_exited"),
+        Some(BoundOwner::Reused | BoundOwner::ControlChanged) => Some("owner_identity_mismatch"),
+        Some(BoundOwner::Verified | BoundOwner::Uncompared) => None,
+        Some(BoundOwner::Unknown) | None => Some("owner_unverified"),
+    }
+}
+
+/// Status's `owner` object: the attestation's projection for a bound record, otherwise
+/// null facts with the reason no attestation was made.
+fn owner_value(owner: &OwnerJudgment) -> OwnerObservation {
+    let reason = match owner {
+        OwnerJudgment::Bound(_) => return owner.observation(),
+        OwnerJudgment::UnboundLegacy { .. } => "owner record is unbound",
+        OwnerJudgment::Foreign => FOREIGN_OWNER,
+        OwnerJudgment::Absent => "no owner record",
+        OwnerJudgment::Unreadable(reason) => reason,
+    };
+    OwnerObservation {
+        error: Some(reason.to_owned()),
+        ..OwnerObservation::default()
+    }
+}
+
 fn attention(
     observed: &StatusObservation,
-    owner: &OwnerObservation,
-    bound: bool,
+    owner: &OwnerJudgment,
     origin: &OriginObservation,
 ) -> Vec<&'static str> {
     let observation = &observed.observation;
@@ -121,18 +148,7 @@ fn attention(
         flags.push("recovery_required");
     }
     if records.status.state != SessionState::Closed {
-        if owner.process_alive == Some(false) {
-            flags.push("owner_exited");
-        }
-        if owner.identity_matches == Some(false) {
-            flags.push("owner_identity_mismatch");
-        }
-        if !bound
-            || owner.error.is_some()
-            || (owner.process_alive.is_none() && owner.identity_matches.is_none())
-        {
-            flags.push("owner_unverified");
-        }
+        flags.extend(owner_flag(owner));
     }
     let index_incomplete = records.unreadable_requests > 0 || records.request_index_error.is_some();
     if observation.evidence.held.is_err()
@@ -188,30 +204,10 @@ fn result_command(observed: &StatusObservation, id: &str) -> Option<String> {
     }
 }
 
-fn entry(mut observed: StatusObservation, id: &str, origin: OriginObservation) -> Value {
-    let bound = matches!(&observed.observation.evidence.owner,
-        Ok(Some(owner)) if owner.managed_session_id.as_deref() == Some(id));
-    let owner = if bound {
-        let owner = observed.observation.evidence.observe_owner();
-        OwnerObservation {
-            process_alive: owner.process_alive,
-            identity_matches: owner.identity_matches,
-            error: owner.error.clone(),
-        }
-    } else {
-        OwnerObservation {
-            error: Some(match &observed.observation.evidence.owner {
-                Err(error) => format!("{error:#}"),
-                Ok(None) => "no owner record".to_owned(),
-                Ok(Some(owner)) if owner.managed_session_id.is_none() => {
-                    "owner record is unbound".to_owned()
-                }
-                Ok(Some(_)) => "owner record belongs to another session".to_owned(),
-            }),
-            ..OwnerObservation::default()
-        }
-    };
-    let flags = attention(&observed, &owner, bound, &origin);
+fn entry(observed: StatusObservation, id: &str, origin: OriginObservation) -> Value {
+    let judgment = observed.observation.evidence.judge_owner(id);
+    let owner = owner_value(judgment);
+    let flags = attention(&observed, judgment, &origin);
     let command = result_command(&observed, id);
     let observation = &observed.observation;
     let records = &observation.records;
