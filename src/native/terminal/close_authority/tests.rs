@@ -234,7 +234,11 @@ impl Row {
                 fault("presence")?;
                 Ok(self.present)
             })
-            .with_evidence(terminal::close_evidence::with_apple(handle.kind, &apple))
+            .with_evidence(if handle.kind == terminal::TerminalKind::AppleTerminal {
+                &apple
+            } else {
+                terminal::close_evidence(handle.kind)
+            })
             .with_owner_record(|owner| {
                 assert_eq!(owner.pid, 123);
                 OwnerObservation {

@@ -1627,7 +1627,11 @@ fn apple_terminal_close_retry_after_teardown_reaches_the_adapter() {
                 );
                 TestObservation::on_records(directory.path(), "session-owner123", &handle, deadline)
                     .with_presence(|| panic!("a matching intent does not need a surface query"))
-                    .with_evidence(terminal::close_evidence::with_apple(handle.kind, &apple))
+                    .with_evidence(if handle.kind == terminal::TerminalKind::AppleTerminal {
+                        &apple
+                    } else {
+                        terminal::close_evidence(handle.kind)
+                    })
                     .decide("session-owner123", &handle, deadline)
             }
             .unwrap()
@@ -1696,7 +1700,11 @@ fn apple_terminal_close_retry_without_app_incarnation_never_reaches_the_adapter(
                             deadline,
                         )
                         .with_presence(|| Ok(present))
-                        .with_evidence(terminal::close_evidence::with_apple(session.kind, &apple))
+                        .with_evidence(if session.kind == terminal::TerminalKind::AppleTerminal {
+                            &apple
+                        } else {
+                            terminal::close_evidence(session.kind)
+                        })
                         .decide("session-owner123", session, deadline)
                     }?;
                     assert_eq!(
@@ -1788,10 +1796,13 @@ fn apple_terminal_incarnation_gates_retry_and_read_only_absence() {
                                 observations.set(observations.get() + 1);
                                 Ok(mode == "same-present")
                             })
-                            .with_evidence(terminal::close_evidence::with_apple(
-                                session.kind,
-                                &apple,
-                            ))
+                            .with_evidence(
+                                if session.kind == terminal::TerminalKind::AppleTerminal {
+                                    &apple
+                                } else {
+                                    terminal::close_evidence(session.kind)
+                                },
+                            )
                             .decide(
                                 "session-owner123",
                                 session,
@@ -1979,10 +1990,13 @@ fn terminal_record_without_app_incarnation_is_consumed_only_by_proven_absence() 
                                     _ => Ok(false),
                                 }
                             })
-                            .with_evidence(terminal::close_evidence::with_apple(
-                                session.kind,
-                                &apple,
-                            ))
+                            .with_evidence(
+                                if session.kind == terminal::TerminalKind::AppleTerminal {
+                                    &apple
+                                } else {
+                                    terminal::close_evidence(session.kind)
+                                },
+                            )
                             .decide(
                                 "session-owner123",
                                 session,
@@ -2378,11 +2392,6 @@ fn close_uses_the_stored_creation_scope_of_a_wezterm_session() {
                 &mut |session: &terminal::TerminalSession| -> Result<terminal::CloseOutcome> {
                     let authority = {
                         let deadline = crate::native::session::close::budget::close_deadline();
-                        let apple =
-                            terminal::macos::apple_terminal::close_evidence::with_observations(
-                                |_| panic!("a WezTerm handle names no Terminal.app incarnation"),
-                                || panic!("a WezTerm handle lists no Terminal.app instances"),
-                            );
                         TestObservation::on_records(
                             directory.path(),
                             "session-owner123",
@@ -2392,7 +2401,7 @@ fn close_uses_the_stored_creation_scope_of_a_wezterm_session() {
                         .with_presence(|| {
                             panic!("the recorded intent needs no surface observation")
                         })
-                        .with_evidence(terminal::close_evidence::with_apple(session.kind, &apple))
+                        .with_evidence(terminal::close_evidence(session.kind))
                         .decide("session-owner123", session, deadline)
                     }?;
                     assert_eq!(authority, TerminalCloseAuthority::SurfaceOnly);

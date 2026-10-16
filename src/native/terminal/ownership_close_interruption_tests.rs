@@ -8,7 +8,6 @@ use crate::native::terminal::close_authority::close_owned_surface_with;
 use crate::native::terminal::close_authority::test_support::TestObservation;
 use session::close::interruption::{self, Point};
 use std::cell::Cell;
-use terminal::close_evidence::with_apple;
 use terminal::macos::apple_terminal::close_evidence::with_observations as apple_evidence;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -93,7 +92,11 @@ impl Processes {
                             deadline,
                         )
                         .with_presence(|| Ok(false))
-                        .with_evidence(with_apple(surface.kind, &apple))
+                        .with_evidence(if surface.kind == terminal::TerminalKind::AppleTerminal {
+                            &apple
+                        } else {
+                            terminal::close_evidence(surface.kind)
+                        })
                         .with_owner_record(|_| panic!("not a failed startup"))
                         .with_pid_alive(|_| self.owner_live.get())
                         .with_mac_owner_live(|_| test_owner_attestation(self.owner_live.get()))

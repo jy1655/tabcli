@@ -814,7 +814,11 @@ fn explicit_close_recovers_a_failed_startup_only_through_a_stable_native_id() {
             .with_presence(|| panic!("an unproven owner allows no surface observation"));
         #[cfg(target_os = "macos")]
         let observation =
-            observation.with_evidence(terminal::close_evidence::with_apple(kind, &apple));
+            observation.with_evidence(if kind == terminal::TerminalKind::AppleTerminal {
+                &apple
+            } else {
+                terminal::close_evidence(kind)
+            });
         observation.decide(id, &surface, deadline)
     };
     assert_eq!(

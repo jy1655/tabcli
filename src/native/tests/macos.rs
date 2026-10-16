@@ -1091,10 +1091,13 @@ fn assert_dead_owner_preserves_unverified_surface(kind: terminal::TerminalKind) 
                                 deadline,
                             )
                             .with_presence(|| Ok(true))
-                            .with_evidence(terminal::close_evidence::with_apple(
-                                session.kind,
-                                &apple,
-                            ))
+                            .with_evidence(
+                                if session.kind == terminal::TerminalKind::AppleTerminal {
+                                    &apple
+                                } else {
+                                    terminal::close_evidence(session.kind)
+                                },
+                            )
                             .decide(
                                 "session-owner123",
                                 session,
@@ -1190,7 +1193,11 @@ fn dead_owner_exact_absence_can_finish_without_adapter_or_signal() {
                             observations += 1;
                             Ok(false)
                         })
-                        .with_evidence(terminal::close_evidence::with_apple(session.kind, &apple))
+                        .with_evidence(if session.kind == terminal::TerminalKind::AppleTerminal {
+                            &apple
+                        } else {
+                            terminal::close_evidence(session.kind)
+                        })
                         .decide("session-owner123", session, deadline)
                     }?;
                     assert_eq!(authority, TerminalCloseAuthority::Absent);
@@ -1255,7 +1262,11 @@ fn dead_owner_absence_errors_and_reused_or_incomplete_owners_retain_handle() {
                                 _ => panic!("unproven owner must not inspect a surface"),
                             }
                         })
-                        .with_evidence(terminal::close_evidence::with_apple(session.kind, &apple))
+                        .with_evidence(if session.kind == terminal::TerminalKind::AppleTerminal {
+                            &apple
+                        } else {
+                            terminal::close_evidence(session.kind)
+                        })
                         .decide("session-owner123", session, deadline)
                     }?;
                     panic!("unproven absence must never close or signal")
@@ -1439,7 +1450,11 @@ fn failed_launch_with_a_recorded_owner_gets_no_close_without_a_prior_intent() {
                                     _ => bail!("injected unreadable target"),
                                 }
                             })
-                            .with_evidence(terminal::close_evidence::with_apple(session.kind, &apple))
+                            .with_evidence(if session.kind == terminal::TerminalKind::AppleTerminal {
+                                &apple
+                            } else {
+                                terminal::close_evidence(session.kind)
+                            })
                             .decide("session-owner123", session, deadline)?;
                             if authority == TerminalCloseAuthority::Absent {
                                 return Ok(terminal::CloseOutcome::Missing);
@@ -1521,10 +1536,6 @@ fn ownerless_warp_and_wezterm_failures_only_consume_proven_absence() {
                             } else {
                                 "session-owner123"
                             };
-                            let apple = terminal::macos::apple_terminal::close_evidence::with_observations(
-                                |_| panic!("these adapters own their process identity checks"),
-                                || panic!("this is not a Terminal.app surface"),
-                            );
                             let authority = TestObservation::on_records(
                                 directory.path(),
                                 id,
@@ -1539,7 +1550,7 @@ fn ownerless_warp_and_wezterm_failures_only_consume_proven_absence() {
                                     _ => bail!("injected unreadable surface"),
                                 }
                             })
-                            .with_evidence(terminal::close_evidence::with_apple(session.kind, &apple))
+                            .with_evidence(terminal::close_evidence(session.kind))
                             .decide(id, session, deadline)?;
                             if authority == TerminalCloseAuthority::Absent {
                                 return Ok(terminal::CloseOutcome::Missing);
@@ -1574,50 +1585,6 @@ fn ownerless_warp_and_wezterm_failures_only_consume_proven_absence() {
                     );
                 }
             }
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn ghostty_failed_start_native_id_recovery_does_not_need_a_prior_intent() {
-    for owner_recorded in [false, true] {
-        for phase in [launch::Phase::Pending, launch::Phase::Spawning] {
-            let directory = tempfile::tempdir().unwrap();
-            write_failed_launch_with_owner(
-                directory.path(),
-                terminal::TerminalKind::Ghostty,
-                phase,
-                reaped_child_pid(),
-            );
-            if !owner_recorded {
-                fs::remove_file(directory.path().join(SESSION_OWNER_FILE)).unwrap();
-            }
-            let handle: terminal::TerminalSession =
-                read_json(&directory.path().join(TERMINAL_HANDLE_FILE)).unwrap();
-            assert!(!directory.path().join(TERMINAL_CLOSE_INTENT_FILE).exists());
-            assert_eq!(
-                {
-                    let deadline = crate::native::session::close::budget::close_deadline();
-                    let apple = terminal::macos::apple_terminal::close_evidence::with_observations(
-                        |_| panic!("no Terminal.app process observation"),
-                        || panic!("no Terminal.app instance observation"),
-                    );
-                    TestObservation::on_records(
-                        directory.path(),
-                        "session-owner123",
-                        &handle,
-                        deadline,
-                    )
-                    .with_presence(|| {
-                        panic!("the exact native-ID close adapter verifies its target")
-                    })
-                    .with_evidence(terminal::close_evidence::with_apple(handle.kind, &apple))
-                    .decide("session-owner123", &handle, deadline)
-                }
-                .unwrap(),
-                TerminalCloseAuthority::SurfaceOnly
-            );
         }
     }
 }
@@ -1670,10 +1637,13 @@ fn failed_launch_keeps_the_prior_intent_retry_and_the_stable_id_recovery() {
                             .with_presence(|| {
                                 panic!("{kind:?}/{phase:?}: no surface observation is needed")
                             })
-                            .with_evidence(terminal::close_evidence::with_apple(
-                                session.kind,
-                                &apple,
-                            ))
+                            .with_evidence(
+                                if session.kind == terminal::TerminalKind::AppleTerminal {
+                                    &apple
+                                } else {
+                                    terminal::close_evidence(session.kind)
+                                },
+                            )
                             .decide(
                                 "session-owner123",
                                 session,

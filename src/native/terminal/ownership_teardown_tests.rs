@@ -211,7 +211,11 @@ fn decision(
     );
     TestObservation::on_records(dir, "session-owner123", surface, deadline)
         .with_presence(|| Ok(false))
-        .with_evidence(terminal::close_evidence::with_apple(surface.kind, &apple))
+        .with_evidence(if surface.kind == terminal::TerminalKind::AppleTerminal {
+            &apple
+        } else {
+            terminal::close_evidence(surface.kind)
+        })
         .with_owner_record(|_| panic!("spawn recovery must not run"))
         .with_pid_alive(move |_| pid_alive)
         .with_mac_owner_live(move |_| test_owner_attestation(live))
@@ -293,7 +297,7 @@ fn r3_terminal_incarnation_changes_or_old_window_in_new_app_refuse() {
         let result =
             TestObservation::on_records(dir.path(), "session-owner123", &surface, deadline)
                 .with_presence(|| Ok(case == "old-id-in-new-app"))
-                .with_evidence(terminal::close_evidence::with_apple(surface.kind, &apple))
+                .with_evidence(&apple)
                 .with_owner_record(|_| panic!("not startup"))
                 .with_pid_alive(|_| true)
                 .with_mac_owner_live(|_| test_owner_attestation(true))
@@ -338,13 +342,9 @@ fn r3_owner_dying_during_live_intent_retry_cannot_bypass_group_check() {
     .unwrap();
     let live_reads = Cell::new(0);
     let deadline = crate::native::session::close::budget::close_deadline();
-    let apple = terminal::macos::apple_terminal::close_evidence::with_observations(
-        |_| panic!("not Terminal.app"),
-        || panic!("not Terminal.app"),
-    );
     let result = TestObservation::on_records(dir.path(), "session-owner123", &surface, deadline)
         .with_presence(|| Ok(false))
-        .with_evidence(terminal::close_evidence::with_apple(surface.kind, &apple))
+        .with_evidence(terminal::close_evidence(surface.kind))
         .with_owner_record(|_| panic!("not startup"))
         .with_pid_alive(|_| false)
         .with_mac_owner_live(|_| {
@@ -431,14 +431,10 @@ fn damaged_teardown_refuses(path: &str) {
         }
         let before = record.bytes().unwrap();
         let deadline = crate::native::session::close::budget::close_deadline();
-        let apple = terminal::macos::apple_terminal::close_evidence::with_observations(
-            |_| panic!("not Terminal.app"),
-            || panic!("not Terminal.app"),
-        );
         let result =
             TestObservation::on_records(dir.path(), "session-owner123", &surface, deadline)
                 .with_presence(|| Ok(false))
-                .with_evidence(terminal::close_evidence::with_apple(surface.kind, &apple))
+                .with_evidence(terminal::close_evidence(surface.kind))
                 .with_owner_record(|_| session::OwnerObservation {
                     process_alive: Some(false),
                     identity_matches: Some(false),
@@ -606,16 +602,12 @@ fn close_deadline_shared_observations_policy_adapter_and_retry() {
         };
         let proof_calls = Cell::new(0);
         let decide = |until| {
-            let apple = terminal::macos::apple_terminal::close_evidence::with_observations(
-                |_| Ok(None),
-                || Ok(vec![]),
-            );
             TestObservation::on_records(dir.path(), "session-owner123", &surface, until)
                 .with_presence(|| {
                     expire("presence");
                     Ok(false)
                 })
-                .with_evidence(terminal::close_evidence::with_apple(surface.kind, &apple))
+                .with_evidence(terminal::close_evidence(surface.kind))
                 .with_owner_record(|_| panic!("not startup"))
                 .with_pid_alive(|_| true)
                 .with_mac_owner_live(|_| test_owner_attestation(true))
