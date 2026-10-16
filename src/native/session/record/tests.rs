@@ -1,7 +1,9 @@
 use super::*;
 use crate::native::session::primitives::write_json_atomic;
+use crate::native::session::schema::EVENT_READ_LIMIT;
+use crate::native::session::snapshot::{PublicationRead, Snapshot};
 use crate::native::session::turn::JournaledEventState;
-use crate::native::session::{SessionState, names::*};
+use crate::native::session::{SessionState, names::*, origin};
 use crate::native::tests::seed_close_fixture;
 use std::fs;
 
@@ -344,7 +346,7 @@ fn required_status_reports_a_missing_record_with_its_cause_and_malformed_bytes_w
     let directory = tempfile::tempdir().unwrap();
     let reader = Reader::open_unchecked(directory.path());
     let path = directory.path().join(STATUS_FILE);
-    let error = reader.status().unwrap_err();
+    let error = reader.status().err().unwrap();
     assert_eq!(
         error.to_string(),
         format!("failed to read {}", path.display())
@@ -357,8 +359,8 @@ fn required_status_reports_a_missing_record_with_its_cause_and_malformed_bytes_w
     assert!(reader.closed_if_present().unwrap().is_none());
     fs::write(&path, b"{").unwrap();
     for error in [
-        reader.status().unwrap_err(),
-        reader.status_if_present().unwrap_err(),
+        reader.status().err().unwrap(),
+        reader.status_if_present().err().unwrap(),
     ] {
         assert_eq!(
             error.to_string(),
@@ -366,10 +368,10 @@ fn required_status_reports_a_missing_record_with_its_cause_and_malformed_bytes_w
         );
     }
     fs::write(&path, b"\xff").unwrap();
-    assert!(format!("{:#}", reader.status().unwrap_err()).contains("invalid UTF-8"));
+    assert!(format!("{:#}", reader.status().err().unwrap()).contains("invalid UTF-8"));
     fs::write(&path, OVERFLOW).unwrap();
     assert!(
-        format!("{:#}", reader.status_if_present().unwrap_err())
+        format!("{:#}", reader.status_if_present().err().unwrap())
             .contains("record timestamp is outside the JSON unsigned integer range")
     );
     fs::write(&path, STATUS).unwrap();
@@ -411,11 +413,11 @@ fn linked_core_records_are_refused_by_every_reader() {
         symlink(outside.path().join(name), &path).unwrap();
         match name {
             STATUS_FILE => {
-                refused(reader.status().unwrap_err(), name);
-                refused(reader.status_if_present().unwrap_err(), name);
+                refused(reader.status().err().unwrap(), name);
+                refused(reader.status_if_present().err().unwrap(), name);
             }
-            CLOSED_STATUS_FILE => refused(reader.closed_if_present().unwrap_err(), name),
-            MANIFEST_FILE => refused(reader.manifest().unwrap_err(), name),
+            CLOSED_STATUS_FILE => refused(reader.closed_if_present().err().unwrap(), name),
+            MANIFEST_FILE => refused(reader.manifest().err().unwrap(), name),
             _ => (),
         }
         // The Live read pins status, journal and launch and reads the manifest; the
@@ -429,4 +431,298 @@ fn linked_core_records_are_refused_by_every_reader() {
         }
     }
     assert!(reader.snapshot().is_ok());
+}
+
+// Build the same byte-cache shape as the timeline, without borrowing query's collection.
+fn cached_records(reader: &Reader) -> CachedRecords {
+    let mut records = CachedRecords::new();
+    for record in [
+        CoreRecord::Manifest,
+        CoreRecord::Status,
+        CoreRecord::TurnClaim,
+        CoreRecord::Completion,
+        CoreRecord::Launch,
+    ] {
+        records.insert(
+            record.name().to_owned(),
+            reader
+                .record(record)
+                .timeline(EVENT_READ_LIMIT)
+                .map_err(|e| format!("{e:#}")),
+        );
+    }
+    records.insert("requests/".to_owned(), Ok(Some(vec![1])));
+    for entry in fs::read_dir(reader.record(CoreRecord::Requests).path()).unwrap() {
+        let entry = entry.unwrap();
+        records.insert(
+            format!("requests/{}", entry.file_name().to_str().unwrap()),
+            Ok(Some(fs::read(entry.path()).unwrap())),
+        );
+    }
+    for path in reader.events().unwrap() {
+        records.insert(
+            format!("events/{}", path.file_name().unwrap().to_str().unwrap()),
+            Ok(Some(fs::read(path).unwrap())),
+        );
+    }
+    records
+}
+
+/// The fixture's own directory name, which its manifest names.
+const FIXTURE_ID: &str = "session-fault";
+
+fn cached_snapshot(records: &CachedRecords) -> Result<Snapshot> {
+    Snapshot::assemble(
+        Cached::new(records, None),
+        FIXTURE_ID,
+        PublicationRead::Within(EVENT_READ_LIMIT),
+    )
+}
+
+#[test]
+fn cached_and_live_snapshots_agree_on_publication_and_requests() {
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    let reader = Reader::open_unchecked(&fixture.directory);
+    let cache = cached_records(&reader);
+    let disk = reader.snapshot().unwrap();
+    let cached = cached_snapshot(&cache).unwrap();
+    assert_eq!(
+        serde_json::to_value(&disk.receipts).unwrap(),
+        serde_json::to_value(&cached.receipts).unwrap()
+    );
+    assert_eq!(disk.claim, cached.claim);
+    assert_eq!(
+        disk.active_receipt().unwrap().request_id,
+        cached.active_receipt().unwrap().request_id
+    );
+    assert_eq!(disk.latest_event_id(), cached.latest_event_id());
+    for receipt in &disk.receipts {
+        assert!(disk.published(&receipt.event_file));
+        assert!(cached.published(&receipt.event_file));
+    }
+    assert!(disk.paths[0].is_absolute());
+    assert_eq!(
+        cached.paths[0],
+        PathBuf::from(format!("events/{}", disk.latest_event_id().unwrap()))
+    );
+    assert!(disk._lock.is_some());
+    assert!(cached._lock.is_none());
+    let disk_read = disk.pending_event.as_ref().unwrap();
+    assert!(disk_read.bytes_read > 0);
+    assert!(disk_read.committed_text.is_some());
+    let cached_read = cached.pending_event.as_ref().unwrap();
+    assert_eq!(cached_read.bytes_read, 0);
+    assert!(cached_read.committed_text.is_none());
+}
+
+#[test]
+fn cached_source_preserves_the_timeline_fault_policies() {
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    let reader = Reader::open_unchecked(&fixture.directory);
+    let base = cached_records(&reader);
+    let mut cache = base.clone();
+    cache.insert(
+        CoreRecord::Status.name().to_owned(),
+        Err("status denied".to_owned()),
+    );
+    let status = cached_snapshot(&cache).unwrap().status;
+    assert_eq!(status.state, SessionState::Unknown("unknown".to_owned()));
+    assert_eq!((status.generation, status.updated_unix_ms), (0, 0));
+    assert!(
+        status.exit_code.is_none() && status.error.is_none() && status.residual_surface.is_none()
+    );
+    for value in [Ok(None), Ok(Some(b"{".to_vec()))] {
+        cache.insert(CoreRecord::Status.name().to_owned(), value);
+        assert!(cached_snapshot(&cache).is_err());
+    }
+    for record in [CoreRecord::Completion, CoreRecord::Launch] {
+        let mut cache = base.clone();
+        cache.insert(record.name().to_owned(), Err("unreadable".to_owned()));
+        let snapshot = cached_snapshot(&cache).unwrap();
+        if record.name() == CoreRecord::Completion.name() {
+            assert!(snapshot.pending.is_none());
+        } else {
+            assert!(snapshot.launch.is_none());
+        }
+        cache.insert(record.name().to_owned(), Ok(Some(b"{".to_vec())));
+        assert!(cached_snapshot(&cache).is_err());
+    }
+    // A claim fault leaves the claim absent and the receipts inactive.
+    let mut cache = base.clone();
+    cache.insert(
+        CoreRecord::TurnClaim.name().to_owned(),
+        Err("claim denied".to_owned()),
+    );
+    let snapshot = cached_snapshot(&cache).unwrap();
+    assert!(snapshot.claim.is_none());
+    assert!(snapshot.active_receipt().is_none());
+    // A manifest fault, or no manifest, fails as it did.
+    let mut cache = base.clone();
+    cache.insert(
+        CoreRecord::Manifest.name().to_owned(),
+        Err("manifest denied".to_owned()),
+    );
+    assert_eq!(
+        cached_snapshot(&cache).err().unwrap().to_string(),
+        "manifest denied"
+    );
+    cache.insert(CoreRecord::Manifest.name().to_owned(), Ok(None));
+    assert_eq!(
+        cached_snapshot(&cache).err().unwrap().to_string(),
+        "session has no manifest"
+    );
+    let mut cache = base.clone();
+    cache.insert(
+        "requests/".to_owned(),
+        Err("request index denied".to_owned()),
+    );
+    cache.insert("requests/1-2-3.json".to_owned(), Ok(Some(b"{".to_vec())));
+    let snapshot = cached_snapshot(&cache).unwrap();
+    assert_eq!(
+        snapshot.request_index_error.as_deref(),
+        Some("request index denied")
+    );
+    assert_eq!(snapshot.unreadable_requests, 1);
+    assert_eq!(snapshot.receipts.len(), 1);
+    // An absent requests directory is an empty index without an error.
+    let mut cache = base.clone();
+    cache.retain(|key, _| !key.starts_with("requests/"));
+    cache.insert("requests/".to_owned(), Ok(None));
+    let snapshot = cached_snapshot(&cache).unwrap();
+    assert!(snapshot.receipts.is_empty() && snapshot.request_index_error.is_none());
+    assert_eq!(snapshot.unreadable_requests, 0);
+}
+
+#[test]
+fn cached_source_does_not_fill_filtered_or_unreadable_events_from_disk() {
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    let reader = Reader::open_unchecked(&fixture.directory);
+    let disk = reader.snapshot().unwrap();
+    let name = disk.receipts[0].event_file.clone();
+    let source = format!("events/{name}");
+    for entry in [None, Some(Err("unreadable".to_owned())), Some(Ok(None))] {
+        let mut cache = cached_records(&reader);
+        cache.remove(&source);
+        if let Some(entry) = entry {
+            cache.insert(source.clone(), entry);
+        }
+        let cached = cached_snapshot(&cache).unwrap();
+        assert_eq!(
+            cached.pending_event.unwrap().state,
+            JournaledEventState::Mismatched
+        );
+        assert!(disk.published(&name));
+    }
+    drop(disk);
+    fs::remove_file(reader.event(&name).path()).unwrap();
+    assert_eq!(
+        reader.snapshot().unwrap().pending_event.unwrap().state,
+        JournaledEventState::Absent
+    );
+    assert_eq!(
+        cached_snapshot(&cached_records(&reader))
+            .unwrap()
+            .pending_event
+            .unwrap()
+            .state,
+        JournaledEventState::Mismatched
+    );
+}
+
+/// The Origin observation of the fixture as a managed Origin under its root.
+fn budgeted_observation(directory: &std::path::Path) -> origin::OriginObservation {
+    let reference = origin::OriginReference {
+        id: Some(FIXTURE_ID.to_owned()),
+        kind: origin::SourceKind::Managed,
+        request_id: None,
+        reason: "recorded_source".to_owned(),
+        detail: None,
+    };
+    origin::observe(
+        directory.parent().unwrap(),
+        reference,
+        &mut origin::ReadBudget::for_query(None),
+    )
+}
+
+#[test]
+fn a_manifest_of_another_directory_is_refused_by_every_source() {
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    let reader = Reader::open_unchecked(&fixture.directory);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(reader.record(CoreRecord::Manifest).path()).unwrap())
+            .unwrap();
+    manifest["id"] = "session-other".into();
+    write_json_atomic(reader.record(CoreRecord::Manifest).path(), &manifest).unwrap();
+    const RULE: &str = "session manifest id does not match its directory";
+    // Live: the decoder's rule, without a path.
+    assert_eq!(reader.snapshot().err().unwrap().to_string(), RULE);
+    // Cached: the same rule from the same decoder; the timeline's own check is gone.
+    let cache = cached_records(&reader);
+    assert_eq!(cached_snapshot(&cache).err().unwrap().to_string(), RULE);
+    // Budgeted: the decoder's rule in Origin's own words.
+    let observation = budgeted_observation(&fixture.directory);
+    assert_eq!(observation.reason, "origin_unreadable");
+    assert_eq!(
+        observation.detail.as_deref(),
+        Some("the session manifest does not bind this session id")
+    );
+    assert_eq!(observation.ended, None);
+    // The Cached source binds to the id it is asked for, not to the map's own idea.
+    manifest["id"] = FIXTURE_ID.into();
+    write_json_atomic(reader.record(CoreRecord::Manifest).path(), &manifest).unwrap();
+    let cache = cached_records(&reader);
+    assert!(cached_snapshot(&cache).is_ok());
+    let error = Snapshot::assemble(
+        Cached::new(&cache, None),
+        "session-other",
+        PublicationRead::Within(EVENT_READ_LIMIT),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.to_string(), RULE);
+}
+
+#[test]
+fn a_malformed_status_wins_over_a_malformed_journal_in_every_source() {
+    let fixture = seed_close_fixture(JournaledEventState::Committed);
+    let reader = Reader::open_unchecked(&fixture.directory);
+    fs::write(reader.record(CoreRecord::Status).path(), b"{\"state\":").unwrap();
+    fs::write(reader.record(CoreRecord::Completion).path(), b"[").unwrap();
+    let status_error = format!("{}", status(b"{\"state\":").err().unwrap());
+    let journal_error = format!("{}", journal(b"[").err().unwrap());
+    assert_ne!(status_error, journal_error);
+    // Live and Cached decode the status before the journal.
+    assert_eq!(
+        format!("{:#}", reader.snapshot().err().unwrap()),
+        status_error
+    );
+    let cache = cached_records(&reader);
+    assert_eq!(
+        format!("{:#}", cached_snapshot(&cache).err().unwrap()),
+        status_error
+    );
+    // Budgeted never reads the journal: the status is the fault it reports.
+    let observation = budgeted_observation(&fixture.directory);
+    assert_eq!(observation.reason, "origin_unreadable");
+    assert_eq!(
+        observation.detail.as_deref(),
+        Some(format!("invalid status record: {status_error}").as_str())
+    );
+    // With a readable status, the journal's own error is the one reported.
+    fs::write(reader.record(CoreRecord::Status).path(), STATUS).unwrap();
+    assert_eq!(
+        format!("{:#}", reader.snapshot().err().unwrap()),
+        journal_error
+    );
+    let cache = cached_records(&reader);
+    assert_eq!(
+        format!("{:#}", cached_snapshot(&cache).err().unwrap()),
+        journal_error
+    );
+    // The malformed journal is no fault of Origin's: it goes on to the owner verdict.
+    assert_eq!(
+        budgeted_observation(&fixture.directory).reason,
+        "owner_unverified"
+    );
 }

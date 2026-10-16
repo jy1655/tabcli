@@ -1,22 +1,13 @@
 //! Consistent read-only session records and their publication evidence.
-use super::record::{self, Live, Read, ReceiptNames, Source};
-use super::schema::{EVENT_READ_LIMIT, SESSION_SCHEMA, SessionEvent, SessionManifest};
-use super::turn::{
-    JournaledEventRead, JournaledEventState, PendingTurnCompletion, validate_pending_completion,
-};
-use super::{
-    CoreRecord, Reader, RecordReader, SessionState, SessionStatus, launch, requests, turn,
-};
+use super::record::{self, Live, Read, ReceiptNames, Source, Tolerance};
+use super::schema::{EVENT_READ_LIMIT, SessionEvent, SessionManifest};
+use super::turn::{JournaledEventRead, PendingTurnCompletion};
+use super::{CoreRecord, Reader, RecordReader, SessionState, SessionStatus, launch, requests};
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
-use serde_json::Value;
 use std::{
-    collections::BTreeMap,
     fs::File,
     path::{Path, PathBuf},
 };
-
-pub(in crate::native) type Records = BTreeMap<String, std::result::Result<Option<Vec<u8>>, String>>;
 
 pub(in crate::native) struct Snapshot {
     pub(in crate::native) manifest: SessionManifest,
@@ -153,27 +144,42 @@ impl Snapshot {
     /// Builds the Snapshot from `source` in the order the Live read always used: status
     /// and journal from the state bytes, the publication read as `publication` says, the
     /// receipt index, the manifest bound to `expected_id`, the events, the claim, the
-    /// launch record, then the source's consistency check. A source fault fails the read;
-    /// a source that tolerates faults presents what it keeps as present or absent.
+    /// launch record, then the source's consistency check. A retained fault reaches the
+    /// Snapshot as the source's [`Tolerance`] for that record says: it fails the read,
+    /// leaves the record absent, or (status) yields the unknown status.
     pub(in crate::native) fn assemble(
         mut source: impl Source,
         expected_id: &str,
         publication: PublicationRead,
     ) -> Result<Self> {
-        fn present(read: Read) -> Result<Option<Vec<u8>>> {
-            match read {
+        fn present(source: &mut impl Source, record: CoreRecord) -> Result<Option<Vec<u8>>> {
+            match source.core(record)? {
                 Read::Present(bytes) => Ok(Some(bytes)),
                 Read::Absent => Ok(None),
-                Read::Fault(error) => bail!("{error}"),
+                Read::Fault(error) => match source.tolerance(record) {
+                    Tolerance::Absent => Ok(None),
+                    Tolerance::Fail | Tolerance::UnknownStatus => bail!("{error}"),
+                },
             }
         }
-        let status = match present(source.core(CoreRecord::Status)?)? {
-            Some(bytes) => {
+        let status = match source.core(CoreRecord::Status)? {
+            Read::Present(bytes) => {
                 record::status(&bytes).map_err(|error| source.locate(CoreRecord::Status, error))?
             }
-            None => bail!("session has no status record"),
+            Read::Absent => bail!("session has no status record"),
+            Read::Fault(error) => match source.tolerance(CoreRecord::Status) {
+                Tolerance::UnknownStatus => SessionStatus {
+                    state: SessionState::Unknown("unknown".to_owned()),
+                    generation: 0,
+                    updated_unix_ms: 0,
+                    exit_code: None,
+                    error: None,
+                    residual_surface: None,
+                },
+                Tolerance::Fail | Tolerance::Absent => bail!("{error}"),
+            },
         };
-        let pending = present(source.core(CoreRecord::Completion)?)?
+        let pending = present(&mut source, CoreRecord::Completion)?
             .map(|bytes| {
                 record::journal(&bytes)
                     .map_err(|error| source.locate(CoreRecord::Completion, error))
@@ -197,16 +203,16 @@ impl Snapshot {
                 Some(error),
             ),
         };
-        let manifest = match present(source.core(CoreRecord::Manifest)?)? {
+        let manifest = match present(&mut source, CoreRecord::Manifest)? {
             Some(bytes) => record::manifest(&bytes, expected_id)
                 .map_err(|error| source.locate(CoreRecord::Manifest, error))?,
             None => bail!("session has no manifest"),
         };
         let paths = source.event_paths()?;
         // The Claim is a text token, read as the lifecycle readers read it.
-        let claim = present(source.core(CoreRecord::TurnClaim)?)?
+        let claim = present(&mut source, CoreRecord::TurnClaim)?
             .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned());
-        let launch = present(source.core(CoreRecord::Launch)?)?
+        let launch = present(&mut source, CoreRecord::Launch)?
             .map(|bytes| {
                 record::launch(&bytes).map_err(|error| source.locate(CoreRecord::Launch, error))
             })
@@ -305,150 +311,6 @@ impl Snapshot {
             .context("event has no completion journal")?;
         Reader::open_unchecked(reader.directory()).journaled_event_state_within(pending, limit)
     }
-
-    pub(in crate::native) fn from_records(records: &Records) -> Result<Self> {
-        fn optional<T: for<'de> Deserialize<'de>>(
-            records: &Records,
-            source: &str,
-        ) -> Result<Option<T>> {
-            if records[source].is_err() {
-                return Ok(None);
-            }
-            parsed(records, source)
-        }
-        let index = receipt_index(records);
-        let manifest: SessionManifest =
-            parsed(records, CoreRecord::Manifest.name())?.context("session has no manifest")?;
-        if manifest.schema != SESSION_SCHEMA {
-            bail!(
-                "unsupported session schema {} for {}",
-                manifest.schema,
-                manifest.id
-            );
-        }
-        let pending: Option<PendingTurnCompletion> =
-            optional(records, CoreRecord::Completion.name())?;
-        if let Some(p) = &pending {
-            validate_pending_completion(p)?;
-        }
-        let pending_event = pending
-            .as_ref()
-            .map(|p| -> Result<JournaledEventRead> {
-                let source = format!("events/{}", p.event_file);
-                let bytes = records
-                    .get(&source)
-                    .and_then(|r| r.as_ref().ok())
-                    .and_then(|r| r.as_ref());
-                let state = bytes
-                    .map(|b| turn::journaled_event_state_of(p, b, EVENT_READ_LIMIT))
-                    .transpose()?
-                    .unwrap_or(JournaledEventState::Mismatched);
-                Ok(JournaledEventRead {
-                    state,
-                    bytes_read: 0,
-                    committed_text: None,
-                })
-            })
-            .transpose()?;
-        let launch: Option<launch::Record> = optional(records, CoreRecord::Launch.name())?;
-        if launch
-            .as_ref()
-            .is_some_and(|l| l.schema != 1 || l.claim_token.is_empty())
-        {
-            bail!("invalid launch receipt identity");
-        }
-        let claim = records[CoreRecord::TurnClaim.name()]
-            .as_ref()
-            .ok()
-            .and_then(|v| v.as_ref())
-            .map(|b| std::str::from_utf8(b).map(|s| s.trim().to_owned()))
-            .transpose()?;
-        Ok(Snapshot {
-            manifest,
-            status: if records[CoreRecord::Status.name()].is_err() {
-                SessionStatus {
-                    state: SessionState::Unknown("unknown".to_owned()),
-                    generation: 0,
-                    updated_unix_ms: 0,
-                    exit_code: None,
-                    error: None,
-                    residual_surface: None,
-                }
-            } else {
-                parsed(records, CoreRecord::Status.name())?
-                    .context("session has no status record")?
-            },
-            receipts: index.receipts,
-            unreadable_requests: index.unreadable,
-            request_index_error: records["requests/"].as_ref().err().cloned(),
-            paths: records
-                .keys()
-                .filter(|s| s.starts_with("events/") && s.ends_with(".json"))
-                .map(PathBuf::from)
-                .collect(),
-            claim,
-            pending,
-            launch,
-            pending_event,
-            _lock: None,
-        })
-    }
-}
-
-pub(in crate::native) fn parsed<T: for<'de> Deserialize<'de>>(
-    records: &Records,
-    source: &str,
-) -> Result<Option<T>> {
-    let bytes = records
-        .get(source)
-        .context("record not selected")?
-        .as_ref()
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    bytes
-        .as_ref()
-        .map(|b| {
-            let text = std::str::from_utf8(b).context("invalid UTF-8")?;
-            // Recorded u128 values must fit the integer range supported by json!.
-            fn numbers(v: &Value) -> Result<()> {
-                match v {
-                    Value::Array(vs) => {
-                        for v in vs {
-                            numbers(v)?;
-                        }
-                    }
-                    Value::Object(vs) => {
-                        for (key, v) in vs {
-                            if key.ends_with("_unix_ms") && !v.is_null() && v.as_u64().is_none() {
-                                bail!(
-                                    "record timestamp is outside the JSON unsigned integer range"
-                                );
-                            }
-                            numbers(v)?;
-                        }
-                    }
-                    _ => (),
-                }
-                Ok(())
-            }
-            numbers(&serde_json::from_str::<Value>(text)?)?;
-            serde_json::from_str(text).context("invalid JSON record")
-        })
-        .transpose()
-}
-
-pub(in crate::native) fn receipt_index(records: &Records) -> requests::Index {
-    let tokens = records
-        .keys()
-        .filter_map(|source| source.strip_prefix("requests/")?.strip_suffix(".json"))
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    record::receipt_index(&tokens, |token| {
-        match &records[&format!("requests/{token}.json")] {
-            Ok(Some(bytes)) => Read::Present(bytes.clone()),
-            Ok(None) => Read::Absent,
-            Err(error) => Read::Fault(error.clone()),
-        }
-    })
 }
 
 #[cfg(test)]

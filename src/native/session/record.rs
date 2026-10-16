@@ -6,7 +6,9 @@
 //! caller context; every caller adds its own and keeps its own missing-record policy. The
 //! Claim is a text token, not a decoded Record, and keeps its readers.
 use super::schema::{SESSION_SCHEMA, SessionManifest};
-use super::turn::{JournaledEventRead, PendingTurnCompletion, validate_pending_completion};
+use super::turn::{
+    JournaledEventRead, JournaledEventState, PendingTurnCompletion, validate_pending_completion,
+};
 use super::{CoreRecord, Reader, SessionStatus, SnapshotBusy, launch, requests};
 use anyhow::{Context, Error, Result, bail};
 use serde::de::DeserializeOwned;
@@ -69,9 +71,10 @@ pub(in crate::native) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, 
     serde_json::from_str(text).map_err(|error| DecodeError::Malformed(error.into()))
 }
 
-// Recorded u128 values must fit the integer range supported by `json!`, or a renderer
-// that re-serializes the record would panic.
-fn timestamps_in_range(value: &Value) -> Result<()> {
+/// Recorded u128 values must fit the integer range supported by `json!`, or a renderer
+/// that re-serializes the record would panic. Shared with the timeline's own parser of
+/// auxiliary and event projections.
+pub(in crate::native) fn timestamps_in_range(value: &Value) -> Result<()> {
     match value {
         Value::Array(values) => values.iter().try_for_each(timestamps_in_range),
         Value::Object(fields) => fields.iter().try_for_each(|(key, value)| {
@@ -168,14 +171,34 @@ pub(in crate::native) enum ReceiptNames {
     },
 }
 
+/// What the assembly does with a [`Read::Fault`] of one core Record: the source's own
+/// tolerance, decided per record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::native) enum Tolerance {
+    /// The fault fails the read with its retained text.
+    Fail,
+    /// The Record is absent in the Snapshot; the source keeps the fault where it retains it.
+    Absent,
+    /// Status only: the Snapshot carries `SessionState::Unknown("unknown")` with
+    /// generation and time zero and no diagnostics.
+    UnknownStatus,
+}
+
 /// The bytes a Snapshot is assembled from, under the source's own read policy. The
-/// assembly decodes; the source decides where bytes come from, which faults it retains,
-/// how it keeps the read consistent, and which lock it hands to the Snapshot.
+/// assembly decodes; the source decides where bytes come from, which faults it retains
+/// and how the assembly tolerates them, how it keeps the read consistent, and which lock
+/// it hands to the Snapshot.
 pub(in crate::native) trait Source {
     /// The bytes of a core Record: manifest, status, claim, journal or launch record.
     /// `Err` is reserved for a failure the source does not retain as a fault, such as
     /// [`SnapshotBusy`] or the Live reads' own I/O errors.
     fn core(&mut self, record: CoreRecord) -> Result<Read>;
+    /// How a retained fault of `record` reaches the Snapshot; by default it fails the
+    /// read.
+    fn tolerance(&self, record: CoreRecord) -> Tolerance {
+        let _ = record;
+        Tolerance::Fail
+    }
     /// The source's own context for a decoder error of `record`.
     fn locate(&self, record: CoreRecord, error: DecodeError) -> Error {
         let _ = record;
@@ -327,6 +350,112 @@ impl Source for Live<'_> {
                 return Err(SnapshotBusy.into());
             }
         }
+        Ok(self.lock)
+    }
+}
+
+/// The timeline's read-once map: every selected record by its name, present with its
+/// bytes, absent, or the text of the fault that kept it from being read. The core
+/// Records are keyed by [`CoreRecord::name`]; `requests/` holds the presence of the
+/// directory (`Err` when the listing failed, after any entries read before that),
+/// `requests/<claim>.json` the receipt bytes, `events/` the presence of the events
+/// directory and `events/<name>` the retained event bytes.
+pub(in crate::native) type CachedRecords =
+    std::collections::BTreeMap<String, std::result::Result<Option<Vec<u8>>, String>>;
+
+/// The Cached adapter: the timeline's map, collected once before the assembly and
+/// compared again by the timeline after rendering. A fault of the status yields the
+/// unknown status; a fault of the claim, journal or launch record leaves it absent and
+/// stays in the map for the timeline's unreadable entries; every other fault fails. The
+/// publication of the journaled event is decided from the retained event bytes, never
+/// from disk.
+pub(in crate::native) struct Cached<'a> {
+    records: &'a CachedRecords,
+    lock: Option<File>,
+}
+
+impl<'a> Cached<'a> {
+    pub(in crate::native) fn new(records: &'a CachedRecords, lock: Option<File>) -> Self {
+        Self { records, lock }
+    }
+
+    fn read(&self, key: &str) -> Read {
+        match self.records.get(key) {
+            Some(Ok(Some(bytes))) => Read::Present(bytes.clone()),
+            Some(Ok(None)) | None => Read::Absent,
+            Some(Err(error)) => Read::Fault(error.clone()),
+        }
+    }
+
+    /// The claim tokens of the receipts the map holds.
+    fn receipt_tokens(&self) -> Vec<String> {
+        self.records
+            .keys()
+            .filter_map(|source| source.strip_prefix("requests/")?.strip_suffix(".json"))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+impl Source for Cached<'_> {
+    fn core(&mut self, record: CoreRecord) -> Result<Read> {
+        Ok(self.read(record.name()))
+    }
+
+    fn tolerance(&self, record: CoreRecord) -> Tolerance {
+        match record {
+            CoreRecord::Status => Tolerance::UnknownStatus,
+            CoreRecord::TurnClaim | CoreRecord::Completion | CoreRecord::Launch => {
+                Tolerance::Absent
+            }
+            _ => Tolerance::Fail,
+        }
+    }
+
+    fn publication_read(
+        &mut self,
+        pending: &PendingTurnCompletion,
+        limit: u64,
+    ) -> Result<JournaledEventRead> {
+        // A missing, filtered or unreadable event is never refilled from disk: it is
+        // unpublished for this read.
+        let state = match self.read(&format!("events/{}", pending.event_file)) {
+            Read::Present(bytes) => super::turn::journaled_event_state_of(pending, &bytes, limit)?,
+            Read::Absent | Read::Fault(_) => JournaledEventState::Mismatched,
+        };
+        Ok(JournaledEventRead {
+            state,
+            bytes_read: 0,
+            committed_text: None,
+        })
+    }
+
+    fn receipt_names(&mut self) -> ReceiptNames {
+        match self.records.get("requests/") {
+            Some(Ok(Some(_))) => ReceiptNames::Present(self.receipt_tokens()),
+            Some(Ok(None)) | None => ReceiptNames::Absent,
+            Some(Err(error)) => ReceiptNames::Fault {
+                tokens: self.receipt_tokens(),
+                error: error.clone(),
+            },
+        }
+    }
+
+    fn receipt(&mut self, token: &str) -> Read {
+        self.read(&format!("requests/{token}.json"))
+    }
+
+    fn event_paths(&mut self) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .records
+            .keys()
+            .filter(|source| source.starts_with("events/") && source.ends_with(".json"))
+            .map(PathBuf::from)
+            .collect())
+    }
+
+    fn finish(self) -> Result<Option<File>> {
+        // The whole-map recheck is the timeline's, after it has rendered from the map.
         Ok(self.lock)
     }
 }

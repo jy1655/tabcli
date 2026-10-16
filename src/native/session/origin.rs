@@ -8,15 +8,14 @@
 use super::enumerate::{CheckOrder, Fault, enumerate};
 use super::launch;
 use super::primitives::{EXTERNAL_SOURCE, valid_session_id};
+use super::record::{self, DecodeError};
 use super::requests::{self, Receipt};
-use super::schema::{SESSION_SCHEMA, SessionManifest};
 use super::snapshot::Snapshot;
 use super::turn::valid_turn_claim_token;
 use super::{CoreRecord, Reader, RecordReader, SessionState, SessionStatus, SnapshotBusy};
 use crate::native::process_identity::{Attested, Gone, ProcessObservation};
 use crate::native::terminal::ownership::NativeSessionOwner;
 use serde::Serialize;
-use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -154,14 +153,19 @@ impl ReadBudget {
         outcome
     }
 
-    fn json<T: DeserializeOwned>(&mut self, record: &RecordReader) -> Result<Option<T>, ReadFault> {
+    /// The Budgeted adapter over one core Record: the bytes within the budget, then the
+    /// shared decoder. Only a decoder failure maps to `Unreadable`, malformed bytes with
+    /// the path-qualified `invalid JSON in {path}` context and a broken rule with its own
+    /// message; the read's own faults keep their kind and charging.
+    fn decoded<T>(
+        &mut self,
+        record: &RecordReader,
+        decode: impl FnOnce(&[u8]) -> Result<T, DecodeError>,
+    ) -> Result<Option<T>, ReadFault> {
         self.read(record)?
             .map(|bytes| {
-                serde_json::from_slice(&bytes).map_err(|error| {
-                    ReadFault::Unreadable(format!(
-                        "invalid JSON in {}: {error}",
-                        record.path().display()
-                    ))
+                decode(&bytes).map_err(|error| {
+                    ReadFault::Unreadable(format!("{:#}", error.in_path(record.path())))
                 })
             })
             .transpose()
@@ -316,14 +320,7 @@ pub(in crate::native) fn read_reference(
         .and_then(|name| name.to_str())
         .unwrap_or_default()
         .to_owned();
-    let launch = budget
-        .json::<launch::Record>(&reader.record(CoreRecord::Launch))
-        .and_then(|launch| match launch {
-            Some(launch) if launch.schema != 1 || launch.claim_token.is_empty() => Err(
-                ReadFault::Unreadable("invalid launch receipt identity".to_owned()),
-            ),
-            launch => Ok(launch),
-        });
+    let launch = budget.decoded(&reader.record(CoreRecord::Launch), record::launch);
     select(&own_id, launch, |token| {
         if !requests::requests_directory_present(reader)
             .map_err(|error| ReadFault::Unreadable(format!("{error:#}")))?
@@ -332,18 +329,9 @@ pub(in crate::native) fn read_reference(
         }
         #[cfg(test)]
         tests::count_receipt_read();
-        let Some(receipt) = budget.json::<Receipt>(&requests::receipt_record(reader, token))?
-        else {
-            return Ok(None);
-        };
-        requests::validate(&receipt)
-            .map_err(|error| ReadFault::Unreadable(format!("{error:#}")))?;
-        if receipt.claim_token != token {
-            return Err(ReadFault::Unreadable(
-                "Bridge request receipt belongs to a different claim".to_owned(),
-            ));
-        }
-        Ok(Some(receipt))
+        budget.decoded(&requests::receipt_record(reader, token), |bytes| {
+            record::receipt(bytes, token)
+        })
     })
 }
 
@@ -448,19 +436,22 @@ fn session_directory(root: &Path, id: &str) -> Result<Option<Reader>, Target> {
 }
 
 fn bound_manifest(reader: &Reader, id: &str, budget: &mut ReadBudget) -> Result<(), ReadFault> {
-    let manifest = budget
-        .json::<SessionManifest>(&reader.record(CoreRecord::Manifest))?
+    // The decoder's schema and id rules are Origin's one binding rule, in its own words.
+    budget
+        .decoded(&reader.record(CoreRecord::Manifest), |bytes| {
+            record::manifest(bytes, id).map_err(|error| match error {
+                DecodeError::Rule(_) => DecodeError::Rule(anyhow::anyhow!(
+                    "the session manifest does not bind this session id"
+                )),
+                malformed => malformed,
+            })
+        })?
         .ok_or_else(|| ReadFault::Unreadable("the session has no manifest".to_owned()))?;
-    if manifest.schema != SESSION_SCHEMA || manifest.id != id {
-        return Err(ReadFault::Unreadable(
-            "the session manifest does not bind this session id".to_owned(),
-        ));
-    }
     Ok(())
 }
 
 fn status_of(bytes: &[u8]) -> Result<SessionStatus, ReadFault> {
-    serde_json::from_slice(bytes)
+    record::status(bytes)
         .map_err(|error| ReadFault::Unreadable(format!("invalid status record: {error}")))
 }
 

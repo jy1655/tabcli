@@ -1247,6 +1247,44 @@ fn failed_reads_are_charged_against_the_cumulative_allowance() {
 }
 
 #[test]
+fn a_short_invalid_utf8_record_is_charged_the_whole_attempt() {
+    let _hooks = Hooks::new();
+    let root = tempfile::tempdir().unwrap();
+    let origin = Session::new(root.path(), "session-origin", "ready");
+    let status = origin.reader().record(CoreRecord::Status);
+    let mut budget = ReadBudget::new(Instant::now() + Duration::from_secs(60), OBSERVATION_BYTES);
+    // Two bytes that are not UTF-8: the reader refuses them, and the whole attempt is
+    // reserved, as for a record that fills the per-record limit.
+    fs::write(status.path(), b"\xff\xfe").unwrap();
+    let fault = budget.decoded(&status, record::status).err().unwrap();
+    assert!(
+        matches!(&fault, ReadFault::Unreadable(error) if error.contains("invalid UTF-8")),
+        "{fault:?}"
+    );
+    assert_eq!(budget.remaining, OBSERVATION_BYTES - RECORD_LIMIT);
+    // Two bytes the reader accepts and the decoder refuses cost only what was read.
+    fs::write(status.path(), b"{}").unwrap();
+    let fault = budget.decoded(&status, record::status).err().unwrap();
+    assert!(
+        matches!(&fault, ReadFault::Unreadable(error) if error.starts_with("invalid JSON in ")),
+        "{fault:?}"
+    );
+    assert_eq!(budget.remaining, OBSERVATION_BYTES - RECORD_LIMIT - 2);
+    // Through the observation the fault is the record's, not the budget's.
+    fs::write(status.path(), b"\xff\xfe").unwrap();
+    let child = Session::started_from(root.path(), "session-child", "ready", "session-origin");
+    let observation = observed(root.path(), &child);
+    assert_eq!(observation.reason, "origin_unreadable");
+    assert!(
+        observation
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("invalid UTF-8")),
+        "{observation:?}"
+    );
+}
+
+#[test]
 fn reaching_a_scan_cap_exactly_stops_and_marks_the_scan_incomplete() {
     let hooks = Hooks::new();
     let root = tempfile::tempdir().unwrap();

@@ -1,10 +1,11 @@
 //! A read-only projection of retained evidence, not a history of inferred transitions.
 use super::*;
+use crate::native::session::record::{self, Cached, CachedRecords as Records};
 use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
-use crate::native::session::snapshot::{Records, parsed, receipt_index};
 use crate::native::session::{CoreRecord, Reader};
 use crate::native::{EventsDirectory, valid_turn_claim_token};
 use agent_bridge::PUBLIC_COMMAND;
+use serde::de::DeserializeOwned;
 
 // Auxiliary launch diagnostics retain at most 1 MiB; all other reads use
 // the existing 64 MiB event limit. Oversized files are evidence gaps.
@@ -99,6 +100,40 @@ fn records(reader: &Reader, request: Option<&str>) -> Result<Records> {
     }
     records.insert("events/".to_owned(), Ok(present.then(|| vec![1])));
     Ok(records)
+}
+
+/// The timeline's own strict parser of a retained record that is not a core Record (the
+/// cancel record, the terminal records, an event) or a deserialize-only diagnostic: strict
+/// UTF-8, the `_unix_ms` range rule, then the shape, with the `invalid JSON record`
+/// context. A retained read fault is the error it was retained as.
+fn parsed<T: DeserializeOwned>(records: &Records, source: &str) -> Result<Option<T>> {
+    let bytes = records
+        .get(source)
+        .context("record not selected")?
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    bytes
+        .as_ref()
+        .map(|b| {
+            let text = std::str::from_utf8(b).context("invalid UTF-8")?;
+            record::timestamps_in_range(&serde_json::from_str::<Value>(text)?)?;
+            serde_json::from_str(text).context("invalid JSON record")
+        })
+        .transpose()
+}
+
+/// The receipt index over the retained receipts, as the Cached source presents it, so
+/// that the request filter of the event collection matches the assembled Snapshot.
+fn receipt_index(records: &Records) -> requests::Index {
+    let mut source = Cached::new(records, None);
+    use crate::native::session::record::Source as _;
+    let tokens = match source.receipt_names() {
+        record::ReceiptNames::Absent => Vec::new(),
+        record::ReceiptNames::Present(tokens) | record::ReceiptNames::Fault { tokens, .. } => {
+            tokens
+        }
+    };
+    record::receipt_index(&tokens, |token| source.receipt(token))
 }
 
 fn event(records: &Records, snapshot: &Snapshot, name: &str) -> Result<Option<SessionEvent>> {
@@ -596,7 +631,12 @@ fn render_close_and_log(
             }
             Ok(Some(_)) => {
                 let parsed = if source == CoreRecord::Closed.name() {
-                    parsed::<SessionStatus>(before, source).map(|v| v.map(|v| json!(v)))
+                    match read {
+                        Ok(Some(bytes)) => record::status(bytes)
+                            .map(|status| Some(json!(status)))
+                            .map_err(anyhow::Error::from),
+                        _ => unreachable!("matched a present record"),
+                    }
                 } else if source == CoreRecord::TerminalClosing.name() {
                     parsed::<terminal::TerminalSession>(before, source).map(|v| v.map(|v| json!(v)))
                 } else {
@@ -659,11 +699,15 @@ pub(in crate::native) fn timeline_value(
     let directory = reader.directory();
     let lock = reader.lock_shared_with_retry(snapshot_retry_window())?;
     let before = records(reader, request)?;
-    let mut snapshot = Snapshot::from_records(&before)?;
-    snapshot._lock = lock;
-    if directory.file_name().and_then(|n| n.to_str()) != Some(snapshot.manifest.id.as_str()) {
-        bail!("session manifest id does not match its directory");
-    }
+    let expected_id = directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let snapshot = Snapshot::assemble(
+        Cached::new(&before, lock),
+        expected_id,
+        PublicationRead::Within(EVENT_READ_LIMIT),
+    )?;
     before_consistency_check(directory);
     if let Some(request) = request {
         // Keep the exact-request lookup's missing/incomplete-index error contract.
@@ -705,12 +749,7 @@ pub(in crate::native) fn timeline_value(
     let request_index_state =
         if snapshot.request_index_error.is_some() || snapshot.unreadable_requests > 0 {
             "unreadable"
-        } else if Reader::open_unchecked(directory)
-            .record(CoreRecord::Requests)
-            .path()
-            .to_owned()
-            .exists()
-        {
+        } else if before["requests/"].as_ref().is_ok_and(|v| v.is_some()) {
             "observed"
         } else {
             "missing"
