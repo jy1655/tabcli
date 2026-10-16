@@ -109,6 +109,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   order, the adapter's own arguments, the Initial prompt's place), the environment removals, the
   initial-prompt disposition the wrapper applies after the spawn, and an unstarted completion
   watcher the wrapper starts and stops; `provider/mod.rs` holds only provider-neutral contracts.
+  Claude's cross-session messenger (the follow-up Transport, the Windows initial transport, and
+  the `message-guard` and `message-receipt` controls) is its own module under `claude/`, built
+  per send from a clock and a retry policy so that its timeout and retry tests inject both; the
+  adapter keeps launch, resume, trust, hook completion, Reopen and doctor.
   It uses the session seam and terminal operations. Keep provider schemas and transport selection
   in `src/native/provider/<provider>/` (or a single `<provider>.rs` file), not in shared
   orchestration.
