@@ -95,6 +95,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   command; shared launch code no longer does.
 - `src/native/provider/` owns each provider's launch and resume plans, trust interpretation,
   transports, completion correlation, hooks, diagnostics, and adapter-private records. Each
+  adapter owns its provider home, resolved from the environment snapshot: the trust store, and
+  for Claude the session registry, for Agy the brain root, for Codex the memories directory. Each
   adapter's launch and resume plan is the complete provider command (the policy flags in the fixed
   order, the adapter's own arguments, the Initial prompt's place), the environment removals, the
   initial-prompt disposition the wrapper applies after the spawn, and an unstarted completion
@@ -204,16 +206,20 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   root unless isolation is requested; it is not called implicitly by another command.
 - `src/native/consent.rs` reads exact-workspace trust evidence, maintains Bridge consent, and
   coordinates its application through provider and terminal adapters, consuming their declared
-  `LaunchTrust` facts for launch trust policy. Provider stores are read directly but never written
-  directly by Bridge.
+  `LaunchTrust` facts for launch trust policy. It snapshots the caller's environment once per
+  boundary and asks each adapter for a workspace's trust against the adapter's own home, or the
+  recorded source store for a recheck; it knows no provider path. Provider stores are still read
+  through consent's store reader and never written by Bridge. It also owns the one trust wait,
+  which checks the ended-session rule first and serves the Codex paste gate and the Agy delivery
+  gate with their own readiness and messages.
 - `src/native/settings.rs` owns user preferences for surface creation and one launch admission
   preference, `codex-memory-workspace`. A preference cannot grant or remove close authority over
   an existing session or surface.
 - `src/native/session_start/admission.rs` applies that admission preference to a resolved
   workspace for `ask`, `reopen`, and `self-test`, before any session record, consent record,
-  provider check, or surface exists. It reads the caller's environment through the same `Homes`
-  resolution as workspace trust; the protected `memories` location is declared by the Codex
-  adapter, and no other adapter takes part. A refusal writes nothing.
+  provider check, or surface exists. It reads the caller's environment through the same
+  `Environment` snapshot as workspace trust; the protected `memories` location is declared by the
+  Codex adapter, and no other adapter takes part. A refusal writes nothing.
 
 ## Session lifecycle
 
