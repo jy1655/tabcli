@@ -316,12 +316,16 @@ fn submission_return_drain_times_out_at_the_deadline_as_uncertain() {
         error.to_string(),
         "Windows console input was not consumed before the submission Return"
     );
-    assert!(!super::super::windows_console_helper_reports_send_not_started(&error.to_string()));
+    assert!(
+        !super::super::windows_budget::windows_console_helper_reports_send_not_started(
+            &error.to_string()
+        )
+    );
 }
 
 #[test]
 fn codex_paste_confirmation_and_submission_are_delayed_from_the_text_batch() {
-    let immediate = super::super::windows_console_immediate_submit_count(2);
+    let immediate = super::super::windows_budget::windows_console_immediate_submit_count(2);
     let initial_records =
         build_console_input_records("prompt", immediate, super::ConsoleNewline::ShiftReturn);
     assert_eq!(return_key_down_count(&initial_records), 0);
@@ -524,7 +528,7 @@ fn close_deadline_new_helper_observes_gone_root_and_ends_recorded_live_host() {
     )
     .unwrap_err();
     assert!(
-        super::super::windows_console_helper_reports_missing(&error.to_string()),
+        super::super::windows_budget::windows_console_helper_reports_missing(&error.to_string()),
         "{error:#}"
     );
     assert_eq!(host.wait().unwrap().code(), Some(0));

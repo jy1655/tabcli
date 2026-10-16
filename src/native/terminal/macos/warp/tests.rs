@@ -56,6 +56,7 @@ use super::*;
 struct FakeRunner {
     directory: PathBuf,
     attempt: String,
+    clients: Vec<ControlClient>,
     dispatched: bool,
     ambiguous: bool,
     wrong_rename_identity: bool,
@@ -101,6 +102,7 @@ impl FakeRunner {
         Self {
             directory: directory.to_owned(),
             attempt: attempt.to_owned(),
+            clients: Vec::new(),
             dispatched: false,
             ambiguous: false,
             wrong_rename_identity: false,
@@ -170,6 +172,14 @@ impl FakeRunner {
 }
 
 impl WarpRunner for FakeRunner {
+    fn control_clients(&mut self) -> Result<Vec<ControlClient>> {
+        Ok(self.clients.clone())
+    }
+
+    fn attempt_token(&mut self) -> Result<String> {
+        Ok(self.attempt.clone())
+    }
+
     fn process_birth(&mut self, _pid: u32) -> Result<Option<(u64, u64)>> {
         if self.birth_unreadable {
             bail!("injected app birth unreadable");
@@ -605,6 +615,7 @@ fn public_seam_uses_supplied_directory_without_global_rescue() {
         deadline: Instant,
     ) -> Result<CloseOutcome> {
         super::super::close_owned_session(
+            super::super::INSTALLED,
             directory,
             "session-test",
             session,
@@ -872,6 +883,51 @@ fn public_seam_uses_supplied_directory_without_global_rescue() {
             .to_string()
             .contains("non-directory")
     );
+}
+
+// The adapter takes the clients and the attempt token from its runner, in that
+// order, before the open protocol, and every later operation reaches the same runner.
+#[test]
+fn adapter_opens_and_observes_through_its_own_runner() {
+    let (temp, client, attempt) = fixture();
+    let directory = temp.path().join("session-test");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut runner = FakeRunner::new(&directory, &attempt);
+    runner.clients = vec![client];
+    let local = Adapter::with_runner(runner);
+    let adapter: &dyn MacTerminalAdapter = &local;
+    let bound = Cell::new(false);
+    let session = adapter
+        .open_bound_tab(
+            MacosOpenMode::TabFirst,
+            ". launch.sh",
+            &directory,
+            Instant::now() + Duration::from_secs(4),
+            Box::new(|record| {
+                assert_eq!(record.tab_id.as_deref(), Some("new-tab"));
+                record.managed_session_id = Some("session-test".into());
+                bound.set(true);
+                Ok(())
+            }),
+            Box::new(|| panic!("successful open stays bound")),
+        )
+        .unwrap();
+    assert!(bound.get());
+    assert_eq!(session.kind, TerminalKind::Warp);
+    let binding: ControlBinding = read_record(&directory.join(CONTROL_FILE), "binding").unwrap();
+    assert_eq!(
+        binding.attempt, attempt,
+        "the attempt token is the runner's"
+    );
+    let calls_after_open = local.runner().calls.len();
+    assert!(calls_after_open > 0);
+    assert!(
+        adapter
+            .surface_present(&directory, &session, Duration::from_secs(2))
+            .unwrap()
+    );
+    assert!(local.runner().calls.len() > calls_after_open);
 }
 
 #[test]
@@ -2526,6 +2582,12 @@ struct ProofBirthRunner {
 }
 
 impl WarpRunner for ProofBirthRunner {
+    fn control_clients(&mut self) -> Result<Vec<ControlClient>> {
+        self.fake.control_clients()
+    }
+    fn attempt_token(&mut self) -> Result<String> {
+        self.fake.attempt_token()
+    }
     fn process_birth(&mut self, pid: u32) -> Result<Option<(u64, u64)>> {
         match self.injected_birth {
             Some(birth) => Ok(birth),

@@ -428,6 +428,7 @@ pub(in crate::native) fn close_owned_surface(
             },
             |has_native_owner| {
                 terminal::macos::close_owned_session(
+                    terminal::macos::INSTALLED,
                     directory,
                     id,
                     session,

@@ -452,9 +452,15 @@ fn close_session_until(
 pub(super) struct Adapter<R: Automation> {
     automation: R,
 }
-pub(super) static ADAPTER: Adapter<Osascript> = Adapter {
-    automation: Osascript,
-};
+pub(super) type InstalledAdapter = Adapter<Osascript>;
+impl Adapter<Osascript> {
+    /// The adapter over the installed `osascript`.
+    pub(super) const fn installed() -> Self {
+        Self {
+            automation: Osascript,
+        }
+    }
+}
 #[cfg(test)]
 pub(super) fn with_automation<R: Automation>(automation: R) -> Adapter<R> {
     Adapter { automation }

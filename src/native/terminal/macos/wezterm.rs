@@ -1209,7 +1209,13 @@ pub(super) fn close_session_until(
 pub(super) struct Adapter<H: Host> {
     host: H,
 }
-pub(super) static ADAPTER: Adapter<Installed> = Adapter { host: Installed };
+pub(super) type InstalledAdapter = Adapter<Installed>;
+impl Adapter<Installed> {
+    /// The adapter over the installed `wezterm` and this machine's processes.
+    pub(super) const fn installed() -> Self {
+        Self { host: Installed }
+    }
+}
 #[cfg(test)]
 impl<H: Host> Adapter<H> {
     fn with_host(host: H) -> Self {

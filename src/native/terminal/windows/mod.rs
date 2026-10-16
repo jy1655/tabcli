@@ -717,7 +717,11 @@ pub(super) fn close_session_until(
 ) -> Result<CloseOutcome> {
     match run_console_helper("close", session, None, deadline) {
         Ok(()) => Ok(CloseOutcome::Closed),
-        Err(error) if super::windows_console_helper_reports_missing(&error.to_string()) => {
+        Err(error)
+            if super::windows_budget::windows_console_helper_reports_missing(
+                &error.to_string(),
+            ) =>
+        {
             Ok(CloseOutcome::Missing)
         }
         Err(error) => Err(error),
@@ -731,7 +735,7 @@ fn run_console_send_helper(
 ) -> super::TerminalSendResult {
     let mut command = console_helper_command("send", session, Some(input))
         .map_err(super::TerminalSendFailure::not_sent)?;
-    let timeout = super::remaining_send_budget_at(deadline, Instant::now())
+    let timeout = super::windows_budget::remaining_send_budget_at(deadline, Instant::now())
         .map_err(super::TerminalSendFailure::not_sent)?;
     let timeout_ms = u64::try_from(timeout.as_millis())
         .context("Windows console timeout is too large")
@@ -754,7 +758,7 @@ fn run_console_send_helper(
     }
     let message = console_helper_failure_message(&output);
     let error = anyhow::anyhow!(message);
-    if super::windows_console_helper_reports_send_not_started(&error.to_string()) {
+    if super::windows_budget::windows_console_helper_reports_send_not_started(&error.to_string()) {
         Err(super::TerminalSendFailure::not_sent(error))
     } else {
         Err(super::TerminalSendFailure::delivery_uncertain(error))
@@ -859,7 +863,8 @@ pub(super) fn console_control(
         Err(error) => {
             // The root is gone, and with it the session. The host of its tab has nothing
             // left to wait for.
-            if close_requested && super::windows_console_helper_reports_missing(&error.to_string())
+            if close_requested
+                && super::windows_budget::windows_console_helper_reports_missing(&error.to_string())
             {
                 end_tab_host(recorded_host.as_ref())?;
             }
@@ -933,7 +938,7 @@ pub(super) fn console_control(
             newline,
             timeout,
         } => {
-            if !super::windows_console_submit_delays_fit(submit_count, timeout) {
+            if !super::windows_budget::windows_console_submit_delays_fit(submit_count, timeout) {
                 bail!(
                     "Windows console submission delays do not fit inside the remaining turn timeout"
                 );
@@ -1342,7 +1347,8 @@ fn write_console_input(
             .context("failed to open managed Windows console input");
     }
     let result = (|| {
-        let first_submit = super::windows_console_immediate_submit_count(submit_count);
+        let first_submit =
+            super::windows_budget::windows_console_immediate_submit_count(submit_count);
         if Instant::now() >= deadline {
             bail!("Windows console input timed out before delivery");
         }
@@ -1354,7 +1360,7 @@ fn write_console_input(
             // Codex detects the fast synthetic text batch as a paste. Keep both
             // its confirmation Return and later submission Return out of that
             // batch so processing speed cannot decide which action they perform.
-            let delay = super::windows_console_extra_submit_delay();
+            let delay = super::windows_budget::windows_console_extra_submit_delay();
             // Temporary measure for issue #124
             wait_for_console_input_drain_with(
                 || {

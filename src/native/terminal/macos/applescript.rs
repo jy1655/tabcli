@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use super::super::TerminalSendFailure;
 use super::{CloseOutcome, TerminalKind};
 
-pub(super) trait Automation {
+pub(in crate::native::terminal) trait Automation {
     fn run(&self, application: &str, script: &str, arguments: &[&str]) -> Result<String>;
     fn run_until(
         &self,
@@ -30,10 +30,6 @@ pub(super) struct Osascript;
 
 impl Automation for Osascript {
     fn run(&self, application: &str, script: &str, arguments: &[&str]) -> Result<String> {
-        #[cfg(test)]
-        if let Some(result) = testing::run(None) {
-            return result;
-        }
         let output = command(script, arguments)
             .output()
             .context("failed to execute /usr/bin/osascript")?;
@@ -47,10 +43,6 @@ impl Automation for Osascript {
         arguments: &[&str],
         deadline: Instant,
     ) -> Result<String> {
-        #[cfg(test)]
-        if let Some(result) = testing::run(Some(deadline)) {
-            return result;
-        }
         if Instant::now() >= deadline {
             bail!("{application} automation timed out before it started");
         }
@@ -397,14 +389,15 @@ mod tests {
     }
 }
 
-// Substitute only the external automation boundary; close dispatch remains production code.
+// The recording automation that tests inject in place of `Osascript`; the adapters'
+// own dispatch and close protocols stay production code.
 #[cfg(test)]
 pub(in crate::native) mod testing {
     use super::*;
     use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(in crate::native::terminal::macos) enum ScriptId {
+    pub(in crate::native::terminal) enum ScriptId {
         ItermOpen,
         ItermSend,
         ItermVerify,
@@ -419,10 +412,7 @@ pub(in crate::native) mod testing {
         TerminalScreen,
     }
     impl ScriptId {
-        pub(in crate::native::terminal::macos) fn identify(
-            application: &str,
-            script: &str,
-        ) -> Self {
+        pub(in crate::native::terminal) fn identify(application: &str, script: &str) -> Self {
             use ScriptId::*;
             let matches: Vec<_> = [
                 ("iTerm2", "on itermCreateWindow(bridgeCommand)", ItermOpen),
@@ -470,13 +460,13 @@ pub(in crate::native) mod testing {
         }
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(in crate::native::terminal::macos) enum Method {
+    pub(in crate::native::terminal) enum Method {
         Run,
         RunUntil,
         RunSendUntil,
     }
     #[derive(Clone, Debug, PartialEq, Eq)]
-    pub(in crate::native::terminal::macos) struct Call {
+    pub(in crate::native::terminal) struct Call {
         pub application: String,
         pub method: Method,
         pub script: ScriptId,
@@ -484,7 +474,7 @@ pub(in crate::native) mod testing {
         pub deadline: Option<Instant>,
     }
     impl Call {
-        pub(in crate::native::terminal::macos) fn new(
+        pub(in crate::native::terminal) fn new(
             application: &str,
             method: Method,
             script: ScriptId,
@@ -500,7 +490,7 @@ pub(in crate::native) mod testing {
             }
         }
     }
-    pub(in crate::native::terminal::macos) enum Reply {
+    pub(in crate::native::terminal) enum Reply {
         Normal(Result<String>),
         Send(std::result::Result<String, TerminalSendFailure>),
     }
@@ -516,23 +506,21 @@ pub(in crate::native) mod testing {
         }
     }
     #[derive(Clone)]
-    pub(in crate::native::terminal::macos) struct Replay(Rc<RefCell<Recording>>);
+    pub(in crate::native::terminal) struct Replay(Rc<RefCell<Recording>>);
     impl Replay {
-        pub(in crate::native::terminal::macos) fn new(
-            replies: impl IntoIterator<Item = Reply>,
-        ) -> Self {
+        pub(in crate::native::terminal) fn new(replies: impl IntoIterator<Item = Reply>) -> Self {
             Self(Rc::new(RefCell::new(Recording {
                 calls: Vec::new(),
                 replies: replies.into_iter().collect(),
             })))
         }
-        pub(in crate::native::terminal::macos) fn normal(replies: &[&str]) -> Self {
+        pub(in crate::native::terminal) fn normal(replies: &[&str]) -> Self {
             Self::new(replies.iter().map(|s| Reply::Normal(Ok((*s).into()))))
         }
-        pub(in crate::native::terminal::macos) fn calls(&self) -> Vec<Call> {
+        pub(in crate::native::terminal) fn calls(&self) -> Vec<Call> {
             self.0.borrow().calls.clone()
         }
-        pub(in crate::native::terminal::macos) fn assert_finished(&self) {
+        pub(in crate::native::terminal) fn assert_finished(&self) {
             assert!(
                 self.0.borrow().replies.is_empty(),
                 "unconsumed automation replies"
@@ -605,27 +593,6 @@ pub(in crate::native) mod testing {
             }
         }
     }
-
-    type Runner = Box<dyn FnMut(Option<Instant>) -> Result<String>>;
-    thread_local! {
-        static RUNNER: std::cell::RefCell<Option<Runner>> = const { std::cell::RefCell::new(None) };
-    }
-    pub(super) fn run(deadline: Option<Instant>) -> Option<Result<String>> {
-        RUNNER.with(|runner| runner.borrow_mut().as_mut().map(|run| run(deadline)))
-    }
-    pub(in crate::native) fn with_runner<T>(
-        runner: impl FnMut(Option<Instant>) -> Result<String> + 'static,
-        run: impl FnOnce() -> T,
-    ) -> T {
-        struct Reset(Option<Runner>);
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                RUNNER.with(|runner| *runner.borrow_mut() = self.0.take());
-            }
-        }
-        let _reset = Reset(RUNNER.with(|slot| slot.replace(Some(Box::new(runner)))));
-        run()
-    }
 }
 
 #[cfg(test)]
@@ -675,7 +642,7 @@ end run
         ))
     }
 
-    pub(in crate::native::terminal::macos) fn assert_guarded_replay(
+    pub(in crate::native::terminal) fn assert_guarded_replay(
         script: &str,
         read_parameters: &str,
         read_arguments: &str,

@@ -7,6 +7,7 @@ use crate::native::session::close::budget::close_remaining;
 use crate::native::session::{self, Store};
 use crate::native::terminal;
 use crate::native::terminal::close_evidence::{CloseEvidence, ResumableAuthority};
+use crate::native::terminal::macos::applescript::Automation;
 use crate::native::terminal::macos::ownership::verified_macos_terminal_owner;
 use crate::native::terminal::macos::process::{live_native_process_identity, macos_process_start};
 use crate::native::terminal::ownership::{
@@ -108,14 +109,17 @@ where
     }
 }
 
-pub(in crate::native) fn terminate_owner(
+// `automation` is the closing adapter's: the surface verification here is the second
+// of the close and runs through the same dependency as the first.
+pub(in crate::native::terminal) fn terminate_owner(
+    automation: &dyn Automation,
     directory: &Path,
     expected_session_id: &str,
     session: &terminal::TerminalSession,
     deadline: std::time::Instant,
 ) -> Result<()> {
     close_remaining(deadline)?;
-    let surface_tty = verified_close_tty(session, deadline)?;
+    let surface_tty = verified_close_tty(automation, session, deadline)?;
     let (mut owner, live) =
         verified_macos_terminal_owner(directory, expected_session_id, session, Some(&surface_tty))?;
     let process_group = verified_terminal_owner_process_group(&owner, &live)?;

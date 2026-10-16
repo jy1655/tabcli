@@ -375,7 +375,7 @@
     "{HOST_COMMAND}": 1,
     "const HOST_COMMAND: &str = TerminalKind::WezTerm.registration().host_command;": 1
   },
-  "src/native/terminal/mod.rs": {
+  "src/native/terminal/windows/budget.rs": {
     "console process is no longer available": 2,
     "Windows console submission delays do not fit inside the remaining turn timeout": 3
   },

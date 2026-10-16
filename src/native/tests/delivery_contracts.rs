@@ -15,18 +15,6 @@ fn remaining_turn_timeout_rejects_an_exhausted_total_budget() {
 }
 
 #[test]
-fn terminal_delivery_keeps_the_original_deadline_after_preflight_work() {
-    let started = Instant::now();
-    let deadline = started + Duration::from_secs(5);
-
-    assert_eq!(
-        terminal::remaining_send_budget_at(deadline, started + Duration::from_secs(3)).unwrap(),
-        Duration::from_secs(2)
-    );
-    assert!(terminal::remaining_send_budget_at(deadline, deadline).is_err());
-}
-
-#[test]
 fn effort_uses_each_provider_native_session_option() {
     assert_eq!(
         provider_effort_args(FirstPartyCli::Codex, "xhigh").unwrap(),
