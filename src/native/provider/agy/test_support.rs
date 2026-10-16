@@ -1,13 +1,9 @@
-use super::delivery::Clock;
 use super::monitor::parse_planner_result;
 use super::{PendingAgyTurn, install_pending_turn, terminal_correlated_prompt};
 use crate::native::session::{Store, turn};
 
 use anyhow::Result;
-use std::cell::Cell;
 use std::path::Path;
-use std::rc::Rc;
-use std::time::{Duration, Instant};
 
 #[cfg(test)]
 pub(super) fn parse_transcript_line(line: &str) -> Option<(u64, String)> {
@@ -477,35 +473,7 @@ pub(super) fn framed_receipt_line(prompt: &str, pending: &PendingAgyTurn) -> Str
     receipt_line(&go_quoted(&framed))
 }
 
-pub(super) struct FakeClock {
-    now: Rc<Cell<Instant>>,
-    pub(super) slept: Duration,
-}
-
-impl FakeClock {
-    pub(super) fn new(now: Instant) -> Self {
-        Self {
-            now: Rc::new(Cell::new(now)),
-            slept: Duration::ZERO,
-        }
-    }
-
-    // The clock's instant, for a log reader that grows the log with the clock.
-    pub(super) fn shared(&self) -> Rc<Cell<Instant>> {
-        Rc::clone(&self.now)
-    }
-}
-
-impl Clock for FakeClock {
-    fn now(&mut self) -> Instant {
-        self.now.get()
-    }
-
-    fn sleep(&mut self, duration: Duration) {
-        self.now.set(self.now.get() + duration);
-        self.slept += duration;
-    }
-}
+pub(super) use crate::native::consent::FakeClock;
 
 pub(super) fn log_sequence(
     logs: Vec<Result<Option<Vec<u8>>>>,

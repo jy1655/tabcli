@@ -1,13 +1,14 @@
-use super::delivery::{Clock, SystemClock, complete_log_lines, glog_timestamp, read_log_bytes};
+use super::delivery::{complete_log_lines, glog_timestamp, read_log_bytes};
 use super::{
     ADAPTER, AGY_LOG_FILE, HOOKS_LOADED_SOURCE, STARTUP_POLL_INTERVAL, TRUST_RECOVERY,
     TRUST_STORE_MISSING,
 };
+use crate::native::consent::{self, Clock, SystemClock, TrustReadiness};
 use crate::native::provider::NativeProviderAdapter;
 use crate::native::session::Reader;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 // Require exact stored trust and this process's non-main hooks load; shared trust alone is insufficient.
 // A missing line does not prove a dialog; see docs/verification/2026-10-01-bug-triage.md.
@@ -30,48 +31,51 @@ pub(super) fn workspace_customizations_loaded(log: &[u8]) -> bool {
 }
 
 // Missing or unreadable trust evidence keeps waiting; timeout or session end returns not_sent.
-// Never paste into an ended session or infer consent from a failed lookup.
-fn wait_for_workspace_trust_with<T, C>(
-    missing: &mut T,
-    ended: &mut dyn FnMut() -> Option<String>,
+// Never paste into an ended session or infer consent from a failed lookup. The loop is
+// consent's shared trust wait; this is Agy's readiness and its two messages. Tests call
+// this seam with a simulated clock and their own observations.
+fn wait_for_workspace_trust_evidence<C: Clock>(
+    directory: &Path,
     deadline: Instant,
-    poll_interval: Duration,
     clock: &mut C,
-) -> Result<()>
-where
-    T: FnMut() -> Result<Option<&'static str>>,
-    C: Clock,
-{
-    loop {
-        if let Some(state) = ended() {
-            bail!(
+    missing: &mut dyn FnMut() -> Result<Option<&'static str>>,
+) -> Result<()> {
+    consent::wait_until_trusted(
+        directory,
+        deadline,
+        consent::TrustPoll {
+            interval: STARTUP_POLL_INTERVAL,
+            sleep_bound: consent::SleepBound::CapturedNow,
+        },
+        clock,
+        &|state| {
+            format!(
                 "the session is {state} and no longer waits for Agy workspace trust, so the prompt was not pasted"
-            );
-        }
-        let observed = missing();
-        if matches!(observed, Ok(None)) {
-            return Ok(());
-        }
-        let now = clock.now();
-        if now >= deadline {
-            let reason = match observed {
-                Err(error) => format!("Agy's trust evidence could not be read ({error:#})"),
-                Ok(missing) => missing.unwrap_or_default().to_owned(),
-            };
-            bail!(
+            )
+        },
+        &mut || {
+            Ok(match missing() {
+                Ok(None) => TrustReadiness::Ready,
+                Ok(Some(missing)) => TrustReadiness::Pending(missing.to_owned()),
+                Err(error) => TrustReadiness::Pending(format!(
+                    "Agy's trust evidence could not be read ({error:#})"
+                )),
+            })
+        },
+        &|reason| {
+            format!(
                 "Agy workspace trust was not verified before the deadline, so the prompt was not pasted: {reason}. {TRUST_RECOVERY}"
-            );
-        }
-        clock.sleep(deadline.saturating_duration_since(now).min(poll_interval));
-    }
+            )
+        },
+    )
 }
 
 pub(super) fn workspace_trust_missing(
     workspace: &Path,
-    env: &super::super::super::consent::Environment,
+    env: &consent::Environment,
     log_path: &Path,
 ) -> Result<Option<&'static str>> {
-    use super::super::super::consent::Trust;
+    use consent::Trust;
     if !matches!(
         ADAPTER.workspace_trust(workspace, env, None)?,
         Trust::Trusted(_)
@@ -89,28 +93,17 @@ pub(super) fn workspace_trust_missing(
 pub(super) fn wait_for_workspace_trust(
     directory: &Path,
     deadline: Instant,
-    env: &super::super::super::consent::Environment,
+    env: &consent::Environment,
 ) -> Result<()> {
     let workspace = Reader::open_unchecked(directory).manifest()?.workspace;
-    super::super::super::consent::user_home(env)?;
+    consent::user_home(env)?;
     let log_path = Reader::open_unchecked(directory)
         .private(AGY_LOG_FILE)
         .path()
         .to_owned();
-    wait_for_workspace_trust_with(
-        &mut || workspace_trust_missing(&workspace, env, &log_path),
-        &mut || {
-            Reader::open_unchecked(directory)
-                .status()
-                .ok()
-                .map(|status| status.state)
-                .filter(|state| state.ended())
-                .map(|state| state.to_string())
-        },
-        deadline,
-        STARTUP_POLL_INTERVAL,
-        &mut SystemClock,
-    )
+    wait_for_workspace_trust_evidence(directory, deadline, &mut SystemClock, &mut || {
+        workspace_trust_missing(&workspace, env, &log_path)
+    })
 }
 
 #[cfg(test)]

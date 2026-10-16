@@ -498,6 +498,123 @@ fn complete_launch_dialog(
     )
 }
 
+// The clock a trust wait and Agy's paste gates poll with. Production reads the system
+// clock; tests inject a simulated one so that no simulated wait becomes a wall-clock sleep.
+pub(in crate::native) trait Clock {
+    fn now(&mut self) -> Instant;
+    fn sleep(&mut self, duration: Duration);
+}
+
+pub(in crate::native) struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&mut self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
+
+// A simulated clock: `sleep` advances it and adds up what was slept, and `shared`
+// hands its instant to a log reader that grows the log with the clock.
+#[cfg(test)]
+pub(in crate::native) struct FakeClock {
+    now: std::rc::Rc<std::cell::Cell<Instant>>,
+    pub(in crate::native) slept: Duration,
+}
+
+#[cfg(test)]
+impl FakeClock {
+    pub(in crate::native) fn new(now: Instant) -> Self {
+        Self {
+            now: std::rc::Rc::new(std::cell::Cell::new(now)),
+            slept: Duration::ZERO,
+        }
+    }
+
+    pub(in crate::native) fn shared(&self) -> std::rc::Rc<std::cell::Cell<Instant>> {
+        std::rc::Rc::clone(&self.now)
+    }
+}
+
+#[cfg(test)]
+impl Clock for FakeClock {
+    fn now(&mut self) -> Instant {
+        self.now.get()
+    }
+
+    fn sleep(&mut self, duration: Duration) {
+        self.now.set(self.now.get() + duration);
+        self.slept += duration;
+    }
+}
+
+// What one poll of a trust wait's readiness callback found. A fatal error is the
+// callback's `Err` and ends the wait at once; a retryable observation is `Pending`
+// with the reason the timeout message reports when it is the last one.
+pub(in crate::native) enum TrustReadiness<R> {
+    Ready,
+    Pending(R),
+}
+
+// How the wait bounds its sleep by the deadline: from the instant it compared with
+// the deadline, or from the clock sampled again after the comparison.
+#[derive(Clone, Copy)]
+pub(in crate::native) enum SleepBound {
+    CapturedNow,
+    Resampled,
+}
+
+// A caller's poll cadence: how long one sleep is at most, and which instant bounds it.
+#[derive(Clone, Copy)]
+pub(in crate::native) struct TrustPoll {
+    pub(in crate::native) interval: Duration,
+    pub(in crate::native) sleep_bound: SleepBound,
+}
+
+// The one trust wait of the paste gates (AGENTS.md, Trust Store Boundary). Every poll
+// looks at the session before it looks at the evidence: a session that has ended has
+// no terminal left to send to, whatever becomes of its workspace's trust, and without
+// this the launcher of a closed session went on waiting until its deadline (#60). A
+// failed status read is ignored. Then the caller's readiness: `Ready` ends the wait,
+// and positive evidence wins over an already-expired deadline; a fatal error
+// propagates; `Pending` keeps waiting until the deadline, whose message formats the
+// current poll's reason. The caller reads the manifest once, outside this loop.
+pub(in crate::native) fn wait_until_trusted<R, C: Clock>(
+    directory: &Path,
+    deadline: Instant,
+    poll: TrustPoll,
+    clock: &mut C,
+    ended_message: &dyn Fn(&str) -> String,
+    ready: &mut dyn FnMut() -> Result<TrustReadiness<R>>,
+    timeout_message: &dyn Fn(R) -> String,
+) -> Result<()> {
+    loop {
+        if let Ok(status) = Reader::open_unchecked(directory).status()
+            && status.state.ended()
+        {
+            bail!("{}", ended_message(&status.state.to_string()));
+        }
+        let reason = match ready()? {
+            TrustReadiness::Ready => return Ok(()),
+            TrustReadiness::Pending(reason) => reason,
+        };
+        let now = clock.now();
+        if now >= deadline {
+            bail!("{}", timeout_message(reason));
+        }
+        let remaining = match poll.sleep_bound {
+            SleepBound::CapturedNow => deadline.saturating_duration_since(now),
+            SleepBound::Resampled => deadline.saturating_duration_since(clock.now()),
+        };
+        clock.sleep(remaining.min(poll.interval));
+    }
+}
+
+const NATIVE_TRUST_TIMEOUT: &str = "workspace trust is not verified; no initial console input was sent. Approve the exact workspace in the managed provider and start a new request after a timeout";
+
 // A provider's positive input-readiness evidence may open the paste gate without exact stored trust.
 // It never widens shared consent; see AGENTS.md, Trust Store Boundary.
 pub(super) fn wait_for_native_trust(
@@ -523,6 +640,9 @@ fn wait_for_native_trust_with(
     })
 }
 
+// Codex's readiness, in order and short-circuiting: a registered applied marker with
+// authorization (an authorization error is fatal), then the adapter's exact stored
+// trust (a lookup error is not trust), then the adapter's own readiness evidence.
 fn wait_for_native_trust_authorized_with(
     directory: &Path,
     target: FirstPartyCli,
@@ -532,43 +652,43 @@ fn wait_for_native_trust_authorized_with(
     authorized: &mut dyn FnMut() -> Result<bool>,
 ) -> Result<()> {
     let manifest = Reader::open_unchecked(directory).manifest()?;
-    loop {
-        // A session that has ended has no terminal left to send to, whatever becomes
-        // of its workspace's trust, so this comes before the evidence. Without it the
-        // launcher of a closed session went on waiting until its deadline.
-        if let Ok(status) = Reader::open_unchecked(directory).status()
-            && status.state.ended()
-        {
-            bail!(
-                "the session is {} and no longer waits for workspace trust; no initial console input was sent",
-                status.state
-            );
-        }
-        let assessment = observe(directory);
-        let applied_here = assessment
-            .get("applied")
-            .and_then(|s| s.as_str())
-            .is_some_and(|marker| {
-                provider::launch_trust_markers().any(|registered| registered == marker)
-            });
-        if (applied_here && authorized()?)
-            || matches!(
-                provider::workspace_trust(target, &manifest.workspace, env, None),
-                Ok(Trust::Trusted(_))
+    wait_until_trusted(
+        directory,
+        deadline,
+        TrustPoll {
+            interval: Duration::from_millis(100),
+            sleep_bound: SleepBound::Resampled,
+        },
+        &mut SystemClock,
+        &|state| {
+            format!(
+                "the session is {state} and no longer waits for workspace trust; no initial console input was sent"
             )
-            || ready()
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "workspace trust is not verified; no initial console input was sent. Approve the exact workspace in the managed provider and start a new request after a timeout"
-            );
-        }
-        thread::sleep(
-            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
-        );
-    }
+        },
+        &mut || {
+            let assessment = observe(directory);
+            let applied_here = assessment
+                .get("applied")
+                .and_then(|s| s.as_str())
+                .is_some_and(|marker| {
+                    provider::launch_trust_markers().any(|registered| registered == marker)
+                });
+            Ok(
+                if (applied_here && authorized()?)
+                    || matches!(
+                        provider::workspace_trust(target, &manifest.workspace, env, None),
+                        Ok(Trust::Trusted(_))
+                    )
+                    || ready()
+                {
+                    TrustReadiness::Ready
+                } else {
+                    TrustReadiness::Pending(())
+                },
+            )
+        },
+        &|()| NATIVE_TRUST_TIMEOUT.to_owned(),
+    )
 }
 
 pub(super) fn observe(directory: &Path) -> serde_json::Value {
@@ -1220,11 +1340,7 @@ mod tests {
                 )
                 .unwrap_err();
                 assert!(asked);
-                assert!(
-                    error
-                        .to_string()
-                        .starts_with("workspace trust is not verified")
-                );
+                assert_eq!(error.to_string(), NATIVE_TRUST_TIMEOUT);
             }
         }
     }
@@ -1273,11 +1389,7 @@ mod tests {
                 )
                 .unwrap_err();
                 assert!(asked);
-                assert!(
-                    error
-                        .to_string()
-                        .starts_with("workspace trust is not verified")
-                );
+                assert_eq!(error.to_string(), NATIVE_TRUST_TIMEOUT);
                 // False authorization still permits the adapter's independent readiness evidence.
                 wait_for_native_trust_authorized_with(
                     &directory,
@@ -1322,10 +1434,11 @@ mod tests {
                 &mut || panic!("authorization after ended"),
             )
             .unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .starts_with(&format!("the session is {state}"))
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "the session is {state} and no longer waits for workspace trust; no initial console input was sent"
+                )
             );
         }
     }
@@ -1398,11 +1511,7 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(ready_calls, 2);
-        assert!(
-            error
-                .to_string()
-                .starts_with("workspace trust is not verified")
-        );
+        assert_eq!(error.to_string(), NATIVE_TRUST_TIMEOUT);
     }
 
     // Issue #60. The store never lists a workspace whose trust the provider takes from
@@ -1477,10 +1586,83 @@ mod tests {
             &mut || false,
         )
         .unwrap_err();
-        assert!(
-            error.starts_with("workspace trust is not verified; no initial console input was sent"),
-            "{error}"
-        );
+        assert_eq!(error, NATIVE_TRUST_TIMEOUT);
+    }
+
+    // The shared loop looks at the session before it asks either caller's readiness,
+    // with each caller's own message, and sleeps nothing for an ended session.
+    #[test]
+    fn the_shared_trust_wait_checks_the_session_before_any_readiness_for_both_callers() {
+        let (_temp, workspace, _fixture) = setup();
+        let start = Instant::now();
+        let poll = TrustPoll {
+            interval: Duration::from_millis(100),
+            sleep_bound: SleepBound::CapturedNow,
+        };
+        fn codex_ended(state: &str) -> String {
+            format!(
+                "the session is {state} and no longer waits for workspace trust; no initial console input was sent"
+            )
+        }
+        fn agy_ended(state: &str) -> String {
+            format!(
+                "the session is {state} and no longer waits for Agy workspace trust, so the prompt was not pasted"
+            )
+        }
+        type EndedMessage = fn(&str) -> String;
+        let messages: [(&str, EndedMessage); 2] = [("codex", codex_ended), ("agy", agy_ended)];
+        for state in ["closed", "failed", "exited"] {
+            let (_root, ended) = session(&workspace, state);
+            for (caller, ended_message) in messages {
+                let mut clock = FakeClock::new(start);
+                let error = wait_until_trusted(
+                    &ended,
+                    start + Duration::from_secs(60),
+                    poll,
+                    &mut clock,
+                    &ended_message,
+                    &mut || -> Result<TrustReadiness<()>> { panic!("{caller}: ready after ended") },
+                    &|()| panic!("{caller}: timeout after ended"),
+                )
+                .unwrap_err();
+                assert_eq!(error.to_string(), ended_message(state), "{caller}");
+                assert_eq!(clock.slept, Duration::ZERO, "{caller}");
+            }
+        }
+
+        // A session that is still waiting is asked, a fatal error ends the wait at
+        // once, and the deadline formats the reason of its own poll.
+        let (_root, waiting) = session(&workspace, "awaiting-initial-input");
+        let mut clock = FakeClock::new(start);
+        let error = wait_until_trusted(
+            &waiting,
+            start + Duration::from_secs(60),
+            poll,
+            &mut clock,
+            &|_| panic!("not ended"),
+            &mut || -> Result<TrustReadiness<()>> { bail!("fatal") },
+            &|()| panic!("fatal precedes the deadline"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "fatal");
+        assert_eq!(clock.slept, Duration::ZERO);
+        let mut reasons = ["first", "second", "third", "fourth"].into_iter();
+        let mut clock = FakeClock::new(start);
+        let error = wait_until_trusted(
+            &waiting,
+            start + Duration::from_millis(250),
+            TrustPoll {
+                interval: Duration::from_millis(100),
+                sleep_bound: SleepBound::Resampled,
+            },
+            &mut clock,
+            &|_| panic!("not ended"),
+            &mut || Ok(TrustReadiness::Pending(reasons.next().unwrap())),
+            &|reason| format!("timed out: {reason}"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "timed out: fourth");
+        assert_eq!(clock.slept, Duration::from_millis(250));
     }
 
     // Writes the exact workspace as trusted into one provider's store, as that provider
