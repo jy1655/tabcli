@@ -1,7 +1,23 @@
 use super::support::*;
 use super::*;
 use crate::native::prune::prune_closed_sessions;
+use crate::native::session::SessionStatus;
+use crate::native::session::primitives::{
+    read_json, remove_file_if_present, rename_session_file, state_root_durability_receipt_present,
+    write_json_atomic, write_private,
+};
+use crate::native::session::test_support::{
+    STATE_ROOT_ANCESTRY_SYNC_LIMIT, STATE_ROOT_DURABLE_FILE, SyncRecord, TERMINAL_CLOSING_FILE,
+    TURN_CLAIM_FILE, TURN_COMPLETION_FILE, injected_fault, injected_sync_failure,
+    with_fault_budget, with_sync_failure, with_sync_log,
+};
 use crate::native::sessions::sessions_in;
+use crate::native::{
+    CreatedSession, NativeCommand, SessionSpec, create_session_within, parse_args, session,
+};
+use anyhow::Result;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 #[test]
 fn atomic_json_write_syncs_temporary_then_persisted_file_then_parent() {

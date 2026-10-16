@@ -9,14 +9,11 @@
 // The builders and the trace serve the macOS table; other targets use a subset.
 #![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 use super::{CloseObservation, Production, TerminalCloseAuthority, decide};
+#[cfg(any(target_os = "macos", windows))]
+use crate::native::session::{OwnerObservation, SessionState, SessionStatus, launch};
 use crate::native::terminal::TerminalSession;
 #[cfg(any(target_os = "macos", windows))]
 use crate::native::terminal::ownership::NativeSessionOwner;
-#[cfg(any(target_os = "macos", windows))]
-use crate::native::{
-    SessionStatus,
-    session::{OwnerObservation, SessionState, launch},
-};
 use anyhow::Result;
 use std::cell::RefCell;
 use std::path::Path;

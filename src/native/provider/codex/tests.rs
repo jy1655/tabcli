@@ -112,7 +112,7 @@ fn workspace_trust_reads_exact_toml_key_and_no_permission_override() {
     );
     // Created as Codex creates it in a user profile: nobody else can change it. A
     // plain file in the temporary directory inherits whatever that directory allows.
-    super::super::super::write_private(&store, config.as_bytes()).unwrap();
+    crate::native::session::primitives::write_private(&store, config.as_bytes()).unwrap();
     // The evidence names the store the adapter read, spelled as its home resolves it.
     let Trust::Trusted(evidence) = ADAPTER.workspace_trust(&workspace, &env, None).unwrap() else {
         panic!("trusted");
@@ -313,7 +313,7 @@ fn windows_trust_keys_are_lowercased_and_the_store_path_is_not() {
             "[projects.{}]\ntrust_level = \"trusted\"\n",
             serde_json::to_string(entry).unwrap()
         );
-        super::super::super::write_private(&store, config.as_bytes()).unwrap();
+        crate::native::session::primitives::write_private(&store, config.as_bytes()).unwrap();
         let Trust::Trusted(evidence) = ADAPTER.workspace_trust(&workspace, &env, None).unwrap()
         else {
             panic!("trusted through {entry}");

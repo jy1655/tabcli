@@ -7,6 +7,20 @@ use crate::native::session::launch::wrapper::{
 use crate::native::session::launch::wrapper::{
     check_provider_version, check_provider_version_until, provision, resolve_provider_from_path,
 };
+#[cfg(unix)]
+use crate::native::session::primitives::{read_json, write_json_atomic, write_private};
+#[cfg(unix)]
+use crate::native::session::test_support::PROVIDER_PROCESS_FILE;
+#[cfg(unix)]
+use crate::native::session::{SessionState, SessionStatus, launch, update_status};
+use crate::native::{native_delegation_prompt, process_env, provider, sanitize_title};
+#[cfg(unix)]
+use std::fs;
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 #[test]

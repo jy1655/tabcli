@@ -1,6 +1,12 @@
 //! Provider hook entry: validates the session, reads the payload, and hands it to the adapter.
 use super::*;
+use crate::native::session::Reader;
 use crate::native::session::primitives::SESSION_DIR_ENV;
+use agent_bridge::FirstPartyCli;
+use anyhow::{Context, Result, bail};
+use std::io::Read;
+use std::path::PathBuf;
+use std::str::FromStr;
 
 pub(super) fn parse(args: &[String]) -> Result<NativeCommand> {
     let (provider, payload) = args

@@ -1,6 +1,11 @@
 use super::support::*;
 use super::*;
 use crate::native::session::close as session_close;
+use crate::native::session::primitives::{read_json, write_json_atomic};
+use crate::native::session::test_support::{SESSION_OWNER_FILE, TURN_CLAIM_FILE};
+use crate::native::session::{SessionState, SessionStatus, update_status};
+use crate::native::terminal::ownership::NativeSessionOwner;
+use std::fs;
 
 #[test]
 fn resume_pending_dead_owner_is_repaired_instead_of_stalling() {

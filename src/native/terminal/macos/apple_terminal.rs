@@ -2,6 +2,8 @@ use super::OwnedSurfaceClose;
 use super::applescript::{Automation, Osascript};
 use super::{DialogKey, GuardedDialogInput, MacTerminalAdapter, MacosOpenMode};
 use crate::native::session::close::budget::close_remaining;
+#[cfg(test)]
+mod ancestry_tests;
 pub(in crate::native) mod close_evidence;
 
 use super::process;
@@ -27,7 +29,7 @@ use super::{
     applescript, applescript::close_response,
 };
 
-use crate::native::launch::BindingFacts;
+use crate::native::session::launch::BindingFacts;
 
 const HOST_COMMAND: &str = TerminalKind::AppleTerminal.registration().host_command;
 const BINDING: &BindingFacts = TerminalKind::AppleTerminal.registration().binding();
@@ -310,7 +312,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
         },
         |directory, id, tty| wait_for_binding(directory, id, tty),
         |released| {
-            crate::native::launch::log(
+            crate::native::session::launch::log(
                 &Store::open_unchecked(directory),
                 &match released {
                     Ok(tty) => format!("terminal_host_released tty={tty}"),
@@ -322,7 +324,7 @@ pub(in crate::native) fn run_host(directory: &Path) -> Result<()> {
 }
 
 fn wait_for_binding(directory: &Path, id: &str, tty: &str) -> Result<()> {
-    use crate::native::launch::wait_for_binding;
+    use crate::native::session::launch::wait_for_binding;
     let surface = wait_for_binding(&Reader::open_unchecked(directory), id, BINDING)?;
     if surface.kind != TerminalKind::AppleTerminal
         || surface.id != tty
@@ -1400,9 +1402,10 @@ mod tests {
 
     #[test]
     fn host_binding_partial_transitions() {
-        crate::native::launch::binding_tests::characterize("Terminal.app", |directory, id| {
-            super::wait_for_binding(directory, id, "host-id")
-        });
+        crate::native::session::launch::binding_tests::characterize(
+            "Terminal.app",
+            |directory, id| super::wait_for_binding(directory, id, "host-id"),
+        );
     }
 
     use super::{
@@ -2611,8 +2614,8 @@ end run
     }
 
     fn bind(directory: &std::path::Path, binding: &serde_json::Value) {
-        crate::native::write_json_atomic(
-            &directory.join(crate::native::TERMINAL_HANDLE_FILE),
+        crate::native::session::primitives::write_json_atomic(
+            &directory.join(crate::native::session::test_support::TERMINAL_HANDLE_FILE),
             binding,
         )
         .unwrap();
@@ -2622,9 +2625,9 @@ end run
     // for nothing else.
     #[test]
     fn terminal_app_host_starts_only_for_its_bound_tty_in_a_pending_launch() {
-        use crate::native::{
-            TERMINAL_HANDLE_FILE, TURN_CLAIM_FILE, launch, update_status, write_json_atomic,
-        };
+        use crate::native::session::primitives::write_json_atomic;
+        use crate::native::session::test_support::{TERMINAL_HANDLE_FILE, TURN_CLAIM_FILE};
+        use crate::native::session::{launch, update_status};
         for case in [
             "bound",
             "another tty",
@@ -2697,7 +2700,7 @@ end run
 
         let shared = launch_fixture();
         bind(shared.path(), &binding(shared.path(), TTY));
-        let log = std::fs::read(shared.path().join(crate::native::launch::LOG)).unwrap();
+        let log = std::fs::read(shared.path().join(crate::native::session::launch::LOG)).unwrap();
         std::fs::set_permissions(shared.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
         refused(shared.path(), "not private");
 
@@ -2708,12 +2711,12 @@ end run
 
         let unnamed = root.path().join("not-a-session");
         std::fs::create_dir(&unnamed).unwrap();
-        crate::native::set_private_directory_permissions(&unnamed).unwrap();
+        crate::native::session::primitives::set_private_directory_permissions(&unnamed).unwrap();
         refused(&unnamed, "invalid Agent Bridge session id");
 
         refused(&root.path().join("session-missing"), "failed to inspect");
         assert_eq!(
-            std::fs::read(shared.path().join(crate::native::launch::LOG)).unwrap(),
+            std::fs::read(shared.path().join(crate::native::session::launch::LOG)).unwrap(),
             log
         );
     }
@@ -2785,7 +2788,7 @@ end run
         let id = directory.file_name().unwrap().to_str().unwrap();
         let owner = ownership::current_native_session_owner(id).unwrap();
         let shell = owner.terminal_shell.unwrap();
-        crate::native::write_json_atomic(
+        crate::native::session::primitives::write_json_atomic(
             &directory.join("owner-probe.json"),
             &serde_json::json!({
                 "group": owner.process_group, "shell": shell.pid,
@@ -2895,8 +2898,13 @@ end run
             match outcome {
                 "bound" => bind(directory, &binding(directory, &tty)),
                 "another tty" => bind(directory, &binding(directory, "/dev/ttys999")),
-                _ => crate::native::update_status(directory, SessionState::Closed, None, None)
-                    .unwrap(),
+                _ => crate::native::session::update_status(
+                    directory,
+                    SessionState::Closed,
+                    None,
+                    None,
+                )
+                .unwrap(),
             }
         }
         if !read_tab_until(&mut master, &mut screen, deadline, |_| {
@@ -2907,7 +2915,8 @@ end run
             panic!("{outcome}: the tab's shell did not end: {}", shown(&screen));
         }
         let status = child.wait().unwrap();
-        let log = std::fs::read_to_string(directory.join(crate::native::launch::LOG)).unwrap();
+        let log =
+            std::fs::read_to_string(directory.join(crate::native::session::launch::LOG)).unwrap();
         let expected_host_log = match outcome {
             "bound" => format!("terminal_host_released tty={tty}\n"),
             "closed" => "terminal_host_refused: Terminal.app launch was cancelled or timed out before its surface was bound\n".into(),

@@ -23,6 +23,8 @@ mod applescript;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
+mod tests;
+#[cfg(test)]
 pub(in crate::native) use applescript::testing as automation_testing;
 #[cfg(test)]
 use test_support::Unused as UnusedAdapter;

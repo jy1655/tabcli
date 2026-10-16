@@ -292,6 +292,9 @@ fn identity_if_present(
 }
 
 #[cfg(test)]
+mod tests;
+
+#[cfg(test)]
 mod observation_tests {
     use super::*;
     #[test]

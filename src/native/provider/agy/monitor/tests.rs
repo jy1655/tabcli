@@ -4,8 +4,9 @@ use super::super::test_support::{
 use super::super::{PENDING_TURN_FILE, PendingAgyTurn, terminal_correlated_prompt};
 use super::*;
 use crate::native::session::SessionState;
+use crate::native::session::primitives::{event_paths, read_json};
 use crate::native::session::schema::SessionEvent;
-use crate::native::{SessionStatus, event_paths, read_json, update_status};
+use crate::native::session::{SessionStatus, update_status};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 
@@ -228,7 +229,7 @@ fn monitor_switches_to_the_newest_created_conversation() {
 // is seen wins; one written after the failure was recorded is not accepted.
 #[test]
 fn monitor_records_a_turn_agy_gave_up_on_as_a_failed_request() {
-    use super::super::super::super::TURN_CLAIM_FILE;
+    use crate::native::session::test_support::TURN_CLAIM_FILE;
     const FORWARDED: &str = "I1001 17:23:48.670594     402 conversation_manager.go:699] Forwarding user message to conversation 97ad12fd-9e7a-4556-83a4-8f0147343657 (items=1, media=0)\n";
     const QUOTA: &str = "E1001 17:23:49.333283     246 errorreport.go:224] agent executor error: generating and executing: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h22m28s.\nE1001 17:23:49.335578     246 errorreport.go:224] generating and executing: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h22m28s.\n";
     let root = tempfile::tempdir().unwrap();

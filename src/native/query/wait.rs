@@ -333,7 +333,8 @@ pub(in crate::native) fn run(request: WaitRequest) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native::{tests::seed_close_fixture, write_json_atomic};
+    use crate::native::session::primitives::write_json_atomic;
+    use crate::native::tests::seed_close_fixture;
 
     use crate::native::process_identity::{Attested, ProcessObservation};
     use crate::native::session::owner::tests::reused_attestation;

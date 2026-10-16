@@ -1,6 +1,11 @@
 //! Control of a managed Windows console from inside the session's own process tree.
 use super::*;
+#[cfg(windows)]
+use crate::native::session::RecordReader;
 use crate::native::session::primitives::require_valid_session_id;
+use anyhow::{Context, Result, bail};
+use std::path::Path;
+use std::time::Duration;
 #[cfg(windows)]
 use terminal::ownership::verify_terminal_surface_ownership;
 #[cfg(windows)]

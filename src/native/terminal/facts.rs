@@ -4,7 +4,7 @@
 //! macOS binding facts) reads that registration.
 use super::TerminalKind;
 #[cfg(target_os = "macos")]
-use crate::native::launch::BindingFacts;
+use crate::native::session::launch::BindingFacts;
 
 #[derive(Clone, Copy)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]

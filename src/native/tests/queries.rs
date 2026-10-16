@@ -1,7 +1,17 @@
 use super::support::*;
 use super::*;
 use crate::native::prune::prune_closed_sessions;
+use crate::native::session::primitives::{read_json, write_json_atomic};
+use crate::native::session::test_support::{
+    LAUNCH_FILE, REQUESTS_DIRECTORY, SESSION_OWNER_FILE, STATUS_FILE, TURN_CLAIM_FILE,
+    TURN_CLAIM_LOCK_FILE, TURN_COMPLETION_FILE, with_publication_read_log,
+};
+use crate::native::session::{SessionState, launch, requests, update_status};
 use crate::native::sessions::sessions_in_read_only;
+use crate::native::{NativeCommand, parse_args, query, session};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[test]
 fn timeline_rejects_a_log_change_during_a_consistent_lifecycle_snapshot() {

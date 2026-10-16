@@ -4,11 +4,23 @@ use super::{
     open_verified_control_process, query_process_identity, query_process_identity_from_handle,
     resolve_executable_from_path, verify_control_process_identity, verify_process_identity,
 };
+use crate::native::console_control::ConsoleControlRequest;
+use crate::native::session::primitives::write_json_atomic;
+use crate::native::session::test_support::{
+    SESSION_OWNER_FILE, TERMINAL_CLOSING_FILE, TERMINAL_HANDLE_FILE,
+};
+#[cfg(windows)]
+use crate::native::terminal::ownership::current_native_session_owner;
+#[cfg(windows)]
+use crate::native::terminal::ownership::verified_windows_native_owner;
+use crate::native::terminal::windows_console_handle_path;
+use crate::native::{provider_process, terminal};
 use std::fs;
 use std::os::windows::{
     io::{AsRawHandle, FromRawHandle, OwnedHandle},
     process::CommandExt,
 };
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
@@ -701,4 +713,66 @@ fn console_helpers_explicitly_forward_only_the_selected_state_root() {
             &[(STATE_DIR_ENV, root.as_deref())],
         );
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_console_launch_uses_non_verbatim_powershell_paths() {
+    // The normalized value must reach both the tab request and console-window
+    // constructor, not just argv[0]: CreateProcessW has a separate application name.
+    let source = include_str!("mod.rs").replace("\r\n", "\n");
+    assert!(source.contains(
+        "let powershell = PathBuf::from(crate::native::provider_process::windows_command_path(\n        &powershell_executable()?,\n    ));"
+    ));
+    assert!(source.contains("tab::offer(\n        &powershell,\n        &command_line,"));
+    assert!(source.contains("ConsoleWindow::create(&powershell, &command_line, deadline)"));
+    for (path, expected) in [
+        (
+            r"\\?\C:\Program Files (x86)\PowerShell\7\pwsh.exe",
+            r"C:\Program Files (x86)\PowerShell\7\pwsh.exe",
+        ),
+        (
+            r"\\?\UNC\server\share\PowerShell\7\pwsh.exe",
+            r"\\server\share\PowerShell\7\pwsh.exe",
+        ),
+    ] {
+        let application = PathBuf::from(provider_process::windows_command_path(Path::new(path)));
+        assert_eq!(application, Path::new(expected));
+        let command_line =
+            terminal::windows_console_launch_command_line(Path::new(path), "exit 0").unwrap();
+        assert!(command_line.starts_with(&format!("\"{expected}\" ")));
+        assert!(!command_line.contains(r"\\?\"));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_terminal_input_requires_the_live_native_session_owner() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = current_native_session_owner("session-owner123").unwrap();
+    write_json_atomic(&directory.path().join(SESSION_OWNER_FILE), &owner).unwrap();
+
+    verified_windows_native_owner(directory.path(), "session-owner123").unwrap();
+    assert!(
+        verified_windows_native_owner(directory.path(), "session-other123")
+            .unwrap_err()
+            .to_string()
+            .contains("not bound")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_close_control_uses_the_claimed_terminal_handle() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join(TERMINAL_HANDLE_FILE), b"active").unwrap();
+    assert_eq!(
+        windows_console_handle_path(directory.path(), &ConsoleControlRequest::Close),
+        directory.path().join(TERMINAL_HANDLE_FILE)
+    );
+    fs::write(directory.path().join(TERMINAL_CLOSING_FILE), b"closing").unwrap();
+    assert_eq!(
+        windows_console_handle_path(directory.path(), &ConsoleControlRequest::Close),
+        directory.path().join(TERMINAL_CLOSING_FILE)
+    );
 }

@@ -1,16 +1,39 @@
 use super::*;
 use crate::native::session::close as session_close;
 #[cfg(windows)]
+use crate::native::session::launch;
+#[cfg(windows)]
 use crate::native::session::launch::wrapper::provision;
 use crate::native::session::launch::wrapper::record_provider_process;
 use crate::native::session::primitives::STATE_DIR_ENV;
+use crate::native::session::primitives::{
+    event_paths, read_json, read_manifest, remove_file_if_present, session_directory_in,
+    valid_event_file_name, write_json_atomic, write_private,
+};
 use crate::native::session::schema::{
     ProviderProcessRecord, RecordedReopenRefusal, SESSION_SCHEMA, SessionEvent, SessionManifest,
 };
+use crate::native::session::test_support::{
+    CLOSED_STATUS_FILE, PROVIDER_PROCESS_FILE, REOPEN_MARKER_FILE, REOPEN_REFUSAL_FILE,
+    SESSION_OWNER_FILE, TERMINAL_HANDLE_FILE, TERMINAL_TOMBSTONE_FILE, TURN_CLAIM_FILE,
+};
+use crate::native::session::{CoreRecord, SessionState, SessionStatus, requests, update_status};
 use crate::native::session::{Reader, Store, turn};
+use crate::native::terminal::ownership::NativeSessionOwner;
 use crate::native::tests::{
     spawn_surviving_process, test_windows_process_identity, write_provider_process_record,
 };
+use crate::native::{
+    DEFAULT_TIMEOUT_SECS, NativeCommand, SessionSpec, create_session_within, delivery,
+    native_delegation_prompt, parse_args, provider, query, terminal,
+};
+use agent_bridge::{FirstPartyCli, process_is_alive};
+use anyhow::bail;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::str::FromStr;
+use std::time::{Duration, Instant};
+use std::{fs, thread};
 
 const REOPEN_TEST_CONVERSATION: &str = "6928ca1c-1234-4abc-8def-0123456789ab";
 

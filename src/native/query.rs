@@ -3,21 +3,29 @@ use super::args::{
     WorkspaceScope, option_value, parse_timeout, set_flag_once, set_once, workspace_scope,
 };
 use super::envelope;
-use super::{
-    DEFAULT_TIMEOUT_SECS, Duration, FirstPartyCli, Instant, JournaledEventState, NativeCommand,
-    Path, PathBuf, Reader, Result, Serialize, SessionStatus, bail, checked_deadline_from, consent,
-    fs, launch, read_resumed_from, requests, terminal, terminal_safe_text, thread,
-};
-#[cfg(test)]
-use super::{EVENTS_DIRECTORY, File, read_event_within_budget};
+use super::{DEFAULT_TIMEOUT_SECS, NativeCommand, consent, terminal};
+use crate::native::reopen::read_resumed_from;
 use crate::native::session::SessionState;
 use crate::native::session::enumerate::{CheckOrder, Fault, Scope, enumerate};
 use crate::native::session::primitives::require_valid_session_id;
 use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
+#[cfg(test)]
+use crate::native::session::test_support::EVENTS_DIRECTORY;
+use crate::native::session::turn::JournaledEventState;
 use crate::native::session::{CoreRecord, RecordReader};
-use crate::native::{Context, FromStr};
+use crate::native::session::{Reader, SessionStatus, launch, requests};
 use agent_bridge::PUBLIC_COMMAND;
+use agent_bridge::{FirstPartyCli, checked_deadline_from, terminal_safe_text};
+use anyhow::Context;
+use anyhow::{Result, bail};
+use serde::Serialize;
 use serde_json::{Value, json};
+#[cfg(test)]
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+use std::time::{Duration, Instant};
+use std::{fs, thread};
 
 mod inspect;
 pub(super) mod observation;
@@ -1342,16 +1350,27 @@ mod search_tests {
         let path = directory.path().join("event.json");
         fs::write(&path, b"0123456789").unwrap();
         assert_eq!(
-            read_event_within_budget(&path, 10).unwrap().unwrap(),
+            RecordReader::at(&path)
+                .event_within_budget(10)
+                .unwrap()
+                .unwrap(),
             "0123456789"
         );
-        assert_eq!(read_event_within_budget(&path, 9).unwrap_err().unwrap(), 10);
+        assert_eq!(
+            RecordReader::at(&path)
+                .event_within_budget(9)
+                .unwrap_err()
+                .unwrap(),
+            10
+        );
         assert!(
-            read_event_within_budget(&directory.path().join("missing.json"), 10)
+            RecordReader::at(&directory.path().join("missing.json"))
+                .event_within_budget(10)
                 .unwrap()
                 .is_none()
         );
-        let error = read_event_within_budget(directory.path(), 10)
+        let error = RecordReader::at(directory.path())
+            .event_within_budget(10)
             .unwrap_err()
             .unwrap_err();
         assert!(error.to_string().contains("non-regular"), "{error}");

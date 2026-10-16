@@ -3,7 +3,7 @@ use crate::native::terminal::facts::{
 };
 
 #[cfg(target_os = "macos")]
-use crate::native::launch::{BindingBudget, BindingFacts};
+use crate::native::session::launch::{BindingBudget, BindingFacts};
 
 pub(in crate::native) const REGISTRATION: Registration = Registration {
     facts: SurfaceFacts {

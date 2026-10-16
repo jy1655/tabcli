@@ -254,7 +254,7 @@ mod tests {
                 directory.display()
             )
         );
-        crate::native::write_private(&directory, b"file").unwrap();
+        crate::native::session::primitives::write_private(&directory, b"file").unwrap();
         assert_eq!(
             invoke(&directory).unwrap_err().to_string(),
             format!(
@@ -264,7 +264,7 @@ mod tests {
         );
         std::fs::remove_file(&directory).unwrap();
         std::fs::create_dir(&directory).unwrap();
-        crate::native::set_private_directory_permissions(&directory).unwrap();
+        crate::native::session::primitives::set_private_directory_permissions(&directory).unwrap();
         invoke(&directory).unwrap();
         let link = root.path().join("session-link");
         match std::os::windows::fs::symlink_dir(&directory, &link) {

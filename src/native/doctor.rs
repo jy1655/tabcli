@@ -5,23 +5,28 @@ use super::query::observation::judgment::{
     SurfacePresence, SurfaceSource, Turn,
 };
 use super::query::observation::{Observation, SessionEvidence};
-use super::{
-    Duration, FirstPartyCli, Instant, NativeCommand, OsString, Path, Reader, Result, Serialize,
-    bail, cli_version_is_supported, consent, fs, provider, provider_process, query, reopen,
-    terminal, terminal_safe_text, thread,
-};
-use crate::native::session::SessionState;
+use super::{NativeCommand, consent, provider, provider_process, query, reopen, terminal};
+use crate::native::process_env;
 use crate::native::session::launch::wrapper::{
     is_executable, provider_version_text, resolve_provider,
 };
 use crate::native::session::origin::{OriginObservation, SourceKind};
 use crate::native::session::primitives::{SESSION_DIR_ENV, require_valid_session_id, unix_ms};
 use crate::native::session::schema::SessionManifest;
-use crate::native::{FromStr, Read, process_env};
+use crate::native::session::{Reader, SessionState};
 use agent_bridge::PUBLIC_COMMAND;
+use agent_bridge::{FirstPartyCli, cli_version_is_supported, terminal_safe_text};
+use anyhow::{Result, bail};
+use serde::Serialize;
 use serde_json::{Value, json};
+use std::ffi::OsString;
+use std::io::Read;
 use std::io::{Seek, SeekFrom};
+use std::path::Path;
 use std::process::{Output, Stdio};
+use std::str::FromStr;
+use std::time::{Duration, Instant};
+use std::{fs, thread};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_PROBE_OUTPUT: u64 = 64 * 1024;

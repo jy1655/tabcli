@@ -25,7 +25,7 @@ use crate::native::session::SessionState;
 
 #[test]
 fn host_binding_partial_transitions() {
-    crate::native::launch::binding_tests::characterize("WezTerm", |directory, id| {
+    crate::native::session::launch::binding_tests::characterize("WezTerm", |directory, id| {
         wait_for_binding(directory, id, "host-id", Path::new("/tmp/binding-socket"))
     });
 }
@@ -892,7 +892,7 @@ fn persisted_scope_survives_settings_changes_after_launch() {
         let root = tempfile::tempdir().unwrap();
         let setting = root.path().join("settings.json");
         let save_mode = |mode: MacosOpenMode| {
-            crate::native::write_json_atomic(
+            crate::native::session::primitives::write_json_atomic(
                 &setting,
                 &serde_json::json!({"schema": 1, "macos_open_mode": mode.as_str()}),
             )
@@ -913,7 +913,7 @@ fn persisted_scope_survives_settings_changes_after_launch() {
         )
         .unwrap();
         let saved_handle = root.path().join("terminal.json");
-        crate::native::write_json_atomic(&saved_handle, &handle).unwrap();
+        crate::native::session::primitives::write_json_atomic(&saved_handle, &handle).unwrap();
 
         let later = if initial == MacosOpenMode::TabFirst {
             MacosOpenMode::NewWindow
@@ -922,7 +922,8 @@ fn persisted_scope_survives_settings_changes_after_launch() {
         };
         save_mode(later);
         assert_eq!(macos_open_mode(root.path()).unwrap(), later);
-        let handle: TerminalSession = crate::native::read_json(&saved_handle).unwrap();
+        let handle: TerminalSession =
+            crate::native::session::primitives::read_json(&saved_handle).unwrap();
         assert_eq!(
             handle.wezterm_mux.as_ref().unwrap().owns_gui,
             initial == MacosOpenMode::NewWindow
@@ -1479,8 +1480,8 @@ fn launch_fixture() -> tempfile::TempDir {
 fn bind(directory: &Path, session: &TerminalSession) {
     let mut session = session.clone();
     session.managed_session_id = directory.file_name().unwrap().to_str().map(str::to_owned);
-    crate::native::write_json_atomic(
-        &directory.join(crate::native::TERMINAL_HANDLE_FILE),
+    crate::native::session::primitives::write_json_atomic(
+        &directory.join(crate::native::session::test_support::TERMINAL_HANDLE_FILE),
         &session,
     )
     .unwrap();
@@ -1516,7 +1517,7 @@ fn pane_probe() {
         let owner = ownership::current_native_session_owner(id).unwrap();
         let mut queued: libc::c_int = -1;
         assert_eq!(unsafe { libc::ioctl(0, libc::FIONREAD, &mut queued) }, 0);
-        crate::native::write_json_atomic(
+        crate::native::session::primitives::write_json_atomic(
             &directory.join("owner-probe.json"),
             &serde_json::json!({"pid": owner.pid, "queued_input": queued}),
         )
@@ -1617,7 +1618,8 @@ fn replay_on_a_private_pty(cancelled: bool) {
                 )
             });
             if cancelled {
-                crate::native::update_status(directory, SessionState::Closed, None, None).unwrap();
+                crate::native::session::update_status(directory, SessionState::Closed, None, None)
+                    .unwrap();
             } else {
                 bind(directory, &session);
             }
@@ -1647,7 +1649,7 @@ fn replay_on_a_private_pty(cancelled: bool) {
     if cancelled {
         assert!(!owner.exists(), "a cancelled launch started its wrapper");
         assert!(!status.success());
-        let log = fs::read_to_string(directory.join(crate::native::launch::LOG)).unwrap();
+        let log = fs::read_to_string(directory.join(crate::native::session::launch::LOG)).unwrap();
         assert!(
             log.contains("wezterm_host_refused: WezTerm launch was cancelled"),
             "{log}"
@@ -1664,7 +1666,9 @@ fn replay_on_a_private_pty(cancelled: bool) {
 
 #[test]
 fn the_launch_host_starts_only_for_the_bound_pane_of_a_pending_launch() {
-    use crate::native::{TERMINAL_HANDLE_FILE, launch, write_json_atomic};
+    use crate::native::session::launch;
+    use crate::native::session::primitives::write_json_atomic;
+    use crate::native::session::test_support::TERMINAL_HANDLE_FILE;
     let binding = |directory: &Path| {
         serde_json::json!({
             "terminal": "wezterm", "session_id": "8", "tab_id": "8", "window_id": "7",
@@ -1719,7 +1723,8 @@ fn the_launch_host_starts_only_for_the_bound_pane_of_a_pending_launch() {
         }
         match case {
             "cancelled" => {
-                crate::native::update_status(directory, SessionState::Closed, None, None).unwrap()
+                crate::native::session::update_status(directory, SessionState::Closed, None, None)
+                    .unwrap()
             }
             "expired" | "another claim" => {
                 let mut receipt =

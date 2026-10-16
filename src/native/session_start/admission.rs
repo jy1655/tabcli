@@ -11,6 +11,9 @@ use super::super::*;
 use crate::native::consent::Environment;
 use crate::native::settings::CodexMemoryWorkspace;
 use agent_bridge::PUBLIC_COMMAND;
+use anyhow::{Context, Result, bail};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 /// Applies the setting of the state root to a canonical workspace. An `allow` setting
 /// admits without reading the caller's Codex home.

@@ -1,6 +1,11 @@
 //! The `sessions` listing over a state root.
 use super::args::{option_value, resolve_explicit_workspace, set_flag_once, set_once};
 use super::*;
+use crate::native::session::{Reader, Store};
+use agent_bridge::{FirstPartyCli, terminal_safe_text};
+use anyhow::{Result, bail};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 #[derive(Debug)]
 pub(crate) struct SessionsRequest {

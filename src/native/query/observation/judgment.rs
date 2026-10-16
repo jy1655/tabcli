@@ -1,10 +1,10 @@
 //! What an Observation concludes from its Records and, on request, from the OS. Every
 //! renderer maps these typed judgments to its own vocabulary and derives none of its own.
 use super::{CancelObservation, SessionEvidence, SurfaceRecord};
-use crate::native::launch::ResidualSurface;
 use crate::native::process_identity::{Attested, Gone, ProcessObservation};
 use crate::native::query::RequestState;
 use crate::native::reopen::ResumedFrom;
+use crate::native::session::launch::ResidualSurface;
 use crate::native::session::owner::{ControlAttestation, OwnerAttestation, attest_owner};
 use crate::native::session::snapshot::Snapshot;
 use crate::native::session::{self, OwnerObservation, SessionState, SessionStatus};
@@ -525,8 +525,8 @@ impl Judgments {
 #[cfg(test)]
 pub(in crate::native) mod tests {
     use super::*;
-    use crate::native::launch::{self, Phase};
-    use crate::native::requests::Receipt;
+    use crate::native::session::launch::{self, Phase};
+    use crate::native::session::requests::Receipt;
     use crate::native::session::schema::{SessionEvent, SessionManifest};
     use crate::native::session::turn::PendingTurnCompletion;
     use crate::native::terminal::TerminalSession;

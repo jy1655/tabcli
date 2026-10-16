@@ -2,7 +2,8 @@ use super::*;
 use crate::native::process_identity::{Attested, Gone, ProcessObservation};
 use crate::native::session::owner::ControlAttestation::{self, *};
 use crate::native::session::owner::tests::reused_attestation;
-use crate::native::{session, tests::seed_close_fixture, write_json_atomic, write_private};
+use crate::native::session::primitives::{write_json_atomic, write_private};
+use crate::native::{session, tests::seed_close_fixture};
 use observation::judgment::tests::{CLAIM, SESSION, attestation, evidence, receipt, snapshot};
 use observation::judgment::{IndexIncomplete, Judgments, Surface, SurfaceSource, UnreadablePart};
 

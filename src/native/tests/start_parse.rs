@@ -2,6 +2,11 @@ use super::*;
 use crate::native::args::{CommonStartOptions, parse_common_start_option};
 use crate::native::reopen::parse_reopen;
 use crate::native::session_start::parse_ask;
+use crate::native::{NativeCommand, terminal};
+use anyhow::Result;
+use std::fs;
+use std::path::PathBuf;
+use std::time::Duration;
 
 fn parse(command: &str, options: &[&str]) -> Result<NativeCommand> {
     let mut args = vec![

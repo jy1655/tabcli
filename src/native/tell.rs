@@ -2,6 +2,12 @@
 use super::args::{option_value, parse_timeout, read_prompt_option, set_flag_once, set_once};
 use super::*;
 use crate::native::session::primitives::require_valid_session_id;
+use crate::native::session::{Reader, Store, turn};
+use agent_bridge::{FirstPartyCli, checked_deadline_from, validate_terminal_input};
+use anyhow::{Context, Result, bail};
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub(crate) struct TellRequest {

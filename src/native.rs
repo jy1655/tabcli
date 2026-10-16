@@ -1,8 +1,10 @@
 use crate::native::session::primitives::{delegation_source, require_valid_session_id, unix_ms};
-use crate::native::session::schema::{SESSION_SCHEMA, SessionEvent, SessionManifest};
-use agent_bridge::PUBLIC_COMMAND;
-#[cfg(test)]
-use terminal::ownership::NativeSessionOwner;
+use crate::native::session::schema::{SESSION_SCHEMA, SessionManifest};
+use crate::native::session::{CoreRecord, Reader, SessionState, Store, launch, update_status};
+use agent_bridge::{FirstPartyCli, PUBLIC_COMMAND};
+use anyhow::{Context, Result, bail};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 #[cfg(test)]
 mod tests;
 
@@ -36,63 +38,12 @@ pub(crate) use session_start::AskRequest;
 mod sessions;
 pub(crate) use sessions::SessionsRequest;
 
-use session::turn::*;
-use session::*;
 mod settings;
 mod tell;
 mod terminal;
 mod turn_report;
 use turn_report::TurnReport;
-#[cfg(test)]
-use turn_report::finish_request_with_extra;
 mod turn_run;
-
-#[cfg(all(target_os = "macos", test))]
-use terminal::macos::apple_terminal::{
-    apple_terminal_startup_absent_with, record_legacy_terminal_app, terminal_app_ancestor,
-    terminal_app_process_with,
-};
-#[cfg(all(target_os = "macos", test))]
-use terminal::macos::apple_terminal::{terminal_app_process, terminal_surface_absent};
-#[cfg(all(target_os = "macos", test))]
-use terminal::macos::process::{macos_process_info, macos_process_start, macos_processes_named};
-#[cfg(all(target_os = "macos", test))]
-use terminal::ownership::MacTerminalAppIdentity;
-#[cfg(test)]
-use terminal::ownership::verify_terminal_owner_attestation;
-#[cfg(test)]
-use terminal::ownership::{
-    MacTerminalShellIdentity, NativeProcessIdentity, native_owner_identity_matches,
-    verified_terminal_owner_process_group, verified_terminal_shell_process_group,
-};
-#[cfg(all(windows, test))]
-use terminal::ownership::{current_native_session_owner, verified_windows_native_owner};
-
-#[cfg(all(test, windows))]
-use provider_process::command as provider_process_command;
-
-#[cfg(any(windows, test))]
-use std::fs::File;
-use std::{
-    ffi::OsString,
-    fs::{self, OpenOptions},
-    io::Read,
-    path::{Path, PathBuf},
-    process::Command,
-    str::FromStr,
-    sync::atomic::{AtomicU64, Ordering},
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
-
-#[cfg(test)]
-use agent_bridge::provider_effort_args;
-use agent_bridge::{
-    FirstPartyCli, checked_deadline_from, cli_version_is_supported, confirm_explicit_close,
-    process_is_alive, terminal_safe_text, validate_terminal_input,
-};
-use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
 
@@ -421,11 +372,6 @@ fn create_session_within(
         directory,
         manifest,
     })
-}
-
-#[cfg(test)]
-fn valid_status_transition(current: &SessionState, next: &SessionState) -> bool {
-    current.clone().transition_allowed(next.clone())
 }
 
 // The first line of every prompt that Bridge sends to a provider. It is framing, not an

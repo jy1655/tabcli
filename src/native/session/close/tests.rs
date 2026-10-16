@@ -1,6 +1,4 @@
 use super::*;
-#[cfg(target_os = "macos")]
-use crate::native::MacTerminalAppIdentity;
 use crate::native::prune::prune_closed_sessions;
 use crate::native::query::observation::{Observation, ResultReference};
 use crate::native::session::close as session_close;
@@ -9,6 +7,7 @@ use crate::native::session::primitives::event_paths;
 use crate::native::session::primitives::{SyncRecord, read_json, write_json_atomic};
 use crate::native::session::schema::SessionEvent;
 use crate::native::session::schema::{EVENT_READ_LIMIT, SESSION_SCHEMA, SessionManifest};
+use crate::native::session::test_support::{injected_fault, with_fault_budget};
 use crate::native::session::turn::PendingTurnCompletion;
 use crate::native::session::{Reader, Store, turn};
 use crate::native::sessions::sessions_in;
@@ -16,12 +15,12 @@ use crate::native::sessions::sessions_in;
 use crate::native::terminal::close_authority::{
     TerminalCloseAuthority, test_support::TestObservation,
 };
+#[cfg(target_os = "macos")]
+use crate::native::terminal::ownership::MacTerminalAppIdentity;
 use crate::native::tests::test_windows_process_identity;
 #[cfg(target_os = "macos")]
 use crate::native::tests::write_attested_apple_terminal_state;
-use crate::native::{
-    NativeCommand, context, doctor, injected_fault, parse_args, query, with_fault_budget,
-};
+use crate::native::{NativeCommand, context, doctor, parse_args, query};
 use agent_bridge::FirstPartyCli;
 use serde_json::{Value, json};
 use std::{path::PathBuf, process::Command};
@@ -3343,7 +3342,7 @@ fn close_fixtures_keep_independent_publication_expectations() {
         let committed = state == JournaledEventState::Committed;
         for budget in 0.. {
             let fixture = seed_close_fixture(state);
-            let outcome = crate::native::with_fault_budget(budget, || {
+            let outcome = crate::native::session::test_support::with_fault_budget(budget, || {
                 close_session_state_with_error(
                     &Store::open_unchecked(&fixture.directory),
                     Some("closed by the maintainer".to_owned()),
@@ -3353,7 +3352,7 @@ fn close_fixtures_keep_independent_publication_expectations() {
             });
             let finished = outcome.is_ok();
             if let Err(error) = outcome {
-                assert!(crate::native::injected_fault(&error));
+                assert!(crate::native::session::test_support::injected_fault(&error));
             }
             let reader = Reader::open_unchecked(&fixture.directory);
             let before = entries(&fixture.directory);

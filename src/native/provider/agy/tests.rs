@@ -55,7 +55,7 @@ fn workspace_trust_and_dialog_are_exact_and_do_not_accept_permission_prompts() {
     std::fs::create_dir_all(tmp.path().join(".gemini/antigravity-cli")).unwrap();
     let store = tmp.path().join(".gemini/antigravity-cli/settings.json");
     let key = consent::native_key(&workspace).unwrap();
-    super::super::super::write_json_atomic(
+    crate::native::session::primitives::write_json_atomic(
         &store,
         &serde_json::json!({"trustedWorkspaces":[key.clone()]}),
     )

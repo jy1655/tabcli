@@ -125,7 +125,7 @@ where
         .context("the session directory has no state root")
         .and_then(super::super::settings::windows_tab_window)
         .unwrap_or_else(|error| {
-            super::super::launch::log(
+            crate::native::session::launch::log(
                 &Store::open_unchecked(directory),
                 &format!("settings could not be read, using the dedicated window: {error:#}"),
             );
@@ -146,7 +146,7 @@ where
         guard.as_ref(),
     ) {
         Ok(tab) => {
-            super::super::launch::log(
+            crate::native::session::launch::log(
                 &Store::open_unchecked(directory),
                 &format!(
                     "surface=windows-terminal-tab window={}",
@@ -156,7 +156,7 @@ where
             Surface::Tab(tab)
         }
         Err(reason) => {
-            super::super::launch::log(
+            crate::native::session::launch::log(
                 &Store::open_unchecked(directory),
                 &format!("surface=console-window; no Windows Terminal tab: {reason:#}"),
             );
@@ -196,7 +196,7 @@ where
             || lookup.as_mut().and_then(WindowLookup::poll),
             FOREGROUND_SETTLE,
         );
-        super::super::launch::log(&Store::open_unchecked(directory), &summary);
+        crate::native::session::launch::log(&Store::open_unchecked(directory), &summary);
     }
     Ok(session)
 }
