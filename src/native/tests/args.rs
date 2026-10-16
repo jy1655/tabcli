@@ -1,4 +1,7 @@
 use super::*;
+use crate::native::args::parse_timeout;
+use crate::native::console_control::{ConsoleControlRequest, parse as parse_console_control};
+use crate::native::tell::TellRequest;
 
 #[test]
 fn ask_yolo_is_false_unless_the_child_request_contains_the_flag() {

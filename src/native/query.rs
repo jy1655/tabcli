@@ -1,10 +1,12 @@
 //! Read-only views of durable session records. Never recover, send, or close here.
+use super::args::{
+    WorkspaceScope, option_value, parse_timeout, set_flag_once, set_once, workspace_scope,
+};
 use super::envelope;
 use super::{
     DEFAULT_TIMEOUT_SECS, Duration, FirstPartyCli, Instant, JournaledEventState, NativeCommand,
     Path, PathBuf, Reader, Result, Serialize, SessionStatus, bail, checked_deadline_from, consent,
-    fs, launch, option_value, parse_timeout, read_resumed_from, requests, set_flag_once, set_once,
-    terminal, terminal_safe_text, thread,
+    fs, launch, read_resumed_from, requests, terminal, terminal_safe_text, thread,
 };
 #[cfg(test)]
 use super::{EVENTS_DIRECTORY, File, read_event_within_budget};
@@ -681,6 +683,15 @@ pub(super) enum SearchScope {
     AllWorkspaces,
 }
 
+impl From<WorkspaceScope> for SearchScope {
+    fn from(scope: WorkspaceScope) -> Self {
+        match scope {
+            WorkspaceScope::Workspace(path) => Self::Workspace(path),
+            WorkspaceScope::AllWorkspaces => Self::AllWorkspaces,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct SearchRequest {
     query: String,
@@ -789,25 +800,8 @@ fn parse_search_options(args: &[String]) -> Result<NativeCommand> {
         }
         index += 1;
     }
-    let scope = match (workspace, all_workspaces) {
-        (Some(_), true) => bail!("search accepts only one of --workspace or --all-workspaces"),
-        (None, true) => SearchScope::AllWorkspaces,
-        // Same canonical form that `sessions --workspace` compares against the manifest.
-        (Some(path), false) => SearchScope::Workspace(path.canonicalize().or_else(|_| {
-            if path.is_absolute() {
-                Ok(path)
-            } else {
-                std::env::current_dir().map(|cwd| cwd.join(path))
-            }
-        })?),
-        (None, false) => SearchScope::Workspace(
-            std::env::current_dir()
-                .and_then(|cwd| cwd.canonicalize())
-                .context(
-                    "failed to resolve the current workspace; pass --workspace or --all-workspaces",
-                )?,
-        ),
-    };
+    // Same canonical form that `sessions --workspace` compares against the manifest.
+    let scope = SearchScope::from(workspace_scope("search", workspace, all_workspaces)?);
     Ok(NativeCommand::Search(SearchRequest {
         query: query.clone(),
         scope,

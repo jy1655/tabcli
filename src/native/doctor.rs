@@ -1,4 +1,5 @@
 //! Observations and advice only. No recovery, delivery, terminal control, or settings writes.
+use super::args::{option_value, set_flag_once, set_once};
 use super::query::observation::judgment::{
     self, ActiveHandle, BoundOwner, Cancel, Hold, OwnerJudgment, ResultCandidate, Surface,
     SurfacePresence, SurfaceSource, Turn,
@@ -6,8 +7,8 @@ use super::query::observation::judgment::{
 use super::query::observation::{Observation, SessionEvidence};
 use super::{
     Duration, FirstPartyCli, Instant, NativeCommand, OsString, Path, Reader, Result, Serialize,
-    bail, cli_version_is_supported, consent, fs, option_value, provider, provider_process, query,
-    reopen, set_flag_once, set_once, terminal, terminal_safe_text, thread,
+    bail, cli_version_is_supported, consent, fs, provider, provider_process, query, reopen,
+    terminal, terminal_safe_text, thread,
 };
 use crate::native::session::SessionState;
 use crate::native::session::launch::wrapper::{

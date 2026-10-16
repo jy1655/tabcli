@@ -1,5 +1,6 @@
 use super::support::*;
 use super::*;
+use crate::native::prune::prune_closed_sessions;
 
 #[test]
 fn pruning_removes_only_old_quiescent_closed_session_directories() {

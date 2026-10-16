@@ -1,6 +1,7 @@
 use super::*;
 #[cfg(target_os = "macos")]
 use crate::native::MacTerminalAppIdentity;
+use crate::native::prune::prune_closed_sessions;
 use crate::native::query::observation::{Observation, ResultReference};
 use crate::native::session::close as session_close;
 use crate::native::session::names::*;
@@ -10,6 +11,7 @@ use crate::native::session::schema::SessionEvent;
 use crate::native::session::schema::{EVENT_READ_LIMIT, SESSION_SCHEMA, SessionManifest};
 use crate::native::session::turn::PendingTurnCompletion;
 use crate::native::session::{Reader, Store, turn};
+use crate::native::sessions::sessions_in;
 #[cfg(target_os = "macos")]
 use crate::native::terminal::close_authority::{
     TerminalCloseAuthority, test_support::TestObservation,
@@ -18,9 +20,8 @@ use crate::native::tests::test_windows_process_identity;
 #[cfg(target_os = "macos")]
 use crate::native::tests::write_attested_apple_terminal_state;
 use crate::native::{
-    NativeCommand, doctor, injected_fault, parse_args, query, sessions_in, with_fault_budget,
+    NativeCommand, context, doctor, injected_fault, parse_args, query, with_fault_budget,
 };
-use crate::native::{context, prune_closed_sessions};
 use agent_bridge::FirstPartyCli;
 use serde_json::{Value, json};
 use std::{path::PathBuf, process::Command};

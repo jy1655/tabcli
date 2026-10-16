@@ -1,5 +1,6 @@
 //! Query waits: one consistent read per session per pass, without lifecycle changes.
 use super::*;
+use crate::native::args::{option_value, parse_timeout, set_flag_once, set_once};
 use crate::native::session::primitives::valid_session_id;
 use observation::{SessionEvidence, judgment};
 

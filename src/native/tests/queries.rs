@@ -1,5 +1,7 @@
 use super::support::*;
 use super::*;
+use crate::native::prune::prune_closed_sessions;
+use crate::native::sessions::sessions_in_read_only;
 
 #[test]
 fn timeline_rejects_a_log_change_during_a_consistent_lifecycle_snapshot() {

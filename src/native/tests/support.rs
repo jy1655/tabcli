@@ -1,4 +1,5 @@
 use super::*;
+use crate::native::sessions::sessions_in;
 
 pub(super) fn write_prune_test_session(
     root: &Path,

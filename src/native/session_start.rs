@@ -1,4 +1,7 @@
 //! One start operation; each source owns resolution, creation and provider-specific gates.
+use super::args::{
+    CommonStartOptions, option_value, parse_common_start_option, read_prompt_option, set_once,
+};
 use super::*;
 use crate::native::session::launch::wrapper::{check_provider_version_until, resolve_provider};
 
@@ -180,3 +183,101 @@ pub(super) fn start(
 
 #[cfg(test)]
 mod tests;
+
+#[derive(Debug)]
+pub(crate) struct AskRequest {
+    pub(crate) provider: FirstPartyCli,
+    pub(crate) workspace: PathBuf,
+    pub(crate) prompt: String,
+    pub(crate) title: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+    pub(crate) terminal: Option<terminal::TerminalKind>,
+    pub(crate) yolo: bool,
+    pub(crate) timeout: Duration,
+    pub(crate) detach: bool,
+    pub(crate) json: bool,
+    pub(crate) context_results: Vec<context::ContextResultRef>,
+}
+
+pub(super) fn parse_ask(args: &[String]) -> Result<NativeCommand> {
+    let (provider, options) = args
+        .split_first()
+        .context("ask requires codex, claude, agy, or pi")?;
+    let provider = FirstPartyCli::from_str(provider).map_err(anyhow::Error::msg)?;
+    let mut workspace = None;
+    let mut parsed = CommonStartOptions::default();
+    let mut context_results = Vec::new();
+    let mut index = 0;
+    while index < options.len() {
+        if parse_common_start_option(options, &mut index, &mut parsed)? {
+            continue;
+        }
+        match options[index].as_str() {
+            "--workspace" => set_once(
+                &mut workspace,
+                PathBuf::from(option_value(options, &mut index, "--workspace")?),
+                "--workspace",
+            )?,
+            "--context-result" => context::push_option(
+                &mut context_results,
+                option_value(options, &mut index, "--context-result")?,
+            )?,
+            option => bail!("unknown ask option: {option}"),
+        }
+        index += 1;
+    }
+    let CommonStartOptions {
+        prompt,
+        prompt_file,
+        title,
+        model,
+        effort,
+        terminal,
+        yolo,
+        timeout,
+        detach,
+        json,
+    } = parsed;
+    let workspace = workspace.unwrap_or(std::env::current_dir()?);
+    let prompt = read_prompt_option(prompt, prompt_file, "ask")?;
+    if prompt.trim().is_empty() {
+        bail!("--prompt cannot be empty");
+    }
+    validate_terminal_input(&prompt, "--prompt")?;
+    if model.as_ref().is_some_and(|value| value.trim().is_empty()) {
+        bail!("--model cannot be empty");
+    }
+    if effort.as_ref().is_some_and(|value| value.trim().is_empty()) {
+        bail!("--effort cannot be empty");
+    }
+    Ok(NativeCommand::Ask(AskRequest {
+        provider,
+        workspace,
+        prompt,
+        title,
+        model,
+        effort,
+        terminal,
+        yolo,
+        timeout: timeout.unwrap_or(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
+        detach,
+        json,
+        context_results,
+    }))
+}
+
+pub(super) fn run_ask(request: AskRequest) -> Result<()> {
+    let mut report = TurnReport::new(request.json, serde_json::Map::new());
+    let outcome = run_ask_inner(request, &mut report);
+    report.finish(outcome, serde_json::Map::new())
+}
+
+fn run_ask_inner(request: AskRequest, report: &mut TurnReport) -> Result<()> {
+    let options = session_start::StartOptions {
+        timeout: request.timeout,
+        detach: request.detach,
+        json: request.json,
+    };
+    session_start::start(options, &mut session_start::FreshSource(request), report)
+}

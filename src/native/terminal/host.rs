@@ -1,5 +1,6 @@
 use super::TerminalKind;
-use crate::native::{one_positional, require_valid_session_id};
+use crate::native::args::one_positional;
+use crate::native::session::primitives::require_valid_session_id;
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 

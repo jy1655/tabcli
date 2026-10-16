@@ -1,5 +1,7 @@
 use super::*;
 #[cfg(windows)]
+use crate::native::console_control::ConsoleControlRequest;
+#[cfg(windows)]
 use crate::native::session::launch::launcher::bridge_shell_command;
 #[cfg(windows)]
 use crate::native::session::launch::wrapper::{
@@ -7,6 +9,8 @@ use crate::native::session::launch::wrapper::{
 };
 #[cfg(windows)]
 use crate::native::session::primitives::STATE_DIR_ENV;
+#[cfg(windows)]
+use crate::native::terminal::windows_console_handle_path;
 
 #[cfg(windows)]
 #[test]

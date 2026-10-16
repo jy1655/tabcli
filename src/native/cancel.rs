@@ -1,4 +1,5 @@
 //! Record the user's intent to interrupt the active request.
+use super::args::{set_flag_once, set_once};
 use super::*;
 use crate::native::session::primitives::require_valid_session_id;
 use serde_json::json;

@@ -1,5 +1,6 @@
 //! Read-only Session observations within a workspace and a shared scan budget.
 use super::*;
+use crate::native::args::{option_value, set_flag_once, set_once, workspace_scope};
 use crate::native::session;
 use crate::native::session::OwnerObservation;
 use crate::native::session::enumerate::{CheckOrder, Fault, Scope, enumerate};
@@ -63,24 +64,7 @@ fn parse_options(args: &[String]) -> Result<StatusRequest> {
         }
         index += 1;
     }
-    let scope = match (workspace, all_workspaces) {
-        (Some(_), true) => bail!("status accepts only one of --workspace or --all-workspaces"),
-        (None, true) => SearchScope::AllWorkspaces,
-        (Some(path), false) => SearchScope::Workspace(path.canonicalize().or_else(|_| {
-            if path.is_absolute() {
-                Ok(path)
-            } else {
-                std::env::current_dir().map(|cwd| cwd.join(path))
-            }
-        })?),
-        (None, false) => SearchScope::Workspace(
-            std::env::current_dir()
-                .and_then(|cwd| cwd.canonicalize())
-                .context(
-                    "failed to resolve the current workspace; pass --workspace or --all-workspaces",
-                )?,
-        ),
-    };
+    let scope = SearchScope::from(workspace_scope("status", workspace, all_workspaces)?);
     Ok(StatusRequest {
         scope,
         provider,

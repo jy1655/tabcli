@@ -1,5 +1,7 @@
 use super::support::*;
 use super::*;
+use crate::native::prune::prune_closed_sessions;
+use crate::native::sessions::sessions_in;
 
 #[test]
 fn atomic_json_write_syncs_temporary_then_persisted_file_then_parent() {
