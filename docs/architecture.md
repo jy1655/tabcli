@@ -8,7 +8,10 @@ these boundaries:
 native.rs: parse ask, check inputs, prepare the session directory
   -> session::turn + session::requests: acquire the initial claim and write its receipt
   -> provider + terminal: prepare the CLI and bind a newly created surface
-  -> session::launch: record provider spawn or launch failure
+  -> session::launch::launcher: write the launch receipt, run the bootstrap in the bound surface,
+     wait for the confirmed startup
+  -> session::launch::wrapper (inside the surface): admit the wrapper, record the owner, plan the
+     provider command, spawn it, finalize the launch record
   -> delivery: use the adapter-declared Transport and settle delivery of the claimed turn
   -> provider: recognize the matching completion
   -> session::turn: write the completion journal
@@ -40,9 +43,12 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
 
 ## Module map and dependencies
 
-- `src/main.rs` contains top-level dispatch and help; `src/native.rs` parses native commands,
-  coordinates launch and calls the Delivery seam; wrapper admission and exit settlement live in
-  `session::launch`.
+- `src/main.rs` contains top-level dispatch and help; `src/native.rs` parses native commands and
+  dispatches them. The launch protocol is two operations in `session::launch`: `launcher.rs`
+  holds the start-in-surface operation and both bootstrap builders; `wrapper.rs` holds the
+  native-session wrapper with its admission and provision steps, the fd handoff consumer,
+  provider resolution and the version gate; `mod.rs` keeps the launch records and their rules
+  (receipt, phases, failure handoff, repair, wait, spawn, finalize).
 - `src/native/process_identity.rs` classifies process evidence as Live (Incarnation or PID-only
   compatibility), Gone (Exited or Reused), or Unknown. It performs no OS or record reads;
   platform adapters own absence and identity observations. A reused incarnation grants no
@@ -100,8 +106,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   helpers. `close::budget` owns the close deadline and test clock. `requests` binds public requests to
   claims and events; `turn` owns delivery settlement, completion and recovery; `close` owns
   close-record transitions and dead-owner repair; `launch` coordinates spawn, cancellation,
-  and the full macOS binding wait. Terminal adapters supply surface identity checks and declare
-  binding diagnostics and wait budgets.
+  and the full macOS binding wait, and holds the two launch operations: `launcher` starts a
+  created session in a surface and `wrapper` runs the native-session command inside it.
+  Terminal adapters supply surface identity checks and declare binding diagnostics and wait
+  budgets.
   `enumerate` owns lazy state-root entry traversal and exact workspace/provider scope matching.
   It returns root-open errors separately from typed entry and file-type faults; callers retain
   their error policies and validation order. `sessions` repairs and `prune-sessions` deletes in
