@@ -47,6 +47,11 @@ pub(super) struct ClaudeAdapter;
 const PENDING_TURN_FILE: &str = "claude-pending-turn.json";
 // Drop caller-session markers from managed and messenger launches, preserving user configuration; nested children have no inbox.
 // Remove when Claude stops deriving identity from inherited markers; see docs/verification/2026-10-11-macos-0.4.1.md.
+// The two CODEX_COMPANION_ names are set by the Claude Code Codex plugin's SessionStart hook
+// (openai-codex/codex 1.0.6, scripts/session-lifecycle-hook.mjs) to the caller's session id and
+// transcript path, and its tracked-jobs runtime reads the id to attribute jobs to the current
+// session (#149). The plugin's app-server endpoint, pid-file and log-file names are user
+// configuration and stay.
 const CLAUDE_CODE_SESSION_MARKERS: &[&str] = &[
     "AI_AGENT",
     "CLAUDE_CODE_BRIDGE_SESSION_ID",
@@ -60,6 +65,8 @@ const CLAUDE_CODE_SESSION_MARKERS: &[&str] = &[
     "CLAUDE_CODE_ENTRYPOINT",
     "CLAUDE_CODE_EXECPATH",
     "CLAUDE_EFFORT",
+    "CODEX_COMPANION_SESSION_ID",
+    "CODEX_COMPANION_TRANSCRIPT_PATH",
 ];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
