@@ -1,7 +1,195 @@
-use super::correlation::{established_codex_thread, valid_codex_thread_id};
-use super::{ADAPTER, codex_version_supports_native_queue};
+use super::correlation::{correlated_prompt, established_codex_thread, valid_codex_thread_id};
+use super::{ADAPTER, codex_version_supports_native_queue, read_pending_turn};
 use crate::native::provider::NativeProviderAdapter;
+use crate::native::session::{CoreRecord, Reader, requests};
 use anyhow::{Context, Result, bail};
+use std::path::Path;
+
+/// Windows limits a process command line to this many UTF-16 units (`CreateProcessW`).
+/// Codex runs the configured `notify` command with the whole payload as one argument.
+pub(super) const NOTIFY_COMMAND_LINE_LIMIT_UNITS: usize = 32_767;
+/// Below this remaining budget for the answer the check reports `near_limit`.
+pub(super) const NOTIFY_ANSWER_BUDGET_THRESHOLD_UNITS: usize = 4_096;
+/// Allowance for the payload's other fields (`type`, `thread-id`, `turn-id`, the JSON
+/// framing of `input-messages` and `last-assistant-message`) and the notify command's own
+/// arguments (`native-hook codex`) and quoting, on top of the executable path.
+const NOTIFY_ENVELOPE_FIXED_UNITS: usize = 300;
+
+/// The command-line budget of one Codex `notify` payload, estimated from the delivered
+/// prompt. A lower bound: the shell quoting Codex applies to the argument adds escaping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct NotifyPayloadBudget {
+    pub(super) prompt_chars: usize,
+    pub(super) escaped_units: usize,
+    pub(super) envelope_units: usize,
+    pub(super) limit_units: usize,
+    pub(super) answer_budget_units: usize,
+}
+
+/// The sizes the pending-turn record keeps of a framed prompt: its characters, and the
+/// UTF-16 units of its JSON escape, which is how the notify payload carries it.
+pub(super) fn delivered_prompt_sizes(framed: &str) -> (u64, u64) {
+    let escaped_units = serde_json::to_string(framed)
+        .map(|escaped| escaped.encode_utf16().count())
+        .unwrap_or(0);
+    (framed.chars().count() as u64, escaped_units as u64)
+}
+
+pub(super) fn notify_payload_budget(prompt: &str, executable_units: usize) -> NotifyPayloadBudget {
+    let (prompt_chars, escaped_units) = delivered_prompt_sizes(prompt);
+    notify_payload_budget_from_sizes(prompt_chars, escaped_units, executable_units)
+}
+
+pub(super) fn notify_payload_budget_from_sizes(
+    prompt_chars: u64,
+    escaped_units: u64,
+    executable_units: usize,
+) -> NotifyPayloadBudget {
+    let escaped_units = usize::try_from(escaped_units).unwrap_or(usize::MAX);
+    let envelope_units = executable_units + NOTIFY_ENVELOPE_FIXED_UNITS;
+    NotifyPayloadBudget {
+        prompt_chars: usize::try_from(prompt_chars).unwrap_or(usize::MAX),
+        escaped_units,
+        envelope_units,
+        limit_units: NOTIFY_COMMAND_LINE_LIMIT_UNITS,
+        answer_budget_units: NOTIFY_COMMAND_LINE_LIMIT_UNITS
+            .saturating_sub(escaped_units.saturating_add(envelope_units)),
+    }
+}
+
+pub(super) fn classify_notify_payload_budget(
+    budget: &NotifyPayloadBudget,
+    windows: bool,
+) -> (crate::native::doctor::Availability, &'static str) {
+    use crate::native::doctor::Availability::*;
+    if !windows {
+        (Available, "codex_notify_payload_no_limit")
+    } else if budget.escaped_units.saturating_add(budget.envelope_units) >= budget.limit_units {
+        (Unavailable, "codex_notify_payload_over_limit")
+    } else if budget.answer_budget_units < NOTIFY_ANSWER_BUDGET_THRESHOLD_UNITS {
+        (Unavailable, "codex_notify_payload_near_limit")
+    } else {
+        (Available, "codex_notify_payload_within_limit")
+    }
+}
+
+fn notify_payload_evidence(
+    budget: &NotifyPayloadBudget,
+    pending_request: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "prompt_chars": budget.prompt_chars,
+        "escaped_units": budget.escaped_units,
+        "envelope_units": budget.envelope_units,
+        "limit_units": budget.limit_units,
+        "answer_budget_units": budget.answer_budget_units,
+        "threshold_units": NOTIFY_ANSWER_BUDGET_THRESHOLD_UNITS,
+        "pending_request": pending_request,
+    })
+}
+
+const NOTIFY_PAYLOAD_DETAIL: &str = "Estimated command line of the pending turn's notify payload, a lower bound: the JSON-escaped delivered prompt in UTF-16 units plus a fixed envelope for the other fields and the notify executable path; Codex's own argument quoting adds more. Windows refuses a command line of 32,767 units or more, so a completion whose answer does not fit the remaining budget never reaches Bridge.";
+const NOTIFY_PAYLOAD_ACTION: &str = "If the request stays pending with the session working, read the answer from Codex's rollout record (~/.codex/sessions/<date>/rollout-*.jsonl), then close-session the session. Keep delivered prompts and requested answers short on native Windows; put long material in workspace files and ask for a file-based report. Never resend an uncertain turn.";
+
+fn notify_payload_check(directory: Option<&Path>) -> crate::native::doctor::Check {
+    use crate::native::doctor::{Availability::*, Check};
+    let Some(directory) = directory else {
+        return Check::new(
+            "codex_notify_payload_budget",
+            Unknown,
+            "session_required",
+            NOTIFY_PAYLOAD_DETAIL,
+            NOTIFY_PAYLOAD_ACTION,
+        );
+    };
+    let pending = match read_pending_turn(directory) {
+        Ok(Some(pending)) => pending,
+        Ok(None) => {
+            return Check::new(
+                "codex_notify_payload_budget",
+                Unknown,
+                "codex_turn_not_pending",
+                "No Codex turn is pending in this session, so there is no payload to estimate.",
+                NOTIFY_PAYLOAD_ACTION,
+            );
+        }
+        Err(error) => {
+            return Check::new(
+                "codex_notify_payload_budget",
+                Unknown,
+                "codex_pending_prompt_unavailable",
+                NOTIFY_PAYLOAD_DETAIL,
+                NOTIFY_PAYLOAD_ACTION,
+            )
+            .evidence(serde_json::json!({"error": format!("{error:#}")}));
+        }
+    };
+    let pending_request = Reader::open_unchecked(directory)
+        .record(CoreRecord::Requests)
+        .child(&format!("{}.json", pending.claim_token))
+        .json::<requests::Receipt>()
+        .ok()
+        .map(|receipt| receipt.request_id);
+    let executable_units = std::env::current_exe()
+        .map(|path| path.to_string_lossy().encode_utf16().count())
+        .unwrap_or(0);
+    let budget = match (
+        pending.delivered_prompt_chars,
+        pending.delivered_prompt_units,
+    ) {
+        // Exact for the delivered prompt: the sizes the install wrote into the record.
+        (Some(chars), Some(units)) => Ok((
+            notify_payload_budget_from_sizes(chars, units, executable_units),
+            "pending_turn_record",
+        )),
+        // A record without them was installed by an older binary; the preserved initial
+        // prompt still describes the turn while it exists.
+        _ => pending_prompt(directory, &pending).map(|prompt| {
+            (
+                notify_payload_budget(&prompt, executable_units),
+                "initial_prompt_record",
+            )
+        }),
+    };
+    match budget {
+        Ok((budget, source)) => {
+            let (availability, reason) = classify_notify_payload_budget(&budget, cfg!(windows));
+            let mut evidence = notify_payload_evidence(&budget, pending_request.as_deref());
+            evidence["source"] = serde_json::Value::from(source);
+            Check::new(
+                "codex_notify_payload_budget",
+                availability,
+                reason,
+                NOTIFY_PAYLOAD_DETAIL,
+                NOTIFY_PAYLOAD_ACTION,
+            )
+            .evidence(evidence)
+        }
+        Err(error) => Check::new(
+            "codex_notify_payload_budget",
+            Unknown,
+            "codex_pending_prompt_unavailable",
+            NOTIFY_PAYLOAD_DETAIL,
+            NOTIFY_PAYLOAD_ACTION,
+        )
+        .evidence(serde_json::json!({
+            "error": format!("{error:#}"),
+            "pending_request": pending_request,
+        })),
+    }
+}
+
+/// The fallback for a pending turn whose record carries no sizes: the preserved initial
+/// prompt, framed as Codex received it. The wrapper removes that record when the launch
+/// argument accepts it (macOS) and delivery removes it after the paste (Windows), and
+/// `tell` keeps no copy of a follow-up prompt, so a turn installed before the sizes were
+/// recorded is only estimable before its delivery.
+fn pending_prompt(directory: &Path, pending: &super::PendingCodexTurn) -> Result<String> {
+    let prompt = Reader::open_unchecked(directory)
+        .initial_prompt()
+        .context("the pending turn record of an older version carries no prompt sizes and the initial prompt record is gone: the delivered prompt is not retained")?;
+    Ok(correlated_prompt(&prompt, pending))
+}
 
 pub(super) fn diagnose_codex(
     context: crate::native::doctor::Context<'_>,
@@ -51,6 +239,7 @@ pub(super) fn diagnose_codex(
     checks.push(Check::new("codex_thread", availability, reason,
         "Uses the same provider-owned event identity lookup as the queue sender. It does not prove a TUI currently has that thread loaded.",
         "Select a managed session with a recorded Codex result; a queue acceptance is not a completion.").evidence(evidence));
+    checks.push(notify_payload_check(context.directory));
     let daemon = if !context.probe {
         Check::new(
             "codex_daemon",

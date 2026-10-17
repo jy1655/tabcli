@@ -140,9 +140,9 @@
   },
   "src/native/provider/codex/mod.rs": {
     "const PENDING_TURN_FILE: &str = \"codex-pending-turn.json\";": 1,
-    "struct PendingCodexTurn {\n    schema: u32,\n    claim_token: String,\n    marker: String,\n}": 1,
+    "struct PendingCodexTurn {\n    schema: u32,\n    claim_token: String,\n    marker: String,\n    // The size of the framed prompt as Codex received it, kept for the doctor's notify\n    // payload estimate (#127). Additive within schema 1: a record of 0.4.14 reads with\n    // `None`, and 0.4.14 ignores the fields (serde keeps unknown fields by default).\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    delivered_prompt_chars: Option<u64>,\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    delivered_prompt_units: Option<u64>,\n}": 1,
     "marker: format!(\"<!-- agent-bridge-codex-turn:{claim_token} -->\"),": 1,
-    "impl PendingCodexTurn {\n    fn new(claim_token: &str) -> Result<Self> {\n        validate_claim_token(claim_token)?;\n        Ok(Self {\n            schema: 1,\n            claim_token: claim_token.to_owned(),\n            marker: format!(\"<!-- agent-bridge-codex-turn:{claim_token} -->\"),\n        })\n    }\n}": 1,
+    "impl PendingCodexTurn {\n    fn new(claim_token: &str) -> Result<Self> {\n        validate_claim_token(claim_token)?;\n        Ok(Self {\n            schema: 1,\n            claim_token: claim_token.to_owned(),\n            marker: format!(\"<!-- agent-bridge-codex-turn:{claim_token} -->\"),\n            delivered_prompt_chars: None,\n            delivered_prompt_units: None,\n        })\n    }\n": 1,
     "agent-bridge-codex-turn": 1,
     "codex-pending-turn.json": 1,
     "last-assistant-message": 1,

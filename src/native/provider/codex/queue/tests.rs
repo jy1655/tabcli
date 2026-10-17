@@ -543,10 +543,13 @@ exit 91
     assert!(directory.join("queue-ran").exists());
     assert!(directory.join(PENDING_TURN_FILE).exists());
     assert!(directory.join(TURN_CLAIM_FILE).exists());
-    assert_eq!(
-        read_pending_turn(&directory).unwrap().unwrap().claim_token,
-        claim_token
+    let pending = read_pending_turn(&directory).unwrap().unwrap();
+    assert_eq!(pending.claim_token, claim_token);
+    let (chars, units) = super::super::diagnose::delivered_prompt_sizes(
+        &super::super::correlation::correlated_prompt("follow up", &pending),
     );
+    assert_eq!(pending.delivered_prompt_chars, Some(chars));
+    assert_eq!(pending.delivered_prompt_units, Some(units));
     assert_eq!(event_paths(&directory).unwrap().len(), 1);
 }
 

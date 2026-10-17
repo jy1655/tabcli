@@ -407,6 +407,10 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                             "consent={consent} windows={windows} yolo={yolo} model={model:?} effort={effort:?}"
                         );
                         let pending = read_pending_turn(&directory).unwrap().unwrap();
+                        let (chars, units) =
+                            diagnose::delivered_prompt_sizes(&correlated_prompt(&prompt, &pending));
+                        assert_eq!(pending.delivered_prompt_chars, Some(chars), "{label}");
+                        assert_eq!(pending.delivered_prompt_units, Some(units), "{label}");
                         assert_eq!(
                             pending.claim_token,
                             turn::current_claim_token(&Reader::open_unchecked(&directory))
@@ -455,4 +459,49 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
             }
         }
     }
+}
+
+#[test]
+fn pending_turn_record_round_trips_with_and_without_delivered_prompt_sizes() {
+    let directory = tempfile::tempdir().unwrap();
+    // The shape 0.4.14 writes: no size fields. It decodes with both absent.
+    let legacy = r#"{"schema":1,"claim_token":"1700000000000-1","marker":"<!-- agent-bridge-codex-turn:1700000000000-1 -->"}"#;
+    std::fs::write(directory.path().join(PENDING_TURN_FILE), legacy).unwrap();
+    let pending = read_pending_turn(directory.path()).unwrap().unwrap();
+    assert_eq!(pending.claim_token, "1700000000000-1");
+    assert_eq!(pending.delivered_prompt_chars, None);
+    assert_eq!(pending.delivered_prompt_units, None);
+    let encoded = serde_json::to_value(&pending).unwrap();
+    assert!(encoded.get("delivered_prompt_chars").is_none());
+    assert!(encoded.get("delivered_prompt_units").is_none());
+
+    // A record with the sizes keeps schema 1 and reads back exactly.
+    let written =
+        install_pending_turn_for_prompt(directory.path(), "1700000000000-2", "a\"b😀").unwrap();
+    let framed = correlated_prompt("a\"b😀", &written);
+    let (chars, units) = diagnose::delivered_prompt_sizes(&framed);
+    assert_eq!(written.delivered_prompt_chars, Some(chars));
+    assert_eq!(written.delivered_prompt_units, Some(units));
+    let text = std::fs::read_to_string(directory.path().join(PENDING_TURN_FILE)).unwrap();
+    let raw: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(raw["schema"], 1);
+    assert_eq!(raw["delivered_prompt_chars"], chars);
+    assert_eq!(raw["delivered_prompt_units"], units);
+    let read = read_pending_turn(directory.path()).unwrap().unwrap();
+    assert_eq!(read.delivered_prompt_chars, Some(chars));
+    assert_eq!(read.delivered_prompt_units, Some(units));
+    // A binary that does not know the fields decodes the same text: the struct denies no
+    // unknown field, so the 0.4.14 shape with an extra field still reads.
+    #[derive(serde::Deserialize)]
+    struct Legacy {
+        schema: u32,
+        claim_token: String,
+        marker: String,
+    }
+    let legacy: Legacy = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        (legacy.schema, legacy.claim_token.as_str()),
+        (1, "1700000000000-2")
+    );
+    assert_eq!(legacy.marker, read.marker);
 }
