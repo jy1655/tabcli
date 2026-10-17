@@ -14,19 +14,34 @@ struct Fixture {
 }
 
 // Restricts a fixture directory to the current user, so that a file created inside it is a
-// store that the trust-store check accepts: on Windows the inherited rules are replaced by one
-// full-control rule for this user (the owner stays this user); on Unix the temporary directory
-// already belongs to the user alone and a file's mode is what the check reads.
+// store that the trust-store check accepts. On Windows the inherited rules are replaced by one
+// full-control rule for the current token's user, named by its SID (a name alone can resolve
+// to another account of the same name); the owner of what is created inside stays the token's
+// user, or its default owner on an elevated runner, both of which the check accepts. On Unix
+// the temporary directory already belongs to the user alone and a file's mode is what the
+// check reads.
 #[cfg(windows)]
 fn make_private(directory: &std::path::Path) {
-    let user = std::env::var("USERNAME").expect("USERNAME");
+    let output = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .expect("whoami runs");
+    assert!(output.status.success(), "{output:?}");
+    let line = String::from_utf8(output.stdout).unwrap();
+    let sid = line
+        .trim()
+        .rsplit(',')
+        .next()
+        .map(|field| field.trim_matches('"'))
+        .filter(|sid| sid.starts_with("S-1-"))
+        .unwrap_or_else(|| panic!("whoami /user did not report a SID: {line:?}"))
+        .to_owned();
     let output = std::process::Command::new("icacls")
         .arg(directory)
         .args([
             "/inheritance:r",
             "/grant:r",
-            &format!("{user}:(OI)(CI)F"),
-            "/t",
+            &format!("*{sid}:(OI)(CI)F"),
             "/q",
         ])
         .output()
