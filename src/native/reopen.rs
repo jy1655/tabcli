@@ -89,13 +89,18 @@ pub(super) fn reopen_refusal_gate(error: &anyhow::Error) -> Option<&'static str>
 pub(super) const REOPEN_LAUNCH_GATE: &str = "provider-unsupported";
 const REOPEN_CONFLICT_GATE: &str = "reopen-conflict";
 const REOPEN_VERIFICATION_FAILED_GATE: &str = "reopen-verification-failed";
+// The new session existed, but a record it needs before its launch (the result context or
+// the initial claim) could not be made. No provider process exists at that point, so the
+// refusal's cleanup is `NoProcessSpawned` and the source marker is released (#245).
+const REOPEN_START_FAILED_GATE: &str = "start-failed";
 // Launch admission refused the source workspace before the new session existed.
 const REOPEN_WORKSPACE_REFUSED_GATE: &str = "workspace-refused";
 
 // The gates a reopen can fail after its session exists. Each one leaves the new session
 // failed with no prompt delivered. The source's reopen marker is released again only once
 // the refused launch provably cannot hold the conversation (`RefusedLaunchCleanup`).
-const REOPEN_POST_CREATION_GATES: [&str; 3] = [
+const REOPEN_POST_CREATION_GATES: [&str; 4] = [
+    REOPEN_START_FAILED_GATE,
     REOPEN_LAUNCH_GATE,
     REOPEN_CONFLICT_GATE,
     REOPEN_VERIFICATION_FAILED_GATE,
@@ -254,8 +259,8 @@ fn observe_provider_process_with(
 // a closed surface cannot rule out an unregistered provider that still holds the conversation.
 #[derive(Debug, PartialEq)]
 enum RefusedLaunchCleanup {
-    // The pre-spawn recheck refused and no provider process was recorded: the launch
-    // wrapper started none.
+    // The refusal came before a provider process could exist (the pre-spawn recheck, or a
+    // failure before the launch) and none was recorded: the launch wrapper started none.
     NoProcessSpawned,
     // The provider process the launch wrapper recorded is verified gone: its pid is dead
     // or the pid is alive under a different identity. `surface_closed` adds that the
@@ -347,7 +352,7 @@ fn refused_launch_cleanup_with(
     )
     .optional_json::<ProviderProcessRecord>()?;
     let Some(record) = record else {
-        if gate == REOPEN_LAUNCH_GATE {
+        if gate == REOPEN_LAUNCH_GATE || gate == REOPEN_START_FAILED_GATE {
             return Ok(RefusedLaunchCleanup::NoProcessSpawned);
         }
         return Ok(RefusedLaunchCleanup::Pending(format!(
@@ -720,6 +725,20 @@ impl session_start::StartSource for ReopenedSource {
             })?;
         self.resumed_from = Some(resumed_from);
         Ok(created)
+    }
+
+    fn start_failed(&self, created: &CreatedSession, error: anyhow::Error) -> anyhow::Error {
+        // The refusal first: it is what lets the next reopen release the source marker even
+        // if the status write fails. No provider process exists before the launch, so the
+        // refusal's cleanup is `NoProcessSpawned`, and this command's own settlement
+        // (`settle_reopen_outcome`) releases the marker at once (#245).
+        let refusal = record_reopen_refusal(
+            &created.directory,
+            REOPEN_START_FAILED_GATE,
+            format!("{error:#}"),
+        );
+        session_start::mark_start_failed(created, &refusal);
+        refusal
     }
 
     fn gate(&self, directory: &Path, gate: delivery::Gate, deadline: Instant) -> Result<()> {
