@@ -85,7 +85,7 @@ pub(super) fn send_native_queue_message<C: Clock>(
     // See docs/verification/2026-10-04-codex-queue.md for the provider source.
 
     let mut pending = PendingCodexTurn::new(context.correlation_id).map_err(Outcome::NotSent)?;
-    pending.record_delivered_prompt(&correlated_prompt(context.prompt, &pending));
+    pending.record_framed_prompt(&correlated_prompt(context.prompt, &pending));
     let arguments = codex_queue_arguments(&thread_id, context.prompt, &pending);
     let mut command = queue_command(
         context.provider_path,

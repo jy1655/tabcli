@@ -60,13 +60,15 @@ struct PendingCodexTurn {
     schema: u32,
     claim_token: String,
     marker: String,
-    // The size of the framed prompt as Codex received it, kept for the doctor's notify
-    // payload estimate (#127). Additive within schema 1: a record of 0.4.14 reads with
-    // `None`, and 0.4.14 ignores the fields (serde keeps unknown fields by default).
+    // The sizes of the framed prompt as Bridge handed it to delivery, kept for the doctor's
+    // notify payload estimate (#127). The macOS launch argument and the queue message
+    // deliver that text; the Windows console paste can drop a non-BMP character (#147),
+    // so the delivered text can be smaller. Additive within schema 1: a record of 0.4.14
+    // reads with `None`, and 0.4.14 ignores the fields (serde keeps unknown fields).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    delivered_prompt_chars: Option<u64>,
+    framed_prompt_chars: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    delivered_prompt_units: Option<u64>,
+    framed_prompt_units: Option<u64>,
 }
 
 impl PendingCodexTurn {
@@ -76,17 +78,17 @@ impl PendingCodexTurn {
             schema: 1,
             claim_token: claim_token.to_owned(),
             marker: format!("<!-- agent-bridge-codex-turn:{claim_token} -->"),
-            delivered_prompt_chars: None,
-            delivered_prompt_units: None,
+            framed_prompt_chars: None,
+            framed_prompt_units: None,
         })
     }
 
-    // Records the framed prompt's sizes: characters, and UTF-16 units of its JSON escape,
-    // which is what the notify payload carries in `input-messages`.
-    fn record_delivered_prompt(&mut self, framed: &str) {
-        let (chars, units) = diagnose::delivered_prompt_sizes(framed);
-        self.delivered_prompt_chars = Some(chars);
-        self.delivered_prompt_units = Some(units);
+    // Records the framed prompt's sizes before delivery: characters, and UTF-16 units of
+    // its JSON escape, which is how the notify payload carries it in `input-messages`.
+    fn record_framed_prompt(&mut self, framed: &str) {
+        let (chars, units) = diagnose::framed_prompt_sizes(framed);
+        self.framed_prompt_chars = Some(chars);
+        self.framed_prompt_units = Some(units);
     }
 }
 
@@ -452,7 +454,7 @@ fn install_pending_turn_for_prompt(
 ) -> Result<PendingCodexTurn> {
     let mut pending = PendingCodexTurn::new(claim_token)?;
     let framed = correlated_prompt(prompt, &pending);
-    pending.record_delivered_prompt(&framed);
+    pending.record_framed_prompt(&framed);
     write_pending_turn(directory, &pending)?;
     Ok(pending)
 }

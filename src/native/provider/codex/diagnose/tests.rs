@@ -350,14 +350,27 @@ fn notify_payload_check_reads_the_pending_initial_prompt_and_reports_unknown_oth
     assert!(evidence["answer_budget_units"].as_u64().unwrap() > 4_096);
     assert!(evidence["pending_request"].is_null());
     assert!(row["next_action"].as_str().unwrap().contains("rollout"));
-    assert!(row["detail"].as_str().unwrap().contains("lower bound"));
+    assert!(
+        row["detail"]
+            .as_str()
+            .unwrap()
+            .contains("not a measurement")
+    );
+    assert_eq!(evidence["executable_source"], "doctor_executable");
 
-    // A delivered turn: the initial prompt record is gone, and the pending turn record
-    // carries the sizes the install wrote. The record wins even while the prompt exists.
+    // A pending turn record that carries the sizes wins over the preserved initial prompt
+    // while both exist (`hello` would give a far smaller prompt), and still answers once
+    // delivery has removed the initial prompt record.
     let delivered = "x".repeat(10_000);
     let pending =
         super::super::install_pending_turn_for_prompt(&directory, "1700000000000-3", &delivered)
             .unwrap();
+    let (_, _, row) = check(Some(&directory));
+    assert_eq!(row["evidence"]["source"], "pending_turn_record");
+    assert_eq!(
+        row["evidence"]["prompt_chars"],
+        pending.framed_prompt_chars.unwrap()
+    );
     std::fs::remove_file(
         Store::open_unchecked(&directory)
             .record(CoreRecord::InitialPrompt)
@@ -378,11 +391,11 @@ fn notify_payload_check_reads_the_pending_initial_prompt_and_reports_unknown_oth
     assert_eq!(evidence["source"], "pending_turn_record");
     assert_eq!(
         evidence["prompt_chars"],
-        pending.delivered_prompt_chars.unwrap()
+        pending.framed_prompt_chars.unwrap()
     );
     assert_eq!(
         evidence["escaped_units"],
-        pending.delivered_prompt_units.unwrap()
+        pending.framed_prompt_units.unwrap()
     );
     assert!(evidence["prompt_chars"].as_u64().unwrap() > 10_000);
     assert!(evidence["answer_budget_units"].as_u64().unwrap() < 32_767 - 10_000);

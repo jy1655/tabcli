@@ -122,9 +122,10 @@ answer short on native Windows: put long material in files in the workspace, ask
 written result, and prefer a file-based report. To recover, read the answer from Codex's rollout
 record (`~/.codex/sessions/<date>/rollout-*.jsonl`), then `close-session` the session; do not
 resend an uncertain turn. `tabcli doctor <session>` reports `codex_notify_payload_budget`, an
-estimate of the pending turn's payload against the limit from the delivered prompt's size, which
-the pending-turn record retains for the initial turn and for each follow-up; see
-[doctor](cli.md#doctor).
+estimate of the pending turn's payload against the limit from the framed prompt's size, which the
+pending-turn record keeps for the initial turn and for each follow-up as sized before delivery (the
+console paste can drop a non-BMP character, so the delivered text can be smaller); the estimate can
+differ from the real command line by a few hundred units either way. See [doctor](cli.md#doctor).
 
 `reopen` refuses closed Codex sessions. Bridge still needs checks for the thread's writer lock
 and queued inputs before supporting resume; start a new session instead.

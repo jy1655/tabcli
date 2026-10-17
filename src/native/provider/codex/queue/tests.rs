@@ -545,11 +545,11 @@ exit 91
     assert!(directory.join(TURN_CLAIM_FILE).exists());
     let pending = read_pending_turn(&directory).unwrap().unwrap();
     assert_eq!(pending.claim_token, claim_token);
-    let (chars, units) = super::super::diagnose::delivered_prompt_sizes(
+    let (chars, units) = super::super::diagnose::framed_prompt_sizes(
         &super::super::correlation::correlated_prompt("follow up", &pending),
     );
-    assert_eq!(pending.delivered_prompt_chars, Some(chars));
-    assert_eq!(pending.delivered_prompt_units, Some(units));
+    assert_eq!(pending.framed_prompt_chars, Some(chars));
+    assert_eq!(pending.framed_prompt_units, Some(units));
     assert_eq!(event_paths(&directory).unwrap().len(), 1);
 }
 

@@ -12,11 +12,13 @@ pub(super) const NOTIFY_COMMAND_LINE_LIMIT_UNITS: usize = 32_767;
 pub(super) const NOTIFY_ANSWER_BUDGET_THRESHOLD_UNITS: usize = 4_096;
 /// Allowance for the payload's other fields (`type`, `thread-id`, `turn-id`, the JSON
 /// framing of `input-messages` and `last-assistant-message`) and the notify command's own
-/// arguments (`native-hook codex`) and quoting, on top of the executable path.
+/// arguments (`native-hook codex`) and quoting, on top of the executable path. Not a proven
+/// bound: the real command line can be a few hundred units above or below the estimate.
 const NOTIFY_ENVELOPE_FIXED_UNITS: usize = 300;
 
-/// The command-line budget of one Codex `notify` payload, estimated from the delivered
-/// prompt. A lower bound: the shell quoting Codex applies to the argument adds escaping.
+/// The command-line budget of one Codex `notify` payload, estimated from the framed prompt.
+/// An estimate, not a bound: the envelope is an allowance, and the executable length is
+/// the doctor's own path standing in for the notify path fixed at launch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct NotifyPayloadBudget {
     pub(super) prompt_chars: usize,
@@ -28,7 +30,7 @@ pub(super) struct NotifyPayloadBudget {
 
 /// The sizes the pending-turn record keeps of a framed prompt: its characters, and the
 /// UTF-16 units of its JSON escape, which is how the notify payload carries it.
-pub(super) fn delivered_prompt_sizes(framed: &str) -> (u64, u64) {
+pub(super) fn framed_prompt_sizes(framed: &str) -> (u64, u64) {
     let escaped_units = serde_json::to_string(framed)
         .map(|escaped| escaped.encode_utf16().count())
         .unwrap_or(0);
@@ -36,7 +38,7 @@ pub(super) fn delivered_prompt_sizes(framed: &str) -> (u64, u64) {
 }
 
 pub(super) fn notify_payload_budget(prompt: &str, executable_units: usize) -> NotifyPayloadBudget {
-    let (prompt_chars, escaped_units) = delivered_prompt_sizes(prompt);
+    let (prompt_chars, escaped_units) = framed_prompt_sizes(prompt);
     notify_payload_budget_from_sizes(prompt_chars, escaped_units, executable_units)
 }
 
@@ -84,12 +86,13 @@ fn notify_payload_evidence(
         "limit_units": budget.limit_units,
         "answer_budget_units": budget.answer_budget_units,
         "threshold_units": NOTIFY_ANSWER_BUDGET_THRESHOLD_UNITS,
+        "executable_source": "doctor_executable",
         "pending_request": pending_request,
     })
 }
 
-const NOTIFY_PAYLOAD_DETAIL: &str = "Estimated command line of the pending turn's notify payload, a lower bound: the JSON-escaped delivered prompt in UTF-16 units plus a fixed envelope for the other fields and the notify executable path; Codex's own argument quoting adds more. Windows refuses a command line of 32,767 units or more, so a completion whose answer does not fit the remaining budget never reaches Bridge.";
-const NOTIFY_PAYLOAD_ACTION: &str = "If the request stays pending with the session working, read the answer from Codex's rollout record (~/.codex/sessions/<date>/rollout-*.jsonl), then close-session the session. Keep delivered prompts and requested answers short on native Windows; put long material in workspace files and ask for a file-based report. Never resend an uncertain turn.";
+const NOTIFY_PAYLOAD_DETAIL: &str = "Estimate of the pending turn's notify command line, not a measurement: the JSON-escaped framed prompt in UTF-16 units, as sized before delivery, plus an allowance of 300 units for the payload's other fields and Codex's argument quoting, plus the length of this doctor's executable path standing in for the notify executable fixed at launch, which the records do not retain. The real command line can differ by a few hundred units either way. Windows refuses a command line of 32,767 units or more: an estimate at or over the limit means the completion has probably failed to reach Bridge, and one near the limit that a long answer will.";
+const NOTIFY_PAYLOAD_ACTION: &str = "If the request stays pending while the session is working after a long turn, read the answer from Codex's rollout record (~/.codex/sessions/<date>/rollout-*.jsonl) and close-session the session; never resend an uncertain turn. Otherwise keep delivered prompts and requested answers short on native Windows: put long material in workspace files and ask for a file-based report.";
 
 fn notify_payload_check(directory: Option<&Path>) -> crate::native::doctor::Check {
     use crate::native::doctor::{Availability::*, Check};
@@ -133,11 +136,8 @@ fn notify_payload_check(directory: Option<&Path>) -> crate::native::doctor::Chec
     let executable_units = std::env::current_exe()
         .map(|path| path.to_string_lossy().encode_utf16().count())
         .unwrap_or(0);
-    let budget = match (
-        pending.delivered_prompt_chars,
-        pending.delivered_prompt_units,
-    ) {
-        // Exact for the delivered prompt: the sizes the install wrote into the record.
+    let budget = match (pending.framed_prompt_chars, pending.framed_prompt_units) {
+        // The sizes the install wrote into the record: the framed prompt before delivery.
         (Some(chars), Some(units)) => Ok((
             notify_payload_budget_from_sizes(chars, units, executable_units),
             "pending_turn_record",
