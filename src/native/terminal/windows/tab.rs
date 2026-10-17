@@ -49,6 +49,7 @@
 use crate::native::session::{Reader, RecordReader, RecordStore, Store};
 use std::{
     cell::Cell,
+    cmp::Ordering,
     collections::BTreeMap,
     ffi::{OsStr, OsString},
     os::windows::{
@@ -62,7 +63,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use windows_sys::Win32::{
-    Foundation::WAIT_OBJECT_0,
+    Foundation::{TRUE, WAIT_OBJECT_0},
+    Globalization::{CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN, CompareStringOrdinal},
     System::{
         Console::{FlushConsoleInputBuffer, FreeConsole, GetConsoleProcessList},
         JobObjects::{
@@ -777,13 +779,74 @@ fn terminal_command_line(
 }
 
 // The environment of this process, as a block for `CreateProcessW`, with the attempt
-// marker set to `attempt` or absent. The names are sorted without regard to case, as the
-// system expects of a block.
+// marker set to `attempt` or absent. Names are compared as Windows compares them
+// (`EnvironmentName`): by UTF-16 unit, ignoring case through the system's ordinal,
+// locale-independent mapping. Names equal by that rule are one variable, and the later
+// one wins; the block is sorted by that rule, as the system expects of a block. The
+// hidden `=C:` names are kept.
 pub(super) fn environment_block(attempt: Option<&str>) -> Vec<u16> {
     environment_block_from(std::env::vars_os(), attempt)
 }
 
-fn environment_block_from(
+// The name of an environment variable as Windows identifies it. Windows compares names by
+// UTF-16 unit after its own uppercase mapping of single units, which `CompareStringOrdinal`
+// applies when it ignores case; the standard library's own `EnvKey` compares names this
+// way. Rust's `to_uppercase` is another rule: it maps `ß` to `SS` and merged
+// `AB_REVIEW_SS` and `AB_REVIEW_ß`, which Windows keeps apart (#148).
+#[derive(Debug)]
+struct EnvironmentName(Vec<u16>);
+
+impl EnvironmentName {
+    fn new(name: &OsStr) -> Self {
+        Self(name.encode_wide().collect())
+    }
+}
+
+impl Ord for EnvironmentName {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // A negative length would be read as a NUL-terminated string. The name of a
+        // variable is far shorter than `i32::MAX` units.
+        let length = |name: &Self| {
+            i32::try_from(name.0.len()).expect("an environment name is shorter than i32::MAX")
+        };
+        let result = unsafe {
+            CompareStringOrdinal(
+                self.0.as_ptr(),
+                length(self),
+                other.0.as_ptr(),
+                length(other),
+                TRUE,
+            )
+        };
+        match result {
+            CSTR_LESS_THAN => Ordering::Less,
+            CSTR_EQUAL => Ordering::Equal,
+            CSTR_GREATER_THAN => Ordering::Greater,
+            // It fails only for invalid parameters, as `EnvKey` also relies on.
+            _ => panic!(
+                "comparing environment names failed: {}",
+                std::io::Error::last_os_error()
+            ),
+        }
+    }
+}
+
+impl PartialOrd for EnvironmentName {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for EnvironmentName {
+    fn eq(&self, other: &Self) -> bool {
+        // The mapping replaces single units, so equal names have the same length.
+        self.0.len() == other.0.len() && self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for EnvironmentName {}
+
+pub(super) fn environment_block_from(
     variables: impl IntoIterator<Item = (OsString, OsString)>,
     attempt: Option<&str>,
 ) -> Vec<u16> {
@@ -794,11 +857,11 @@ fn environment_block_from(
                 && !crate::native::process_env::non_provider_removals()
                     .any(|removal| name.eq_ignore_ascii_case(removal))
         })
-        .map(|(name, value)| (name.to_string_lossy().to_uppercase(), (name, value)))
+        .map(|(name, value)| (EnvironmentName::new(&name), (name, value)))
         .collect::<BTreeMap<_, _>>();
     if let Some(attempt) = attempt {
         variables.insert(
-            ATTEMPT_ENV.to_owned(),
+            EnvironmentName::new(OsStr::new(ATTEMPT_ENV)),
             (OsString::from(ATTEMPT_ENV), OsString::from(attempt)),
         );
     }

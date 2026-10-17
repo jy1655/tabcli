@@ -22,7 +22,8 @@ use std::os::windows::{
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+use windows_sys::Win32::Foundation::{TRUE, WAIT_OBJECT_0};
+use windows_sys::Win32::Globalization::{CSTR_LESS_THAN, CompareStringOrdinal};
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Console::INPUT_RECORD;
 use windows_sys::Win32::System::Threading::{CREATE_SUSPENDED, OpenProcess, WaitForSingleObject};
@@ -409,7 +410,12 @@ fn close_deadline_console_helper_is_bounded() {
         super::run_console_helper_command(&mut command, started + Duration::from_millis(100))
             .unwrap_err();
     assert!(format!("{error:#}").contains("timed out"), "{error:#}");
-    assert!(started.elapsed() < Duration::from_secs(5));
+    // The timeout error alone does not prove the bound: a helper that failed to end the
+    // command would report it too, after waiting for the 30 s sleep. 25 s still proves the
+    // sleep was cut short and leaves a loaded runner room to start and end PowerShell; a
+    // 5 s bound let a slow runner decide the result, as the 10 s deadline below did (#180).
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(25), "{elapsed:?}");
     let mut command = std::process::Command::new(&powershell);
     command.args([
         "-NoProfile",
@@ -417,10 +423,86 @@ fn close_deadline_console_helper_is_bounded() {
         "-Command",
         "[Console]::Error.WriteLine('own close timeout'); exit 1",
     ]);
+    // This case checks that the command's own message survives a failure before the
+    // deadline, so the deadline must not expire first. PowerShell did not print within
+    // 10 s on a loaded `windows-latest` runner (#180). The command exits at once, so the
+    // test never waits this long.
     let error =
-        super::run_console_helper_command(&mut command, Instant::now() + Duration::from_secs(10))
+        super::run_console_helper_command(&mut command, Instant::now() + Duration::from_secs(120))
             .unwrap_err();
     assert_eq!(error.to_string(), "own close timeout");
+}
+
+// Windows keeps `AB_REVIEW_SS` and `AB_REVIEW_ß` apart, and a key built with Rust's
+// `to_uppercase` merged them (#148). ASCII case variants stay one variable, the hidden
+// `=C:` name stays, and the block is in the order of the system's own comparison.
+#[test]
+fn environment_block_compares_names_as_windows_does() {
+    let variables = [
+        ("path", "C:\\lower"),
+        ("AB_REVIEW_ß", "sharp-s"),
+        ("=C:", "C:\\"),
+        ("AB_REVIEW_SS", "double-s"),
+        ("ab_review_case", "lower-case"),
+        ("PATH", "C:\\upper"),
+    ]
+    .map(|(name, value)| {
+        (
+            std::ffi::OsString::from(name),
+            std::ffi::OsString::from(value),
+        )
+    });
+    let block = super::tab::environment_block_from(variables, None);
+
+    let entries = block
+        .strip_suffix(&[0, 0])
+        .expect("the block ends with two NULs")
+        .split(|unit| *unit == 0)
+        .map(|entry| {
+            // A hidden name begins with `=`, so the separator is the first `=` after it.
+            let separator = 1 + entry[1..]
+                .iter()
+                .position(|unit| *unit == u16::from(b'='))
+                .expect("every entry has a value");
+            (
+                String::from_utf16(&entry[..separator]).unwrap(),
+                String::from_utf16(&entry[separator + 1..]).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let names = entries
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names.len(), 5, "{entries:?}");
+    assert_eq!(
+        names[..4],
+        ["=C:", "ab_review_case", "AB_REVIEW_SS", "AB_REVIEW_ß"]
+    );
+    assert!(names[4].eq_ignore_ascii_case("PATH"), "{entries:?}");
+    let value = |name: &str| {
+        entries
+            .iter()
+            .find(|(entry, _)| entry == name)
+            .map(|(_, value)| value.as_str())
+    };
+    assert_eq!(value("AB_REVIEW_SS"), Some("double-s"));
+    assert_eq!(value("AB_REVIEW_ß"), Some("sharp-s"));
+    assert_eq!(value("=C:"), Some("C:\\"));
+    for pair in names.windows(2) {
+        let [first, second] =
+            [pair[0], pair[1]].map(|name| name.encode_utf16().collect::<Vec<_>>());
+        let order = unsafe {
+            CompareStringOrdinal(
+                first.as_ptr(),
+                first.len() as i32,
+                second.as_ptr(),
+                second.len() as i32,
+                TRUE,
+            )
+        };
+        assert_eq!(order, CSTR_LESS_THAN, "{pair:?}");
+    }
 }
 
 struct PrivateConsoleChild(std::process::Child);
