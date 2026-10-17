@@ -67,6 +67,8 @@ fn begins_with_bridge_prompt(message: &str) -> bool {
 
 // Require header and trailing marker: Codex's title turn can quote the marker on another thread.
 // Framing is not turn identity; see docs/verification/2026-10-02-windows.md.
+// Any element may be the prompt: a message typed into the TUI during the turn is steered into
+// that turn and follows the prompt as a later element (codex-cli 0.163.0, 2026-10-17, #65).
 pub(super) fn codex_input_correlates(
     payload: &serde_json::Value,
     pending: &PendingCodexTurn,
@@ -77,9 +79,14 @@ pub(super) fn codex_input_correlates(
     payload
         .get("input-messages")
         .and_then(serde_json::Value::as_array)
-        .and_then(|messages| messages.iter().rev().find_map(serde_json::Value::as_str))
-        .is_some_and(|message| {
-            begins_with_bridge_prompt(message) && message.trim_end().ends_with(&pending.marker)
+        .is_some_and(|messages| {
+            messages
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|message| {
+                    begins_with_bridge_prompt(message)
+                        && message.trim_end().ends_with(&pending.marker)
+                })
         })
 }
 
