@@ -725,8 +725,9 @@ sends nothing. It is an estimate, not a measurement: the JSON-escaped framed pro
 delivery (the Windows console paste can drop a non-BMP character, so the delivered text can be
 smaller), plus an allowance of 300 units for the payload's other fields and Codex's argument
 quoting, plus the length of the doctor's own executable path, which stands in for the notify
-executable fixed at launch because the records do not retain it. The real command line can differ
-by a few hundred units either way. `evidence` carries `prompt_chars`, `escaped_units`,
+executable fixed at launch because the records do not retain it. The real command line can be
+larger or smaller: Codex's argument quoting adds a backslash for every quotation mark in the
+payload, so text with many quotation marks is undercounted by that many units. `evidence` carries `prompt_chars`, `escaped_units`,
 `envelope_units`, `limit_units`, `answer_budget_units` (the remaining units an answer can take),
 `threshold_units` (4,096), `executable_source` (`doctor_executable`), `pending_request` when the
 receipt is readable, and `source`: `pending_turn_record` for the retained sizes, or

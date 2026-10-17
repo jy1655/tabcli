@@ -124,8 +124,9 @@ record (`~/.codex/sessions/<date>/rollout-*.jsonl`), then `close-session` the se
 resend an uncertain turn. `tabcli doctor <session>` reports `codex_notify_payload_budget`, an
 estimate of the pending turn's payload against the limit from the framed prompt's size, which the
 pending-turn record keeps for the initial turn and for each follow-up as sized before delivery (the
-console paste can drop a non-BMP character, so the delivered text can be smaller); the estimate can
-differ from the real command line by a few hundred units either way. See [doctor](cli.md#doctor).
+console paste can drop a non-BMP character, so the delivered text can be smaller); the real command
+line can be larger or smaller than the estimate, and text with many quotation marks is undercounted
+because Codex's argument quoting escapes each of them. See [doctor](cli.md#doctor).
 
 `reopen` refuses closed Codex sessions. Bridge still needs checks for the thread's writer lock
 and queued inputs before supporting resume; start a new session instead.

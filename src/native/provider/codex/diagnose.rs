@@ -13,7 +13,9 @@ pub(super) const NOTIFY_ANSWER_BUDGET_THRESHOLD_UNITS: usize = 4_096;
 /// Allowance for the payload's other fields (`type`, `thread-id`, `turn-id`, the JSON
 /// framing of `input-messages` and `last-assistant-message`) and the notify command's own
 /// arguments (`native-hook codex`) and quoting, on top of the executable path. Not a proven
-/// bound: the real command line can be a few hundred units above or below the estimate.
+/// bound: the real command line can be larger or smaller than the estimate, and Codex's
+/// argument quoting adds a backslash for every quotation mark in the payload, so a prompt
+/// or an answer with many quotation marks is undercounted by that many units.
 const NOTIFY_ENVELOPE_FIXED_UNITS: usize = 300;
 
 /// The command-line budget of one Codex `notify` payload, estimated from the framed prompt.
@@ -91,7 +93,7 @@ fn notify_payload_evidence(
     })
 }
 
-const NOTIFY_PAYLOAD_DETAIL: &str = "Estimate of the pending turn's notify command line, not a measurement: the JSON-escaped framed prompt in UTF-16 units, as sized before delivery, plus an allowance of 300 units for the payload's other fields and Codex's argument quoting, plus the length of this doctor's executable path standing in for the notify executable fixed at launch, which the records do not retain. The real command line can differ by a few hundred units either way. Windows refuses a command line of 32,767 units or more: an estimate at or over the limit means the completion has probably failed to reach Bridge, and one near the limit that a long answer will.";
+const NOTIFY_PAYLOAD_DETAIL: &str = "Estimate of the pending turn's notify command line, not a measurement: the JSON-escaped framed prompt in UTF-16 units, as sized before delivery, plus an allowance of 300 units for the payload's other fields and Codex's argument quoting, plus the length of this doctor's executable path standing in for the notify executable fixed at launch, which the records do not retain. The real command line can be larger or smaller: Codex's argument quoting adds a backslash for every quotation mark in the payload, so text with many quotation marks is undercounted. Windows refuses a command line of 32,767 units or more: an estimate at or over the limit means the completion has probably failed to reach Bridge, and one near the limit that a long answer will.";
 const NOTIFY_PAYLOAD_ACTION: &str = "If the request stays pending while the session is working after a long turn, read the answer from Codex's rollout record (~/.codex/sessions/<date>/rollout-*.jsonl) and close-session the session; never resend an uncertain turn. Otherwise keep delivered prompts and requested answers short on native Windows: put long material in workspace files and ask for a file-based report.";
 
 fn notify_payload_check(directory: Option<&Path>) -> crate::native::doctor::Check {
