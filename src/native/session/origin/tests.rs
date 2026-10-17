@@ -7,13 +7,16 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum Checkpoint {
+pub(in crate::native) enum Checkpoint {
     /// After an Origin's status and owner were read, before the consistency recheck.
     OriginRead,
     /// After a scanned session matched, before its recheck.
     Matched,
     /// After the scan admitted an entry, before any of its records were read.
     Entry,
+    /// After a verification admitted the candidate directory, before any of its records
+    /// were re-read.
+    Verify,
 }
 
 type CheckpointHook = Box<dyn FnMut(Checkpoint, &Path)>;
@@ -37,9 +40,9 @@ pub(super) fn checkpoint(point: Checkpoint, directory: &Path) {
 }
 
 /// Resets every observation hook of this thread when a test ends, also on panic.
-struct Hooks;
+pub(in crate::native) struct Hooks;
 impl Hooks {
-    fn new() -> Self {
+    pub(in crate::native) fn new() -> Self {
         Self::reset();
         Self
     }
@@ -47,7 +50,7 @@ impl Hooks {
         RECEIPT_READS.with(|count| count.set(0));
         CHECKPOINT.with(|cell| *cell.borrow_mut() = None);
     }
-    fn checkpoint(&self, hook: impl FnMut(Checkpoint, &Path) + 'static) {
+    pub(in crate::native) fn checkpoint(&self, hook: impl FnMut(Checkpoint, &Path) + 'static) {
         CHECKPOINT.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
     }
     fn receipt_reads(&self) -> usize {
@@ -95,17 +98,17 @@ impl Environment {
     }
 }
 
-fn write(path: &Path, value: &Value) {
+pub(in crate::native) fn write(path: &Path, value: &Value) {
     fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
 }
 
 /// A session fixture written the way the records are named by `CoreRecord`.
-struct Session {
-    directory: PathBuf,
+pub(in crate::native) struct Session {
+    pub(in crate::native) directory: PathBuf,
 }
 
 impl Session {
-    fn new(root: &Path, id: &str, state: &str) -> Self {
+    pub(in crate::native) fn new(root: &Path, id: &str, state: &str) -> Self {
         let directory = root.join(id);
         fs::create_dir_all(directory.join(CoreRecord::Events.name())).unwrap();
         write(
@@ -118,30 +121,30 @@ impl Session {
         session.status(state, 3);
         session
     }
-    fn record(&self, record: CoreRecord) -> PathBuf {
+    pub(in crate::native) fn record(&self, record: CoreRecord) -> PathBuf {
         self.directory.join(record.name())
     }
-    fn status(&self, state: &str, generation: u64) {
+    pub(in crate::native) fn status(&self, state: &str, generation: u64) {
         write(
             &self.record(CoreRecord::Status),
             &json!({"state": state, "generation": generation, "updated_unix_ms": 1,
                 "exit_code": null, "error": null}),
         );
     }
-    fn tombstone(&self) {
+    pub(in crate::native) fn tombstone(&self) {
         write(
             &self.record(CoreRecord::Closed),
             &json!({"state": "closed", "generation": 9, "updated_unix_ms": 1,
                 "exit_code": null, "error": null}),
         );
     }
-    fn launch(&self, token: &str) {
+    pub(in crate::native) fn launch(&self, token: &str) {
         write(
             &self.record(CoreRecord::Launch),
             &json!({"schema": 1, "claim_token": token, "deadline_unix_ms": 1, "phase": "spawned"}),
         );
     }
-    fn receipt(&self, token: &str, created: u128, source: Option<&str>) {
+    pub(in crate::native) fn receipt(&self, token: &str, created: u128, source: Option<&str>) {
         let requests = self.record(CoreRecord::Requests);
         fs::create_dir_all(&requests).unwrap();
         let mut receipt = json!({"schema": 1, "request_id": format!("request-{token}"),
@@ -158,13 +161,18 @@ impl Session {
         fs::write(requests.join(format!("{token}.json")), b"{").unwrap();
     }
     /// A launched session whose initial request was sent from `source`.
-    fn started_from(root: &Path, id: &str, state: &str, source: &str) -> Self {
+    pub(in crate::native) fn started_from(
+        root: &Path,
+        id: &str,
+        state: &str,
+        source: &str,
+    ) -> Self {
         let session = Self::new(root, id, state);
         session.launch("100-1");
         session.receipt("100-1", 100, Some(source));
         session
     }
-    fn owner(&self, managed: Option<&str>, pid: u32) {
+    pub(in crate::native) fn owner(&self, managed: Option<&str>, pid: u32) {
         let mut owner = json!({"pid": pid});
         if let Some(managed) = managed {
             owner["managed_session_id"] = json!(managed);

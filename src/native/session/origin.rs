@@ -189,11 +189,26 @@ impl ReadBudget {
         clock: &mut dyn Clock,
         decode: impl FnOnce(&[u8]) -> Result<T, DecodeError>,
     ) -> Result<Option<T>, ReadFault> {
+        Ok(self
+            .decoded_with_bytes(record, clock, decode)?
+            .map(|(_, value)| value))
+    }
+
+    /// `decoded`, keeping the bytes the value was decoded from: the evidence a later
+    /// verification compares against.
+    fn decoded_with_bytes<T>(
+        &mut self,
+        record: &RecordReader,
+        clock: &mut dyn Clock,
+        decode: impl FnOnce(&[u8]) -> Result<T, DecodeError>,
+    ) -> Result<Option<(Vec<u8>, T)>, ReadFault> {
         self.read(record, clock)?
             .map(|bytes| {
-                decode(&bytes).map_err(|error| {
-                    ReadFault::Unreadable(format!("{:#}", error.in_path(record.path())))
-                })
+                decode(&bytes)
+                    .map_err(|error| {
+                        ReadFault::Unreadable(format!("{:#}", error.in_path(record.path())))
+                    })
+                    .map(|value| (bytes, value))
             })
             .transpose()
     }
@@ -342,6 +357,19 @@ pub(in crate::native) fn read_reference(
     budget: &mut ReadBudget,
     clock: &mut dyn Clock,
 ) -> OriginReference {
+    read_provenance(reader, budget, clock).reference
+}
+
+/// The Origin reference with the records it was selected from: the launch Claim token
+/// of a valid launch record and the bytes of the one receipt that was read for it. Both
+/// are set whenever the reference is `Managed` or `External`.
+struct Provenance {
+    reference: OriginReference,
+    launch_claim: Option<String>,
+    receipt: Option<Vec<u8>>,
+}
+
+fn read_provenance(reader: &Reader, budget: &mut ReadBudget, clock: &mut dyn Clock) -> Provenance {
     let own_id = reader
         .directory()
         .file_name()
@@ -349,7 +377,10 @@ pub(in crate::native) fn read_reference(
         .unwrap_or_default()
         .to_owned();
     let launch = budget.decoded(&reader.record(CoreRecord::Launch), clock, record::launch);
-    select(&own_id, launch, |token| {
+    let mut launch_claim = None;
+    let mut receipt_bytes = None;
+    let reference = select(&own_id, launch, |token| {
+        launch_claim = Some(token.to_owned());
         if !requests::requests_directory_present(reader)
             .map_err(|error| ReadFault::Unreadable(format!("{error:#}")))?
         {
@@ -357,10 +388,21 @@ pub(in crate::native) fn read_reference(
         }
         #[cfg(test)]
         tests::count_receipt_read();
-        budget.decoded(&requests::receipt_record(reader, token), clock, |bytes| {
-            record::receipt(bytes, token)
-        })
-    })
+        let read = budget.decoded_with_bytes(
+            &requests::receipt_record(reader, token),
+            clock,
+            |bytes| record::receipt(bytes, token),
+        )?;
+        Ok(read.map(|(bytes, receipt)| {
+            receipt_bytes = Some(bytes);
+            receipt
+        }))
+    });
+    Provenance {
+        reference,
+        launch_claim,
+        receipt: receipt_bytes,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -745,6 +787,11 @@ pub(in crate::native) struct StartedFrom {
     pub(in crate::native) incomplete_reasons: Vec<IncompleteReason>,
     pub(in crate::native) additional_incomplete_reasons: u64,
     pub(in crate::native) scanned: Scanned,
+    /// The evidence behind `open`, one per id in the same order. Private to the process
+    /// that scanned: `close-session --with-started-from` verifies each against the live
+    /// records before it closes. Never serialized.
+    #[serde(skip)]
+    pub(in crate::native) candidates: Vec<Candidate>,
 }
 
 impl StartedFrom {
@@ -759,23 +806,62 @@ impl StartedFrom {
     }
 }
 
-enum Examined {
-    Unrelated,
-    Open,
-    Incomplete(String),
-    Stop(&'static str),
+/// What the scan read of one open session, kept so that a later verification can tell a
+/// session that changed from one that did not: the status record and its generation, the
+/// launch Claim, the one receipt of that Claim and its source, and the current Claim.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::native) struct Evidence {
+    status: Vec<u8>,
+    generation: u64,
+    launch_claim: String,
+    receipt: Vec<u8>,
+    source: String,
+    claim: ClaimEvidence,
 }
 
-fn stop(why: Exhaustion) -> Examined {
-    Examined::Stop(match why {
+/// The current Claim (`turn.claim`) as the scan saw it. `Unreadable` is kept as what was
+/// seen, not resolved: a verification that cannot match it skips the session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ClaimEvidence {
+    Absent,
+    Token(String),
+    Unreadable,
+}
+
+/// One open session listed by the scan, with its evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::native) struct Candidate {
+    pub(in crate::native) id: String,
+    pub(in crate::native) directory: std::path::PathBuf,
+    evidence: Evidence,
+}
+
+/// Why an examined session is not a started-from session of the origin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Unrelated {
+    /// Its tombstone, or its status, records the closed state.
+    Closed,
+    /// Its initial Request has a valid managed or external source that is not the origin.
+    OtherSource,
+}
+
+enum Examined {
+    Unrelated(Unrelated),
+    Open(Evidence),
+    Incomplete(String),
+    Stop(Exhaustion),
+}
+
+fn stop_reason(why: Exhaustion) -> &'static str {
+    match why {
         Exhaustion::Time => "time_budget_exhausted",
         Exhaustion::Bytes => "byte_limit",
-    })
+    }
 }
 
 fn scan_fault(fault: ReadFault, unreadable: &str) -> Examined {
     match fault {
-        ReadFault::Exhausted(why) => stop(why),
+        ReadFault::Exhausted(why) => Examined::Stop(why),
         ReadFault::Busy => Examined::Incomplete("session_changed".to_owned()),
         ReadFault::Unreadable(error) => Examined::Incomplete(format!("{unreadable}: {error}")),
     }
@@ -804,7 +890,9 @@ fn examine(
         Err(fault) => return scan_fault(fault, "records_unreadable"),
     };
     match closed_state(closed.as_deref()) {
-        Some(true) if closed_state(status.as_deref()) == Some(true) => return Examined::Unrelated,
+        Some(true) if closed_state(status.as_deref()) == Some(true) => {
+            return Examined::Unrelated(Unrelated::Closed);
+        }
         Some(true) => return Examined::Incomplete("close_in_progress".to_owned()),
         Some(false) => {
             return Examined::Incomplete(
@@ -818,39 +906,62 @@ fn examine(
             "records_unreadable: the session has no status record".to_owned(),
         );
     };
-    match status_of(&status_bytes) {
-        Ok(status) if status.state == SessionState::Closed => return Examined::Unrelated,
+    let generation = match status_of(&status_bytes) {
+        Ok(status) if status.state == SessionState::Closed => {
+            return Examined::Unrelated(Unrelated::Closed);
+        }
         Ok(status) if matches!(status.state, SessionState::Unknown(_)) => {
             return Examined::Incomplete(
                 "records_unreadable: the recorded state is not one this version knows".to_owned(),
             );
         }
-        Ok(_) => (),
+        Ok(status) => status.generation,
         Err(fault) => return scan_fault(fault, "records_unreadable"),
-    }
-    let reference = read_reference(reader, budget, clock);
+    };
+    let Provenance {
+        reference,
+        launch_claim,
+        receipt,
+    } = read_provenance(reader, budget, clock);
     if let Some(why) = budget.exhausted {
-        return stop(why);
+        return Examined::Stop(why);
     }
-    match (reference.kind, reference.id.as_deref()) {
-        (SourceKind::Managed, Some(source)) if source == origin_id => (),
-        (SourceKind::Managed | SourceKind::External, _) => return Examined::Unrelated,
+    let source = match (reference.kind, reference.id.as_deref()) {
+        (SourceKind::Managed, Some(source)) if source == origin_id => source.to_owned(),
+        (SourceKind::Managed | SourceKind::External, _) => {
+            return Examined::Unrelated(Unrelated::OtherSource);
+        }
         (SourceKind::Unknown, _) => {
             return Examined::Incomplete(match reference.detail {
                 Some(detail) => format!("{}: {detail}", reference.reason),
                 None => reference.reason,
             });
         }
-    }
+    };
+    let (Some(launch_claim), Some(receipt)) = (launch_claim, receipt) else {
+        // A managed reference is selected from both records; this is unreachable.
+        return Examined::Incomplete(
+            "records_unreadable: the initial request records were not retained".to_owned(),
+        );
+    };
     #[cfg(test)]
     tests::checkpoint(tests::Checkpoint::Matched, reader.directory());
+    // The current Claim is evidence of the turn lifecycle only; it never replaces the
+    // launch Claim above. A read that fails for a reason other than the budget is kept
+    // as unreadable, so that the unflagged scan classifies the session as before.
+    let claim = match budget.read(&reader.record(CoreRecord::TurnClaim), clock) {
+        Ok(None) => ClaimEvidence::Absent,
+        Ok(Some(bytes)) => ClaimEvidence::Token(String::from_utf8_lossy(&bytes).trim().to_owned()),
+        Err(ReadFault::Exhausted(why)) => return Examined::Stop(why),
+        Err(ReadFault::Busy | ReadFault::Unreadable(_)) => ClaimEvidence::Unreadable,
+    };
     // Recheck just before reporting: a session that closed since is not open.
     let closed = match budget.read(&reader.record(CoreRecord::Closed), clock) {
         Ok(closed) => closed,
         Err(fault) => return scan_fault(fault, "session_changed"),
     };
     match closed_state(closed.as_deref()) {
-        Some(true) => return Examined::Unrelated,
+        Some(true) => return Examined::Unrelated(Unrelated::Closed),
         Some(false) => {
             return Examined::Incomplete(
                 "session_changed: the close tombstone does not record a closed state".to_owned(),
@@ -859,10 +970,103 @@ fn examine(
         None => (),
     }
     match budget.read(&reader.record(CoreRecord::Status), clock) {
-        Ok(Some(bytes)) if bytes == status_bytes => Examined::Open,
-        Ok(Some(bytes)) if closed_state(Some(&bytes)) == Some(true) => Examined::Unrelated,
+        Ok(Some(bytes)) if bytes == status_bytes => Examined::Open(Evidence {
+            status: status_bytes,
+            generation,
+            launch_claim,
+            receipt,
+            source,
+            claim,
+        }),
+        Ok(Some(bytes)) if closed_state(Some(&bytes)) == Some(true) => {
+            Examined::Unrelated(Unrelated::Closed)
+        }
         Ok(_) => Examined::Incomplete("session_changed".to_owned()),
         Err(fault) => scan_fault(fault, "session_changed"),
+    }
+}
+
+/// The outcome of re-verifying one scan Candidate immediately before it is closed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::native) enum Verified {
+    /// The records are what the scan saw and the session is still open.
+    Open,
+    /// The session is not to be closed, and why: it closed since the scan, its source
+    /// changed, its records changed or could not be classified, or it is gone.
+    Skipped(String),
+    /// The shared deadline passed before the verification finished.
+    Expired,
+}
+
+/// Byte allowance of one verification: the eight records it reads at the record limit.
+const VERIFY_BYTES: u64 = 8 * RECORD_LIMIT;
+
+/// Re-examines `candidate` against the live records, within `deadline`: the directory
+/// admission of the scan first, then the same examination as the scan with a budget of
+/// its own, and then every re-read record against the scan's evidence. Reads only.
+pub(in crate::native) fn verify_started_from(
+    root: &Path,
+    candidate: &Candidate,
+    origin_id: &str,
+    deadline: Instant,
+    clock: &mut dyn Clock,
+) -> Verified {
+    if clock.now() >= deadline {
+        return Verified::Expired;
+    }
+    let directory = root.join(&candidate.id);
+    if directory != candidate.directory {
+        return Verified::Skipped("session_changed: directory".to_owned());
+    }
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Verified::Skipped(
+                "session_gone: refusing a linked or non-directory session path".to_owned(),
+            );
+        }
+        Ok(_) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Verified::Skipped("session_gone".to_owned());
+        }
+        Err(error) => return Verified::Skipped(format!("records_unreadable: {error}")),
+    }
+    #[cfg(test)]
+    tests::checkpoint(tests::Checkpoint::Verify, &directory);
+    let reader = Reader::open_unchecked(&directory);
+    let mut budget = ReadBudget::new(deadline, VERIFY_BYTES);
+    let fresh = match examine(&reader, &candidate.id, origin_id, &mut budget, clock) {
+        Examined::Unrelated(Unrelated::Closed) => {
+            return Verified::Skipped("closed_since_scan".to_owned());
+        }
+        Examined::Unrelated(Unrelated::OtherSource) => {
+            return Verified::Skipped("source_changed".to_owned());
+        }
+        Examined::Incomplete(reason) => return Verified::Skipped(reason),
+        Examined::Stop(Exhaustion::Time) => return Verified::Expired,
+        Examined::Stop(why @ Exhaustion::Bytes) => {
+            return Verified::Skipped(stop_reason(why).to_owned());
+        }
+        Examined::Open(fresh) => fresh,
+    };
+    let seen = &candidate.evidence;
+    let changed = if fresh.generation != seen.generation {
+        Some("status generation")
+    } else if fresh.status != seen.status {
+        Some("status")
+    } else if fresh.launch_claim != seen.launch_claim {
+        Some("launch claim")
+    } else if fresh.source != seen.source {
+        Some("source")
+    } else if fresh.receipt != seen.receipt {
+        Some("initial receipt")
+    } else if fresh.claim != seen.claim || fresh.claim == ClaimEvidence::Unreadable {
+        Some("claim")
+    } else {
+        None
+    };
+    match changed {
+        Some(what) => Verified::Skipped(format!("session_changed: {what}")),
+        None => Verified::Open,
     }
 }
 
@@ -913,9 +1117,14 @@ pub(in crate::native) fn scan_started_from(
         tests::checkpoint(tests::Checkpoint::Entry, &entry.directory);
         let reader = Reader::open_unchecked(&entry.directory);
         match examine(&reader, &entry.id, origin_id, &mut budget, clock) {
-            Examined::Unrelated => (),
-            Examined::Open => {
-                scan.open.push(entry.id);
+            Examined::Unrelated(_) => (),
+            Examined::Open(evidence) => {
+                scan.open.push(entry.id.clone());
+                scan.candidates.push(Candidate {
+                    id: entry.id,
+                    directory: entry.directory,
+                    evidence,
+                });
                 if scan.open.len() >= SCAN_OPEN {
                     scan.note(
                         None,
@@ -925,8 +1134,8 @@ pub(in crate::native) fn scan_started_from(
                 }
             }
             Examined::Incomplete(reason) => scan.note(Some(entry.id), reason),
-            Examined::Stop(reason) => {
-                scan.note(None, reason.to_owned());
+            Examined::Stop(why) => {
+                scan.note(None, stop_reason(why).to_owned());
                 break;
             }
         }
@@ -939,6 +1148,7 @@ pub(in crate::native) fn scan_started_from(
         }
     }
     scan.open.sort();
+    scan.candidates.sort_by(|a, b| a.id.cmp(&b.id));
     scan.scanned.listed = scan.open.len() as u64;
     scan
 }

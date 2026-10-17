@@ -278,3 +278,317 @@ fn close_reports_unclosed_sessions_started_from_it_and_keeps_its_success() {
          Started-from scan incomplete; the list may omit sessions.\n"
     );
 }
+
+// `--with-started-from`: the listed sessions are closed through their own ordinary close.
+// The fixtures below need no terminal: a dead reaped owner, no owner at all, or a refusal
+// that the ordinary close reports before any terminal automation.
+
+fn reaped_child_pid() -> u32 {
+    #[cfg(windows)]
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "exit", "0"])
+        .spawn()
+        .unwrap();
+    #[cfg(not(windows))]
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+fn owner(directory: &Path, id: &str, pid: u32) {
+    write(
+        &directory.join("native-session.json"),
+        &json!({"pid": pid, "managed_session_id": id}),
+    );
+}
+
+/// A handle-less `launching` session whose launch is still pending: the ordinary close
+/// refuses it, and so does the flagged close.
+fn pending_launch(directory: &Path) {
+    write(
+        &directory.join("status.json"),
+        &status("launching", 2, None),
+    );
+    let deadline = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        + 600_000;
+    write(
+        &directory.join("launch.json"),
+        &json!({"schema": 1, "claim_token": "100-1", "deadline_unix_ms": deadline,
+            "phase": "pending"}),
+    );
+}
+
+fn without_lock(entries: Vec<support::Entry>) -> Vec<support::Entry> {
+    entries
+        .into_iter()
+        .filter(|(path, _)| {
+            path.file_name()
+                .is_some_and(|name| name != "turn.claim.lock")
+        })
+        .collect()
+}
+
+fn report(output: &Output) -> Value {
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+    let value: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        stdout,
+        format!("{}\n", serde_json::to_string_pretty(&value).unwrap()),
+        "exactly one JSON object on stdout"
+    );
+    value
+}
+
+#[test]
+fn with_started_from_closes_each_listed_session_through_its_own_close() {
+    let root = Root::new();
+    root.session("session-origin", "failed", None);
+    // A dead, reaped owner and no handle: the ordinary dead-owner repair closes it.
+    let dead = root.session("session-dead", "working", Some("session-origin"));
+    fs::write(dead.join("turn.claim"), "100-1").unwrap();
+    owner(&dead, "session-dead", reaped_child_pid());
+    // No owner and no handle: the ordinary close records the cascade reason.
+    let plain = root.session("session-plain", "ready", Some("session-origin"));
+    // Its own started-from session is reported under it and never closed.
+    let grand = root.session("session-grand", "working", Some("session-plain"));
+    // A session that closed before the command is not a candidate.
+    let done = root.session("session-done", "closed", Some("session-origin"));
+    write(&done.join("closed.json"), &status("closed", 2, None));
+    // A current Claim the scan could not read cannot be matched: skipped, never closed.
+    let unreadable = root.session("session-unreadable", "ready", Some("session-origin"));
+    fs::write(unreadable.join("turn.claim"), [0xff, 0xfe]).unwrap();
+    root.session("session-unrelated", "ready", Some("external"));
+    let grand_before = entries(&grand);
+    let unreadable_before = entries(&unreadable);
+    let done_before = entries(&done);
+
+    let output = root.run(&[
+        "close-session",
+        "session-origin",
+        "--explicit",
+        "--with-started-from",
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    // Reported, not closed: one level only. Compared before any query runs.
+    assert_eq!(entries(&grand), grand_before);
+    assert_eq!(entries(&unreadable), unreadable_before);
+    assert_eq!(entries(&done), done_before);
+    let value = report(&output);
+    let scan = |sessions: u64, listed: u64, open: Value| {
+        json!({"open": open, "incomplete": false, "incomplete_reasons": [],
+            "additional_incomplete_reasons": 0,
+            "scanned": {"sessions": sessions, "listed": listed}})
+    };
+    assert_eq!(
+        value,
+        json!({"ok": true, "session": "session-origin", "closed": true, "started_from": {
+            "open": ["session-dead", "session-plain", "session-unreadable"],
+            "incomplete": false, "incomplete_reasons": [],
+            "additional_incomplete_reasons": 0, "scanned": {"sessions": 6, "listed": 3},
+            "closed": [
+                {"session": "session-dead", "started_from": scan(6, 0, json!([]))},
+                {"session": "session-plain",
+                    "started_from": scan(6, 1, json!(["session-grand"]))}],
+            "skipped": [{"session": "session-unreadable", "reason": "session_changed: claim"}],
+            "failed": []}})
+    );
+    // The dead-owner target closed through its repair and keeps the repair's diagnostic.
+    let dead_status = root.sessions_of("session-dead");
+    assert_eq!(dead_status["state"], "closed");
+    let error = dead_status["error"].as_str().unwrap();
+    assert!(error.contains("no longer running"), "{error}");
+    assert!(!error.contains("--with-started-from"), "{error}");
+    assert!(!dead.join("turn.claim").exists());
+    assert!(dead.join("closed.json").exists());
+    // The ownerless target keeps the supplied reason, visible as the session error.
+    let inspect = success(root.run(&["inspect", "session-plain", "--json"]));
+    assert_eq!(inspect["stored_state"], "closed");
+    assert_eq!(
+        inspect["error"],
+        "closed by close-session --with-started-from of session-origin"
+    );
+    assert!(plain.join("closed.json").exists());
+    assert_eq!(root.sessions_of("session-grand")["state"], "working");
+    assert_eq!(root.sessions_of("session-unreadable")["state"], "ready");
+    assert_eq!(root.sessions_of("session-unrelated")["state"], "ready");
+}
+
+#[test]
+fn a_target_the_ordinary_close_refuses_fails_the_command_after_the_full_report() {
+    let root = Root::new();
+    root.session("session-origin", "failed", None);
+    let plain = root.session("session-a-plain", "ready", Some("session-origin"));
+    let launching = root.session("session-b-launching", "ready", Some("session-origin"));
+    pending_launch(&launching);
+    let launching_before = entries(&launching);
+
+    let output = root.run(&[
+        "close-session",
+        "session-origin",
+        "--explicit",
+        "--with-started-from",
+        "--json",
+    ]);
+    assert!(!output.status.success());
+    let value = report(&output);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["closed"], true);
+    assert_eq!(value["session"], "session-origin");
+    assert_eq!(
+        value["started_from"]["open"],
+        json!(["session-a-plain", "session-b-launching"])
+    );
+    assert_eq!(
+        value["started_from"]["closed"][0]["session"],
+        "session-a-plain"
+    );
+    assert_eq!(value["started_from"]["skipped"], json!([]));
+    let failed = &value["started_from"]["failed"];
+    assert_eq!(failed.as_array().unwrap().len(), 1);
+    assert_eq!(failed[0]["session"], "session-b-launching");
+    let error = failed[0]["error"].as_str().unwrap();
+    assert!(
+        error.contains("the launcher is still creating the surface for this session"),
+        "{error}"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(
+            "close-session closed session-origin but 1 of 2 started-from session(s) failed to close; see the report"
+        ),
+        "{stderr}"
+    );
+    assert!(plain.join("closed.json").exists());
+    // The refused close took the session's lifecycle lock, as an explicit close of it
+    // would, and changed nothing else.
+    assert_eq!(without_lock(entries(&launching)), launching_before);
+    assert_eq!(root.sessions_of("session-origin")["state"], "closed");
+}
+
+#[test]
+fn the_human_report_lists_every_target_in_order_and_the_totals() {
+    let root = Root::new();
+    root.session("session-origin", "failed", None);
+    let dead = root.session("session-a-dead", "working", Some("session-origin"));
+    owner(&dead, "session-a-dead", reaped_child_pid());
+    let launching = root.session("session-b-launching", "ready", Some("session-origin"));
+    pending_launch(&launching);
+    let plain = root.session("session-c-plain", "ready", Some("session-origin"));
+    root.session("session-grand", "ready", Some("session-c-plain"));
+    let unreadable = root.session("session-d-unreadable", "ready", Some("session-origin"));
+    fs::write(unreadable.join("turn.claim"), [0xff, 0xfe]).unwrap();
+
+    let output = root.run(&[
+        "close-session",
+        "session-origin",
+        "--explicit",
+        "--with-started-from",
+    ]);
+    assert!(!output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 7, "{stdout}");
+    assert_eq!(lines[0], "closed session-origin");
+    assert_eq!(lines[1], "started-from candidates: 4 (scan complete)");
+    assert_eq!(
+        lines[2],
+        "closed session-a-dead (started from session-origin); its own started-from: 0 open"
+    );
+    assert!(
+        lines[3].starts_with(
+            "failed session-b-launching: the launcher is still creating the surface for this session"
+        ),
+        "{}",
+        lines[3]
+    );
+    assert_eq!(
+        lines[4],
+        "closed session-c-plain (started from session-origin); its own started-from: 1 open"
+    );
+    assert_eq!(
+        lines[5],
+        "skipped session-d-unreadable: session_changed: claim"
+    );
+    assert_eq!(
+        lines[6],
+        "started-from close: 2 closed, 1 skipped, 1 failed"
+    );
+    assert!(!stdout.contains("remain unclosed"));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("but 1 of 4 started-from session(s) failed to close"),
+        "{stderr}"
+    );
+    assert!(plain.join("closed.json").exists());
+    assert_eq!(root.sessions_of("session-grand")["state"], "ready");
+}
+
+/// A retained, bound handle whose owner cannot be attested: the ordinary authority path
+/// refuses before any terminal automation. On macOS a recorded birth with `pid: u32::MAX`
+/// is the explicit range error; the Windows observer classifies that pid as absent, so no
+/// Windows public case is claimed here.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_target_with_an_unknown_owner_and_a_retained_handle_is_failed() {
+    let root = Root::new();
+    root.session("session-origin", "failed", None);
+    let unknown = root.session("session-unknown", "ready", Some("session-origin"));
+    write(
+        &unknown.join("terminal.json"),
+        &json!({"terminal": "apple-terminal", "session_id": "/dev/ttys999",
+            "window_id": "1001", "managed_session_id": "session-unknown"}),
+    );
+    write(
+        &unknown.join("native-session.json"),
+        &json!({"pid": u32::MAX, "managed_session_id": "session-unknown",
+            "terminal_tty": "/dev/ttys999", "process_start_seconds": 1,
+            "process_start_microseconds": 0}),
+    );
+
+    let output = root.run(&[
+        "close-session",
+        "session-origin",
+        "--explicit",
+        "--with-started-from",
+        "--json",
+    ]);
+    assert!(!output.status.success());
+    let value = report(&output);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["closed"], true);
+    assert_eq!(value["started_from"]["open"], json!(["session-unknown"]));
+    assert_eq!(value["started_from"]["closed"], json!([]));
+    assert_eq!(value["started_from"]["skipped"], json!([]));
+    assert_eq!(
+        value["started_from"]["failed"][0]["session"],
+        "session-unknown"
+    );
+    let error = value["started_from"]["failed"][0]["error"]
+        .as_str()
+        .unwrap();
+    assert!(error.contains("out of range"), "{error}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(
+            "close-session closed session-origin but 1 of 1 started-from session(s) failed to close; see the report"
+        ),
+        "{stderr}"
+    );
+    // The refusal kept the handle and the session open.
+    assert!(unknown.join("terminal.json").exists());
+    assert!(!unknown.join("closed.json").exists());
+    assert_eq!(root.sessions_of("session-unknown")["state"], "ready");
+}

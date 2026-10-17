@@ -939,14 +939,15 @@ before pruning.
 Run `close-session` when you have finished with a session or want to stop waiting for it.
 
 ```text
-tabcli close-session SESSION --explicit [--timeout-secs N] [--json]
+tabcli close-session SESSION --explicit [--with-started-from] [--timeout-secs N] [--json]
 ```
 
 See the command and output in the [opening workflow](#command-reference).
 
 `--explicit` is required because this ends the session's surface. You can close active, exited, or
-failed sessions. Repeating a completed close succeeds without closing another surface. Bridge
-records the close in a tombstone and keeps the result history.
+failed sessions. Repeating a completed close succeeds without closing another surface; with
+`--with-started-from` it can still discover and close another session started from this one
+(see below). Bridge records the close in a tombstone and keeps the result history.
 
 `--timeout-secs N` sets the maximum time the close may take, in whole seconds from 1 through
 3600; the default is 60 seconds. The budget covers observation, ownership checks, lock waits,
@@ -1013,11 +1014,58 @@ never fails the close. The answer describes the records at the time of the scan:
 created, closed or changed during and after it, and a session launched from this one but not yet
 recorded is not found.
 
-Human output is `closed SESSION`. When sessions were found it adds
+Without `--with-started-from`, human output is `closed SESSION`. When sessions were found it adds
 `N session(s) started from SESSION remain unclosed in the observed records: ID ...` and
 `Close a session you no longer need with 'tabcli close-session ID --explicit'.`; an incomplete
 scan adds `Started-from scan incomplete; the list may omit sessions.`. JSON has `ok`, `session`,
 `closed`, and `started_from` (see the [JSON field reference](#close-session-1)).
+
+### Closing the sessions started from it
+
+`--with-started-from` closes, after SESSION, each session that the scan listed, one level
+deep: a session started from a listed session is reported, never closed. It requires
+`--explicit` like the close itself; without the flag the command and its output are unchanged.
+The scan is the one described above, with the same bounds, and runs only after SESSION closed.
+
+Each listed session goes through the same close as an explicit `close-session` of it: the
+dead-owner repair, the owner attestation and the terminal-close authority checks. The
+recorded origin grants nothing; a session that its own explicit close would refuse is refused
+here with the same error. Immediately before each close, Bridge re-reads the session's records
+and compares them with what the scan saw. A session that is not what the scan listed is
+skipped and not closed. The skip reasons are `closed_since_scan` (its records now say closed),
+`source_changed` (its initial request now names another source), `session_gone` (its directory
+disappeared or was replaced), `session_changed: <what>` (its status, generation, launch Claim,
+initial receipt, source or current Claim changed, or its current Claim could not be read),
+`byte_limit`, or one of the scan's own classification reasons such as `close_in_progress`.
+A target is closed at most once and never retried.
+
+`--timeout-secs` is the one budget for the close of SESSION, the scan and every target close.
+A target reached after the deadline, or whose verification or close outruns it, is `failed`
+with `time_budget_exhausted`; the remaining targets get the same verdict, so the report covers
+every listed session. The scan's own two-second cap does not reserve time for the closes: a
+scan that stopped early still has its listed sessions closed while the deadline permits, and
+an exhausted scan with no listed session exits 0 with `incomplete: true`, which does not
+establish that every session started from SESSION was closed.
+
+After each target closes, Bridge runs the same bounded scan for that target and attaches the
+result to its entry, so the sessions started from a closed target are visible without being
+closed. Sessions started from SESSION after the scan, or recorded only later, are not found.
+Repeating the flagged command can discover and close another session started from SESSION.
+
+Human output is `closed SESSION`, then `started-from candidates: N (scan complete|incomplete)`,
+then one line per listed session in id order: `closed ID (started from SESSION); its own
+started-from: K open[, incomplete]`, `skipped ID: REASON`, or `failed ID: ERROR`; then
+`started-from close: C closed, S skipped, F failed`. The "remain unclosed" lines are not printed.
+JSON is one object with `ok`, `session`, `closed`, and `started_from`, which adds `closed`,
+`skipped`, and `failed` (see the [JSON field reference](#close-session-1)).
+
+Exit 0 means SESSION closed and no listed session failed; skipped sessions do not fail the
+command. When any target failed, the full report is printed first, JSON or human, and the
+command then exits non-zero with
+`close-session closed SESSION but N of M started-from session(s) failed to close; see the report`
+on stderr. In JSON, `closed` is `true` and `ok` is `false` then. A failure of the close of
+SESSION itself is reported as without the flag, and no target is closed. For a failed target,
+check its error, then close it with its own `close-session ID --explicit` once resolved.
 
 Exit 0 means Bridge completed the close. If the id is missing, check it with `sessions`; if the
 command asks for acknowledgement, add `--explicit` only when you intend to close that session. For
@@ -1282,6 +1330,18 @@ for a root-level reason; `additional_incomplete_reasons`, the count of reasons b
 `records_unreadable`, `close_in_progress`, `session_changed`, `time_budget_exhausted`,
 `entry_limit`, `byte_limit`, `open_limit`, `root_unreadable`, or `entry_unreadable`. `incomplete:
 false` does not mean that no session will be launched from the closed one later.
+
+With `--with-started-from`, `started_from` keeps those fields, where `open` is the list of
+candidates before any target close, and adds `closed`, `skipped`, and `failed`, each in
+candidate order and together covering every id of `open`. `closed` holds objects
+`{session, started_from}`, where `started_from` is the same report-only scan object for that
+closed target (its `open` sessions are listed, not closed). `skipped` holds `{session, reason}`
+with `closed_since_scan`, `source_changed`, `session_gone`, `session_changed: <what>`,
+`byte_limit`, or a scan classification reason. `failed` holds `{session, error}`, where `error`
+is the target's own close error or `time_budget_exhausted`. `closed` at the top level says that
+the named session closed; `ok` is `true` only when `failed` is empty, and the command exits
+non-zero after printing the object when it is not. The object is still printed without a
+`schema_version`.
 
 ### inspect
 
