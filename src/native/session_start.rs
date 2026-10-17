@@ -4,7 +4,7 @@ use super::args::{
 };
 use crate::native::session::launch::wrapper::{check_provider_version_until, resolve_provider};
 use crate::native::session::primitives::delegation_source;
-use crate::native::session::{Reader, Store, launch, requests, turn};
+use crate::native::session::{Reader, SessionState, Store, launch, requests, turn, update_status};
 use crate::native::turn_report::TurnReport;
 use crate::native::{
     CreatedSession, DEFAULT_TIMEOUT_SECS, NativeCommand, SessionSpec, consent, context,
@@ -32,13 +32,20 @@ pub(super) struct Resolved {
     pub(super) spec: SessionSpec,
     pub(super) terminal_kind: terminal::TerminalKind,
     pub(super) context_sources: Vec<requests::ContextSource>,
-    // Preserve the original requested path, including aliases. None skips assessment.
-    pub(super) assess_consent: Option<PathBuf>,
+    // Assessed by resolve, from the original requested path including aliases, before anything
+    // is created; recorded with the session once it exists. None records nothing.
+    pub(super) consent: Option<consent::Assessment>,
 }
 
 pub(super) trait StartSource {
     fn resolve(&mut self, deadline: Instant) -> Result<Resolved>;
-    fn create(&mut self, spec: SessionSpec) -> Result<CreatedSession>;
+    // Creates the session and records the assessment with it (`record_consent`) before
+    // anything else binds to the session.
+    fn create(
+        &mut self,
+        spec: SessionSpec,
+        consent: Option<&consent::Assessment>,
+    ) -> Result<CreatedSession>;
     fn gate(&self, directory: &Path, gate: delivery::Gate, deadline: Instant) -> Result<()>;
     fn delivery_failed(
         &self,
@@ -68,7 +75,8 @@ impl StartSource for FreshSource {
         if !workspace.is_dir() {
             bail!("workspace is not a directory: {}", workspace.display());
         }
-        admission::check(&Reader::state_root()?, &workspace)?;
+        let root = Reader::state_root()?;
+        admission::check(&root, &workspace)?;
         let provider_path = resolve_provider(request.provider)?;
         let provider_version =
             check_provider_version_until(request.provider, &provider_path, Some(deadline))?;
@@ -80,6 +88,7 @@ impl StartSource for FreshSource {
             format!("{} · {workspace_name}", request.provider.as_str())
         });
         let title = sanitize_title(&requested_title)?;
+        let consent = consent::assess(&root, &request.workspace)?;
         Ok(Resolved {
             spec: SessionSpec {
                 provider: request.provider,
@@ -94,13 +103,19 @@ impl StartSource for FreshSource {
             },
             terminal_kind,
             context_sources: attached.sources,
-            assess_consent: Some(request.workspace.clone()),
+            consent: Some(consent),
         })
     }
 
-    fn create(&mut self, mut spec: SessionSpec) -> Result<CreatedSession> {
+    fn create(
+        &mut self,
+        mut spec: SessionSpec,
+        consent: Option<&consent::Assessment>,
+    ) -> Result<CreatedSession> {
         spec.prompt = native_delegation_prompt(&delegation_source(), &spec.prompt);
-        create_session(spec)
+        let created = create_session(spec)?;
+        record_consent(&created, consent)?;
+        Ok(created)
     }
 
     fn gate(&self, _: &Path, _: delivery::Gate, _: Instant) -> Result<()> {
@@ -120,7 +135,30 @@ impl StartSource for FreshSource {
     }
 }
 
-// Single-use protocol: resolve, create, optional assessment, extra, then claim/launch.
+// Record the assessment with the session that create made, before anything else binds to
+// that session: a reopen finalizes its source marker only after its create has returned, so
+// a record that cannot be written releases the source like any creation failure. The session
+// is marked failed, so that nothing takes it for a launchable one.
+pub(super) fn record_consent(
+    created: &CreatedSession,
+    consent: Option<&consent::Assessment>,
+) -> Result<()> {
+    let Some(assessment) = consent else {
+        return Ok(());
+    };
+    consent::record(&created.directory, assessment).map_err(|error| {
+        let _ = update_status(
+            &created.directory,
+            SessionState::Failed,
+            None,
+            Some(format!("{error:#}")),
+        );
+        error
+    })
+}
+
+// Single-use protocol: resolve (with the consent assessment), create (which records it),
+// extra, then claim/launch.
 pub(super) fn start(
     options: StartOptions,
     source: &mut dyn StartSource,
@@ -136,13 +174,10 @@ pub(super) fn start(
         spec,
         terminal_kind,
         context_sources,
-        assess_consent,
+        consent: assessment,
     } = source.resolve(deadline)?;
     let provider = spec.provider;
-    let created = source.create(spec)?;
-    if let Some(requested) = assess_consent {
-        consent::prepare(&created.directory, &requested)?;
-    }
+    let created = source.create(spec, assessment.as_ref())?;
     let result_extra = source.result_extra()?;
     let mut initial_claim =
         turn::claim(&Store::open_unchecked(&created.directory), &context_sources)?;

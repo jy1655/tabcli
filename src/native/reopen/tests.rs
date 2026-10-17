@@ -39,7 +39,7 @@ const REOPEN_TEST_CONVERSATION: &str = "6928ca1c-1234-4abc-8def-0123456789ab";
 
 #[test]
 fn creation_binds_both_sessions_or_releases_the_source_reservation() {
-    for failure in [None, Some("create"), Some("provenance")] {
+    for failure in [None, Some("create"), Some("consent"), Some("provenance")] {
         let root = tempfile::tempdir().unwrap();
         let source_id = "session-creation-source";
         let directory = write_closed_reopen_source(
@@ -74,6 +74,13 @@ fn creation_binds_both_sessions_or_releases_the_source_reservation() {
                 },
             )?;
             created_directory = Some(created.directory.clone());
+            if failure == Some("consent") {
+                // The consent record is written inside create, before the provenance and
+                // the marker; an unwritable record releases the reservation (#202 review).
+                fs::create_dir(created.directory.join("workspace-consent.json"))?;
+                let assessment = consent::assess(root.path(), root.path())?;
+                session_start::record_consent(&created, Some(&assessment))?;
+            }
             if failure == Some("provenance") {
                 fs::remove_file(created.directory.join("manifest.json"))?;
                 fs::create_dir(created.directory.join("manifest.json"))?;
@@ -3353,6 +3360,36 @@ fn start_source_fixture(root: &Path) -> (ReopenedSource, SessionSpec) {
 }
 
 #[test]
+fn reopened_source_assesses_workspace_consent_for_the_new_session() {
+    // The new session assesses the current workspace exactly as a fresh ask does, as part of
+    // the resolution and before create claims the source marker; the source's assessment is
+    // another session's diagnostic history (#202).
+    let root = tempfile::tempdir().unwrap();
+    let (_, mut spec) = start_source_fixture(root.path());
+    spec.workspace = root.path().canonicalize().unwrap();
+    let workspace = spec.workspace.clone();
+    let start = resolved(root.path(), spec, terminal::TerminalKind::WindowsConsole).unwrap();
+    assert!(start.consent.is_some());
+    assert_eq!(start.spec.workspace, workspace);
+    assert_eq!(start.terminal_kind, terminal::TerminalKind::WindowsConsole);
+    assert!(start.context_sources.is_empty());
+    // A workspace that cannot be identified fails the resolution, and the failure leaves the
+    // state root as it was: only the fixture's source session, no shared consent record.
+    let other = tempfile::tempdir().unwrap();
+    let (_, mut missing) = start_source_fixture(other.path());
+    missing.workspace = other.path().join("missing");
+    let error = resolved(
+        other.path(),
+        missing,
+        terminal::TerminalKind::WindowsConsole,
+    )
+    .err()
+    .expect("an unidentifiable workspace must fail the resolution");
+    assert_eq!(error.to_string(), "cannot identify workspace");
+    assert_eq!(fs::read_dir(other.path()).unwrap().count(), 1);
+}
+
+#[test]
 fn reopened_source_creation_extra_and_failure_joints() {
     use crate::native::session_start::StartSource;
     const CHILD: &str = "TABCLI_REOPEN_START_CHILD";
@@ -3375,7 +3412,7 @@ fn reopened_source_creation_extra_and_failure_joints() {
     let root = Reader::state_root().unwrap();
     let (mut adapter, spec) = start_source_fixture(&root);
     let original = snapshot_directory(&adapter.resolved.as_ref().unwrap().0);
-    let created = adapter.create(spec).unwrap();
+    let created = adapter.create(spec, None).unwrap();
     let provenance = adapter.resumed_from.as_ref().unwrap();
     assert_eq!(
         read_resumed_from(&created.directory).unwrap().as_ref(),

@@ -1,5 +1,5 @@
 use super::*;
-use crate::native::session::{CoreRecord, Reader, requests};
+use crate::native::session::{CoreRecord, Reader, SessionState, requests};
 use crate::native::turn_report::TurnReport;
 use crate::native::{CreatedSession, SessionSpec, create_session_within, delivery, terminal};
 use agent_bridge::FirstPartyCli;
@@ -13,6 +13,8 @@ struct Fake {
     root: tempfile::TempDir,
     stop: &'static str,
     consent: Option<PathBuf>,
+    // Make the consent record unwritable: a directory where the record file must go.
+    unwritable_consent_record: bool,
     calls: RefCell<Vec<&'static str>>,
     directory: Option<PathBuf>,
 }
@@ -23,6 +25,7 @@ impl Fake {
             root: tempfile::tempdir().unwrap(),
             stop,
             consent: None,
+            unwritable_consent_record: false,
             calls: RefCell::new(Vec::new()),
             directory: None,
         }
@@ -63,15 +66,27 @@ impl StartSource for Fake {
             },
             terminal_kind: terminal::TerminalKind::WindowsConsole,
             context_sources: context_sources(),
-            assess_consent: self.consent.clone(),
+            consent: self
+                .consent
+                .as_ref()
+                .map(|requested| consent::assess(self.root.path(), requested))
+                .transpose()?,
         })
     }
-    fn create(&mut self, spec: SessionSpec) -> Result<CreatedSession> {
+    fn create(
+        &mut self,
+        spec: SessionSpec,
+        consent: Option<&consent::Assessment>,
+    ) -> Result<CreatedSession> {
         self.step("create")?;
         let created =
             create_session_within(self.root.path(), &[self.root.path().to_owned()], spec)?;
         fs::create_dir(created.directory.join(CoreRecord::Launch.name()))?;
         self.directory = Some(created.directory.clone());
+        if self.unwritable_consent_record {
+            fs::create_dir(created.directory.join("workspace-consent.json"))?;
+        }
+        record_consent(&created, consent)?;
         Ok(created)
     }
     fn result_extra(&self) -> Result<ResultExtra> {
@@ -121,10 +136,6 @@ fn pre_open_short_circuits() {
         ),
     ] {
         let mut fake = Fake::new(stop);
-        // A missing path would fail prepare if create did not short circuit.
-        if stop == "create" {
-            fake.consent = Some(fake.root.path().join("missing"));
-        }
         let (error, report) = run(&mut fake, timeout);
         if stop != "deadline" {
             assert_eq!(error.to_string(), format!("injected {stop}"));
@@ -168,14 +179,37 @@ fn real_create_stops_at_launch_begin_with_optional_consent() {
 }
 
 #[test]
-fn missing_consent_path_stops_before_extra_and_claim() {
+fn failed_consent_assessment_stops_before_create_and_consumes_nothing() {
+    // The assessment precedes create, so a failure consumes nothing: no session, no shared
+    // record, and for a reopen no source marker, which only create claims (#202).
     let mut fake = Fake::new("begin");
     fake.consent = Some(fake.root.path().join("missing"));
     let (error, report) = run(&mut fake, Duration::from_secs(30));
     assert_eq!(error.to_string(), "cannot identify workspace");
+    assert_eq!(*fake.calls.borrow(), ["resolve"]);
+    assert!(report.address().is_none());
+    assert!(fake.directory.is_none());
+    assert_eq!(fs::read_dir(fake.root.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn unwritable_consent_record_fails_create_and_marks_the_session_failed() {
+    // The record is part of create: no extra, claim or, for a reopen, provenance and source
+    // marker binds to a session whose assessment could not be recorded (#202 review).
+    let mut fake = Fake::new("begin");
+    fake.consent = Some(fake.root.path().canonicalize().unwrap());
+    fake.unwritable_consent_record = true;
+    let (error, report) = run(&mut fake, Duration::from_secs(30));
+    assert!(!error.to_string().contains("injected"), "{error:#}");
     assert_eq!(*fake.calls.borrow(), ["resolve", "create"]);
     assert!(report.address().is_none());
-    assert!(!fake.directory.unwrap().join("turn.claim").exists());
+    let directory = fake.directory.unwrap();
+    assert!(!directory.join("turn.claim").exists());
+    assert!(!directory.join("requests").exists());
+    assert_eq!(
+        Reader::open_unchecked(&directory).status().unwrap().state,
+        SessionState::Failed
+    );
 }
 
 #[cfg(unix)]

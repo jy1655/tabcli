@@ -285,7 +285,12 @@ tabcli reopen session-C4r8Ta --prompt "Continue the review." --json
 This command supports only Claude Code on native Windows; the example assumes the source is a closed
 Claude session. The source must be closed, have a recorded Claude conversation id, and have readable
 results for its recorded requests. The workspace is reused from the source and must still exist.
-Bridge saves a marker on the source to allow only one reopen from it.
+Bridge saves a marker on the source to allow only one reopen from it. Workspace consent is
+assessed for the new session exactly as `ask` assesses it, from the current trust stores and
+Bridge's shared consent records, never from the source session's records; with verified consent
+and without `--yolo`, a reopened session can take the same guarded trust-dialog answer as a fresh
+`ask`. The assessment and its record precede the source marker, so a failure in either leaves
+the source reopenable.
 
 Options follow `ask`, with a 900-second default timeout. The default title is `<provider> ·
 <workspace-basename> (reopened <source-session>)`. Model, effort, and bypass options are not copied
