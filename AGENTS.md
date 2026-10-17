@@ -350,6 +350,11 @@ launch, observe, continue, and close without replacing the capabilities those CL
   directory allows, and on a PC with the Codex sandbox that directory lets another
   account modify its files (observed 2026-10-02: `CodexSandboxUsers`), so the fixture is
   refused there and accepted on CI.
+- Every session start assesses workspace consent for the new session from the current
+  stores, `reopen` exactly as `ask`: the source session's assessment is diagnostic history
+  of another session and is never reused as consent (#202). A start that skipped the
+  assessment would leave `authorized` false for good, so the session could not take the
+  guarded dialog answer that a fresh `ask` can.
 
 ## Observation and Self-Test Boundary
 

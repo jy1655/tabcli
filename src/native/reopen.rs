@@ -614,6 +614,19 @@ struct ReopenedSource {
     resumed_from: Option<ResumedFrom>,
 }
 
+// A reopened session assesses workspace consent for itself, from the current stores and
+// exactly as a fresh `ask` does, so that it can take the same guarded trust-dialog answer. The
+// source's assessment is diagnostic history of another session, never consent for this one
+// (#202). The workspace is the source's recorded, canonical path: reopen takes no path alias.
+fn resolved(spec: SessionSpec, terminal_kind: terminal::TerminalKind) -> session_start::Resolved {
+    session_start::Resolved {
+        assess_consent: Some(spec.workspace.clone()),
+        spec,
+        terminal_kind,
+        context_sources: Vec::new(),
+    }
+}
+
 impl ReopenedSource {
     fn new(request: ReopenRequest) -> Self {
         Self {
@@ -680,12 +693,7 @@ impl session_start::StartSource for ReopenedSource {
             prompt: request.prompt.clone(),
         };
         self.resolved = Some((source_directory, source));
-        Ok(session_start::Resolved {
-            spec,
-            terminal_kind,
-            context_sources: Vec::new(),
-            assess_consent: None,
-        })
+        Ok(resolved(spec, terminal_kind))
     }
 
     fn create(&mut self, mut spec: SessionSpec) -> Result<CreatedSession> {

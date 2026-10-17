@@ -3353,6 +3353,23 @@ fn start_source_fixture(root: &Path) -> (ReopenedSource, SessionSpec) {
 }
 
 #[test]
+fn reopened_source_assesses_workspace_consent_for_the_new_session() {
+    // The new session assesses the current workspace exactly as a fresh ask does; the source's
+    // assessment is another session's diagnostic history (#202).
+    let root = tempfile::tempdir().unwrap();
+    let (_, spec) = start_source_fixture(root.path());
+    let workspace = spec.workspace.clone();
+    let resolved = resolved(spec, terminal::TerminalKind::WindowsConsole);
+    assert_eq!(resolved.assess_consent, Some(workspace.clone()));
+    assert_eq!(resolved.spec.workspace, workspace);
+    assert_eq!(
+        resolved.terminal_kind,
+        terminal::TerminalKind::WindowsConsole
+    );
+    assert!(resolved.context_sources.is_empty());
+}
+
+#[test]
 fn reopened_source_creation_extra_and_failure_joints() {
     use crate::native::session_start::StartSource;
     const CHILD: &str = "TABCLI_REOPEN_START_CHILD";

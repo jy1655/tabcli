@@ -65,7 +65,9 @@ Use `tabcli consent revoke /path/to/project` to stop sharing that decision. This
 provider-owned trust unchanged. Use `tabcli consent reset /path/to/project` when you want
 a later launch to assess fresh evidence; reset clears Bridge's source and revocation decision,
 but does not approve the workspace. Shared records live in `workspace-consent/` under the state
-root. Each session keeps its own assessment in `workspace-consent.json`.
+root. Each session keeps its own assessment in `workspace-consent.json`; a reopened session
+assesses its workspace for itself, like a fresh `ask`, and inherits nothing from the source
+session's assessment.
 
 If consent is missing or unreadable, check the store Bridge reads. In these paths, home means
 `HOME` when set, otherwise `USERPROFILE`:
