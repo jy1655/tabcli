@@ -14,6 +14,8 @@ pub(super) fn write_established_thread(directory: &Path, thread_id: &str) {
             provider_session_id: Some(thread_id.to_owned()),
             turn_id: Some("initial-turn".to_owned()),
             created_unix_ms: Some(1),
+            usage: None,
+            usage_error: None,
         },
     )
     .unwrap();

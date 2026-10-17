@@ -33,6 +33,8 @@ fn event(message: &str) -> SessionEvent {
         provider_session_id: Some("provider-session".to_owned()),
         turn_id: Some("provider-turn".to_owned()),
         created_unix_ms: Some(1),
+        usage: None,
+        usage_error: None,
     }
 }
 
@@ -1056,6 +1058,8 @@ fn timeline_uses_the_existing_publication_predicate_at_every_completion_boundary
             provider_session_id: Some("thread".to_owned()),
             turn_id: Some("turn".to_owned()),
             created_unix_ms: Some(5),
+            usage: None,
+            usage_error: None,
         };
         let mut pending = PendingTurnCompletion::new(&token, event, None).unwrap();
         pending.event_file = event_path.file_name().unwrap().to_str().unwrap().to_owned();
@@ -1346,6 +1350,8 @@ fn immutable_request_mapping_survives_each_partial_completion_recovery() {
             provider_session_id: Some("thread".to_owned()),
             turn_id: Some("turn".to_owned()),
             created_unix_ms: Some(1),
+            usage: None,
+            usage_error: None,
         };
         let mut pending = PendingTurnCompletion::new(&token, event, None).unwrap();
         pending.event_file = receipt.event_file.clone();
@@ -1459,4 +1465,224 @@ fn refusal_release_is_fenced_by_claim_ownership_without_publishing_events() {
         Some(format!("{reported:#}").as_str())
     );
     assert!(!directory.join(TURN_CLAIM_FILE).exists());
+}
+
+fn sample_usage() -> crate::native::session::schema::ProviderUsage {
+    crate::native::session::schema::ProviderUsage {
+        source: "pi_extension_agent_end".to_owned(),
+        scope: "request".to_owned(),
+        coverage: "complete".to_owned(),
+        runs: 1,
+        assistant_messages: 2,
+        input_tokens: 793,
+        output_tokens: 58,
+        cache_read_tokens: 16640,
+        cache_write_tokens: 0,
+        reasoning_tokens: Some(23),
+        total_tokens: 17491,
+    }
+}
+
+#[test]
+fn size_policy_drops_usage_before_it_fails_a_message_that_fits_on_its_own() {
+    use crate::native::session::schema::USAGE_OMITTED_SIZE;
+    let mut with_usage = event("fits");
+    with_usage.usage = Some(sample_usage());
+    let without_usage = event("fits");
+    let bare = serde_json::to_vec_pretty(&without_usage).unwrap().len() as u64;
+    let full = serde_json::to_vec_pretty(&with_usage).unwrap().len() as u64;
+    assert!(full > bare);
+    let pending =
+        |event: &SessionEvent| PendingTurnCompletion::new("1-2-3", event.clone(), None).unwrap();
+    // Room for everything: the usage is kept.
+    let kept = bound_pending_completion(pending(&with_usage), full).unwrap();
+    assert_eq!(kept.event, with_usage);
+    assert_eq!(kept.status_state, SessionState::Ready);
+    // Room for the message but not the usage: the completion is recorded without usage.
+    let dropped = bound_pending_completion(pending(&with_usage), full - 1).unwrap();
+    assert_eq!(dropped.event.usage, None);
+    assert_eq!(
+        dropped.event.usage_error.as_deref(),
+        Some(USAGE_OMITTED_SIZE)
+    );
+    assert_eq!(dropped.event.message, "fits");
+    assert_eq!(dropped.event.error, None);
+    assert_eq!(dropped.status_state, SessionState::Ready);
+    assert_eq!(dropped.status_error, None);
+    let mut expected = without_usage.clone();
+    expected.usage_error = Some(USAGE_OMITTED_SIZE.to_owned());
+    assert_eq!(dropped.event, expected);
+    // The message exceeds the limit on its own: the existing size failure, named by the
+    // size of the bare event, with both usage fields absent.
+    let failed = bound_pending_completion(pending(&with_usage), bare - 1).unwrap();
+    let error = format!(
+        "provider result of {bare} bytes exceeds the {} byte event limit",
+        bare - 1
+    );
+    assert_eq!(failed.event.message, "");
+    assert_eq!(failed.event.error.as_deref(), Some(error.as_str()));
+    assert_eq!(failed.status_error.as_deref(), Some(error.as_str()));
+    assert_eq!(failed.status_state, SessionState::Failed);
+    assert_eq!(failed.event.usage, None);
+    assert_eq!(failed.event.usage_error, None);
+    // A completion without usage behaves exactly as before.
+    let plain = bound_pending_completion(pending(&without_usage), bare - 1).unwrap();
+    assert_eq!(plain.status_state, SessionState::Failed);
+    assert_eq!(
+        plain.event.error.as_deref(),
+        Some(
+            format!(
+                "provider result of {bare} bytes exceeds the {} byte event limit",
+                bare - 1
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(plain.event.usage_error, None);
+}
+
+#[test]
+fn size_policy_publishes_a_bare_event_at_the_limit_before_it_fails() {
+    use crate::native::query::reported_usage;
+    use crate::native::session::schema::USAGE_OMITTED_SIZE;
+    let without_usage = event("fits");
+    let bare = serde_json::to_vec_pretty(&without_usage).unwrap().len() as u64;
+    let pending =
+        |event: &SessionEvent| PendingTurnCompletion::new("1-2-3", event.clone(), None).unwrap();
+    // The bare event is exactly the limit; the usage pushes it over, and so does the
+    // omission marker that replaces it. The event is published bare, not failed.
+    let mut with_usage = event("fits");
+    with_usage.usage = Some(sample_usage());
+    let published = bound_pending_completion(pending(&with_usage), bare).unwrap();
+    assert_eq!(published.event, without_usage);
+    assert_eq!(published.status_state, SessionState::Ready);
+    assert_eq!(published.status_error, None);
+    assert_eq!(
+        reported_usage(Some(&published.event)),
+        (None, Some("not_reported"), None)
+    );
+    // The only extra is a malformed-usage error the writer recorded: it is dropped the same
+    // way, and never turns a message that fits on its own into a failure.
+    let mut with_error = event("fits");
+    with_error.usage_error = Some("malformed usage: total_tokens".to_owned());
+    let with_error_size = serde_json::to_vec_pretty(&with_error).unwrap().len() as u64;
+    assert!(with_error_size > bare);
+    let published = bound_pending_completion(pending(&with_error), bare).unwrap();
+    assert_eq!(published.event, without_usage);
+    assert_eq!(published.status_state, SessionState::Ready);
+    // With room for the marker but not the malformed error, the marker is recorded.
+    let mut marked = without_usage.clone();
+    marked.usage_error = Some(USAGE_OMITTED_SIZE.to_owned());
+    let marked_size = serde_json::to_vec_pretty(&marked).unwrap().len() as u64;
+    assert!(marked_size < with_error_size);
+    let omitted = bound_pending_completion(pending(&with_error), marked_size).unwrap();
+    assert_eq!(omitted.event, marked);
+    // Below the bare size the failure record carries neither usage field.
+    let failed = bound_pending_completion(pending(&with_error), bare - 1).unwrap();
+    assert_eq!(failed.status_state, SessionState::Failed);
+    assert_eq!(failed.event.message, "");
+    assert_eq!(
+        failed.event.error.as_deref(),
+        Some(
+            format!(
+                "provider result of {bare} bytes exceeds the {} byte event limit",
+                bare - 1
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(failed.event.usage, None);
+    assert_eq!(failed.event.usage_error, None);
+}
+
+#[test]
+fn journal_predicate_accepts_legacy_event_bytes_and_round_trips_usage() {
+    // An event this binary writes without usage has the bytes an older writer produced:
+    // no usage field appears, so an old journal and its old event read as Committed.
+    let legacy = event("legacy");
+    let legacy_bytes = serde_json::to_vec_pretty(&legacy).unwrap();
+    assert!(!String::from_utf8_lossy(&legacy_bytes).contains("usage"));
+    let old_journal: PendingTurnCompletion = serde_json::from_str(&format!(
+        r#"{{"schema":1,"claim_token":"1-2-3","event_file":"event-1-1.json","event":{},"status_error":null}}"#,
+        String::from_utf8(legacy_bytes.clone()).unwrap()
+    ))
+    .unwrap();
+    assert_eq!(old_journal.event.usage, None);
+    assert_eq!(old_journal.event.usage_error, None);
+    assert_eq!(
+        journaled_event_state_of(&old_journal, &legacy_bytes, EVENT_READ_LIMIT).unwrap(),
+        JournaledEventState::Committed
+    );
+    // The strict decoders read a legacy event and an event with usage alike.
+    let decoded: SessionEvent = crate::native::session::record::decode(&legacy_bytes).unwrap();
+    assert_eq!(decoded, legacy);
+    let mut with_usage = event("usage");
+    with_usage.usage = Some(sample_usage());
+    let (_root, store) = fixture(SessionState::Working);
+    let pending = PendingTurnCompletion::new("1-2-3", with_usage.clone(), None).unwrap();
+    let path = store
+        .record(CoreRecord::Events)
+        .path()
+        .join(&pending.event_file);
+    RecordStore::at(&path).write_json(&pending.event).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    assert_eq!(
+        journaled_event_state_of(&pending, &bytes, EVENT_READ_LIMIT).unwrap(),
+        JournaledEventState::Committed
+    );
+    let decoded: SessionEvent = crate::native::session::record::decode(&bytes).unwrap();
+    assert_eq!(decoded, with_usage);
+    assert_eq!(
+        Reader::open_unchecked(store.directory())
+            .event_strict(&pending.event_file)
+            .unwrap(),
+        with_usage
+    );
+    // An older binary would drop the fields and see Mismatched: the declared no-downgrade
+    // boundary while a session's turn is journaled.
+    let mut dropped = pending.event.clone();
+    dropped.usage = None;
+    assert_ne!(serde_json::to_vec_pretty(&dropped).unwrap(), bytes);
+}
+
+#[test]
+fn report_usage_never_changes_the_recorded_outcome() {
+    for (kind, cancelled_flag) in [("complete", false), ("fail", false), ("cancelled", false)] {
+        let (_root, store) = hold_fixture(SessionState::Working);
+        let claimed = claim(&store, &[]).unwrap();
+        let token = claimed.token().to_owned();
+        claimed.retain();
+        let report = Report::for_claim(&store, FirstPartyCli::Pi, Some(&token))
+            .with_usage(Some(sample_usage()), None);
+        match kind {
+            "complete" => report.complete("done", None, None).unwrap(),
+            "fail" => report.fail("broken", None, None).unwrap(),
+            _ => report.cancelled("stopped", None, None).unwrap(),
+        }
+        let paths = crate::native::session::primitives::event_paths(store.directory()).unwrap();
+        let event: SessionEvent = read_json(&paths[0]).unwrap();
+        assert_eq!(event.usage, Some(sample_usage()), "{kind}");
+        assert_eq!(event.usage_error, None, "{kind}");
+        // No cancel intent was recorded, so `cancelled` is an ordinary failure here.
+        assert_eq!(event.cancelled, cancelled_flag, "{kind}");
+        assert_eq!(event.error.is_some(), kind != "complete", "{kind}");
+        let request_id = requests::list(&Reader::open_unchecked(store.directory()))
+            .unwrap()
+            .receipts[0]
+            .request_id
+            .clone();
+        let value =
+            query::request_result(&Reader::open_unchecked(store.directory()), &request_id).unwrap();
+        assert_eq!(value["usage"]["total_tokens"], 17491, "{kind}");
+        assert_eq!(value["usage_reason"], serde_json::Value::Null, "{kind}");
+        assert_eq!(
+            value["request_state"],
+            if kind == "complete" {
+                "completed"
+            } else {
+                "failed"
+            },
+            "{kind}"
+        );
+    }
 }

@@ -196,7 +196,8 @@ fn poll(root: &Path, addresses: &[Address], timeout: Duration) -> Result<Outcome
         last: addresses.iter().map(|address| envelope::ok(json!({
             "session": address.session,
             "request_id": address.request, "request_state": "busy", "result": null,
-            "bridge_observed_elapsed_ms": null, "bridge_observed_elapsed_reason": "no_published_result"
+            "bridge_observed_elapsed_ms": null, "bridge_observed_elapsed_reason": "no_published_result",
+            "usage": null, "usage_reason": "no_published_result", "usage_error": null
         }).as_object().unwrap().clone())).collect(),
     };
     loop {

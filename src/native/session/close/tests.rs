@@ -47,6 +47,8 @@ fn damaged_completion_fixture() -> (tempfile::TempDir, Store) {
                 provider_session_id: None,
                 turn_id: None,
                 created_unix_ms: Some(99),
+                usage: None,
+                usage_error: None,
             },
             status_error: None,
             status_state: SessionState::Ready,
@@ -221,6 +223,8 @@ fn converge_publishes_completion_before_repairing_dead_owner() {
                     provider_session_id: Some("provider-session".to_owned()),
                     turn_id: Some("provider-turn".to_owned()),
                     created_unix_ms: Some(99),
+                    usage: None,
+                    usage_error: None,
                 },
                 status_error: None,
                 status_state: SessionState::Ready,
@@ -3580,6 +3584,8 @@ fn sample_completion(claim_token: &str, message: &str) -> PendingTurnCompletion 
             provider_session_id: Some("provider-session".to_owned()),
             turn_id: Some("provider-turn".to_owned()),
             created_unix_ms: Some(1),
+            usage: None,
+            usage_error: None,
         },
         None,
     )
@@ -3741,6 +3747,8 @@ fn oversized_sample_event(message: &str) -> SessionEvent {
         provider_session_id: Some("provider-session".to_owned()),
         turn_id: Some("provider-turn".to_owned()),
         created_unix_ms: Some(1),
+        usage: None,
+        usage_error: None,
     }
 }
 

@@ -37,6 +37,8 @@ fn correlated_wait_ignores_other_completed_turns() {
                 provider_session_id: Some("claude-session".to_owned()),
                 turn_id: Some(turn_id.to_owned()),
                 created_unix_ms: Some(unix_ms()),
+                usage: None,
+                usage_error: None,
             },
         )
         .unwrap();
@@ -81,6 +83,8 @@ fn completed_event_is_not_published_until_the_session_is_ready() {
             provider_session_id: Some("codex-session".to_owned()),
             turn_id: Some("codex-turn".to_owned()),
             created_unix_ms: Some(unix_ms()),
+            usage: None,
+            usage_error: None,
         },
     )
     .unwrap();
@@ -115,6 +119,8 @@ fn completed_event_uses_its_own_released_claim_not_a_later_turns_claim() {
             provider_session_id: None,
             turn_id: None,
             created_unix_ms: Some(unix_ms()),
+            usage: None,
+            usage_error: None,
         },
     )
     .unwrap();
@@ -157,6 +163,8 @@ fn completed_event_waits_for_its_own_claim_to_be_released() {
             provider_session_id: None,
             turn_id: None,
             created_unix_ms: Some(unix_ms()),
+            usage: None,
+            usage_error: None,
         },
     )
     .unwrap();
@@ -190,6 +198,8 @@ fn uncorrelated_wait_returns_the_first_event_after_its_baseline() {
                 provider_session_id: None,
                 turn_id: None,
                 created_unix_ms: Some(unix_ms()),
+                usage: None,
+                usage_error: None,
             },
         )
         .unwrap();
@@ -221,6 +231,8 @@ fn event_commit_does_not_create_a_racy_latest_cache() {
         provider_session_id: None,
         turn_id: None,
         created_unix_ms: Some(1),
+        usage: None,
+        usage_error: None,
     };
 
     write_event(directory.path(), &event).unwrap();

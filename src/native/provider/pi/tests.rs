@@ -765,3 +765,297 @@ fn launch_plan_watcher_starts_the_hook_failure_monitor_only_when_started() {
         "the started monitor did not consume the signal"
     );
 }
+
+#[test]
+fn usage_extension_reports_pi_usage_beside_every_outcome_in_node() {
+    use crate::native::session::schema::SessionManifest;
+    use crate::native::session::{CoreRecord, cancel};
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    fs::write(root.join("extension.js"), bridge_extension()).unwrap();
+    fs::write(root.join("test.mjs"), include_str!("../pi_usage_test.mjs")).unwrap();
+    fs::write(
+        root.join("fixtures.json"),
+        include_str!("../pi_usage_fixtures.json"),
+    )
+    .unwrap();
+    let cases = [
+        "one_run_two_messages",
+        "two_runs",
+        "retry_without_before_agent_start",
+        "reasoning_omitted_unless_everywhere",
+        "missing_usage",
+        "fractional_operand",
+        "negative_operand",
+        "unsafe_operand",
+        "unsafe_sum",
+        "fractional_reasoning",
+        "error_run_is_uncertain",
+        "cancelled_keeps_usage",
+        "claim_replaced_resets",
+        "delivery_failure_persists_usage",
+        "delivery_failure_persists_usage_error",
+        "session_shutdown_resets",
+    ];
+    let mut inputs = serde_json::Map::new();
+    for name in cases {
+        let dir = root.join(name);
+        fs::create_dir(&dir).unwrap();
+        fs::create_dir(dir.join("events")).unwrap();
+        update_status(&dir, SessionState::Working, None, None).unwrap();
+        Store::open_unchecked(&dir)
+            .write_manifest(&SessionManifest {
+                schema: 1,
+                id: name.into(),
+                provider: "pi".into(),
+                provider_path: "pi".into(),
+                provider_version: "1.2.0".into(),
+                workspace: root.to_path_buf(),
+                title: name.into(),
+                model: None,
+                effort: None,
+                yolo: false,
+                created_unix_ms: 1,
+            })
+            .unwrap();
+        let mut records = Vec::new();
+        // The first claim is the live one; a replacement claim is created by replacing it.
+        for round in 0..2 {
+            if round == 1 {
+                if name != "claim_replaced_resets" {
+                    break;
+                }
+                fs::remove_file(dir.join(CoreRecord::TurnClaim.name())).unwrap();
+            }
+            let pending = claim_pending_turn(&dir);
+            let mut record = serde_json::json!({
+                "token": pending.claim_token,
+                "claim": fs::read_to_string(dir.join(CoreRecord::TurnClaim.name())).unwrap(),
+                "prompt": correlated_prompt("prompt", &pending),
+                "response": marked("result", &pending),
+            });
+            if name == "cancelled_keeps_usage" {
+                // Cancel admission needs the extension's schema-2 readiness for this claim.
+                write_json_atomic(
+                    &dir.join(STARTUP_READY_FILE),
+                    &StartupReady {
+                        schema: 2,
+                        claim_token: pending.claim_token.clone(),
+                        session_id: name.into(),
+                    },
+                )
+                .unwrap();
+                cancel::request(&Store::open_unchecked(&dir), name).unwrap();
+                record["cancel"] = serde_json::json!(
+                    fs::read_to_string(dir.join(CoreRecord::Cancel.name())).unwrap()
+                );
+                fs::remove_file(dir.join(CoreRecord::Cancel.name())).unwrap();
+            }
+            records.push(record);
+        }
+        inputs.insert(name.to_owned(), serde_json::Value::Array(records));
+    }
+    write_json_atomic(&root.join("inputs.json"), &inputs).unwrap();
+    run_extension_harness(root, false);
+    let outputs: Vec<serde_json::Value> = read_json(&root.join("payloads.json")).unwrap();
+    let live_second_request = (793, 58, 16640, 0, Some(23), 17491);
+    // (case, error, cancelled, usage (tokens), usage_error)
+    for (name, error, cancelled, usage, usage_error) in [
+        (
+            "one_run_two_messages",
+            None,
+            false,
+            Some(("complete", 1, 2, live_second_request)),
+            None,
+        ),
+        (
+            "two_runs",
+            None,
+            false,
+            Some(("complete", 2, 2, (16800, 10, 0, 0, Some(0), 16810))),
+            None,
+        ),
+        (
+            "retry_without_before_agent_start",
+            None,
+            false,
+            Some(("uncertain", 2, 2, (8401, 5, 0, 0, Some(0), 8406))),
+            None,
+        ),
+        (
+            "reasoning_omitted_unless_everywhere",
+            None,
+            false,
+            Some(("complete", 1, 2, (793, 58, 16640, 0, None, 17491))),
+            None,
+        ),
+        (
+            "missing_usage",
+            None,
+            false,
+            None,
+            Some("assistant message has no usage"),
+        ),
+        (
+            "unsafe_sum",
+            None,
+            false,
+            None,
+            Some("usage.cacheRead sum exceeds the safe integer range"),
+        ),
+        (
+            "error_run_is_uncertain",
+            Some("Pi turn ended with error: Network connection failed"),
+            false,
+            Some(("uncertain", 1, 2, live_second_request)),
+            None,
+        ),
+        (
+            "cancelled_keeps_usage",
+            Some("cancelled: Pi turn ended with aborted"),
+            true,
+            Some(("uncertain", 1, 2, live_second_request)),
+            None,
+        ),
+        (
+            "claim_replaced_resets",
+            None,
+            false,
+            Some(("complete", 1, 1, (623, 5, 8320, 0, Some(0), 8948))),
+            None,
+        ),
+    ] {
+        let dir = root.join(name);
+        let payloads = outputs.iter().find(|v| v["name"] == name).unwrap()["payloads"]
+            .as_array()
+            .unwrap();
+        assert_eq!(payloads.len(), 1, "{name}");
+        ADAPTER.handle_hook(&dir, &payloads[0]).unwrap();
+        let paths = event_paths(&dir).unwrap();
+        assert_eq!(paths.len(), 1, "{name}");
+        let event: SessionEvent = read_json(&paths[0]).unwrap();
+        assert_eq!(event.error.as_deref(), error, "{name}");
+        assert_eq!(event.cancelled, cancelled, "{name}");
+        assert_eq!(event.usage_error.as_deref(), usage_error, "{name}");
+        match usage {
+            None => assert_eq!(event.usage, None, "{name}"),
+            Some((coverage, runs, messages, tokens)) => {
+                let usage = event.usage.expect(name);
+                assert_eq!(usage.source, "pi_extension_agent_end", "{name}");
+                assert_eq!(usage.scope, "request", "{name}");
+                assert_eq!(usage.coverage, coverage, "{name}");
+                assert_eq!(
+                    (usage.runs, usage.assistant_messages),
+                    (runs, messages),
+                    "{name}"
+                );
+                assert_eq!(
+                    (
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cache_read_tokens,
+                        usage.cache_write_tokens,
+                        usage.reasoning_tokens,
+                        usage.total_tokens,
+                    ),
+                    tokens,
+                    "{name}"
+                );
+            }
+        }
+        // The usage is part of the published bytes, so the journal predicate covers it.
+        assert!(!dir.join(CoreRecord::TurnClaim.name()).exists(), "{name}");
+    }
+    // The failure signal keeps the reported usage, and the monitor records it.
+    for (name, total, usage_error) in [
+        ("delivery_failure_persists_usage", Some(8405), None),
+        (
+            "delivery_failure_persists_usage_error",
+            None,
+            Some("assistant message has no usage"),
+        ),
+    ] {
+        let dir = root.join(name);
+        let signal: serde_json::Value = read_json(&dir.join(HOOK_FAILURE_FILE)).unwrap();
+        assert_eq!(signal["usage"]["total_tokens"].as_u64(), total, "{name}");
+        assert_eq!(signal["usage_error"].as_str(), usage_error, "{name}");
+        assert!(super::monitor::consume_hook_failure_for_test(&dir).unwrap());
+        let paths = event_paths(&dir).unwrap();
+        let event: SessionEvent = read_json(&paths[0]).unwrap();
+        assert!(
+            event
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Pi result delivery failed")
+        );
+        assert_eq!(event.usage.map(|u| u.total_tokens), total, "{name}");
+        assert_eq!(event.usage_error.as_deref(), usage_error, "{name}");
+    }
+}
+
+#[test]
+fn hook_payload_usage_is_validated_without_changing_the_outcome() {
+    use crate::native::session::schema::SessionManifest;
+    for (usage_field, expected_usage, expected_error) in [
+        (
+            serde_json::json!({"usage": {"coverage": "complete", "runs": 1, "assistant_messages": 1,
+                "input_tokens": 8400, "output_tokens": 5, "cache_read_tokens": 0,
+                "cache_write_tokens": 0, "reasoning_tokens": 0, "total_tokens": 8405}}),
+            Some(8405),
+            None,
+        ),
+        (
+            serde_json::json!({"usage": {"coverage": "complete", "runs": -1, "assistant_messages": 1,
+                "input_tokens": 1, "output_tokens": 1, "cache_read_tokens": 0,
+                "cache_write_tokens": 0, "total_tokens": 2}}),
+            None,
+            Some("malformed usage: runs".to_owned()),
+        ),
+        (
+            serde_json::json!({"usage_error": "x".repeat(400)}),
+            None,
+            Some("x".repeat(200)),
+        ),
+        (serde_json::json!({}), None, None),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let dir = directory.path();
+        fs::create_dir(dir.join("events")).unwrap();
+        update_status(dir, SessionState::Working, None, None).unwrap();
+        Store::open_unchecked(dir)
+            .write_manifest(&SessionManifest {
+                schema: 1,
+                id: "usage".into(),
+                provider: "pi".into(),
+                provider_path: "pi".into(),
+                provider_version: "1.2.0".into(),
+                workspace: dir.to_path_buf(),
+                title: "usage".into(),
+                model: None,
+                effort: None,
+                yolo: false,
+                created_unix_ms: 1,
+            })
+            .unwrap();
+        let pending = claim_pending_turn(dir);
+        let mut payload = serde_json::json!({
+            "last_assistant_message": marked("result", &pending),
+            "session_id": "pi-session", "turn_id": "leaf",
+            "agent_bridge_claim_token": pending.claim_token,
+            "agent_bridge_prompt_correlated": true,
+        });
+        for (key, value) in usage_field.as_object().unwrap() {
+            payload[key] = value.clone();
+        }
+        ADAPTER.handle_hook(dir, &payload).unwrap();
+        let paths = event_paths(dir).unwrap();
+        assert_eq!(paths.len(), 1);
+        let event: SessionEvent = read_json(&paths[0]).unwrap();
+        assert_eq!(event.message, "result");
+        assert_eq!(event.error, None);
+        assert_eq!(event.usage.map(|u| u.total_tokens), expected_usage);
+        assert_eq!(event.usage_error, expected_error);
+        assert!(!dir.join(TURN_CLAIM_FILE).exists());
+    }
+}

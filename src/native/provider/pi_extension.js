@@ -29,6 +29,92 @@ function lastAssistantOutcome(messages) {
   return { agent_bridge_error: "Pi settled without an assistant result." };
 }
 
+// Pi documents `usage` as a required field of every assistant message (docs/message-types.md,
+// "Assistant messages always contain usage"; `Usage` in @earendil-works/pi-ai types.d.ts). The
+// accumulator sums the usage of the assistant messages that every `agent_end` of the correlated
+// claim delivers; Pi's agent loop emits only the run's new messages there (pi v1.2.0
+// packages/agent/src/agent-loop.ts), so no deduplication is needed. Tool-result usage (nested
+// model work), compaction summaries and Pi's computed `cost` are not collected.
+const USAGE_FIELDS = ["input", "output", "cacheRead", "cacheWrite", "totalTokens"];
+const USAGE_ERROR_LIMIT = 200;
+
+function newUsage() {
+  return {
+    runs: 0,
+    assistantMessages: 0,
+    sums: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, reasoning: 0 },
+    reasoningEverywhere: true,
+    complete: true,
+    error: undefined,
+  };
+}
+
+function countable(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
+function addUsageField(accumulator, usage, field) {
+  if (accumulator.error) return;
+  const value = usage[field];
+  if (!countable(value)) {
+    accumulator.error = `assistant message usage.${field} is not a non-negative safe integer`;
+    return;
+  }
+  const sum = accumulator.sums[field] + value;
+  if (!Number.isSafeInteger(sum)) {
+    accumulator.error = `usage.${field} sum exceeds the safe integer range`;
+    return;
+  }
+  accumulator.sums[field] = sum;
+}
+
+function accumulateRun(accumulator, messages) {
+  if (!accumulator) return;
+  accumulator.runs += 1;
+  const assistants = Array.isArray(messages)
+    ? messages.filter((message) => message?.role === "assistant")
+    : [];
+  // Pi emits a synthetic failure message with zero usage after an escaped exception, and
+  // earlier calls of the run may be missing; only an ordinary stop proves the run complete.
+  if (assistants.length === 0 || assistants.at(-1).stopReason !== "stop") accumulator.complete = false;
+  for (const message of assistants) {
+    accumulator.assistantMessages += 1;
+    if (accumulator.error) continue;
+    const usage = message.usage;
+    if (usage === null || typeof usage !== "object") {
+      accumulator.error = "assistant message has no usage";
+      continue;
+    }
+    for (const field of USAGE_FIELDS) addUsageField(accumulator, usage, field);
+    if (usage.reasoning === undefined) {
+      accumulator.reasoningEverywhere = false;
+    } else {
+      addUsageField(accumulator, usage, "reasoning");
+    }
+  }
+}
+
+function usagePayload(accumulator) {
+  if (!accumulator) return {};
+  if (accumulator.error) return { usage_error: accumulator.error.slice(0, USAGE_ERROR_LIMIT) };
+  const sums = accumulator.sums;
+  const usage = {
+    coverage: accumulator.complete ? "complete" : "uncertain",
+    runs: accumulator.runs,
+    assistant_messages: accumulator.assistantMessages,
+    input_tokens: sums.input,
+    output_tokens: sums.output,
+    cache_read_tokens: sums.cacheRead,
+    cache_write_tokens: sums.cacheWrite,
+    total_tokens: sums.totalTokens,
+  };
+  // A partial reasoning sum would misrepresent a subset of `output`.
+  if (accumulator.reasoningEverywhere && accumulator.assistantMessages > 0) {
+    usage.reasoning_tokens = sums.reasoning;
+  }
+  return { usage };
+}
+
 function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -67,6 +153,8 @@ function persistHookFailure(payload, detail) {
     turn_id: payload.turn_id,
     claim_token: payload.agent_bridge_claim_token,
   };
+  if (payload.usage !== undefined) signal.usage = payload.usage;
+  if (payload.usage_error !== undefined) signal.usage_error = payload.usage_error;
   try {
     writeFileSync(temporary, JSON.stringify(signal), { encoding: "utf8", flag: "wx", mode: 0o600 });
     renameSync(temporary, target);
@@ -85,6 +173,7 @@ export default function (pi) {
   let cancelTimer;
   let runId = 0;
   let abortClaimToken;
+  let usage;
 
   function stopCancelTimer() {
     // Invalidate callbacks before clearing the timer or changing run correlation.
@@ -170,6 +259,9 @@ export default function (pi) {
       activeClaimToken
       && event.prompt.includes(`<!-- agent-bridge-pi-turn:${activeClaimToken} -->`),
     );
+    // A new correlated prompt, or a replaced claim, starts the usage of that claim afresh;
+    // a retry's agent_start without this event keeps accumulating.
+    usage = activePromptCorrelated ? newUsage() : undefined;
   });
 
   pi.on("agent_start", (_event, ctx) => {
@@ -190,10 +282,13 @@ export default function (pi) {
     if (undelivered) return;
     if (!activePromptCorrelated || !activeClaimToken) {
       pending = undefined;
+      usage = undefined;
       return;
     }
+    accumulateRun(usage, event.messages);
     pending = {
       ...lastAssistantOutcome(event.messages),
+      ...usagePayload(usage),
       session_id: ctx.sessionManager.getSessionId(),
       turn_id: ctx.sessionManager.getLeafId() ?? undefined,
       agent_bridge_claim_token: activeClaimToken,
@@ -222,6 +317,7 @@ export default function (pi) {
     if (!delivery.ok) {
       if (persistHookFailure(payload, delivery.detail)) {
         pending = undefined;
+        usage = undefined;
         ctx.ui.notify("Agent Bridge marked this undelivered Pi result as failed.", "warning");
         return;
       }
@@ -230,10 +326,12 @@ export default function (pi) {
       return;
     }
     pending = undefined;
+    usage = undefined;
   });
   pi.on("session_shutdown", () => {
     stopCancelTimer();
     activeClaimToken = undefined;
     activePromptCorrelated = false;
+    usage = undefined;
   });
 }

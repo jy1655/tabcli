@@ -1,5 +1,6 @@
 use super::hook::record_correlated_failure;
 use super::read_pending_turn;
+use super::usage::reported_usage;
 use crate::native::session::{Reader, Store, turn};
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
@@ -23,6 +24,14 @@ struct HookFailureSignal {
     turn_id: Option<String>,
     #[serde(default)]
     claim_token: Option<String>,
+    /// What the extension's payload reported, kept when delivery failed; the same shape and
+    /// validation as the hook payload (`usage` or a bounded `usage_error`). Both are kept raw
+    /// so that a malformed field never rejects the signal before its claim is checked:
+    /// [`reported_usage`] bounds them after the claim matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usage: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usage_error: Option<serde_json::Value>,
 }
 
 pub(in crate::native::provider) struct PiFailureMonitor {
@@ -86,6 +95,11 @@ fn monitor_hook_failures(directory: &Path, stop: &AtomicBool) -> Result<()> {
     }
 }
 
+#[cfg(test)]
+pub(super) fn consume_hook_failure_for_test(directory: &Path) -> Result<bool> {
+    consume_hook_failure(directory)
+}
+
 fn consume_hook_failure(directory: &Path) -> Result<bool> {
     let Some(text) = Reader::open_unchecked(directory)
         .private(HOOK_FAILURE_FILE)
@@ -109,12 +123,21 @@ fn consume_hook_failure(directory: &Path) -> Result<bool> {
     if signal.claim_token.as_deref() != Some(pending.claim_token.as_str()) {
         return Ok(true);
     }
+    let mut reported = serde_json::Map::new();
+    if let Some(usage) = signal.usage {
+        reported.insert("usage".to_owned(), usage);
+    }
+    if let Some(error) = signal.usage_error {
+        reported.insert("usage_error".to_owned(), error);
+    }
+    let usage = reported_usage(&serde_json::Value::Object(reported));
     record_correlated_failure(
         directory,
         error,
         signal.provider_session_id,
         signal.turn_id,
         &pending,
+        usage,
     )?;
     Ok(true)
 }

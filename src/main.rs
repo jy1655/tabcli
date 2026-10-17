@@ -198,7 +198,9 @@ Session policy:
   result reports bridge_observed_elapsed_ms from Bridge receipt creation to the
   published completion event, not model or billing time. Uncomputable values are
   null with bridge_observed_elapsed_reason. inspect and finished ask/tell JSON
-  report the same per-request measurement; no token or cost usage is collected.
+  report the same per-request measurement. Token usage is recorded only from a
+  signal the provider documents as usage (today Pi, tokens only, no cost):
+  result reports it as usage with usage_reason when it is absent.
 
   --context-result attaches a previously recorded result, addressed exactly as
   <session>/<request-id> (or <session>/<event-id> for records without a receipt),
@@ -568,7 +570,8 @@ mod tests {
             "bridge_observed_elapsed_ms",
             "bridge_observed_elapsed_reason",
             "not model or billing time",
-            "no token or cost usage is collected",
+            "signal the provider documents as usage",
+            "usage_reason",
         ] {
             assert!(help.contains(expected), "help is missing {expected:?}");
         }

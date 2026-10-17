@@ -176,6 +176,20 @@ launch, observe, continue, and close without replacing the capabilities those CL
   reports, not what the cancel intended. Pi returns queued messages to the editor on
   abort. Bridge uses no Pi queue and deletes no editor input. Tell the user to check
   the surface before another `tell`, whose paste can combine with restored input.
+- Usage comes only from the signal Pi documents as usage: the `usage` of every assistant
+  message, which the extension sums over every `agent_end` of the correlated claim until
+  settlement (`source: pi_extension_agent_end`, `scope: request`). Tool-result usage,
+  compaction summaries and Pi's computed `cost` are excluded; `reasoning_tokens` only when
+  every message reports it; `coverage: complete` only when every run's final assistant
+  message stopped ordinarily. A malformed operand or sum becomes a bounded `usage_error`
+  and no partial sum. Usage never changes the outcome, and the size policy drops usage
+  (`usage_error: "omitted: event size"`), then the usage error itself, before it fails a
+  message that fits on its own.
+  The event fields are optional and omitted when absent, so an older binary reads a new
+  event but drops the fields and sees a journaled completion as `Mismatched`: do not
+  downgrade the installed binary or `AGENT_BRIDGE_EXECUTABLE` while a session whose turn
+  this binary journaled is open; upgrading is supported. Replace the accumulation when Pi
+  reports a turn's usage through an addressed first-party signal.
 
 ## Current Codex Boundary
 
@@ -353,7 +367,8 @@ launch, observe, continue, and close without replacing the capabilities those CL
   path may publish an event without it: the completion-journal validation rejects one.
 - The elapsed time is what Bridge observed between two records. Do not present it as
   model time or billing time, and do not collect provider usage from a signal that the
-  provider does not document as usage.
+  provider does not document as usage. Usage a query shows is what the event records
+  (`usage`, or `usage_reason` with the bounded `usage_error`); never estimate or total it.
 - The self-test runs in the ordinary state root by default and in a private directory
   only with `--isolated` (owner's decision, 2026-10-02): its purpose is to check the
   installed setup as it is. It closes only what it created, bounds every command it

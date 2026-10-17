@@ -629,6 +629,8 @@ pub(in crate::native) mod tests {
                 provider_session_id: None,
                 turn_id: None,
                 created_unix_ms: Some(3),
+                usage: None,
+                usage_error: None,
             },
             None,
         )

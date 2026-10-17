@@ -4,6 +4,7 @@ mod monitor;
 mod startup;
 #[cfg(test)]
 mod test_support;
+mod usage;
 use super::super::terminal;
 use super::{
     ActiveWatcher, CompletionWatcher, InitialPromptDisposition, LaunchContext, LaunchPlan,
@@ -28,6 +29,7 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
+use usage::reported_usage;
 
 pub(super) static ADAPTER: PiAdapter = PiAdapter;
 
@@ -321,6 +323,8 @@ impl NativeProviderAdapter for PiAdapter {
         }
         let provider_session_id = pi_owned_string(payload, "session_id");
         let turn_id = pi_owned_string(payload, "turn_id");
+        // Usage is information beside the outcome; a malformed usage never changes it.
+        let usage = reported_usage(payload);
         if let Some(error) = pi_string(payload, "agent_bridge_error")
             .map(str::trim)
             .filter(|error| !error.is_empty())
@@ -335,6 +339,7 @@ impl NativeProviderAdapter for PiAdapter {
                     FirstPartyCli::Pi,
                     Some(&pending.claim_token),
                 )
+                .with_usage(usage.usage, usage.usage_error)
                 .cancelled(error, provider_session_id, turn_id)
                 .context("failed to record the correlated Pi interruption");
             }
@@ -344,6 +349,7 @@ impl NativeProviderAdapter for PiAdapter {
                 provider_session_id,
                 turn_id,
                 &pending,
+                usage,
             );
         }
         let raw_message = pi_string(payload, "last_assistant_message")
@@ -358,6 +364,7 @@ impl NativeProviderAdapter for PiAdapter {
             FirstPartyCli::Pi,
             Some(&pending.claim_token),
         )
+        .with_usage(usage.usage, usage.usage_error)
         .complete(message, provider_session_id, turn_id)
         .context("failed to record the correlated Pi result")
     }

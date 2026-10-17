@@ -1,7 +1,9 @@
 //! Claims, receipts, completion publication and recovery for one session.
 use crate::native::session;
 use crate::native::session::primitives::unix_ms;
-use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
+use crate::native::session::schema::{
+    EVENT_READ_LIMIT, ProviderUsage, SessionEvent, USAGE_OMITTED_SIZE,
+};
 use crate::native::session::state::{SessionState, SessionStatus, update_status};
 use crate::native::session::{CoreRecord, Reader, RecordReader, RecordStore, Store, requests};
 #[cfg(target_os = "macos")]
@@ -72,15 +74,16 @@ fn default_completion_status_state() -> SessionState {
 }
 
 fn record_provider_result_for_claim_condition(
-    directory: &Path,
-    provider: FirstPartyCli,
+    report: &Report<'_>,
     message: &str,
     provider_session_id: Option<String>,
     turn_id: Option<String>,
-    expected_claim_token: Option<&str>,
-    require_no_prior_provider_event: bool,
 ) -> Result<()> {
-    let expected_claim_token = match expected_claim_token {
+    let directory = report.store.directory();
+    let provider = report.provider;
+    let require_no_prior_provider_event = report.initial;
+    let usage = report.usage.clone();
+    let expected_claim_token = match report.claim_token {
         Some(token) => token.to_owned(),
         None => match read_claim_token(directory)? {
             Some(token) => token,
@@ -114,6 +117,8 @@ fn record_provider_result_for_claim_condition(
         provider_session_id,
         turn_id,
         created_unix_ms: Some(unix_ms()),
+        usage: usage.usage,
+        usage_error: usage.usage_error,
     };
     commit_completion_locked(
         directory,
@@ -152,6 +157,8 @@ fn record_monitor_failure(directory: &Path, provider: FirstPartyCli, error: &str
         provider_session_id: None,
         turn_id: None,
         created_unix_ms: Some(unix_ms()),
+        usage: None,
+        usage_error: None,
     };
     commit_provider_completion_with_status_locked(
         directory,
@@ -315,15 +322,35 @@ fn commit_completion_within_locked(
 /// than `event_limit` (the bytes the journal would write) is never journaled as
 /// publishable: the publication predicate reads at most that many bytes, so such a record
 /// could be published when the commit stopped before writing it and refused when it
-/// stopped after. The completion is journaled instead as a failure whose error names the
-/// size, keeping the provider identity, so every interruption settles to the same state.
+/// stopped after. The event is measured as recorded, usage fields included. One that
+/// exceeds the limit is retried in this order and the first shape that fits is journaled:
+/// first without `usage` and with [`USAGE_OMITTED_SIZE`] as its `usage_error`, so that a
+/// completion that exceeds the limit only because of its usage is journaled as it would
+/// have been without usage; then bare, without either usage field, so that the omission
+/// marker, or a malformed-usage error the writer recorded, never turns a message that fits
+/// on its own into a failure. Only a bare event that still exceeds the limit is journaled
+/// as a failure whose error names the size, with both usage fields absent and keeping the
+/// provider identity, so every interruption settles to the same state.
 fn bound_pending_completion(
     mut pending: PendingTurnCompletion,
     event_limit: u64,
 ) -> Result<PendingTurnCompletion> {
-    let size = serde_json::to_vec_pretty(&pending.event)?.len() as u64;
+    let mut size = serde_json::to_vec_pretty(&pending.event)?.len() as u64;
     if size <= event_limit {
         return Ok(pending);
+    }
+    if pending.event.usage.is_some() || pending.event.usage_error.is_some() {
+        pending.event.usage = None;
+        pending.event.usage_error = Some(USAGE_OMITTED_SIZE.to_owned());
+        size = serde_json::to_vec_pretty(&pending.event)?.len() as u64;
+        if size <= event_limit {
+            return Ok(pending);
+        }
+        pending.event.usage_error = None;
+        size = serde_json::to_vec_pretty(&pending.event)?.len() as u64;
+        if size <= event_limit {
+            return Ok(pending);
+        }
     }
     let error =
         format!("provider result of {size} bytes exceeds the {event_limit} byte event limit");
@@ -1091,6 +1118,15 @@ pub(in crate::native) struct Report<'a> {
     provider: FirstPartyCli,
     claim_token: Option<&'a str>,
     initial: bool,
+    usage: Usage,
+}
+
+/// What a report records about the provider's own usage: the usage, or the bounded reason
+/// there is none. Both absent means the provider's signal carries no usage at all.
+#[derive(Clone, Debug, Default)]
+struct Usage {
+    usage: Option<ProviderUsage>,
+    usage_error: Option<String>,
 }
 
 impl<'a> Report<'a> {
@@ -1104,7 +1140,20 @@ impl<'a> Report<'a> {
             provider,
             claim_token,
             initial: false,
+            usage: Usage::default(),
         }
+    }
+
+    /// Attaches the usage the provider reported for this turn, or the bounded reason it
+    /// could not be recorded. Usage never changes which outcome `complete`, `fail` and
+    /// `cancelled` record; a caller whose signal carries no usage leaves both absent.
+    pub(in crate::native) fn with_usage(
+        mut self,
+        usage: Option<ProviderUsage>,
+        usage_error: Option<String>,
+    ) -> Self {
+        self.usage = Usage { usage, usage_error };
+        self
     }
 
     /// Claude's uncorrelated initial hooks are accepted only before its first event.
@@ -1114,6 +1163,7 @@ impl<'a> Report<'a> {
             provider,
             claim_token: None,
             initial: true,
+            usage: Usage::default(),
         }
     }
 
@@ -1131,15 +1181,7 @@ impl<'a> Report<'a> {
         provider_session_id: Option<String>,
         turn_id: Option<String>,
     ) -> Result<()> {
-        record_provider_result_for_claim_condition(
-            self.store.directory(),
-            self.provider,
-            message,
-            provider_session_id,
-            turn_id,
-            self.claim_token,
-            self.initial,
-        )
+        record_provider_result_for_claim_condition(self, message, provider_session_id, turn_id)
     }
 
     pub(in crate::native) fn fail(
@@ -1215,6 +1257,8 @@ impl<'a> Report<'a> {
             provider_session_id,
             turn_id,
             created_unix_ms: Some(unix_ms()),
+            usage: self.usage.usage.clone(),
+            usage_error: self.usage.usage_error.clone(),
         };
         commit_completion_locked(
             directory,
