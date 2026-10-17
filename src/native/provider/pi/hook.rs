@@ -1,4 +1,5 @@
 use super::PendingPiTurn;
+use super::usage::ReportedUsage;
 use crate::native::session::{Store, turn};
 use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result};
@@ -10,12 +11,14 @@ pub(super) fn record_correlated_failure(
     provider_session_id: Option<String>,
     turn_id: Option<String>,
     pending: &PendingPiTurn,
+    usage: ReportedUsage,
 ) -> Result<()> {
     turn::Report::for_claim(
         &Store::open_unchecked(directory),
         FirstPartyCli::Pi,
         Some(&pending.claim_token),
     )
+    .with_usage(usage.usage, usage.usage_error)
     .fail(error, provider_session_id, turn_id)
     .context("failed to record the correlated Pi failure")
 }

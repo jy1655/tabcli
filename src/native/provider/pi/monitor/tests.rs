@@ -19,11 +19,24 @@ fn hook_transport_failure_signal_recovers_the_bridge_turn() {
             provider_session_id: Some("provider-session".to_owned()),
             turn_id: Some("provider-turn".to_owned()),
             claim_token: Some(pending.claim_token),
+            usage: Some(serde_json::json!({"coverage": "uncertain", "runs": 2,
+                "assistant_messages": 3, "input_tokens": 11, "output_tokens": 7,
+                "cache_read_tokens": 0, "cache_write_tokens": 0, "total_tokens": 18})),
+            usage_error: None,
         },
     )
     .unwrap();
 
     assert!(consume_hook_failure(directory.path()).unwrap());
+    // The failure record keeps what Pi reported before delivery failed.
+    let events = crate::native::session::primitives::event_paths(directory.path()).unwrap();
+    let event: crate::native::session::schema::SessionEvent = read_json(&events[0]).unwrap();
+    let usage = event.usage.unwrap();
+    assert_eq!(
+        (usage.runs, usage.total_tokens, usage.coverage.as_str()),
+        (2, 18, "uncertain")
+    );
+    assert_eq!(event.usage_error, None);
     assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
     assert!(!directory.path().join(HOOK_FAILURE_FILE).exists());
     let error = turn::wait(

@@ -523,7 +523,10 @@ tabcli result session-K7m2Qx --request request-1791285000000000000-4217-0 --wait
   "request_state": "completed",
   "result": "The program starts in src/main.rs.",
   "bridge_observed_elapsed_ms": 12438,
-  "bridge_observed_elapsed_reason": null
+  "bridge_observed_elapsed_reason": null,
+  "usage": null,
+  "usage_reason": "not_reported",
+  "usage_error": null
 }
 ```
 
@@ -535,12 +538,28 @@ including older events with no receipt. `--request` follows the receipt of that 
 refused. `--timeout-secs` requires `--wait` and defaults to 900 seconds.
 
 Human output gives session, request when available, request state, Bridge-observed elapsed time,
-result text, and error. List rows show event id, request state, request id or `legacy`, and elapsed
-time. See the [JSON field reference](#json-field-reference).
+one usage line when the provider reported usage, result text, and error. List rows show event id,
+request state, request id or `legacy`, and elapsed time. See the
+[JSON field reference](#json-field-reference).
 
 Elapsed time measures receipt creation to the published event, as Bridge observed them. It is
-neither model nor billing time. An uncomputable value is null with a reason; no token or cost usage
-is collected.
+neither model nor billing time. An uncomputable value is null with a reason.
+
+Token usage is collected only from a signal the provider itself documents as usage; today that is
+Pi (every assistant message carries `usage`), tokens only. `usage` is null or an object with
+`source` (`pi_extension_agent_end`), `scope` (`request`), `coverage`, `runs`, `assistant_messages`,
+`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, optional
+`reasoning_tokens` (present only when every assistant message of the request reported it) and
+`total_tokens`. The numbers are the sums over the assistant messages of every run of that request
+until it settled, as Pi reported them; nested tool usage, compaction summaries and Pi's computed
+cost are not included. `coverage` is `complete` when every run ended with an ordinary stop and
+`uncertain` otherwise (an aborted, failed or retried run can leave calls unreported). `usage_reason`
+is null with usage, else `not_reported` (the event carries no usage fields: legacy events and
+providers that report none), `malformed` (the writer recorded a bounded `usage_error` naming the
+field), `omitted_size` (the event exceeded the size limit with usage and was recorded without it) or
+`no_published_result`. `usage_error` carries that bounded text and is otherwise null. Usage never
+changes the request state. The same three fields appear in `--wait` replies, in both `--list`
+arrays and in the timeline's request summaries. No cost is estimated or recorded.
 
 Without `--wait`, a readable `--request` can exit 0 while reporting `pending`, `failed`,
 `unresolved`, or `recovery_required`. A recorded failed event can also be read successfully. An
@@ -1390,10 +1409,14 @@ this field; it grants no additional close authority.
 Single-result fields: `schema_version`, `ok`, `session`, `provider`, `workspace`, `request_id`,
 `event_id`, `context_sources`, `request_state`, `session_state`, `result`, `error`, `session_error`,
 `provider_session_id`, `turn_id`, `created_unix_ms`, `recovery_required`, `unreadable_requests`,
-`request_index_error`, `bridge_observed_elapsed_ms`, and `bridge_observed_elapsed_reason`. Waiting
-can add `owner_process_alive`, `owner`, and `timed_out`. List JSON has `schema_version`, `ok`,
-`session`, `events`, `requests`, `unreadable_requests`, and `request_index_error`; event/request
-entries omit the result body.
+`request_index_error`, `bridge_observed_elapsed_ms`, `bridge_observed_elapsed_reason`, `usage`,
+`usage_reason`, and `usage_error` (see [result](#result)). Waiting can add `owner_process_alive`,
+`owner`, and `timed_out`. List JSON has `schema_version`, `ok`, `session`, `events`, `requests`,
+`unreadable_requests`, and `request_index_error`; event/request entries omit the result body and
+carry the same usage fields. A record written by this version can carry `usage` or
+`usage_error`; an older `tabcli` reading the same session drops them and would treat a still
+journaled completion as not published, so do not downgrade `tabcli` while a session it has
+written is open.
 
 ### wait
 

@@ -2234,3 +2234,161 @@ fn cancel_identity_mismatch_is_unreadable_in_every_reader_without_hiding_result(
         assert_eq!(support::entries(fixture.root.path()), before);
     }
 }
+
+#[test]
+fn result_reports_provider_usage_wherever_elapsed_appears() {
+    let fixture = Fixture::new();
+    // The human line names the session's provider; this is a Pi session.
+    write(
+        &fixture.directory.join("manifest.json"),
+        &manifest(
+            "session-observe",
+            "pi",
+            "pi".as_ref(),
+            "1.2.0",
+            &fixture.root.path().canonicalize().unwrap(),
+            "usage fixture",
+        ),
+    );
+    let usage = json!({"source": "pi_extension_agent_end", "scope": "request",
+        "coverage": "complete", "runs": 1, "assistant_messages": 2, "input_tokens": 793,
+        "output_tokens": 58, "cache_read_tokens": 16640, "cache_write_tokens": 0,
+        "reasoning_tokens": 23, "total_tokens": 17491});
+    // A legacy event, an event with usage, one whose usage the size policy dropped and one
+    // whose usage was malformed; each with its own request.
+    for (name, claim, request_id, extra) in [
+        ("event-1.json", "1-1-1", "request-legacy", json!({})),
+        (
+            "event-2.json",
+            "2-2-2",
+            "request-usage",
+            json!({"usage": usage}),
+        ),
+        (
+            "event-3.json",
+            "3-3-3",
+            "request-omitted",
+            json!({"usage_error": "omitted: event size"}),
+        ),
+        (
+            "event-4.json",
+            "4-4-4",
+            "request-malformed",
+            json!({"usage_error": "malformed usage: runs"}),
+        ),
+    ] {
+        let mut event = support::event("pi", "native-session", name, "body", None, 3);
+        for (key, value) in extra.as_object().unwrap() {
+            event[key] = value.clone();
+        }
+        write(&fixture.directory.join("events").join(name), &event);
+        request(&fixture, claim, request_id, name);
+    }
+    let expectations = [
+        (
+            "request-legacy",
+            Value::Null,
+            json!("not_reported"),
+            Value::Null,
+        ),
+        ("request-usage", usage.clone(), Value::Null, Value::Null),
+        (
+            "request-omitted",
+            Value::Null,
+            json!("omitted_size"),
+            json!("omitted: event size"),
+        ),
+        (
+            "request-malformed",
+            Value::Null,
+            json!("malformed"),
+            json!("malformed usage: runs"),
+        ),
+    ];
+    let check = |value: &Value, label: &str, expected: &(&str, Value, Value, Value)| {
+        assert_eq!(value["usage"], expected.1, "{label}");
+        assert_eq!(value["usage_reason"], expected.2, "{label}");
+        assert_eq!(value["usage_error"], expected.3, "{label}");
+        assert!(
+            value.get("bridge_observed_elapsed_ms").is_some(),
+            "{label} has no elapsed field"
+        );
+    };
+    let list = success(fixture.run(&["result", "session-observe", "--list", "--json"]));
+    let timeline = timeline(&fixture, None);
+    for expected in &expectations {
+        let single = success(fixture.run(&[
+            "result",
+            "session-observe",
+            "--request",
+            expected.0,
+            "--json",
+        ]));
+        check(&single, &format!("single {}", expected.0), expected);
+        // Two queries of the same record say the same thing.
+        let again = success(fixture.run(&[
+            "result",
+            "session-observe",
+            "--request",
+            expected.0,
+            "--json",
+        ]));
+        assert_eq!(again["usage"], single["usage"]);
+        assert_eq!(again["usage_reason"], single["usage_reason"]);
+        let waited = success(fixture.run(&[
+            "result",
+            "session-observe",
+            "--request",
+            expected.0,
+            "--wait",
+            "--timeout-secs",
+            "5",
+            "--json",
+        ]));
+        check(&waited, &format!("wait {}", expected.0), expected);
+        for (array, key) in [("requests", "request_id"), ("events", "request_id")] {
+            let entry = list[array]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry[key] == expected.0)
+                .unwrap_or_else(|| panic!("{array} lacks {}", expected.0));
+            check(entry, &format!("list {array} {}", expected.0), expected);
+            assert!(entry.get("result").is_none());
+        }
+        let summary = timeline["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["request_id"] == expected.0)
+            .unwrap();
+        check(summary, &format!("timeline {}", expected.0), expected);
+        assert_eq!(summary["derived_from"], "result");
+    }
+    let human = |args: &[&str]| {
+        let output = fixture.run(args);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let text = human(&["result", "session-observe", "--request", "request-usage"]);
+    assert!(
+        text.contains(
+            "usage: Pi reported 793 input, 58 output, 16640 cache read, 0 cache write, 17491 total tokens over 1 run (coverage complete)"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("cost"), "{text}");
+    let legacy = human(&["result", "session-observe", "--request", "request-legacy"]);
+    assert!(!legacy.contains("usage:"), "{legacy}");
+    let malformed = human(&[
+        "result",
+        "session-observe",
+        "--request",
+        "request-malformed",
+    ]);
+    assert!(!malformed.contains("usage:"), "{malformed}");
+}

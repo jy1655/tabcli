@@ -8,7 +8,7 @@ use crate::native::reopen::read_resumed_from;
 use crate::native::session::SessionState;
 use crate::native::session::enumerate::{CheckOrder, Fault, Scope, enumerate};
 use crate::native::session::primitives::require_valid_session_id;
-use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
+use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent, USAGE_OMITTED_SIZE};
 #[cfg(test)]
 use crate::native::session::test_support::EVENTS_DIRECTORY;
 use crate::native::session::turn::JournaledEventState;
@@ -203,8 +203,10 @@ impl RequestObservation<'_> {
         let snapshot = self.snapshot;
         let event = self.event.as_ref();
         let (elapsed, elapsed_reason) = observed_elapsed(self.receipt, event);
+        let (usage, usage_reason, usage_error) = reported_usage(event);
         envelope::ok(json!({
             "bridge_observed_elapsed_ms": elapsed, "bridge_observed_elapsed_reason": elapsed_reason,
+            "usage": usage, "usage_reason": usage_reason, "usage_error": usage_error,
             "session": snapshot.manifest.id,
             "provider": snapshot.manifest.provider, "workspace": snapshot.manifest.workspace,
             "request_id": self.receipt.map(|r| &r.request_id), "event_id": self.event_id,
@@ -308,6 +310,56 @@ pub(super) fn observed_elapsed(
         Some(elapsed) => (Some(elapsed), None),
         None => (None, Some("inverted_time")),
     }
+}
+
+// The usage the provider itself reported for the request, as the event recorded it, and
+// why there is none: `not_reported` (no usage fields on the event: legacy events and
+// providers that report nothing), `malformed` (the bounded `usage_error` the writer recorded),
+// `omitted_size` (dropped by the event size policy) or `no_published_result`.
+pub(super) fn reported_usage(
+    event: Option<&SessionEvent>,
+) -> (
+    Option<&crate::native::session::schema::ProviderUsage>,
+    Option<&'static str>,
+    Option<&str>,
+) {
+    let Some(event) = event else {
+        return (None, Some("no_published_result"), None);
+    };
+    if let Some(usage) = &event.usage {
+        return (Some(usage), None, None);
+    }
+    match event.usage_error.as_deref() {
+        None => (None, Some("not_reported"), None),
+        Some(USAGE_OMITTED_SIZE) => (None, Some("omitted_size"), Some(USAGE_OMITTED_SIZE)),
+        Some(error) => (None, Some("malformed"), Some(error)),
+    }
+}
+
+/// The human line for a result that carries the provider's own usage; none otherwise.
+fn usage_text(value: &Value) -> Option<String> {
+    let usage = value["usage"].as_object()?;
+    let count = |field: &str| usage.get(field).and_then(Value::as_u64).unwrap_or(0);
+    let runs = count("runs");
+    let provider = value["provider"].as_str().unwrap_or("provider");
+    let mut provider_name = provider.chars();
+    let provider_name = match provider_name.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + provider_name.as_str(),
+        None => String::new(),
+    };
+    Some(format!(
+        "usage: {provider_name} reported {} input, {} output, {} cache read, {} cache write, {} total tokens over {runs} run{} (coverage {})",
+        count("input_tokens"),
+        count("output_tokens"),
+        count("cache_read_tokens"),
+        count("cache_write_tokens"),
+        count("total_tokens"),
+        if runs == 1 { "" } else { "s" },
+        usage
+            .get("coverage")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+    ))
 }
 
 fn elapsed_text(value: &Value) -> String {
@@ -527,6 +579,9 @@ fn print_result(value: &Value, json: bool) -> Result<()> {
             value["request_state"].as_str().unwrap_or("unknown")
         );
         println!("{}", elapsed_text(value));
+        if let Some(usage) = usage_text(value) {
+            println!("{usage}");
+        }
         if let Some(message) = value["result"].as_str() {
             println!("\n{}", terminal_safe_text(message, true));
         }
@@ -1386,6 +1441,63 @@ mod search_tests {
 #[cfg(test)]
 mod elapsed_tests {
     use super::*;
+
+    #[test]
+    fn human_usage_line_names_counts_runs_and_coverage() {
+        let usage = json!({"provider": "pi", "usage": {"source": "pi_extension_agent_end",
+            "scope": "request", "coverage": "complete", "runs": 1, "assistant_messages": 1,
+            "input_tokens": 1234, "output_tokens": 567, "cache_read_tokens": 0,
+            "cache_write_tokens": 0, "total_tokens": 1801}});
+        assert_eq!(
+            usage_text(&usage).unwrap(),
+            "usage: Pi reported 1234 input, 567 output, 0 cache read, 0 cache write, 1801 total tokens over 1 run (coverage complete)"
+        );
+        let mut uncertain = usage.clone();
+        uncertain["usage"]["coverage"] = json!("uncertain");
+        uncertain["usage"]["runs"] = json!(2);
+        assert!(
+            usage_text(&uncertain)
+                .unwrap()
+                .ends_with("over 2 runs (coverage uncertain)")
+        );
+        assert_eq!(
+            usage_text(&json!({"usage": null, "usage_reason": "not_reported"})),
+            None
+        );
+    }
+
+    #[test]
+    fn reported_usage_reasons_follow_the_recorded_fields() {
+        let mut event = SessionEvent {
+            cancelled: false,
+            provider: "pi".to_owned(),
+            message: "m".to_owned(),
+            error: None,
+            provider_session_id: None,
+            turn_id: None,
+            created_unix_ms: Some(1),
+            usage: None,
+            usage_error: None,
+        };
+        assert_eq!(
+            reported_usage(None),
+            (None, Some("no_published_result"), None)
+        );
+        assert_eq!(
+            reported_usage(Some(&event)),
+            (None, Some("not_reported"), None)
+        );
+        event.usage_error = Some(USAGE_OMITTED_SIZE.to_owned());
+        assert_eq!(
+            reported_usage(Some(&event)),
+            (None, Some("omitted_size"), Some(USAGE_OMITTED_SIZE))
+        );
+        event.usage_error = Some("malformed usage: runs".to_owned());
+        assert_eq!(
+            reported_usage(Some(&event)),
+            (None, Some("malformed"), Some("malformed usage: runs"))
+        );
+    }
 
     #[test]
     fn human_elapsed_distinguishes_zero_from_uncomputable() {

@@ -305,6 +305,30 @@ editor contents, or subsequent delivery on macOS or Windows.
 [pi-session-abort]: https://github.com/earendil-works/pi/blob/v1.0.4/packages/coding-agent/src/core/agent-session.ts#L2268
 [pi-agent-loop]: https://github.com/earendil-works/pi/blob/v1.0.4/packages/agent/src/agent-loop.ts#L354
 
+Pi documents `usage` as a required field of every assistant message (`docs/message-types.md`,
+"Assistant messages always contain usage"; `Usage` in `@earendil-works/pi-ai`). The extension
+sums that field over the assistant messages that every `agent_end` of the correlated claim
+delivers, until the request settles, and reports the sums beside the result; `result --json`
+shows them as `usage` with `usage_reason` and `usage_error` (see the CLI guide). Pi's agent loop
+emits only the run's new messages at `agent_end` (v1.2.0, `packages/agent/src/agent-loop.ts`), so
+retries and recovery runs of the same claim add up without deduplication, and `runs` counts
+them. The scope is one request, assistant messages only: a tool result's own `usage` (nested
+model work), compaction and branch summaries (published through other events, possibly before
+the prompt is correlated) and Pi's computed `cost` are not recorded; cost is excluded by issue
+#55, which rules out price-based estimation. `reasoning_tokens` is reported only when every
+assistant message of the request carried `reasoning`, because it is a subset of `output` and a
+partial sum would misrepresent it. Every operand must be a non-negative safe integer and every
+sum must stay one; otherwise, or when an assistant message lacks `usage`, the extension sends a
+bounded `usage_error` and no partial sums. `coverage` is `complete` only when the final assistant
+message of every run has `stopReason: "stop"`; Pi emits a synthetic failure message with zero
+usage after an escaped exception and earlier calls may be missing, so an aborted, failed or
+retried run is `uncertain`. Usage is reported for successful, failed and cancelled outcomes alike
+and never changes the outcome; a failure signal written when delivery fails keeps it too. Verified
+live on 2026-10-17 with Pi 1.2.0 against the session JSONL (one request of one run with a tool
+call: two assistant messages, 793 input, 58 output, 16640 cache read, 23 reasoning, 17491 total).
+Replace the extension's accumulation when Pi reports a turn's usage through an addressed
+first-party signal.
+
 Pi 1.0.0 can reject a prompt for missing credentials before an agent turn starts, without
 an extension event identifying that refusal. Bridge therefore leaves that request pending
 and claimed. `doctor SESSION --probe` reports `pi_provider_credentials` using Pi's

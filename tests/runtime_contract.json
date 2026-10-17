@@ -220,7 +220,7 @@
     "\"agent_start\"": 1,
     "\"agent_settled\"": 1,
     "\"session_start\"": 1,
-    "\"stop\"": 1,
+    "\"stop\"": 2,
     "`.pi-hook-failure-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`": 1,
     "`.pi-startup-${process.pid}-${Date.now()}.tmp`": 1,
     "\"turn.claim\"": 1

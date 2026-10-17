@@ -217,6 +217,8 @@ pub(super) fn sample_completion(claim_token: &str, message: &str) -> PendingTurn
             provider_session_id: Some("provider-session".to_owned()),
             turn_id: Some("provider-turn".to_owned()),
             created_unix_ms: Some(1),
+            usage: None,
+            usage_error: None,
         },
         None,
     )
@@ -403,6 +405,8 @@ pub(super) fn oversized_sample_event(message: &str) -> SessionEvent {
         provider_session_id: Some("provider-session".to_owned()),
         turn_id: Some("provider-turn".to_owned()),
         created_unix_ms: Some(1),
+        usage: None,
+        usage_error: None,
     }
 }
 
