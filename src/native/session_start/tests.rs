@@ -15,6 +15,8 @@ struct Fake {
     consent: Option<PathBuf>,
     // Make the consent record unwritable: a directory where the record file must go.
     unwritable_consent_record: bool,
+    // Make the initial claim unwritable the same way.
+    unwritable_claim: bool,
     calls: RefCell<Vec<&'static str>>,
     directory: Option<PathBuf>,
 }
@@ -26,6 +28,7 @@ impl Fake {
             stop,
             consent: None,
             unwritable_consent_record: false,
+            unwritable_claim: false,
             calls: RefCell::new(Vec::new()),
             directory: None,
         }
@@ -87,6 +90,9 @@ impl StartSource for Fake {
             fs::create_dir(created.directory.join("workspace-consent.json"))?;
         }
         record_consent(&created, consent)?;
+        if self.unwritable_claim {
+            fs::create_dir(created.directory.join("turn.claim"))?;
+        }
         Ok(created)
     }
     fn result_extra(&self) -> Result<ResultExtra> {
@@ -95,6 +101,11 @@ impl StartSource for Fake {
     }
     fn gate(&self, _: &Path, _: delivery::Gate, _: Instant) -> Result<()> {
         self.step("gate")
+    }
+    fn start_failed(&self, created: &CreatedSession, error: anyhow::Error) -> anyhow::Error {
+        self.calls.borrow_mut().push("start_failed");
+        mark_start_failed(created, &error);
+        error
     }
     fn delivery_failed(
         &self,
@@ -132,7 +143,7 @@ fn pre_open_short_circuits() {
         (
             "extra",
             Duration::from_secs(30),
-            vec!["resolve", "create", "extra"],
+            vec!["resolve", "create", "extra", "start_failed"],
         ),
     ] {
         let mut fake = Fake::new(stop);
@@ -146,10 +157,36 @@ fn pre_open_short_circuits() {
             assert!(!directory.join("turn.claim").exists());
             assert!(!directory.join("requests").exists());
             assert!(!directory.join("workspace-consent.json").exists());
+            // A failure after create is settled by the source: the session is failed.
+            assert_eq!(
+                Reader::open_unchecked(&directory).status().unwrap().state,
+                SessionState::Failed
+            );
         } else {
             assert_eq!(fs::read_dir(fake.root.path()).unwrap().count(), 0);
         }
     }
+}
+
+#[test]
+fn unwritable_initial_claim_is_settled_by_the_source_before_the_launch() {
+    // The claim is the last record before the launch; its failure reaches the source's
+    // start_failed, which marks the session failed, and the launch never begins (#245).
+    let mut fake = Fake::new("begin");
+    fake.unwritable_claim = true;
+    let (error, report) = run(&mut fake, Duration::from_secs(30));
+    assert!(!error.to_string().contains("injected"), "{error:#}");
+    assert_eq!(
+        *fake.calls.borrow(),
+        ["resolve", "create", "extra", "start_failed"]
+    );
+    assert!(report.address().is_none());
+    let directory = fake.directory.unwrap();
+    assert!(!directory.join(CoreRecord::Terminal.name()).exists());
+    assert_eq!(
+        Reader::open_unchecked(&directory).status().unwrap().state,
+        SessionState::Failed
+    );
 }
 
 #[test]

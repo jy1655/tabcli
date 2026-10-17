@@ -306,7 +306,8 @@ refusal gate applies).
 Later failures include the request address, `source_session`, and `gate`.
 
 Exit behaviour otherwise matches `ask`. Refusal gates include `provider-unsupported`,
-`workspace-refused`, `reopen-conflict`, `reopen-verification-failed`, and `already-reopened`. Source refusals include
+`workspace-refused`, `start-failed`, `reopen-conflict`, `reopen-verification-failed`, and
+`already-reopened`. Source refusals include
 `source-not-closed`, `source-not-converged`, `request-unresolved`, and `source-identity-missing`.
 For `source-not-closed`, close the source first. For `source-not-converged`, repeat `close-session
 SESSION --explicit` on the source, then inspect it again. `request-unresolved` and
@@ -318,6 +319,12 @@ runs after the platform and provider check, so `provider-unsupported` still come
 the new session exists: the source's marker is not taken and no refusal record is written. Permit
 the workspace with `tabcli settings codex-memory-workspace allow` in the same state root, or start a
 new `ask` elsewhere.
+
+`start-failed` means the new session existed but a record it needs before its launch (its result
+context or its initial claim) could not be made. No provider process exists at that point, so the
+new session is left failed with the refusal recorded, the source marker is released by the same
+command, or by the next `reopen` if the command did not get that far, and a new `reopen` of the
+source is admitted.
 
 For `provider-unsupported`, check the platform and provider before retrying. For `reopen-conflict`,
 stop the other resume yourself before trying another delivery. Run `doctor SESSION` for

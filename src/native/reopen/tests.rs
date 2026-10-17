@@ -3390,6 +3390,124 @@ fn reopened_source_assesses_workspace_consent_for_the_new_session() {
 }
 
 #[test]
+fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_source() {
+    use crate::native::session_start::StartSource;
+    // A reopened session that fails between create and the launch (its result context or its
+    // initial claim could not be made) records a launch-phase refusal with the start-failed
+    // gate. No provider process exists, so the refusal's cleanup is NoProcessSpawned: the
+    // next reopen's gate finds the marker stale, the command's own settlement releases it,
+    // and a second reopen of the source is admitted (#245).
+    const CHILD: &str = "TABCLI_REOPEN_START_FAILED_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let root = tempfile::tempdir().unwrap();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native::reopen::tests::a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_source",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env(STATE_DIR_ENV, root.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        return;
+    }
+    let root = Reader::state_root().unwrap();
+    // A failure between create and the launch: start_failed records the refusal, fails the
+    // session and releases the source marker itself, because no request address exists yet
+    // and the settlement that follows `start` would not run.
+    let (mut adapter, spec) = start_source_fixture(&root);
+    let source_id = adapter.request.id.clone();
+    let source_directory = adapter.resolved.as_ref().unwrap().0.clone();
+    let created = adapter.create(spec, None).unwrap();
+    assert!(
+        claim_reopen_marker(&source_directory, &source_id, REOPEN_TEST_CONVERSATION).is_err(),
+        "the marker is consumed while the launch is prepared"
+    );
+    let error = adapter.start_failed(&created, anyhow::anyhow!("injected claim failure"));
+    assert_eq!(reopen_refusal_gate(&error), Some(REOPEN_START_FAILED_GATE));
+    assert_eq!(
+        format!("{error:#}"),
+        "reopen refused (start-failed): injected claim failure"
+    );
+    let refusal = read_reopen_launch_refusal(&created.directory).unwrap();
+    assert_eq!(refusal.gate, REOPEN_START_FAILED_GATE);
+    assert_eq!(refusal.detail, "injected claim failure");
+    assert_eq!(
+        Reader::open_unchecked(&created.directory)
+            .status()
+            .unwrap()
+            .state,
+        SessionState::Failed
+    );
+    assert_eq!(
+        refused_launch_cleanup(&created.directory, REOPEN_START_FAILED_GATE).unwrap(),
+        RefusedLaunchCleanup::NoProcessSpawned
+    );
+    assert!(
+        !Reader::open_unchecked(&source_directory)
+            .record(CoreRecord::ReopenMarker)
+            .path()
+            .exists(),
+        "start_failed releases the source marker"
+    );
+    assert!(
+        verify_reopen_source_is_closed(&source_directory, &source_id)
+            .unwrap()
+            .is_none()
+    );
+    let second = claim_reopen_marker(&source_directory, &source_id, REOPEN_TEST_CONVERSATION)
+        .expect("a second reopen of the source is admitted");
+    drop(second);
+
+    // A reopen that died after recording the refusal and before the release (its status
+    // still launching): the next reopen's gate finds the marker stale and admits the reopen.
+    let died_id = "session-start-died";
+    let died_source = write_closed_reopen_source(
+        &root,
+        died_id,
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let inspected = inspect_reopen_source(&died_source, died_id).unwrap();
+    let (died, _) = create_reopened_session(&died_source, died_id, &inspected, || {
+        create_session_within(
+            &root,
+            std::slice::from_ref(&root),
+            SessionSpec {
+                provider: FirstPartyCli::Claude,
+                provider_path: PathBuf::from("claude"),
+                provider_version: "fixture".to_owned(),
+                workspace: root.clone(),
+                title: "reopened".to_owned(),
+                model: None,
+                effort: None,
+                yolo: false,
+                prompt: "test".to_owned(),
+            },
+        )
+    })
+    .unwrap();
+    record_reopen_refusal(
+        &died.directory,
+        REOPEN_START_FAILED_GATE,
+        "died before the release".to_owned(),
+    );
+    let stale = verify_reopen_source_is_closed(&died_source, died_id)
+        .unwrap()
+        .expect("the consumed marker names a reconcilable refusal");
+    assert_eq!(stale.refused_session, died.id);
+    assert_eq!(stale.gate, REOPEN_START_FAILED_GATE);
+    assert_eq!(stale.cleanup, RefusedLaunchCleanup::NoProcessSpawned);
+    let admitted = claim_reopen_marker(&died_source, died_id, REOPEN_TEST_CONVERSATION)
+        .expect("the next reopen releases the stale marker and is admitted");
+    drop(admitted);
+}
+
+#[test]
 fn reopened_source_creation_extra_and_failure_joints() {
     use crate::native::session_start::StartSource;
     const CHILD: &str = "TABCLI_REOPEN_START_CHILD";

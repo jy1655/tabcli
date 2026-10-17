@@ -47,6 +47,10 @@ pub(super) trait StartSource {
         consent: Option<&consent::Assessment>,
     ) -> Result<CreatedSession>;
     fn gate(&self, directory: &Path, gate: delivery::Gate, deadline: Instant) -> Result<()>;
+    // A failure between create and the launch, when the session exists but no provider
+    // process does: the source settles what it reserved for the session (`mark_start_failed`
+    // at least) and returns the error to report.
+    fn start_failed(&self, created: &CreatedSession, error: anyhow::Error) -> anyhow::Error;
     fn delivery_failed(
         &self,
         directory: &Path,
@@ -121,6 +125,10 @@ impl StartSource for FreshSource {
     fn gate(&self, _: &Path, _: delivery::Gate, _: Instant) -> Result<()> {
         Ok(())
     }
+    fn start_failed(&self, created: &CreatedSession, error: anyhow::Error) -> anyhow::Error {
+        mark_start_failed(created, &error);
+        error
+    }
     fn delivery_failed(
         &self,
         _: &Path,
@@ -133,6 +141,17 @@ impl StartSource for FreshSource {
     fn result_extra(&self) -> Result<ResultExtra> {
         Ok(ResultExtra::new())
     }
+}
+
+// Marks a session that failed between its creation and its launch, so that nothing takes
+// it for a launchable one. No provider process exists at that point.
+pub(super) fn mark_start_failed(created: &CreatedSession, error: &anyhow::Error) {
+    let _ = update_status(
+        &created.directory,
+        SessionState::Failed,
+        None,
+        Some(format!("{error:#}")),
+    );
 }
 
 // Record the assessment with the session that create made, before anything else binds to
@@ -158,7 +177,7 @@ pub(super) fn record_consent(
 }
 
 // Single-use protocol: resolve (with the consent assessment), create (which records it),
-// extra, then claim/launch.
+// extra and claim (a failure there is `start_failed`), then launch.
 pub(super) fn start(
     options: StartOptions,
     source: &mut dyn StartSource,
@@ -178,9 +197,16 @@ pub(super) fn start(
     } = source.resolve(deadline)?;
     let provider = spec.provider;
     let created = source.create(spec, assessment.as_ref())?;
-    let result_extra = source.result_extra()?;
-    let mut initial_claim =
-        turn::claim(&Store::open_unchecked(&created.directory), &context_sources)?;
+    // Between create and the launch the session exists and no provider process does. A
+    // failure here is settled by the source: the session is marked failed, and a reopen
+    // records a launch-phase refusal that releases the source marker (#245).
+    let (result_extra, mut initial_claim) = match source.result_extra().and_then(|extra| {
+        turn::claim(&Store::open_unchecked(&created.directory), &context_sources)
+            .map(|claim| (extra, claim))
+    }) {
+        Ok(prepared) => prepared,
+        Err(error) => return Err(source.start_failed(&created, error)),
+    };
     let expected_claim_token = initial_claim.token().to_owned();
     let receipt = initial_claim.receipt().clone();
     report.addressed(created.id.clone(), receipt.request_id.clone());
