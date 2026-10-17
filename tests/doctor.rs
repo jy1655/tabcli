@@ -27,7 +27,8 @@ fn make_private(directory: &std::path::Path) {
         .output()
         .expect("whoami runs");
     assert!(output.status.success(), "{output:?}");
-    let line = String::from_utf8(output.stdout).unwrap();
+    // Lossy: the account name can be non-ASCII in a legacy code page; the SID is ASCII.
+    let line = String::from_utf8_lossy(&output.stdout);
     let sid = line
         .trim()
         .rsplit(',')
