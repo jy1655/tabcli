@@ -186,7 +186,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   regular-file reads within a `ReadBudget`, rechecks the tombstone and status after the verdict,
   and opens no Store, takes no lock, repairs, recovers or writes nothing. It renders the public
   `origin` and `origin_observation` fields once for `status`, `sessions`, `inspect` and `doctor`,
-  and owns the bounded started-from scan that `close-session` reports after a successful close.
+  and owns the bounded started-from scan that `close-session` reports after a successful close,
+  with the re-verification of each listed session that `--with-started-from` runs before its
+  close.
   The scan enumerates lazily and reads per session only the manifest, tombstone, status, launch
   record and one receipt; it never closes or repairs another session and never fails the close.
 - `src/native/query.rs` and `query/timeline.rs` own command-specific observations and fields for
