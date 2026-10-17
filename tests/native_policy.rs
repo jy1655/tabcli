@@ -1125,6 +1125,10 @@ fn public_identity_in_version_and_help() {
             assert!(text.contains("tabcli cancel <session> [--json]"));
             assert!(text.contains("tabcli status [--workspace PATH | --all-workspaces]"));
             assert!(text.contains("tabcli wait ADDRESS [ADDRESS ...] [--timeout-secs N] [--json]"));
+            assert!(text.contains(
+                "tabcli close-session <session> --explicit [--with-started-from] [--timeout-secs N] [--json]"
+            ));
+            assert!(text.contains("--with-started-from also closes"));
         }
         if flag == "--version" {
             assert_eq!(text, format!("{expected}\n"));

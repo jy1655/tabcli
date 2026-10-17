@@ -622,7 +622,7 @@ fn registry_routes_every_command_to_its_variant_and_fields() {
         (vec!["sessions", "--provider", "pi", "--state", "ready", "--sort", "updated", "--json"], "Sessions(SessionsRequest { json: true, workspace: None, provider: Some(Pi), state: Some(\"ready\"), sort_updated: true })".into()),
         (vec!["status", "--all-workspaces", "--provider", "codex", "--all", "--json"], "Status(StatusRequest { scope: AllWorkspaces, provider: Some(Codex), include_closed: true, json: true })".into()),
         (vec!["prune-sessions", "--closed-before-days", "30", "--explicit", "--json"], "Prune(PruneRequest { closed_before_days: 30, explicit: true, json: true })".into()),
-        (vec!["close-session", "session-route", "--explicit", "--timeout-secs", "7", "--json"], "Close(CloseRequest { id: \"session-route\", explicit: true, json: true, timeout: 7s })".into()),
+        (vec!["close-session", "session-route", "--explicit", "--timeout-secs", "7", "--json"], "Close(CloseRequest { id: \"session-route\", explicit: true, json: true, with_started_from: false, timeout: 7s })".into()),
         (vec!["native-session", "session-route"], "RunSession { id: \"session-route\" }".into()),
         (vec!["native-hook", "codex", "{}"], "Hook { provider: Codex, payload: Some(\"{}\") }".into()),
         (vec!["native-provider-control", "claude", "operation", "payload"], "ProviderControl { provider: Claude, arguments: [\"operation\", \"payload\"] }".into()),

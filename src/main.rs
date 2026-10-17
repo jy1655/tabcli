@@ -52,7 +52,7 @@ Usage:
   {PUBLIC_COMMAND} settings macos-open-mode <tab-first|new-window> [--json]
   {PUBLIC_COMMAND} settings codex-memory-workspace <refuse|allow> [--json]
   {PUBLIC_COMMAND} prune-sessions --closed-before-days N --explicit [--json]
-  {PUBLIC_COMMAND} close-session <session> --explicit [--timeout-secs N] [--json]
+  {PUBLIC_COMMAND} close-session <session> --explicit [--with-started-from] [--timeout-secs N] [--json]
   {PUBLIC_COMMAND} --help | --version
 
 Runtime:
@@ -108,6 +108,10 @@ Self-test:
 
 Close:
   close-session --timeout-secs is the maximum time the close may take (default 60 seconds).
+  --with-started-from also closes, within that same budget and one level deep, each
+  open session whose recorded origin is the closed one, re-verifying its records
+  first and closing it through its own ordinary close; each is reported as closed,
+  skipped or failed, and a failed one makes the command fail after the report.
 
 Session policy:
   --model and --effort apply only to the new child session. For Codex, a non-empty
