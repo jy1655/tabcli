@@ -728,17 +728,37 @@ impl session_start::StartSource for ReopenedSource {
     }
 
     fn start_failed(&self, created: &CreatedSession, error: anyhow::Error) -> anyhow::Error {
-        // The refusal first: it is what lets the next reopen release the source marker even
-        // if the status write fails. No provider process exists before the launch, so the
-        // refusal's cleanup is `NoProcessSpawned`, and this command's own settlement
-        // (`settle_reopen_outcome`) releases the marker at once (#245).
+        let (source_directory, _) = self
+            .resolved
+            .as_ref()
+            .expect("resolve precedes start_failed");
+        // The refusal first: it is what lets the next reopen release the source marker if
+        // the status write or the release below fails. No provider process exists before the
+        // launch, so the refusal's cleanup is `NoProcessSpawned` and the marker is released
+        // here: no request address exists yet, so the settlement that follows `start` in
+        // `run_reopen` would not run for this failure (#245).
         let refusal = record_reopen_refusal(
             &created.directory,
             REOPEN_START_FAILED_GATE,
             format!("{error:#}"),
         );
         session_start::mark_start_failed(created, &refusal);
-        refusal
+        release_reopen_marker_after_refusal(
+            source_directory,
+            &created.directory,
+            REOPEN_START_FAILED_GATE,
+            Err(refusal),
+        )
+        .err()
+        .unwrap_or_else(|| {
+            reopen_refusal(
+                REOPEN_START_FAILED_GATE,
+                format!(
+                    "the reopened session {} failed before its launch",
+                    created.id
+                ),
+            )
+        })
     }
 
     fn gate(&self, directory: &Path, gate: delivery::Gate, deadline: Instant) -> Result<()> {

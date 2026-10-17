@@ -3415,6 +3415,9 @@ fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_s
         return;
     }
     let root = Reader::state_root().unwrap();
+    // A failure between create and the launch: start_failed records the refusal, fails the
+    // session and releases the source marker itself, because no request address exists yet
+    // and the settlement that follows `start` would not run.
     let (mut adapter, spec) = start_source_fixture(&root);
     let source_id = adapter.request.id.clone();
     let source_directory = adapter.resolved.as_ref().unwrap().0.clone();
@@ -3423,9 +3426,12 @@ fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_s
         claim_reopen_marker(&source_directory, &source_id, REOPEN_TEST_CONVERSATION).is_err(),
         "the marker is consumed while the launch is prepared"
     );
-
     let error = adapter.start_failed(&created, anyhow::anyhow!("injected claim failure"));
     assert_eq!(reopen_refusal_gate(&error), Some(REOPEN_START_FAILED_GATE));
+    assert_eq!(
+        format!("{error:#}"),
+        "reopen refused (start-failed): injected claim failure"
+    );
     let refusal = read_reopen_launch_refusal(&created.directory).unwrap();
     assert_eq!(refusal.gate, REOPEN_START_FAILED_GATE);
     assert_eq!(refusal.detail, "injected claim failure");
@@ -3440,35 +3446,65 @@ fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_s
         refused_launch_cleanup(&created.directory, REOPEN_START_FAILED_GATE).unwrap(),
         RefusedLaunchCleanup::NoProcessSpawned
     );
-    // Without a settlement (the command died), the next reopen's gate finds the marker stale.
-    let stale = verify_reopen_source_is_closed(&source_directory, &source_id)
-        .unwrap()
-        .expect("the consumed marker names a reconcilable refusal");
-    assert_eq!(stale.refused_session, created.id);
-    assert_eq!(stale.gate, REOPEN_START_FAILED_GATE);
-    assert_eq!(stale.cleanup, RefusedLaunchCleanup::NoProcessSpawned);
-    // The command's own settlement releases the marker and keeps the error and its gate.
-    let (outcome, gate) = settle_reopen_outcome(
-        Reader::session_directory,
-        &source_id,
-        &created.id,
-        Err(error),
-    );
-    assert_eq!(gate.as_deref(), Some(REOPEN_START_FAILED_GATE));
-    assert_eq!(
-        reopen_refusal_gate(&outcome.unwrap_err()),
-        Some(REOPEN_START_FAILED_GATE)
-    );
     assert!(
         !Reader::open_unchecked(&source_directory)
             .record(CoreRecord::ReopenMarker)
             .path()
-            .exists()
+            .exists(),
+        "start_failed releases the source marker"
     );
-    // A second reopen of the same source is admitted.
+    assert!(
+        verify_reopen_source_is_closed(&source_directory, &source_id)
+            .unwrap()
+            .is_none()
+    );
     let second = claim_reopen_marker(&source_directory, &source_id, REOPEN_TEST_CONVERSATION)
-        .expect("a second reopen is admitted once the marker is released");
+        .expect("a second reopen of the source is admitted");
     drop(second);
+
+    // A reopen that died after recording the refusal and before the release (its status
+    // still launching): the next reopen's gate finds the marker stale and admits the reopen.
+    let died_id = "session-start-died";
+    let died_source = write_closed_reopen_source(
+        &root,
+        died_id,
+        "claude",
+        Some(REOPEN_TEST_CONVERSATION),
+        true,
+    );
+    let inspected = inspect_reopen_source(&died_source, died_id).unwrap();
+    let (died, _) = create_reopened_session(&died_source, died_id, &inspected, || {
+        create_session_within(
+            &root,
+            std::slice::from_ref(&root),
+            SessionSpec {
+                provider: FirstPartyCli::Claude,
+                provider_path: PathBuf::from("claude"),
+                provider_version: "fixture".to_owned(),
+                workspace: root.clone(),
+                title: "reopened".to_owned(),
+                model: None,
+                effort: None,
+                yolo: false,
+                prompt: "test".to_owned(),
+            },
+        )
+    })
+    .unwrap();
+    record_reopen_refusal(
+        &died.directory,
+        REOPEN_START_FAILED_GATE,
+        "died before the release".to_owned(),
+    );
+    let stale = verify_reopen_source_is_closed(&died_source, died_id)
+        .unwrap()
+        .expect("the consumed marker names a reconcilable refusal");
+    assert_eq!(stale.refused_session, died.id);
+    assert_eq!(stale.gate, REOPEN_START_FAILED_GATE);
+    assert_eq!(stale.cleanup, RefusedLaunchCleanup::NoProcessSpawned);
+    let admitted = claim_reopen_marker(&died_source, died_id, REOPEN_TEST_CONVERSATION)
+        .expect("the next reopen releases the stale marker and is admitted");
+    drop(admitted);
 }
 
 #[test]
