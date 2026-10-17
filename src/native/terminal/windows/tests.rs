@@ -723,31 +723,63 @@ fn console_newline_modes_preserve_text_and_plain_submission_records() {
         (ConsoleNewline::LineFeed, "a\n\tb😀", 1),
     ] {
         let records = build_console_input_records(input, submits, mode);
-        let units = input.encode_utf16().collect::<Vec<_>>();
-        assert_eq!(records.len(), (units.len() + submits) * 2);
-        for (index, pair) in records.as_chunks::<2>().0.iter().enumerate() {
-            let submit = index >= units.len();
-            let unit = if submit {
-                u16::from(b'\r')
-            } else {
-                units[index]
-            };
-            let soft = !submit && unit == u16::from(b'\n') && mode == ConsoleNewline::ShiftReturn;
-            for (record, down) in pair.iter().zip([1, 0]) {
-                assert_eq!(record.EventType, KEY_EVENT as u16);
-                let key = unsafe { record.Event.KeyEvent };
-                assert_eq!(key.bKeyDown, down);
-                assert_eq!(key.wRepeatCount, 1);
-                assert_eq!(key.wVirtualKeyCode, if submit || soft { 0x0d } else { 0 });
-                assert_eq!(key.wVirtualScanCode, if submit || soft { 0x1c } else { 0 });
-                assert_eq!(
-                    unsafe { key.uChar.UnicodeChar },
-                    if soft { u16::from(b'\r') } else { unit }
-                );
-                assert_eq!(key.dwControlKeyState, if soft { SHIFT_PRESSED } else { 0 });
+        // One key-down and one key-up per BMP unit and per submission Return; a surrogate unit
+        // is key-down only (#147).
+        let mut expected = Vec::new();
+        for unit in input.encode_utf16() {
+            let soft = unit == u16::from(b'\n') && mode == ConsoleNewline::ShiftReturn;
+            expected.push((unit, 1, soft, false));
+            if !(0xD800..=0xDFFF).contains(&unit) {
+                expected.push((unit, 0, soft, false));
             }
         }
+        for _ in 0..submits {
+            expected.push((u16::from(b'\r'), 1, false, true));
+            expected.push((u16::from(b'\r'), 0, false, true));
+        }
+        assert_eq!(records.len(), expected.len());
+        for (record, (unit, down, soft, submit)) in records.iter().zip(expected) {
+            assert_eq!(record.EventType, KEY_EVENT as u16);
+            let key = unsafe { record.Event.KeyEvent };
+            assert_eq!(key.bKeyDown, down);
+            assert_eq!(key.wRepeatCount, 1);
+            assert_eq!(key.wVirtualKeyCode, if submit || soft { 0x0d } else { 0 });
+            assert_eq!(key.wVirtualScanCode, if submit || soft { 0x1c } else { 0 });
+            assert_eq!(
+                unsafe { key.uChar.UnicodeChar },
+                if soft { u16::from(b'\r') } else { unit }
+            );
+            assert_eq!(key.dwControlKeyState, if soft { SHIFT_PRESSED } else { 0 });
+        }
     }
+}
+
+#[test]
+fn console_surrogate_pair_is_two_consecutive_key_down_events_without_releases() {
+    // Codex reads the console through crossterm (openai-oss-forks/crossterm ed1cdab,
+    // src/event/sys/windows/parse.rs): a surrogate unit is buffered regardless of bKeyDown and
+    // combined with the next surrogate event, so the high surrogate's release discarded the
+    // pair; a completed pair is always reported as a press, so a release pair would repeat the
+    // character (#147).
+    let records = build_console_input_records("a😀b", 0, super::ConsoleNewline::ShiftReturn);
+    let keys = records
+        .iter()
+        .map(|record| {
+            let key = unsafe { record.Event.KeyEvent };
+            (unsafe { key.uChar.UnicodeChar }, key.bKeyDown)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        keys,
+        [
+            (u16::from(b'a'), 1),
+            (u16::from(b'a'), 0),
+            (0xD83D, 1),
+            (0xDE00, 1),
+            (u16::from(b'b'), 1),
+            (u16::from(b'b'), 0),
+        ]
+    );
 }
 
 #[test]
