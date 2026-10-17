@@ -63,7 +63,11 @@ impl StartSource for Fake {
             },
             terminal_kind: terminal::TerminalKind::WindowsConsole,
             context_sources: context_sources(),
-            assess_consent: self.consent.clone(),
+            consent: self
+                .consent
+                .as_ref()
+                .map(|requested| consent::assess(self.root.path(), requested))
+                .transpose()?,
         })
     }
     fn create(&mut self, spec: SessionSpec) -> Result<CreatedSession> {
@@ -121,10 +125,6 @@ fn pre_open_short_circuits() {
         ),
     ] {
         let mut fake = Fake::new(stop);
-        // A missing path would fail prepare if create did not short circuit.
-        if stop == "create" {
-            fake.consent = Some(fake.root.path().join("missing"));
-        }
         let (error, report) = run(&mut fake, timeout);
         if stop != "deadline" {
             assert_eq!(error.to_string(), format!("injected {stop}"));
@@ -168,14 +168,17 @@ fn real_create_stops_at_launch_begin_with_optional_consent() {
 }
 
 #[test]
-fn missing_consent_path_stops_before_extra_and_claim() {
+fn failed_consent_assessment_stops_before_create_and_consumes_nothing() {
+    // The assessment precedes create, so a failure consumes nothing: no session, no shared
+    // record, and for a reopen no source marker, which only create claims (#202).
     let mut fake = Fake::new("begin");
     fake.consent = Some(fake.root.path().join("missing"));
     let (error, report) = run(&mut fake, Duration::from_secs(30));
     assert_eq!(error.to_string(), "cannot identify workspace");
-    assert_eq!(*fake.calls.borrow(), ["resolve", "create"]);
+    assert_eq!(*fake.calls.borrow(), ["resolve"]);
     assert!(report.address().is_none());
-    assert!(!fake.directory.unwrap().join("turn.claim").exists());
+    assert!(fake.directory.is_none());
+    assert_eq!(fs::read_dir(fake.root.path()).unwrap().count(), 0);
 }
 
 #[cfg(unix)]

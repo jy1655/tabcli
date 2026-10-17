@@ -16,8 +16,8 @@ use crate::native::session::{
 };
 use crate::native::turn_report::TurnReport;
 use crate::native::{
-    CreatedSession, DEFAULT_TIMEOUT_SECS, NativeCommand, SessionSpec, create_session, delivery,
-    native_delegation_prompt, provider, sanitize_title, session, session_start, terminal,
+    CreatedSession, DEFAULT_TIMEOUT_SECS, NativeCommand, SessionSpec, consent, create_session,
+    delivery, native_delegation_prompt, provider, sanitize_title, session, session_start, terminal,
 };
 use agent_bridge::{FirstPartyCli, process_is_alive, validate_terminal_input};
 use anyhow::{Context, Result, bail};
@@ -618,13 +618,19 @@ struct ReopenedSource {
 // exactly as a fresh `ask` does, so that it can take the same guarded trust-dialog answer. The
 // source's assessment is diagnostic history of another session, never consent for this one
 // (#202). The workspace is the source's recorded, canonical path: reopen takes no path alias.
-fn resolved(spec: SessionSpec, terminal_kind: terminal::TerminalKind) -> session_start::Resolved {
-    session_start::Resolved {
-        assess_consent: Some(spec.workspace.clone()),
+// The assessment is part of the resolution, before create claims the source marker, so a
+// failed assessment leaves the source reopenable.
+fn resolved(
+    root: &Path,
+    spec: SessionSpec,
+    terminal_kind: terminal::TerminalKind,
+) -> Result<session_start::Resolved> {
+    Ok(session_start::Resolved {
+        consent: Some(consent::assess(root, &spec.workspace)?),
         spec,
         terminal_kind,
         context_sources: Vec::new(),
-    }
+    })
 }
 
 impl ReopenedSource {
@@ -663,8 +669,8 @@ impl session_start::StartSource for ReopenedSource {
         }
         // A pre-create gate: the source marker is claimed only by create, and no refusal
         // record is written.
-        Reader::state_root()
-            .and_then(|root| session_start::admission::check(&root, &workspace))
+        let root = Reader::state_root()
+            .and_then(|root| session_start::admission::check(&root, &workspace).map(|()| root))
             .map_err(|error| reopen_refusal(REOPEN_WORKSPACE_REFUSED_GATE, format!("{error:#}")))?;
         let provider_path = resolve_provider(source.provider)?;
         let provider_version =
@@ -692,8 +698,9 @@ impl session_start::StartSource for ReopenedSource {
             yolo: request.yolo,
             prompt: request.prompt.clone(),
         };
+        let start = resolved(&root, spec, terminal_kind)?;
         self.resolved = Some((source_directory, source));
-        Ok(resolved(spec, terminal_kind))
+        Ok(start)
     }
 
     fn create(&mut self, mut spec: SessionSpec) -> Result<CreatedSession> {

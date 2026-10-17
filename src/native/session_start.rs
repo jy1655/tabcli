@@ -32,8 +32,9 @@ pub(super) struct Resolved {
     pub(super) spec: SessionSpec,
     pub(super) terminal_kind: terminal::TerminalKind,
     pub(super) context_sources: Vec<requests::ContextSource>,
-    // Preserve the original requested path, including aliases. None skips assessment.
-    pub(super) assess_consent: Option<PathBuf>,
+    // Assessed by resolve, from the original requested path including aliases, before anything
+    // is created; recorded with the session once it exists. None records nothing.
+    pub(super) consent: Option<consent::Assessment>,
 }
 
 pub(super) trait StartSource {
@@ -68,7 +69,8 @@ impl StartSource for FreshSource {
         if !workspace.is_dir() {
             bail!("workspace is not a directory: {}", workspace.display());
         }
-        admission::check(&Reader::state_root()?, &workspace)?;
+        let root = Reader::state_root()?;
+        admission::check(&root, &workspace)?;
         let provider_path = resolve_provider(request.provider)?;
         let provider_version =
             check_provider_version_until(request.provider, &provider_path, Some(deadline))?;
@@ -80,6 +82,7 @@ impl StartSource for FreshSource {
             format!("{} · {workspace_name}", request.provider.as_str())
         });
         let title = sanitize_title(&requested_title)?;
+        let consent = consent::assess(&root, &request.workspace)?;
         Ok(Resolved {
             spec: SessionSpec {
                 provider: request.provider,
@@ -94,7 +97,7 @@ impl StartSource for FreshSource {
             },
             terminal_kind,
             context_sources: attached.sources,
-            assess_consent: Some(request.workspace.clone()),
+            consent: Some(consent),
         })
     }
 
@@ -120,7 +123,8 @@ impl StartSource for FreshSource {
     }
 }
 
-// Single-use protocol: resolve, create, optional assessment, extra, then claim/launch.
+// Single-use protocol: resolve (with the consent assessment), create, record the assessment,
+// extra, then claim/launch.
 pub(super) fn start(
     options: StartOptions,
     source: &mut dyn StartSource,
@@ -136,12 +140,12 @@ pub(super) fn start(
         spec,
         terminal_kind,
         context_sources,
-        assess_consent,
+        consent: assessment,
     } = source.resolve(deadline)?;
     let provider = spec.provider;
     let created = source.create(spec)?;
-    if let Some(requested) = assess_consent {
-        consent::prepare(&created.directory, &requested)?;
+    if let Some(assessment) = &assessment {
+        consent::record(&created.directory, assessment)?;
     }
     let result_extra = source.result_extra()?;
     let mut initial_claim =

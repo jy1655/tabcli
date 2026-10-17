@@ -356,14 +356,25 @@ fn assess_with(root: &Path, requested: &Path, env: &Environment) -> Result<Asses
     })
 }
 
-pub(super) fn prepare(directory: &Path, requested: &Path) -> Result<()> {
-    let root = directory.parent().context("session has no state root")?;
+// Assess before anything is created: the assessment reads the shared record and the provider
+// stores, and a failure there must consume nothing (a reopen's source marker is claimed by
+// create). The assessment is recorded with the session once that exists.
+pub(super) fn assess(root: &Path, requested: &Path) -> Result<Assessment> {
     let env = Environment::current();
     user_home(&env)?;
-    let assessment = assess_with(root, requested, &env)?;
+    assess_with(root, requested, &env)
+}
+
+pub(super) fn record(directory: &Path, assessment: &Assessment) -> Result<()> {
     Store::open_unchecked(directory)
         .private(SESSION_FILE)
-        .write_json(&assessment)
+        .write_json(assessment)
+}
+
+#[cfg(test)]
+pub(super) fn prepare(directory: &Path, requested: &Path) -> Result<()> {
+    let root = directory.parent().context("session has no state root")?;
+    record(directory, &assess(root, requested)?)
 }
 
 pub(super) fn authorized(directory: &Path, target: FirstPartyCli) -> Result<bool> {

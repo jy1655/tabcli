@@ -3354,19 +3354,32 @@ fn start_source_fixture(root: &Path) -> (ReopenedSource, SessionSpec) {
 
 #[test]
 fn reopened_source_assesses_workspace_consent_for_the_new_session() {
-    // The new session assesses the current workspace exactly as a fresh ask does; the source's
-    // assessment is another session's diagnostic history (#202).
+    // The new session assesses the current workspace exactly as a fresh ask does, as part of
+    // the resolution and before create claims the source marker; the source's assessment is
+    // another session's diagnostic history (#202).
     let root = tempfile::tempdir().unwrap();
-    let (_, spec) = start_source_fixture(root.path());
+    let (_, mut spec) = start_source_fixture(root.path());
+    spec.workspace = root.path().canonicalize().unwrap();
     let workspace = spec.workspace.clone();
-    let resolved = resolved(spec, terminal::TerminalKind::WindowsConsole);
-    assert_eq!(resolved.assess_consent, Some(workspace.clone()));
-    assert_eq!(resolved.spec.workspace, workspace);
-    assert_eq!(
-        resolved.terminal_kind,
-        terminal::TerminalKind::WindowsConsole
-    );
-    assert!(resolved.context_sources.is_empty());
+    let start = resolved(root.path(), spec, terminal::TerminalKind::WindowsConsole).unwrap();
+    assert!(start.consent.is_some());
+    assert_eq!(start.spec.workspace, workspace);
+    assert_eq!(start.terminal_kind, terminal::TerminalKind::WindowsConsole);
+    assert!(start.context_sources.is_empty());
+    // A workspace that cannot be identified fails the resolution, and the failure leaves the
+    // state root as it was: only the fixture's source session, no shared consent record.
+    let other = tempfile::tempdir().unwrap();
+    let (_, mut missing) = start_source_fixture(other.path());
+    missing.workspace = other.path().join("missing");
+    let error = resolved(
+        other.path(),
+        missing,
+        terminal::TerminalKind::WindowsConsole,
+    )
+    .err()
+    .expect("an unidentifiable workspace must fail the resolution");
+    assert_eq!(error.to_string(), "cannot identify workspace");
+    assert_eq!(fs::read_dir(other.path()).unwrap().count(), 1);
 }
 
 #[test]
