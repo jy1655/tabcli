@@ -13,6 +13,30 @@ struct Fixture {
     directory: PathBuf,
 }
 
+// Restricts a fixture directory to the current user, so that a file created inside it is a
+// store that the trust-store check accepts: on Windows the inherited rules are replaced by one
+// full-control rule for this user (the owner stays this user); on Unix the temporary directory
+// already belongs to the user alone and a file's mode is what the check reads.
+#[cfg(windows)]
+fn make_private(directory: &std::path::Path) {
+    let user = std::env::var("USERNAME").expect("USERNAME");
+    let output = std::process::Command::new("icacls")
+        .arg(directory)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            &format!("{user}:(OI)(CI)F"),
+            "/t",
+            "/q",
+        ])
+        .output()
+        .expect("icacls runs");
+    assert!(output.status.success(), "{output:?}");
+}
+
+#[cfg(not(windows))]
+fn make_private(_: &std::path::Path) {}
+
 impl Fixture {
     fn new(provider: &str) -> Self {
         let root = tempfile::tempdir().unwrap();
@@ -1125,6 +1149,11 @@ fn agy_workspace_trust_rows_are_observed_from_the_callers_home() {
     const RECOVERY: &str = "If the managed terminal shows the trust dialog, approve it there and send the prompt again; if it shows the composer or the prompt is still withheld afterwards, close this session and start a new one";
     let fixture = Fixture::new("agy");
     let home = tempfile::tempdir().unwrap();
+    // A provider store is evidence only when nobody but the user can change it. The temporary
+    // directory inherits what the system allows, and a PC with the Codex sandbox lets another
+    // account modify its files, so the home is made private the way Bridge's own records are
+    // before the store is written (#240).
+    make_private(home.path());
     fs::create_dir_all(home.path().join(".gemini/antigravity-cli")).unwrap();
     // Spelled as the Agy adapter spells it: one literal under the home, so the
     // evidence row compares equal on Windows, where a second join would use `\`.
