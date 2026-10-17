@@ -431,7 +431,12 @@ fn probe_and_version_queries_drop_the_same_markers_as_managed_launches() {
         probe_environment_removals(FirstPartyCli::Claude),
         CLAUDE_CODE_SESSION_MARKERS
     );
-    for marker in ["AI_AGENT", "CLAUDE_CODE_BRIDGE_SESSION_ID"] {
+    for marker in [
+        "AI_AGENT",
+        "CLAUDE_CODE_BRIDGE_SESSION_ID",
+        "CODEX_COMPANION_SESSION_ID",
+        "CODEX_COMPANION_TRANSCRIPT_PATH",
+    ] {
         assert!(probe_environment_removals(FirstPartyCli::Claude).contains(&marker));
     }
     for other in [FirstPartyCli::Codex, FirstPartyCli::Agy, FirstPartyCli::Pi] {
@@ -474,6 +479,9 @@ fn managed_launch_drops_inherited_claude_code_session_markers() {
             "CLAUDE_CODE_MESSAGING_SOCKET",
             "CLAUDE_CODE_MESSAGING_TOKEN",
             "CLAUDE_EFFORT",
+            // The caller's Claude Code Codex plugin names the caller's session (#149).
+            "CODEX_COMPANION_SESSION_ID",
+            "CODEX_COMPANION_TRANSCRIPT_PATH",
         ] {
             assert!(plan.environment_removals.contains(&marker), "{marker}");
         }

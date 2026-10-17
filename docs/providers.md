@@ -152,7 +152,9 @@ The macOS initial prompt is a launch argument. On native Windows, Bridge deliver
 through Claude's official cross-session messaging. Every follow-up uses that messaging path too:
 a separate, nonpersistent Claude messenger model turn calls `ListAgents` to find your session
 and `SendMessage` to deliver the prompt. Bridge removes inherited Claude session markers so a
-launch from inside Claude does not create a nested session with an undiscoverable inbox.
+launch from inside Claude does not create a nested session with an undiscoverable inbox; the list
+includes the caller's session id and transcript path that the Claude Code Codex plugin sets
+(`CODEX_COMPANION_SESSION_ID`, `CODEX_COMPANION_TRANSCRIPT_PATH`, #149).
 On macOS, Bridge also keeps those markers and its own per-session variables out of every
 other process it starts, including a terminal application it starts. An application already
 started by an earlier version keeps them until it is restarted. The [2026-10-12 Windows check][win48]
