@@ -84,7 +84,8 @@ pub(super) fn send_native_queue_message<C: Clock>(
     // Codex chooses daemon or embedded queue; acceptance is not completion, which needs notify.
     // See docs/verification/2026-10-04-codex-queue.md for the provider source.
 
-    let pending = PendingCodexTurn::new(context.correlation_id).map_err(Outcome::NotSent)?;
+    let mut pending = PendingCodexTurn::new(context.correlation_id).map_err(Outcome::NotSent)?;
+    pending.record_framed_prompt(&correlated_prompt(context.prompt, &pending));
     let arguments = codex_queue_arguments(&thread_id, context.prompt, &pending);
     let mut command = queue_command(
         context.provider_path,

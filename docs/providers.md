@@ -112,6 +112,24 @@ thread, and later results must name that thread.
 IDE-wrapper support comes from Codex's source and Bridge's tests. A live session with `/ide`
 is not verified; see the [Windows verification record][win10].
 
+On native Windows the `notify` payload has a size limit. Codex runs the notify command with the
+whole JSON payload as one argument, and that payload carries the delivered prompt
+(`input-messages`) and the whole answer (`last-assistant-message`). Windows refuses a process
+command line of 32,767 UTF-16 units or more, so a long prompt with a long answer makes the spawn
+of `tabcli.exe` fail with error 206 and the completion never reaches Bridge: the request stays
+`pending` for good and the session stays `working` until the caller's timeout (observed
+2026-10-11 with codex-cli 0.162.1: a 21,655-character prompt and a 12,586-character answer).
+Bridge has no second path to a Codex completion. Keep the delivered prompt and the requested
+answer short on native Windows: put long material in files in the workspace, ask for a short
+written result, and prefer a file-based report. To recover, read the answer from Codex's rollout
+record (`~/.codex/sessions/<date>/rollout-*.jsonl`), then `close-session` the session; do not
+resend an uncertain turn. `tabcli doctor <session>` reports `codex_notify_payload_budget`, an
+estimate of the pending turn's payload against the limit from the framed prompt's size, which the
+pending-turn record keeps for the initial turn and for each follow-up as sized before delivery (the
+console paste can drop a non-BMP character, so the delivered text can be smaller); the real command
+line can be larger or smaller than the estimate, and text with many quotation marks is undercounted
+because Codex's argument quoting escapes each of them. See [doctor](cli.md#doctor).
+
 `reopen` refuses closed Codex sessions. Bridge still needs checks for the thread's writer lock
 and queued inputs before supporting resume; start a new session instead.
 

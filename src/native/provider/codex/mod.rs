@@ -60,6 +60,15 @@ struct PendingCodexTurn {
     schema: u32,
     claim_token: String,
     marker: String,
+    // The sizes of the framed prompt as Bridge handed it to delivery, kept for the doctor's
+    // notify payload estimate (#127). The macOS launch argument and the queue message
+    // deliver that text; the Windows console paste can drop a non-BMP character (#147),
+    // so the delivered text can be smaller. Additive within schema 1: a record of 0.4.14
+    // reads with `None`, and 0.4.14 ignores the fields (serde keeps unknown fields).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    framed_prompt_chars: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    framed_prompt_units: Option<u64>,
 }
 
 impl PendingCodexTurn {
@@ -69,7 +78,17 @@ impl PendingCodexTurn {
             schema: 1,
             claim_token: claim_token.to_owned(),
             marker: format!("<!-- agent-bridge-codex-turn:{claim_token} -->"),
+            framed_prompt_chars: None,
+            framed_prompt_units: None,
         })
+    }
+
+    // Records the framed prompt's sizes before delivery: characters, and UTF-16 units of
+    // its JSON escape, which is how the notify payload carries it in `input-messages`.
+    fn record_framed_prompt(&mut self, framed: &str) {
+        let (chars, units) = diagnose::framed_prompt_sizes(framed);
+        self.framed_prompt_chars = Some(chars);
+        self.framed_prompt_units = Some(units);
     }
 }
 
@@ -368,7 +387,7 @@ fn prepare_launch_for_platform(
 ) -> Result<LaunchPlan> {
     let claim_token = turn::current_claim_token(&Reader::open_unchecked(context.directory))?
         .context("Codex launch has no native turn claim")?;
-    let pending = install_pending_turn(context.directory, &claim_token)?;
+    let pending = install_pending_turn_for_prompt(context.directory, &claim_token, context.prompt)?;
     let mut arguments = provider_launch_args(FirstPartyCli::Codex, context.yolo)
         .into_iter()
         .map(OsString::from)
@@ -417,8 +436,25 @@ fn prepare_launch_for_platform(
     })
 }
 
+// A record without prompt sizes, as a binary before them wrote it; the tests use it for
+// that shape and for turns whose prompt is not under test.
+#[cfg(test)]
 fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingCodexTurn> {
     let pending = PendingCodexTurn::new(claim_token)?;
+    write_pending_turn(directory, &pending)?;
+    Ok(pending)
+}
+
+// The initial turn's record, written once with the sizes of the prompt as Codex receives it
+// (the launch argument on macOS, the paste on Windows: both are `correlated_prompt`).
+fn install_pending_turn_for_prompt(
+    directory: &Path,
+    claim_token: &str,
+    prompt: &str,
+) -> Result<PendingCodexTurn> {
+    let mut pending = PendingCodexTurn::new(claim_token)?;
+    let framed = correlated_prompt(prompt, &pending);
+    pending.record_framed_prompt(&framed);
     write_pending_turn(directory, &pending)?;
     Ok(pending)
 }

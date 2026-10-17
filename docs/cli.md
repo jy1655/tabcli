@@ -717,6 +717,33 @@ read consistently. Only `origin_ended` suggests a command: an explicit `close-se
 session, if you no longer need it. The origin observation grants no close authority.
 `doctor --provider` has no origin check.
 
+For Codex, `checks` includes `codex_notify_payload_budget`, an estimate of the pending turn's
+`notify` command line against the native Windows limit of 32,767 UTF-16 units (see
+[providers](providers.md#codex)). It reads the sizes of the framed prompt that the pending-turn
+record keeps for the initial turn and for each `tell` follow-up, computes nothing beyond them, and
+sends nothing. It is an estimate, not a measurement: the JSON-escaped framed prompt as sized before
+delivery (the Windows console paste can drop a non-BMP character, so the delivered text can be
+smaller), plus an allowance of 300 units for the payload's other fields and Codex's argument
+quoting, plus the length of the doctor's own executable path, which stands in for the notify
+executable fixed at launch because the records do not retain it. The real command line can be
+larger or smaller: Codex's argument quoting adds a backslash for every quotation mark in the
+payload, so text with many quotation marks is undercounted by that many units. `evidence` carries `prompt_chars`, `escaped_units`,
+`envelope_units`, `limit_units`, `answer_budget_units` (the remaining units an answer can take),
+`threshold_units` (4,096), `executable_source` (`doctor_executable`), `pending_request` when the
+receipt is readable, and `source`: `pending_turn_record` for the retained sizes, or
+`initial_prompt_record` when a pending turn installed before this version carries none and the
+preserved initial prompt still exists. Off Windows it is `available` /
+`codex_notify_payload_no_limit` with the same evidence. On Windows it is `unavailable` /
+`codex_notify_payload_over_limit` when the estimate alone reaches the limit (the completion has
+probably failed to reach Bridge), `unavailable` / `codex_notify_payload_near_limit` when fewer
+than 4,096 units remain for the answer, and `available` / `codex_notify_payload_within_limit`
+otherwise. It is `unknown` / `session_required` without a session, `unknown` /
+`codex_turn_not_pending` when no Codex turn is pending, and `unknown` /
+`codex_pending_prompt_unavailable` when the pending-turn record cannot be read or when a turn
+installed before this version has lost its initial prompt record. If the request stays pending
+while the session is working after a long turn, read the answer from Codex's rollout record and
+close the session; never resend. Otherwise keep prompts and requested answers short on Windows.
+
 For Pi, `checks` includes `pi_provider_credentials`. With a session's explicit
 `provider/model` and `--probe`, Pi's local, non-refreshing auth check reports
 `evidence.status` as `ready`, `not_ready`, or `unknown`, alongside `provider`, `authType`,

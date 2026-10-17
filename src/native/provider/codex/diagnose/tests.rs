@@ -196,3 +196,207 @@ fn codex_daemon_probe_requires_a_running_compatible_app_server() {
         );
     }
 }
+
+#[test]
+fn notify_payload_budget_counts_json_escaped_utf16_units() {
+    use super::{NOTIFY_COMMAND_LINE_LIMIT_UNITS, notify_payload_budget};
+    let ascii = notify_payload_budget("abcd", 100);
+    assert_eq!(ascii.prompt_chars, 4);
+    assert_eq!(ascii.escaped_units, 6, "two quotes around four characters");
+    assert_eq!(ascii.envelope_units, 400);
+    assert_eq!(ascii.limit_units, NOTIFY_COMMAND_LINE_LIMIT_UNITS);
+    assert_eq!(
+        ascii.answer_budget_units,
+        NOTIFY_COMMAND_LINE_LIMIT_UNITS - 406
+    );
+
+    let escaped = notify_payload_budget("a\"b\\c\nd", 0);
+    assert_eq!(escaped.prompt_chars, 7);
+    assert_eq!(
+        escaped.escaped_units, 12,
+        "quote, backslash and newline each take two units"
+    );
+
+    let non_bmp = notify_payload_budget("😀", 0);
+    assert_eq!(non_bmp.prompt_chars, 1);
+    assert_eq!(non_bmp.escaped_units, 4, "two quotes plus a surrogate pair");
+}
+
+#[test]
+fn notify_payload_budget_classifies_by_host_and_remaining_budget() {
+    use super::{
+        NOTIFY_ANSWER_BUDGET_THRESHOLD_UNITS, NOTIFY_COMMAND_LINE_LIMIT_UNITS,
+        classify_notify_payload_budget, notify_payload_budget,
+    };
+    use crate::native::doctor::Availability::*;
+    assert_eq!(NOTIFY_ANSWER_BUDGET_THRESHOLD_UNITS, 4_096);
+    let short = notify_payload_budget("short", 100);
+    let near = notify_payload_budget(
+        &"x".repeat(
+            NOTIFY_COMMAND_LINE_LIMIT_UNITS - 400 - 2 - NOTIFY_ANSWER_BUDGET_THRESHOLD_UNITS + 1,
+        ),
+        100,
+    );
+    assert_eq!(
+        near.answer_budget_units,
+        NOTIFY_ANSWER_BUDGET_THRESHOLD_UNITS - 1
+    );
+    let within = notify_payload_budget(
+        &"x".repeat(
+            NOTIFY_COMMAND_LINE_LIMIT_UNITS - 400 - 2 - NOTIFY_ANSWER_BUDGET_THRESHOLD_UNITS,
+        ),
+        100,
+    );
+    assert_eq!(
+        within.answer_budget_units,
+        NOTIFY_ANSWER_BUDGET_THRESHOLD_UNITS
+    );
+    let over = notify_payload_budget(&"x".repeat(NOTIFY_COMMAND_LINE_LIMIT_UNITS - 400 - 2), 100);
+    assert_eq!(over.answer_budget_units, 0);
+    let beyond = notify_payload_budget(&"x".repeat(NOTIFY_COMMAND_LINE_LIMIT_UNITS), 100);
+    assert_eq!(beyond.answer_budget_units, 0);
+    for (budget, expected) in [
+        (&short, (Available, "codex_notify_payload_within_limit")),
+        (&within, (Available, "codex_notify_payload_within_limit")),
+        (&near, (Unavailable, "codex_notify_payload_near_limit")),
+        (&over, (Unavailable, "codex_notify_payload_over_limit")),
+        (&beyond, (Unavailable, "codex_notify_payload_over_limit")),
+    ] {
+        assert_eq!(classify_notify_payload_budget(budget, true), expected);
+        assert_eq!(
+            classify_notify_payload_budget(budget, false),
+            (Available, "codex_notify_payload_no_limit")
+        );
+    }
+}
+
+#[test]
+fn notify_payload_check_reads_the_pending_initial_prompt_and_reports_unknown_otherwise() {
+    use crate::native::doctor::{Availability, Context};
+    use crate::native::session::{CoreRecord, Store};
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("session-codexbudget");
+    std::fs::create_dir(&directory).unwrap();
+    let environment = crate::native::consent::Environment::default();
+    let check = |directory: Option<&std::path::Path>| {
+        let checks = diagnose_codex(Context {
+            directory,
+            manifest: None,
+            executable: None,
+            current_version: Some("0.159.3"),
+            workspace: root.path(),
+            probe: false,
+            deadline: std::time::Instant::now(),
+            environment: &environment,
+        });
+        let check = checks
+            .into_iter()
+            .find(|c| c.id == "codex_notify_payload_budget")
+            .unwrap();
+        let row = serde_json::to_value(&check).unwrap();
+        (check.availability, check.reason_code, row)
+    };
+    let (availability, reason, _) = check(None);
+    assert_eq!(
+        (availability, reason),
+        (Availability::Unknown, "session_required")
+    );
+
+    let (availability, reason, _) = check(Some(&directory));
+    assert_eq!(
+        (availability, reason),
+        (Availability::Unknown, "codex_turn_not_pending")
+    );
+
+    let claim = "1700000000000-1";
+    super::super::install_pending_turn(&directory, claim).unwrap();
+    let (availability, reason, row) = check(Some(&directory));
+    assert_eq!(
+        (availability, reason),
+        (Availability::Unknown, "codex_pending_prompt_unavailable")
+    );
+    assert!(
+        row["evidence"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("carries no prompt sizes")
+    );
+
+    Store::open_unchecked(&directory)
+        .record(CoreRecord::InitialPrompt)
+        .write_private(b"hello")
+        .unwrap();
+    let (availability, reason, row) = check(Some(&directory));
+    if cfg!(windows) {
+        assert_eq!(
+            (availability, reason),
+            (Availability::Available, "codex_notify_payload_within_limit")
+        );
+    } else {
+        assert_eq!(
+            (availability, reason),
+            (Availability::Available, "codex_notify_payload_no_limit")
+        );
+    }
+    let evidence = &row["evidence"];
+    assert_eq!(evidence["source"], "initial_prompt_record");
+    assert_eq!(evidence["limit_units"], 32_767);
+    assert_eq!(evidence["threshold_units"], 4_096);
+    assert!(evidence["prompt_chars"].as_u64().unwrap() > "hello".len() as u64);
+    assert!(
+        evidence["escaped_units"].as_u64().unwrap() > evidence["prompt_chars"].as_u64().unwrap()
+    );
+    assert!(evidence["envelope_units"].as_u64().unwrap() >= 300);
+    assert!(evidence["answer_budget_units"].as_u64().unwrap() > 4_096);
+    assert!(evidence["pending_request"].is_null());
+    assert!(row["next_action"].as_str().unwrap().contains("rollout"));
+    assert!(
+        row["detail"]
+            .as_str()
+            .unwrap()
+            .contains("not a measurement")
+    );
+    assert_eq!(evidence["executable_source"], "doctor_executable");
+
+    // A pending turn record that carries the sizes wins over the preserved initial prompt
+    // while both exist (`hello` would give a far smaller prompt), and still answers once
+    // delivery has removed the initial prompt record.
+    let delivered = "x".repeat(10_000);
+    let pending =
+        super::super::install_pending_turn_for_prompt(&directory, "1700000000000-3", &delivered)
+            .unwrap();
+    let (_, _, row) = check(Some(&directory));
+    assert_eq!(row["evidence"]["source"], "pending_turn_record");
+    assert_eq!(
+        row["evidence"]["prompt_chars"],
+        pending.framed_prompt_chars.unwrap()
+    );
+    std::fs::remove_file(
+        Store::open_unchecked(&directory)
+            .record(CoreRecord::InitialPrompt)
+            .path(),
+    )
+    .unwrap();
+    let (availability, reason, row) = check(Some(&directory));
+    assert_eq!(
+        reason,
+        if cfg!(windows) {
+            "codex_notify_payload_within_limit"
+        } else {
+            "codex_notify_payload_no_limit"
+        }
+    );
+    assert_eq!(availability, Availability::Available);
+    let evidence = &row["evidence"];
+    assert_eq!(evidence["source"], "pending_turn_record");
+    assert_eq!(
+        evidence["prompt_chars"],
+        pending.framed_prompt_chars.unwrap()
+    );
+    assert_eq!(
+        evidence["escaped_units"],
+        pending.framed_prompt_units.unwrap()
+    );
+    assert!(evidence["prompt_chars"].as_u64().unwrap() > 10_000);
+    assert!(evidence["answer_budget_units"].as_u64().unwrap() < 32_767 - 10_000);
+}
