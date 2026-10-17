@@ -355,9 +355,10 @@ launch, observe, continue, and close without replacing the capabilities those CL
   of another session and is never reused as consent (#202). A start that skipped the
   assessment would leave `authorized` false for good, so the session could not take the
   guarded dialog answer that a fresh `ask` can. The assessment is part of the resolution,
-  before anything is created, and is recorded with the session once it exists: a failed
-  assessment consumes nothing, in particular not the source marker that a reopen's create
-  claims (found in review, 2026-10-17).
+  before anything is created, and create records it with the session before anything else
+  binds to that session: a failed assessment consumes nothing, and a record that cannot be
+  written fails the creation, which for a reopen releases the source reservation (found in
+  review, 2026-10-17).
 
 ## Observation and Self-Test Boundary
 

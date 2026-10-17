@@ -703,12 +703,20 @@ impl session_start::StartSource for ReopenedSource {
         Ok(start)
     }
 
-    fn create(&mut self, mut spec: SessionSpec) -> Result<CreatedSession> {
+    fn create(
+        &mut self,
+        mut spec: SessionSpec,
+        consent: Option<&consent::Assessment>,
+    ) -> Result<CreatedSession> {
         let (directory, source) = self.resolved.as_ref().expect("resolve precedes create");
         let (created, resumed_from) =
             create_reopened_session(directory, &self.request.id, source, || {
                 spec.prompt = native_delegation_prompt(&delegation_source(), &spec.prompt);
-                create_session(spec)
+                let created = create_session(spec)?;
+                // Before the provenance and the marker: a record that cannot be written
+                // releases the source reservation like any creation failure.
+                session_start::record_consent(&created, consent)?;
+                Ok(created)
             })?;
         self.resumed_from = Some(resumed_from);
         Ok(created)

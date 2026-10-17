@@ -39,7 +39,7 @@ const REOPEN_TEST_CONVERSATION: &str = "6928ca1c-1234-4abc-8def-0123456789ab";
 
 #[test]
 fn creation_binds_both_sessions_or_releases_the_source_reservation() {
-    for failure in [None, Some("create"), Some("provenance")] {
+    for failure in [None, Some("create"), Some("consent"), Some("provenance")] {
         let root = tempfile::tempdir().unwrap();
         let source_id = "session-creation-source";
         let directory = write_closed_reopen_source(
@@ -74,6 +74,13 @@ fn creation_binds_both_sessions_or_releases_the_source_reservation() {
                 },
             )?;
             created_directory = Some(created.directory.clone());
+            if failure == Some("consent") {
+                // The consent record is written inside create, before the provenance and
+                // the marker; an unwritable record releases the reservation (#202 review).
+                fs::create_dir(created.directory.join("workspace-consent.json"))?;
+                let assessment = consent::assess(root.path(), root.path())?;
+                session_start::record_consent(&created, Some(&assessment))?;
+            }
             if failure == Some("provenance") {
                 fs::remove_file(created.directory.join("manifest.json"))?;
                 fs::create_dir(created.directory.join("manifest.json"))?;
@@ -3405,7 +3412,7 @@ fn reopened_source_creation_extra_and_failure_joints() {
     let root = Reader::state_root().unwrap();
     let (mut adapter, spec) = start_source_fixture(&root);
     let original = snapshot_directory(&adapter.resolved.as_ref().unwrap().0);
-    let created = adapter.create(spec).unwrap();
+    let created = adapter.create(spec, None).unwrap();
     let provenance = adapter.resumed_from.as_ref().unwrap();
     assert_eq!(
         read_resumed_from(&created.directory).unwrap().as_ref(),

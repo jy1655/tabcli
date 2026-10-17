@@ -4,7 +4,7 @@ use super::args::{
 };
 use crate::native::session::launch::wrapper::{check_provider_version_until, resolve_provider};
 use crate::native::session::primitives::delegation_source;
-use crate::native::session::{Reader, Store, launch, requests, turn};
+use crate::native::session::{Reader, SessionState, Store, launch, requests, turn, update_status};
 use crate::native::turn_report::TurnReport;
 use crate::native::{
     CreatedSession, DEFAULT_TIMEOUT_SECS, NativeCommand, SessionSpec, consent, context,
@@ -39,7 +39,13 @@ pub(super) struct Resolved {
 
 pub(super) trait StartSource {
     fn resolve(&mut self, deadline: Instant) -> Result<Resolved>;
-    fn create(&mut self, spec: SessionSpec) -> Result<CreatedSession>;
+    // Creates the session and records the assessment with it (`record_consent`) before
+    // anything else binds to the session.
+    fn create(
+        &mut self,
+        spec: SessionSpec,
+        consent: Option<&consent::Assessment>,
+    ) -> Result<CreatedSession>;
     fn gate(&self, directory: &Path, gate: delivery::Gate, deadline: Instant) -> Result<()>;
     fn delivery_failed(
         &self,
@@ -101,9 +107,15 @@ impl StartSource for FreshSource {
         })
     }
 
-    fn create(&mut self, mut spec: SessionSpec) -> Result<CreatedSession> {
+    fn create(
+        &mut self,
+        mut spec: SessionSpec,
+        consent: Option<&consent::Assessment>,
+    ) -> Result<CreatedSession> {
         spec.prompt = native_delegation_prompt(&delegation_source(), &spec.prompt);
-        create_session(spec)
+        let created = create_session(spec)?;
+        record_consent(&created, consent)?;
+        Ok(created)
     }
 
     fn gate(&self, _: &Path, _: delivery::Gate, _: Instant) -> Result<()> {
@@ -123,7 +135,29 @@ impl StartSource for FreshSource {
     }
 }
 
-// Single-use protocol: resolve (with the consent assessment), create, record the assessment,
+// Record the assessment with the session that create made, before anything else binds to
+// that session: a reopen finalizes its source marker only after its create has returned, so
+// a record that cannot be written releases the source like any creation failure. The session
+// is marked failed, so that nothing takes it for a launchable one.
+pub(super) fn record_consent(
+    created: &CreatedSession,
+    consent: Option<&consent::Assessment>,
+) -> Result<()> {
+    let Some(assessment) = consent else {
+        return Ok(());
+    };
+    consent::record(&created.directory, assessment).map_err(|error| {
+        let _ = update_status(
+            &created.directory,
+            SessionState::Failed,
+            None,
+            Some(format!("{error:#}")),
+        );
+        error
+    })
+}
+
+// Single-use protocol: resolve (with the consent assessment), create (which records it),
 // extra, then claim/launch.
 pub(super) fn start(
     options: StartOptions,
@@ -143,10 +177,7 @@ pub(super) fn start(
         consent: assessment,
     } = source.resolve(deadline)?;
     let provider = spec.provider;
-    let created = source.create(spec)?;
-    if let Some(assessment) = &assessment {
-        consent::record(&created.directory, assessment)?;
-    }
+    let created = source.create(spec, assessment.as_ref())?;
     let result_extra = source.result_extra()?;
     let mut initial_claim =
         turn::claim(&Store::open_unchecked(&created.directory), &context_sources)?;
