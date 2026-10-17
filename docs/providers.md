@@ -102,10 +102,12 @@ and inspect the reported prerequisite. Bridge never falls back to typing a follo
 surface could be showing another thread or a picker.
 
 Codex reports finished turns through its `notify` hook. Bridge accepts an assistant result ending
-with the pending marker, or a completion whose last string input begins with Bridge's delegation
-header and ends with that marker. It recognizes Codex's IDE-context wrapper. These checks identify
-framing, not provenance: a copied framed prompt can still match. The first accepted result
-establishes the thread, and later results must name that thread.
+with the pending marker, or a completion one of whose string inputs begins with Bridge's
+delegation header and ends with that marker. A message typed into the TUI while the turn runs is
+steered into that turn: it follows Bridge's prompt as another input, and the recorded result is
+the answer to both. Bridge recognizes Codex's IDE-context wrapper. These checks identify framing,
+not provenance: a copied framed prompt can still match. The first accepted result establishes the
+thread, and later results must name that thread.
 
 IDE-wrapper support comes from Codex's source and Bridge's tests. A live session with `/ide`
 is not verified; see the [Windows verification record][win10].

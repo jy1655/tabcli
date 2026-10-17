@@ -128,6 +128,87 @@ fn codex_hook_ignores_the_task_title_turn_that_quotes_the_prompt() {
     assert_eq!(event_paths(directory.path()).unwrap().len(), 1);
 }
 
+// Issue #65. A message typed into the managed TUI while Bridge's turn was running is
+// steered into that turn: the completion's `input-messages` carries the framed prompt
+// first and the typed text last, and the answer follows both (codex-cli 0.163.0, macOS,
+// 2026-10-17, session-g3V0ph; both payloads recorded with a temporary build). The title
+// turn of the same session still quotes the whole prompt behind Codex's instruction.
+#[test]
+fn codex_hook_accepts_the_turn_steered_by_a_message_typed_into_the_tui() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("events")).unwrap();
+    update_status(directory.path(), SessionState::Working, None, None).unwrap();
+    let pending = claim_pending_turn(directory.path());
+    let prompt = correlated_prompt(
+        &native_delegation_prompt(
+            "external",
+            "Run the shell command `sleep 90` and wait for it to complete. Do nothing else in the meantime. When it has finished, reply with exactly the single word DONE.",
+        ),
+        &pending,
+    );
+    let typed =
+        "Direct TUI follow-up typed during the turn: after DONE also write the word PINEAPPLE.";
+    let title_turn = serde_json::json!({
+        "client": "codex-tui",
+        "cwd": "/Users/jy/Developments/ForTest/agent-bridge",
+        "input-messages": [format!(
+            "Generate a concise, single-line task title of at most 36 characters and under five words where possible. Start with an imperative verb. Capitalize only the first word unless the user's language, proper nouns, acronyms, or code terms require otherwise. Preserve ticket references exactly. Write in the user's language. Do not use quotes, markdown, or trailing punctuation. Do not answer the request.\n\nUser prompt:\n{prompt}"
+        )],
+        "last-assistant-message": "{\"title\":\"Run and await sleep command\"}",
+        "thread-id": "01a14893-fbdf-7b40-807f-2d8463630186",
+        "turn-id": "01a14893-fc26-7443-af17-283f9525ba7a",
+        "type": "agent-turn-complete",
+    });
+
+    ADAPTER.handle_hook(directory.path(), &title_turn).unwrap();
+    assert!(event_paths(directory.path()).unwrap().is_empty());
+
+    // The typed text alone, as Codex would report a turn of its own, is not Bridge's turn.
+    ADAPTER
+        .handle_hook(
+            directory.path(),
+            &serde_json::json!({
+                "client": "codex-tui",
+                "input-messages": [typed],
+                "last-assistant-message": "PINEAPPLE",
+                "thread-id": "01a14893-f1e3-7e40-8a10-d149b6d583bb",
+                "turn-id": "another-turn",
+                "type": "agent-turn-complete",
+            }),
+        )
+        .unwrap();
+    assert!(event_paths(directory.path()).unwrap().is_empty());
+    assert!(directory.path().join(TURN_CLAIM_FILE).exists());
+
+    ADAPTER
+        .handle_hook(
+            directory.path(),
+            &serde_json::json!({
+                "client": "codex-tui",
+                "cwd": "/Users/jy/Developments/ForTest/agent-bridge",
+                "input-messages": [prompt, typed],
+                "last-assistant-message": "DONE PINEAPPLE",
+                "thread-id": "01a14893-f1e3-7e40-8a10-d149b6d583bb",
+                "turn-id": "01a14893-f5b7-7051-9ea3-eb789139a896",
+                "type": "agent-turn-complete",
+            }),
+        )
+        .unwrap();
+
+    let paths = event_paths(directory.path()).unwrap();
+    assert_eq!(paths.len(), 1);
+    let event: SessionEvent = read_json(&paths[0]).unwrap();
+    assert_eq!(event.message, "DONE PINEAPPLE");
+    assert_eq!(
+        event.provider_session_id.as_deref(),
+        Some("01a14893-f1e3-7e40-8a10-d149b6d583bb")
+    );
+    assert_eq!(
+        event.turn_id.as_deref(),
+        Some("01a14893-f5b7-7051-9ea3-eb789139a896")
+    );
+}
+
 // With `/ide` on, the TUI puts its IDE context in front of the message
 // (codex-rs/tui/src/ide_context/prompt.rs, rust-v0.159.3). That turn is still the
 // one Bridge started; the title turn that quotes it is not. Not observed live: the

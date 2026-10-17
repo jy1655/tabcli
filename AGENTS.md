@@ -181,10 +181,13 @@ launch, observe, continue, and close without replacing the capabilities those CL
 
 - Codex gives no identity of a turn before its first `notify`. The adapter appends a turn
   marker to the prompt and accepts an `agent-turn-complete` payload when the assistant
-  message ends with the marker, or when the last element of `input-messages` is the
-  prompt Bridge sent: it begins with Bridge's delegation header and ends with the marker.
-  The thread of the first accepted payload becomes the session's thread, which every
-  follow-up addresses, so a wrong first payload is a wrong result and a wrong thread.
+  message ends with the marker, or when an element of `input-messages` is the prompt
+  Bridge sent: it begins with Bridge's delegation header and ends with the marker. The
+  position of that element does not identify the turn: a message typed into the TUI while
+  the turn runs is steered into it and follows the prompt as a later element, and the
+  answer then serves both (codex-cli 0.163.0, 2026-10-17, #65). The thread of the first
+  accepted payload becomes the session's thread, which every follow-up addresses, so a
+  wrong first payload is a wrong result and a wrong thread.
 - The marker alone does not identify the turn. Codex CLI 0.159.3 answers the first message
   of a TUI with a second turn, on a thread of its own, that makes the task title; its
   input is Codex's instruction followed by the user's whole message, marker included, and
