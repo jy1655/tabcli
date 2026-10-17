@@ -411,9 +411,11 @@ fn close_deadline_console_helper_is_bounded() {
             .unwrap_err();
     assert!(format!("{error:#}").contains("timed out"), "{error:#}");
     // The timeout error alone does not prove the bound: a helper that failed to end the
-    // command would report it too, after waiting for the 30 s sleep. 25 s still proves the
-    // sleep was cut short and leaves a loaded runner room to start and end PowerShell; a
-    // 5 s bound let a slow runner decide the result, as the 10 s deadline below did (#180).
+    // command would report it too, after waiting for the 30 s sleep. 25 s proves that the
+    // helper did not wait for the sleep, whether it ended the running command or timed out
+    // before PowerShell had started, and leaves a loaded runner room to start and end
+    // PowerShell; a 5 s bound let a slow runner decide the result, as the 10 s deadline
+    // below did (#180).
     let elapsed = started.elapsed();
     assert!(elapsed < Duration::from_secs(25), "{elapsed:?}");
     let mut command = std::process::Command::new(&powershell);
@@ -479,7 +481,12 @@ fn environment_block_compares_names_as_windows_does() {
         names[..4],
         ["=C:", "ab_review_case", "AB_REVIEW_SS", "AB_REVIEW_ß"]
     );
-    assert!(names[4].eq_ignore_ascii_case("PATH"), "{entries:?}");
+    // The later of two names that Windows treats as one is kept, with its own spelling.
+    assert_eq!(
+        entries[4],
+        ("PATH".to_owned(), "C:\\upper".to_owned()),
+        "{entries:?}"
+    );
     let value = |name: &str| {
         entries
             .iter()
