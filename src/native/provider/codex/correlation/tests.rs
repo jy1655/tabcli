@@ -207,6 +207,15 @@ fn codex_hook_accepts_the_turn_steered_by_a_message_typed_into_the_tui() {
         event.turn_id.as_deref(),
         Some("01a14893-f5b7-7051-9ea3-eb789139a896")
     );
+    // The request is no longer pending: the claim is released and the session is ready.
+    assert!(!directory.path().join(TURN_CLAIM_FILE).exists());
+    assert_eq!(
+        Store::open_unchecked(directory.path())
+            .status()
+            .unwrap()
+            .state,
+        SessionState::Ready
+    );
 }
 
 // With `/ide` on, the TUI puts its IDE context in front of the message
