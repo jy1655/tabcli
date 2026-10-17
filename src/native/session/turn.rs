@@ -322,12 +322,15 @@ fn commit_completion_within_locked(
 /// than `event_limit` (the bytes the journal would write) is never journaled as
 /// publishable: the publication predicate reads at most that many bytes, so such a record
 /// could be published when the commit stopped before writing it and refused when it
-/// stopped after. The size is measured with the provider's usage included; an event that
-/// exceeds the limit only because of its usage drops the usage and records
-/// [`USAGE_OMITTED_SIZE`] instead, so that the completion is journaled as it would have
-/// been without usage. Only a message that exceeds the limit on its own is journaled as a
-/// failure whose error names the size, keeping the provider identity, so every
-/// interruption settles to the same state.
+/// stopped after. The event is measured as recorded, usage fields included. One that
+/// exceeds the limit is retried in this order and the first shape that fits is journaled:
+/// first without `usage` and with [`USAGE_OMITTED_SIZE`] as its `usage_error`, so that a
+/// completion that exceeds the limit only because of its usage is journaled as it would
+/// have been without usage; then bare, without either usage field, so that the omission
+/// marker, or a malformed-usage error the writer recorded, never turns a message that fits
+/// on its own into a failure. Only a bare event that still exceeds the limit is journaled
+/// as a failure whose error names the size, with both usage fields absent and keeping the
+/// provider identity, so every interruption settles to the same state.
 fn bound_pending_completion(
     mut pending: PendingTurnCompletion,
     event_limit: u64,
@@ -336,9 +339,14 @@ fn bound_pending_completion(
     if size <= event_limit {
         return Ok(pending);
     }
-    if pending.event.usage.is_some() {
+    if pending.event.usage.is_some() || pending.event.usage_error.is_some() {
         pending.event.usage = None;
         pending.event.usage_error = Some(USAGE_OMITTED_SIZE.to_owned());
+        size = serde_json::to_vec_pretty(&pending.event)?.len() as u64;
+        if size <= event_limit {
+            return Ok(pending);
+        }
+        pending.event.usage_error = None;
         size = serde_json::to_vec_pretty(&pending.event)?.len() as u64;
         if size <= event_limit {
             return Ok(pending);

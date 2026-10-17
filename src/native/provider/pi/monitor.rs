@@ -25,11 +25,13 @@ struct HookFailureSignal {
     #[serde(default)]
     claim_token: Option<String>,
     /// What the extension's payload reported, kept when delivery failed; the same shape and
-    /// validation as the hook payload (`usage` or a bounded `usage_error`).
+    /// validation as the hook payload (`usage` or a bounded `usage_error`). Both are kept raw
+    /// so that a malformed field never rejects the signal before its claim is checked:
+    /// [`reported_usage`] bounds them after the claim matched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     usage: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    usage_error: Option<String>,
+    usage_error: Option<serde_json::Value>,
 }
 
 pub(in crate::native::provider) struct PiFailureMonitor {
@@ -126,7 +128,7 @@ fn consume_hook_failure(directory: &Path) -> Result<bool> {
         reported.insert("usage".to_owned(), usage);
     }
     if let Some(error) = signal.usage_error {
-        reported.insert("usage_error".to_owned(), serde_json::Value::String(error));
+        reported.insert("usage_error".to_owned(), error);
     }
     let usage = reported_usage(&serde_json::Value::Object(reported));
     record_correlated_failure(

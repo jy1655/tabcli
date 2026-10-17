@@ -556,7 +556,8 @@ cost are not included. `coverage` is `complete` when every run ended with an ord
 `uncertain` otherwise (an aborted, failed or retried run can leave calls unreported). `usage_reason`
 is null with usage, else `not_reported` (the event carries no usage fields: legacy events and
 providers that report none), `malformed` (the writer recorded a bounded `usage_error` naming the
-field), `omitted_size` (the event exceeded the size limit with usage and was recorded without it) or
+field), `omitted_size` (the event exceeded the size limit with usage and was recorded without it; an
+event that fits only without any usage field is recorded bare and reads `not_reported`) or
 `no_published_result`. `usage_error` carries that bounded text and is otherwise null. Usage never
 changes the request state. The same three fields appear in `--wait` replies, in both `--list`
 arrays and in the timeline's request summaries. No cost is estimated or recorded.

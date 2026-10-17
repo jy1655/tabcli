@@ -47,8 +47,19 @@ pub(super) fn reported_usage(payload: &Value) -> ReportedUsage {
     }
 }
 
+/// JavaScript's `Number.MAX_SAFE_INTEGER`: the extension's contract is safe integers, and a
+/// larger count can only be a sum JavaScript could not represent exactly.
+const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+fn safe_count(value: &Value, field: &'static str) -> Result<u64, &'static str> {
+    match value.as_u64() {
+        Some(count) if count <= MAX_SAFE_INTEGER => Ok(count),
+        _ => Err(field),
+    }
+}
+
 fn count(usage: &Value, field: &'static str) -> Result<u64, &'static str> {
-    usage.get(field).and_then(Value::as_u64).ok_or(field)
+    safe_count(usage.get(field).ok_or(field)?, field)
 }
 
 fn small_count(usage: &Value, field: &'static str) -> Result<u32, &'static str> {
@@ -65,7 +76,7 @@ fn validate(usage: &Value) -> Result<ProviderUsage, &'static str> {
     };
     let reasoning_tokens = match usage.get("reasoning_tokens") {
         None | Some(Value::Null) => None,
-        Some(value) => Some(value.as_u64().ok_or("reasoning_tokens")?),
+        Some(value) => Some(safe_count(value, "reasoning_tokens")?),
     };
     Ok(ProviderUsage {
         source: USAGE_SOURCE.to_owned(),
@@ -165,5 +176,28 @@ mod tests {
             reported.usage_error.as_deref(),
             Some("malformed usage: usage is not an object")
         );
+    }
+
+    #[test]
+    fn counts_above_javascript_safe_integers_are_malformed() {
+        for field in ["total_tokens", "reasoning_tokens"] {
+            let mut usage = complete();
+            usage[field] = json!(MAX_SAFE_INTEGER);
+            let accepted = reported_usage(&json!({"usage": usage})).usage.unwrap();
+            let value = if field == "reasoning_tokens" {
+                accepted.reasoning_tokens.unwrap()
+            } else {
+                accepted.total_tokens
+            };
+            assert_eq!(value, 9_007_199_254_740_991, "{field}");
+            let mut usage = complete();
+            usage[field] = json!(MAX_SAFE_INTEGER + 1);
+            let reported = reported_usage(&json!({"usage": usage}));
+            assert_eq!(reported.usage, None, "{field}");
+            assert_eq!(
+                reported.usage_error.as_deref(),
+                Some(format!("malformed usage: {field}").as_str())
+            );
+        }
     }
 }

@@ -183,7 +183,8 @@ launch, observe, continue, and close without replacing the capabilities those CL
   every message reports it; `coverage: complete` only when every run's final assistant
   message stopped ordinarily. A malformed operand or sum becomes a bounded `usage_error`
   and no partial sum. Usage never changes the outcome, and the size policy drops usage
-  (`usage_error: "omitted: event size"`) before it fails a message that fits on its own.
+  (`usage_error: "omitted: event size"`), then the usage error itself, before it fails a
+  message that fits on its own.
   The event fields are optional and omitted when absent, so an older binary reads a new
   event but drops the fields and sees a journaled completion as `Mismatched`: do not
   downgrade the installed binary or `AGENT_BRIDGE_EXECUTABLE` while a session whose turn

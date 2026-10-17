@@ -1513,11 +1513,10 @@ fn size_policy_drops_usage_before_it_fails_a_message_that_fits_on_its_own() {
     expected.usage_error = Some(USAGE_OMITTED_SIZE.to_owned());
     assert_eq!(dropped.event, expected);
     // The message exceeds the limit on its own: the existing size failure, named by the
-    // size the message has without the usage.
+    // size of the bare event, with both usage fields absent.
     let failed = bound_pending_completion(pending(&with_usage), bare - 1).unwrap();
-    let dropped_size = serde_json::to_vec_pretty(&expected).unwrap().len() as u64;
     let error = format!(
-        "provider result of {dropped_size} bytes exceeds the {} byte event limit",
+        "provider result of {bare} bytes exceeds the {} byte event limit",
         bare - 1
     );
     assert_eq!(failed.event.message, "");
@@ -1525,6 +1524,7 @@ fn size_policy_drops_usage_before_it_fails_a_message_that_fits_on_its_own() {
     assert_eq!(failed.status_error.as_deref(), Some(error.as_str()));
     assert_eq!(failed.status_state, SessionState::Failed);
     assert_eq!(failed.event.usage, None);
+    assert_eq!(failed.event.usage_error, None);
     // A completion without usage behaves exactly as before.
     let plain = bound_pending_completion(pending(&without_usage), bare - 1).unwrap();
     assert_eq!(plain.status_state, SessionState::Failed);
@@ -1539,6 +1539,60 @@ fn size_policy_drops_usage_before_it_fails_a_message_that_fits_on_its_own() {
         )
     );
     assert_eq!(plain.event.usage_error, None);
+}
+
+#[test]
+fn size_policy_publishes_a_bare_event_at_the_limit_before_it_fails() {
+    use crate::native::query::reported_usage;
+    use crate::native::session::schema::USAGE_OMITTED_SIZE;
+    let without_usage = event("fits");
+    let bare = serde_json::to_vec_pretty(&without_usage).unwrap().len() as u64;
+    let pending =
+        |event: &SessionEvent| PendingTurnCompletion::new("1-2-3", event.clone(), None).unwrap();
+    // The bare event is exactly the limit; the usage pushes it over, and so does the
+    // omission marker that replaces it. The event is published bare, not failed.
+    let mut with_usage = event("fits");
+    with_usage.usage = Some(sample_usage());
+    let published = bound_pending_completion(pending(&with_usage), bare).unwrap();
+    assert_eq!(published.event, without_usage);
+    assert_eq!(published.status_state, SessionState::Ready);
+    assert_eq!(published.status_error, None);
+    assert_eq!(
+        reported_usage(Some(&published.event)),
+        (None, Some("not_reported"), None)
+    );
+    // The only extra is a malformed-usage error the writer recorded: it is dropped the same
+    // way, and never turns a message that fits on its own into a failure.
+    let mut with_error = event("fits");
+    with_error.usage_error = Some("malformed usage: total_tokens".to_owned());
+    let with_error_size = serde_json::to_vec_pretty(&with_error).unwrap().len() as u64;
+    assert!(with_error_size > bare);
+    let published = bound_pending_completion(pending(&with_error), bare).unwrap();
+    assert_eq!(published.event, without_usage);
+    assert_eq!(published.status_state, SessionState::Ready);
+    // With room for the marker but not the malformed error, the marker is recorded.
+    let mut marked = without_usage.clone();
+    marked.usage_error = Some(USAGE_OMITTED_SIZE.to_owned());
+    let marked_size = serde_json::to_vec_pretty(&marked).unwrap().len() as u64;
+    assert!(marked_size < with_error_size);
+    let omitted = bound_pending_completion(pending(&with_error), marked_size).unwrap();
+    assert_eq!(omitted.event, marked);
+    // Below the bare size the failure record carries neither usage field.
+    let failed = bound_pending_completion(pending(&with_error), bare - 1).unwrap();
+    assert_eq!(failed.status_state, SessionState::Failed);
+    assert_eq!(failed.event.message, "");
+    assert_eq!(
+        failed.event.error.as_deref(),
+        Some(
+            format!(
+                "provider result of {bare} bytes exceeds the {} byte event limit",
+                bare - 1
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(failed.event.usage, None);
+    assert_eq!(failed.event.usage_error, None);
 }
 
 #[test]
