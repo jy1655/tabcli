@@ -74,7 +74,11 @@ The input policy rejects any remaining CR.
 Replace this fallback when Codex provides a newline-preserving input API or paste event on
 Windows console. The [2026-10-12 Windows check][win48] measured newline preservation with
 codex-cli 0.162.1: the recorded message retained 28 line feeds from a 23-line prompt, but lost
-an emoji (#147). Agy and Pi retain their existing LF encoding and need separate provider evidence.
+an emoji (#147): each UTF-16 surrogate unit was written as its own key-down and key-up pair, and
+Codex's console reader (crossterm) combines consecutive surrogate events regardless of the key
+state, so the release of the high surrogate broke the pair. A surrogate pair is now written as two
+key-down events only; a BMP character keeps its key-down and key-up pair. Agy and Pi retain their
+existing LF encoding and need separate provider evidence.
 
 Temporary measure for #124: after the Windows initial paste, Bridge waits up to 10 s (bounded by
 the request deadline) for the empty composer row with no `› [Pasted Content` row. If that submission
@@ -125,9 +129,8 @@ written result, and prefer a file-based report. To recover, read the answer from
 record (`~/.codex/sessions/<date>/rollout-*.jsonl`), then `close-session` the session; do not
 resend an uncertain turn. `tabcli doctor <session>` reports `codex_notify_payload_budget`, an
 estimate of the pending turn's payload against the limit from the framed prompt's size, which the
-pending-turn record keeps for the initial turn and for each follow-up as sized before delivery (the
-console paste can drop a non-BMP character, so the delivered text can be smaller); the real command
-line can be larger or smaller than the estimate, and text with many quotation marks is undercounted
+pending-turn record keeps for the initial turn and for each follow-up as sized before delivery; the
+real command line can be larger or smaller than the estimate, and text with many quotation marks is undercounted
 because Codex's argument quoting escapes each of them. See [doctor](cli.md#doctor).
 
 `reopen` refuses closed Codex sessions. Bridge still needs checks for the thread's writer lock
@@ -391,7 +394,8 @@ WezTerm, including Pi 1.0.4, with defaults for Codex, Claude and Pi and `--yolo`
 Terminal.app, WezTerm and Warp were not verified on macOS 0.4.9; the latest record's two Ghostty
 `ask` round trips used the installed 0.4.9 with Ghostty already running, not a cold start (#104).
 The Windows 0.4.9 record covers candidate Codex and Claude self-tests, not a downloaded published
-binary. The 0.4.8 record measures Codex newline preservation (with emoji loss, #147) and environment
+binary. The 0.4.8 record measures Codex newline preservation (with the emoji loss of #147, since
+fixed) and environment
 scrubbing on both Windows surfaces; the Windows Terminal cold-start observation of #111 remains
 open. The [daemon-absent Codex queue probe][queue] used a mock model, not an authenticated TUI.
 

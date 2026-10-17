@@ -1437,7 +1437,18 @@ fn build_console_input_records(
     let mut records = Vec::new();
     for character in input.encode_utf16() {
         let soft_return = character == u16::from(b'\n') && newline == ConsoleNewline::ShiftReturn;
-        for key_down in [1, 0] {
+        // A UTF-16 surrogate unit gets a key-down event only. Codex reads the console through
+        // crossterm (openai-oss-forks/crossterm ed1cdab, src/event/sys/windows/parse.rs), which
+        // buffers a surrogate unit regardless of bKeyDown and combines it with the next surrogate
+        // event: the high surrogate's release discarded the pair, and a release pair after the
+        // completed character would repeat it, because a combined pair is always a press (#147).
+        // Remove when the provider accepts text through an input API instead of key events.
+        let key_states: &[i32] = if (0xD800..=0xDFFF).contains(&character) {
+            &[1]
+        } else {
+            &[1, 0]
+        };
+        for &key_down in key_states {
             records.push(INPUT_RECORD {
                 EventType: KEY_EVENT as u16,
                 Event: windows_sys::Win32::System::Console::INPUT_RECORD_0 {
