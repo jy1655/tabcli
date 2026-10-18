@@ -85,6 +85,10 @@ mod tests {
 
     #[test]
     fn windows_console_rejects_a_submit_plan_that_cannot_fit_the_remaining_budget() {
+        assert!(windows_console_submit_delays_fit(
+            0,
+            Duration::from_millis(1)
+        ));
         assert!(!windows_console_submit_delays_fit(
             2,
             Duration::from_secs(4)

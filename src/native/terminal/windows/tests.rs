@@ -680,10 +680,10 @@ fn guarded_dialog_file_stays_private_in_the_supplied_helper_directory() {
     let other_root = tempfile::tempdir().unwrap();
     let other = other_root.path().join("session-dialog");
     fs::create_dir(&other).unwrap();
-    let error = terminal::guarded_dialog_input(
+    let error = terminal::submit_if_unchanged(
         &other,
         &handle,
-        &input,
+        &input.screen,
         Instant::now() + Duration::from_secs(2),
     )
     .unwrap_err();
@@ -703,7 +703,7 @@ fn guarded_dialog_file_stays_private_in_the_supplied_helper_directory() {
     // The existing command boundary refuses to spawn the helper, after the temporary
     // file was created; returning must remove that file again.
     assert_eq!(
-        terminal::guarded_dialog_input(&directory, &handle, &input, Instant::now())
+        terminal::submit_if_unchanged(&directory, &handle, &input.screen, Instant::now())
             .unwrap_err()
             .to_string(),
         "managed console dialog input timed out before it started"
@@ -896,4 +896,190 @@ fn windows_close_control_uses_the_claimed_terminal_handle() {
         windows_console_handle_path(directory.path(), &ConsoleControlRequest::Close),
         directory.path().join(TERMINAL_CLOSING_FILE)
     );
+}
+
+#[test]
+fn text_only_writes_scalars_and_soft_returns_then_reports_after_drain() {
+    use std::cell::Cell;
+    use windows_sys::Win32::System::Console::SHIFT_PRESSED;
+    for input in ["ascii", "한글", "😀", "a\n한😀\n", ""] {
+        let polls = Cell::new(0);
+        struct AfterDrain<'a> {
+            polls: &'a Cell<usize>,
+            bytes: Vec<u8>,
+        }
+        impl std::io::Write for AfterDrain<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                assert_eq!(self.polls.get(), 3, "no output before the third poll");
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut output = AfterDrain {
+            polls: &polls,
+            bytes: Vec::new(),
+        };
+        let mut records = Vec::new();
+        super::write_text_only_with(
+            input,
+            super::ConsoleNewline::ShiftReturn,
+            Instant::now() + Duration::from_secs(5),
+            |chunk| {
+                records.extend_from_slice(chunk);
+                Ok(chunk.len() as u32)
+            },
+            || {
+                let n = polls.get();
+                polls.set(n + 1);
+                Ok([3, 1, 0][n])
+            },
+            &mut output,
+            Instant::now,
+        )
+        .unwrap();
+        assert_eq!(polls.get(), 3);
+        assert_eq!(
+            super::parse_text_only_output(&output.bytes).unwrap(),
+            input.chars().count()
+        );
+        assert_eq!(output.bytes.iter().filter(|&&b| b == b'\n').count(), 1);
+        let keys = records
+            .iter()
+            .map(|r| unsafe { r.Event.KeyEvent })
+            .collect::<Vec<_>>();
+        assert!(
+            !keys
+                .iter()
+                .any(|k| k.wVirtualKeyCode == 0x0d && k.dwControlKeyState == 0)
+        );
+        assert_eq!(
+            keys.iter()
+                .filter(|k| k.wVirtualKeyCode == 0x0d && k.dwControlKeyState == SHIFT_PRESSED)
+                .count(),
+            input.matches('\n').count() * 2
+        );
+        for key in keys {
+            if (0xD800..=0xDFFF).contains(&unsafe { key.uChar.UnicodeChar }) {
+                assert_eq!(key.bKeyDown, 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn text_only_timeout_partial_write_and_pending_failure_emit_no_count() {
+    use std::cell::Cell;
+    let start = Instant::now();
+    // Stop within a normal key pair or the surrogate pair at the end of a
+    // 1024-record chunk; neither partial write can yield a scalar count.
+    let input = format!("{}😀tail", "a".repeat(511));
+    for mode in 0..7 {
+        let mut output = Vec::new();
+        let clock = Cell::new(start);
+        let calls = Cell::new(0);
+        let result = super::write_text_only_with(
+            &input,
+            super::ConsoleNewline::ShiftReturn,
+            start + Duration::from_secs(1),
+            |chunk| {
+                calls.set(calls.get() + 1);
+                assert!(chunk.len() <= 1024);
+                if mode == 5 {
+                    anyhow::bail!("write failed");
+                }
+                if mode == 0 {
+                    return Ok(1);
+                }
+                if mode == 1 {
+                    return Ok(1023);
+                }
+                if mode == 4 {
+                    clock.set(start + Duration::from_secs(2));
+                }
+                Ok(chunk.len() as u32)
+            },
+            || {
+                if mode == 3 {
+                    anyhow::bail!("count unavailable");
+                }
+                clock.set(start + Duration::from_secs(2));
+                Ok(if mode == 6 { 0 } else { 1 })
+            },
+            &mut output,
+            || clock.get(),
+        );
+        assert!(result.is_err(), "mode {mode}");
+        assert!(output.is_empty());
+        if mode == 4 {
+            assert_eq!(calls.get(), 1);
+        }
+    }
+}
+
+#[test]
+fn text_only_launcher_rejects_malformed_success_as_uncertain() {
+    assert_eq!(
+        super::parse_text_only_output(b"{\"schema\":1,\"written_chars\":3}\n").unwrap(),
+        3
+    );
+    for output in [
+        "",
+        "{}",
+        "{\"schema\":2,\"written_chars\":3}",
+        "{\"schema\":1,\"written_chars\":1.5}",
+        "{\"schema\":1,\"written_chars\":-1}",
+        "{\"schema\":1,\"written_chars\":3} garbage",
+        "{\"schema\":1,\"written_chars\":3}\n{}",
+    ] {
+        let failure = super::parse_text_only_output(output.as_bytes()).unwrap_err();
+        assert!(failure.delivery_may_have_occurred());
+    }
+}
+
+#[test]
+fn text_only_launcher_classifies_start_and_exit_failures() {
+    let root = tempfile::tempdir().unwrap();
+    let mut missing = std::process::Command::new(root.path().join("missing.exe"));
+    let deadline = Instant::now() + Duration::from_secs(120);
+    assert!(
+        !super::run_console_send_command(&mut missing, deadline)
+            .unwrap_err()
+            .delivery_may_have_occurred()
+    );
+    let mut failed =
+        crate::native::process_env::helper_command(std::env::var_os("ComSpec").unwrap());
+    failed.args(["/d", "/c", "exit 1"]);
+    assert!(
+        super::run_console_send_command(&mut failed, deadline)
+            .unwrap_err()
+            .delivery_may_have_occurred()
+    );
+}
+
+#[test]
+fn guarded_submission_writes_one_return_only_for_unchanged_screen() {
+    let input = terminal::GuardedDialogInput {
+        screen: "composer text".into(),
+        key: terminal::DialogKey::Enter,
+    };
+    for (screen, expected, count) in [("composer text", "sent", 2), ("changed text", "changed", 0)]
+    {
+        let mut records = Vec::new();
+        let result = super::guarded_key_with(&input, screen, |key| {
+            records = super::build_dialog_records(key);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(result, expected);
+        assert_eq!(records.len(), count);
+        for (index, record) in records.iter().enumerate() {
+            let key = unsafe { record.Event.KeyEvent };
+            assert_eq!(key.wVirtualKeyCode, 0x0d);
+            assert_eq!(key.dwControlKeyState, 0);
+            assert_eq!(key.bKeyDown, if index == 0 { 1 } else { 0 });
+        }
+    }
 }

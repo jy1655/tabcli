@@ -23,6 +23,7 @@ use std::time::Duration;
 pub(crate) enum ConsoleControlRequest {
     Screen,
     Send {
+        submit_count: Option<usize>,
         input_name: String,
         timeout: Duration,
     },
@@ -64,8 +65,15 @@ pub(super) fn parse(rest: &[String]) -> Result<NativeCommand> {
         Ok(Duration::from_millis(timeout_ms))
     };
     let request = match (action.as_str(), tail) {
-        ("send", [input, timeout_ms]) if valid_pending_prompt_name(input) => {
+        ("send", [input, timeout_ms, count @ ..])
+            if valid_pending_prompt_name(input) && count.len() <= 1 =>
+        {
             ConsoleControlRequest::Send {
+                submit_count: count
+                    .first()
+                    .map(|value| value.parse::<usize>())
+                    .transpose()
+                    .context("invalid native console control arguments")?,
                 input_name: input.clone(),
                 timeout: timeout(timeout_ms)?,
             }
@@ -132,11 +140,12 @@ pub(super) fn run(request: ConsoleControlRequest, id: &str) -> Result<()> {
     let action = match request {
         ConsoleControlRequest::Screen => terminal::ConsoleControlAction::Screen,
         ConsoleControlRequest::Send {
+            submit_count: override_count,
             input_name,
             timeout,
         } => terminal::ConsoleControlAction::Send {
             input: input_path(&input_name),
-            submit_count,
+            submit_count: override_count.unwrap_or(submit_count),
             newline,
             timeout,
         },

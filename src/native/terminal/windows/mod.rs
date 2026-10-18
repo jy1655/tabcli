@@ -625,7 +625,43 @@ pub(super) fn send_file(
         .to_str()
         .context("prompt path is not valid UTF-8")
         .map_err(super::TerminalSendFailure::not_sent)?;
-    run_console_send_helper(session, prompt_path, deadline)
+    run_console_send_helper(session, prompt_path, deadline, None).map(|_| ())
+}
+
+pub(super) fn send_file_text_only(
+    session: &TerminalSession,
+    prompt_path: &Path,
+    deadline: Instant,
+) -> std::result::Result<usize, super::TerminalSendFailure> {
+    let path = prompt_path
+        .to_str()
+        .context("prompt path is not valid UTF-8")
+        .map_err(super::TerminalSendFailure::not_sent)?;
+    let output = run_console_send_helper(session, path, deadline, Some(0))?;
+    parse_text_only_output(&output)
+}
+
+fn parse_text_only_output(output: &[u8]) -> std::result::Result<usize, super::TerminalSendFailure> {
+    parse_text_only_count(output).map_err(super::TerminalSendFailure::delivery_uncertain)
+}
+
+fn parse_text_only_count(output: &[u8]) -> Result<usize> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Written {
+        schema: u32,
+        written_chars: usize,
+    }
+    let line = std::str::from_utf8(output)?.trim();
+    if line.lines().count() != 1 {
+        bail!("expected one Windows console text-only result line");
+    }
+    let value: Written =
+        serde_json::from_str(line).context("invalid Windows console text-only result")?;
+    if value.schema != 1 {
+        bail!("invalid Windows console text-only result schema");
+    }
+    Ok(value.written_chars)
 }
 
 pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Result<String> {
@@ -732,7 +768,8 @@ fn run_console_send_helper(
     session: &TerminalSession,
     input: &str,
     deadline: Instant,
-) -> super::TerminalSendResult {
+    submit_count: Option<usize>,
+) -> std::result::Result<Vec<u8>, super::TerminalSendFailure> {
     let mut command = console_helper_command("send", session, Some(input))
         .map_err(super::TerminalSendFailure::not_sent)?;
     let timeout = super::windows_budget::remaining_send_budget_at(deadline, Instant::now())
@@ -741,8 +778,18 @@ fn run_console_send_helper(
         .context("Windows console timeout is too large")
         .map_err(super::TerminalSendFailure::not_sent)?;
     command.arg(timeout_ms.max(1).to_string());
+    if let Some(count) = submit_count {
+        command.arg(count.to_string());
+    }
+    run_console_send_command(&mut command, deadline)
+}
+
+fn run_console_send_command(
+    command: &mut Command,
+    deadline: Instant,
+) -> std::result::Result<Vec<u8>, super::TerminalSendFailure> {
     let output = crate::native::process_env::command_output_until_classified(
-        &mut command,
+        command,
         deadline,
         "Windows console control helper",
     )
@@ -754,7 +801,7 @@ fn run_console_send_helper(
         }
     })?;
     if output.status.success() {
-        return Ok(());
+        return Ok(output.stdout);
     }
     let message = console_helper_failure_message(&output);
     let error = anyhow::anyhow!(message);
@@ -923,13 +970,10 @@ pub(super) fn console_control(
             let input: super::GuardedDialogInput = serde_json::from_slice(
                 &crate::native::session::RecordReader::at(&path).raw_bytes()?,
             )?;
-            match dialog_decision(&input.screen, &attached_screen()?) {
-                DialogDecision::Changed => println!("changed"),
-                DialogDecision::Send => {
-                    write_dialog_key(input.key)?;
-                    println!("sent");
-                }
-            }
+            println!(
+                "{}",
+                guarded_key_with(&input, &attached_screen()?, write_dialog_key)?
+            );
             Ok(())
         }
         ConsoleControlAction::Send {
@@ -1124,6 +1168,20 @@ fn screen_row(cells: &[u16], read: u32) -> Result<String> {
     Ok(String::from_utf16(characters)?)
 }
 
+fn guarded_key_with(
+    input: &super::GuardedDialogInput,
+    actual: &str,
+    write: impl FnOnce(super::DialogKey) -> Result<()>,
+) -> Result<&'static str> {
+    match dialog_decision(&input.screen, actual) {
+        DialogDecision::Changed => Ok("changed"),
+        DialogDecision::Send => {
+            write(input.key)?;
+            Ok("sent")
+        }
+    }
+}
+
 fn write_dialog_key(key: super::DialogKey) -> Result<()> {
     let name: Vec<u16> = "CONIN$".encode_utf16().chain(Some(0)).collect();
     let raw = unsafe {
@@ -1141,6 +1199,10 @@ fn write_dialog_key(key: super::DialogKey) -> Result<()> {
         return Err(std::io::Error::last_os_error().into());
     }
     let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    write_input_records(handle.as_raw_handle(), &build_dialog_records(key))
+}
+
+fn build_dialog_records(key: super::DialogKey) -> Vec<INPUT_RECORD> {
     let mut records = Vec::new();
     if key == super::DialogKey::DownEnter {
         for key_down in [1, 0] {
@@ -1160,7 +1222,7 @@ fn write_dialog_key(key: super::DialogKey) -> Result<()> {
         }
     }
     records.extend(build_console_input_records("", 1, ConsoleNewline::LineFeed));
-    write_input_records(handle.as_raw_handle(), &records)
+    records
 }
 
 struct ConsoleProcess {
@@ -1347,6 +1409,17 @@ fn write_console_input(
             .context("failed to open managed Windows console input");
     }
     let result = (|| {
+        if submit_count == 0 {
+            return write_text_only_with(
+                input,
+                newline,
+                deadline,
+                |chunk| write_console_chunk(handle, chunk),
+                || console_pending_count(handle),
+                &mut std::io::stdout().lock(),
+                Instant::now,
+            );
+        }
         let first_submit =
             super::windows_budget::windows_console_immediate_submit_count(submit_count);
         if Instant::now() >= deadline {
@@ -1363,14 +1436,7 @@ fn write_console_input(
             let delay = super::windows_budget::windows_console_extra_submit_delay();
             // Temporary measure for issue #124
             wait_for_console_input_drain_with(
-                || {
-                    let mut pending = 0;
-                    if unsafe { GetNumberOfConsoleInputEvents(handle, &mut pending) } == 0 {
-                        return Err(std::io::Error::last_os_error())
-                            .context("failed to read managed Windows console input event count");
-                    }
-                    Ok(pending)
-                },
+                || console_pending_count(handle),
                 deadline - delay,
                 Duration::from_millis(50),
                 Instant::now,
@@ -1389,6 +1455,43 @@ fn write_console_input(
     })();
     unsafe { CloseHandle(handle) };
     result
+}
+
+fn console_pending_count(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<u32> {
+    let mut pending = 0;
+    if unsafe { GetNumberOfConsoleInputEvents(handle, &mut pending) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to read managed Windows console input event count");
+    }
+    Ok(pending)
+}
+
+fn write_text_only_with(
+    input: &str,
+    newline: ConsoleNewline,
+    deadline: Instant,
+    mut write: impl FnMut(&[INPUT_RECORD]) -> Result<u32>,
+    pending: impl FnMut() -> Result<u32>,
+    output: &mut impl std::io::Write,
+    mut now: impl FnMut() -> Instant,
+) -> Result<()> {
+    let records = build_console_input_records(input, 0, newline);
+    for chunk in records.chunks(1024) {
+        if now() >= deadline {
+            bail!("Windows console input timed out during text delivery");
+        }
+        check_written_count(write(chunk)?, chunk.len())?;
+    }
+    wait_for_console_input_drain_with(pending, deadline, Duration::from_millis(50), &mut now)?;
+    if now() >= deadline {
+        bail!("Windows console input drain exceeded the deadline");
+    }
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({"schema": 1, "written_chars": input.chars().count()})
+    )?;
+    Ok(())
 }
 
 fn wait_for_console_input_drain_with(
@@ -1411,22 +1514,29 @@ fn write_input_records(
     records: &[INPUT_RECORD],
 ) -> Result<()> {
     for chunk in records.chunks(1024) {
-        let mut written = 0;
-        if unsafe { WriteConsoleInputW(handle, chunk.as_ptr(), chunk.len() as u32, &mut written) }
-            == 0
-        {
-            let error = Err(std::io::Error::last_os_error())
-                .context("failed to write managed Windows console input");
-            return error;
-        }
-        if written != chunk.len() as u32 {
-            bail!(
-                "managed Windows console accepted only {written} of {} input events",
-                chunk.len()
-            );
-        }
+        check_written_count(write_console_chunk(handle, chunk)?, chunk.len())?;
     }
     Ok(())
+}
+
+fn check_written_count(written: u32, expected: usize) -> Result<()> {
+    if written as usize != expected {
+        bail!("managed Windows console accepted only {written} of {expected} input events");
+    }
+    Ok(())
+}
+
+fn write_console_chunk(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    chunk: &[INPUT_RECORD],
+) -> Result<u32> {
+    let mut written = 0;
+    if unsafe { WriteConsoleInputW(handle, chunk.as_ptr(), chunk.len() as u32, &mut written) } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to write managed Windows console input");
+    }
+    Ok(written)
 }
 
 fn build_console_input_records(

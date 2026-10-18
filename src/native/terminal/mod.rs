@@ -413,6 +413,48 @@ pub(super) fn send_file(
     }
 }
 
+// Raw Windows operations for the provider-owned paste protocol in R2.
+#[allow(dead_code)] // R1 exposes the seam; R2 supplies the caller.
+pub(super) fn send_file_text_only(
+    session: &TerminalSession,
+    prompt_path: &Path,
+    deadline: Instant,
+) -> std::result::Result<usize, TerminalSendFailure> {
+    #[cfg(windows)]
+    return windows::send_file_text_only(session, prompt_path, deadline);
+    #[cfg(not(windows))]
+    {
+        let _ = (session, prompt_path, deadline);
+        Err(TerminalSendFailure::not_sent(anyhow::anyhow!(
+            "managed text-only input unsupported on this platform"
+        )))
+    }
+}
+
+#[allow(dead_code)] // R1 exposes the seam; R2 supplies the caller.
+pub(super) fn submit_if_unchanged(
+    directory: &Path,
+    session: &TerminalSession,
+    expected_screen: &str,
+    deadline: Instant,
+) -> Result<bool> {
+    #[cfg(windows)]
+    return guarded_dialog_input(
+        directory,
+        session,
+        &GuardedDialogInput {
+            screen: expected_screen.to_owned(),
+            key: DialogKey::Enter,
+        },
+        deadline,
+    );
+    #[cfg(not(windows))]
+    {
+        let _ = (directory, session, expected_screen, deadline);
+        bail!("managed dialog input unsupported on this platform");
+    }
+}
+
 // Transport-neutral keys for an exact, unchanged managed dialog. Providers own
 // recognition and authorization; the terminal only compares the captured screen.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
