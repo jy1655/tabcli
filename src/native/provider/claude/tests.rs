@@ -303,6 +303,121 @@ fn the_claude_home_has_two_defaults_and_one_override_for_both_paths() {
 
 use super::*;
 
+const MOD_CONVERSATION: &str = "00000000-0000-4000-8000-000000000249";
+const MOD_REQUEST: &str = "claude-turn-1000000000000000000-10000-1";
+
+fn mod_regression_fixture(native: bool) -> (tempfile::TempDir, String, serde_json::Value) {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("events")).unwrap();
+    crate::native::session::update_status(directory.path(), SessionState::Working, None, None)
+        .unwrap();
+    let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
+    let token = claim.token().to_owned();
+    claim.retain();
+    let start: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/249-start.json")).unwrap();
+    let text = start["event"]["text"].as_str().unwrap();
+    let expected = text
+        .split_once(">\n")
+        .unwrap()
+        .1
+        .strip_suffix("\n</cross-session-message>")
+        .unwrap();
+    let pending = PendingCrossSessionTurn::new(MOD_REQUEST).unwrap();
+    Store::open_unchecked(directory.path())
+        .private(PENDING_TURN_FILE)
+        .write_json(&serde_json::json!({
+            "schema": 1, "request_id": pending.request_id, "marker": pending.marker,
+            "claim_token": token, "expected_message": expected,
+        }))
+        .unwrap();
+    if native {
+        Store::open_unchecked(directory.path()).private("claude-completion-mode.json").write_json(
+            &serde_json::json!({"schema":1,"mode":"native_v1","reason":"windows_verified_profile","claude_version":"2.1.302"})
+        ).unwrap();
+    }
+    (directory, token, start["event"].clone())
+}
+
+#[test]
+fn native_mod_stop_draft_does_not_settle_the_claim() {
+    let (directory, token, _) = mod_regression_fixture(true);
+    let stop: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/249-stop-draft.json")).unwrap();
+    handle_hook(directory.path(), &stop["event"]).unwrap();
+    assert!(
+        Reader::open_unchecked(directory.path())
+            .events()
+            .unwrap()
+            .is_empty(),
+        "a Stop draft is not a terminal turn"
+    );
+    assert_eq!(
+        turn::current_claim_token(&Reader::open_unchecked(directory.path()))
+            .unwrap()
+            .as_deref(),
+        Some(token.as_str())
+    );
+}
+
+#[test]
+fn native_mod_final_settles_with_the_bridge_wait_identity() {
+    let (directory, token, start) = mod_regression_fixture(true);
+    let mut pending: serde_json::Value = Reader::open_unchecked(directory.path())
+        .private(PENDING_TURN_FILE)
+        .json()
+        .unwrap();
+    pending["schema"] = serde_json::json!(2);
+    Store::open_unchecked(directory.path())
+        .private(PENDING_TURN_FILE)
+        .write_json(&pending)
+        .unwrap();
+    handle_hook(directory.path(), &serde_json::json!({"agent_bridge_claude_mod":1,"event":"turn.start","conversation":MOD_CONVERSATION,"data":start})).unwrap();
+    let complete: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/249-complete.json")).unwrap();
+    handle_hook(directory.path(), &serde_json::json!({"agent_bridge_claude_mod":1,"event":"turn.complete","conversation":MOD_CONVERSATION,"data":complete["event"]})).unwrap();
+    let event = turn::wait(
+        &Store::open_unchecked(directory.path()),
+        0,
+        Some(MOD_REQUEST),
+        Some(&token),
+        Instant::now() + Duration::from_millis(100),
+        Duration::from_millis(100),
+    )
+    .unwrap();
+    assert_eq!(event.message, "PROBE-FINAL");
+    assert_eq!(event.turn_id.as_deref(), Some(MOD_REQUEST));
+    assert_eq!(
+        event.provenance.as_deref(),
+        Some("claude_mod_turn_complete")
+    );
+    assert_eq!(
+        Reader::open_unchecked(directory.path())
+            .events()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        turn::current_claim_token(&Reader::open_unchecked(directory.path()))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn legacy_stop_draft_completion_remains_compatible() {
+    let (directory, _, _) = mod_regression_fixture(false);
+    let stop: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/249-stop-draft.json")).unwrap();
+    handle_hook(directory.path(), &stop["event"]).unwrap();
+    let paths = Reader::open_unchecked(directory.path()).events().unwrap();
+    assert_eq!(paths.len(), 1);
+    let event: crate::native::session::schema::SessionEvent =
+        RecordReader::at(&paths[0]).json().unwrap();
+    assert_eq!(event.message, "PROBE-DRAFT");
+}
+
 // The watcher of a plan whose completion arrives through the hook alone: starting it on a
 // directory that does not exist succeeds, stopping it succeeds, and the directory is left
 // as it was, so nothing ran.
