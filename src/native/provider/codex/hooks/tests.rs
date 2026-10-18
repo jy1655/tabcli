@@ -12,6 +12,20 @@ const MACOS_EXE: &str = "/Users/jyh/.local/bin/tabcli";
 const MACOS_STOP: &str = "sha256:9a3d2ddbafef699ee6addaf9ec24e5c00cf4beaec6af55e0cae219bf28273efe";
 const MACOS_UPS: &str = "sha256:e34dae680a24bd17287545820261c0a98b9118ca447ddabc23e9cb12f0226d45";
 
+#[test]
+fn trust_hash_matches_known_sha256_of_fixed_identity() {
+    // SHA-256 of this exact sorted JSON identity, including its command quotes.
+    let identity = r#"{"event_name":"stop","hooks":[{"async":false,"command":"'/Users/jyh/.local/bin/tabcli' native-hook codex","timeout":30,"type":"command"}]}"#;
+    let identity: serde_json::Value = serde_json::from_str(identity).unwrap();
+    assert_eq!(
+        trust_hash(
+            identity["event_name"].as_str().unwrap(),
+            identity["hooks"][0]["command"].as_str().unwrap()
+        ),
+        MACOS_STOP
+    );
+}
+
 // Identity hashing is host-independent, so the Mac vectors run on Windows too.
 #[test]
 fn trust_hash_matches_both_codex_0_163_macos_vectors() {

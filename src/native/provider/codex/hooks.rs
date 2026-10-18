@@ -10,9 +10,8 @@ use crate::native::session::{Reader, Store};
 use crate::native::settings::{self, CodexLifecycleHooks};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::Path;
-
-mod sha256;
 
 const FILE: &str = "codex-launch-mode.json";
 const VECTOR_VERSION: &str = "0.163.0";
@@ -34,7 +33,11 @@ pub(super) fn trust_hash(event_label: &str, command: &str) -> String {
     let mut json = serde_json::to_value(identity).expect("hook identity is JSON representable");
     json.sort_all_objects();
     let bytes = serde_json::to_vec(&json).expect("hook identity serializes");
-    format!("sha256:{}", sha256::hex_digest(&bytes))
+    let digest: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("sha256:{digest}")
 }
 
 pub(super) fn session_flags_state_key(label: &str) -> String {
