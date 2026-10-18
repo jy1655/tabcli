@@ -297,7 +297,11 @@ fn launch_dialog_rechecks_close_revoke_and_deadline_after_blocking_observation()
 
 #[test]
 fn launch_dialog_sent_or_uncertain_input_never_retries_or_extends_deadline() {
-    for helper_error in [false, true] {
+    for helper_error in [
+        None,
+        Some("partial console write"),
+        Some("stale claim at guarded submission"),
+    ] {
         let h = Harness::new();
         let start = Instant::now();
         let mut clock = FakeClock::new(start);
@@ -314,8 +318,8 @@ fn launch_dialog_sent_or_uncertain_input_never_retries_or_extends_deadline() {
                 },
                 |_| {
                     calls.set(calls.get() + 1);
-                    if helper_error {
-                        bail!("partial console write");
+                    if let Some(error) = helper_error {
+                        bail!(error);
                     }
                     Ok(true)
                 },
@@ -324,8 +328,10 @@ fn launch_dialog_sent_or_uncertain_input_never_retries_or_extends_deadline() {
             .to_string();
         assert_eq!(calls.get(), 1);
         assert!(error.contains("trust unconfirmed"), "{error}");
-        if helper_error {
-            assert!(error.contains("partial console write"));
+        assert!(error.contains("possible response"), "{error}");
+        assert!(!error.contains("no response sent"), "{error}");
+        if let Some(helper_error) = helper_error {
+            assert!(error.contains(helper_error));
         } else {
             assert_eq!(now.get() - start, Duration::from_millis(1500));
         }
@@ -334,6 +340,45 @@ fn launch_dialog_sent_or_uncertain_input_never_retries_or_extends_deadline() {
             "workspace-dialog-response-pending"
         );
     }
+}
+
+#[test]
+fn launch_dialog_confirmed_trust_survives_applied_record_failure() {
+    let h = Harness::new();
+    let mut clock = FakeClock::new(Instant::now());
+    let calls = Cell::new(0);
+    let error = h
+        .run(
+            FirstPartyCli::Claude,
+            &mut clock,
+            Duration::from_secs(3),
+            || Ok(h.screen()),
+            |_| {
+                calls.set(calls.get() + 1);
+                h.trust_claude();
+                write_json_atomic(&h.directory.join(SESSION_FILE), &serde_json::json!({}))?;
+                Ok(true)
+            },
+        )
+        .unwrap_err();
+    assert_eq!(calls.get(), 1);
+    assert!(matches!(
+        provider::workspace_trust(FirstPartyCli::Claude, &h.workspace, &h.stores.env, None).unwrap(),
+        Trust::Trusted(_)
+    ));
+    let detail = format!("{error:#}");
+    assert!(detail.contains("provider trust is confirmed"), "{detail}");
+    assert!(
+        detail.contains("recording the Bridge applied marker failed"),
+        "{detail}"
+    );
+    assert!(detail.contains("no input was retried"), "{detail}");
+    assert!(!detail.contains("trust unconfirmed"), "{detail}");
+    assert!(detail.contains("missing field `schema`"), "{detail}");
+    assert!(
+        error.chain().any(|cause| cause.is::<serde_json::Error>()),
+        "{detail}"
+    );
 }
 
 #[test]
@@ -379,6 +424,7 @@ fn launch_dialog_claim_and_original_expiry_reach_real_helper() {
         return;
     }
     let root = PathBuf::from(std::env::var_os("AGENT_BRIDGE_NATIVE_STATE_DIR").unwrap());
+    let mut failures = Vec::new();
     for change in ["retired", "replaced", "closed", "expired"] {
         let h = Harness::new();
         let directory = root.join(format!("session-{change}"));
@@ -432,9 +478,14 @@ fn launch_dialog_claim_and_original_expiry_reach_real_helper() {
             )
             .unwrap_err();
             assert!(format!("{error:#}").contains("stale"), "{error:#}");
+            let detail = format!("{error:#}");
+            if !detail.contains("no response sent") || detail.contains("possible response") {
+                failures.push(format!("{change}: {detail}"));
+            }
         });
         claim.retain();
     }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]
