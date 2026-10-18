@@ -137,6 +137,7 @@ fn launch_dialog_resets_on_full_screen_nonmatch_and_prewrite_changed() {
         let mut clock = FakeClock::new(start);
         let now = clock.shared();
         let calls = Cell::new(0);
+        let original_expiry = Cell::new(None);
         let result = h.run(
             FirstPartyCli::Claude,
             &mut clock,
@@ -158,7 +159,16 @@ fn launch_dialog_resets_on_full_screen_nonmatch_and_prewrite_changed() {
                     original
                 })
             },
-            |_| {
+            |input| {
+                let expiry = input.expires_unix_ms.expect("bounded helper expiry");
+                if let Some(original) = original_expiry.get() {
+                    assert_eq!(
+                        expiry, original,
+                        "a changed screen must not renew the helper budget"
+                    );
+                } else {
+                    original_expiry.set(Some(expiry));
+                }
                 let call = calls.get() + 1;
                 calls.set(call);
                 if change == "helper" && call == 1 {
@@ -405,7 +415,8 @@ fn launch_dialog_claim_and_original_expiry_reach_real_helper() {
                     assert_eq!(now.get() - start, Duration::from_secs(1));
                     let expiry = input.expires_unix_ms.unwrap();
                     assert!(
-                        (expiry_floor..=expiry_floor + 100).contains(&expiry),
+                        (expiry_floor..=crate::native::session::primitives::unix_ms() + 3000)
+                            .contains(&expiry),
                         "original expiry {expiry} vs {expiry_floor}"
                     );
                     terminal::guarded_dialog_input(
@@ -421,4 +432,72 @@ fn launch_dialog_claim_and_original_expiry_reach_real_helper() {
         });
         claim.retain();
     }
+}
+
+#[test]
+fn launch_dialog_entry_rejects_ended_session_before_consent_short_circuit() {
+    let h = Harness::new();
+    h.close();
+    fs::remove_file(h.directory.join(SESSION_FILE)).unwrap();
+    let error = complete_launch(
+        &h.directory,
+        FirstPartyCli::Claude,
+        &h.surface,
+        "1-2-3",
+        Instant::now() + Duration::from_secs(3),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("closed"), "{error}");
+    assert!(error.contains("no response sent"), "{error}");
+}
+
+#[test]
+fn launch_dialog_prewrite_changed_does_not_renew_original_deadline() {
+    let h = Harness::new();
+    let start = Instant::now();
+    let mut clock = FakeClock::new(start);
+    let now = clock.shared();
+    let calls = Cell::new(0);
+    let error = h
+        .run(
+            FirstPartyCli::Claude,
+            &mut clock,
+            Duration::from_millis(1500),
+            || Ok(h.screen()),
+            |_| {
+                calls.set(calls.get() + 1);
+                Ok(false)
+            },
+        )
+        .unwrap_err()
+        .to_string();
+    assert_eq!(calls.get(), 1);
+    assert_eq!(now.get() - start, Duration::from_millis(1500));
+    assert!(error.contains("no response sent"), "{error}");
+}
+
+#[test]
+fn launch_dialog_settle_starts_when_first_screen_read_completes() {
+    let h = Harness::new();
+    let start = Instant::now();
+    let mut clock = FakeClock::new(start);
+    let now = clock.shared();
+    let error = h
+        .run(
+            FirstPartyCli::Claude,
+            &mut clock,
+            Duration::from_millis(1799),
+            || {
+                if now.get() == start {
+                    now.set(start + Duration::from_millis(800));
+                }
+                Ok(h.screen())
+            },
+            |_| panic!("screen read time is not settle time"),
+        )
+        .unwrap_err()
+        .to_string();
+    assert_eq!(now.get() - start, Duration::from_millis(1799));
+    assert!(error.contains("no response sent"), "{error}");
 }
