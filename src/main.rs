@@ -149,7 +149,7 @@ Session policy:
   provably cannot hold the conversation. The launch wrapper records the provider
   process it spawns in the new session's provider-process.json (pid and, on Windows,
   creation time and executable path) before the session leaves its launch state. The
-  marker is released in two cases: the pre-spawn recheck refused and no provider
+  marker is released when the pre-spawn recheck refused and no provider
   process was recorded, or the recorded provider process is verified gone, meaning its
   pid is dead or the pid is alive under a different identity (a reused pid). Neither
   the exit of the launch wrapper nor a closed surface is evidence on its own: Windows
@@ -163,8 +163,12 @@ Session policy:
   proceeds; otherwise the reopen is refused with gate already-reopened naming the
   blocking condition. A parent that crashed before settling the marker, or timed out
   before the wrapper recorded its refusal, is recovered this way; nothing is inferred
-  from missing records. A later tell refusal and an ordinary launch or delivery
-  failure leave the marker consumed.
+  from missing records. A launcher failure after the initial request was recorded
+  has gate launch-failed. It releases the marker only with a matching launch receipt
+  and proof that no provider spawn remains unresolved, or that the recorded provider
+  process is verified gone. Live or unverifiable processes and missing, damaged or
+  mismatched records keep the marker consumed. A later tell refusal, or a consent or
+  delivery failure, leaves it consumed.
   Before a tell either gate refuses the delivery and leaves the session ready. A
   foreign claude --resume can still register between two checks and interleave until
   the next one. doctor reports the other live holders of a reopened session's

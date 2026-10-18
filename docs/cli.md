@@ -308,7 +308,7 @@ refusal gate applies).
 Later failures include the request address, `source_session`, and `gate`.
 
 Exit behaviour otherwise matches `ask`. Refusal gates include `provider-unsupported`,
-`workspace-refused`, `start-failed`, `reopen-conflict`, `reopen-verification-failed`, and
+`workspace-refused`, `start-failed`, `launch-failed`, `reopen-conflict`, `reopen-verification-failed`, and
 `already-reopened`. Source refusals include
 `source-not-closed`, `source-not-converged`, `request-unresolved`, and `source-identity-missing`.
 For `source-not-closed`, close the source first. For `source-not-converged`, repeat `close-session
