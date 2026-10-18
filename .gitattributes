@@ -5,3 +5,8 @@ src/native/session/fixtures/** -text
 tests/fixtures/** -text
 # The harness strips LF import lines; prevent Windows autocrlf conversion.
 src/native/provider/pi_extension.js -text
+# Real Codex console captures and the prompts that produced them are compared by scalar count
+# and byte content; a Windows runner must not turn their LF into CRLF.
+src/native/provider/codex/launch/paste/fixtures/** -text
+src/native/provider/codex/launch/paste/*.txt -text
+src/native/provider/codex/launch/paste/picker-screen.json -text
