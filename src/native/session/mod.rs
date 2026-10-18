@@ -50,6 +50,8 @@ pub(in crate::native) mod test_support {
         TERMINAL_CLOSING_FILE, TERMINAL_HANDLE_FILE, TERMINAL_TOMBSTONE_FILE, TURN_CLAIM_FILE,
         TURN_CLAIM_LOCK_FILE, TURN_COMPLETION_FILE,
     };
+    #[cfg(windows)]
+    pub(in crate::native) use super::primitives::close_io_test;
     pub(in crate::native) use super::primitives::{
         SyncRecord, injected_fault, injected_sync_failure, with_fault_budget,
         with_publication_read_log, with_sync_failure, with_sync_log, write_event,

@@ -308,7 +308,7 @@ refusal gate applies).
 Later failures include the request address, `source_session`, and `gate`.
 
 Exit behaviour otherwise matches `ask`. Refusal gates include `provider-unsupported`,
-`workspace-refused`, `start-failed`, `reopen-conflict`, `reopen-verification-failed`, and
+`workspace-refused`, `start-failed`, `launch-failed`, `reopen-conflict`, `reopen-verification-failed`, and
 `already-reopened`. Source refusals include
 `source-not-closed`, `source-not-converged`, `request-unresolved`, and `source-identity-missing`.
 For `source-not-closed`, close the source first. For `source-not-converged`, repeat `close-session
@@ -327,6 +327,14 @@ context or its initial claim) could not be made. No provider process exists at t
 new session is left failed with the refusal recorded, the source marker is released by the same
 command, or by the next `reopen` if the command did not get that far, and a new `reopen` of the
 source is admitted.
+
+`launch-failed` means the launcher failed after the initial request was recorded. Bridge
+releases the source marker only with a matching launch receipt and proof that no provider
+spawn remains unresolved, or that the recorded provider process is verified gone. Live or
+unverifiable processes and missing, damaged or mismatched records retain the marker. A
+failure before the launch receipt is durable therefore retains it. A later `reopen` retries
+an interrupted failure fence before checking the marker; observation commands do not repair
+it. The original launch error remains in the response.
 
 For `provider-unsupported`, check the platform and provider before retrying. For `reopen-conflict`,
 stop the other resume yourself before trying another delivery. Run `doctor SESSION` for

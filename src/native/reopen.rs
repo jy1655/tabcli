@@ -93,14 +93,13 @@ const REOPEN_VERIFICATION_FAILED_GATE: &str = "reopen-verification-failed";
 // the initial claim) could not be made. No provider process exists at that point, so the
 // refusal's cleanup is `NoProcessSpawned` and the source marker is released (#245).
 const REOPEN_START_FAILED_GATE: &str = "start-failed";
+const REOPEN_LAUNCH_FAILED_GATE: &str = "launch-failed";
 // Launch admission refused the source workspace before the new session existed.
 const REOPEN_WORKSPACE_REFUSED_GATE: &str = "workspace-refused";
 
-// The gates a reopen can fail after its session exists. Each one leaves the new session
-// failed with no prompt delivered. The source's reopen marker is released again only once
-// the refused launch provably cannot hold the conversation (`RefusedLaunchCleanup`).
-const REOPEN_POST_CREATION_GATES: [&str; 4] = [
+const REOPEN_POST_CREATION_GATES: [&str; 5] = [
     REOPEN_START_FAILED_GATE,
+    REOPEN_LAUNCH_FAILED_GATE,
     REOPEN_LAUNCH_GATE,
     REOPEN_CONFLICT_GATE,
     REOPEN_VERIFICATION_FAILED_GATE,
@@ -127,6 +126,7 @@ pub(super) fn record_reopen_refusal(
         gate: gate.to_owned(),
         detail: detail.clone(),
         created_unix_ms: unix_ms(),
+        claim_token: None,
         cleanup: None,
         cleanup_detail: None,
     };
@@ -148,8 +148,69 @@ fn read_reopen_launch_refusal(directory: &Path) -> Option<RecordedReopenRefusal>
         .text()
         .ok()
         .flatten()?;
-    let record: RecordedReopenRefusal = serde_json::from_str(&text).ok()?;
-    (record.schema == 2 && record.phase == REOPEN_REFUSAL_LAUNCH_PHASE).then_some(record)
+    decode_launch_refusal(&text)
+}
+
+fn decode_launch_refusal(text: &str) -> Option<RecordedReopenRefusal> {
+    let record: RecordedReopenRefusal = serde_json::from_str(text).ok()?;
+    let valid = record.phase == REOPEN_REFUSAL_LAUNCH_PHASE
+        && match record.schema {
+            2 => {
+                record.gate != REOPEN_LAUNCH_FAILED_GATE
+                    && REOPEN_POST_CREATION_GATES.contains(&record.gate.as_str())
+            }
+            3 => {
+                record.gate == REOPEN_LAUNCH_FAILED_GATE
+                    && record
+                        .claim_token
+                        .as_ref()
+                        .is_some_and(|token| !token.trim().is_empty())
+            }
+            _ => false,
+        };
+    valid.then_some(record)
+}
+
+fn record_failed_launch(
+    directory: &Path,
+    token: &str,
+    error: &anyhow::Error,
+) -> Result<&'static str> {
+    let store = Store::open_unchecked(directory);
+    let _lock = store.lock()?;
+    if let Some(text) = store.record(CoreRecord::ReopenRefusal).text()? {
+        let record =
+            decode_launch_refusal(&text).context("the existing launch refusal is invalid")?;
+        if record.gate == REOPEN_LAUNCH_FAILED_GATE && record.claim_token.as_deref() != Some(token)
+        {
+            bail!("the existing launch refusal belongs to another claim");
+        }
+        return Ok(*REOPEN_POST_CREATION_GATES
+            .iter()
+            .find(|gate| **gate == record.gate)
+            .unwrap());
+    }
+    let gate = reopen_refusal_gate(error)
+        .filter(|gate| REOPEN_POST_CREATION_GATES.contains(gate))
+        .unwrap_or(REOPEN_LAUNCH_FAILED_GATE);
+    let record = RecordedReopenRefusal {
+        schema: if gate == REOPEN_LAUNCH_FAILED_GATE {
+            3
+        } else {
+            2
+        },
+        phase: REOPEN_REFUSAL_LAUNCH_PHASE.to_owned(),
+        gate: gate.to_owned(),
+        detail: format!("{error:#}"),
+        created_unix_ms: unix_ms(),
+        claim_token: (gate == REOPEN_LAUNCH_FAILED_GATE).then(|| token.to_owned()),
+        cleanup: None,
+        cleanup_detail: None,
+    };
+    store
+        .record(CoreRecord::ReopenRefusal)
+        .write_private(&serde_json::to_vec_pretty(&record)?)?;
+    Ok(gate)
 }
 
 fn read_reopen_refusal_gate(directory: &Path) -> Option<String> {
@@ -317,15 +378,43 @@ impl std::fmt::Display for RefusedLaunchCleanup {
 
 // Read-only: ready/working sessions are not refused launches. A pre-spawn refusal proves
 // no spawn only without a provider record; an existing record must be verified.
-fn refused_launch_cleanup(refused_directory: &Path, gate: &str) -> Result<RefusedLaunchCleanup> {
-    refused_launch_cleanup_with(refused_directory, gate, observe_provider_process)
+fn refused_launch_cleanup(
+    refused_directory: &Path,
+    refusal: &RecordedReopenRefusal,
+) -> Result<RefusedLaunchCleanup> {
+    refused_launch_cleanup_with(refused_directory, refusal, observe_provider_process)
 }
 
 fn refused_launch_cleanup_with(
     refused_directory: &Path,
-    gate: &str,
+    refusal: &RecordedReopenRefusal,
     observe: impl FnOnce(&ProviderProcessRecord) -> ProviderProcessObservation,
 ) -> Result<RefusedLaunchCleanup> {
+    let store = Store::open_unchecked(refused_directory);
+    let generic = refusal.gate == REOPEN_LAUNCH_FAILED_GATE;
+    let _lock = if generic {
+        let Some(lock) = store.try_lock()? else {
+            return Ok(RefusedLaunchCleanup::Pending(
+                "provider startup holds the lifecycle lock".to_owned(),
+            ));
+        };
+        Some(lock)
+    } else {
+        None
+    };
+    let evidence = if generic {
+        let token = refusal
+            .claim_token
+            .as_deref()
+            .context("the launch refusal has no claim token")?;
+        let evidence = session::launch::failed_start_evidence_locked(&store, token)?;
+        if let session::launch::FailedStartEvidence::Pending(reason) = evidence {
+            return Ok(RefusedLaunchCleanup::Pending(reason));
+        }
+        Some(evidence)
+    } else {
+        None
+    };
     let refused_session = refused_directory
         .file_name()
         .and_then(|name| name.to_str())
@@ -352,7 +441,13 @@ fn refused_launch_cleanup_with(
     )
     .optional_json::<ProviderProcessRecord>()?;
     let Some(record) = record else {
-        if gate == REOPEN_LAUNCH_GATE || gate == REOPEN_START_FAILED_GATE {
+        if refusal.gate == REOPEN_LAUNCH_GATE
+            || refusal.gate == REOPEN_START_FAILED_GATE
+            || matches!(
+                evidence,
+                Some(session::launch::FailedStartEvidence::NoUnresolvedSpawn)
+            )
+        {
             return Ok(RefusedLaunchCleanup::NoProcessSpawned);
         }
         return Ok(RefusedLaunchCleanup::Pending(format!(
@@ -619,6 +714,39 @@ struct ReopenedSource {
     resumed_from: Option<ResumedFrom>,
 }
 
+fn retry_interrupted_launch_fence(source_directory: &Path) -> Result<()> {
+    let marker = Reader::open_unchecked(source_directory)
+        .record(CoreRecord::ReopenMarker)
+        .optional_json::<ReopenMarker>();
+    let Ok(Some(marker)) = marker else {
+        return Ok(());
+    };
+    let Some(child) = marker.reopened_by.filter(|id| valid_session_id(id)) else {
+        return Ok(());
+    };
+    let child = source_directory
+        .parent()
+        .context("session directory has no state root")?
+        .join(child);
+    if !fs::symlink_metadata(&child).is_ok_and(|metadata| metadata.is_dir()) {
+        return Ok(());
+    }
+    let Some(refusal) = read_reopen_launch_refusal(&child) else {
+        return Ok(());
+    };
+    if refusal.gate == REOPEN_LAUNCH_FAILED_GATE {
+        session::launch::retry_failed_start_fence(
+            &Store::open_unchecked(&child),
+            refusal
+                .claim_token
+                .as_deref()
+                .expect("validated launch token"),
+            &refusal.detail,
+        )?;
+    }
+    Ok(())
+}
+
 // A reopened session assesses workspace consent for itself, from the current stores and
 // exactly as a fresh `ask` does, so that it can take the same guarded trust-dialog answer. The
 // source's assessment is diagnostic history of another session, never consent for this one
@@ -653,6 +781,7 @@ impl session_start::StartSource for ReopenedSource {
         let request = &self.request;
         let terminal_kind = terminal::select(request.terminal)?;
         let source_directory = Reader::session_directory(&request.id)?;
+        let _ = retry_interrupted_launch_fence(&source_directory);
         // Every check against the source is read-only. Pending-completion recovery and dead-owner
         // repair are never run on it: a closed session has nothing to converge, and reopen must not
         // alter the record it continues from.
@@ -776,6 +905,35 @@ impl session_start::StartSource for ReopenedSource {
         )
     }
 
+    fn launch_failed(
+        &self,
+        created: &CreatedSession,
+        initial_claim: &mut session::turn::Claim,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        initial_claim.fence_launch();
+        let mut detail = format!("{error:#}");
+        let gate = match record_failed_launch(&created.directory, initial_claim.token(), &error) {
+            Ok(gate) => gate,
+            Err(record_error) => {
+                detail.push_str(&format!(
+                    "; the refusal record could not be written: {record_error:#}"
+                ));
+                reopen_refusal_gate(&error).unwrap_or(REOPEN_LAUNCH_FAILED_GATE)
+            }
+        };
+        if let Err(fence_error) = session::launch::fence_failed_start(
+            &Store::open_unchecked(&created.directory),
+            initial_claim.token(),
+            &detail,
+        ) {
+            detail.push_str(&format!(
+                "; the failed launch could not be fenced: {fence_error:#}"
+            ));
+        }
+        reopen_refusal(gate, detail)
+    }
+
     fn delivery_failed(
         &self,
         directory: &Path,
@@ -845,7 +1003,26 @@ fn release_reopen_marker_after_refusal(
     outcome: Result<()>,
 ) -> Result<()> {
     release_reopen_marker_after_refusal_with(source_directory, refused_directory, outcome, || {
-        refused_launch_cleanup(refused_directory, gate)
+        let refusal = read_reopen_launch_refusal(refused_directory);
+        let refusal = match refusal {
+            Some(refusal) => refusal,
+            None if gate != REOPEN_LAUNCH_FAILED_GATE => RecordedReopenRefusal {
+                schema: 2,
+                phase: REOPEN_REFUSAL_LAUNCH_PHASE.to_owned(),
+                gate: gate.to_owned(),
+                detail: String::new(),
+                created_unix_ms: unix_ms(),
+                claim_token: None,
+                cleanup: None,
+                cleanup_detail: None,
+            },
+            None => {
+                return Ok(RefusedLaunchCleanup::Pending(
+                    "the failed launch has no valid durable refusal".to_owned(),
+                ));
+            }
+        };
+        refused_launch_cleanup(refused_directory, &refusal)
     })
 }
 
@@ -1060,7 +1237,7 @@ fn verify_reopen_source_is_closed(directory: &Path, id: &str) -> Result<Option<S
     let Some(refusal) = read_reopen_launch_refusal(&refused_directory) else {
         return refuse(already);
     };
-    let cleanup = match refused_launch_cleanup(&refused_directory, &refusal.gate) {
+    let cleanup = match refused_launch_cleanup(&refused_directory, &refusal) {
         Ok(cleanup) => cleanup,
         Err(error) => {
             return refuse(format!(
@@ -1343,7 +1520,7 @@ pub(super) fn marker_check(reader: &Reader, id: &str, checks: &mut Vec<Check>) {
             Value::Null,
         ),
         Some((refusal, refused_directory)) => {
-            match refused_launch_cleanup(refused_directory, &refusal.gate) {
+            match refused_launch_cleanup(refused_directory, refusal) {
                 Ok(cleanup) if cleanup.releases_marker() => (
                     Available,
                     "reopen_marker_reconcilable",

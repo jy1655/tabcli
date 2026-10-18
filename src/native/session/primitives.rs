@@ -639,9 +639,9 @@ pub(in crate::native) fn sync_directory_entries(_directory: &Path) -> Result<()>
 // Observe the actual I/O boundary, not time spent reaching it. Test callbacks
 // may synchronize a worker or advance its thread-local close clock.
 #[cfg(test)]
-pub(in crate::native::session) mod close_io_test {
+pub(in crate::native) mod close_io_test {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(in crate::native::session) enum Point {
+    pub(in crate::native) enum Point {
         BeforeLock(&'static str),
         BlockingLock,
         WouldBlock(&'static str),
@@ -659,7 +659,7 @@ pub(in crate::native::session) mod close_io_test {
             }
         });
     }
-    pub(in crate::native::session) fn during<T>(
+    pub(in crate::native) fn during<T>(
         hook: impl FnMut(Point) + 'static,
         run: impl FnOnce() -> T,
     ) -> T {

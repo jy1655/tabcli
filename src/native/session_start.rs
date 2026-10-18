@@ -51,6 +51,12 @@ pub(super) trait StartSource {
     // process does: the source settles what it reserved for the session (`mark_start_failed`
     // at least) and returns the error to report.
     fn start_failed(&self, created: &CreatedSession, error: anyhow::Error) -> anyhow::Error;
+    fn launch_failed(
+        &self,
+        created: &CreatedSession,
+        initial_claim: &mut turn::Claim,
+        error: anyhow::Error,
+    ) -> anyhow::Error;
     fn delivery_failed(
         &self,
         directory: &Path,
@@ -138,6 +144,14 @@ impl StartSource for FreshSource {
     ) -> anyhow::Error {
         error
     }
+    fn launch_failed(
+        &self,
+        _: &CreatedSession,
+        _: &mut turn::Claim,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        error
+    }
     fn result_extra(&self) -> Result<ResultExtra> {
         Ok(ResultExtra::new())
     }
@@ -210,13 +224,16 @@ pub(super) fn start(
     let expected_claim_token = initial_claim.token().to_owned();
     let receipt = initial_claim.receipt().clone();
     report.addressed(created.id.clone(), receipt.request_id.clone());
-    let terminal_session = launch::launcher::start(
+    let terminal_session = match launch::launcher::start(
         &created,
         terminal_kind,
         &mut initial_claim,
         &expected_claim_token,
         deadline,
-    )?;
+    ) {
+        Ok(surface) => surface,
+        Err(error) => return Err(source.launch_failed(&created, &mut initial_claim, error)),
+    };
     // A trust response is separate from model input. Only verified consent and an
     // adapter-recognized exact workspace dialog may produce one guarded response.
     consent::complete_launch(&created.directory, provider, &terminal_session, deadline)?;

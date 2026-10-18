@@ -35,6 +35,28 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
+#[cfg(windows)]
+mod launch_failure;
+#[cfg(windows)]
+mod launch_recovery;
+
+fn test_launch_refusal(gate: &str) -> RecordedReopenRefusal {
+    RecordedReopenRefusal {
+        schema: if gate == REOPEN_LAUNCH_FAILED_GATE {
+            3
+        } else {
+            2
+        },
+        phase: "launch".to_owned(),
+        gate: gate.to_owned(),
+        detail: String::new(),
+        created_unix_ms: 1,
+        claim_token: (gate == REOPEN_LAUNCH_FAILED_GATE).then(|| "fixture-launch".to_owned()),
+        cleanup: None,
+        cleanup_detail: None,
+    }
+}
+
 const REOPEN_TEST_CONVERSATION: &str = "6928ca1c-1234-4abc-8def-0123456789ab";
 
 #[test]
@@ -2538,7 +2560,7 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
     // surface is reported alongside.
     write_provider_process_record(&new, new_id, 0);
     assert_eq!(
-        refused_launch_cleanup(&new, REOPEN_CONFLICT_GATE)
+        refused_launch_cleanup(&new, &test_launch_refusal(REOPEN_CONFLICT_GATE))
             .unwrap()
             .to_string(),
         "provider process 0 is verified gone (it has exited) and the refused session's surface was closed"
@@ -2614,7 +2636,9 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
     ));
     // A record that cannot be read leaves the launch unverifiable rather than gone.
     fs::write(new.join(PROVIDER_PROCESS_FILE), "not json").unwrap();
-    let unverifiable = refused_launch_cleanup(&new, REOPEN_VERIFICATION_FAILED_GATE).unwrap_err();
+    let unverifiable =
+        refused_launch_cleanup(&new, &test_launch_refusal(REOPEN_VERIFICATION_FAILED_GATE))
+            .unwrap_err();
     assert!(
         format!("{unverifiable:#}").contains("invalid JSON"),
         "{unverifiable:#}"
@@ -2688,9 +2712,15 @@ fn recorded_provider_process_is_verified_from_the_record_until_it_exits() {
         REOPEN_CONFLICT_GATE,
         "held by pid 4242; no prompt was delivered".to_owned(),
     );
+    Store::open_unchecked(&directory)
+        .record(CoreRecord::Launch)
+        .write_json(&json!({
+            "schema":1,"claim_token":"fixture-launch","deadline_unix_ms":1,"phase":"spawned"
+        }))
+        .unwrap();
     for gate in REOPEN_POST_CREATION_GATES {
         assert_eq!(
-            refused_launch_cleanup(&directory, gate).unwrap(),
+            refused_launch_cleanup(&directory, &test_launch_refusal(gate)).unwrap(),
             RefusedLaunchCleanup::Pending(format!(
                 "provider process {} of refused session {id} is still running",
                 child.id()
@@ -2705,7 +2735,7 @@ fn recorded_provider_process_is_verified_from_the_record_until_it_exits() {
         ProviderProcessObservation::Gone(ProviderProcessGone::Exited)
     );
     for gate in REOPEN_POST_CREATION_GATES {
-        let cleanup = refused_launch_cleanup(&directory, gate).unwrap();
+        let cleanup = refused_launch_cleanup(&directory, &test_launch_refusal(gate)).unwrap();
         assert_eq!(
             cleanup,
             RefusedLaunchCleanup::ProviderProcessGone {
@@ -2825,7 +2855,7 @@ fn surviving_provider_process_retains_the_source_marker_until_it_is_verified_gon
     provider.kill().unwrap();
     provider.wait().unwrap();
     assert_eq!(
-        refused_launch_cleanup(&new, REOPEN_CONFLICT_GATE)
+        refused_launch_cleanup(&new, &test_launch_refusal(REOPEN_CONFLICT_GATE))
             .unwrap()
             .to_string(),
         format!(
@@ -2957,7 +2987,8 @@ fn reused_provider_pid_with_a_different_identity_releases_the_marker() {
 
     record(identity.clone());
     assert_eq!(
-        refused_launch_cleanup(&new, REOPEN_VERIFICATION_FAILED_GATE).unwrap(),
+        refused_launch_cleanup(&new, &test_launch_refusal(REOPEN_VERIFICATION_FAILED_GATE))
+            .unwrap(),
         RefusedLaunchCleanup::Pending(format!(
             "provider process {pid} of refused session {new_id} is still running"
         ))
@@ -2991,7 +3022,9 @@ fn reused_provider_pid_with_a_different_identity_releases_the_marker() {
         ),
     ] {
         record(reused);
-        let cleanup = refused_launch_cleanup(&new, REOPEN_VERIFICATION_FAILED_GATE).unwrap();
+        let cleanup =
+            refused_launch_cleanup(&new, &test_launch_refusal(REOPEN_VERIFICATION_FAILED_GATE))
+                .unwrap();
         assert_eq!(
             cleanup,
             RefusedLaunchCleanup::ProviderProcessGone {
@@ -3058,7 +3091,7 @@ fn uninspectable_provider_process_retains_the_marker() {
         },
     )
     .unwrap();
-    let cleanup = refused_launch_cleanup(&new, REOPEN_CONFLICT_GATE).unwrap();
+    let cleanup = refused_launch_cleanup(&new, &test_launch_refusal(REOPEN_CONFLICT_GATE)).unwrap();
     assert_eq!(
         cleanup,
         RefusedLaunchCleanup::Pending(format!(
@@ -3165,8 +3198,12 @@ fn inspection_error_with_dead_provider_pid_retains_reopen_marker() {
     let observe = |record: &ProviderProcessRecord| {
         observe_provider_process_with(record, |_| Err(anyhow::anyhow!("inspection failed")))
     };
-    let cleanup =
-        refused_launch_cleanup_with(&new, REOPEN_VERIFICATION_FAILED_GATE, observe).unwrap();
+    let cleanup = refused_launch_cleanup_with(
+        &new,
+        &test_launch_refusal(REOPEN_VERIFICATION_FAILED_GATE),
+        observe,
+    )
+    .unwrap();
     assert!(!cleanup.releases_marker(), "{cleanup:?}");
     assert_eq!(
         observe(&record),
@@ -3443,7 +3480,11 @@ fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_s
         SessionState::Failed
     );
     assert_eq!(
-        refused_launch_cleanup(&created.directory, REOPEN_START_FAILED_GATE).unwrap(),
+        refused_launch_cleanup(
+            &created.directory,
+            &test_launch_refusal(REOPEN_START_FAILED_GATE)
+        )
+        .unwrap(),
         RefusedLaunchCleanup::NoProcessSpawned
     );
     assert!(

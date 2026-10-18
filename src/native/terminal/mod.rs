@@ -312,6 +312,10 @@ where
     F: FnOnce(&mut TerminalSession) -> Result<()>,
     U: FnOnce() -> Result<()>,
 {
+    #[cfg(all(test, windows))]
+    if let Some(error) = launch_failure_test_support::take_failure(directory) {
+        return Err(error);
+    }
     #[cfg(windows)]
     {
         windows::open_bound_tab(kind, command, directory, deadline, bind, unbind)
@@ -349,6 +353,9 @@ where
         Ok(session)
     }
 }
+
+#[cfg(all(test, windows))]
+pub(in crate::native) mod launch_failure_test_support;
 
 #[cfg(any(windows, target_os = "macos", test))]
 fn bind_surface_before_start<T, Bind, Start, Cleanup, Unbind>(
