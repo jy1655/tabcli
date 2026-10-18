@@ -922,6 +922,7 @@ tabcli settings [--json]
 tabcli settings windows-tab-window dedicated|current [--json]
 tabcli settings macos-open-mode tab-first|new-window [--json]
 tabcli settings codex-memory-workspace refuse|allow [--json]
+tabcli settings codex-lifecycle-hooks on|off [--json] # default: on
 ```
 
 ```sh

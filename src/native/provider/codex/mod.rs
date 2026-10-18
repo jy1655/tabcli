@@ -1,5 +1,6 @@
 mod correlation;
 mod diagnose;
+mod hooks;
 mod launch;
 mod queue;
 mod runner;
@@ -37,7 +38,11 @@ pub(super) struct CodexAdapter;
 const PENDING_TURN_FILE: &str = "codex-pending-turn.json";
 
 fn codex_version_supports_native_queue(output: &str) -> Result<bool> {
-    let installed = output
+    Ok(codex_version(output)? >= Version::new(0, 149, 0))
+}
+
+fn codex_version(output: &str) -> Result<Version> {
+    output
         .split_whitespace()
         .filter_map(|token| {
             let candidate = token
@@ -49,10 +54,7 @@ fn codex_version_supports_native_queue(output: &str) -> Result<bool> {
             Version::parse(candidate).ok()
         })
         .next()
-        .ok_or_else(|| {
-            anyhow::anyhow!("could not parse a semantic Codex version from {output:?}")
-        })?;
-    Ok(installed >= Version::new(0, 149, 0))
+        .ok_or_else(|| anyhow::anyhow!("could not parse a semantic Codex version from {output:?}"))
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -413,6 +415,11 @@ fn prepare_launch_for_platform(
         &pending,
         windows,
     )?;
+    let hook_override = hooks::prepare(context.directory, context.bridge_executable)?;
+    if let Some(value) = hook_override {
+        // Immediately after the unchanged notify override, before a positional prompt.
+        own.splice(2..2, [OsString::from("-c"), OsString::from(value)]);
+    }
     if authorized(context.directory, FirstPartyCli::Codex)? {
         // Official process-local TOML override; never edits config.toml or any
         // approval/sandbox setting. Insert before the positional prompt.

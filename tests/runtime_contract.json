@@ -148,6 +148,12 @@
     "struct PendingCodexTurn {\n    schema: u32,\n    claim_token: String,\n    marker: String,\n    // The sizes of the framed prompt as Bridge handed it to delivery, kept for the doctor's\n    // notify payload estimate (#127). The macOS launch argument and the queue message\n    // deliver that text; the Windows console paste can drop a non-BMP character (#147),\n    // so the delivered text can be smaller. Additive within schema 1: a record of 0.4.14\n    // reads with `None`, and 0.4.14 ignores the fields (serde keeps unknown fields).\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    framed_prompt_chars: Option<u64>,\n    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n    framed_prompt_units: Option<u64>,\n}": 1,
     "impl PendingCodexTurn {\n    fn new(claim_token: &str) -> Result<Self> {\n        validate_claim_token(claim_token)?;\n        Ok(Self {\n            schema: 1,\n            claim_token: claim_token.to_owned(),\n            marker: format!(\"<!-- agent-bridge-codex-turn:{claim_token} -->\"),\n            framed_prompt_chars: None,\n            framed_prompt_units: None,\n        })\n    }\n": 1
   },
+  "src/native/provider/codex/hooks.rs": {
+    "const FILE: &str = \"codex-launch-mode.json\";": 1,
+    "codex-launch-mode.json": 1,
+    "native-hook codex": 2,
+    "const VECTOR_VERSION: &str = \"0.163.0\";": 1
+  },
   "src/native/provider/codex/launch.rs": {
     "native-hook": 1,
     "const COMPOSER_ROW: &str = \"› Ask Codex to do anything\";": 1,
