@@ -131,6 +131,82 @@ fn interrupted_fence_recovers_only_its_claim_on_real_reopen() {
 }
 
 #[test]
+fn failed_fence_retry_preserves_refusal_gate_and_evidence() {
+    if isolated_with_output(
+        concat!(
+            module_path!(),
+            "::failed_fence_retry_preserves_refusal_gate_and_evidence"
+        ),
+        |output| assert!(output.contains("\"gate\": \"already-reopened\"")),
+    ) {
+        return;
+    }
+    let root = Reader::state_root().unwrap();
+    let (source, child, token) = interrupted(&root);
+    let refusal = read_reopen_launch_refusal(&child).unwrap();
+    assert_eq!(refusal.schema, 3);
+    assert_eq!(refusal.claim_token.as_deref(), Some(token.as_str()));
+    assert_eq!(refusal.detail, FAILURE);
+    let status = Store::open_unchecked(&child).record(CoreRecord::Status);
+    fs::write(status.path(), b"{damaged").unwrap();
+    let before_source = snapshot_directory(&source);
+    let before_child = snapshot_directory(&child);
+    let entries_before = fs::read_dir(&root).unwrap().count();
+    let error = run_reopen(request()).unwrap_err();
+    assert_eq!(
+        reopen_refusal_gate(&error),
+        Some("already-reopened"),
+        "{error:#}"
+    );
+    let detail = format!("{error:#}");
+    assert!(detail.contains("launch-failed"), "{detail}");
+    assert!(
+        detail.contains("its records cannot be verified"),
+        "{detail}"
+    );
+    assert!(detail.contains(status.path().to_str().unwrap()), "{detail}");
+    assert_eq!(snapshot_directory(&source), before_source);
+    assert_eq!(snapshot_directory(&child), before_child);
+    assert_eq!(fs::read_dir(&root).unwrap().count(), entries_before);
+}
+
+#[test]
+fn failed_fence_retry_keeps_source_admission_precedence() {
+    if isolated(concat!(
+        module_path!(),
+        "::failed_fence_retry_keeps_source_admission_precedence"
+    )) {
+        return;
+    }
+    let root = Reader::state_root().unwrap();
+    let (source, child, _) = interrupted(&root);
+    fs::write(
+        Store::open_unchecked(&child)
+            .record(CoreRecord::Status)
+            .path(),
+        b"{damaged",
+    )
+    .unwrap();
+    for (state, gate) in [
+        (SessionState::Ready, "source-not-closed"),
+        (SessionState::Closed, "source-not-converged"),
+    ] {
+        let store = Store::open_unchecked(&source);
+        let mut status = store.status().unwrap();
+        status.state = state;
+        store.write_status(&status).unwrap();
+        write_private(&source.join(TURN_CLAIM_FILE), b"unconverged-source").unwrap();
+        let before_source = snapshot_directory(&source);
+        let before_child = snapshot_directory(&child);
+        let error = run_reopen(request()).unwrap_err();
+        assert_eq!(reopen_refusal_gate(&error), Some(gate), "{error:#}");
+        assert_eq!(snapshot_directory(&source), before_source);
+        assert_eq!(snapshot_directory(&child), before_child);
+        fs::remove_file(source.join(TURN_CLAIM_FILE)).unwrap();
+    }
+}
+
+#[test]
 fn failed_refusal_write_keeps_typed_gate_and_marker() {
     if isolated_with_output(
         concat!(
