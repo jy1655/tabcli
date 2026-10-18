@@ -194,7 +194,8 @@ terminal fallback. See [providers](providers.md) for readiness and receipt gates
 On native Windows, Codex follow-ups also have a measured command-line size refusal; see the
 [Codex send-side limit](providers.md#codex) for the limit and remedy.
 On native Windows, Pi waits for its extension's per-turn submission receipt even with `--detach`.
-That wait shares the request deadline; an older extension refuses input before typing. See
+That wait shares the request deadline. Bridge refuses input before typing when the session's
+extension did not report the required capability. See
 [Pi](providers.md#pi) for uncertain-delivery recovery and receipt limits.
 
 Exit behaviour matches `ask`. If you see `tell requires the ready state`, inspect the session and

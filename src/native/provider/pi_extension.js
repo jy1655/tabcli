@@ -227,7 +227,8 @@ export default function (pi) {
     inputCandidate = undefined;
     if (!candidate || inputAttemptedClaim === candidate.claim_token
         || readActiveClaimToken() !== candidate.claim_token) return;
-    // This claim read witnesses a submitted run. Later retirement cannot undo it.
+    // Reading the current claim witnesses this frame's submission at agent_start.
+    // Later retirement does not undo that historical fact.
     inputAttemptedClaim = candidate.claim_token;
     const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
     const temporary = join(directory, `.pi-input-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`);
@@ -326,9 +327,9 @@ export default function (pi) {
 
   pi.on("before_agent_start", (event) => {
     inputCandidate = undefined;
+    stopCancelTimer();
     activePromptCorrelated = false;
     usage = undefined;
-    stopCancelTimer();
     activeClaimToken = readActiveClaimToken();
     const userPrompt = typeof event?.prompt === "string"
       && (event.messageType === undefined || event.messageType === "user");
