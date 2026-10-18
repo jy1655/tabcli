@@ -37,9 +37,10 @@ cross-platform live claim follows from this test.
 
 The user first approved two new exact canonical workspaces: one through Codex outside Bridge,
 one through a managed Agy session. Subsequent tests reused those genuine approvals; they did not
-create approval evidence. Each Claude run received a protected private configuration copied from
-an unmodified provider backup that did not trust the target. Provider settings were copied
-unchanged. No global trust or permission setting was changed by these runs.
+create approval evidence. Each Claude run received a protected private configuration from a
+hash-verified copy of an unmodified provider backup that did not trust the target. The original
+backup had rotated away; the copy matched its earlier recorded hash. Provider settings were
+copied unchanged. No global trust or permission setting was changed by these runs.
 
 An independent Opus verifier built actual parent `53962ad7d4d83c12b0ba7b35187176be65fa11e4`
 and final head `66f4e442d76ecfc1103007adfa327364f26e2d55`. Both binaries reported 0.4.18.
