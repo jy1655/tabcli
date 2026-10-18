@@ -405,16 +405,34 @@ fn concurrent_reopens_reserve_safe_generic_failure_once() {
 #[test]
 fn failure_before_durable_launch_receipt_retains_reopen_but_preserves_fresh_drop() {
     use crate::native::session_start::StartSource;
+    if isolated(concat!(
+        module_path!(),
+        "::failure_before_durable_launch_receipt_retains_reopen_but_preserves_fresh_drop"
+    )) {
+        return;
+    }
+    let root = Reader::state_root().unwrap();
+    let (mut adapter, mut spec) = start_source_fixture(&root);
+    spec.yolo = true;
+    let created = adapter.create(spec, None).unwrap();
+    let source = adapter.resolved.as_ref().unwrap().0.clone();
+    assert_eq!(source, root.join(&adapter.request.id));
+    assert_eq!(
+        created.directory,
+        root.join(&created.id),
+        "created session must share the source fixture state root"
+    );
+    println!(
+        "fixture root={}, source={}, child={}",
+        root.display(),
+        source.display(),
+        created.directory.display()
+    );
+    let store = Store::open_unchecked(&created.directory);
+    fs::create_dir(created.directory.join(launch::FILE)).unwrap();
     for reopen in [false, true] {
-        let root = tempfile::tempdir().unwrap();
-        let (mut adapter, mut spec) = start_source_fixture(root.path());
-        spec.yolo = true;
-        let created = adapter.create(spec, None).unwrap();
-        let source = adapter.resolved.as_ref().unwrap().0.clone();
-        let store = Store::open_unchecked(&created.directory);
         let mut claim = turn::claim(&store, &[]).unwrap();
         let token = claim.token().to_owned();
-        fs::create_dir(created.directory.join(launch::FILE)).unwrap();
         let error = launch::launcher::start(
             &created,
             terminal::TerminalKind::WindowsConsole,
@@ -428,13 +446,36 @@ fn failure_before_durable_launch_receipt_retains_reopen_but_preserves_fresh_drop
             let error = adapter.launch_failed(&created, &mut claim, error);
             assert_eq!(reopen_refusal_gate(&error), Some("launch-failed"));
             assert!(format!("{error:#}").contains(&original));
+            let refusal = read_reopen_launch_refusal(&created.directory)
+                .expect("the created child must carry the durable generic refusal");
+            assert_eq!(refusal.schema, 3);
+            assert_eq!(refusal.phase, "launch");
+            assert_eq!(refusal.gate, "launch-failed");
+            assert_eq!(refusal.claim_token.as_deref(), Some(token.as_str()));
+            assert_eq!(refusal.detail, original);
+            let resolved = std::cell::RefCell::new(Vec::new());
             let (outcome, gate) = settle_reopen_outcome(
-                |id| Ok(root.path().join(id)),
+                |id| {
+                    let directory = root.join(id);
+                    resolved.borrow_mut().push(directory.clone());
+                    Ok(directory)
+                },
                 "session-start-source",
                 &created.id,
                 Err(error),
             );
+            assert_eq!(
+                *resolved.borrow(),
+                [source.clone(), created.directory.clone()]
+            );
             assert!(outcome.is_err());
+            let settlement_error = outcome.unwrap_err().to_string();
+            assert!(
+                settlement_error.contains("refusing non-regular session file")
+                    && settlement_error
+                        .contains(created.directory.join(launch::FILE).to_str().unwrap()),
+                "settlement must read the actual child's refused launch receipt: {settlement_error}"
+            );
             assert_eq!(gate.as_deref(), Some("launch-failed"));
             drop(claim);
             assert!(source.join(REOPEN_MARKER_FILE).exists());
@@ -443,7 +484,7 @@ fn failure_before_durable_launch_receipt_retains_reopen_but_preserves_fresh_drop
         } else {
             let fresh = session_start::FreshSource(session_start::AskRequest {
                 provider: FirstPartyCli::Claude,
-                workspace: root.path().to_owned(),
+                workspace: root.clone(),
                 prompt: "fixture".into(),
                 title: None,
                 model: None,
