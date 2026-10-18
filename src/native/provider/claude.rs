@@ -156,7 +156,14 @@ impl NativeProviderAdapter for ClaudeAdapter {
             // Claude Code 2.1.302 still shows workspace trust under bypass on native Windows (#28).
             bypass_suppresses_dialog: !cfg!(windows),
             applied_marker: None,
-            dialog_settle: std::time::Duration::ZERO,
+            // 2.1.302 guards input for 150 ms and remounts its selector. One second
+            // allows margin for an idle renderer; equal pixels do not prove settlement.
+            // Replace with an official addressed workspace-approval capability.
+            dialog_settle: if cfg!(windows) {
+                std::time::Duration::from_secs(1)
+            } else {
+                std::time::Duration::ZERO
+            },
         }
     }
 

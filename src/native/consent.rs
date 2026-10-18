@@ -12,16 +12,18 @@ use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::ffi::{OsStr, OsString};
+use std::fs;
 #[cfg(windows)]
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+#[cfg(test)]
+use std::thread;
 #[cfg(unix)]
 use std::time::UNIX_EPOCH;
 use std::time::{Duration, Instant};
-use std::{fs, thread};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct Identity {
@@ -51,6 +53,7 @@ pub(in crate::native) struct LaunchTrust {
     pub(in crate::native) answers_launch_dialog: bool,
     pub(in crate::native) bypass_suppresses_dialog: bool,
     pub(in crate::native) applied_marker: Option<&'static str>,
+    // Eligibility for one attempt, never evidence that the provider accepted it.
     pub(in crate::native) dialog_settle: Duration,
 }
 
@@ -450,7 +453,10 @@ pub(super) fn complete_launch(
 ) -> Result<()> {
     complete_launch_with(
         provider::launch_trust(target),
-        || authorized(directory, target),
+        || {
+            require_launch_dialog_live(directory, false)?;
+            authorized(directory, target)
+        },
         || Reader::open_unchecked(directory).manifest(),
         |manifest| {
             let id = manifest.id.clone();
@@ -506,6 +512,24 @@ struct LaunchDialog<'a> {
     manifest: SessionManifest,
 }
 
+fn require_launch_dialog_live(directory: &Path, responded: bool) -> Result<()> {
+    let status = Reader::open_unchecked(directory)
+        .status()
+        .map_err(|error| launch_dialog_error(error, responded))?;
+    if status.state.ended() {
+        let detail = if responded {
+            "after the one workspace trust response; the provider may have taken it as No"
+        } else {
+            "before the workspace trust response"
+        };
+        return Err(launch_dialog_error(
+            format!("the session is {} {detail}", status.state),
+            responded,
+        ));
+    }
+    Ok(())
+}
+
 impl LaunchDialog<'_> {
     fn complete(
         &self,
@@ -523,58 +547,116 @@ impl LaunchDialog<'_> {
             ..
         } = self;
         let (target, deadline) = (*target, *deadline);
-        let _ = self.expected_claim;
-        let _ = provider::launch_trust(target).dialog_settle;
         user_home(env)?;
-        if matches!(
-            provider::workspace_trust(target, &manifest.workspace, env, None)?,
-            Trust::Trusted(_)
-        ) {
-            return Ok(());
-        }
+        let expires_unix_ms = crate::native::session::primitives::unix_ms()
+            + deadline.saturating_duration_since(clock.now()).as_millis();
+        let settle = provider::launch_trust(target).dialog_settle;
+        let mut stable: Option<(String, Instant)> = None;
         let mut responded = false;
-        while clock.now() < deadline {
-            if matches!(
-                provider::workspace_trust(target, &manifest.workspace, env, None)?,
+        loop {
+            require_launch_dialog_live(directory, responded)?;
+            let trusted = matches!(
+                provider::workspace_trust(target, &manifest.workspace, env, None)
+                    .map_err(|error| launch_dialog_error(error, responded))?,
                 Trust::Trusted(_)
-            ) {
+            );
+            require_launch_dialog_live(directory, responded)?;
+            if trusted {
                 if responded {
-                    applied(directory, "provider-workspace-dialog")?;
+                    applied(directory, "provider-workspace-dialog")
+                        .map_err(|error| launch_dialog_error(error, responded))?;
                 }
                 return Ok(());
             }
+            if clock.now() >= deadline {
+                return Err(launch_dialog_error(
+                    "workspace trust was not confirmed before the deadline; inspect workspace_consent and the managed terminal",
+                    responded,
+                ));
+            }
             if !responded {
-                if !authorized_with(directory, target, env)? {
+                if !authorized_with(directory, target, env)
+                    .map_err(|error| launch_dialog_error(error, false))?
+                {
                     bail!(
                         "workspace consent changed before trust dialog response; no response sent"
                     );
                 }
-                let screen = screen()?;
+                let screen = screen().map_err(|error| launch_dialog_error(error, false))?;
+                let observed_at = clock.now();
+                require_launch_dialog_live(directory, false)?;
                 if let Some(key) =
                     provider::workspace_trust_key(target, &screen, &manifest.workspace)
                 {
+                    let since = match &stable {
+                        Some((previous, since)) if previous == &screen => *since,
+                        _ => {
+                            stable = Some((screen.clone(), observed_at));
+                            observed_at
+                        }
+                    };
+                    if observed_at.saturating_duration_since(since) < settle {
+                        let remaining = deadline.saturating_duration_since(clock.now());
+                        clock.sleep(Duration::from_millis(200).min(remaining));
+                        continue;
+                    }
+                    // Observation and provider matching may block. Re-read consent before
+                    // reserving intent; the helper fences the claim at the actual write.
+                    if !authorized_with(directory, target, env)
+                        .map_err(|error| launch_dialog_error(error, false))?
+                    {
+                        bail!(
+                            "workspace consent changed before trust dialog response; no response sent"
+                        );
+                    }
+                    require_launch_dialog_live(directory, false)?;
+                    if clock.now() >= deadline {
+                        continue;
+                    }
                     // Persist intent before the one response. Never retry an input call
                     // that errors: it may already have reached the target dialog.
+                    let mut attempted = false;
                     responded = respond_to_workspace_dialog(
                         directory,
                         session,
                         &terminal::GuardedDialogInput {
                             screen,
                             key,
-                            expected_claim: None,
-                            expires_unix_ms: None,
+                            expected_claim: Some(self.expected_claim.to_owned()),
+                            expires_unix_ms: Some(expires_unix_ms),
                         },
-                        &mut dispatch,
-                    )?;
+                        |input| {
+                            require_launch_dialog_live(directory, false)?;
+                            if clock.now() >= deadline {
+                                bail!("workspace trust response deadline expired before dispatch");
+                            }
+                            attempted = true;
+                            dispatch(input)
+                        },
+                    )
+                    .map_err(|error| launch_dialog_error(error, attempted))?;
+                    if !responded {
+                        // `changed` proves that the helper wrote nothing.
+                        stable = None;
+                    }
+                    require_launch_dialog_live(directory, responded)?;
+                } else {
+                    stable = None;
                 }
             }
             let remaining = deadline.saturating_duration_since(clock.now());
             clock.sleep(Duration::from_millis(200).min(remaining));
         }
-        bail!(
-            "workspace trust was not confirmed before the deadline; inspect workspace_consent and the managed terminal; no input was retried"
-        )
     }
+}
+
+fn launch_dialog_error(error: impl std::fmt::Display, responded: bool) -> anyhow::Error {
+    let evidence = if responded {
+        "possible response; trust unconfirmed; no input was retried"
+    } else {
+        "no response sent"
+    };
+    anyhow::anyhow!("{error:#}; {evidence}")
 }
 
 // What one poll of a trust wait's readiness callback found. A fatal error is the
@@ -999,6 +1081,9 @@ mod tests {
 
     pub(super) fn setup() -> (tempfile::TempDir, PathBuf, Fixture) {
         let temp = tempfile::tempdir().unwrap();
+        RecordStore::at(temp.path())
+            .set_directory_private()
+            .unwrap();
         let root = temp.path().canonicalize().unwrap();
         let workspace = root.join("workspace");
         fs::create_dir(&workspace).unwrap();
@@ -1232,6 +1317,9 @@ mod tests {
     // directory that bears its id.
     pub(super) fn session(workspace: &Path, state: &str) -> (tempfile::TempDir, PathBuf) {
         let root = tempfile::tempdir().unwrap();
+        RecordStore::at(root.path())
+            .set_directory_private()
+            .unwrap();
         let directory = root.path().join("session-trustwait");
         fs::create_dir(&directory).unwrap();
         write_json_atomic(

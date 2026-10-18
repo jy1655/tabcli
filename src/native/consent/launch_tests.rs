@@ -361,6 +361,9 @@ fn launch_dialog_claim_and_original_expiry_reach_real_helper() {
         "native::consent::launch_tests::launch_dialog_claim_and_original_expiry_reach_real_helper";
     if std::env::var_os(CHILD).is_none() {
         let root = tempfile::tempdir().unwrap();
+        RecordStore::at(root.path())
+            .set_directory_private()
+            .unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
             .env(CHILD, "1")
