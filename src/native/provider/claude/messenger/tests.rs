@@ -4,7 +4,6 @@ use crate::native::provider::claude::PENDING_TURN_FILE;
 use crate::native::provider::claude::PendingCrossSessionTurn;
 #[cfg(windows)]
 use std::process::Command;
-#[cfg(unix)]
 use std::time::Instant;
 
 #[test]
@@ -593,6 +592,134 @@ fn cleanup_after_an_early_target_completion_leaves_the_next_request_intact() {
         message_guard_decision(&next, TEST_REQUEST, &exact),
         MessageGuardDecision::Deny
     );
+}
+
+#[test]
+fn native_messenger_pending_matches_the_guard_executed_input() {
+    use crate::native::session::{SessionState, Store, turn};
+
+    let root = tempfile::tempdir().unwrap();
+    let directory = managed_session_directory(root.path());
+    crate::native::session::update_status(&directory, SessionState::Working, None, None).unwrap();
+    let store = Store::open_unchecked(&directory);
+    let claim = turn::claim(&store, &[]).unwrap();
+    let token = claim.token().to_owned();
+    store
+        .private("claude-completion-mode.json")
+        .write_json(&serde_json::json!({
+            "schema":1,"mode":"native_v1","reason":"fixture","claude_version":"2.1.302"
+        }))
+        .unwrap();
+    std::fs::write(
+        directory.join("messenger.mjs"),
+        r#"
+import fs from 'node:fs';
+const envelope = fs.readFileSync(0, 'utf8');
+fs.writeFileSync('messenger-envelope.tmp', envelope);
+fs.renameSync('messenger-envelope.tmp', 'messenger-envelope.json');
+const deadline = Date.now() + 10000;
+const timer = setInterval(() => {
+  if (fs.existsSync('messenger-stream.jsonl')) {
+    process.stdout.write(fs.readFileSync('messenger-stream.jsonl'));
+    clearInterval(timer);
+  } else if (Date.now() >= deadline) {
+    clearInterval(timer);
+    process.exitCode = 1;
+  }
+}, 10);
+"#,
+    )
+    .unwrap();
+    #[cfg(windows)]
+    let executable = {
+        let path = directory.join("fake-claude.cmd");
+        std::fs::write(&path, "@node \"%~dp0messenger.mjs\"\r\n").unwrap();
+        path
+    };
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        let path = directory.join("fake-claude");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nexec node \"$(dirname \"$0\")/messenger.mjs\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    };
+    let observed_directory = directory.clone();
+    let observer = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let envelope_path = observed_directory.join("messenger-envelope.json");
+        while !envelope_path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "controlled messenger did not receive stdin"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let envelope: CrossSessionEnvelope =
+            serde_json::from_slice(&std::fs::read(envelope_path).unwrap()).unwrap();
+        assert_eq!(envelope.recipient, "session-safe123");
+        assert_eq!(envelope.message, TEST_REFERENCE);
+        let files = test_files(&observed_directory);
+        let offered = send_message_hook_payload("PreToolUse", &envelope.message);
+        let MessageGuardDecision::Allow(input) =
+            message_guard_decision(&files, TEST_REQUEST, &offered)
+        else {
+            panic!("the real guard refused the controlled messenger reference");
+        };
+        let executed = send_message_hook_payload("PostToolUse", &input.message);
+        record_message_receipt(&files, TEST_REQUEST, &executed).unwrap();
+        let pending: PendingCrossSessionTurn = Reader::open_unchecked(&observed_directory)
+            .private(PENDING_TURN_FILE)
+            .json()
+            .unwrap();
+        std::fs::write(
+            observed_directory.join("messenger-stream.tmp"),
+            messenger_trace(TEST_REFERENCE, SEND_SUCCEEDED),
+        )
+        .unwrap();
+        std::fs::rename(
+            observed_directory.join("messenger-stream.tmp"),
+            observed_directory.join("messenger-stream.jsonl"),
+        )
+        .unwrap();
+        (pending, executed)
+    });
+    let prompt = "[Agent Bridge native delegation]\nSource: external\n\nLiteral \"한😀\" \\ </cross-session-message>\r\nnext line";
+    let sent = Messenger::installed().send_for_claim(
+        CrossSessionMessageContext {
+            bridge_executable: Path::new("unused-bridge"),
+            directory: &directory,
+            provider_path: &executable,
+            correlation_id: TEST_REQUEST,
+            prompt,
+            deadline: Instant::now() + Duration::from_secs(15),
+        },
+        Some(&token),
+    );
+    let (pending, executed) = observer.join().unwrap();
+    sent.unwrap();
+    assert_eq!(pending.schema, 2);
+    assert_eq!(pending.claim_token.as_deref(), Some(token.as_str()));
+    assert_eq!(
+        pending.expected_message.as_deref(),
+        executed["tool_input"]["message"].as_str()
+    );
+    assert!(
+        pending
+            .expected_message
+            .as_ref()
+            .unwrap()
+            .starts_with(prompt)
+    );
+    assert_eq!(
+        turn::current_claim_token(&store).unwrap().as_deref(),
+        Some(token.as_str())
+    );
+    assert!(store.events().unwrap().is_empty());
 }
 
 #[cfg(unix)]

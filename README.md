@@ -104,10 +104,14 @@ round trip and close are not verified. Choose another terminal for those provide
 
 Codex follow-ups require 0.149.0 or newer; no shared daemon is required. Claude needs working
 cross-session messaging in its installed backend and configuration, not only a recent version.
-New Windows Claude launches and reopens also require stable 2.1.302 or newer and working native
-completion modules.
+New Windows Claude launches and reopens also require stable 2.1.302 or newer and a Bridge
+completion module that Claude loads and that reports readiness.
 See [provider requirements](docs/providers.md) for delivery paths and failure handling.
 
+- [2026-10-19 Windows, Claude native completion owner checks](docs/verification/2026-10-19-windows-249-claude-native-completion.md):
+  ask and tell retained a blocked Stop draft and published the final answer, including marker
+  omission and protected-tag quoting; disabled hooks withheld readiness. The record separates
+  the owner's diagnostic-module probes from unverified configured user command hooks.
 - [2026-10-18 Windows, Codex initial paste evidence (0.4.18)](docs/verification/2026-10-18-windows-124-paste-evidence.md):
   injected Codex launches write the body and the claim marker separately, observe the marker,
   write one guarded Return and settle Sent on the claim binding; three live matrices with the

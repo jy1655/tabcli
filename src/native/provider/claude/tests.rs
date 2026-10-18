@@ -351,7 +351,7 @@ fn mod_regression_fixture(native: bool) -> (tempfile::TempDir, String, serde_jso
         .unwrap();
     if native {
         Store::open_unchecked(directory.path()).private("claude-completion-mode.json").write_json(
-            &serde_json::json!({"schema":1,"mode":"native_v1","reason":"windows_verified_profile","claude_version":"2.1.302"})
+            &serde_json::json!({"schema":1,"mode":"native_v1","reason":"windows_stable_2_1_302_or_newer","claude_version":"2.1.302"})
         ).unwrap();
     }
     (directory, token, start["event"].clone())

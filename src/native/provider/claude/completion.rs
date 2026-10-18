@@ -104,7 +104,7 @@ pub(super) fn prepare(directory: &Path, windows: bool) -> Result<Vec<OsString>> 
             Mode::LegacyStop
         },
         reason: if windows {
-            "windows_verified_profile"
+            "windows_stable_2_1_302_or_newer"
         } else {
             "platform_legacy"
         }
@@ -114,7 +114,7 @@ pub(super) fn prepare(directory: &Path, windows: bool) -> Result<Vec<OsString>> 
     let store = Store::open_unchecked(directory);
     if let Some(existing) = store.private(MODE_FILE).optional_json::<LaunchMode>()? {
         if existing != mode {
-            bail!("Claude completion mode was already selected for this launch");
+            bail!("a different Claude completion mode was already recorded for this launch");
         }
     } else {
         store.private(MODE_FILE).write_json(&mode)?;
@@ -450,7 +450,7 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
         return diagnostic(
             directory,
             event,
-            "No matching Claude turn.start binding was observed for this pending request; input delivered into an already-running turn cannot be correlated",
+            "Claude module event has no matching turn.start binding for the pending request; unrelated turns and input without its own exact start cannot settle it",
         );
     }
     let outcome = if event == "oversize" {

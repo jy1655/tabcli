@@ -19,7 +19,7 @@ async function report($, event, data) {
         if (result.exitCode === 0) return;
       } catch {}
     }
-    $.ui.log("Agent Bridge could not record the Claude completion signal; inspect the pending request before sending again.");
+    $.ui.log(`Agent Bridge could not record Claude ${event}; inspect the session before sending again.`);
   } catch {}
 }
 

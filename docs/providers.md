@@ -275,10 +275,11 @@ interruption completion, and verified follow-up resumption.
 
 Install and sign in to `claude` 2.1.234 or newer. Resolve workspace trust in Claude before launch,
 or use [existing workspace consent](security-and-data.md#workspace-trust-and-consent).
-New native Windows launches and reopens require stable Claude Code 2.1.302 or newer and a
-session-local official completion module. Bridge waits for that module to report readiness
-before sending the initial prompt. Disabled modules, unresolved plugin trust or provider policy
-can withhold readiness; Bridge sends no prompt and never substitutes a Stop hook or terminal input.
+New native Windows launches and reopens require stable Claude Code 2.1.302 or newer and load a
+session-local Bridge completion module through Claude's official `--plugin-dir` flag. Bridge
+waits for that module to report readiness before sending the initial prompt. Disabled hooks
+(`disableAllHooks: true`, verified), unresolved plugin trust or provider policy can withhold
+readiness; Bridge sends no prompt and never substitutes a Stop hook or terminal input.
 
 The macOS initial prompt is a launch argument. On native Windows, Bridge delivers it after launch
 through Claude's official cross-session messaging. Every follow-up uses that messaging path too:
@@ -308,24 +309,35 @@ request, or explicitly close the session if you decide to abandon it.
 
 The messenger model sees a per-request reference, not your follow-up text. A `PreToolUse` hook
 supplies the exact addressed payload through `updatedInput`, and a `PostToolUse` report confirms
-what ran. On new Windows sessions, the official module binds the complete addressed prompt at
-`turn.start` to the current Bridge claim and settles only the matching `turn.complete`.
+what ran. On new Windows sessions, Bridge's completion module forwards Claude's official
+`turn.start` and `turn.complete` events. Bridge binds the complete addressed prompt at
+`turn.start` to the current claim and settles only the matching `turn.complete`.
 Claude can quote protected tags in the peer body by inserting a backslash after `<`;
 the comparison permits only that reversible insertion and admission reserves its wire space.
-User Stop hooks can continue a draft without publishing it. Stored results retain Claude's
-conversation identity and Bridge's request correlation id; the official turn id stays in the
-adapter's binding. A final answer need not repeat the marker, which is stripped only at its suffix.
+If a Stop hook blocks the stop and Claude continues the turn, Bridge publishes nothing until
+the matching `turn.complete`. Stored results retain Claude's conversation identity and Bridge's
+request correlation id; the official turn id stays in the
+adapter's binding. A final answer need not repeat the marker. Bridge removes it only when it
+ends the answer.
 
 An official interrupted, API-error, refused or empty final outcome fails the bound request.
-Malformed or unmatched signals retain the claim with an adapter diagnostic. A message delivered
-into an unrelated running turn without its own exact start cannot be correlated; inspect the
-original request before sending again. Native completion wires are limited to 4 MiB of UTF-8
-JSON. Admission includes framing and escaping overhead; oversized answers fail without truncation.
+Failure does not prove that no work or tools ran. Malformed or unmatched signals retain the
+claim and write the latest rejection reason to `claude-mod-diagnostic.json` in the session
+directory. A message delivered into an unrelated running turn without its own exact start
+cannot be correlated. Combined queued input that differs from the exact addressed frame also
+stays unbound. A retained claim prevents another tell; inspect the result and terminal, then
+close and reopen if you abandon it. These running-turn and combined-input limits follow from
+exact matching and have not been driven live. Native completion wires are limited to 4 MiB of
+UTF-8 JSON. Admission includes framing and escaping overhead; oversized answers fail without truncation.
+See the [2026-10-19 owner verification record](verification/2026-10-19-windows-249-claude-native-completion.md)
+for the live observations and unverified cases.
 
 macOS and existing sessions retain legacy Stop completion, including its limitation when another
 Stop hook continues the turn. Legacy pending requests can finish after a binary upgrade, but new
 Windows tells into those sessions are refused; close and reopen to use native completion.
 Legacy `StopFailure` cannot identify a pending cross-session request and leaves its claim held.
+Do not downgrade the binary or `AGENT_BRIDGE_EXECUTABLE` while native-mode Claude sessions
+remain open; older binaries cannot interpret their completion protocol.
 
 **Other Claude sessions on the same account can send work to your Bridge-launched session.**
 With `--yolo`, that work runs with skipped permission checks. Do not use that combination if you
@@ -346,6 +358,7 @@ and settings; omitting `--yolo` therefore does not prove that bypass is off.
 `cancel` is unsupported in this release's Claude integration. The completion module observes
 interruptions but implements no addressed interruption request. An observed interruption does
 not identify who caused it. Starting a separate resumed process does not cancel the running TUI.
+Support needs an official way to interrupt this running interactive session from outside it.
 
 ## Agy
 
