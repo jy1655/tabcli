@@ -236,7 +236,13 @@ pub(super) fn start(
     };
     // A trust response is separate from model input. Only verified consent and an
     // adapter-recognized exact workspace dialog may produce one guarded response.
-    consent::complete_launch(&created.directory, provider, &terminal_session, deadline)?;
+    consent::complete_launch(
+        &created.directory,
+        provider,
+        &terminal_session,
+        &expected_claim_token,
+        deadline,
+    )?;
     // The existing delivery paths own rollback/uncertainty after confirmed startup.
     initial_claim.startup_confirmed();
     let mut gate = |gate| source.gate(&created.directory, gate, deadline);

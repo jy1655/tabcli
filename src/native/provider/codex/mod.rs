@@ -198,6 +198,7 @@ impl NativeProviderAdapter for CodexAdapter {
             answers_launch_dialog: false,
             bypass_suppresses_dialog: false,
             applied_marker: Some(APPLIED_MARKER),
+            dialog_settle: std::time::Duration::ZERO,
         }
     }
 

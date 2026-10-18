@@ -156,6 +156,7 @@ impl NativeProviderAdapter for ClaudeAdapter {
             // Claude Code 2.1.302 still shows workspace trust under bypass on native Windows (#28).
             bypass_suppresses_dialog: !cfg!(windows),
             applied_marker: None,
+            dialog_settle: std::time::Duration::ZERO,
         }
     }
 

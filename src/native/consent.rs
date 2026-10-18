@@ -51,6 +51,7 @@ pub(in crate::native) struct LaunchTrust {
     pub(in crate::native) answers_launch_dialog: bool,
     pub(in crate::native) bypass_suppresses_dialog: bool,
     pub(in crate::native) applied_marker: Option<&'static str>,
+    pub(in crate::native) dialog_settle: Duration,
 }
 
 // A raw snapshot of the caller's environment variables that locate a provider's home.
@@ -378,6 +379,10 @@ pub(super) fn prepare(directory: &Path, requested: &Path) -> Result<()> {
 }
 
 pub(super) fn authorized(directory: &Path, target: FirstPartyCli) -> Result<bool> {
+    authorized_with(directory, target, &Environment::current())
+}
+
+fn authorized_with(directory: &Path, target: FirstPartyCli, env: &Environment) -> Result<bool> {
     let Some(text) = Reader::open_unchecked(directory)
         .private(SESSION_FILE)
         .text()?
@@ -391,10 +396,9 @@ pub(super) fn authorized(directory: &Path, target: FirstPartyCli) -> Result<bool
     {
         return Ok(false);
     }
-    let env = Environment::current();
-    user_home(&env)?;
+    user_home(env)?;
     if matches!(
-        provider::workspace_trust(target, &assessment.identity.path, &env, None),
+        provider::workspace_trust(target, &assessment.identity.path, env, None),
         Err(_) | Ok(Trust::Declined)
     ) {
         return Ok(false);
@@ -404,7 +408,7 @@ pub(super) fn authorized(directory: &Path, target: FirstPartyCli) -> Result<bool
     let now = assess_with(
         directory.parent().context("session has no state root")?,
         &assessment.identity.path,
-        &env,
+        env,
     )?;
     Ok(now.state == "verified"
         && now.identity == assessment.identity
@@ -425,7 +429,7 @@ fn respond_to_workspace_dialog(
     directory: &Path,
     session: &terminal::TerminalSession,
     input: &terminal::GuardedDialogInput,
-    deadline: Instant,
+    dispatch: impl FnOnce(&terminal::GuardedDialogInput) -> Result<bool>,
 ) -> Result<bool> {
     if !terminal::guards_dialog_input(session.kind) {
         bail!(
@@ -434,20 +438,46 @@ fn respond_to_workspace_dialog(
         );
     }
     applied(directory, "workspace-dialog-response-pending")?;
-    terminal::guarded_dialog_input(directory, session, input, deadline)
+    dispatch(input)
 }
 
 pub(super) fn complete_launch(
     directory: &Path,
     target: FirstPartyCli,
     session: &terminal::TerminalSession,
+    expected_claim: &str,
     deadline: Instant,
 ) -> Result<()> {
     complete_launch_with(
         provider::launch_trust(target),
         || authorized(directory, target),
         || Reader::open_unchecked(directory).manifest(),
-        |manifest| complete_launch_dialog(directory, target, session, deadline, manifest),
+        |manifest| {
+            let id = manifest.id.clone();
+            LaunchDialog {
+                directory,
+                target,
+                session,
+                expected_claim,
+                deadline,
+                manifest,
+            }
+            .complete(
+                &Environment::current(),
+                &mut SystemClock,
+                || {
+                    verify_terminal_surface_ownership_until(
+                        directory,
+                        &id,
+                        session,
+                        deadline,
+                        deadline.saturating_duration_since(Instant::now()),
+                    )?;
+                    terminal::read_screen(session, deadline)
+                },
+                |input| terminal::guarded_dialog_input(directory, session, input, deadline),
+            )
+        },
     )
 }
 
@@ -467,67 +497,84 @@ fn complete_launch_with(
     dialog(manifest)
 }
 
-fn complete_launch_dialog(
-    directory: &Path,
+struct LaunchDialog<'a> {
+    directory: &'a Path,
     target: FirstPartyCli,
-    session: &terminal::TerminalSession,
+    session: &'a terminal::TerminalSession,
+    expected_claim: &'a str,
     deadline: Instant,
     manifest: SessionManifest,
-) -> Result<()> {
-    let env = Environment::current();
-    user_home(&env)?;
-    if matches!(
-        provider::workspace_trust(target, &manifest.workspace, &env, None)?,
-        Trust::Trusted(_)
-    ) {
-        return Ok(());
-    }
-    let mut responded = false;
-    while Instant::now() < deadline {
+}
+
+impl LaunchDialog<'_> {
+    fn complete(
+        &self,
+        env: &Environment,
+        clock: &mut impl Clock,
+        mut screen: impl FnMut() -> Result<String>,
+        mut dispatch: impl FnMut(&terminal::GuardedDialogInput) -> Result<bool>,
+    ) -> Result<()> {
+        let Self {
+            directory,
+            target,
+            session,
+            deadline,
+            manifest,
+            ..
+        } = self;
+        let (target, deadline) = (*target, *deadline);
+        let _ = self.expected_claim;
+        let _ = provider::launch_trust(target).dialog_settle;
+        user_home(env)?;
         if matches!(
-            provider::workspace_trust(target, &manifest.workspace, &env, None)?,
+            provider::workspace_trust(target, &manifest.workspace, env, None)?,
             Trust::Trusted(_)
         ) {
-            if responded {
-                applied(directory, "provider-workspace-dialog")?;
-            }
             return Ok(());
         }
-        if !responded {
-            if !authorized(directory, target)? {
-                bail!("workspace consent changed before trust dialog response; no response sent");
+        let mut responded = false;
+        while clock.now() < deadline {
+            if matches!(
+                provider::workspace_trust(target, &manifest.workspace, env, None)?,
+                Trust::Trusted(_)
+            ) {
+                if responded {
+                    applied(directory, "provider-workspace-dialog")?;
+                }
+                return Ok(());
             }
-            verify_terminal_surface_ownership_until(
-                directory,
-                &manifest.id,
-                session,
-                deadline,
-                deadline.saturating_duration_since(Instant::now()),
-            )?;
-            let screen = terminal::read_screen(session, deadline)?;
-            if let Some(key) = provider::workspace_trust_key(target, &screen, &manifest.workspace) {
-                // Persist intent before the one response. Never retry an input call
-                // that errors: it may already have reached the target dialog.
-                responded = respond_to_workspace_dialog(
-                    directory,
-                    session,
-                    &terminal::GuardedDialogInput {
-                        screen,
-                        key,
-                        expected_claim: None,
-                        expires_unix_ms: None,
-                    },
-                    deadline,
-                )?;
+            if !responded {
+                if !authorized_with(directory, target, env)? {
+                    bail!(
+                        "workspace consent changed before trust dialog response; no response sent"
+                    );
+                }
+                let screen = screen()?;
+                if let Some(key) =
+                    provider::workspace_trust_key(target, &screen, &manifest.workspace)
+                {
+                    // Persist intent before the one response. Never retry an input call
+                    // that errors: it may already have reached the target dialog.
+                    responded = respond_to_workspace_dialog(
+                        directory,
+                        session,
+                        &terminal::GuardedDialogInput {
+                            screen,
+                            key,
+                            expected_claim: None,
+                            expires_unix_ms: None,
+                        },
+                        &mut dispatch,
+                    )?;
+                }
             }
+            let remaining = deadline.saturating_duration_since(clock.now());
+            clock.sleep(Duration::from_millis(200).min(remaining));
         }
-        thread::sleep(
-            Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now())),
-        );
+        bail!(
+            "workspace trust was not confirmed before the deadline; inspect workspace_consent and the managed terminal; no input was retried"
+        )
     }
-    bail!(
-        "workspace trust was not confirmed before the deadline; inspect workspace_consent and the managed terminal; no input was retried"
-    )
 }
 
 // What one poll of a trust wait's readiness callback found. A fatal error is the
@@ -916,6 +963,10 @@ fn windows_sid(sid: windows_sys::Win32::Security::PSID) -> Result<String> {
     result
 }
 
+#[cfg(all(test, windows))]
+#[path = "consent/launch_tests.rs"]
+mod launch_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -946,7 +997,7 @@ mod tests {
         }
     }
 
-    fn setup() -> (tempfile::TempDir, PathBuf, Fixture) {
+    pub(super) fn setup() -> (tempfile::TempDir, PathBuf, Fixture) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let workspace = root.join("workspace");
@@ -985,14 +1036,14 @@ mod tests {
                     screen: "verified dialog".into(),
                     key: terminal::DialogKey::Enter,
                 },
-                Instant::now() + Duration::from_secs(1),
+                |_| panic!("unsupported surface must not dispatch"),
             )
             .unwrap_err();
             assert_eq!(fs::read(&path).unwrap(), before, "{kind:?}: {error:#}");
         }
     }
 
-    fn trust_pi(fixture: &Fixture, workspace: &Path) {
+    pub(super) fn trust_pi(fixture: &Fixture, workspace: &Path) {
         if fixture.pi.exists() {
             fs::remove_file(&fixture.pi).unwrap();
         }
@@ -1179,7 +1230,7 @@ mod tests {
 
     // A session directory in a state root of its own; a manifest is read only from a
     // directory that bears its id.
-    fn session(workspace: &Path, state: &str) -> (tempfile::TempDir, PathBuf) {
+    pub(super) fn session(workspace: &Path, state: &str) -> (tempfile::TempDir, PathBuf) {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("session-trustwait");
         fs::create_dir(&directory).unwrap();
@@ -1200,11 +1251,11 @@ mod tests {
             },
         )
         .unwrap();
-        fs::write(
-            directory.join("status.json"),
+        write_private(
+            &directory.join("status.json"),
             format!(
                 r#"{{"state":"{state}","generation":1,"updated_unix_ms":1,"exit_code":null,"error":null}}"#
-            ),
+            ).as_bytes(),
         )
         .unwrap();
         (root, directory)
@@ -1217,6 +1268,7 @@ mod tests {
                 answers_launch_dialog: false,
                 bypass_suppresses_dialog: false,
                 applied_marker: None,
+                dialog_settle: Duration::ZERO,
             },
             || panic!("authorization"),
             || panic!("manifest"),
@@ -1235,6 +1287,7 @@ mod tests {
                 answers_launch_dialog: true,
                 bypass_suppresses_dialog: true,
                 applied_marker: None,
+                dialog_settle: Duration::ZERO,
             },
             || {
                 order.borrow_mut().push("authorization");
