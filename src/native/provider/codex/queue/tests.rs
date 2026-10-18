@@ -504,22 +504,7 @@ exit 91
     #[cfg(windows)]
     let provider = directory.join("fake-codex.ps1");
     #[cfg(windows)]
-    crate::native::session::primitives::write_private(
-        &provider,
-        br#"if ($args[0] -eq 'app-server') {
-  [IO.File]::WriteAllText((Join-Path $env:AGENT_BRIDGE_NATIVE_SESSION_DIR 'daemon-probed'), '')
-  [Console]::Error.WriteLine('daemon socket is missing')
-  exit 1
-}
-if ($args[0] -eq 'queue') {
-  [IO.File]::WriteAllText((Join-Path $env:AGENT_BRIDGE_NATIVE_SESSION_DIR 'queue-ran'), '')
-  [Console]::WriteLine(('Queued message queued-id for thread {0}.' -f $args[2]))
-  exit 0
-}
-exit 91
-"#,
-    )
-    .unwrap();
+    write_windows_queue_provider(&provider);
     write_queue_manifest(&directory, &provider, "codex-cli 0.160.0");
     write_established_thread(&directory, "018f0000-0000-7000-8000-000000000001");
     let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
@@ -706,5 +691,130 @@ exit 91
     assert!(
         !directory.join("descendant-survived").exists(),
         "a timed-out provider wrapper left a message-delivery descendant running"
+    );
+}
+
+#[cfg(windows)]
+fn write_windows_queue_provider(provider: &Path) {
+    crate::native::session::primitives::write_private(
+        provider,
+        br#"if ($args[0] -eq 'app-server') {
+  [IO.File]::WriteAllText((Join-Path $env:AGENT_BRIDGE_NATIVE_SESSION_DIR 'daemon-probed'), '')
+  [Console]::Error.WriteLine('daemon socket is missing')
+  exit 1
+}
+if ($args[0] -eq 'queue') {
+  [IO.File]::WriteAllText((Join-Path $env:AGENT_BRIDGE_NATIVE_SESSION_DIR 'queue-ran'), '')
+  [Console]::WriteLine(('Queued message queued-id for thread {0}.' -f $args[2]))
+  exit 0
+}
+exit 91
+"#,
+    )
+    .unwrap();
+}
+
+#[cfg(windows)]
+fn check_windows_queue_command_line_boundary(units: usize, refused: bool) {
+    use crate::native::provider_process::windows_command_line_units;
+    use crate::native::session::{SessionState, update_status};
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("session-codexqueue");
+    std::fs::create_dir(&path).unwrap();
+    let directory = path.as_path();
+    let provider = directory.join("fake codex.ps1");
+    write_windows_queue_provider(&provider);
+    write_queue_manifest(directory, &provider, "codex-cli 0.163.0");
+    let thread_id = "018f0000-0000-7000-8000-000000000001";
+    write_established_thread(directory, thread_id);
+    update_status(directory, SessionState::Ready, None, None).unwrap();
+    let (claim, _) =
+        turn::claim_ready(&Store::open_unchecked(directory), "session-codexqueue", &[]).unwrap();
+    let pending = PendingCodexTurn::new(claim.token()).unwrap();
+    let mut prompt = crate::native::native_delegation_prompt("external", "boundary ");
+    let measure = |prompt: &str| {
+        windows_command_line_units(
+            &queue_command(
+                &provider,
+                directory,
+                directory,
+                codex_queue_arguments(thread_id, prompt, &pending),
+            )
+            .unwrap(),
+        )
+    };
+    prompt.push_str(&"x".repeat(units - measure(&prompt)));
+    assert_eq!(measure(&prompt), units);
+    let snapshot = || {
+        let mut records = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let contents = entry
+                    .file_type()
+                    .unwrap()
+                    .is_file()
+                    .then(|| std::fs::read(entry.path()).unwrap());
+                (entry.file_name(), contents)
+            })
+            .collect::<Vec<_>>();
+        records.sort();
+        records
+    };
+    let before = snapshot();
+    let result = send_native_queue_message(
+        CrossSessionMessageContext {
+            bridge_executable: Path::new("unused"),
+            directory,
+            provider_path: &provider,
+            correlation_id: claim.token(),
+            prompt: &prompt,
+            deadline: Instant::now() + Duration::from_secs(10),
+        },
+        &mut SystemClock,
+    );
+    if refused {
+        let failure = result.unwrap_err();
+        assert!(matches!(failure, Outcome::NotSent(_)));
+        let reason = format!("{:#}", outcome_error(&failure));
+        assert!(
+            reason.contains(&format!("measures {units} UTF-16 units")),
+            "{reason}"
+        );
+        assert!(reason.contains("limit is 32767 units"), "{reason}");
+        assert!(reason.contains("Shorten the follow-up"), "{reason}");
+        assert!(reason.contains("by path in the workspace"), "{reason}");
+        assert!(!directory.join("queue-ran").exists());
+        assert!(!directory.join(PENDING_TURN_FILE).exists());
+        assert_eq!(snapshot(), before, "refusal must not write any records");
+        drop(claim);
+        assert_eq!(
+            Reader::open_unchecked(directory).status().unwrap().state,
+            SessionState::Ready
+        );
+        assert!(!directory.join(TURN_CLAIM_FILE).exists());
+    } else {
+        result.unwrap();
+        assert!(directory.join("queue-ran").is_file());
+        assert!(directory.join(PENDING_TURN_FILE).is_file());
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_queue_refuses_at_or_above_command_line_limit_without_records() {
+    use crate::native::provider_process::WINDOWS_COMMAND_LINE_LIMIT;
+    for units in [WINDOWS_COMMAND_LINE_LIMIT, WINDOWS_COMMAND_LINE_LIMIT + 1] {
+        check_windows_queue_command_line_boundary(units, true);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_queue_just_below_command_line_limit_reaches_spawn() {
+    check_windows_queue_command_line_boundary(
+        crate::native::provider_process::WINDOWS_COMMAND_LINE_LIMIT - 1,
+        false,
     );
 }

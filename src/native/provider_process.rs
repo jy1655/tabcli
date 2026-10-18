@@ -313,3 +313,82 @@ pub(in crate::native) fn windows_command_path(path: &Path) -> OsString {
         .strip_prefix(r"\\?\")
         .map_or_else(|| path.as_os_str().to_owned(), OsString::from)
 }
+
+/// First refused length, excluding the terminating NUL (CreateProcessW needs room for it).
+#[cfg(windows)]
+pub(super) const WINDOWS_COMMAND_LINE_LIMIT: usize = 32_767;
+
+/// Length of std's Windows command line, excluding its terminating NUL.
+/// Only for regular arguments with default quoting, as prepared by `command`:
+/// no raw_arg, force_quotes, or direct batch-file launch.
+#[cfg(windows)]
+pub(super) fn windows_command_line_units(command: &Command) -> usize {
+    use std::os::windows::ffi::OsStrExt;
+
+    // std's make_command_line always quotes argv[0], without escaping it.
+    let mut units = command.get_program().encode_wide().count() + 2;
+    for argument in command.get_args() {
+        // Match std's append_arg (Quote::Auto): quotes alone are escaped but
+        // do not require surrounding quotes. Spaces, tabs and empty args do.
+        let quoted = argument.is_empty()
+            || argument
+                .as_encoded_bytes()
+                .iter()
+                .any(|b| matches!(b, b' ' | b'\t'));
+        units += 1 + if quoted { 2 } else { 0 };
+        let mut backslashes = 0;
+        for unit in argument.encode_wide() {
+            units += 1;
+            if unit == u16::from(b'\\') {
+                backslashes += 1;
+            } else {
+                if unit == u16::from(b'"') {
+                    units += backslashes + 1;
+                }
+                backslashes = 0;
+            }
+        }
+        if quoted {
+            units += backslashes;
+        }
+    }
+    units
+}
+
+#[cfg(all(test, windows))]
+mod command_line_tests {
+    use super::*;
+
+    #[test]
+    fn windows_command_line_units_matches_std_quoting() {
+        // Expected serialized arguments, independent of the length calculation.
+        for (argument, serialized) in [
+            ("plain", "plain"),
+            ("two words", "\"two words\""),
+            ("a\tb", "\"a\tb\""),
+            ("", "\"\""),
+            (r#"a"b"#, r#"a\"b"#),
+            (r#"a\\"b"#, r#"a\\\\\"b"#),
+            (r#"a \\"b\"#, r#""a \\\\\"b\\""#),
+            (r"plain\", r"plain\"),
+            ("\u{1f600}", "\u{1f600}"),
+        ] {
+            let mut command = Command::new("tool.exe");
+            command.arg(argument);
+            let expected = format!("\"tool.exe\" {serialized}").encode_utf16().count();
+            assert_eq!(
+                windows_command_line_units(&command),
+                expected,
+                "{argument:?}"
+            );
+        }
+        let mut command = Command::new("C:\\some dir\\\u{1f600}.exe");
+        command.args(["plain", "", "\u{1f600}"]);
+        assert_eq!(
+            windows_command_line_units(&command),
+            "\"C:\\some dir\\\u{1f600}.exe\" plain \"\" \u{1f600}"
+                .encode_utf16()
+                .count()
+        );
+    }
+}

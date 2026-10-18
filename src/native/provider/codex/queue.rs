@@ -96,6 +96,18 @@ pub(super) fn send_native_queue_message<C: Clock>(
     .map_err(|error| {
         queue_unavailable(error.context("failed to prepare the Codex queue command"))
     })?;
+    #[cfg(windows)]
+    {
+        use crate::native::provider_process::{
+            WINDOWS_COMMAND_LINE_LIMIT, windows_command_line_units,
+        };
+        let units = windows_command_line_units(&command);
+        if units >= WINDOWS_COMMAND_LINE_LIMIT {
+            return Err(queue_unavailable(anyhow::anyhow!(
+                "Codex queue command line measures {units} UTF-16 units; the Windows limit is {WINDOWS_COMMAND_LINE_LIMIT} units (command line must be shorter). Shorten the follow-up and pass long material by path in the workspace; nothing was sent"
+            )));
+        }
+    }
     write_pending_turn(context.directory, &pending).map_err(Outcome::NotSent)?;
     let result =
         match run_bounded_command_until(&mut command, context.deadline, "Codex queue", clock) {
