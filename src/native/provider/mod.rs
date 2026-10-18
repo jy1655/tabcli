@@ -37,6 +37,7 @@ pub(super) struct QuestionEmissions {
     pub(super) observation: QuestionObservation,
 }
 
+/// Reads under the Snapshot's lifecycle lock; a snapshot without it gets no question fields.
 pub(super) fn question_emissions(
     reader: &super::session::Reader,
     provider: &str,

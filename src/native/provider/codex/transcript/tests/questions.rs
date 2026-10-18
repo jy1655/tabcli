@@ -1230,17 +1230,23 @@ fn linked_question_record_is_refused_without_reading_or_replacing_its_target() {
     #[cfg(unix)]
     std::os::unix::fs::symlink(&target, &path).unwrap();
     #[cfg(windows)]
-    if let Err(error) = std::os::windows::fs::symlink_file(&target, &path) {
-        assert_eq!(error.raw_os_error(), Some(1314));
-        let target_directory = root.path().join("linked-target");
-        std::fs::create_dir(&target_directory).unwrap();
-        let output = std::process::Command::new("cmd.exe")
-            .args(["/C", "mklink", "/J"])
-            .arg(&path)
-            .arg(&target_directory)
-            .output()
-            .unwrap();
-        assert!(output.status.success());
+    match std::os::windows::fs::symlink_file(&target, &path) {
+        Ok(()) => eprintln!("linked-record coverage: actual file symlink"),
+        Err(error) => {
+            assert_eq!(error.raw_os_error(), Some(1314));
+            eprintln!(
+                "linked-record coverage: directory junction only; file symlink denied (1314)"
+            );
+            let target_directory = root.path().join("linked-target");
+            std::fs::create_dir(&target_directory).unwrap();
+            let output = std::process::Command::new("cmd.exe")
+                .args(["/C", "mklink", "/J"])
+                .arg(&path)
+                .arg(&target_directory)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        }
     }
     assert!(
         std::fs::symlink_metadata(&path)

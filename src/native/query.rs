@@ -579,6 +579,7 @@ fn observe_snapshot_until(
 #[cfg(test)]
 pub(super) use super::session::observe_owner;
 
+/// Ordinary `result --request`, with question fields, outside wait, failure envelopes and the doctor.
 pub(super) fn request_result(reader: &Reader, request_id: &str) -> Result<Value> {
     Ok(observe_snapshot(reader)?
         .observe_result(reader, &Selector::Request(request_id.to_owned()))?

@@ -573,6 +573,8 @@ Read published results without changing records. Exactly one selector is allowed
 default. `--list` prints event rows. With `--json`, it also includes a `requests` array, including
 requests without an event; neither array includes result bodies. `--event` reads an event directly,
 including older events with no receipt. `--request` follows the receipt of that exact request.
+`--wait` defaults to off and requires `--request`; waiting for an unspecified latest turn is
+refused. `--timeout-secs` requires `--wait` and defaults to 900 seconds.
 
 An ordinary single Codex result can include `question_emissions` while the request is still
 `pending`, and retains them after completion or close. Each item has the provider's `id`
@@ -585,19 +587,21 @@ Free-text questions use `options: null`. For example:
 ]}]}
 ```
 
+Only a request that Bridge bound through its injected Codex hooks can have this evidence.
+An unbound request settled through notify cannot have it.
+
 These fields report emission, without changing request state, result text, or exit status.
 `question_observation: "incomplete"` means Bridge retained a limited prefix or rejected
 optional evidence. `"unreadable"` means the retained record could not be validated.
 Absence of either field is unknown; it does not prove that no question existed.
 After the session becomes `ready`, `tell` can carry a known fact as another request. It
 does not resolve the earlier emission. `ask`, `tell`, `wait`, `result --wait`, `result --list`,
-timeline, and context attachments retain their output and waiting behavior. There is no
-question-answer transport or parent wake in this slice.
-`--wait` defaults to off and requires `--request`; waiting for an unspecified latest turn is
-refused. `--timeout-secs` requires `--wait` and defaults to 900 seconds.
+timeline, and context attachments retain their output and waiting behavior. Bridge has no
+transport that answers a question, and an emission does not end `wait` or `result --wait` early.
 
 Human output gives session, request when available, request state, Bridge-observed elapsed time,
-one usage line when the provider reported usage, result text, and error. List rows show event id,
+one usage line when the provider reported usage, each emitted question title and its options
+with control characters escaped, result text, and error. List rows show event id,
 request state, request id or `legacy`, and elapsed time. See the
 [JSON field reference](#json-field-reference).
 

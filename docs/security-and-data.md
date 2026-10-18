@@ -149,11 +149,11 @@ and grant no result, input, or cancellation authority. Close retains them with t
 
 For Codex, `codex-questions-<claim>.json` retains structured question ids, titles, and options,
 Request identity, and an incompleteness flag. The complete serialized record is limited to
-64 KiB. It uses the same private record writer and remains after completion and close until the session records
-are removed. Question strings can contain sensitive data. The record contains no copied
-prompt, transcript, transcript path, timestamps, or tool output. Queries validate it against
-the selected Receipt without opening provider history or writing records. A missing record
-is unknown, and an unreadable record changes no result or delivery authority.
+64 KiB. It uses the same private record writer and remains after completion and close until
+the session records are removed. Question strings can contain sensitive data. The record
+contains no copied prompt, transcript, transcript path, timestamps, or tool output. Queries
+validate it against the selected Receipt without opening provider history or writing records.
+A missing record is unknown, and an unreadable record changes no result or delivery authority.
 
 Bridge reads its own JSON records (`manifest.json`, `status.json`, `closed.json`,
 `turn.completion.json`, `launch.json` and the receipts under `requests/`) through one decoder

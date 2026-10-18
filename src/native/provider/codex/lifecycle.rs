@@ -109,7 +109,7 @@ fn publish_binding(directory: &Path, pending: &PendingCodexTurn, payload: &Value
     })
 }
 
-// Caller holds the lifecycle lock. Both binding and optional publication use this currency.
+// Caller holds the lifecycle lock.
 pub(super) fn current_claim(directory: &Path, token: &str) -> Result<bool> {
     if turn::current_claim_token(&Reader::open_unchecked(directory))?.as_deref() != Some(token) {
         return Ok(false);
