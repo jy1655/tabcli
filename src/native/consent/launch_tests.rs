@@ -363,7 +363,8 @@ fn launch_dialog_confirmed_trust_survives_applied_record_failure() {
         .unwrap_err();
     assert_eq!(calls.get(), 1);
     assert!(matches!(
-        provider::workspace_trust(FirstPartyCli::Claude, &h.workspace, &h.stores.env, None).unwrap(),
+        provider::workspace_trust(FirstPartyCli::Claude, &h.workspace, &h.stores.env, None)
+            .unwrap(),
         Trust::Trusted(_)
     ));
     let detail = format!("{error:#}");

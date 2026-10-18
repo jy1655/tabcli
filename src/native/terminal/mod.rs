@@ -62,6 +62,8 @@ use macos as platform;
 use unsupported as platform;
 #[cfg(target_os = "windows")]
 use windows as platform;
+#[cfg(windows)]
+pub(in crate::native) use windows::StaleDialogClaim;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]

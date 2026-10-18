@@ -563,7 +563,7 @@ impl LaunchDialog<'_> {
             if trusted {
                 if responded {
                     applied(directory, "provider-workspace-dialog")
-                        .map_err(|error| launch_dialog_error(error, responded))?;
+                        .context("provider trust is confirmed; recording the Bridge applied marker failed; no input was retried")?;
                 }
                 return Ok(());
             }
@@ -629,7 +629,11 @@ impl LaunchDialog<'_> {
                             dispatch(input)
                         },
                     )
-                    .map_err(|error| launch_dialog_error(error, attempted))?;
+                    .map_err(|error| {
+                        #[cfg(windows)]
+                        let attempted = attempted && !error.is::<terminal::StaleDialogClaim>();
+                        launch_dialog_error(error, attempted)
+                    })?;
                     if !responded {
                         stable = None;
                     }
