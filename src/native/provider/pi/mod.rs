@@ -84,6 +84,18 @@ fn send_terminal_follow_up(
     prompt_path: &Path,
     deadline: Instant,
 ) -> terminal::TerminalSendResult {
+    send_console_file(session, prompt_path, deadline)
+}
+
+fn send_console_file(
+    session: &terminal::TerminalSession,
+    prompt_path: &Path,
+    deadline: Instant,
+) -> terminal::TerminalSendResult {
+    #[cfg(test)]
+    if let Some(result) = test_support::console_send(prompt_path) {
+        return result;
+    }
     terminal::send_file(session, prompt_path, deadline)
 }
 
@@ -115,6 +127,7 @@ impl Transport for PiInitialPaste {
     }
     fn send(&self, turn: &TurnContext<'_>, _: &Prepared, file: Option<&Path>) -> Outcome {
         send_initial_prompt(
+            turn.directory,
             turn.surface,
             file.expect("surface transport has a prompt file"),
             turn.deadline,
@@ -557,5 +570,7 @@ fn bridge_extension() -> &'static str {
     include_str!("../pi_extension.js")
 }
 
+#[cfg(test)]
+mod input_tests;
 #[cfg(test)]
 mod tests;

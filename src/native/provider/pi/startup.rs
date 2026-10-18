@@ -10,24 +10,22 @@ use std::{path::Path, time::Instant};
 use std::{thread, time::Duration};
 
 pub(super) fn send_initial_prompt(
+    directory: &Path,
     session: &terminal::TerminalSession,
     prompt_path: &Path,
     deadline: Instant,
 ) -> terminal::TerminalSendResult {
     #[cfg(windows)]
     {
-        let directory = session
-            .managed_session_id
-            .as_deref()
-            .context("Pi initial input has no managed session identity")
-            .and_then(Reader::session_directory)
-            .map_err(terminal::TerminalSendFailure::not_sent)?;
-        send_initial_prompt_after_startup(&directory, deadline, || {
-            terminal::send_file(session, prompt_path, deadline)
+        send_initial_prompt_after_startup(directory, deadline, || {
+            super::send_console_file(session, prompt_path, deadline)
         })
     }
     #[cfg(not(windows))]
-    terminal::send_file(session, prompt_path, deadline)
+    {
+        let _ = directory;
+        super::send_console_file(session, prompt_path, deadline)
+    }
 }
 
 #[cfg(any(windows, test))]
