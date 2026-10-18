@@ -782,8 +782,7 @@ fn pinned_footer_variants_and_ambiguous_boundaries() {
 
 // Synthetic pinned shapes supplement the raw a7-screen.txt capture below.
 const PICKER: &str = "  Hooks need review\n\n› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting hooks\n\n  enter confirm · esc skip";
-const TRUST: &str =
-    "  Trust this folder?\n› 1. Trust and continue\n  2. Don't trust\n  enter continue · esc quit";
+const TRUST: &str = "  Folder access\n  C:\\work\\project\n  Trust this folder? Codex can read, edit, and run files here, subject to your permission settings. Folder settings\n  can run code automatically, even without a model request. Continue only if you trust these files. Your trust\n  decision will be saved.\n› 1. Trust and continue\n  2. Quit\n  enter continue · esc quit";
 
 #[test]
 fn dialog_words_in_inline_and_placeholder_drafts_submit() {
@@ -894,4 +893,97 @@ fn real_console_payload_to_helper_seam_fences_late_retirement() {
             claim.retain();
         }
     }
+}
+
+#[test]
+fn addressed_span_keeps_footer_shaped_content_and_exposes_menu_suffixes() {
+    let real_picker: String = serde_json::from_str(include_str!("picker-screen.json")).unwrap();
+    for phrase in [
+        "Review hooks",
+        "Trust this folder?",
+        "Trust and continue",
+        "Trust all and continue",
+    ] {
+        for hint in ["Plan mode", "100% context left"] {
+            for placeholder in [false, true] {
+                for picker in [false, true] {
+                    let (mut io, claim, _) = Fake::new();
+                    let tail = format!("<!-- agent-bridge-codex-turn:{} -->", io.token);
+                    let body = if placeholder {
+                        "x".repeat(1001)
+                    } else {
+                        "Explain these UI labels:".into()
+                    };
+                    let prompt = format!("{body}\n{hint}\n{phrase}\n{tail}");
+                    let shown = if placeholder {
+                        prompt.replacen(&body, "[Pasted Content 1001 chars]", 1)
+                    } else {
+                        prompt.clone()
+                    };
+                    let screen = format!(
+                        "{}{}",
+                        frame(&shown),
+                        if picker { &real_picker } else { "" }
+                    );
+                    io.screens = [screen.clone()].into();
+                    io.fallback = screen.clone();
+                    assert_eq!(io.execute(&prompt).is_ok(), !picker);
+                    assert_eq!(io.calls.contains(&"submit"), !picker);
+                    assert_eq!(
+                        super::classification(Ok(screen), &tail, Path::new(WORKSPACE)),
+                        if picker { "blocked" } else { "populated" }
+                    );
+                    claim.retain();
+                }
+            }
+        }
+    }
+    for suffix in [
+        "› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n\n  enter confirm · esc skip",
+        "› 1. Trust and continue\n  2. Quit\n  enter continue · esc quit",
+    ] {
+        for footer in [false, true] {
+            for placeholder in [false, true] {
+                let (mut io, claim, prompt) = Fake::new();
+                let tail = prompt.rsplit_once('\n').unwrap().1;
+                let shown = if placeholder {
+                    format!("[Pasted Content {} chars]", normalized_count(&prompt))
+                } else {
+                    prompt.clone()
+                };
+                let screen = format!(
+                    "› {}\n{}{}",
+                    shown.replace('\n', "\n  "),
+                    if footer { "  100% context left\n" } else { "" },
+                    suffix
+                );
+                io.screens = [screen.clone()].into();
+                io.fallback = screen.clone();
+                assert!(io.execute(&prompt).is_err());
+                assert!(!io.calls.contains(&"submit"));
+                assert!(
+                    super::classification(Ok(screen), tail, Path::new(WORKSPACE))
+                        .starts_with("ambiguous")
+                );
+                claim.retain();
+            }
+        }
+    }
+    let tail = "<!-- agent-bridge-codex-turn:claim -->";
+    assert_eq!(
+        super::classification(
+            Ok(include_str!("r4-picker-suffix.txt").into()),
+            tail,
+            Path::new(WORKSPACE)
+        ),
+        "ambiguous (unresolved overlay)"
+    );
+    assert_eq!(
+        super::classification(
+            Ok(include_str!("r4-footer-content.txt").into()),
+            tail,
+            Path::new(WORKSPACE)
+        ),
+        "populated"
+    );
 }

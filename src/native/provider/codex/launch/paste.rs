@@ -30,36 +30,39 @@ enum Overlay {
     Ambiguous,
 }
 
+// One addressed span is shared by parsing, overlay recognition and classification.
+// The exact marker outranks footer-shaped content; menu selections are not starts.
+fn composer_span(rows: &[&str], tail: &str, workspace: &Path) -> Option<std::ops::Range<usize>> {
+    let start = rows
+        .iter()
+        .position(|r| r.starts_with("› ") && !selected_option(r))?;
+    let marker = (start..rows.len()).find(|&i| {
+        !tail.is_empty()
+            && rows[i]
+                .strip_prefix("› ")
+                .or_else(|| rows[i].strip_prefix("  "))
+                == Some(tail)
+    });
+    let end = marker
+        .map(|i| i + 1)
+        .or_else(|| (start + 1..rows.len()).find(|&i| footer(rows[i], workspace)))?;
+    Some(start..end)
+}
+fn selected_option(row: &str) -> bool {
+    row.strip_prefix("› ").is_some_and(|text| {
+        text.split_once(". ")
+            .is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+    })
+}
 fn overlay(screen: &str, tail: &str, workspace: &Path) -> Overlay {
-    let mut composer = false;
-    let mut outside: Vec<&str> = Vec::new();
-    for row in screen.lines().map(str::trim_end) {
-        let option = row.trim().trim_start_matches("› ");
-        let menu =
-            (option.starts_with("1. ") || option.starts_with("2. ") || option.starts_with("3. "))
-                && outside
-                    .iter()
-                    .any(|r| *r == "Hooks need review" || r.starts_with("Trust this folder?"));
-        if row.starts_with("› ") && !menu {
-            composer = true;
-        }
-        if composer
-            && (footer(row, workspace)
-                || (menu && row.starts_with("› "))
-                || (!row.is_empty() && !row.starts_with("  ") && !row.starts_with("› ")))
-        {
-            composer = false;
-        }
-        if composer {
-            if !tail.is_empty()
-                && row.strip_prefix("› ").or_else(|| row.strip_prefix("  ")) == Some(tail)
-            {
-                composer = false;
-            }
-            continue;
-        }
-        outside.push(option);
-    }
+    let rows: Vec<_> = screen.lines().map(str::trim_end).collect();
+    let span = composer_span(&rows, tail, workspace);
+    let outside: Vec<_> = rows
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !span.as_ref().is_some_and(|span| span.contains(i)))
+        .map(|(_, row)| row.trim().trim_start_matches("› "))
+        .collect();
     let has = |value: &str| outside.contains(&value);
     let picker = has("Hooks need review")
         && has("1. Review hooks")
@@ -76,7 +79,9 @@ fn overlay(screen: &str, tail: &str, workspace: &Path) -> Overlay {
     if picker || trust {
         return Overlay::Blocked;
     }
-    if outside.iter().any(|r| {
+    if rows.iter().enumerate().any(|(i, row)| {
+        !span.as_ref().is_some_and(|span| span.contains(&i)) && selected_option(row)
+    }) || outside.iter().any(|r| {
         matches!(
             *r,
             "Hooks need review"
@@ -152,22 +157,11 @@ fn composer_segments(
         Overlay::Clear => {}
     }
     let rows: Vec<_> = screen.lines().map(str::trim_end).collect();
-    let start = rows
-        .iter()
-        .position(|r| r.starts_with("› "))
-        .ok_or(Ambiguous("missing prompt row"))?;
-    let marker_end = rows[start..]
-        .iter()
-        .position(|r| {
-            !tail.is_empty() && r.strip_prefix("› ").or_else(|| r.strip_prefix("  ")) == Some(tail)
-        })
-        .map(|i| start + i);
-    let end = marker_end
-        .or_else(|| (start + 1..rows.len()).find(|&i| footer(rows[i], workspace)))
-        .ok_or(Ambiguous("no footer and no marker"))?;
-    let mut contents = vec![rows[start]["› ".len()..].to_owned()];
-    let exclusive_end = if marker_end.is_some() { end + 1 } else { end };
-    for row in &rows[start + 1..exclusive_end] {
+    let span = composer_span(&rows, tail, workspace).ok_or(Ambiguous(
+        "no composer span: missing prompt, footer or marker",
+    ))?;
+    let mut contents = vec![rows[span.start]["› ".len()..].to_owned()];
+    for row in &rows[span.start + 1..span.end] {
         if row.is_empty() {
             contents.push(String::new());
         } else if let Some(text) = row.strip_prefix("  ") {

@@ -1005,22 +1005,20 @@ pub(super) fn console_control(
             Ok(())
         }
         ConsoleControlAction::Dialog { input: path } => {
-            let input: super::GuardedDialogInput = serde_json::from_slice(
-                &crate::native::session::RecordReader::at(&path).raw_bytes()?,
-            )?;
-            println!(
-                "{}",
-                guarded_key_with(&input, &attached_screen()?, |key| {
-                    dispatch_with_claim(
-                        records.directory,
-                        input.expected_claim.as_deref(),
-                        input.expires_unix_ms,
-                        || write_dialog_key(key),
-                    )
-                    .map(|v| v.is_some())
-                })?
-            );
-            Ok(())
+            let payload = crate::native::session::RecordReader::at(&path).raw_bytes()?;
+            dispatch_attached_input(
+                records.directory,
+                &payload,
+                AttachedInput::Dialog,
+                attached_screen,
+                |chunk| {
+                    let handle = open_console_input(GENERIC_WRITE)?;
+                    write_console_chunk(handle.as_raw_handle(), chunk)
+                },
+                || unreachable!("dialog has no drain"),
+                &mut std::io::stdout().lock(),
+                Instant::now,
+            )
         }
         ConsoleControlAction::Send {
             input: path,
@@ -1039,22 +1037,21 @@ pub(super) fn console_control(
             let input = crate::native::session::RecordReader::at(&path)
                 .raw_text()
                 .with_context(|| format!("failed to read prompt payload {}", path.display()))?;
-            let guarded = if submit_count == 0 {
-                Some(
-                    serde_json::from_str::<GuardedTextInput>(&input)
-                        .context("invalid text-only console payload")?,
+            if submit_count == 0 {
+                let handle = open_console_input(GENERIC_READ | GENERIC_WRITE)?;
+                dispatch_attached_input(
+                    records.directory,
+                    input.as_bytes(),
+                    AttachedInput::Text { newline, deadline },
+                    attached_screen,
+                    |chunk| write_console_chunk(handle.as_raw_handle(), chunk),
+                    || console_pending_count(handle.as_raw_handle()),
+                    &mut std::io::stdout().lock(),
+                    Instant::now,
                 )
             } else {
-                None
-            };
-            write_console_input(
-                guarded.as_ref().map_or(input.as_str(), |v| v.text.as_str()),
-                submit_count,
-                newline,
-                deadline,
-                records.directory,
-                guarded.as_ref(),
-            )
+                write_console_input(&input, submit_count, newline, deadline)
+            }
         }
         ConsoleControlAction::Window { .. } => loop {
             if let Some(window) = focus::attached_console_host_window() {
@@ -1289,12 +1286,80 @@ fn guarded_key_with(
     }
 }
 
-fn write_dialog_key(key: super::DialogKey) -> Result<()> {
+enum AttachedInput {
+    Dialog,
+    Text {
+        newline: ConsoleNewline,
+        deadline: Instant,
+    },
+}
+
+// Shared post-attachment dispatch. Tests replace only screen and console operations.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_attached_input(
+    directory: &Path,
+    payload: &[u8],
+    action: AttachedInput,
+    screen: impl FnOnce() -> Result<String>,
+    mut write: impl FnMut(&[INPUT_RECORD]) -> Result<u32>,
+    pending: impl FnMut() -> Result<u32>,
+    output: &mut impl std::io::Write,
+    now: impl FnMut() -> Instant,
+) -> Result<()> {
+    match action {
+        AttachedInput::Dialog => {
+            let input: super::GuardedDialogInput = serde_json::from_slice(payload)?;
+            let outcome = guarded_key_with(&input, &screen()?, |key| {
+                dispatch_with_claim(
+                    directory,
+                    input.expected_claim.as_deref(),
+                    input.expires_unix_ms,
+                    || {
+                        let records = build_dialog_records(key);
+                        check_written_count(write(&records)?, records.len())
+                    },
+                )
+                .map(|v| v.is_some())
+            })?;
+            writeln!(output, "{outcome}")?;
+            Ok(())
+        }
+        AttachedInput::Text { newline, deadline } => {
+            let input: GuardedTextInput =
+                serde_json::from_slice(payload).context("invalid text-only console payload")?;
+            let mut attempted = false;
+            write_text_only_with(
+                &input.text,
+                newline,
+                deadline,
+                |chunk| {
+                    guarded_text_write_with(
+                        &mut attempted,
+                        |write| {
+                            dispatch_with_claim(
+                                directory,
+                                input.expected_claim.as_deref(),
+                                input.expires_unix_ms,
+                                write,
+                            )
+                        },
+                        || write(chunk),
+                    )
+                },
+                pending,
+                output,
+                now,
+            )
+        }
+    }
+}
+
+fn open_console_input(access: u32) -> Result<OwnedHandle> {
     let name: Vec<u16> = "CONIN$".encode_utf16().chain(Some(0)).collect();
     let raw = unsafe {
         CreateFileW(
             name.as_ptr(),
-            GENERIC_WRITE,
+            access,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             std::ptr::null(),
             OPEN_EXISTING,
@@ -1305,8 +1370,7 @@ fn write_dialog_key(key: super::DialogKey) -> Result<()> {
     if raw == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error().into());
     }
-    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
-    write_input_records(handle.as_raw_handle(), &build_dialog_records(key))
+    Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
 }
 
 fn build_dialog_records(key: super::DialogKey) -> Vec<INPUT_RECORD> {
@@ -1498,8 +1562,6 @@ fn write_console_input(
     submit_count: usize,
     newline: ConsoleNewline,
     deadline: Instant,
-    directory: &Path,
-    guard: Option<&GuardedTextInput>,
 ) -> Result<()> {
     let console_name = "CONIN$\0".encode_utf16().collect::<Vec<_>>();
     let handle = unsafe {
@@ -1518,31 +1580,6 @@ fn write_console_input(
             .context("failed to open managed Windows console input");
     }
     let result = (|| {
-        if submit_count == 0 {
-            let mut attempted = false;
-            return write_text_only_with(
-                input,
-                newline,
-                deadline,
-                |chunk| {
-                    guarded_text_write_with(
-                        &mut attempted,
-                        |write| {
-                            dispatch_with_claim(
-                                directory,
-                                guard.and_then(|v| v.expected_claim.as_deref()),
-                                guard.and_then(|v| v.expires_unix_ms),
-                                write,
-                            )
-                        },
-                        || write_console_chunk(handle, chunk),
-                    )
-                },
-                || console_pending_count(handle),
-                &mut std::io::stdout().lock(),
-                Instant::now,
-            );
-        }
         let first_submit =
             super::windows_budget::windows_console_immediate_submit_count(submit_count);
         if Instant::now() >= deadline {

@@ -1288,84 +1288,48 @@ pub(super) fn helper_output(
                     _ => unreachable!(),
                 }
             }
-            let mut records = 0;
-            let result = if action == "dialog" {
-                let mut input: terminal::GuardedDialogInput =
-                    serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(input.expected_claim.as_deref(), Some(token.as_str()));
-                assert!(input.expires_unix_ms.is_some());
-                if stale && state.change == "expired" {
-                    input.expires_unix_ms = Some(0);
-                }
-                super::guarded_key_with(&input, &state.screen, |key| {
-                    super::dispatch_with_claim(
-                        &state.directory,
-                        input.expected_claim.as_deref(),
-                        input.expires_unix_ms,
-                        || {
-                            assert!(
-                                Store::open_unchecked(&state.directory)
-                                    .try_lock()?
-                                    .is_none()
-                            );
-                            records += super::build_dialog_records(key).len();
-                            Ok(())
-                        },
-                    )
-                    .map(|v| v.is_some())
-                })
-                .map(|outcome| {
-                    assert_eq!(outcome, "stale");
-                    stdout = outcome.as_bytes().to_vec();
-                })
+            let mut payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(payload["expected_claim"], token);
+            assert!(payload["expires_unix_ms"].is_number());
+            if stale && state.change == "expired" {
+                payload["expires_unix_ms"] = 0.into();
+            }
+            let fixed_now = Instant::now();
+            let action = if action == "dialog" {
+                super::AttachedInput::Dialog
             } else {
                 assert_eq!(args.last(), Some(&"0"));
-                let mut input: super::GuardedTextInput = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(input.expected_claim.as_deref(), Some(token.as_str()));
-                assert!(input.expires_unix_ms.is_some());
-                if stale && state.change == "expired" {
-                    input.expires_unix_ms = Some(0);
+                super::AttachedInput::Text {
+                    newline: super::ConsoleNewline::ShiftReturn,
+                    deadline: fixed_now + Duration::from_secs(5),
                 }
-                let mut attempted = false;
-                super::write_text_only_with(
-                    &input.text,
-                    super::ConsoleNewline::ShiftReturn,
-                    Instant::now() + Duration::from_secs(5),
-                    |chunk| {
-                        super::guarded_text_write_with(
-                            &mut attempted,
-                            |write| {
-                                super::dispatch_with_claim(
-                                    &state.directory,
-                                    input.expected_claim.as_deref(),
-                                    input.expires_unix_ms,
-                                    write,
-                                )
-                            },
-                            || {
-                                assert!(
-                                    Store::open_unchecked(&state.directory)
-                                        .try_lock()?
-                                        .is_none()
-                                );
-                                records += chunk.len();
-                                Ok(chunk.len() as u32)
-                            },
-                        )
-                    },
-                    || {
-                        assert!(
-                            Store::open_unchecked(&state.directory)
-                                .try_lock()
-                                .unwrap()
-                                .is_some()
-                        );
-                        Ok(0)
-                    },
-                    &mut stdout,
-                    Instant::now,
-                )
             };
+            let mut records = 0;
+            let result = super::dispatch_attached_input(
+                &state.directory,
+                &serde_json::to_vec(&payload).unwrap(),
+                action,
+                || Ok(state.screen.clone()),
+                |chunk| {
+                    assert!(
+                        Store::open_unchecked(&state.directory)
+                            .try_lock()?
+                            .is_none()
+                    );
+                    records += chunk.len();
+                    Ok(chunk.len() as u32)
+                },
+                || {
+                    assert!(
+                        Store::open_unchecked(&state.directory)
+                            .try_lock()?
+                            .is_some()
+                    );
+                    Ok(0)
+                },
+                &mut stdout,
+                || fixed_now,
+            );
             if stale {
                 assert_eq!(records, 0, "stale helper must write zero input records");
                 state.refused = true;
@@ -1431,4 +1395,102 @@ fn stale_guard_after_first_chunk_is_never_not_sent() {
         )
     );
     assert!(error.to_string().contains("after input dispatch"));
+}
+
+#[test]
+fn attached_dispatch_holds_claim_until_write_returns() {
+    use crate::native::session::{SessionState, Store, turn, update_status};
+    use std::sync::mpsc;
+    for dialog in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("events")).unwrap();
+        update_status(root.path(), SessionState::Working, None, None).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(root.path()), &[]).unwrap();
+        let payload = if dialog {
+            serde_json::to_vec(&terminal::GuardedDialogInput {
+                screen: "draft".into(),
+                key: terminal::DialogKey::Enter,
+                expected_claim: Some(claim.token().into()),
+                expires_unix_ms: None,
+            })
+            .unwrap()
+        } else {
+            serde_json::to_vec(&super::GuardedTextInput {
+                text: "body".into(),
+                expected_claim: Some(claim.token().into()),
+                expires_unix_ms: None,
+            })
+            .unwrap()
+        };
+        let now = Instant::now();
+        let action = || {
+            if dialog {
+                super::AttachedInput::Dialog
+            } else {
+                super::AttachedInput::Text {
+                    newline: super::ConsoleNewline::ShiftReturn,
+                    deadline: now + Duration::from_secs(1),
+                }
+            }
+        };
+        let (start_tx, start_rx) = mpsc::channel();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let directory = root.path().to_owned();
+        let contender = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            let store = Store::open_unchecked(&directory);
+            assert!(store.try_lock().unwrap().is_none());
+            blocked_tx.send(()).unwrap();
+            let _lock = store.lock().unwrap();
+            fs::remove_file(directory.join("turn.claim")).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        let mut writes = 0;
+        let mut output = Vec::new();
+        super::dispatch_attached_input(
+            root.path(),
+            &payload,
+            action(),
+            || Ok("draft".into()),
+            |chunk| {
+                writes += 1;
+                start_tx.send(()).unwrap();
+                blocked_rx.recv().unwrap();
+                assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+                Ok(chunk.len() as u32)
+            },
+            || Ok(0),
+            &mut output,
+            || now,
+        )
+        .unwrap();
+        contender.join().unwrap();
+        done_rx.recv().unwrap();
+        assert_eq!(writes, 1);
+        // Retirement won before the next dispatch: the shared wiring must refuse it.
+        output.clear();
+        let result = super::dispatch_attached_input(
+            root.path(),
+            &payload,
+            action(),
+            || Ok("draft".into()),
+            |_| panic!("retired claim reached writer"),
+            || Ok(0),
+            &mut output,
+            || now,
+        );
+        if dialog {
+            result.unwrap();
+            assert_eq!(output, b"stale\n");
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("stale before any input")
+            );
+        }
+        claim.retain();
+    }
 }

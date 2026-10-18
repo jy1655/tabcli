@@ -98,7 +98,10 @@ counts and visible inline scalars (physical rows joined with LF) to equal the fr
 Codex-normalized scalar count. This fallback is cardinality only, not a content receipt; wrapping, clipping,
 scrolling and literal placeholder collisions can make it ambiguous or misleading.
 Structural title, option and hint rows identify a dialog or hook picker and veto success;
-phrases within recognized composer content do not. Unresolved overlay rows remain ambiguous.
+one addressed composer span is excluded from that evidence. The span ends at the exact marker,
+or, without a marker, at the first recognized footer. Footer-shaped rows before the marker
+remain content. Selected menu options outside that span cannot start another composer;
+title-clipped option/hint layouts remain ambiguous.
 Bridge then requests one guarded Return: the helper compares the entire accepted screen and
 writes no Return if it changed. Injected text and Return helpers also check the addressed claim,
 session status and original expiry under the lifecycle lock immediately at dispatch. This assumes no
