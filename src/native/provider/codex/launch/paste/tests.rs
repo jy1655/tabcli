@@ -745,6 +745,10 @@ fn confirmation_fragments_alone_anywhere_refuse_return() {
 fn chord_and_bare_action_fragments_alone_anywhere_refuse_return() {
     for hint in [
         "ctrl+x a confirm · ctrl+x s skip",
+        "ctrl+pgup confirm · alt+pgdn skip",
+        "pgup confirm · pgdn skip",
+        "pgup confirm",
+        "pgdn skip",
         "enter confirm · ctrl+x s skip",
         "ctrl+x s skip",
         "a confirm · ctrl+x s skip",

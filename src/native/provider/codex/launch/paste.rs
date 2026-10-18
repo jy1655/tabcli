@@ -97,6 +97,8 @@ fn confirmation_hint(text: &str) -> bool {
                     | "end"
                     | "pageup"
                     | "pagedown"
+                    | "pgup"
+                    | "pgdn"
                     | "up"
                     | "down"
                     | "left"
