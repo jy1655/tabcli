@@ -1,4 +1,4 @@
-//! Claim-addressed lifecycle evidence. Only an unbound notify can settle in R2.
+//! Claim-addressed lifecycle evidence. Bound claims settle through the transcript observer.
 use super::correlation::{begins_with_bridge_prompt, valid_codex_thread_id};
 use super::{
     PendingCodexTurn, codex_input_correlates, codex_string, established_codex_thread,
@@ -16,14 +16,14 @@ const CANDIDATE_PREFIX: &str = "codex-candidate-";
 const NOTIFY_PREFIX: &str = "codex-notify-";
 const DIAGNOSTIC_PREFIX: &str = "codex-binding-conflict-";
 
-#[derive(Debug, Deserialize, Serialize)]
-struct Binding {
-    schema: u32,
-    claim_token: String,
-    thread_id: String,
-    turn_id: String,
-    transcript_path: String,
-    bound_unix_ms: u128,
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(super) struct Binding {
+    pub(super) schema: u32,
+    pub(super) claim_token: String,
+    pub(super) thread_id: String,
+    pub(super) turn_id: String,
+    pub(super) transcript_path: String,
+    pub(super) bound_unix_ms: u128,
 }
 
 fn record_name(prefix: &str, token: &str) -> Result<String> {
@@ -33,7 +33,7 @@ fn record_name(prefix: &str, token: &str) -> Result<String> {
     Ok(format!("{prefix}{token}.json"))
 }
 
-fn read_binding(directory: &Path, token: &str) -> Result<Option<Binding>> {
+pub(super) fn read_binding(directory: &Path, token: &str) -> Result<Option<Binding>> {
     let name = record_name(BINDING_PREFIX, token)?;
     let binding = Reader::open_unchecked(directory)
         .private(&name)
@@ -171,8 +171,8 @@ pub(super) fn record_notify(
         return Ok(false);
     };
     // Binding is written at turn start, notify arrives at turn end: route selection
-    // does not depend on a scheduling race. Bound claims stay pending until the R3
-    // transcript watcher lands; there is deliberately no timer or notify fallback.
+    // does not depend on a scheduling race. Bound claims are settled by the
+    // transcript watcher; there is deliberately no timer or notify fallback.
     if codex_string(payload, "thread-id") == Some(&binding.thread_id)
         && codex_string(payload, "turn-id") == Some(&binding.turn_id)
     {

@@ -1,10 +1,9 @@
 use super::*;
 
-// The watcher of a plan whose completion arrives through the hook alone: starting it on a
-// directory that does not exist succeeds, stopping it succeeds, and the directory is left
-// as it was, so nothing ran.
-fn assert_no_op_watcher(watcher: Box<dyn crate::native::provider::CompletionWatcher>) {
-    assert_eq!(format!("{watcher:?}"), "NoWatcher");
+// The session watcher waits without a Claim or binding. Starting and stopping on an
+// absent session directory must leave it absent and publish no observation records.
+fn assert_idle_watcher(watcher: Box<dyn crate::native::provider::CompletionWatcher>) {
+    assert_eq!(format!("{watcher:?}"), "Watcher");
     let root = tempfile::tempdir().unwrap();
     let absent = root.path().join("absent-session");
     let active = watcher.start(&absent).unwrap();
@@ -446,7 +445,7 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                             },
                             "{label}"
                         );
-                        assert_no_op_watcher(plan.watcher);
+                        assert_idle_watcher(plan.watcher);
                         assert!(plan.environment_removals.is_empty(), "{label}");
                         let observed = crate::native::consent::observe(&directory);
                         if consent {

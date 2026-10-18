@@ -7,6 +7,7 @@ mod queue;
 mod runner;
 #[cfg(test)]
 mod test_support;
+mod transcript;
 use self::correlation::{
     codex_input_correlates, codex_owned_string, codex_string, correlated_prompt,
     correlated_response, established_codex_thread,
@@ -16,7 +17,7 @@ use self::launch::{codex_launch_arguments, send_initial_prompt, workspace_trust_
 use self::queue::send_native_queue_message;
 use super::{
     CrossSessionMessageContext, InitialPromptDisposition, LaunchContext, LaunchPlan,
-    NativeProviderAdapter, NoWatcher, ReopenSupport,
+    NativeProviderAdapter, ReopenSupport,
 };
 use crate::native::delivery::{
     self, Outcome, Prepared, Readiness, SurfaceInput, Transport, TransportFacts, TurnContext,
@@ -452,7 +453,7 @@ fn prepare_launch_for_platform(
         initial_prompt: InitialPromptDisposition::of(
             initial_transport_for_platform(windows).as_ref(),
         ),
-        watcher: Box::new(NoWatcher),
+        watcher: Box::new(transcript::Watcher),
         environment_removals: &[],
     })
 }
