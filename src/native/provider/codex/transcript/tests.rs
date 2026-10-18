@@ -4,6 +4,7 @@ use crate::native::provider::{CompletionWatcher, NativeProviderAdapter};
 use crate::native::session::{Reader, SessionState, Store, turn, update_status};
 use serde_json::{Value, json};
 use std::{io::Write, path::Path};
+mod questions;
 const THREAD: &str = "01234567-89ab-cdef-0123-456789abcdef";
 fn fixture() -> (tempfile::TempDir, PendingCodexTurn, Value) {
     let root = tempfile::tempdir().unwrap();
