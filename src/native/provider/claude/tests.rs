@@ -303,6 +303,24 @@ fn the_claude_home_has_two_defaults_and_one_override_for_both_paths() {
 
 use super::*;
 
+fn launch_preflight(directory: &Path) {
+    Store::open_unchecked(directory)
+        .write_manifest(&crate::native::session::schema::SessionManifest {
+            schema: 1,
+            id: directory.file_name().unwrap().to_str().unwrap().into(),
+            provider: "claude".into(),
+            provider_path: "claude".into(),
+            provider_version: "2.1.302 (Claude Code)".into(),
+            workspace: directory.into(),
+            title: "Claude launch fixture".into(),
+            model: None,
+            effort: None,
+            yolo: true,
+            created_unix_ms: 1,
+        })
+        .unwrap();
+}
+
 const MOD_CONVERSATION: &str = "00000000-0000-4000-8000-000000000249";
 const MOD_REQUEST: &str = "claude-turn-1000000000000000000-10000-1";
 
@@ -619,6 +637,7 @@ fn managed_launch_name_is_the_known_unique_session_id() {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("session-safe123");
     std::fs::create_dir(&directory).unwrap();
+    launch_preflight(&directory);
     let plan = ADAPTER
         .prepare_launch(LaunchContext {
             bridge_executable: Path::new("/opt/agent-bridge"),
@@ -671,6 +690,13 @@ fn managed_launch_drops_inherited_claude_code_session_markers() {
     let directory = root.path().join("session-safe123");
     std::fs::create_dir(&directory).unwrap();
     for windows in [false, true] {
+        let directory = directory.join(if windows {
+            "session-windows"
+        } else {
+            "session-macos"
+        });
+        std::fs::create_dir(&directory).unwrap();
+        launch_preflight(&directory);
         let plan = prepare_launch_for_platform(
             LaunchContext {
                 bridge_executable: Path::new("/opt/agent-bridge"),
@@ -762,6 +788,7 @@ fn windows_launch_keeps_large_initial_prompts_out_of_argv() {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("session-large123");
     std::fs::create_dir(&directory).unwrap();
+    launch_preflight(&directory);
     let prompt = "x".repeat(64 * 1024);
     let plan = prepare_launch_for_platform(
         LaunchContext {
@@ -992,6 +1019,7 @@ fn resume_plan_uses_the_official_resume_with_private_settings_and_managed_name_o
     let root = tempfile::tempdir().unwrap();
     let session = root.path().join("session-reopenplan");
     std::fs::create_dir(&session).unwrap();
+    launch_preflight(&session);
     let plan = prepare_resume_for_platform(
         ResumeContext {
             bridge_executable: Path::new("/opt/agent-bridge"),
@@ -1014,6 +1042,8 @@ fn resume_plan_uses_the_official_resume_with_private_settings_and_managed_name_o
             settings_path.clone().into_os_string(),
             OsString::from("--name"),
             OsString::from("session-reopenplan"),
+            OsString::from("--plugin-dir"),
+            session.join("claude-mod").into_os_string(),
         ]
     );
     assert_no_op_watcher(plan.watcher);
@@ -1034,8 +1064,7 @@ fn resume_plan_uses_the_official_resume_with_private_settings_and_managed_name_o
     let settings: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
     assert_eq!(settings["crossSessionInbound"], "accept");
-    assert!(settings["hooks"]["Stop"].is_array());
-    assert!(settings["hooks"]["StopFailure"].is_array());
+    assert!(settings.get("hooks").is_none());
 }
 
 #[test]
@@ -1165,14 +1194,19 @@ fn claude_policy(yolo: bool, model: Option<&str>, effort: Option<&str>) -> Vec<O
 // policy, private settings, managed name, and the prompt last off Windows only.
 #[test]
 fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
-    let root = tempfile::tempdir().unwrap();
-    let directory = root.path().join("session-safe123");
-    std::fs::create_dir(&directory).unwrap();
-    let settings_path = directory.join("claude-settings.json");
     for windows in [false, true] {
         for yolo in [false, true] {
             for (model, mapped) in [(None, None), (Some("Fable5"), Some("Fable"))] {
                 for effort in [None, Some("high")] {
+                    let root = tempfile::tempdir().unwrap();
+                    let directory = root.path().join(if windows {
+                        "session-windows"
+                    } else {
+                        "session-macos"
+                    });
+                    std::fs::create_dir(&directory).unwrap();
+                    launch_preflight(&directory);
+                    let settings_path = directory.join("claude-settings.json");
                     let _ = std::fs::remove_file(&settings_path);
                     let plan = prepare_launch_for_platform(
                         LaunchContext {
@@ -1195,8 +1229,18 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                         OsString::from("--settings"),
                         settings_path.clone().into_os_string(),
                         OsString::from("--name"),
-                        OsString::from("session-safe123"),
+                        OsString::from(if windows {
+                            "session-windows"
+                        } else {
+                            "session-macos"
+                        }),
                     ]);
+                    if windows {
+                        expected.extend([
+                            OsString::from("--plugin-dir"),
+                            directory.join("claude-mod").into_os_string(),
+                        ]);
+                    }
                     if !windows {
                         expected.push(OsString::from("claude prompt"));
                     }
@@ -1216,10 +1260,15 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
                         serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap())
                             .unwrap();
                     assert_eq!(settings["crossSessionInbound"], "accept", "{label}");
-                    assert_eq!(
-                        settings["hooks"]["Stop"][0]["hooks"][0]["command"], "/opt/agent-bridge",
-                        "{label}"
-                    );
+                    if windows {
+                        assert!(settings.get("hooks").is_none(), "{label}");
+                    } else {
+                        assert_eq!(
+                            settings["hooks"]["Stop"][0]["hooks"][0]["command"],
+                            "/opt/agent-bridge",
+                            "{label}"
+                        );
+                    }
                 }
             }
         }
@@ -1230,13 +1279,14 @@ fn launch_plan_is_the_complete_command_for_every_policy_and_platform() {
 // resume arguments and never a prompt; the reopened session awaits delivery.
 #[test]
 fn resume_plan_is_the_complete_command_for_every_policy() {
-    let root = tempfile::tempdir().unwrap();
-    let session = root.path().join("session-reopenplan");
-    std::fs::create_dir(&session).unwrap();
-    let settings_path = session.join("claude-settings.json");
     for yolo in [false, true] {
         for (model, mapped) in [(None, None), (Some("Fable5"), Some("Fable"))] {
             for effort in [None, Some("max")] {
+                let root = tempfile::tempdir().unwrap();
+                let session = root.path().join("session-reopenplan");
+                std::fs::create_dir(&session).unwrap();
+                launch_preflight(&session);
+                let settings_path = session.join("claude-settings.json");
                 let plan = prepare_resume_for_platform(
                     ResumeContext {
                         bridge_executable: Path::new("/opt/agent-bridge"),
@@ -1258,6 +1308,8 @@ fn resume_plan_is_the_complete_command_for_every_policy() {
                     settings_path.clone().into_os_string(),
                     OsString::from("--name"),
                     OsString::from("session-reopenplan"),
+                    OsString::from("--plugin-dir"),
+                    session.join("claude-mod").into_os_string(),
                 ]);
                 assert_eq!(plan.arguments, expected, "{label}");
                 assert_eq!(

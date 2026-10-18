@@ -617,14 +617,17 @@ fn cross_session_process_never_receives_the_payload() {
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     Messenger::installed()
-        .send(CrossSessionMessageContext {
-            bridge_executable: Path::new("/opt/agent-bridge"),
-            directory: &directory,
-            provider_path: &executable,
-            correlation_id: "claude-turn-safe123",
-            prompt: "follow-up secret",
-            deadline: Instant::now() + Duration::from_secs(10),
-        })
+        .send_for_claim(
+            CrossSessionMessageContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &directory,
+                provider_path: &executable,
+                correlation_id: "claude-turn-safe123",
+                prompt: "follow-up secret",
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
+            None,
+        )
         .unwrap();
 
     let arguments = std::fs::read_to_string(directory.join("argv.txt")).unwrap();
@@ -674,14 +677,17 @@ fn messenger_failure_without_send_is_known_not_delivered() {
         },
     };
     let error = messenger
-        .send(CrossSessionMessageContext {
-            bridge_executable: Path::new("/opt/agent-bridge"),
-            directory: &directory,
-            provider_path: &executable,
-            correlation_id: "claude-turn-safe123",
-            prompt: "follow-up secret",
-            deadline: Instant::now() + Duration::from_secs(10),
-        })
+        .send_for_claim(
+            CrossSessionMessageContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &directory,
+                provider_path: &executable,
+                correlation_id: "claude-turn-safe123",
+                prompt: "follow-up secret",
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
+            None,
+        )
         .unwrap_err();
 
     assert!(!error.delivery_may_have_occurred());
@@ -705,14 +711,17 @@ fn expired_cross_session_deadline_never_starts_the_messenger() {
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     let error = Messenger::installed()
-        .send(CrossSessionMessageContext {
-            bridge_executable: Path::new("/opt/agent-bridge"),
-            directory: &directory,
-            provider_path: &executable,
-            correlation_id: "claude-turn-safe123",
-            prompt: "follow-up secret",
-            deadline: Instant::now(),
-        })
+        .send_for_claim(
+            CrossSessionMessageContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &directory,
+                provider_path: &executable,
+                correlation_id: "claude-turn-safe123",
+                prompt: "follow-up secret",
+                deadline: Instant::now(),
+            },
+            None,
+        )
         .unwrap_err();
 
     assert!(!error.delivery_may_have_occurred());
@@ -814,14 +823,17 @@ fn messenger_timeout_terminates_descendants_before_they_can_act_late() {
         retry: RetryPolicy::installed(),
     };
     let error = messenger
-        .send(CrossSessionMessageContext {
-            bridge_executable: Path::new("/opt/agent-bridge"),
-            directory: &directory,
-            provider_path: &executable,
-            correlation_id: "claude-turn-safe123",
-            prompt: "follow-up secret",
-            deadline,
-        })
+        .send_for_claim(
+            CrossSessionMessageContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &directory,
+                provider_path: &executable,
+                correlation_id: "claude-turn-safe123",
+                prompt: "follow-up secret",
+                deadline,
+            },
+            None,
+        )
         .unwrap_err();
 
     assert!(error.delivery_may_have_occurred());
@@ -923,14 +935,17 @@ fn messenger_retries_only_a_proven_pre_send_discovery_miss() {
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     Messenger::installed()
-        .send(CrossSessionMessageContext {
-            bridge_executable: Path::new("/opt/agent-bridge"),
-            directory: &directory,
-            provider_path: &executable,
-            correlation_id: "claude-turn-safe123",
-            prompt: "follow-up secret",
-            deadline: Instant::now() + Duration::from_secs(10),
-        })
+        .send_for_claim(
+            CrossSessionMessageContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &directory,
+                provider_path: &executable,
+                correlation_id: "claude-turn-safe123",
+                prompt: "follow-up secret",
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
+            None,
+        )
         .unwrap();
 
     assert_eq!(
@@ -975,14 +990,17 @@ fn messenger_retry_window_starts_at_the_first_proven_discovery_miss() {
         },
     };
     messenger
-        .send(CrossSessionMessageContext {
-            bridge_executable: Path::new("/opt/agent-bridge"),
-            directory: &directory,
-            provider_path: &executable,
-            correlation_id: "claude-turn-safe123",
-            prompt: "follow-up secret",
-            deadline: Instant::now() + Duration::from_secs(2),
-        })
+        .send_for_claim(
+            CrossSessionMessageContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &directory,
+                provider_path: &executable,
+                correlation_id: "claude-turn-safe123",
+                prompt: "follow-up secret",
+                deadline: Instant::now() + Duration::from_secs(2),
+            },
+            None,
+        )
         .unwrap();
 
     assert_eq!(
@@ -1025,14 +1043,17 @@ fn only_a_send_reported_as_blocked_is_retried_and_released() {
             },
         };
         let error = messenger
-            .send(CrossSessionMessageContext {
-                bridge_executable: Path::new("/opt/agent-bridge"),
-                directory: &directory,
-                provider_path: &executable,
-                correlation_id: TEST_REQUEST,
-                prompt: "follow-up secret",
-                deadline: Instant::now() + Duration::from_secs(10),
-            })
+            .send_for_claim(
+                CrossSessionMessageContext {
+                    bridge_executable: Path::new("/opt/agent-bridge"),
+                    directory: &directory,
+                    provider_path: &executable,
+                    correlation_id: TEST_REQUEST,
+                    prompt: "follow-up secret",
+                    deadline: Instant::now() + Duration::from_secs(10),
+                },
+                None,
+            )
             .unwrap_err();
 
         let attempts = std::fs::read_to_string(directory.join("attempts")).unwrap();
@@ -1071,14 +1092,17 @@ fn successful_messenger_trace_without_send_is_not_classified_as_delivered() {
         },
     };
     let error = messenger
-        .send(CrossSessionMessageContext {
-            bridge_executable: Path::new("/opt/agent-bridge"),
-            directory: &directory,
-            provider_path: &executable,
-            correlation_id: "claude-turn-safe123",
-            prompt: "follow-up secret",
-            deadline: Instant::now() + Duration::from_secs(10),
-        })
+        .send_for_claim(
+            CrossSessionMessageContext {
+                bridge_executable: Path::new("/opt/agent-bridge"),
+                directory: &directory,
+                provider_path: &executable,
+                correlation_id: "claude-turn-safe123",
+                prompt: "follow-up secret",
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
+            None,
+        )
         .unwrap_err();
 
     assert!(!error.delivery_may_have_occurred());

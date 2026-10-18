@@ -275,6 +275,10 @@ interruption completion, and verified follow-up resumption.
 
 Install and sign in to `claude` 2.1.234 or newer. Resolve workspace trust in Claude before launch,
 or use [existing workspace consent](security-and-data.md#workspace-trust-and-consent).
+New native Windows launches and reopens require stable Claude Code 2.1.302 or newer and a
+session-local official completion module. Bridge waits for that module to report readiness
+before sending the initial prompt. Disabled modules, unresolved plugin trust or provider policy
+can withhold readiness; Bridge sends no prompt and never substitutes a Stop hook or terminal input.
 
 The macOS initial prompt is a launch argument. On native Windows, Bridge delivers it after launch
 through Claude's official cross-session messaging. Every follow-up uses that messaging path too:
@@ -304,14 +308,22 @@ request, or explicitly close the session if you decide to abandon it.
 
 The messenger model sees a per-request reference, not your follow-up text. A `PreToolUse` hook
 supplies the exact addressed payload through `updatedInput`, and a `PostToolUse` report confirms
-what ran. Claude's `Stop` hook reports the finished result. Cross-session turns carry a
-per-request marker, while an argument-delivered initial turn has its own hook path. Stored
-results retain Claude's conversation identity.
+what ran. On new Windows sessions, the official module binds the complete addressed prompt at
+`turn.start` to the current Bridge claim and settles only the matching `turn.complete`.
+User Stop hooks can continue a draft without publishing it. Stored results retain Claude's
+conversation identity and Bridge's request correlation id; the official turn id stays in the
+adapter's binding. A final answer need not repeat the marker, which is stripped only at its suffix.
 
-Bridge records `StopFailure` for an argument-delivered initial turn. For a pending cross-session
-turn, it cannot identify which request failed and leaves the claim held. This affects every
-follow-up and the Windows initial prompt. Inspect the original request; do not resend it merely
-because Claude reported an error.
+An official interrupted, API-error, refused or empty final outcome fails the bound request.
+Malformed or unmatched signals retain the claim with an adapter diagnostic. A message delivered
+into an unrelated running turn without its own exact start cannot be correlated; inspect the
+original request before sending again. Native completion wires are limited to 4 MiB of UTF-8
+JSON. Admission includes framing and escaping overhead; oversized answers fail without truncation.
+
+macOS and existing sessions retain legacy Stop completion, including its limitation when another
+Stop hook continues the turn. Legacy pending requests can finish after a binary upgrade, but new
+Windows tells into those sessions are refused; close and reopen to use native completion.
+Legacy `StopFailure` cannot identify a pending cross-session request and leaves its claim held.
 
 **Other Claude sessions on the same account can send work to your Bridge-launched session.**
 With `--yolo`, that work runs with skipped permission checks. Do not use that combination if you
@@ -329,11 +341,9 @@ effort, or bypass option from the closed source. Claude applies its own
 [resume rules](https://code.claude.com/docs/en/sessions#what-a-resumed-session-restores)
 and settings; omitting `--yolo` therefore does not prove that bypass is off.
 
-`cancel` is unsupported in this release's Claude integration. The 2.1.296 investigation
-found no documented interrupt operation in `SendMessage`, nor a way for SDK `interrupt()`
-to attach to this running TUI. User interruption does not fire `Stop`. Support needs an
-official addressed interrupt for the existing interactive session and a turn-correlated
-completion signal; starting a separate resumed process does not supply either.
+`cancel` is unsupported in this release's Claude integration. The completion module observes
+interruptions but implements no addressed interruption request. An observed interruption does
+not identify who caused it. Starting a separate resumed process does not cancel the running TUI.
 
 ## Agy
 

@@ -52,6 +52,31 @@ launch, observe, continue, and close without replacing the capabilities those CL
 - Use the official `ListAgents` and `SendMessage` path on every supported Agent Bridge
   platform. Do not restore the removed native-Windows `--print --resume` supervisor or
   silently fall back to terminal input when official messaging is unavailable.
+- New native Windows launches and reopens select `native_v1` completion before spawn from
+  the recorded stable Claude version, at least 2.1.302, and load a session-local official
+  module. Actual `session.start` readiness is required before input; a version or plugin
+  flag is no proof that the module ran. Missing readiness refuses delivery without a
+  Stop fallback or a provider trust/policy override. macOS keeps legacy completion.
+- Native completion observes only main-loop `turn.start` and `turn.complete`. Bind the
+  whole expected message inside one anchored peer envelope to the live claim under the
+  lifecycle lock, then keep that binding immutable. Compare start/completion conversation
+  and turn identities with each other, not the startup conversation, which `/clear` may
+  change. The official turn id stays adapter-private; core `turn_id` must remain the
+  Bridge correlation id because delivery waits for it. Replace envelope matching when
+  official SendMessage returns an addressed target-turn identity.
+- Classic Stop and StopFailure never settle a native-mode claim: another user's Stop hook
+  can continue the draft. Publish only a bound official final, stripping the exact marker
+  only at its suffix; marker absence is allowed. Malformed or unmatched signals retain
+  the claim with diagnosis. Input injected into an unrelated running turn without its
+  own exact start remains unbound. A 4 MiB UTF-8 JSON limit covers native wires; admission
+  counts escaping and bounded peer-header overhead, and an oversized final fails without
+  truncation. This route adds no cancellation API or usage mapping.
+- An absent completion-mode record is a pre-upgrade legacy session, never upgraded from
+  version inference. Its pending Stop completion remains readable, but new Windows tells
+  are refused with close/reopen recovery. Pending cleanup checks its request id under the
+  lifecycle lock so an older sender cannot delete a successor's record. The module reports
+  through existing native-hook stdin and core Report; at most one identical helper-wire
+  repeat is allowed after transport failure, never another SendMessage.
 - Do not emulate Claude result correlation with a generic message hash. Identical valid
   responses can occur in separate turns; correlation must use Claude-owned identity or a
   provider-specific protocol with an explicit replacement boundary.

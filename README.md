@@ -104,6 +104,8 @@ round trip and close are not verified. Choose another terminal for those provide
 
 Codex follow-ups require 0.149.0 or newer; no shared daemon is required. Claude needs working
 cross-session messaging in its installed backend and configuration, not only a recent version.
+New Windows Claude launches and reopens also require stable 2.1.302 or newer and working native
+completion modules.
 See [provider requirements](docs/providers.md) for delivery paths and failure handling.
 
 - [2026-10-18 Windows, Codex initial paste evidence (0.4.18)](docs/verification/2026-10-18-windows-124-paste-evidence.md):
