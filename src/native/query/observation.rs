@@ -359,6 +359,15 @@ impl Observation {
                     .map(|observed| active_value(&observed))
             }
         });
+        let focus = if records.claim.is_some() {
+            records.active_receipt()
+        } else {
+            latest.as_ref().ok().and_then(|observed| observed.receipt)
+        };
+        if Instant::now() >= deadline {
+            bail!("status time budget exhausted");
+        }
+        let questions = focus.and_then(|receipt| question_emissions(reader, &records, receipt));
         let latest = latest.map(|observed| {
             observed.event.as_ref().map_or(Value::Null, |event| {
                 json!({
@@ -382,6 +391,7 @@ impl Observation {
             observation,
             active,
             latest,
+            questions,
         }))
     }
 
@@ -420,6 +430,7 @@ pub(super) struct StatusObservation {
     pub(super) observation: Observation,
     pub(super) active: Option<Result<Value>>,
     pub(super) latest: Result<Value>,
+    pub(super) questions: Option<QuestionEmissions>,
 }
 
 #[cfg(test)]

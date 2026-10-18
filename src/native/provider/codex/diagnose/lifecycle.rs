@@ -123,7 +123,10 @@ fn sidecar(reader: &Reader, prefix: &str, token: &str) -> Value {
 }
 
 fn terminal(reader: &Reader, receipt: &requests::Receipt) -> Result<Value> {
-    let result = crate::native::query::request_result(reader, &receipt.request_id)?;
+    let result = crate::native::query::observe_snapshot(reader)?.result(
+        reader,
+        &crate::native::query::Selector::Request(receipt.request_id.clone()),
+    )?;
     if !matches!(
         result["request_state"].as_str(),
         Some("completed" | "failed" | "cancelled")

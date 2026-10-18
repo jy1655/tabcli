@@ -64,7 +64,9 @@ pub(super) fn finish_request_with_extra(
         if json {
             let mut value = Reader::session_directory(session)
                 .and_then(|directory| {
-                    query::request_result(&Reader::open_unchecked(&directory), request_id)
+                    let reader = Reader::open_unchecked(&directory);
+                    query::observe_snapshot(&reader)?
+                        .result(&reader, &query::Selector::Request(request_id.to_owned()))
                 })
                 .unwrap_or_else(|_| {
                     serde_json::json!({

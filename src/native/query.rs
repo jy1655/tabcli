@@ -3,6 +3,7 @@ use super::args::{
     WorkspaceScope, option_value, parse_timeout, set_flag_once, set_once, workspace_scope,
 };
 use super::envelope;
+use super::provider::{self, QuestionEmissions, QuestionObservation};
 use super::{DEFAULT_TIMEOUT_SECS, NativeCommand, consent, terminal};
 use crate::native::reopen::read_resumed_from;
 use crate::native::session::SessionState;
@@ -199,6 +200,20 @@ struct RequestObservation<'a> {
 }
 
 impl RequestObservation<'_> {
+    fn value_with_questions(&self, reader: &Reader) -> Value {
+        let mut value = self.value();
+        if let Some(questions) = self
+            .receipt
+            .and_then(|receipt| question_emissions(reader, self.snapshot, receipt))
+        {
+            if !questions.items.is_empty() {
+                value["question_emissions"] = json!(questions.items);
+            }
+            question_observation(&mut value, &questions);
+        }
+        value
+    }
+
     fn value(&self) -> Value {
         let snapshot = self.snapshot;
         let event = self.event.as_ref();
@@ -565,7 +580,35 @@ fn observe_snapshot_until(
 pub(super) use super::session::observe_owner;
 
 pub(super) fn request_result(reader: &Reader, request_id: &str) -> Result<Value> {
-    observe_snapshot(reader)?.result(reader, &Selector::Request(request_id.to_owned()))
+    Ok(observe_snapshot(reader)?
+        .observe_result(reader, &Selector::Request(request_id.to_owned()))?
+        .value_with_questions(reader))
+}
+
+fn question_emissions(
+    reader: &Reader,
+    snapshot: &Snapshot,
+    receipt: &requests::Receipt,
+) -> Option<QuestionEmissions> {
+    provider::question_emissions(
+        reader,
+        &snapshot.manifest.provider,
+        snapshot._lock.is_some(),
+        receipt,
+    )
+}
+
+fn question_observation(value: &mut Value, questions: &QuestionEmissions) {
+    if questions.observation != QuestionObservation::Complete {
+        value["question_observation"] = json!(questions.observation);
+    }
+}
+
+fn question_presence(value: &mut Value, questions: &QuestionEmissions) {
+    if !questions.items.is_empty() {
+        value["question_emitted"] = json!(true);
+    }
+    question_observation(value, questions);
 }
 
 fn print_result(value: &Value, json: bool) -> Result<()> {
@@ -582,6 +625,9 @@ fn print_result(value: &Value, json: bool) -> Result<()> {
         if let Some(usage) = usage_text(value) {
             println!("{usage}");
         }
+        for line in question_lines(value) {
+            println!("{line}");
+        }
         if let Some(message) = value["result"].as_str() {
             println!("\n{}", terminal_safe_text(message, true));
         }
@@ -590,6 +636,35 @@ fn print_result(value: &Value, json: bool) -> Result<()> {
         }
         Ok(())
     })
+}
+
+fn question_lines(value: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    for item in value["question_emissions"].as_array().into_iter().flatten() {
+        for question in item["questions"].as_array().into_iter().flatten() {
+            if let Some(title) = question["title"].as_str() {
+                lines.push(format!(
+                    "question emitted: {}",
+                    terminal_safe_text(title, true)
+                ));
+            }
+            for option in question["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                lines.push(format!("  {}", terminal_safe_text(option, true)));
+            }
+        }
+    }
+    if let Some(observation) = value["question_observation"].as_str() {
+        lines.push(format!(
+            "question observation: {}",
+            terminal_safe_text(observation, false)
+        ));
+    }
+    lines
 }
 
 fn correct_unsuccessful_result(value: &mut Value) {
@@ -670,6 +745,9 @@ pub(super) fn result_value_in(root: &Path, request: &ResultRequest) -> Result<Va
     let directory = Reader::session_directory_in(root, &request.id)?;
     checked_deadline_from(Instant::now(), request.timeout)?;
     let reader = Reader::open_unchecked(&directory);
+    if let Selector::Request(id) = &request.selector {
+        return request_result(&reader, id);
+    }
     let snapshot = observe_snapshot(&reader)?;
     if matches!(request.selector, Selector::List) {
         let mut events = Vec::new();
@@ -699,7 +777,9 @@ pub(super) fn result_value_in(root: &Path, request: &ResultRequest) -> Result<Va
                         "unreadable_requests": snapshot.unreadable_requests, "request_index_error": snapshot.request_index_error}).as_object().unwrap().clone()),
         );
     }
-    Ok(snapshot.observe_result(&reader, &request.selector)?.value())
+    Ok(snapshot
+        .observe_result(&reader, &request.selector)?
+        .value_with_questions(&reader))
 }
 
 pub(super) fn run_inspect(
@@ -1511,6 +1591,27 @@ mod elapsed_tests {
                 &json!({"bridge_observed_elapsed_ms": null, "bridge_observed_elapsed_reason": "missing_receipt"})
             ),
             "Bridge observed elapsed: not computable (missing_receipt)"
+        );
+    }
+
+    #[test]
+    fn human_question_output_escapes_controls_and_preserves_unicode_and_options() {
+        let value = json!({"question_emissions":[{"id":"example","questions":[
+            {"title":"한국어😀\u{1b}]52;clipboard", "options":["One\u{7}","Two"]}
+        ]}],"question_observation":"incomplete"});
+        assert_eq!(
+            question_lines(&value),
+            [
+                "question emitted: 한국어😀\\u{1b}]52;clipboard",
+                "  One\\u{7}",
+                "  Two",
+                "question observation: incomplete"
+            ]
+        );
+        assert!(question_lines(&json!({})).is_empty());
+        assert_eq!(
+            value["question_emissions"][0]["questions"][0]["options"][0],
+            "One\u{7}"
         );
     }
 }

@@ -341,6 +341,23 @@ launch, observe, continue, and close without replacing the capabilities those CL
   provides a terminal lifecycle event that carries the answer, delivers notify through
   stdin, or lets a TUI launched with overrides attach to the daemon (the embedded app
   server is in-process, so no external client can observe `turn/completed`).
+- The same Cursor observes question emissions only from the bound turn's completed
+  `AgentMessage` with `delivery: async` and validated structured questions, after accepted
+  framed input. Raw calls, tool output and prose supply no emission evidence. Optional
+  turn attribution that is absent, malformed or different is ignored during byte-zero
+  replay; an attributable item's malformed optional content marks incompleteness without
+  suspending completion. One private `codex-questions-<claim>.json` holds a semantically
+  immutable prefix within 64 KiB, including its full pretty encoding and Request identity.
+  Replay preserves prior items and monotone incompleteness. Publication checks the same
+  locked Claim/status/pending predicate as binding plus exact Binding equality; failure
+  never changes completion, and there is no backfill after Claim release. Queries use the
+  selected historical Receipt under their existing lock. Ordinary single `result` shows
+  content; status focuses its active Receipt or existing latest Result's Receipt; ordinary
+  inspect shows per-request presence. Wait, list, timeline, attachments and completion
+  records retain their contracts. Emitted never means pending or answered, absence is
+  unknown, and a later `tell` is another Request, not resolution. Tool availability depends
+  on model/configuration and retained history. Replace this provider-owned transcript
+  fallback when the same managed TUI has an official addressed question event or lifecycle.
 - Live on native Windows, 2026-10-18, codex-cli 0.163.0
   (`docs/verification/2026-10-18-windows-127-codex-lifecycle-hooks.md`): bound claims settled
   from `task_complete` with and without a notify record (a 25,463-character prompt with a

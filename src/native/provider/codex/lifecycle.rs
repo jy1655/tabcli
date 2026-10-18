@@ -61,23 +61,7 @@ pub(super) fn bind(directory: &Path, payload: &Value) -> Result<()> {
 fn publish_binding(directory: &Path, pending: &PendingCodexTurn, payload: &Value) -> Result<()> {
     let store = Store::open_unchecked(directory);
     let _lock = store.lock()?;
-    if turn::current_claim_token(&Reader::open_unchecked(directory))?.as_deref()
-        != Some(&pending.claim_token)
-    {
-        return Ok(());
-    }
-    if !matches!(
-        Reader::open_unchecked(directory).status()?.state,
-        crate::native::session::SessionState::Running
-            | crate::native::session::SessionState::Working
-            | crate::native::session::SessionState::ResumePending
-    ) {
-        return Ok(());
-    }
-    let Some(current_pending) = read_pending_turn(directory)? else {
-        return Ok(());
-    };
-    if current_pending.claim_token != pending.claim_token {
+    if !current_claim(directory, &pending.claim_token)? {
         return Ok(());
     }
     let (Some(prompt), Some(thread_id), Some(turn_id), Some(transcript_path)) = (
@@ -123,6 +107,25 @@ fn publish_binding(directory: &Path, pending: &PendingCodexTurn, payload: &Value
         transcript_path: transcript_path.into(),
         bound_unix_ms: unix_ms(),
     })
+}
+
+// Caller holds the lifecycle lock. Both binding and optional publication use this currency.
+pub(super) fn current_claim(directory: &Path, token: &str) -> Result<bool> {
+    if turn::current_claim_token(&Reader::open_unchecked(directory))?.as_deref() != Some(token) {
+        return Ok(false);
+    }
+    if !matches!(
+        Reader::open_unchecked(directory).status()?.state,
+        crate::native::session::SessionState::Running
+            | crate::native::session::SessionState::Working
+            | crate::native::session::SessionState::ResumePending
+    ) {
+        return Ok(false);
+    }
+    let Some(current_pending) = read_pending_turn(directory)? else {
+        return Ok(false);
+    };
+    Ok(current_pending.claim_token == token)
 }
 
 pub(super) fn stop(directory: &Path, payload: &Value) -> Result<()> {

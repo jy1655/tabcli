@@ -74,13 +74,17 @@ pub(super) fn value(
                 Ok(event) => observed_elapsed(Some(receipt), event.as_ref()),
                 Err(_) => (None, Some("unreadable_result")),
             };
-            json!({
+            let mut value = json!({
                 "request_id": receipt.request_id, "created_unix_ms": receipt.created_unix_ms, "source": receipt.source,
                 "event_id": receipt.event_file, "context_sources": receipt.context_sources,
                 "active": snapshot.is_active(receipt),
                 "bridge_observed_elapsed_ms": elapsed,
                 "bridge_observed_elapsed_reason": elapsed_reason,
-            })
+            });
+            if let Some(questions) = question_emissions(reader, snapshot, receipt) {
+                question_presence(&mut value, &questions);
+            }
+            value
         })
         .collect::<Vec<_>>();
     let mut value = envelope::ok(json!({

@@ -88,6 +88,13 @@ The act of putting a prompt in front of the provider. Its outcome is sent, not s
 uncertain; an uncertain delivery is never retried blindly.
 _Avoid_: send, submit, paste (these name transports, not the act)
 
+**Question emission**:
+Request-scoped evidence that a provider emitted a structured question, retained independently
+of a Result or Close without implying a pending question or an answer.
+Emissions can be incomplete, absence is unknown, and a later Follow-up creates another
+Request without resolving an earlier emission.
+_Avoid_: needs input, unanswered, waiting for an answer
+
 **Transport**:
 The provider-chosen way to deliver an initial prompt or follow-up, including the evidence
 needed before input and whether a failed attempt is known not sent or uncertain.
