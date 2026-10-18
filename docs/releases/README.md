@@ -6,6 +6,7 @@ Older notes retain their own requirements and limitations; use the
 [providers](../providers.md) and [terminals](../terminals.md) pages for current behavior.
 Each note separates live checks from automated tests.
 
+- [0.4.20](0.4.20.md) (2026-10-19): Requires Pi-owned receipts for native Windows input delivery (#254); exposes historical Codex question emissions in ordinary result, status, and inspect queries (#189)
 - [0.4.19](0.4.19.md) (2026-10-19): Recovers a Windows Claude reopen reservation after a proven launch failure (#248, #257); transfers genuine exact-workspace consent through Claude's Windows trust dialog under yolo with one guarded response (#28, #258)
 - [0.4.18](0.4.18.md) (2026-10-18): Replaces the timed Windows console paste of a Codex initial prompt for injected launches with an evidence-based protocol: body and claim marker written separately, the rendered marker as completion evidence, one guarded Return under the lifecycle lock, Sent on the claim binding, structural dialog and picker recognition with documented refusals (#124, #255)
 - [0.4.17](0.4.17.md) (2026-10-18): Moves Codex completion onto Codex 0.163.0's lifecycle hooks and the rollout's terminal record, which closes the stranded Windows completion above the command-line limit (#127, #250), with a Windows composer gate for the hook-review picker, `doctor` lifecycle evidence and `--probe` hook-trust comparison, and `settings codex-lifecycle-hooks`; refuses a Windows queue follow-up whose command line would reach the process limit before anything is sent (#251, #252)
