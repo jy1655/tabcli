@@ -23,15 +23,81 @@ enum Segment {
 #[derive(Debug)]
 struct Ambiguous(&'static str);
 
-fn blocked(screen: &str) -> bool {
-    [
-        "Trust this folder?",
-        "Trust and continue",
-        "Review hooks",
-        "Trust all and continue",
-    ]
-    .iter()
-    .any(|text| screen.contains(text))
+#[derive(PartialEq)]
+enum Overlay {
+    Clear,
+    Blocked,
+    Ambiguous,
+}
+
+fn overlay(screen: &str, tail: &str, workspace: &Path) -> Overlay {
+    let mut composer = false;
+    let mut outside: Vec<&str> = Vec::new();
+    for row in screen.lines().map(str::trim_end) {
+        let option = row.trim().trim_start_matches("› ");
+        let menu =
+            (option.starts_with("1. ") || option.starts_with("2. ") || option.starts_with("3. "))
+                && outside
+                    .iter()
+                    .any(|r| *r == "Hooks need review" || r.starts_with("Trust this folder?"));
+        if row.starts_with("› ") && !menu {
+            composer = true;
+        }
+        if composer
+            && (footer(row, workspace)
+                || (menu && row.starts_with("› "))
+                || (!row.is_empty() && !row.starts_with("  ") && !row.starts_with("› ")))
+        {
+            composer = false;
+        }
+        if composer {
+            if !tail.is_empty()
+                && row.strip_prefix("› ").or_else(|| row.strip_prefix("  ")) == Some(tail)
+            {
+                composer = false;
+            }
+            continue;
+        }
+        outside.push(option);
+    }
+    let has = |value: &str| outside.contains(&value);
+    let picker = has("Hooks need review")
+        && has("1. Review hooks")
+        && has("2. Trust all and continue")
+        && outside
+            .iter()
+            .any(|r| r.starts_with("3. Continue without trusting"))
+        && has("enter confirm · esc skip");
+    let trust = outside
+        .iter()
+        .any(|r| *r == "Trust this folder?" || r.starts_with("Trust this folder? Codex "))
+        && has("1. Trust and continue")
+        && (has("2. Don't trust") || has("2. Quit"));
+    if picker || trust {
+        return Overlay::Blocked;
+    }
+    if outside.iter().any(|r| {
+        matches!(
+            *r,
+            "Hooks need review"
+                | "Trust this folder?"
+                | "Review hooks"
+                | "Trust and continue"
+                | "Trust all and continue"
+                | "2. Don't trust"
+                | "2. Quit"
+                | "enter confirm · esc skip"
+                | "enter continue · esc quit"
+        ) || r.starts_with("Trust this folder? Codex ")
+            || r.starts_with("1. Review hooks")
+            || r.starts_with("1. Trust and continue")
+            || r.starts_with("2. Trust all and continue")
+            || r.starts_with("3. Continue without trusting")
+    }) {
+        Overlay::Ambiguous
+    } else {
+        Overlay::Clear
+    }
 }
 
 // rust-v0.163.0 footer.rs: left_side_line, footer_from_props_lines,
@@ -80,8 +146,10 @@ fn composer_segments(
     tail: &str,
     workspace: &Path,
 ) -> std::result::Result<Vec<Segment>, Ambiguous> {
-    if blocked(screen) {
-        return Err(Ambiguous("blocked"));
+    match overlay(screen, tail, workspace) {
+        Overlay::Blocked => return Err(Ambiguous("blocked")),
+        Overlay::Ambiguous => return Err(Ambiguous("unresolved overlay")),
+        Overlay::Clear => {}
     }
     let rows: Vec<_> = screen.lines().map(str::trim_end).collect();
     let start = rows
@@ -251,7 +319,7 @@ fn applied(
                 bail!("unreadable composer: {e}");
             }
         };
-        if blocked(&screen) {
+        if overlay(&screen, tail, workspace) == Overlay::Blocked {
             bail!("blocked composer: dialog or hook-review picker; no further input");
         }
         let parsed = composer_segments(&screen, tail, workspace);
@@ -277,7 +345,7 @@ fn applied(
 fn classification(screen: Result<String>, tail: &str, workspace: &Path) -> String {
     match screen {
         Err(error) => format!("unreadable ({error})"),
-        Ok(screen) if blocked(&screen) => "blocked".into(),
+        Ok(screen) if overlay(&screen, tail, workspace) == Overlay::Blocked => "blocked".into(),
         Ok(screen) => match composer_segments(&screen, tail, workspace) {
             Ok(segments) if segments == [Segment::Inline("Ask Codex to do anything".into())] => {
                 "positively empty".into()
@@ -358,6 +426,61 @@ fn run(
     result.map_err(|error| Failure::delivery_uncertain(anyhow::anyhow!("{error:#}. {RECOVERY}")))
 }
 
+struct Console<'a> {
+    session: &'a terminal::TerminalSession,
+    directory: &'a Path,
+    claim: &'a str,
+    deadline: Instant,
+}
+impl Input for Console<'_> {
+    fn now(&mut self) -> Instant {
+        Instant::now()
+    }
+    fn sleep(&mut self, duration: Duration) {
+        SystemClock.sleep(duration);
+    }
+    fn current(&mut self) -> Result<()> {
+        let reader = Reader::open_unchecked(self.directory);
+        if turn::current_claim_token(&reader)?.as_deref() != Some(self.claim) {
+            bail!("Codex claim changed");
+        }
+        if reader.status()?.state.ended() {
+            bail!("Codex session ended");
+        }
+        Ok(())
+    }
+    fn screen(&mut self) -> Result<String> {
+        terminal::read_screen(self.session, self.deadline)
+    }
+    fn text(&mut self, text: &str) -> std::result::Result<usize, Failure> {
+        let file = (|| -> Result<_> {
+            let mut file = tempfile::Builder::new()
+                .prefix("pending-prompt-")
+                .suffix(".txt")
+                .tempfile_in(self.directory)?;
+            RecordStore::set_file_private(file.as_file())?;
+            file.write_all(text.as_bytes())?;
+            file.flush()?;
+            self.current()?;
+            Ok(file)
+        })()
+        .map_err(Failure::not_sent)?;
+        terminal::send_file_text_only(self.session, file.path(), self.claim, self.deadline)
+    }
+    fn submit(&mut self, screen: &str) -> Result<bool> {
+        terminal::submit_if_unchanged(
+            self.directory,
+            self.session,
+            screen,
+            Some(self.claim),
+            self.deadline,
+        )
+    }
+    fn bound(&mut self) -> Result<bool> {
+        Ok(super::super::lifecycle::read_binding(self.directory, self.claim)?.is_some())
+    }
+}
+
 pub(super) fn send(
     session: &terminal::TerminalSession,
     directory: &Path,
@@ -372,54 +495,6 @@ pub(super) fn send(
     let claim = turn::current_claim_token(&Reader::open_unchecked(directory))
         .and_then(|c| c.context("no current Codex claim"))
         .map_err(Failure::not_sent)?;
-    struct Console<'a> {
-        session: &'a terminal::TerminalSession,
-        directory: &'a Path,
-        claim: &'a str,
-        deadline: Instant,
-    }
-    impl Input for Console<'_> {
-        fn now(&mut self) -> Instant {
-            Instant::now()
-        }
-        fn sleep(&mut self, duration: Duration) {
-            SystemClock.sleep(duration);
-        }
-        fn current(&mut self) -> Result<()> {
-            let reader = Reader::open_unchecked(self.directory);
-            if turn::current_claim_token(&reader)?.as_deref() != Some(self.claim) {
-                bail!("Codex claim changed");
-            }
-            if reader.status()?.state.ended() {
-                bail!("Codex session ended");
-            }
-            Ok(())
-        }
-        fn screen(&mut self) -> Result<String> {
-            terminal::read_screen(self.session, self.deadline)
-        }
-        fn text(&mut self, text: &str) -> std::result::Result<usize, Failure> {
-            let file = (|| -> Result<_> {
-                let mut file = tempfile::Builder::new()
-                    .prefix("pending-prompt-")
-                    .suffix(".txt")
-                    .tempfile_in(self.directory)?;
-                RecordStore::set_file_private(file.as_file())?;
-                file.write_all(text.as_bytes())?;
-                file.flush()?;
-                self.current()?;
-                Ok(file)
-            })()
-            .map_err(Failure::not_sent)?;
-            terminal::send_file_text_only(self.session, file.path(), self.deadline)
-        }
-        fn submit(&mut self, screen: &str) -> Result<bool> {
-            terminal::submit_if_unchanged(self.directory, self.session, screen, self.deadline)
-        }
-        fn bound(&mut self) -> Result<bool> {
-            Ok(super::super::lifecycle::read_binding(self.directory, self.claim)?.is_some())
-        }
-    }
     run(
         &mut Console {
             session,

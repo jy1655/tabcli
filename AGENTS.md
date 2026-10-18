@@ -221,7 +221,9 @@ launch, observe, continue, and close without replacing the capabilities those CL
   Bridge trims source prompts before framing: the live 25596/1094 estimates become
   25595/1093 there. Cursor-dependent blockquote fallback stays ambiguous; exact inline
   marker evidence remains usable. Unknown custom status lines require that marker.
-- Recheck the current claim, session and deadline after blocking work and before input.
+- Recheck the current claim, session and deadline after blocking work and at input dispatch.
+  The injected Windows helpers hold the lifecycle lock across the final claim/session/expiry
+  check and each write; screen reads and drain waits remain outside that lock.
   Submit one guarded Return against the exact accepted full screen; a changed screen gets
   none. After body dispatch all unconfirmed failures are uncertain, except a helper's
   proven pre-write refusal. Never retry text or Return, including after late binding.

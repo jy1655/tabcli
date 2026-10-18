@@ -631,11 +631,31 @@ pub(super) fn send_file(
 pub(super) fn send_file_text_only(
     session: &TerminalSession,
     prompt_path: &Path,
+    expected_claim: &str,
     deadline: Instant,
 ) -> std::result::Result<usize, super::TerminalSendFailure> {
-    let path = prompt_path
+    let payload = (|| -> Result<_> {
+        let input = GuardedTextInput {
+            text: std::fs::read_to_string(prompt_path)?,
+            expected_claim: Some(expected_claim.to_owned()),
+            expires_unix_ms: Some(
+                crate::native::session::primitives::unix_ms()
+                    + deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis(),
+            ),
+        };
+        dialog_input_file(
+            prompt_path.parent().context("missing payload directory")?,
+            session,
+            &input,
+        )
+    })()
+    .map_err(super::TerminalSendFailure::not_sent)?;
+    let path = payload
+        .path()
         .to_str()
-        .context("prompt path is not valid UTF-8")
+        .context("payload path is not UTF-8")
         .map_err(super::TerminalSendFailure::not_sent)?;
     let output = run_console_send_helper(session, path, deadline, Some(0))?;
     parse_text_only_output(&output)
@@ -664,13 +684,24 @@ fn parse_text_only_count(output: &[u8]) -> Result<usize> {
     Ok(value.written_chars)
 }
 
+fn console_output_until(
+    command: &mut Command,
+    deadline: Instant,
+    label: &str,
+) -> Result<std::process::Output> {
+    #[cfg(test)]
+    if let Some(output) = tests::helper_output(command) {
+        return output.map_err(super::TerminalSendFailure::into_error);
+    }
+    crate::native::process_env::command_output_until(command, deadline, label)
+}
+
+#[cfg(test)]
+pub(in crate::native) use tests::with_stale_helper;
+
 pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Result<String> {
     let mut command = console_helper_command("screen", session, None)?;
-    let output = crate::native::process_env::command_output_until(
-        &mut command,
-        deadline,
-        "managed console screen",
-    )?;
+    let output = console_output_until(&mut command, deadline, "managed console screen")?;
     if !output.status.success() {
         bail!("{}", console_helper_failure_message(&output));
     }
@@ -682,7 +713,7 @@ pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Resul
 fn dialog_input_file(
     directory: &Path,
     session: &TerminalSession,
-    input: &super::GuardedDialogInput,
+    input: &impl serde::Serialize,
 ) -> Result<tempfile::NamedTempFile> {
     use std::io::Write;
     let id = session
@@ -731,17 +762,14 @@ pub(super) fn guarded_dialog_input(
             .max(1)
             .to_string(),
     );
-    let output = crate::native::process_env::command_output_until(
-        &mut command,
-        deadline,
-        "managed console dialog input",
-    )?;
+    let output = console_output_until(&mut command, deadline, "managed console dialog input")?;
     if !output.status.success() {
         bail!("{}", console_helper_failure_message(&output));
     }
     match String::from_utf8_lossy(&output.stdout).trim() {
         "sent" => Ok(true),
         "changed" => Ok(false),
+        "stale" => bail!("stale claim at guarded submission"),
         _ => bail!("unexpected managed console dialog result"),
     }
 }
@@ -788,6 +816,10 @@ fn run_console_send_command(
     command: &mut Command,
     deadline: Instant,
 ) -> std::result::Result<Vec<u8>, super::TerminalSendFailure> {
+    #[cfg(test)]
+    if let Some(output) = tests::helper_output(command) {
+        return classify_send_output(output?);
+    }
     let output = crate::native::process_env::command_output_until_classified(
         command,
         deadline,
@@ -800,6 +832,12 @@ fn run_console_send_command(
             super::TerminalSendFailure::not_sent(failure.into_error())
         }
     })?;
+    classify_send_output(output)
+}
+
+fn classify_send_output(
+    output: std::process::Output,
+) -> std::result::Result<Vec<u8>, super::TerminalSendFailure> {
     if output.status.success() {
         return Ok(output.stdout);
     }
@@ -972,7 +1010,15 @@ pub(super) fn console_control(
             )?;
             println!(
                 "{}",
-                guarded_key_with(&input, &attached_screen()?, write_dialog_key)?
+                guarded_key_with(&input, &attached_screen()?, |key| {
+                    dispatch_with_claim(
+                        records.directory,
+                        input.expected_claim.as_deref(),
+                        input.expires_unix_ms,
+                        || write_dialog_key(key),
+                    )
+                    .map(|v| v.is_some())
+                })?
             );
             Ok(())
         }
@@ -993,7 +1039,22 @@ pub(super) fn console_control(
             let input = crate::native::session::RecordReader::at(&path)
                 .raw_text()
                 .with_context(|| format!("failed to read prompt payload {}", path.display()))?;
-            write_console_input(&input, submit_count, newline, deadline)
+            let guarded = if submit_count == 0 {
+                Some(
+                    serde_json::from_str::<GuardedTextInput>(&input)
+                        .context("invalid text-only console payload")?,
+                )
+            } else {
+                None
+            };
+            write_console_input(
+                guarded.as_ref().map_or(input.as_str(), |v| v.text.as_str()),
+                submit_count,
+                newline,
+                deadline,
+                records.directory,
+                guarded.as_ref(),
+            )
         }
         ConsoleControlAction::Window { .. } => loop {
             if let Some(window) = focus::attached_console_host_window() {
@@ -1168,17 +1229,63 @@ fn screen_row(cells: &[u16], read: u32) -> Result<String> {
     Ok(String::from_utf16(characters)?)
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GuardedTextInput {
+    text: String,
+    #[serde(default)]
+    expected_claim: Option<String>,
+    #[serde(default)]
+    expires_unix_ms: Option<u128>,
+}
+
+// Screen capture, attachment and drain waits are outside this section. Each write
+// shares the lifecycle lock with claim retirement and closed-state publication.
+fn dispatch_with_claim<T>(
+    directory: &Path,
+    expected: Option<&str>,
+    expires: Option<u128>,
+    write: impl FnOnce() -> Result<T>,
+) -> Result<Option<T>> {
+    let Some(expected) = expected else {
+        return write().map(Some);
+    };
+    let store = Store::open_unchecked(directory);
+    let _lock = store.lock()?;
+    let reader = Reader::open_unchecked(directory);
+    if crate::native::session::turn::current_claim_token(&reader)?.as_deref() != Some(expected)
+        || reader.status()?.state.ended()
+        || expires.is_some_and(|expiry| crate::native::session::primitives::unix_ms() >= expiry)
+    {
+        return Ok(None);
+    }
+    write().map(Some)
+}
+
+fn guarded_text_write_with(
+    attempted: &mut bool,
+    guard: impl FnOnce(&mut dyn FnMut() -> Result<u32>) -> Result<Option<u32>>,
+    mut write: impl FnMut() -> Result<u32>,
+) -> Result<u32> {
+    let previously_attempted = *attempted;
+    let result = guard(&mut || {
+        *attempted = true;
+        write()
+    })?;
+    match result {
+        Some(count) => Ok(count),
+        None if !previously_attempted => bail!("Windows console claim stale before any input"),
+        None => bail!("Windows console claim stale after input dispatch"),
+    }
+}
+
 fn guarded_key_with(
     input: &super::GuardedDialogInput,
     actual: &str,
-    write: impl FnOnce(super::DialogKey) -> Result<()>,
+    write: impl FnOnce(super::DialogKey) -> Result<bool>,
 ) -> Result<&'static str> {
     match dialog_decision(&input.screen, actual) {
         DialogDecision::Changed => Ok("changed"),
-        DialogDecision::Send => {
-            write(input.key)?;
-            Ok("sent")
-        }
+        DialogDecision::Send => Ok(if write(input.key)? { "sent" } else { "stale" }),
     }
 }
 
@@ -1391,6 +1498,8 @@ fn write_console_input(
     submit_count: usize,
     newline: ConsoleNewline,
     deadline: Instant,
+    directory: &Path,
+    guard: Option<&GuardedTextInput>,
 ) -> Result<()> {
     let console_name = "CONIN$\0".encode_utf16().collect::<Vec<_>>();
     let handle = unsafe {
@@ -1410,11 +1519,25 @@ fn write_console_input(
     }
     let result = (|| {
         if submit_count == 0 {
+            let mut attempted = false;
             return write_text_only_with(
                 input,
                 newline,
                 deadline,
-                |chunk| write_console_chunk(handle, chunk),
+                |chunk| {
+                    guarded_text_write_with(
+                        &mut attempted,
+                        |write| {
+                            dispatch_with_claim(
+                                directory,
+                                guard.and_then(|v| v.expected_claim.as_deref()),
+                                guard.and_then(|v| v.expires_unix_ms),
+                                write,
+                            )
+                        },
+                        || write_console_chunk(handle, chunk),
+                    )
+                },
                 || console_pending_count(handle),
                 &mut std::io::stdout().lock(),
                 Instant::now,

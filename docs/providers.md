@@ -87,8 +87,8 @@ existing LF encoding and need separate provider evidence.
 
 For Windows initial launches recorded as `injected`, #124 uses a bounded best-effort console
 fallback pinned to Codex 0.163.0. After the positive composer gate, Bridge reserves at least
-20 s of the original deadline before writing. It writes and drains the exact framed body as
-text only, verifies its scalar count, then waits 150 ms before writing and draining LF plus the claim
+20 s of the original deadline at admission; this is not a guaranteed post-text budget.
+It writes and drains the exact framed body as text only, verifies its scalar count, then waits 150 ms before writing and draining LF plus the claim
 marker and verifies that count. There is no screen observation between these writes.
 The final inline marker line is completion evidence under ordered console/reader/composer
 processing: earlier input was processed before the marker, and applying its paste clears
@@ -97,8 +97,11 @@ If the tail merged into a final placeholder, Bridge instead requires the sum of 
 counts and visible inline scalars (physical rows joined with LF) to equal the framed prompt's
 Codex-normalized scalar count. This fallback is cardinality only, not a content receipt; wrapping, clipping,
 scrolling and literal placeholder collisions can make it ambiguous or misleading.
-A dialog or hook picker vetoes success. Bridge then requests one guarded Return: the helper
-compares the entire accepted screen and writes no Return if it changed. This assumes no
+Structural title, option and hint rows identify a dialog or hook picker and veto success;
+phrases within recognized composer content do not. Unresolved overlay rows remain ambiguous.
+Bridge then requests one guarded Return: the helper compares the entire accepted screen and
+writes no Return if it changed. Injected text and Return helpers also check the addressed claim,
+session status and original expiry under the lifecycle lock immediately at dispatch. This assumes no
 concurrent human input; screen comparison is not atomic with a TUI transition. A clipped or
 wrapped marker with no recognized footer, or an unsupported layout remains unconfirmed.
 

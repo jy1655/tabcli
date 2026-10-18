@@ -608,6 +608,8 @@ mod adapter_tests {
     fn declared_refusals_answer_before_adapters_and_windows_is_rejected() {
         let deadline = Instant::now() + Duration::from_secs(2);
         let input = GuardedDialogInput {
+            expected_claim: None,
+            expires_unix_ms: None,
             screen: "screen".into(),
             key: DialogKey::Enter,
         };
@@ -780,6 +782,8 @@ mod adapter_tests {
                         .guarded_dialog_input(
                             &session,
                             &GuardedDialogInput {
+                                expected_claim: None,
+                                expires_unix_ms: None,
                                 screen: "".into(),
                                 key: DialogKey::Enter
                             },
@@ -815,6 +819,8 @@ mod adapter_tests {
                                 .guarded_dialog_input(
                                     &session,
                                     &GuardedDialogInput {
+                                        expected_claim: None,
+                                        expires_unix_ms: None,
                                         screen: "".into(),
                                         key
                                     },

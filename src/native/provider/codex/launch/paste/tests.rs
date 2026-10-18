@@ -89,7 +89,7 @@ fn parser_literal_labels_and_clipped_labels_are_ambiguous_and_dialogs_veto() {
                 "{}\n{dialog}",
                 frame("Ask Codex to do anything")
             ))),
-            "blocked"
+            "ambiguous (unresolved overlay)"
         );
     }
     assert!(composer_segments("").is_err());
@@ -226,6 +226,9 @@ impl Input for Fake {
     }
     fn submit(&mut self, screen: &str) -> Result<bool> {
         self.calls.push("submit");
+        if self.fault == Some("stale") {
+            bail!("stale claim at guarded submission");
+        }
         if self.fault == Some("submit") {
             bail!("submit helper could not start");
         }
@@ -455,7 +458,7 @@ fn no_binding_diagnostic_distinguishes_all_final_screen_classes() {
     for (screen, expected) in [
         (frame("draft"), "populated"),
         (frame("Ask Codex to do anything"), "positively empty"),
-        ("Review hooks".into(), "blocked"),
+        (PICKER.into(), "blocked"),
         (String::new(), "ambiguous"),
     ] {
         let (mut io, claim, prompt) = Fake::new();
@@ -775,4 +778,120 @@ fn pinned_footer_variants_and_ambiguous_boundaries() {
     assert!(
         super::composer_segments("› marker\nReview hooks", "marker", Path::new(WORKSPACE)).is_err()
     );
+}
+
+// Synthetic pinned shapes supplement the raw a7-screen.txt capture below.
+const PICKER: &str = "  Hooks need review\n\n› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting hooks\n\n  enter confirm · esc skip";
+const TRUST: &str =
+    "  Trust this folder?\n› 1. Trust and continue\n  2. Don't trust\n  enter continue · esc quit";
+
+#[test]
+fn dialog_words_in_inline_and_placeholder_drafts_submit() {
+    for phrase in [
+        "Review hooks",
+        "Trust this folder?",
+        "Trust and continue",
+        "Trust all and continue",
+    ] {
+        for placeholder in [false, true] {
+            let (mut io, claim, _) = Fake::new();
+            let tail = format!("<!-- agent-bridge-codex-turn:{} -->", io.token);
+            let body = if placeholder {
+                "x".repeat(1001)
+            } else {
+                "Explain this:".into()
+            };
+            let prompt = format!("{body}\n{phrase}\n{tail}");
+            io.screens = [frame(&if placeholder {
+                format!("[Pasted Content 1001 chars]\n{phrase}\n{tail}")
+            } else {
+                prompt.clone()
+            })]
+            .into();
+            assert!(io.execute(&prompt).is_ok(), "{phrase}");
+            assert_eq!(io.calls.iter().filter(|c| **c == "submit").count(), 1);
+            claim.retain();
+        }
+    }
+}
+
+#[test]
+fn structural_overlays_veto_mixed_frames_and_partial_overlays_wait() {
+    let real_picker: String = serde_json::from_str(include_str!("picker-screen.json")).unwrap();
+    for overlay in [
+        PICKER,
+        TRUST,
+        &real_picker,
+        "  Hooks need review\n  1. Review hooks",
+    ] {
+        for mixed in [false, true] {
+            let (mut io, claim, prompt) = Fake::new();
+            let screen = if mixed {
+                format!("{}\n{overlay}", frame(&prompt))
+            } else {
+                overlay.into()
+            };
+            io.screens = [screen.clone()].into();
+            io.fallback = screen.clone();
+            let error = io.execute(&prompt).unwrap_err();
+            assert!(error.delivery_may_have_occurred());
+            assert!(!io.calls.contains(&"submit"));
+            assert_eq!(
+                classification(Ok(screen)).starts_with("blocked"),
+                overlay != "  Hooks need review\n  1. Review hooks"
+            );
+            claim.retain();
+        }
+    }
+    let (mut io, claim, prompt) = Fake::new();
+    io.fault = Some("stale");
+    let error = io.execute(&prompt).unwrap_err();
+    assert!(error.delivery_may_have_occurred());
+    assert!(error.error().to_string().contains("stale"));
+    assert_eq!(io.calls.iter().filter(|c| **c == "submit").count(), 1);
+    claim.retain();
+}
+
+#[cfg(windows)]
+#[test]
+fn real_console_payload_to_helper_seam_fences_late_retirement() {
+    const CHILD: &str = "AB_R3_CONSOLE_SEAM";
+    if std::env::var_os(CHILD).is_none() {
+        let root = tempfile::tempdir().unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "native::provider::codex::launch::paste::tests::real_console_payload_to_helper_seam_fences_late_retirement", "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1").env("AGENT_BRIDGE_NATIVE_STATE_DIR", root.path()).output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
+    let root = std::path::PathBuf::from(std::env::var_os("AGENT_BRIDGE_NATIVE_STATE_DIR").unwrap());
+    for phase in [1, 2, 3] {
+        for change in ["retired", "replaced", "closed", "expired"] {
+            let directory = root.join(format!("session-{phase}-{change}"));
+            std::fs::create_dir_all(directory.join("events")).unwrap();
+            update_status(&directory, SessionState::Working, None, None).unwrap();
+            let claim = turn::claim(&Store::open_unchecked(&directory), &[]).unwrap();
+            let token = claim.token().to_owned();
+            let prompt = format!("body\n<!-- agent-bridge-codex-turn:{token} -->");
+            let session = serde_json::from_value(serde_json::json!({"terminal":"windows-console", "session_id":"1", "managed_session_id":directory.file_name().unwrap().to_str().unwrap()})).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(25);
+            terminal::with_stale_helper(&directory, phase, change, &frame(&prompt), || {
+                let mut io = Console {
+                    session: &session,
+                    directory: &directory,
+                    claim: &token,
+                    deadline,
+                };
+                let error = run(&mut io, &prompt, &token, deadline).unwrap_err();
+                assert_eq!(error.delivery_may_have_occurred(), phase != 1);
+                assert!(error.error().to_string().contains("stale"), "{error:?}");
+            });
+            claim.retain();
+        }
+    }
 }

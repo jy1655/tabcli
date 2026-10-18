@@ -668,6 +668,8 @@ fn guarded_dialog_file_stays_private_in_the_supplied_helper_directory() {
     }))
     .unwrap();
     let input = GuardedDialogInput {
+        expected_claim: None,
+        expires_unix_ms: None,
         screen: "exact dialog".into(),
         key: DialogKey::Enter,
     };
@@ -684,6 +686,7 @@ fn guarded_dialog_file_stays_private_in_the_supplied_helper_directory() {
         &other,
         &handle,
         &input.screen,
+        None,
         Instant::now() + Duration::from_secs(2),
     )
     .unwrap_err();
@@ -703,7 +706,7 @@ fn guarded_dialog_file_stays_private_in_the_supplied_helper_directory() {
     // The existing command boundary refuses to spawn the helper, after the temporary
     // file was created; returning must remove that file again.
     assert_eq!(
-        terminal::submit_if_unchanged(&directory, &handle, &input.screen, Instant::now())
+        terminal::submit_if_unchanged(&directory, &handle, &input.screen, None, Instant::now())
             .unwrap_err()
             .to_string(),
         "managed console dialog input timed out before it started"
@@ -1075,6 +1078,8 @@ fn text_only_launcher_classifies_start_and_exit_failures() {
 #[test]
 fn guarded_submission_writes_one_return_only_for_unchanged_screen() {
     let input = terminal::GuardedDialogInput {
+        expected_claim: None,
+        expires_unix_ms: None,
         screen: "composer text".into(),
         key: terminal::DialogKey::Enter,
     };
@@ -1083,7 +1088,7 @@ fn guarded_submission_writes_one_return_only_for_unchanged_screen() {
         let mut records = Vec::new();
         let result = super::guarded_key_with(&input, screen, |key| {
             records = super::build_dialog_records(key);
-            Ok(())
+            Ok(true)
         })
         .unwrap();
         assert_eq!(result, expected);
@@ -1166,6 +1171,8 @@ fn text_only_multichunk_unicode_count_and_second_chunk_failure() {
 #[test]
 fn guarded_down_enter_sequence_and_writer_error() {
     let input = terminal::GuardedDialogInput {
+        expected_claim: None,
+        expires_unix_ms: None,
         screen: "dialog".into(),
         key: terminal::DialogKey::DownEnter,
     };
@@ -1182,7 +1189,7 @@ fn guarded_down_enter_sequence_and_writer_error() {
             assert_eq!(key.bKeyDown, down);
             assert_eq!(key.dwControlKeyState, 0);
         }
-        Ok(())
+        Ok(true)
     })
     .unwrap();
     assert_eq!(result, "sent");
@@ -1191,4 +1198,237 @@ fn guarded_down_enter_sequence_and_writer_error() {
     })
     .unwrap_err();
     assert!(error.to_string().contains("writer failed"));
+}
+
+struct StaleHelper {
+    directory: std::path::PathBuf,
+    phase: usize,
+    change: &'static str,
+    screen: String,
+    calls: usize,
+    refused: bool,
+}
+thread_local! {
+    static STALE_HELPER: std::cell::RefCell<Option<StaleHelper>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(in crate::native) fn with_stale_helper(
+    directory: &std::path::Path,
+    phase: usize,
+    change: &'static str,
+    screen: &str,
+    run: impl FnOnce(),
+) {
+    STALE_HELPER.with(|slot| {
+        *slot.borrow_mut() = Some(StaleHelper {
+            directory: directory.into(),
+            phase,
+            change,
+            screen: screen.into(),
+            calls: 0,
+            refused: false,
+        })
+    });
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            STALE_HELPER.with(|s| *s.borrow_mut() = None);
+        }
+    }
+    let _reset = Reset;
+    run();
+    STALE_HELPER.with(|slot| {
+        let slot = slot.borrow();
+        let state = slot.as_ref().unwrap();
+        assert_eq!(state.calls, phase);
+        assert!(state.refused);
+    });
+}
+
+// Replace only OS process/attachment and console I/O. The real Console prepares
+// private JSON, the helper deserializes it, and production guard/writer/launcher
+// classification runs. Invalidation occurs after payload preparation and capture,
+// where an attested child would be about to dispatch to an unchanged screen.
+pub(super) fn helper_output(
+    command: &std::process::Command,
+) -> Option<std::result::Result<std::process::Output, terminal::TerminalSendFailure>> {
+    use crate::native::session::{Reader, SessionState, Store, turn, update_status};
+    use std::os::windows::process::ExitStatusExt;
+    STALE_HELPER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let state = slot.as_mut()?;
+        let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+        let mut stdout = Vec::new();
+        let action = args[1];
+        if action == "screen" {
+            stdout = serde_json::to_vec(&state.screen).unwrap();
+        } else {
+            state.calls += 1;
+            let stale = state.calls == state.phase;
+            let path = state.directory.join(args[3]);
+            let bytes = crate::native::session::RecordReader::at(&path)
+                .raw_bytes()
+                .unwrap();
+            let token = turn::current_claim_token(&Reader::open_unchecked(&state.directory))
+                .unwrap()
+                .unwrap();
+            if stale {
+                let store = Store::open_unchecked(&state.directory);
+                let _lock = store.lock().unwrap();
+                match state.change {
+                    "retired" => fs::remove_file(state.directory.join("turn.claim")).unwrap(),
+                    "replaced" => {
+                        fs::remove_file(state.directory.join("turn.claim")).unwrap();
+                        store.private("turn.claim").write_private(b"1-2-3").unwrap();
+                    }
+                    "closed" => {
+                        update_status(&state.directory, SessionState::Closed, None, None).unwrap()
+                    }
+                    "expired" => {}
+                    _ => unreachable!(),
+                }
+            }
+            let mut records = 0;
+            let result = if action == "dialog" {
+                let mut input: terminal::GuardedDialogInput =
+                    serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(input.expected_claim.as_deref(), Some(token.as_str()));
+                assert!(input.expires_unix_ms.is_some());
+                if stale && state.change == "expired" {
+                    input.expires_unix_ms = Some(0);
+                }
+                super::guarded_key_with(&input, &state.screen, |key| {
+                    super::dispatch_with_claim(
+                        &state.directory,
+                        input.expected_claim.as_deref(),
+                        input.expires_unix_ms,
+                        || {
+                            assert!(
+                                Store::open_unchecked(&state.directory)
+                                    .try_lock()?
+                                    .is_none()
+                            );
+                            records += super::build_dialog_records(key).len();
+                            Ok(())
+                        },
+                    )
+                    .map(|v| v.is_some())
+                })
+                .map(|outcome| {
+                    assert_eq!(outcome, "stale");
+                    stdout = outcome.as_bytes().to_vec();
+                })
+            } else {
+                assert_eq!(args.last(), Some(&"0"));
+                let mut input: super::GuardedTextInput = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(input.expected_claim.as_deref(), Some(token.as_str()));
+                assert!(input.expires_unix_ms.is_some());
+                if stale && state.change == "expired" {
+                    input.expires_unix_ms = Some(0);
+                }
+                let mut attempted = false;
+                super::write_text_only_with(
+                    &input.text,
+                    super::ConsoleNewline::ShiftReturn,
+                    Instant::now() + Duration::from_secs(5),
+                    |chunk| {
+                        super::guarded_text_write_with(
+                            &mut attempted,
+                            |write| {
+                                super::dispatch_with_claim(
+                                    &state.directory,
+                                    input.expected_claim.as_deref(),
+                                    input.expires_unix_ms,
+                                    write,
+                                )
+                            },
+                            || {
+                                assert!(
+                                    Store::open_unchecked(&state.directory)
+                                        .try_lock()?
+                                        .is_none()
+                                );
+                                records += chunk.len();
+                                Ok(chunk.len() as u32)
+                            },
+                        )
+                    },
+                    || {
+                        assert!(
+                            Store::open_unchecked(&state.directory)
+                                .try_lock()
+                                .unwrap()
+                                .is_some()
+                        );
+                        Ok(0)
+                    },
+                    &mut stdout,
+                    Instant::now,
+                )
+            };
+            if stale {
+                assert_eq!(records, 0, "stale helper must write zero input records");
+                state.refused = true;
+            } else {
+                assert!(records > 0);
+            }
+            if let Err(error) = result {
+                return Some(Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(1),
+                    stdout,
+                    stderr: format!("Error: {error}").into_bytes(),
+                }));
+            }
+        }
+        Some(Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout,
+            stderr: vec![],
+        }))
+    })
+}
+
+#[test]
+fn stale_guard_after_first_chunk_is_never_not_sent() {
+    // An omitted guard never reads session records (the directory does not exist).
+    let absent = tempfile::tempdir().unwrap();
+    assert_eq!(
+        super::dispatch_with_claim(&absent.path().join("missing"), None, Some(0), || Ok(7))
+            .unwrap(),
+        Some(7)
+    );
+    let mut attempted = false;
+    let mut calls = 0;
+    let mut output = Vec::new();
+    let error = super::write_text_only_with(
+        &"x".repeat(1200),
+        super::ConsoleNewline::ShiftReturn,
+        Instant::now() + Duration::from_secs(5),
+        |chunk| {
+            calls += 1;
+            super::guarded_text_write_with(
+                &mut attempted,
+                |write| {
+                    if calls == 1 {
+                        write().map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                },
+                || Ok(chunk.len() as u32),
+            )
+        },
+        || Ok(0),
+        &mut output,
+        Instant::now,
+    )
+    .unwrap_err();
+    assert_eq!(calls, 2);
+    assert!(output.is_empty());
+    assert!(
+        !super::super::windows_budget::windows_console_helper_reports_send_not_started(
+            &error.to_string()
+        )
+    );
+    assert!(error.to_string().contains("after input dispatch"));
 }

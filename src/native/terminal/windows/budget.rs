@@ -15,7 +15,9 @@ pub(super) fn windows_console_helper_reports_missing(message: &str) -> bool {
 pub(super) fn windows_console_helper_reports_send_not_started(message: &str) -> bool {
     matches!(
         message.trim(),
-        "Windows console submission delays do not fit inside the remaining turn timeout"
+        "Windows console claim stale before any input"
+            | "Error: Windows console claim stale before any input"
+            | "Windows console submission delays do not fit inside the remaining turn timeout"
             | "Error: Windows console submission delays do not fit inside the remaining turn timeout"
     )
 }
