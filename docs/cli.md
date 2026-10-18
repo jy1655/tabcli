@@ -191,6 +191,8 @@ Codex uses its addressed native queue and does not require a shared daemon. Ther
 terminal-input fallback. Claude uses official cross-session messaging, including a messenger model
 turn; unavailable messaging is an error, not a terminal fallback. Agy and Pi use their adapter-owned
 terminal fallback. See [providers](providers.md) for readiness and receipt gates.
+On native Windows, Codex follow-ups also have a measured command-line size refusal; see the
+[Codex send-side limit](providers.md#codex) for the limit and remedy.
 
 Exit behaviour matches `ask`. If you see `tell requires the ready state`, inspect the session and
 wait for its active request with `result SESSION --request REQUEST --wait`. A closed session cannot

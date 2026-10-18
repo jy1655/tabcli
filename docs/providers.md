@@ -184,12 +184,15 @@ real command line can be larger or smaller than the estimate, and text with many
 because Codex's argument quoting escapes each of them. See [doctor](cli.md#doctor).
 
 The native-queue follow-up has a send-side limit of its own on native Windows. `tell` starts
-`codex queue` with the framed prompt as one `--message` argument, so a follow-up whose command
-line reaches 32,767 UTF-16 units cannot start the queue client (error 206) and nothing is sent:
-the request is recorded as unresolved and the session returns to `ready` (observed 2026-10-18
-with codex-cli 0.163.0 and a 35,520-character prompt; issue #251). The lifecycle-hook route does
-not change this limit. Keep follow-up prompts short on native Windows and pass long material by
-path; the console-pasted initial prompt has no such limit beyond the paste defects of #124.
+`codex queue` with the framed prompt as one `--message` argument. Before spawning the queue
+client or writing its pending-turn record, Bridge measures the prepared command line, including
+the launcher, arguments and Windows quoting, in UTF-16 units (excluding the terminating NUL).
+At 32,767 units or more it refuses delivery with the measured size, limit and remedy; nothing
+is sent, the request is recorded as unresolved and the session returns to `ready` (issue #251).
+Shorten the follow-up and pass long material by path in the workspace. Codex's inner hop from
+`codex.ps1` to `node` is unmeasured and can still fail below Bridge's limit. The lifecycle-hook
+route does not change this send-side limit; the console-pasted initial prompt has no such limit
+beyond the paste defects of #124.
 
 `reopen` refuses closed Codex sessions. Bridge still needs checks for the thread's writer lock
 and queued inputs before supporting resume; start a new session instead.
