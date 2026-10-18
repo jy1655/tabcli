@@ -142,6 +142,11 @@ and other logs also live in provider-specific records. Prompts and results can c
 from your input or the provider's work; do not publish a session directory without reviewing
 it. The [contributor record map](architecture.md#session-records) lists the lifecycle records.
 
+Pi on native Windows also retains `pi-input-accepted-<claim>.json`. It contains the claim,
+Pi session id, submitted frame's SHA-256 and UTF-8 byte length, and the `agent_start` signal.
+The pending Pi record holds the expected fingerprint. These records contain no prompt copy
+and grant no result, input, or cancellation authority. Close retains them with the session.
+
 Bridge reads its own JSON records (`manifest.json`, `status.json`, `closed.json`,
 `turn.completion.json`, `launch.json` and the receipts under `requests/`) through one decoder
 per record, in every command. The decoder takes the bytes as strict UTF-8, so a record with

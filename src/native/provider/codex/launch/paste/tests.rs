@@ -479,10 +479,6 @@ fn no_binding_diagnostic_distinguishes_all_final_screen_classes() {
         include_str!("../../../agy/delivery.rs")
             .contains("|| terminal::send_file(session, prompt_path, deadline)")
     );
-    assert!(
-        include_str!("../../../pi/startup.rs")
-            .contains("terminal::send_file(session, prompt_path, deadline)")
-    );
 }
 
 #[test]

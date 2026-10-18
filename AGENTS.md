@@ -160,6 +160,25 @@ launch, observe, continue, and close without replacing the capabilities those CL
   when Pi provides an addressed interruption endpoint and Bridge has an adapter claim
   retirement boundary.
 
+- Native Windows Pi input has no verified addressed first-party endpoint with per-turn
+  acceptance. Bridge requires the installed extension's actual schema 2 startup record
+  with `input_ack_schema: 1` before one console attempt, never a version inference.
+  The extension matches the complete framed prompt's SHA-256 and UTF-8 byte length to
+  Pi pending state at `before_agent_start`. Reading the whole trimmed core `turn.claim`
+  at the correlated `agent_start` is also a declared read-only exception: it witnesses
+  historical submission, without acquiring result or cancel authority. Latch one receipt
+  publication attempt per claim before writing `pi-input-accepted-<claim>.json` through
+  exclusive temporary creation and rename. Retirement after the witness read or a Pi
+  conversation change does not invalidate that history. Retain receipts through later
+  installs, rollback and close; they grant no input, result or abort authority. Sent
+  requires a matching receipt within the original deadline. Read it before interpreting
+  retirement or close, then re-read once; later publication can still leave Uncertain.
+  Never resend text or Return. This fallback assumes no concurrent input and cannot
+  distinguish a manual exact copy of the framed prompt. Keep open sessions on the same
+  or a newer Bridge binary, including `AGENT_BRIDGE_EXECUTABLE`: older follow-ups can
+  strip the startup input capability. Replace this fallback when Pi exposes addressed
+  interactive input with per-turn acceptance identity.
+
 - Pi v1.0.4 exposes `ctx.abort()` to an interactive extension, but no verified official
   endpoint addresses that running interactive session from outside. Cancel therefore
   reaches the official API through a Pi-owned record and polling fallback. Replace the

@@ -1,5 +1,6 @@
 mod credentials;
 mod hook;
+mod input;
 mod monitor;
 mod startup;
 #[cfg(test)]
@@ -48,6 +49,8 @@ struct StartupReady {
     schema: u32,
     claim_token: String,
     session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    input_ack_schema: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -55,6 +58,8 @@ struct PendingPiTurn {
     schema: u32,
     claim_token: String,
     marker: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    windows_input: Option<input::Fingerprint>,
 }
 
 impl PendingPiTurn {
@@ -64,6 +69,7 @@ impl PendingPiTurn {
             schema: 1,
             claim_token: claim_token.to_owned(),
             marker: format!("<!-- agent-bridge-pi-turn:{claim_token} -->"),
+            windows_input: None,
         })
     }
 }
@@ -73,20 +79,35 @@ impl PendingPiTurn {
 // refusal when Pi exposes a live-session registry or a held session lock.
 const PI_REOPEN_UNSUPPORTED: &str = "reopen unsupported: Pi exposes no verifiable ownership evidence for a session (no lock, pid, or registry under ~/.pi identifies a live writer)";
 
+#[cfg(any(not(windows), test))]
 fn terminal_initial_prompt(directory: &Path, prompt: &str) -> Result<String> {
     let pending =
         read_pending_turn(directory)?.context("Pi initial turn correlation state is missing")?;
     terminal_correlated_prompt(prompt, &pending, cfg!(windows))
 }
 
+#[cfg(not(windows))]
 fn send_terminal_follow_up(
     session: &terminal::TerminalSession,
     prompt_path: &Path,
     deadline: Instant,
 ) -> terminal::TerminalSendResult {
+    send_console_file(session, prompt_path, deadline)
+}
+
+fn send_console_file(
+    session: &terminal::TerminalSession,
+    prompt_path: &Path,
+    deadline: Instant,
+) -> terminal::TerminalSendResult {
+    #[cfg(all(windows, test))]
+    if let Some(result) = test_support::console_send(prompt_path) {
+        return result;
+    }
     terminal::send_file(session, prompt_path, deadline)
 }
 
+#[cfg(not(windows))]
 fn prepare_terminal_follow_up(directory: &Path, prompt: &str, claim_token: &str) -> Result<String> {
     let pending = install_pending_turn(directory, claim_token)?;
     terminal_correlated_prompt(prompt, &pending, cfg!(windows))
@@ -109,15 +130,18 @@ impl Transport for PiInitialPaste {
     }
     fn prepare(&self, turn: &TurnContext<'_>) -> Result<Prepared> {
         Ok(Prepared {
+            #[cfg(windows)]
+            prompt: input::prepare_windows(turn, true)?,
+            #[cfg(not(windows))]
             prompt: terminal_initial_prompt(turn.directory, turn.prompt)?,
             correlation_id: None,
         })
     }
-    fn send(&self, turn: &TurnContext<'_>, _: &Prepared, file: Option<&Path>) -> Outcome {
+    fn send(&self, turn: &TurnContext<'_>, prepared: &Prepared, file: Option<&Path>) -> Outcome {
         send_initial_prompt(
-            turn.surface,
+            turn,
+            prepared,
             file.expect("surface transport has a prompt file"),
-            turn.deadline,
         )
         .into()
     }
@@ -142,17 +166,31 @@ impl Transport for PiPaste {
     }
     fn prepare(&self, turn: &TurnContext<'_>) -> Result<Prepared> {
         Ok(Prepared {
+            #[cfg(windows)]
+            prompt: input::prepare_windows(turn, false)?,
+            #[cfg(not(windows))]
             prompt: prepare_terminal_follow_up(turn.directory, turn.prompt, turn.claim_token)?,
             correlation_id: None,
         })
     }
-    fn send(&self, turn: &TurnContext<'_>, _: &Prepared, file: Option<&Path>) -> Outcome {
-        send_terminal_follow_up(
-            turn.surface,
+    fn send(&self, turn: &TurnContext<'_>, prepared: &Prepared, file: Option<&Path>) -> Outcome {
+        #[cfg(windows)]
+        return input::send_windows(
+            turn,
+            prepared,
             file.expect("surface transport has a prompt file"),
-            turn.deadline,
         )
-        .into()
+        .into();
+        #[cfg(not(windows))]
+        {
+            let _ = prepared;
+            send_terminal_follow_up(
+                turn.surface,
+                file.expect("surface transport has a prompt file"),
+                turn.deadline,
+            )
+            .into()
+        }
     }
     fn discard_prepared(&self, turn: &TurnContext<'_>, _: Option<&Prepared>) {
         let _ = cancel_pending_turn(turn.directory, turn.claim_token);
@@ -468,15 +506,34 @@ impl ActiveWatcher for PiFailureMonitor {
 }
 
 fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingPiTurn> {
-    let pending = PendingPiTurn::new(claim_token)?;
+    install_pending_turn_bound(directory, claim_token, None)
+}
+
+fn install_pending_turn_bound(
+    directory: &Path,
+    claim_token: &str,
+    windows_input: Option<input::Fingerprint>,
+) -> Result<PendingPiTurn> {
+    let mut pending = PendingPiTurn::new(claim_token)?;
+    pending.windows_input = windows_input;
     let store = Store::open_unchecked(directory);
+    let _lock = store.lock()?;
+    if turn::current_claim_token(&store)?.as_deref() != Some(claim_token) {
+        bail!("Pi pending turn no longer holds the session claim");
+    }
     store.private(CANCEL_ACCEPTED_FILE).remove()?;
     // Startup proves the installed extension's capability for the whole session.
     // Carry that evidence to a follow-up claim before delivery, including after a
     // rolled-back delivery; never upgrade a legacy extension's schema.
-    if let Ok(Some(mut ready)) = store
+    let ready = store
         .private(STARTUP_READY_FILE)
-        .optional_json::<StartupReady>()
+        .timeline(4096)
+        .and_then(|bytes| {
+            bytes
+                .map(|bytes| serde_json::from_slice::<StartupReady>(&bytes).map_err(Into::into))
+                .transpose()
+        });
+    if let Ok(Some(mut ready)) = ready
         && ready.schema == 2
         && validate_claim_token(&ready.claim_token).is_ok()
         && !ready.session_id.trim().is_empty()
@@ -491,32 +548,36 @@ fn install_pending_turn(directory: &Path, claim_token: &str) -> Result<PendingPi
 fn read_pending_turn(directory: &Path) -> Result<Option<PendingPiTurn>> {
     let Some(text) = Reader::open_unchecked(directory)
         .private(PENDING_TURN_FILE)
-        .text()?
+        .timeline(4096)?
     else {
         return Ok(None);
     };
     let pending: PendingPiTurn =
-        serde_json::from_str(&text).context("failed to parse the pending Pi turn")?;
+        serde_json::from_slice(&text).context("failed to parse the pending Pi turn")?;
     let expected = PendingPiTurn::new(&pending.claim_token)?;
     if pending.schema != expected.schema || pending.marker != expected.marker {
         bail!("Agent Bridge rejected invalid Pi turn correlation state")
+    }
+    if let Some(fingerprint) = &pending.windows_input {
+        fingerprint.validate()?;
     }
     Ok(Some(pending))
 }
 
 fn cancel_pending_turn(directory: &Path, claim_token: &str) -> Result<()> {
+    let store = Store::open_unchecked(directory);
+    let _lock = store.lock()?;
+    if turn::current_claim_token(&store)?.as_deref() != Some(claim_token) {
+        return Ok(());
+    }
     let Some(pending) = read_pending_turn(directory)? else {
         return Ok(());
     };
     if pending.claim_token != claim_token {
         return Ok(());
     }
-    Store::open_unchecked(directory)
-        .private(CANCEL_ACCEPTED_FILE)
-        .remove()?;
-    Store::open_unchecked(directory)
-        .private(PENDING_TURN_FILE)
-        .remove()
+    store.private(CANCEL_ACCEPTED_FILE).remove()?;
+    store.private(PENDING_TURN_FILE).remove()
 }
 
 fn correlated_prompt(prompt: &str, pending: &PendingPiTurn) -> String {
@@ -557,5 +618,7 @@ fn bridge_extension() -> &'static str {
     include_str!("../pi_extension.js")
 }
 
+#[cfg(test)]
+mod input_tests;
 #[cfg(test)]
 mod tests;

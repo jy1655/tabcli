@@ -20,11 +20,12 @@ fn declared_transports_preserve_framing_and_pending_cleanup() {
         serde_json::json!({"terminal":"windows-console", "session_id":"surface"}),
     )
     .unwrap();
-    let initial =
+    let pending = claim_pending_turn(directory.path());
+    let mut initial =
         super::super::transport_test_context(directory.path(), &surface, TurnKind::Initial);
-    install_pending_turn(directory.path(), initial.claim_token).unwrap();
-    let before = std::fs::read(directory.path().join(PENDING_TURN_FILE)).unwrap();
+    initial.claim_token = &pending.claim_token;
     let prepared = PiInitialPaste.prepare(&initial).unwrap();
+    let before = std::fs::read(directory.path().join(PENDING_TURN_FILE)).unwrap();
     assert_eq!(
         prepared.prompt,
         terminal_initial_prompt(directory.path(), initial.prompt).unwrap()
@@ -35,8 +36,9 @@ fn declared_transports_preserve_framing_and_pending_cleanup() {
         std::fs::read(directory.path().join(PENDING_TURN_FILE)).unwrap(),
         before
     );
-    let follow =
+    let mut follow =
         super::super::transport_test_context(directory.path(), &surface, TurnKind::FollowUp);
+    follow.claim_token = &pending.claim_token;
     let prepared = PiPaste.prepare(&follow).unwrap();
     let pending = read_pending_turn(directory.path()).unwrap().unwrap();
     assert_eq!(
@@ -370,6 +372,7 @@ fn cancel_support_requires_schema_two_and_current_claim() {
         write_json_atomic(
             &directory.path().join(STARTUP_READY_FILE),
             &StartupReady {
+                input_ack_schema: None,
                 schema,
                 claim_token: token.into(),
                 session_id: session.into(),
@@ -401,26 +404,31 @@ fn cancel_support_requires_schema_two_and_current_claim() {
 #[test]
 fn cancel_accepted_cleanup_is_owned_by_pending_turn_lifecycle() {
     let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_unchecked(directory.path());
     let accepted = directory.path().join("pi-cancel-accepted.json");
-    install_pending_turn(directory.path(), "1-2-3").unwrap();
+    let first = claim_pending_turn(directory.path());
     write_json_atomic(
         &accepted,
-        &serde_json::json!({"schema":1,"claim_token":"1-2-3"}),
+        &serde_json::json!({"schema":1,"claim_token":first.claim_token}),
     )
     .unwrap();
-    install_pending_turn(directory.path(), "4-5-6").unwrap();
+    store
+        .record(crate::native::session::CoreRecord::TurnClaim)
+        .remove()
+        .unwrap();
+    let next = claim_pending_turn(directory.path());
     assert!(!accepted.exists());
     write_json_atomic(
         &accepted,
-        &serde_json::json!({"schema":1,"claim_token":"4-5-6"}),
+        &serde_json::json!({"schema":1,"claim_token":next.claim_token}),
     )
     .unwrap();
-    cancel_pending_turn(directory.path(), "1-2-3").unwrap();
+    cancel_pending_turn(directory.path(), &first.claim_token).unwrap();
     assert!(
         accepted.exists(),
         "stale rollback cannot remove the new claim's record"
     );
-    cancel_pending_turn(directory.path(), "4-5-6").unwrap();
+    cancel_pending_turn(directory.path(), &next.claim_token).unwrap();
     assert!(!accepted.exists());
 }
 
@@ -432,6 +440,7 @@ fn cancel_support_survives_follow_up_and_delivery_rollback_without_upgrading_leg
         write_json_atomic(
             &directory.path().join(STARTUP_READY_FILE),
             &StartupReady {
+                input_ack_schema: None,
                 schema,
                 claim_token: pending.claim_token,
                 session_id: "native".into(),
@@ -839,6 +848,7 @@ fn usage_extension_reports_pi_usage_beside_every_outcome_in_node() {
                 write_json_atomic(
                     &dir.join(STARTUP_READY_FILE),
                     &StartupReady {
+                        input_ack_schema: None,
                         schema: 2,
                         claim_token: pending.claim_token.clone(),
                         session_id: name.into(),
