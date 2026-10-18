@@ -85,10 +85,39 @@ state, so the release of the high surrogate broke the pair. A surrogate pair is 
 key-down events only; a BMP character keeps its key-down and key-up pair. Agy and Pi retain their
 existing LF encoding and need separate provider evidence.
 
-Temporary measure for #124: after the Windows initial paste, Bridge waits up to 10 s (bounded by
-the request deadline) for the empty composer row with no `› [Pasted Content` row. If that submission
-evidence is absent or the screen cannot be read, delivery is uncertain and Bridge does not resend.
-Press Enter in the managed surface or close the session.
+For Windows initial launches recorded as `injected`, #124 uses a bounded best-effort console
+fallback pinned to Codex 0.163.0. After the positive composer gate, Bridge reserves at least
+20 s of the original deadline before writing. It writes and drains the exact framed body as
+text only, verifies its scalar count, then immediately writes and drains LF plus the claim
+marker and verifies that count. There is no screen observation between these writes.
+The final inline marker line is completion evidence under ordered console/reader/composer
+processing: earlier input was processed before the marker, and applying its paste clears
+burst suppression. Wrapped or scrolled inline body text does not need positional matching.
+If the tail merged into a final placeholder, Bridge instead requires the sum of placeholder
+counts and visible inline scalars (physical rows joined with LF) to equal the framed prompt's
+scalar count. This fallback is cardinality only, not a content receipt; wrapping, clipping,
+scrolling and literal placeholder collisions can make it ambiguous or misleading.
+A dialog or hook picker vetoes success. Bridge then requests one guarded Return: the helper
+compares the entire accepted screen and writes no Return if it changed. This assumes no
+concurrent human input; screen comparison is not atomic with a TUI transition. A clipped or
+wrapped marker, missing footer or unsupported layout remains unconfirmed.
+
+`Sent` means this claim's `UserPromptSubmit` binding was observed, not completion or final
+acceptance: another input hook may still reject the turn, and the transcript observer decides
+acceptance and result. A gate/reserve failure or proven pre-write refusal is `not_sent`.
+After body input, count mismatch, ambiguous or unreadable evidence, claim/session changes,
+tail failures, changed-screen refusal and missing binding are delivery-uncertain; Bridge keeps
+the claim and never automatically repeats text or Return. Missing binding includes a final
+composer classification: populated, positively empty, blocked, unreadable or ambiguous.
+This also applies when a launch is recorded as injected but `features.hooks=false` prevents binding.
+Check `tabcli result <session>` and the surface. Only if the entire draft remains in the composer
+with no dialog or running turn, consider pressing Enter once. Otherwise close the session or
+diagnose with `doctor`.
+
+The **legacy console route for not-injected launches (#124)** retains the consent OR composer
+gate, two delayed Returns and the empty-composer wait (up to 10 s within the request deadline).
+Its consent-only admission does not prove that the surface is editable; it has none of the new
+binding-based submission evidence. Missing launch records also use this explicit legacy route.
 
 `tell` uses `codex queue --thread <UUID> --message <TEXT>` to address the same conversation.
 Codex chooses a shared or embedded server; you do not need to start a shared daemon. Bridge waits
@@ -270,6 +299,8 @@ completion signal; starting a separate resumed process does not supply either.
 
 ## Agy
 
+Agy's submission evidence is its receipt; it does not use Codex's composer protocol.
+
 Install and sign in to `agy` (Antigravity CLI) 1.1.12 or newer. Trust the exact project directory
 in Agy before launching it through Bridge.
 
@@ -327,6 +358,8 @@ official addressed turn-interruption path and a correlated interruption signal; 
 observed quota-failure log is not evidence of cancellation.
 
 ## Pi
+
+Pi per-turn submission acknowledgement is tracked separately in [#254](https://github.com/jy1655/tabcli/issues/254).
 
 Install and sign in to `pi` 0.84.1 or newer. If Pi asks you to resolve project trust, answer that
 prompt before launching through Bridge.

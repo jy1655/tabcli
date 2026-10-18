@@ -414,7 +414,6 @@ pub(super) fn send_file(
 }
 
 // Raw Windows operations for the provider-owned paste protocol in R2.
-#[allow(dead_code)] // R1 exposes the seam; R2 supplies the caller.
 pub(super) fn send_file_text_only(
     session: &TerminalSession,
     prompt_path: &Path,
@@ -431,7 +430,6 @@ pub(super) fn send_file_text_only(
     }
 }
 
-#[allow(dead_code)] // R1 exposes the seam; R2 supplies the caller.
 pub(super) fn submit_if_unchanged(
     directory: &Path,
     session: &TerminalSession,

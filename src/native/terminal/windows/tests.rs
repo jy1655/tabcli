@@ -903,6 +903,7 @@ fn text_only_writes_scalars_and_soft_returns_then_reports_after_drain() {
     use std::cell::Cell;
     use windows_sys::Win32::System::Console::SHIFT_PRESSED;
     for input in ["ascii", "한글", "😀", "a\n한😀\n", ""] {
+        let start = Instant::now();
         let polls = Cell::new(0);
         struct AfterDrain<'a> {
             polls: &'a Cell<usize>,
@@ -926,7 +927,7 @@ fn text_only_writes_scalars_and_soft_returns_then_reports_after_drain() {
         super::write_text_only_with(
             input,
             super::ConsoleNewline::ShiftReturn,
-            Instant::now() + Duration::from_secs(5),
+            start + Duration::from_secs(5),
             |chunk| {
                 records.extend_from_slice(chunk);
                 Ok(chunk.len() as u32)
@@ -937,7 +938,7 @@ fn text_only_writes_scalars_and_soft_returns_then_reports_after_drain() {
                 Ok([3, 1, 0][n])
             },
             &mut output,
-            Instant::now,
+            || start,
         )
         .unwrap();
         assert_eq!(polls.get(), 3);
@@ -1028,6 +1029,9 @@ fn text_only_launcher_rejects_malformed_success_as_uncertain() {
     for output in [
         "",
         "{}",
+        "{\"schema\":1,\"written_chars\":3,\"unknown\":true}",
+        "{\"schema\":1,\"schema\":1,\"written_chars\":3}",
+        "{\"schema\":1,\"written_chars\":184467440737095516160}",
         "{\"schema\":2,\"written_chars\":3}",
         "{\"schema\":1,\"written_chars\":1.5}",
         "{\"schema\":1,\"written_chars\":-1}",
@@ -1037,6 +1041,15 @@ fn text_only_launcher_rejects_malformed_success_as_uncertain() {
         let failure = super::parse_text_only_output(output.as_bytes()).unwrap_err();
         assert!(failure.delivery_may_have_occurred());
     }
+    assert!(
+        super::parse_text_only_output(b"\xff")
+            .unwrap_err()
+            .delivery_may_have_occurred()
+    );
+    assert_eq!(
+        super::parse_text_only_output(b" \n {\"schema\":1,\"written_chars\":3}\n ").unwrap(),
+        3
+    );
 }
 
 #[test]
@@ -1082,4 +1095,100 @@ fn guarded_submission_writes_one_return_only_for_unchanged_screen() {
             assert_eq!(key.bKeyDown, if index == 0 { 1 } else { 0 });
         }
     }
+}
+
+#[test]
+fn text_only_multichunk_unicode_count_and_second_chunk_failure() {
+    let start = Instant::now();
+    // Every scalar has two records. The emoji occupies records 1022/1023,
+    // immediately before the next chunk; full chunks cannot bisect this pair.
+    let input = format!(
+        "{}😀한글e\u{301}👩\u{200d}💻{}",
+        "a".repeat(511),
+        "끝".repeat(600)
+    );
+    for fail in [false, true] {
+        let mut output = Vec::new();
+        let mut records = Vec::new();
+        let mut calls = 0;
+        let mut drained = false;
+        let result = super::write_text_only_with(
+            &input,
+            super::ConsoleNewline::ShiftReturn,
+            start + Duration::from_secs(5),
+            |chunk| {
+                calls += 1;
+                if fail && calls == 2 {
+                    anyhow::bail!("second chunk failed");
+                }
+                records.extend_from_slice(chunk);
+                Ok(chunk.len() as u32)
+            },
+            || {
+                drained = true;
+                Ok(0)
+            },
+            &mut output,
+            || start,
+        );
+        if fail {
+            assert!(result.is_err());
+            assert_eq!(calls, 2);
+            assert_eq!(records.len(), 1024);
+            assert!(!drained);
+            assert!(output.is_empty());
+        } else {
+            result.unwrap();
+            assert!(calls >= 3);
+            assert!(drained);
+            assert_eq!(
+                super::parse_text_only_output(&output).unwrap(),
+                input.chars().count()
+            );
+            let units: Vec<u16> = records
+                .iter()
+                .filter_map(|r| {
+                    let key = unsafe { r.Event.KeyEvent };
+                    (key.bKeyDown != 0).then_some(unsafe { key.uChar.UnicodeChar })
+                })
+                .collect();
+            assert_eq!(String::from_utf16(&units).unwrap(), input);
+        }
+        for index in [1022, 1023] {
+            let key = unsafe { records[index].Event.KeyEvent };
+            assert_eq!(key.bKeyDown, 1);
+            let unit = unsafe { key.uChar.UnicodeChar };
+            assert!((0xD800..=0xDFFF).contains(&unit));
+        }
+    }
+}
+
+#[test]
+fn guarded_down_enter_sequence_and_writer_error() {
+    let input = terminal::GuardedDialogInput {
+        screen: "dialog".into(),
+        key: terminal::DialogKey::DownEnter,
+    };
+    let result = super::guarded_key_with(&input, "dialog", |key| {
+        let records = super::build_dialog_records(key);
+        assert_eq!(records.len(), 4);
+        for (record, (code, down)) in
+            records
+                .iter()
+                .zip([(0x28, 1), (0x28, 0), (0x0d, 1), (0x0d, 0)])
+        {
+            let key = unsafe { record.Event.KeyEvent };
+            assert_eq!(key.wVirtualKeyCode, code);
+            assert_eq!(key.bKeyDown, down);
+            assert_eq!(key.dwControlKeyState, 0);
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(result, "sent");
+    let error = super::guarded_key_with(&input, "dialog", |_| {
+        anyhow::bail!("writer failed after key down")
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("writer failed"));
 }

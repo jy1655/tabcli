@@ -80,9 +80,17 @@ adapters above them are macOS-only.
 | Windows | Terminal tab | Tab | Console input | Console and tab |
 | Windows | Console window | Window fallback | Console input | Console |
 
-Temporary measure for #124: on Windows, each delayed submission Return waits for the console
-input buffer to drain before its existing 2 s delay, within the request deadline. Immediate
-single-Return input is unchanged; a drain timeout after typing leaves delivery uncertain.
+The legacy Codex console route for not-injected launches (#124) keeps delayed submission
+Returns: each waits for the console input buffer to drain before its existing 2 s delay,
+within the request deadline. Immediate single-Return Agy/Pi input is unchanged.
+For injected Codex launches, text-only sends explicitly request zero submission Returns;
+LF still uses Shift+Return. They drain the input buffer and report written Unicode scalar
+counts, which do not prove composer processing. Codex writes body then LF plus the claim
+marker without an intervening screen read. The final inline marker is its completion evidence;
+a merged-tail placeholder uses a cardinality-only sum. Sent still requires the claim binding.
+Codex then requests one guarded submission: the helper compares the full captured screen
+and writes Return only if unchanged. No second Return is sent. See the
+[Codex provider boundary](providers.md#codex) for binding evidence and uncertain recovery.
 
 Codex follow-ups use its thread-addressed queue; Claude uses official cross-session messaging.
 Neither falls back to unaddressed terminal input. Agy and Pi need the terminal fallback, which rules

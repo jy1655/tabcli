@@ -1,3 +1,4 @@
+mod paste;
 use super::PendingCodexTurn;
 use super::correlation::correlated_prompt;
 use crate::native::session::Reader;
@@ -51,10 +52,16 @@ pub(super) fn send_initial_prompt(
             },
         )
         .map_err(terminal::TerminalSendFailure::not_sent)?;
+        if super::hooks::read_launch_mode(&directory)
+            .map_err(terminal::TerminalSendFailure::not_sent)?
+            .is_some_and(|mode| mode.lifecycle_hooks == super::hooks::LifecycleHooks::Injected)
+        {
+            return paste::send(session, &directory, prompt_path, deadline);
+        }
     }
     terminal::send_file(session, prompt_path, deadline)?;
     if cfg!(windows) {
-        // Temporary measure for issue #124
+        // legacy console route for not-injected launches (#124)
         let submission_deadline = deadline.min(Instant::now() + Duration::from_secs(10));
         wait_for_submission_with(
             || terminal::read_screen(session, submission_deadline),
@@ -151,7 +158,7 @@ fn legacy_composer_is_ready(screen: &str) -> bool {
     composer
 }
 
-// Temporary measure for issue #124
+// legacy console route for not-injected launches (#124)
 fn submission_observed(screen: &str) -> bool {
     let mut composer = false;
     for line in screen.lines().map(str::trim) {
