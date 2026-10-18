@@ -211,6 +211,12 @@ fn complete_prefix_requires_one_user_text_with_matching_turn_and_framing() {
         "nested_compaction",
         "no_header",
         "no_marker",
+        "metadata_absent",
+        "metadata_null",
+        "turn_id_absent",
+        "unknown_content_type",
+        "other_role",
+        "other_payload_type",
     ] {
         let (root, pending, payload) = fixture();
         ADAPTER.handle_hook(root.path(), &payload).unwrap();
@@ -232,6 +238,22 @@ fn complete_prefix_requires_one_user_text_with_matching_turn_and_framing() {
             "no_marker" => {
                 input["content"][0]["text"] = json!(crate::native::NATIVE_DELEGATION_HEADER)
             }
+            "metadata_absent" => {
+                input
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("internal_chat_message_metadata_passthrough");
+            }
+            "metadata_null" => input["internal_chat_message_metadata_passthrough"] = Value::Null,
+            "turn_id_absent" => {
+                input["internal_chat_message_metadata_passthrough"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("turn_id");
+            }
+            "unknown_content_type" => input["content"][0]["type"] = json!("unknown"),
+            "other_role" => input["role"] = json!("assistant"),
+            "other_payload_type" => input["type"] = json!("function_call"),
             _ => {}
         }
         let path = root.path().join("rollout.jsonl");
@@ -740,6 +762,12 @@ fn matching_turn_malformed_attribution_suspends_without_releasing_claim() {
         "content_object",
         "content_number",
         "text_number",
+        "content_type_number",
+        "content_type_missing",
+        "role_number",
+        "turn_id_number",
+        "payload_type_number",
+        "metadata_number",
     ] {
         let (root, pending, payload) = fixture();
         let mut input = json!({"type":"message","role":"user",
@@ -757,6 +785,16 @@ fn matching_turn_malformed_attribution_suspends_without_releasing_claim() {
             "content_object" => input["content"] = json!({}),
             "content_number" => input["content"] = json!([3]),
             "text_number" => input["content"][0]["text"] = json!(3),
+            "content_type_number" => input["content"][0]["type"] = json!(3),
+            "content_type_missing" => {
+                input["content"][0].as_object_mut().unwrap().remove("type");
+            }
+            "role_number" => input["role"] = json!(3),
+            "turn_id_number" => {
+                input["internal_chat_message_metadata_passthrough"]["turn_id"] = json!(3)
+            }
+            "payload_type_number" => input["type"] = json!(3),
+            "metadata_number" => input["internal_chat_message_metadata_passthrough"] = json!(3),
             _ => unreachable!(),
         }
         let path = root.path().join("rollout.jsonl");
@@ -773,6 +811,33 @@ fn matching_turn_malformed_attribution_suspends_without_releasing_claim() {
             "{variant}"
         );
     }
+}
+#[test]
+fn unaccepted_aborted_turn_preserves_terminal_provenance() {
+    let (root, _, payload) = fixture();
+    let path = root.path().join("rollout.jsonl");
+    append(&path, &line("session_meta", json!({"id":THREAD})));
+    append(
+        &path,
+        &line(
+            "event_msg",
+            json!({"type":"turn_aborted","turn_id":"turn-1","reason":"interrupted"}),
+        ),
+    );
+    ADAPTER.handle_hook(root.path(), &payload).unwrap();
+    Observer::default().poll(root.path(), true);
+    let result = events(root.path());
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result[0]["error"],
+        "Codex did not accept the delegated prompt"
+    );
+    assert_eq!(result[0]["provenance"], "codex_transcript_turn_aborted");
+    assert!(
+        turn::current_claim_token(&Reader::open_unchecked(root.path()))
+            .unwrap()
+            .is_none()
+    );
 }
 #[test]
 fn post_read_observed_growth_then_truncation_suspends_with_terminal_still_present() {

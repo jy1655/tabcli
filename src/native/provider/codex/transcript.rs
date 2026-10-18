@@ -210,11 +210,27 @@ impl Cursor {
             self.meta_seen = true;
             return Ok(None);
         }
-        if kind == "response_item" && payload["type"] == "message" && payload["role"] == "user" {
+        if kind == "response_item" {
+            if payload["type"].as_str().ok_or("invalid_schema")? != "message" {
+                return Ok(None);
+            }
+            if payload["role"].as_str().ok_or("invalid_schema")? != "user" {
+                return Ok(None);
+            }
+            // Older records can lack attribution; malformed attribution is not
+            // evidence that the delegated input was absent.
             let metadata = &payload["internal_chat_message_metadata_passthrough"];
-            if metadata["turn_id"].as_str() == Some(&binding.turn_id) {
-                let kinds = metadata["content_item_kinds"]
-                    .as_array()
+            if metadata.is_null() {
+                return Ok(None);
+            }
+            let metadata = metadata.as_object().ok_or("invalid_schema")?;
+            let Some(turn_id) = metadata.get("turn_id") else {
+                return Ok(None);
+            };
+            if turn_id.as_str().ok_or("invalid_schema")? == binding.turn_id {
+                let kinds = metadata
+                    .get("content_item_kinds")
+                    .and_then(Value::as_array)
                     .ok_or("invalid_schema")?;
                 if !kinds.iter().all(Value::is_string) {
                     return Err("invalid_schema");
@@ -225,7 +241,7 @@ impl Cursor {
                     if !item.is_object() {
                         return Err("invalid_schema");
                     }
-                    if item["type"] == "input_text" {
+                    if item["type"].as_str().ok_or("invalid_schema")? == "input_text" {
                         let text = item["text"].as_str().ok_or("invalid_schema")?;
                         self.accepted |= user_text
                             && begins_with_bridge_prompt(text)
@@ -284,13 +300,8 @@ impl Cursor {
         }
         let binding = self.binding.as_ref().unwrap();
         let store = Store::open_unchecked(directory);
-        let source = if self.accepted {
-            terminal.source
-        } else {
-            COMPLETE_SOURCE
-        };
         let report = turn::Report::for_claim(&store, FirstPartyCli::Codex, Some(&self.claim))
-            .with_provenance(Some(source));
+            .with_provenance(Some(terminal.source));
         let outcome = if self.accepted {
             terminal.outcome
         } else {

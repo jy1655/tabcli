@@ -151,6 +151,7 @@ fn lifecycle_doctor_terminal_kinds_come_only_from_committed_provenance() {
             Some("codex_transcript_task_complete"),
             Some("task_complete"),
         ),
+        (Some("codex_transcript_turn_aborted"), Some("turn_aborted")),
     ] {
         let root = tempfile::tempdir().unwrap();
         let dir = super::super::test_support::launch_session(root.path(), Some("0.163.0"));
@@ -159,13 +160,25 @@ fn lifecycle_doctor_terminal_kinds_come_only_from_committed_provenance() {
         let token = turn::current_claim_token(&Reader::open_unchecked(&dir))
             .unwrap()
             .unwrap();
-        turn::Report::for_claim(&store, agent_bridge::FirstPartyCli::Codex, Some(&token))
-            .with_provenance(source)
-            .complete("answer", None, None)
-            .unwrap();
+        let report =
+            turn::Report::for_claim(&store, agent_bridge::FirstPartyCli::Codex, Some(&token))
+                .with_provenance(source);
+        if kind == Some("turn_aborted") {
+            report
+                .fail("Codex did not accept the delegated prompt", None, None)
+                .unwrap();
+        } else {
+            report.complete("answer", None, None).unwrap();
+        }
         let evidence = lifecycle_evidence(&dir);
         if let Some(kind) = kind {
             assert_eq!(evidence["terminal_outcome"]["record"]["kind"], kind);
+            if kind == "turn_aborted" {
+                assert_eq!(
+                    evidence["terminal_outcome"]["record"]["request_state"],
+                    "failed"
+                );
+            }
             assert_eq!(
                 evidence["terminal_outcome"]["record"]["provenance"],
                 source.unwrap()
