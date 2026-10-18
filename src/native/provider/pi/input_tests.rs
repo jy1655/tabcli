@@ -172,12 +172,26 @@ fn delivery_without_pi_event(initial: bool) {
             "input_ack_schema": 1,
         }))
         .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let expected = terminal_correlated_prompt(
+        "prompt",
+        &read_pending_turn(fixture.store.directory())
+            .unwrap()
+            .unwrap(),
+        true,
+    )
+    .unwrap();
     let sends = Rc::new(Cell::new(0));
     let count = sends.clone();
     let result = super::test_support::with_console_send(
         Box::new(move |path| {
             count.set(count.get() + 1);
+            assert!(
+                Instant::now() < deadline,
+                "setup exhausted the input deadline"
+            );
             let frame = fs::read_to_string(path).unwrap();
+            assert_eq!(frame, expected);
             assert!(frame.contains("agent-bridge-pi-turn:"));
             assert!(!frame.contains('\n'));
             Ok(())
@@ -192,7 +206,7 @@ fn delivery_without_pi_event(initial: bool) {
                     Turn::FollowUp { prompt: "prompt" }
                 },
                 DeliveryContext {
-                    deadline: Instant::now() + Duration::from_millis(150),
+                    deadline,
                     ..fixture.context()
                 },
                 if initial { &PiInitialPaste } else { &PiPaste },
@@ -200,7 +214,11 @@ fn delivery_without_pi_event(initial: bool) {
             )
         },
     );
-    assert_eq!(sends.get(), 1);
+    assert_eq!(
+        sends.get(),
+        1,
+        "the missing-receipt path requires console dispatch"
+    );
     assert!(
         result.is_err(),
         "console batch success alone must remain Uncertain, got {result:?}"
@@ -213,7 +231,12 @@ fn delivery_without_pi_event(initial: bool) {
     );
     let status = fixture.store.status().unwrap();
     assert_eq!(status.state, SessionState::Working);
-    assert!(status.error.unwrap().contains("Pi"));
+    let error = status.error.unwrap();
+    assert!(
+        error.contains("Pi input submission is uncertain"),
+        "{error}"
+    );
+    assert!(error.contains("deadline"), "{error}");
     assert!(fixture.store.private(PENDING_TURN_FILE).path().exists());
     assert_eq!(
         fixture
@@ -723,44 +746,105 @@ fn input_ack_invalid_receipts_are_uncertain_and_never_roll_back_dispatched_input
 #[test]
 #[cfg(windows)]
 fn input_ack_receipt_observed_after_the_original_deadline_cannot_report_sent() {
+    use std::{cell::Cell, rc::Rc};
     let fixture = delivery::test_support::Fixture::new();
     let claim = fixture.claim(false);
     let token = claim.token().to_owned();
     write_ready(&fixture.store, &token, 2, Some(1));
     let directory = fixture.store.directory().to_owned();
-    let deadline = Instant::now() + Duration::from_millis(100);
-    let result = super::test_support::with_console_send(
-        Box::new(move |path| {
-            publish_receipt(&directory, &token, &fs::read_to_string(path).unwrap());
+    let expected = terminal_correlated_prompt(
+        "synthetic request",
+        &PendingPiTurn::new(&token).unwrap(),
+        true,
+    )
+    .unwrap();
+    let receipt_token = token.clone();
+    let sends = Rc::new(Cell::new(0));
+    let count = sends.clone();
+    let reads = Rc::new(Cell::new(0));
+    let read_count = reads.clone();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let result = super::test_support::with_receipt_hooks(
+        Some(Box::new(move || {
+            read_count.set(read_count.get() + 1);
+            assert!(
+                Instant::now() < deadline,
+                "setup exhausted the input deadline"
+            );
             std::thread::sleep(
                 deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
             );
-            Ok(())
-        }),
+            assert!(Instant::now() >= deadline);
+        })),
+        None,
         || {
-            delivery::deliver_with(
-                claim,
-                delivery::Turn::FollowUp {
-                    prompt: "synthetic request",
+            super::test_support::with_console_send(
+                Box::new(move |path| {
+                    count.set(count.get() + 1);
+                    assert!(
+                        Instant::now() < deadline,
+                        "setup exhausted the input deadline"
+                    );
+                    let frame = fs::read_to_string(path).unwrap();
+                    assert_eq!(frame, expected);
+                    publish_receipt(&directory, &receipt_token, &frame);
+                    Ok(())
+                }),
+                || {
+                    delivery::deliver_with(
+                        claim,
+                        delivery::Turn::FollowUp {
+                            prompt: "synthetic request",
+                        },
+                        delivery::DeliveryContext {
+                            deadline,
+                            ..fixture.context()
+                        },
+                        &PiPaste,
+                        &fixture.checks,
+                    )
                 },
-                delivery::DeliveryContext {
-                    deadline,
-                    ..fixture.context()
-                },
-                &PiPaste,
-                &fixture.checks,
             )
         },
     );
-    assert!(result.is_err());
-    assert!(turn::current_claim_token(&fixture.store).unwrap().is_some());
-    assert!(
-        fixture
-            .store
-            .status()
-            .unwrap()
-            .error
-            .unwrap()
-            .contains("deadline")
+    assert_eq!(
+        sends.get(),
+        1,
+        "the late-receipt path requires console dispatch"
     );
+    assert_eq!(
+        reads.get(),
+        1,
+        "the matching receipt crosses the deadline while read"
+    );
+    assert!(
+        result.is_err(),
+        "a receipt observed after the original deadline cannot be Sent"
+    );
+    assert_eq!(
+        turn::current_claim_token(&fixture.store)
+            .unwrap()
+            .as_deref(),
+        Some(token.as_str())
+    );
+    let pending = read_pending_turn(fixture.store.directory())
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.claim_token, token);
+    assert!(
+        input::read_accepted(
+            fixture.store.directory(),
+            &token,
+            pending.windows_input.as_ref().unwrap(),
+        )
+        .unwrap()
+    );
+    let status = fixture.store.status().unwrap();
+    assert_eq!(status.state, SessionState::Working);
+    let error = status.error.unwrap();
+    assert!(
+        error.contains("Pi input submission is uncertain"),
+        "{error}"
+    );
+    assert!(error.contains("deadline"), "{error}");
 }
