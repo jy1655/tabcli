@@ -193,6 +193,53 @@ launch, observe, continue, and close without replacing the capabilities those CL
 
 ## Current Codex Boundary
 
+- The injected Windows initial paste is a bounded best-effort console fallback (#124),
+  pinned to Codex 0.163.0. It assumes no concurrent input; screen snapshots are not atomic
+  with TUI transitions and placeholder counts are not content receipts. Non-injected or
+  missing launch records retain the legacy console route, including its consent-only limit.
+- Codex groups plain input at 8 ms intervals, flushes on Windows after 60 ms, and collapses
+  individual pastes over 1000 Unicode scalars. Active-burst Enter and Shift+Enter insert LF.
+  Applying a complete paste clears the 120 ms suppression window: no 150 ms proof exists.
+  A visible prefix with input still pending can absorb Return into a later burst.
+- Before writing, require the positive empty composer and a 20 s reserve. Write/drain body
+  text only and verify its scalar count, then wait 150 ms before writing/draining LF plus the claim
+  marker and verify that count, with no screen read between writes. The final exact inline
+  marker is completion evidence under ordered console/reader/composer processing; its
+  applied paste clears burst suppression. Wrapped/scrolled body rows need no positional
+  matching. If the last segment is a placeholder, require the Codex-normalized framed scalar total
+  from placeholders plus inline text (physical rows joined with LF): cardinality only,
+  not a content receipt. Repeated labels use ` #2` outside the bracket. A dialog/picker
+  veto precedes success; an unobserved/clipped marker or ambiguous fallback never submits.
+  The request has one absolute deadline, and Sent still requires the claim binding.
+- The 150 ms split gap only encourages the 60 ms idle flush; it proves nothing.
+  The exact inset-stripped marker row ends composer content; subsequent rows still undergo
+  the UI veto. Numbered pinned menu labels and confirmation hints anywhere, and any
+  column-zero `› ` row outside the span, remain unresolved UI; the UI recognizer is pinned
+  to Codex 0.163.0 forms at this PC's 120-column managed Windows Terminal tab and console
+  window widths, the upstream 40-column snapshot and the 43–47-column sandbox wrap.
+  Otherwise use the first recognized footer (workspace-qualified model line, warning,
+  shortcut/queue/interrupt/edit/quit hint or context/token count), trimming separator blanks
+  but preserving internal blanks. No marker and no recognized footer remains ambiguous.
+  Count normalization is CRLF/CR to LF and control/CSI sanitization, not blank-line collapse
+  (Codex rust-v0.163.0 paste_input.rs:145-176; history_cell/messages.rs:25-85).
+  Bridge trims source prompts before framing: the live 25596/1094 estimates become
+  25595/1093 there. Cursor-dependent blockquote fallback stays ambiguous; exact inline
+  marker evidence remains usable. Unknown custom status lines require that marker.
+- Recheck the current claim, session and deadline after blocking work and at input dispatch.
+  The injected Windows helpers hold the lifecycle lock across the final claim/session/expiry
+  check and each write; screen reads and drain waits remain outside that lock.
+  Submit one guarded Return against the exact accepted full screen; a changed screen gets
+  none. After body dispatch all unconfirmed failures are uncertain, except a helper's
+  proven pre-write refusal. Never retry text or Return, including after late binding.
+- Sent requires this claim's `UserPromptSubmit` binding, which proves inspection; acceptance
+  and completion remain the transcript observer's job. Missing binding is uncertain with
+  a final composer classification. Recovery is conditional: inspect result and surface;
+  consider Enter once only with the complete draft, no dialog and no running turn, otherwise
+  close or diagnose. Never claim unreadable content was observed.
+- Replace this protocol when Codex exposes a verified Windows console paste event or
+  newline-preserving input API. The legacy delayed-Return machinery remains until its
+  supported non-injected configurations have a replacement.
+
 - Codex 0.163.0 runs Claude-compatible lifecycle hooks (feature `hooks`, stable and on by
   default): a command hook receives one JSON object on stdin, runs in the turn's cwd with
   Codex's environment, and must never exit with code 2 (that blocks the turn). The legacy
@@ -294,6 +341,8 @@ launch, observe, continue, and close without replacing the capabilities those CL
   official control or an upstream fix; do not disable it from a version check alone.
 
 ## Current Windows Surface Boundary
+
+- Codex owns injected paste evidence and guarded submission; see Current Codex Boundary (#124).
 
 - A managed console on native Windows is a tab of Windows Terminal, and a console window
   of its own only when no tab can be had: `wt.exe` is not on an absolute `PATH` entry, the

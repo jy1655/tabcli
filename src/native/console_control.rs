@@ -23,6 +23,7 @@ use std::time::Duration;
 pub(crate) enum ConsoleControlRequest {
     Screen,
     Send {
+        submit_count: Option<usize>,
         input_name: String,
         timeout: Duration,
     },
@@ -64,8 +65,15 @@ pub(super) fn parse(rest: &[String]) -> Result<NativeCommand> {
         Ok(Duration::from_millis(timeout_ms))
     };
     let request = match (action.as_str(), tail) {
-        ("send", [input, timeout_ms]) if valid_pending_prompt_name(input) => {
+        ("send", [input, timeout_ms, count @ ..])
+            if valid_pending_prompt_name(input) && count.len() <= 1 =>
+        {
             ConsoleControlRequest::Send {
+                submit_count: count
+                    .first()
+                    .map(|value| value.parse::<usize>())
+                    .transpose()
+                    .context("invalid native console control arguments")?,
                 input_name: input.clone(),
                 timeout: timeout(timeout_ms)?,
             }
@@ -112,31 +120,43 @@ pub(super) fn run(request: ConsoleControlRequest, id: &str) -> Result<()> {
     } else {
         verify_terminal_surface_ownership(&directory, id, &session)?;
     }
+    let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
+    let records = terminal::WindowsSessionRecords {
+        directory: &directory,
+        root_never_ran: windows_console_root_never_ran(&directory),
+    };
+    let action = resolve_action(request, &directory, provider);
+    terminal::windows_console_control(action, &session, &records)
+}
+
+// Pure resolution after the caller has verified the managed session and surface.
+#[cfg(windows)]
+fn resolve_action(
+    request: ConsoleControlRequest,
+    directory: &Path,
+    provider: FirstPartyCli,
+) -> terminal::ConsoleControlAction {
     let input_path = |name: &str| {
-        Reader::open_unchecked(&directory)
+        Reader::open_unchecked(directory)
             .private(name)
             .path()
             .to_owned()
     };
-    let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
     let (submit_count, newline) = provider::initial_transport(provider)
         .facts()
         .surface
         .map_or((1, terminal::ConsoleNewline::LineFeed), |surface| {
             (surface.submit_count, surface.newline)
         });
-    let records = terminal::WindowsSessionRecords {
-        directory: &directory,
-        root_never_ran: windows_console_root_never_ran(&directory),
-    };
-    let action = match request {
+    match request {
         ConsoleControlRequest::Screen => terminal::ConsoleControlAction::Screen,
         ConsoleControlRequest::Send {
+            submit_count: override_count,
             input_name,
             timeout,
         } => terminal::ConsoleControlAction::Send {
             input: input_path(&input_name),
-            submit_count,
+            submit_count: override_count.unwrap_or(submit_count),
             newline,
             timeout,
         },
@@ -150,11 +170,53 @@ pub(super) fn run(request: ConsoleControlRequest, id: &str) -> Result<()> {
             terminal::ConsoleControlAction::Window { timeout }
         }
         ConsoleControlRequest::Close => terminal::ConsoleControlAction::Close,
-    };
-    terminal::windows_console_control(action, &session, &records)
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
 pub(super) fn run(_request: ConsoleControlRequest, _id: &str) -> Result<()> {
     bail!("native Windows console control is only available on Windows")
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    #[test]
+    fn parsed_send_resolves_override_and_provider_facts() {
+        for (provider, count, newline) in [
+            (
+                FirstPartyCli::Codex,
+                2,
+                terminal::ConsoleNewline::ShiftReturn,
+            ),
+            (FirstPartyCli::Agy, 1, terminal::ConsoleNewline::LineFeed),
+            (FirstPartyCli::Pi, 1, terminal::ConsoleNewline::LineFeed),
+        ] {
+            for explicit in [false, true] {
+                let mut args: Vec<String> =
+                    ["send", "session-test", "pending-prompt-test.txt", "5000"]
+                        .map(str::to_owned)
+                        .into();
+                if explicit {
+                    args.push("0".into());
+                }
+                let NativeCommand::ConsoleControl { request, .. } = parse(&args).unwrap() else {
+                    panic!("wrong command");
+                };
+                let terminal::ConsoleControlAction::Send {
+                    input,
+                    submit_count,
+                    newline: actual_newline,
+                    timeout,
+                } = resolve_action(request, Path::new("fixture"), provider)
+                else {
+                    panic!("wrong action");
+                };
+                assert_eq!(submit_count, if explicit { 0 } else { count });
+                assert_eq!(actual_newline, newline);
+                assert_eq!(timeout, Duration::from_secs(5));
+                assert_eq!(input, Path::new("fixture").join("pending-prompt-test.txt"));
+            }
+        }
+    }
 }

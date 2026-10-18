@@ -625,16 +625,83 @@ pub(super) fn send_file(
         .to_str()
         .context("prompt path is not valid UTF-8")
         .map_err(super::TerminalSendFailure::not_sent)?;
-    run_console_send_helper(session, prompt_path, deadline)
+    run_console_send_helper(session, prompt_path, deadline, None).map(|_| ())
 }
+
+pub(super) fn send_file_text_only(
+    session: &TerminalSession,
+    prompt_path: &Path,
+    expected_claim: &str,
+    deadline: Instant,
+) -> std::result::Result<usize, super::TerminalSendFailure> {
+    let payload = (|| -> Result<_> {
+        let input = GuardedTextInput {
+            text: std::fs::read_to_string(prompt_path)?,
+            expected_claim: Some(expected_claim.to_owned()),
+            expires_unix_ms: Some(
+                crate::native::session::primitives::unix_ms()
+                    + deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis(),
+            ),
+        };
+        dialog_input_file(
+            prompt_path.parent().context("missing payload directory")?,
+            session,
+            &input,
+        )
+    })()
+    .map_err(super::TerminalSendFailure::not_sent)?;
+    let path = payload
+        .path()
+        .to_str()
+        .context("payload path is not UTF-8")
+        .map_err(super::TerminalSendFailure::not_sent)?;
+    let output = run_console_send_helper(session, path, deadline, Some(0))?;
+    parse_text_only_output(&output)
+}
+
+fn parse_text_only_output(output: &[u8]) -> std::result::Result<usize, super::TerminalSendFailure> {
+    parse_text_only_count(output).map_err(super::TerminalSendFailure::delivery_uncertain)
+}
+
+fn parse_text_only_count(output: &[u8]) -> Result<usize> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Written {
+        schema: u32,
+        written_chars: usize,
+    }
+    let line = std::str::from_utf8(output)?.trim();
+    if line.lines().count() != 1 {
+        bail!("expected one Windows console text-only result line");
+    }
+    let value: Written =
+        serde_json::from_str(line).context("invalid Windows console text-only result")?;
+    if value.schema != 1 {
+        bail!("invalid Windows console text-only result schema");
+    }
+    Ok(value.written_chars)
+}
+
+fn console_output_until(
+    command: &mut Command,
+    deadline: Instant,
+    label: &str,
+) -> Result<std::process::Output> {
+    #[cfg(test)]
+    if let Some(output) = tests::helper_output(command) {
+        return output.map_err(super::TerminalSendFailure::into_error);
+    }
+    crate::native::process_env::command_output_until(command, deadline, label)
+}
+
+#[cfg(test)]
+pub(in crate::native) use tests::with_stale_helper;
 
 pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Result<String> {
     let mut command = console_helper_command("screen", session, None)?;
-    let output = crate::native::process_env::command_output_until(
-        &mut command,
-        deadline,
-        "managed console screen",
-    )?;
+    let output = console_output_until(&mut command, deadline, "managed console screen")?;
     if !output.status.success() {
         bail!("{}", console_helper_failure_message(&output));
     }
@@ -646,7 +713,7 @@ pub(super) fn read_screen(session: &TerminalSession, deadline: Instant) -> Resul
 fn dialog_input_file(
     directory: &Path,
     session: &TerminalSession,
-    input: &super::GuardedDialogInput,
+    input: &impl serde::Serialize,
 ) -> Result<tempfile::NamedTempFile> {
     use std::io::Write;
     let id = session
@@ -695,17 +762,14 @@ pub(super) fn guarded_dialog_input(
             .max(1)
             .to_string(),
     );
-    let output = crate::native::process_env::command_output_until(
-        &mut command,
-        deadline,
-        "managed console dialog input",
-    )?;
+    let output = console_output_until(&mut command, deadline, "managed console dialog input")?;
     if !output.status.success() {
         bail!("{}", console_helper_failure_message(&output));
     }
     match String::from_utf8_lossy(&output.stdout).trim() {
         "sent" => Ok(true),
         "changed" => Ok(false),
+        "stale" => bail!("stale claim at guarded submission"),
         _ => bail!("unexpected managed console dialog result"),
     }
 }
@@ -732,7 +796,8 @@ fn run_console_send_helper(
     session: &TerminalSession,
     input: &str,
     deadline: Instant,
-) -> super::TerminalSendResult {
+    submit_count: Option<usize>,
+) -> std::result::Result<Vec<u8>, super::TerminalSendFailure> {
     let mut command = console_helper_command("send", session, Some(input))
         .map_err(super::TerminalSendFailure::not_sent)?;
     let timeout = super::windows_budget::remaining_send_budget_at(deadline, Instant::now())
@@ -741,8 +806,22 @@ fn run_console_send_helper(
         .context("Windows console timeout is too large")
         .map_err(super::TerminalSendFailure::not_sent)?;
     command.arg(timeout_ms.max(1).to_string());
+    if let Some(count) = submit_count {
+        command.arg(count.to_string());
+    }
+    run_console_send_command(&mut command, deadline)
+}
+
+fn run_console_send_command(
+    command: &mut Command,
+    deadline: Instant,
+) -> std::result::Result<Vec<u8>, super::TerminalSendFailure> {
+    #[cfg(test)]
+    if let Some(output) = tests::helper_output(command) {
+        return classify_send_output(output?);
+    }
     let output = crate::native::process_env::command_output_until_classified(
-        &mut command,
+        command,
         deadline,
         "Windows console control helper",
     )
@@ -753,8 +832,14 @@ fn run_console_send_helper(
             super::TerminalSendFailure::not_sent(failure.into_error())
         }
     })?;
+    classify_send_output(output)
+}
+
+fn classify_send_output(
+    output: std::process::Output,
+) -> std::result::Result<Vec<u8>, super::TerminalSendFailure> {
     if output.status.success() {
-        return Ok(());
+        return Ok(output.stdout);
     }
     let message = console_helper_failure_message(&output);
     let error = anyhow::anyhow!(message);
@@ -920,17 +1005,20 @@ pub(super) fn console_control(
             Ok(())
         }
         ConsoleControlAction::Dialog { input: path } => {
-            let input: super::GuardedDialogInput = serde_json::from_slice(
-                &crate::native::session::RecordReader::at(&path).raw_bytes()?,
-            )?;
-            match dialog_decision(&input.screen, &attached_screen()?) {
-                DialogDecision::Changed => println!("changed"),
-                DialogDecision::Send => {
-                    write_dialog_key(input.key)?;
-                    println!("sent");
-                }
-            }
-            Ok(())
+            let payload = crate::native::session::RecordReader::at(&path).raw_bytes()?;
+            dispatch_attached_input(
+                records.directory,
+                &payload,
+                AttachedInput::Dialog,
+                attached_screen,
+                |chunk| {
+                    let handle = open_console_input(GENERIC_WRITE)?;
+                    write_console_chunk(handle.as_raw_handle(), chunk)
+                },
+                || unreachable!("dialog has no drain"),
+                &mut std::io::stdout().lock(),
+                Instant::now,
+            )
         }
         ConsoleControlAction::Send {
             input: path,
@@ -949,7 +1037,21 @@ pub(super) fn console_control(
             let input = crate::native::session::RecordReader::at(&path)
                 .raw_text()
                 .with_context(|| format!("failed to read prompt payload {}", path.display()))?;
-            write_console_input(&input, submit_count, newline, deadline)
+            if submit_count == 0 {
+                let handle = open_console_input(GENERIC_READ | GENERIC_WRITE)?;
+                dispatch_attached_input(
+                    records.directory,
+                    input.as_bytes(),
+                    AttachedInput::Text { newline, deadline },
+                    attached_screen,
+                    |chunk| write_console_chunk(handle.as_raw_handle(), chunk),
+                    || console_pending_count(handle.as_raw_handle()),
+                    &mut std::io::stdout().lock(),
+                    Instant::now,
+                )
+            } else {
+                write_console_input(&input, submit_count, newline, deadline)
+            }
         }
         ConsoleControlAction::Window { .. } => loop {
             if let Some(window) = focus::attached_console_host_window() {
@@ -1124,12 +1226,140 @@ fn screen_row(cells: &[u16], read: u32) -> Result<String> {
     Ok(String::from_utf16(characters)?)
 }
 
-fn write_dialog_key(key: super::DialogKey) -> Result<()> {
+#[derive(serde::Serialize, serde::Deserialize)]
+struct GuardedTextInput {
+    text: String,
+    #[serde(default)]
+    expected_claim: Option<String>,
+    #[serde(default)]
+    expires_unix_ms: Option<u128>,
+}
+
+// Screen capture, attachment and drain waits are outside this section. Each write
+// shares the lifecycle lock with claim retirement and closed-state publication.
+fn dispatch_with_claim<T>(
+    directory: &Path,
+    expected: Option<&str>,
+    expires: Option<u128>,
+    write: impl FnOnce() -> Result<T>,
+) -> Result<Option<T>> {
+    let Some(expected) = expected else {
+        return write().map(Some);
+    };
+    let store = Store::open_unchecked(directory);
+    let _lock = store.lock()?;
+    let reader = Reader::open_unchecked(directory);
+    if crate::native::session::turn::current_claim_token(&reader)?.as_deref() != Some(expected)
+        || reader.status()?.state.ended()
+        || expires.is_some_and(|expiry| crate::native::session::primitives::unix_ms() >= expiry)
+    {
+        return Ok(None);
+    }
+    write().map(Some)
+}
+
+fn guarded_text_write_with(
+    attempted: &mut bool,
+    guard: impl FnOnce(&mut dyn FnMut() -> Result<u32>) -> Result<Option<u32>>,
+    mut write: impl FnMut() -> Result<u32>,
+) -> Result<u32> {
+    let previously_attempted = *attempted;
+    let result = guard(&mut || {
+        *attempted = true;
+        write()
+    })?;
+    match result {
+        Some(count) => Ok(count),
+        None if !previously_attempted => bail!("Windows console claim stale before any input"),
+        None => bail!("Windows console claim stale after input dispatch"),
+    }
+}
+
+fn guarded_key_with(
+    input: &super::GuardedDialogInput,
+    actual: &str,
+    write: impl FnOnce(super::DialogKey) -> Result<bool>,
+) -> Result<&'static str> {
+    match dialog_decision(&input.screen, actual) {
+        DialogDecision::Changed => Ok("changed"),
+        DialogDecision::Send => Ok(if write(input.key)? { "sent" } else { "stale" }),
+    }
+}
+
+enum AttachedInput {
+    Dialog,
+    Text {
+        newline: ConsoleNewline,
+        deadline: Instant,
+    },
+}
+
+// Shared post-attachment dispatch. Tests replace only screen and console operations.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_attached_input(
+    directory: &Path,
+    payload: &[u8],
+    action: AttachedInput,
+    screen: impl FnOnce() -> Result<String>,
+    mut write: impl FnMut(&[INPUT_RECORD]) -> Result<u32>,
+    pending: impl FnMut() -> Result<u32>,
+    output: &mut impl std::io::Write,
+    now: impl FnMut() -> Instant,
+) -> Result<()> {
+    match action {
+        AttachedInput::Dialog => {
+            let input: super::GuardedDialogInput = serde_json::from_slice(payload)?;
+            let outcome = guarded_key_with(&input, &screen()?, |key| {
+                dispatch_with_claim(
+                    directory,
+                    input.expected_claim.as_deref(),
+                    input.expires_unix_ms,
+                    || {
+                        let records = build_dialog_records(key);
+                        check_written_count(write(&records)?, records.len())
+                    },
+                )
+                .map(|v| v.is_some())
+            })?;
+            writeln!(output, "{outcome}")?;
+            Ok(())
+        }
+        AttachedInput::Text { newline, deadline } => {
+            let input: GuardedTextInput =
+                serde_json::from_slice(payload).context("invalid text-only console payload")?;
+            let mut attempted = false;
+            write_text_only_with(
+                &input.text,
+                newline,
+                deadline,
+                |chunk| {
+                    guarded_text_write_with(
+                        &mut attempted,
+                        |write| {
+                            dispatch_with_claim(
+                                directory,
+                                input.expected_claim.as_deref(),
+                                input.expires_unix_ms,
+                                write,
+                            )
+                        },
+                        || write(chunk),
+                    )
+                },
+                pending,
+                output,
+                now,
+            )
+        }
+    }
+}
+
+fn open_console_input(access: u32) -> Result<OwnedHandle> {
     let name: Vec<u16> = "CONIN$".encode_utf16().chain(Some(0)).collect();
     let raw = unsafe {
         CreateFileW(
             name.as_ptr(),
-            GENERIC_WRITE,
+            access,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             std::ptr::null(),
             OPEN_EXISTING,
@@ -1140,7 +1370,10 @@ fn write_dialog_key(key: super::DialogKey) -> Result<()> {
     if raw == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error().into());
     }
-    let handle = unsafe { OwnedHandle::from_raw_handle(raw) };
+    Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
+}
+
+fn build_dialog_records(key: super::DialogKey) -> Vec<INPUT_RECORD> {
     let mut records = Vec::new();
     if key == super::DialogKey::DownEnter {
         for key_down in [1, 0] {
@@ -1160,7 +1393,7 @@ fn write_dialog_key(key: super::DialogKey) -> Result<()> {
         }
     }
     records.extend(build_console_input_records("", 1, ConsoleNewline::LineFeed));
-    write_input_records(handle.as_raw_handle(), &records)
+    records
 }
 
 struct ConsoleProcess {
@@ -1363,14 +1596,7 @@ fn write_console_input(
             let delay = super::windows_budget::windows_console_extra_submit_delay();
             // Temporary measure for issue #124
             wait_for_console_input_drain_with(
-                || {
-                    let mut pending = 0;
-                    if unsafe { GetNumberOfConsoleInputEvents(handle, &mut pending) } == 0 {
-                        return Err(std::io::Error::last_os_error())
-                            .context("failed to read managed Windows console input event count");
-                    }
-                    Ok(pending)
-                },
+                || console_pending_count(handle),
                 deadline - delay,
                 Duration::from_millis(50),
                 Instant::now,
@@ -1389,6 +1615,43 @@ fn write_console_input(
     })();
     unsafe { CloseHandle(handle) };
     result
+}
+
+fn console_pending_count(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<u32> {
+    let mut pending = 0;
+    if unsafe { GetNumberOfConsoleInputEvents(handle, &mut pending) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to read managed Windows console input event count");
+    }
+    Ok(pending)
+}
+
+fn write_text_only_with(
+    input: &str,
+    newline: ConsoleNewline,
+    deadline: Instant,
+    mut write: impl FnMut(&[INPUT_RECORD]) -> Result<u32>,
+    pending: impl FnMut() -> Result<u32>,
+    output: &mut impl std::io::Write,
+    mut now: impl FnMut() -> Instant,
+) -> Result<()> {
+    let records = build_console_input_records(input, 0, newline);
+    for chunk in records.chunks(1024) {
+        if now() >= deadline {
+            bail!("Windows console input timed out during text delivery");
+        }
+        check_written_count(write(chunk)?, chunk.len())?;
+    }
+    wait_for_console_input_drain_with(pending, deadline, Duration::from_millis(50), &mut now)?;
+    if now() >= deadline {
+        bail!("Windows console input drain exceeded the deadline");
+    }
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({"schema": 1, "written_chars": input.chars().count()})
+    )?;
+    Ok(())
 }
 
 fn wait_for_console_input_drain_with(
@@ -1411,22 +1674,29 @@ fn write_input_records(
     records: &[INPUT_RECORD],
 ) -> Result<()> {
     for chunk in records.chunks(1024) {
-        let mut written = 0;
-        if unsafe { WriteConsoleInputW(handle, chunk.as_ptr(), chunk.len() as u32, &mut written) }
-            == 0
-        {
-            let error = Err(std::io::Error::last_os_error())
-                .context("failed to write managed Windows console input");
-            return error;
-        }
-        if written != chunk.len() as u32 {
-            bail!(
-                "managed Windows console accepted only {written} of {} input events",
-                chunk.len()
-            );
-        }
+        check_written_count(write_console_chunk(handle, chunk)?, chunk.len())?;
     }
     Ok(())
+}
+
+fn check_written_count(written: u32, expected: usize) -> Result<()> {
+    if written as usize != expected {
+        bail!("managed Windows console accepted only {written} of {expected} input events");
+    }
+    Ok(())
+}
+
+fn write_console_chunk(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    chunk: &[INPUT_RECORD],
+) -> Result<u32> {
+    let mut written = 0;
+    if unsafe { WriteConsoleInputW(handle, chunk.as_ptr(), chunk.len() as u32, &mut written) } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to write managed Windows console input");
+    }
+    Ok(written)
 }
 
 fn build_console_input_records(

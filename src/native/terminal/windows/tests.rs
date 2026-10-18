@@ -668,6 +668,8 @@ fn guarded_dialog_file_stays_private_in_the_supplied_helper_directory() {
     }))
     .unwrap();
     let input = GuardedDialogInput {
+        expected_claim: None,
+        expires_unix_ms: None,
         screen: "exact dialog".into(),
         key: DialogKey::Enter,
     };
@@ -680,10 +682,11 @@ fn guarded_dialog_file_stays_private_in_the_supplied_helper_directory() {
     let other_root = tempfile::tempdir().unwrap();
     let other = other_root.path().join("session-dialog");
     fs::create_dir(&other).unwrap();
-    let error = terminal::guarded_dialog_input(
+    let error = terminal::submit_if_unchanged(
         &other,
         &handle,
-        &input,
+        &input.screen,
+        None,
         Instant::now() + Duration::from_secs(2),
     )
     .unwrap_err();
@@ -703,7 +706,7 @@ fn guarded_dialog_file_stays_private_in_the_supplied_helper_directory() {
     // The existing command boundary refuses to spawn the helper, after the temporary
     // file was created; returning must remove that file again.
     assert_eq!(
-        terminal::guarded_dialog_input(&directory, &handle, &input, Instant::now())
+        terminal::submit_if_unchanged(&directory, &handle, &input.screen, None, Instant::now())
             .unwrap_err()
             .to_string(),
         "managed console dialog input timed out before it started"
@@ -896,4 +899,598 @@ fn windows_close_control_uses_the_claimed_terminal_handle() {
         windows_console_handle_path(directory.path(), &ConsoleControlRequest::Close),
         directory.path().join(TERMINAL_CLOSING_FILE)
     );
+}
+
+#[test]
+fn text_only_writes_scalars_and_soft_returns_then_reports_after_drain() {
+    use std::cell::Cell;
+    use windows_sys::Win32::System::Console::SHIFT_PRESSED;
+    for input in ["ascii", "한글", "😀", "a\n한😀\n", ""] {
+        let start = Instant::now();
+        let polls = Cell::new(0);
+        struct AfterDrain<'a> {
+            polls: &'a Cell<usize>,
+            bytes: Vec<u8>,
+        }
+        impl std::io::Write for AfterDrain<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                assert_eq!(self.polls.get(), 3, "no output before the third poll");
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut output = AfterDrain {
+            polls: &polls,
+            bytes: Vec::new(),
+        };
+        let mut records = Vec::new();
+        super::write_text_only_with(
+            input,
+            super::ConsoleNewline::ShiftReturn,
+            start + Duration::from_secs(5),
+            |chunk| {
+                records.extend_from_slice(chunk);
+                Ok(chunk.len() as u32)
+            },
+            || {
+                let n = polls.get();
+                polls.set(n + 1);
+                Ok([3, 1, 0][n])
+            },
+            &mut output,
+            || start,
+        )
+        .unwrap();
+        assert_eq!(polls.get(), 3);
+        assert_eq!(
+            super::parse_text_only_output(&output.bytes).unwrap(),
+            input.chars().count()
+        );
+        assert_eq!(output.bytes.iter().filter(|&&b| b == b'\n').count(), 1);
+        let keys = records
+            .iter()
+            .map(|r| unsafe { r.Event.KeyEvent })
+            .collect::<Vec<_>>();
+        assert!(
+            !keys
+                .iter()
+                .any(|k| k.wVirtualKeyCode == 0x0d && k.dwControlKeyState == 0)
+        );
+        assert_eq!(
+            keys.iter()
+                .filter(|k| k.wVirtualKeyCode == 0x0d && k.dwControlKeyState == SHIFT_PRESSED)
+                .count(),
+            input.matches('\n').count() * 2
+        );
+        for key in keys {
+            if (0xD800..=0xDFFF).contains(&unsafe { key.uChar.UnicodeChar }) {
+                assert_eq!(key.bKeyDown, 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn text_only_timeout_partial_write_and_pending_failure_emit_no_count() {
+    use std::cell::Cell;
+    let start = Instant::now();
+    // Stop within a normal key pair or the surrogate pair at the end of a
+    // 1024-record chunk; neither partial write can yield a scalar count.
+    let input = format!("{}😀tail", "a".repeat(511));
+    for mode in 0..7 {
+        let mut output = Vec::new();
+        let clock = Cell::new(start);
+        let calls = Cell::new(0);
+        let result = super::write_text_only_with(
+            &input,
+            super::ConsoleNewline::ShiftReturn,
+            start + Duration::from_secs(1),
+            |chunk| {
+                calls.set(calls.get() + 1);
+                assert!(chunk.len() <= 1024);
+                if mode == 5 {
+                    anyhow::bail!("write failed");
+                }
+                if mode == 0 {
+                    return Ok(1);
+                }
+                if mode == 1 {
+                    return Ok(1023);
+                }
+                if mode == 4 {
+                    clock.set(start + Duration::from_secs(2));
+                }
+                Ok(chunk.len() as u32)
+            },
+            || {
+                if mode == 3 {
+                    anyhow::bail!("count unavailable");
+                }
+                clock.set(start + Duration::from_secs(2));
+                Ok(if mode == 6 { 0 } else { 1 })
+            },
+            &mut output,
+            || clock.get(),
+        );
+        assert!(result.is_err(), "mode {mode}");
+        assert!(output.is_empty());
+        if mode == 4 {
+            assert_eq!(calls.get(), 1);
+        }
+    }
+}
+
+#[test]
+fn text_only_launcher_rejects_malformed_success_as_uncertain() {
+    assert_eq!(
+        super::parse_text_only_output(b"{\"schema\":1,\"written_chars\":3}\n").unwrap(),
+        3
+    );
+    for output in [
+        "",
+        "{}",
+        "{\"schema\":1,\"written_chars\":3,\"unknown\":true}",
+        "{\"schema\":1,\"schema\":1,\"written_chars\":3}",
+        "{\"schema\":1,\"written_chars\":184467440737095516160}",
+        "{\"schema\":2,\"written_chars\":3}",
+        "{\"schema\":1,\"written_chars\":1.5}",
+        "{\"schema\":1,\"written_chars\":-1}",
+        "{\"schema\":1,\"written_chars\":3} garbage",
+        "{\"schema\":1,\"written_chars\":3}\n{}",
+    ] {
+        let failure = super::parse_text_only_output(output.as_bytes()).unwrap_err();
+        assert!(failure.delivery_may_have_occurred());
+    }
+    assert!(
+        super::parse_text_only_output(b"\xff")
+            .unwrap_err()
+            .delivery_may_have_occurred()
+    );
+    assert_eq!(
+        super::parse_text_only_output(b" \n {\"schema\":1,\"written_chars\":3}\n ").unwrap(),
+        3
+    );
+}
+
+#[test]
+fn text_only_launcher_classifies_start_and_exit_failures() {
+    let root = tempfile::tempdir().unwrap();
+    let mut missing = std::process::Command::new(root.path().join("missing.exe"));
+    let deadline = Instant::now() + Duration::from_secs(120);
+    assert!(
+        !super::run_console_send_command(&mut missing, deadline)
+            .unwrap_err()
+            .delivery_may_have_occurred()
+    );
+    let mut failed =
+        crate::native::process_env::helper_command(std::env::var_os("ComSpec").unwrap());
+    failed.args(["/d", "/c", "exit 1"]);
+    assert!(
+        super::run_console_send_command(&mut failed, deadline)
+            .unwrap_err()
+            .delivery_may_have_occurred()
+    );
+}
+
+#[test]
+fn guarded_submission_writes_one_return_only_for_unchanged_screen() {
+    let input = terminal::GuardedDialogInput {
+        expected_claim: None,
+        expires_unix_ms: None,
+        screen: "composer text".into(),
+        key: terminal::DialogKey::Enter,
+    };
+    for (screen, expected, count) in [("composer text", "sent", 2), ("changed text", "changed", 0)]
+    {
+        let mut records = Vec::new();
+        let result = super::guarded_key_with(&input, screen, |key| {
+            records = super::build_dialog_records(key);
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(result, expected);
+        assert_eq!(records.len(), count);
+        for (index, record) in records.iter().enumerate() {
+            let key = unsafe { record.Event.KeyEvent };
+            assert_eq!(key.wVirtualKeyCode, 0x0d);
+            assert_eq!(key.dwControlKeyState, 0);
+            assert_eq!(key.bKeyDown, if index == 0 { 1 } else { 0 });
+        }
+    }
+}
+
+#[test]
+fn text_only_multichunk_unicode_count_and_second_chunk_failure() {
+    let start = Instant::now();
+    // Every scalar has two records. The emoji occupies records 1022/1023,
+    // immediately before the next chunk; full chunks cannot bisect this pair.
+    let input = format!(
+        "{}😀한글e\u{301}👩\u{200d}💻{}",
+        "a".repeat(511),
+        "끝".repeat(600)
+    );
+    for fail in [false, true] {
+        let mut output = Vec::new();
+        let mut records = Vec::new();
+        let mut calls = 0;
+        let mut drained = false;
+        let result = super::write_text_only_with(
+            &input,
+            super::ConsoleNewline::ShiftReturn,
+            start + Duration::from_secs(5),
+            |chunk| {
+                calls += 1;
+                if fail && calls == 2 {
+                    anyhow::bail!("second chunk failed");
+                }
+                records.extend_from_slice(chunk);
+                Ok(chunk.len() as u32)
+            },
+            || {
+                drained = true;
+                Ok(0)
+            },
+            &mut output,
+            || start,
+        );
+        if fail {
+            assert!(result.is_err());
+            assert_eq!(calls, 2);
+            assert_eq!(records.len(), 1024);
+            assert!(!drained);
+            assert!(output.is_empty());
+        } else {
+            result.unwrap();
+            assert!(calls >= 3);
+            assert!(drained);
+            assert_eq!(
+                super::parse_text_only_output(&output).unwrap(),
+                input.chars().count()
+            );
+            let units: Vec<u16> = records
+                .iter()
+                .filter_map(|r| {
+                    let key = unsafe { r.Event.KeyEvent };
+                    (key.bKeyDown != 0).then_some(unsafe { key.uChar.UnicodeChar })
+                })
+                .collect();
+            assert_eq!(String::from_utf16(&units).unwrap(), input);
+        }
+        for index in [1022, 1023] {
+            let key = unsafe { records[index].Event.KeyEvent };
+            assert_eq!(key.bKeyDown, 1);
+            let unit = unsafe { key.uChar.UnicodeChar };
+            assert!((0xD800..=0xDFFF).contains(&unit));
+        }
+    }
+}
+
+#[test]
+fn guarded_down_enter_sequence_and_writer_error() {
+    let input = terminal::GuardedDialogInput {
+        expected_claim: None,
+        expires_unix_ms: None,
+        screen: "dialog".into(),
+        key: terminal::DialogKey::DownEnter,
+    };
+    let result = super::guarded_key_with(&input, "dialog", |key| {
+        let records = super::build_dialog_records(key);
+        assert_eq!(records.len(), 4);
+        for (record, (code, down)) in
+            records
+                .iter()
+                .zip([(0x28, 1), (0x28, 0), (0x0d, 1), (0x0d, 0)])
+        {
+            let key = unsafe { record.Event.KeyEvent };
+            assert_eq!(key.wVirtualKeyCode, code);
+            assert_eq!(key.bKeyDown, down);
+            assert_eq!(key.dwControlKeyState, 0);
+        }
+        Ok(true)
+    })
+    .unwrap();
+    assert_eq!(result, "sent");
+    let error = super::guarded_key_with(&input, "dialog", |_| {
+        anyhow::bail!("writer failed after key down")
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("writer failed"));
+}
+
+struct StaleHelper {
+    directory: std::path::PathBuf,
+    phase: usize,
+    change: &'static str,
+    screen: String,
+    calls: usize,
+    refused: bool,
+}
+thread_local! {
+    static STALE_HELPER: std::cell::RefCell<Option<StaleHelper>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(in crate::native) fn with_stale_helper(
+    directory: &std::path::Path,
+    phase: usize,
+    change: &'static str,
+    screen: &str,
+    run: impl FnOnce(),
+) {
+    STALE_HELPER.with(|slot| {
+        *slot.borrow_mut() = Some(StaleHelper {
+            directory: directory.into(),
+            phase,
+            change,
+            screen: screen.into(),
+            calls: 0,
+            refused: false,
+        })
+    });
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            STALE_HELPER.with(|s| *s.borrow_mut() = None);
+        }
+    }
+    let _reset = Reset;
+    run();
+    STALE_HELPER.with(|slot| {
+        let slot = slot.borrow();
+        let state = slot.as_ref().unwrap();
+        assert_eq!(state.calls, phase);
+        assert!(state.refused);
+    });
+}
+
+// Replace only OS process/attachment and console I/O. The real Console prepares
+// private JSON, the helper deserializes it, and production guard/writer/launcher
+// classification runs. Invalidation occurs after payload preparation and capture,
+// where an attested child would be about to dispatch to an unchanged screen.
+pub(super) fn helper_output(
+    command: &std::process::Command,
+) -> Option<std::result::Result<std::process::Output, terminal::TerminalSendFailure>> {
+    use crate::native::session::{Reader, SessionState, Store, turn, update_status};
+    use std::os::windows::process::ExitStatusExt;
+    STALE_HELPER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let state = slot.as_mut()?;
+        let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+        let mut stdout = Vec::new();
+        let action = args[1];
+        if action == "screen" {
+            stdout = serde_json::to_vec(&state.screen).unwrap();
+        } else {
+            state.calls += 1;
+            let stale = state.calls == state.phase;
+            let path = state.directory.join(args[3]);
+            let bytes = crate::native::session::RecordReader::at(&path)
+                .raw_bytes()
+                .unwrap();
+            let token = turn::current_claim_token(&Reader::open_unchecked(&state.directory))
+                .unwrap()
+                .unwrap();
+            if stale {
+                let store = Store::open_unchecked(&state.directory);
+                let _lock = store.lock().unwrap();
+                match state.change {
+                    "retired" => fs::remove_file(state.directory.join("turn.claim")).unwrap(),
+                    "replaced" => {
+                        fs::remove_file(state.directory.join("turn.claim")).unwrap();
+                        store.private("turn.claim").write_private(b"1-2-3").unwrap();
+                    }
+                    "closed" => {
+                        update_status(&state.directory, SessionState::Closed, None, None).unwrap()
+                    }
+                    "expired" => {}
+                    _ => unreachable!(),
+                }
+            }
+            let mut payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(payload["expected_claim"], token);
+            assert!(payload["expires_unix_ms"].is_number());
+            if stale && state.change == "expired" {
+                payload["expires_unix_ms"] = 0.into();
+            }
+            let fixed_now = Instant::now();
+            let action = if action == "dialog" {
+                super::AttachedInput::Dialog
+            } else {
+                assert_eq!(args.last(), Some(&"0"));
+                super::AttachedInput::Text {
+                    newline: super::ConsoleNewline::ShiftReturn,
+                    deadline: fixed_now + Duration::from_secs(5),
+                }
+            };
+            let mut records = 0;
+            let result = super::dispatch_attached_input(
+                &state.directory,
+                &serde_json::to_vec(&payload).unwrap(),
+                action,
+                || Ok(state.screen.clone()),
+                |chunk| {
+                    assert!(
+                        Store::open_unchecked(&state.directory)
+                            .try_lock()?
+                            .is_none()
+                    );
+                    records += chunk.len();
+                    Ok(chunk.len() as u32)
+                },
+                || {
+                    assert!(
+                        Store::open_unchecked(&state.directory)
+                            .try_lock()?
+                            .is_some()
+                    );
+                    Ok(0)
+                },
+                &mut stdout,
+                || fixed_now,
+            );
+            if stale {
+                assert_eq!(records, 0, "stale helper must write zero input records");
+                state.refused = true;
+            } else {
+                assert!(records > 0);
+            }
+            if let Err(error) = result {
+                return Some(Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(1),
+                    stdout,
+                    stderr: format!("Error: {error}").into_bytes(),
+                }));
+            }
+        }
+        Some(Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout,
+            stderr: vec![],
+        }))
+    })
+}
+
+#[test]
+fn stale_guard_after_first_chunk_is_never_not_sent() {
+    // An omitted guard never reads session records (the directory does not exist).
+    let absent = tempfile::tempdir().unwrap();
+    assert_eq!(
+        super::dispatch_with_claim(&absent.path().join("missing"), None, Some(0), || Ok(7))
+            .unwrap(),
+        Some(7)
+    );
+    let mut attempted = false;
+    let mut calls = 0;
+    let mut output = Vec::new();
+    let error = super::write_text_only_with(
+        &"x".repeat(1200),
+        super::ConsoleNewline::ShiftReturn,
+        Instant::now() + Duration::from_secs(5),
+        |chunk| {
+            calls += 1;
+            super::guarded_text_write_with(
+                &mut attempted,
+                |write| {
+                    if calls == 1 {
+                        write().map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                },
+                || Ok(chunk.len() as u32),
+            )
+        },
+        || Ok(0),
+        &mut output,
+        Instant::now,
+    )
+    .unwrap_err();
+    assert_eq!(calls, 2);
+    assert!(output.is_empty());
+    assert!(
+        !super::super::windows_budget::windows_console_helper_reports_send_not_started(
+            &error.to_string()
+        )
+    );
+    assert!(error.to_string().contains("after input dispatch"));
+}
+
+#[test]
+fn attached_dispatch_holds_claim_until_write_returns() {
+    use crate::native::session::{SessionState, Store, turn, update_status};
+    use std::sync::mpsc;
+    for dialog in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("events")).unwrap();
+        update_status(root.path(), SessionState::Working, None, None).unwrap();
+        let claim = turn::claim(&Store::open_unchecked(root.path()), &[]).unwrap();
+        let payload = if dialog {
+            serde_json::to_vec(&terminal::GuardedDialogInput {
+                screen: "draft".into(),
+                key: terminal::DialogKey::Enter,
+                expected_claim: Some(claim.token().into()),
+                expires_unix_ms: None,
+            })
+            .unwrap()
+        } else {
+            serde_json::to_vec(&super::GuardedTextInput {
+                text: "body".into(),
+                expected_claim: Some(claim.token().into()),
+                expires_unix_ms: None,
+            })
+            .unwrap()
+        };
+        let now = Instant::now();
+        let action = || {
+            if dialog {
+                super::AttachedInput::Dialog
+            } else {
+                super::AttachedInput::Text {
+                    newline: super::ConsoleNewline::ShiftReturn,
+                    deadline: now + Duration::from_secs(1),
+                }
+            }
+        };
+        let (start_tx, start_rx) = mpsc::channel();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let directory = root.path().to_owned();
+        let contender = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            let store = Store::open_unchecked(&directory);
+            assert!(store.try_lock().unwrap().is_none());
+            blocked_tx.send(()).unwrap();
+            let _lock = store.lock().unwrap();
+            fs::remove_file(directory.join("turn.claim")).unwrap();
+            done_tx.send(()).unwrap();
+        });
+        let mut writes = 0;
+        let mut output = Vec::new();
+        super::dispatch_attached_input(
+            root.path(),
+            &payload,
+            action(),
+            || Ok("draft".into()),
+            |chunk| {
+                writes += 1;
+                start_tx.send(()).unwrap();
+                blocked_rx.recv().unwrap();
+                assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+                Ok(chunk.len() as u32)
+            },
+            || Ok(0),
+            &mut output,
+            || now,
+        )
+        .unwrap();
+        contender.join().unwrap();
+        done_rx.recv().unwrap();
+        assert_eq!(writes, 1);
+        // Retirement won before the next dispatch: the shared wiring must refuse it.
+        output.clear();
+        let result = super::dispatch_attached_input(
+            root.path(),
+            &payload,
+            action(),
+            || Ok("draft".into()),
+            |_| panic!("retired claim reached writer"),
+            || Ok(0),
+            &mut output,
+            || now,
+        );
+        if dialog {
+            result.unwrap();
+            assert_eq!(output, b"stale\n");
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("stale before any input")
+            );
+        }
+        claim.retain();
+    }
 }

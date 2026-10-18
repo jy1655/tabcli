@@ -1,0 +1,6 @@
+› Explain these UI labels:
+  Plan mode
+  Review hooks
+  <!-- agent-bridge-codex-turn:claim -->
+
+  100% context left

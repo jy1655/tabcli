@@ -511,7 +511,12 @@ fn complete_launch_dialog(
                 responded = respond_to_workspace_dialog(
                     directory,
                     session,
-                    &terminal::GuardedDialogInput { screen, key },
+                    &terminal::GuardedDialogInput {
+                        screen,
+                        key,
+                        expected_claim: None,
+                        expires_unix_ms: None,
+                    },
                     deadline,
                 )?;
             }
@@ -975,6 +980,8 @@ mod tests {
                 temp.path(),
                 &session,
                 &terminal::GuardedDialogInput {
+                    expected_claim: None,
+                    expires_unix_ms: None,
                     screen: "verified dialog".into(),
                     key: terminal::DialogKey::Enter,
                 },

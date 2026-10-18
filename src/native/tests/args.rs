@@ -626,7 +626,7 @@ fn registry_routes_every_command_to_its_variant_and_fields() {
         (vec!["native-session", "session-route"], "RunSession { id: \"session-route\" }".into()),
         (vec!["native-hook", "codex", "{}"], "Hook { provider: Codex, payload: Some(\"{}\") }".into()),
         (vec!["native-provider-control", "claude", "operation", "payload"], "ProviderControl { provider: Claude, arguments: [\"operation\", \"payload\"] }".into()),
-        (vec!["native-console-control", "send", "session-route", "pending-prompt-route.txt", "7"], "ConsoleControl { request: Send { input_name: \"pending-prompt-route.txt\", timeout: 7ms }, id: \"session-route\" }".into()),
+        (vec!["native-console-control", "send", "session-route", "pending-prompt-route.txt", "7"], "ConsoleControl { request: Send { submit_count: None, input_name: \"pending-prompt-route.txt\", timeout: 7ms }, id: \"session-route\" }".into()),
         (vec!["native-console-host", directory_text], format!("Host(Console {{ directory: {directory:?} }})")),
         (vec!["native-iterm2-host", directory_text], format!("Host(Iterm2 {{ directory: {directory:?} }})")),
         (vec!["native-terminal-host", directory_text], format!("Host(AppleTerminal {{ directory: {directory:?} }})")),
@@ -665,6 +665,21 @@ fn console_control_parser_preserves_positional_action_contract() {
         (
             vec!["send", "session-route", "pending-prompt-route.txt", "7"],
             ConsoleControlRequest::Send {
+                submit_count: None,
+                input_name: "pending-prompt-route.txt".into(),
+                timeout,
+            },
+        ),
+        (
+            vec![
+                "send",
+                "session-route",
+                "pending-prompt-route.txt",
+                "7",
+                "0",
+            ],
+            ConsoleControlRequest::Send {
+                submit_count: Some(0),
                 input_name: "pending-prompt-route.txt".into(),
                 timeout,
             },

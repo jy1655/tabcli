@@ -893,6 +893,8 @@ mod tests {
                         .guarded_dialog_input(
                             &session,
                             &GuardedDialogInput {
+                                expected_claim: None,
+                                expires_unix_ms: None,
                                 screen: "  screen\n".into(),
                                 key
                             },

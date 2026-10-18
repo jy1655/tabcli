@@ -119,6 +119,8 @@ impl Transport for CodexInitialPaste {
             // Shift+Return preserves LF only in the default editable composer; replace with a native input API.
             // Custom bindings/modes are outside this fallback; see docs/verification/2026-10-12-windows-0.4.8.md.
             surface: Some(SurfaceInput {
+                // Legacy not-injected route only; injected sends explicitly override
+                // this with zero and own their single guarded Return (#124).
                 submit_count: 2,
                 newline: terminal::ConsoleNewline::ShiftReturn,
             }),

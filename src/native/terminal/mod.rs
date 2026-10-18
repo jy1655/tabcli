@@ -413,6 +413,61 @@ pub(super) fn send_file(
     }
 }
 
+// Raw Windows operations for the provider-owned paste protocol in R2.
+pub(super) fn send_file_text_only(
+    session: &TerminalSession,
+    prompt_path: &Path,
+    expected_claim: &str,
+    deadline: Instant,
+) -> std::result::Result<usize, TerminalSendFailure> {
+    #[cfg(windows)]
+    return windows::send_file_text_only(session, prompt_path, expected_claim, deadline);
+    #[cfg(not(windows))]
+    {
+        let _ = (session, prompt_path, expected_claim, deadline);
+        Err(TerminalSendFailure::not_sent(anyhow::anyhow!(
+            "managed text-only input unsupported on this platform"
+        )))
+    }
+}
+
+pub(super) fn submit_if_unchanged(
+    directory: &Path,
+    session: &TerminalSession,
+    expected_screen: &str,
+    expected_claim: Option<&str>,
+    deadline: Instant,
+) -> Result<bool> {
+    #[cfg(windows)]
+    return guarded_dialog_input(
+        directory,
+        session,
+        &GuardedDialogInput {
+            expected_claim: expected_claim.map(str::to_owned),
+            expires_unix_ms: Some(
+                crate::native::session::primitives::unix_ms()
+                    + deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis(),
+            ),
+            screen: expected_screen.to_owned(),
+            key: DialogKey::Enter,
+        },
+        deadline,
+    );
+    #[cfg(not(windows))]
+    {
+        let _ = (
+            directory,
+            session,
+            expected_screen,
+            expected_claim,
+            deadline,
+        );
+        bail!("managed dialog input unsupported on this platform");
+    }
+}
+
 // Transport-neutral keys for an exact, unchanged managed dialog. Providers own
 // recognition and authorization; the terminal only compares the captured screen.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -423,6 +478,10 @@ pub(super) enum DialogKey {
 
 #[derive(Deserialize, Serialize)]
 pub(super) struct GuardedDialogInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) expected_claim: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) expires_unix_ms: Option<u128>,
     pub(super) screen: String,
     pub(super) key: DialogKey,
 }
@@ -599,6 +658,9 @@ pub(super) fn validate_terminal_send_budget(
         Ok(())
     }
 }
+
+#[cfg(all(test, windows))]
+pub(in crate::native) use windows::with_stale_helper;
 
 #[cfg(test)]
 mod tests {

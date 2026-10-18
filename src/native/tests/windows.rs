@@ -150,7 +150,7 @@ fn windows_console_helper_accepts_only_managed_session_identity() {
         ])
         .unwrap(),
         NativeCommand::ConsoleControl {
-            request: ConsoleControlRequest::Send { input_name, timeout },
+            request: ConsoleControlRequest::Send { input_name, timeout, submit_count: None },
             id,
         } if timeout == Duration::from_millis(5000) && id == "session-owner123" && input_name == "pending-prompt-1.txt"
     ));
@@ -260,6 +260,7 @@ fn console_control_requests_preserve_surface_verification_and_handle_selection()
         (ConsoleControlRequest::Screen, false),
         (
             ConsoleControlRequest::Send {
+                submit_count: None,
                 input_name: "pending-prompt-route.txt".into(),
                 timeout: Duration::from_millis(7),
             },

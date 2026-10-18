@@ -1,0 +1,1 @@
+Reply with exactly the single line "R124-SHORT-OK" and nothing else. No tools, no file reads or writes.

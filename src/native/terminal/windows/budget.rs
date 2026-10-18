@@ -15,7 +15,9 @@ pub(super) fn windows_console_helper_reports_missing(message: &str) -> bool {
 pub(super) fn windows_console_helper_reports_send_not_started(message: &str) -> bool {
     matches!(
         message.trim(),
-        "Windows console submission delays do not fit inside the remaining turn timeout"
+        "Windows console claim stale before any input"
+            | "Error: Windows console claim stale before any input"
+            | "Windows console submission delays do not fit inside the remaining turn timeout"
             | "Error: Windows console submission delays do not fit inside the remaining turn timeout"
     )
 }
@@ -85,6 +87,10 @@ mod tests {
 
     #[test]
     fn windows_console_rejects_a_submit_plan_that_cannot_fit_the_remaining_budget() {
+        assert!(windows_console_submit_delays_fit(
+            0,
+            Duration::from_millis(1)
+        ));
         assert!(!windows_console_submit_delays_fit(
             2,
             Duration::from_secs(4)
