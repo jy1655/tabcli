@@ -227,6 +227,83 @@ fn fail_locked(store: &Store, record: &Record, reason: &str) -> Result<()> {
     fail_locked_with_residual(store, record, reason, None)
 }
 
+pub(in crate::native) fn fence_failed_start(
+    store: &Store,
+    expected_token: &str,
+    reason: &str,
+) -> Result<()> {
+    let _lock = store.lock()?;
+    fence_failed_start_locked(store, expected_token, reason)
+}
+
+pub(in crate::native) fn retry_failed_start_fence(
+    store: &Store,
+    expected_token: &str,
+    reason: &str,
+) -> Result<()> {
+    let Some(_lock) = store.try_lock()? else {
+        return Ok(());
+    };
+    fence_failed_start_locked(store, expected_token, reason)
+}
+
+fn fence_failed_start_locked(store: &Store, expected_token: &str, reason: &str) -> Result<()> {
+    let status = store.status()?;
+    if status.state != SessionState::Launching
+        || turn::current_claim_token(store)?.as_deref() != Some(expected_token)
+    {
+        return Ok(());
+    }
+    let reason = status.error.map_or_else(
+        || reason.to_owned(),
+        |earlier| format!("{earlier}; {reason}"),
+    );
+    if let Ok(Some(record)) = read(store)
+        && record.claim_token == expected_token
+    {
+        return fail_locked(store, &record, &reason);
+    }
+    update_status(store.directory(), SessionState::Failed, None, Some(reason))
+}
+
+pub(in crate::native) enum FailedStartEvidence {
+    NoUnresolvedSpawn,
+    SpawnAttempted,
+    Pending(String),
+}
+
+// The caller holds the child's lifecycle try-lock through process observation.
+pub(in crate::native) fn failed_start_evidence(
+    store: &Store,
+    expected_token: &str,
+) -> Result<FailedStartEvidence> {
+    let pending = |reason: &str| Ok(FailedStartEvidence::Pending(reason.to_owned()));
+    let state = store.status()?.state;
+    if state.accepts_prompt() || state == SessionState::Working {
+        return pending("the session can already accept or execute prompts");
+    }
+    if turn::current_claim_token(store)?.is_some_and(|token| token != expected_token) {
+        return pending("the current claim belongs to another request");
+    }
+    let Some(record) = read(store)? else {
+        return pending("the failed launch has no receipt");
+    };
+    if record.claim_token != expected_token {
+        return pending("the launch receipt belongs to another claim");
+    }
+    match record.phase {
+        Phase::Pending if state.ended() => {
+            if store.record(CoreRecord::ProviderProcess).bytes()?.is_none() {
+                Ok(FailedStartEvidence::NoUnresolvedSpawn)
+            } else {
+                Ok(FailedStartEvidence::SpawnAttempted)
+            }
+        }
+        Phase::Pending => pending("the pending launch is not fenced by an ended status"),
+        Phase::Spawning | Phase::Spawned => Ok(FailedStartEvidence::SpawnAttempted),
+    }
+}
+
 fn fail_locked_with_residual(
     store: &Store,
     record: &Record,

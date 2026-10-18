@@ -212,6 +212,10 @@ fn request() -> ReopenRequest {
 }
 
 pub(super) fn isolated(test_name: &str) -> bool {
+    isolated_with_output(test_name, |_| {})
+}
+
+pub(super) fn isolated_with_output(test_name: &str, check: impl FnOnce(&str)) -> bool {
     if std::env::var_os(CHILD).is_none() {
         let test_name = test_name.split_once("::").unwrap().1;
         let base = tempfile::tempdir().unwrap();
@@ -242,6 +246,7 @@ pub(super) fn isolated(test_name: &str) -> bool {
         print!("{}", String::from_utf8_lossy(&output.stdout));
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
         assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
+        check(&String::from_utf8_lossy(&output.stdout));
         assert!(output.status.success(), "isolated test: {}", output.status);
         return true;
     }

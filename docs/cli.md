@@ -328,6 +328,14 @@ new session is left failed with the refusal recorded, the source marker is relea
 command, or by the next `reopen` if the command did not get that far, and a new `reopen` of the
 source is admitted.
 
+`launch-failed` means the launcher failed after the initial request was recorded. Bridge
+releases the source marker only with a matching launch receipt and proof that no provider
+spawn remains unresolved, or that the recorded provider process is verified gone. Live or
+unverifiable processes and missing, damaged or mismatched records retain the marker. A
+failure before the launch receipt is durable therefore retains it. A later `reopen` retries
+an interrupted failure fence before checking the marker; observation commands do not repair
+it. The original launch error remains in the response.
+
 For `provider-unsupported`, check the platform and provider before retrying. For `reopen-conflict`,
 stop the other resume yourself before trying another delivery. Run `doctor SESSION` for
 `reopen-verification-failed` or `already-reopened`; it reports other live holders and retained

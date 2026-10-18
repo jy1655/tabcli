@@ -1,4 +1,4 @@
-use super::launch_failure::isolated;
+use super::launch_failure::{isolated, isolated_with_output};
 use super::*;
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Barrier, mpsc};
@@ -132,10 +132,16 @@ fn interrupted_fence_recovers_only_its_claim_on_real_reopen() {
 
 #[test]
 fn failed_refusal_write_keeps_typed_gate_and_marker() {
-    if isolated(concat!(
-        module_path!(),
-        "::failed_refusal_write_keeps_typed_gate_and_marker"
-    )) {
+    if isolated_with_output(
+        concat!(
+            module_path!(),
+            "::failed_refusal_write_keeps_typed_gate_and_marker"
+        ),
+        |output| {
+            assert!(output.contains("\"gate\": \"launch-failed\""));
+            assert!(output.contains(FAILURE));
+        },
+    ) {
         return;
     }
     let root = Reader::state_root().unwrap();
@@ -329,8 +335,10 @@ fn spawn_commits_before_failure_preserves_live_states_then_releases_on_exit() {
         assert!(inspect_reopen_source(&source, SOURCE).is_err());
         drop(child_slot.borrow_mut().take());
         assert!(inspect_reopen_source(&source, SOURCE).is_ok());
-        let next = claim_reopen_marker(&source, SOURCE, REOPEN_TEST_CONVERSATION).unwrap();
-        drop(next);
+        fail_next();
+        let error = run_reopen(request()).unwrap_err();
+        assert_eq!(reopen_refusal_gate(&error), Some("launch-failed"));
+        assert!(!source.join(REOPEN_MARKER_FILE).exists());
     }
 }
 
@@ -392,4 +400,110 @@ fn concurrent_reopens_reserve_safe_generic_failure_once() {
     barrier.wait();
     let outcomes: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
     assert_eq!(outcomes.iter().filter(|r| r.is_ok()).count(), 1);
+}
+
+#[test]
+fn failure_before_durable_launch_receipt_retains_reopen_but_preserves_fresh_drop() {
+    use crate::native::session_start::StartSource;
+    for reopen in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let (mut adapter, mut spec) = start_source_fixture(root.path());
+        spec.yolo = true;
+        let created = adapter.create(spec, None).unwrap();
+        let source = adapter.resolved.as_ref().unwrap().0.clone();
+        let store = Store::open_unchecked(&created.directory);
+        let mut claim = turn::claim(&store, &[]).unwrap();
+        let token = claim.token().to_owned();
+        fs::create_dir(created.directory.join(launch::FILE)).unwrap();
+        let error = launch::launcher::start(
+            &created,
+            terminal::TerminalKind::WindowsConsole,
+            &mut claim,
+            &token,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap_err();
+        let original = format!("{error:#}");
+        if reopen {
+            let error = adapter.launch_failed(&created, &mut claim, error);
+            assert_eq!(reopen_refusal_gate(&error), Some("launch-failed"));
+            assert!(format!("{error:#}").contains(&original));
+            let (outcome, gate) = settle_reopen_outcome(
+                |id| Ok(root.path().join(id)),
+                "session-start-source",
+                &created.id,
+                Err(error),
+            );
+            assert!(outcome.is_err());
+            assert_eq!(gate.as_deref(), Some("launch-failed"));
+            drop(claim);
+            assert!(source.join(REOPEN_MARKER_FILE).exists());
+            assert!(created.directory.join(TURN_CLAIM_FILE).exists());
+            assert_eq!(store.status().unwrap().state, SessionState::Failed);
+        } else {
+            let fresh = session_start::FreshSource(session_start::AskRequest {
+                provider: FirstPartyCli::Claude,
+                workspace: root.path().to_owned(),
+                prompt: "fixture".into(),
+                title: None,
+                model: None,
+                effort: None,
+                terminal: None,
+                yolo: true,
+                timeout: Duration::from_secs(30),
+                detach: false,
+                json: false,
+                context_results: Vec::new(),
+            });
+            let before = snapshot_directory(&created.directory);
+            let error = fresh.launch_failed(&created, &mut claim, error);
+            assert_eq!(format!("{error:#}"), original);
+            assert_eq!(snapshot_directory(&created.directory), before);
+            drop(claim);
+            assert!(!created.directory.join(TURN_CLAIM_FILE).exists());
+            assert!(!created.directory.join(REOPEN_REFUSAL_FILE).exists());
+            assert_eq!(store.status().unwrap().state, SessionState::Launching);
+        }
+    }
+}
+
+#[test]
+fn untrusted_receipts_and_later_claims_retain_even_with_a_gone_provider() {
+    let root = tempfile::tempdir().unwrap();
+    let (source, child, token) = interrupted(root.path());
+    let store = Store::open_unchecked(&child);
+    update_status(&child, SessionState::Failed, None, None).unwrap();
+    let mut standin = StandIn(command().spawn().unwrap());
+    record_provider_process(&child, CHILD, &standin.0).unwrap();
+    drop(standin.0.stdin.take());
+    standin.0.wait().unwrap();
+    let receipt = json!({"schema":1,"claim_token":token,"deadline_unix_ms":1,"phase":"pending"});
+    for wire in [
+        {
+            let mut r = receipt.clone();
+            r["schema"] = json!(2);
+            r
+        },
+        {
+            let mut r = receipt.clone();
+            r["claim_token"] = json!("different");
+            r
+        },
+        {
+            let mut r = receipt.clone();
+            r["phase"] = json!("invalid");
+            r
+        },
+    ] {
+        store.record(CoreRecord::Launch).write_json(&wire).unwrap();
+        assert!(inspect_reopen_source(&source, SOURCE).is_err());
+    }
+    store
+        .record(CoreRecord::Launch)
+        .write_json(&receipt)
+        .unwrap();
+    fs::write(child.join(TURN_CLAIM_FILE), b"later-turn").unwrap();
+    assert!(inspect_reopen_source(&source, SOURCE).is_err());
+    fs::write(child.join(TURN_CLAIM_FILE), token.as_bytes()).unwrap();
+    assert!(inspect_reopen_source(&source, SOURCE).is_ok());
 }

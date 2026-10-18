@@ -107,6 +107,8 @@ pub(in crate::native) struct RecordedReopenRefusal {
     pub(in crate::native) detail: String,
     pub(in crate::native) created_unix_ms: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::native) claim_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::native) cleanup: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::native) cleanup_detail: Option<String>,

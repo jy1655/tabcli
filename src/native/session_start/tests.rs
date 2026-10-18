@@ -117,6 +117,14 @@ impl StartSource for Fake {
         self.calls.borrow_mut().push("delivery_failed");
         error
     }
+    fn launch_failed(
+        &self,
+        _: &CreatedSession,
+        _: &mut turn::Claim,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        error
+    }
 }
 
 fn run(fake: &mut Fake, timeout: Duration) -> (anyhow::Error, TurnReport) {
