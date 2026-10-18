@@ -153,7 +153,8 @@ impl NativeProviderAdapter for ClaudeAdapter {
     fn launch_trust(&self) -> crate::native::consent::LaunchTrust {
         crate::native::consent::LaunchTrust {
             answers_launch_dialog: true,
-            bypass_suppresses_dialog: true,
+            // Claude Code 2.1.302 still shows workspace trust under bypass on native Windows (#28).
+            bypass_suppresses_dialog: !cfg!(windows),
             applied_marker: None,
         }
     }
@@ -389,13 +390,16 @@ fn claude_trust_prompt_key(screen: &str, workspace: &Path) -> Option<terminal::D
         .collect();
     let start = lines.iter().rposition(|s| *s == "Accessing workspace:")?;
     let lines = &lines[start..];
-    let key = super::super::consent::native_key(workspace).ok()?;
+    let native = super::super::consent::native_key(workspace).ok()?;
     let key = if cfg!(windows) {
-        key.replace('\\', "/")
+        native.replace('\\', "/")
     } else {
-        key
+        native.clone()
     };
-    if lines.len() < 8 || lines[1] != key || *lines.last()? != "Enter to confirm · Esc to cancel" {
+    if lines.len() < 8
+        || (lines[1] != native && lines[1] != key)
+        || *lines.last()? != "Enter to confirm · Esc to cancel"
+    {
         return None;
     }
     let guide = lines.iter().position(|s| *s == "Security guide")?;
