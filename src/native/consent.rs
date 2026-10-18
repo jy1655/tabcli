@@ -53,7 +53,6 @@ pub(in crate::native) struct LaunchTrust {
     pub(in crate::native) answers_launch_dialog: bool,
     pub(in crate::native) bypass_suppresses_dialog: bool,
     pub(in crate::native) applied_marker: Option<&'static str>,
-    // Eligibility for one attempt, never evidence that the provider accepted it.
     pub(in crate::native) dialog_settle: Duration,
 }
 
@@ -600,8 +599,6 @@ impl LaunchDialog<'_> {
                         clock.sleep(Duration::from_millis(200).min(remaining));
                         continue;
                     }
-                    // Observation and provider matching may block. Re-read consent before
-                    // reserving intent; the helper fences the claim at the actual write.
                     if !authorized_with(directory, target, env)
                         .map_err(|error| launch_dialog_error(error, false))?
                     {
@@ -613,8 +610,6 @@ impl LaunchDialog<'_> {
                     if clock.now() >= deadline {
                         continue;
                     }
-                    // Persist intent before the one response. Never retry an input call
-                    // that errors: it may already have reached the target dialog.
                     let mut attempted = false;
                     responded = respond_to_workspace_dialog(
                         directory,
@@ -636,7 +631,6 @@ impl LaunchDialog<'_> {
                     )
                     .map_err(|error| launch_dialog_error(error, attempted))?;
                     if !responded {
-                        // `changed` proves that the helper wrote nothing.
                         stable = None;
                     }
                     require_launch_dialog_live(directory, responded)?;
