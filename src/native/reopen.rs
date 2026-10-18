@@ -781,7 +781,7 @@ impl session_start::StartSource for ReopenedSource {
         let request = &self.request;
         let terminal_kind = terminal::select(request.terminal)?;
         let source_directory = Reader::session_directory(&request.id)?;
-        retry_interrupted_launch_fence(&source_directory)?;
+        let _ = retry_interrupted_launch_fence(&source_directory);
         // Every check against the source is read-only. Pending-completion recovery and dead-owner
         // repair are never run on it: a closed session has nothing to converge, and reopen must not
         // alter the record it continues from.
