@@ -35,7 +35,8 @@ enum Overlay {
 fn composer_span(rows: &[&str], tail: &str, workspace: &Path) -> Option<std::ops::Range<usize>> {
     let start = rows
         .iter()
-        .position(|r| r.starts_with("› ") && !selected_option(r))?;
+        .enumerate()
+        .position(|(i, r)| r.starts_with("› ") && !selected_option(rows, i))?;
     let marker = (start..rows.len()).find(|&i| {
         !tail.is_empty()
             && rows[i]
@@ -48,11 +49,39 @@ fn composer_span(rows: &[&str], tail: &str, workspace: &Path) -> Option<std::ops
         .or_else(|| (start + 1..rows.len()).find(|&i| footer(rows[i], workspace)))?;
     Some(start..end)
 }
-fn selected_option(row: &str) -> bool {
-    row.strip_prefix("› ").is_some_and(|text| {
-        text.split_once(". ")
-            .is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
-    })
+fn numbered_label(text: &str) -> Option<&str> {
+    let (n, label) = text.split_once(". ")?;
+    (!n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())).then_some(label)
+}
+fn pinned_option(label: &str) -> bool {
+    matches!(
+        label,
+        "Review hooks"
+            | "Trust all and continue"
+            | "Continue without trusting"
+            | "Continue without trusting hooks"
+            | "Continue without trusting (hooks won't run)"
+            | "Trust and continue"
+            | "Don't trust"
+            | "Quit"
+    )
+}
+fn selected_option(rows: &[&str], index: usize) -> bool {
+    let Some(label) = rows[index].strip_prefix("› ").and_then(numbered_label) else {
+        return false;
+    };
+    // A scrolled composer can start with an ordinary numbered instruction.
+    // A companion option needs a pinned label too: numbered prose is not a menu.
+    pinned_option(label)
+        || rows.get(index + 1).is_some_and(|row| {
+            row.strip_prefix("  ")
+                .and_then(numbered_label)
+                .is_some_and(pinned_option)
+                || matches!(
+                    row.trim(),
+                    "enter confirm · esc skip" | "enter continue · esc quit"
+                )
+        })
 }
 fn overlay(screen: &str, tail: &str, workspace: &Path) -> Overlay {
     let rows: Vec<_> = screen.lines().map(str::trim_end).collect();
@@ -79,8 +108,8 @@ fn overlay(screen: &str, tail: &str, workspace: &Path) -> Overlay {
     if picker || trust {
         return Overlay::Blocked;
     }
-    if rows.iter().enumerate().any(|(i, row)| {
-        !span.as_ref().is_some_and(|span| span.contains(&i)) && selected_option(row)
+    if rows.iter().enumerate().any(|(i, _)| {
+        !span.as_ref().is_some_and(|span| span.contains(&i)) && selected_option(&rows, i)
     }) || outside.iter().any(|r| {
         matches!(
             *r,

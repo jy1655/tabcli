@@ -531,19 +531,64 @@ fn protocol_helper_and_read_failures_keep_post_text_uncertainty() {
 
 #[test]
 fn marker_tail_accepts_wrapped_and_scrolled_inline_body() {
-    for body_view in ["bo\ndy", "dy", ""] {
+    for body_view in [
+        "bo\ndy",
+        "dy",
+        "",
+        "1. Summarize the changes\n2. Explain the regression\n\n[Agent Bridge Codex turn metadata; do not include this metadata in the response]",
+        "42. Explain the regression",
+    ] {
+        for footer in [false, true] {
+            let (mut io, claim, prompt) = Fake::new();
+            let tail = prompt.rsplit_once('\n').unwrap().1;
+            let shown = if body_view.is_empty() {
+                tail.to_owned()
+            } else {
+                format!("{body_view}\n{tail}")
+            };
+            let screen = if footer {
+                frame(&shown)
+            } else {
+                format!("› {}", shown.replace('\n', "\n  "))
+            };
+            assert_eq!(
+                super::classification(Ok(screen.clone()), tail, Path::new(WORKSPACE)),
+                "populated"
+            );
+            io.screens = [screen].into();
+            let result = io.execute(&prompt);
+            assert!(result.is_ok(), "{body_view}");
+            assert_eq!(&io.calls[..3], ["text", "text", "screen"]);
+            assert_eq!(io.calls.iter().filter(|c| **c == "submit").count(), 1);
+            settle(claim, result);
+        }
+    }
+}
+
+#[test]
+fn numbered_menu_selections_do_not_start_an_addressed_composer() {
+    for menu in [
+        "› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting (hooks won't run)\n\n  enter confirm · esc skip",
+        "› 1. Trust and continue\n  2. Quit\n  enter continue · esc quit",
+        "› 42. Other selection\n  2. Quit",
+        "› 42. Other selection\n  enter confirm · esc skip",
+        "› 42. Other selection\n  enter continue · esc quit",
+        "› 1. Review hooks",
+        "› 1. Trust and continue",
+    ] {
         let (mut io, claim, prompt) = Fake::new();
         let tail = prompt.rsplit_once('\n').unwrap().1;
-        io.screens = [frame(&if body_view.is_empty() {
-            tail.to_owned()
-        } else {
-            format!("{body_view}\n{tail}")
-        })]
-        .into();
-        let result = io.execute(&prompt);
-        assert!(result.is_ok());
-        assert_eq!(&io.calls[..3], ["text", "text", "screen"]);
-        settle(claim, result);
+        let screen = format!("{menu}\n  {tail}");
+        assert_eq!(
+            super::classification(Ok(screen.clone()), tail, Path::new(WORKSPACE)),
+            "ambiguous (unresolved overlay)"
+        );
+        io.screens = [screen.clone()].into();
+        io.fallback = screen;
+        let error = io.execute(&prompt).unwrap_err();
+        assert!(error.delivery_may_have_occurred());
+        assert!(!io.calls.contains(&"submit"));
+        settle(claim, Err(error));
     }
 }
 
