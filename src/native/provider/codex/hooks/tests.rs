@@ -404,7 +404,7 @@ fn assert_real_shell_preserves_large_stdin(is_cmd: bool) {
     let expected = "한글😀".repeat(5000);
     assert!(expected.len() > 32_000);
     let payload = serde_json::to_vec(&serde_json::json!({
-        "hook_event_name":"Stop", "session_id":"test", "turn_id":"test",
+        "type":"agent-turn-complete", "session_id":"test", "turn_id":"test",
         "last_assistant_message": expected, "stop_hook_active": false
     }))
     .unwrap();
@@ -492,4 +492,65 @@ fn windows_cmd_hook_preserves_large_unicode_results_and_nonblocking_errors() {
 #[test]
 fn windows_pwsh_hook_preserves_large_unicode_results_and_nonblocking_errors() {
     assert_real_shell_preserves_large_stdin(false);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_lifecycle_hook_binary_never_blocks_or_writes_stdout() {
+    use crate::native::provider::codex;
+    use crate::native::session::{SessionState, turn, update_status};
+    let exe = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("tabcli.exe");
+    assert!(exe.is_file(), "all-targets must build tabcli.exe");
+    let shell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+        .join("System32")
+        .join("cmd.exe");
+    let Some(line) = hook_command(&exe) else {
+        eprintln!("SKIP lifecycle shell test: executable path outside the injection whitelist");
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let directory = test_support::launch_session(root.path(), Some("0.163.0"));
+    update_status(&directory, SessionState::Working, None, None).unwrap();
+    let token = turn::current_claim_token(&Reader::open_unchecked(&directory))
+        .unwrap()
+        .unwrap();
+    let pending = codex::install_pending_turn(&directory, &token).unwrap();
+    let prompt = codex::correlated_prompt(
+        &crate::native::native_delegation_prompt("external", &"한글😀".repeat(5000)),
+        &pending,
+    );
+    let thread = "01234567-89ab-cdef-0123-456789abcdef";
+    for (payload, expected) in [
+        (serde_json::to_vec(&serde_json::json!({"hook_event_name":"UserPromptSubmit", "session_id":thread, "turn_id":"turn", "transcript_path":"rollout.jsonl", "prompt":prompt})).unwrap(), 0),
+        (serde_json::to_vec(&serde_json::json!({"hook_event_name":"Stop", "session_id":thread, "turn_id":"turn", "last_assistant_message":"한글😀", "stop_hook_active":false})).unwrap(), 0),
+        (br#"{"hook_event_name":"FutureEvent"}"#.to_vec(), 0),
+        (b"{".to_vec(), 1),
+    ] {
+        let output = run_shell_hook(&shell, true, &line, root.path(), &directory, payload);
+        assert_eq!(output.status.code(), Some(expected), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_ne!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+    }
+    let binding: serde_json::Value = Reader::open_unchecked(&directory)
+        .private(&format!("codex-turn-{token}.json"))
+        .json()
+        .unwrap();
+    assert_eq!(binding["thread_id"], thread);
+    let candidate: serde_json::Value = Reader::open_unchecked(&directory)
+        .private(&format!("codex-candidate-{token}.json"))
+        .json()
+        .unwrap();
+    assert_eq!(candidate["last_assistant_message"], "한글😀");
+    assert!(
+        Reader::open_unchecked(&directory)
+            .events()
+            .unwrap()
+            .is_empty()
+    );
 }

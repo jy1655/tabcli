@@ -40,6 +40,7 @@ fn damaged_completion_fixture() -> (tempfile::TempDir, Store) {
             claim_token: "1-2-3".to_owned(),
             event_file: "event-fixture.json".to_owned(),
             event: SessionEvent {
+                provenance: None,
                 cancelled: false,
                 provider: "codex".to_owned(),
                 message: "unpublished".to_owned(),
@@ -216,6 +217,7 @@ fn converge_publishes_completion_before_repairing_dead_owner() {
                 claim_token: "1-2-3".to_owned(),
                 event_file: "event-fixture.json".to_owned(),
                 event: SessionEvent {
+                    provenance: None,
                     cancelled: false,
                     provider: "codex".to_owned(),
                     message: "completed before owner exit".to_owned(),
@@ -3577,6 +3579,7 @@ fn sample_completion(claim_token: &str, message: &str) -> PendingTurnCompletion 
     PendingTurnCompletion::new(
         claim_token,
         SessionEvent {
+            provenance: None,
             cancelled: false,
             provider: FirstPartyCli::Codex.as_str().to_owned(),
             message: message.to_owned(),
@@ -3740,6 +3743,7 @@ fn cli_sessions(root: &Path) -> Vec<serde_json::Value> {
 
 fn oversized_sample_event(message: &str) -> SessionEvent {
     SessionEvent {
+        provenance: None,
         cancelled: false,
         provider: FirstPartyCli::Codex.as_str().to_owned(),
         message: message.to_owned(),

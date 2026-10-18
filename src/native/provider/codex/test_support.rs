@@ -7,6 +7,7 @@ pub(super) fn write_established_thread(directory: &Path, thread_id: &str) {
     write_json_atomic(
         &directory.join("events/event-1.json"),
         &SessionEvent {
+            provenance: None,
             cancelled: false,
             provider: "codex".to_owned(),
             message: "initial result".to_owned(),

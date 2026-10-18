@@ -2,6 +2,7 @@ mod correlation;
 mod diagnose;
 mod hooks;
 mod launch;
+mod lifecycle;
 mod queue;
 mod runner;
 #[cfg(test)]
@@ -287,11 +288,23 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 
     fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()> {
+        match codex_string(payload, "hook_event_name") {
+            Some("UserPromptSubmit") => return lifecycle::bind(directory, payload),
+            Some("Stop") => return lifecycle::stop(directory, payload),
+            Some(_) => return Ok(()),
+            None => {}
+        }
+        let pending = read_pending_turn(directory)?;
+        if let Some(pending) = &pending
+            && lifecycle::record_notify(directory, pending, payload)?
+        {
+            return Ok(());
+        }
         let raw_message = codex_string(payload, "last-assistant-message")
             .map(|message| message.trim())
             .filter(|message| !message.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Codex notify payload has no assistant result"))?;
-        let Some(pending) = read_pending_turn(directory)? else {
+        let Some(pending) = pending else {
             return Ok(());
         };
         let message = match correlated_response(raw_message, &pending) {
@@ -312,6 +325,7 @@ impl NativeProviderAdapter for CodexAdapter {
             FirstPartyCli::Codex,
             Some(&pending.claim_token),
         )
+        .with_provenance(Some("codex_notify"))
         .complete(message, thread_id, codex_owned_string(payload, "turn-id"))
         .context("failed to record the correlated Codex result")
     }

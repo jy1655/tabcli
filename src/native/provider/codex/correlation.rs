@@ -51,7 +51,7 @@ const IDE_REQUEST_HEADING: &str = "## My request for Codex:";
 
 // Require the delegation header, directly or after the exact IDE wrapper.
 // Try every request heading because context and prompt can themselves quote it.
-fn begins_with_bridge_prompt(message: &str) -> bool {
+pub(super) fn begins_with_bridge_prompt(message: &str) -> bool {
     let header = crate::native::NATIVE_DELEGATION_HEADER;
     let message = message.trim_start();
     message.starts_with(header)

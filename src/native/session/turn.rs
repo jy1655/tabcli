@@ -110,6 +110,7 @@ fn record_provider_result_for_claim_condition(
         return Ok(());
     }
     let event = SessionEvent {
+        provenance: report.provenance.map(str::to_owned),
         cancelled: false,
         provider: provider.as_str().to_owned(),
         message: message.to_owned(),
@@ -150,6 +151,7 @@ fn record_monitor_failure(directory: &Path, provider: FirstPartyCli, error: &str
     };
     let error = terminal_safe_text(error, true);
     let event = SessionEvent {
+        provenance: None,
         cancelled: false,
         provider: provider.as_str().to_owned(),
         message: String::new(),
@@ -1118,6 +1120,7 @@ pub(in crate::native) struct Report<'a> {
     provider: FirstPartyCli,
     claim_token: Option<&'a str>,
     initial: bool,
+    provenance: Option<&'a str>,
     usage: Usage,
 }
 
@@ -1140,8 +1143,15 @@ impl<'a> Report<'a> {
             provider,
             claim_token,
             initial: false,
+            provenance: None,
             usage: Usage::default(),
         }
+    }
+
+    /// Selects the adapter's completion signal; stale reports cannot change the winner.
+    pub(in crate::native) fn with_provenance(mut self, provenance: Option<&'a str>) -> Self {
+        self.provenance = provenance;
+        self
     }
 
     /// Attaches the usage the provider reported for this turn, or the bounded reason it
@@ -1163,6 +1173,7 @@ impl<'a> Report<'a> {
             provider,
             claim_token: None,
             initial: true,
+            provenance: None,
             usage: Usage::default(),
         }
     }
@@ -1250,6 +1261,7 @@ impl<'a> Report<'a> {
         };
         let error = terminal_safe_text(&error, true);
         let event = SessionEvent {
+            provenance: self.provenance.map(str::to_owned),
             cancelled,
             provider: provider.as_str().to_owned(),
             message: String::new(),
