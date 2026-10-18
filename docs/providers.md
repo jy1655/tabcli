@@ -183,6 +183,14 @@ pending-turn record keeps for the initial turn and for each follow-up as sized b
 real command line can be larger or smaller than the estimate, and text with many quotation marks is undercounted
 because Codex's argument quoting escapes each of them. See [doctor](cli.md#doctor).
 
+The native-queue follow-up has a send-side limit of its own on native Windows. `tell` starts
+`codex queue` with the framed prompt as one `--message` argument, so a follow-up whose command
+line reaches 32,767 UTF-16 units cannot start the queue client (error 206) and nothing is sent:
+the request is recorded as unresolved and the session returns to `ready` (observed 2026-10-18
+with codex-cli 0.163.0 and a 35,520-character prompt; issue #251). The lifecycle-hook route does
+not change this limit. Keep follow-up prompts short on native Windows and pass long material by
+path; the console-pasted initial prompt has no such limit beyond the paste defects of #124.
+
 `reopen` refuses closed Codex sessions. Bridge still needs checks for the thread's writer lock
 and queued inputs before supporting resume; start a new session instead.
 

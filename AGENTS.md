@@ -265,6 +265,19 @@ launch, observe, continue, and close without replacing the capabilities those CL
   provides a terminal lifecycle event that carries the answer, delivers notify through
   stdin, or lets a TUI launched with overrides attach to the daemon (the embedded app
   server is in-process, so no external client can observe `turn/completed`).
+- Live on native Windows, 2026-10-18, codex-cli 0.163.0
+  (`docs/verification/2026-10-18-windows-127-codex-lifecycle-hooks.md`): bound claims settled
+  from `task_complete` with and without a notify record (a 25,463-character prompt with a
+  10,092-character answer left none), a steered TUI message joined the bound turn without
+  rebinding, a user Stop hook's block continued the turn and only the final answer was
+  published, a model error failed the request from `task_complete{error}` with no Stop and no
+  notify at all, `settings_off` and `features.hooks=false` settled through notify, and an
+  untrusted user hook held the picker, which the Windows gate named at the deadline. Not
+  verified: Esc during post-turn compaction, a Bridge hash-drift build, and macOS. The
+  native-queue `tell` passes the framed prompt as one `--message` argument, so on native
+  Windows a follow-up above the command-line limit fails to start `codex queue` before anything
+  is sent (os error 206 at 35,520 characters; #251): a send-side limit that the hook route does
+  not change.
 - When a correlation question comes up, record the raw payloads with a temporary build
   and read them: hook stdin, notify argv and the transcript lines. Do not reason from the
   result alone. The two payloads of #61 looked alike in everything but the thread, the
