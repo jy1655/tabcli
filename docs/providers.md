@@ -103,17 +103,24 @@ at the exact marker or, without one, the first recognized footer. Footer-shaped 
 the marker remains content. Any column-zero `› ` row outside that span is unresolved UI,
 regardless of text or numbering. Anywhere on screen, numbered rows after `› ` or two spaces
 whose labels begin with a pinned hook/trust option, and confirmation-hint fragments, are UI
-evidence. Hints include single-key confirm/continue prefixes with a middle-dot separator,
-keyed skip/quit/back/cancel endings, and `and create sandbox`, even across wrapped rows.
-Incomplete layouts are Ambiguous. Ordinary numbered prose remains content, but a
+evidence. An inset-stripped row is hint evidence if a ` · `-separated part (including a
+terminal ` ·` after wrapping) ends in confirm/continue/skip/quit/back/cancel with any number
+of preceding key tokens, the whole row ends in one of those actions after one or more key
+tokens, the row is exactly one of those bare action words, or it contains `and create sandbox`.
+Incomplete layouts with recognized UI evidence are Ambiguous. Ordinary numbered prose remains content, but a
 numbered pinned menu label inside the draft (such as `2. Quit` or `1. Review hooks`) or a
-hint-like draft line (such as `enter confirm · esc skip` quoted in a prompt) is refused
+hint-like draft line (such as `enter confirm · esc skip` quoted in a prompt) or a bare
+action word on its own draft line (such as `quit`, `back` or `confirm`) is refused
 as unresolved UI: rephrase the line or press Enter yourself after checking the surface.
 Bridge then requests one guarded Return: the helper compares the entire accepted screen and
 writes no Return if it changed. Injected text and Return helpers also check the addressed claim,
 session status and original expiry under the lifecycle lock immediately at dispatch. This assumes no
 concurrent human input; screen comparison is not atomic with a TUI transition. A clipped or
-wrapped marker with no recognized footer, or an unsupported layout remains unconfirmed.
+wrapped marker with no recognized footer remains unconfirmed.
+The UI recognizer is pinned to Codex 0.163.0 forms at the 120-column console widths of both
+the managed Windows Terminal tab and console window on this PC, plus the upstream 40-column
+snapshot and the 43–47-column sandbox wrap; narrower or custom layouts and other torn-frame
+shapes fall under this fallback's best-effort limits and are not guaranteed to be recognized.
 
 The gap is a heuristic to let the 60 ms idle flush separate the body; it proves no
 processing boundary and the merged-tail fallback remains. Parsing ends at the exact

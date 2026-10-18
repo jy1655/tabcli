@@ -74,24 +74,52 @@ fn pinned_option(label: &str) -> bool {
 // Deliberately also refuses draft lines that look like these confirmation hints.
 fn confirmation_hint(text: &str) -> bool {
     let text = text.trim().strip_prefix("› ").unwrap_or(text.trim());
-    fn keyed_action(value: &str) -> Option<&str> {
-        value.split_once(' ').and_then(|(key, action)| {
-            (!key.is_empty() && !key.chars().any(char::is_whitespace)).then_some(action)
+    fn action(value: &str) -> bool {
+        matches!(
+            value,
+            "confirm" | "continue" | "skip" | "quit" | "back" | "cancel"
+        )
+    }
+    fn key_token(value: &str) -> bool {
+        let key = value.rsplit('+').next().unwrap_or(value);
+        key.chars().count() == 1
+            || matches!(
+                key,
+                "enter"
+                    | "esc"
+                    | "escape"
+                    | "tab"
+                    | "space"
+                    | "backspace"
+                    | "delete"
+                    | "insert"
+                    | "home"
+                    | "end"
+                    | "pageup"
+                    | "pagedown"
+                    | "up"
+                    | "down"
+                    | "left"
+                    | "right"
+            )
+            || key
+                .strip_prefix('f')
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+    }
+    fn keyed_action(value: &str) -> bool {
+        value.rsplit_once(' ').is_some_and(|(keys, verb)| {
+            keys.split_whitespace().next().is_some()
+                && keys.split_whitespace().all(key_token)
+                && action(verb)
         })
     }
-    let prefix = keyed_action(text).is_some_and(|action| {
-        ["confirm", "continue"].iter().any(|verb| {
-            action.strip_prefix(verb).is_some_and(|rest| {
-                (rest.is_empty() || rest.starts_with(' '))
-                    && (text.contains(" · ") || text.ends_with(" ·"))
-            })
-        })
-    });
-    let ending = text.rsplit_once("· ").map_or(text, |(_, end)| end);
-    prefix
-        || keyed_action(ending)
-            .is_some_and(|action| matches!(action, "skip" | "quit" | "back" | "cancel"))
-        || text.contains("and create sandbox")
+    // Keep terminal separators too: trimming a wrapped row removes their final space.
+    let separated = (text.contains(" · ") || text.ends_with(" ·"))
+        && text.split('·').any(|part| {
+            let part = part.trim();
+            action(part) || keyed_action(part)
+        });
+    action(text) || separated || keyed_action(text) || text.contains("and create sandbox")
 }
 fn menu_evidence(row: &str) -> bool {
     row.strip_prefix("› ")

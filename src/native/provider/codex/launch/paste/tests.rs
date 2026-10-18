@@ -742,6 +742,58 @@ fn confirmation_fragments_alone_anywhere_refuse_return() {
 }
 
 #[test]
+fn chord_and_bare_action_fragments_alone_anywhere_refuse_return() {
+    for hint in [
+        "ctrl+x a confirm · ctrl+x s skip",
+        "enter confirm · ctrl+x s skip",
+        "ctrl+x s skip",
+        "a confirm · ctrl+x s skip",
+        "enter continue and create sandbox · esc\n  quit",
+        "enter continue and create sandbox · esc\n  back",
+        "enter continue and create sandbox · esc\n  cancel",
+        "enter continue and create sandbox · esc",
+        "quit",
+        "back",
+        "cancel",
+        "skip",
+        "confirm",
+        "continue",
+        "ctrl+x a confirm",
+        "ctrl+x a continue",
+        "ctrl+x s quit",
+        "ctrl+x s back",
+        "ctrl+x s cancel",
+    ] {
+        for after_marker in [false, true] {
+            for footer in [false, true] {
+                let (mut io, claim, prompt) = Fake::new();
+                let tail = prompt.rsplit_once('\n').unwrap().1;
+                // No extra prompt glyph or menu option can mask a missed hint.
+                let mut screen = if after_marker {
+                    format!("› body\n  {tail}\n  {hint}")
+                } else {
+                    format!("› body\n  {hint}\n  {tail}")
+                };
+                if footer {
+                    screen.push_str("\n  100% context left");
+                }
+                assert_eq!(
+                    super::classification(Ok(screen.clone()), tail, Path::new(WORKSPACE)),
+                    "ambiguous (unresolved overlay)",
+                    "{screen}"
+                );
+                io.screens = [screen.clone()].into();
+                io.fallback = screen;
+                let error = io.execute(&prompt).unwrap_err();
+                assert!(error.delivery_may_have_occurred());
+                assert!(!io.calls.contains(&"submit"));
+                settle(claim, Err(error));
+            }
+        }
+    }
+}
+
+#[test]
 fn body_prefix_without_marker_never_authorizes_submission() {
     let (mut io, claim, prompt) = Fake::new();
     io.screens.clear();

@@ -214,7 +214,9 @@ launch, observe, continue, and close without replacing the capabilities those CL
 - The 150 ms split gap only encourages the 60 ms idle flush; it proves nothing.
   The exact inset-stripped marker row ends composer content; subsequent rows still undergo
   the UI veto. Numbered pinned menu labels and confirmation hints anywhere, and any
-  column-zero `› ` row outside the span, remain unresolved UI.
+  column-zero `› ` row outside the span, remain unresolved UI; the UI recognizer is pinned
+  to Codex 0.163.0 forms at this PC's 120-column managed Windows Terminal tab and console
+  window widths, the upstream 40-column snapshot and the 43–47-column sandbox wrap.
   Otherwise use the first recognized footer (workspace-qualified model line, warning,
   shortcut/queue/interrupt/edit/quit hint or context/token count), trimming separator blanks
   but preserving internal blanks. No marker and no recognized footer remains ambiguous.
