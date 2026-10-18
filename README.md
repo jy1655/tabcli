@@ -106,11 +106,12 @@ Codex follow-ups require 0.149.0 or newer; no shared daemon is required. Claude 
 cross-session messaging in its installed backend and configuration, not only a recent version.
 See [provider requirements](docs/providers.md) for delivery paths and failure handling.
 
-- Upcoming Codex lifecycle support: stdin hooks bind turns, transcript events settle bound
-  requests, and Windows waits for the empty composer before pasting. See [Codex](docs/providers.md#codex)
-  for the notify fallback, hook-trust diagnostics and `settings codex-lifecycle-hooks off`.
-  Windows live record: [2026-10-18](docs/verification/2026-10-18-windows-127-codex-lifecycle-hooks.md)
-  (hook route, long-payload reproduction, steering, user Stop hook, picker gate, notify fallbacks).
+- [2026-10-18 Windows, Codex lifecycle hooks (0.4.17)](docs/verification/2026-10-18-windows-127-codex-lifecycle-hooks.md):
+  stdin hooks bind turns, transcript events settle bound requests, and Windows waits for the
+  empty composer before pasting; the long-payload reproduction of #127, steering, a user Stop
+  hook, the picker gate and the notify fallbacks were run live with codex-cli 0.163.0. See
+  [Codex](docs/providers.md#codex) for the notify fallback, hook-trust diagnostics and
+  `settings codex-lifecycle-hooks off`.
 - [2026-10-15 macOS, published 0.4.9](docs/verification/2026-10-15-macos-0.4.9.md): all four
   providers passed iTerm2 self-tests after publication; Codex and Claude defaults, Pi with an
   explicit model, Agy with `--yolo`. Separate installed-binary Ghostty checks used an already-running app.
@@ -149,18 +150,18 @@ Download the archive for your platform and its matching `.sha256` file from
 `tabcli-<version>-aarch64-apple-darwin.tar.gz` for Apple Silicon macOS, or
 `tabcli-<version>-x86_64-pc-windows-msvc.zip` for x64 Windows.
 
-For version 0.4.16, verify the checksum in the download directory before extracting.
+For version 0.4.17, verify the checksum in the download directory before extracting.
 On macOS, continue only if the checksum command reports `OK`:
 
 ```sh
-shasum -a 256 -c tabcli-0.4.16-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf tabcli-0.4.16-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c tabcli-0.4.17-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf tabcli-0.4.17-aarch64-apple-darwin.tar.gz
 ```
 
 On Windows, run these commands in PowerShell:
 
 ```powershell
-$archive = "tabcli-0.4.16-x86_64-pc-windows-msvc.zip"
+$archive = "tabcli-0.4.17-x86_64-pc-windows-msvc.zip"
 $expected = (Get-Content "$archive.sha256").Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "checksum mismatch" }
@@ -173,7 +174,7 @@ Put the extracted `tabcli` (macOS) or `tabcli.exe` (Windows) in a directory on y
 To install from source, use Rust 1.97.1 or newer and Cargo:
 
 ```sh
-cargo install --git https://github.com/jy1655/tabcli --tag v0.4.16 --locked
+cargo install --git https://github.com/jy1655/tabcli --tag v0.4.17 --locked
 ```
 
 The package is not on crates.io. The crates named `agent-bridge` and `tab-cli` there are unrelated
