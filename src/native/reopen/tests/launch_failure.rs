@@ -1,6 +1,6 @@
 use super::*;
 use std::cell::RefCell;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::process::{Child, Stdio};
 use std::rc::Rc;
 
@@ -22,6 +22,115 @@ enum Fault {
 impl Fault {
     fn releases_source(self) -> bool {
         matches!(self, Self::BeforeSpawn | Self::ExitedProcess)
+    }
+}
+
+struct DisabledDebugPrivilege {
+    token: OwnedHandle,
+    previous: windows_sys::Win32::Security::TOKEN_PRIVILEGES,
+}
+
+impl DisabledDebugPrivilege {
+    fn in_isolated_process() -> Self {
+        use windows_sys::Win32::{
+            Foundation::{ERROR_NOT_ALL_ASSIGNED, ERROR_SUCCESS, GetLastError},
+            Security::{
+                AdjustTokenPrivileges, LookupPrivilegeValueW, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED,
+                TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+            },
+            System::Threading::{GetCurrentProcess, OpenProcessToken},
+        };
+
+        assert_eq!(
+            std::env::var_os(CHILD).as_deref(),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        let mut raw = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+                    &mut raw,
+                )
+            },
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        let token = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut disabled = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            ..Default::default()
+        };
+        assert_ne!(
+            unsafe {
+                LookupPrivilegeValueW(
+                    std::ptr::null(),
+                    SE_DEBUG_NAME,
+                    &mut disabled.Privileges[0].Luid,
+                )
+            },
+            0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        let mut previous = TOKEN_PRIVILEGES::default();
+        let mut length = 0;
+        let adjusted = unsafe {
+            AdjustTokenPrivileges(
+                token.as_raw_handle(),
+                0,
+                &disabled,
+                std::mem::size_of_val(&previous) as u32,
+                &mut previous,
+                &mut length,
+            )
+        };
+        let error = unsafe { GetLastError() };
+        assert_ne!(
+            adjusted,
+            0,
+            "{}",
+            std::io::Error::from_raw_os_error(error as i32)
+        );
+        assert!(
+            matches!(error, ERROR_SUCCESS | ERROR_NOT_ALL_ASSIGNED),
+            "token adjustment: {error}"
+        );
+        println!(
+            "isolated SeDebugPrivilege: absent={}, disabled_previous_enabled={}",
+            error == ERROR_NOT_ALL_ASSIGNED,
+            previous.PrivilegeCount == 1
+                && previous.Privileges[0].Attributes & SE_PRIVILEGE_ENABLED != 0
+        );
+        Self { token, previous }
+    }
+}
+
+impl Drop for DisabledDebugPrivilege {
+    fn drop(&mut self) {
+        if self.previous.PrivilegeCount == 0 {
+            return;
+        }
+        let restored = unsafe {
+            windows_sys::Win32::Security::AdjustTokenPrivileges(
+                self.token.as_raw_handle(),
+                0,
+                &self.previous,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        assert_ne!(
+            restored,
+            0,
+            "{}",
+            std::io::Error::from_raw_os_error(error as i32)
+        );
+        assert_eq!(error, windows_sys::Win32::Foundation::ERROR_SUCCESS);
     }
 }
 
@@ -157,10 +266,15 @@ fn install_fault(fault: Fault, process: Rc<RefCell<Option<OwnedChild>>>) {
                     ),
                     Fault::UnknownProcess => {
                         child.1 = Some(deny_process_synchronize(&child.0));
-                        assert!(matches!(
-                            observe_provider_process(&record),
-                            ProviderProcessObservation::Unknown(_)
-                        ));
+                        assert_eq!(
+                            terminal::windows_process_identity(record.pid).unwrap(),
+                            record.windows_process_identity.clone().unwrap()
+                        );
+                        let observation = observe_provider_process(&record);
+                        assert!(
+                            matches!(observation, ProviderProcessObservation::Unknown(_)),
+                            "{observation:?}"
+                        );
                     }
                     _ => unreachable!(),
                 }
@@ -257,6 +371,8 @@ fn reproduce(test_name: &str, fault: Fault) {
         return;
     }
 
+    let _privilege =
+        matches!(fault, Fault::UnknownProcess).then(DisabledDebugPrivilege::in_isolated_process);
     let root = Reader::state_root().unwrap();
     let source = write_closed_reopen_source(
         &root,
@@ -339,6 +455,16 @@ fn reproduce(test_name: &str, fault: Fault) {
     }
     let refusal = refusal.expect("generic launcher failure must record a launch-phase refusal");
     assert_eq!(refusal.gate, "launch-failed");
+    if matches!(fault, Fault::UnknownProcess) {
+        assert_eq!(refusal.cleanup.as_deref(), Some("pending"));
+        assert!(
+            refusal
+                .cleanup_detail
+                .as_deref()
+                .unwrap()
+                .contains("could not be verified")
+        );
+    }
     assert_eq!(reader.status().unwrap().state, SessionState::Failed);
     if !fault.releases_source() {
         assert_ne!(refusal.gate, REOPEN_START_FAILED_GATE);
