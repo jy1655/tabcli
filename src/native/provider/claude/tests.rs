@@ -6,6 +6,112 @@ fn git_probe_drops_caller_session_environment() {
     );
 }
 
+#[cfg(windows)]
+fn windows_workspace_trust_screen(displayed_workspace: &str, yes_selected: bool) -> String {
+    // Dialog text and wrapping from the issue #28 native Windows capture, Claude Code 2.1.302.
+    let (no, yes) = if yes_selected {
+        ("No, exit", "❯ Yes, I trust this folder")
+    } else {
+        ("❯ No, exit", "Yes, I trust this folder")
+    };
+    format!(
+        "\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n Accessing workspace:\n\n {displayed_workspace}\n\n Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source\n project, or work from your team). If not, take a moment to review what's in this folder first.\n\n Claude Code'll be able to read, edit, and execute files here.\n\n Security guide\n\n {no}\n   {yes}\n\n Enter to confirm · Esc to cancel\n\n"
+    )
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_workspace_trust_dialog_accepts_the_observed_native_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().canonicalize().unwrap();
+    let native = crate::native::consent::native_key(&workspace).unwrap();
+    assert!(native.contains('\\'));
+    for (yes_selected, key) in [
+        (false, terminal::DialogKey::DownEnter),
+        (true, terminal::DialogKey::Enter),
+    ] {
+        assert_eq!(
+            ADAPTER.workspace_trust_key(
+                &windows_workspace_trust_screen(&native, yes_selected),
+                &workspace,
+            ),
+            Some(key),
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_workspace_trust_dialog_keeps_forward_slash_compatibility() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().canonicalize().unwrap();
+    let forward = crate::native::consent::native_key(&workspace)
+        .unwrap()
+        .replace('\\', "/");
+    for (yes_selected, key) in [
+        (false, terminal::DialogKey::DownEnter),
+        (true, terminal::DialogKey::Enter),
+    ] {
+        assert_eq!(
+            ADAPTER.workspace_trust_key(
+                &windows_workspace_trust_screen(&forward, yes_selected),
+                &workspace,
+            ),
+            Some(key),
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_workspace_trust_dialog_refuses_other_paths_and_extra_permissions() {
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let native = crate::native::consent::native_key(&workspace).unwrap();
+    for displayed in [native.clone(), native.replace('\\', "/")] {
+        for yes_selected in [false, true] {
+            let screen = windows_workspace_trust_screen(&displayed, yes_selected);
+            for other in [
+                temp.path().join("unrelated"),
+                temp.path().join("workspace-sibling"),
+                workspace.join("child"),
+            ] {
+                assert_eq!(ADAPTER.workspace_trust_key(&screen, &other), None);
+                let other_key = crate::native::consent::native_key(&other).unwrap();
+                let other_key = if displayed.contains('/') {
+                    other_key.replace('\\', "/")
+                } else {
+                    other_key
+                };
+                assert_eq!(
+                    ADAPTER
+                        .workspace_trust_key(&screen.replace(&displayed, &other_key), &workspace),
+                    None,
+                );
+            }
+            for alias in [
+                format!("{displayed}/"),
+                format!("{displayed}/../workspace"),
+                displayed.to_uppercase(),
+            ] {
+                assert_ne!(alias, displayed);
+                assert_eq!(
+                    ADAPTER.workspace_trust_key(&screen.replace(&displayed, &alias), &workspace),
+                    None,
+                );
+            }
+            for extra_prompt in [
+                format!("{screen}Allow Bash?\n"),
+                screen.replace("Enter to confirm", "Allow Bash?\nEnter to confirm"),
+            ] {
+                assert_eq!(ADAPTER.workspace_trust_key(&extra_prompt, &workspace), None);
+            }
+        }
+    }
+}
+
 #[test]
 fn workspace_trust_and_dialog_require_the_exact_workspace() {
     use super::super::super::consent::{self, Trust};

@@ -1290,6 +1290,40 @@ mod tests {
         assert_eq!(*order.borrow(), ["authorization", "manifest", "dialog"]);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn complete_launch_windows_claude_yolo_reaches_only_an_authorized_dialog() {
+        let (_temp, workspace, _fixture) = setup();
+        let (_root, directory) = session(&workspace, "launching");
+        for authorized in [false, true] {
+            let mut dialogs = 0;
+            let result = complete_launch_with(
+                provider::launch_trust(FirstPartyCli::Claude),
+                || Ok(authorized),
+                || {
+                    assert!(authorized, "unverified consent must not read the manifest");
+                    let mut manifest = Reader::open_unchecked(&directory).manifest()?;
+                    manifest.provider = "claude".to_owned();
+                    manifest.provider_version = "2.1.302 (Claude Code)".to_owned();
+                    manifest.yolo = true;
+                    Ok(manifest)
+                },
+                |manifest| {
+                    assert!(manifest.yolo);
+                    assert_eq!(manifest.workspace, workspace);
+                    dialogs += 1;
+                    bail!("guarded dialog refused")
+                },
+            );
+            assert_eq!(dialogs, usize::from(authorized));
+            if authorized {
+                assert_eq!(result.unwrap_err().to_string(), "guarded dialog refused");
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
     #[test]
     fn native_trust_rejects_absent_and_unregistered_markers() {
         let (_temp, workspace, fixture) = setup();
