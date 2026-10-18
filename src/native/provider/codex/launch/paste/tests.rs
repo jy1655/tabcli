@@ -1,6 +1,17 @@
 use super::*;
 use crate::native::session::{SessionState, Store, update_status};
 
+const WORKSPACE: &str = "D:/Dev/agent-bridge";
+fn composer_segments(screen: &str) -> std::result::Result<Vec<Segment>, Ambiguous> {
+    super::composer_segments(screen, "", Path::new(WORKSPACE))
+}
+fn classification(screen: Result<String>) -> String {
+    super::classification(screen, "", Path::new(WORKSPACE))
+}
+fn run(io: &mut impl Input, prompt: &str, claim: &str, deadline: Instant) -> TerminalSendResult {
+    super::run(io, prompt, claim, deadline, Path::new(WORKSPACE))
+}
+
 fn frame(text: &str) -> String {
     format!("› {}\n\n  100% context left\n", text.replace('\n', "\n  "))
 }
@@ -100,6 +111,7 @@ struct Fake {
     fail_text: Option<usize>,
     texts: usize,
     writes: Vec<String>,
+    write_times: Vec<Instant>,
     fault: Option<&'static str>,
     invalidate_at: Option<usize>,
     checks: usize,
@@ -129,6 +141,7 @@ impl Fake {
                 fail_text: None,
                 texts: 0,
                 writes: vec![],
+                write_times: vec![],
                 fault: None,
                 invalidate_at: None,
                 checks: 0,
@@ -195,6 +208,7 @@ impl Input for Fake {
         self.calls.push("text");
         self.texts += 1;
         self.writes.push(text.to_owned());
+        self.write_times.push(self.now);
         if self.fault == Some("body_started") {
             return Err(Failure::delivery_uncertain(anyhow::anyhow!(
                 "helper started then failed"
@@ -252,6 +266,7 @@ fn protocol_success_orders_body_tail_guard_and_binding() {
     let result = io.execute(&prompt);
     assert!(result.is_ok());
     assert_eq!(io.calls, ["text", "text", "screen", "submit", "binding"]);
+    assert_eq!(io.write_times[1] - io.write_times[0], PASTE_SPLIT_GAP);
     assert_eq!(
         io.writes,
         [
@@ -569,4 +584,195 @@ fn windows_transport_bytes_split_exact_framing_and_only_one_terminal_lf() {
     );
     assert_eq!(io.texts, before);
     claim.retain();
+}
+
+fn live_frame(prompt: &str, marker: &str) -> String {
+    // Exercise Bridge's real pre-framing trim, not an invented Codex LF collapse.
+    format!(
+        "{}\n\n[Agent Bridge Codex turn metadata; do not include this metadata in the response]\n{marker}",
+        crate::native::native_delegation_prompt("external", prompt)
+    )
+}
+fn capture(json: &str) -> String {
+    serde_json::from_str(json).unwrap()
+}
+#[test]
+fn real_inline_and_separate_tail_captures_end_at_marker() {
+    for (json, raw, body_count) in [
+        (
+            include_str!("fixtures/session-spnLLG.txt"),
+            include_str!("fixtures/short.txt"),
+            236,
+        ),
+        (
+            include_str!("fixtures/session-prLun4.txt"),
+            include_str!("fixtures/25kb.txt"),
+            25595,
+        ),
+        (
+            include_str!("fixtures/session-4349NT.txt"),
+            &capture(include_str!("fixtures/multi.txt")),
+            1093,
+        ),
+        (
+            include_str!("fixtures/session-1kz1jb.txt"),
+            include_str!("fixtures/body1001.txt"),
+            1001,
+        ),
+    ] {
+        let screen = capture(json);
+        let marker = screen
+            .lines()
+            .map(str::trim)
+            .find(|s| s.starts_with("<!-- agent-bridge-codex-turn:"))
+            .unwrap();
+        let prompt = live_frame(raw, marker);
+        assert_eq!(
+            prompt.rsplit_once('\n').unwrap().0.chars().count(),
+            body_count
+        );
+        let segments = super::composer_segments(&screen, marker, Path::new(WORKSPACE)).unwrap();
+        assert_eq!(segments.last(), Some(&Segment::Inline(marker.into())));
+        assert!(!format!("{segments:?}").contains("OpenAI Codex"));
+        assert!(!format!("{segments:?}").contains("GPT-6-Astra"));
+        let (mut io, claim, _) = Fake::new();
+        io.screens = [screen.clone()].into();
+        let deadline = io.now + Duration::from_secs(1);
+        assert_eq!(
+            applied(&mut io, deadline, &prompt, marker, Path::new(WORKSPACE)).unwrap(),
+            screen
+        );
+        claim.retain();
+        // Primary marker rule ignores all later rows, even unknown footer shapes.
+        let truncated = screen
+            .lines()
+            .take_while(|row| !row.contains("GPT-6-Astra"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            super::composer_segments(&truncated, marker, Path::new(WORKSPACE)).unwrap(),
+            segments
+        );
+    }
+}
+#[test]
+fn real_merged_tail_captures_use_normalized_total() {
+    for (json, raw, token) in [
+        (
+            include_str!("fixtures/session-FXoq6U.txt"),
+            include_str!("fixtures/body1000.txt"),
+            "2136-1792315332023997000-0",
+        ),
+        (
+            include_str!("fixtures/session-s5RIn4.txt"),
+            include_str!("fixtures/body999.txt"),
+            "18476-1792314931932060800-0",
+        ),
+    ] {
+        // Tokens recovered read-only from each session's codex-pending-turn.json.
+        let marker = format!("<!-- agent-bridge-codex-turn:{token} -->");
+        let prompt = live_frame(raw, &marker);
+        assert_eq!(normalized_count(&prompt), 1060);
+        let screen = capture(json);
+        let segments = super::composer_segments(&screen, &marker, Path::new(WORKSPACE)).unwrap();
+        assert_eq!(segments, [Segment::Placeholder(1060)]);
+        assert_eq!(observe(&segments, &prompt), Observation::Complete);
+        let (mut io, claim, _) = Fake::new();
+        io.screens = [screen.clone()].into();
+        let deadline = io.now + Duration::from_secs(1);
+        assert_eq!(
+            applied(&mut io, deadline, &prompt, &marker, Path::new(WORKSPACE)).unwrap(),
+            screen
+        );
+        claim.retain();
+    }
+}
+#[test]
+fn real_trailing_lf_counts_come_from_bridge_framing_not_codex_collapse() {
+    for (raw, untrimmed, actual) in [
+        (include_str!("fixtures/25kb.txt"), 25596, 25595),
+        (&capture(include_str!("fixtures/multi.txt")), 1094, 1093),
+    ] {
+        assert!(raw.ends_with('\n'));
+        let naive = format!(
+            "[Agent Bridge native delegation]\nSource: external\n\n{raw}\n\n[Agent Bridge Codex turn metadata; do not include this metadata in the response]"
+        );
+        assert!(naive.contains("\n\n\n"));
+        assert_eq!(normalized_count(&naive), untrimmed);
+        let prompt = live_frame(raw, "marker");
+        let body = prompt.rsplit_once('\n').unwrap().0;
+        assert_eq!(normalized_count(body), actual);
+    }
+    assert_eq!(normalized_count("a\r\nb\rc\n\n\nd\t\x01\x1b[31me"), 11);
+    assert_eq!(
+        observe(&[Segment::Placeholder(10)], "body\n> quoted\n"),
+        Observation::Ambiguous
+    );
+}
+#[test]
+fn pinned_footer_variants_and_ambiguous_boundaries() {
+    for hint in [
+        "? for shortcuts",
+        "ctrl+g for agents · ? for shortcuts",
+        "100% context left",
+        "12.3K used",
+        "1T used",
+        "⚠ 1 warning · f2 to view",
+        "⚠ 2 warnings · f2 to view",
+        "GPT-6-Astra xhigh · d:/dev/AGENT-BRIDGE",
+        "esc to interrupt",
+        "tab to queue message",
+        "tab to queue",
+        "ctrl+c again to quit",
+        "ctrl+d again to quit",
+        "Plan mode",
+        "Plan mode (shift+tab to cycle)",
+        "esc again to edit previous message",
+        "esc esc to edit previous message",
+    ] {
+        assert!(footer(hint, Path::new(WORKSPACE)), "{hint}");
+        let screen = format!("banner\n› first\n  \n  second\n\n\n  {hint}\n");
+        assert_eq!(
+            composer_segments(&screen).unwrap(),
+            [
+                Segment::Inline("first".into()),
+                Segment::Inline("\n".into()),
+                Segment::Inline("\n".into()),
+                Segment::Inline("second".into())
+            ],
+            "{hint}"
+        );
+    }
+    assert!(!footer("GPT-6-Astra · D:/Dev/other", Path::new(WORKSPACE)));
+    assert_eq!(
+        normalized_workspace(r"\\?\D:\Dev\agent-bridge"),
+        normalized_workspace(WORKSPACE)
+    );
+    assert_eq!(
+        normalized_workspace(r"\\?\UNC\server\share"),
+        normalized_workspace(r"\\server\share")
+    );
+    assert_eq!(
+        super::composer_segments(
+            "› marker\n› ignored after marker",
+            "marker",
+            Path::new(WORKSPACE)
+        )
+        .unwrap(),
+        [Segment::Inline("marker".into())]
+    );
+    assert!(super::composer_segments("› draft\n› marker", "marker", Path::new(WORKSPACE)).is_err());
+    assert!(composer_segments("› draft\n").is_err());
+    assert!(composer_segments("› draft\nunrecognized\n  ? for shortcuts").is_err());
+    assert!(
+        super::composer_segments(
+            "› draft\nunrecognized\n  marker",
+            "marker",
+            Path::new(WORKSPACE)
+        )
+        .is_err()
+    );
+    assert!(
+        super::composer_segments("› marker\nReview hooks", "marker", Path::new(WORKSPACE)).is_err()
+    );
 }

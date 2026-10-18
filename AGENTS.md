@@ -202,15 +202,25 @@ launch, observe, continue, and close without replacing the capabilities those CL
   Applying a complete paste clears the 120 ms suppression window: no 150 ms proof exists.
   A visible prefix with input still pending can absorb Return into a later burst.
 - Before writing, require the positive empty composer and a 20 s reserve. Write/drain body
-  text only and verify its scalar count, then immediately write/drain LF plus the claim
+  text only and verify its scalar count, then wait 150 ms before writing/draining LF plus the claim
   marker and verify that count, with no screen read between writes. The final exact inline
   marker is completion evidence under ordered console/reader/composer processing; its
   applied paste clears burst suppression. Wrapped/scrolled body rows need no positional
-  matching. If the last segment is a placeholder, require the full framed scalar total
+  matching. If the last segment is a placeholder, require the Codex-normalized framed scalar total
   from placeholders plus inline text (physical rows joined with LF): cardinality only,
   not a content receipt. Repeated labels use ` #2` outside the bracket. A dialog/picker
   veto precedes success; an unobserved/clipped marker or ambiguous fallback never submits.
   The request has one absolute deadline, and Sent still requires the claim binding.
+- The 150 ms split gap only encourages the 60 ms idle flush; it proves nothing.
+  The exact inset-stripped marker row ends composer content; subsequent rows are ignored.
+  Otherwise use the first recognized footer (workspace-qualified model line, warning,
+  shortcut/queue/interrupt/edit/quit hint or context/token count), trimming separator blanks
+  but preserving internal blanks. No marker and no recognized footer remains ambiguous.
+  Count normalization is CRLF/CR to LF and control/CSI sanitization, not blank-line collapse
+  (Codex rust-v0.163.0 paste_input.rs:145-176; history_cell/messages.rs:25-85).
+  Bridge trims source prompts before framing: the live 25596/1094 estimates become
+  25595/1093 there. Cursor-dependent blockquote fallback stays ambiguous; exact inline
+  marker evidence remains usable. Unknown custom status lines require that marker.
 - Recheck the current claim, session and deadline after blocking work and before input.
   Submit one guarded Return against the exact accepted full screen; a changed screen gets
   none. After body dispatch all unconfirmed failures are uncertain, except a helper's

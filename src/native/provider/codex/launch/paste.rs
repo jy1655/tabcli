@@ -11,6 +11,7 @@ use std::{
 };
 
 const POST_TEXT_RESERVE: Duration = Duration::from_secs(20);
+const PASTE_SPLIT_GAP: Duration = Duration::from_millis(150);
 const POLL: Duration = Duration::from_millis(250);
 const RECOVERY: &str = "Check tabcli result <session> and the surface. Only if the entire draft remains in the composer with no dialog or running turn, consider pressing Enter once. Otherwise close the session or diagnose with doctor. Bridge resends neither text nor Return.";
 
@@ -33,46 +34,81 @@ fn blocked(screen: &str) -> bool {
     .any(|text| screen.contains(text))
 }
 
-// The prompt row is recorded in docs/verification/2026-10-02-windows.md.
-// rust-v0.163.0 chat_composer.rs and footer.rs::context_window_line pin the
-// two-column inset and footer (100% context left; ? for shortcuts when empty).
-// Preserve physical row boundaries as LF for the cardinality-only fallback.
-// The marker path tolerates a wrapped/scrolled body. Right padding is not content.
-fn composer_segments(screen: &str) -> std::result::Result<Vec<Segment>, Ambiguous> {
+// rust-v0.163.0 footer.rs: left_side_line, footer_from_props_lines,
+// context_window_line. Unknown custom status lines need an inline marker.
+fn normalized_workspace(value: &str) -> String {
+    let value = value.replace('/', "\\");
+    let value = if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        value.strip_prefix(r"\\?\").unwrap_or(&value).to_owned()
+    };
+    value.to_lowercase()
+}
+fn footer(row: &str, workspace: &Path) -> bool {
+    let hint = row.trim();
+    hint.starts_with("? for shortcuts")
+        || hint.contains(" · ? for shortcuts")
+        || hint.ends_with("% context left")
+        || hint.contains("warning · f2 to view")
+        || hint.contains("warnings · f2 to view")
+        || hint.starts_with("esc to interrupt")
+        || hint.starts_with("tab to queue")
+        || matches!(
+            hint,
+            "esc again to edit previous message"
+                | "esc esc to edit previous message"
+                | "ctrl+c again to quit"
+                | "ctrl+d again to quit"
+                | "Plan mode"
+                | "Plan mode (shift+tab to cycle)"
+        )
+        || hint.strip_suffix(" used").is_some_and(|n| {
+            !n.is_empty()
+                && n.chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, '.' | 'K' | 'M' | 'B' | 'T'))
+        })
+        || hint.rsplit_once(" · ").is_some_and(|(_, path)| {
+            normalized_workspace(path) == normalized_workspace(&workspace.to_string_lossy())
+        })
+}
+
+// Internal empty rows and physical LF are content; right padding is not.
+// The addressed marker is primary: rows after it do not enter the draft.
+fn composer_segments(
+    screen: &str,
+    tail: &str,
+    workspace: &Path,
+) -> std::result::Result<Vec<Segment>, Ambiguous> {
     if blocked(screen) {
         return Err(Ambiguous("blocked"));
     }
     let rows: Vec<_> = screen.lines().map(str::trim_end).collect();
-    let starts: Vec<_> = rows
+    let start = rows
         .iter()
-        .enumerate()
-        .filter(|(_, r)| r.starts_with("› "))
-        .collect();
-    if starts.len() != 1 {
-        return Err(Ambiguous("missing or multiple prompt rows"));
-    }
-    let start = starts[0].0;
+        .position(|r| r.starts_with("› "))
+        .ok_or(Ambiguous("missing prompt row"))?;
+    let marker_end = rows[start..]
+        .iter()
+        .position(|r| {
+            !tail.is_empty() && r.strip_prefix("› ").or_else(|| r.strip_prefix("  ")) == Some(tail)
+        })
+        .map(|i| start + i);
+    let end = marker_end
+        .or_else(|| (start + 1..rows.len()).find(|&i| footer(rows[i], workspace)))
+        .ok_or(Ambiguous("no footer and no marker"))?;
     let mut contents = vec![rows[start]["› ".len()..].to_owned()];
-    let mut ended = false;
-    for row in &rows[start + 1..] {
-        let hint = row.trim();
-        if hint.starts_with("? for shortcuts") || hint.ends_with("% context left") {
-            ended = true;
-            break;
-        }
+    let exclusive_end = if marker_end.is_some() { end + 1 } else { end };
+    for row in &rows[start + 1..exclusive_end] {
         if row.is_empty() {
             contents.push(String::new());
         } else if let Some(text) = row.strip_prefix("  ") {
             contents.push(text.to_owned());
         } else {
-            return Err(Ambiguous("unrecognized or clipped composer row"));
+            return Err(Ambiguous("unrecognized continuation row"));
         }
     }
-    if !ended {
-        return Err(Ambiguous("missing footer"));
-    }
-    // One empty layout row separates the editor and its footer.
-    if contents.last().is_some_and(String::is_empty) {
+    while contents.last().is_some_and(String::is_empty) {
         contents.pop();
     }
     let text = contents.join("\n");
@@ -116,6 +152,31 @@ fn composer_segments(screen: &str) -> std::result::Result<Vec<Segment>, Ambiguou
     Ok(segments)
 }
 
+// rust-v0.163.0 chat_composer/paste_input.rs:145-176 normalizes CRLF/CR,
+// sanitizes controls/CSI (history_cell/messages.rs:25-85), then counts scalars.
+// It does NOT collapse triple LF. Bridge trims the source before framing,
+// explaining the real 25596->25595 / 1094->1093 differences.
+// Blockquote expansion at 163-175 depends on insertion target and burst
+// boundaries, which captures cannot establish. Refuse that fallback.
+fn normalized_count(text: &str) -> usize {
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut chars = text.chars().peekable();
+    let mut sanitized = String::new();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        } else if !c.is_control() || matches!(c, '\n' | '\t') {
+            sanitized.push(c);
+        }
+    }
+    sanitized.chars().count()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Observation {
     Complete,
@@ -123,7 +184,14 @@ enum Observation {
     Ambiguous,
 }
 fn observe(segments: &[Segment], expected: &str) -> Observation {
-    let expected = expected.chars().count();
+    if expected
+        .replace('\r', "\n")
+        .lines()
+        .any(|line| line.starts_with("> "))
+    {
+        return Observation::Ambiguous;
+    }
+    let expected = normalized_count(expected);
     let mut offset: usize = 0;
     for segment in segments {
         let count = match segment {
@@ -165,7 +233,13 @@ fn wait(io: &mut impl Input, deadline: Instant) {
     let remaining = deadline.saturating_duration_since(io.now());
     io.sleep(POLL.min(remaining));
 }
-fn applied(io: &mut impl Input, deadline: Instant, expected: &str, tail: &str) -> Result<String> {
+fn applied(
+    io: &mut impl Input,
+    deadline: Instant,
+    expected: &str,
+    tail: &str,
+    workspace: &Path,
+) -> Result<String> {
     let mut observed = "unreadable: no screen observed".to_owned();
     loop {
         check(io, deadline).with_context(|| format!("paste observation: {observed}"))?;
@@ -180,7 +254,7 @@ fn applied(io: &mut impl Input, deadline: Instant, expected: &str, tail: &str) -
         if blocked(&screen) {
             bail!("blocked composer: dialog or hook-review picker; no further input");
         }
-        let parsed = composer_segments(&screen);
+        let parsed = composer_segments(&screen, tail, workspace);
         observed = format!("{parsed:?}");
         check(io, deadline).with_context(|| format!("paste observation: {observed}"))?;
         if let Ok(segments) = parsed {
@@ -200,11 +274,11 @@ fn applied(io: &mut impl Input, deadline: Instant, expected: &str, tail: &str) -
         wait(io, deadline);
     }
 }
-fn classification(screen: Result<String>) -> String {
+fn classification(screen: Result<String>, tail: &str, workspace: &Path) -> String {
     match screen {
         Err(error) => format!("unreadable ({error})"),
         Ok(screen) if blocked(&screen) => "blocked".into(),
-        Ok(screen) => match composer_segments(&screen) {
+        Ok(screen) => match composer_segments(&screen, tail, workspace) {
             Ok(segments) if segments == [Segment::Inline("Ask Codex to do anything".into())] => {
                 "positively empty".into()
             }
@@ -214,7 +288,13 @@ fn classification(screen: Result<String>) -> String {
         },
     }
 }
-fn run(io: &mut impl Input, prompt: &str, claim: &str, deadline: Instant) -> TerminalSendResult {
+fn run(
+    io: &mut impl Input,
+    prompt: &str,
+    claim: &str,
+    deadline: Instant,
+    workspace: &Path,
+) -> TerminalSendResult {
     // Windows currently writes raw UTF-8 unchanged. Tolerate at most one
     // terminal LF; never trim arbitrary prompt whitespace or multiple lines.
     let prompt = prompt.strip_suffix('\n').unwrap_or(prompt);
@@ -241,13 +321,17 @@ fn run(io: &mut impl Input, prompt: &str, claim: &str, deadline: Instant) -> Ter
         if count != body.chars().count() {
             bail!("body scalar count mismatch");
         }
+        // Heuristic only: usually closes the 60 ms Windows idle burst.
+        // Scheduling can still merge the tail; retain cardinality fallback.
+        let gap = PASTE_SPLIT_GAP.min(deadline.saturating_duration_since(io.now()));
+        io.sleep(gap);
         check(io, deadline)?;
         let count = io.text(&format!("\n{tail}")).map_err(Failure::into_error)?;
         check(io, deadline)?;
         if count != tail.chars().count() + 1 {
             bail!("tail scalar count mismatch");
         }
-        let screen = applied(io, deadline, prompt, tail)?;
+        let screen = applied(io, deadline, prompt, tail, workspace)?;
         check(io, deadline)?;
         if !io.submit(&screen)? {
             bail!("composer changed before guarded submission");
@@ -267,7 +351,7 @@ fn run(io: &mut impl Input, prompt: &str, claim: &str, deadline: Instant) -> Ter
         binding_result.map_err(|error| {
             // Diagnostic only. The bounded reader may refuse an expired deadline;
             // report unreadable rather than pretending the last draft is still there.
-            let state = classification(io.screen());
+            let state = classification(io.screen(), tail, workspace);
             anyhow::anyhow!("no claim binding observed: {error:#}; final composer: {state}")
         })
     })();
@@ -280,6 +364,10 @@ pub(super) fn send(
     prompt_path: &Path,
     deadline: Instant,
 ) -> TerminalSendResult {
+    let workspace = Reader::open_unchecked(directory)
+        .manifest()
+        .map_err(Failure::not_sent)?
+        .workspace;
     let prompt = std::fs::read_to_string(prompt_path).map_err(|e| Failure::not_sent(e.into()))?;
     let claim = turn::current_claim_token(&Reader::open_unchecked(directory))
         .and_then(|c| c.context("no current Codex claim"))
@@ -342,6 +430,7 @@ pub(super) fn send(
         &prompt,
         &claim,
         deadline,
+        &workspace,
     )
 }
 

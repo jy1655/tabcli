@@ -88,19 +88,36 @@ existing LF encoding and need separate provider evidence.
 For Windows initial launches recorded as `injected`, #124 uses a bounded best-effort console
 fallback pinned to Codex 0.163.0. After the positive composer gate, Bridge reserves at least
 20 s of the original deadline before writing. It writes and drains the exact framed body as
-text only, verifies its scalar count, then immediately writes and drains LF plus the claim
+text only, verifies its scalar count, then waits 150 ms before writing and draining LF plus the claim
 marker and verifies that count. There is no screen observation between these writes.
 The final inline marker line is completion evidence under ordered console/reader/composer
 processing: earlier input was processed before the marker, and applying its paste clears
 burst suppression. Wrapped or scrolled inline body text does not need positional matching.
 If the tail merged into a final placeholder, Bridge instead requires the sum of placeholder
 counts and visible inline scalars (physical rows joined with LF) to equal the framed prompt's
-scalar count. This fallback is cardinality only, not a content receipt; wrapping, clipping,
+Codex-normalized scalar count. This fallback is cardinality only, not a content receipt; wrapping, clipping,
 scrolling and literal placeholder collisions can make it ambiguous or misleading.
 A dialog or hook picker vetoes success. Bridge then requests one guarded Return: the helper
 compares the entire accepted screen and writes no Return if it changed. This assumes no
 concurrent human input; screen comparison is not atomic with a TUI transition. A clipped or
-wrapped marker, missing footer or unsupported layout remains unconfirmed.
+wrapped marker with no recognized footer, or an unsupported layout remains unconfirmed.
+
+The gap is a heuristic to let the 60 ms idle flush separate the body; it proves no
+processing boundary and the merged-tail fallback remains. Parsing ends at the exact
+inset-stripped marker row, ignoring later rows. Without that row, the first recognized
+footer ends the content: model/status text ending in this session's workspace (case-insensitive
+Windows path normalization), warnings, shortcut/queue/interrupt/edit/quit/plan-mode hints, context
+percentage or token usage. Trailing separator blanks are dropped; internal blanks stay.
+Unknown custom status lines, history search and overlays are not inferred as draft footers.
+
+[Codex paste normalization](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/tui/src/bottom_pane/chat_composer/paste_input.rs#L145-L176)
+maps CRLF/CR to LF and invokes
+[control/CSI sanitization](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/tui/src/history_cell/messages.rs#L25-L85)
+before counting Unicode scalars. It preserves triple LF. The real 25596→25595 and
+1094→1093 differences come from Bridge's existing source-prompt trim before framing,
+not Codex normalization. Blockquote expansion depends on insertion position and burst
+boundaries, so a merged-tail fallback containing blockquote lines remains ambiguous;
+an exact inline marker can still complete observation.
 
 `Sent` means this claim's `UserPromptSubmit` binding was observed, not completion or final
 acceptance: another input hook may still reject the turn, and the transcript observer decides
