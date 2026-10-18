@@ -493,3 +493,23 @@ fn windows_selects_native_mode_from_the_recorded_stable_version_only() {
         }
     }
 }
+
+#[test]
+fn official_peer_body_escapes_its_own_closing_delimiter_before_turn_start() {
+    let f = Fixture::new();
+    let observed = f.frame().replacen(
+        &f.message,
+        &f.message
+            .replace("</cross-session-message>", "<\\/cross-session-message>"),
+        1,
+    );
+    f.send("turn.start", json!({"turnId":TURN,"text":observed}));
+    f.complete("escaped body final");
+    let events = f.events();
+    assert_eq!(
+        events.len(),
+        1,
+        "Claude escapes its own closing delimiter inside peer message data"
+    );
+    assert_eq!(events[0].message, "escaped body final");
+}
