@@ -327,9 +327,11 @@ impl Cursor {
         }
         .map(|()| true)
     }
-    fn flush_questions(&mut self, directory: &Path) -> Observation<()> {
+    fn flush_questions(&mut self, directory: &Path, terminal_verified: bool) -> Observation<()> {
         if self.accepted && self.questions.dirty() {
-            self.verify()?;
+            if !terminal_verified {
+                self.verify()?;
+            }
             #[cfg(test)]
             tests::at_read_checkpoint(tests::ReadCheckpoint::BeforeQuestionLock);
             self.questions
@@ -400,7 +402,7 @@ impl Observer {
             return;
         }
         let read = cursor.read(drain).and_then(|terminal| {
-            cursor.flush_questions(directory)?;
+            cursor.flush_questions(directory, terminal.is_some())?;
             Ok(terminal)
         });
         match read {
