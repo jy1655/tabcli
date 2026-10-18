@@ -705,7 +705,8 @@ tabcli doctor --provider codex --json
 ```
 
 Observe a session or provider, exactly one of the two. `--probe` defaults to off; it enables bounded
-local capability/version probes, with a five-second probe budget. It does not launch a model turn,
+local capability/version probes, with a shared five-second probe budget. The Codex hook-trust
+exchange has its own additional ten-second maximum. It does not launch a model turn,
 deliver a prompt, start a daemon, repair records, or change settings. Historical launch
 configuration and current observations are reported separately.
 
@@ -748,6 +749,40 @@ session is not closed, `available` / `origin_ended_session_closed` when both hav
 read consistently. Only `origin_ended` suggests a command: an explicit `close-session` of this
 session, if you no longer need it. The origin observation grants no close authority.
 `doctor --provider` has no origin check.
+
+`codex_lifecycle` reads only this session's records. Its `evidence.source` is `session_records`;
+`launch_mode`, `input_hook_observed`, `stop_candidate_observed`, `observer` and `terminal_outcome`
+each have `observation: observed|not_observed|unavailable`. An observed field has `record`;
+an unavailable field has `reason`. Missing legacy records say `not_observed`. The row stays
+`unknown`: it does not certify effective configuration. Human output prints the same evidence
+object that `--json` places in `checks[].evidence`.
+
+- `launch_mode.record` contains `lifecycle_hooks` (`injected|not_injected`), `reason`,
+  `codex_version`, `vector_codex_version` and schema. A version mismatch adds `warning`.
+- `claim_token` selects the current claim, otherwise the last request's claim.
+  `input_hook_observed.record` contains the binding identity and `bound_unix_ms`;
+  `stop_candidate_observed.record` includes `observed_unix_ms`, without candidate answer text.
+- `observer.record` reports the recorded `armed`, `suspended` or `settled` state, reason,
+  offset and observation time when present. `settled` is diagnostic, not publication proof.
+- `terminal_outcome.record` comes from the last request's committed event, following the
+  ordinary result publication rules. It includes request/event ids, provenance, request state,
+  time and kind (`task_complete`, `turn_aborted`, `agent-turn-complete`, or `not_observed`).
+
+Only with `--probe`, `codex_hook_trust` starts the installed Codex with the exact hooks override
+this Bridge executable would inject, then sends stdio JSON-RPC `initialize`, `initialized`, and
+`hooks/list` with this workspace. It ends the process tree after the response or ten seconds.
+It creates no Bridge scratch files or configuration writes. This is `source: current_probe`,
+not evidence about a session's live configuration or hook execution. Each of Bridge's two keys
+reports `trustStatus`, `currentHash`, `expected_hash`, `hash_matches`, and `diagnostic`:
+`normalization drift` when the hashes differ. Both trusted and matching means `available`;
+untrusted/modified/mismatched means `unavailable`. Missing executable/keys, malformed replies,
+errors and timeouts report `codex_hook_trust_unavailable` with a reason. Batch-only launchers
+that require a disk forwarder are unavailable for this file-free probe.
+
+The notify budget applies whenever a current request may still depend on notify: no binding
+has been observed, or launch did not record injected lifecycle hooks. With both injection and
+a binding it reports `available` / `codex_notify_payload_not_required`, even if the observer
+is suspended; this never restores notify authority.
 
 For Codex, `checks` includes `codex_notify_payload_budget`, an estimate of the pending turn's
 `notify` command line against the native Windows limit of 32,767 UTF-16 units (see
@@ -924,6 +959,12 @@ tabcli settings macos-open-mode tab-first|new-window [--json]
 tabcli settings codex-memory-workspace refuse|allow [--json]
 tabcli settings codex-lifecycle-hooks on|off [--json] # default: on
 ```
+
+`codex-lifecycle-hooks` controls hook injection for new Codex launches only. It writes Bridge's
+setting, never Codex configuration. Existing sessions retain their recorded launch mode and
+Windows composer gate. Injection requires stable Codex 0.163.0+ and a supported executable
+path; it is not proof of hook execution. See [Codex](providers.md#codex) for trust hashes,
+picker recovery, transcript completion and the unbound notify fallback.
 
 ```sh
 tabcli settings

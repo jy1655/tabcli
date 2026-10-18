@@ -3,8 +3,7 @@
 //! Mac R0 (Codex 0.163.0, 2026-10-18): `state` inside the same `-c hooks=` value
 //! is honoured without writing to the user's config (run C); a wrong hash raises
 //! the picker for that hook only (run D). `codex app-server` + JSON-RPC `hooks/list`
-//! reports key/currentHash/trustStatus without writing (run F), the doctor probe
-//! planned for R4. That probe is not implemented in this round.
+//! reports key/currentHash/trustStatus without configuration writes (run F).
 use super::codex_version;
 use crate::native::session::{Reader, Store};
 use crate::native::settings::{self, CodexLifecycleHooks};
@@ -163,14 +162,7 @@ pub(super) fn prepare(directory: &Path, executable: &Path) -> Result<Option<Stri
     Ok(if injected { value } else { None })
 }
 
-// R2/R4 will consume this adapter-private record instead of re-probing settings/version.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "reader staged for subsequent lifecycle-hook rounds"
-    )
-)]
+// Read the launch decision without re-probing settings/version.
 pub(super) fn read_launch_mode(directory: &Path) -> Result<Option<LaunchMode>> {
     let Some(text) = Reader::open_unchecked(directory).private(FILE).text()? else {
         return Ok(None);

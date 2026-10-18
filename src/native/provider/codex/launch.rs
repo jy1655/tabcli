@@ -28,18 +28,26 @@ pub(super) fn send_initial_prompt(
         let mut last_read: Option<Instant> = None;
         // The caller's environment is read once per paste gate.
         let env = crate::native::consent::Environment::current();
-        crate::native::consent::wait_for_native_trust(
+        initial_readiness_with(
             &directory,
-            FirstPartyCli::Codex,
             deadline,
-            &env,
-            &mut || {
-                if last_read.is_some_and(|read| read.elapsed() < COMPOSER_POLL) {
-                    return false;
-                }
-                last_read = Some(Instant::now());
-                terminal::read_screen(session, deadline)
-                    .is_ok_and(|screen| composer_is_ready(&screen))
+            &mut crate::native::clock::SystemClock,
+            &mut || terminal::read_screen(session, deadline),
+            || {
+                crate::native::consent::wait_for_native_trust(
+                    &directory,
+                    FirstPartyCli::Codex,
+                    deadline,
+                    &env,
+                    &mut || {
+                        if last_read.is_some_and(|read| read.elapsed() < COMPOSER_POLL) {
+                            return false;
+                        }
+                        last_read = Some(Instant::now());
+                        terminal::read_screen(session, deadline)
+                            .is_ok_and(|screen| legacy_composer_is_ready(&screen))
+                    },
+                )
             },
         )
         .map_err(terminal::TerminalSendFailure::not_sent)?;
@@ -62,9 +70,77 @@ pub(super) fn send_initial_prompt(
 const COMPOSER_ROW: &str = "› Ask Codex to do anything";
 const COMPOSER_POLL: Duration = Duration::from_secs(1);
 
+// The launch record, never mutable settings or a current probe, selects this gate.
+// Positive composer evidence already supplies the legacy OR's readiness branch;
+// requiring exact trust as well would break repository-root trust.
+fn initial_readiness_with(
+    directory: &Path,
+    deadline: Instant,
+    clock: &mut impl crate::native::clock::Clock,
+    read_screen: &mut impl FnMut() -> Result<String>,
+    legacy: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if !super::hooks::read_launch_mode(directory)?
+        .is_some_and(|mode| mode.lifecycle_hooks == super::hooks::LifecycleHooks::Injected)
+    {
+        return legacy();
+    }
+    let mut last_screen = String::new();
+    loop {
+        if let Ok(status) = Reader::open_unchecked(directory).status()
+            && status.state.ended()
+        {
+            anyhow::bail!(
+                "the session is {} and no longer waits for the Codex composer; no initial console input was sent",
+                status.state
+            );
+        }
+        if clock.now() >= deadline {
+            let picker = if hook_picker_present(&last_screen) {
+                " The last screen contained Review hooks or Trust all and continue (hook-review picker); Bridge never answers this picker."
+            } else {
+                ""
+            };
+            anyhow::bail!(
+                "Codex empty composer readiness was not observed; no initial console input was sent.{picker}"
+            );
+        }
+        if let Ok(screen) = read_screen() {
+            last_screen = screen;
+            // Reading the surface can take time: recheck the session and deadline
+            // before accepting its evidence, not only before starting the read.
+            if let Ok(status) = Reader::open_unchecked(directory).status()
+                && status.state.ended()
+            {
+                anyhow::bail!(
+                    "the session is {} and no longer waits for the Codex composer; no initial console input was sent",
+                    status.state
+                );
+            }
+            if composer_is_ready(&last_screen) && clock.now() < deadline {
+                return Ok(());
+            }
+        }
+        let remaining = deadline.saturating_duration_since(clock.now());
+        clock.sleep(COMPOSER_POLL.min(remaining));
+    }
+}
+
+fn hook_picker_present(screen: &str) -> bool {
+    screen.contains("Review hooks") || screen.contains("Trust all and continue")
+}
+
 // Require a known empty composer with no dialog; blank/loading screens prove nothing.
 // This is input readiness, not shared consent; see docs/verification/2026-10-02-windows.md.
 fn composer_is_ready(screen: &str) -> bool {
+    if hook_picker_present(screen) {
+        return false;
+    }
+    legacy_composer_is_ready(screen)
+}
+
+// Preserve the pre-record session's readiness predicate as well as its consent OR.
+fn legacy_composer_is_ready(screen: &str) -> bool {
     let mut composer = false;
     for line in screen.lines() {
         if line.contains("Trust this folder?") || line.contains("Trust and continue") {

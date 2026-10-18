@@ -159,7 +159,9 @@
     "native-hook": 1,
     "const COMPOSER_ROW: &str = \"› Ask Codex to do anything\";": 1,
     "Trust this folder?": 1,
-    "Trust and continue": 1
+    "Trust and continue": 1,
+    "Review hooks": 2,
+    "Trust all and continue": 2
   },
   "src/native/provider/codex/queue.rs": {
     "thread not found: {thread_id}": 1,
@@ -484,5 +486,17 @@
     "const LINE_BYTES: usize = 8 * 1024 * 1024;": 1,
     "const CHUNK_BYTES: usize = 256 * 1024;": 1,
     "const POLL_INTERVAL: Duration = Duration::from_millis(200);": 1
+  },
+  "src/native/provider/codex/diagnose/lifecycle.rs": {
+    "codex_lifecycle": 2,
+    "session_records": 1,
+    "codex-candidate-": 1,
+    "codex-observer-": 2
+  },
+  "src/native/provider/codex/diagnose/hook_trust.rs": {
+    "hooks/list": 6,
+    "codex_hook_trust": 5,
+    "normalization drift": 2,
+    "const TIMEOUT: Duration = Duration::from_secs(10);": 1
   }
 }

@@ -1,6 +1,219 @@
 #[cfg(unix)]
 use super::super::test_support::write_established_thread;
 use super::*;
+
+fn lifecycle_evidence(directory: &Path) -> serde_json::Value {
+    serde_json::to_value(lifecycle::check(Some(directory))).unwrap()["evidence"].clone()
+}
+
+#[test]
+fn lifecycle_doctor_legacy_records_are_not_observed_and_write_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let before = std::fs::read_dir(root.path()).unwrap().count();
+    let evidence = lifecycle_evidence(root.path());
+    for field in [
+        "launch_mode",
+        "input_hook_observed",
+        "stop_candidate_observed",
+        "observer",
+        "terminal_outcome",
+    ] {
+        assert_eq!(evidence[field]["observation"], "not_observed", "{field}");
+    }
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), before);
+}
+
+#[test]
+fn lifecycle_doctor_records_current_and_last_claim_without_mutation() {
+    use crate::native::session::{SessionState, Store, turn, update_status};
+    use serde_json::json;
+    let root = tempfile::tempdir().unwrap();
+    let dir = super::super::test_support::launch_session(root.path(), Some("0.164.0"));
+    let store = Store::open_unchecked(&dir);
+    update_status(&dir, SessionState::Working, None, None).unwrap();
+    let token = turn::current_claim_token(&Reader::open_unchecked(&dir))
+        .unwrap()
+        .unwrap();
+    let pending = super::super::install_pending_turn_for_prompt(&dir, &token, "hello").unwrap();
+    let exe = Path::new(if cfg!(windows) {
+        r"C:\tabcli.exe"
+    } else {
+        "/opt/tabcli"
+    });
+    super::super::hooks::prepare(&dir, exe).unwrap();
+    let binding = super::super::lifecycle::Binding {
+        schema: 1,
+        claim_token: token.clone(),
+        thread_id: "01234567-89ab-cdef-0123-456789abcdef".into(),
+        turn_id: "turn-1".into(),
+        transcript_path: "rollout.jsonl".into(),
+        bound_unix_ms: 42,
+    };
+    store
+        .private(&format!("codex-turn-{token}.json"))
+        .write_json(&binding)
+        .unwrap();
+    store.private(&format!("codex-candidate-{token}.json")).write_json(&json!({
+        "schema":1,"claim_token":token,"thread_id":binding.thread_id,"turn_id":"turn-1",
+        "stop_hook_active":false,"last_assistant_message":"not the result", "observed_unix_ms":43
+    })).unwrap();
+    for state in ["armed", "suspended", "settled"] {
+        store.private(&format!("codex-observer-{token}.json")).write_json(&json!({
+            "schema":1,"claim_token":token,"state":state,"reason":"observation_unavailable: truncated", "observed_unix_ms":44
+        })).unwrap();
+        let evidence = lifecycle_evidence(&dir);
+        assert_eq!(
+            evidence["launch_mode"]["record"]["lifecycle_hooks"],
+            "injected"
+        );
+        assert!(
+            evidence["launch_mode"]["warning"]
+                .as_str()
+                .unwrap()
+                .contains("differs")
+        );
+        assert_eq!(
+            evidence["input_hook_observed"]["record"]["bound_unix_ms"],
+            42
+        );
+        assert_eq!(
+            evidence["stop_candidate_observed"]["record"]["observed_unix_ms"],
+            43
+        );
+        assert!(
+            evidence["stop_candidate_observed"]["record"]
+                .get("last_assistant_message")
+                .is_none()
+        );
+        assert_eq!(evidence["observer"]["record"]["state"], state);
+        assert_eq!(evidence["terminal_outcome"]["observation"], "not_observed");
+    }
+    assert_eq!(
+        notify_payload_check(Some(&dir)).reason_code,
+        "codex_notify_payload_not_required"
+    );
+    assert!(pending.framed_prompt_chars.is_some());
+    turn::Report::for_claim(&store, agent_bridge::FirstPartyCli::Codex, Some(&token))
+        .with_provenance(Some("codex_transcript_turn_aborted"))
+        .fail(
+            "interrupted",
+            Some(binding.thread_id),
+            Some("turn-1".into()),
+        )
+        .unwrap();
+    fn snapshot(path: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut rows = Vec::new();
+        for entry in std::fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rows.extend(snapshot(&path));
+            } else {
+                rows.push((path.clone(), std::fs::read(path).unwrap()));
+            }
+        }
+        rows.sort();
+        rows
+    }
+    let before = snapshot(&dir);
+    let evidence = lifecycle_evidence(&dir);
+    assert_eq!(evidence["claim_token"], token);
+    assert_eq!(
+        evidence["terminal_outcome"]["record"]["provenance"],
+        "codex_transcript_turn_aborted"
+    );
+    assert_eq!(
+        evidence["terminal_outcome"]["record"]["kind"],
+        "turn_aborted"
+    );
+    assert_eq!(
+        evidence["terminal_outcome"]["record"]["request_state"],
+        "failed"
+    );
+    assert_eq!(snapshot(&dir), before);
+    // A newer pending request must not inherit the previous committed outcome.
+    turn::claim(&store, &[]).unwrap().retain();
+    let evidence = lifecycle_evidence(&dir);
+    assert_ne!(evidence["claim_token"], token);
+    assert_eq!(evidence["terminal_outcome"]["observation"], "not_observed");
+    assert_eq!(
+        evidence["input_hook_observed"]["observation"],
+        "not_observed"
+    );
+}
+
+#[test]
+fn lifecycle_doctor_terminal_kinds_come_only_from_committed_provenance() {
+    use crate::native::session::{SessionState, Store, turn, update_status};
+    for (source, kind) in [
+        (None, None),
+        (Some("codex_notify"), Some("agent-turn-complete")),
+        (
+            Some("codex_transcript_task_complete"),
+            Some("task_complete"),
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let dir = super::super::test_support::launch_session(root.path(), Some("0.163.0"));
+        let store = Store::open_unchecked(&dir);
+        update_status(&dir, SessionState::Working, None, None).unwrap();
+        let token = turn::current_claim_token(&Reader::open_unchecked(&dir))
+            .unwrap()
+            .unwrap();
+        turn::Report::for_claim(&store, agent_bridge::FirstPartyCli::Codex, Some(&token))
+            .with_provenance(source)
+            .complete("answer", None, None)
+            .unwrap();
+        let evidence = lifecycle_evidence(&dir);
+        if let Some(kind) = kind {
+            assert_eq!(evidence["terminal_outcome"]["record"]["kind"], kind);
+            assert_eq!(
+                evidence["terminal_outcome"]["record"]["provenance"],
+                source.unwrap()
+            );
+        } else {
+            for field in [
+                "launch_mode",
+                "input_hook_observed",
+                "stop_candidate_observed",
+                "observer",
+                "terminal_outcome",
+            ] {
+                assert_eq!(evidence[field]["observation"], "not_observed");
+            }
+        }
+    }
+}
+
+#[test]
+fn notify_budget_remains_for_injected_unbound_and_not_injected_claims() {
+    use crate::native::session::{Store, turn};
+    let root = tempfile::tempdir().unwrap();
+    let dir = super::super::test_support::launch_session(root.path(), Some("0.163.0"));
+    let token = turn::current_claim_token(&Reader::open_unchecked(&dir))
+        .unwrap()
+        .unwrap();
+    super::super::install_pending_turn_for_prompt(&dir, &token, "hello").unwrap();
+    let exe = Path::new(if cfg!(windows) {
+        r"C:\tabcli.exe"
+    } else {
+        "/opt/tabcli"
+    });
+    super::super::hooks::prepare(&dir, exe).unwrap();
+    for injected in [true, false] {
+        if !injected {
+            Store::open_unchecked(&dir)
+                .private("codex-launch-mode.json")
+                .write_json(&serde_json::json!({
+                    "schema":1,"lifecycle_hooks":"not_injected","reason":"settings_off",
+                    "codex_version":"0.163.0","vector_codex_version":"0.163.0"
+                }))
+                .unwrap();
+        }
+        let row = serde_json::to_value(notify_payload_check(Some(&dir))).unwrap();
+        assert_eq!(row["evidence"]["source"], "pending_turn_record");
+        assert_eq!(row["evidence"]["limit_units"], 32767);
+    }
+}
 #[cfg(unix)]
 use std::time::Instant;
 
@@ -23,6 +236,7 @@ fn diagnostics_keep_launch_version_and_unprobed_daemon_observations_explicit() {
             deadline: std::time::Instant::now(),
             environment: &crate::native::consent::Environment::default(),
         });
+        assert!(!checks.iter().any(|c| c.id == "codex_hook_trust"));
         assert_eq!(
             checks
                 .iter()
