@@ -173,8 +173,6 @@ fn install_fault(fault: Fault, process: Rc<RefCell<Option<OwnedChild>>>) {
                 *process.borrow_mut() = Some(child);
             }
             Fault::SpawnAttemptWithoutProcess => {
-                // This is the durable crash window between announcing a spawn and
-                // recording its process. No process record cannot rule out a child.
                 receipt.phase = launch::Phase::Spawning;
                 store
                     .record(CoreRecord::Launch)

@@ -272,8 +272,7 @@ pub(in crate::native) enum FailedStartEvidence {
     Pending(String),
 }
 
-// The caller holds the child's lifecycle try-lock through process observation.
-pub(in crate::native) fn failed_start_evidence(
+pub(in crate::native) fn failed_start_evidence_locked(
     store: &Store,
     expected_token: &str,
 ) -> Result<FailedStartEvidence> {

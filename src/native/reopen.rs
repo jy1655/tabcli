@@ -97,8 +97,6 @@ const REOPEN_LAUNCH_FAILED_GATE: &str = "launch-failed";
 // Launch admission refused the source workspace before the new session existed.
 const REOPEN_WORKSPACE_REFUSED_GATE: &str = "workspace-refused";
 
-// Post-creation failures release the source marker only once the refused launch
-// provably cannot hold the conversation (`RefusedLaunchCleanup`).
 const REOPEN_POST_CREATION_GATES: [&str; 5] = [
     REOPEN_START_FAILED_GATE,
     REOPEN_LAUNCH_FAILED_GATE,
@@ -409,7 +407,7 @@ fn refused_launch_cleanup_with(
             .claim_token
             .as_deref()
             .context("the launch refusal has no claim token")?;
-        let evidence = session::launch::failed_start_evidence(&store, token)?;
+        let evidence = session::launch::failed_start_evidence_locked(&store, token)?;
         if let session::launch::FailedStartEvidence::Pending(reason) = evidence {
             return Ok(RefusedLaunchCleanup::Pending(reason));
         }
