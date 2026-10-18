@@ -187,6 +187,8 @@ impl Cursor {
                     let value: Value = serde_json::from_str(text).map_err(|_| "invalid_json")?;
                     if let Some(terminal) = self.record(&value)? {
                         self.verify()?;
+                        #[cfg(test)]
+                        tests::at_read_checkpoint(tests::ReadCheckpoint::AfterTerminalVerify);
                         return Ok(Some(terminal));
                     }
                 } else {

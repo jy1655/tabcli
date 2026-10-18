@@ -733,6 +733,7 @@ fn launch_plan_owns_session_watcher_even_before_hook_availability_is_known() {
 pub(super) enum ReadCheckpoint {
     BeforePostReadVerify,
     AfterPostReadVerify,
+    AfterTerminalVerify,
     BeforeQuestionLock,
 }
 type ReadHook = Box<dyn FnMut(ReadCheckpoint)>;
@@ -869,7 +870,7 @@ fn post_read_observed_growth_then_truncation_suspends_with_terminal_still_presen
                     .set_len(retained_length)
                     .unwrap();
             }
-            ReadCheckpoint::BeforeQuestionLock => (),
+            ReadCheckpoint::BeforeQuestionLock | ReadCheckpoint::AfterTerminalVerify => (),
         },
         || observer.poll(root.path(), false),
     );

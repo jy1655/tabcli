@@ -756,6 +756,73 @@ fn divergent_stored_prefix_is_never_overwritten_or_added_to() {
 }
 
 #[test]
+fn optional_question_flush_cannot_suspend_an_already_verified_terminal() {
+    for change in ["truncate", "replace"] {
+        for drain in [false, true] {
+            let (root, directory, pending, _, mut observer) = question_fixture();
+            emit(&directory, simple_item("terminal_question"));
+            let path = directory.join("rollout.jsonl");
+            append(&path, &complete(json!("verified answer")));
+            assert_pending(&directory, &pending);
+            assert!(!question_path(&directory, &pending).exists());
+            let bytes = std::fs::read(&path).unwrap();
+            let mutated = std::rc::Rc::new(std::cell::Cell::new(false));
+            let checkpoint_mutated = mutated.clone();
+            during_read(
+                move |point| {
+                    if !matches!(point, ReadCheckpoint::AfterTerminalVerify) {
+                        return;
+                    }
+                    assert!(!checkpoint_mutated.replace(true));
+                    if change == "truncate" {
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&path)
+                            .unwrap()
+                            .set_len(0)
+                            .unwrap();
+                    } else {
+                        std::fs::rename(&path, path.with_extension("old")).unwrap();
+                        std::fs::write(&path, &bytes).unwrap();
+                    }
+                },
+                || observer.poll(&directory, drain),
+            );
+            assert!(
+                mutated.get(),
+                "successful terminal checkpoint must be reached"
+            );
+            let completed = result(&directory, &pending);
+            assert_eq!(
+                completed["request_state"], "completed",
+                "{change}, drain={drain}"
+            );
+            assert_eq!(completed["result"], "verified answer");
+            assert_eq!(completed["error"], Value::Null);
+            assert_eq!(
+                completed["question_emissions"][0]["id"],
+                "terminal_question"
+            );
+            assert_eq!(events(&directory)[0]["provenance"], COMPLETE_SOURCE);
+            assert_eq!(diagnostic(&directory, &pending)["state"], "settled");
+            assert!(observer.cursor.is_none());
+            assert!(
+                turn::current_claim_token(&Reader::open_unchecked(&directory))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                status(root.path())["attention"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("question_emitted"))
+            );
+            assert_eq!(inspect(&directory)["requests"][0]["question_emitted"], true);
+        }
+    }
+}
+
+#[test]
 fn strict_transcript_checks_before_optional_publication_preserve_prior_evidence() {
     for change in ["truncate", "replace", "json"] {
         let (_root, directory, pending, _, mut observer) = question_fixture();
