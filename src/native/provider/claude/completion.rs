@@ -234,14 +234,21 @@ fn start_wire_size(expected: &str) -> Result<usize> {
         "\\".repeat(MAX_NAME_BYTES),
         "x".repeat(MAX_MODE_BYTES)
     );
-    Ok(serde_json::to_vec(&json!({"agent_bridge_claude_mod":1,"event":"turn.start","conversation":"00000000-0000-0000-0000-000000000000","data":{"turnId":"x".repeat(MAX_TURN_BYTES),"text":format!("{header}\n{expected}\n</cross-session-message>")}}))?.len())
+    let mut quoted = String::with_capacity(expected.len());
+    let mut characters = expected.chars().peekable();
+    while let Some(character) = characters.next() {
+        quoted.push(character);
+        if character == '<' && characters.peek() != Some(&'\\') {
+            quoted.push('\\');
+        }
+    }
+    Ok(serde_json::to_vec(&json!({"agent_bridge_claude_mod":1,"event":"turn.start","conversation":"00000000-0000-0000-0000-000000000000","data":{"turnId":"x".repeat(MAX_TURN_BYTES),"text":format!("{header}\n{quoted}\n</cross-session-message>")}}))?.len())
 }
 
 fn exact_frame(text: &str, expected: &str) -> bool {
-    let Some(header) = text
+    let Some((header, body)) = text
         .strip_suffix("\n</cross-session-message>")
-        .and_then(|text| text.strip_suffix(expected))
-        .and_then(|text| text.strip_suffix('\n'))
+        .and_then(|text| text.split_once('\n'))
     else {
         return false;
     };
@@ -271,6 +278,22 @@ fn exact_frame(text: &str, expected: &str) -> bool {
         && mode
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+        && matches_peer_quoted_body(body, expected)
+}
+
+fn matches_peer_quoted_body(body: &str, expected: &str) -> bool {
+    // Claude 2.1.302 quotes protected peer-body tags by inserting a backslash after '<'.
+    let mut body = body.chars().peekable();
+    let mut expected = expected.chars().peekable();
+    while let Some(character) = expected.next() {
+        if body.next() != Some(character) {
+            return false;
+        }
+        if character == '<' && expected.peek() != Some(&'\\') && body.peek() == Some(&'\\') {
+            body.next();
+        }
+    }
+    body.next().is_none()
 }
 
 fn diagnostic(directory: &Path, event: &str, reason: &str) -> Result<()> {

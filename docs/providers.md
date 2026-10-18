@@ -310,6 +310,8 @@ The messenger model sees a per-request reference, not your follow-up text. A `Pr
 supplies the exact addressed payload through `updatedInput`, and a `PostToolUse` report confirms
 what ran. On new Windows sessions, the official module binds the complete addressed prompt at
 `turn.start` to the current Bridge claim and settles only the matching `turn.complete`.
+Claude can quote protected tags in the peer body by inserting a backslash after `<`;
+the comparison permits only that reversible insertion and admission reserves its wire space.
 User Stop hooks can continue a draft without publishing it. Stored results retain Claude's
 conversation identity and Bridge's request correlation id; the official turn id stays in the
 adapter's binding. A final answer need not repeat the marker, which is stripped only at its suffix.

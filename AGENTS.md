@@ -59,7 +59,10 @@ launch, observe, continue, and close without replacing the capabilities those CL
   Stop fallback or a provider trust/policy override. macOS keeps legacy completion.
 - Native completion observes only main-loop `turn.start` and `turn.complete`. Bind the
   whole expected message inside one anchored peer envelope to the live claim under the
-  lifecycle lock, then keep that binding immutable. Compare start/completion conversation
+  lifecycle lock, permitting only Claude's reversible backslash insertion after an unescaped
+  ASCII `<` in the body, then keep that binding immutable. Claude 2.1.302 quotes protected
+  opening and closing tags before turn.start; reserve that expansion at admission without
+  reproducing its protected-tag grammar. Compare start/completion conversation
   and turn identities with each other, not the startup conversation, which `/clear` may
   change. The official turn id stays adapter-private; core `turn_id` must remain the
   Bridge correlation id because delivery waits for it. Replace envelope matching when

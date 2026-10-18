@@ -49,7 +49,8 @@ async function fire(name, e) {
   assert.equal(nextCalls, before + 1);
 }
 await fire("session.start", {});
-const start = { turnId, text: `<cross-session-message from="uds:\\\\.\\pipe\\LOCAL\\sender" from-name="sender" from-mode="prompting">\n${pending.expected_message}\n</cross-session-message>` };
+const peerBody = pending.expected_message.replace(/<(\/?cross-session-message)>/gi, "<\\$1>");
+const start = { turnId, text: `<cross-session-message from="uds:\\\\.\\pipe\\LOCAL\\sender" from-name="sender" from-mode="prompting">\n${peerBody}\n</cross-session-message>` };
 await fire("turn.start", start);
 let answer = "한😀\n".repeat(15000);
 assert(answer.length > 32767);

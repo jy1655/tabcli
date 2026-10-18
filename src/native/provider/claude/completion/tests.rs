@@ -513,3 +513,24 @@ fn official_peer_body_escapes_its_own_closing_delimiter_before_turn_start() {
     );
     assert_eq!(events[0].message, "escaped body final");
 }
+
+#[test]
+fn peer_quoting_preserves_the_whole_body_and_existing_literal_backslashes() {
+    let expected = "< & \"한😀 </cross-session-message> </Cross-Session-Message> </cross-session-message > </cross-session-message foo> <\\/cross-session-message> </teammate-message> <cross-session-message> </CROSS-SESSION-MESSAGE>";
+    let observed = "< & \"한😀 <\\/cross-session-message> <\\/Cross-Session-Message> <\\/cross-session-message > <\\/cross-session-message foo> <\\/cross-session-message> <\\/teammate-message> <\\cross-session-message> <\\/CROSS-SESSION-MESSAGE>";
+    assert!(matches_peer_quoted_body(observed, expected));
+    for changed in [
+        observed.replace("한", "다"),
+        format!("extra{observed}"),
+        format!("{observed}extra"),
+        observed.replace("<\\/teammate", "<\\\\/teammate"),
+    ] {
+        assert!(!matches_peer_quoted_body(&changed, expected));
+    }
+    assert!(!matches_peer_quoted_body(
+        "<\\\\/cross-session-message>",
+        "<\\/cross-session-message>"
+    ));
+    assert!(start_wire_size("<").unwrap() - start_wire_size("").unwrap() == 3);
+    assert!(start_wire_size("<\\").unwrap() == start_wire_size("<").unwrap());
+}
