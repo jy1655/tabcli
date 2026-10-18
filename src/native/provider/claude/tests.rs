@@ -817,6 +817,49 @@ fn windows_launch_keeps_large_initial_prompts_out_of_argv() {
 }
 
 #[test]
+fn legacy_pending_turn_writer_preserves_schema_one_json() {
+    let directory = tempfile::tempdir().unwrap();
+    let _pending_file = install_pending_turn(directory.path(), "claude-turn-safe123").unwrap();
+    let written: serde_json::Value = Reader::open_unchecked(directory.path())
+        .private(PENDING_TURN_FILE)
+        .json()
+        .unwrap();
+    assert_eq!(
+        written,
+        serde_json::json!({
+            "schema": 1,
+            "request_id": "claude-turn-safe123",
+            "marker": "<!-- agent-bridge-claude-turn:claude-turn-safe123 -->",
+        })
+    );
+}
+
+#[test]
+fn pending_turn_ids_require_the_bounded_ascii_claude_prefix() {
+    let maximum = format!("claude-turn-{}", "a".repeat(128 - "claude-turn-".len()));
+    for valid in ["claude-turn-", "claude-turn-Ab09-1", maximum.as_str()] {
+        assert!(PendingCrossSessionTurn::new(valid).is_ok(), "{valid:?}");
+    }
+    for invalid in [
+        "",
+        "claude-turn",
+        "other-turn-safe123",
+        "claude-turn-safe_123",
+        "claude-turn-safe/123",
+        "claude-turn-safe 123",
+        "claude-turn-safe\n123",
+        "claude-turn-safe\0",
+        "claude-turn-한글",
+        &format!("{maximum}a"),
+    ] {
+        assert!(
+            PendingCrossSessionTurn::new(invalid).is_err(),
+            "{invalid:?}"
+        );
+    }
+}
+
+#[test]
 fn correlated_response_requires_the_exact_final_turn_marker() {
     let pending = PendingCrossSessionTurn::new("claude-turn-safe123").unwrap();
     let exact = format!("completed response\n\n{}", pending.marker);
@@ -906,12 +949,18 @@ fn correlated_stop_records_only_the_expected_claude_turn() {
         .unwrap();
     let claim = turn::claim(&Store::open_unchecked(directory.path()), &[]).unwrap();
     claim.retain();
-    let pending = PendingCrossSessionTurn::new("claude-turn-safe123").unwrap();
+    let legacy_json = br#"{"schema":1,"request_id":"claude-turn-safe123","marker":"<!-- agent-bridge-claude-turn:claude-turn-safe123 -->"}"#;
     crate::native::session::primitives::write_private(
         &directory.path().join(PENDING_TURN_FILE),
-        &serde_json::to_vec_pretty(&pending).unwrap(),
+        legacy_json,
     )
     .unwrap();
+    let pending: PendingCrossSessionTurn = Reader::open_unchecked(directory.path())
+        .private(PENDING_TURN_FILE)
+        .json()
+        .unwrap();
+    assert!(pending.claim_token.is_none());
+    assert!(pending.expected_message.is_none());
     let payload = serde_json::json!({
         "hook_event_name": "Stop",
         "session_id": "claude-session-id",
@@ -937,6 +986,70 @@ fn correlated_stop_records_only_the_expected_claude_turn() {
             .join(crate::native::session::test_support::TURN_CLAIM_FILE)
             .exists()
     );
+}
+
+#[test]
+fn legacy_pending_reader_rejects_changed_schema_marker_and_invalid_id() {
+    for (field, value) in [
+        ("schema", serde_json::json!(2)),
+        ("request_id", serde_json::json!("claude-turn-invalid_id")),
+        (
+            "marker",
+            serde_json::json!("<!-- agent-bridge-claude-turn:claude-turn-other -->"),
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_unchecked(directory.path());
+        std::fs::create_dir(directory.path().join("events")).unwrap();
+        crate::native::session::update_status(directory.path(), SessionState::Working, None, None)
+            .unwrap();
+        let claim = turn::claim(&store, &[]).unwrap();
+        let token = claim.token().to_owned();
+        claim.retain();
+        let mut pending = serde_json::json!({
+            "schema": 1,
+            "request_id": "claude-turn-safe123",
+            "marker": "<!-- agent-bridge-claude-turn:claude-turn-safe123 -->",
+        });
+        pending[field] = value;
+        if field == "request_id" {
+            pending["marker"] =
+                serde_json::json!("<!-- agent-bridge-claude-turn:claude-turn-invalid_id -->");
+        }
+        store
+            .private(PENDING_TURN_FILE)
+            .write_json(&pending)
+            .unwrap();
+        let payload = serde_json::json!({
+            "hook_event_name": "Stop",
+            "session_id": "claude-session-id",
+            "last_assistant_message": "result\n<!-- agent-bridge-claude-turn:claude-turn-safe123 -->",
+        });
+
+        let error = handle_hook(directory.path(), &payload).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid Claude turn correlation state"),
+            "{field}: {error:#}"
+        );
+        let reader = Reader::open_unchecked(directory.path());
+        assert!(reader.events().unwrap().is_empty(), "{field}");
+        assert_eq!(
+            turn::current_claim_token(&reader).unwrap().as_deref(),
+            Some(token.as_str()),
+            "{field}"
+        );
+        assert_eq!(
+            reader
+                .private(PENDING_TURN_FILE)
+                .json::<serde_json::Value>()
+                .unwrap(),
+            pending,
+            "{field}"
+        );
+    }
 }
 
 #[test]

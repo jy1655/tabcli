@@ -105,9 +105,10 @@
   },
   "src/native/provider/claude.rs": {
     "const PENDING_TURN_FILE: &str = \"claude-pending-turn.json\";": 1,
-    "struct PendingCrossSessionTurn {\n    schema: u32,\n    request_id: String,\n    marker: String,\n}": 1,
+    "struct PendingCrossSessionTurn {\n    schema: u32,\n    request_id: String,\n    marker: String,": 1,
     "marker: format!(\"<!-- agent-bridge-claude-turn:{request_id} -->\"),": 1,
-    "impl PendingCrossSessionTurn {\n    fn new(request_id: &str) -> Result<Self> {\n        if !(request_id.starts_with(\"claude-turn-\")\n            && request_id.len() <= 128\n            && request_id\n                .bytes()\n                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))\n        {\n            bail!(\"invalid Claude cross-session turn id\")\n        }\n        Ok(Self {\n            schema: 1,\n            request_id: request_id.to_owned(),\n            marker: format!(\"<!-- agent-bridge-claude-turn:{request_id} -->\"),\n        })\n    }\n}": 1,
+    "if !(request_id.starts_with(\"claude-turn-\")\n            && request_id.len() <= 128\n            && request_id\n                .bytes()\n                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))\n        {\n            bail!(\"invalid Claude cross-session turn id\")\n        }": 1,
+    "schema: 1,\n            request_id: request_id.to_owned(),": 1,
     "fn managed_session_name(directory: &Path) -> Result<String> {\n    let recipient = directory\n        .file_name()\n        .and_then(|name| name.to_str())\n        .context(\"Claude managed session id is not UTF-8\")?\n        .to_owned();\n    super::super::require_valid_session_id(&recipient)?;\n    Ok(recipient)\n}": 1,
     "agent-bridge-claude-turn": 1,
     "claude-pending-turn.json": 1,

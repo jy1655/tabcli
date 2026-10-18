@@ -30,7 +30,7 @@ command hook on an unmodified production launch.
 
 ## Deterministic evidence
 
-After privacy sanitization and rebasing onto main, both original regressions compiled and
+After privacy sanitization and rebasing onto main `193e8e7`, both original regressions compiled and
 failed for their original reasons. Native-mode Stop still published a draft before the fix,
 and the official completion wire failed legacy parsing. The absent-mode legacy Stop guard
 passed. The second red commit compiled and failed because the original matcher rejected
@@ -50,8 +50,9 @@ Windows argv limit, exactly 4 MiB, one byte over the limit, helper failure befor
 nonzero helper exit after publication, repeated helper failure and subagent exclusion.
 Those controlled scenarios are not authenticated provider outcomes.
 
-The correction pass ran these focused checks on native Windows after rebasing onto main.
-Every test command used `--test-threads=1`.
+The correction pass ran these focused checks on native Windows at `88a45c8` on main `193e8e7`.
+The later 0.4.19 rebase onto `7ce83b5` kept every patch identical. These are the earlier run's
+results, not reruns after that rebase. Every test command used `--test-threads=1`.
 
 | Command | Result |
 | --- | --- |
@@ -65,7 +66,7 @@ Every test command used `--test-threads=1`.
 | `cargo clippy --all-targets --all-features --target aarch64-apple-darwin -- -D warnings` | Passed, compilation only |
 | `cargo fmt --all -- --check` and `git diff --check` | Passed |
 
-The full serial suite was not rerun in this correction pass.
+The full serial suite was not rerun in that correction pass.
 
 ## Unverified cases
 
