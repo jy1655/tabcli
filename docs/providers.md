@@ -97,13 +97,15 @@ If the tail merged into a final placeholder, Bridge instead requires the sum of 
 counts and visible inline scalars (physical rows joined with LF) to equal the framed prompt's
 Codex-normalized scalar count. This fallback is cardinality only, not a content receipt; wrapping, clipping,
 scrolling and literal placeholder collisions can make it ambiguous or misleading.
-Structural title, option and hint rows identify a dialog or hook picker and veto success;
-one addressed composer span is excluded from that evidence. The span ends at the exact marker,
-or, without a marker, at the first recognized footer. Footer-shaped rows before the marker
-remain content. Numbered selections require pinned option labels or an immediately following
-pinned option or confirmation hint; ordinary numbered prose remains content. Selected menu
-options outside that span cannot start another composer;
-title-clipped option/hint layouts remain ambiguous.
+Complete pinned dialog or hook-picker layouts veto success as Blocked. The addressed composer
+starts at the first column-zero `› ` row unless that row is pinned UI evidence; its span ends
+at the exact marker or, without one, the first recognized footer. Footer-shaped content before
+the marker remains content. Any column-zero `› ` row outside that span is unresolved UI,
+regardless of text or numbering. Anywhere on screen, numbered rows after `› ` or two spaces
+whose labels begin with a pinned hook/trust option, and pinned confirmation hints, are UI
+evidence; incomplete layouts are Ambiguous. Ordinary numbered prose remains content, but a
+numbered pinned menu label inside the draft (such as `2. Quit` or `1. Review hooks`) is refused
+as unresolved UI: rephrase the line or press Enter yourself after checking the surface.
 Bridge then requests one guarded Return: the helper compares the entire accepted screen and
 writes no Return if it changed. Injected text and Return helpers also check the addressed claim,
 session status and original expiry under the lifecycle lock immediately at dispatch. This assumes no

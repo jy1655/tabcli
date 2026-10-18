@@ -537,6 +537,7 @@ fn marker_tail_accepts_wrapped_and_scrolled_inline_body() {
         "",
         "1. Summarize the changes\n2. Explain the regression\n\n[Agent Bridge Codex turn metadata; do not include this metadata in the response]",
         "42. Explain the regression",
+        "1. Summarize the changes\n2. Explain the regression",
     ] {
         for footer in [false, true] {
             let (mut io, claim, prompt) = Fake::new();
@@ -590,6 +591,96 @@ fn numbered_menu_selections_do_not_start_an_addressed_composer() {
         assert!(!io.calls.contains(&"submit"));
         settle(claim, Err(error));
     }
+}
+
+#[test]
+fn pinned_ui_anywhere_and_extra_prompt_rows_refuse_return() {
+    let mut fragments = vec![
+        "› 3. Continue without trusting (hooks\n     won't run)\n\n  enter confirm · esc skip"
+            .to_owned(),
+        // Accepted limitation: text-only evidence cannot distinguish this draft from UI.
+        "› 1. Explain the exit menu\n  2. Quit".to_owned(),
+        "› 1. Review hooks".to_owned(),
+    ];
+    for label in [
+        "Review hooks",
+        "Trust all and continue",
+        "Continue without trusting hooks",
+        "Continue without trusting (hooks won't run)",
+        "Trust and continue",
+        "Open existing task",
+        "Open restricted",
+        "Back to Agent Command Center",
+        "Keep current directory",
+        "Quit",
+        "Don't trust",
+    ] {
+        fragments.push(format!("› 1. {label}"));
+        fragments.push(format!("› ordinary draft\n  2. {label}"));
+    }
+    for hint in [
+        "enter confirm · esc skip",
+        "enter continue · esc quit",
+        "enter continue · esc back",
+        "enter continue · esc cancel",
+        "enter continue and create sandbox · esc quit",
+        "enter continue and create sandbox · esc back",
+        "enter continue and create sandbox · esc cancel",
+    ] {
+        fragments.push(format!("› ordinary draft\n  {hint}"));
+    }
+    for fragment in fragments {
+        for after_marker in [false, true] {
+            for footer in [false, true] {
+                let (mut io, claim, prompt) = Fake::new();
+                let tail = prompt.rsplit_once('\n').unwrap().1;
+                let screen = format!(
+                    "{}{}",
+                    if after_marker {
+                        format!("› body\n  {tail}\n{fragment}")
+                    } else {
+                        format!("{fragment}\n  {tail}")
+                    },
+                    if footer { "\n  100% context left" } else { "" }
+                );
+                assert_eq!(
+                    super::classification(Ok(screen.clone()), tail, Path::new(WORKSPACE)),
+                    "ambiguous (unresolved overlay)",
+                    "{screen}"
+                );
+                io.screens = [screen.clone()].into();
+                io.fallback = screen;
+                let error = io.execute(&prompt).unwrap_err();
+                assert!(error.delivery_may_have_occurred());
+                assert!(!io.calls.contains(&"submit"));
+                settle(claim, Err(error));
+            }
+        }
+    }
+    for suffix in ["› 1. Open restricted", "› 42. Unknown option", "› unknown"] {
+        let (mut io, claim, prompt) = Fake::new();
+        let tail = prompt.rsplit_once('\n').unwrap().1;
+        let screen = format!("› body\n  {tail}\n{suffix}");
+        assert_eq!(
+            super::classification(Ok(screen.clone()), tail, Path::new(WORKSPACE)),
+            "ambiguous (unresolved overlay)"
+        );
+        io.screens = [screen.clone()].into();
+        io.fallback = screen;
+        let error = io.execute(&prompt).unwrap_err();
+        assert!(error.delivery_may_have_occurred());
+        assert!(!io.calls.contains(&"submit"));
+        settle(claim, Err(error));
+    }
+    // A pinned first prompt prevents a later ordinary prompt from becoming a composer.
+    assert!(
+        composer_span(
+            &["› 1. Review hooks", "› body", "  marker"],
+            "marker",
+            Path::new(WORKSPACE)
+        )
+        .is_none()
+    );
 }
 
 #[test]
@@ -800,14 +891,13 @@ fn pinned_footer_variants_and_ambiguous_boundaries() {
         normalized_workspace(r"\\?\UNC\server\share"),
         normalized_workspace(r"\\server\share")
     );
-    assert_eq!(
+    assert!(
         super::composer_segments(
-            "› marker\n› ignored after marker",
+            "› marker\n› unresolved UI after marker",
             "marker",
             Path::new(WORKSPACE)
         )
-        .unwrap(),
-        [Segment::Inline("marker".into())]
+        .is_err()
     );
     assert!(super::composer_segments("› draft\n› marker", "marker", Path::new(WORKSPACE)).is_err());
     assert!(composer_segments("› draft\n").is_err());

@@ -212,7 +212,9 @@ launch, observe, continue, and close without replacing the capabilities those CL
   veto precedes success; an unobserved/clipped marker or ambiguous fallback never submits.
   The request has one absolute deadline, and Sent still requires the claim binding.
 - The 150 ms split gap only encourages the 60 ms idle flush; it proves nothing.
-  The exact inset-stripped marker row ends composer content; subsequent rows are ignored.
+  The exact inset-stripped marker row ends composer content; subsequent rows still undergo
+  the UI veto. Numbered pinned menu labels and confirmation hints anywhere, and any
+  column-zero `› ` row outside the span, remain unresolved UI.
   Otherwise use the first recognized footer (workspace-qualified model line, warning,
   shortcut/queue/interrupt/edit/quit hint or context/token count), trimming separator blanks
   but preserving internal blanks. No marker and no recognized footer remains ambiguous.

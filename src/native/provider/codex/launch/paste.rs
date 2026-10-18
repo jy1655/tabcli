@@ -33,10 +33,10 @@ enum Overlay {
 // One addressed span is shared by parsing, overlay recognition and classification.
 // The exact marker outranks footer-shaped content; menu selections are not starts.
 fn composer_span(rows: &[&str], tail: &str, workspace: &Path) -> Option<std::ops::Range<usize>> {
-    let start = rows
-        .iter()
-        .enumerate()
-        .position(|(i, r)| r.starts_with("› ") && !selected_option(rows, i))?;
+    let start = rows.iter().position(|r| r.starts_with("› "))?;
+    if menu_evidence(rows[start]) {
+        return None;
+    }
     let marker = (start..rows.len()).find(|&i| {
         !tail.is_empty()
             && rows[i]
@@ -53,35 +53,35 @@ fn numbered_label(text: &str) -> Option<&str> {
     let (n, label) = text.split_once(". ")?;
     (!n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())).then_some(label)
 }
+// Pinned startup-hook and trust-directory options, including wrapped label prefixes.
 fn pinned_option(label: &str) -> bool {
-    matches!(
-        label,
-        "Review hooks"
-            | "Trust all and continue"
-            | "Continue without trusting"
-            | "Continue without trusting hooks"
-            | "Continue without trusting (hooks won't run)"
-            | "Trust and continue"
-            | "Don't trust"
-            | "Quit"
-    )
+    [
+        "Review hooks",
+        "Trust all and continue",
+        "Continue without trusting",
+        "Trust and continue",
+        "Open existing task",
+        "Open restricted",
+        "Back to Agent Command Center",
+        "Keep current directory",
+        "Quit",
+        "Don't trust",
+    ]
+    .iter()
+    .any(|prefix| label.starts_with(prefix))
 }
-fn selected_option(rows: &[&str], index: usize) -> bool {
-    let Some(label) = rows[index].strip_prefix("› ").and_then(numbered_label) else {
-        return false;
-    };
-    // A scrolled composer can start with an ordinary numbered instruction.
-    // A companion option needs a pinned label too: numbered prose is not a menu.
-    pinned_option(label)
-        || rows.get(index + 1).is_some_and(|row| {
-            row.strip_prefix("  ")
-                .and_then(numbered_label)
-                .is_some_and(pinned_option)
-                || matches!(
-                    row.trim(),
-                    "enter confirm · esc skip" | "enter continue · esc quit"
-                )
+fn confirmation_hint(text: &str) -> bool {
+    text == "enter confirm · esc skip"
+        || text.strip_prefix("enter continue").is_some_and(|rest| {
+            let rest = rest.strip_prefix(" and create sandbox").unwrap_or(rest);
+            matches!(rest, " · esc quit" | " · esc back" | " · esc cancel")
         })
+}
+fn menu_evidence(row: &str) -> bool {
+    row.strip_prefix("› ")
+        .or_else(|| row.strip_prefix("  "))
+        .is_some_and(|text| numbered_label(text).is_some_and(pinned_option))
+        || confirmation_hint(row.trim())
 }
 fn overlay(screen: &str, tail: &str, workspace: &Path) -> Overlay {
     let rows: Vec<_> = screen.lines().map(str::trim_end).collect();
@@ -108,8 +108,11 @@ fn overlay(screen: &str, tail: &str, workspace: &Path) -> Overlay {
     if picker || trust {
         return Overlay::Blocked;
     }
-    if rows.iter().enumerate().any(|(i, _)| {
-        !span.as_ref().is_some_and(|span| span.contains(&i)) && selected_option(&rows, i)
+    // Even inside a draft, numbered pinned labels and hints cannot be distinguished
+    // from clipped UI. Outside the single span, every prompt glyph is unresolved UI.
+    if rows.iter().enumerate().any(|(i, row)| {
+        menu_evidence(row)
+            || (!span.as_ref().is_some_and(|span| span.contains(&i)) && row.starts_with("› "))
     }) || outside.iter().any(|r| {
         matches!(
             *r,
