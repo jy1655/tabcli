@@ -210,6 +210,7 @@ pub(super) fn sample_completion(claim_token: &str, message: &str) -> PendingTurn
     PendingTurnCompletion::new(
         claim_token,
         SessionEvent {
+            provenance: None,
             cancelled: false,
             provider: FirstPartyCli::Codex.as_str().to_owned(),
             message: message.to_owned(),
@@ -398,6 +399,7 @@ pub(super) fn seed_event_written_completion_with(
 
 pub(super) fn oversized_sample_event(message: &str) -> SessionEvent {
     SessionEvent {
+        provenance: None,
         cancelled: false,
         provider: FirstPartyCli::Codex.as_str().to_owned(),
         message: message.to_owned(),

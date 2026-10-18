@@ -7,7 +7,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 const FILE: &str = "settings.json";
-const USAGE: &str = "settings takes no argument to show the settings, or macos-open-mode <tab-first|new-window>, windows-tab-window <dedicated|current> or codex-memory-workspace <refuse|allow> to change one; --json is accepted";
+const USAGE: &str = "settings takes no argument to show the settings, or macos-open-mode <tab-first|new-window>, windows-tab-window <dedicated|current>, codex-memory-workspace <refuse|allow> or codex-lifecycle-hooks <on|off> to change one; --json is accepted";
 
 /// A creation preference, never cleanup authority. Each terminal handle records
 /// the surface that was actually created, even if this setting changes later.
@@ -109,6 +109,35 @@ impl FromStr for CodexMemoryWorkspace {
     }
 }
 
+/// Whether new Codex launches inject lifecycle hooks; not evidence of execution.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum CodexLifecycleHooks {
+    #[default]
+    On,
+    Off,
+}
+
+impl CodexLifecycleHooks {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl FromStr for CodexLifecycleHooks {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "on" => Ok(Self::On),
+            "off" => Ok(Self::Off),
+            _ => bail!("codex-lifecycle-hooks is on or off, not {value:?}"),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct Record {
     schema: u32,
@@ -118,6 +147,8 @@ struct Record {
     macos_open_mode: Option<MacosOpenMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     codex_memory_workspace: Option<CodexMemoryWorkspace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_lifecycle_hooks: Option<CodexLifecycleHooks>,
 }
 
 fn read(root: &Path) -> Result<Record> {
@@ -128,6 +159,7 @@ fn read(root: &Path) -> Result<Record> {
             windows_tab_window: None,
             macos_open_mode: None,
             codex_memory_workspace: None,
+            codex_lifecycle_hooks: None,
         });
     };
     let record: Record = serde_json::from_str(&text)
@@ -152,6 +184,10 @@ pub(super) fn macos_open_mode(root: &Path) -> Result<MacosOpenMode> {
 
 pub(super) fn codex_memory_workspace(root: &Path) -> Result<CodexMemoryWorkspace> {
     Ok(read(root)?.codex_memory_workspace.unwrap_or_default())
+}
+
+pub(super) fn codex_lifecycle_hooks(root: &Path) -> Result<CodexLifecycleHooks> {
+    Ok(read(root)?.codex_lifecycle_hooks.unwrap_or_default())
 }
 
 pub(super) fn run(args: &[String]) -> Result<()> {
@@ -188,6 +224,14 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
             RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
                 .write_json(&record)?;
         }
+        ["codex-lifecycle-hooks", value] => {
+            let value = value.parse::<CodexLifecycleHooks>()?;
+            Store::create_state_root(root, &Reader::home_directories())?;
+            let mut record = read(root)?;
+            record.codex_lifecycle_hooks = Some(value);
+            RecordStore::at(Reader::open_unchecked(root).private(FILE).path())
+                .write_json(&record)?;
+        }
         ["codex-memory-workspace", value] => {
             let value = value.parse::<CodexMemoryWorkspace>()?;
             Store::create_state_root(root, &Reader::home_directories())?;
@@ -203,6 +247,7 @@ fn apply(root: &Path, args: &[String]) -> Result<serde_json::Value> {
         "windows_tab_window": windows_tab_window(root)?.as_str(),
         "macos_open_mode": macos_open_mode(root)?.as_str(),
         "codex_memory_workspace": codex_memory_workspace(root)?.as_str(),
+        "codex_lifecycle_hooks": codex_lifecycle_hooks(root)?.as_str(),
     }))
 }
 
@@ -214,6 +259,39 @@ mod tests {
 
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn lifecycle_hooks_default_on_and_updates_preserve_other_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("state");
+        assert_eq!(apply(&root, &[]).unwrap()["codex_lifecycle_hooks"], "on");
+        assert!(!root.exists());
+        for invalid in [
+            vec!["codex-lifecycle-hooks"],
+            vec!["codex-lifecycle-hooks", "ON"],
+            vec!["codex-lifecycle-hooks", "off", "extra"],
+        ] {
+            assert!(apply(&root, &arguments(&invalid)).is_err());
+        }
+        assert!(!root.exists());
+        apply(&root, &arguments(&["codex-memory-workspace", "allow"])).unwrap();
+        for value in ["off", "on"] {
+            assert_eq!(
+                apply(&root, &arguments(&["codex-lifecycle-hooks", value])).unwrap()["codex_lifecycle_hooks"],
+                value
+            );
+            assert_eq!(
+                codex_memory_workspace(&root).unwrap(),
+                CodexMemoryWorkspace::Allow
+            );
+        }
+        fs::write(
+            root.join(FILE),
+            r#"{"schema":1,"codex_lifecycle_hooks":"invalid"}"#,
+        )
+        .unwrap();
+        assert!(codex_lifecycle_hooks(&root).is_err());
     }
 
     #[test]
@@ -337,6 +415,7 @@ mod tests {
                 "windows_tab_window": "dedicated",
                 "macos_open_mode": "tab-first",
                 "codex_memory_workspace": "refuse",
+                "codex_lifecycle_hooks": "on",
             })
         );
         assert!(!root.exists(), "reading defaults must not write settings");

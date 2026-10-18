@@ -177,6 +177,8 @@ fn generate_notices(root: &Path, lock: &str) -> Result<String> {
         let used = match declared {
             "MIT"
             | "MIT OR Apache-2.0"
+            // Legacy slash spelling of the same dual licence (version_check 0.9.5, reviewed 2026-10-18).
+            | "MIT/Apache-2.0"
             | "Apache-2.0 OR MIT"
             | "Unlicense OR MIT"
             | "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT"
@@ -199,6 +201,10 @@ fn generate_notices(root: &Path, lock: &str) -> Result<String> {
         let mit_file = if name == "r-efi" && version == "6.0.0" {
             // This crate ships its complete MIT text and copyright notices in AUTHORS.
             "AUTHORS"
+        } else if name == "generic-array" && version == "0.14.7" {
+            // Declared MIT only; the complete MIT text and copyright notice are in LICENSE
+            // (reviewed 2026-10-18, sha2 0.10 dependency).
+            "LICENSE"
         } else {
             ["LICENSE-MIT", "license-mit"]
                 .into_iter()

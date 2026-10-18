@@ -1,10 +1,9 @@
 use super::*;
 
-// The watcher of a plan whose completion arrives through the hook alone: starting it on a
-// directory that does not exist succeeds, stopping it succeeds, and the directory is left
-// as it was, so nothing ran.
-fn assert_no_op_watcher(watcher: Box<dyn crate::native::provider::CompletionWatcher>) {
-    assert_eq!(format!("{watcher:?}"), "NoWatcher");
+// The session watcher waits without a Claim or binding. Starting and stopping on an
+// absent session directory must leave it absent and publish no observation records.
+fn assert_idle_watcher(watcher: Box<dyn crate::native::provider::CompletionWatcher>) {
+    assert_eq!(format!("{watcher:?}"), "Watcher");
     let root = tempfile::tempdir().unwrap();
     let absent = root.path().join("absent-session");
     let active = watcher.start(&absent).unwrap();
@@ -446,7 +445,7 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                             },
                             "{label}"
                         );
-                        assert_no_op_watcher(plan.watcher);
+                        assert_idle_watcher(plan.watcher);
                         assert!(plan.environment_removals.is_empty(), "{label}");
                         let observed = crate::native::consent::observe(&directory);
                         if consent {
@@ -508,4 +507,44 @@ fn pending_turn_record_round_trips_with_and_without_framed_prompt_sizes() {
         (1, "1700000000000-2")
     );
     assert_eq!(legacy.marker, read.marker);
+}
+
+#[test]
+fn lifecycle_binding_and_stop_keep_the_claim_pending() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path();
+    crate::native::session::update_status(
+        directory,
+        crate::native::session::SessionState::Working,
+        None,
+        None,
+    )
+    .unwrap();
+    std::fs::create_dir(directory.join("events")).unwrap();
+    let claim = turn::claim(&Store::open_unchecked(directory), &[]).unwrap();
+    let pending = install_pending_turn(directory, claim.token()).unwrap();
+    let prompt = correlated_prompt(
+        &crate::native::native_delegation_prompt("external", "hello"),
+        &pending,
+    );
+    let payload = serde_json::json!({"hook_event_name":"UserPromptSubmit", "session_id":"01234567-89ab-cdef-0123-456789abcdef", "turn_id":"turn-1", "transcript_path":"rollout.jsonl", "prompt":prompt});
+    ADAPTER.handle_hook(directory, &payload).unwrap();
+    assert!(
+        directory
+            .join(format!("codex-turn-{}.json", claim.token()))
+            .exists()
+    );
+    ADAPTER.handle_hook(directory, &serde_json::json!({"hook_event_name":"Stop", "session_id":payload["session_id"], "turn_id":"turn-1", "last_assistant_message":"candidate", "stop_hook_active":false})).unwrap();
+    assert!(
+        Reader::open_unchecked(directory)
+            .events()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        turn::current_claim_token(&Reader::open_unchecked(directory))
+            .unwrap()
+            .as_deref(),
+        Some(claim.token())
+    );
 }

@@ -1469,6 +1469,7 @@ mod elapsed_tests {
     #[test]
     fn reported_usage_reasons_follow_the_recorded_fields() {
         let mut event = SessionEvent {
+            provenance: None,
             cancelled: false,
             provider: "pi".to_owned(),
             message: "m".to_owned(),

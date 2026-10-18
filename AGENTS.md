@@ -193,35 +193,95 @@ launch, observe, continue, and close without replacing the capabilities those CL
 
 ## Current Codex Boundary
 
-- Codex gives no identity of a turn before its first `notify`. The adapter appends a turn
-  marker to the prompt and accepts an `agent-turn-complete` payload when the assistant
-  message ends with the marker, or when an element of `input-messages` is the prompt
-  Bridge sent: it begins with Bridge's delegation header and ends with the marker. The
-  position of that element does not identify the turn: a message typed into the TUI while
-  the turn runs is steered into it and follows the prompt as a later element, and the
-  answer then serves both (codex-cli 0.163.0, 2026-10-17, #65). The thread of the first
-  accepted payload becomes the session's thread, which every follow-up addresses, so a
-  wrong first payload is a wrong result and a wrong thread.
-- The marker alone does not identify the turn. Codex CLI 0.159.3 answers the first message
-  of a TUI with a second turn, on a thread of its own, that makes the task title; its
-  input is Codex's instruction followed by the user's whole message, marker included, and
-  its `notify` can arrive first (issue #61, 2026-10-02: `{"title":"READY"}` recorded as
-  the result of two short initial requests out of six; a long prompt is cut in the title
-  input and loses the marker). Any turn that Codex starts itself can quote the prompt in
-  the same way. Do not weaken the header requirement to a substring match.
-- With `/ide` on, the TUI puts its IDE context in front of the user's message: a first
-  line `# Context from my IDE setup:`, the context, and a line `## My request for Codex:`
-  (codex-rs/tui/src/ide_context/prompt.rs, rust-v0.159.3; taken from the source, not
-  observed live). That input is still Bridge's turn. Recognise this wrapper exactly and
-  no other; a new wrapper needs its own evidence from Codex's source or from a recorded
-  payload.
-- The header is framing, not provenance: a turn that copies the framed prompt verbatim,
-  or an answer that ends with the marker, would still be accepted. Replace the
-  correlation when Codex reports the thread of the TUI before the first turn, or gives a
-  turn an identity that the launcher can choose.
-- When a correlation question comes up, record the raw `notify` payloads with a temporary
-  build and read them; do not reason from the result alone. The two payloads of #61
-  looked alike in everything but the thread, the input and the answer.
+- Codex 0.163.0 runs Claude-compatible lifecycle hooks (feature `hooks`, stable and on by
+  default): a command hook receives one JSON object on stdin, runs in the turn's cwd with
+  Codex's environment, and must never exit with code 2 (that blocks the turn). The legacy
+  `notify` is `hooks/src/legacy_notify.rs`: the whole payload as one argv argument,
+  spawned and not awaited, marked for removal upstream; on native Windows a payload past
+  32,767 UTF-16 units never spawns (#127). Bridge therefore injects a `UserPromptSubmit`
+  and a `Stop` command hook as one `-c hooks=` session-flag value and keeps `-c notify`
+  as the fallback. The hook path is the official one; the notify path stays until every
+  supported configuration has a verified replacement route (settings off, hook feature
+  off, a launcher the shell cannot run, a transcript Bridge cannot observe, and Codex
+  below 0.163.0 all still complete through notify), and removing notify needs that
+  capability matrix, not an upstream deletion.
+- Injection is decided at launch and recorded in `codex-launch-mode.json`: the recorded
+  preflight version must be 0.163.0 or newer and not a prerelease, the state root's
+  `codex-lifecycle-hooks` setting on, and the executable path one that cmd.exe and
+  PowerShell run unquoted (the npm `codex.ps1` shim strips double quotes inside a `-c`
+  argument, observed 2026-10-18, so the value uses TOML literal strings and no `"`).
+  Every later decision reads that record, never current settings or a probe. The record
+  says what was configured; only the session's own records say what ran.
+- A non-managed hook runs only when `hooks.state.<key>.trusted_hash` equals the hash
+  Codex computes from the normalized handler, and the state is read from the user and
+  session-flag layers, so Bridge passes the two hashes it computes itself: SHA-256 over
+  the compact, key-sorted JSON of the TOML identity `{event_name, hooks:[{type, command,
+  timeout, async}]}` (`discovery.rs:777-793`, `fingerprint.rs:54-65`), pinned to the four
+  values Codex wrote on Windows and macOS (R0, 2026-10-18; keys
+  `C:\<session-flags>\config.toml:<label>:0:0` and `/<session-flags>/config.toml:...`).
+  This replication is a fallback with a drift risk: a hash Codex no longer accepts makes
+  the TUI open its hook-review picker before the composer on both platforms, and the
+  picker holds the initial prompt (macOS awaits the review before `App::run`). Bridge
+  never answers the picker. On Windows the Codex adapter requires the empty composer row
+  before every initial paste of an injected launch, regardless of stored workspace trust
+  or an applied trust override; a deadline names the picker as diagnosis. The doctor's
+  `hooks/list` probe (`codex app-server`, JSON-RPC) reports the installed Codex's own
+  trust status and hash without writing anything. `--dangerously-bypass-hook-trust` is
+  never passed: it would run every user and project hook unreviewed.
+- `UserPromptSubmit` gives the turn's identity before the answer exists: `session_id`,
+  `turn_id` and `transcript_path`. It proves inspection, not acceptance; another input
+  hook can still reject Bridge's input. Bridge binds the current claim to that identity
+  (`codex-turn-<claim>.json`) only for a prompt that begins with the delegation header
+  (directly or after the exact IDE wrapper) and ends with the pending marker, under the
+  lifecycle lock against the live claim; an identical rebinding is idempotent, a
+  different identity is a diagnostic. The marker alone never identifies a turn (#61), and
+  a message typed into the TUI during the turn is steered into the same turn without the
+  header (#65). The title turn is a temporary thread with hooks disabled, so it sends no
+  hook payload, but its legacy notify can still arrive first; keep the #61 fixtures.
+- `Stop` is not the end of the turn: every Stop handler runs while Codex decides whether
+  to stop, and another handler's block continues the same turn (`session/turn.rs`).
+  Bridge records the last Stop as a candidate (`codex-candidate-<claim>.json`) and never
+  publishes from it. Legacy notify runs after that decision but before the turn function
+  returns, so a post-turn compaction interrupted by Esc can follow a notify success with
+  `turn_aborted`. For a bound claim notify is therefore evidence only
+  (`codex-notify-<claim>.json`) and does not release the claim; for an unbound claim
+  (no hook injected or no binding) notify settles exactly as before.
+- A bound claim settles from Codex's own terminal record in the rollout transcript,
+  observed by the adapter's session watcher (`LaunchPlan.watcher`): `task_complete` (or
+  its `turn_complete` alias) and `turn_aborted` for the bound turn id, emitted after the
+  hooks and notify of the turn (`tasks/mod.rs:829-866`) and persisted with a flush per
+  append but no latency guarantee. The watcher reads the bound file only, from byte zero,
+  newline-terminated records with strict UTF-8 and JSON, verifying the file's identity and
+  its largest observed length around every read; replacement, shrink, a read failure, an
+  oversized record or a malformed attribution field suspend that claim with a diagnostic
+  (`codex-observer-<claim>.json`) and are never evidence about the prompt. Acceptance is
+  proved by one `user.text` message of the bound turn
+  (`payload.internal_chat_message_metadata_passthrough.turn_id`) that carries the framed
+  prompt; its absence is proved only by a complete, validated prefix, and then the request
+  fails as not accepted. An abort fails with Codex's reason, a terminal error with its
+  text, a null or blank answer as such; otherwise the answer is published after the
+  marker is stripped, with `provenance` naming the signal. The transcript is a
+  provider-owned record, not a documented contract: replace the watcher when Codex
+  provides a terminal lifecycle event that carries the answer, delivers notify through
+  stdin, or lets a TUI launched with overrides attach to the daemon (the embedded app
+  server is in-process, so no external client can observe `turn/completed`).
+- Live on native Windows, 2026-10-18, codex-cli 0.163.0
+  (`docs/verification/2026-10-18-windows-127-codex-lifecycle-hooks.md`): bound claims settled
+  from `task_complete` with and without a notify record (a 25,463-character prompt with a
+  10,092-character answer left none), a steered TUI message joined the bound turn without
+  rebinding, a user Stop hook's block continued the turn and only the final answer was
+  published, a model error failed the request from `task_complete{error}` with no Stop and no
+  notify at all, `settings_off` and `features.hooks=false` settled through notify, and an
+  untrusted user hook held the picker, which the Windows gate named at the deadline. Not
+  verified: Esc during post-turn compaction, a Bridge hash-drift build, and macOS. The
+  native-queue `tell` passes the framed prompt as one `--message` argument, so on native
+  Windows a follow-up above the command-line limit fails to start `codex queue` before anything
+  is sent (os error 206 at 35,520 characters; #251): a send-side limit that the hook route does
+  not change.
+- When a correlation question comes up, record the raw payloads with a temporary build
+  and read them: hook stdin, notify argv and the transcript lines. Do not reason from the
+  result alone. The two payloads of #61 looked alike in everything but the thread, the
+  input and the answer.
 - Codex's background memory consolidation delegated through `tabcli ask` from its memory
   workspace and left the sessions open (issue #216: three on 2026-10-15 with tabcli 0.4.10 and
   codex-cli 0.162.1, three on 2026-10-08 with 0.2.6), and a `LOCAL.md` instruction did not

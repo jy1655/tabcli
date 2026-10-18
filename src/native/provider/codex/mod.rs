@@ -1,10 +1,13 @@
 mod correlation;
 mod diagnose;
+mod hooks;
 mod launch;
+mod lifecycle;
 mod queue;
 mod runner;
 #[cfg(test)]
 mod test_support;
+mod transcript;
 use self::correlation::{
     codex_input_correlates, codex_owned_string, codex_string, correlated_prompt,
     correlated_response, established_codex_thread,
@@ -14,7 +17,7 @@ use self::launch::{codex_launch_arguments, send_initial_prompt, workspace_trust_
 use self::queue::send_native_queue_message;
 use super::{
     CrossSessionMessageContext, InitialPromptDisposition, LaunchContext, LaunchPlan,
-    NativeProviderAdapter, NoWatcher, ReopenSupport,
+    NativeProviderAdapter, ReopenSupport,
 };
 use crate::native::delivery::{
     self, Outcome, Prepared, Readiness, SurfaceInput, Transport, TransportFacts, TurnContext,
@@ -37,7 +40,11 @@ pub(super) struct CodexAdapter;
 const PENDING_TURN_FILE: &str = "codex-pending-turn.json";
 
 fn codex_version_supports_native_queue(output: &str) -> Result<bool> {
-    let installed = output
+    Ok(codex_version(output)? >= Version::new(0, 149, 0))
+}
+
+fn codex_version(output: &str) -> Result<Version> {
+    output
         .split_whitespace()
         .filter_map(|token| {
             let candidate = token
@@ -49,10 +56,7 @@ fn codex_version_supports_native_queue(output: &str) -> Result<bool> {
             Version::parse(candidate).ok()
         })
         .next()
-        .ok_or_else(|| {
-            anyhow::anyhow!("could not parse a semantic Codex version from {output:?}")
-        })?;
-    Ok(installed >= Version::new(0, 149, 0))
+        .ok_or_else(|| anyhow::anyhow!("could not parse a semantic Codex version from {output:?}"))
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -285,11 +289,23 @@ impl NativeProviderAdapter for CodexAdapter {
     }
 
     fn handle_hook(&self, directory: &Path, payload: &serde_json::Value) -> Result<()> {
+        match codex_string(payload, "hook_event_name") {
+            Some("UserPromptSubmit") => return lifecycle::bind(directory, payload),
+            Some("Stop") => return lifecycle::stop(directory, payload),
+            Some(_) => return Ok(()),
+            None => {}
+        }
+        let pending = read_pending_turn(directory)?;
+        if let Some(pending) = &pending
+            && lifecycle::record_notify(directory, pending, payload)?
+        {
+            return Ok(());
+        }
         let raw_message = codex_string(payload, "last-assistant-message")
             .map(|message| message.trim())
             .filter(|message| !message.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Codex notify payload has no assistant result"))?;
-        let Some(pending) = read_pending_turn(directory)? else {
+        let Some(pending) = pending else {
             return Ok(());
         };
         let message = match correlated_response(raw_message, &pending) {
@@ -310,6 +326,7 @@ impl NativeProviderAdapter for CodexAdapter {
             FirstPartyCli::Codex,
             Some(&pending.claim_token),
         )
+        .with_provenance(Some("codex_notify"))
         .complete(message, thread_id, codex_owned_string(payload, "turn-id"))
         .context("failed to record the correlated Codex result")
     }
@@ -413,6 +430,11 @@ fn prepare_launch_for_platform(
         &pending,
         windows,
     )?;
+    let hook_override = hooks::prepare(context.directory, context.bridge_executable)?;
+    if let Some(value) = hook_override {
+        // Immediately after the unchanged notify override, before a positional prompt.
+        own.splice(2..2, [OsString::from("-c"), OsString::from(value)]);
+    }
     if authorized(context.directory, FirstPartyCli::Codex)? {
         // Official process-local TOML override; never edits config.toml or any
         // approval/sandbox setting. Insert before the positional prompt.
@@ -431,7 +453,7 @@ fn prepare_launch_for_platform(
         initial_prompt: InitialPromptDisposition::of(
             initial_transport_for_platform(windows).as_ref(),
         ),
-        watcher: Box::new(NoWatcher),
+        watcher: Box::new(transcript::Watcher),
         environment_removals: &[],
     })
 }

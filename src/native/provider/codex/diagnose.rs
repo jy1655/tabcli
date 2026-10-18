@@ -5,6 +5,9 @@ use crate::native::session::{CoreRecord, Reader, requests};
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
+mod hook_trust;
+mod lifecycle;
+
 /// Windows limits a process command line to this many UTF-16 units (`CreateProcessW`).
 /// Codex runs the configured `notify` command with the whole payload as one argument.
 pub(super) const NOTIFY_COMMAND_LINE_LIMIT_UNITS: usize = 32_767;
@@ -93,7 +96,7 @@ fn notify_payload_evidence(
     })
 }
 
-const NOTIFY_PAYLOAD_DETAIL: &str = "Estimate of the pending turn's notify command line, not a measurement: the JSON-escaped framed prompt in UTF-16 units, as sized before delivery, plus an allowance of 300 units for the payload's other fields and Codex's argument quoting, plus the length of this doctor's executable path standing in for the notify executable fixed at launch, which the records do not retain. The real command line can be larger or smaller: Codex's argument quoting adds a backslash for every quotation mark in the payload, so text with many quotation marks is undercounted. Windows refuses a command line of 32,767 units or more: an estimate at or over the limit means the completion has probably failed to reach Bridge, and one near the limit that a long answer will.";
+const NOTIFY_PAYLOAD_DETAIL: &str = "This request may still depend on notify (no binding observed or lifecycle hooks were not recorded as injected). Estimate of the pending turn's notify command line, not a measurement: the JSON-escaped framed prompt in UTF-16 units, as sized before delivery, plus an allowance of 300 units for the payload's other fields and Codex's argument quoting, plus the length of this doctor's executable path standing in for the notify executable fixed at launch, which the records do not retain. The real command line can be larger or smaller: Codex's argument quoting adds a backslash for every quotation mark in the payload, so text with many quotation marks is undercounted. Windows refuses a command line of 32,767 units or more: an estimate at or over the limit means the completion has probably failed to reach Bridge, and one near the limit that a long answer will.";
 const NOTIFY_PAYLOAD_ACTION: &str = "If the request stays pending while the session is working after a long turn, read the answer from Codex's rollout record (~/.codex/sessions/<date>/rollout-*.jsonl) and close-session the session; never resend an uncertain turn. Otherwise keep delivered prompts and requested answers short on native Windows: put long material in workspace files and ask for a file-based report.";
 
 fn notify_payload_check(directory: Option<&Path>) -> crate::native::doctor::Check {
@@ -129,6 +132,20 @@ fn notify_payload_check(directory: Option<&Path>) -> crate::native::doctor::Chec
             .evidence(serde_json::json!({"error": format!("{error:#}")}));
         }
     };
+    if matches!(super::hooks::read_launch_mode(directory), Ok(Some(mode)) if mode.lifecycle_hooks == super::hooks::LifecycleHooks::Injected)
+        && matches!(
+            super::lifecycle::read_binding(directory, &pending.claim_token),
+            Ok(Some(_))
+        )
+    {
+        return Check::new(
+            "codex_notify_payload_budget",
+            Available,
+            "codex_notify_payload_not_required",
+            "This session recorded hook injection and a binding for this request; notify is not its terminal authority, even if transcript observation is suspended.",
+            "Inspect codex_lifecycle for this request's recorded observer state.",
+        );
+    }
     let pending_request = Reader::open_unchecked(directory)
         .record(CoreRecord::Requests)
         .child(&format!("{}.json", pending.claim_token))
@@ -242,6 +259,7 @@ pub(super) fn diagnose_codex(
         "Uses the same provider-owned event identity lookup as the queue sender. It does not prove a TUI currently has that thread loaded.",
         "Select a managed session with a recorded Codex result; a queue acceptance is not a completion.").evidence(evidence));
     checks.push(notify_payload_check(context.directory));
+    checks.push(lifecycle::check(context.directory));
     let daemon = if !context.probe {
         Check::new(
             "codex_daemon",
@@ -299,6 +317,11 @@ pub(super) fn diagnose_codex(
         "MCP connection and authentication state have not been observed. Version, daemon availability and completed model turns do not prove MCP startup succeeded.",
         "Inspect /mcp in this exact Codex session. A codex_apps startup failure with 401/token_revoked (or reauthenticationRequired) means the provider rejected the stored ChatGPT sign-in: every newly launched Codex reads the same stored sign-in and fails the same way until `codex login`, and a long-lived Codex process that still fails afterwards needs a restart to load the new one. `codex doctor` checks that sign-in outside a session (auth.credentials and the authenticated network.websocket_reachability handshake). Optional MCP failure does not by itself mean the model turn failed; doctor does not change authentication or retry prompts.",
     ));
+    // Existing probes consume their shared budget first. The hook exchange owns
+    // its explicitly documented ten-second bound, without starving those probes.
+    if context.probe {
+        checks.push(hook_trust::check(&context));
+    }
     checks
 }
 

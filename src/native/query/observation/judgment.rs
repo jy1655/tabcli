@@ -622,6 +622,7 @@ pub(in crate::native) mod tests {
         PendingTurnCompletion::new(
             claim,
             SessionEvent {
+                provenance: None,
                 cancelled: false,
                 provider: "codex".to_owned(),
                 message: "done".to_owned(),

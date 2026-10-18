@@ -34,6 +34,9 @@ pub(in crate::native) struct SessionEvent {
     pub(in crate::native) turn_id: Option<String>,
     #[serde(default)]
     pub(in crate::native) created_unix_ms: Option<u128>,
+    /// Adapter-selected completion signal, also retained in the journal event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::native) provenance: Option<String>,
     /// Usage the provider itself reported for this request, when its signal carries one.
     /// Never part of the completion outcome; see [`ProviderUsage`].
     #[serde(default, skip_serializing_if = "Option::is_none")]

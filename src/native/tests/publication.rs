@@ -30,6 +30,7 @@ fn correlated_wait_ignores_other_completed_turns() {
         write_event(
             directory.path(),
             &SessionEvent {
+                provenance: None,
                 cancelled: false,
                 provider: "claude".to_owned(),
                 message: message.to_owned(),
@@ -76,6 +77,7 @@ fn completed_event_is_not_published_until_the_session_is_ready() {
     write_event(
         directory.path(),
         &SessionEvent {
+            provenance: None,
             cancelled: false,
             provider: "codex".to_owned(),
             message: "completed result".to_owned(),
@@ -112,6 +114,7 @@ fn completed_event_uses_its_own_released_claim_not_a_later_turns_claim() {
     write_event(
         directory.path(),
         &SessionEvent {
+            provenance: None,
             cancelled: false,
             provider: "codex".to_owned(),
             message: "completed result".to_owned(),
@@ -156,6 +159,7 @@ fn completed_event_waits_for_its_own_claim_to_be_released() {
     write_event(
         directory.path(),
         &SessionEvent {
+            provenance: None,
             cancelled: false,
             provider: "codex".to_owned(),
             message: "completed result".to_owned(),
@@ -191,6 +195,7 @@ fn uncorrelated_wait_returns_the_first_event_after_its_baseline() {
         write_event(
             directory.path(),
             &SessionEvent {
+                provenance: None,
                 cancelled: false,
                 provider: "codex".to_owned(),
                 message: message.to_owned(),
@@ -224,6 +229,7 @@ fn event_commit_does_not_create_a_racy_latest_cache() {
     let directory = tempfile::tempdir().unwrap();
     fs::create_dir(directory.path().join("events")).unwrap();
     let event = SessionEvent {
+        provenance: None,
         cancelled: false,
         provider: "codex".to_owned(),
         message: "committed".to_owned(),

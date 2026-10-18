@@ -26,6 +26,7 @@ fn fixture(state: SessionState) -> (tempfile::TempDir, Store) {
 
 fn event(message: &str) -> SessionEvent {
     SessionEvent {
+        provenance: None,
         cancelled: false,
         provider: "codex".to_owned(),
         message: message.to_owned(),
@@ -1051,6 +1052,7 @@ fn timeline_uses_the_existing_publication_predicate_at_every_completion_boundary
             .join(&claimed.receipt().event_file);
         claimed.retain();
         let event = SessionEvent {
+            provenance: None,
             cancelled: false,
             provider: "codex".to_owned(),
             message: "same result".to_owned(),
@@ -1343,6 +1345,7 @@ fn immutable_request_mapping_survives_each_partial_completion_recovery() {
         let token = claim.token().to_owned();
         claim.retain();
         let event = SessionEvent {
+            provenance: None,
             cancelled: false,
             provider: "codex".to_owned(),
             message: "same text".to_owned(),
@@ -1684,5 +1687,151 @@ fn report_usage_never_changes_the_recorded_outcome() {
             },
             "{kind}"
         );
+    }
+}
+
+#[test]
+fn provenance_is_optional_byte_compatible_and_old_journal_readers_lose_it() {
+    let legacy = br#"{"provider":"codex","message":"legacy","error":null,"provider_session_id":"provider-session","turn_id":"provider-turn","created_unix_ms":1}"#;
+    let decoded: SessionEvent = serde_json::from_slice(legacy).unwrap();
+    assert_eq!(decoded.provenance, None);
+    assert_eq!(serde_json::to_vec(&decoded).unwrap(), legacy);
+    let mut marked = decoded;
+    marked.provenance = Some("codex_notify".into());
+    let journal = PendingTurnCompletion::new("1-2-3", marked, None).unwrap();
+    let bytes = serde_json::to_vec_pretty(&journal.event).unwrap();
+    let encoded = serde_json::to_vec(&journal).unwrap();
+    let decoded: PendingTurnCompletion = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(
+        journaled_event_state_of(&decoded, &bytes, EVENT_READ_LIMIT).unwrap(),
+        JournaledEventState::Committed
+    );
+    // Actual pre-provenance event shape (unknown fields ignored), inside a pending journal.
+    #[derive(Deserialize, Serialize)]
+    struct OldEvent {
+        provider: String,
+        message: String,
+        error: Option<String>,
+        provider_session_id: Option<String>,
+        turn_id: Option<String>,
+        created_unix_ms: Option<u128>,
+    }
+    #[derive(Deserialize)]
+    struct OldJournal {
+        event: OldEvent,
+    }
+    let old: OldJournal = serde_json::from_slice(&encoded).unwrap();
+    let mut dropped: PendingTurnCompletion = serde_json::from_slice(&encoded).unwrap();
+    dropped.event = serde_json::from_value(serde_json::to_value(old.event).unwrap()).unwrap();
+    assert_eq!(
+        journaled_event_state_of(&dropped, &bytes, EVENT_READ_LIMIT).unwrap(),
+        JournaledEventState::Mismatched
+    );
+}
+
+#[test]
+fn provenance_survives_each_completion_publication_fault_boundary() {
+    let mut journal_only = false;
+    let mut journal_and_event = false;
+    for budget in 0..40 {
+        let (_root, store) = hold_fixture(SessionState::Working);
+        let claimed = claim(&store, &[]).unwrap();
+        let token = claimed.token().to_owned();
+        let request_id = claimed.receipt().request_id.clone();
+        claimed.retain();
+        let outcome = with_fault_budget(budget, || {
+            Report::for_claim(&store, FirstPartyCli::Codex, Some(&token))
+                .with_provenance(Some("codex_notify"))
+                .complete("done", Some("thread".into()), Some("turn".into()))
+        });
+        if let Err(error) = &outcome {
+            assert!(injected_fault(error), "{error:#}");
+        }
+        let reader = Reader::open_unchecked(store.directory());
+        let journal: Option<PendingTurnCompletion> = reader
+            .record(CoreRecord::Completion)
+            .optional_json()
+            .unwrap();
+        if let Some(journal) = journal {
+            assert_eq!(journal.event.provenance.as_deref(), Some("codex_notify"));
+            if reader.events().unwrap().is_empty() {
+                journal_only = true;
+            } else {
+                journal_and_event = true;
+            }
+        } else if reader.events().unwrap().is_empty() {
+            continue;
+        }
+        recover_pending_completion(store.directory()).unwrap();
+        let events = reader.events().unwrap();
+        assert_eq!(events.len(), 1);
+        let event: SessionEvent = read_json(&events[0]).unwrap();
+        assert_eq!(event.provenance.as_deref(), Some("codex_notify"));
+        let result = query::request_result(&reader, &request_id).unwrap();
+        assert_eq!(result["request_state"], "completed");
+        assert_eq!(
+            reader
+                .event_strict(events[0].file_name().unwrap().to_str().unwrap())
+                .unwrap()
+                .provenance,
+            event.provenance
+        );
+        if outcome.is_ok() {
+            assert!(journal_only && journal_and_event);
+            return;
+        }
+    }
+    panic!("publication did not finish within the fault sweep");
+}
+
+#[test]
+fn stale_and_duplicate_reports_never_rewrite_winning_provenance_in_either_order() {
+    for (first, second) in [
+        ("codex_notify", "codex_transcript_task_complete"),
+        ("codex_transcript_task_complete", "codex_notify"),
+    ] {
+        for failure in [false, true] {
+            let (_root, store) = fixture(SessionState::Working);
+            let claim = claim(&store, &[]).unwrap();
+            let report = Report::for_claim(&store, FirstPartyCli::Codex, Some(claim.token()))
+                .with_provenance(Some(first));
+            if failure {
+                report
+                    .fail("failed", Some("thread".into()), Some("turn".into()))
+                    .unwrap();
+            } else {
+                report
+                    .complete("done", Some("thread".into()), Some("turn".into()))
+                    .unwrap();
+            }
+            let reader = Reader::open_unchecked(store.directory());
+            let path = reader.events().unwrap().pop().unwrap();
+            let before = fs::read(&path).unwrap();
+            Report::for_claim(&store, FirstPartyCli::Codex, Some(claim.token()))
+                .with_provenance(Some(second))
+                .complete("stale", Some("thread".into()), Some("turn".into()))
+                .unwrap();
+            let next = turn::claim(&store, &[]).unwrap();
+            update_status(store.directory(), SessionState::Claimed, None, None).unwrap();
+            update_status(store.directory(), SessionState::Working, None, None).unwrap();
+            Report::for_claim(&store, FirstPartyCli::Codex, Some(next.token()))
+                .with_provenance(Some(second))
+                .fail(
+                    "duplicate identity",
+                    Some("thread".into()),
+                    Some("turn".into()),
+                )
+                .unwrap();
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert_eq!(reader.events().unwrap().len(), 1);
+            assert_eq!(
+                reader
+                    .event_strict(path.file_name().unwrap().to_str().unwrap())
+                    .unwrap()
+                    .provenance
+                    .as_deref(),
+                Some(first)
+            );
+        }
     }
 }

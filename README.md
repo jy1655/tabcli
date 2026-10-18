@@ -106,6 +106,11 @@ Codex follow-ups require 0.149.0 or newer; no shared daemon is required. Claude 
 cross-session messaging in its installed backend and configuration, not only a recent version.
 See [provider requirements](docs/providers.md) for delivery paths and failure handling.
 
+- Upcoming Codex lifecycle support: stdin hooks bind turns, transcript events settle bound
+  requests, and Windows waits for the empty composer before pasting. See [Codex](docs/providers.md#codex)
+  for the notify fallback, hook-trust diagnostics and `settings codex-lifecycle-hooks off`.
+  Windows live record: [2026-10-18](docs/verification/2026-10-18-windows-127-codex-lifecycle-hooks.md)
+  (hook route, long-payload reproduction, steering, user Stop hook, picker gate, notify fallbacks).
 - [2026-10-15 macOS, published 0.4.9](docs/verification/2026-10-15-macos-0.4.9.md): all four
   providers passed iTerm2 self-tests after publication; Codex and Claude defaults, Pi with an
   explicit model, Agy with `--yolo`. Separate installed-binary Ghostty checks used an already-running app.

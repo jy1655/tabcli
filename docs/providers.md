@@ -57,8 +57,13 @@ Install and sign in to `codex`. You need 0.147.0 or newer to launch, and 0.149.0
 follow-ups. Open the project in Codex first and resolve its workspace-trust prompt.
 
 On macOS, Bridge passes the initial prompt as a launch argument. On native Windows, it waits for
-Codex's startup delay and either verified workspace trust or the empty composer before typing.
-If that wait expires, the error says `workspace trust is not verified` and that no initial input
+Codex's startup delay and either verified workspace trust or the empty composer before typing
+when lifecycle hooks were not injected. For a session recorded as `injected`, Bridge always
+requires the visible empty `› Ask Codex to do anything` composer with no workspace dialog or
+hook-review picker. Stored exact trust and an applied trust override cannot skip that check.
+A visible composer still passes with repository-root trust and no exact project entry. The gate
+checks session termination before readiness and keeps the original request deadline.
+If the legacy trust wait expires, the error says `workspace trust is not verified` and that no initial input
 was sent. Check the managed surface and approve the workspace if you trust it. After a failed
 initial request, close that session and run a new `ask`; `tell` requires a ready session.
 An empty screen does not count as a ready composer.
@@ -105,25 +110,70 @@ first completed turn. If the queue is unavailable, run `tabcli doctor <session> 
 and inspect the reported prerequisite. Bridge never falls back to typing a follow-up: the
 surface could be showing another thread or a picker.
 
-Codex reports finished turns through its `notify` hook. Bridge accepts an assistant result ending
-with the pending marker, or a completion one of whose string inputs begins with Bridge's
-delegation header and ends with that marker. A message typed into the TUI while the turn runs is
-steered into that turn: it follows Bridge's prompt as another input, and the recorded result is
-the answer to both. Bridge recognizes Codex's IDE-context wrapper. These checks identify framing,
-not provenance: a copied framed prompt can still match. The first accepted result establishes the
-thread, and later results must name that thread.
+With stable Codex 0.163.0 or newer, `settings codex-lifecycle-hooks on` (the default), and a
+supported Bridge executable path, Bridge injects process-local `UserPromptSubmit` and `Stop`
+command hooks. Both call this executable's `native-hook codex`, receive JSON on stdin, use a
+30-second timeout, and run synchronously. Injection does not prove that hooks run: Codex's
+feature flags, disabled handlers, trust and managed configuration still govern availability.
+`codex-launch-mode.json` records the injection decision, reason and version at launch; later
+settings changes do not change that session's readiness gate. `off` affects new launches only.
+Older/unknown/prerelease Codex versions and unavailable launchers retain notify. On Windows,
+the hook executable path must contain only ASCII letters, digits, `_`, `.`, `:`, `\` or `-`;
+a path with spaces, Unicode or shell metacharacters makes hook injection unavailable.
+
+The same `-c hooks=...` value supplies `trusted_hash` for only Bridge's two synthetic
+session-flags keys (`user_prompt_submit:0:0` and `stop:0:0`). Hashes use Codex 0.163.0's
+normalized event label and selected platform command, timeout 30 and async false; they depend
+on this executable's path. Bridge writes no Codex config and sets no `enabled` flags. It leaves
+unrelated trust state and user-disabled handlers to Codex's merge. Vector agreement proves
+normalization, not execution; doctor warns when the recorded launch version differs.
+
+Hash drift, or an unrelated untrusted hook, can open Codex's startup hook-review picker on both
+platforms. Bridge never answers it. On Windows the positive gate withholds all initial input;
+at the deadline it reports `not_sent`, naming the picker when the last readable screen contains
+`Review hooks` or `Trust all and continue`, even if stale composer text is also visible.
+On macOS the argument-delivered prompt can wait behind the picker: a result timeout and no
+input-hook observation mean there is no observed initial-input acceptance, possibly because of
+a startup review screen; they do not prove `not_sent`. Inspect the managed surface yourself.
+`doctor SESSION --probe` can compare current hook trust/hashes; settings `off` is a fallback
+for new sessions, not permission for Bridge to answer a picker or resend uncertain input.
+
+An observed `UserPromptSubmit` binds the current claim to Codex's thread, turn and transcript.
+The prompt must carry Bridge's exact delegation framing (or the recognized IDE wrapper) and
+trailing marker. `Stop` records only the latest candidate, which can precede continuation or
+compaction: it is neither a terminal signal nor a source of result text.
+For bound claims, the transcript watcher is the terminal signal. It reads from byte zero for
+each binding, verifies the session identity and accepted framed user input for that turn,
+and settles only on a matching `task_complete`/`turn_complete` or `turn_aborted`. Null/empty
+answers, provider errors, interruption and proved nonacceptance fail the request. It reads
+strict newline-terminated UTF-8 JSON in bounded chunks, retaining partial tails; replacement,
+truncation or malformed evidence suspends observation and leaves the claim pending. It never
+falls back to notify for a bound claim. Replace this polling reader when Codex supplies an
+addressed first-party terminal signal with equivalent identity and settlement semantics.
+
+Unbound claims retain the `notify` fallback: Bridge accepts an assistant result ending with
+the pending marker, or a completion whose string input begins with the delegation header and
+ends with that marker. A steered TUI input may follow Bridge's prompt; the answer serves both.
+These checks identify framing, not provenance: a copied framed prompt can still match. The
+first committed result establishes the thread, which later results must name. Notify stays
+until every supported configuration has a verified replacement or is explicitly unsupported,
+including hooks off/disabled/untrusted, older versions, managed-only configurations and
+unavailable launchers or transcripts. A bound transcript failure does not grant notify authority.
+Do not use an older separate binary for commands or recovery on sessions journaled by this
+binary, or downgrade the executable while they remain open; older readers lose provenance.
 
 IDE-wrapper support comes from Codex's source and Bridge's tests. A live session with `/ide`
 is not verified; see the [Windows verification record][win10].
 
-On native Windows the `notify` payload has a size limit. Codex runs the notify command with the
-whole JSON payload as one argument, and that payload carries the delivered prompt
+On native Windows an unbound request that still depends on `notify` has a payload size limit.
+Codex runs the notify command with the whole JSON payload as one argument, and that payload
+carries the delivered prompt
 (`input-messages`) and the whole answer (`last-assistant-message`). Windows refuses a process
 command line of 32,767 UTF-16 units or more, so a long prompt with a long answer makes the spawn
 of `tabcli.exe` fail with error 206 and the completion never reaches Bridge: the request stays
 `pending` for good and the session stays `working` until the caller's timeout (observed
 2026-10-11 with codex-cli 0.162.1: a 21,655-character prompt and a 12,586-character answer).
-Bridge has no second path to a Codex completion. Keep the delivered prompt and the requested
+For that unbound route, keep the delivered prompt and the requested
 answer short on native Windows: put long material in files in the workspace, ask for a short
 written result, and prefer a file-based report. To recover, read the answer from Codex's rollout
 record (`~/.codex/sessions/<date>/rollout-*.jsonl`), then `close-session` the session; do not
@@ -132,6 +182,14 @@ estimate of the pending turn's payload against the limit from the framed prompt'
 pending-turn record keeps for the initial turn and for each follow-up as sized before delivery; the
 real command line can be larger or smaller than the estimate, and text with many quotation marks is undercounted
 because Codex's argument quoting escapes each of them. See [doctor](cli.md#doctor).
+
+The native-queue follow-up has a send-side limit of its own on native Windows. `tell` starts
+`codex queue` with the framed prompt as one `--message` argument, so a follow-up whose command
+line reaches 32,767 UTF-16 units cannot start the queue client (error 206) and nothing is sent:
+the request is recorded as unresolved and the session returns to `ready` (observed 2026-10-18
+with codex-cli 0.163.0 and a 35,520-character prompt; issue #251). The lifecycle-hook route does
+not change this limit. Keep follow-up prompts short on native Windows and pass long material by
+path; the console-pasted initial prompt has no such limit beyond the paste defects of #124.
 
 `reopen` refuses closed Codex sessions. Bridge still needs checks for the thread's writer lock
 and queued inputs before supporting resume; start a new session instead.

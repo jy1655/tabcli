@@ -1,5 +1,208 @@
 use super::*;
 
+#[cfg(windows)]
+mod positive_gate {
+    use super::*;
+    use crate::native::clock::FakeClock;
+    use crate::native::session::{SessionState, Store, update_status};
+    use serde_json::json;
+
+    fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let dir = super::super::super::test_support::launch_session(root.path(), Some("0.163.0"));
+        super::super::super::hooks::prepare(&dir, Path::new(r"C:\tabcli.exe")).unwrap();
+        (root, dir)
+    }
+
+    #[test]
+    fn hook_review_picker_rejects_even_a_stale_empty_composer() {
+        for picker in ["Review hooks", "Trust all and continue"] {
+            assert!(!composer_is_ready(picker));
+            assert!(!composer_is_ready(&format!("{COMPOSER_ROW}\n{picker}")));
+            assert!(legacy_composer_is_ready(&format!(
+                "{COMPOSER_ROW}\n{picker}"
+            )));
+        }
+    }
+
+    #[test]
+    fn injected_gate_sends_zero_input_despite_exact_trust_or_applied_override() {
+        for applied in [false, true] {
+            let (root, dir) = fixture();
+            let config = workspace_trust_override(root.path()).unwrap();
+            Store::open_unchecked(root.path())
+                .private("config.toml")
+                .write_private(config.as_bytes())
+                .unwrap();
+            if applied {
+                Store::open_unchecked(&dir)
+                    .private("workspace-consent.json")
+                    .write_json(&json!({"state":"verified", "applied":"codex-config-override"}))
+                    .unwrap();
+            }
+            let env = crate::native::consent::Environment {
+                home: Some(root.path().into()),
+                userprofile: Some(root.path().into()),
+                codex_home: Some(root.path().into()),
+                ..Default::default()
+            };
+            use crate::native::provider::NativeProviderAdapter;
+            assert!(matches!(
+                super::super::super::ADAPTER
+                    .workspace_trust(root.path(), &env, None)
+                    .unwrap(),
+                crate::native::consent::Trust::Trusted(_)
+            ));
+            let start = Instant::now();
+            let mut clock = FakeClock::new(start);
+            let mut sends = 0;
+            let result = initial_readiness_with(
+                &dir,
+                start + Duration::from_secs(2),
+                &mut clock,
+                &mut || Ok(String::new()),
+                || panic!("consent cannot bypass injected readiness"),
+            );
+            if result.is_ok() {
+                sends += 1;
+            }
+            assert_eq!(sends, 0);
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("no initial console input was sent")
+            );
+            assert_eq!(clock.slept, Duration::from_secs(2));
+        }
+    }
+
+    #[test]
+    fn injected_gate_ended_session_wins_before_and_after_screen_read() {
+        for end_during_read in [false, true] {
+            let (_root, dir) = fixture();
+            if !end_during_read {
+                update_status(&dir, SessionState::Closed, None, None).unwrap();
+            }
+            let start = Instant::now();
+            let mut reads = 0;
+            let error = initial_readiness_with(
+                &dir,
+                start + Duration::from_secs(2),
+                &mut FakeClock::new(start),
+                &mut || {
+                    reads += 1;
+                    update_status(&dir, SessionState::Closed, None, None).unwrap();
+                    Ok(COMPOSER_ROW.into())
+                },
+                || panic!("legacy"),
+            )
+            .unwrap_err();
+            assert_eq!(reads, usize::from(end_during_read));
+            assert!(error.to_string().contains("session is closed"));
+        }
+    }
+
+    #[test]
+    fn injected_gate_screen_failure_and_picker_deadlines_send_nothing() {
+        for screen in [
+            None,
+            Some("Review hooks"),
+            Some("Trust all and continue"),
+            Some("› Ask Codex to do anything\nReview hooks"),
+        ] {
+            let (_root, dir) = fixture();
+            let start = Instant::now();
+            let mut clock = FakeClock::new(start);
+            let error = initial_readiness_with(
+                &dir,
+                start + Duration::from_secs(2),
+                &mut clock,
+                &mut || {
+                    screen
+                        .map(str::to_owned)
+                        .ok_or_else(|| anyhow::anyhow!("read failed"))
+                },
+                || panic!("legacy"),
+            )
+            .unwrap_err();
+            assert_eq!(clock.slept, Duration::from_secs(2));
+            assert_eq!(
+                error.to_string().contains("hook-review picker"),
+                screen.is_some()
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("no initial console input was sent")
+            );
+        }
+    }
+
+    #[test]
+    fn injected_gate_uses_launch_record_after_settings_change_and_accepts_root_trust_composer() {
+        let (root, dir) = fixture();
+        Store::open_unchecked(root.path())
+            .private("settings.json")
+            .write_json(&json!({"schema":1,"codex_lifecycle_hooks":"off"}))
+            .unwrap();
+        let start = Instant::now();
+        assert!(
+            initial_readiness_with(
+                &dir,
+                start + Duration::from_secs(1),
+                &mut FakeClock::new(start),
+                &mut || Ok(String::new()),
+                || panic!("settings cannot bypass gate")
+            )
+            .is_err()
+        );
+        initial_readiness_with(
+            &dir,
+            start + Duration::from_secs(1),
+            &mut FakeClock::new(start),
+            &mut || Ok(COMPOSER_ROW.into()),
+            || panic!("exact trust is not required"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn legacy_session_keeps_consent_short_circuit_and_injected_read_cannot_extend_deadline() {
+        let (_root, dir) = fixture();
+        Store::open_unchecked(&dir)
+            .private("codex-launch-mode.json")
+            .remove()
+            .unwrap();
+        let start = Instant::now();
+        initial_readiness_with(
+            &dir,
+            start,
+            &mut FakeClock::new(start),
+            &mut || panic!("legacy short circuit"),
+            || Ok(()),
+        )
+        .unwrap();
+        super::super::super::hooks::prepare(&dir, Path::new(r"C:\tabcli.exe")).unwrap();
+        let mut clock = FakeClock::new(start);
+        let now = clock.shared();
+        let deadline = start + Duration::from_secs(1);
+        assert!(
+            initial_readiness_with(
+                &dir,
+                deadline,
+                &mut clock,
+                &mut || {
+                    now.set(deadline);
+                    Ok(COMPOSER_ROW.into())
+                },
+                || panic!("legacy")
+            )
+            .is_err()
+        );
+    }
+}
+
 #[test]
 fn workspace_trust_override_uses_a_toml_value_for_paths_with_dots_and_quotes() {
     for workspace in [

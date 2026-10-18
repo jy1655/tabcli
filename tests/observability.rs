@@ -2392,3 +2392,26 @@ fn result_reports_provider_usage_wherever_elapsed_appears() {
     ]);
     assert!(!malformed.contains("usage:"), "{malformed}");
 }
+
+#[test]
+fn completion_provenance_is_readable_by_result_inspect_and_timeline_without_writes() {
+    let fixture = Fixture::new();
+    let mut event = fixture.event("event-provenance.json", "provenance result");
+    event["provenance"] = json!("codex_notify");
+    write(
+        &fixture.directory.join("events/event-provenance.json"),
+        &event,
+    );
+    let before = support::entries(fixture.root.path());
+    let result = success(fixture.run(&[
+        "result",
+        "session-observe",
+        "--event",
+        "event-provenance.json",
+        "--json",
+    ]));
+    assert_eq!(result["result"], "provenance result");
+    success(fixture.run(&["inspect", "session-observe", "--json"]));
+    success(fixture.run(&["inspect", "session-observe", "--timeline", "--json"]));
+    assert_eq!(support::entries(fixture.root.path()), before);
+}
