@@ -419,6 +419,115 @@ fn spawn_commits_before_failure_preserves_live_states_then_releases_on_exit() {
 }
 
 #[test]
+fn launch_failed_waits_for_in_progress_spawn_and_preserves_committed_live_state() {
+    use crate::native::session::test_support::close_io_test::{self, Point};
+    use crate::native::session_start::StartSource;
+
+    for state in [SessionState::Running, SessionState::AwaitingInitialInput] {
+        let root = tempfile::tempdir().unwrap();
+        let source = source(root.path());
+        let child = write_reopen_launch_session(root.path(), CHILD, Path::new("claude"));
+        claim_reopen_marker(&source, SOURCE, REOPEN_TEST_CONVERSATION)
+            .unwrap()
+            .finalize(CHILD)
+            .unwrap();
+        let created = CreatedSession {
+            id: CHILD.into(),
+            directory: child.clone(),
+            manifest: Reader::open_unchecked(&child).manifest().unwrap(),
+        };
+        let store = Store::open_unchecked(&child);
+        let mut claim = turn::claim(&store, &[]).unwrap();
+        let token = claim.token().to_owned();
+        launch::begin(&store, &token, Instant::now() + Duration::from_secs(30)).unwrap();
+        launch::admit_wrapper(&store).unwrap();
+        let before_source = snapshot_directory(&source);
+        let expected = state.clone();
+        let owned = child.clone();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            StandIn(
+                launch::spawn(&Store::open_unchecked(&owned), &mut command(), |process| {
+                    locked_tx.send(()).unwrap();
+                    resume_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .context("failure handler did not reach the blocking lock attempt")?;
+                    record_provider_process(&owned, CHILD, process)?;
+                    update_status(&owned, state, None, None)
+                })
+                .unwrap(),
+            )
+        });
+        locked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (attempt_tx, attempt_rx) = mpsc::channel();
+        let held = child.clone();
+        let held_token = token.clone();
+        let releaser = thread::spawn(move || {
+            attempt_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            let store = Store::open_unchecked(&held);
+            assert!(store.try_lock().unwrap().is_none());
+            assert_eq!(store.status().unwrap().state, SessionState::Launching);
+            assert_eq!(
+                launch::read(&store).unwrap().unwrap().phase,
+                launch::Phase::Spawning
+            );
+            assert_eq!(
+                turn::current_claim_token(&store).unwrap().as_deref(),
+                Some(held_token.as_str())
+            );
+            assert!(!held.join(REOPEN_REFUSAL_FILE).exists());
+            resume_tx.send(()).unwrap();
+        });
+        let mut attempt = Some(attempt_tx);
+        let error = close_io_test::during(
+            move |point| {
+                if point == Point::BlockingLock
+                    && let Some(attempt) = attempt.take()
+                {
+                    attempt.send(()).unwrap();
+                }
+            },
+            || {
+                ReopenedSource::new(request()).launch_failed(
+                    &created,
+                    &mut claim,
+                    anyhow::anyhow!(FAILURE),
+                )
+            },
+        );
+        releaser.join().unwrap();
+        let process = worker.join().unwrap();
+        assert_eq!(reopen_refusal_gate(&error), Some("launch-failed"));
+        assert!(format!("{error:#}").contains(FAILURE));
+        assert_eq!(store.status().unwrap().state, expected);
+        assert_eq!(
+            launch::read(&store).unwrap().unwrap().phase,
+            launch::Phase::Spawned
+        );
+        let refusal = read_reopen_launch_refusal(&child).unwrap();
+        assert_eq!(refusal.claim_token.as_deref(), Some(token.as_str()));
+        assert_eq!(refusal.detail, FAILURE);
+        drop(claim);
+        assert_eq!(
+            turn::current_claim_token(&store).unwrap().as_deref(),
+            Some(token.as_str())
+        );
+        assert_eq!(snapshot_directory(&source), before_source);
+        assert_eq!(
+            observe_provider_process(&store.provider_process().unwrap()),
+            ProviderProcessObservation::Alive
+        );
+        assert_eq!(
+            reopen_refusal_gate(&inspect_reopen_source(&source, SOURCE).unwrap_err()),
+            Some("already-reopened")
+        );
+        assert_eq!(snapshot_directory(&source), before_source);
+        drop(process);
+    }
+}
+
+#[test]
 fn fence_prevents_admitted_and_legacy_spawns() {
     if isolated(concat!(
         module_path!(),
