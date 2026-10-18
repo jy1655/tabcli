@@ -35,6 +35,16 @@ launch, observe, continue, and close without replacing the capabilities those CL
 
 ## Current Claude Boundary
 
+- Native Windows workspace approval is a bounded best-effort console fallback, derived
+  from Claude Code 2.1.302's 150 ms input guard. The exact full dialog must be observed
+  unchanged for one second before one combined Down/Enter response (or Enter when Yes
+  is already selected), under an idle renderer and no concurrent input. Equal pixels do
+  not identify a React generation, and the exact screen check is not atomic with Claude
+  consuming input. A delayed remount can ignore input or reset selection to No before
+  Enter and end Claude. Neither timing, a sent batch nor queue drain confirms trust:
+  only Claude's private trust store does. Never retry uncertain input or answer the
+  dangerous-mode warning. Replace this fallback when an official addressed workspace
+  approval capability provides acceptance; the pinned source is not a runtime version gate.
 - Claude Code v2.1.224+ provides official cross-session messaging on macOS and Linux,
   including WSL 2. Native Windows support is official from v2.1.234 and uses a
   per-session named pipe. Prefer the official path only when every runtime availability

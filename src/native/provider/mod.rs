@@ -306,7 +306,7 @@ mod tests {
                 false,
                 Some("codex-config-override"),
             ),
-            (FirstPartyCli::Claude, true, true, None),
+            (FirstPartyCli::Claude, true, !cfg!(windows), None),
             (FirstPartyCli::Agy, true, false, None),
             (FirstPartyCli::Pi, false, false, Some("pi-approve-once")),
         ] {
@@ -314,6 +314,15 @@ mod tests {
             assert_eq!(facts.answers_launch_dialog, answers, "{provider:?}");
             assert_eq!(facts.bypass_suppresses_dialog, bypass, "{provider:?}");
             assert_eq!(facts.applied_marker, marker, "{provider:?}");
+            assert_eq!(
+                facts.dialog_settle,
+                if provider == FirstPartyCli::Claude && cfg!(windows) {
+                    std::time::Duration::from_secs(1)
+                } else {
+                    std::time::Duration::ZERO
+                },
+                "{provider:?}",
+            );
         }
     }
 }

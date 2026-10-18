@@ -743,6 +743,17 @@ fn dialog_input_file(
     Ok(file)
 }
 
+#[derive(Debug)]
+pub(in crate::native) struct StaleDialogClaim;
+
+impl std::fmt::Display for StaleDialogClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("stale claim at guarded submission")
+    }
+}
+
+impl std::error::Error for StaleDialogClaim {}
+
 pub(super) fn guarded_dialog_input(
     directory: &Path,
     session: &TerminalSession,
@@ -769,7 +780,7 @@ pub(super) fn guarded_dialog_input(
     match String::from_utf8_lossy(&output.stdout).trim() {
         "sent" => Ok(true),
         "changed" => Ok(false),
-        "stale" => bail!("stale claim at guarded submission"),
+        "stale" => Err(StaleDialogClaim.into()),
         _ => bail!("unexpected managed console dialog result"),
     }
 }

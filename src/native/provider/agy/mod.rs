@@ -249,6 +249,7 @@ impl NativeProviderAdapter for AgyAdapter {
             answers_launch_dialog: true,
             bypass_suppresses_dialog: false,
             applied_marker: None,
+            dialog_settle: std::time::Duration::ZERO,
         }
     }
 

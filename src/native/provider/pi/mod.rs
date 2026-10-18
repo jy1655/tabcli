@@ -201,6 +201,7 @@ impl NativeProviderAdapter for PiAdapter {
             answers_launch_dialog: false,
             bypass_suppresses_dialog: false,
             applied_marker: Some(APPLIED_MARKER),
+            dialog_settle: std::time::Duration::ZERO,
         }
     }
 
