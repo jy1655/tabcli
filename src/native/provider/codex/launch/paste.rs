@@ -70,12 +70,28 @@ fn pinned_option(label: &str) -> bool {
     .iter()
     .any(|prefix| label.starts_with(prefix))
 }
+// Fragments survive wrapping and clipped frames; key names come from the keymap.
+// Deliberately also refuses draft lines that look like these confirmation hints.
 fn confirmation_hint(text: &str) -> bool {
-    text == "enter confirm · esc skip"
-        || text.strip_prefix("enter continue").is_some_and(|rest| {
-            let rest = rest.strip_prefix(" and create sandbox").unwrap_or(rest);
-            matches!(rest, " · esc quit" | " · esc back" | " · esc cancel")
+    let text = text.trim().strip_prefix("› ").unwrap_or(text.trim());
+    fn keyed_action(value: &str) -> Option<&str> {
+        value.split_once(' ').and_then(|(key, action)| {
+            (!key.is_empty() && !key.chars().any(char::is_whitespace)).then_some(action)
         })
+    }
+    let prefix = keyed_action(text).is_some_and(|action| {
+        ["confirm", "continue"].iter().any(|verb| {
+            action.strip_prefix(verb).is_some_and(|rest| {
+                (rest.is_empty() || rest.starts_with(' '))
+                    && (text.contains(" · ") || text.ends_with(" ·"))
+            })
+        })
+    });
+    let ending = text.rsplit_once("· ").map_or(text, |(_, end)| end);
+    prefix
+        || keyed_action(ending)
+            .is_some_and(|action| matches!(action, "skip" | "quit" | "back" | "cancel"))
+        || text.contains("and create sandbox")
 }
 fn menu_evidence(row: &str) -> bool {
     row.strip_prefix("› ")

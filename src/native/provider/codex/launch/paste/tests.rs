@@ -684,6 +684,64 @@ fn pinned_ui_anywhere_and_extra_prompt_rows_refuse_return() {
 }
 
 #[test]
+fn confirmation_fragments_alone_anywhere_refuse_return() {
+    for hint in [
+        "enter continue and create sandbox ·\n  esc quit",
+        "enter continue ·\n  esc back",
+        "enter continue and create sandbox ·\n  esc cancel",
+        "enter confirm · ctrl+c skip",
+        "ctrl+j confirm · ctrl+c skip",
+        "ctrl+j continue · ctrl+c cancel",
+        "enter confirm · esc skip",
+        "enter continue · esc quit",
+        "enter continue · esc back",
+        "enter continue · esc cancel",
+        "enter continue and create sandbox · esc quit",
+        "enter continue and create sandbox · esc back",
+        "enter continue and create sandbox · esc cancel",
+        "enter confirm ·",
+        "ctrl+j continue ·",
+        "esc skip",
+        "esc quit",
+        "esc back",
+        "esc cancel",
+        "ctrl+c skip",
+        "clipped · ctrl+c skip",
+        "clipped · esc quit",
+        "clipped · esc back",
+        "clipped · esc cancel",
+        "and create sandbox",
+    ] {
+        for after_marker in [false, true] {
+            for footer in [false, true] {
+                let (mut io, claim, prompt) = Fake::new();
+                let tail = prompt.rsplit_once('\n').unwrap().1;
+                // No extra prompt glyph or menu option can mask a missed hint.
+                let mut screen = if after_marker {
+                    format!("› body\n  {tail}\n  {hint}")
+                } else {
+                    format!("› body\n  {hint}\n  {tail}")
+                };
+                if footer {
+                    screen.push_str("\n  100% context left");
+                }
+                assert_eq!(
+                    super::classification(Ok(screen.clone()), tail, Path::new(WORKSPACE)),
+                    "ambiguous (unresolved overlay)",
+                    "{screen}"
+                );
+                io.screens = [screen.clone()].into();
+                io.fallback = screen;
+                let error = io.execute(&prompt).unwrap_err();
+                assert!(error.delivery_may_have_occurred());
+                assert!(!io.calls.contains(&"submit"));
+                settle(claim, Err(error));
+            }
+        }
+    }
+}
+
+#[test]
 fn body_prefix_without_marker_never_authorizes_submission() {
     let (mut io, claim, prompt) = Fake::new();
     io.screens.clear();

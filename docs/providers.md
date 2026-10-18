@@ -102,9 +102,12 @@ starts at the first column-zero `› ` row unless that row is pinned UI evidence
 at the exact marker or, without one, the first recognized footer. Footer-shaped content before
 the marker remains content. Any column-zero `› ` row outside that span is unresolved UI,
 regardless of text or numbering. Anywhere on screen, numbered rows after `› ` or two spaces
-whose labels begin with a pinned hook/trust option, and pinned confirmation hints, are UI
-evidence; incomplete layouts are Ambiguous. Ordinary numbered prose remains content, but a
-numbered pinned menu label inside the draft (such as `2. Quit` or `1. Review hooks`) is refused
+whose labels begin with a pinned hook/trust option, and confirmation-hint fragments, are UI
+evidence. Hints include single-key confirm/continue prefixes with a middle-dot separator,
+keyed skip/quit/back/cancel endings, and `and create sandbox`, even across wrapped rows.
+Incomplete layouts are Ambiguous. Ordinary numbered prose remains content, but a
+numbered pinned menu label inside the draft (such as `2. Quit` or `1. Review hooks`) or a
+hint-like draft line (such as `enter confirm · esc skip` quoted in a prompt) is refused
 as unresolved UI: rephrase the line or press Enter yourself after checking the surface.
 Bridge then requests one guarded Return: the helper compares the entire accepted screen and
 writes no Return if it changed. Injected text and Return helpers also check the addressed claim,
@@ -114,7 +117,8 @@ wrapped marker with no recognized footer, or an unsupported layout remains uncon
 
 The gap is a heuristic to let the 60 ms idle flush separate the body; it proves no
 processing boundary and the merged-tail fallback remains. Parsing ends at the exact
-inset-stripped marker row, ignoring later rows. Without that row, the first recognized
+inset-stripped marker row, excluding later rows from draft content while still checking them
+for UI. Without that row, the first recognized
 footer ends the content: model/status text ending in this session's workspace (case-insensitive
 Windows path normalization), warnings, shortcut/queue/interrupt/edit/quit/plan-mode hints, context
 percentage or token usage. Trailing separator blanks are dropped; internal blanks stay.
