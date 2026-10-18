@@ -37,6 +37,8 @@ use std::{fs, thread};
 
 #[cfg(windows)]
 mod launch_failure;
+#[cfg(windows)]
+mod launch_recovery;
 
 const REOPEN_TEST_CONVERSATION: &str = "6928ca1c-1234-4abc-8def-0123456789ab";
 

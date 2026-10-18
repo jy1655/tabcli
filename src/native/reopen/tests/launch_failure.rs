@@ -25,17 +25,29 @@ impl Fault {
     }
 }
 
-struct OwnedChild(Child);
+struct OwnedChild(Child, Option<Vec<u8>>);
 
 impl Drop for OwnedChild {
     fn drop(&mut self) {
+        if let Some(descriptor) = &self.1 {
+            assert_ne!(
+                unsafe {
+                    windows_sys::Win32::Security::SetKernelObjectSecurity(
+                        self.0.as_raw_handle(),
+                        windows_sys::Win32::Security::DACL_SECURITY_INFORMATION,
+                        descriptor.as_ptr().cast_mut().cast(),
+                    )
+                },
+                0
+            );
+        }
         drop(self.0.stdin.take());
         let status = self.0.wait().unwrap();
         println!("fixture process pid={} reaped with {status}", self.0.id());
     }
 }
 
-fn deny_process_synchronize(child: &Child) {
+fn deny_process_synchronize(child: &Child) -> Vec<u8> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{
         ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -44,6 +56,30 @@ fn deny_process_synchronize(child: &Child) {
 
     // Only this test-owned child's new handles lose SYNCHRONIZE. Its existing Child
     // handle still allows waiting, and EOF on its private stdin ends it without a kill.
+    let mut size = 0;
+    unsafe {
+        windows_sys::Win32::Security::GetKernelObjectSecurity(
+            child.as_raw_handle(),
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            0,
+            &mut size,
+        );
+    }
+    assert!(size > 0);
+    let mut original = vec![0u8; size as usize];
+    assert_ne!(
+        unsafe {
+            windows_sys::Win32::Security::GetKernelObjectSecurity(
+                child.as_raw_handle(),
+                DACL_SECURITY_INFORMATION,
+                original.as_mut_ptr().cast(),
+                size,
+                &mut size,
+            )
+        },
+        0
+    );
     let sddl: Vec<u16> = "D:(A;;0x1000;;;WD)\0".encode_utf16().collect();
     let mut descriptor = std::ptr::null_mut();
     unsafe {
@@ -64,6 +100,7 @@ fn deny_process_synchronize(child: &Child) {
         LocalFree(descriptor);
         assert_ne!(changed, 0, "{error}");
     }
+    original
 }
 
 fn install_fault(fault: Fault, process: Rc<RefCell<Option<OwnedChild>>>) {
@@ -92,6 +129,7 @@ fn install_fault(fault: Fault, process: Rc<RefCell<Option<OwnedChild>>>) {
                         record_provider_process(directory, id, child)
                     })
                     .unwrap(),
+                    None,
                 );
                 assert_eq!(
                     launch::read(&reader).unwrap().unwrap().phase,
@@ -118,7 +156,7 @@ fn install_fault(fault: Fault, process: Rc<RefCell<Option<OwnedChild>>>) {
                         ProviderProcessObservation::Alive
                     ),
                     Fault::UnknownProcess => {
-                        deny_process_synchronize(&child.0);
+                        child.1 = Some(deny_process_synchronize(&child.0));
                         assert!(matches!(
                             observe_provider_process(&record),
                             ProviderProcessObservation::Unknown(_)
@@ -173,7 +211,7 @@ fn request() -> ReopenRequest {
     request
 }
 
-fn reproduce(test_name: &str, fault: Fault) {
+pub(super) fn isolated(test_name: &str) -> bool {
     if std::env::var_os(CHILD).is_none() {
         let test_name = test_name.split_once("::").unwrap().1;
         let base = tempfile::tempdir().unwrap();
@@ -204,11 +242,15 @@ fn reproduce(test_name: &str, fault: Fault) {
         print!("{}", String::from_utf8_lossy(&output.stdout));
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
         assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
-        assert!(
-            output.status.success(),
-            "isolated {fault:?}: {}",
-            output.status
-        );
+        assert!(output.status.success(), "isolated test: {}", output.status);
+        return true;
+    }
+
+    false
+}
+
+fn reproduce(test_name: &str, fault: Fault) {
+    if isolated(test_name) {
         return;
     }
 
