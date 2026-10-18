@@ -193,6 +193,9 @@ turn; unavailable messaging is an error, not a terminal fallback. Agy and Pi use
 terminal fallback. See [providers](providers.md) for readiness and receipt gates.
 On native Windows, Codex follow-ups also have a measured command-line size refusal; see the
 [Codex send-side limit](providers.md#codex) for the limit and remedy.
+On native Windows, Pi waits for its extension's per-turn submission receipt even with `--detach`.
+That wait shares the request deadline; an older extension refuses input before typing. See
+[Pi](providers.md#pi) for uncertain-delivery recovery and receipt limits.
 
 Exit behaviour matches `ask`. If you see `tell requires the ready state`, inspect the session and
 wait for its active request with `result SESSION --request REQUEST --wait`. A closed session cannot

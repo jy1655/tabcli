@@ -5,26 +5,27 @@ use crate::native::session::{Reader, turn};
 use crate::native::terminal;
 #[cfg(any(windows, test))]
 use anyhow::{Context, Result, bail};
-use std::{path::Path, time::Instant};
+use std::path::Path;
+#[cfg(any(windows, test))]
+use std::time::Instant;
 #[cfg(any(windows, test))]
 use std::{thread, time::Duration};
 
 pub(super) fn send_initial_prompt(
-    directory: &Path,
-    session: &terminal::TerminalSession,
+    turn: &super::TurnContext<'_>,
+    prepared: &super::Prepared,
     prompt_path: &Path,
-    deadline: Instant,
 ) -> terminal::TerminalSendResult {
     #[cfg(windows)]
     {
-        send_initial_prompt_after_startup(directory, deadline, || {
-            super::send_console_file(session, prompt_path, deadline)
+        send_initial_prompt_after_startup(turn.directory, turn.deadline, || {
+            super::input::send_windows(turn, prepared, prompt_path)
         })
     }
     #[cfg(not(windows))]
     {
-        let _ = directory;
-        super::send_console_file(session, prompt_path, deadline)
+        let _ = prepared;
+        super::send_console_file(turn.surface, prompt_path, turn.deadline)
     }
 }
 
@@ -52,10 +53,10 @@ fn send_initial_prompt_after_startup(
             }
             if let Some(text) = Reader::open_unchecked(directory)
                 .private(STARTUP_READY_FILE)
-                .text()?
+                .timeline(4096)?
             {
                 let ready: StartupReady =
-                    serde_json::from_str(&text).context("invalid Pi startup receipt")?;
+                    serde_json::from_slice(&text).context("invalid Pi startup receipt; start a new Bridge session; no initial console input was sent")?;
                 if !matches!(ready.schema, 1 | 2)
                     || ready.claim_token != pending.claim_token
                     || ready.session_id.trim().is_empty()

@@ -29,6 +29,7 @@ fn startup_receipt_allows_one_paste_and_preserves_the_transport_outcome() {
         write_json_atomic(
             &directory.path().join(STARTUP_READY_FILE),
             &StartupReady {
+                input_ack_schema: None,
                 schema,
                 claim_token: pending.claim_token,
                 session_id: "pi-native-session".to_owned(),

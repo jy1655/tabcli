@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
-import { readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { closeSync, fstatSync, lstatSync, openSync, readFileSync, readSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 function assistantText(message) {
@@ -174,6 +175,75 @@ export default function (pi) {
   let runId = 0;
   let abortClaimToken;
   let usage;
+  let inputCandidate;
+  let inputAttemptedClaim;
+
+  function readInputPending() {
+    const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
+    if (!directory) return undefined;
+    let fd;
+    try {
+      const path = join(directory, "pi-pending-turn.json");
+      if (!lstatSync(path).isFile()) return undefined;
+      fd = openSync(path, "r");
+      const stat = fstatSync(fd);
+      if (!stat.isFile() || stat.size > 4096) return undefined;
+      const bytes = Buffer.alloc(4097);
+      let length = 0;
+      while (length < bytes.length) {
+        const count = readSync(fd, bytes, length, bytes.length - length, length);
+        if (count === 0) break;
+        length += count;
+      }
+      if (length > 4096) return undefined;
+      return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, length)));
+    } catch {
+      return undefined;
+    } finally {
+      if (fd !== undefined) { try { closeSync(fd); } catch {} }
+    }
+  }
+
+  function armInput(event) {
+    if (process.platform !== "win32"
+        || (event.images !== undefined && (!Array.isArray(event.images) || event.images.length !== 0))) return;
+    const binding = readInputPending();
+    const claim = binding?.claim_token;
+    const fingerprint = binding?.windows_input;
+    if (binding?.schema !== 1 || typeof claim !== "string" || !/^[0-9-]{1,160}$/.test(claim)
+        || binding.marker !== `<!-- agent-bridge-pi-turn:${claim} -->`
+        || !fingerprint || Object.keys(fingerprint).length !== 2
+        || typeof fingerprint.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(fingerprint.sha256)
+        || !Number.isSafeInteger(fingerprint.utf8_bytes) || fingerprint.utf8_bytes <= 0) return;
+    const digest = createHash("sha256").update(event.prompt, "utf8").digest("hex");
+    const length = Buffer.byteLength(event.prompt, "utf8");
+    if (digest === fingerprint.sha256 && length === fingerprint.utf8_bytes) {
+      inputCandidate = { claim_token: claim, prompt_sha256: digest, prompt_utf8_bytes: length };
+    }
+  }
+
+  function publishInput(ctx) {
+    const candidate = inputCandidate;
+    inputCandidate = undefined;
+    if (!candidate || inputAttemptedClaim === candidate.claim_token
+        || readActiveClaimToken() !== candidate.claim_token) return;
+    // This claim read witnesses a submitted run. Later retirement cannot undo it.
+    inputAttemptedClaim = candidate.claim_token;
+    const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
+    const temporary = join(directory, `.pi-input-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`);
+    try {
+      const session = ctx.sessionManager.getSessionId();
+      if (typeof session !== "string" || !session.trim() || Buffer.byteLength(session, "utf8") > 256
+          || /\p{Cc}/u.test(session)) throw new Error("invalid Pi session identity");
+      writeFileSync(temporary, JSON.stringify({
+        schema: 1, signal: "agent_start", ...candidate, session_id: session,
+      }), { encoding: "utf8", flag: "wx", mode: 0o600 });
+      renameSync(temporary, join(directory, `pi-input-accepted-${candidate.claim_token}.json`));
+    } catch {
+      try { unlinkSync(temporary); } catch {}
+      ctx.ui.notify("Agent Bridge could not record Pi input submission. Delivery may remain uncertain; do not resend.", "warning");
+    }
+  }
 
   function stopCancelTimer() {
     // Invalidate callbacks before clearing the timer or changing run correlation.
@@ -231,6 +301,7 @@ export default function (pi) {
   // Official session_start follows project_trust resolution, including a user's decline.
   // Never return a trust decision here or persist one in Pi's provider-owned store.
   pi.on("session_start", (event, ctx) => {
+    inputCandidate = undefined;
     stopCancelTimer();
     if (event.reason !== "startup") return;
     const directory = process.env.AGENT_BRIDGE_NATIVE_SESSION_DIR;
@@ -242,6 +313,7 @@ export default function (pi) {
         schema: 2,
         claim_token: claimToken,
         session_id: ctx.sessionManager.getSessionId(),
+        ...(process.platform === "win32" ? { input_ack_schema: 1 } : {}),
       }), { encoding: "utf8", flag: "wx", mode: 0o600 });
       renameSync(temporary, join(directory, "pi-startup-ready.json"));
     } catch {
@@ -253,19 +325,26 @@ export default function (pi) {
   });
 
   pi.on("before_agent_start", (event) => {
+    inputCandidate = undefined;
+    activePromptCorrelated = false;
+    usage = undefined;
     stopCancelTimer();
     activeClaimToken = readActiveClaimToken();
+    const userPrompt = typeof event?.prompt === "string"
+      && (event.messageType === undefined || event.messageType === "user");
     activePromptCorrelated = Boolean(
-      activeClaimToken
+      userPrompt && activeClaimToken
       && event.prompt.includes(`<!-- agent-bridge-pi-turn:${activeClaimToken} -->`),
     );
     // A new correlated prompt, or a replaced claim, starts the usage of that claim afresh;
     // a retry's agent_start without this event keeps accumulating.
     usage = activePromptCorrelated ? newUsage() : undefined;
+    if (userPrompt) armInput(event);
   });
 
   pi.on("agent_start", (_event, ctx) => {
     stopCancelTimer();
+    try { publishInput(ctx); } catch {}
     if (undelivered && pending) {
       if (!persistHookFailure(pending, "a prior result remained undelivered")) {
         ctx.ui.notify("Agent Bridge still cannot recover the previous Pi result.", "warning");
@@ -309,6 +388,7 @@ export default function (pi) {
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
+    inputCandidate = undefined;
     stopCancelTimer();
     if (!pending) return;
     const payload = pending;
@@ -329,6 +409,7 @@ export default function (pi) {
     usage = undefined;
   });
   pi.on("session_shutdown", () => {
+    inputCandidate = undefined;
     stopCancelTimer();
     activeClaimToken = undefined;
     activePromptCorrelated = false;
