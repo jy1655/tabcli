@@ -2,6 +2,160 @@ use super::*;
 use crate::native::session::{CoreRecord, SessionState, update_status};
 use std::fs;
 
+#[test]
+fn pending_turn_without_windows_input_preserves_the_legacy_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_unchecked(directory.path());
+    let pending = super::test_support::claim_pending_turn(directory.path());
+    let expected = serde_json::json!({
+        "schema": 1,
+        "claim_token": pending.claim_token,
+        "marker": format!("<!-- agent-bridge-pi-turn:{} -->", pending.claim_token),
+    });
+    let written: serde_json::Value = store.private(PENDING_TURN_FILE).json().unwrap();
+    assert_eq!(written, expected);
+    assert!(pending.windows_input.is_none());
+
+    store
+        .private(PENDING_TURN_FILE)
+        .write_json(&expected)
+        .unwrap();
+    let read = read_pending_turn(directory.path()).unwrap().unwrap();
+    assert_eq!(read.schema, 1);
+    assert_eq!(read.claim_token, pending.claim_token);
+    assert_eq!(read.marker, pending.marker);
+    assert!(read.windows_input.is_none());
+}
+
+#[test]
+fn pending_turn_windows_fingerprint_round_trips_without_changing_core_or_legacy_fields() {
+    #[derive(serde::Deserialize)]
+    struct LegacyPendingPiTurn {
+        schema: u32,
+        claim_token: String,
+        marker: String,
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_unchecked(directory.path());
+    let pending = super::test_support::claim_pending_turn(directory.path());
+    update_status(directory.path(), SessionState::Working, None, None).unwrap();
+    let claim_before = fs::read(store.record(CoreRecord::TurnClaim).path()).unwrap();
+    let status_before = fs::read(store.record(CoreRecord::Status).path()).unwrap();
+    let surface = serde_json::from_value(
+        serde_json::json!({"terminal":"windows-console", "session_id":"surface"}),
+    )
+    .unwrap();
+    let mut context = super::super::transport_test_context(
+        directory.path(),
+        &surface,
+        delivery::TurnKind::Initial,
+    );
+    context.claim_token = &pending.claim_token;
+    context.prompt = "synthetic 한글 😀\t\nrequest";
+    let framed = input::prepare_windows(&context, true).unwrap();
+    let fingerprint = input::Fingerprint::of(&framed);
+    let written: serde_json::Value = store.private(PENDING_TURN_FILE).json().unwrap();
+    assert_eq!(
+        written,
+        serde_json::json!({
+            "schema": 1,
+            "claim_token": pending.claim_token,
+            "marker": pending.marker,
+            "windows_input": fingerprint,
+        })
+    );
+    assert!(
+        fs::metadata(store.private(PENDING_TURN_FILE).path())
+            .unwrap()
+            .len()
+            <= 4096
+    );
+    let read = read_pending_turn(directory.path()).unwrap().unwrap();
+    assert_eq!(read.windows_input.as_ref(), Some(&fingerprint));
+    let legacy: LegacyPendingPiTurn = store.private(PENDING_TURN_FILE).json().unwrap();
+    assert_eq!(legacy.schema, 1);
+    assert_eq!(legacy.claim_token, pending.claim_token);
+    assert_eq!(legacy.marker, pending.marker);
+    assert_eq!(
+        fs::read(store.record(CoreRecord::TurnClaim).path()).unwrap(),
+        claim_before
+    );
+    assert_eq!(
+        fs::read(store.record(CoreRecord::Status).path()).unwrap(),
+        status_before
+    );
+}
+
+#[test]
+fn pending_turn_reader_rejects_invalid_identity_in_legacy_and_extended_records() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_unchecked(directory.path());
+    let pending = super::test_support::claim_pending_turn(directory.path());
+    for fingerprint in [
+        None,
+        Some(input::Fingerprint::of("synthetic framed prompt")),
+    ] {
+        install_pending_turn_bound(directory.path(), &pending.claim_token, fingerprint).unwrap();
+        let valid: serde_json::Value = store.private(PENDING_TURN_FILE).json().unwrap();
+        assert!(read_pending_turn(directory.path()).unwrap().is_some());
+        for (field, replacement) in [
+            ("schema", serde_json::json!(0)),
+            ("schema", serde_json::json!(2)),
+            ("claim_token", serde_json::json!("../invalid")),
+            ("claim_token", serde_json::json!("1".repeat(161))),
+            ("claim_token", serde_json::json!("1-2-3")),
+            ("marker", serde_json::json!("unrelated marker")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = replacement;
+            store
+                .private(PENDING_TURN_FILE)
+                .write_json(&invalid)
+                .unwrap();
+            assert!(read_pending_turn(directory.path()).is_err(), "{invalid}");
+        }
+    }
+}
+
+#[test]
+fn pending_turn_reader_bounds_and_validates_the_optional_windows_fingerprint() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_unchecked(directory.path());
+    let pending = super::test_support::claim_pending_turn(directory.path());
+    install_pending_turn_bound(
+        directory.path(),
+        &pending.claim_token,
+        Some(input::Fingerprint::of("synthetic framed prompt")),
+    )
+    .unwrap();
+    let valid: serde_json::Value = store.private(PENDING_TURN_FILE).json().unwrap();
+    for (field, replacement) in [
+        ("sha256", serde_json::json!("a".repeat(63))),
+        ("sha256", serde_json::json!("A".repeat(64))),
+        ("utf8_bytes", serde_json::json!(0)),
+        ("utf8_bytes", serde_json::json!(9_007_199_254_740_992_u64)),
+        ("utf8_bytes", serde_json::json!("1")),
+        ("extra", serde_json::json!(true)),
+    ] {
+        let mut invalid = valid.clone();
+        invalid["windows_input"][field] = replacement;
+        store
+            .private(PENDING_TURN_FILE)
+            .write_json(&invalid)
+            .unwrap();
+        assert!(read_pending_turn(directory.path()).is_err(), "{invalid}");
+    }
+    let mut oversized = serde_json::to_vec(&valid).unwrap();
+    oversized.resize(4097, b' ');
+    store.private(PENDING_TURN_FILE).remove().unwrap();
+    store
+        .private(PENDING_TURN_FILE)
+        .write_private(&oversized)
+        .unwrap();
+    assert!(read_pending_turn(directory.path()).is_err());
+}
+
 #[cfg(windows)]
 fn delivery_without_pi_event(initial: bool) {
     use crate::native::delivery::{DeliveryContext, Turn, deliver_with, test_support::Fixture};
