@@ -448,6 +448,14 @@ surface is not probed. At most two result events are decoded per listed session:
 published event and the active request's published event when they differ. Result bodies are
 not returned.
 
+For Codex, status also reads at most one optional 64 KiB question record per listed session,
+under its existing budget. Attention `question_emitted` means that record has emissions for
+the active request, or for the request behind the latest published result when no claim exists.
+A claim without a readable receipt has no question focus. Closed sessions have no
+`question_emitted` attention. Changing focus does not resolve an older emission.
+`question_observation` is present only as `incomplete` or `unreadable`; unreadable evidence
+also adds `records_partially_unreadable`. Question content is in `result --request`.
+
 A required-record failure omits that session and adds its id and reason to `incomplete_reasons`.
 Unreadable hold, owner or terminal records, reopen history, latest events, or request indexes leave
 the session in the list with attention flags. Fields whose evidence could not be read stay
@@ -517,6 +525,11 @@ The default inspection also reports `held` as true, false, or null with `hold_er
 Timeline does not include hold history. The default inspection adds `origin` and
 `origin_observation` as in `status`; the timeline has no origin entry.
 
+For Codex, ordinary JSON inspection adds `question_emitted: true` to a request reference
+when retained emissions exist. It adds `question_observation` only as `incomplete` or
+`unreadable`. This reads at most one optional 64 KiB record per request. Retrieve content
+with `result SESSION --request REQUEST --json`. Timeline output does not include emissions.
+
 Timeline output groups request summaries and recorded evidence. Derived request summaries carry
 `derived_from: "result"`; session diagnostics remain separate from request entries.
 
@@ -563,8 +576,32 @@ including older events with no receipt. `--request` follows the receipt of that 
 `--wait` defaults to off and requires `--request`; waiting for an unspecified latest turn is
 refused. `--timeout-secs` requires `--wait` and defaults to 900 seconds.
 
+An ordinary single Codex result can include `question_emissions` while the request is still
+`pending`, and retains them after completion or close. Each item has the provider's `id`
+and `questions`, whose `title` and optional `options` preserve the provider's strings.
+Free-text questions use `options: null`. For example:
+
+```json
+{"question_emissions": [{"id": "call_example", "questions": [
+  {"title": "Which report format?", "options": ["Text", "Table"]}
+]}]}
+```
+
+Only a request that Bridge bound through its injected Codex hooks can have this evidence.
+An unbound request settled through notify cannot have it.
+
+These fields report emission, without changing request state, result text, or exit status.
+`question_observation: "incomplete"` means Bridge retained a limited prefix or rejected
+optional evidence. `"unreadable"` means the retained record could not be validated.
+Absence of either field is unknown; it does not prove that no question existed.
+After the session becomes `ready`, `tell` can carry a known fact as another request. It
+does not resolve the earlier emission. `ask`, `tell`, `wait`, `result --wait`, `result --list`,
+timeline, and context attachments retain their output and waiting behavior. Bridge has no
+transport that answers a question, and an emission does not end `wait` or `result --wait` early.
+
 Human output gives session, request when available, request state, Bridge-observed elapsed time,
-one usage line when the provider reported usage, result text, and error. List rows show event id,
+one usage line when the provider reported usage, each emitted question title and its options
+with control characters escaped, result text, and error. List rows show event id,
 request state, request id or `legacy`, and elapsed time. See the
 [JSON field reference](#json-field-reference).
 
@@ -1513,6 +1550,10 @@ carry the same usage fields. A record written by this version can carry `usage` 
 `usage_error`; an older `tabcli` reading the same session drops them and would treat a still
 journaled completion as not published, so do not downgrade `tabcli` while a session it has
 written is open.
+
+Ordinary single-result JSON can also have `question_emissions` and `question_observation`,
+as described in [result](#result). These optional fields are omitted from waited and listed
+results and do not alter the completion event or journal schema.
 
 ### wait
 

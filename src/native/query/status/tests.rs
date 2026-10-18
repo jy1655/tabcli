@@ -51,6 +51,7 @@ fn in_memory(records: Snapshot) -> StatusObservation {
         },
         active: None,
         latest: Ok(Value::Null),
+        questions: None,
     }
 }
 

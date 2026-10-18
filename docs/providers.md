@@ -218,6 +218,28 @@ truncation or malformed evidence suspends observation and leaves the claim pendi
 falls back to notify for a bound claim. Replace this polling reader when Codex supplies an
 addressed first-party terminal signal with equivalent identity and settlement semantics.
 
+The same watcher observes Codex's emitted async questions from completed `AgentMessage`
+items attributed to the bound turn, after it verifies accepted framed input. Only requests
+bound through Bridge's injected Codex hooks can have this evidence; unbound, notify-settled
+claims cannot. The optional `codex-questions-<claim>.json` retains an ordered prefix within
+64 KiB of serialized JSON.
+Duplicate ids keep their first content; conflicting or invalid items and the size limit mark
+known incompleteness. Storage failures can lose optional evidence, including at completion.
+They do not block the ordinary result. No record is backfilled after the claim ends.
+
+Ordinary `result` exposes `question_emissions` during the turn and afterward. `status`
+reports presence for its active or latest-result request, and ordinary `inspect` reports
+per-request presence. Absence is unknown. Emission never means that a question is still
+pending or has been answered. A Ready `tell` is a new request, without a resolution receipt.
+Codex registers the tool only for a root session with its question configuration on and a
+model whose catalog offers it. Codex keeps the item only under its paginated rollout history;
+its legacy history policy can omit it. Bridge does not infer support from a version,
+parse question-shaped prose, or accept a raw `function_call` as emission evidence.
+Replace this transcript fallback when the same managed TUI exposes a verified official
+addressed question event or lifecycle. Answer handling and parent wake remain deferred.
+Component verification is recorded in
+[the focused verification note](verification/2026-10-19-codex-question-emissions.md).
+
 Unbound claims retain the `notify` fallback: Bridge accepts an assistant result ending with
 the pending marker, or a completion whose string input begins with the delegation header and
 ends with that marker. A steered TUI input may follow Bridge's prompt; the answer serves both.
