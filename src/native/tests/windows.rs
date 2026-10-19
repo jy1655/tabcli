@@ -11,7 +11,7 @@ use crate::native::session::primitives::STATE_DIR_ENV;
 use crate::native::session::primitives::{
     default_state_root, read_json, write_json_atomic, write_private,
 };
-use crate::native::{parse_args, process_env, provider, provider_process, terminal};
+use crate::native::{process_env, provider, provider_process, terminal};
 use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
