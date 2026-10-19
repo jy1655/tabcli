@@ -174,3 +174,24 @@ Authenticated macOS runtime, its Automation prompts and live TTY ownership, and 
 Windows Terminal startup are not verified by these runs. Linux managed sessions are
 unsupported. CI, release packaging, and published-asset checks are separate from this
 local matrix and must not be inferred from it.
+
+## Main CI completion-record recovery, October 20
+
+PR #265 merged as `3ce788207018816be4f164420ba5ba0cbcfd1de2`, with exactly the
+reviewed tree and all six PR checks successful in run `39273026679`. Its exact-main
+push CI was run `39275683672`. Both platform archives passed checksum, member, license
+and notices checks, and the Windows executable reported 0.4.21.
+
+The Windows job's downloaded log reports 1,185 passed, zero failed and five ignored,
+then completes its post-job cleanup at 2026-10-19 15:30:36 UTC. Afterward GitHub kept
+reporting that job and run as in progress, with a null conclusion; the job's steps became
+empty and the job-list endpoint intermittently returned HTTP 502. Cancellation replied
+that the run was already completed; force-cancellation replied that it was not in
+progress (HTTP 409); both CLI and REST rerun requests said it was already running
+(HTTP 403). These responses do not establish a successful CI conclusion.
+
+The original log, API observations and rejected recovery requests are preserved privately.
+This documentation checkpoint starts a fresh PR and main-push validation path, with
+product source, tests, dependencies, version and workflows unchanged. No tag or release
+was created from the inconsistent run. Final publication still requires all six checks
+and a successful CI conclusion for the exact main commit that receives the tag.
