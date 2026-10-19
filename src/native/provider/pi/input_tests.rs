@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use super::test_support::InputScenario;
 use super::*;
 use crate::native::session::{CoreRecord, SessionState, update_status};
 use std::fs;
@@ -158,8 +160,7 @@ fn pending_turn_reader_bounds_and_validates_the_optional_windows_fingerprint() {
 
 #[cfg(windows)]
 fn delivery_without_pi_event(initial: bool) {
-    use crate::native::delivery::{DeliveryContext, Turn, deliver_with, test_support::Fixture};
-    use std::{cell::Cell, rc::Rc};
+    use crate::native::delivery::test_support::Fixture;
     let fixture = Fixture::new();
     let claim = fixture.claim(initial);
     let token = claim.token().to_owned();
@@ -172,53 +173,35 @@ fn delivery_without_pi_event(initial: bool) {
             "input_ack_schema": 1,
         }))
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
     let expected = terminal_correlated_prompt(
-        "prompt",
+        if initial {
+            "prompt"
+        } else {
+            "synthetic request"
+        },
         &read_pending_turn(fixture.store.directory())
             .unwrap()
             .unwrap(),
         true,
     )
     .unwrap();
-    let sends = Rc::new(Cell::new(0));
-    let count = sends.clone();
-    let result = super::test_support::with_console_send(
-        Box::new(move |path| {
-            count.set(count.get() + 1);
-            assert!(
-                Instant::now() < deadline,
-                "setup exhausted the input deadline"
-            );
-            let frame = fs::read_to_string(path).unwrap();
-            assert_eq!(frame, expected);
-            assert!(frame.contains("agent-bridge-pi-turn:"));
-            assert!(!frame.contains('\n'));
-            Ok(())
-        }),
-        || {
-            let mut gate = |_| Ok(());
-            deliver_with(
-                claim,
-                if initial {
-                    Turn::Initial { gate: &mut gate }
-                } else {
-                    Turn::FollowUp { prompt: "prompt" }
-                },
-                DeliveryContext {
-                    deadline,
-                    ..fixture.context()
-                },
-                if initial { &PiInitialPaste } else { &PiPaste },
-                &fixture.checks,
-            )
-        },
-    );
+    let mut scenario = InputScenario::new(move |path| {
+        let frame = fs::read_to_string(path).unwrap();
+        assert_eq!(frame, expected);
+        assert!(frame.contains("agent-bridge-pi-turn:"));
+        assert!(!frame.contains('\n'));
+        Ok(())
+    });
+    scenario
+        .clock
+        .shared()
+        .set(scenario.deadline - Duration::from_millis(100));
+    let result = deliver_pi(&fixture, claim, initial, &mut scenario);
     assert_eq!(
-        sends.get(),
-        1,
+        scenario.sends, 1,
         "the missing-receipt path requires console dispatch"
     );
+    assert_eq!(scenario.clock.slept, Duration::from_millis(100));
     assert!(
         result.is_err(),
         "console batch success alone must remain Uncertain, got {result:?}"
@@ -433,8 +416,19 @@ fn deliver_pi(
     fixture: &delivery::test_support::Fixture,
     claim: turn::Claim,
     initial: bool,
+    scenario: &mut InputScenario,
 ) -> Result<delivery::Delivered> {
     let mut gate = |_| Ok(());
+    let deadline = scenario.deadline;
+    let transport: Box<dyn Transport + '_> = if initial {
+        Box::new(PiInitialPaste {
+            input: RefCell::new(scenario),
+        })
+    } else {
+        Box::new(PiPaste {
+            input: RefCell::new(scenario),
+        })
+    };
     delivery::deliver_with(
         claim,
         if initial {
@@ -444,8 +438,11 @@ fn deliver_pi(
                 prompt: "synthetic request",
             }
         },
-        fixture.context(),
-        if initial { &PiInitialPaste } else { &PiPaste },
+        delivery::DeliveryContext {
+            deadline,
+            ..fixture.context()
+        },
+        transport.as_ref(),
         &fixture.checks,
     )
 }
@@ -481,8 +478,33 @@ fn publish_receipt(directory: &Path, token: &str, prompt: &str) {
 
 #[test]
 #[cfg(windows)]
+fn initial_transport_rechecks_startup_before_input_receipt_delivery() {
+    let fixture = delivery::test_support::Fixture::new();
+    let claim = fixture.claim(true);
+    let token = claim.token().to_owned();
+    install_pending_turn(fixture.store.directory(), &token).unwrap();
+    write_ready(&fixture.store, &token, 2, Some(1));
+    let directory = fixture.store.directory().to_owned();
+    // Preparation succeeds, then its startup correlation disappears before the
+    // actual PiInitialPaste::send. The input capability alone must not skip the
+    // initial readiness gate, even though the core Claim and startup receipt match.
+    *fixture.checks.before_begin.borrow_mut() = Some(Box::new(move || {
+        Store::open_unchecked(&directory)
+            .private(PENDING_TURN_FILE)
+            .remove()
+            .unwrap();
+    }));
+    let mut scenario = InputScenario::new(|_| panic!("initial readiness was bypassed"));
+    let error = deliver_pi(&fixture, claim, true, &mut scenario).unwrap_err();
+    assert!(format!("{error:#}").contains("Pi initial turn is missing"));
+    assert_eq!(scenario.sends, 0);
+    assert_eq!(scenario.reads, 0);
+    assert!(turn::current_claim_token(&fixture.store).unwrap().is_none());
+}
+
+#[test]
+#[cfg(windows)]
 fn input_ack_legacy_or_unknown_capability_refuses_both_transports_before_input() {
-    use std::{cell::Cell, rc::Rc};
     for initial in [true, false] {
         for (schema, capability) in [(1, None), (2, None), (2, Some(2))] {
             let fixture = delivery::test_support::Fixture::new();
@@ -490,18 +512,10 @@ fn input_ack_legacy_or_unknown_capability_refuses_both_transports_before_input()
             let token = claim.token().to_owned();
             install_pending_turn(fixture.store.directory(), &token).unwrap();
             write_ready(&fixture.store, &token, schema, capability);
-            let calls = Rc::new(Cell::new(0));
-            let count = calls.clone();
-            let error = super::test_support::with_console_send(
-                Box::new(move |_| {
-                    count.set(count.get() + 1);
-                    Ok(())
-                }),
-                || deliver_pi(&fixture, claim, initial),
-            )
-            .unwrap_err();
+            let mut scenario = InputScenario::new(|_| Ok(()));
+            let error = deliver_pi(&fixture, claim, initial, &mut scenario).unwrap_err();
             assert!(format!("{error:#}").contains("start a new Bridge session"));
-            assert_eq!(calls.get(), 0);
+            assert_eq!(scenario.sends, 0);
             assert!(turn::current_claim_token(&fixture.store).unwrap().is_none());
         }
     }
@@ -516,16 +530,16 @@ fn input_ack_proven_prewrite_refusal_rolls_back_without_waiting() {
         let token = claim.token().to_owned();
         install_pending_turn(fixture.store.directory(), &token).unwrap();
         write_ready(&fixture.store, &token, 2, Some(1));
-        let error = super::test_support::with_console_send(
-            Box::new(|_| {
-                Err(terminal::TerminalSendFailure::not_sent(anyhow::anyhow!(
-                    "prewrite refusal"
-                )))
-            }),
-            || deliver_pi(&fixture, claim, initial),
-        )
-        .unwrap_err();
+        let mut scenario = InputScenario::new(|_| {
+            Err(terminal::TerminalSendFailure::not_sent(anyhow::anyhow!(
+                "prewrite refusal"
+            )))
+        });
+        let error = deliver_pi(&fixture, claim, initial, &mut scenario).unwrap_err();
         assert!(format!("{error:#}").contains("prewrite refusal"));
+        assert_eq!(scenario.sends, 1);
+        assert_eq!(scenario.reads, 0);
+        assert_eq!(scenario.clock.slept, Duration::ZERO);
         assert!(turn::current_claim_token(&fixture.store).unwrap().is_none());
         assert_eq!(
             fixture.store.private(PENDING_TURN_FILE).path().exists(),
@@ -545,32 +559,31 @@ fn input_ack_fast_completion_and_next_claim_preserve_the_first_senders_receipt()
         write_ready(&fixture.store, &token, 2, Some(1));
         let directory = fixture.store.directory().to_owned();
         let first = token.clone();
-        super::test_support::with_console_send(
-            Box::new(move |path| {
-                let prompt = fs::read_to_string(path).unwrap();
-                publish_receipt(&directory, &first, &prompt);
-                let store = Store::open_unchecked(&directory);
-                turn::Report::for_claim(&store, FirstPartyCli::Pi, Some(&first))
-                    .complete("done", None, None)
-                    .unwrap();
-                let next = turn::claim_ready(&store, "session-test", &[]).unwrap().0;
-                let surface = serde_json::from_value(
-                    serde_json::json!({"terminal":"windows-console", "session_id":"surface"}),
-                )
+        let mut scenario = InputScenario::new(move |path| {
+            let prompt = fs::read_to_string(path).unwrap();
+            publish_receipt(&directory, &first, &prompt);
+            let store = Store::open_unchecked(&directory);
+            turn::Report::for_claim(&store, FirstPartyCli::Pi, Some(&first))
+                .complete("done", None, None)
                 .unwrap();
-                let mut turn = super::super::transport_test_context(
-                    &directory,
-                    &surface,
-                    delivery::TurnKind::FollowUp,
-                );
-                turn.claim_token = next.token();
-                input::prepare_windows(&turn, false).unwrap();
-                next.retain();
-                Ok(())
-            }),
-            || deliver_pi(&fixture, claim, initial),
-        )
-        .unwrap();
+            let next = turn::claim_ready(&store, "session-test", &[]).unwrap().0;
+            let surface = serde_json::from_value(
+                serde_json::json!({"terminal":"windows-console", "session_id":"surface"}),
+            )
+            .unwrap();
+            let mut turn = super::super::transport_test_context(
+                &directory,
+                &surface,
+                delivery::TurnKind::FollowUp,
+            );
+            turn.claim_token = next.token();
+            input::prepare_windows(&turn, false).unwrap();
+            next.retain();
+            Ok(())
+        });
+        deliver_pi(&fixture, claim, initial, &mut scenario).unwrap();
+        assert_eq!(scenario.sends, 1);
+        assert_eq!(scenario.reads, 1);
         let next = turn::current_claim_token(&fixture.store).unwrap().unwrap();
         assert_ne!(next, token);
         assert_eq!(
@@ -610,7 +623,6 @@ fn input_ack_fast_completion_and_next_claim_preserve_the_first_senders_receipt()
 #[test]
 #[cfg(windows)]
 fn input_ack_close_rechecks_the_receipt_once_before_reporting_uncertainty() {
-    use std::{cell::Cell, rc::Rc};
     for late_receipt in [false, true] {
         let fixture = delivery::test_support::Fixture::new();
         let claim = fixture.claim(false);
@@ -620,34 +632,27 @@ fn input_ack_close_rechecks_the_receipt_once_before_reporting_uncertainty() {
         let closed_directory = directory.clone();
         let receipt_directory = directory.clone();
         let receipt_token = token.clone();
-        let reads = Rc::new(Cell::new(0));
-        let count = reads.clone();
-        let result = super::test_support::with_receipt_hooks(
-            Some(Box::new(move || count.set(count.get() + 1))),
-            Some(Box::new(move || {
-                if late_receipt {
-                    let pending = read_pending_turn(&receipt_directory).unwrap().unwrap();
-                    let prompt =
-                        terminal_correlated_prompt("synthetic request", &pending, true).unwrap();
-                    publish_receipt(&receipt_directory, &receipt_token, &prompt);
-                }
-            })),
-            || {
-                super::test_support::with_console_send(
-                    Box::new(move |_| {
-                        update_status(&closed_directory, SessionState::Closed, None, None).unwrap();
-                        Ok(())
-                    }),
-                    || deliver_pi(&fixture, claim, false),
-                )
-            },
-        );
+        let mut scenario = InputScenario::new(move |_| {
+            update_status(&closed_directory, SessionState::Closed, None, None).unwrap();
+            Ok(())
+        });
+        scenario.current = Some(Box::new(move |turn| {
+            let observation = input::current(turn);
+            if observation.is_err() && late_receipt {
+                let pending = read_pending_turn(&receipt_directory).unwrap().unwrap();
+                let prompt =
+                    terminal_correlated_prompt("synthetic request", &pending, true).unwrap();
+                publish_receipt(&receipt_directory, &receipt_token, &prompt);
+            }
+            observation
+        }));
+        let result = deliver_pi(&fixture, claim, false, &mut scenario);
         assert_eq!(result.is_ok(), late_receipt);
         assert_eq!(
-            reads.get(),
-            2,
+            scenario.reads, 2,
             "read once before observing close and once after"
         );
+        assert_eq!(scenario.sends, 1);
         assert_eq!(fixture.store.status().unwrap().state, SessionState::Closed);
     }
 }
@@ -677,52 +682,51 @@ fn input_ack_invalid_receipts_are_uncertain_and_never_roll_back_dispatched_input
         write_ready(&fixture.store, &token, 2, Some(1));
         let directory = fixture.store.directory().to_owned();
         let receipt_token = token.clone();
-        let outcome = super::test_support::with_console_send(
-            Box::new(move |path| {
-                let prompt = fs::read_to_string(path).unwrap();
-                let store = Store::open_unchecked(&directory);
-                let record = store.private(&format!("pi-input-accepted-{receipt_token}.json"));
-                let mut value = receipt_value(&receipt_token, &prompt);
-                match kind {
-                    "wrong_digest" => value["prompt_sha256"] = serde_json::json!("0".repeat(64)),
-                    "wrong_claim" => value["claim_token"] = serde_json::json!("1-2-3"),
-                    "wrong_length" => value["prompt_utf8_bytes"] = serde_json::json!(1),
-                    "wrong_signal" => value["signal"] = serde_json::json!("before_agent_start"),
-                    "wrong_schema" => value["schema"] = serde_json::json!(2),
-                    "unknown_field" => value["extra"] = serde_json::json!(true),
-                    "bad_id" => value["session_id"] = serde_json::json!("pi\n"),
-                    "bad_id_type" => value["session_id"] = serde_json::json!(7),
-                    "bad_length_type" => value["prompt_utf8_bytes"] = serde_json::json!("100"),
-                    "json" => {
-                        record.write_private(b"{").unwrap();
-                        return Ok(());
-                    }
-                    "utf8" => {
-                        record.write_private(&[0xff]).unwrap();
-                        return Ok(());
-                    }
-                    "oversized" => {
-                        record.write_private(&[b' '; 4097]).unwrap();
-                        return Ok(());
-                    }
-                    "directory" => {
-                        fs::create_dir(record.path()).unwrap();
-                        return Ok(());
-                    }
-                    _ => {}
+        let mut scenario = InputScenario::new(move |path| {
+            let prompt = fs::read_to_string(path).unwrap();
+            let store = Store::open_unchecked(&directory);
+            let record = store.private(&format!("pi-input-accepted-{receipt_token}.json"));
+            let mut value = receipt_value(&receipt_token, &prompt);
+            match kind {
+                "wrong_digest" => value["prompt_sha256"] = serde_json::json!("0".repeat(64)),
+                "wrong_claim" => value["claim_token"] = serde_json::json!("1-2-3"),
+                "wrong_length" => value["prompt_utf8_bytes"] = serde_json::json!(1),
+                "wrong_signal" => value["signal"] = serde_json::json!("before_agent_start"),
+                "wrong_schema" => value["schema"] = serde_json::json!(2),
+                "unknown_field" => value["extra"] = serde_json::json!(true),
+                "bad_id" => value["session_id"] = serde_json::json!("pi\n"),
+                "bad_id_type" => value["session_id"] = serde_json::json!(7),
+                "bad_length_type" => value["prompt_utf8_bytes"] = serde_json::json!("100"),
+                "json" => {
+                    record.write_private(b"{").unwrap();
+                    return Ok(());
                 }
-                record.write_json(&value).unwrap();
-                if kind == "uncertain_write" {
-                    Err(terminal::TerminalSendFailure::delivery_uncertain(
-                        anyhow::anyhow!("write outcome unknown"),
-                    ))
-                } else {
-                    Ok(())
+                "utf8" => {
+                    record.write_private(&[0xff]).unwrap();
+                    return Ok(());
                 }
-            }),
-            || deliver_pi(&fixture, claim, false),
-        );
+                "oversized" => {
+                    record.write_private(&[b' '; 4097]).unwrap();
+                    return Ok(());
+                }
+                "directory" => {
+                    fs::create_dir(record.path()).unwrap();
+                    return Ok(());
+                }
+                _ => {}
+            }
+            record.write_json(&value).unwrap();
+            if kind == "uncertain_write" {
+                Err(terminal::TerminalSendFailure::delivery_uncertain(
+                    anyhow::anyhow!("write outcome unknown"),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        let outcome = deliver_pi(&fixture, claim, false, &mut scenario);
         assert_eq!(outcome.is_ok(), kind == "uncertain_write", "{kind}");
+        assert_eq!(scenario.sends, 1);
         assert_eq!(
             turn::current_claim_token(&fixture.store)
                 .unwrap()
@@ -746,7 +750,6 @@ fn input_ack_invalid_receipts_are_uncertain_and_never_roll_back_dispatched_input
 #[test]
 #[cfg(windows)]
 fn input_ack_receipt_observed_after_the_original_deadline_cannot_report_sent() {
-    use std::{cell::Cell, rc::Rc};
     let fixture = delivery::test_support::Fixture::new();
     let claim = fixture.claim(false);
     let token = claim.token().to_owned();
@@ -759,62 +762,26 @@ fn input_ack_receipt_observed_after_the_original_deadline_cannot_report_sent() {
     )
     .unwrap();
     let receipt_token = token.clone();
-    let sends = Rc::new(Cell::new(0));
-    let count = sends.clone();
-    let reads = Rc::new(Cell::new(0));
-    let read_count = reads.clone();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let result = super::test_support::with_receipt_hooks(
-        Some(Box::new(move || {
-            read_count.set(read_count.get() + 1);
-            assert!(
-                Instant::now() < deadline,
-                "setup exhausted the input deadline"
-            );
-            std::thread::sleep(
-                deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
-            );
-            assert!(Instant::now() >= deadline);
-        })),
-        None,
-        || {
-            super::test_support::with_console_send(
-                Box::new(move |path| {
-                    count.set(count.get() + 1);
-                    assert!(
-                        Instant::now() < deadline,
-                        "setup exhausted the input deadline"
-                    );
-                    let frame = fs::read_to_string(path).unwrap();
-                    assert_eq!(frame, expected);
-                    publish_receipt(&directory, &receipt_token, &frame);
-                    Ok(())
-                }),
-                || {
-                    delivery::deliver_with(
-                        claim,
-                        delivery::Turn::FollowUp {
-                            prompt: "synthetic request",
-                        },
-                        delivery::DeliveryContext {
-                            deadline,
-                            ..fixture.context()
-                        },
-                        &PiPaste,
-                        &fixture.checks,
-                    )
-                },
-            )
-        },
-    );
+    let mut scenario = InputScenario::new(move |path| {
+        let frame = fs::read_to_string(path).unwrap();
+        assert_eq!(frame, expected);
+        publish_receipt(&directory, &receipt_token, &frame);
+        Ok(())
+    });
+    let now = scenario.clock.shared();
+    let deadline = scenario.deadline;
+    scenario.receipt = Some(Box::new(move |turn, fingerprint| {
+        let receipt = input::read_accepted(turn.directory, turn.claim_token, fingerprint);
+        now.set(deadline + Duration::from_millis(1));
+        receipt
+    }));
+    let result = deliver_pi(&fixture, claim, false, &mut scenario);
     assert_eq!(
-        sends.get(),
-        1,
+        scenario.sends, 1,
         "the late-receipt path requires console dispatch"
     );
     assert_eq!(
-        reads.get(),
-        1,
+        scenario.reads, 1,
         "the matching receipt crosses the deadline while read"
     );
     assert!(

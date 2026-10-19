@@ -405,13 +405,22 @@ fn unrelated_provider_routes_keep_send_file_and_single_return_facts() {
             1
         );
     }
-    for source in [
-        include_str!("../../../agy/mod.rs"),
-        include_str!("../../../pi/mod.rs"),
+    for (source, console_source, dispatch) in [
+        (
+            include_str!("../../../agy/mod.rs"),
+            include_str!("../../../agy/mod.rs"),
+            "terminal::send_file(session, prompt_path, deadline)",
+        ),
+        (
+            include_str!("../../../pi/mod.rs"),
+            include_str!("../../../pi/input.rs"),
+            "terminal::send_file(turn.surface, path, turn.deadline)",
+        ),
     ] {
-        assert!(source.contains("terminal::send_file(session, prompt_path, deadline)"));
+        assert!(console_source.contains(dispatch));
         assert!(source.contains("submit_count: 1"));
         assert!(!source.contains("send_file_text_only"));
+        assert!(!console_source.contains("send_file_text_only"));
     }
 }
 

@@ -93,11 +93,21 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   the `Checks` so the tail is tested at its own interface with the shared fake Transport.
 - `src/native/turn_report.rs` keeps `TurnReport`: address-aware failure finishing. Callers call
   `TurnReport::finish` outside the Turn run, with their own extra fields.
+- `src/native/session_start.rs` owns the original start deadline and the Initial prompt
+  operation for an already prepared Session. Fresh and Reopen resolution and creation finish
+  before that operation; their explicit `InitialSource` implementations supply result fields,
+  holder gates, and phase-specific failure handling. Consent failure remains separate from
+  launcher and Delivery failures.
 - `src/native/reopen.rs` owns Reopen source reservations, provenance, launch refusals,
   and their settlement, including read-only marker diagnostics. Session owns the refusal record
-  shape. Reopen creates the new Session
-  and records its provenance before finalizing the source marker. Launch and delivery keep
-  their existing holder-check timing; provider adapters supply the holder evidence.
+  shape. Reopen creates the new Session and records its provenance before finalizing the source
+  marker. The resulting `ReopenAttempt` owns settlement after the Initial prompt operation,
+  including failures before a Request address exists. Launch and delivery keep their existing
+  holder-check timing; provider adapters supply the holder evidence.
+  `reopen/marker.rs` observes the marker, its named Session and refused-launch cleanup once,
+  then maps that Judgment to command eligibility or doctor diagnostics. Only these callers
+  request the cross-session observation. The command repeats it under the source lock before
+  replacing a stale marker; doctor never acquires mutation authority.
 - `src/providers/` defines the CLI identities, minimum versions, and model, effort, and bypass
   argument mappings. The native adapters call these mappings when they build their complete
   command; shared launch code no longer does.
@@ -113,6 +123,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   the `message-guard` and `message-receipt` controls) is its own module under `claude/`, built
   per send from a clock and a retry policy so that its timeout and retry tests inject both; the
   adapter keeps launch, resume, trust, hook completion, Reopen and doctor.
+  Pi's Windows input operation owns its receipt-first polling and final retirement recheck.
+  Its internal runtime supplies console dispatch, Record observations and the existing Clock;
+  tests substitute that runtime while retaining the real Record readers and delivery settlement.
   It uses the session seam and terminal operations. Keep provider schemas and transport selection
   in `src/native/provider/<provider>/` (or a single `<provider>.rs` file), not in shared
   orchestration.

@@ -34,22 +34,20 @@ impl Fingerprint {
 }
 
 #[cfg(any(windows, test))]
-use super::{PendingPiTurn, TurnContext};
+use super::PendingPiTurn;
+use super::TurnContext;
 #[cfg(windows)]
 use super::{Prepared, STARTUP_READY_FILE, StartupReady, turn};
+#[cfg(windows)]
+use crate::native::clock::{Clock, SystemClock};
 #[cfg(any(windows, test))]
 use crate::native::session::Reader;
-#[cfg(windows)]
 use crate::native::terminal;
 #[cfg(any(windows, test))]
 use anyhow::Context;
-#[cfg(any(windows, test))]
 use std::path::Path;
 #[cfg(windows)]
-use std::{
-    thread,
-    time::{Duration, Instant},
-};
+use std::time::Duration;
 
 #[cfg(any(windows, test))]
 pub(super) fn prepare_windows(turn: &TurnContext<'_>, initial: bool) -> Result<String> {
@@ -94,8 +92,6 @@ pub(super) fn read_accepted(
     fingerprint: &Fingerprint,
 ) -> Result<bool> {
     super::validate_claim_token(claim)?;
-    #[cfg(all(windows, test))]
-    super::test_support::before_receipt_read();
     let reader = Reader::open_unchecked(directory);
     let Some(bytes) = reader
         .private(&format!("pi-input-accepted-{claim}.json"))
@@ -117,7 +113,7 @@ pub(super) fn read_accepted(
 }
 
 #[cfg(windows)]
-fn current(turn: &TurnContext<'_>) -> Result<()> {
+pub(super) fn current(turn: &TurnContext<'_>) -> Result<()> {
     let reader = Reader::open_unchecked(turn.directory);
     if turn::current_claim_token(&reader)?.as_deref() != Some(turn.claim_token) {
         bail!("Pi turn claim retired or changed");
@@ -126,6 +122,50 @@ fn current(turn: &TurnContext<'_>) -> Result<()> {
         bail!("Pi session ended");
     }
     Ok(())
+}
+
+// Pi's input operation owns the ordering of observations. Its runtime supplies only
+// effects, so tests can move time or retire a Claim during an actual receipt read
+// without changing the protocol or installing thread-local test checkpoints.
+pub(super) trait Runtime {
+    #[cfg(windows)]
+    fn clock(&mut self) -> &mut dyn Clock;
+    fn send(&mut self, turn: &TurnContext<'_>, path: &Path) -> terminal::TerminalSendResult;
+    #[cfg(windows)]
+    fn accepted(&mut self, turn: &TurnContext<'_>, fingerprint: &Fingerprint) -> Result<bool>;
+    #[cfg(windows)]
+    fn current(&mut self, turn: &TurnContext<'_>) -> Result<()>;
+}
+
+#[cfg_attr(not(windows), derive(Default))]
+pub(super) struct Console {
+    #[cfg(windows)]
+    clock: SystemClock,
+}
+
+#[cfg(windows)]
+impl Default for Console {
+    fn default() -> Self {
+        Self { clock: SystemClock }
+    }
+}
+
+impl Runtime for Console {
+    #[cfg(windows)]
+    fn clock(&mut self) -> &mut dyn Clock {
+        &mut self.clock
+    }
+    fn send(&mut self, turn: &TurnContext<'_>, path: &Path) -> terminal::TerminalSendResult {
+        terminal::send_file(turn.surface, path, turn.deadline)
+    }
+    #[cfg(windows)]
+    fn accepted(&mut self, turn: &TurnContext<'_>, fingerprint: &Fingerprint) -> Result<bool> {
+        read_accepted(turn.directory, turn.claim_token, fingerprint)
+    }
+    #[cfg(windows)]
+    fn current(&mut self, turn: &TurnContext<'_>) -> Result<()> {
+        current(turn)
+    }
 }
 
 #[cfg(windows)]
@@ -143,9 +183,10 @@ pub(super) fn send_windows(
     turn: &TurnContext<'_>,
     prepared: &Prepared,
     path: &Path,
+    runtime: &mut impl Runtime,
 ) -> terminal::TerminalSendResult {
     let fingerprint = Fingerprint::of(&prepared.prompt);
-    let preflight = || -> Result<()> {
+    let mut preflight = || -> Result<()> {
         super::validate_claim_token(turn.claim_token)?;
         let reader = Reader::open_unchecked(turn.directory);
         let capability = (|| -> Result<()> {
@@ -164,40 +205,39 @@ pub(super) fn send_windows(
             Ok(())
         })();
         capability.context("this Pi session cannot acknowledge Windows input; start a new Bridge session; no console input was sent")?;
-        current(turn)?;
-        if Instant::now() >= turn.deadline {
+        runtime.current(turn)?;
+        if runtime.clock().now() >= turn.deadline {
             bail!("Pi input deadline expired before console input; nothing was sent");
         }
         Ok(())
     };
     preflight().map_err(terminal::TerminalSendFailure::not_sent)?;
-    if let Err(failure) = super::send_console_file(turn.surface, path, turn.deadline)
+    if let Err(failure) = runtime.send(turn, path)
         && !failure.delivery_may_have_occurred()
     {
         return Err(failure);
     }
     loop {
-        if Instant::now() >= turn.deadline {
+        if runtime.clock().now() >= turn.deadline {
             return unconfirmed("no matching agent_start receipt before the request deadline");
         }
-        match read_accepted(turn.directory, turn.claim_token, &fingerprint) {
-            Ok(true) if Instant::now() < turn.deadline => return Ok(()),
+        match runtime.accepted(turn, &fingerprint) {
+            Ok(true) if runtime.clock().now() < turn.deadline => return Ok(()),
             Ok(_) => {}
             Err(error) => return unconfirmed(error),
         }
-        if let Err(error) = current(turn) {
-            #[cfg(test)]
-            super::test_support::after_retirement();
-            return match read_accepted(turn.directory, turn.claim_token, &fingerprint) {
-                Ok(true) if Instant::now() < turn.deadline => Ok(()),
+        if let Err(error) = runtime.current(turn) {
+            return match runtime.accepted(turn, &fingerprint) {
+                Ok(true) if runtime.clock().now() < turn.deadline => Ok(()),
                 Ok(_) => unconfirmed(error),
                 Err(error) => unconfirmed(error),
             };
         }
-        thread::sleep(
-            turn.deadline
-                .saturating_duration_since(Instant::now())
-                .min(Duration::from_millis(50)),
-        );
+        let remaining = turn
+            .deadline
+            .saturating_duration_since(runtime.clock().now());
+        runtime
+            .clock()
+            .sleep(remaining.min(Duration::from_millis(50)));
     }
 }

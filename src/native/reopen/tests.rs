@@ -7,7 +7,7 @@ use crate::native::session::launch::wrapper::provision;
 use crate::native::session::launch::wrapper::record_provider_process;
 use crate::native::session::primitives::STATE_DIR_ENV;
 use crate::native::session::primitives::{
-    event_paths, read_json, read_manifest, remove_file_if_present, session_directory_in,
+    delegation_source, event_paths, read_json, read_manifest, remove_file_if_present,
     valid_event_file_name, write_json_atomic, write_private,
 };
 use crate::native::session::schema::{
@@ -1667,7 +1667,6 @@ fn a_later_tell_refusal_never_releases_the_marker_of_a_delivered_initial_prompt(
     let marker = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
     marker.finalize(new_id).unwrap();
     let marker_before = fs::read(source.join(REOPEN_MARKER_FILE)).unwrap();
-    let resolve = |id: &str| session_directory_in(root.path(), id);
 
     // Both launch-phase holder checks passed: the managed process registered alone.
     #[cfg(windows)]
@@ -1748,7 +1747,7 @@ fn a_later_tell_refusal_never_releases_the_marker_of_a_delivered_initial_prompt(
             "Claude initial cross-session delivery could not be confirmed; the turn remains claimed until completion or explicit close"
         )
     };
-    let (outcome, gate) = settle_reopen_outcome(resolve, source_id, new_id, Err(uncertain()));
+    let (outcome, gate) = settle_reopen_outcome(&source, &new, Err(uncertain()));
     assert_eq!(gate, None);
     assert_eq!(
         format!("{:#}", outcome.unwrap_err()),
@@ -1773,7 +1772,7 @@ fn a_later_tell_refusal_never_releases_the_marker_of_a_delivered_initial_prompt(
         "held by another live process; no prompt was delivered".to_owned(),
     );
     assert_eq!(reopen_refusal_gate(&recorded), Some("reopen-conflict"));
-    let (outcome, gate) = settle_reopen_outcome(resolve, source_id, new_id, Err(uncertain()));
+    let (outcome, gate) = settle_reopen_outcome(&source, &new, Err(uncertain()));
     assert_eq!(gate.as_deref(), Some("reopen-conflict"));
     let text = format!("{:#}", outcome.unwrap_err());
     assert!(
@@ -1784,7 +1783,7 @@ fn a_later_tell_refusal_never_releases_the_marker_of_a_delivered_initial_prompt(
     );
     assert!(source.join(REOPEN_MARKER_FILE).is_file());
     write_provider_process_record(&new, new_id, 0);
-    let (outcome, gate) = settle_reopen_outcome(resolve, source_id, new_id, Err(uncertain()));
+    let (outcome, gate) = settle_reopen_outcome(&source, &new, Err(uncertain()));
     assert_eq!(gate.as_deref(), Some("reopen-conflict"));
     assert_eq!(
         format!("{:#}", outcome.unwrap_err()),
@@ -1792,6 +1791,79 @@ fn a_later_tell_refusal_never_releases_the_marker_of_a_delivered_initial_prompt(
     );
     assert!(!source.join(REOPEN_MARKER_FILE).exists());
     provider::claude::override_session_registry_for_test(None);
+}
+
+// A long-running attempt must revalidate its saved Session directories before reading
+// a persisted refusal or mutating either Session during settlement.
+#[test]
+fn settlement_rechecks_replaced_session_directories_without_touching_outside_records() {
+    for (target, typed) in [(false, true), (true, true), (true, false)] {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source_id = "session-settlement-source";
+        let child_id = "session-settlement-child";
+        let source = write_closed_reopen_source(
+            root.path(),
+            source_id,
+            "claude",
+            Some(REOPEN_TEST_CONVERSATION),
+            true,
+        );
+        let child = write_reopen_launch_session(root.path(), child_id, Path::new("claude"));
+        claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION)
+            .unwrap()
+            .finalize(child_id)
+            .unwrap();
+        update_status(&child, SessionState::Failed, None, None).unwrap();
+        record_reopen_refusal(&child, REOPEN_LAUNCH_GATE, "pre-spawn refusal".into());
+        let replaced = if target { &child } else { &source };
+        let replaced_id = if target { child_id } else { source_id };
+        let relocated = outside.path().join("records");
+        fs::rename(replaced, &relocated).unwrap();
+        assert!(crate::native::tests::link_directory(&relocated, replaced));
+        assert!(Reader::session_directory_in(root.path(), replaced_id).is_err());
+        let before_outside = snapshot_directory(&relocated);
+        let before_source = snapshot_directory(&source);
+        let outcome = if typed {
+            Err(reopen_refusal(
+                REOPEN_LAUNCH_GATE,
+                "original refusal".into(),
+            ))
+        } else {
+            Err(anyhow::anyhow!("ordinary launch error"))
+        };
+        let (outcome, gate) = settle_reopen_outcome(&source, &child, outcome);
+        assert!(
+            snapshot_directory(&relocated) == before_outside,
+            "outside records changed: target={target}, typed={typed}"
+        );
+        assert!(
+            snapshot_directory(&source) == before_source,
+            "source changed through replaced directory"
+        );
+        let detail = format!("{:#}", outcome.unwrap_err());
+        if typed {
+            assert_eq!(gate.as_deref(), Some(REOPEN_LAUNCH_GATE));
+            assert!(
+                detail.contains("refusing non-directory Agent Bridge session"),
+                "{detail}"
+            );
+            assert!(
+                detail.ends_with("reopen refused (provider-unsupported): original refusal"),
+                "{detail}"
+            );
+        } else {
+            assert_eq!(
+                gate, None,
+                "a linked target cannot supply a persisted refusal"
+            );
+            assert_eq!(detail, "ordinary launch error");
+        }
+        #[cfg(windows)]
+        fs::remove_dir(replaced).unwrap();
+        #[cfg(unix)]
+        fs::remove_file(replaced).unwrap();
+    }
 }
 
 // A refused follow-up records its reason only while the turn is still its own. Between the
@@ -2489,6 +2561,26 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
                 "{label}"
             );
         }
+        // The same Records must explain the refusal in doctor without acquiring
+        // mutation authority or collapsing an invalid/missing target into no refusal.
+        let before = snapshot_directory(&source);
+        let mut checks = Vec::new();
+        marker_check(&Reader::open_unchecked(&source), source_id, &mut checks);
+        assert_eq!(checks.len(), 1);
+        let check = serde_json::to_value(&checks[0]).unwrap();
+        assert_ne!(check["availability"], "available");
+        for detail in [
+            "invalid session id",
+            "records of session-reopenmissing are missing",
+        ] {
+            if expected.contains(detail) {
+                assert!(
+                    check["detail"].as_str().unwrap().contains(detail),
+                    "{check}"
+                );
+            }
+        }
+        assert_eq!(snapshot_directory(&source), before);
         assert_eq!(
             fs::read(source.join(REOPEN_MARKER_FILE)).unwrap(),
             marker_before,
@@ -2499,6 +2591,11 @@ fn stale_launch_refusals_are_reconciled_by_the_next_reopen_only_once_cleanup_is_
         // The read-only gate admits the source; the claim releases the stale marker under
         // the lock and writes its own in its place.
         inspect_reopen_source(&source, source_id).unwrap();
+        let before = snapshot_directory(&source);
+        let mut checks = Vec::new();
+        marker_check(&Reader::open_unchecked(&source), source_id, &mut checks);
+        assert_eq!(checks[0].reason_code, "reopen_marker_reconcilable");
+        assert_eq!(snapshot_directory(&source), before);
         let stale: ReopenMarker = read_json(&source.join(REOPEN_MARKER_FILE)).unwrap();
         let next = claim_reopen_marker(&source, source_id, REOPEN_TEST_CONVERSATION).unwrap();
         let marker: ReopenMarker = read_json(&source.join(REOPEN_MARKER_FILE)).unwrap();
@@ -3308,11 +3405,11 @@ fn holder_checks_select_registration_wait_or_immediate_check() {
         )
         .unwrap_err();
         // Exercise the new source joints against the same registry and preserve every
-        // existing helper assertion below. Follow-up remains outside StartSource.
+        // existing helper assertion below. Follow-up remains outside InitialSource.
         if check != ResumedHolderCheck::BeforeFollowUp {
-            use crate::native::session_start::StartSource;
-            let (mut adapter, _) = start_source_fixture(root.path());
-            adapter.resumed_from = Some(resumed.clone());
+            use crate::native::session_start::InitialSource;
+            let mut adapter = attempt_fixture(root.path());
+            adapter.resumed_from = resumed.clone();
             let gate = if check == ResumedHolderCheck::AfterLaunch {
                 delivery::Gate::AfterLaunch
             } else {
@@ -3362,23 +3459,11 @@ fn holder_checks_select_registration_wait_or_immediate_check() {
     }
 }
 
-fn start_source_fixture(root: &Path) -> (ReopenedSource, SessionSpec) {
+fn start_source_fixture(root: &Path) -> ResolvedReopen {
     let id = "session-start-source";
     let directory =
         write_closed_reopen_source(root, id, "claude", Some(REOPEN_TEST_CONVERSATION), true);
     let source = inspect_reopen_source(&directory, id).unwrap();
-    let request = ReopenRequest {
-        id: id.into(),
-        prompt: "new prompt".into(),
-        title: None,
-        model: None,
-        effort: None,
-        terminal: None,
-        yolo: false,
-        timeout: Duration::from_secs(30),
-        detach: false,
-        json: false,
-    };
     let spec = SessionSpec {
         provider: source.provider,
         provider_path: PathBuf::from("claude"),
@@ -3388,12 +3473,38 @@ fn start_source_fixture(root: &Path) -> (ReopenedSource, SessionSpec) {
         model: None,
         effort: None,
         yolo: false,
-        prompt: request.prompt.clone(),
+        prompt: "new prompt".into(),
     };
-    let mut adapter = ReopenedSource::new(request);
-    // Seed only the resolve output: real resolve requires the platform/provider capability.
-    adapter.resolved = Some((directory, source));
-    (adapter, spec)
+    ResolvedReopen {
+        source_id: id.into(),
+        source_directory: directory,
+        source,
+        start: session_start::Resolved {
+            spec,
+            terminal_kind: terminal::TerminalKind::WindowsConsole,
+            context_sources: Vec::new(),
+            consent: None,
+        },
+    }
+}
+
+fn attempt_fixture(root: &Path) -> ReopenAttempt {
+    start_source_fixture(root)
+        .create_with(|spec, consent| {
+            let created = create_session_within(root, &[root.to_owned()], spec)?;
+            session_start::record_consent(&created, consent)?;
+            Ok(created)
+        })
+        .unwrap()
+}
+
+fn start_operation() -> session_start::Start {
+    session_start::Start::new(session_start::StartOptions {
+        timeout: Duration::from_secs(30),
+        detach: false,
+        json: false,
+    })
+    .unwrap()
 }
 
 #[test]
@@ -3402,7 +3513,7 @@ fn reopened_source_assesses_workspace_consent_for_the_new_session() {
     // the resolution and before create claims the source marker; the source's assessment is
     // another session's diagnostic history (#202).
     let root = tempfile::tempdir().unwrap();
-    let (_, mut spec) = start_source_fixture(root.path());
+    let mut spec = start_source_fixture(root.path()).start.spec;
     spec.workspace = root.path().canonicalize().unwrap();
     let workspace = spec.workspace.clone();
     let start = resolved(root.path(), spec, terminal::TerminalKind::WindowsConsole).unwrap();
@@ -3413,7 +3524,7 @@ fn reopened_source_assesses_workspace_consent_for_the_new_session() {
     // A workspace that cannot be identified fails the resolution, and the failure leaves the
     // state root as it was: only the fixture's source session, no shared consent record.
     let other = tempfile::tempdir().unwrap();
-    let (_, mut missing) = start_source_fixture(other.path());
+    let mut missing = start_source_fixture(other.path()).start.spec;
     missing.workspace = other.path().join("missing");
     let error = resolved(
         other.path(),
@@ -3428,7 +3539,6 @@ fn reopened_source_assesses_workspace_consent_for_the_new_session() {
 
 #[test]
 fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_source() {
-    use crate::native::session_start::StartSource;
     // A reopened session that fails between create and the launch (its result context or its
     // initial claim could not be made) records a launch-phase refusal with the start-failed
     // gate. No provider process exists, so the refusal's cleanup is NoProcessSpawned: the
@@ -3452,28 +3562,38 @@ fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_s
         return;
     }
     let root = Reader::state_root().unwrap();
-    // A failure between create and the launch: start_failed records the refusal, fails the
-    // session and releases the source marker itself, because no request address exists yet
-    // and the settlement that follows `start` would not run.
-    let (mut adapter, spec) = start_source_fixture(&root);
-    let source_id = adapter.request.id.clone();
-    let source_directory = adapter.resolved.as_ref().unwrap().0.clone();
-    let created = adapter.create(spec, None).unwrap();
+    // A real Claim failure before a Request address exists still reaches the same
+    // operation settlement as every failure after the address.
+    let adapter = start_source_fixture(&root).create().unwrap();
+    let source_id = adapter.source_id.clone();
+    let source_directory = adapter.source_directory.clone();
+    let created_directory = adapter.prepared.created.directory.clone();
+    fs::create_dir(created_directory.join(CoreRecord::TurnClaim.name())).unwrap();
     assert!(
         claim_reopen_marker(&source_directory, &source_id, REOPEN_TEST_CONVERSATION).is_err(),
         "the marker is consumed while the launch is prepared"
     );
-    let error = adapter.start_failed(&created, anyhow::anyhow!("injected claim failure"));
+    let mut report = TurnReport::new(false, serde_json::Map::new());
+    let (outcome, gate) = adapter.run(&start_operation(), &mut report);
+    let error = outcome.unwrap_err();
+    assert_eq!(gate.as_deref(), Some(REOPEN_START_FAILED_GATE));
     assert_eq!(reopen_refusal_gate(&error), Some(REOPEN_START_FAILED_GATE));
-    assert_eq!(
-        format!("{error:#}"),
-        "reopen refused (start-failed): injected claim failure"
-    );
-    let refusal = read_reopen_launch_refusal(&created.directory).unwrap();
+    assert!(report.address().is_none());
+    let refusal = read_reopen_launch_refusal(&created_directory).unwrap();
     assert_eq!(refusal.gate, REOPEN_START_FAILED_GATE);
-    assert_eq!(refusal.detail, "injected claim failure");
+    assert!(
+        refusal
+            .detail
+            .starts_with("another tell request already owns this session turn"),
+        "{}",
+        refusal.detail
+    );
     assert_eq!(
-        Reader::open_unchecked(&created.directory)
+        error.to_string(),
+        format!("reopen refused (start-failed): {}", refusal.detail)
+    );
+    assert_eq!(
+        Reader::open_unchecked(&created_directory)
             .status()
             .unwrap()
             .state,
@@ -3481,7 +3601,7 @@ fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_s
     );
     assert_eq!(
         refused_launch_cleanup(
-            &created.directory,
+            &created_directory,
             &test_launch_refusal(REOPEN_START_FAILED_GATE)
         )
         .unwrap(),
@@ -3492,7 +3612,7 @@ fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_s
             .record(CoreRecord::ReopenMarker)
             .path()
             .exists(),
-        "start_failed releases the source marker"
+        "the operation releases the source marker without a Request address"
     );
     assert!(
         verify_reopen_source_is_closed(&source_directory, &source_id)
@@ -3550,7 +3670,7 @@ fn a_failure_before_the_launch_records_a_start_failed_refusal_and_releases_the_s
 
 #[test]
 fn reopened_source_creation_extra_and_failure_joints() {
-    use crate::native::session_start::StartSource;
+    use crate::native::session_start::InitialSource;
     const CHILD: &str = "TABCLI_REOPEN_START_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let root = tempfile::tempdir().unwrap();
@@ -3569,16 +3689,17 @@ fn reopened_source_creation_extra_and_failure_joints() {
         return;
     }
     let root = Reader::state_root().unwrap();
-    let (mut adapter, spec) = start_source_fixture(&root);
-    let original = snapshot_directory(&adapter.resolved.as_ref().unwrap().0);
-    let created = adapter.create(spec, None).unwrap();
-    let provenance = adapter.resumed_from.as_ref().unwrap();
+    let resolved = start_source_fixture(&root);
+    let original = snapshot_directory(&resolved.source_directory);
+    let adapter = resolved.create().unwrap();
+    let created = &adapter.prepared.created;
+    let provenance = &adapter.resumed_from;
     assert_eq!(
         read_resumed_from(&created.directory).unwrap().as_ref(),
         Some(provenance)
     );
     let extra = adapter.result_extra().unwrap();
-    assert_eq!(extra["source_session"], adapter.request.id);
+    assert_eq!(extra["source_session"], adapter.source_id);
     assert_eq!(
         extra["resumed_from"],
         serde_json::to_value(provenance).unwrap()
@@ -3593,7 +3714,7 @@ fn reopened_source_creation_extra_and_failure_joints() {
         fs::read_to_string(created.directory.join(CoreRecord::InitialPrompt.name())).unwrap(),
         native_delegation_prompt(&delegation_source(), "new prompt")
     );
-    let directory = &adapter.resolved.as_ref().unwrap().0;
+    let directory = &adapter.source_directory;
     let marker: ReopenMarker = Reader::open_unchecked(directory)
         .record(CoreRecord::ReopenMarker)
         .json()
@@ -3605,7 +3726,7 @@ fn reopened_source_creation_extra_and_failure_joints() {
 
     let before = snapshot_directory(&created.directory);
     let ordinary = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "original delivery error");
-    let error = adapter.delivery_failed(
+    let error = close_surface_after_reopen_verification_failure(
         &created.directory,
         &created.id,
         ordinary.into(),
@@ -3615,7 +3736,7 @@ fn reopened_source_creation_extra_and_failure_joints() {
         error.downcast_ref::<std::io::Error>().unwrap().kind(),
         std::io::ErrorKind::BrokenPipe
     );
-    let error = adapter.delivery_failed(
+    let error = close_surface_after_reopen_verification_failure(
         &created.directory,
         &created.id,
         reopen_refusal("provider-unsupported", "unsupported".into()),
@@ -3626,7 +3747,7 @@ fn reopened_source_creation_extra_and_failure_joints() {
     // No terminal exists. A typed refusal still survives the close helper's error context.
     for gate in [REOPEN_CONFLICT_GATE, REOPEN_VERIFICATION_FAILED_GATE] {
         let missing = root.join("session-missing");
-        let error = adapter.delivery_failed(
+        let error = close_surface_after_reopen_verification_failure(
             &missing,
             "session-missing",
             reopen_refusal(gate, "original refusal".into()),
@@ -3640,7 +3761,7 @@ fn reopened_source_creation_extra_and_failure_joints() {
 #[cfg(not(windows))]
 #[test]
 fn reopened_source_gates_keep_provenance_and_refusal_on_unsupported_platform() {
-    use crate::native::session_start::StartSource;
+    use crate::native::session_start::InitialSource;
     for (gate, check) in [
         (delivery::Gate::AfterLaunch, ResumedHolderCheck::AfterLaunch),
         (
@@ -3649,13 +3770,13 @@ fn reopened_source_gates_keep_provenance_and_refusal_on_unsupported_platform() {
         ),
     ] {
         let root = tempfile::tempdir().unwrap();
-        let (mut adapter, _) = start_source_fixture(root.path());
+        let mut adapter = attempt_fixture(root.path());
         let resumed = ResumedFrom {
-            session: adapter.request.id.clone(),
+            session: adapter.source_id.clone(),
             provider_session_id: REOPEN_TEST_CONVERSATION.into(),
             event_id: "event-1-1.json".into(),
         };
-        adapter.resumed_from = Some(resumed.clone());
+        adapter.resumed_from = resumed.clone();
         let directory = root.path().join("session-new");
         fs::create_dir(&directory).unwrap();
         let deadline = Instant::now();
@@ -3689,7 +3810,6 @@ fn reopened_source_gates_keep_provenance_and_refusal_on_unsupported_platform() {
 #[cfg(any(target_os = "macos", windows))]
 #[test]
 fn a_memory_workspace_source_is_refused_before_creation_without_touching_the_source() {
-    use crate::native::session_start::StartSource;
     const CHILD: &str = "TABCLI_REOPEN_ADMISSION_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let base = tempfile::tempdir().unwrap();
@@ -3717,12 +3837,22 @@ fn a_memory_workspace_source_is_refused_before_creation_without_touching_the_sou
     let registry = root.parent().unwrap().join("claude-sessions");
     fs::create_dir_all(&registry).unwrap();
     provider::claude::override_session_registry_for_test(Some(registry));
-    let (fixture, _) = start_source_fixture(&root);
-    let (directory, _) = fixture.resolved.unwrap();
+    let fixture = start_source_fixture(&root);
+    let directory = fixture.source_directory;
     let before = snapshot_directory(&directory);
-    let mut adapter = ReopenedSource::new(fixture.request);
-    let error = adapter
-        .resolve(Instant::now() + Duration::from_secs(30))
+    let request = ReopenRequest {
+        id: fixture.source_id,
+        prompt: "new prompt".into(),
+        title: None,
+        model: None,
+        effort: None,
+        terminal: None,
+        yolo: false,
+        timeout: Duration::from_secs(30),
+        detach: false,
+        json: false,
+    };
+    let error = ResolvedReopen::resolve(request, Instant::now() + Duration::from_secs(30))
         .err()
         .expect("reopen must be refused");
     provider::claude::override_session_registry_for_test(None);
@@ -3743,7 +3873,6 @@ fn a_memory_workspace_source_is_refused_before_creation_without_touching_the_sou
     } else {
         assert_eq!(reopen_refusal_gate(&error), Some(REOPEN_LAUNCH_GATE));
     }
-    assert!(adapter.resolved.is_none());
     assert_eq!(snapshot_directory(&directory), before);
     assert!(!directory.join(CoreRecord::ReopenMarker.name()).exists());
     let sessions: Vec<_> = fs::read_dir(&root)

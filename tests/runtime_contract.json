@@ -40,8 +40,10 @@
     "[Agent Bridge context result {index}/{total}]": 1
   },
   "src/native/reopen.rs": {
-    "provider-process.json": 1,
     "status.json": 1
+  },
+  "src/native/reopen/marker.rs": {
+    "provider-process.json": 1
   },
   "src/native/provider/agy/mod.rs": {
     "const PENDING_TURN_FILE: &str = \"agy-pending-turn.json\";": 1,

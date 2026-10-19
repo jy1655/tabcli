@@ -2,10 +2,9 @@
 //! Provider adapters retain conversation-holder evidence; terminal ownership retains Close authority.
 use super::args::{CommonStartOptions, parse_common_start_option, read_prompt_option};
 use super::close::close_session_surface;
-use super::doctor::{Availability, Check};
 use crate::native::session::launch::wrapper::{check_provider_version_until, resolve_provider};
 use crate::native::session::primitives::require_valid_session_id;
-use crate::native::session::primitives::{delegation_source, unix_ms, valid_session_id};
+use crate::native::session::primitives::{unix_ms, valid_session_id};
 use crate::native::session::schema::{
     ProviderProcessRecord, RecordedReopenRefusal, SessionEvent, SessionManifest,
 };
@@ -16,18 +15,22 @@ use crate::native::session::{
 };
 use crate::native::turn_report::TurnReport;
 use crate::native::{
-    CreatedSession, DEFAULT_TIMEOUT_SECS, NativeCommand, SessionSpec, consent, create_session,
-    delivery, native_delegation_prompt, provider, sanitize_title, session, session_start, terminal,
+    CreatedSession, DEFAULT_TIMEOUT_SECS, NativeCommand, SessionSpec, consent, delivery, provider,
+    sanitize_title, session, session_start, terminal,
 };
 use agent_bridge::{FirstPartyCli, process_is_alive, validate_terminal_input};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+#[cfg(test)]
+use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod marker;
+pub(super) use marker::check as marker_check;
 
 // Where a reopened session's provider conversation came from: the closed Bridge session and
 // the event whose provider session id was passed to the provider's official resume.
@@ -639,48 +642,47 @@ pub(super) fn run_reopen(request: ReopenRequest) -> Result<()> {
         request.json,
         serde_json::Map::from_iter([("source_session".into(), serde_json::json!(source))]),
     );
-    let outcome = run_reopen_inner(request, &mut report);
-    match report.address() {
-        Some((session, _)) => {
-            let (outcome, gate) =
-                settle_reopen_outcome(Reader::session_directory, &source, session, outcome);
-            let mut extra = serde_json::Map::new();
-            extra.insert("source_session".to_owned(), serde_json::json!(source));
-            extra.insert("gate".to_owned(), serde_json::json!(gate));
-            report.finish(outcome, extra)
-        }
-        None => {
-            let extra = serde_json::json!({
-                "session": null,
-                "request_id": null,
-                "gate": outcome.as_ref().err().and_then(reopen_refusal_gate),
-            })
-            .as_object()
-            .unwrap()
-            .clone();
-            report.finish(outcome, extra)
-        }
+    let (outcome, gate) = run_reopen_inner(request, &mut report);
+    let mut extra = serde_json::Map::from_iter([
+        ("source_session".into(), serde_json::json!(source)),
+        ("gate".into(), serde_json::json!(gate)),
+    ]);
+    if report.address().is_none() {
+        extra.insert("session".into(), serde_json::Value::Null);
+        extra.insert("request_id".into(), serde_json::Value::Null);
     }
+    report.finish(outcome, extra)
 }
 
 // Only a launch-phase refusal can release the source marker. A later tell can fail while
 // the initial messenger settles; its refusal cannot prove the initial prompt was not sent.
 fn settle_reopen_outcome(
-    session_directory: impl Fn(&str) -> Result<PathBuf>,
-    source: &str,
-    session: &str,
+    source_directory: &Path,
+    session_directory: &Path,
     outcome: Result<()>,
 ) -> (Result<()>, Option<String>) {
+    // Retain the directories selected by this attempt, but repeat the original
+    // session-root validation before reading a refusal and before any settlement write.
+    let revalidate = |directory: &Path| {
+        let root = directory
+            .parent()
+            .context("session directory has no state root")?;
+        let id = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("session directory has no valid name")?;
+        Reader::session_directory_in(root, id)
+    };
     let gate = outcome.as_ref().err().and_then(|error| {
         reopen_refusal_gate(error).map(str::to_owned).or_else(|| {
-            session_directory(session)
+            revalidate(session_directory)
                 .ok()
                 .and_then(|directory| read_reopen_refusal_gate(&directory))
         })
     });
     let outcome = match gate.as_deref() {
         Some(gate) if REOPEN_POST_CREATION_GATES.contains(&gate) => {
-            match (session_directory(source), session_directory(session)) {
+            match (revalidate(source_directory), revalidate(session_directory)) {
                 (Ok(source_directory), Ok(refused_directory)) => {
                     release_reopen_marker_after_refusal(
                         &source_directory,
@@ -690,7 +692,11 @@ fn settle_reopen_outcome(
                     )
                 }
                 (Err(error), _) | (_, Err(error)) => outcome.context(format!(
-                    "the reopen marker of source session {source} was not released: {error:#}"
+                    "the reopen marker of source session {} was not released: {error:#}",
+                    source_directory
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default(),
                 )),
             }
         }
@@ -699,19 +705,58 @@ fn settle_reopen_outcome(
     (outcome, gate)
 }
 
-fn run_reopen_inner(request: ReopenRequest, report: &mut TurnReport) -> Result<()> {
-    let options = session_start::StartOptions {
-        timeout: request.timeout,
-        detach: request.detach,
-        json: request.json,
-    };
-    session_start::start(options, &mut ReopenedSource::new(request), report)
+fn run_reopen_inner(
+    request: ReopenRequest,
+    report: &mut TurnReport,
+) -> (Result<()>, Option<String>) {
+    let prepared = (|| {
+        let start = session_start::Start::new(session_start::StartOptions {
+            timeout: request.timeout,
+            detach: request.detach,
+            json: request.json,
+        })?;
+        let attempt = ResolvedReopen::resolve(request, start.deadline())?.create()?;
+        Ok::<_, anyhow::Error>((start, attempt))
+    })();
+    match prepared {
+        Ok((start, attempt)) => attempt.run(&start, report),
+        Err(error) => {
+            let gate = reopen_refusal_gate(&error).map(str::to_owned);
+            (Err(error), gate)
+        }
+    }
 }
 
-struct ReopenedSource {
-    request: ReopenRequest,
-    resolved: Option<(PathBuf, ReopenSource)>,
-    resumed_from: Option<ResumedFrom>,
+struct ResolvedReopen {
+    source_id: String,
+    source_directory: PathBuf,
+    source: ReopenSource,
+    start: session_start::Resolved,
+}
+
+// A successfully created Reopen owns its source reservation through every later phase.
+// Its run always settles after the shared Initial prompt operation and its Claim drop,
+// independently of whether a Request address could be recorded.
+struct ReopenAttempt {
+    source_id: String,
+    source_directory: PathBuf,
+    resumed_from: ResumedFrom,
+    prepared: session_start::Prepared,
+}
+
+impl ReopenAttempt {
+    fn run(
+        self,
+        start: &session_start::Start,
+        report: &mut TurnReport,
+    ) -> (Result<()>, Option<String>) {
+        let outcome = start.run(&self.prepared, &self, report);
+        settle_reopen_outcome(
+            &self.source_directory,
+            &self.prepared.created.directory,
+            outcome,
+        )
+    }
 }
 
 fn retry_interrupted_launch_fence(source_directory: &Path) -> Result<()> {
@@ -766,19 +811,8 @@ fn resolved(
     })
 }
 
-impl ReopenedSource {
-    fn new(request: ReopenRequest) -> Self {
-        Self {
-            request,
-            resolved: None,
-            resumed_from: None,
-        }
-    }
-}
-
-impl session_start::StartSource for ReopenedSource {
-    fn resolve(&mut self, deadline: Instant) -> Result<session_start::Resolved> {
-        let request = &self.request;
+impl ResolvedReopen {
+    fn resolve(request: ReopenRequest, deadline: Instant) -> Result<Self> {
         let terminal_kind = terminal::select(request.terminal)?;
         let source_directory = Reader::session_directory(&request.id)?;
         let _ = retry_interrupted_launch_fence(&source_directory);
@@ -833,70 +867,58 @@ impl session_start::StartSource for ReopenedSource {
             prompt: request.prompt.clone(),
         };
         let start = resolved(&root, spec, terminal_kind)?;
-        self.resolved = Some((source_directory, source));
-        Ok(start)
-    }
-
-    fn create(
-        &mut self,
-        mut spec: SessionSpec,
-        consent: Option<&consent::Assessment>,
-    ) -> Result<CreatedSession> {
-        let (directory, source) = self.resolved.as_ref().expect("resolve precedes create");
-        let (created, resumed_from) =
-            create_reopened_session(directory, &self.request.id, source, || {
-                spec.prompt = native_delegation_prompt(&delegation_source(), &spec.prompt);
-                let created = create_session(spec)?;
-                // Before the provenance and the marker: a record that cannot be written
-                // releases the source reservation like any creation failure.
-                session_start::record_consent(&created, consent)?;
-                Ok(created)
-            })?;
-        self.resumed_from = Some(resumed_from);
-        Ok(created)
-    }
-
-    fn start_failed(&self, created: &CreatedSession, error: anyhow::Error) -> anyhow::Error {
-        let (source_directory, _) = self
-            .resolved
-            .as_ref()
-            .expect("resolve precedes start_failed");
-        // The refusal first: it is what lets the next reopen release the source marker if
-        // the status write or the release below fails. No provider process exists before the
-        // launch, so the refusal's cleanup is `NoProcessSpawned` and the marker is released
-        // here: no request address exists yet, so the settlement that follows `start` in
-        // `run_reopen` would not run for this failure (#245).
-        let refusal = record_reopen_refusal(
-            &created.directory,
-            REOPEN_START_FAILED_GATE,
-            format!("{error:#}"),
-        );
-        session_start::mark_start_failed(created, &refusal);
-        release_reopen_marker_after_refusal(
+        Ok(Self {
+            source_id: request.id,
             source_directory,
-            &created.directory,
-            REOPEN_START_FAILED_GATE,
-            Err(refusal),
-        )
-        .err()
-        .unwrap_or_else(|| {
-            reopen_refusal(
-                REOPEN_START_FAILED_GATE,
-                format!(
-                    "the reopened session {} failed before its launch",
-                    created.id
-                ),
-            )
+            source,
+            start,
         })
     }
 
+    fn create(self) -> Result<ReopenAttempt> {
+        self.create_with(session_start::create_with_consent)
+    }
+
+    fn create_with(
+        self,
+        create: impl FnOnce(SessionSpec, Option<&consent::Assessment>) -> Result<CreatedSession>,
+    ) -> Result<ReopenAttempt> {
+        let (prepared, resumed_from) = self.start.create_with(|spec, consent| {
+            create_reopened_session(
+                &self.source_directory,
+                &self.source_id,
+                &self.source,
+                || create(spec, consent),
+            )
+        })?;
+        Ok(ReopenAttempt {
+            source_id: self.source_id,
+            source_directory: self.source_directory,
+            resumed_from,
+            prepared,
+        })
+    }
+}
+
+impl session_start::InitialSource for ReopenAttempt {
+    fn result_extra(&self) -> Result<session_start::ResultExtra> {
+        let mut result_extra = serde_json::Map::new();
+        result_extra.insert(
+            "source_session".to_owned(),
+            serde_json::Value::String(self.source_id.clone()),
+        );
+        result_extra.insert(
+            "resumed_from".to_owned(),
+            serde_json::to_value(&self.resumed_from)?,
+        );
+        Ok(result_extra)
+    }
+
     fn gate(&self, directory: &Path, gate: delivery::Gate, deadline: Instant) -> Result<()> {
-        let (_, source) = self.resolved.as_ref().expect("resolve precedes gate");
-        let resumed_from = self.resumed_from.as_ref().expect("create precedes gate");
         verify_reopened_conversation_exclusive(
-            source.provider,
+            self.prepared.provider,
             directory,
-            Some(resumed_from),
+            Some(&self.resumed_from),
             deadline,
             match gate {
                 delivery::Gate::AfterLaunch => ResumedHolderCheck::AfterLaunch,
@@ -905,61 +927,64 @@ impl session_start::StartSource for ReopenedSource {
         )
     }
 
-    fn launch_failed(
+    fn failed(
         &self,
         created: &CreatedSession,
-        initial_claim: &mut session::turn::Claim,
-        error: anyhow::Error,
+        failure: session_start::Failure<'_>,
     ) -> anyhow::Error {
-        initial_claim.fence_launch();
-        let mut detail = format!("{error:#}");
-        let gate = match record_failed_launch(&created.directory, initial_claim.token(), &error) {
-            Ok(gate) => gate,
-            Err(record_error) => {
-                detail.push_str(&format!(
-                    "; the refusal record could not be written: {record_error:#}"
-                ));
-                reopen_refusal_gate(&error).unwrap_or(REOPEN_LAUNCH_FAILED_GATE)
+        match failure {
+            session_start::Failure::Preparing(error) => {
+                // Record before status: an interrupted attempt is reconcilable by the
+                // next Reopen. Marker release belongs to run's one settlement path.
+                let refusal = record_reopen_refusal(
+                    &created.directory,
+                    REOPEN_START_FAILED_GATE,
+                    format!("{error:#}"),
+                );
+                session_start::mark_start_failed(created, &refusal);
+                refusal
             }
-        };
-        if let Err(fence_error) = session::launch::fence_failed_start(
-            &Store::open_unchecked(&created.directory),
-            initial_claim.token(),
-            &detail,
-        ) {
-            detail.push_str(&format!(
-                "; the failed launch could not be fenced: {fence_error:#}"
-            ));
+            session_start::Failure::Launch { claim, error } => {
+                fail_reopen_launch(created, claim, error)
+            }
+            session_start::Failure::Delivery { error, deadline } => {
+                close_surface_after_reopen_verification_failure(
+                    &created.directory,
+                    &created.id,
+                    error,
+                    deadline,
+                )
+            }
         }
-        reopen_refusal(gate, detail)
     }
+}
 
-    fn delivery_failed(
-        &self,
-        directory: &Path,
-        id: &str,
-        error: anyhow::Error,
-        deadline: Instant,
-    ) -> anyhow::Error {
-        close_surface_after_reopen_verification_failure(directory, id, error, deadline)
+fn fail_reopen_launch(
+    created: &CreatedSession,
+    initial_claim: &mut session::turn::Claim,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    initial_claim.fence_launch();
+    let mut detail = format!("{error:#}");
+    let gate = match record_failed_launch(&created.directory, initial_claim.token(), &error) {
+        Ok(gate) => gate,
+        Err(record_error) => {
+            detail.push_str(&format!(
+                "; the refusal record could not be written: {record_error:#}"
+            ));
+            reopen_refusal_gate(&error).unwrap_or(REOPEN_LAUNCH_FAILED_GATE)
+        }
+    };
+    if let Err(fence_error) = session::launch::fence_failed_start(
+        &Store::open_unchecked(&created.directory),
+        initial_claim.token(),
+        &detail,
+    ) {
+        detail.push_str(&format!(
+            "; the failed launch could not be fenced: {fence_error:#}"
+        ));
     }
-
-    fn result_extra(&self) -> Result<session_start::ResultExtra> {
-        let resumed_from = self
-            .resumed_from
-            .as_ref()
-            .expect("create precedes result_extra");
-        let mut result_extra = serde_json::Map::new();
-        result_extra.insert(
-            "source_session".to_owned(),
-            serde_json::Value::String(self.request.id.clone()),
-        );
-        result_extra.insert(
-            "resumed_from".to_owned(),
-            serde_json::to_value(resumed_from)?,
-        );
-        Ok(result_extra)
-    }
+    reopen_refusal(gate, detail)
 }
 
 fn create_reopened_session(
@@ -1162,18 +1187,12 @@ fn inspect_reopen_source(directory: &Path, id: &str) -> Result<ReopenSource> {
     })
 }
 
-// A refused launch with verified cleanup no longer holds the conversation; the next
-// claim removes its stale marker under the source lock before installing its own.
-#[derive(Debug)]
-struct StaleReopenMarker {
-    refused_session: String,
-    gate: String,
-    cleanup: RefusedLaunchCleanup,
-}
-
 // Read-only: release eligibility requires a durable launch refusal and verified cleanup.
 // Missing records or a possibly surviving provider keep the marker consumed after a crash.
-fn verify_reopen_source_is_closed(directory: &Path, id: &str) -> Result<Option<StaleReopenMarker>> {
+fn verify_reopen_source_is_closed(
+    directory: &Path,
+    id: &str,
+) -> Result<Option<marker::StaleReopenMarker>> {
     let closed = Reader::open_unchecked(directory).closed_if_present()?;
     let status = Reader::open_unchecked(directory).status_if_present()?;
     let state = status
@@ -1204,59 +1223,7 @@ fn verify_reopen_source_is_closed(directory: &Path, id: &str) -> Result<Option<S
             ));
         }
     }
-    let Some(text) = Reader::open_unchecked(directory)
-        .record(CoreRecord::ReopenMarker)
-        .text()?
-    else {
-        return Ok(None);
-    };
-    let refuse = |detail: String| Err(reopen_refusal("already-reopened", detail));
-    let Ok(marker) = serde_json::from_str::<ReopenMarker>(&text) else {
-        return refuse(format!(
-            "session {id} carries a reopen marker that cannot be read; it is treated as consumed"
-        ));
-    };
-    let Some(new_id) = marker.reopened_by else {
-        return refuse(format!("a reopen of session {id} is already in progress"));
-    };
-    let already = format!("session {id} was already reopened as {new_id}");
-    if !valid_session_id(&new_id) {
-        return refuse(format!(
-            "{already}; the marker names an invalid session id, so it is treated as consumed"
-        ));
-    }
-    let refused_directory = directory
-        .parent()
-        .context("session directory has no state root")?
-        .join(&new_id);
-    if !fs::symlink_metadata(&refused_directory).is_ok_and(|metadata| metadata.is_dir()) {
-        return refuse(format!(
-            "{already}; the records of {new_id} are missing, so the marker is treated as consumed"
-        ));
-    }
-    let Some(refusal) = read_reopen_launch_refusal(&refused_directory) else {
-        return refuse(already);
-    };
-    let cleanup = match refused_launch_cleanup(&refused_directory, &refusal) {
-        Ok(cleanup) => cleanup,
-        Err(error) => {
-            return refuse(format!(
-                "{already}; that launch was refused ({}) but its records cannot be verified: {error:#}",
-                refusal.gate
-            ));
-        }
-    };
-    if !cleanup.releases_marker() {
-        return refuse(format!(
-            "{already}; that launch was refused ({}) but {cleanup}",
-            refusal.gate
-        ));
-    }
-    Ok(Some(StaleReopenMarker {
-        refused_session: new_id,
-        gate: refusal.gate,
-        cleanup,
-    }))
+    marker::observe(directory)?.into_stale(id)
 }
 
 // Read every event, including legacy and older events: any unreadable outcome refuses
@@ -1469,95 +1436,6 @@ fn record_follow_up_refusal(
             "the turn claim of session {id} could not be released: {release_error:#}"
         )),
     }
-}
-
-// Doctor observes the same marker eligibility as the locked reopen gate, using the
-// provider identity; it never releases or annotates the marker.
-pub(super) fn marker_check(reader: &Reader, id: &str, checks: &mut Vec<Check>) {
-    let directory = reader.directory();
-    use Availability::*;
-    let marker = match RecordReader::at(
-        Reader::open_unchecked(directory)
-            .record(CoreRecord::ReopenMarker)
-            .path(),
-    )
-    .optional_json::<ReopenMarker>()
-    {
-        Ok(Some(marker)) => marker,
-        Ok(None) => return,
-        Err(error) => {
-            checks.push(Check::new("reopen_marker", Unknown, "reopen_marker_unreadable", format!("{error:#}"), "reopen treats an unreadable marker as consumed; inspect the marker before any reopen."));
-            return;
-        }
-    };
-    let next_action = "reopen releases a marker only when the session it names recorded a launch refusal and either no provider process was spawned or the provider process recorded in its provider-process.json is verified gone (pid dead, or alive under another identity); doctor never releases or repairs it.";
-    let Some(reopened_by) = marker.reopened_by else {
-        checks.push(Check::new("reopen_marker", Unavailable, "reopen_in_progress", format!("A reopen of {id} holds the marker and has not recorded its new session yet; a new reopen is refused with gate already-reopened."), next_action)
-            .evidence(json!({"claim": marker.claim})));
-        return;
-    };
-    let refused_directory = directory.parent().map(|root| root.join(&reopened_by));
-    let refusal = match &refused_directory {
-        Some(refused_directory)
-            if valid_session_id(&reopened_by)
-                && fs::symlink_metadata(refused_directory)
-                    .is_ok_and(|metadata| metadata.is_dir()) =>
-        {
-            read_reopen_launch_refusal(refused_directory)
-        }
-        _ => None,
-    };
-    let (availability, reason, detail, cleanup) = match refusal
-        .as_ref()
-        .zip(refused_directory.as_deref())
-    {
-        None => (
-            Unavailable,
-            "reopen_marker_consumed",
-            format!(
-                "Session {id} was reopened as {reopened_by}, which recorded no launch refusal; a new reopen is refused with gate already-reopened."
-            ),
-            Value::Null,
-        ),
-        Some((refusal, refused_directory)) => {
-            match refused_launch_cleanup(refused_directory, refusal) {
-                Ok(cleanup) if cleanup.releases_marker() => (
-                    Available,
-                    "reopen_marker_reconcilable",
-                    format!(
-                        "The reopen as {reopened_by} was refused at launch (gate {}) and {cleanup}; the next reopen of {id} releases the marker and proceeds.",
-                        refusal.gate
-                    ),
-                    json!(cleanup.to_string()),
-                ),
-                Ok(cleanup) => (
-                    Unavailable,
-                    "reopen_marker_retained",
-                    format!(
-                        "The reopen as {reopened_by} was refused at launch (gate {}) but {cleanup}; the marker stays consumed and a new reopen is refused with gate already-reopened until the provider process of {reopened_by} is verified gone. Closing its console or the exit of its launch wrapper is not that evidence on its own.",
-                        refusal.gate
-                    ),
-                    json!(cleanup.to_string()),
-                ),
-                Err(error) => (
-                    Unknown,
-                    "reopen_marker_unverified",
-                    format!(
-                        "The reopen as {reopened_by} was refused at launch (gate {}) but its records cannot be verified: {error:#}",
-                        refusal.gate
-                    ),
-                    Value::Null,
-                ),
-            }
-        }
-    };
-    checks.push(Check::new("reopen_marker", availability, reason, detail, next_action).evidence(json!({
-        "reopened_by": reopened_by,
-        "gate": refusal.as_ref().map(|refusal| &refusal.gate),
-        "recorded_cleanup": refusal.as_ref().and_then(|refusal| refusal.cleanup.as_ref()),
-        "recorded_cleanup_detail": refusal.as_ref().and_then(|refusal| refusal.cleanup_detail.as_ref()),
-        "cleanup": cleanup,
-    })));
 }
 
 #[cfg(test)]
