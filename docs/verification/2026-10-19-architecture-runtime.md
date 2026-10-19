@@ -68,6 +68,12 @@ At this checkpoint, the Claude-parent runtime and release gates remain pending.
 
 ## Evidence and remaining scope
 
+At release preparation commit `83e9f32`, the local serial suite passed 1,185 tests,
+zero failed, and five ignored. All-feature Clippy, formatting, and diff checks also
+passed. This used a separate Cargo target directory so the running verification
+sessions retained their original executable. No `src/` or `tests/` file changed
+between the matrix source and this release-preparation commit.
+
 Private evidence is retained under
 `C:/Users/user/AppData/Local/Temp/pstack-tabcli-architecture-165806/runtime-follow-up`.
 `run-case.ps1`, the per-case JSON, `matrix-summary.json`, and `summarize-matrix.py`
