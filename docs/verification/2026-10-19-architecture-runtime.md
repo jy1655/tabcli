@@ -183,7 +183,7 @@ push CI was run `39275683672`. Both platform archives passed checksum, member, l
 and notices checks, and the Windows executable reported 0.4.21.
 
 The Windows job's downloaded log reports 1,185 passed, zero failed and five ignored,
-then completes its post-job cleanup at 2026-10-19 15:30:36 UTC. Afterward GitHub kept
+then reaches orphan-process cleanup at 2026-10-19 15:30:36 UTC. Afterward GitHub kept
 reporting that job and run as in progress, with a null conclusion; the job's steps became
 empty and the job-list endpoint intermittently returned HTTP 502. Cancellation replied
 that the run was already completed; force-cancellation replied that it was not in
