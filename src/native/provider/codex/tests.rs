@@ -449,9 +449,9 @@ fn launch_plan_is_the_complete_command_for_every_policy_platform_and_consent() {
                         assert!(plan.environment_removals.is_empty(), "{label}");
                         let observed = crate::native::consent::observe(&directory);
                         if consent {
-                            assert_eq!(observed["applied"], APPLIED_MARKER, "{label}");
+                            assert_eq!(observed.applied_marker(), Some(APPLIED_MARKER), "{label}");
                         } else {
-                            assert!(observed.is_null(), "{label}: {observed}");
+                            assert!(observed.value().is_null(), "{label}: {observed:?}");
                         }
                     }
                 }

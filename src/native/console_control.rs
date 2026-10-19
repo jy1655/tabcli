@@ -1,29 +1,35 @@
-//! Control of a managed Windows console from inside the session's own process tree.
 use crate::native::NativeCommand;
 use crate::native::session::primitives::require_valid_session_id;
-#[cfg(windows)]
-use crate::native::session::{Reader, RecordReader};
-#[cfg(windows)]
-use crate::native::terminal::ownership::verify_terminal_surface_ownership;
-#[cfg(windows)]
-use crate::native::terminal::{windows_console_handle_path, windows_console_root_never_ran};
-#[cfg(windows)]
-use crate::native::{provider, terminal};
-#[cfg(windows)]
-use agent_bridge::FirstPartyCli;
 use anyhow::{Context, Result, bail};
-use std::path::Path;
-#[cfg(windows)]
-use std::str::FromStr;
-use std::time::Duration;
+use std::{num::NonZeroUsize, path::Path, time::Duration};
 
-// Parsed on every target; paths and provider console input facts are resolved only
-// after the managed session and its surface have been verified.
+#[cfg(windows)]
+use crate::native::{
+    provider,
+    session::{Reader, RecordReader},
+    terminal::{self, ownership::verify_terminal_surface_ownership},
+};
+#[cfg(windows)]
+use std::{ffi::OsString, path::PathBuf, str::FromStr};
+
+#[cfg(windows)]
+mod client;
+#[cfg(windows)]
+pub(in crate::native) use client::{
+    WindowLookup, close_session_until, guarded_dialog_input, read_screen, send_file,
+    send_file_text_only,
+};
+
 #[derive(Debug, PartialEq)]
-pub(crate) enum ConsoleControlRequest {
+pub(crate) struct ConsoleControlRequest {
+    operation: Operation,
+}
+
+#[derive(Debug, PartialEq)]
+enum Operation {
     Screen,
     Send {
-        submit_count: Option<usize>,
+        mode: SendMode,
         input_name: String,
         timeout: Duration,
     },
@@ -37,14 +43,50 @@ pub(crate) enum ConsoleControlRequest {
     Close,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SendMode {
+    ProviderDefault,
+    Submit(NonZeroUsize),
+    TextOnly,
+}
+
+impl SendMode {
+    fn from_override(count: Option<usize>) -> Self {
+        match count {
+            None => Self::ProviderDefault,
+            Some(0) => Self::TextOnly,
+            Some(count) => Self::Submit(NonZeroUsize::new(count).unwrap()),
+        }
+    }
+
+    #[cfg(windows)]
+    fn override_count(self) -> Option<usize> {
+        match self {
+            Self::ProviderDefault => None,
+            Self::TextOnly => Some(0),
+            Self::Submit(count) => Some(count.get()),
+        }
+    }
+}
+
 impl ConsoleControlRequest {
     #[cfg(windows)]
-    pub(super) fn needs_only_bound_surface(&self) -> bool {
-        matches!(self, Self::Close | Self::Window { .. })
+    fn needs_only_bound_surface(&self) -> bool {
+        matches!(self.operation, Operation::Close | Operation::Window { .. })
+    }
+
+    #[cfg(windows)]
+    fn is_close(&self) -> bool {
+        matches!(self.operation, Operation::Close)
     }
 }
 
 pub(super) fn parse(rest: &[String]) -> Result<NativeCommand> {
+    let (id, request) = decode_arguments(rest)?;
+    Ok(NativeCommand::ConsoleControl { request, id })
+}
+
+fn decode_arguments(rest: &[String]) -> Result<(String, ConsoleControlRequest)> {
     let [action, id, tail @ ..] = rest else {
         bail!("native-console-control requires an action and managed session id");
     };
@@ -64,37 +106,34 @@ pub(super) fn parse(rest: &[String]) -> Result<NativeCommand> {
         }
         Ok(Duration::from_millis(timeout_ms))
     };
-    let request = match (action.as_str(), tail) {
+    let operation = match (action.as_str(), tail) {
         ("send", [input, timeout_ms, count @ ..])
             if valid_pending_prompt_name(input) && count.len() <= 1 =>
         {
-            ConsoleControlRequest::Send {
-                submit_count: count
-                    .first()
-                    .map(|value| value.parse::<usize>())
-                    .transpose()
-                    .context("invalid native console control arguments")?,
+            Operation::Send {
+                mode: SendMode::from_override(
+                    count
+                        .first()
+                        .map(|value| value.parse::<usize>())
+                        .transpose()
+                        .context("invalid native console control arguments")?,
+                ),
                 input_name: input.clone(),
                 timeout: timeout(timeout_ms)?,
             }
         }
-        ("dialog", [input, timeout_ms]) if valid_pending_prompt_name(input) => {
-            ConsoleControlRequest::Dialog {
-                input_name: input.clone(),
-                timeout: timeout(timeout_ms)?,
-            }
-        }
-        ("window", [timeout_ms]) => ConsoleControlRequest::Window {
+        ("dialog", [input, timeout_ms]) if valid_pending_prompt_name(input) => Operation::Dialog {
+            input_name: input.clone(),
             timeout: timeout(timeout_ms)?,
         },
-        ("close", []) => ConsoleControlRequest::Close,
-        ("screen", []) => ConsoleControlRequest::Screen,
+        ("window", [timeout_ms]) => Operation::Window {
+            timeout: timeout(timeout_ms)?,
+        },
+        ("close", []) => Operation::Close,
+        ("screen", []) => Operation::Screen,
         _ => bail!("invalid native console control arguments"),
     };
-    Ok(NativeCommand::ConsoleControl {
-        request,
-        id: id.clone(),
-    })
+    Ok((id.clone(), ConsoleControlRequest { operation }))
 }
 
 fn valid_pending_prompt_name(value: &str) -> bool {
@@ -104,38 +143,109 @@ fn valid_pending_prompt_name(value: &str) -> bool {
         && Path::new(value).file_name().and_then(|name| name.to_str()) == Some(value)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
+fn encode_arguments(id: &str, request: &ConsoleControlRequest) -> Vec<OsString> {
+    let (action, input, timeout, count) = match &request.operation {
+        Operation::Screen => ("screen", None, None, None),
+        Operation::Close => ("close", None, None, None),
+        Operation::Window { timeout } => ("window", None, Some(*timeout), None),
+        Operation::Dialog {
+            input_name,
+            timeout,
+        } => ("dialog", Some(input_name), Some(*timeout), None),
+        Operation::Send {
+            input_name,
+            timeout,
+            mode,
+        } => (
+            "send",
+            Some(input_name),
+            Some(*timeout),
+            mode.override_count(),
+        ),
+    };
+    let mut args = vec![action.into(), id.into()];
+    if let Some(input) = input {
+        args.push(input.into());
+    }
+    if let Some(timeout) = timeout {
+        args.push(timeout.as_millis().to_string().into());
+    }
+    if let Some(count) = count {
+        args.push(count.to_string().into());
+    }
+    args
+}
+
+#[cfg(windows)]
+pub(in crate::native) enum ResolvedAction {
+    Screen,
+    Send {
+        input: PathBuf,
+        submit_count: usize,
+        newline: terminal::ConsoleNewline,
+        timeout: Duration,
+    },
+    Dialog {
+        input: PathBuf,
+    },
+    Window {
+        timeout: Duration,
+    },
+    Close,
+}
+
+#[cfg(windows)]
 pub(super) fn run(request: ConsoleControlRequest, id: &str) -> Result<()> {
+    run_with(
+        request,
+        id,
+        verify_terminal_surface_ownership,
+        terminal::windows_console_control,
+    )
+}
+
+#[cfg(windows)]
+fn run_with(
+    request: ConsoleControlRequest,
+    id: &str,
+    verify_owner: impl FnOnce(&Path, &str, &terminal::TerminalSession) -> Result<()>,
+    execute: impl FnOnce(
+        ResolvedAction,
+        &terminal::TerminalSession,
+        &terminal::WindowsSessionRecords<'_>,
+    ) -> Result<()>,
+) -> Result<()> {
     let directory = Reader::session_directory(id)?;
     let manifest = Reader::open_unchecked(&directory).manifest()?;
-    let session: terminal::TerminalSession =
-        RecordReader::at(&windows_console_handle_path(&directory, &request)).json()?;
+    let session: terminal::TerminalSession = RecordReader::at(
+        &terminal::windows_console_handle_path(&directory, request.is_close()),
+    )
+    .json()?;
     if session.kind != terminal::TerminalKind::WindowsConsole {
         bail!("managed session is not owned by the Windows console transport");
     }
-    // A window is looked up right after the console root was started, before the wrapper
-    // has recorded itself as the owner. Like a close, it needs only the bound surface.
     if request.needs_only_bound_surface() {
         session.verify_managed_session(id)?;
     } else {
-        verify_terminal_surface_ownership(&directory, id, &session)?;
+        verify_owner(&directory, id, &session)?;
     }
-    let provider = FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
+    let provider =
+        agent_bridge::FirstPartyCli::from_str(&manifest.provider).map_err(anyhow::Error::msg)?;
     let records = terminal::WindowsSessionRecords {
         directory: &directory,
-        root_never_ran: windows_console_root_never_ran(&directory),
+        root_never_ran: terminal::windows_console_root_never_ran(&directory),
     };
     let action = resolve_action(request, &directory, provider);
-    terminal::windows_console_control(action, &session, &records)
+    execute(action, &session, &records)
 }
 
-// Pure resolution after the caller has verified the managed session and surface.
 #[cfg(windows)]
 fn resolve_action(
     request: ConsoleControlRequest,
     directory: &Path,
-    provider: FirstPartyCli,
-) -> terminal::ConsoleControlAction {
+    provider: agent_bridge::FirstPartyCli,
+) -> ResolvedAction {
     let input_path = |name: &str| {
         Reader::open_unchecked(directory)
             .private(name)
@@ -148,75 +258,212 @@ fn resolve_action(
         .map_or((1, terminal::ConsoleNewline::LineFeed), |surface| {
             (surface.submit_count, surface.newline)
         });
-    match request {
-        ConsoleControlRequest::Screen => terminal::ConsoleControlAction::Screen,
-        ConsoleControlRequest::Send {
-            submit_count: override_count,
+    match request.operation {
+        Operation::Screen => ResolvedAction::Screen,
+        Operation::Send {
+            mode,
             input_name,
             timeout,
-        } => terminal::ConsoleControlAction::Send {
+        } => ResolvedAction::Send {
             input: input_path(&input_name),
-            submit_count: override_count.unwrap_or(submit_count),
+            submit_count: mode.override_count().unwrap_or(submit_count),
             newline,
             timeout,
         },
-        ConsoleControlRequest::Dialog {
-            input_name,
-            timeout: _,
-        } => terminal::ConsoleControlAction::Dialog {
+        Operation::Dialog { input_name, .. } => ResolvedAction::Dialog {
             input: input_path(&input_name),
         },
-        ConsoleControlRequest::Window { timeout } => {
-            terminal::ConsoleControlAction::Window { timeout }
-        }
-        ConsoleControlRequest::Close => terminal::ConsoleControlAction::Close,
+        Operation::Window { timeout } => ResolvedAction::Window { timeout },
+        Operation::Close => ResolvedAction::Close,
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+pub(in crate::native) const SUBMIT_DELAYS_EXHAUSTED: &str =
+    "Windows console submission delays do not fit inside the remaining turn timeout";
+#[cfg(windows)]
+pub(in crate::native) const STALE_BEFORE_INPUT: &str =
+    "Windows console claim stale before any input";
+#[cfg(windows)]
+pub(in crate::native) const STALE_AFTER_INPUT: &str =
+    "Windows console claim stale after input dispatch";
+#[cfg(windows)]
+pub(in crate::native) const MISSING_PROCESS: &str = "console process is no longer available";
+
+#[cfg(windows)]
+pub(in crate::native) fn helper_reports_missing(message: &str) -> bool {
+    exact_helper_message(message, MISSING_PROCESS)
+}
+
+#[cfg(windows)]
+pub(in crate::native) fn helper_proves_no_input(message: &str) -> bool {
+    exact_helper_message(message, STALE_BEFORE_INPUT)
+        || exact_helper_message(message, SUBMIT_DELAYS_EXHAUSTED)
+}
+
+#[cfg(windows)]
+fn exact_helper_message(message: &str, expected: &str) -> bool {
+    let message = message.trim();
+    message == expected || message.strip_prefix("Error: ") == Some(expected)
+}
+
+#[cfg(windows)]
+fn helper_failure_message(output: &std::process::Output) -> String {
+    let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if message.is_empty() {
+        "Windows console control helper failed".to_owned()
+    } else {
+        message
+    }
+}
+
+#[cfg(windows)]
+fn classify_send_output(
+    output: std::process::Output,
+) -> std::result::Result<Vec<u8>, terminal::TerminalSendFailure> {
+    if output.status.success() {
+        return Ok(output.stdout);
+    }
+    let message = helper_failure_message(&output);
+    let not_sent = helper_proves_no_input(&message);
+    let error = anyhow::anyhow!(message);
+    Err(if not_sent {
+        terminal::TerminalSendFailure::not_sent(error)
+    } else {
+        terminal::TerminalSendFailure::delivery_uncertain(error)
+    })
+}
+
+#[cfg(windows)]
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(in crate::native) struct GuardedTextInput {
+    pub(in crate::native) text: String,
+    #[serde(default)]
+    pub(in crate::native) expected_claim: Option<String>,
+    #[serde(default)]
+    pub(in crate::native) expires_unix_ms: Option<u128>,
+}
+
+#[cfg(windows)]
+pub(in crate::native) fn decode_text_payload(payload: &[u8]) -> Result<GuardedTextInput> {
+    serde_json::from_slice(payload).context("invalid text-only console payload")
+}
+
+#[cfg(windows)]
+pub(in crate::native) fn decode_dialog_payload(
+    payload: &[u8],
+) -> Result<terminal::GuardedDialogInput> {
+    Ok(serde_json::from_slice(payload)?)
+}
+
+#[cfg(windows)]
+pub(in crate::native) fn write_text_count(
+    output: &mut impl std::io::Write,
+    count: usize,
+) -> Result<()> {
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({"schema": 1, "written_chars": count})
+    )?;
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(in crate::native) fn parse_text_only_output(
+    output: &[u8],
+) -> std::result::Result<usize, terminal::TerminalSendFailure> {
+    parse_text_only_count(output).map_err(terminal::TerminalSendFailure::delivery_uncertain)
+}
+
+#[cfg(windows)]
+fn parse_text_only_count(output: &[u8]) -> Result<usize> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Written {
+        schema: u32,
+        written_chars: usize,
+    }
+    let line = std::str::from_utf8(output)?.trim();
+    if line.lines().count() != 1 {
+        bail!("expected one Windows console text-only result line");
+    }
+    let value: Written =
+        serde_json::from_str(line).context("invalid Windows console text-only result")?;
+    if value.schema != 1 {
+        bail!("invalid Windows console text-only result schema");
+    }
+    Ok(value.written_chars)
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub(in crate::native) struct StaleDialogClaim;
+#[cfg(windows)]
+impl std::fmt::Display for StaleDialogClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("stale claim at guarded submission")
+    }
+}
+#[cfg(windows)]
+impl std::error::Error for StaleDialogClaim {}
+
+#[cfg(windows)]
+fn decode_dialog_reply(output: &[u8]) -> Result<bool> {
+    match String::from_utf8_lossy(output).trim() {
+        "sent" => Ok(true),
+        "changed" => Ok(false),
+        "stale" => Err(StaleDialogClaim.into()),
+        _ => bail!("unexpected managed console dialog result"),
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Eq, PartialEq)]
+pub(in crate::native) enum DialogReply {
+    Sent,
+    Changed,
+    Stale,
+}
+
+#[cfg(windows)]
+pub(in crate::native) fn write_dialog_reply(
+    output: &mut impl std::io::Write,
+    reply: DialogReply,
+) -> Result<()> {
+    let message = match reply {
+        DialogReply::Sent => "sent",
+        DialogReply::Changed => "changed",
+        DialogReply::Stale => "stale",
+    };
+    writeln!(output, "{message}")?;
+    Ok(())
+}
+
+#[cfg(windows)]
+pub(in crate::native) fn screen_output(screen: &str) -> Result<String> {
+    Ok(format!("{}\n", serde_json::to_string(screen)?))
+}
+
+#[cfg(windows)]
+pub(in crate::native) fn window_output(window: isize) -> String {
+    format!("{window}\n")
+}
+
+#[cfg(windows)]
+fn decode_window(output: &[u8]) -> Option<isize> {
+    String::from_utf8_lossy(output)
+        .trim()
+        .parse::<isize>()
+        .ok()
+        .filter(|window| *window != 0)
+}
+
+#[cfg(not(windows))]
 pub(super) fn run(_request: ConsoleControlRequest, _id: &str) -> Result<()> {
     bail!("native Windows console control is only available on Windows")
 }
 
+#[cfg(test)]
+mod tests;
 #[cfg(all(test, windows))]
-mod tests {
-    use super::*;
-    #[test]
-    fn parsed_send_resolves_override_and_provider_facts() {
-        for (provider, count, newline) in [
-            (
-                FirstPartyCli::Codex,
-                2,
-                terminal::ConsoleNewline::ShiftReturn,
-            ),
-            (FirstPartyCli::Agy, 1, terminal::ConsoleNewline::LineFeed),
-            (FirstPartyCli::Pi, 1, terminal::ConsoleNewline::LineFeed),
-        ] {
-            for explicit in [false, true] {
-                let mut args: Vec<String> =
-                    ["send", "session-test", "pending-prompt-test.txt", "5000"]
-                        .map(str::to_owned)
-                        .into();
-                if explicit {
-                    args.push("0".into());
-                }
-                let NativeCommand::ConsoleControl { request, .. } = parse(&args).unwrap() else {
-                    panic!("wrong command");
-                };
-                let terminal::ConsoleControlAction::Send {
-                    input,
-                    submit_count,
-                    newline: actual_newline,
-                    timeout,
-                } = resolve_action(request, Path::new("fixture"), provider)
-                else {
-                    panic!("wrong action");
-                };
-                assert_eq!(submit_count, if explicit { 0 } else { count });
-                assert_eq!(actual_newline, newline);
-                assert_eq!(timeout, Duration::from_secs(5));
-                assert_eq!(input, Path::new("fixture").join("pending-prompt-test.txt"));
-            }
-        }
-    }
-}
+pub(in crate::native) use tests::with_in_process_helper;

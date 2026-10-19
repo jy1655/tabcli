@@ -129,13 +129,19 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   It uses the session seam and terminal operations. Keep provider schemas and transport selection
   in `src/native/provider/<provider>/` (or a single `<provider>.rs` file), not in shared
   orchestration.
+- `src/native/console_control.rs` owns the Windows helper's argv, payload, reply, and failure
+  protocol; its private client owns process invocation, private payload lifetime, and asynchronous
+  window lookup. Command parsing builds an opaque `ConsoleControlRequest`; after session and
+  surface verification, provider facts resolve it to an action for the Windows executor. The
+  in-process test adapter uses the same decoder, provider resolution, and reply interpretation.
 - `src/native/terminal/` selects and implements platform-specific surfaces, input, observation,
-  and close. Native command parsing builds a `ConsoleControlRequest`; after session verification,
-  the Windows adapter executes a typed `ConsoleControlAction` with resolved input and timing.
+  and close. Windows retains console attachment, Win32 effects, and lifecycle-locked input dispatch.
   Its `close_authority` module owns the observation seam (the Records read when the decision
   asks, and the OS and surface observations), the decision and the dispatch, with a production
   adapter and an in-memory test adapter; `ownership` keeps the owner record types, control
   proof and the owner-teardown action, and the platform adapters keep the surface close.
+  The macOS owner wrapper reads the record and calls the same ordered verifier as portable tests;
+  live-process and TTY observations are lazy so that an earlier refusal prevents later OS reads.
   `session::owner` owns process observation and
   attestation. The Terminal.app adapter owns app incarnation. Process reuse alone never
   supplies control proof or ordinary dead-owner Surface authority.
@@ -213,6 +219,11 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   observation and requires strict event decoding, an exact event name, and verifiable provenance;
   it does not reconstruct Request meaning from command JSON. Timeline retains its cached strict
   reads, and search retains its cumulative byte budget.
+  Codex lifecycle diagnostics read the typed Request state and event identity, release the
+  Snapshot's shared lock, then perform their existing strict event reread for provenance.
+  `query::observation::PartialObservation` owns doctor's fallback when no Snapshot can be read:
+  Cancel and Hold retain separate lock attempts and failure scopes, with the best-effort manifest
+  read after both. Rendering partial evidence does not repair it or grant control authority.
   Inspect, doctor, and `status` render one Observation per session from these readers and publication rules;
   owner process observations and surface probes are added on request, while `sessions` keeps
   its own lock-free listing after its optional repair. The Observation's judgments live in
@@ -248,6 +259,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   through consent's store reader and never written by Bridge. It also owns the one trust wait,
   which checks the ended-session rule first and serves the Codex paste gate and the Agy delivery
   gate with their own readiness and messages.
+  Its `SessionConsentObservation` preserves the raw diagnostic JSON while exposing known state
+  and applied-marker accessors. Unknown or damaged diagnostic records are not authorization;
+  the strict consent record and current-source revalidation remain separate. Doctor retains its
+  later normal-path consent reread.
 - `src/native/settings.rs` owns user preferences for surface creation and one launch admission
   preference, `codex-memory-workspace`. A preference cannot grant or remove close authority over
   an existing session or surface.

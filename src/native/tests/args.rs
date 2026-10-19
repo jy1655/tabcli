@@ -1,6 +1,5 @@
 use super::*;
 use crate::native::args::parse_timeout;
-use crate::native::console_control::{ConsoleControlRequest, parse as parse_console_control};
 use crate::native::tell::TellRequest;
 use crate::native::{
     AskRequest, COMMANDS, NativeCommand, context, is_command, parse_args, terminal,
@@ -626,7 +625,7 @@ fn registry_routes_every_command_to_its_variant_and_fields() {
         (vec!["native-session", "session-route"], "RunSession { id: \"session-route\" }".into()),
         (vec!["native-hook", "codex", "{}"], "Hook { provider: Codex, payload: Some(\"{}\") }".into()),
         (vec!["native-provider-control", "claude", "operation", "payload"], "ProviderControl { provider: Claude, arguments: [\"operation\", \"payload\"] }".into()),
-        (vec!["native-console-control", "send", "session-route", "pending-prompt-route.txt", "7"], "ConsoleControl { request: Send { submit_count: None, input_name: \"pending-prompt-route.txt\", timeout: 7ms }, id: \"session-route\" }".into()),
+        (vec!["native-console-control", "send", "session-route", "pending-prompt-route.txt", "7"], "ConsoleControl { request: ConsoleControlRequest { operation: Send { mode: ProviderDefault, input_name: \"pending-prompt-route.txt\", timeout: 7ms } }, id: \"session-route\" }".into()),
         (vec!["native-console-host", directory_text], format!("Host(Console {{ directory: {directory:?} }})")),
         (vec!["native-iterm2-host", directory_text], format!("Host(Iterm2 {{ directory: {directory:?} }})")),
         (vec!["native-terminal-host", directory_text], format!("Host(AppleTerminal {{ directory: {directory:?} }})")),
@@ -646,146 +645,6 @@ fn registry_routes_every_command_to_its_variant_and_fields() {
             expected,
             "{args:?}"
         );
-    }
-}
-
-#[test]
-fn console_control_parser_preserves_positional_action_contract() {
-    let timeout = Duration::from_millis(7);
-    for (tail, expected) in [
-        (
-            vec!["screen", "session-route"],
-            ConsoleControlRequest::Screen,
-        ),
-        (vec!["close", "session-route"], ConsoleControlRequest::Close),
-        (
-            vec!["window", "session-route", "7"],
-            ConsoleControlRequest::Window { timeout },
-        ),
-        (
-            vec!["send", "session-route", "pending-prompt-route.txt", "7"],
-            ConsoleControlRequest::Send {
-                submit_count: None,
-                input_name: "pending-prompt-route.txt".into(),
-                timeout,
-            },
-        ),
-        (
-            vec![
-                "send",
-                "session-route",
-                "pending-prompt-route.txt",
-                "7",
-                "0",
-            ],
-            ConsoleControlRequest::Send {
-                submit_count: Some(0),
-                input_name: "pending-prompt-route.txt".into(),
-                timeout,
-            },
-        ),
-        (
-            vec!["dialog", "session-route", "pending-prompt-route.txt", "7"],
-            ConsoleControlRequest::Dialog {
-                input_name: "pending-prompt-route.txt".into(),
-                timeout,
-            },
-        ),
-    ] {
-        let NativeCommand::ConsoleControl { request, id } =
-            parse_console_control(&tail.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
-                .unwrap()
-        else {
-            panic!("wrong command")
-        };
-        assert_eq!(request, expected);
-        assert_eq!(id, "session-route");
-    }
-    for tail in [
-        vec!["screen", "session-route", "7"],
-        vec!["close", "session-route", "7"],
-        vec!["window", "session-route"],
-        vec!["window", "session-route", "7", "extra"],
-        vec!["send", "session-route"],
-        vec!["send", "session-route", "pending-prompt-route.txt"],
-        vec![
-            "send",
-            "session-route",
-            "pending-prompt-route.txt",
-            "7",
-            "extra",
-        ],
-        vec!["dialog", "session-route"],
-        vec!["dialog", "session-route", "pending-prompt-route.txt"],
-        vec![
-            "dialog",
-            "session-route",
-            "pending-prompt-route.txt",
-            "7",
-            "extra",
-        ],
-    ] {
-        let error =
-            parse_console_control(&tail.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
-                .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "invalid native console control arguments",
-            "{tail:?}"
-        );
-    }
-    for action in ["send", "dialog"] {
-        for input in [
-            "outside.txt".to_owned(),
-            "../pending-prompt-route.txt".into(),
-            "pending-prompt-route.json".into(),
-            format!("pending-prompt-{}.txt", "x".repeat(110)),
-            format!("pending-prompt-{}.txt", "가".repeat(37)),
-        ] {
-            let error = parse_args([
-                "native-console-control",
-                action,
-                "session-route",
-                &input,
-                "invalid",
-            ])
-            .unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                "invalid native console control arguments"
-            );
-        }
-        let longest = format!("pending-prompt-{}.txt", "x".repeat(109));
-        assert!(
-            parse_args([
-                "native-console-control",
-                action,
-                "session-route",
-                &longest,
-                "18446744073709551615"
-            ])
-            .is_ok()
-        );
-    }
-    for action in ["send", "dialog", "window"] {
-        for (timeout, expected) in [
-            ("0", "native console timeout must be positive"),
-            (
-                "bad",
-                "invalid native console timeout: invalid digit found in string",
-            ),
-            (
-                "18446744073709551616",
-                "invalid native console timeout: number too large to fit in target type",
-            ),
-        ] {
-            let mut args = vec!["native-console-control", action, "session-route"];
-            if action != "window" {
-                args.push("pending-prompt-route.txt");
-            }
-            args.push(timeout);
-            assert_eq!(format!("{:#}", parse_args(args).unwrap_err()), expected);
-        }
     }
 }
 

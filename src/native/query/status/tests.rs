@@ -46,7 +46,7 @@ fn in_memory(records: Snapshot) -> StatusObservation {
             records,
             evidence,
             resumed_from: Ok(None),
-            workspace_consent: Value::Null,
+            workspace_consent: consent::SessionConsentObservation::default(),
             judgments,
         },
         active: None,

@@ -1,9 +1,9 @@
 use super::*;
+use crate::native::clock::FakeClock;
 
 #[cfg(windows)]
 mod positive_gate {
     use super::*;
-    use crate::native::clock::FakeClock;
     use crate::native::session::{SessionState, Store, update_status};
     use serde_json::json;
 
@@ -253,22 +253,24 @@ fn submission_observed_rejects_empty_screen() {
 #[test]
 fn submission_check_accepts_observed_submission() {
     let start = Instant::now();
+    let mut clock = FakeClock::new(start);
     let mut screens = ["› [Pasted Content 21657 chars]", COMPOSER_ROW].into_iter();
     wait_for_submission_with(
         || Ok(screens.next().unwrap().to_owned()),
         start + Duration::from_secs(10),
-        Duration::ZERO,
-        || start,
+        COMPOSER_POLL,
+        &mut clock,
     )
     .unwrap();
     assert_eq!(screens.next(), None);
+    assert_eq!(clock.slept, COMPOSER_POLL);
 }
 
 #[test]
 fn submission_check_timeout_is_uncertain() {
     let start = Instant::now();
-    let deadline = start + Duration::from_secs(10);
-    let mut clock = [start, start, deadline].into_iter();
+    let deadline = start + Duration::from_millis(1500);
+    let mut clock = FakeClock::new(start);
     let mut reads = 0;
     let failure = wait_for_submission_with(
         || {
@@ -276,11 +278,12 @@ fn submission_check_timeout_is_uncertain() {
             Ok("› [Pasted Content 21657 chars]".to_owned())
         },
         deadline,
-        Duration::ZERO,
-        || clock.next().unwrap(),
+        COMPOSER_POLL,
+        &mut clock,
     )
     .unwrap_err();
-    assert_eq!(reads, 1);
+    assert_eq!(reads, 2);
+    assert_eq!(clock.slept, Duration::from_millis(1500));
     assert!(failure.delivery_may_have_occurred());
     assert_eq!(
         failure.error().to_string(),
@@ -291,13 +294,20 @@ fn submission_check_timeout_is_uncertain() {
 #[test]
 fn submission_check_screen_read_failure_is_uncertain() {
     let start = Instant::now();
+    let mut clock = FakeClock::new(start);
+    let mut reads = 0;
     let failure = wait_for_submission_with(
-        || anyhow::bail!("screen unavailable"),
+        || {
+            reads += 1;
+            anyhow::bail!("screen unavailable");
+        },
         start + Duration::from_secs(10),
-        Duration::ZERO,
-        || start,
+        COMPOSER_POLL,
+        &mut clock,
     )
     .unwrap_err();
+    assert_eq!(reads, 1);
+    assert_eq!(clock.slept, Duration::ZERO);
     assert!(failure.delivery_may_have_occurred());
     assert!(
         failure
@@ -305,6 +315,65 @@ fn submission_check_screen_read_failure_is_uncertain() {
             .to_string()
             .contains("submission was not observed")
     );
+}
+
+#[test]
+fn submission_check_requires_time_strictly_before_the_deadline() {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    for (now, expected_reads) in [
+        (deadline - Duration::from_nanos(1), 1),
+        (deadline, 0),
+        (deadline + Duration::from_nanos(1), 0),
+    ] {
+        let mut clock = FakeClock::new(now);
+        let mut reads = 0;
+        let result = wait_for_submission_with(
+            || {
+                reads += 1;
+                Ok(COMPOSER_ROW.into())
+            },
+            deadline,
+            COMPOSER_POLL,
+            &mut clock,
+        );
+        assert_eq!(reads, expected_reads);
+        assert_eq!(result.is_ok(), expected_reads == 1);
+        if let Err(failure) = result {
+            assert!(failure.delivery_may_have_occurred());
+        }
+        assert_eq!(clock.slept, Duration::ZERO);
+    }
+}
+
+#[test]
+fn submission_check_rechecks_the_deadline_after_reading_ready_screen() {
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(1);
+    for read_finished in [
+        deadline - Duration::from_nanos(1),
+        deadline,
+        deadline + Duration::from_nanos(1),
+    ] {
+        let mut clock = FakeClock::new(start);
+        let now = clock.shared();
+        let mut reads = 0;
+        let result = wait_for_submission_with(
+            || {
+                reads += 1;
+                now.set(read_finished);
+                Ok(COMPOSER_ROW.into())
+            },
+            deadline,
+            COMPOSER_POLL,
+            &mut clock,
+        );
+        assert_eq!(reads, 1);
+        assert_eq!(result.is_ok(), read_finished < deadline);
+        if let Err(failure) = result {
+            assert!(failure.delivery_may_have_occurred());
+        }
+        assert_eq!(clock.slept, Duration::ZERO);
+    }
 }
 
 // The screens an initial paste can meet, as Codex CLI 0.159.3 drew them on

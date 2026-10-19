@@ -3,12 +3,52 @@ use super::*;
 use crate::native::reopen::ResumedFrom;
 use crate::native::session;
 use crate::native::session::origin;
-use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent};
+use crate::native::session::schema::{EVENT_READ_LIMIT, SessionEvent, SessionManifest};
 use crate::native::terminal::ownership::NativeSessionOwner;
-use judgment::{Cancel, CancelState, Judgments, OwnerJudgment, SurfacePresence};
+use judgment::{Cancel, CancelState, Hold, Judgments, OwnerJudgment, Surface, SurfacePresence};
 use std::cell::OnceCell;
+use std::fs::File;
 
 pub(in crate::native) mod judgment;
+
+pub(in crate::native) struct PartialObservation {
+    pub(in crate::native) manifest: Option<SessionManifest>,
+    pub(in crate::native) evidence: SessionEvidence,
+    pub(in crate::native) cancel: Cancel,
+    pub(in crate::native) surface: Surface,
+    pub(in crate::native) hold: Hold,
+}
+
+impl PartialObservation {
+    pub(in crate::native) fn read(reader: &Reader, id: &str) -> Self {
+        Self::read_with_lock(reader, id, || reader.lock_shared())
+    }
+
+    fn read_with_lock(
+        reader: &Reader,
+        id: &str,
+        mut lock_shared: impl FnMut() -> Result<Option<File>>,
+    ) -> Self {
+        let cancel =
+            lock_shared().and_then(|lock| session::cancel::observe(reader, lock.is_some()));
+        let cancel = judgment::cancel_record(&cancel);
+        let evidence = match lock_shared() {
+            Ok(lock) => {
+                SessionEvidence::read(reader, session::hold::observe(reader, lock.is_some()))
+            }
+            Err(error) => SessionEvidence::read(reader, Err(error)),
+        };
+        let surface = judgment::surface(&evidence.surface, id);
+        let hold = judgment::hold(&evidence.held, evidence.close_tombstone.as_ref(), None);
+        Self {
+            manifest: reader.manifest().ok(),
+            evidence,
+            cancel,
+            surface,
+            hold,
+        }
+    }
+}
 
 /// Hold, Owner and Surface records are separate observations from the four lifecycle records.
 /// They remain readable when the lifecycle records cannot form a consistent Observation.
@@ -229,7 +269,7 @@ pub(in crate::native) struct Observation {
     pub(in crate::native) cancel: Option<CancelObservation>,
     pub(in crate::native) evidence: SessionEvidence,
     pub(in crate::native) resumed_from: Result<Option<ResumedFrom>>,
-    pub(in crate::native) workspace_consent: Value,
+    pub(in crate::native) workspace_consent: consent::SessionConsentObservation,
     /// Decided once from the Records above; renderers map them (judgment.rs).
     pub(in crate::native) judgments: Judgments,
     /// The Origin as this Snapshot's launch record and initial receipt name it.

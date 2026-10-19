@@ -1,6 +1,8 @@
 //! Historical session evidence only; never effective live configuration.
 use super::super::{codex_version, hooks, lifecycle};
 use crate::native::doctor::{Availability, Check};
+use crate::native::query::{RequestState, Selector};
+use crate::native::session::schema::SessionEvent;
 use crate::native::session::{Reader, requests, turn};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
@@ -123,20 +125,30 @@ fn sidecar(reader: &Reader, prefix: &str, token: &str) -> Value {
 }
 
 fn terminal(reader: &Reader, receipt: &requests::Receipt) -> Result<Value> {
-    let result = crate::native::query::observe_snapshot(reader)?.result(
-        reader,
-        &crate::native::query::Selector::Request(receipt.request_id.clone()),
-    )?;
-    if !matches!(
-        result["request_state"].as_str(),
-        Some("completed" | "failed" | "cancelled")
-    ) || result["event_id"].as_str() != Some(&receipt.event_file)
-    {
-        return Ok(absent());
-    }
-    let event = reader
-        .event_strict(&receipt.event_file)
-        .map_err(anyhow::Error::msg)?;
+    terminal_with(reader, receipt, |name| {
+        reader.event_strict(name).map_err(anyhow::Error::msg)
+    })
+}
+
+fn terminal_with(
+    reader: &Reader,
+    receipt: &requests::Receipt,
+    read_event: impl FnOnce(&str) -> Result<SessionEvent>,
+) -> Result<Value> {
+    let state = {
+        let snapshot = crate::native::query::observe_snapshot(reader)?;
+        let selector = Selector::Request(receipt.request_id.clone());
+        let result = snapshot.observe_result(reader, &selector)?;
+        if !matches!(
+            result.state(),
+            RequestState::Completed | RequestState::Failed | RequestState::Cancelled
+        ) || result.event_id() != Some(receipt.event_file.as_str())
+        {
+            return Ok(absent());
+        }
+        result.state()
+    };
+    let event = read_event(&receipt.event_file)?;
     if event.provenance.is_none() {
         return Ok(absent());
     }
@@ -148,7 +160,10 @@ fn terminal(reader: &Reader, receipt: &requests::Receipt) -> Result<Value> {
     };
     Ok(observed(
         json!({"request_id":receipt.request_id,"event_id":receipt.event_file,
-        "provenance":event.provenance,"kind":kind,"request_state":result["request_state"],
+        "provenance":event.provenance,"kind":kind,"request_state":state,
         "created_unix_ms":event.created_unix_ms}),
     ))
 }
+
+#[cfg(test)]
+mod tests;

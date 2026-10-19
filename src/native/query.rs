@@ -190,7 +190,7 @@ impl RequestState {
 
 /// One Request's meaning, independent of its command's JSON representation. The
 /// snapshot retains the lifecycle read lock; each caller keeps its own read policy.
-struct RequestObservation<'a> {
+pub(in crate::native) struct RequestObservation<'a> {
     snapshot: &'a Snapshot,
     receipt: Option<&'a requests::Receipt>,
     event_id: Option<&'a str>,
@@ -200,6 +200,14 @@ struct RequestObservation<'a> {
 }
 
 impl RequestObservation<'_> {
+    pub(in crate::native) fn state(&self) -> RequestState {
+        self.state
+    }
+
+    pub(in crate::native) fn event_id(&self) -> Option<&str> {
+        self.event_id
+    }
+
     fn value_with_questions(&self, reader: &Reader) -> Value {
         let mut value = self.value();
         if let Some(questions) = self
@@ -394,7 +402,7 @@ impl Snapshot {
         Ok(self.observe_result(reader, selector)?.value())
     }
 
-    fn observe_result<'a>(
+    pub(in crate::native) fn observe_result<'a>(
         &'a self,
         reader: &Reader,
         selector: &'a Selector,
