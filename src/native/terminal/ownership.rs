@@ -85,48 +85,47 @@ pub(in crate::native) struct NativeProcessIdentity {
     pub(in crate::native) process_start_microseconds: u64,
 }
 
-#[cfg(test)]
-pub(in crate::native) fn verify_terminal_owner_attestation(
+#[cfg(any(target_os = "macos", test))]
+pub(in crate::native::terminal) fn verify_native_terminal_owner_with(
     expected_session_id: &str,
     session: &terminal::TerminalSession,
-    owner: &NativeSessionOwner,
-    live: &NativeProcessIdentity,
-    surface_tty_device: u64,
-) -> Result<()> {
-    if session.kind != terminal::TerminalKind::AppleTerminal {
-        bail!("native-session TTY attestation is only valid for Terminal.app")
-    }
+    surface_tty: Option<&str>,
+    owner: NativeSessionOwner,
+    mut process: impl FnMut(u32) -> Result<NativeProcessIdentity>,
+    tty_device: impl FnOnce(&Path) -> Result<u64>,
+) -> Result<(NativeSessionOwner, NativeProcessIdentity)> {
+    let live = process(owner.pid)?;
     session.verify_managed_session(expected_session_id)?;
-    if session.window_id.as_deref().is_none_or(str::is_empty) {
-        bail!("Terminal.app session record is missing its dedicated window id")
-    }
     if owner.managed_session_id.as_deref() != Some(expected_session_id) {
         bail!("native-session owner is not bound to this managed session")
     }
-    if owner.terminal_tty.as_deref() != Some(session.id.as_str()) {
-        bail!("native-session owner is attached to a different terminal TTY")
-    }
-    if owner.pid != live.pid {
-        bail!("native-session owner PID no longer identifies the live process")
-    }
-    let owner_tty_device = owner
-        .terminal_tty_device
-        .context("native-session owner is missing its controlling TTY device")?;
-    if owner_tty_device != live.terminal_tty_device || owner_tty_device != surface_tty_device {
-        bail!("Terminal.app TTY no longer belongs to the native-session owner")
-    }
-    let owner_start_seconds = owner
-        .process_start_seconds
-        .context("native-session owner is missing its process start time")?;
-    let owner_start_microseconds = owner
-        .process_start_microseconds
-        .context("native-session owner is missing its process start time")?;
-    if owner_start_seconds != live.process_start_seconds
-        || owner_start_microseconds != live.process_start_microseconds
+    if !matches!(
+        (
+            owner.terminal_tty_device,
+            owner.process_start_seconds,
+            owner.process_start_microseconds,
+            owner.process_group,
+            owner.terminal_process_group,
+        ),
+        (Some(_), Some(_), Some(_), Some(_), Some(_))
+    ) || !native_owner_identity_matches(&owner, &live)
     {
-        bail!("native-session owner PID was reused by another process")
+        bail!("native-session owner birth, TTY, or foreground identity changed")
     }
-    Ok(())
+    let owner_tty = owner
+        .terminal_tty
+        .as_deref()
+        .context("native-session owner is missing its controlling TTY")?;
+    if surface_tty.is_some_and(|tty| tty != owner_tty) {
+        bail!("terminal surface is attached to a different native-session TTY")
+    }
+    if tty_device(Path::new(owner_tty))? != live.terminal_tty_device {
+        bail!("native-session owner TTY path no longer identifies its controlling TTY")
+    }
+    verified_terminal_owner_process_group(&owner, &live)?;
+    let live_shell = process(live.parent_pid)?;
+    verified_terminal_shell_process_group(&owner, &live, &live_shell)?;
+    Ok((owner, live))
 }
 
 #[cfg(target_os = "macos")]
