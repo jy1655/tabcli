@@ -248,7 +248,7 @@ impl InProcessHelper {
                 Ok(0)
             },
             stdout,
-            || now,
+            &mut crate::native::clock::FakeClock::new(now),
         );
         if stale {
             assert_eq!(count, 0, "stale helper must write zero input records");

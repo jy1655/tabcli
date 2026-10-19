@@ -1,6 +1,7 @@
 mod paste;
 use super::PendingCodexTurn;
 use super::correlation::correlated_prompt;
+use crate::native::clock::{Clock, SystemClock};
 use crate::native::session::Reader;
 use crate::native::terminal;
 use agent_bridge::FirstPartyCli;
@@ -8,7 +9,6 @@ use anyhow::{Context, Result};
 use std::{
     ffi::OsString,
     path::Path,
-    thread,
     time::{Duration, Instant},
 };
 
@@ -67,7 +67,7 @@ pub(super) fn send_initial_prompt(
             || terminal::read_screen(session, submission_deadline),
             submission_deadline,
             COMPOSER_POLL,
-            Instant::now,
+            &mut SystemClock,
         )?;
     }
     Ok(())
@@ -174,15 +174,16 @@ fn wait_for_submission_with(
     mut read_screen: impl FnMut() -> Result<String>,
     deadline: Instant,
     poll: Duration,
-    mut now: impl FnMut() -> Instant,
+    clock: &mut impl Clock,
 ) -> terminal::TerminalSendResult {
-    while now() < deadline {
+    while clock.now() < deadline {
         match read_screen() {
-            Ok(screen) if submission_observed(&screen) && now() < deadline => return Ok(()),
+            Ok(screen) if submission_observed(&screen) && clock.now() < deadline => return Ok(()),
             Err(_) => break,
             Ok(_) => {}
         }
-        thread::sleep(poll.min(deadline.saturating_duration_since(now())));
+        let remaining = deadline.saturating_duration_since(clock.now());
+        clock.sleep(poll.min(remaining));
     }
     Err(terminal::TerminalSendFailure::delivery_uncertain(
         anyhow::anyhow!(

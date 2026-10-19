@@ -4,6 +4,7 @@ use super::{
     open_verified_control_process, query_process_identity, query_process_identity_from_handle,
     resolve_executable_from_path, verify_control_process_identity, verify_process_identity,
 };
+use crate::native::clock::FakeClock;
 use crate::native::console_control;
 use crate::native::session::primitives::write_json_atomic;
 use crate::native::session::test_support::{
@@ -292,6 +293,7 @@ fn missing_console_process_converges_to_the_standard_missing_result() {
 #[test]
 fn submission_return_waits_until_the_console_input_buffer_is_drained() {
     let start = Instant::now();
+    let mut clock = FakeClock::new(start);
     let mut pending = [3, 2, 0].into_iter();
     let mut calls = 0;
     super::wait_for_console_input_drain_with(
@@ -300,19 +302,20 @@ fn submission_return_waits_until_the_console_input_buffer_is_drained() {
             Ok(pending.next().unwrap())
         },
         start + Duration::from_secs(1),
-        Duration::ZERO,
-        || start,
+        Duration::from_millis(50),
+        &mut clock,
     )
     .unwrap();
     assert_eq!(calls, 3);
     assert_eq!(pending.next(), None);
+    assert_eq!(clock.slept, Duration::from_millis(100));
 }
 
 #[test]
 fn submission_return_drain_times_out_at_the_deadline_as_uncertain() {
     let start = Instant::now();
     let deadline = start + Duration::from_millis(100);
-    let mut clock = [start, start, deadline].into_iter();
+    let mut clock = FakeClock::new(start);
     let mut calls = 0;
     let error = super::wait_for_console_input_drain_with(
         || {
@@ -320,16 +323,83 @@ fn submission_return_drain_times_out_at_the_deadline_as_uncertain() {
             Ok(3)
         },
         deadline,
-        Duration::ZERO,
-        || clock.next().unwrap(),
+        Duration::from_millis(60),
+        &mut clock,
     )
     .unwrap_err();
-    assert_eq!(calls, 1);
+    assert_eq!(calls, 2);
+    assert_eq!(clock.slept, Duration::from_millis(100));
     assert_eq!(
         error.to_string(),
         "Windows console input was not consumed before the submission Return"
     );
     assert!(!console_control::helper_proves_no_input(&error.to_string()));
+}
+
+#[test]
+fn submission_return_drain_checks_the_deadline_before_reading_pending_count() {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    for (now, expected_calls) in [
+        (deadline - Duration::from_nanos(1), 1),
+        (deadline, 0),
+        (deadline + Duration::from_nanos(1), 0),
+    ] {
+        let mut clock = FakeClock::new(now);
+        let mut calls = 0;
+        let result = super::wait_for_console_input_drain_with(
+            || {
+                calls += 1;
+                Ok(0)
+            },
+            deadline,
+            Duration::from_millis(50),
+            &mut clock,
+        );
+        assert_eq!(calls, expected_calls);
+        assert_eq!(result.is_ok(), expected_calls == 1);
+        assert_eq!(clock.slept, Duration::ZERO);
+    }
+}
+
+#[test]
+fn submission_return_drain_accepts_zero_pending_without_a_post_read_deadline_check() {
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(1);
+    for read_finished in [deadline, deadline + Duration::from_nanos(1)] {
+        let mut clock = FakeClock::new(start);
+        let now = clock.shared();
+        super::wait_for_console_input_drain_with(
+            || {
+                now.set(read_finished);
+                Ok(0)
+            },
+            deadline,
+            Duration::from_millis(50),
+            &mut clock,
+        )
+        .unwrap();
+        assert_eq!(clock.slept, Duration::ZERO);
+    }
+}
+
+#[test]
+fn submission_return_drain_pending_error_exits_without_sleep_or_retry() {
+    let start = Instant::now();
+    let mut clock = FakeClock::new(start);
+    let mut calls = 0;
+    let error = super::wait_for_console_input_drain_with(
+        || {
+            calls += 1;
+            anyhow::bail!("count unavailable");
+        },
+        start + Duration::from_secs(1),
+        Duration::from_millis(50),
+        &mut clock,
+    )
+    .unwrap_err();
+    assert_eq!(calls, 1);
+    assert_eq!(clock.slept, Duration::ZERO);
+    assert_eq!(error.to_string(), "count unavailable");
 }
 
 #[test]
@@ -729,6 +799,7 @@ fn text_only_writes_scalars_and_soft_returns_then_reports_after_drain() {
     use windows_sys::Win32::System::Console::SHIFT_PRESSED;
     for input in ["ascii", "한글", "😀", "a\n한😀\n", ""] {
         let start = Instant::now();
+        let mut clock = FakeClock::new(start);
         let polls = Cell::new(0);
         struct AfterDrain<'a> {
             polls: &'a Cell<usize>,
@@ -763,10 +834,11 @@ fn text_only_writes_scalars_and_soft_returns_then_reports_after_drain() {
                 Ok([3, 1, 0][n])
             },
             &mut output,
-            || start,
+            &mut clock,
         )
         .unwrap();
         assert_eq!(polls.get(), 3);
+        assert_eq!(clock.slept, Duration::from_millis(100));
         assert_eq!(
             console_control::parse_text_only_output(&output.bytes).unwrap(),
             input.chars().count()
@@ -804,7 +876,8 @@ fn text_only_timeout_partial_write_and_pending_failure_emit_no_count() {
     let input = format!("{}😀tail", "a".repeat(511));
     for mode in 0..7 {
         let mut output = Vec::new();
-        let clock = Cell::new(start);
+        let mut clock = FakeClock::new(start);
+        let now = clock.shared();
         let calls = Cell::new(0);
         let result = super::write_text_only_with(
             &input,
@@ -823,7 +896,7 @@ fn text_only_timeout_partial_write_and_pending_failure_emit_no_count() {
                     return Ok(1023);
                 }
                 if mode == 4 {
-                    clock.set(start + Duration::from_secs(2));
+                    now.set(start + Duration::from_secs(2));
                 }
                 Ok(chunk.len() as u32)
             },
@@ -831,16 +904,70 @@ fn text_only_timeout_partial_write_and_pending_failure_emit_no_count() {
                 if mode == 3 {
                     anyhow::bail!("count unavailable");
                 }
-                clock.set(start + Duration::from_secs(2));
+                now.set(start + Duration::from_secs(2));
                 Ok(if mode == 6 { 0 } else { 1 })
             },
             &mut output,
-            || clock.get(),
+            &mut clock,
         );
         assert!(result.is_err(), "mode {mode}");
         assert!(output.is_empty());
         if mode == 4 {
             assert_eq!(calls.get(), 1);
+        }
+    }
+}
+
+#[test]
+fn text_only_checks_the_deadline_before_write_and_after_drain() {
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(1);
+    for during_drain in [false, true] {
+        for observed in [
+            deadline - Duration::from_nanos(1),
+            deadline,
+            deadline + Duration::from_nanos(1),
+        ] {
+            let mut clock = FakeClock::new(if during_drain { start } else { observed });
+            let now = clock.shared();
+            let mut writes = 0;
+            let mut polls = 0;
+            let mut output = Vec::new();
+            let result = super::write_text_only_with(
+                "😀",
+                super::ConsoleNewline::ShiftReturn,
+                deadline,
+                |chunk| {
+                    writes += 1;
+                    Ok(chunk.len() as u32)
+                },
+                || {
+                    polls += 1;
+                    if during_drain {
+                        now.set(observed);
+                    }
+                    Ok(0)
+                },
+                &mut output,
+                &mut clock,
+            );
+            assert_eq!(writes, usize::from(during_drain || observed < deadline));
+            assert_eq!(polls, writes);
+            assert_eq!(clock.slept, Duration::ZERO);
+            if observed < deadline {
+                result.unwrap();
+                assert_eq!(console_control::parse_text_only_output(&output).unwrap(), 1);
+            } else {
+                assert!(output.is_empty());
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    if during_drain {
+                        "Windows console input drain exceeded the deadline"
+                    } else {
+                        "Windows console input timed out during text delivery"
+                    }
+                );
+            }
         }
     }
 }
@@ -906,7 +1033,7 @@ fn text_only_multichunk_unicode_count_and_second_chunk_failure() {
                 Ok(0)
             },
             &mut output,
-            || start,
+            &mut FakeClock::new(start),
         );
         if fail {
             assert!(result.is_err());
@@ -1004,7 +1131,7 @@ fn stale_guard_after_first_chunk_is_never_not_sent() {
         },
         || Ok(0),
         &mut output,
-        Instant::now,
+        &mut FakeClock::new(Instant::now()),
     )
     .unwrap_err();
     assert_eq!(calls, 2);
@@ -1078,7 +1205,7 @@ fn attached_dispatch_holds_claim_until_write_returns() {
             },
             || Ok(0),
             &mut output,
-            || now,
+            &mut FakeClock::new(now),
         )
         .unwrap();
         contender.join().unwrap();
@@ -1094,7 +1221,7 @@ fn attached_dispatch_holds_claim_until_write_returns() {
             |_| panic!("retired claim reached writer"),
             || Ok(0),
             &mut output,
-            || now,
+            &mut FakeClock::new(now),
         );
         if dialog {
             result.unwrap();

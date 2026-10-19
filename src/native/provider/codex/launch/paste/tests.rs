@@ -18,6 +18,62 @@ fn frame(text: &str) -> String {
 fn evidence(rendered: &str, expected: &str) -> Observation {
     composer_segments(&frame(rendered)).map_or(Observation::Ambiguous, |s| observe(&s, expected))
 }
+
+#[test]
+fn paired_initial_readiness_and_draft_observation_need_different_evidence() {
+    let empty = super::super::COMPOSER_ROW;
+    assert!(super::super::composer_is_ready(empty));
+    assert_eq!(
+        classification(Ok(empty.into())),
+        "ambiguous (unresolved overlay)"
+    );
+
+    let pending = super::super::PendingCodexTurn::new("1-2-3").unwrap();
+    let prompt = super::super::correlated_prompt("body", &pending);
+    let screen = format!("› {}", prompt.replace('\n', "\n  "));
+    assert!(!super::super::composer_is_ready(&screen));
+    for tail in ["", "<!-- agent-bridge-codex-turn:4-5-6 -->"] {
+        assert!(super::composer_segments(&screen, tail, Path::new(WORKSPACE)).is_err());
+    }
+    let segments =
+        super::composer_segments(&screen, &pending.marker, Path::new(WORKSPACE)).unwrap();
+    assert_eq!(segments.last(), Some(&Segment::Inline(pending.marker)));
+    assert_eq!(observe(&segments, &prompt), Observation::Complete);
+}
+
+#[test]
+fn paired_global_hook_veto_still_allows_plain_words_in_an_addressed_draft() {
+    let pending = super::super::PendingCodexTurn::new("1-2-3").unwrap();
+    for phrase in ["Review hooks", "Trust all and continue"] {
+        let body = format!(
+            "Explain these labels\n{}\n{phrase}",
+            super::super::COMPOSER_ROW
+        );
+        let prompt = super::super::correlated_prompt(&body, &pending);
+        let screen = frame(&prompt);
+        assert!(super::super::legacy_composer_is_ready(&screen));
+        assert!(!super::super::composer_is_ready(&screen));
+        let segments =
+            super::composer_segments(&screen, &pending.marker, Path::new(WORKSPACE)).unwrap();
+        assert_eq!(observe(&segments, &prompt), Observation::Complete);
+    }
+}
+
+#[test]
+fn paired_structural_picker_refuses_both_initial_readiness_and_addressed_draft() {
+    let pending = super::super::PendingCodexTurn::new("1-2-3").unwrap();
+    let prompt = super::super::correlated_prompt("body", &pending);
+    let picker: String = serde_json::from_str(include_str!("picker-screen.json")).unwrap();
+    let screen = format!("{}\n{picker}", frame(&prompt));
+    assert!(!super::super::composer_is_ready(&screen));
+    assert_eq!(
+        super::composer_segments(&screen, &pending.marker, Path::new(WORKSPACE))
+            .unwrap_err()
+            .0,
+        "blocked"
+    );
+}
+
 #[test]
 fn parser_ordered_placeholder_inline_and_unicode_fixtures() {
     for n in [1001, 1500] {

@@ -1,5 +1,6 @@
 pub(in crate::native) mod ownership;
 
+use crate::native::clock::{Clock, SystemClock};
 use crate::native::console_control::{self, ResolvedAction, WindowLookup};
 use crate::native::session::{Reader, Store};
 use std::{
@@ -658,7 +659,7 @@ pub(super) fn console_control(
                 },
                 || unreachable!("dialog has no drain"),
                 &mut std::io::stdout().lock(),
-                Instant::now,
+                &mut SystemClock,
             )
         }
         ResolvedAction::Send {
@@ -678,7 +679,7 @@ pub(super) fn console_control(
                     |chunk| write_console_chunk(handle.as_raw_handle(), chunk),
                     || console_pending_count(handle.as_raw_handle()),
                     &mut std::io::stdout().lock(),
-                    Instant::now,
+                    &mut SystemClock,
                 )
             } else {
                 write_console_input(&input, submit_count, newline, deadline)
@@ -948,7 +949,7 @@ pub(in crate::native) fn dispatch_attached_input(
     mut write: impl FnMut(&[INPUT_RECORD]) -> Result<u32>,
     pending: impl FnMut() -> Result<u32>,
     output: &mut impl std::io::Write,
-    now: impl FnMut() -> Instant,
+    clock: &mut impl Clock,
 ) -> Result<()> {
     match action {
         AttachedInput::Dialog => {
@@ -991,7 +992,7 @@ pub(in crate::native) fn dispatch_attached_input(
                 },
                 pending,
                 output,
-                now,
+                clock,
             )
         }
     }
@@ -1242,7 +1243,7 @@ fn write_console_input(
                 || console_pending_count(handle),
                 deadline - delay,
                 Duration::from_millis(50),
-                Instant::now,
+                &mut SystemClock,
             )?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if delay >= remaining {
@@ -1276,17 +1277,17 @@ fn write_text_only_with(
     mut write: impl FnMut(&[INPUT_RECORD]) -> Result<u32>,
     pending: impl FnMut() -> Result<u32>,
     output: &mut impl std::io::Write,
-    mut now: impl FnMut() -> Instant,
+    clock: &mut impl Clock,
 ) -> Result<()> {
     let records = build_console_input_records(input, 0, newline);
     for chunk in records.chunks(1024) {
-        if now() >= deadline {
+        if clock.now() >= deadline {
             bail!("Windows console input timed out during text delivery");
         }
         check_written_count(write(chunk)?, chunk.len())?;
     }
-    wait_for_console_input_drain_with(pending, deadline, Duration::from_millis(50), &mut now)?;
-    if now() >= deadline {
+    wait_for_console_input_drain_with(pending, deadline, Duration::from_millis(50), clock)?;
+    if clock.now() >= deadline {
         bail!("Windows console input drain exceeded the deadline");
     }
     console_control::write_text_count(output, input.chars().count())?;
@@ -1297,13 +1298,14 @@ fn wait_for_console_input_drain_with(
     mut pending: impl FnMut() -> Result<u32>,
     deadline: Instant,
     poll: Duration,
-    mut now: impl FnMut() -> Instant,
+    clock: &mut impl Clock,
 ) -> Result<()> {
-    while now() < deadline {
+    while clock.now() < deadline {
         if pending()? == 0 {
             return Ok(());
         }
-        std::thread::sleep(poll.min(deadline.saturating_duration_since(now())));
+        let remaining = deadline.saturating_duration_since(clock.now());
+        clock.sleep(poll.min(remaining));
     }
     bail!("Windows console input was not consumed before the submission Return")
 }
