@@ -2,7 +2,9 @@
 
 This record follows the nine candidates in the 16:58 review of `b6c3e84`
 (v0.4.20 plus PR #264). The owner requested review of all nine and implementation
-and verification of the warranted changes. This is local work, not a release.
+and verification of the warranted changes. The initial cutoff below records local
+work before release authorization. The later [runtime and release follow-up](2026-10-19-architecture-runtime.md)
+records the owner's expanded scope and subsequent evidence.
 
 All nine candidates have a disposition. Six received production refactoring, one
 received paired tests, one received a documentation correction, and the common Launch
