@@ -103,6 +103,53 @@ old tag `v0.4.20`; it did not publish and does not validate this candidate's sou
 PR #265 remains a draft. Main-push CI, tag creation, release publication, and local
 installation are not complete at this checkpoint.
 
+## Claude parent verification after the permission-mode correction
+
+At 23:40 KST the owner corrected the intended default to explicit `--yolo`. The
+previous exact-command permission proposal was superseded and never applied. A new
+Claude parent, `session-zUjtY5`, and every new child received `--yolo`; no global
+permission or trust setting changed. This corrects the verification workflow, not
+Bridge's policy: `--yolo` still requires an explicit launch option and is never inherited.
+
+Two fixture defects were retained as failed attempts. The first invocation read
+`AGENT_BRIDGE_SESSION_ID` instead of the actual `AGENT_BRIDGE_NATIVE_SESSION_ID`
+and stopped before launching a child. After correcting that and the directory variable,
+four children returned their exact initial answer and closed, but the script incorrectly
+required `event_id` in `ask` output. That field belongs to `result --request`; no follow-up
+was sent in that attempt. The separate v2 harness queries each addressed result and
+preserves the original outputs. No product source changed for either correction.
+
+The actual Claude shell executed v2, using the same verified PR Windows executable
+above. From 23:44 to 23:46 KST all four complete round trips passed:
+
+| Child | Session | Initial / context-dependent follow-up | Close |
+| --- | --- | --- | --- |
+| codex | `session-FUGBuW` | Exact provider token + `42` / same token + `43` | Closed, owner absent |
+| agy | `session-ZjMx3O` | Exact provider token + `42` / same token + `43` | Closed, owner absent |
+| pi | `session-huuWUU` | Exact provider token + `42` / same token + `43` | Closed, owner absent |
+| claude | `session-uFUQQH` | Exact provider token + `42` / same token + `43` | Closed, owner absent |
+
+The follow-up did not repeat the token or the first answer. Each pair had distinct
+Request and event identities and retained one nonempty provider conversation identity.
+Independent reads of raw event files and addressed result queries matched both answers.
+Every child's recorded origin was the actual managed Claude parent, and its configured
+`yolo` value was true. Close and inspect exited zero with a closed state, a boolean false
+owner observation, no owner inspection error, and no recovery requirement.
+
+The caller record contained the six checked Claude marker names, without recording
+their values. The Claude-child case also explicitly set `CLAUDE_CODE_CHILD_SESSION=1`
+in the calling process and restored it afterward; its official follow-up succeeded.
+This exercises the known inherited-child-marker failure path. It is not a complete dump
+or independent inspection of every child's environment.
+
+Private evidence includes `nested-independent-verification.json`, the actual Claude
+provider transcript, and `target/runtime-follow-up/nested-v2` with the exact ask, tell,
+addressed result, close and inspect outputs. An initial independent-verifier invocation
+ran before the fourth row existed and refused the incomplete data; the completed four-row
+verification passed. Earlier failed fixtures and approval refusals remain separate.
+The requested nested runtime gate is now satisfied. Publication still requires the
+latest PR checks, exact main-push CI, annotated tag, and release asset verification.
+
 ## Evidence and remaining scope
 
 At release preparation commit `83e9f32`, the local serial suite passed 1,185 tests,
