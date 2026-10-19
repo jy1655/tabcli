@@ -122,6 +122,47 @@ pub(super) struct Assessment {
 
 const SESSION_FILE: &str = "workspace-consent.json";
 
+#[derive(Debug, Default)]
+pub(super) struct SessionConsentObservation {
+    value: serde_json::Value,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ConsentState {
+    Verified,
+    Unverified,
+    Alias,
+    IdentityChanged,
+    Revoked,
+    SourceReset,
+}
+
+impl SessionConsentObservation {
+    pub(super) fn state(&self) -> Option<ConsentState> {
+        match self.value.get("state").and_then(|state| state.as_str()) {
+            Some("verified") => Some(ConsentState::Verified),
+            Some("unverified") => Some(ConsentState::Unverified),
+            Some("alias") => Some(ConsentState::Alias),
+            Some("identity-changed") => Some(ConsentState::IdentityChanged),
+            Some("revoked") => Some(ConsentState::Revoked),
+            Some("source-reset") => Some(ConsentState::SourceReset),
+            _ => None,
+        }
+    }
+
+    pub(super) fn applied_marker(&self) -> Option<&str> {
+        self.value.get("applied").and_then(|marker| marker.as_str())
+    }
+
+    pub(super) fn value(&self) -> &serde_json::Value {
+        &self.value
+    }
+
+    pub(super) fn into_value(self) -> serde_json::Value {
+        self.value
+    }
+}
+
 pub(super) fn identity(path: &Path) -> Result<Identity> {
     let path = path.canonicalize().context("cannot identify workspace")?;
     let meta = fs::metadata(&path)?;
@@ -773,12 +814,9 @@ fn wait_for_native_trust_authorized_with(
         },
         &mut || {
             let assessment = observe(directory);
-            let applied_here = assessment
-                .get("applied")
-                .and_then(|s| s.as_str())
-                .is_some_and(|marker| {
-                    provider::launch_trust_markers().any(|registered| registered == marker)
-                });
+            let applied_here = assessment.applied_marker().is_some_and(|marker| {
+                provider::launch_trust_markers().any(|registered| registered == marker)
+            });
             Ok(
                 if (applied_here && authorized()?)
                     || matches!(
@@ -797,8 +835,8 @@ fn wait_for_native_trust_authorized_with(
     )
 }
 
-pub(super) fn observe(directory: &Path) -> serde_json::Value {
-    match Reader::open_unchecked(directory)
+pub(super) fn observe(directory: &Path) -> SessionConsentObservation {
+    let value = match Reader::open_unchecked(directory)
         .private(SESSION_FILE)
         .text()
     {
@@ -806,7 +844,8 @@ pub(super) fn observe(directory: &Path) -> serde_json::Value {
             .unwrap_or_else(|e| serde_json::json!({"state":"unreadable","detail":e.to_string()})),
         Ok(None) => serde_json::Value::Null,
         Err(e) => serde_json::json!({"state":"unreadable","detail":e.to_string()}),
-    }
+    };
+    SessionConsentObservation { value }
 }
 
 pub(super) fn run(args: &[String]) -> Result<()> {
@@ -1053,6 +1092,72 @@ mod tests {
     use crate::native::clock::FakeClock;
     use crate::native::session::primitives::{write_json_atomic, write_private};
     use crate::native::session::schema::SESSION_SCHEMA;
+
+    #[test]
+    fn session_consent_observation_preserves_permissive_json_and_read_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(SESSION_FILE);
+        assert_eq!(observe(temp.path()).into_value(), serde_json::Value::Null);
+        assert!(!path.exists());
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(true),
+            serde_json::json!(42),
+            serde_json::json!("verified"),
+            serde_json::json!(["verified"]),
+            serde_json::json!({}),
+            serde_json::json!({"state":"future", "applied":17, "extra":{"kept":true}}),
+            serde_json::json!({"state":"verified", "applied":"future-marker"}),
+        ] {
+            write_json_atomic(&path, &value).unwrap();
+            let before = fs::read(&path).unwrap();
+            let observed = observe(temp.path());
+            assert_eq!(observed.value(), &value);
+            assert_eq!(observed.into_value(), value);
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+        fs::write(&path, b"{").unwrap();
+        let error = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        assert_eq!(
+            observe(temp.path()).into_value(),
+            serde_json::json!({"state":"unreadable", "detail":error.to_string()})
+        );
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let observed = observe(temp.path()).into_value();
+        assert_eq!(observed["state"], "unreadable");
+        assert!(observed["detail"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[test]
+    fn session_consent_accessors_recognize_only_known_states_and_string_markers() {
+        for (state, expected) in [
+            ("verified", ConsentState::Verified),
+            ("unverified", ConsentState::Unverified),
+            ("alias", ConsentState::Alias),
+            ("identity-changed", ConsentState::IdentityChanged),
+            ("revoked", ConsentState::Revoked),
+            ("source-reset", ConsentState::SourceReset),
+        ] {
+            let observed = SessionConsentObservation {
+                value: serde_json::json!({"state":state, "applied":"future-marker"}),
+            };
+            assert_eq!(observed.state(), Some(expected));
+            assert_eq!(observed.applied_marker(), Some("future-marker"));
+        }
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("verified"),
+            serde_json::json!(["verified"]),
+            serde_json::json!({}),
+            serde_json::json!({"state":"future", "applied":false}),
+            serde_json::json!({"state":42, "applied":null}),
+        ] {
+            let observed = SessionConsentObservation { value };
+            assert_eq!(observed.state(), None);
+            assert_eq!(observed.applied_marker(), None);
+        }
+    }
 
     // A caller whose `HOME` is the temporary root, and the four stores the adapters
     // resolve under it.

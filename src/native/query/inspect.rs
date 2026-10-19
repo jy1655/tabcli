@@ -96,7 +96,7 @@ pub(super) fn value(
         "configured": {"model": snapshot.manifest.model, "effort": snapshot.manifest.effort,
             "yolo": snapshot.manifest.yolo, "provider_version_at_launch": snapshot.manifest.provider_version},
         "resumed_from": resumed_from,
-        "workspace_consent": observation.workspace_consent,
+        "workspace_consent": observation.workspace_consent.into_value(),
         "cancel": observation.cancel,
         "owner_process_alive": owner.process_alive, "owner_identity_verified": owner.identity_matches == Some(true), "owner": owner,
         "recovery_required": judgments.recovery_required, "turn_claimed": snapshot.claim.is_some(),

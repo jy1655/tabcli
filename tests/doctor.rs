@@ -194,6 +194,180 @@ fn active_and_recovery_states_are_diagnosed_without_repair() {
 }
 
 #[test]
+fn codex_terminal_diagnosis_keeps_state_identity_and_strict_reread_policy() {
+    for (state, provenance) in [
+        ("completed", Some("codex_transcript_task_complete")),
+        ("failed", Some("codex_transcript_turn_aborted")),
+        ("cancelled", Some("codex_notify")),
+        ("completed", Some("future_signal")),
+        ("completed", None),
+        ("pending", Some("codex_notify")),
+        ("invalid_utf8", Some("codex_notify")),
+    ] {
+        let fixture = Fixture::new("codex");
+        fixture.claim(None);
+        if state != "pending" {
+            fs::remove_file(fixture.directory.join("turn.claim")).unwrap();
+        }
+        let event_path = fixture.directory.join("events/event-1.json");
+        write(
+            &event_path,
+            &json!({
+                "provider":"codex", "message":"answer", "provenance":provenance,
+                "provider_session_id":null, "turn_id":null, "created_unix_ms":7,
+                "error":if matches!(state, "failed" | "cancelled") { Some("failure") } else { None },
+                "cancelled":state == "cancelled"
+            }),
+        );
+        if state == "invalid_utf8" {
+            let mut bytes = fs::read(&event_path).unwrap();
+            let at = bytes.windows(6).position(|part| part == b"answer").unwrap();
+            bytes[at] = 0xff;
+            fs::write(&event_path, bytes).unwrap();
+            let ordinary = report(fixture.run(&[
+                "result",
+                "session-doctor",
+                "--request",
+                "request-exact",
+                "--json",
+            ]));
+            assert_eq!(ordinary["request_state"], "completed");
+        }
+        let before = entries(fixture.root.path());
+        let value = fixture.doctor();
+        let terminal = &check(&value, "codex_lifecycle")["evidence"]["terminal_outcome"];
+        if state == "invalid_utf8" {
+            assert_eq!(terminal["observation"], "unavailable");
+            assert!(
+                terminal["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not valid UTF-8")
+            );
+        } else if state == "pending" || provenance.is_none() {
+            assert_eq!(terminal, &json!({"observation":"not_observed"}));
+        } else {
+            let kind = match provenance.unwrap() {
+                "codex_transcript_task_complete" => "task_complete",
+                "codex_transcript_turn_aborted" => "turn_aborted",
+                "codex_notify" => "agent-turn-complete",
+                _ => "not_observed",
+            };
+            assert_eq!(
+                terminal,
+                &json!({"observation":"observed", "record":{
+                    "request_id":"request-exact", "event_id":"event-1.json", "request_state":state,
+                    "provenance":provenance, "kind":kind, "created_unix_ms":7
+                }})
+            );
+        }
+        assert_eq!(entries(fixture.root.path()), before, "{state}");
+    }
+}
+
+#[test]
+fn partial_record_diagnostics_keep_independent_evidence_and_check_order() {
+    for damaged in [
+        "none",
+        "cancel.json",
+        "hold.json",
+        "native-session.json",
+        "terminal.closed.json",
+        "manifest.json",
+    ] {
+        let fixture = Fixture::new("pi");
+        fs::File::create(fixture.directory.join("turn.claim.lock")).unwrap();
+        fs::write(fixture.directory.join("status.json"), "{").unwrap();
+        write(
+            &fixture.directory.join("cancel.json"),
+            &json!({
+                "schema":1, "request_id":"request-exact", "claim_token":"123-456-0", "created_unix_ms":1
+            }),
+        );
+        write(
+            &fixture.directory.join("hold.json"),
+            &json!({"held":true, "created_unix_ms":1}),
+        );
+        write(
+            &fixture.directory.join("native-session.json"),
+            &json!({"pid":0, "managed_session_id":"session-doctor"}),
+        );
+        write(
+            &fixture.directory.join("terminal.closed.json"),
+            &json!({"consumed":true}),
+        );
+        if damaged != "none" {
+            fs::write(fixture.directory.join(damaged), "{").unwrap();
+        }
+        let before = entries(fixture.root.path());
+        let value = fixture.doctor();
+        let rows = value["checks"].as_array().unwrap();
+        assert_eq!(
+            rows.iter()
+                .skip(1)
+                .take(9)
+                .map(|row| row["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "session_records",
+                "session_state",
+                "turn",
+                "completion",
+                "cancel",
+                "origin",
+                "owner",
+                "terminal_record",
+                "hold"
+            ],
+            "{damaged}"
+        );
+        assert_eq!(
+            check(&value, "session_records")["reason_code"],
+            "records_unreadable"
+        );
+        assert_eq!(
+            check(&value, "cancel")["reason_code"],
+            if damaged == "cancel.json" {
+                "cancel_unreadable"
+            } else {
+                "cancel_recorded"
+            },
+            "{damaged}"
+        );
+        assert_eq!(
+            check(&value, "hold")["reason_code"],
+            if damaged == "hold.json" {
+                "hold_unreadable"
+            } else {
+                "session_held"
+            },
+            "{damaged}"
+        );
+        assert_eq!(
+            check(&value, "owner")["reason_code"],
+            if damaged == "native-session.json" {
+                "owner_unreadable"
+            } else {
+                "owner_exited"
+            },
+            "{damaged}"
+        );
+        assert_eq!(
+            check(&value, "terminal_record")["reason_code"],
+            if damaged == "terminal.closed.json" {
+                "terminal_tombstone_unreadable"
+            } else {
+                "terminal_consumed"
+            },
+            "{damaged}"
+        );
+        assert_eq!(value["configured"].is_null(), damaged == "manifest.json");
+        assert_eq!(value["observations"], json!({}));
+        assert_eq!(entries(fixture.root.path()), before, "{damaged}");
+    }
+}
+
+#[test]
 fn missing_corrupt_and_locked_records_produce_unknown_without_writes() {
     let fixture = Fixture::new("claude");
     let absent = report(fixture.run(&["doctor", "session-absent", "--json"]));
@@ -862,6 +1036,43 @@ fn version_probe_preserves_text_classification_and_scope() {
             );
         }
         assert_eq!(entries(&fixture.directory), before);
+    }
+}
+
+#[test]
+fn consent_diagnostics_preserve_raw_values_and_only_known_verified_is_available() {
+    let fixture = Fixture::new("pi");
+    let path = fixture.directory.join("workspace-consent.json");
+    for raw in [
+        "null",
+        "true",
+        "42",
+        "\"verified\"",
+        "[\"verified\"]",
+        "{}",
+        r#"{"state":42,"extra":"kept"}"#,
+        r#"{"state":"future","applied":"future-marker"}"#,
+        r#"{"state":"verified","extra":{"kept":true}}"#,
+        "{",
+    ] {
+        fs::write(&path, raw).unwrap();
+        let before = entries(fixture.root.path());
+        let expected = serde_json::from_str::<Value>(raw)
+            .unwrap_or_else(|error| json!({"state":"unreadable", "detail":error.to_string()}));
+        let value = fixture.doctor();
+        let consent = check(&value, "workspace_consent");
+        assert_eq!(consent["evidence"], expected, "{raw}");
+        assert_eq!(value["scope"]["consent_state"], expected["state"], "{raw}");
+        assert_eq!(
+            consent["availability"],
+            if expected["state"] == "verified" {
+                "available"
+            } else {
+                "unknown"
+            },
+            "{raw}"
+        );
+        assert_eq!(entries(fixture.root.path()), before, "{raw}");
     }
 }
 

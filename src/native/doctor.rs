@@ -4,7 +4,7 @@ use super::query::observation::judgment::{
     self, ActiveHandle, BoundOwner, Cancel, Hold, OwnerJudgment, ResultCandidate, Surface,
     SurfacePresence, SurfaceSource, Turn,
 };
-use super::query::observation::{Observation, SessionEvidence};
+use super::query::observation::{Observation, PartialObservation, SessionEvidence};
 use super::{NativeCommand, consent, provider, provider_process, query, reopen, terminal};
 use crate::native::clock::SystemClock;
 use crate::native::process_env;
@@ -415,15 +415,15 @@ fn assemble_checks(request: &DoctorRequest, deadline: Instant) -> Result<Diagnos
         checks.push(Check::new("workspace", availability, reason, "Working directory observation; CLI version checks do not depend on this directory.", "Restore or inspect the recorded directory before workspace-relative operations.").evidence(json!({"path": workspace})));
         if let Some(directory) = &directory {
             let consent = consent::observe(directory);
-            consent_state = consent["state"].clone();
-            let availability = if consent["state"] == "verified" {
+            consent_state = consent.value()["state"].clone();
+            let availability = if consent.state() == Some(consent::ConsentState::Verified) {
                 Available
             } else {
                 Unknown
             };
             checks.push(Check::new("workspace_consent", availability, "recorded_workspace_consent",
                 "Launch-time workspace consent and its provider-owned source. This is historical evidence, not a new trust grant.",
-                "Inspect workspace_consent; consent revoke disables sharing, and consent reset permits fresh provider evidence on a later ask.").evidence(consent));
+                "Inspect workspace_consent; consent revoke disables sharing, and consent reset permits fresh provider evidence on a later ask.").evidence(consent.into_value()));
         }
         let environment = consent::Environment::current();
         checks.extend(provider::diagnose(
@@ -582,22 +582,16 @@ pub(super) fn record_checks(
             };
             checks.push(Check::new("session_records", Availability::Unknown, reason, format!("{error:#}"), "Inspect the records without deleting locks or resending a request; retry if a writer is active."));
             unknown_session_checks(id, reason, checks);
-            let cancel = reader
-                .lock_shared()
-                .and_then(|lock| super::session::cancel::observe(reader, lock.is_some()));
-            cancel_check(&judgment::cancel_record(&cancel), id, checks);
+            let PartialObservation {
+                manifest,
+                evidence,
+                cancel,
+                surface,
+                hold,
+            } = PartialObservation::read(reader, id);
+            cancel_check(&cancel, id, checks);
             unobserved_origin_check(id, checks);
-            // No Snapshot: the evidence-only judgments, with the stored state unknown.
-            let evidence = match reader.lock_shared() {
-                Ok(lock) => SessionEvidence::read(
-                    reader,
-                    super::session::hold::observe(reader, lock.is_some()),
-                ),
-                Err(error) => SessionEvidence::read(reader, Err(error)),
-            };
-            let surface = judgment::surface(&evidence.surface, id);
-            let hold = judgment::hold(&evidence.held, evidence.close_tombstone.as_ref(), None);
-            (reader.manifest().ok(), evidence, surface, hold)
+            (manifest, evidence, surface, hold)
         }
     };
     owner_check(evidence.judge_owner(id), checks);
@@ -1331,7 +1325,7 @@ mod attestation_tests {
             records,
             evidence,
             resumed_from: Ok(None),
-            workspace_consent: Value::Null,
+            workspace_consent: consent::SessionConsentObservation::default(),
             judgments,
         }
     }

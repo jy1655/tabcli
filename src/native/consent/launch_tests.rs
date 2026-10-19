@@ -105,7 +105,7 @@ fn launch_dialog_settle_boundary_and_pending_intent_precede_one_response() {
                 calls.set(calls.get() + 1);
                 assert_eq!(now.get() - start, Duration::from_secs(1));
                 assert_eq!(
-                    observe(&h.directory)["applied"],
+                    observe(&h.directory).value()["applied"],
                     "workspace-dialog-response-pending"
                 );
                 assert_eq!(input.screen, h.screen());
@@ -122,7 +122,7 @@ fn launch_dialog_settle_boundary_and_pending_intent_precede_one_response() {
             result.unwrap();
             assert_eq!(calls.get(), 1);
             assert_eq!(
-                observe(&h.directory)["applied"],
+                observe(&h.directory).value()["applied"],
                 "provider-workspace-dialog"
             );
         }
@@ -253,7 +253,7 @@ fn launch_dialog_ended_session_wins_over_shared_store_initially_and_after_input(
         );
         assert_eq!(calls.get(), usize::from(after_input));
         assert_ne!(
-            observe(&h.directory)["applied"],
+            observe(&h.directory).value()["applied"],
             "provider-workspace-dialog"
         );
     }
@@ -291,7 +291,7 @@ fn launch_dialog_rechecks_close_revoke_and_deadline_after_blocking_observation()
             .to_string();
         assert_eq!(calls.get(), 0, "{change}: {error}");
         assert!(error.contains("no response sent"), "{change}: {error}");
-        assert!(observe(&h.directory)["applied"].is_null());
+        assert!(observe(&h.directory).value()["applied"].is_null());
     }
 }
 
@@ -336,7 +336,7 @@ fn launch_dialog_sent_or_uncertain_input_never_retries_or_extends_deadline() {
             assert_eq!(now.get() - start, Duration::from_millis(1500));
         }
         assert_eq!(
-            observe(&h.directory)["applied"],
+            observe(&h.directory).value()["applied"],
             "workspace-dialog-response-pending"
         );
     }
@@ -397,7 +397,7 @@ fn launch_dialog_read_error_is_not_input() {
         .unwrap_err();
     assert!(error.to_string().contains("screen unreadable"));
     assert!(error.to_string().contains("no response sent"));
-    assert!(observe(&h.directory)["applied"].is_null());
+    assert!(observe(&h.directory).value()["applied"].is_null());
 }
 
 #[test]
