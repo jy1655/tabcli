@@ -105,7 +105,7 @@ installation are not complete at this checkpoint.
 
 ## Claude parent verification after the permission-mode correction
 
-At 23:40 KST the owner corrected the intended default to explicit `--yolo`. The
+At 23:36:47 KST the owner corrected the intended default to explicit `--yolo`. The
 previous exact-command permission proposal was superseded and never applied. A new
 Claude parent, `session-zUjtY5`, and every new child received `--yolo`; no global
 permission or trust setting changed. This corrects the verification workflow, not
@@ -147,6 +147,12 @@ provider transcript, and `target/runtime-follow-up/nested-v2` with the exact ask
 addressed result, close and inspect outputs. An initial independent-verifier invocation
 ran before the fourth row existed and refused the incomplete data; the completed four-row
 verification passed. Earlier failed fixtures and approval refusals remain separate.
+The parent reported the completed run and then closed with no open started-from children.
+A fresh independent `gpt-6.1-sol` high review at a 23:48:48 KST evidence cutoff
+verified all 145 export hashes and confirmed the raw nested round trips and cleanup.
+It required a final log checkpoint for the parent close and PR readiness, retained
+the bounded environment coverage, and kept release conditions separate. That log
+checkpoint was appended; the reviewer session was also closed.
 The requested nested runtime gate is now satisfied. Publication still requires the
 latest PR checks, exact main-push CI, annotated tag, and release asset verification.
 
