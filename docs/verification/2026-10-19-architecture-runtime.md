@@ -64,7 +64,44 @@ The second parent, `session-gbvwn4`, read the harness but Claude Code's auto-mod
 classifier denied its PowerShell invocation with `Create Unsafe Agents` before the
 script started. Its raw tool result and missing output records support that refusal.
 The owner was asked for one exact command rule confined to that managed session.
-At this checkpoint, the Claude-parent runtime and release gates remain pending.
+No rule was added while that decision was pending. Both parent attempts were closed;
+authorization would apply to one fresh verification parent. The Claude-parent runtime
+and release gates remain pending.
+
+## CI candidate archive and independent review
+
+The Windows archive from PR CI run `39248419782`, source `c93ab8c`, passed its checksum
+and exact member checks. LICENSE and THIRD_PARTY_NOTICES.md differed from their Git
+blobs only by the Windows checkout's complete LF-to-CRLF conversion. The initial
+byte-exact text comparison rejected that conversion; the follow-up check established
+that it was the only difference. Archive and executable bytes were not changed.
+
+The extracted executable reported `tabcli 0.4.21`, with SHA-256
+`64219395f13e4646e2f7e52a98b79526115d84fd059e8e0b0795c45300b2d428` before and after
+the runs. Codex (`session-KFdow8`), Claude (`session-qtqYNi`), Agy (`session-J3U1Mm`),
+and Pi (`session-yQXPg6`) each passed all five real self-test steps on Windows Terminal
+tabs without `--yolo`. All four sessions closed. These are PR candidate runs, not
+verification of a main-push or published release asset.
+
+The independent `gpt-6.1-sol` high audit used a 21:00:48 KST evidence cutoff. It
+confirmed all 43 copied raw-record hashes, the original eight successful round trips,
+the separate Agy approval timeout, and the 1,185/0/5 local result. Its first attempt
+stopped at private-session read permissions without a completed review; the fresh
+review used workspace-scoped copies. Neither reviewer received escalation.
+
+It identified two checks missing from the unexecuted nested harness: strict failure
+on unsuccessful or unknown owner inspection, and an assertion that each child's
+recorded origin matches the actual managed Claude parent. Both checks were added;
+the script also checks provider conversation continuity and successful close identity.
+Its syntax passed, but execution is still unverified. Caller marker names alone do
+not prove child environment isolation. The prepared Claude-child case adds a
+process-local `CLAUDE_CODE_CHILD_SESSION=1` sentinel and would require a successful
+official follow-up, then restore the caller environment. That case has not run.
+
+Rehearsal run `39246849668` completed successfully with `workflow_dispatch` against
+old tag `v0.4.20`; it did not publish and does not validate this candidate's source.
+PR #265 remains a draft. Main-push CI, tag creation, release publication, and local
+installation are not complete at this checkpoint.
 
 ## Evidence and remaining scope
 
