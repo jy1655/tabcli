@@ -201,16 +201,23 @@ fn unwritable_consent_record_fails_create_and_marks_the_session_failed() {
     fixture.unwritable_consent = true;
     let error = fixture.prepare().err().unwrap();
     assert!(!error.to_string().contains("injected"), "{error:#}");
-    let directory = fs::read_dir(fixture.root.path())
+    // Consent state and the Unix root durability receipt are not session directories.
+    let directories: Vec<_> = fs::read_dir(fixture.root.path())
         .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("session-"))
+        })
+        .collect();
+    assert_eq!(directories.len(), 1);
+    let directory = &directories[0];
     assert!(!directory.join("turn.claim").exists());
     assert!(!directory.join("requests").exists());
     assert_eq!(
-        Reader::open_unchecked(&directory).status().unwrap().state,
+        Reader::open_unchecked(directory).status().unwrap().state,
         SessionState::Failed
     );
 }
