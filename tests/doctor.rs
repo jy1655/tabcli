@@ -626,6 +626,26 @@ fn reopen_marker_is_reported_with_its_release_condition_without_writes() {
     );
     marker(Value::Null);
     observe("reopen_in_progress", "unavailable");
+    for (target, detail) in [
+        ("../session-reopened", "invalid session id"),
+        ("session-missing", "records of session-missing are missing"),
+    ] {
+        marker(json!(target));
+        let consumed = observe("reopen_marker_consumed", "unavailable");
+        assert_eq!(consumed["evidence"]["reopened_by"], target);
+        assert_eq!(consumed["evidence"]["gate"], Value::Null);
+        assert_eq!(consumed["evidence"]["cleanup"], Value::Null);
+        assert!(
+            consumed["detail"].as_str().unwrap().contains(detail),
+            "{consumed}"
+        );
+        assert!(
+            !consumed["detail"]
+                .as_str()
+                .unwrap()
+                .contains("recorded no launch refusal")
+        );
+    }
     marker(json!("session-reopened"));
     let consumed = observe("reopen_marker_consumed", "unavailable");
     assert_eq!(consumed["evidence"]["reopened_by"], "session-reopened");
@@ -689,6 +709,16 @@ fn reopen_marker_is_reported_with_its_release_condition_without_writes() {
     assert_eq!(
         reconcilable["evidence"]["cleanup"],
         "provider process 0 is verified gone (it has exited) and the refused session's surface was closed"
+    );
+    fs::write(refused.join("provider-process.json"), "not json").unwrap();
+    let unverified = observe("reopen_marker_unverified", "unknown");
+    assert_eq!(unverified["evidence"]["gate"], "reopen-conflict");
+    assert_eq!(unverified["evidence"]["cleanup"], Value::Null);
+    assert!(
+        unverified["detail"]
+            .as_str()
+            .unwrap()
+            .contains("cannot be verified")
     );
     fs::remove_file(refused.join("provider-process.json")).unwrap();
     fs::remove_file(refused.join("native-session.json")).unwrap();

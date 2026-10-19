@@ -25,11 +25,7 @@ use hook::{pi_owned_string, pi_string, record_correlated_failure};
 use monitor::PiFailureMonitor;
 use serde::{Deserialize, Serialize};
 use startup::send_initial_prompt;
-use std::{
-    ffi::OsString,
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{cell::RefCell, ffi::OsString, path::Path, time::Duration};
 use usage::reported_usage;
 
 pub(super) static ADAPTER: PiAdapter = PiAdapter;
@@ -87,35 +83,24 @@ fn terminal_initial_prompt(directory: &Path, prompt: &str) -> Result<String> {
 }
 
 #[cfg(not(windows))]
-fn send_terminal_follow_up(
-    session: &terminal::TerminalSession,
-    prompt_path: &Path,
-    deadline: Instant,
-) -> terminal::TerminalSendResult {
-    send_console_file(session, prompt_path, deadline)
-}
-
-fn send_console_file(
-    session: &terminal::TerminalSession,
-    prompt_path: &Path,
-    deadline: Instant,
-) -> terminal::TerminalSendResult {
-    #[cfg(all(windows, test))]
-    if let Some(result) = test_support::console_send(prompt_path) {
-        return result;
-    }
-    terminal::send_file(session, prompt_path, deadline)
-}
-
-#[cfg(not(windows))]
 fn prepare_terminal_follow_up(directory: &Path, prompt: &str, claim_token: &str) -> Result<String> {
     let pending = install_pending_turn(directory, claim_token)?;
     terminal_correlated_prompt(prompt, &pending, cfg!(windows))
 }
 
-struct PiInitialPaste;
+struct PiInitialPaste<R = input::Console> {
+    input: RefCell<R>,
+}
 
-impl Transport for PiInitialPaste {
+impl PiInitialPaste {
+    fn new() -> Self {
+        Self {
+            input: RefCell::new(input::Console::default()),
+        }
+    }
+}
+
+impl<R: input::Runtime> Transport for PiInitialPaste<R> {
     fn facts(&self) -> TransportFacts {
         TransportFacts {
             name: "terminal-paste-fallback",
@@ -142,6 +127,7 @@ impl Transport for PiInitialPaste {
             turn,
             prepared,
             file.expect("surface transport has a prompt file"),
+            &mut *self.input.borrow_mut(),
         )
         .into()
     }
@@ -149,9 +135,19 @@ impl Transport for PiInitialPaste {
 }
 
 // Replace this paste fallback when Pi exposes addressed interactive input.
-struct PiPaste;
+struct PiPaste<R = input::Console> {
+    input: RefCell<R>,
+}
 
-impl Transport for PiPaste {
+impl PiPaste {
+    fn new() -> Self {
+        Self {
+            input: RefCell::new(input::Console::default()),
+        }
+    }
+}
+
+impl<R: input::Runtime> Transport for PiPaste<R> {
     fn facts(&self) -> TransportFacts {
         TransportFacts {
             name: "terminal-paste-fallback",
@@ -179,17 +175,16 @@ impl Transport for PiPaste {
             turn,
             prepared,
             file.expect("surface transport has a prompt file"),
+            &mut *self.input.borrow_mut(),
         )
         .into();
         #[cfg(not(windows))]
         {
             let _ = prepared;
-            send_terminal_follow_up(
-                turn.surface,
-                file.expect("surface transport has a prompt file"),
-                turn.deadline,
-            )
-            .into()
+            self.input
+                .borrow_mut()
+                .send(turn, file.expect("surface transport has a prompt file"))
+                .into()
         }
     }
     fn discard_prepared(&self, turn: &TurnContext<'_>, _: Option<&Prepared>) {
@@ -247,7 +242,7 @@ impl NativeProviderAdapter for PiAdapter {
         initial_transport_for_platform(cfg!(windows))
     }
     fn follow_up_transport(&self) -> Box<dyn Transport> {
-        Box::new(PiPaste)
+        Box::new(PiPaste::new())
     }
 
     fn cancel_support(&self, directory: &Path) -> Result<super::CancelSupport> {
@@ -422,7 +417,7 @@ fn validate_claim_token(claim_token: &str) -> Result<()> {
 
 fn initial_transport_for_platform(windows: bool) -> Box<dyn Transport> {
     if windows {
-        Box::new(PiInitialPaste)
+        Box::new(PiInitialPaste::new())
     } else {
         Box::new(delivery::LAUNCH_ARGUMENT)
     }

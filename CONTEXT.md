@@ -30,16 +30,16 @@ _Avoid_: snapshot, inspector
 **Observation**:
 The read-only account of one session that a Reader yields: its recorded lifecycle, the
 active request and its state, its published results, and what those records imply. A query
-renders its Judgments rather than deriving its own; owner and surface facts are added to it on
-request.
+renders its Judgments rather than deriving its own; owner, surface, and Reopen marker facts are
+observed only on request, including the named Session when a marker refers to one.
 _Avoid_: view, summary, status report, listing row, snapshot (an internal read, not the account)
 
 **Judgment**:
 What an Observation concludes from its Records and, on request, from the owner and surface: owner
 binding and liveness, the turn, Claim without Receipt, recovery required, the request index, the
-residual surface, Hold, Cancel, the surface record and its presence, the unreadable parts, and the
-next `result` address. The Observation decides each once; every renderer (status, doctor, inspect,
-wait) maps a judgment to its own vocabulary and derives none of its own.
+residual surface, Hold, Cancel, the surface record and its presence, the unreadable parts, Reopen
+marker eligibility, and the next `result` address. The Observation decides each once; every renderer
+(status, doctor, inspect, wait) maps a judgment to its own vocabulary and derives none of its own.
 _Avoid_: flag, check, attention, reason (renderer vocabularies)
 
 **Store**:

@@ -9,7 +9,9 @@ use std::fs;
 
 #[test]
 fn declared_transports_preserve_framing_and_pending_cleanup() {
-    for facts in [PiInitialPaste.facts(), PiPaste.facts()] {
+    let initial_transport = PiInitialPaste::new();
+    let follow_up_transport = PiPaste::new();
+    for facts in [initial_transport.facts(), follow_up_transport.facts()] {
         let input = facts.surface.unwrap();
         assert_eq!(input.submit_count, 1);
         assert_eq!(input.newline, terminal::ConsoleNewline::LineFeed);
@@ -24,14 +26,14 @@ fn declared_transports_preserve_framing_and_pending_cleanup() {
     let mut initial =
         super::super::transport_test_context(directory.path(), &surface, TurnKind::Initial);
     initial.claim_token = &pending.claim_token;
-    let prepared = PiInitialPaste.prepare(&initial).unwrap();
+    let prepared = initial_transport.prepare(&initial).unwrap();
     let before = std::fs::read(directory.path().join(PENDING_TURN_FILE)).unwrap();
     assert_eq!(
         prepared.prompt,
         terminal_initial_prompt(directory.path(), initial.prompt).unwrap()
     );
     assert!(prepared.correlation_id.is_none());
-    PiInitialPaste.discard_prepared(&initial, Some(&prepared));
+    initial_transport.discard_prepared(&initial, Some(&prepared));
     assert_eq!(
         std::fs::read(directory.path().join(PENDING_TURN_FILE)).unwrap(),
         before
@@ -39,17 +41,17 @@ fn declared_transports_preserve_framing_and_pending_cleanup() {
     let mut follow =
         super::super::transport_test_context(directory.path(), &surface, TurnKind::FollowUp);
     follow.claim_token = &pending.claim_token;
-    let prepared = PiPaste.prepare(&follow).unwrap();
+    let prepared = follow_up_transport.prepare(&follow).unwrap();
     let pending = read_pending_turn(directory.path()).unwrap().unwrap();
     assert_eq!(
         prepared.prompt,
         terminal_correlated_prompt(follow.prompt, &pending, cfg!(windows)).unwrap()
     );
     assert!(prepared.correlation_id.is_none());
-    PiPaste.discard_prepared(&follow, Some(&prepared));
+    follow_up_transport.discard_prepared(&follow, Some(&prepared));
     assert!(!directory.path().join(PENDING_TURN_FILE).exists());
-    PiPaste.prepare(&follow).unwrap();
-    PiPaste.discard_prepared(&follow, None);
+    follow_up_transport.prepare(&follow).unwrap();
+    follow_up_transport.discard_prepared(&follow, None);
     assert!(!directory.path().join(PENDING_TURN_FILE).exists());
 }
 

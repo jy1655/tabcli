@@ -15,17 +15,18 @@ pub(super) fn send_initial_prompt(
     turn: &super::TurnContext<'_>,
     prepared: &super::Prepared,
     prompt_path: &Path,
+    runtime: &mut impl super::input::Runtime,
 ) -> terminal::TerminalSendResult {
     #[cfg(windows)]
     {
         send_initial_prompt_after_startup(turn.directory, turn.deadline, || {
-            super::input::send_windows(turn, prepared, prompt_path)
+            super::input::send_windows(turn, prepared, prompt_path, runtime)
         })
     }
     #[cfg(not(windows))]
     {
         let _ = prepared;
-        super::send_console_file(turn.surface, prompt_path, turn.deadline)
+        runtime.send(turn, prompt_path)
     }
 }
 
