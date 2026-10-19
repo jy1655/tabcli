@@ -1133,17 +1133,25 @@ fn real_console_payload_to_helper_seam_fences_late_retirement() {
             let prompt = format!("body\n<!-- agent-bridge-codex-turn:{token} -->");
             let session = serde_json::from_value(serde_json::json!({"terminal":"windows-console", "session_id":"1", "managed_session_id":directory.file_name().unwrap().to_str().unwrap()})).unwrap();
             let deadline = Instant::now() + Duration::from_secs(25);
-            terminal::with_stale_helper(&directory, phase, change, &frame(&prompt), || {
-                let mut io = Console {
-                    session: &session,
-                    directory: &directory,
-                    claim: &token,
-                    deadline,
-                };
-                let error = run(&mut io, &prompt, &token, deadline).unwrap_err();
-                assert_eq!(error.delivery_may_have_occurred(), phase != 1);
-                assert!(error.error().to_string().contains("stale"), "{error:?}");
-            });
+            terminal::with_in_process_helper(
+                &directory,
+                &session,
+                agent_bridge::FirstPartyCli::Codex,
+                phase,
+                change,
+                &frame(&prompt),
+                || {
+                    let mut io = Console {
+                        session: &session,
+                        directory: &directory,
+                        claim: &token,
+                        deadline,
+                    };
+                    let error = run(&mut io, &prompt, &token, deadline).unwrap_err();
+                    assert_eq!(error.delivery_may_have_occurred(), phase != 1);
+                    assert!(error.error().to_string().contains("stale"), "{error:?}");
+                },
+            );
             claim.retain();
         }
     }

@@ -4,7 +4,7 @@ use super::{
     open_verified_control_process, query_process_identity, query_process_identity_from_handle,
     resolve_executable_from_path, verify_control_process_identity, verify_process_identity,
 };
-use crate::native::console_control::ConsoleControlRequest;
+use crate::native::console_control;
 use crate::native::session::primitives::write_json_atomic;
 use crate::native::session::test_support::{
     SESSION_OWNER_FILE, TERMINAL_CLOSING_FILE, TERMINAL_HANDLE_FILE,
@@ -329,11 +329,7 @@ fn submission_return_drain_times_out_at_the_deadline_as_uncertain() {
         error.to_string(),
         "Windows console input was not consumed before the submission Return"
     );
-    assert!(
-        !super::super::windows_budget::windows_console_helper_reports_send_not_started(
-            &error.to_string()
-        )
-    );
+    assert!(!console_control::helper_proves_no_input(&error.to_string()));
 }
 
 #[test]
@@ -393,46 +389,6 @@ fn private_acl_is_one_protected_current_user_entry() {
         "D:P(A;OICI;FA;;;S-1-5-21-1)"
     );
     assert_eq!(private_sddl("S-1-5-21-1", false), "D:P(A;;FA;;;S-1-5-21-1)");
-}
-
-#[test]
-fn close_deadline_console_helper_is_bounded() {
-    let powershell = super::powershell_executable().unwrap();
-    let mut command = std::process::Command::new(&powershell);
-    command.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "Start-Sleep -Seconds 30",
-    ]);
-    let started = Instant::now();
-    let error =
-        super::run_console_helper_command(&mut command, started + Duration::from_millis(100))
-            .unwrap_err();
-    assert!(format!("{error:#}").contains("timed out"), "{error:#}");
-    // The timeout error alone does not prove the bound: a helper that failed to end the
-    // command would report it too, after waiting for the 30 s sleep. 25 s proves that the
-    // helper did not wait for the sleep, whether it ended the running command or timed out
-    // before PowerShell had started, and leaves a loaded runner room to start and end
-    // PowerShell; a 5 s bound let a slow runner decide the result, as the 10 s deadline
-    // below did (#180).
-    let elapsed = started.elapsed();
-    assert!(elapsed < Duration::from_secs(25), "{elapsed:?}");
-    let mut command = std::process::Command::new(&powershell);
-    command.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "[Console]::Error.WriteLine('own close timeout'); exit 1",
-    ]);
-    // This case checks that the command's own message survives a failure before the
-    // deadline, so the deadline must not expire first. PowerShell did not print within
-    // 10 s on a loaded `windows-latest` runner (#180). The command exits at once, so the
-    // test never waits this long.
-    let error =
-        super::run_console_helper_command(&mut command, Instant::now() + Duration::from_secs(120))
-            .unwrap_err();
-    assert_eq!(error.to_string(), "own close timeout");
 }
 
 // Windows keeps `AB_REVIEW_SS` and `AB_REVIEW_ß` apart, and a key built with Rust's
@@ -620,7 +576,7 @@ fn close_deadline_new_helper_observes_gone_root_and_ends_recorded_live_host() {
     assert!(host.try_wait().unwrap().is_none());
     // This returns before FreeConsole/AttachConsole: it cannot touch the test runner's console.
     let error = super::console_control(
-        super::ConsoleControlAction::Close,
+        super::ResolvedAction::Close,
         &session,
         &super::super::WindowsSessionRecords {
             directory: directory.path(),
@@ -629,90 +585,10 @@ fn close_deadline_new_helper_observes_gone_root_and_ends_recorded_live_host() {
     )
     .unwrap_err();
     assert!(
-        super::super::windows_budget::windows_console_helper_reports_missing(&error.to_string()),
+        console_control::helper_reports_missing(&error.to_string()),
         "{error:#}"
     );
     assert_eq!(host.wait().unwrap().code(), Some(0));
-}
-
-#[test]
-fn guarded_dialog_file_stays_private_in_the_supplied_helper_directory() {
-    use crate::native::{
-        consent,
-        terminal::{self, DialogKey, GuardedDialogInput, TerminalSession},
-    };
-    use std::{path::PathBuf, process::Command};
-    const CHILD: &str = "AB_WINDOWS_DIALOG_DIRECTORY_TEST";
-    const TEST: &str = "native::terminal::windows::tests::guarded_dialog_file_stays_private_in_the_supplied_helper_directory";
-    if std::env::var_os(CHILD).is_none() {
-        let root = tempfile::tempdir().unwrap();
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", TEST, "--test-threads=1", "--nocapture"])
-            .env(CHILD, "1")
-            .env("AGENT_BRIDGE_NATIVE_STATE_DIR", root.path())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
-    let root = PathBuf::from(std::env::var_os("AGENT_BRIDGE_NATIVE_STATE_DIR").unwrap());
-    let directory = root.join("session-dialog");
-    fs::create_dir(&directory).unwrap();
-    let handle: TerminalSession = serde_json::from_value(serde_json::json!({
-        "terminal":"windows-console", "session_id":"1", "managed_session_id":"session-dialog"
-    }))
-    .unwrap();
-    let input = GuardedDialogInput {
-        expected_claim: None,
-        expires_unix_ms: None,
-        screen: "exact dialog".into(),
-        key: DialogKey::Enter,
-    };
-    let file = super::dialog_input_file(&directory, &handle, &input).unwrap();
-    assert_eq!(file.path().parent(), Some(directory.as_path()));
-    let bytes = consent::read_store(file.path()).unwrap().unwrap(); // checks owner and ACL on the read handle
-    assert_eq!(bytes, serde_json::to_string(&input).unwrap());
-    drop(file);
-    assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
-    let other_root = tempfile::tempdir().unwrap();
-    let other = other_root.path().join("session-dialog");
-    fs::create_dir(&other).unwrap();
-    let error = terminal::submit_if_unchanged(
-        &other,
-        &handle,
-        &input.screen,
-        None,
-        Instant::now() + Duration::from_secs(2),
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("helper state root"), "{error:#}");
-    for id in [None, Some("session-other".into())] {
-        let mut wrong = handle.clone();
-        wrong.managed_session_id = id;
-        let error = terminal::guarded_dialog_input(
-            &directory,
-            &wrong,
-            &input,
-            Instant::now() + Duration::from_secs(2),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("managed session"), "{error:#}");
-    }
-    // The existing command boundary refuses to spawn the helper, after the temporary
-    // file was created; returning must remove that file again.
-    assert_eq!(
-        terminal::submit_if_unchanged(&directory, &handle, &input.screen, None, Instant::now())
-            .unwrap_err()
-            .to_string(),
-        "managed console dialog input timed out before it started"
-    );
-    assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
-    assert_eq!(fs::read_dir(&other).unwrap().count(), 0);
 }
 
 #[test]
@@ -785,60 +661,6 @@ fn console_surrogate_pair_is_two_consecutive_key_down_events_without_releases() 
     );
 }
 
-#[test]
-fn console_helpers_explicitly_forward_only_the_selected_state_root() {
-    use crate::native::session::primitives::STATE_DIR_ENV;
-    const CHILD: &str = "ISSUE111_HELPER_TEST_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let test = "native::terminal::windows::tests::console_helpers_explicitly_forward_only_the_selected_state_root";
-        for root in [Some("C:\\selected-private-root"), None] {
-            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-            command
-                .args(["--exact", test, "--nocapture", "--test-threads=1"])
-                .env(CHILD, "1");
-            for name in crate::native::process_env::non_provider_removals() {
-                command.env(name, "caller-sentinel");
-            }
-            if let Some(root) = root {
-                command.env(STATE_DIR_ENV, root);
-            } else {
-                command.env_remove(STATE_DIR_ENV);
-            }
-            let output = crate::native::process_env::command_output_until(
-                &mut command,
-                Instant::now() + Duration::from_secs(30),
-                "helper environment test",
-            )
-            .unwrap();
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
-        }
-        return;
-    }
-    let session = super::TerminalSession {
-        managed_session_id: Some("session-environment".into()),
-        kind: super::TerminalKind::WindowsConsole,
-        id: "1".into(),
-        tab_id: None,
-        window_id: None,
-        windows_process_identity: None,
-        wezterm_mux: None,
-    };
-    let root = std::env::var_os(STATE_DIR_ENV);
-    for action in ["window", "screen", "dialog", "send", "close"] {
-        let command = super::console_helper_command(action, &session, None).unwrap();
-        crate::native::process_env::tests::assert_helper_environment(
-            &command,
-            &[(STATE_DIR_ENV, root.as_deref())],
-        );
-    }
-}
-
 #[cfg(windows)]
 #[test]
 fn windows_console_launch_uses_non_verbatim_powershell_paths() {
@@ -891,12 +713,12 @@ fn windows_close_control_uses_the_claimed_terminal_handle() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(directory.path().join(TERMINAL_HANDLE_FILE), b"active").unwrap();
     assert_eq!(
-        windows_console_handle_path(directory.path(), &ConsoleControlRequest::Close),
+        windows_console_handle_path(directory.path(), true),
         directory.path().join(TERMINAL_HANDLE_FILE)
     );
     fs::write(directory.path().join(TERMINAL_CLOSING_FILE), b"closing").unwrap();
     assert_eq!(
-        windows_console_handle_path(directory.path(), &ConsoleControlRequest::Close),
+        windows_console_handle_path(directory.path(), true),
         directory.path().join(TERMINAL_CLOSING_FILE)
     );
 }
@@ -946,7 +768,7 @@ fn text_only_writes_scalars_and_soft_returns_then_reports_after_drain() {
         .unwrap();
         assert_eq!(polls.get(), 3);
         assert_eq!(
-            super::parse_text_only_output(&output.bytes).unwrap(),
+            console_control::parse_text_only_output(&output.bytes).unwrap(),
             input.chars().count()
         );
         assert_eq!(output.bytes.iter().filter(|&&b| b == b'\n').count(), 1);
@@ -1024,58 +846,6 @@ fn text_only_timeout_partial_write_and_pending_failure_emit_no_count() {
 }
 
 #[test]
-fn text_only_launcher_rejects_malformed_success_as_uncertain() {
-    assert_eq!(
-        super::parse_text_only_output(b"{\"schema\":1,\"written_chars\":3}\n").unwrap(),
-        3
-    );
-    for output in [
-        "",
-        "{}",
-        "{\"schema\":1,\"written_chars\":3,\"unknown\":true}",
-        "{\"schema\":1,\"schema\":1,\"written_chars\":3}",
-        "{\"schema\":1,\"written_chars\":184467440737095516160}",
-        "{\"schema\":2,\"written_chars\":3}",
-        "{\"schema\":1,\"written_chars\":1.5}",
-        "{\"schema\":1,\"written_chars\":-1}",
-        "{\"schema\":1,\"written_chars\":3} garbage",
-        "{\"schema\":1,\"written_chars\":3}\n{}",
-    ] {
-        let failure = super::parse_text_only_output(output.as_bytes()).unwrap_err();
-        assert!(failure.delivery_may_have_occurred());
-    }
-    assert!(
-        super::parse_text_only_output(b"\xff")
-            .unwrap_err()
-            .delivery_may_have_occurred()
-    );
-    assert_eq!(
-        super::parse_text_only_output(b" \n {\"schema\":1,\"written_chars\":3}\n ").unwrap(),
-        3
-    );
-}
-
-#[test]
-fn text_only_launcher_classifies_start_and_exit_failures() {
-    let root = tempfile::tempdir().unwrap();
-    let mut missing = std::process::Command::new(root.path().join("missing.exe"));
-    let deadline = Instant::now() + Duration::from_secs(120);
-    assert!(
-        !super::run_console_send_command(&mut missing, deadline)
-            .unwrap_err()
-            .delivery_may_have_occurred()
-    );
-    let mut failed =
-        crate::native::process_env::helper_command(std::env::var_os("ComSpec").unwrap());
-    failed.args(["/d", "/c", "exit 1"]);
-    assert!(
-        super::run_console_send_command(&mut failed, deadline)
-            .unwrap_err()
-            .delivery_may_have_occurred()
-    );
-}
-
-#[test]
 fn guarded_submission_writes_one_return_only_for_unchanged_screen() {
     let input = terminal::GuardedDialogInput {
         expected_claim: None,
@@ -1083,8 +853,10 @@ fn guarded_submission_writes_one_return_only_for_unchanged_screen() {
         screen: "composer text".into(),
         key: terminal::DialogKey::Enter,
     };
-    for (screen, expected, count) in [("composer text", "sent", 2), ("changed text", "changed", 0)]
-    {
+    for (screen, expected, count) in [
+        ("composer text", console_control::DialogReply::Sent, 2),
+        ("changed text", console_control::DialogReply::Changed, 0),
+    ] {
         let mut records = Vec::new();
         let result = super::guarded_key_with(&input, screen, |key| {
             records = super::build_dialog_records(key);
@@ -1147,7 +919,7 @@ fn text_only_multichunk_unicode_count_and_second_chunk_failure() {
             assert!(calls >= 3);
             assert!(drained);
             assert_eq!(
-                super::parse_text_only_output(&output).unwrap(),
+                console_control::parse_text_only_output(&output).unwrap(),
                 input.chars().count()
             );
             let units: Vec<u16> = records
@@ -1192,164 +964,12 @@ fn guarded_down_enter_sequence_and_writer_error() {
         Ok(true)
     })
     .unwrap();
-    assert_eq!(result, "sent");
+    assert_eq!(result, console_control::DialogReply::Sent);
     let error = super::guarded_key_with(&input, "dialog", |_| {
         anyhow::bail!("writer failed after key down")
     })
     .unwrap_err();
     assert!(error.to_string().contains("writer failed"));
-}
-
-struct StaleHelper {
-    directory: std::path::PathBuf,
-    phase: usize,
-    change: &'static str,
-    screen: String,
-    calls: usize,
-    refused: bool,
-}
-thread_local! {
-    static STALE_HELPER: std::cell::RefCell<Option<StaleHelper>> = const { std::cell::RefCell::new(None) };
-}
-
-pub(in crate::native) fn with_stale_helper(
-    directory: &std::path::Path,
-    phase: usize,
-    change: &'static str,
-    screen: &str,
-    run: impl FnOnce(),
-) {
-    STALE_HELPER.with(|slot| {
-        *slot.borrow_mut() = Some(StaleHelper {
-            directory: directory.into(),
-            phase,
-            change,
-            screen: screen.into(),
-            calls: 0,
-            refused: false,
-        })
-    });
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            STALE_HELPER.with(|s| *s.borrow_mut() = None);
-        }
-    }
-    let _reset = Reset;
-    run();
-    STALE_HELPER.with(|slot| {
-        let slot = slot.borrow();
-        let state = slot.as_ref().unwrap();
-        assert_eq!(state.calls, phase);
-        assert!(state.refused);
-    });
-}
-
-// Replace only OS process/attachment and console I/O. The real Console prepares
-// private JSON, the helper deserializes it, and production guard/writer/launcher
-// classification runs. Invalidation occurs after payload preparation and capture,
-// where an attested child would be about to dispatch to an unchanged screen.
-pub(super) fn helper_output(
-    command: &std::process::Command,
-) -> Option<std::result::Result<std::process::Output, terminal::TerminalSendFailure>> {
-    use crate::native::session::{Reader, SessionState, Store, turn, update_status};
-    use std::os::windows::process::ExitStatusExt;
-    STALE_HELPER.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let state = slot.as_mut()?;
-        let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
-        let mut stdout = Vec::new();
-        let action = args[1];
-        if action == "screen" {
-            stdout = serde_json::to_vec(&state.screen).unwrap();
-        } else {
-            state.calls += 1;
-            let stale = state.calls == state.phase;
-            let path = state.directory.join(args[3]);
-            let bytes = crate::native::session::RecordReader::at(&path)
-                .raw_bytes()
-                .unwrap();
-            let token = turn::current_claim_token(&Reader::open_unchecked(&state.directory))
-                .unwrap()
-                .unwrap();
-            if stale {
-                let store = Store::open_unchecked(&state.directory);
-                let _lock = store.lock().unwrap();
-                match state.change {
-                    "retired" => fs::remove_file(state.directory.join("turn.claim")).unwrap(),
-                    "replaced" => {
-                        fs::remove_file(state.directory.join("turn.claim")).unwrap();
-                        store.private("turn.claim").write_private(b"1-2-3").unwrap();
-                    }
-                    "closed" => {
-                        update_status(&state.directory, SessionState::Closed, None, None).unwrap()
-                    }
-                    "expired" => {}
-                    _ => unreachable!(),
-                }
-            }
-            let mut payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert_eq!(payload["expected_claim"], token);
-            assert!(payload["expires_unix_ms"].is_number());
-            if stale && state.change == "expired" {
-                payload["expires_unix_ms"] = 0.into();
-            }
-            let fixed_now = Instant::now();
-            let action = if action == "dialog" {
-                super::AttachedInput::Dialog
-            } else {
-                assert_eq!(args.last(), Some(&"0"));
-                super::AttachedInput::Text {
-                    newline: super::ConsoleNewline::ShiftReturn,
-                    deadline: fixed_now + Duration::from_secs(5),
-                }
-            };
-            let mut records = 0;
-            let result = super::dispatch_attached_input(
-                &state.directory,
-                &serde_json::to_vec(&payload).unwrap(),
-                action,
-                || Ok(state.screen.clone()),
-                |chunk| {
-                    assert!(
-                        Store::open_unchecked(&state.directory)
-                            .try_lock()?
-                            .is_none()
-                    );
-                    records += chunk.len();
-                    Ok(chunk.len() as u32)
-                },
-                || {
-                    assert!(
-                        Store::open_unchecked(&state.directory)
-                            .try_lock()?
-                            .is_some()
-                    );
-                    Ok(0)
-                },
-                &mut stdout,
-                || fixed_now,
-            );
-            if stale {
-                assert_eq!(records, 0, "stale helper must write zero input records");
-                state.refused = true;
-            } else {
-                assert!(records > 0);
-            }
-            if let Err(error) = result {
-                return Some(Ok(std::process::Output {
-                    status: std::process::ExitStatus::from_raw(1),
-                    stdout,
-                    stderr: format!("Error: {error}").into_bytes(),
-                }));
-            }
-        }
-        Some(Ok(std::process::Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout,
-            stderr: vec![],
-        }))
-    })
 }
 
 #[test]
@@ -1389,11 +1009,7 @@ fn stale_guard_after_first_chunk_is_never_not_sent() {
     .unwrap_err();
     assert_eq!(calls, 2);
     assert!(output.is_empty());
-    assert!(
-        !super::super::windows_budget::windows_console_helper_reports_send_not_started(
-            &error.to_string()
-        )
-    );
+    assert!(!console_control::helper_proves_no_input(&error.to_string()));
     assert!(error.to_string().contains("after input dispatch"));
 }
 
@@ -1415,7 +1031,7 @@ fn attached_dispatch_holds_claim_until_write_returns() {
             })
             .unwrap()
         } else {
-            serde_json::to_vec(&super::GuardedTextInput {
+            serde_json::to_vec(&console_control::GuardedTextInput {
                 text: "body".into(),
                 expected_claim: Some(claim.token().into()),
                 expires_unix_ms: None,

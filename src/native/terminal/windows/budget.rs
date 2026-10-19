@@ -5,23 +5,6 @@ use super::TerminalKind;
 use anyhow::{Result, bail};
 use std::time::{Duration, Instant};
 
-pub(super) fn windows_console_helper_reports_missing(message: &str) -> bool {
-    matches!(
-        message.trim(),
-        "console process is no longer available" | "Error: console process is no longer available"
-    )
-}
-
-pub(super) fn windows_console_helper_reports_send_not_started(message: &str) -> bool {
-    matches!(
-        message.trim(),
-        "Windows console claim stale before any input"
-            | "Error: Windows console claim stale before any input"
-            | "Windows console submission delays do not fit inside the remaining turn timeout"
-            | "Error: Windows console submission delays do not fit inside the remaining turn timeout"
-    )
-}
-
 pub(super) fn windows_console_extra_submit_delay() -> Duration {
     Duration::from_secs(2)
 }
@@ -38,7 +21,10 @@ pub(super) fn windows_console_submit_delays_fit(submit_count: usize, budget: Dur
         .is_some_and(|required| required < budget)
 }
 
-pub(super) fn remaining_send_budget_at(deadline: Instant, now: Instant) -> Result<Duration> {
+pub(in crate::native) fn remaining_send_budget_at(
+    deadline: Instant,
+    now: Instant,
+) -> Result<Duration> {
     match deadline.checked_duration_since(now) {
         Some(remaining) if !remaining.is_zero() => Ok(remaining),
         _ => bail!("terminal send deadline is exhausted"),
@@ -55,7 +41,10 @@ pub(super) fn validate_terminal_send_budget_for_platform(
         && terminal_kind == TerminalKind::WindowsConsole
         && !windows_console_submit_delays_fit(submit_count, timeout)
     {
-        bail!("Windows console submission delays do not fit inside the remaining turn timeout")
+        bail!(
+            "{}",
+            crate::native::console_control::SUBMIT_DELAYS_EXHAUSTED
+        )
     }
     Ok(())
 }
@@ -63,16 +52,6 @@ pub(super) fn validate_terminal_send_budget_for_platform(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn windows_console_access_denied_is_not_a_missing_surface() {
-        assert!(windows_console_helper_reports_missing(
-            "Error: console process is no longer available"
-        ));
-        assert!(!windows_console_helper_reports_missing(
-            "Error: console process is no longer available: Access is denied. (os error 5)"
-        ));
-    }
 
     #[test]
     fn windows_console_extra_submit_waits_for_paste_confirmation() {
@@ -140,16 +119,6 @@ mod tests {
             )
             .is_ok()
         );
-    }
-
-    #[test]
-    fn windows_helper_budget_rejection_proves_send_never_started() {
-        assert!(windows_console_helper_reports_send_not_started(
-            "Error: Windows console submission delays do not fit inside the remaining turn timeout"
-        ));
-        assert!(!windows_console_helper_reports_send_not_started(
-            "Error: Windows console control helper timed out"
-        ));
     }
 
     // The remaining send budget is measured from the original deadline, not from the

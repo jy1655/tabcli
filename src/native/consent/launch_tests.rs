@@ -447,43 +447,51 @@ fn launch_dialog_claim_and_original_expiry_reach_real_helper() {
         let now = clock.shared();
         let expiry_floor = crate::native::session::primitives::unix_ms() + 3000;
         let screen = h.screen();
-        terminal::with_stale_helper(&directory, 1, change, &screen, || {
-            let error = LaunchDialog {
-                directory: &directory,
-                target: FirstPartyCli::Claude,
-                session: &surface,
-                expected_claim: claim.token(),
-                deadline: start + Duration::from_secs(3),
-                manifest,
-            }
-            .complete(
-                &h.stores.env,
-                &mut clock,
-                || Ok(screen.clone()),
-                |input| {
-                    assert_eq!(input.expected_claim.as_deref(), Some(claim.token()));
-                    assert_eq!(now.get() - start, Duration::from_secs(1));
-                    let expiry = input.expires_unix_ms.unwrap();
-                    assert!(
-                        (expiry_floor..=crate::native::session::primitives::unix_ms() + 3000)
-                            .contains(&expiry),
-                        "original expiry {expiry} vs {expiry_floor}"
-                    );
-                    terminal::guarded_dialog_input(
-                        &directory,
-                        &surface,
-                        input,
-                        Instant::now() + Duration::from_secs(3),
-                    )
-                },
-            )
-            .unwrap_err();
-            assert!(format!("{error:#}").contains("stale"), "{error:#}");
-            let detail = format!("{error:#}");
-            if !detail.contains("no response sent") || detail.contains("possible response") {
-                failures.push(format!("{change}: {detail}"));
-            }
-        });
+        terminal::with_in_process_helper(
+            &directory,
+            &surface,
+            FirstPartyCli::Claude,
+            1,
+            change,
+            &screen,
+            || {
+                let error = LaunchDialog {
+                    directory: &directory,
+                    target: FirstPartyCli::Claude,
+                    session: &surface,
+                    expected_claim: claim.token(),
+                    deadline: start + Duration::from_secs(3),
+                    manifest,
+                }
+                .complete(
+                    &h.stores.env,
+                    &mut clock,
+                    || Ok(screen.clone()),
+                    |input| {
+                        assert_eq!(input.expected_claim.as_deref(), Some(claim.token()));
+                        assert_eq!(now.get() - start, Duration::from_secs(1));
+                        let expiry = input.expires_unix_ms.unwrap();
+                        assert!(
+                            (expiry_floor..=crate::native::session::primitives::unix_ms() + 3000)
+                                .contains(&expiry),
+                            "original expiry {expiry} vs {expiry_floor}"
+                        );
+                        terminal::guarded_dialog_input(
+                            &directory,
+                            &surface,
+                            input,
+                            Instant::now() + Duration::from_secs(3),
+                        )
+                    },
+                )
+                .unwrap_err();
+                assert!(format!("{error:#}").contains("stale"), "{error:#}");
+                let detail = format!("{error:#}");
+                if !detail.contains("no response sent") || detail.contains("possible response") {
+                    failures.push(format!("{change}: {detail}"));
+                }
+            },
+        );
         claim.retain();
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));

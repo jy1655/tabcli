@@ -1,6 +1,4 @@
 use super::*;
-#[cfg(windows)]
-use crate::native::console_control::ConsoleControlRequest;
 use crate::native::provider_process::command as provider_process_command;
 #[cfg(windows)]
 use crate::native::session::launch::launcher::bridge_shell_command;
@@ -13,10 +11,7 @@ use crate::native::session::primitives::STATE_DIR_ENV;
 use crate::native::session::primitives::{
     default_state_root, read_json, write_json_atomic, write_private,
 };
-use crate::native::session::test_support::{TERMINAL_CLOSING_FILE, TERMINAL_HANDLE_FILE};
-#[cfg(windows)]
-use crate::native::terminal::windows_console_handle_path;
-use crate::native::{NativeCommand, parse_args, process_env, provider, provider_process, terminal};
+use crate::native::{parse_args, process_env, provider, provider_process, terminal};
 use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -139,53 +134,6 @@ pwsh.exe -NoLogo -NoProfile -Command "[Console]::OutputEncoding=[Text.Encoding]:
 
 #[cfg(windows)]
 #[test]
-fn windows_console_helper_accepts_only_managed_session_identity() {
-    assert!(matches!(
-        parse_args([
-            "native-console-control",
-            "send",
-            "session-owner123",
-            "pending-prompt-1.txt",
-            "5000",
-        ])
-        .unwrap(),
-        NativeCommand::ConsoleControl {
-            request: ConsoleControlRequest::Send { input_name, timeout, submit_count: None },
-            id,
-        } if timeout == Duration::from_millis(5000) && id == "session-owner123" && input_name == "pending-prompt-1.txt"
-    ));
-    assert!(parse_args(["native-console-control", "close", "1234"]).is_err());
-    assert!(
-        parse_args([
-            "native-console-control",
-            "send",
-            "session-owner123",
-            "..\\outside.txt",
-            "5000",
-        ])
-        .is_err()
-    );
-    // The window lookup is bounded and takes nothing but its time.
-    assert!(matches!(
-        parse_args(["native-console-control", "window", "session-owner123", "600"]).unwrap(),
-        NativeCommand::ConsoleControl {
-            request: ConsoleControlRequest::Window { timeout },
-            id,
-        } if timeout == Duration::from_millis(600) && id == "session-owner123"
-    ));
-    for invalid in [
-        &["window", "session-owner123"][..],
-        &["window", "session-owner123", "0"],
-        &["window", "session-owner123", "pending-prompt-1.txt", "600"],
-    ] {
-        let mut arguments = vec!["native-console-control"];
-        arguments.extend_from_slice(invalid);
-        assert!(parse_args(arguments).is_err(), "{invalid:?}");
-    }
-}
-
-#[cfg(windows)]
-#[test]
 fn powershell_launch_quoting_doubles_apostrophes() {
     let command = bridge_shell_command(
         Path::new("C:\\work\\owner's repo"),
@@ -242,56 +190,6 @@ fn a_record_that_stays_open_fails_the_replacement_after_a_bounded_wait() {
     );
     // The temporary record is removed, not left beside the one it could not replace.
     assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
-}
-
-#[cfg(windows)]
-#[test]
-fn console_control_requests_preserve_surface_verification_and_handle_selection() {
-    let directory = tempfile::tempdir().unwrap();
-    let closing = directory.path().join(TERMINAL_CLOSING_FILE);
-    fs::create_dir(&closing).unwrap();
-    assert_eq!(
-        windows_console_handle_path(directory.path(), &ConsoleControlRequest::Close),
-        directory.path().join(TERMINAL_HANDLE_FILE)
-    );
-    fs::remove_dir(&closing).unwrap();
-    fs::write(&closing, b"closing").unwrap();
-    for (request, bound_only) in [
-        (ConsoleControlRequest::Screen, false),
-        (
-            ConsoleControlRequest::Send {
-                submit_count: None,
-                input_name: "pending-prompt-route.txt".into(),
-                timeout: Duration::from_millis(7),
-            },
-            false,
-        ),
-        (
-            ConsoleControlRequest::Dialog {
-                input_name: "pending-prompt-route.txt".into(),
-                timeout: Duration::from_millis(7),
-            },
-            false,
-        ),
-        (
-            ConsoleControlRequest::Window {
-                timeout: Duration::from_millis(7),
-            },
-            true,
-        ),
-        (ConsoleControlRequest::Close, true),
-    ] {
-        assert_eq!(request.needs_only_bound_surface(), bound_only);
-        let expected = if request == ConsoleControlRequest::Close {
-            TERMINAL_CLOSING_FILE
-        } else {
-            TERMINAL_HANDLE_FILE
-        };
-        assert_eq!(
-            windows_console_handle_path(directory.path(), &request),
-            directory.path().join(expected)
-        );
-    }
 }
 
 // Each stage runs in a test child: never mutate the test runner's environment.
