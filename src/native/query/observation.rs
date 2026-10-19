@@ -32,7 +32,6 @@ impl PartialObservation {
         let cancel =
             lock_shared().and_then(|lock| session::cancel::observe(reader, lock.is_some()));
         let cancel = judgment::cancel_record(&cancel);
-        // Cancel and Hold have independent lock attempts and failure scopes.
         let evidence = match lock_shared() {
             Ok(lock) => {
                 SessionEvidence::read(reader, session::hold::observe(reader, lock.is_some()))

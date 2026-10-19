@@ -148,7 +148,6 @@ fn terminal_with(
         }
         result.state()
     };
-    // The Snapshot's shared lifecycle lock ends before this strict reread.
     let event = read_event(&receipt.event_file)?;
     if event.provenance.is_none() {
         return Ok(absent());

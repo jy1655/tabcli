@@ -854,7 +854,7 @@ fn guarded_dialog_file_stays_private_in_the_supplied_helper_directory() {
     };
     let file = client::dialog_input_file(&directory, &handle, &input).unwrap();
     assert_eq!(file.path().parent(), Some(directory.as_path()));
-    let bytes = consent::read_store(file.path()).unwrap().unwrap(); // checks owner and ACL on the read handle
+    let bytes = consent::read_store(file.path()).unwrap().unwrap();
     assert_eq!(bytes, serde_json::to_string(&input).unwrap());
     drop(file);
     assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
@@ -882,8 +882,6 @@ fn guarded_dialog_file_stays_private_in_the_supplied_helper_directory() {
         .unwrap_err();
         assert!(error.to_string().contains("managed session"), "{error:#}");
     }
-    // The existing command boundary refuses to spawn the helper, after the temporary
-    // file was created; returning must remove that file again.
     assert_eq!(
         terminal::submit_if_unchanged(&directory, &handle, &input.screen, None, Instant::now())
             .unwrap_err()
@@ -1085,7 +1083,6 @@ fn windows_console_helper_accepts_only_managed_session_identity() {
         ])
         .is_err()
     );
-    // The window lookup is bounded and takes nothing but its time.
     assert!(matches!(
         parse_args(["native-console-control", "window", "session-owner123", "600"]).unwrap(),
         NativeCommand::ConsoleControl {

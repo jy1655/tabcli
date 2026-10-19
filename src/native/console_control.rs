@@ -1,4 +1,3 @@
-//! The protocol and client of the helper that controls a managed Windows console.
 use crate::native::NativeCommand;
 use crate::native::session::primitives::require_valid_session_id;
 use anyhow::{Context, Result, bail};
@@ -226,7 +225,6 @@ fn run_with(
     if session.kind != terminal::TerminalKind::WindowsConsole {
         bail!("managed session is not owned by the Windows console transport");
     }
-    // Window lookup precedes the wrapper's owner record; close has the same bound-surface authority.
     if request.needs_only_bound_surface() {
         session.verify_managed_session(id)?;
     } else {

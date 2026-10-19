@@ -37,9 +37,6 @@ impl HelperProcess for ProcessHelper {
     }
 }
 
-// A control helper that attaches to the started console and reports the window that
-// hosts it. Best effort, like everything about the foreground: a helper that cannot be
-// started, fails, or is too late reports nothing, and the launch goes on.
 pub(in crate::native) struct WindowLookup {
     helper: Option<std::process::Child>,
 }
@@ -80,7 +77,6 @@ impl WindowLookup {
 
 impl Drop for WindowLookup {
     fn drop(&mut self) {
-        // Not waited for: the launch has no time to spare for a helper that is too late.
         if let Some(mut helper) = self.helper.take() {
             let _ = helper.kill();
         }
@@ -283,8 +279,6 @@ fn wire_timeout(timeout: Duration) -> Duration {
         timeout
     }
 }
-// The helper child still resolves the session by id under its own inherited root.
-// Do not publish an input file that it could resolve in a different session directory.
 pub(super) fn dialog_input_file(
     directory: &Path,
     session: &TerminalSession,
