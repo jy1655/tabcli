@@ -29,7 +29,16 @@
     "native-hook": 2
   },
   "src/native/console_control.rs": {
-    "native-console-control": 1
+    "native-console-control": 1,
+    "console process is no longer available": 1,
+    "Windows console submission delays do not fit inside the remaining turn timeout": 1,
+    "exact_helper_message(message, MISSING_PROCESS)": 1,
+    "exact_helper_message(message, SUBMIT_DELAYS_EXHAUSTED)": 1,
+    "message.strip_prefix(\"Error: \")": 1
+  },
+  "src/native/console_control/client.rs": {
+    ".prefix(\"pending-prompt-\")": 1,
+    "command.arg(\"native-console-control\")": 1
   },
   "src/native/consent.rs": {
     "const SESSION_FILE: &str = \"workspace-consent.json\";": 1,
@@ -366,7 +375,7 @@
     "const HOST_COMMAND: &str = TerminalKind::Iterm2.registration().host_command;": 1
   },
   "src/native/terminal/macos/ownership.rs": {
-    "native-session": 6
+    "native-session": 1
   },
   "src/native/terminal/macos/process.rs": {
     "native-session": 7
@@ -398,24 +407,21 @@
     "const HOST_COMMAND: &str = TerminalKind::WezTerm.registration().host_command;": 1
   },
   "src/native/terminal/windows/budget.rs": {
-    "console process is no longer available": 2,
-    "Windows console submission delays do not fit inside the remaining turn timeout": 3
+    "crate::native::console_control::SUBMIT_DELAYS_EXHAUSTED": 1
   },
   "src/native/terminal/close_authority.rs": {
     "native-session": 4,
     "native-session.json": 1
   },
   "src/native/terminal/ownership.rs": {
-    "native-session": 15
+    "native-session": 11
   },
   "src/native/terminal/windows/focus.rs": {
     "const CONSOLE_HOST_CLASS: &str = \"ConsoleWindowClass\";": 1
   },
   "src/native/terminal/windows/mod.rs": {
-    ".prefix(\"pending-prompt-\")": 1,
-    "native-console-control": 1,
-    "console process is no longer available": 1,
-    "Windows console submission delays do not fit inside the remaining turn timeout": 1
+    "console_control::MISSING_PROCESS": 1,
+    "console_control::SUBMIT_DELAYS_EXHAUSTED": 1
   },
   "src/native/terminal/windows/ownership.rs": {
     "native-session": 4
