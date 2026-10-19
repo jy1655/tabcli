@@ -159,3 +159,11 @@ and producers. The fixture was updated to pin those constants, classifier calls,
 `Error: ` prefix handling, and both Windows producer references. It was not regenerated
 from observed counts. The focused contract test then passed; no Rust source changed.
 The initial failed log is retained separately from the restarted final suite.
+
+The final decision-trail audit used `gpt-6.1-sol` at high effort and standard speed.
+At its 19:33:25 KST evidence cutoff, it confirmed the final tests, static checks,
+Codex round trip, cleanup, and runtime-contract fixture mapping. It found one log
+pointer that cited the candidate review instead of the later user authorization.
+The root verified the exact user reply and appended a correcting row, preserving
+the original entry. The audit found no other false completion claim and retained
+the platform and publication limits above.
