@@ -130,6 +130,35 @@ and the scope of verification, then prepare a fixed version. In the final record
 source commit, tag object, CI run, four file digests, verification results before and after
 publication, attestation results, and the scope of installation and runtime verification.
 
+## Local build cleanup
+
+Finish every release by cleaning the local checkout's build output. Do this after publication
+verification, any requested installation, and all local checks; running another check afterwards
+recreates the cache. GitHub Actions runs on separate machines and cannot clean the maintainer's
+local checkout.
+
+1. Keep release evidence, logs and handwritten probes outside `target/`. Move any such files
+   already there to an evidence directory before cleaning: a full Cargo clean removes the
+   entire directory, including files Cargo did not create.
+2. Confirm that `target/` is this checkout's own directory, not a symlink or shared build
+   directory. Wait for builds and tests to finish. Check that no live managed session depends
+   on an executable under it, including provider hooks that will invoke that path later.
+   Finish task-owned sessions first; if another session still needs the binary, defer cleanup
+   and report that dependency instead of closing it or deleting its executable.
+3. From the repository root, measure the directory and run:
+
+   ```sh
+   du -sh ./target
+   cargo clean --target-dir ./target
+   ```
+
+   The explicit directory limits this step to the checkout's `target/` instead of selecting
+   a shared `CARGO_TARGET_DIR`. Use a full clean, without `--release` or `--package`, to remove
+   debug, incremental and cross-target build caches as well as release builds. Leave installed
+   binaries, session records, other worktrees and global Cargo caches intact.
+4. Confirm that the build output was removed and report the reclaimed space in the release
+   handoff. The next local build will rebuild its dependencies.
+
 References: [GitHub immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases),
 [release attestation verification](https://cli.github.com/manual/gh_release_verify),
 [asset attestation verification](https://cli.github.com/manual/gh_release_verify-asset).
