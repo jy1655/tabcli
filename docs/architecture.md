@@ -220,7 +220,9 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   `query/search.rs` owns search with its budgets.
   Context attachment resolution uses the same
   observation and requires strict event decoding, an exact event name, and verifiable provenance;
-  it does not reconstruct Request meaning from command JSON. Timeline retains its cached strict
+  it does not reconstruct Request meaning from command JSON. Compact rendering in `context.rs`
+  is deterministic over the resolved message and the retained question emissions, read under
+  the same Snapshot, and its mode and counts are recorded on the receipt. Timeline retains its cached strict
   reads, and search retains its cumulative byte budget.
   Codex lifecycle diagnostics read the typed Request state and event identity, release the
   Snapshot's shared lock, then perform their existing strict event reread for provenance.

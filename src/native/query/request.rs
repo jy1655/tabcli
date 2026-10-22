@@ -137,6 +137,9 @@ impl RequestObservation<'_> {
             return Err(refuse("failed", None));
         }
         let source = requests::ContextSource {
+            mode: None,
+            attached_chars: None,
+            omitted_chars: None,
             session: session.to_owned(),
             request_id,
             event_id: event_id.to_owned(),
