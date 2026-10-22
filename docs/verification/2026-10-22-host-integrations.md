@@ -1,6 +1,6 @@
 # Host integration verification (#285)
 
-Started 2026-10-22, native Windows, in the isolated `feat/285-host-integrations` worktree.
+Performed 2026-10-22–23, native Windows, in the isolated `feat/285-host-integrations` worktree.
 The invoking host and the target provider are different roles. This record covers the
 instruction packages; it does not change provider transports or claim Linux support.
 The implementation remains unreleased: v0.4.23 was already published without integrations.
@@ -87,17 +87,30 @@ state-directory or desktop access. They also exercise missing executable, incomp
 and shell-restriction guidance without resending uncertain input. Runtime timeout and other
 failure cases remain distinct from the packaging tests; no synthetic test is called a live check.
 
-## Automated verification and remaining work
+## Automated verification and review
 
 - Local Windows: `cargo test --all-targets --all-features -- --test-threads=1`,
   `cargo clippy --all-targets -- -D warnings`, `cargo fmt -- --check`, `git diff --check` passed.
 - Python package suite: generation drift, release-version changes, relocation/reproducibility,
   manifest escape paths, unsupported components, extra files, invalid checksums, altered bytes,
   duplicate/traversal/link ZIP entries and exact release asset sets are tested.
-- The exact release Bash verifier's twelve-asset path runs in Linux CI; macOS and Windows skip
-  that shell-specific test. No claim of passing Windows CI is made until its actual run succeeds.
-- Full CI, release rehearsal, final independent review and removal
-  of task-installed integrations remain to be recorded before this work is ready for merge.
+- The Python suite has 12 tests: all run on Linux; macOS and Windows skip the Ubuntu release
+  job's GNU Bash verifier. Windows-built checksums additionally passed Git Bash `sha256sum -c`.
+- CI and nonpublishing Release rehearsal run URLs and final conclusions are recorded in
+  [PR #288](https://github.com/jy1655/tabcli/pull/288). The rehearsal uses existing tag v0.4.23,
+  which has no integrations: its release jobs verify the historical four CLI assets, while
+  `integration-rehearsal` checks the candidate source. The exact combined twelve-asset Bash
+  verifier is tested with fixtures on Ubuntu; actual publication of that new asset set remains
+  for the next release. No tag or release was created for this verification.
+- Claude Code collaborated on documentation and independently reviewed the package scripts
+  and workflows. Its Windows checksum-newline and Python portability findings were fixed;
+  the final review of `1474ea9` reported no blocking defects. Its four requests completed in
+  `session-GmxlAp`, which was explicitly closed with no open children and a dead owner.
+- Task-installed integrations in the normal Codex, Agy and Pi profiles were removed through
+  their host CLIs. The remaining Codex catalogs were preserved, Agy listed no plugins and Pi
+  listed no packages. The empty Agy import manifest created by this check was removed only
+  after confirming it contained no imports. Evidence and isolated test profiles remain outside
+  the checkout; no engine binary, workspace trust or global permission default was changed.
 - All macOS live host/provider combinations and Windows combinations outside the table are
   unverified. CI's macOS package checks do not substitute for authenticated model calls.
 

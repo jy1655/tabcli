@@ -429,6 +429,8 @@ run. Checked on native Windows so far:
 
 - every host installed its package from a source checkout and an extracted archive;
 - all four explicit invocation forms loaded their skills;
+- each host completed launch, exact result retrieval, a follow-up and confirmed close, covering
+  Claude → Codex, Codex → Claude, Pi → Agy and Agy → Pi;
 - Codex reinstallation selected a newer version while preserving unrelated settings; Agy
   replaced its files while preserving its disabled state; host removal commands were checked;
 - the default Codex sandbox and Agy print-mode permissions stop delegation, as described under

@@ -27,7 +27,7 @@ If this is itself a delegated task, do not delegate it again unless the task ask
 - Keep the provider's permission and trust controls. Do not add `--yolo`, answer a trust
   dialog, edit consent stores, or relax the host's shell restrictions as setup defaults.
   Forward bypass/model/effort options only when the user actually requests them.
-- On a host that ends child processes when a shell command returns, keep its native shell
+- On a host where a completed shell command can lose a launched session's owner, keep its native shell
   handle alive through launch, result, follow-up and close. Native Windows Agy 1.4.5 needs
   this in its console-window fallback; read [the verified host procedure](references/setup.md)
   before its first launch. `--detach` does not preserve a host-owned process tree.
