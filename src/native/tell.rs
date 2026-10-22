@@ -35,6 +35,7 @@ pub(super) fn parse(args: &[String]) -> Result<NativeCommand> {
     let mut detach = false;
     let mut json = false;
     let mut context_results = Vec::new();
+    let mut context_mode = None;
     let mut index = 0;
     while index < options.len() {
         match options[index].as_str() {
@@ -54,6 +55,11 @@ pub(super) fn parse(args: &[String]) -> Result<NativeCommand> {
             }
             "--detach" => set_flag_once(&mut detach, "--detach")?,
             "--json" => set_flag_once(&mut json, "--json")?,
+            "--context-mode" => set_once(
+                &mut context_mode,
+                context::parse_mode(option_value(options, &mut index, "--context-mode")?)?,
+                "--context-mode",
+            )?,
             "--context-result" => context::push_option(
                 &mut context_results,
                 option_value(options, &mut index, "--context-result")?,
@@ -62,6 +68,7 @@ pub(super) fn parse(args: &[String]) -> Result<NativeCommand> {
         }
         index += 1;
     }
+    context::apply_mode(&mut context_results, context_mode)?;
     let prompt = read_prompt_option(prompt, prompt_file, "tell")?;
     if prompt.trim().is_empty() {
         bail!("--prompt cannot be empty");

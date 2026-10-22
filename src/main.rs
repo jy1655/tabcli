@@ -25,12 +25,12 @@ fn help_text() -> String {
 Usage:
   {PUBLIC_COMMAND} ask <codex|claude|agy|pi> [--workspace PATH] (--prompt TEXT | --prompt-file PATH) [--title NAME]
       [--model MODEL] [--effort EFFORT] [--terminal <ghostty|iterm2|terminal|warp|wezterm|windows-console>]
-      [--yolo] [--timeout-secs N] [--detach] [--json] [--context-result <session>/<request-id>]...
+      [--yolo] [--timeout-secs N] [--detach] [--json] [--context-result <session>/<request-id>]... [--context-mode <full|compact>]
   {PUBLIC_COMMAND} self-test <codex|claude|agy|pi> [--workspace PATH]
       [--terminal <ghostty|iterm2|terminal|warp|wezterm|windows-console>] [--model MODEL] [--effort EFFORT]
       [--yolo] [--timeout-secs N] [--isolated] [--json]
   {PUBLIC_COMMAND} tell <session> (--prompt TEXT | --prompt-file PATH) [--timeout-secs N] [--detach] [--json]
-      [--context-result <session>/<request-id>]...
+      [--context-result <session>/<request-id>]... [--context-mode <full|compact>]
   {PUBLIC_COMMAND} hold <session> [--release] [--json]
   {PUBLIC_COMMAND} cancel <session> [--json]
   {PUBLIC_COMMAND} reopen <closed-session> (--prompt TEXT | --prompt-file PATH) [--title NAME]
@@ -212,6 +212,8 @@ Session policy:
   accepted; each must be a published successful result at resolution time or the
   command fails before anything is created or sent. The new request receipt
   records the attached sources as context_sources for inspect and result.
+  --context-mode compact attaches a bounded excerpt with visible elision and the
+  command to retrieve the full result; the default full keeps the complete text.
 
   Supported CLI minimums: Codex 0.147.0, Claude 2.1.234, Agy 1.1.12, Pi 0.84.1.
   Session state is stored privately under ~/.agent-bridge/native-sessions.

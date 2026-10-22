@@ -66,6 +66,9 @@ fn context_sources() -> Vec<requests::ContextSource> {
         event_id: "event-1-1.json".into(),
         provider: "codex".into(),
         created_unix_ms: 1,
+        mode: None,
+        attached_chars: None,
+        omitted_chars: None,
     }]
 }
 

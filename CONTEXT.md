@@ -95,6 +95,16 @@ Emissions can be incomplete, absence is unknown, and a later Follow-up creates a
 Request without resolving an earlier emission.
 _Avoid_: needs input, unanswered, waiting for an answer
 
+**Context attachment**:
+The copy of a recorded Result that `--context-result` places in a later Request's prompt as
+reference material, never as instructions.
+_Avoid_: context injection, memory
+
+**Compact attachment**:
+A Context attachment reduced to a bounded excerpt, a visible elision and the command that
+retrieves the full Result.
+_Avoid_: summary (it is not summarised), truncation (the elision is declared and the whole Result stays retrievable)
+
 **Transport**:
 The provider-chosen way to deliver an initial prompt or follow-up, including the evidence
 needed before input and whether a failed attempt is known not sent or uncertain.

@@ -327,6 +327,7 @@ pub(super) fn parse_ask(args: &[String]) -> Result<NativeCommand> {
     let mut workspace = None;
     let mut parsed = CommonStartOptions::default();
     let mut context_results = Vec::new();
+    let mut context_mode = None;
     let mut index = 0;
     while index < options.len() {
         if parse_common_start_option(options, &mut index, &mut parsed)? {
@@ -338,6 +339,11 @@ pub(super) fn parse_ask(args: &[String]) -> Result<NativeCommand> {
                 PathBuf::from(option_value(options, &mut index, "--workspace")?),
                 "--workspace",
             )?,
+            "--context-mode" => set_once(
+                &mut context_mode,
+                context::parse_mode(option_value(options, &mut index, "--context-mode")?)?,
+                "--context-mode",
+            )?,
             "--context-result" => context::push_option(
                 &mut context_results,
                 option_value(options, &mut index, "--context-result")?,
@@ -346,6 +352,7 @@ pub(super) fn parse_ask(args: &[String]) -> Result<NativeCommand> {
         }
         index += 1;
     }
+    context::apply_mode(&mut context_results, context_mode)?;
     let CommonStartOptions {
         prompt,
         prompt_file,
