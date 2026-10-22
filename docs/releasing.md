@@ -130,6 +130,45 @@ and the scope of verification, then prepare a fixed version. In the final record
 source commit, tag object, CI run, four file digests, verification results before and after
 publication, attestation results, and the scope of installation and runtime verification.
 
+## Local build cleanup
+
+Finish every release by cleaning the local checkout's build output. Do this after publication
+verification, any requested installation, and all local checks: a later build, test or Clippy
+run that targets this directory recreates its build artifacts. GitHub Actions runs on separate
+machines and cannot clean the maintainer's local checkout.
+
+1. Keep release evidence, logs and handwritten probes outside `target/`. Move any such files
+   already there to an evidence directory before cleaning: a full Cargo clean removes the
+   entire directory, including files Cargo did not create.
+2. Confirm that `target/` is this checkout's own directory, not a symlink or shared build
+   directory. Wait for builds and tests to finish. Check that no live managed session depends
+   on an executable under it, including provider hooks that will invoke that path later: a
+   completed request and the session manifest, which records the provider executable, do not
+   prove that. For each relevant state root, list the sessions that may still be live with
+   `tabcli status --all --all-workspaces` and `inspect`, including the current session, and
+   read their launch executable (`launch.sh` on macOS, the process command line on Windows),
+   their provider hook configuration such as `claude-settings.json`, and
+   `AGENT_BRIDGE_EXECUTABLE`, which Pi invokes again at settlement. Finish task-owned sessions
+   first. If another session still needs the binary, or the dependency cannot be established,
+   defer cleanup and report that session and path, or the missing evidence, instead of closing
+   the session or deleting its executable.
+3. From the repository root, measure the directory and run:
+
+   ```sh
+   du -sh ./target
+   cargo --config 'build.build-dir="./target"' clean --target-dir ./target
+   ```
+
+   The explicit directory selects `./target` for the final artifacts and the `--config` value
+   selects it for the intermediate ones, so a shared `CARGO_TARGET_DIR` and a separately
+   configured `build.build-dir` are left untouched: a full clean deletes both directories when
+   they differ. Use a full clean, without `--release` or `--package`, to remove every profile
+   and target triple within this checkout's verified `target/`, including debug, incremental
+   and cross-target build caches as well as release builds. Leave installed binaries, session
+   records, other worktrees and global Cargo caches intact.
+4. Confirm that the build output was removed and report the reclaimed space in the release
+   handoff. The next local build will rebuild its dependencies.
+
 References: [GitHub immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases),
 [release attestation verification](https://cli.github.com/manual/gh_release_verify),
 [asset attestation verification](https://cli.github.com/manual/gh_release_verify-asset).
