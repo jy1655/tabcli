@@ -1,7 +1,8 @@
 //! Historical session evidence only; never effective live configuration.
 use super::super::{codex_version, hooks, lifecycle};
 use crate::native::doctor::{Availability, Check};
-use crate::native::query::{RequestState, Selector};
+use crate::native::query::Selector;
+use crate::native::query::request::RequestState;
 use crate::native::session::schema::SessionEvent;
 use crate::native::session::{Reader, requests, turn};
 use anyhow::{Result, bail};

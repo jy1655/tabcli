@@ -215,7 +215,10 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   publication rules. Queries get a `Reader`,
   not a `Store`. To expose an adapter-private fact, add an observation to that adapter's interface;
   do not read its private record from the query or call repair.
-  Request observation precedes JSON rendering. Context attachment resolution uses the same
+  `query/request.rs` owns the Request observation, which precedes JSON rendering.
+  `with_owner` is the only adjustment of that observation, and only `wait` applies it.
+  `query/search.rs` owns search with its budgets.
+  Context attachment resolution uses the same
   observation and requires strict event decoding, an exact event name, and verifiable provenance;
   it does not reconstruct Request meaning from command JSON. Timeline retains its cached strict
   reads, and search retains its cumulative byte budget.

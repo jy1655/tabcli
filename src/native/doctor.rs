@@ -1344,13 +1344,13 @@ mod attestation_tests {
 
     #[test]
     fn doctor_maps_each_judgment_to_its_documented_check() {
-        use crate::native::query::RequestState;
         use crate::native::query::observation::judgment::tests::{
             CLAIM, SESSION, receipt, snapshot,
         };
         use crate::native::query::observation::judgment::{
             CancelState, Ended, IndexIncomplete, SurfacePresence,
         };
+        use crate::native::query::request::RequestState;
         use crate::native::terminal::TerminalKind;
         use ControlAttestation::*;
 

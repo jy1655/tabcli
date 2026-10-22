@@ -2,7 +2,7 @@
 //! renderer maps these typed judgments to its own vocabulary and derives none of its own.
 use super::{CancelObservation, SessionEvidence, SurfaceRecord};
 use crate::native::process_identity::{Attested, Gone, ProcessObservation};
-use crate::native::query::RequestState;
+use crate::native::query::request::RequestState;
 use crate::native::reopen::ResumedFrom;
 use crate::native::session::launch::ResidualSurface;
 use crate::native::session::owner::{ControlAttestation, OwnerAttestation, attest_owner};

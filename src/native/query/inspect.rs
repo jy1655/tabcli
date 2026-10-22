@@ -1,4 +1,5 @@
 //! The inspect renderer: one locked Observation of a session, its records and judgments.
+use super::request::observed_elapsed;
 use super::*;
 use crate::native::clock::SystemClock;
 use crate::native::session;

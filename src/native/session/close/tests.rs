@@ -3731,7 +3731,7 @@ fn cli_search(root: &Path, args: &[&str]) -> serde_json::Value {
     let NativeCommand::Search(request) = parse_args(args).unwrap() else {
         panic!("{args:?} is not a search command")
     };
-    query::search_value_in(root, &request).unwrap()
+    query::search::search_value_in(root, &request).unwrap()
 }
 
 fn cli_sessions(root: &Path) -> Vec<serde_json::Value> {
