@@ -235,7 +235,6 @@ impl LaunchDialog<'_> {
                         },
                     )
                     .map_err(|error| {
-                        #[cfg(windows)]
                         let attempted = attempted && !error.is::<terminal::StaleDialogClaim>();
                         launch_dialog_error(error, attempted)
                     })?;

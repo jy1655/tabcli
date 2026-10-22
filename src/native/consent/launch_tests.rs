@@ -329,6 +329,41 @@ fn launch_dialog_rechecks_close_revoke_and_deadline_after_blocking_observation()
 }
 
 #[test]
+fn launch_dialog_typed_prewrite_refusal_is_distinct_from_dispatch_error() {
+    for refused in [true, false] {
+        let h = Harness::new();
+        let mut clock = FakeClock::new(Instant::now());
+        let calls = Cell::new(0);
+        let error = h
+            .run(
+                FirstPartyCli::Claude,
+                &mut clock,
+                Duration::from_secs(3),
+                || Ok(h.screen()),
+                |_| {
+                    calls.set(calls.get() + 1);
+                    let cause = anyhow::anyhow!("dialog dispatch failed");
+                    Err(if refused {
+                        cause.context(terminal::StaleDialogClaim)
+                    } else {
+                        cause
+                    })
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert_eq!(calls.get(), 1, "neither error may retry input");
+        assert!(error.contains("dialog dispatch failed"), "{error}");
+        assert_eq!(error.contains("no response sent"), refused, "{error}");
+        assert_eq!(error.contains("possible response"), !refused, "{error}");
+        assert_eq!(
+            observe(&h.directory).value()["applied"],
+            "workspace-dialog-response-pending"
+        );
+    }
+}
+
+#[test]
 fn launch_dialog_sent_or_uncertain_input_never_retries_or_extends_deadline() {
     for helper_error in [
         None,
