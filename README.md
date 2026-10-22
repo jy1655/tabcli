@@ -7,6 +7,10 @@ signed in to, in terminal tabs or windows you can watch. Read the result, send f
 same conversation, and explicitly close the session when you finish. TAB runs on macOS and native
 Windows; Linux, including Linux processes in WSL, is unsupported, and Warp support is limited.
 
+To delegate from your assistant without writing global instructions, install the
+[Agent Bridge integration](docs/integrations.md) for Claude Code, Codex, Agy, or Pi.
+Each package contains the same workflow skill and uses your installed `tabcli`.
+
 ## Try a session
 
 After [installing `tabcli`](#install) and signing in to Codex 0.149.0 or newer, run this from your

@@ -19,11 +19,18 @@ cannot read the setting either.
    `readme_install_section_names_the_cargo_version` test in `tests/native_policy.rs` checks
    both README Install sections against the Cargo version.
    `tests/fixtures/help.txt` uses a version token and needs no per-release version edit.
+   Run `python scripts/integrations.py generate` after a version bump and commit the
+   generated host packages and catalogs. Run `python scripts/integrations.py check` and
+   `python -m unittest discover -s scripts -p 'test_*.py' -v` (Python 3.11+). Each package's
+   release version must match Cargo; the minimum compatible CLI version is independent.
    Validate changes with `cargo test --all-targets --all-features -- --test-threads=1`,
    Clippy, fmt, and `git diff --check`. If you changed the Release workflow or packaging,
    first pass a rehearsal with `gh workflow run release.yml --ref <branch> -f tag=<existing-tag>`.
    The rehearsal builds the existing tag's source; it does not replace verification of the
-   new candidate binary. The workflow reads the Cargo package name from the validated commit
+   new candidate binary. Its separate `integration-rehearsal` job also validates and builds
+   the candidate branch's integration packages, without uploading them into the old tag's
+   asset set. Tags predating integrations retain four assets. The workflow reads the Cargo
+   package name from the validated commit
    and allows only `tabcli` or `agent-bridge`. For tags before 0.2.0, it puts only the executable
    and `LICENSE` in an `agent-bridge-<version>-<target>` archive and checks
    `agent-bridge <version>`. For `tabcli`, validation fails if `THIRD_PARTY_NOTICES.md` is absent.
@@ -57,7 +64,19 @@ gh run download "$release_run" -R "$release_repo" \
   -n release-candidate-aarch64-apple-darwin -D "$release_dir/macos"
 gh run download "$release_run" -R "$release_repo" \
   -n release-candidate-x86_64-pc-windows-msvc -D "$release_dir/windows"
+gh run download "$release_run" -R "$release_repo" \
+  -n release-candidate-integrations -D "$release_dir/integrations"
 ```
+
+The integrations download applies to source commits containing `scripts/integrations.py`.
+For those releases, require the `release-candidate-integrations` artifact from the same CI
+commit as both binaries. From that exact source checkout run
+`python scripts/integrations.py verify --output <release-dir>/integrations`. It checks the
+four `agent-bridge-<host>-<version>.zip` files (`claude`, `codex`, `agy`, `pi`) and their
+four checksums, including every bundled file against source. Do not substitute locally
+regenerated files for the recorded CI artifact. These are platform-independent instruction
+packages and contain no `tabcli` binary. The twelve-asset set is the two CLI archives and
+their two checksums plus these eight files; older source commits have only the four CLI files.
 
 The immutable query must return `true`. Artifacts must not be expired. Each must contain only
 its archive and the corresponding `.sha256`. Verify checksums in both directories with
@@ -85,7 +104,8 @@ Authenticated runtime results are separate; state explicitly if they were omitte
    the commit. Do not rely only on a local tag ref or the Release's `target_commitish`.
 3. Recheck that the immutable setting is still `enabled=true` and the remote tag object is
    unchanged. Read the version and release notes from the validated commit. Upload exactly
-   four files to a new draft. If a draft exists, first check its creator, commit, and files;
+   twelve files (four for source commits predating integrations) to a new draft. If a draft
+   exists, first check its creator, commit, and files;
    do not overwrite it automatically.
 
 ```sh
@@ -99,7 +119,13 @@ gh release create "$release_tag" -R "$release_repo" --verify-tag --draft \
   "$release_dir/windows/tabcli-<version>-x86_64-pc-windows-msvc.zip.sha256"
 ```
 
-The draft's REST API asset list must match the four files exactly by name. Compare each
+For a source commit with integrations, include the eight previously verified files from
+`"$release_dir"/integrations/*` in that same `gh release create` command. The command above
+shows the historical four-asset CLI set. Never publish an integration-capable source with
+only that subset.
+
+The draft's REST API asset list must match the complete twelve-file set (or historical
+four-file set) exactly by name. Compare each
 `digest=sha256:<local-hash>` and `size` with the local file. Download every draft asset into
 **a new directory** and also check that its bytes match the original CI artifact.
 You can use `gh release download "$release_tag" -R "$release_repo" -D <draft-readback-dir>`.
@@ -108,12 +134,12 @@ If anything differs, do not publish; investigate the cause.
 ## Publication and final verification
 
 1. Immediately before publication, recheck the immutable setting, tag object, and target commit.
-   Confirm that the draft ID and the four assets' names, digests, and sizes remain as validated.
+   Confirm that the draft ID and all assets' names, digests, and sizes remain as validated.
 2. Publish with `gh release edit "$release_tag" -R "$release_repo" --draft=false --latest`.
 3. Check `draft=false`, `prerelease=false`, `immutable=true`, and the intended latest status
    through the REST API. Recheck that the remote tag object and target commit are unchanged,
-   download the four published files into a new directory, and compare their bytes with the CI artifact.
-4. Verify the release attestation and **both checksum files as well as both archives**.
+   download every published file into a new directory, and compare its bytes with the CI artifact.
+4. Verify the release attestation and **every checksum file as well as every archive**.
 
 ```sh
 gh release verify "$release_tag" -R "$release_repo"
@@ -123,11 +149,16 @@ gh release verify-asset "$release_tag" <downloaded-windows-archive> -R "$release
 gh release verify-asset "$release_tag" <downloaded-windows-checksum> -R "$release_repo"
 ```
 
+Also run `gh release verify-asset` on each of the eight downloaded integration files when
+present, and rerun the integration verifier on their readback directory. Record all twelve
+digests. Installing/updating a host integration is a separate operation from publishing these
+assets; it must not update the engine, change consent, or remove a binary used by an open session.
+
 Do not record failed verification as success. Checks after publication cannot undo publication,
 and rechecking the tag does not lock out concurrent changes by another writer. Do not recover by
 replacing or deleting assets of a published immutable release or moving its tag. Record the defect
 and the scope of verification, then prepare a fixed version. In the final record, distinguish the
-source commit, tag object, CI run, four file digests, verification results before and after
+source commit, tag object, CI run, all file digests, verification results before and after
 publication, attestation results, and the scope of installation and runtime verification.
 
 ## Local build cleanup
