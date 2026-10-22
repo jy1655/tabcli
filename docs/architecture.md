@@ -445,7 +445,10 @@ expiry under the lifecycle lock, then releases it before AppleScript. A busy lif
 unreadable evidence refuses the response before automation. This is a precheck, not an
 atomic check-and-write: retirement or repaint can occur before key consumption. iTerm2 and
 Terminal.app compare their captured screen considering case in the same automation call
-that sends the key. Windows guarded input
+that sends the key. Both platforms mark a proven pre-write refusal with the terminal's
+`StaleDialogClaim` error; consent reports no response sent only for that typed evidence.
+An automation error retains possible-response uncertainty and never retries input.
+Windows guarded input
 receives the directory and requires it to match the helper
 child's state-root lookup; the child still resolves the session by id under its own root.
 

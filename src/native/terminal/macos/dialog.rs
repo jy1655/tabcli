@@ -1,4 +1,4 @@
-use super::GuardedDialogInput;
+use super::{GuardedDialogInput, StaleDialogClaim};
 use crate::native::session::{Store, primitives::unix_ms, turn};
 use anyhow::{Context, Result, bail};
 use std::{path::Path, time::Instant};
@@ -9,19 +9,10 @@ pub(super) fn dispatch(
     deadline: Instant,
     automation: impl FnOnce() -> Result<bool>,
 ) -> Result<bool> {
-    precheck(directory, input, deadline).map_err(|error| error.context(DialogPrecheckRefusal))?;
+    precheck(directory, input, deadline).map_err(|error| error.context(StaleDialogClaim))?;
     // The lock protects this observation only. AppleScript runs after it is released:
     // retirement or a repaint can still occur before the terminal consumes the key.
     automation()
-}
-
-#[derive(Debug)]
-pub(in crate::native) struct DialogPrecheckRefusal;
-
-impl std::fmt::Display for DialogPrecheckRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("workspace trust response refused before terminal automation")
-    }
 }
 
 fn precheck(directory: &Path, input: &GuardedDialogInput, deadline: Instant) -> Result<()> {
@@ -102,7 +93,7 @@ mod tests {
                 dispatched.push(case);
                 Ok(true)
             });
-            assert!(result.unwrap_err().is::<DialogPrecheckRefusal>(), "{case}");
+            assert!(result.unwrap_err().is::<StaleDialogClaim>(), "{case}");
         }
         assert!(
             dispatched.is_empty(),
@@ -134,7 +125,33 @@ mod tests {
         assert!(format!("{:#}", run()).contains("lifecycle is busy"));
         drop(lock);
         store.private(STATUS_FILE).write_json(&"broken").unwrap();
-        assert!(run().is::<DialogPrecheckRefusal>());
+        assert!(run().is::<StaleDialogClaim>());
+    }
+
+    #[test]
+    fn guarded_dialog_automation_error_is_not_a_prewrite_refusal() {
+        let temp = tempfile::tempdir().unwrap();
+        fixture(temp.path(), "launching", Some("expected"));
+        let input = GuardedDialogInput {
+            expected_claim: Some("expected".into()),
+            expires_unix_ms: Some(u128::MAX),
+            screen: "exact screen".into(),
+            key: DialogKey::Enter,
+        };
+        let calls = Cell::new(0);
+        let error = dispatch(
+            temp.path(),
+            &input,
+            Instant::now() + Duration::from_secs(10),
+            || {
+                calls.set(calls.get() + 1);
+                bail!("automation failed after dispatch")
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls.get(), 1);
+        assert!(!error.is::<StaleDialogClaim>());
+        assert_eq!(error.to_string(), "automation failed after dispatch");
     }
 
     #[test]

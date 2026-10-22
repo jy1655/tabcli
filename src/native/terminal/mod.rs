@@ -53,14 +53,22 @@ mod macos_dialog;
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 #[path = "macos/selection.rs"]
 mod macos_selection;
-#[cfg(target_os = "macos")]
-pub(in crate::native) use macos_dialog::DialogPrecheckRefusal;
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 #[path = "windows/budget.rs"]
 pub(in crate::native) mod windows_budget;
 
-#[cfg(windows)]
-pub(in crate::native) use crate::native::console_control::StaleDialogClaim;
+/// A guarded dialog response was refused before any input was dispatched.
+#[derive(Debug)]
+pub(in crate::native) struct StaleDialogClaim;
+
+impl std::fmt::Display for StaleDialogClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("stale claim at guarded submission")
+    }
+}
+
+impl std::error::Error for StaleDialogClaim {}
+
 #[cfg(target_os = "linux")]
 use linux as platform;
 #[cfg(target_os = "macos")]

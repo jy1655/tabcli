@@ -475,11 +475,6 @@ launch, observe, continue, and close without replacing the capabilities those CL
 
 ## Trust Store Boundary
 
-- macOS guarded workspace-dialog input checks the Claim, ended state and original expiry
-  under the lifecycle lock, then releases it before AppleScript. This is a precheck, not
-  atomic with the terminal's key write or the provider's input consumption. iTerm2 and
-  Terminal.app screen comparisons consider case. Windows keeps its claim/expiry check
-  inside the helper at each write; never hold the parent's lifecycle lock across that helper.
 - A provider trust store, and a Bridge consent record, is evidence only when nobody but
   the user can change it. On Unix that is the owner and the mode. On Windows it is the
   owner and the access list, both read from the handle that the content is read from: the

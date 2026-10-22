@@ -459,7 +459,7 @@ fn payload_and_reply_codecs_preserve_the_existing_contract() {
             None => assert!(
                 decode_dialog_reply(&output)
                     .unwrap_err()
-                    .downcast_ref::<StaleDialogClaim>()
+                    .downcast_ref::<terminal::StaleDialogClaim>()
                     .is_some()
             ),
         }
