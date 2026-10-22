@@ -48,9 +48,65 @@ had already been published. After correction it passes, including immutable bind
 exact original Bridge wait identity and duplicate publication checks. Provider unit
 tests and the real JS-to-native-hook round trip also cover damaged selection,
 claim/close fencing, timeout retention, unrelated outcomes and read-only inspection.
-The final full-suite, native runtime and CI results are recorded below when complete.
+The corrected binary's full-suite and native runtime results follow. Final CI
+checks and their tested merge identity are tracked on PR #283.
 
-## Source and environment
+## Corrected Windows verification: observed regression passes
+
+Source **`49bb9d1`**, `cargo build --release --locked`, reports 0.4.23. Executable
+SHA-256: `5fe8345b2174d550628a6695a8102e6106ba6c7b8d9ee154a84fd0fa65d5fc25`.
+The source includes main `dda823b` and the same cfg correction as #286.
+The following runs crossed midnight, **2026-10-22 23:59 to 2026-10-23 00:01 KST**,
+with Claude Code 2.1.308 and the ordinary settings, state root, workspace and terminal
+described below. No `--yolo`, trust/permission changes or input retry was used.
+
+| Corrected-binary check | Observation |
+| --- | --- |
+| Background `ask` | `inspect` observed `FIX260_ASK_INTERIM` only as a candidate. The synchronous call returned `FIX260_ASK_FINAL`, completed, after 32.24 s. |
+| Background `tell` in the same session | `inspect` observed `FIX260_TELL_INTERIM` only as a candidate. The synchronous call returned `FIX260_TELL_FINAL`, completed, after 26.78 s. |
+| Genuine unmarked final | Claude returned `FIX260_UNMARKED_FINAL`. The caller timed out at 25 s with `request_state: pending`; the claim remained and `inspect` explained the unmarked candidate. No success Result was invented. |
+| Ordinary `self-test claude` | All five steps passed in 26.374 s, including ask, tell, both results and cleanup. Both completions used `claude_mod_turn_complete`. |
+
+The background transcript reports `claude-opus-5-5`, exactly two Bash tool calls
+(one per request, `run_in_background: true`, each sleeping 12 s and printing its
+token), both unmarked interims, both marked finals, and the final unmarked probe.
+No other tool was used. `ask`'s interim/final were at 23:59:42.946/23:59:55.686 KST;
+`tell`'s were at 00:00:09.735/00:00:22.716 KST. Both Results have
+`claude_mod_marked_continuation` provenance and retain their original Bridge ids:
+
+| Request | Immutable bound official turn | Selected official continuation |
+| --- | --- | --- |
+| ask | `a6f32154-1657-4262-a1eb-39fd7b1dbe97` | `4f216b50-a2a9-44db-b300-929cec816f45` |
+| tell | `83a962ee-85de-4fde-bb2a-a87c6e6f1795` | `d45c4449-057c-423d-b369-87b9c29e078d` |
+
+Conversation: `cd887b74-fe02-42f9-a73e-b1ee9a2f618e`. Candidate inspection captured
+each original binding before any continuation was selected. After publication,
+the original bindings and separate continuation records retained both identities.
+The two synchronous callers and addressed `result` queries agreed on the final
+answers and Bridge correlation ids. This verifies the stated marker protocol, not
+provider-owned parentage.
+
+At that exact source, full native Windows serial tests passed **1,239/0/5** across
+17 suites. All-target/all-feature native, macOS and Linux cross-target Clippy,
+formatting, diff checks and the locked release build passed. The 79 Claude unit
+tests and the JS/native-hook integration's 11 scenarios are included. Cross-target
+Clippy and ignored live tests are not additional native runtime verification.
+
+Both new owned sessions are **closed**, with their status records checked:
+`session-4o21dH` (background ask/tell and intentional missing-marker timeout) and
+`session-9oHMza` (ordinary self-test). The installed 0.4.22 remains unchanged.
+This corrected-binary round did not repeat the configured Stop-blocking hook,
+legacy refusal/reopen, consent transfer, steering, `/clear`, worker respawn,
+interruption, oversized provider output or macOS runtime. Their deterministic
+coverage and earlier dated live observations must not be confused with a fresh
+live check of this binary.
+
+Private evidence: `.git/260-fix-live/`, `.git/260-fix-live.log`,
+`.git/260-fix-live.py`, `.git/260-fix-self-test.json`, `.git/260-fix-*.log`,
+and the two owned session directories/transcripts. No diagnostic instrumentation
+was present in the corrected production binary.
+
+## Initial re-verification: source and environment
 
 Native Windows, 2026-10-22, Claude Code **2.1.308**. The background probes' transcripts
 report model **claude-opus-5-5**. Every run used the ordinary Bridge state root,
