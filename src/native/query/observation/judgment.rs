@@ -4,7 +4,7 @@ use super::{CancelObservation, SessionEvidence, SurfaceRecord};
 use crate::native::process_identity::{Attested, Gone, ProcessObservation};
 use crate::native::query::request::RequestState;
 use crate::native::reopen::ResumedFrom;
-use crate::native::session::launch::ResidualSurface;
+use crate::native::session::ResidualSurface;
 use crate::native::session::owner::{ControlAttestation, OwnerAttestation, attest_owner};
 use crate::native::session::snapshot::Snapshot;
 use crate::native::session::{self, OwnerObservation, SessionState, SessionStatus};
