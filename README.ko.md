@@ -94,17 +94,17 @@ Codex 후속 요청에는 0.149.0 이상이 필요하며 공유 데몬은 필요
 
 [GitHub Releases](https://github.com/jy1655/tabcli/releases)에서 운영체제에 맞는 압축 파일과 같은 이름의 `.sha256` 파일을 받습니다. 미리 빌드된 파일을 설치할 때는 Rust가 필요하지 않습니다. Apple Silicon macOS는 `tabcli-<version>-aarch64-apple-darwin.tar.gz`, x64 Windows는 `tabcli-<version>-x86_64-pc-windows-msvc.zip`을 사용합니다.
 
-0.4.21 버전을 설치한다면 다운로드한 디렉터리에서 압축을 풀기 전에 체크섬을 확인합니다. macOS에서는 체크섬 명령이 `OK`를 출력한 경우에만 다음 명령으로 진행합니다.
+0.4.22 버전을 설치한다면 다운로드한 디렉터리에서 압축을 풀기 전에 체크섬을 확인합니다. macOS에서는 체크섬 명령이 `OK`를 출력한 경우에만 다음 명령으로 진행합니다.
 
 ```sh
-shasum -a 256 -c tabcli-0.4.21-aarch64-apple-darwin.tar.gz.sha256
-tar -xzf tabcli-0.4.21-aarch64-apple-darwin.tar.gz
+shasum -a 256 -c tabcli-0.4.22-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf tabcli-0.4.22-aarch64-apple-darwin.tar.gz
 ```
 
 Windows에서는 PowerShell에서 실행합니다.
 
 ```powershell
-$archive = "tabcli-0.4.21-x86_64-pc-windows-msvc.zip"
+$archive = "tabcli-0.4.22-x86_64-pc-windows-msvc.zip"
 $expected = (Get-Content "$archive.sha256").Split()[0]
 $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw "checksum mismatch" }
@@ -116,7 +116,7 @@ Expand-Archive $archive -DestinationPath .\tabcli
 소스에서 설치하려면 Rust 1.97.1 이상과 Cargo가 필요합니다.
 
 ```sh
-cargo install --git https://github.com/jy1655/tabcli --tag v0.4.21 --locked
+cargo install --git https://github.com/jy1655/tabcli --tag v0.4.22 --locked
 ```
 
 이 패키지는 crates.io에 등록되어 있지 않습니다. 그곳의 `agent-bridge`와 `tab-cli`는 이 프로젝트와 무관합니다. 실행 파일과 Cargo 패키지 이름은 모두 `tabcli`입니다.
