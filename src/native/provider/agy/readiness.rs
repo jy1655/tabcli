@@ -1,5 +1,6 @@
 use super::HOOKS_LOADED_SOURCE;
-use super::delivery::{Clock, complete_log_lines, glog_timestamp};
+use super::delivery::Clock;
+use super::log::{complete_log_lines, glog_timestamp};
 use anyhow::{Context, Result, bail};
 use std::time::{Duration, Instant};
 

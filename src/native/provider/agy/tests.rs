@@ -4,7 +4,7 @@ use std::path::Path;
 
 #[test]
 fn declared_transports_preserve_framing_and_pending_cleanup() {
-    for facts in [AgyInitialPaste.facts(), AgyPaste.facts()] {
+    for facts in [AgyInitialPaste::new().facts(), AgyPaste::new().facts()] {
         let input = facts.surface.unwrap();
         assert_eq!(input.submit_count, 1);
         assert_eq!(input.newline, terminal::ConsoleNewline::LineFeed);
@@ -19,30 +19,30 @@ fn declared_transports_preserve_framing_and_pending_cleanup() {
         super::super::transport_test_context(directory.path(), &surface, TurnKind::Initial);
     install_pending_turn(directory.path(), initial.claim_token).unwrap();
     let before = std::fs::read(directory.path().join(PENDING_TURN_FILE)).unwrap();
-    let prepared = AgyInitialPaste.prepare(&initial).unwrap();
+    let prepared = AgyInitialPaste::new().prepare(&initial).unwrap();
     assert_eq!(
         prepared.prompt,
         terminal_initial_prompt(directory.path(), initial.prompt).unwrap()
     );
     assert!(prepared.correlation_id.is_none());
-    AgyInitialPaste.discard_prepared(&initial, Some(&prepared));
+    AgyInitialPaste::new().discard_prepared(&initial, Some(&prepared));
     assert_eq!(
         std::fs::read(directory.path().join(PENDING_TURN_FILE)).unwrap(),
         before
     );
     let follow =
         super::super::transport_test_context(directory.path(), &surface, TurnKind::FollowUp);
-    let prepared = AgyPaste.prepare(&follow).unwrap();
+    let prepared = AgyPaste::new().prepare(&follow).unwrap();
     let pending = read_pending_turn(directory.path()).unwrap().unwrap();
     assert_eq!(
         prepared.prompt,
         terminal_correlated_prompt(follow.prompt, &pending, cfg!(windows)).unwrap()
     );
     assert!(prepared.correlation_id.is_none());
-    AgyPaste.discard_prepared(&follow, Some(&prepared));
+    AgyPaste::new().discard_prepared(&follow, Some(&prepared));
     assert!(!directory.path().join(PENDING_TURN_FILE).exists());
-    AgyPaste.prepare(&follow).unwrap();
-    AgyPaste.discard_prepared(&follow, None);
+    AgyPaste::new().prepare(&follow).unwrap();
+    AgyPaste::new().discard_prepared(&follow, None);
     assert!(!directory.path().join(PENDING_TURN_FILE).exists());
 }
 

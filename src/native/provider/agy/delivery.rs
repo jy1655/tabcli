@@ -4,6 +4,7 @@ use super::trust::wait_for_workspace_trust;
 use super::{
     AGY_LOG_FILE, INPUT_RECEIPT_WINDOW, PendingAgyTurn, STARTUP_POLL_INTERVAL, read_pending_turn,
 };
+use crate::native::consent::Environment;
 use crate::native::session::{Reader, RecordReader, Store};
 use crate::native::terminal;
 use anyhow::{Context, Result};
@@ -29,6 +30,69 @@ pub(super) fn read_log_bytes(log_path: &Path) -> Result<Option<Vec<u8>>> {
     RecordReader::at(log_path).bytes()
 }
 
+// Agy owns these effects; the gates borrow clock and I/O independently so each
+// poll remains a fresh read. Trust deliberately keeps its real store/log reads.
+pub(super) trait Io {
+    fn session_directory(&mut self, session: &terminal::TerminalSession) -> Result<PathBuf>;
+    fn environment(&mut self) -> Environment;
+    fn read_log(&mut self, path: &Path) -> Result<Option<Vec<u8>>>;
+    fn send(
+        &mut self,
+        session: &terminal::TerminalSession,
+        prompt: &Path,
+        deadline: Instant,
+    ) -> terminal::TerminalSendResult;
+}
+
+pub(super) trait Runtime {
+    type Clock: Clock;
+    type Io: Io;
+    fn split(&mut self) -> (&mut Self::Clock, &mut Self::Io);
+}
+
+pub(super) struct Console {
+    clock: SystemClock,
+    io: ConsoleIo,
+}
+
+impl Console {
+    pub(super) fn new() -> Self {
+        Self {
+            clock: SystemClock,
+            io: ConsoleIo,
+        }
+    }
+}
+
+impl Runtime for Console {
+    type Clock = SystemClock;
+    type Io = ConsoleIo;
+    fn split(&mut self) -> (&mut Self::Clock, &mut Self::Io) {
+        (&mut self.clock, &mut self.io)
+    }
+}
+
+pub(super) struct ConsoleIo;
+impl Io for ConsoleIo {
+    fn session_directory(&mut self, session: &terminal::TerminalSession) -> Result<PathBuf> {
+        session_directory_of(session)
+    }
+    fn environment(&mut self) -> Environment {
+        Environment::current()
+    }
+    fn read_log(&mut self, path: &Path) -> Result<Option<Vec<u8>>> {
+        read_log_bytes(path)
+    }
+    fn send(
+        &mut self,
+        session: &terminal::TerminalSession,
+        prompt: &Path,
+        deadline: Instant,
+    ) -> terminal::TerminalSendResult {
+        terminal::send_file(session, prompt, deadline)
+    }
+}
+
 // Only preparation can produce a paste-ready turn. Consuming it issues one paste
 // and checks the receipt against the offset from the read that passed readiness.
 struct PreparedTerminalTurn<'a> {
@@ -38,15 +102,16 @@ struct PreparedTerminalTurn<'a> {
 }
 
 impl<'a> PreparedTerminalTurn<'a> {
-    fn prepare_with(
+    fn prepare_with<R>(
         directory: &'a Path,
-        trust: impl FnOnce() -> Result<()>,
-        readiness: impl FnOnce() -> Result<usize>,
+        runtime: &mut R,
+        trust: impl FnOnce(&mut R) -> Result<()>,
+        readiness: impl FnOnce(&mut R) -> Result<usize>,
     ) -> Result<Self> {
-        trust()?;
+        trust(runtime)?;
         let pending =
             read_pending_turn(directory)?.context("Agy turn correlation state is missing")?;
-        let pre_paste_len = readiness()?;
+        let pre_paste_len = readiness(runtime)?;
         Ok(Self {
             directory,
             pending,
@@ -54,61 +119,68 @@ impl<'a> PreparedTerminalTurn<'a> {
         })
     }
 
-    fn deliver(
+    fn deliver<R>(
         self,
         terminal: &str,
-        send: impl FnOnce() -> terminal::TerminalSendResult,
-        confirm: impl FnOnce(&PendingAgyTurn, usize) -> terminal::TerminalSendResult,
+        runtime: &mut R,
+        send: impl FnOnce(&mut R) -> terminal::TerminalSendResult,
+        confirm: impl FnOnce(&mut R, &PendingAgyTurn, usize) -> terminal::TerminalSendResult,
     ) -> terminal::TerminalSendResult {
         trace_terminal_delivery(
             self.directory,
             &self.pending,
             self.pre_paste_len,
             terminal,
+            runtime,
             send,
-            || confirm(&self.pending, self.pre_paste_len),
+            |runtime| confirm(runtime, &self.pending, self.pre_paste_len),
         )
     }
 }
 
 // A Windows follow-up has already passed startup trust/readiness in its initial
 // paste; all other pastes wait for both gates here before preparing the turn.
-pub(super) fn deliver_terminal_turn(
+pub(super) fn deliver_terminal_turn<R: Runtime>(
     session: &terminal::TerminalSession,
     prompt_path: &Path,
     deadline: Instant,
     readiness: Option<ReadinessTiming>,
+    runtime: &mut R,
 ) -> terminal::TerminalSendResult {
     use terminal::TerminalSendFailure;
-    let directory = session_directory_of(session).map_err(TerminalSendFailure::not_sent)?;
+    let directory = runtime
+        .split()
+        .1
+        .session_directory(session)
+        .map_err(TerminalSendFailure::not_sent)?;
     let log_path = Reader::open_unchecked(&directory)
         .private(AGY_LOG_FILE)
         .path()
         .to_owned();
     let prepared = PreparedTerminalTurn::prepare_with(
         &directory,
-        || {
+        runtime,
+        |runtime| {
             if readiness.is_some() {
-                wait_for_workspace_trust(
-                    &directory,
-                    deadline,
-                    &crate::native::consent::Environment::current(),
-                )?;
+                let (clock, io) = runtime.split();
+                wait_for_workspace_trust(&directory, deadline, &io.environment(), clock)?;
             }
             Ok(())
         },
-        || {
+        |runtime| {
+            let (clock, io) = runtime.split();
             if let Some(timing) = readiness {
                 // No later log read may replace the gate's receipt offset.
                 wait_for_startup_readiness_with(
-                    &mut || read_log_bytes(&log_path),
+                    &mut || io.read_log(&log_path),
                     deadline,
                     timing,
                     STARTUP_POLL_INTERVAL,
-                    &mut SystemClock,
+                    clock,
                 )
             } else {
-                let log = read_log_bytes(&log_path)
+                let log = io
+                    .read_log(&log_path)
                     .context("Agy log could not be read before the console paste")?;
                 follow_up_pre_paste_offset(log.as_deref())
             }
@@ -117,17 +189,19 @@ pub(super) fn deliver_terminal_turn(
     .map_err(TerminalSendFailure::not_sent)?;
     prepared.deliver(
         session.kind.as_str(),
-        || terminal::send_file(session, prompt_path, deadline),
-        |pending, pre_paste_len| {
+        runtime,
+        |runtime| runtime.split().1.send(session, prompt_path, deadline),
+        |runtime, pending, pre_paste_len| {
+            let (clock, io) = runtime.split();
             // The composer after an unconfirmed paste is unknown; never paste again.
             confirm_input_receipt_with(
-                &mut || read_log_bytes(&log_path),
+                &mut || io.read_log(&log_path),
                 pending,
                 pre_paste_len,
-                Instant::now(),
+                clock.now(),
                 deadline,
                 INPUT_RECEIPT_POLL_INTERVAL,
-                &mut SystemClock,
+                clock,
             )
         },
     )
@@ -137,17 +211,18 @@ pub(super) fn deliver_terminal_turn(
 // the failure between terminal injection, a late reload, and Agy's input loop.
 // Record actual dispatch times and the offset used by the receipt check without
 // copying prompt text. Diagnostic write failures never cancel or retry delivery.
-fn trace_terminal_delivery<S, C>(
+fn trace_terminal_delivery<R, S, C>(
     directory: &Path,
     pending: &PendingAgyTurn,
     pre_paste_len: usize,
     terminal: &str,
+    runtime: &mut R,
     send: S,
     confirm: C,
 ) -> terminal::TerminalSendResult
 where
-    S: FnOnce() -> terminal::TerminalSendResult,
-    C: FnOnce() -> terminal::TerminalSendResult,
+    S: FnOnce(&mut R) -> terminal::TerminalSendResult,
+    C: FnOnce(&mut R) -> terminal::TerminalSendResult,
 {
     let record = Store::open_unchecked(directory)
         .private(&format!("agy-input-{}.json", pending.claim_token));
@@ -160,10 +235,10 @@ where
     let _ = record.write_json(&trace);
     trace["paste_started_unix_ms"] =
         serde_json::json!(crate::native::session::primitives::unix_ms());
-    let result = send();
+    let result = send(runtime);
     trace["paste_returned_unix_ms"] =
         serde_json::json!(crate::native::session::primitives::unix_ms());
-    let result = result.and_then(|()| confirm());
+    let result = result.and_then(|()| confirm(runtime));
     trace["receipt_finished_unix_ms"] =
         serde_json::json!(crate::native::session::primitives::unix_ms());
     trace["outcome"] = serde_json::json!(match &result {
@@ -198,100 +273,6 @@ fn session_directory_of(session: &terminal::TerminalSession) -> Result<PathBuf> 
 pub(super) fn input_receipt_window_end(now: Instant, deadline: Instant) -> Instant {
     now.checked_add(INPUT_RECEIPT_WINDOW)
         .map_or(deadline, |end| end.min(deadline))
-}
-
-// Complete log lines only: a line without its terminating newline may still be
-// written, so it is neither a marker nor a receipt yet. Terminal escape sequences and
-// carriage returns are dropped so a marker is recognised through console noise.
-pub(super) fn complete_log_lines(log: &[u8]) -> impl Iterator<Item = String> + '_ {
-    let complete = match log.iter().rposition(|byte| *byte == b'\n') {
-        Some(end) => &log[..end],
-        None => &log[..0],
-    };
-    complete
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| strip_terminal_noise(&String::from_utf8_lossy(line)))
-}
-
-pub(super) fn strip_terminal_noise(line: &str) -> String {
-    let characters: Vec<char> = line.chars().collect();
-    let mut clean = String::with_capacity(line.len());
-    let mut index = 0;
-    while index < characters.len() {
-        match characters[index] {
-            '\u{1b}' => {
-                index += 1;
-                match characters.get(index) {
-                    Some('[') => {
-                        index += 1;
-                        while let Some(next) = characters.get(index) {
-                            index += 1;
-                            if ('\u{40}'..='\u{7e}').contains(next) {
-                                break;
-                            }
-                        }
-                    }
-                    Some(']') => {
-                        // OSC ends with BEL or with the string terminator `ESC \`.
-                        // Any other escape ends the OSC and is processed on its own.
-                        index += 1;
-                        while let Some(next) = characters.get(index) {
-                            if *next == '\u{7}' {
-                                index += 1;
-                                break;
-                            }
-                            if *next == '\u{1b}' {
-                                if characters.get(index + 1) == Some(&'\\') {
-                                    index += 2;
-                                }
-                                break;
-                            }
-                            index += 1;
-                        }
-                    }
-                    Some(_) => index += 1,
-                    None => {}
-                }
-            }
-            '\r' => index += 1,
-            other => {
-                clean.push(other);
-                index += 1;
-            }
-        }
-    }
-    clean
-}
-
-// The glog `[IWEF]MMDD HH:MM:SS.uuuuuu` stamp of a line as an offset from an
-// arbitrary epoch (months counted as 31 days); only the difference between two
-// stamps of the same log is meaningful, and a difference across a year boundary is
-// not. Agy stamps in local time. A line without a stamp (`CLI ready for user
-// input`, a file header, console noise) yields `None`.
-pub(super) fn glog_timestamp(line: &str) -> Option<Duration> {
-    let bytes = line.as_bytes();
-    if !matches!(bytes.first(), Some(b'I' | b'W' | b'E' | b'F')) || bytes.get(5) != Some(&b' ') {
-        return None;
-    }
-    let date = line.get(1..5)?;
-    let month: u64 = date.get(..2)?.parse().ok()?;
-    let day: u64 = date.get(2..)?.parse().ok()?;
-    let stamp = line.get(6..21)?;
-    let (hours, rest) = stamp.split_once(':')?;
-    let (minutes, seconds) = rest.split_once(':')?;
-    let (seconds, micros) = seconds.split_once('.')?;
-    if micros.len() != 6 {
-        return None;
-    }
-    let hours: u64 = hours.parse().ok()?;
-    let minutes: u64 = minutes.parse().ok()?;
-    let seconds: u64 = seconds.parse().ok()?;
-    let micros: u64 = micros.parse().ok()?;
-    Some(
-        Duration::from_secs((month * 31 + day) * 86_400 + hours * 3600 + minutes * 60 + seconds)
-            + Duration::from_micros(micros),
-    )
 }
 
 #[cfg(test)]
