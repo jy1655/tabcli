@@ -68,6 +68,15 @@ impl Fixture {
             json!({"turnId":TURN,"reason":"answer","isAborted":false,"answer":answer}),
         );
     }
+    fn complete_marked(&self, answer: &str) {
+        self.complete(&format!(
+            "{answer}\n<!-- agent-bridge-claude-turn:{REQUEST} -->"
+        ));
+    }
+    fn final_data(&self, turn: &str) -> Value {
+        json!({"turnId":turn,"reason":"answer","isAborted":false,
+            "answer":format!("final result\n<!-- agent-bridge-claude-turn:{REQUEST} -->")})
+    }
     fn events(&self) -> Vec<SessionEvent> {
         self.store()
             .events()
@@ -90,6 +99,44 @@ impl Fixture {
 }
 
 #[test]
+fn unmarked_interim_waits_for_marked_continuation_and_keeps_waiter_identity() {
+    let f = Fixture::new();
+    f.start();
+    let binding_path = format!("claude-mod-bound-{}.json", f.token);
+    let binding = f.store().private(&binding_path).text().unwrap();
+    f.complete("The background task is still running");
+    f.retained();
+    let continued = "00000000-0000-4000-8000-000000000251";
+    f.send(
+        "turn.start",
+        json!({"turnId":continued,"text":"<task-notification>finished</task-notification>"}),
+    );
+    let final_data = json!({"turnId":continued,"reason":"answer","isAborted":false,
+        "answer":format!("final result\n<!-- agent-bridge-claude-turn:{REQUEST} -->")});
+    f.send("turn.complete", final_data.clone());
+    f.send("turn.complete", final_data);
+    let events = f.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].message, "final result");
+    assert_eq!(events[0].turn_id.as_deref(), Some(REQUEST));
+    assert_eq!(
+        events[0].provenance.as_deref(),
+        Some("claude_mod_marked_continuation")
+    );
+    assert_eq!(f.store().private(&binding_path).text().unwrap(), binding);
+    let result = turn::wait(
+        &f.store(),
+        0,
+        Some(REQUEST),
+        Some(&f.token),
+        Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    assert_eq!(result.message, "final result");
+}
+
+#[test]
 fn queued_start_needs_no_submission_scope_and_duplicate_events_publish_once() {
     let f = Fixture::new();
     f.start();
@@ -101,11 +148,11 @@ fn queued_start_needs_no_submission_scope_and_duplicate_events_publish_once() {
     )
     .unwrap();
     f.retained();
-    f.complete("final without marker");
-    f.complete("duplicate");
+    f.complete_marked("final with marker");
+    f.complete_marked("duplicate");
     let events = f.events();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].message, "final without marker");
+    assert_eq!(events[0].message, "final with marker");
     assert_eq!(events[0].turn_id.as_deref(), Some(REQUEST));
 }
 
@@ -127,11 +174,11 @@ fn only_the_exact_outer_frame_can_bind_even_with_delimiters_in_its_body() {
     ];
     for text in variants {
         f.send("turn.start", json!({"turnId":TURN,"text":text}));
-        f.complete("unrelated");
+        f.complete_marked("unrelated");
         f.retained();
     }
     f.start();
-    f.complete("accepted");
+    f.complete_marked("accepted");
     assert_eq!(f.events()[0].message, "accepted");
 }
 
@@ -143,7 +190,7 @@ fn subagents_conflicting_identities_and_other_conversations_cannot_settle() {
             "turn.start",
             json!({"turnId":TURN,"text":f.frame(),"agentId":agent}),
         );
-        f.complete("unbound");
+        f.complete_marked("unbound");
         f.retained();
     }
     f.start();
@@ -163,7 +210,7 @@ fn subagents_conflicting_identities_and_other_conversations_cannot_settle() {
     other["conversation"] = json!("00000000-0000-0000-0000-000000000000");
     receive(f.root.path(), &other).unwrap();
     f.retained();
-    f.complete("bound");
+    f.complete_marked("bound");
     assert_eq!(f.events()[0].message, "bound");
 }
 
@@ -182,7 +229,7 @@ fn replaced_claim_and_closed_session_fence_late_completion() {
             )
             .unwrap();
         }
-        f.complete("late");
+        f.complete_marked("late");
         assert!(f.events().is_empty());
         if !close {
             assert_eq!(
@@ -322,23 +369,25 @@ fn legacy_windows_refuses_new_input_while_macos_preserves_its_route() {
 }
 
 #[test]
-fn answer_markers_are_optional_and_only_the_exact_suffix_is_removed() {
-    for (answer, expected) in [
-        ("final".to_owned(), "final".to_owned()),
-        (
-            format!("middle <!-- agent-bridge-claude-turn:{REQUEST} --> end"),
-            format!("middle <!-- agent-bridge-claude-turn:{REQUEST} --> end"),
-        ),
-        (
-            format!("final\n<!-- agent-bridge-claude-turn:{REQUEST} -->\n"),
-            "final".into(),
-        ),
+fn only_exact_suffix_markers_complete_answers_and_empty_answers_still_fail() {
+    for answer in [
+        "final".to_owned(),
+        format!("middle <!-- agent-bridge-claude-turn:{REQUEST} --> end"),
+        "final\n<!-- agent-bridge-claude-turn:claude-turn-other -->".into(),
     ] {
         let f = Fixture::new();
         f.start();
         f.complete(&answer);
-        assert_eq!(f.events()[0].message, expected);
+        f.retained();
+        let candidate: Candidate = f.store().private(&candidate_name(&f.token)).json().unwrap();
+        assert_eq!(candidate.answer_preview, answer);
     }
+    let f = Fixture::new();
+    f.start();
+    f.complete(&format!(
+        "final\n<!-- agent-bridge-claude-turn:{REQUEST} -->\n"
+    ));
+    assert_eq!(f.events()[0].message, "final");
     for answer in [
         "".to_owned(),
         " \n".into(),
@@ -353,6 +402,13 @@ fn answer_markers_are_optional_and_only_the_exact_suffix_is_removed() {
                 .as_deref()
                 .unwrap()
                 .contains("no answer text")
+        );
+        assert!(
+            f.store()
+                .private(&candidate_name(&f.token))
+                .text()
+                .unwrap()
+                .is_none()
         );
     }
 }
@@ -407,7 +463,7 @@ fn clear_can_change_conversation_without_revoking_module_capability() {
     ready["conversation"] = json!("00000000-0000-0000-0000-000000000000");
     receive(f.root.path(), &ready).unwrap();
     f.start();
-    f.complete("new conversation");
+    f.complete_marked("new conversation");
     assert_eq!(f.events()[0].message, "new conversation");
 }
 
@@ -504,7 +560,7 @@ fn official_peer_body_escapes_its_own_closing_delimiter_before_turn_start() {
         1,
     );
     f.send("turn.start", json!({"turnId":TURN,"text":observed}));
-    f.complete("escaped body final");
+    f.complete_marked("escaped body final");
     let events = f.events();
     assert_eq!(
         events.len(),
@@ -534,3 +590,6 @@ fn peer_quoting_preserves_the_whole_body_and_existing_literal_backslashes() {
     assert!(start_wire_size("<").unwrap() - start_wire_size("").unwrap() == 3);
     assert!(start_wire_size("<\\").unwrap() == start_wire_size("<").unwrap());
 }
+
+#[path = "continuation_tests.rs"]
+mod continuation_tests;

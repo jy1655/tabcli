@@ -2,7 +2,7 @@ use super::{
     PENDING_TURN_FILE, PendingCrossSessionTurn, PendingTurnFile, valid_claude_conversation_id,
 };
 use crate::native::clock::Clock;
-use crate::native::session::{Reader, Store, turn};
+use crate::native::session::{Reader, Store, primitives::unix_ms, turn};
 use agent_bridge::{FirstPartyCli, terminal_safe_text};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -46,13 +46,43 @@ struct Ready {
     conversation: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 struct Binding {
     schema: u32,
     claim: String,
     correlation_id: String,
     conversation: String,
     turn_id: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Candidate {
+    schema: u32,
+    binding: Binding,
+    answer_preview: String,
+    created_unix_ms: u128,
+}
+
+impl Candidate {
+    fn matches(&self, binding: &Binding) -> bool {
+        self.schema == 1
+            && self.binding == *binding
+            && self.created_unix_ms > 0
+            && self.answer_preview.chars().count() <= 1024
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct Continuation {
+    schema: u32,
+    binding: Binding,
+    turn_id: String,
+    created_unix_ms: u128,
+}
+
+enum Outcome {
+    Answer { text: String, marked: bool },
+    Failed(String),
 }
 
 pub(super) fn native_mode(directory: &Path) -> Result<bool> {
@@ -313,15 +343,151 @@ fn identity<'a>(data: &'a Value, key: &str) -> Result<&'a str> {
         .get(key)
         .and_then(Value::as_str)
         .context("Claude module identity field is missing or not text")?;
-    if value.is_empty()
-        || value.len() > MAX_TURN_BYTES
-        || !value
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
-    {
+    if !valid_identity(value) {
         bail!("Claude module identity field is invalid");
     }
     Ok(value)
+}
+
+fn valid_identity(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_TURN_BYTES
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+}
+
+fn candidate_name(token: &str) -> String {
+    format!("claude-mod-candidate-{token}.json")
+}
+
+fn remember_candidate(store: &Store, binding: &Binding, answer: &str) -> Result<()> {
+    let record = store.private(&candidate_name(&binding.claim));
+    match record.optional_json::<Candidate>()? {
+        Some(candidate) if candidate.matches(binding) => Ok(()),
+        Some(_) => bail!("Claude completion candidate does not match the immutable binding"),
+        None => record.write_json(&Candidate {
+            schema: 1,
+            binding: binding.clone(),
+            answer_preview: bounded(answer),
+            created_unix_ms: unix_ms(),
+        }),
+    }
+}
+
+// Called under the lifecycle lock, after the live claim, pending request, original
+// binding, conversation and fully decoded marked answer have all been verified.
+fn select_continuation(
+    store: &Store,
+    binding: &Binding,
+    turn_id: &str,
+) -> Result<Option<Continuation>> {
+    let candidate: Candidate = store
+        .private(&candidate_name(&binding.claim))
+        .optional_json()?
+        .context("Claude continuation has no unmarked bound-turn candidate")?;
+    if !candidate.matches(binding) {
+        bail!("Claude continuation candidate does not match the immutable binding");
+    }
+    let record = store.private(&format!("claude-mod-continuation-{}.json", binding.claim));
+    if let Some(selected) = record.optional_json::<Continuation>()? {
+        if selected.schema != 1
+            || selected.binding != *binding
+            || selected.turn_id != turn_id
+            || selected.created_unix_ms == 0
+        {
+            bail!("Claude continuation conflicts with the already selected completion identity");
+        }
+        return Ok(None);
+    }
+    // Preserve both official identities before publication. A helper retry can repeat
+    // this selection, but another turn cannot replace it if publication was interrupted.
+    Ok(Some(Continuation {
+        schema: 1,
+        binding: binding.clone(),
+        turn_id: turn_id.into(),
+        created_unix_ms: unix_ms(),
+    }))
+}
+
+fn read_pending(reader: &Reader, token: &str) -> Result<PendingCrossSessionTurn> {
+    let pending: PendingCrossSessionTurn = reader.private(PENDING_TURN_FILE).json()?;
+    let expected = PendingCrossSessionTurn::new(&pending.request_id)?;
+    if pending.schema != 2
+        || pending.marker != expected.marker
+        || pending.claim_token.as_deref() != Some(token)
+        || !pending.expected_message.as_deref().is_some_and(|text| {
+            text.starts_with("[Agent Bridge native delegation]\nSource: ")
+                && text.ends_with(&pending.marker)
+        })
+    {
+        bail!("Claude native pending record does not identify the current framed request");
+    }
+    Ok(pending)
+}
+
+fn binding_matches_request(
+    binding: &Binding,
+    pending: &PendingCrossSessionTurn,
+    token: &str,
+) -> bool {
+    binding.schema == 1
+        && binding.claim == token
+        && binding.correlation_id == pending.request_id
+        && valid_claude_conversation_id(&binding.conversation)
+        && valid_identity(&binding.turn_id)
+}
+
+/// Called only under inspect's existing lifecycle reader lock. This observes private
+/// evidence; it neither selects a completion nor repairs or publishes any result.
+pub(super) fn observe_candidate(reader: &Reader, token: &str) -> Option<Value> {
+    if !turn::valid_turn_claim_token(token) {
+        return None;
+    }
+    let read = || -> Result<Option<Value>> {
+        if !native_mode(reader.directory())? {
+            return Ok(None);
+        }
+        let Some(candidate) = reader
+            .private(&candidate_name(token))
+            .optional_json::<Candidate>()?
+        else {
+            return Ok(None);
+        };
+        let pending = read_pending(reader, token)?;
+        let binding: Binding = reader
+            .private(&format!("claude-mod-bound-{token}.json"))
+            .json()?;
+        if !binding_matches_request(&binding, &pending, token) || !candidate.matches(&binding) {
+            bail!("Claude candidate does not match the current request and original binding");
+        }
+        let selected = reader
+            .private(&format!("claude-mod-continuation-{token}.json"))
+            .optional_json::<Continuation>()?;
+        if let Some(selected) = &selected
+            && (selected.schema != 1
+                || selected.binding != binding
+                || !valid_identity(&selected.turn_id)
+                || selected.turn_id == binding.turn_id
+                || selected.created_unix_ms == 0)
+        {
+            bail!("Claude selected continuation identity is invalid");
+        }
+        Ok(Some(json!({
+            "state":"unmarked_bound_turn",
+            "detail":"The bound Claude turn ended without the final marker. This candidate is not a published result. A caller timeout does not release the claim; inspect the provider surface before closing or diagnosing the session.",
+            "correlation_id":binding.correlation_id,
+            "conversation":binding.conversation,
+            "bound_turn_id":binding.turn_id,
+            "answer_preview":candidate.answer_preview,
+            "created_unix_ms":candidate.created_unix_ms,
+            "selected_completion_turn_id":selected.map(|selected| selected.turn_id),
+        })))
+    };
+    match read() {
+        Ok(observation) => observation,
+        Err(error) => Some(json!({"state":"unreadable","detail":bounded(&format!("{error:#}"))})),
+    }
 }
 
 pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
@@ -375,22 +541,7 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
     if let Err(error) = require_current(directory, &token) {
         return diagnostic(directory, event, &format!("{error:#}"));
     }
-    let parse_pending = || -> Result<PendingCrossSessionTurn> {
-        let pending: PendingCrossSessionTurn = store.private(PENDING_TURN_FILE).json()?;
-        let expected = PendingCrossSessionTurn::new(&pending.request_id)?;
-        if pending.schema != 2
-            || pending.marker != expected.marker
-            || pending.claim_token.as_deref() != Some(&token)
-            || !pending.expected_message.as_deref().is_some_and(|text| {
-                text.starts_with("[Agent Bridge native delegation]\nSource: ")
-                    && text.ends_with(&pending.marker)
-            })
-        {
-            bail!("Claude native pending record does not identify the current framed request");
-        }
-        Ok(pending)
-    };
-    let pending = match parse_pending() {
+    let pending = match read_pending(&store, &token) {
         Ok(pending) => pending,
         Err(error) => return diagnostic(directory, event, &format!("{error:#}")),
     };
@@ -446,11 +597,21 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
             ),
         };
     }
-    if binding.as_ref() != Some(&proposed) {
+    let Some(binding) = binding.filter(|binding| {
+        binding_matches_request(binding, &pending, &token) && binding.conversation == conversation
+    }) else {
         return diagnostic(
             directory,
             event,
             "Claude module event has no matching turn.start binding for the pending request; unrelated turns and input without its own exact start cannot settle it",
+        );
+    };
+    let bound = binding == proposed;
+    if !bound && event != "turn.complete" {
+        return diagnostic(
+            directory,
+            event,
+            "unbound Claude event has no marked completion evidence",
         );
     }
     let outcome = if event == "oversize" {
@@ -459,7 +620,7 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
             .and_then(Value::as_u64)
             .filter(|size| *size > MAX_WIRE_BYTES as u64)
         {
-            Some(size) => Ok(Err(format!(
+            Some(size) => Ok(Outcome::Failed(format!(
                 "Claude turn.complete wire exceeded the 4 MiB limit ({size} UTF-8 bytes); the answer was not truncated"
             ))),
             None => Err(anyhow::anyhow!(
@@ -475,16 +636,53 @@ pub(super) fn receive(directory: &Path, wire: &Value) -> Result<()> {
         Ok(outcome) => outcome,
         Err(error) => return diagnostic(directory, event, &format!("{error:#}")),
     };
+    let (outcome, provenance) = if bound {
+        if let Outcome::Answer {
+            text,
+            marked: false,
+        } = &outcome
+        {
+            remember_candidate(&store, &binding, text)?;
+            return diagnostic(
+                directory,
+                event,
+                "the bound Claude turn ended without the final marker; waiting for a marked completion in the same conversation; a caller timeout does not release the claim; inspect the session before closing or diagnosing it",
+            );
+        }
+        (outcome, "claude_mod_turn_complete")
+    } else {
+        if !matches!(&outcome, Outcome::Answer { marked: true, .. }) {
+            return diagnostic(
+                directory,
+                event,
+                "unbound Claude completion is not a valid nonempty answer with the exact pending marker; the request remains pending",
+            );
+        }
+        let selection = match select_continuation(&store, &binding, turn_id) {
+            Ok(selection) => selection,
+            Err(error) => return diagnostic(directory, event, &format!("{error:#}")),
+        };
+        if let Some(selection) = selection {
+            store
+                .private(&format!("claude-mod-continuation-{token}.json"))
+                .write_json(&selection)?;
+        }
+        (outcome, "claude_mod_marked_continuation")
+    };
     drop(lock);
     let report = turn::Report::for_claim(&store, FirstPartyCli::Claude, Some(&token))
-        .with_provenance(Some("claude_mod_turn_complete"));
+        .with_provenance(Some(provenance));
     match outcome {
-        Ok(answer) => report.complete(&answer, Some(conversation.into()), Some(pending.request_id)),
-        Err(error) => report.fail(&error, Some(conversation.into()), Some(pending.request_id)),
+        Outcome::Answer { text, .. } => {
+            report.complete(&text, Some(conversation.into()), Some(pending.request_id))
+        }
+        Outcome::Failed(error) => {
+            report.fail(&error, Some(conversation.into()), Some(pending.request_id))
+        }
     }
 }
 
-fn outcome(data: &Value, marker: &str) -> Result<Result<String, String>> {
+fn outcome(data: &Value, marker: &str) -> Result<Outcome> {
     let reason = data
         .get("reason")
         .and_then(Value::as_str)
@@ -503,15 +701,19 @@ fn outcome(data: &Value, marker: &str) -> Result<Result<String, String>> {
     Ok(match reason {
         "answer" => {
             let answer = answer.trim_end();
+            let marked = answer.ends_with(marker);
             let answer = answer.strip_suffix(marker).unwrap_or(answer).trim_end();
             if answer.trim().is_empty() {
-                Err("Claude ended the turn with no answer text".into())
+                Outcome::Failed("Claude ended the turn with no answer text".into())
             } else {
-                Ok(answer.into())
+                Outcome::Answer {
+                    text: answer.into(),
+                    marked,
+                }
             }
         }
-        "aborted" => Err("Claude turn was interrupted".into()),
-        "error" => Err(if answer.trim().is_empty() {
+        "aborted" => Outcome::Failed("Claude turn was interrupted".into()),
+        "error" => Outcome::Failed(if answer.trim().is_empty() {
             "Claude turn ended on an API error".into()
         } else {
             format!("Claude turn ended on an API error: {}", bounded(answer))
@@ -533,7 +735,7 @@ fn outcome(data: &Value, marker: &str) -> Result<Result<String, String>> {
                     _ => bail!("Claude refusal field is missing or malformed"),
                 }
             }
-            Err(if details.is_empty() {
+            Outcome::Failed(if details.is_empty() {
                 "Claude refused the turn".into()
             } else {
                 format!("Claude refused the turn: {}", details.join(": "))

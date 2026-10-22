@@ -31,6 +31,9 @@ pub(super) fn inspect_inner(id: &str, json: bool) -> Result<()> {
         if let Some(error) = value["error"].as_str() {
             println!("error: {}", terminal_safe_text(error, true));
         }
+        if let Some(detail) = value["provider_completion"]["detail"].as_str() {
+            println!("provider completion: {}", terminal_safe_text(detail, true));
+        }
         if let Some(id) = value["latest_result"]["event_id"].as_str() {
             println!("latest result: {id}");
         }
@@ -105,6 +108,14 @@ pub(super) fn value(
         "recorded_events": snapshot.paths.len(), "latest_result": latest, "requests": request_refs,
     }).as_object().unwrap().clone());
     session::hold::add_fields(&mut value, &observation.evidence.held);
+    if let Some(completion) = provider::completion_observation(
+        reader,
+        &snapshot.manifest.provider,
+        snapshot._lock.is_some(),
+        snapshot.claim.as_deref(),
+    ) {
+        value["provider_completion"] = completion;
+    }
     if let Some(residual) = judgments.residual_surface {
         value["residual_surface"] = serde_json::to_value(residual)?;
     }

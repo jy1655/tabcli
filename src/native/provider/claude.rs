@@ -30,6 +30,10 @@ mod completion;
 mod messenger;
 mod registry;
 
+pub(super) fn completion_observation(reader: &Reader, token: &str) -> Option<serde_json::Value> {
+    completion::observe_candidate(reader, token)
+}
+
 use messenger::{ClaudeMessage, run_message_guard, run_message_receipt};
 
 #[cfg(test)]

@@ -1,9 +1,54 @@
 # Windows re-verification of Claude native completion
 
-**Verdict: do not merge the completion change yet.** The background-continuation
-regression remains. The prospective legacy-refusal recovery fix from #268 passes.
-This is the verification record for [PR #283](https://github.com/jy1655/tabcli/pull/283),
-kept separate from the unchanged original [PR #260](https://github.com/jy1655/tabcli/pull/260).
+The first re-verification at `fa50fb8` **failed** the background-continuation case and
+passed the prospective legacy-refusal recovery from #268. The owner then authorized
+the correction below in [PR #283](https://github.com/jy1655/tabcli/pull/283), separate
+from the unchanged original [PR #260](https://github.com/jy1655/tabcli/pull/260).
+The earlier observations remain below; they are not evidence for the corrected binary.
+
+## Correction: retain unmarked interim completion
+
+The original exact-frame binding remains immutable. A normal nonempty bound answer
+without the exact suffix marker becomes a private candidate and retains the claim.
+A marked normal answer from a different main-loop turn can settle only with that
+candidate, the exact live claim/pending request/binding and the same conversation.
+The selected continuation record preserves both official turn ids before core
+publication; another continuation cannot replace it after interrupted publication.
+The Result keeps the original Bridge correlation id, so the synchronous caller can
+finish, and uses `claude_mod_marked_continuation` provenance.
+
+Bound abort, error, refusal and empty answer retain their failure behavior. An
+unbound failure, malformed outcome, subagent, missing/damaged candidate, different
+conversation, wrong/infix marker or oversized signal cannot settle the request.
+The latter has no answer marker after JS reduces its oversized wire. Duplicate
+helper delivery can repeat the same selection and yields at most one Result.
+
+This is a provider-specific marker fallback, **not provider-owned parentage or
+general request finality**. A same-conversation unrelated turn repeating the exact
+marker can match; an interim carrying it can still finish early. An unmarked genuine
+final can hold the claim indefinitely after caller timeout. `inspect` exposes the
+current candidate under its existing reader lock and performs no retry, repair or
+publication. Inspect the provider surface before closing or diagnosing the session.
+
+The installed Claude 2.1.308 generated its actual `claude-code/index.d.ts` in the
+owned production session's `.claude-plugin/types/`. SHA-256:
+`3c29d70e7f113f2409db12c3db20dd8385296c46aaf26984d00e5ecacd37c2c0`.
+Its `TurnCompleteFields`/`TurnStartInput` (lines 14168–14300) identify one turn and
+loop, with no continuation-parent or addressed whole-request-final field.
+`PromptOrigin` names task notifications, but `PromptSubmitInput.turnId` (9523–9530)
+identifies an already running turn and is absent for idle submissions; it supplies
+no parent relationship for the observed next turn. This check does not establish
+that every other upstream facility lacks such a capability. Replace the fallback
+when an addressed request-final signal or provider-owned continuation relation is
+verified. Claude identifies generated declarations as authoritative for the loaded
+build in its [official mods guide](https://claude.dev/blog/getting-started-with-claude-code-mods/).
+
+Before implementation, the deterministic two-turn replay failed because the interim
+had already been published. After correction it passes, including immutable binding,
+exact original Bridge wait identity and duplicate publication checks. Provider unit
+tests and the real JS-to-native-hook round trip also cover damaged selection,
+claim/close fencing, timeout retention, unrelated outcomes and read-only inspection.
+The final full-suite, native runtime and CI results are recorded below when complete.
 
 ## Source and environment
 
@@ -62,7 +107,7 @@ The immutable binding names only the first turn. `completion::outcome` accepts i
 answer without requiring the marker, so it settles and releases the claim before
 the later turn. This reproduces the previously reported failure on the newer
 installed provider. It does not establish a provider-owned parent relationship for
-the later turn, or authorize the proposed marker-continuation redesign.
+the later turn. The subsequent correction was separately authorized by the owner.
 
 ## Fresh legacy refusal and reopen: pass
 
@@ -102,7 +147,8 @@ possibly delivered prompt was resent.
 This round did not repeat the configured Stop-blocking hook, consent transfer,
 steering, `/clear`, worker respawn, interruption, oversized completion or macOS
 provider runs. Earlier #260 evidence for those cases remains dated separately.
-No completion-policy fix or installation is part of this verification PR.
+These limits describe the initial re-verification round. The later correction above
+does change completion policy; it does not change the installed executable.
 
 Private evidence: `.git/260-live/` (JSON, stderr and exact diagnostic wires),
 `.git/260-self-test.json`, `.git/260-*.log`, and the task-owned Claude transcript

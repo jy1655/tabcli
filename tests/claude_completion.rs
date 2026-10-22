@@ -25,6 +25,10 @@ fn official_module_round_trips_large_and_boundary_wires_through_native_hook_stdi
         "retry_after",
         "helper_failure",
         "subagent",
+        "unmarked",
+        "continuation",
+        "continuation_retry_after",
+        "continuation_oversize",
     ]
     .iter()
     .enumerate()
@@ -77,7 +81,14 @@ fn official_module_round_trips_large_and_boundary_wires_through_native_hook_stdi
             serde_json::from_slice(&fs::read(directory.join("harness-result.json")).unwrap())
                 .unwrap();
         let mut events = fs::read_dir(directory.join("events")).unwrap();
-        if ["helper_failure", "subagent"].contains(scenario) {
+        if [
+            "helper_failure",
+            "subagent",
+            "unmarked",
+            "continuation_oversize",
+        ]
+        .contains(scenario)
+        {
             assert!(events.next().is_none(), "{scenario}");
             assert!(directory.join("turn.claim").exists());
             continue;
@@ -87,7 +98,14 @@ fn official_module_round_trips_large_and_boundary_wires_through_native_hook_stdi
                 .unwrap();
         assert!(events.next().is_none(), "{scenario}");
         assert_eq!(event["turn_id"], request);
-        assert_eq!(event["provenance"], "claude_mod_turn_complete");
+        assert_eq!(
+            event["provenance"],
+            if scenario.starts_with("continuation") {
+                "claude_mod_marked_continuation"
+            } else {
+                "claude_mod_turn_complete"
+            }
+        );
         assert!(!directory.join("turn.claim").exists());
         if *scenario == "oversize" {
             assert!(event["error"].as_str().unwrap().contains("not truncated"));

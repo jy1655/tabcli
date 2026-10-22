@@ -70,14 +70,31 @@ launch, observe, continue, and close without replacing the capabilities those CL
   Bridge correlation id because delivery waits for it. Replace envelope matching when
   official SendMessage returns an addressed target-turn identity.
 - Classic Stop and StopFailure never settle a native-mode claim: any other Stop handler,
-  including the user's own, can block that stop and continue the turn. Publish only a bound
-  official final, stripping the exact marker only at its suffix; marker absence is allowed.
+  including the user's own, can block that stop and continue the turn. A nonempty normal
+  bound answer without the exact suffix marker is a retained candidate, never a Result.
+  A marked bound answer settles normally. A different main-loop turn may settle only with
+  a valid candidate of the exact current claim, pending request and immutable binding, in
+  the same conversation, and a fully validated nonempty normal answer with that suffix.
+  Record both official identities privately before publication; keep the core Bridge id
+  and use `claude_mod_marked_continuation` provenance. A selected continuation cannot be
+  replaced by a different continuation after interrupted publication. Strip only the suffix.
+  Bound interruption, API error, refusal and empty answer still fail; those outcomes on an
+  unbound turn cannot identify this request and retain its claim.
+  This marker fallback covers the observed unmarked background interim, not general request
+  finality: it proves neither task-notification origin nor provider-owned parentage. An unrelated
+  same-conversation turn repeating the exact marker can match, and a marked interim can still
+  finish early. An unmarked genuine final can remain pending indefinitely; a caller timeout
+  does not retire the claim. `inspect` observes the candidate under its reader lock, without
+  retry, repair or publication. Inspect the provider surface before closing or diagnosing it.
+  Replace this fallback when Claude exposes verified addressed request-final evidence or
+  a provider-owned continuation relation; 2.1.308's installed turn types provide neither.
   Malformed or unmatched signals retain the claim and write the latest rejection reason to
   `claude-mod-diagnostic.json` in the session directory. Input injected into an unrelated
   running turn without its own exact start remains unbound. Combined queued input that is
   not the exact addressed frame also remains unbound. A 4 MiB UTF-8 JSON limit covers native
-  wires; admission counts escaping and bounded peer-header overhead, and an oversized final fails without
-  truncation. This route adds no cancellation API or usage mapping.
+  wires; admission counts escaping and bounded peer-header overhead. An oversized bound final
+  fails without truncation; an unbound oversized signal has no marker and cannot settle the
+  request. This route adds no cancellation API or usage mapping.
 - An absent completion-mode record is a pre-upgrade legacy session, never upgraded from
   version inference. Its pending Stop completion remains readable, but new Windows tells
   are refused with close/reopen recovery. Pending cleanup checks its request id under the
@@ -93,6 +110,9 @@ launch, observe, continue, and close without replacing the capabilities those CL
   The configured user Stop command hook, steering, subagents, running-turn injection, combined
   queued input, Esc, API error, refusal, empty answer, `/clear`, worker respawn, close during a
   turn, non-yolo plugin trust and macOS runtime were not verified by these owner checks.
+  Marker omission was supported by that earlier build; the background-continuation regression
+  and revised marker requirement are recorded in
+  `docs/verification/2026-10-22-windows-260-reverification.md`.
 - Do not emulate Claude result correlation with a generic message hash. Identical valid
   responses can occur in separate turns; correlation must use Claude-owned identity or a
   provider-specific protocol with an explicit replacement boundary.

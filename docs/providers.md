@@ -334,14 +334,27 @@ The messenger model sees a per-request reference, not your follow-up text. A `Pr
 supplies the exact addressed payload through `updatedInput`, and a `PostToolUse` report confirms
 what ran. On new Windows sessions, Bridge's completion module forwards Claude's official
 `turn.start` and `turn.complete` events. Bridge binds the complete addressed prompt at
-`turn.start` to the current claim and settles only the matching `turn.complete`.
+`turn.start` to the current claim. A normal answer completes the request only with the
+exact delegation marker at its suffix.
 Claude can quote protected tags in the peer body by inserting a backslash after `<`;
 the comparison permits only that reversible insertion and admission reserves its wire space.
 If a Stop hook blocks the stop and Claude continues the turn, Bridge publishes nothing until
-the matching `turn.complete`. Stored results retain Claude's conversation identity and Bridge's
-request correlation id; the official turn id stays in the
-adapter's binding. A final answer need not repeat the marker. Bridge removes it only when it
-ends the answer.
+the official `turn.complete`. Stored results retain Claude's conversation identity and Bridge's
+request correlation id; the official turn id stays in the adapter's immutable binding.
+Bridge removes the marker only when it ends the answer.
+
+A normal nonempty bound answer without that marker is retained as a candidate. It does not
+release the claim or become a result. A later main-loop completion in the same conversation
+can finish it only with that candidate, the still-current request and a valid nonempty answer
+ending in the exact marker. Its result has `claude_mod_marked_continuation` provenance; both
+official turn ids remain in private records. This covers an unmarked background interim followed
+by a marked final. It does not establish provider-owned parentage: an unrelated turn repeating
+the same marker can match, and a marked interim can still complete early.
+
+An unmarked genuine final can remain pending indefinitely, including after a caller timeout.
+`tabcli inspect <session>` explains that state; JSON includes `provider_completion` when its
+reader lock and current claim allow the candidate to be read. This query does not retry input,
+repair records or publish results. Inspect the terminal before closing or diagnosing the session.
 
 An official interrupted, API-error, refused or empty final outcome fails the bound request.
 Failure does not prove that no work or tools ran. Malformed or unmatched signals retain the
@@ -351,9 +364,12 @@ cannot be correlated. Combined queued input that differs from the exact addresse
 stays unbound. A retained claim prevents another tell; inspect the result and terminal, then
 close and reopen if you abandon it. These running-turn and combined-input limits follow from
 exact matching and have not been driven live. Native completion wires are limited to 4 MiB of
-UTF-8 JSON. Admission includes framing and escaping overhead; oversized answers fail without truncation.
-See the [2026-10-19 owner verification record](verification/2026-10-19-windows-249-claude-native-completion.md)
-for the live observations and unverified cases.
+UTF-8 JSON. Admission includes framing and escaping overhead; an oversized bound answer fails
+without truncation. An unbound interruption, error, refusal, empty answer or oversized signal
+has no sufficient attribution and leaves the request pending.
+See the [October 22 regression and fix record](verification/2026-10-22-windows-260-reverification.md)
+and the [earlier owner verification](verification/2026-10-19-windows-249-claude-native-completion.md)
+for observations and limits. The earlier build's marker-omission behavior is superseded here.
 
 macOS and existing sessions retain legacy Stop completion, including its limitation when another
 Stop hook continues the turn. Legacy pending requests can finish after a binary upgrade, but new
