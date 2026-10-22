@@ -164,7 +164,6 @@ fn record_provider_result_for_claim_condition(
         &claim_path,
         expected_claim_token.context("provider completion has no claim token")?,
         event,
-        None,
     )
 }
 
@@ -188,7 +187,7 @@ fn record_monitor_failure(directory: &Path, provider: FirstPartyCli, error: &str
         );
     };
     let error = terminal_safe_text(error, true);
-    let event = EventOutcome::Failure(error.clone()).into_event(
+    let event = EventOutcome::Failure(error).into_event(
         None,
         provider.as_str().to_owned(),
         None,
@@ -201,7 +200,6 @@ fn record_monitor_failure(directory: &Path, provider: FirstPartyCli, error: &str
         &claim_path,
         &claim_token,
         event,
-        Some(error),
         SessionState::Failed,
     )
 }
@@ -285,14 +283,12 @@ fn commit_completion_locked(
     claim_path: &Path,
     claim_token: &str,
     event: SessionEvent,
-    status_error: Option<String>,
 ) -> Result<()> {
     commit_provider_completion_with_status_locked(
         directory,
         claim_path,
         claim_token,
         event,
-        status_error,
         SessionState::Ready,
     )
 }
@@ -302,7 +298,6 @@ fn commit_provider_completion_with_status_locked(
     claim_path: &Path,
     claim_token: &str,
     event: SessionEvent,
-    status_error: Option<String>,
     status_state: SessionState,
 ) -> Result<()> {
     commit_completion_within_locked(
@@ -310,7 +305,6 @@ fn commit_provider_completion_with_status_locked(
         claim_path,
         claim_token,
         event,
-        status_error,
         status_state,
         EVENT_READ_LIMIT,
     )
@@ -325,10 +319,11 @@ fn commit_completion_within_locked(
     claim_path: &Path,
     claim_token: &str,
     event: SessionEvent,
-    status_error: Option<String>,
     status_state: SessionState,
     event_limit: u64,
 ) -> Result<()> {
+    // Derive both errors before the size policy can replace them together.
+    let status_error = event.error.clone();
     let mut pending =
         PendingTurnCompletion::new_with_status(claim_token, event, status_error, status_state)?;
     // Request indexing must not prevent a provider-verified completion from publishing.
@@ -565,7 +560,7 @@ fn settle_delivery_refusal_locked(
     // The event names the session's provider as the monitor-failure event does; the
     // refusal itself carries no provider identity, so reopen keeps an older turn's.
     let provider = store.manifest()?.provider;
-    let event = EventOutcome::Failure(error.clone()).into_event(
+    let event = EventOutcome::Failure(error).into_event(
         Some(DELIVERY_NOT_SENT_PROVENANCE.to_owned()),
         provider,
         None,
@@ -578,7 +573,6 @@ fn settle_delivery_refusal_locked(
         claim_path,
         claim_token,
         event,
-        Some(error),
         state,
     )?;
     Ok(true)
@@ -1351,9 +1345,9 @@ impl<'a> Report<'a> {
         };
         let error = terminal_safe_text(&error, true);
         let outcome = if cancelled {
-            EventOutcome::ConfirmedCancelled(error.clone())
+            EventOutcome::ConfirmedCancelled(error)
         } else {
-            EventOutcome::Failure(error.clone())
+            EventOutcome::Failure(error)
         };
         let event = outcome.into_event(
             self.provenance.map(str::to_owned),
@@ -1368,7 +1362,6 @@ impl<'a> Report<'a> {
             &claim_path,
             expected_claim_token.context("provider completion has no claim token")?,
             event,
-            Some(error),
         )
     }
 }

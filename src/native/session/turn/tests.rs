@@ -1403,7 +1403,6 @@ fn an_oversized_completion_settles_identically_whichever_write_it_stops_after() 
                 &claim_path,
                 &claim_token,
                 event.clone(),
-                None,
                 SessionState::Ready,
                 LIMIT,
             )
@@ -1829,6 +1828,47 @@ fn size_policy_publishes_a_bare_event_at_the_limit_before_it_fails() {
     );
     assert_eq!(failed.event.usage, None);
     assert_eq!(failed.event.usage_error, None);
+}
+
+#[test]
+fn monitor_failure_publishes_failed_status_with_sanitized_error() {
+    let (_directory, store) = fixture(SessionState::Working);
+    let claimed = claim(&store, &[]).unwrap();
+    let receipt = claimed.receipt().clone();
+    Report::monitor_failure(&store, FirstPartyCli::Codex, "monitor\r\u{1b}[0m\n\t").unwrap();
+    let status = store.status().unwrap();
+    assert_eq!(status.state, SessionState::Failed);
+    assert_eq!(status.error.as_deref(), Some("monitor\\r\\u{1b}[0m\n\t"));
+    let event = store.event_strict(&receipt.event_file).unwrap();
+    assert_eq!(event.error.as_deref(), Some("monitor\\r\\u{1b}[0m\n\t"));
+    assert!(current_claim_token(&store).unwrap().is_none());
+}
+
+#[test]
+fn delivery_refusal_publishes_error_with_each_passed_rollback_state() {
+    for rollback_state in [SessionState::Ready, SessionState::Failed] {
+        let (_directory, store) = fixture(SessionState::Working);
+        let claimed = claim(&store, &[]).unwrap();
+        let claim_path = store.record(CoreRecord::TurnClaim).path().to_owned();
+        {
+            let _lock = store.lock().unwrap();
+            assert!(
+                settle_delivery_refusal_locked(
+                    store.directory(),
+                    &claim_path,
+                    claimed.token(),
+                    rollback_state.clone(),
+                    "delivery refused".to_owned(),
+                )
+                .unwrap()
+            );
+        }
+        let status = store.status().unwrap();
+        assert_eq!(status.state, rollback_state);
+        assert_eq!(status.error.as_deref(), Some("delivery refused"));
+        refusal_event(&store, claimed.token(), "delivery refused");
+        assert!(current_claim_token(&store).unwrap().is_none());
+    }
 }
 
 #[test]
