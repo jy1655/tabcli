@@ -118,6 +118,9 @@ def packages(root):
         raise ValueError("shared skill identity or minimum CLI requirement differs")
     if "@VERSION@" in skill:
         raise ValueError("unexpanded skill version placeholder")
+    setup = shared["skills/agent-bridge/references/setup.md"].decode("utf-8")
+    if f"`tabcli {MIN_TABCLI}` or newer" not in setup:
+        raise ValueError("setup minimum CLI requirement differs")
     # Relative Markdown links must resolve to a bundled file, not the source checkout.
     for name, content in shared.items():
         if not name.endswith(".md"):
@@ -215,7 +218,7 @@ def build(root, output):
                 info.compress_type = zipfile.ZIP_DEFLATED
                 bundle.writestr(info, content)
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-        (output / f"{archive.name}.sha256").write_text(f"{digest}  {archive.name}\n", encoding="ascii")
+        (output / f"{archive.name}.sha256").write_bytes(f"{digest}  {archive.name}\n".encode("ascii"))
     verify(root, output)
 
 
@@ -233,7 +236,7 @@ def verify(root, output, allow_cli_assets=False):
     for host, contents in packages(root).items():
         archive = output / archive_name(root, host)
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-        if (output / f"{archive.name}.sha256").read_text(encoding="ascii") != f"{digest}  {archive.name}\n":
+        if (output / f"{archive.name}.sha256").read_bytes() != f"{digest}  {archive.name}\n".encode("ascii"):
             raise ValueError(f"checksum differs: {archive.name}")
         expected = archive_contents(root, host, contents)
         with zipfile.ZipFile(archive) as bundle:

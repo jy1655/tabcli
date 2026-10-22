@@ -126,6 +126,11 @@ jobs:
       - run: cargo test --all-targets --all-features -- --test-threads=1
       - name: Validate host integration packages
         if: hashFiles('scripts/integrations.py') != ''
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - name: Test host integration packages
+        if: hashFiles('scripts/integrations.py') != ''
         run: python -m unittest discover -s scripts -p 'test_*.py' -v
 
   build:
@@ -233,6 +238,11 @@ jobs:
           persist-credentials: false
       - name: Build and verify integrations from the validated release source
         if: hashFiles('scripts/integrations.py') != ''
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+      - name: Package validated integrations
+        if: hashFiles('scripts/integrations.py') != ''
         run: python scripts/integrations.py build --output integration-dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: hashFiles('scripts/integrations.py') != ''
@@ -252,6 +262,9 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
       - run: python -m unittest discover -s scripts -p 'test_*.py' -v
       - run: python scripts/integrations.py build --output integration-dist
 
@@ -269,6 +282,11 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Set up Python for integration asset verification
+        if: hashFiles('scripts/integrations.py') != ''
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
       - name: Verify downloaded release assets
         env:
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}

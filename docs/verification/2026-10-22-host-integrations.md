@@ -49,11 +49,12 @@ results and `inspect` to confirm both completed records, `stored_state: closed` 
 | Claude Code | Codex | `request-1792680598617860400-25620-0` | `request-1792680627650975900-33344-0` | `session-4zf4UI` | Both exact markers completed; close confirmed |
 | Codex | Claude Code | `request-1792680907918172000-33436-0` | `request-1792680937592071500-32072-0` | `session-Q2uEi0` | Both exact markers completed; close confirmed |
 | Pi | Agy | `request-1792680472215012000-32612-0` | `request-1792680497548099400-31900-0` | `session-sCQzcW` | Both exact markers completed; close confirmed |
-| Agy | Pi | `request-1792680706256123300-4980-0` | Not issued | `session-VNZrwM` | Initial accepted, then owner exited without a published result; no resend, close confirmed. A supported persistent host shell is under investigation. |
+| Agy | Pi | `request-1792681180220666000-9536-0` | `request-1792681236716235300-32440-0` | `session-TgLqY6` | Both exact markers completed; close confirmed; native persistent shell exited |
 
 Successful markers were `HOST_CLAUDE_TARGET_CODEX_INITIAL_285` / `...FOLLOWUP_285`,
 `HOST_CODEX_TARGET_CLAUDE_INITIAL_285` / `...FOLLOWUP_285`, and
-`HOST_PI_TARGET_AGY_INITIAL_285` / `...FOLLOWUP_285` respectively.
+`HOST_PI_TARGET_AGY_INITIAL_285` / `...FOLLOWUP_285`, and
+`HOST_AGY_PI_PERSISTENT_INITIAL_285` / `...FOLLOWUP_285` respectively.
 
 Host permissions were explicit:
 
@@ -69,9 +70,17 @@ Host permissions were explicit:
 - Pi ran with its existing defaults and encountered no tool permission denial.
 - Agy print mode first auto-denied command permission. The user explicitly approved
   `--dangerously-skip-permissions` for the test host. The ensuing Pi target received initial
-  input, but its owner was gone after the launch shell returned. The launch record reports
+  input (`session-VNZrwM`, `request-1792680706256123300-4980-0`), but its owner was gone after
+  the launch shell returned. That request was not resent and close was confirmed. The launch record reports
   `this desktop has no shell window` and a console-window fallback. This is observed failure,
-  not proof of its process-termination cause. No bypass was added to the Pi target.
+  not proof of its process-termination cause. A new, distinct check with the approved bypass
+  and explicit `--sandbox=false` used native `run_command` with `IsDaemon: true` to start
+  `pwsh -NoLogo -NoProfile`, and `manage_task` (`send_input`/`status`) on the returned task.
+  It read the initial completed JSON before writing the follow-up prompt. The same shell
+  stayed alive through both results and close, then exited with code 0; Agy reported no
+  remaining background tasks. Both Bridge results were independently re-read by the parent.
+  This establishes the working native host procedure, not the internal cause of the earlier
+  termination. No bypass was added to the Pi target.
 
 These failures demonstrate that installing an instruction package does not grant shell,
 state-directory or desktop access. They also exercise missing executable, incompatible CLI
@@ -85,9 +94,9 @@ failure cases remain distinct from the packaging tests; no synthetic test is cal
 - Python package suite: generation drift, release-version changes, relocation/reproducibility,
   manifest escape paths, unsupported components, extra files, invalid checksums, altered bytes,
   duplicate/traversal/link ZIP entries and exact release asset sets are tested.
-- The exact release Bash verifier's twelve-asset path runs in Linux/macOS CI; Windows skips
+- The exact release Bash verifier's twelve-asset path runs in Linux CI; macOS and Windows skip
   that shell-specific test. No claim of passing Windows CI is made until its actual run succeeds.
-- Agy-to-Pi live completion, full CI, release rehearsal, final independent review and removal
+- Full CI, release rehearsal, final independent review and removal
   of task-installed integrations remain to be recorded before this work is ready for merge.
 - All macOS live host/provider combinations and Windows combinations outside the table are
   unverified. CI's macOS package checks do not substitute for authenticated model calls.

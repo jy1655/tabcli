@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -108,6 +109,22 @@ class IntegrationsTest(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             subject.build(self.root, self.output)
 
+    def test_checksums_have_portable_lf_and_reject_crlf(self):
+        subject.build(self.root, self.output)
+        checksum = next(self.output.glob("*.sha256"))
+        content = checksum.read_bytes()
+        self.assertTrue(content.endswith(b"\n"))
+        self.assertNotIn(b"\r", content)
+        checksum.write_bytes(content.replace(b"\n", b"\r\n"))
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            subject.verify(self.root, self.output)
+
+    def test_setup_cannot_drift_from_minimum_cli_version(self):
+        setup = self.root / "integrations/shared/skills/agent-bridge/references/setup.md"
+        setup.write_text(setup.read_text(encoding="utf-8").replace(subject.MIN_TABCLI, "0.0.1"), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "setup minimum"):
+            subject.generate(self.root)
+
     def test_corrupt_checksum_wrong_content_duplicate_and_traversal_are_rejected(self):
         subject.build(self.root, self.output)
         archive = self.output / subject.archive_name(self.root, "codex")
@@ -132,7 +149,7 @@ class IntegrationsTest(unittest.TestCase):
                         bundle.writestr(*entries[0])
                 elif extra not in ("replace-content", "link"):
                     bundle.writestr(extra, b"untrusted")
-            checksum.write_text(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n", encoding="ascii")
+            checksum.write_bytes(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n".encode("ascii"))
             with self.subTest(extra=extra), self.assertRaises(ValueError):
                 subject.verify(self.root, self.output)
 
@@ -148,7 +165,7 @@ class IntegrationsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             subject.verify(self.root, self.output, allow_cli_assets=True)
 
-    @unittest.skipUnless(os.name == "posix", "executes the release's Bash verifier on Linux/macOS CI")
+    @unittest.skipUnless(sys.platform.startswith("linux"), "executes the Ubuntu release job's GNU Bash verifier")
     def test_actual_release_verifier_accepts_twelve_assets_and_rejects_changed_package(self):
         subject.build(self.root, self.root / "dist")
         scripts = self.root / "scripts"

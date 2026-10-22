@@ -66,6 +66,22 @@ needed through its normal approval flow. If that environment cannot launch local
 explain that the integration needs a supported desktop environment. Do not substitute a
 remote daemon or an unrelated execution environment.
 
+### Agy native Windows shell lifetime
+
+In Agy 1.4.5 print mode, a detached launch in a completed `run_command` lost its console-window
+owner without publishing a result. Keeping Agy's native shell task alive supported a real
+initial result and a dynamically composed follow-up. This is a host process-lifetime
+requirement, separate from shell permission; permission bypass alone did not fix it.
+
+Before launching, inspect the tools actually exposed by Agy. The verified route used
+`run_command` with `IsDaemon: true` to start `pwsh -NoLogo -NoProfile`,
+then `manage_task` with `Action: "send_input"` and `Action: "status"` on that exact `TaskId`.
+Send the normal `tabcli` commands through that shell, read each command's JSON, compose the
+follow-up after consuming the initial result, and confirm all task-owned sessions closed
+before sending `exit`. This uses Agy's own background-task handle, not a separate daemon.
+Preserve the same host permissions and do not add bypass flags automatically. If those tools
+are absent or the shell has exited, report that limitation; never resend uncertain input.
+
 ## Timeout, delivery, and lifecycle
 
 Retain any session/request ids even when the shell command exits nonzero. If an interrupted

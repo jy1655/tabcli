@@ -7,8 +7,8 @@ no transport of its own: every launch, delivery, consent decision and close stil
 the installed `tabcli` and its provider adapters.
 
 The skill guides the assistant; it does not guarantee anything after the assistant stops. If the
-host exits, crashes or loses context, sessions it opened stay open until you close them with
-`tabcli close-session SESSION --explicit`.
+host exits, crashes or loses context, sessions it opened may remain open or lose their owner.
+Inspect their state and close task-owned sessions with `tabcli close-session SESSION --explicit`.
 
 Version 0.4.23 was published without integrations. Release assets for the integrations start
 with the next release; until then, install from a source checkout that contains `integrations/`.
@@ -68,6 +68,14 @@ Unrestricted execution modes include `codex exec --sandbox danger-full-access` a
 The recorded checks used them only with the user's explicit approval. The integration never
 enables them, adds allow rules or changes host settings, and the skill does not pass `--yolo` to
 the target provider unless you ask.
+
+Native Windows Agy 1.4.5 also needs its native shell task kept alive when Bridge uses a console
+window on a desktop without a shell window. A completed `run_command` lost the detached
+target's owner even with permission bypass. The successful check used Agy's `run_command`
+with `IsDaemon: true` to start `pwsh -NoLogo -NoProfile`, then `manage_task` to send commands
+and inspect output on that same task. It read the initial result before composing the
+follow-up, confirmed Bridge close, then exited the shell. The skill carries this procedure;
+it requires those native tools to be available and does not install a background service.
 
 ### Target provider
 
