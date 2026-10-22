@@ -1,0 +1,20 @@
+{
+  "name": "tabcli-agent-bridge",
+  "version": "0.4.23",
+  "description": "코딩 에이전트에 작업을 맡기고 결과 확인, 후속 작업, 세션 정리를 진행합니다.",
+  "license": "MIT",
+  "repository": "https://github.com/jy1655/tabcli",
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "skills",
+    "integration.json",
+    "LICENSE"
+  ],
+  "pi": {
+    "skills": [
+      "./skills"
+    ]
+  }
+}
