@@ -2,7 +2,7 @@
 //! evidence that its wrapper ran. The lifecycle lock serializes cancellation with spawn.
 use crate::native::session::primitives::unix_ms;
 use crate::native::session::state::{
-    SessionState, SessionStatus, update_status, update_status_with_residual,
+    ResidualSurface, SessionState, SessionStatus, update_status, update_status_with_residual,
 };
 
 #[cfg(target_os = "macos")]
@@ -32,33 +32,8 @@ pub(in crate::native) mod wrapper;
 // Written at the end of the launch log by whoever sees the wrapper end: the bootstrap for a
 // wrapper that could not write, the wrapper itself, and the admission refusal.
 pub(in crate::native) const WRAPPER_EXIT_CODE_MARKER: &str = "wrapper_exit_code=";
-// Retained for older readers and for reading records written before residual_surface.
-pub(in crate::native) const RESIDUAL_SURFACE_MARKER: &str =
-    "the surface may remain and is not closed by Bridge";
+pub(in crate::native) use super::state::RESIDUAL_SURFACE_MARKER;
 const START_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Whether cleanup of a surface left by a failed launch has been confirmed. This
-/// observation grants no close authority and does not bind a terminal handle.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(in crate::native) enum ResidualSurface {
-    Unverified,
-    Cleared,
-}
-
-impl SessionStatus {
-    pub(in crate::native) fn residual_surface(&self) -> Option<ResidualSurface> {
-        if self.residual_surface == Some(ResidualSurface::Cleared) {
-            return None;
-        }
-        self.residual_surface.or_else(|| {
-            self.error
-                .as_deref()
-                .is_some_and(|error| error.contains(RESIDUAL_SURFACE_MARKER))
-                .then_some(ResidualSurface::Unverified)
-        })
-    }
-}
 
 #[cfg(all(test, target_os = "macos"))]
 pub(in crate::native) mod binding_tests;

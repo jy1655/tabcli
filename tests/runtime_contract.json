@@ -167,11 +167,17 @@
   },
   "src/native/provider/codex/launch.rs": {
     "native-hook": 1,
-    "const COMPOSER_ROW: &str = \"› Ask Codex to do anything\";": 1,
     "Trust this folder?": 1,
     "Trust and continue": 1,
-    "Review hooks": 2,
-    "Trust all and continue": 2
+    "Review hooks": 1,
+    "Trust all and continue": 1,
+    "contains_hook_review_label(": 2
+  },
+  "src/native/provider/codex/launch/lexical.rs": {
+    "const COMPOSER_ROW: &str = \"› Ask Codex to do anything\";": 1,
+    "const REVIEW_HOOKS: &str = \"Review hooks\";": 1,
+    "const TRUST_ALL_AND_CONTINUE: &str = \"Trust all and continue\";": 1,
+    "screen.contains(REVIEW_HOOKS) || screen.contains(TRUST_ALL_AND_CONTINUE)": 1
   },
   "src/native/provider/codex/queue.rs": {
     "thread not found: {thread_id}": 1,
@@ -357,15 +363,11 @@
     "const HOST_COMMAND: &str = TerminalKind::AppleTerminal.registration().host_command;": 1
   },
   "src/native/terminal/macos/ghostty.rs": {
-    "const HOST_FRAME: &str = \"agent-bridge-ghostty-host:\";": 1,
-    "ghostty-start.sh": 2,
     "Terminal surface model is not available": 1,
     "\"not-ready\"": 4,
-    "\"queued\"": 2,
+    "\"queued\"": 1,
     "\"missing\"": 12,
-    "\"closed\"": 1,
-    "{HOST_COMMAND}": 1,
-    "const HOST_COMMAND: &str = TerminalKind::Ghostty.registration().host_command;": 1
+    "\"closed\"": 1
   },
   "src/native/terminal/macos/iterm2.rs": {
     "AB_SCREEN_BEGIN": 1,
@@ -514,5 +516,12 @@
     "const OBSERVER_PREFIX: &str = \"codex-observer-\";": 1,
     "codex-candidate-": 1,
     "codex-observer-": 2
+  },
+  "src/native/terminal/macos/ghostty/host.rs": {
+    "const HOST_FRAME: &str = \"agent-bridge-ghostty-host:\";": 1,
+    "ghostty-start.sh": 2,
+    "{HOST_COMMAND}": 1,
+    "const HOST_COMMAND: &str = TerminalKind::Ghostty.registration().host_command;": 1,
+    "\"queued\"": 1
   }
 }

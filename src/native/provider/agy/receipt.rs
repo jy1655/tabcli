@@ -1,4 +1,5 @@
-use super::delivery::{Clock, complete_log_lines, input_receipt_window_end};
+use super::delivery::{Clock, input_receipt_window_end};
+use super::log::complete_log_lines;
 use super::{INPUT_RECEIPT_WINDOW, PendingAgyTurn};
 use crate::native::terminal;
 use anyhow::Result;

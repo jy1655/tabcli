@@ -181,6 +181,8 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   supports. Shared `open_with` preserves binding and cleanup order; Warp owns its open flow.
   `applescript` owns execution and common response vocabulary, while each adapter owns its
   screen and presence scripts.
+  Ghostty's frame host, its replaceable fallback for the missing surface identity, lives in
+  `terminal/macos/ghostty/host.rs`.
   iTerm2 and Terminal.app carry an internal Automation dependency. Osascript owns execution,
   deadlines and delivery-failure classification; scripts, arguments, ordering and close
   authority remain adapter-owned. Tests inject recording or script-executing Automation
@@ -311,6 +313,12 @@ A record is durable evidence of an operation, not a disposable cache. Use the te
   Codex adapter, and no other adapter takes part. A refusal writes nothing.
 
 ## Session lifecycle
+
+Codex's `launch/lexical.rs` holds its pinned screen labels, numbered-label decoding and
+confirmation-hint lexemes. Initial readiness, legacy submission and addressed draft
+acceptance retain separate predicates. In particular, a hook-review label anywhere vetoes
+injected readiness, while the same unnumbered words inside an addressed draft are content.
+The paste module owns the span, footer, overlay and rendered-cardinality policies.
 
 A launch creates a private session directory, records its manifest and initial request, and binds
 one newly created surface. The wrapper records its owner and provider spawn evidence. Depending
@@ -520,7 +528,7 @@ repair settles the records without resending a prompt or guessing ownership of a
   owns a distinct open protocol, as Warp does. Keep screen and presence scripts in the adapter.
   A creation preference in settings cannot substitute for recorded close authority.
 - For a new platform, start with the dispatch in `src/native/terminal/mod.rs` and the refusal
-  paths in `src/native/terminal/linux/mod.rs`. Then read the process-identity code under the
+  paths in `src/native/terminal/refusing.rs`. Then read the process-identity code under the
   existing platform directories, private-record permissions in
   `src/native/session/primitives.rs`, and trust-store checks in `src/native/consent.rs`. Implement
   those checks along with terminal operations before claiming support. Linux currently refuses

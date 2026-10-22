@@ -1,0 +1,13 @@
+{
+  "name": "agent-bridge",
+  "owner": {
+    "name": "jy1655"
+  },
+  "description": "코딩 에이전트 위임과 작업용 세션 관리를 위한 에이전트 브리지",
+  "plugins": [
+    {
+      "name": "agent-bridge",
+      "source": "./integrations/claude"
+    }
+  ]
+}

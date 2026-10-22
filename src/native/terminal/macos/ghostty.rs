@@ -1,13 +1,10 @@
 use super::OwnedSurfaceClose;
 use super::{MacTerminalAdapter, MacosOpenMode};
-use crate::native::private_to_user::owned_and_not_accessible_by_others;
+#[cfg(test)]
+use crate::native::session::CoreRecord;
+#[cfg(test)]
 use crate::native::session::SessionState;
 use crate::native::session::close::budget::close_remaining;
-use crate::native::session::launch::launcher::validate_shell_command_component;
-use crate::native::session::primitives::unix_ms;
-use crate::native::session::{CoreRecord, Reader, RecordStore};
-#[cfg(test)]
-use crate::native::terminal::ownership;
 // Prove returned-tab ownership and a live input model before binding; keep creation input out of shells.
 // Restore focus only on matching selection; see docs/verification/2026-10-03-v0.1.0-focus.md.
 use super::{
@@ -17,15 +14,12 @@ use super::{
 use anyhow::{Context, Result, anyhow, bail};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ffi::OsStr,
-    io::Write,
-    os::unix::ffi::OsStrExt,
-    path::{Path, PathBuf},
+    path::Path,
     thread,
     time::{Duration, Instant},
 };
 
-const HOST_COMMAND: &str = TerminalKind::Ghostty.registration().host_command;
+pub(in crate::native::terminal) mod host;
 #[cfg(test)]
 pub(in crate::native) const VERSION_SCRIPT: &str = r#"on run
  tell application "Ghostty" to return version
@@ -302,16 +296,6 @@ end run
 
 const POLL: Duration = Duration::from_millis(100);
 const DISCOVERY_ATTEMPTS: usize = 50;
-// What the launcher writes to the bound terminal, and only there, once the surface is
-// bound: `agent-bridge-ghostty-host:<claim token>:<length>:<session directory>`.
-const HOST_FRAME: &str = "agent-bridge-ghostty-host:";
-// A launch receipt lives for at most 30 s (`launch::begin`). The host cannot read it
-// before the frame has named its session, so it waits that long for the frame.
-const HOST_WAIT: Duration = if cfg!(test) {
-    Duration::from_secs(3)
-} else {
-    Duration::from_secs(30)
-};
 pub(super) trait Runner {
     fn capable(&mut self) -> Result<()>;
     fn run(&mut self, script: &str, args: &[&str], deadline: Instant) -> Result<String>;
@@ -556,25 +540,13 @@ fn restore(
         );
     }
 }
-// Use native command creation and an interactive clean shell for foreground jobs.
-// Source only the host-proven launch; see docs/verification/2026-10-03-v0.1.0-focus.md.
-fn bootstrap(executable: &OsStr) -> Result<String> {
-    validate_shell_command_component(executable, "Agent Bridge executable")?;
-    Ok(format!(
-        "/bin/zsh -f -i -c {}",
-        crate::native::terminal::shell_quote(OsStr::new(&format!(
-            "start=$({} {HOST_COMMAND}) || exit; . \"$start\"",
-            crate::native::terminal::shell_quote(executable)
-        )))
-    ))
-}
 fn create_with_runner(
     runner: &mut dyn Runner,
     force_new_window: bool,
     deadline: Instant,
 ) -> Result<TerminalSession> {
     runner.capable()?;
-    let command = bootstrap(
+    let command = host::bootstrap(
         std::env::current_exe()
             .context("failed to resolve Agent Bridge executable")?
             .as_os_str(),
@@ -666,252 +638,6 @@ fn ownership_proof(session: &TerminalSession) -> Result<(&str, &str)> {
         bail!("Ghostty composite identity is invalid");
     }
     Ok((tab, window))
-}
-// One write to the terminal of the handle, and no Enter: what arrives is data for the
-// host, which no shell reads.
-fn start_with_runner(
-    runner: &mut dyn Runner,
-    session: &TerminalSession,
-    frame: &str,
-    deadline: Instant,
-) -> Result<()> {
-    let (tab, window) = ownership_proof(session)?;
-    let response = runner.run(
-        QUEUE_COMMAND_SCRIPT,
-        &[&session.id, tab, window, frame],
-        deadline,
-    )?;
-    if response != "queued" {
-        bail!("Ghostty command input was not confirmed: {response:?}; no paste retry");
-    }
-    Ok(())
-}
-fn host_frame(directory: &Path, token: &str) -> Result<String> {
-    let directory = directory
-        .to_str()
-        .context("Ghostty session directory is not UTF-8")?;
-    let frame = format!("{HOST_FRAME}{token}:{}:{directory}", directory.len());
-    // The frame can arrive while the terminal is still in canonical mode, whose input
-    // queue holds 1024 bytes.
-    if frame.len() >= 1024 || !frame_token(token.as_bytes()) {
-        bail!("Ghostty launch frame cannot be written to its terminal");
-    }
-    Ok(frame)
-}
-fn frame_token(token: &[u8]) -> bool {
-    !token.is_empty()
-        && token
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
-}
-// After the binding: the script that the host hands to its shell, then the frame that
-// releases exactly the host on the bound terminal.
-fn start_bound(
-    runner: &mut dyn Runner,
-    session: &TerminalSession,
-    command: &str,
-    directory: &Path,
-    deadline: Instant,
-) -> Result<()> {
-    launch_command(directory, command, std::env::var_os("PATH").as_deref())?;
-    let receipt = crate::native::session::launch::read(&Reader::open_unchecked(directory))?
-        .context("Ghostty launch has no pending receipt")?;
-    start_with_runner(
-        runner,
-        session,
-        &host_frame(directory, &receipt.claim_token)?,
-        deadline,
-    )
-}
-// Ghostty supplies no surface identity: prove the bound PTY by its frame and discard other input.
-// Replace with a native identity when available; see docs/verification/2026-10-03-v0.1.0-focus.md.
-pub(in crate::native) fn run_host() -> Result<()> {
-    let start = {
-        let _raw = RawInput::enter()?;
-        let (token, directory) = read_frame(Instant::now() + HOST_WAIT)?;
-        let start = verify_launch(&directory, &token)?;
-        // Only this terminal's queue: keys typed while Ghostty showed the surface.
-        if unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("cannot discard Ghostty startup input");
-        }
-        start
-    };
-    let mut out = std::io::stdout().lock();
-    out.write_all(start.as_os_str().as_bytes())?;
-    out.write_all(b"\n")?;
-    out.flush()?;
-    Ok(())
-}
-// Every byte as it was typed: no line editing, no echo, no signal or flow-control key.
-// The terminal gets its settings back before the launch command inherits it.
-struct RawInput(libc::termios);
-impl RawInput {
-    fn enter() -> Result<Self> {
-        let mut saved = std::mem::MaybeUninit::<libc::termios>::uninit();
-        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, saved.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("the Ghostty launch host has no terminal");
-        }
-        let saved = unsafe { saved.assume_init() };
-        let mut raw = saved;
-        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
-        raw.c_iflag &= !libc::IXON;
-        raw.c_cc[libc::VMIN] = 0;
-        raw.c_cc[libc::VTIME] = 1;
-        // Not TCSAFLUSH: a frame that is already queued must stay.
-        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("cannot read the Ghostty terminal");
-        }
-        Ok(Self(saved))
-    }
-}
-impl Drop for RawInput {
-    fn drop(&mut self) {
-        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0) };
-    }
-}
-fn read_frame(deadline: Instant) -> Result<(String, PathBuf)> {
-    let mut typed = Vec::new();
-    loop {
-        let mut bytes = [0u8; 1024];
-        let asked = Instant::now();
-        let count =
-            unsafe { libc::read(libc::STDIN_FILENO, bytes.as_mut_ptr().cast(), bytes.len()) };
-        match usize::try_from(count) {
-            // The timed read returns nothing after a tenth of a second, and at once
-            // only when the terminal is gone.
-            Ok(0) if asked.elapsed() < Duration::from_millis(20) => {
-                bail!("the Ghostty terminal closed before its launch arrived")
-            }
-            Ok(count) => typed.extend_from_slice(&bytes[..count]),
-            Err(_) => {
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(error).context("cannot read the Ghostty terminal");
-                }
-            }
-        }
-        if let Some(frame) = parse_frame(&typed)? {
-            return Ok(frame);
-        }
-        if Instant::now() >= deadline {
-            bail!("no launch reached this Ghostty terminal");
-        }
-        // A frame is shorter than 1024 bytes; older keys cannot belong to one.
-        if typed.len() > 8192 {
-            typed.drain(..typed.len() - 2048);
-        }
-    }
-}
-// `None` while the frame is incomplete. What precedes it was typed by somebody else.
-fn parse_frame(typed: &[u8]) -> Result<Option<(String, PathBuf)>> {
-    let Some(at) = typed
-        .windows(HOST_FRAME.len())
-        .position(|window| window == HOST_FRAME.as_bytes())
-    else {
-        return Ok(None);
-    };
-    let mut fields = typed[at + HOST_FRAME.len()..].splitn(3, |byte| *byte == b':');
-    let (Some(token), Some(length), Some(directory)) =
-        (fields.next(), fields.next(), fields.next())
-    else {
-        return Ok(None);
-    };
-    let length = std::str::from_utf8(length)
-        .ok()
-        .and_then(|length| length.parse::<usize>().ok())
-        .filter(|length| (1..1024).contains(length));
-    let (true, Some(length)) = (frame_token(token), length) else {
-        bail!("malformed Ghostty launch frame");
-    };
-    if directory.len() < length {
-        return Ok(None);
-    }
-    Ok(Some((
-        String::from_utf8_lossy(token).into_owned(),
-        PathBuf::from(OsStr::from_bytes(&directory[..length])),
-    )))
-}
-// The frame names a launch; the records decide whether it is this one and still open:
-// the launcher's private session directory, its pending receipt and claim, the atomic
-// binding of a Ghostty surface to this session, and the script written for the host.
-fn verify_launch(directory: &Path, token: &str) -> Result<PathBuf> {
-    use crate::native::session::{SessionStatus, launch};
-    let private = |path: &Path, directory: bool| -> Result<bool> {
-        let metadata = std::fs::symlink_metadata(path)?;
-        Ok(metadata.is_dir() == directory
-            && (directory || metadata.is_file())
-            && owned_and_not_accessible_by_others(&metadata, unsafe { libc::geteuid() }))
-    };
-    let id = directory
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("invalid Ghostty launch directory")?;
-    crate::native::session::primitives::require_valid_session_id(id)?;
-    if !directory.is_absolute() || !private(directory, true)? {
-        bail!("Ghostty launch directory is not private to the current user");
-    }
-    let receipt = launch::read(&Reader::open_unchecked(directory))?
-        .context("missing Ghostty launch receipt")?;
-    let status: SessionStatus = Reader::open_unchecked(directory).status()?;
-    if receipt.phase != launch::Phase::Pending
-        || receipt.claim_token != token
-        || unix_ms() >= receipt.deadline_unix_ms
-        || status.state != SessionState::Launching
-        || crate::native::session::turn::current_claim_token(
-            &crate::native::session::Reader::open_unchecked(directory),
-        )?
-        .as_deref()
-            != Some(token)
-    {
-        bail!("Ghostty launch was cancelled, timed out or is not the one sent to this terminal");
-    }
-    let surface: TerminalSession = serde_json::from_str(
-        &Reader::open_unchecked(directory)
-            .record(CoreRecord::Terminal)
-            .text()?
-            .context("Ghostty surface is not bound")?,
-    )
-    .context("invalid Ghostty surface binding")?;
-    surface.verify_managed_session(id)?;
-    if surface.kind != TerminalKind::Ghostty {
-        bail!("the bound surface is not a Ghostty terminal");
-    }
-    let start = directory.join("ghostty-start.sh");
-    if !private(&start, false)? {
-        bail!("Ghostty start script is not private to the current user");
-    }
-    Ok(start)
-}
-fn launch_command(
-    directory: &Path,
-    command: &str,
-    path: Option<&std::ffi::OsStr>,
-) -> Result<String> {
-    // Carry PATH for provider shebangs through the clean shell; source only the host's private script.
-    let script = directory.join("ghostty-start.sh");
-    validate_shell_command_component(script.as_os_str(), "Ghostty startup path")?;
-    let input = format!(
-        ". {}",
-        crate::native::terminal::shell_quote(script.as_os_str())
-    );
-    if input.len() >= 1024 {
-        bail!("Ghostty startup path exceeds the canonical input line limit");
-    }
-    let export = match path {
-        Some(path) => {
-            validate_shell_command_component(path, "Ghostty launch PATH")?;
-            format!(
-                "export PATH={}\n",
-                crate::native::terminal::shell_quote(path)
-            )
-        }
-        None => String::new(),
-    };
-    RecordStore::at(&script).write_private(format!("{export}{command}\n").as_bytes())?;
-    Ok(input)
 }
 fn send_file_with_runner(
     runner: &mut dyn Runner,
@@ -1054,7 +780,7 @@ impl<R: Runner> MacTerminalAdapter for Adapter<R> {
                 )
             },
             |session, deadline| {
-                start_bound(&mut *self.runner(), session, command, directory, deadline)
+                host::start(&mut *self.runner(), session, command, directory, deadline)
             },
             |session, deadline| {
                 close_with_runner(&mut *self.runner(), session, deadline).map(|_| ())
@@ -1112,6 +838,9 @@ impl<R: Runner> MacTerminalAdapter for Adapter<R> {
 }
 #[cfg(test)]
 mod tests {
+    use super::host::{bootstrap, start_with_runner};
+    use super::*;
+    use std::ffi::OsStr;
     #[derive(Default)]
     struct ScriptProbe {
         response: Option<Result<String>>,
@@ -1393,90 +1122,6 @@ mod tests {
     }
 
     #[test]
-    fn launch_context_does_not_depend_on_terminal_environment() {
-        if !crate::native::process_env::tests::without_bridge_environment(
-            module_path!(),
-            "launch_context_does_not_depend_on_terminal_environment",
-        ) {
-            return;
-        }
-
-        let directory = launch_fixture();
-        let surface = handle(&CreatedSurface {
-            tab_id: "t2".into(),
-            window_id: "w1".into(),
-            terminal_id: "u2".into(),
-        });
-        bind_fixture(directory.path(), &surface);
-        let token = crate::native::session::launch::read(&Reader::open_unchecked(directory.path()))
-            .unwrap()
-            .unwrap()
-            .claim_token;
-        let wrapper = crate::native::process_env::tests::wrapper_for(directory.path());
-        launch_command(directory.path(), &wrapper, None).unwrap();
-        let frame = host_frame(directory.path(), &token).unwrap();
-        let (received_token, received_directory) = parse_frame(frame.as_bytes()).unwrap().unwrap();
-        assert_eq!(received_directory, directory.path());
-        let script = verify_launch(&received_directory, &received_token).unwrap();
-        assert_eq!(script, directory.path().join("ghostty-start.sh"));
-        assert_eq!(
-            std::fs::read_to_string(script).unwrap(),
-            format!("{wrapper}\n")
-        );
-    }
-
-    use super::*;
-    #[test]
-    fn bound_start_preserves_invoking_path_for_env_interpreters() {
-        use std::{fs, os::unix::fs::PermissionsExt, process::Command};
-        let temp = tempfile::tempdir().unwrap();
-        let bin = temp.path().join("runtime with ' quotes");
-        fs::create_dir(&bin).unwrap();
-        let interpreter = bin.join("bridge-test-runtime");
-        fs::write(&interpreter, "#!/bin/sh\nprintf 'provider-ready\\n'\n").unwrap();
-        fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o700)).unwrap();
-        let provider = temp.path().join("provider");
-        fs::write(&provider, "#!/usr/bin/env bridge-test-runtime\n").unwrap();
-        fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
-        let script = temp.path().join("launch.sh");
-        fs::write(
-            &script,
-            format!(
-                "{} --version",
-                crate::native::terminal::shell_quote(provider.as_os_str())
-            ),
-        )
-        .unwrap();
-        let source = format!(
-            ". {}",
-            crate::native::terminal::shell_quote(script.as_os_str())
-        );
-        let run = |command: &str| {
-            Command::new("/bin/zsh")
-                .args(["-f", "-c", command])
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .output()
-                .unwrap()
-        };
-        assert_eq!(run(&source).status.code(), Some(127));
-        let path = std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
-            .unwrap();
-        let output = run(&launch_command(temp.path(), &source, Some(&path)).unwrap());
-        assert!(output.status.success(), "{:?}", output);
-        assert_eq!(output.stdout, b"provider-ready\n");
-        assert_eq!(
-            fs::metadata(temp.path().join("ghostty-start.sh"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-        assert_eq!(run(&source).status.code(), Some(127));
-    }
-
-    #[test]
     fn close_deadline_during_disappearance_keeps_failure() {
         struct Slow {
             calls: usize,
@@ -1530,9 +1175,9 @@ mod tests {
         assert_eq!(runner.calls, 3);
     }
     #[derive(Default)]
-    struct Fake {
+    pub(super) struct Fake {
         state: Snapshot,
-        calls: Vec<String>,
+        pub(super) calls: Vec<String>,
         created: usize,
         chosen: String,
         reply: Option<String>,
@@ -1560,28 +1205,28 @@ mod tests {
         foreground_error: &'static str,
         // A private PTY in place of the surface: the process Ghostty runs for the
         // creation command, and the input that reaches it.
-        pty: Option<Pty>,
+        pub(super) pty: Option<Pty>,
         // The creation command and what the start wrote to the terminal.
-        command: String,
-        typed: String,
+        pub(super) command: String,
+        pub(super) typed: String,
     }
     #[derive(Default)]
-    struct Pty {
-        master: Option<std::fs::File>,
-        child: Option<std::process::Child>,
-        output: Vec<u8>,
+    pub(super) struct Pty {
+        pub(super) master: Option<std::fs::File>,
+        pub(super) child: Option<std::process::Child>,
+        pub(super) output: Vec<u8>,
         // Typed by somebody while the surface is selected: before its process runs,
         // and directly before and after the launch arrives.
-        keys_before: &'static [u8],
-        keys_with: &'static [u8],
-        keys_after: &'static [u8],
+        pub(super) keys_before: &'static [u8],
+        pub(super) keys_with: &'static [u8],
+        pub(super) keys_after: &'static [u8],
     }
     impl Pty {
         // Ghostty runs the configured command through `bash -c "exec -l <command>"`
         // (Exec.zig, v1.3.1). The test executable stands in for the installed one.
-        fn spawn(&mut self, configured: &str) {
+        pub(super) fn spawn(&mut self, configured: &str) {
             use std::os::{fd::FromRawFd, unix::process::CommandExt};
-            let probe = " --exact native::terminal::macos::ghostty::tests::ghostty_host_probe --nocapture --test-threads=1 3>&1 >/dev/null";
+            let probe = " --exact native::terminal::macos::ghostty::host::tests::ghostty_host_probe --nocapture --test-threads=1 3>&1 >/dev/null";
             let configured = configured.replace(" native-ghostty-host", probe);
             let (mut master, mut slave) = (-1, -1);
             assert_eq!(
@@ -1630,13 +1275,13 @@ mod tests {
             self.write(self.keys_before);
             self.child = Some(command.spawn().unwrap());
         }
-        fn write(&mut self, bytes: &[u8]) {
+        pub(super) fn write(&mut self, bytes: &[u8]) {
             use std::io::Write;
             self.master.as_mut().unwrap().write_all(bytes).unwrap();
         }
         // The exit status of the surface's process, `None` when `done` held first or
         // the time ran out; then the process is ended.
-        fn run(&mut self, done: impl Fn() -> bool, limit: Duration) -> Option<i32> {
+        pub(super) fn run(&mut self, done: impl Fn() -> bool, limit: Duration) -> Option<i32> {
             use std::io::Read;
             let deadline = Instant::now() + limit;
             let child = self.child.as_mut().unwrap();
@@ -1656,12 +1301,12 @@ mod tests {
                 thread::sleep(Duration::from_millis(10));
             }
         }
-        fn shown(&self) -> String {
+        pub(super) fn shown(&self) -> String {
             String::from_utf8_lossy(&self.output).into_owned()
         }
         // The host reads every key as a byte. Before that, the terminal itself acts on
         // an interrupt key.
-        fn wait_until_raw(&mut self) {
+        pub(super) fn wait_until_raw(&mut self) {
             use std::os::fd::AsRawFd;
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
@@ -1687,7 +1332,7 @@ mod tests {
     const GHOSTTY: &str = "47693\ncom.mitchellh.ghostty\nFri Oct 2 00:12:24 2026";
     const EDITOR: &str = "641\ncom.example.editor\nMon Sep 28 00:44:37 2026";
     const MAIL: &str = "702\ncom.example.mail\nMon Sep 28 00:45:00 2026";
-    fn existing() -> Fake {
+    pub(super) fn existing() -> Fake {
         let mut f = Fake::default();
         f.state.front = Some("w1".into());
         f.state.windows.insert("w1".into(), "t1".into());
@@ -1920,7 +1565,7 @@ mod tests {
             }
         }
     }
-    fn soon() -> Instant {
+    pub(super) fn soon() -> Instant {
         Instant::now() + Duration::from_secs(10)
     }
     #[test]
@@ -2287,7 +1932,7 @@ mod tests {
             before.error = after.error.clone();
             assert_eq!(
                 after.residual_surface,
-                Some(launch::ResidualSurface::Unverified)
+                Some(crate::native::session::ResidualSurface::Unverified)
             );
             before.residual_surface = after.residual_surface;
             assert_eq!(
@@ -2427,35 +2072,9 @@ mod tests {
         assert_eq!(f.created, 1);
         assert!(!f.calls.contains(&"close".into()));
     }
-    #[test]
-    fn regression_long_path_is_not_injected_into_canonical_input_line() {
-        let directory = tempfile::tempdir().unwrap();
-        let script = directory.path().join("launch.sh");
-        std::fs::write(&script, "true\n").unwrap();
-        let source = format!(
-            ". {}",
-            crate::native::terminal::shell_quote(script.as_os_str())
-        );
-        let path = format!("/{}:/usr/bin:/bin", "p".repeat(1300));
-        let command =
-            launch_command(directory.path(), &source, Some(std::ffi::OsStr::new(&path))).unwrap();
-        assert!(
-            command.len() < 1024,
-            "injected {}-byte canonical input line",
-            command.len()
-        );
-        assert!(!command.contains(&path));
-        let output = std::process::Command::new("/bin/zsh")
-            .args(["-f", "-c", &format!("{command}; printf '%s' \"$PATH\"")])
-            .env_clear()
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        assert_eq!(output.stdout, path.as_bytes());
-    }
     // A session directory as the launcher leaves it before it opens the surface:
     // launching, claimed, with a pending launch receipt.
-    fn launch_fixture() -> tempfile::TempDir {
+    pub(super) fn launch_fixture() -> tempfile::TempDir {
         super::super::test_support::launch_fixture(
             "session-ghostty-",
             std::time::Duration::from_secs(8),
@@ -2463,7 +2082,7 @@ mod tests {
         )
     }
     // The launcher's atomic binding of the surface that the creation returned.
-    fn bind_fixture(directory: &Path, handle: &TerminalSession) {
+    pub(super) fn bind_fixture(directory: &Path, handle: &TerminalSession) {
         let mut bound = handle.clone();
         bound.managed_session_id = directory
             .file_name()
@@ -2474,323 +2093,6 @@ mod tests {
             &bound,
         )
         .unwrap();
-    }
-    // Issue #58, reproduced by hand on 2026-10-03 in iTerm2 and Terminal.app: a key typed
-    // while the new surface was selected arrived before the launch command, the shell
-    // ran `a. '/.../launch.sh'`, and the provider never started. Replayed on a private
-    // PTY with the process Ghostty runs for the creation command; no terminal
-    // application and no keyboard is involved.
-    #[test]
-    fn regression_startup_keys_cannot_change_the_launch_command() {
-        let directory = launch_fixture();
-        let marker = directory.path().join("started");
-        let launch = directory.path().join("launch.sh");
-        std::fs::write(
-            &launch,
-            format!(
-                "printf started > {}; exit\n",
-                crate::native::terminal::shell_quote(marker.as_os_str())
-            ),
-        )
-        .unwrap();
-        let mut f = existing();
-        f.pty = Some(Pty {
-            keys_before: b"a",
-            ..Pty::default()
-        });
-        let handle = create_with_runner(&mut f, false, soon()).unwrap();
-        bind_fixture(directory.path(), &handle);
-        start_bound(
-            &mut f,
-            &handle,
-            &format!(
-                ". {}",
-                crate::native::terminal::shell_quote(launch.as_os_str())
-            ),
-            directory.path(),
-            soon(),
-        )
-        .unwrap();
-        let pty = f.pty.as_mut().unwrap();
-        pty.run(|| marker.exists(), Duration::from_secs(5));
-        assert!(
-            marker.exists(),
-            "a typed key changed the launch command: {}",
-            pty.shown()
-        );
-    }
-    const PROBE: &str = "--exact native::terminal::macos::ghostty::tests::ghostty_host_probe --nocapture --test-threads=1";
-    // Runs only as a process on the private PTY of the tests below, where the test
-    // executable stands in for the installed one: `host` is the creation command,
-    // `owner` the launch command.
-    #[test]
-    fn ghostty_host_probe() {
-        let Ok(mode) = std::env::var("AB_GHOSTTY_PROBE") else {
-            return;
-        };
-        if mode == "host" {
-            // The test harness writes to standard output; the surface keeps the real
-            // one, which the shell reads, on descriptor 3.
-            assert_eq!(unsafe { libc::dup2(3, 1) }, 1);
-            if let Err(error) = run_host() {
-                eprintln!("{error:#}");
-                std::process::exit(7);
-            }
-            std::process::exit(0);
-        }
-        let directory = PathBuf::from(std::env::var_os("AB_GHOSTTY_PROBE_DIR").unwrap());
-        let id = directory.file_name().unwrap().to_str().unwrap();
-        let owner = ownership::current_native_session_owner(id).unwrap();
-        let mut queued: libc::c_int = -1;
-        assert_eq!(unsafe { libc::ioctl(0, libc::FIONREAD, &mut queued) }, 0);
-        crate::native::session::primitives::write_json_atomic(
-            &directory.join("owner-probe.json"),
-            &serde_json::json!({
-                "group": owner.process_group,
-                "terminal_group": owner.terminal_process_group,
-                "shell": owner.terminal_shell.map(|shell| shell.pid),
-                "queued_input": queued,
-            }),
-        )
-        .unwrap();
-    }
-    #[test]
-    fn creation_runs_only_the_host_and_the_start_writes_one_frame_and_no_enter() {
-        let directory = launch_fixture();
-        let token = crate::native::session::launch::read(
-            &crate::native::session::Reader::open_unchecked(directory.path()),
-        )
-        .unwrap()
-        .unwrap()
-        .claim_token;
-        let mut f = existing();
-        let handle = create_with_runner(&mut f, false, soon()).unwrap();
-        assert_eq!(
-            f.command,
-            bootstrap(std::env::current_exe().unwrap().as_os_str()).unwrap()
-        );
-        assert!(f.command.starts_with("/bin/zsh -f -i -c 'start=$("));
-        assert!(
-            f.command
-                .ends_with(" native-ghostty-host) || exit; . \"$start\"'")
-        );
-        assert!(!f.command.contains(directory.path().to_str().unwrap()));
-        let shell_args = super::super::test_support::shell_argv(&f.command);
-        assert_eq!(&shell_args[..4], ["/bin/zsh", "-f", "-i", "-c"]);
-        let invocation = shell_args[4]
-            .strip_prefix("start=$(")
-            .unwrap()
-            .strip_suffix(") || exit; . \"$start\"")
-            .unwrap();
-        let args = super::super::test_support::host_argv(invocation);
-        assert_eq!(args, [HOST_COMMAND]);
-        assert!(matches!(
-            crate::native::parse_args(args).unwrap(),
-            crate::native::NativeCommand::Host(crate::native::terminal::host::HostCommand::Ghostty)
-        ));
-
-        assert!(CREATE_SURFACE_SCRIPT.contains("set command of cfg to item 2 of argv"));
-        bind_fixture(directory.path(), &handle);
-        let created = f.calls.len();
-        start_bound(&mut f, &handle, ". '/launch.sh'", directory.path(), soon()).unwrap();
-        assert_eq!(f.calls[created..], ["input"], "one write and no Enter");
-        assert_eq!(
-            f.typed,
-            format!(
-                "agent-bridge-ghostty-host:{token}:{}:{}",
-                directory.path().as_os_str().len(),
-                directory.path().display()
-            )
-        );
-        assert!(
-            std::fs::read_to_string(directory.path().join("ghostty-start.sh"))
-                .unwrap()
-                .ends_with("\n. '/launch.sh'\n")
-        );
-        // Without a launch receipt there is nothing to hand to a host.
-        let stray = tempfile::tempdir().unwrap();
-        assert!(start_bound(&mut f, &handle, ". '/launch.sh'", stray.path(), soon()).is_err());
-        assert_eq!(f.calls.len(), created + 1, "a frame without a launch");
-    }
-    #[test]
-    fn host_takes_a_frame_from_among_typed_keys_and_only_for_its_pending_bound_launch() {
-        let surface = handle(&CreatedSurface {
-            tab_id: "t2".into(),
-            window_id: "w1".into(),
-            terminal_id: "u2".into(),
-        });
-        let prepared = || {
-            let directory = launch_fixture();
-            bind_fixture(directory.path(), &surface);
-            launch_command(directory.path(), ". '/launch.sh'", None).unwrap();
-            let token = crate::native::session::launch::read(
-                &crate::native::session::Reader::open_unchecked(directory.path()),
-            )
-            .unwrap()
-            .unwrap()
-            .claim_token;
-            (directory, token)
-        };
-        let (directory, token) = prepared();
-        let path = directory.path();
-        // Keys before and after the frame are somebody else's; a frame that has not
-        // arrived completely is waited for.
-        let frame = host_frame(path, &token).unwrap();
-        let mut typed = b"aaaa\nmore\x03\x15".to_vec();
-        typed.extend_from_slice(frame.as_bytes());
-        for cut in [10, typed.len() - frame.len() + 30, typed.len() - 1] {
-            assert_eq!(parse_frame(&typed[..cut]).unwrap(), None, "{cut}");
-        }
-        typed.extend_from_slice(b"zz\n");
-        assert_eq!(
-            parse_frame(&typed).unwrap(),
-            Some((token.clone(), path.to_path_buf()))
-        );
-        for malformed in [
-            "bad token:3:/ab",
-            ":3:/ab",
-            "token:0:",
-            "token:x:/ab",
-            "token:4096:/",
-        ] {
-            assert!(
-                parse_frame(format!("{HOST_FRAME}{malformed}").as_bytes()).is_err(),
-                "{malformed}"
-            );
-        }
-        assert_eq!(
-            verify_launch(path, &token).unwrap(),
-            path.join("ghostty-start.sh")
-        );
-        use crate::native::session::primitives::write_json_atomic;
-        use crate::native::session::test_support::TERMINAL_HANDLE_FILE;
-        use crate::native::session::{launch, update_status};
-        use std::os::unix::fs::PermissionsExt;
-        let (readable_directory, readable_token) = prepared();
-        let script = readable_directory.path().join("ghostty-start.sh");
-        assert!(std::fs::symlink_metadata(&script).unwrap().is_file());
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(
-            verify_launch(readable_directory.path(), &readable_token)
-                .unwrap_err()
-                .to_string(),
-            "Ghostty start script is not private to the current user"
-        );
-        for case in [
-            "the token of another launch",
-            "the receipt of another launch",
-            "not bound",
-            "bound to another session",
-            "bound to another terminal",
-            "cancelled",
-            "expired",
-            "already spawned",
-            "claim released",
-            "directory open to others",
-            "no start script",
-            "start script is a link",
-            "relative directory",
-        ] {
-            let (directory, token) = prepared();
-            let path = directory.path();
-            let binding = path.join(TERMINAL_HANDLE_FILE);
-            let mut receipt = launch::read(&crate::native::session::Reader::open_unchecked(path))
-                .unwrap()
-                .unwrap();
-            let mut sent = (path.to_path_buf(), token.clone());
-            match case {
-                "the token of another launch" => sent.1 = "1-2-3".into(),
-                "the receipt of another launch" => receipt.claim_token = "1-2-3".into(),
-                "not bound" => std::fs::remove_file(&binding).unwrap(),
-                "bound to another session" => write_json_atomic(
-                    &binding,
-                    &serde_json::json!({ "terminal": "ghostty", "session_id": "u2", "tab_id": "t2", "window_id": "w1", "managed_session_id": "session-other" }),
-                )
-                .unwrap(),
-                "bound to another terminal" => write_json_atomic(
-                    &binding,
-                    &serde_json::json!({ "terminal": "iterm2", "session_id": "u2", "managed_session_id": path.file_name().unwrap().to_str().unwrap() }),
-                )
-                .unwrap(),
-                "cancelled" => update_status(path, SessionState::Closed, None, None).unwrap(),
-                "expired" => receipt.deadline_unix_ms = 0,
-                "already spawned" => receipt.phase = launch::Phase::Spawned,
-                "claim released" => {
-                    std::fs::remove_file(path.join(crate::native::session::test_support::TURN_CLAIM_FILE)).unwrap()
-                }
-                "directory open to others" => {
-                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap()
-                }
-                "no start script" => std::fs::remove_file(path.join("ghostty-start.sh")).unwrap(),
-                "start script is a link" => {
-                    std::fs::remove_file(path.join("ghostty-start.sh")).unwrap();
-                    std::os::unix::fs::symlink(path.join("launch.json"), path.join("ghostty-start.sh"))
-                        .unwrap();
-                }
-                "relative directory" => sent.0 = PathBuf::from(path.file_name().unwrap()),
-                _ => unreachable!(),
-            }
-            write_json_atomic(&path.join(launch::FILE), &receipt).unwrap();
-            assert!(verify_launch(&sent.0, &sent.1).is_err(), "{case}");
-        }
-    }
-    // The whole start on a private PTY: the creation command as Ghostty runs it, keys
-    // typed before, with and after the launch, and the launch command as the shell job
-    // that the owner record describes.
-    #[test]
-    fn host_on_a_private_pty_starts_only_its_bound_launch_and_no_key_reaches_it() {
-        for case in ["launched", "cancelled", "never addressed"] {
-            let directory = launch_fixture();
-            let path = directory.path();
-            let owner = path.join("owner-probe.json");
-            let probe = format!(
-                "AB_GHOSTTY_PROBE=owner AB_GHOSTTY_PROBE_DIR={} {} {PROBE}; exit $?",
-                crate::native::terminal::shell_quote(path.as_os_str()),
-                crate::native::terminal::shell_quote(std::env::current_exe().unwrap().as_os_str())
-            );
-            let mut f = existing();
-            f.pty = Some(Pty {
-                keys_before: b"aaaa\n",
-                keys_with: b"more\x03\x15",
-                keys_after: b"zz\n",
-                ..Pty::default()
-            });
-            let handle = create_with_runner(&mut f, case == "cancelled", soon()).unwrap();
-            f.pty.as_mut().unwrap().wait_until_raw();
-            assert!(!owner.exists(), "{case}: the launch ran before the binding");
-            bind_fixture(path, &handle);
-            if case == "cancelled" {
-                crate::native::session::update_status(path, SessionState::Closed, None, None)
-                    .unwrap();
-            }
-            if case != "never addressed" {
-                start_bound(&mut f, &handle, &probe, path, soon()).unwrap();
-            }
-            let pty = f.pty.as_mut().unwrap();
-            let status = pty.run(|| false, Duration::from_secs(10));
-            if case != "launched" {
-                assert!(!owner.exists(), "{case}: {}", pty.shown());
-                assert!(
-                    matches!(status, Some(code) if code != 0),
-                    "{case}: {status:?}"
-                );
-                continue;
-            }
-            assert_eq!(status, Some(0), "{}", pty.shown());
-            let owner: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(owner).unwrap()).unwrap();
-            assert_eq!(
-                owner["queued_input"], 0,
-                "a typed key reached the launch: {owner}"
-            );
-            assert_eq!(owner["group"], owner["terminal_group"], "{owner}");
-            assert!(owner["shell"].is_u64(), "{owner}");
-            assert!(
-                !pty.shown().contains("more"),
-                "typed keys were echoed: {}",
-                pty.shown()
-            );
-        }
     }
     // A private WezTerm GUI is started without LaunchServices and has no launch date
     // (issue #58 acceptance, 2026-10-03). It must get the foreground back, and a later
