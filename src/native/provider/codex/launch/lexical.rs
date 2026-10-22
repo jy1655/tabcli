@@ -8,11 +8,14 @@ pub(super) fn contains_hook_review_label(screen: &str) -> bool {
     screen.contains(REVIEW_HOOKS) || screen.contains(TRUST_ALL_AND_CONTINUE)
 }
 
+// Draft lexemes are used only by the Windows paste route and its portable tests.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub(super) fn numbered_label(text: &str) -> Option<&str> {
     let (n, label) = text.split_once(". ")?;
     (!n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())).then_some(label)
 }
 // Pinned startup-hook and trust-directory options, including wrapped label prefixes.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub(super) fn pinned_option(label: &str) -> bool {
     [
         REVIEW_HOOKS,
@@ -31,6 +34,7 @@ pub(super) fn pinned_option(label: &str) -> bool {
 }
 // Fragments survive wrapping and clipped frames; key names come from the keymap.
 // The caller decides whether a matching row is content or unresolved UI.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub(super) fn confirmation_hint(text: &str) -> bool {
     let text = text.trim().strip_prefix("› ").unwrap_or(text.trim());
     fn action(value: &str) -> bool {
