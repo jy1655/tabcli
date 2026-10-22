@@ -37,7 +37,8 @@ installed executable remains the published v0.4.22, separate from both builds.
 The local suite preceded the final physical test-file relocation. The module names
 and assertions stayed the same. The final source commit is covered separately by
 [CI run 39767719830](https://github.com/jy1655/tabcli/actions/runs/39767719830);
-its final conclusion and Windows totals are recorded in the PR verification section.
+all six jobs passed. Its Windows job independently reported **1,200 passed,
+0 failed, 5 ignored** on final source `25605f9` (14 min 31 s including setup and checks).
 Ignored authenticated tests are not live-runtime evidence.
 
 ## Authenticated parent/head comparison
