@@ -1,7 +1,7 @@
 //! Optional, read-only Reopen marker Observation. The command re-observes under its
 //! source lock before changing a marker; doctor only renders the same Judgment.
 use super::{
-    RecordedReopenRefusal, RefusedLaunchCleanup, ReopenMarker, read_reopen_launch_refusal,
+    RecordedReopenRefusal, RefusedLaunchCleanup, ReopenGate, read_reopen_launch_refusal,
     refused_launch_cleanup, reopen_refusal, valid_session_id,
 };
 use crate::native::diagnostics::{Availability, Check};
@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use std::{fs, path::Path};
 
 #[derive(Debug)]
-pub(super) struct StaleReopenMarker {
+pub(in crate::native::reopen) struct StaleReopenMarker {
     pub(super) refused_session: String,
     pub(super) gate: String,
     pub(super) cleanup: RefusedLaunchCleanup,
@@ -48,7 +48,7 @@ pub(super) fn observe(directory: &Path) -> Result<Judgment> {
     let Some(text) = record.text()? else {
         return Ok(Judgment::Absent);
     };
-    let marker: ReopenMarker = match serde_json::from_str(&text)
+    let marker = match crate::native::session::record::reopen_marker(&text)
         .with_context(|| format!("invalid JSON in {}", record.path().display()))
     {
         Ok(marker) => marker,
@@ -125,7 +125,7 @@ impl Judgment {
                 }
             }
         };
-        Err(reopen_refusal("already-reopened", detail))
+        Err(reopen_refusal(ReopenGate::AlreadyReopened, detail))
     }
 }
 

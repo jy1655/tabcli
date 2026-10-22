@@ -224,7 +224,35 @@ impl Reader {
         self.private(TERMINAL_TOMBSTONE_FILE).json()
     }
     pub(in crate::native) fn provider_process(&self) -> Result<ProviderProcessRecord> {
-        self.private(PROVIDER_PROCESS_FILE).json()
+        let path = self.private(PROVIDER_PROCESS_FILE).path;
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        record::provider_process(&text)
+            .with_context(|| format!("invalid JSON in {}", path.display()))
+    }
+    pub(in crate::native) fn provider_process_if_present(
+        &self,
+    ) -> Result<Option<ProviderProcessRecord>> {
+        let record = self.record(CoreRecord::ProviderProcess);
+        record
+            .text()?
+            .map(|text| {
+                record::provider_process(&text)
+                    .with_context(|| format!("invalid JSON in {}", record.path().display()))
+            })
+            .transpose()
+    }
+    pub(in crate::native) fn reopen_marker_if_present(
+        &self,
+    ) -> Result<Option<schema::ReopenMarker>> {
+        let record = self.record(CoreRecord::ReopenMarker);
+        record
+            .text()?
+            .map(|text| {
+                record::reopen_marker(&text)
+                    .with_context(|| format!("invalid JSON in {}", record.path().display()))
+            })
+            .transpose()
     }
     pub(in crate::native) fn lock_shared(&self) -> Result<Option<File>> {
         let directory = self.directory();

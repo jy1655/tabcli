@@ -1,10 +1,11 @@
 //! One decoder per JSON core Record, the byte source a Snapshot is assembled from, and
 //! the Live adapter over a session directory.
 //!
-//! A decoder is pure over bytes: strict UTF-8, the `*_unix_ms` unsigned-range rule, the
+//! A Snapshot decoder is pure over bytes: strict UTF-8, the `*_unix_ms` unsigned-range rule, the
 //! Record's shape, then the Record's own rules, one error each. It carries no path and no
 //! caller context; every caller adds its own and keeps its own missing-record policy. The
 //! Claim is a text token, not a decoded Record, and keeps its readers.
+//! Reopen's auxiliary shapes retain their older text-decoding policy, documented below.
 use super::schema::{SESSION_SCHEMA, SessionManifest};
 use super::turn::{
     JournaledEventRead, JournaledEventState, PendingTurnCompletion, validate_pending_completion,
@@ -147,6 +148,27 @@ pub(in crate::native) fn receipt(
         )));
     }
     Ok(receipt)
+}
+
+// These auxiliary records historically use serde's shape decoder directly, without
+// the snapshot timestamp-range rule or added schema validation. Keep that policy here;
+// readers retain strict UTF-8 and their own I/O/error context, and Reopen judges release.
+pub(in crate::native) fn reopen_marker(
+    text: &str,
+) -> serde_json::Result<super::schema::ReopenMarker> {
+    serde_json::from_str(text)
+}
+
+pub(in crate::native) fn reopen_refusal(
+    text: &str,
+) -> serde_json::Result<super::schema::RecordedReopenRefusal> {
+    serde_json::from_str(text)
+}
+
+pub(in crate::native) fn provider_process(
+    text: &str,
+) -> serde_json::Result<super::schema::ProviderProcessRecord> {
+    serde_json::from_str(text)
 }
 
 /// What a source holds for one core Record.
