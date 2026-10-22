@@ -40,7 +40,7 @@
     ".prefix(\"pending-prompt-\")": 1,
     "command.arg(\"native-console-control\")": 1
   },
-  "src/native/consent.rs": {
+  "src/native/consent/record.rs": {
     "const SESSION_FILE: &str = \"workspace-consent.json\";": 1,
     "root.join(\"workspace-consent\")": 1,
     "workspace-consent.json": 1
